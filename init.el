@@ -12,8 +12,6 @@
 (setq make-backup-files nil)
 (setq evil-want-keybinding nil)
 
-
-(tool-bar-mode -1)
 (menu-bar-mode -1)
 
 (set-face-attribute 'default nil :height 120)
@@ -34,35 +32,49 @@
 
 (add-hook 'emacs-startup-hook #'efs/display-startup-time)
 
-(require 'package)
-(add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
-(add-to-list 'package-archives '("gnu" . "https://elpa.gnu.org/packages/") t)
-(package-initialize)
+(let ((shell-path (shell-command-to-string "bash -c 'echo $PATH'")))
+  (setenv "PATH" shell-path)
+  (setq exec-path (split-string shell-path ":")))
 
-(unless (package-installed-p 'use-package)
-  (package-refresh-contents)
-  (package-install 'use-package))
+(defvar +init-files (list
+                     'init-util
+                     'init-straight
+                     'init-themes
+                     'init-highlight
+                     'init-prog
+                     'init-completion
+                     'init-persp
+                     ))
 
-(use-package tree-sitter
-  :ensure t
-  :config
-  (require 'tree-sitter-langs)
-  (global-tree-sitter-mode)
-  (add-hook 'tree-sitter-after-on-hook #'tree-sitter-hl-mode))
+(let ((init-directory (expand-file-name "core/" user-emacs-directory)))
+  (dolist (file +init-files)
+    (when file
+      (load-file (concat init-directory (symbol-name file) ".el")))))
 
 (use-package tree-sitter-langs
   :ensure t
+  :demand t
   :config
   (add-to-list 'tree-sitter-major-mode-language-alist '(rust-mode . rust))
   (add-to-list 'tree-sitter-major-mode-language-alist '(c-mode . c))
   (add-to-list 'tree-sitter-major-mode-language-alist '(c++-mode . cpp))
-  (add-to-list 'tree-sitter-major-mode-language-alist '(go-mode . go)))
+  (add-to-list 'tree-sitter-major-mode-language-alist '(go-mode . go))
+  (tree-sitter-langs-install-grammars))
+
+(use-package tree-sitter
+  :ensure t
+  :demand t
+  :config
+  (require 'tree-sitter-langs)
+  (global-tree-sitter-mode)
+  (add-hook 'tree-sitter-after-on-hook #'tree-sitter-hl-mode))
 
 (global-display-line-numbers-mode 0)
 (setq auto-save-default nil)
 
 (use-package evil
   :ensure t
+  :demand t
   :init
   (setq select-enable-clipboard t)
   :config
@@ -76,6 +88,7 @@
 
 (use-package key-chord
   :ensure t
+  :demand t
   :config
   (key-chord-mode 1)
   (key-chord-define evil-insert-state-map "jk" 'evil-normal-state))
@@ -172,8 +185,14 @@
 (setq ring-bell-function 'ignore)
 (setq visible-bell nil)
 
-(require 'solidity-mode)
-(define-key solidity-mode-map (kbd "C-c C-g") 'solidity-estimate-gas-at-point)
+(use-package htmlize
+  :ensure t
+  :demand t)
+
+(use-package solidity-mode
+  :ensure t
+  :config
+  (define-key solidity-mode-map (kbd "C-c C-g") 'solidity-estimate-gas-at-point))
 
 ;; (setq shell-file-name "/bin/bash")
 ;; (setq explicit-shell-file-name "/bin/sh")
@@ -217,17 +236,18 @@
 (defun my/copy-to-osx-clipboard (beg end)
   "Copy region to the macOS clipboard using pbcopy."
   (interactive "r")
-  (if (eq system-type 'darwinalgae)
+  (if (eq system-type 'darwin)
     (shell-command-on-region beg end "pbcopy")
     (shell-command-on-region beg end "clip.exe"))
   (message "Copied to clipboard"))
 
-
-(define-key evil-visual-state-map (kbd "C-y") 'my/copy-to-osx-clipboard)
+(with-eval-after-load 'evil
+  (define-key evil-visual-state-map (kbd "C-y") 'my/copy-to-osx-clipboard))
 
 
 (use-package projectile
   :ensure t
+  :demand t
   :config
   (projectile-mode +1)
   ;; Existing ripgrep binding
@@ -240,25 +260,9 @@
     ;; Enable caching for faster searches
     (setq projectile-enable-caching t)))
 
-(custom-set-variables
- ;; custom-set-variables was added by Custom.
- ;; If you edit it by hand, you could mess it up, so be careful.
- ;; Your init file should contain only one such instance.
- ;; If there is more than one, they won't work right.
- '(org-agenda-files nil)
- '(package-selected-packages
-   '(agda deadgrep elisp-mode evil evil-collection go-mode help htmlize
-          js-ts-mode key-chord ligature lsp-mode magit org-bullets
-          pbcopy prog-mode projectile rg rgb ripgrep rust-mode
-          solidity-mode tree-sitter-langs treesit typescript-mode
-          typespec-ts-mode)))
-
-(custom-set-faces
- ;; custom-set-faces was added by Custom.
- ;; If you edit it by hand, you could mess it up, so be careful.
- ;; Your init file should contain only one such instance.
- ;; If there is more than one, they won't work right.
- )
+(use-package magit
+  :ensure t
+  :demand t)
 
 ;; Ensure J and K jump 8 lines globally in Evil normal state, overriding mode-specific bindings
 (add-hook 'after-change-major-mode-hook
@@ -286,22 +290,3 @@
 
 (require 'ox-md)
 (require 'htmlize)
-
-(let ((shell-path (shell-command-to-string "bash -c 'echo $PATH'")))
-  (setenv "PATH" shell-path)
-  (setq exec-path (split-string shell-path ":")))
-
-(defvar +init-files (list
-                     'init-util
-                     'init-straight
-                     'init-themes
-                     'init-highlight
-                     'init-prog
-                     'init-completion
-                     'init-persp
-                     ))
-
-(let ((init-directory (expand-file-name "core/" user-emacs-directory)))
-  (dolist (file +init-files)
-    (when file
-      (load-file (concat init-directory (symbol-name file) ".el")))))
