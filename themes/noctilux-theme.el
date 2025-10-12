@@ -4,7 +4,7 @@
 
 ;; Author: Simon Manning <simon@ecksdee.org>
 ;; Maintainer: Simon Manning <simon@ecksdee.org>
-;; Package-Requires: ((emacs "24"))
+;; Package-Requires: ((emacs "24") (cl-lib "0.5"))
 ;; Homepage: https://github.com/sjrmanning/noctilux-theme
 
 ;; This file is not part of GNU Emacs.
@@ -34,8 +34,7 @@
 
 ;;; Code:
 
-(eval-when-compile
-  (require 'cl))
+(require 'cl-lib)
 
 (defconst noctilux-description
   "A Light Table inspired color theme based on Solarized's definitions.")
@@ -113,8 +112,7 @@ the \"Gen RGB\" column in noctilux-definitions.el to improve them further."
    capabilities, etc.")
 
 (defmacro noct-flet (specs &rest body)
-  (let ((flet (if (fboundp 'cl-flet) 'cl-flet 'flet)))
-    `(,flet ,specs ,@body)))
+  `(cl-flet ,specs ,@body))
 
 (defun noctilux-color-definitions (mode)
   (noct-flet ((find-color (name)
@@ -122,10 +120,10 @@ the \"Gen RGB\" column in noctilux-definitions.el to improve them further."
                              (if noctilux-degrade
                                  3
                                (if noctilux-broken-srgb 2 1))
-                           (case (display-color-cells)
+                           (cl-case (display-color-cells)
                              (16 4)
                              (8  5)
-                             (otherwise 3)))))
+                             (t 3)))))
              (nth index (assoc name noctilux-colors)))))
     (let ((base03      (find-color 'base03))
           (base02      (find-color 'base02))
@@ -271,7 +269,7 @@ the \"Gen RGB\" column in noctilux-definitions.el to improve them further."
              (custom-state ((t (,@fg-green))))
              (custom-variable-tag ((t (,@fg-base1))))
              ;; diff - DiffAdd, DiffChange, DiffDelete, and DiffText
-             ,@(case noctilux-diff-mode
+             ,@(cl-case noctilux-diff-mode
                  (high
                   `((diff-added ((t (,@fmt-revr ,@fg-green))))
                     (diff-changed ((t (,@fmt-revr ,@fg-yellow))))
@@ -523,7 +521,7 @@ the \"Gen RGB\" column in noctilux-definitions.el to improve them further."
              ;; magit
              (magit-bisect-bad ((t ,@fg-red)))
              (magit-bisect-good ((t ,@fg-green)))
-             (magit-biset-skip ((t ,@fg-blue)))
+             (magit-bisect-skip ((t ,@fg-blue)))
              (magit-branch-current ((t ,@fg-green)))
              (magit-branch-local ((t ,@fg-cyan)))
              (magit-branch-remote ((t ,@fg-yellow)))
@@ -539,8 +537,8 @@ the \"Gen RGB\" column in noctilux-definitions.el to improve them further."
              (magit-process-ng ((t ,@fmt-bold ,@fg-red)))
              (magit-process-ok ((t ,@fmt-bold ,@fg-green)))
              (magit-section-heading ((t ,@fmt-bold ,@fg-cyan)))
-             (magit-siganture-unmatched ((t ,@fg-magenta)))
-             (magit-siganture-untrusted ((t ,@fg-magenta)))
+             (magit-signature-unmatched ((t ,@fg-magenta)))
+             (magit-signature-untrusted ((t ,@fg-magenta)))
              (magit-signature-bad ((t ,@fg-red)))
              (magit-signature-good ((t ,@fg-green)))
              (magit-tag ((t ,@fg-orange)))
@@ -623,7 +621,7 @@ the \"Gen RGB\" column in noctilux-definitions.el to improve them further."
              (erc-input-face ((t (:foreground ,base01))))
              (erc-keyword-face ((t (,@fmt-bldi ,@fg-yellow))))
              (erc-my-nick-face ((t (:foreground ,blue))))
-             (erc-nick-defaunoctilux-face ((t (,@fmt-none ,@fg-cyan))))
+             (erc-nick-default-face ((t (,@fmt-none ,@fg-cyan))))
              (erc-notice-face ((t (,@fmt-none ,@fg-blue))))
              (erc-timestamp-face ((t (:foreground ,base01))))
              ;; evil
@@ -689,6 +687,6 @@ the \"Gen RGB\" column in noctilux-definitions.el to improve them further."
 
 (create-noctilux-theme)
 
-(provide-theme 'noctilux)
+(provide 'noctilux-theme)
 
 ;;; noctilux-theme.el ends here

@@ -4,6 +4,8 @@
 (defvar shell-mode-map)
 (defvar compilation-mode-map)
 
+(setq gc-cons-threshold most-positive-fixnum)
+
 ;; (declare-function copilot-accept-completion "copilot")
 ;; (declare-function copilot-accept-completion-by-word "copilot")
 ;; (declare-function copilot-next-completion "copilot")
@@ -59,7 +61,7 @@
   (add-to-list 'tree-sitter-major-mode-language-alist '(c-mode . c))
   (add-to-list 'tree-sitter-major-mode-language-alist '(c++-mode . cpp))
   (add-to-list 'tree-sitter-major-mode-language-alist '(go-mode . go))
-  (tree-sitter-langs-install-grammars))
+  (tree-sitter-langs-install-grammars t))
 
 (use-package tree-sitter
   :ensure t
