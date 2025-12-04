@@ -76,7 +76,9 @@
   :demand t
   :init
   ;; Enable system clipboard integration
-  (setq select-enable-clipboard t)
+  (setq select-enable-clipboard t
+        select-enable-primary t           ; Also use PRIMARY selection (Linux)
+        save-interprogram-paste-before-kill t)  ; Save clipboard to kill ring
   ;; Use C-u for scroll (like vim)
   (setq evil-want-C-u-scroll nil)  ; Keep C-u for universal-argument
   :config
@@ -85,7 +87,79 @@
   ;; Set cursor shapes for different states
   (setq evil-insert-state-cursor '(bar . 2)
         evil-normal-state-cursor 'box
-        evil-visual-state-cursor 'hollow))
+        evil-visual-state-cursor 'hollow)
+  
+  ;; Make evil use system clipboard for yank/paste
+  (setq evil-kill-on-visual-paste nil))  ; Don't replace clipboard when pasting over selection
+
+;; =============================================================================
+;; WSL/System Clipboard Support
+;; =============================================================================
+
+;; Detect if running in WSL
+(defvar +is-wsl
+  (and (eq system-type 'gnu/linux)
+       (string-match-p "microsoft\\|WSL" (shell-command-to-string "uname -r")))
+  "Non-nil if running inside WSL.")
+
+(defun +clipboard/get ()
+  "Get text from system clipboard. Works in WSL, Linux, and macOS."
+  (cond
+   ;; WSL: use powershell to get Windows clipboard
+   (+is-wsl
+    (let ((clip (shell-command-to-string
+                 "powershell.exe -Command Get-Clipboard 2>/dev/null")))
+      ;; Remove trailing \r\n that Windows adds
+      (when (and clip (not (string-empty-p clip)))
+        (string-trim-right clip "[\r\n]+"))))
+   ;; macOS
+   ((eq system-type 'darwin)
+    (shell-command-to-string "pbpaste"))
+   ;; Linux with X11
+   ((and (eq system-type 'gnu/linux)
+         (getenv "DISPLAY"))
+    (ignore-errors (gui-get-selection 'CLIPBOARD)))
+   ;; Fallback
+   (t
+    (ignore-errors (gui-get-selection 'CLIPBOARD)))))
+
+(defun +clipboard/set (text)
+  "Set TEXT to system clipboard. Works in WSL, Linux, and macOS."
+  (cond
+   ;; WSL: use clip.exe to set Windows clipboard
+   (+is-wsl
+    (let ((process-connection-type nil))
+      (let ((proc (start-process "clip" nil "clip.exe")))
+        (process-send-string proc text)
+        (process-send-eof proc))))
+   ;; macOS
+   ((eq system-type 'darwin)
+    (let ((process-connection-type nil))
+      (let ((proc (start-process "pbcopy" nil "pbcopy")))
+        (process-send-string proc text)
+        (process-send-eof proc))))
+   ;; Linux with X11 - use xclip or xsel
+   ((and (eq system-type 'gnu/linux)
+         (getenv "DISPLAY"))
+    (cond
+     ((executable-find "xclip")
+      (let ((process-connection-type nil))
+        (let ((proc (start-process "xclip" nil "xclip" "-selection" "clipboard")))
+          (process-send-string proc text)
+          (process-send-eof proc))))
+     ((executable-find "xsel")
+      (let ((process-connection-type nil))
+        (let ((proc (start-process "xsel" nil "xsel" "--clipboard" "--input")))
+          (process-send-string proc text)
+          (process-send-eof proc))))))
+   ;; Fallback to Emacs built-in
+   (t
+    (gui-set-selection 'CLIPBOARD text))))
+
+;; Override interprogram paste/copy for WSL
+(when +is-wsl
+  (setq interprogram-paste-function '+clipboard/get
+        interprogram-cut-function '+clipboard/set))
 
 ;; =============================================================================
 ;; Evil Collection (consistent bindings across modes)
@@ -97,6 +171,7 @@
   :demand t
   :config
   ;; Setup evil-collection for common modes
+  ;; Note: Only include modes that exist in evil-collection
   (evil-collection-init '(magit
                           dired
                           ibuffer
@@ -106,7 +181,10 @@
                           compile
                           xref
                           calendar
-                          debug)))
+                          debug
+                          eshell
+                          term
+                          vterm)))
 
 ;; =============================================================================
 ;; Key-chord (for 'jk' escape)
@@ -117,8 +195,14 @@
   :demand t
   :config
   (key-chord-mode 1)
-  ;; Exit insert mode with 'jk'
-  (key-chord-define evil-insert-state-map "jk" 'evil-normal-state))
+  ;; Exit insert mode with 'jk' - works globally
+  (key-chord-define evil-insert-state-map "jk" 'evil-normal-state)
+  
+  ;; Ensure jk works in eshell too
+  (with-eval-after-load 'eshell
+    (add-hook 'eshell-mode-hook
+              (lambda ()
+                (key-chord-define-local "jk" 'evil-normal-state)))))
 
 ;; =============================================================================
 ;; Movement Functions
