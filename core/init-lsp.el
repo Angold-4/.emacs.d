@@ -480,8 +480,11 @@ This helps clangd find the compile database more reliably."
     (when (file-exists-p cargo-file)
       (with-temp-buffer
         (insert-file-contents cargo-file)
-        (when (re-search-forward "^edition\\s-*=\\s-*[\"']\\([0-9]+\\)[\"']" nil t)
-          (match-string 1))))))
+        ;; Search for edition = "20xx" or edition = '20xx'
+        ;; Handles whitespace and potential comments
+        (if (re-search-forward "^\\s-*edition\\s-*=\\s-*[\"']\\([0-9]+\\)[\"']" nil t)
+            (match-string 1)
+          "2021")))))  ; Default to 2021 if not found
 
 (defun +rust/format-buffer ()
   "Format current Rust buffer using rustfmt with correct edition.
@@ -493,7 +496,7 @@ Reads the edition from Cargo.toml and passes it to rustfmt."
       ;; Save first
       (save-buffer)
       ;; Get edition from Cargo.toml
-      (let* ((edition (or (+rust/get-edition-from-cargo-toml) "2021"))
+      (let* ((edition (+rust/get-edition-from-cargo-toml))
              (cmd (format "rustfmt --edition %s %s"
                           edition
                           (shell-quote-argument file))))
@@ -502,7 +505,7 @@ Reads the edition from Cargo.toml and passes it to rustfmt."
       ;; Revert buffer to see changes
       (revert-buffer t t t)
       (message "Formatted with rustfmt (edition %s)"
-               (or (+rust/get-edition-from-cargo-toml) "2021")))))
+               (+rust/get-edition-from-cargo-toml)))))
 
 ;; Override C-c f in rust-mode to use cargo fmt
 (with-eval-after-load 'rust-mode
