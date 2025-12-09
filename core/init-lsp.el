@@ -474,35 +474,31 @@ This helps clangd find the compile database more reliably."
 ;; =============================================================================
 
 (defun +rust/get-edition-from-cargo-toml ()
-  "Extract the edition from Cargo.toml in the project root."
-  (when-let* ((root (+lsp/rust-project-root default-directory))
-              (cargo-file (expand-file-name "Cargo.toml" root)))
-    (when (file-exists-p cargo-file)
-      (with-temp-buffer
-        (insert-file-contents cargo-file)
-        ;; Search for edition = "20xx" or edition = '20xx'
-        ;; Handles whitespace and potential comments
-        (if (re-search-forward "^\\s-*edition\\s-*=\\s-*[\"']\\([0-9]+\\)[\"']" nil t)
-            (match-string 1)
-          "2021")))))  ; Default to 2021 if not found
+  "Extract the edition from Cargo.toml in the project root.
+Returns '2021' if Cargo.toml is missing or edition is not found."
+  (let ((edition
+         (when-let* ((root (+lsp/rust-project-root default-directory))
+                     (cargo-file (expand-file-name "Cargo.toml" root)))
+           (when (file-exists-p cargo-file)
+             (with-temp-buffer
+               (insert-file-contents cargo-file)
+               (when (re-search-forward "^\\s-*edition\\s-*=\\s-*[\"']\\([0-9]+\\)[\"']" nil t)
+                 (match-string 1)))))))
+    (or edition "2021")))
 
 (defun +rust/format-buffer ()
-  "Format current Rust buffer using rustfmt with correct edition.
-Reads the edition from Cargo.toml and passes it to rustfmt."
+  "Format current Rust buffer using rustfmt with correct edition."
   (interactive)
   (let ((file (buffer-file-name)))
     (if (not file)
         (message "Buffer is not visiting a file")
-      ;; Save first
       (save-buffer)
-      ;; Get edition from Cargo.toml
       (let* ((edition (+rust/get-edition-from-cargo-toml))
              (cmd (format "rustfmt --edition %s %s"
                           edition
                           (shell-quote-argument file))))
         (message "Running: %s" cmd)
         (shell-command cmd))
-      ;; Revert buffer to see changes
       (revert-buffer t t t)
       (message "Formatted with rustfmt (edition %s)"
                (+rust/get-edition-from-cargo-toml)))))
