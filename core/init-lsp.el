@@ -197,23 +197,28 @@ For workspaces, finds the topmost Cargo.toml."
 (defun +lsp/eldoc-diagnostics (callback &rest _)
   "Show LSP diagnostics in eldoc (echo area)."
   (when (bound-and-true-p lsp-mode)
-    (when-let* ((diags (lsp--cur-line-diagnotics))
-                (diag (car diags))
-                (severity (gethash "severity" diag 1))
-                (msg (gethash "message" diag)))
-      (funcall callback
-               (format "%s: %s"
-                       (propertize
-                        (pcase severity
-                          (1 "Error")
-                          (2 "Warning")
-                          (3 "Info")
-                          (_ "Hint"))
-                        'face (pcase severity
-                                (1 'error)
-                                (2 'warning)
-                                (_ 'shadow)))
-                       msg)))))
+    (let ((diags (and (fboundp 'lsp--cur-line-diagnotics)
+                      (lsp--cur-line-diagnotics))))
+      ;; Handle vector return from lsp-mode
+      (when (vectorp diags)
+        (setq diags (append diags nil)))
+      
+      (when-let* ((diag (car diags))
+                  (severity (gethash "severity" diag 1))
+                  (msg (gethash "message" diag)))
+        (funcall callback
+                 (format "%s: %s"
+                         (propertize
+                          (pcase severity
+                            (1 "Error")
+                            (2 "Warning")
+                            (3 "Info")
+                            (_ "Hint"))
+                          'face (pcase severity
+                                  (1 'error)
+                                  (2 'warning)
+                                  (_ 'shadow)))
+                         msg))))))
 
 ;; Add our diagnostic function to eldoc
 (with-eval-after-load 'lsp-mode
@@ -268,8 +273,13 @@ If LSP is running, shut it down. If not, start it."
     ;; Collect diagnostics from LSP
     (when (and (bound-and-true-p lsp-mode)
                (fboundp 'lsp--cur-line-diagnotics))
-      (setq diags (lsp--cur-line-diagnotics))
-      (setq source "lsp"))
+      (let ((raw-diags (lsp--cur-line-diagnotics)))
+        ;; Handle vector return
+        (when (vectorp raw-diags)
+          (setq raw-diags (append raw-diags nil)))
+        (when (listp raw-diags)
+          (setq diags raw-diags)
+          (setq source "lsp"))))
     ;; Fallback to flymake
     (when (and (not diags) (bound-and-true-p flymake-mode))
       (setq diags (flymake-diagnostics (point)))
