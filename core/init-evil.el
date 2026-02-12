@@ -126,12 +126,16 @@
 (defun +clipboard/set (text)
   "Set TEXT to system clipboard. Works in WSL, Linux, and macOS."
   (cond
-   ;; WSL: use clip.exe to set Windows clipboard
+   ;; WSL: use clip.exe to set Windows clipboard (with path fallback)
    (+is-wsl
-    (let ((process-connection-type nil))
-      (let ((proc (start-process "clip" nil "clip.exe")))
-        (process-send-string proc text)
-        (process-send-eof proc))))
+    (let ((clip-exe (or (executable-find "clip.exe")
+                        "/mnt/c/Windows/System32/clip.exe")))
+      (if (file-exists-p clip-exe)
+          (let ((process-connection-type nil))
+            (let ((proc (start-process "clip" nil clip-exe)))
+              (process-send-string proc text)
+              (process-send-eof proc)))
+        (message "Warning: clip.exe not found. System clipboard sync skipped."))))
    ;; macOS
    ((eq system-type 'darwin)
     (let ((process-connection-type nil))

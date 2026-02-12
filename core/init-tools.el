@@ -232,6 +232,96 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 (add-hook 'eshell-mode-hook #'+eshell/evil-setup)
 
 ;; =============================================================================
+;; Vterm (Full Terminal Emulator via libvterm)
+;; =============================================================================
+
+(use-package vterm
+  :straight t
+  :commands (vterm vterm-other-window vterm-mode)
+  :bind (("C-c v" . +vterm/toggle)
+         ("C-c V" . +vterm/new))
+  :config
+  ;; General settings
+  (setq vterm-max-scrollback 10000
+        vterm-kill-buffer-on-exit t
+        vterm-timer-delay 0.01)        ; Faster rendering
+
+  ;; Shell to use (default to user's shell)
+  (setq vterm-shell (or (getenv "SHELL") "/bin/bash"))
+
+  ;; Enable directory tracking so Emacs knows the CWD
+  ;; Add this to your .bashrc/.zshrc:
+  ;;   vterm_printf(){ printf "\e]%s\e\\" "$1"; }
+  ;;   vterm_prompt_end(){ vterm_printf "51;A$(whoami)@$(hostname):$(pwd)"; }
+  ;;   PS1=$PS1'\[$(vterm_prompt_end)\]'
+
+  ;; Toggle vterm at bottom
+  (defun +vterm/toggle ()
+    "Toggle vterm window at the bottom of the frame."
+    (interactive)
+    (if-let ((vterm-window (cl-find-if
+                            (lambda (w)
+                              (with-current-buffer (window-buffer w)
+                                (eq major-mode 'vterm-mode)))
+                            (window-list))))
+        (delete-window vterm-window)
+      (let ((vterm-buffer (or (cl-find-if
+                               (lambda (b)
+                                 (with-current-buffer b
+                                   (eq major-mode 'vterm-mode)))
+                               (buffer-list))
+                              (vterm))))
+        (select-window (split-window-below -15))
+        (switch-to-buffer vterm-buffer))))
+
+  ;; Open new vterm
+  (defun +vterm/new ()
+    "Open a new vterm buffer."
+    (interactive)
+    (vterm t)))
+
+;; Evil integration for vterm
+(defun +vterm/evil-setup ()
+  "Setup Evil keybindings for vterm."
+  (when (bound-and-true-p evil-mode)
+    ;; Start in insert state (vterm handles its own input)
+    (evil-set-initial-state 'vterm-mode 'insert)
+
+    ;; Window navigation in normal mode
+    (evil-local-set-key 'normal (kbd "C-h") 'windmove-left)
+    (evil-local-set-key 'normal (kbd "C-l") 'windmove-right)
+    (evil-local-set-key 'normal (kbd "C-j") 'windmove-down)
+    (evil-local-set-key 'normal (kbd "C-k") 'windmove-up)
+
+    ;; Also in insert mode for quick window switching
+    (evil-local-set-key 'insert (kbd "C-h") 'windmove-left)
+    (evil-local-set-key 'insert (kbd "C-l") 'windmove-right)
+    (evil-local-set-key 'insert (kbd "C-j") 'windmove-down)
+    (evil-local-set-key 'insert (kbd "C-k") 'windmove-up)
+
+    ;; i/a in normal mode → go to end and switch to insert
+    (evil-local-set-key 'normal (kbd "i")
+      (lambda () (interactive)
+        (goto-char (point-max))
+        (evil-insert-state)))
+    (evil-local-set-key 'normal (kbd "a")
+      (lambda () (interactive)
+        (goto-char (point-max))
+        (evil-insert-state)))
+
+    ;; Paste from clipboard in normal mode
+    (evil-local-set-key 'normal (kbd "p")
+      (lambda () (interactive)
+        (vterm-send-string (current-kill 0))))
+
+    ;; C-v to paste in insert mode
+    (evil-local-set-key 'insert (kbd "C-v")
+      (lambda () (interactive)
+        (vterm-send-string (current-kill 0))))))
+
+(add-hook 'vterm-mode-hook #'+vterm/evil-setup)
+
+;; =============================================================================
 ;; Magit (Git Interface)
 ;; =============================================================================
 

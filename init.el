@@ -53,8 +53,21 @@
 ;; =============================================================================
 
 ;; User info (change as needed)
-(setq user-full-name "Ango Wang"
-      user-mail-address "ango@weids.dev")
+(setq user-full-name "Angold Wang"
+      user-mail-address "awang@weids.dev")
+
+
+;; Render center
+(setq org-html-head "
+<style>
+  body {
+    max-width: 800px;
+    margin: auto;
+    padding: 1em;
+    font-family: sans-serif;
+  }
+</style>
+")
 
 ;; Define the core configuration directory
 (defvar +emacs-core-dir (expand-file-name "core/" user-emacs-directory)
@@ -84,6 +97,7 @@
     init-languages  ; Language-specific settings
     init-org        ; Org-mode configuration
     init-tools      ; Development tools
+    init-opencode   ; OpenCode vterm integration
     )
   "List of configuration modules to load.")
 
