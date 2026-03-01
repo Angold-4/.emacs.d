@@ -73,6 +73,51 @@
 (defvar +emacs-core-dir (expand-file-name "core/" user-emacs-directory)
   "Directory containing modular configuration files.")
 
+;; =============================================================================
+;; Line Ending / ^M Handling (load early, even if packages fail)
+;; =============================================================================
+
+;; Prefer Unix line endings and allow EOL conversion from DOS files
+(set-language-environment "UTF-8")
+(prefer-coding-system 'utf-8-unix)
+(set-default-coding-systems 'utf-8-unix)
+(setq-default buffer-file-coding-system 'utf-8-unix)
+(setq inhibit-eol-conversion nil)
+
+(defun +emacs/remove-carriage-returns ()
+  "Remove carriage return characters from the current buffer."
+  (interactive)
+  (save-excursion
+    (goto-char (point-min))
+    (while (search-forward "\r" nil t)
+      (replace-match "" nil t))))
+
+(defun +emacs/hide-carriage-return-display ()
+  "Hide ^M display in the current buffer."
+  (setq-local buffer-display-table (or buffer-display-table (make-display-table)))
+  (aset buffer-display-table ?\r []))
+
+(defun +emacs/normalize-line-endings-on-visit ()
+  "Convert visited files with CRLF characters to Unix line endings."
+  (when (and buffer-file-name
+             (not (derived-mode-p 'special-mode))
+             (save-excursion
+               (goto-char (point-min))
+               (search-forward "\r" nil t)))
+    (set-buffer-file-coding-system 'utf-8-unix t)))
+
+;; Hide ^M globally and per-buffer
+(setq standard-display-table (or standard-display-table (make-display-table)))
+(aset standard-display-table ?\r [])
+(add-hook 'after-change-major-mode-hook #'+emacs/hide-carriage-return-display)
+
+;; Normalize on open and clean on save
+(add-hook 'find-file-hook #'+emacs/normalize-line-endings-on-visit)
+(add-hook 'before-save-hook
+          (lambda ()
+            (when (and buffer-file-name (not (derived-mode-p 'special-mode)))
+              (+emacs/remove-carriage-returns))))
+
 ;; Helper function to load configuration modules
 (defun +load-module (module)
   "Load a configuration MODULE from the core directory."
@@ -115,11 +160,6 @@
 (setq make-backup-files nil
       auto-save-default nil
       create-lockfiles nil)
-
-;; UTF-8 everywhere
-(set-language-environment "UTF-8")
-(prefer-coding-system 'utf-8)
-(set-default-coding-systems 'utf-8)
 
 ;; Silence bell
 (setq ring-bell-function 'ignore

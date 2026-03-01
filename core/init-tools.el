@@ -325,6 +325,9 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 ;; Magit (Git Interface)
 ;; =============================================================================
 
+;; Magit depends on cond-let; pin recipe explicitly to avoid recipe lookup issues.
+(straight-use-package '(cond-let :type git :host github :repo "tarsius/cond-let"))
+
 (use-package magit
   :straight t
   :commands (magit-status magit-dispatch)
