@@ -20,8 +20,10 @@
 
 ;; Disable UI chrome (already done in early-init, but ensure it)
 (menu-bar-mode -1)
-(tool-bar-mode -1)
-(scroll-bar-mode -1)
+(when (fboundp 'tool-bar-mode)
+  (tool-bar-mode -1))
+(when (fboundp 'scroll-bar-mode)
+  (scroll-bar-mode -1))
 
 ;; Disable tab bar (Emacs 27+)
 (when (fboundp 'tab-bar-mode)

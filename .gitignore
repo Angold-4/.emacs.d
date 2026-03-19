@@ -88,6 +88,31 @@ tree-sitter/
 Thumbs.db
 
 # =============================================================================
+# Secrets & OAuth Tokens
+# =============================================================================
+# OAuth token store (contains access/refresh tokens)
+oauth2-auto.plist
+
+# Local secrets file (OAuth client ID/secret)
+secrets.el
+
+# =============================================================================
+# Org-mode State Files
+# =============================================================================
+# Org ID tracking (machine-specific)
+.org-id-locations
+.org-generic-id-locations
+
+# Clock persistence
+org-clock-save.el
+
+# org-gcal / org-persist state
+persist/
+
+# HTTP request cookies
+request/
+
+# =============================================================================
 # Editor Files
 # =============================================================================
 .vscode/

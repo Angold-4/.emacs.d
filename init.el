@@ -186,6 +186,12 @@
 ;; Use y/n instead of yes/no
 (fset 'yes-or-no-p 'y-or-n-p)
 
+;; GPG: use loopback pinentry so Emacs handles passphrase prompts
+;; in the minibuffer (or programmatically in batch mode).
+;; Without this, GPG tries to launch a GUI pinentry and fails in terminal/WSL2.
+(setq epg-pinentry-mode 'loopback
+      epa-pinentry-mode 'loopback)
+
 ;; Set PATH from shell (important for LSP servers)
 (when (memq window-system '(mac ns x))
   (let ((shell-path (shell-command-to-string "bash -c 'echo -n $PATH'")))

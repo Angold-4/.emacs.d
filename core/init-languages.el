@@ -54,19 +54,25 @@
           (message "Installing tree-sitter grammar: %s" lang)
           (treesit-install-language-grammar lang)))))
   
-  ;; Auto-remap to tree-sitter modes when grammar is available
+  ;; Auto-remap to tree-sitter modes only when grammar is actually installed
+  (defvar +treesit-mode-remap-defaults
+    '((c-mode          . (c          . c-ts-mode))
+      (c++-mode        . (cpp        . c++-ts-mode))
+      (css-mode        . (css        . css-ts-mode))
+      (go-mode         . (go         . go-ts-mode))
+      (javascript-mode . (javascript . js-ts-mode))
+      (js-mode         . (javascript . js-ts-mode))
+      (json-mode       . (json       . json-ts-mode))
+      (python-mode     . (python     . python-ts-mode))
+      (sh-mode         . (bash       . bash-ts-mode))
+      (typescript-mode . (typescript . typescript-ts-mode))
+      (yaml-mode       . (yaml       . yaml-ts-mode)))
+    "Alist of (OLD-MODE . (GRAMMAR . TS-MODE)) for tree-sitter remapping.")
+
   (setq major-mode-remap-alist
-        '((c-mode          . c-ts-mode)
-          (c++-mode        . c++-ts-mode)
-          (css-mode        . css-ts-mode)
-          (go-mode         . go-ts-mode)
-          (javascript-mode . js-ts-mode)
-          (js-mode         . js-ts-mode)
-          (json-mode       . json-ts-mode)
-          (python-mode     . python-ts-mode)
-          (sh-mode         . bash-ts-mode)
-          (typescript-mode . typescript-ts-mode)
-          (yaml-mode       . yaml-ts-mode))))
+        (cl-loop for (old-mode . (grammar . ts-mode)) in +treesit-mode-remap-defaults
+                 when (treesit-language-available-p grammar)
+                 collect (cons old-mode ts-mode))))
 
 ;; =============================================================================
 ;; C/C++

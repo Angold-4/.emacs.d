@@ -311,6 +311,7 @@ This ensures C-h/j/k/l work for window navigation in all buffers."
 ;; Org-mode global bindings
 (global-set-key (kbd "C-c l") 'org-store-link)
 (global-set-key (kbd "C-c a") 'org-agenda)
+(global-set-key (kbd "C-c c") 'org-capture)
 
 ;; =============================================================================
 ;; Windmove (fallback)

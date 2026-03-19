@@ -189,6 +189,17 @@ This command does the inverse of `fill-region'."
 (add-hook 'project-find-functions #'+project-find-go-module)
 
 ;; =============================================================================
+;; WSL2 Browser Integration
+;; =============================================================================
+;; Open URLs in the Windows host browser (Chrome) from WSL2.
+;; This is required for OAuth flows (org-gcal) and general browse-url usage.
+
+(when (and (eq system-type 'gnu/linux)
+           (string-match-p "microsoft\\|WSL" (shell-command-to-string "uname -r")))
+  (setq browse-url-generic-program "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"
+        browse-url-browser-function 'browse-url-generic))
+
+;; =============================================================================
 ;; Clipboard Integration
 ;; =============================================================================
 
