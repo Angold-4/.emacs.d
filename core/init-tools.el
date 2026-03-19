@@ -52,8 +52,6 @@
 (use-package eshell
   :straight (:type built-in)
   :commands eshell
-  :bind (("C-c t" . +eshell/toggle)
-         ("C-c T" . +eshell/new))
   :hook (eshell-mode . +eshell/setup)
   :init
   ;; Fix: Remove eshell-term from modules list (doesn't exist in newer Emacs)
@@ -474,7 +472,12 @@ Supports WSL by using powershell.exe to access Windows clipboard."
         persp-add-buffer-on-after-change-major-mode t
         persp-set-last-persp-for-new-frames t
         persp-remove-buffers-from-nil-persp-behaviour nil
-        persp-auto-resume-time 0)  ; Don't auto-restore (start fresh)
+        persp-auto-resume-time 0   ; Don't auto-restore (start fresh)
+        ;; Don't prompt when killing buffers not in the current perspective.
+        ;; org-gcal opens temporary buffers (gcal.org, task files) that may
+        ;; not belong to the active perspective — this prevents interactive
+        ;; prompts that block automated sync.
+        persp-kill-foreign-buffer-behaviour nil)
   
   ;; Filter out temporary buffers from saving
   (add-hook 'persp-filter-save-buffers-functions

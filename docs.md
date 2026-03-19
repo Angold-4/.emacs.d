@@ -66,7 +66,7 @@ LSP is **not auto-enabled**. It must be toggled on manually per buffer.
 | `C-c .` | Show documentation (eldoc) |
 | `C-c C-d` | Show doc popup (lsp-ui) |
 | `M-l` | Code actions (quick fix) |
-| `C-c f` | Format buffer (LSP formatter, or language-specific fallback) |
+| `C-c f` | Format buffer (prog-mode only; in org-mode this runs cleanup instead) |
 
 ### Supported Language Servers
 
@@ -151,11 +151,12 @@ Backends: `company-capf` (integrates with LSP) > `company-dabbrev-code` + keywor
 
 | Key | Action |
 |-----|--------|
-| `C-c t` | Toggle eshell at bottom |
-| `C-c T` | Open new eshell |
 | `C-p` / `Up` | Previous input (insert mode) |
 | `C-n` / `Down` | Next input (insert mode) |
 | `C-r` | Search history backwards (insert mode) |
+
+Use `M-x +eshell/toggle` to toggle eshell at the bottom, or `M-x +eshell/new`
+to open a new eshell buffer.
 
 ### Vterm
 
@@ -176,6 +177,7 @@ documentation on task management, time tracking, and calendar sync.
 | `C-c c` | Org capture (quick entry) |
 | `C-c d` | Set deadline |
 | `C-c s` | Schedule |
+| `C-c f` | Cleanup: refile DONE tasks from Inbox to Completed, normalize formatting |
 | `C-c C-t` | Cycle TODO state |
 | `TAB` | Cycle visibility |
 
@@ -216,6 +218,9 @@ M-x +treesit/install-all-grammars
 When a grammar is installed, the corresponding major mode is automatically remapped to its `-ts-mode` variant (e.g. `c++-mode` -> `c++-ts-mode`).
 
 ## Formatting (`C-c f`)
+
+In programming modes, `C-c f` runs the code formatter. In org-mode, the same
+key runs the cleanup command instead (see [Cleanup](#cleanup-c-c-f) below).
 
 The formatter used depends on the current major mode:
 
@@ -259,6 +264,12 @@ calendar sync system.
 **Key design**: Only the 3 `tasks.org` files + `gcal.org` feed into the
 agenda. Notes files are free-form -- create as many `.org` files as you want
 in each directory and they won't pollute the agenda.
+
+Each `tasks.org` file has three sections:
+
+- **Inbox** -- new tasks land here (from capture or manual entry)
+- **Someday** -- tasks deferred for the future, not actively tracked
+- **Completed** -- tasks automatically refiled here when marked DONE or CANCELLED
 
 ---
 
@@ -335,10 +346,10 @@ Press `C-c c` from anywhere in Emacs to open the capture menu.
 | `t` | Quick TODO | `agenda/tasks.org > Inbox` | -- |
 | `w t` | Weids TODO | `weids/tasks.org > Inbox` | `:weids:` |
 | `w n` | Weids Note | `weids/notes.org > Notes` | `:weids:note:` |
-| `w m` | Weids Meeting | `weids/tasks.org > Meetings` | `:weids:meeting:` |
+| `w m` | Weids Meeting | `weids/tasks.org > Inbox` | `:weids:meeting:` |
 | `z t` | Zynerise TODO | `zynerise/tasks.org > Inbox` | `:zynerise:` |
 | `z n` | Zynerise Note | `zynerise/notes.org > Notes` | `:zynerise:note:` |
-| `z m` | Zynerise Meeting | `zynerise/tasks.org > Meetings` | `:zynerise:meeting:` |
+| `z m` | Zynerise Meeting | `zynerise/tasks.org > Inbox` | `:zynerise:meeting:` |
 | `n` | Note | `agenda/notes.org > Notes` | `:note:` |
 | `j` | Journal | `journal.org` (date-tree) | -- |
 | `a` | Appointment | `gcal.org` | -- |
@@ -620,6 +631,32 @@ Batch scripts (`scripts/gcal-fetch.sh`, `scripts/gcal-sync.sh`,
 
 `C-c c a` (Appointment) -- creates an entry in `gcal.org`. Then run
 `M-x org-gcal-sync` to push it to Google.
+
+### Automatic push from task files
+
+When you schedule a task with a **time** (e.g., `<2026-03-20 Fri 14:00>`),
+a mirror entry is automatically created in `gcal.org` and posted to Google
+Calendar. Tasks with only a date (no time) stay local.
+
+**Flow:**
+
+1. `C-c s` (schedule) → enter date+time → mirror entry created in `gcal.org`
+   with `:calendar-id:` and `:org-gcal:` drawer → posted to Google Calendar
+2. Work on the task, clocking in/out as you go
+3. `C-c C-t d` (mark DONE) → the `gcal.org` mirror is updated with actual
+   clock range (earliest clock-in to latest clock-out) → re-posted to Google
+
+If no clock data exists when marked DONE, the original scheduled time is kept.
+
+### Cleanup (C-c f)
+
+Press `C-c f` in any task file to:
+
+1. **Refile** all DONE/CANCELLED tasks from **Inbox** to **Completed**
+2. **Normalize formatting** -- collapse excessive blank lines, ensure
+   consistent spacing between headings
+
+The Completed heading is created automatically if it doesn't exist.
 
 ---
 

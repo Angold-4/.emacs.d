@@ -42,7 +42,7 @@
 ;; │ M-l         : Code actions                                       │
 ;; │ M-/         : Find type definition                               │
 ;; │ M-?         : Find references                                    │
-;; │ C-c f       : Format buffer                                      │
+;; │ C-c f       : Format buffer (prog) / Cleanup (org)                │
 ;; ├─────────────────────────────────────────────────────────────────┤
 ;; │ Org-mode                                                         │
 ;; ├─────────────────────────────────────────────────────────────────┤
@@ -286,6 +286,28 @@ This ensures C-h/j/k/l work for window navigation in all buffers."
 ;; Org-mode specific bindings
 (with-eval-after-load 'org
   (evil-define-key 'normal org-mode-map (kbd "TAB") #'org-cycle))
+
+;; Org-agenda evil bindings — hjkl navigation + RET to jump to heading
+(with-eval-after-load 'org-agenda
+  (evil-set-initial-state 'org-agenda-mode 'normal)
+  (evil-define-key 'normal org-agenda-mode-map
+    "j"  'org-agenda-next-line
+    "k"  'org-agenda-previous-line
+    (kbd "RET") 'org-agenda-switch-to       ; jump to heading in org file
+    "t"  'org-agenda-todo                   ; cycle TODO state
+    "u"  'org-agenda-undo
+    "I"  'org-agenda-clock-in
+    "O"  'org-agenda-clock-out
+    "d"  'org-agenda-day-view
+    "w"  'org-agenda-week-view
+    "f"  'org-agenda-later
+    "b"  'org-agenda-earlier
+    "."  'org-agenda-goto-today
+    "gr" 'org-agenda-redo
+    "q"  'org-agenda-quit
+    "s"  'org-agenda-schedule
+    "S"  'org-agenda-sunrise-sunset
+    "/"  'org-agenda-filter-by-tag))
 
 ;; Magit specific bindings
 (with-eval-after-load 'magit
