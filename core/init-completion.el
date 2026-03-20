@@ -1,14 +1,53 @@
 ;;; init-completion.el --- Completion framework -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2024 Ango Wang
-;; Description: Completion configuration with Company
+;; Description: Completion configuration with Vertico, Orderless, and Company
 
 ;;; Commentary:
 ;; This module configures the completion framework:
-;; - Company mode for in-buffer completion
-;; - Optimized for speed and non-intrusiveness
+;; - Vertico: Vertical minibuffer completion UI (for C-p, C-x b, M-x, etc.)
+;; - Orderless: Fuzzy/multi-component matching (type "binance ts" to find binance.ts)
+;; - Marginalia: Rich annotations in completion candidates
+;; - Company: In-buffer popup completion (for code, LSP, etc.)
 
 ;;; Code:
+
+;; =============================================================================
+;; Vertico (Vertical Completion UI)
+;; =============================================================================
+
+;; Vertico enhances the built-in completing-read with a vertical list.
+;; Everything that uses completing-read benefits: projectile, xref, M-x, etc.
+(use-package vertico
+  :straight t
+  :hook (after-init . vertico-mode)
+  :config
+  (setq vertico-count 15           ; Show 15 candidates
+        vertico-cycle t            ; Cycle at top/bottom
+        vertico-resize nil))       ; Fixed height (no resizing)
+
+;; =============================================================================
+;; Orderless (Fuzzy/Multi-component Matching)
+;; =============================================================================
+
+;; Orderless lets you type space-separated patterns in any order.
+;; e.g., "binance ts" matches "hybrid/src/libs/exchanges/core/binance.ts"
+(use-package orderless
+  :straight t
+  :config
+  (setq completion-styles '(orderless basic)
+        completion-category-defaults nil
+        completion-category-overrides '((file (styles partial-completion)))))
+
+;; =============================================================================
+;; Marginalia (Rich Annotations)
+;; =============================================================================
+
+;; Marginalia adds helpful annotations next to completion candidates:
+;; file sizes, docstrings, keybindings, etc.
+(use-package marginalia
+  :straight t
+  :hook (after-init . marginalia-mode))
 
 ;; =============================================================================
 ;; Company Mode
@@ -76,6 +115,18 @@
   :hook ((prog-mode . yas-minor-mode)
          (org-mode . yas-minor-mode))
   :config
+  (setq yas-wrap-around-region t)
+
+  ;; Suppress noisy warnings from snippet conditions that reference
+  ;; uninstalled packages (e.g., js2-mode's `js2-node-type' in js-mode
+  ;; snippets).  yasnippet-snippets ships js-mode/js2-mode snippets whose
+  ;; #condition calls js2-mode functions; these fail in typescript buffers
+  ;; because TS modes inherit js-mode snippets via the parent-mode chain.
+  ;; The condition evaluator already catches the error and returns nil,
+  ;; but it logs a noisy message via `yas--message' that floods the echo
+  ;; area and can interfere with company popup display.
+  (setq yas-verbosity 0)
+
   (yas-reload-all))
 
 ;; Common snippets collection

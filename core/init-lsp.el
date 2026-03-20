@@ -185,42 +185,16 @@ For workspaces, finds the topmost Cargo.toml."
 ;; Eldoc - Show diagnostics in echo area (status bar)
 ;; =============================================================================
 
-;; Eldoc shows diagnostics in the echo area when cursor is on that line
+;; Eldoc shows diagnostics in the echo area when cursor is on that line.
+;; Flymake's built-in `flymake-eldoc-function' handles the display cleanly
+;; (registered in the flymake section below).  No custom diagnostic function
+;; is needed — lsp-mode feeds diagnostics through flymake, which feeds eldoc.
 (use-package eldoc
   :straight (:type built-in)
   :config
   (setq eldoc-idle-delay 0.2
         eldoc-echo-area-use-multiline-p t
         eldoc-echo-area-prefer-doc-buffer nil))  ; Prefer echo area
-
-;; Custom function to show LSP diagnostics in echo area
-(defun +lsp/eldoc-diagnostics (callback &rest _)
-  "Show LSP diagnostics in eldoc (echo area)."
-  (when (bound-and-true-p lsp-mode)
-    (when-let* ((diags (lsp--cur-line-diagnotics))
-                (diag (car diags))
-                (severity (gethash "severity" diag 1))
-                (msg (gethash "message" diag)))
-      (funcall callback
-               (format "%s: %s"
-                       (propertize
-                        (pcase severity
-                          (1 "Error")
-                          (2 "Warning")
-                          (3 "Info")
-                          (_ "Hint"))
-                        'face (pcase severity
-                                (1 'error)
-                                (2 'warning)
-                                (_ 'shadow)))
-                       msg)))))
-
-;; Add our diagnostic function to eldoc
-(with-eval-after-load 'lsp-mode
-  (add-hook 'lsp-mode-hook
-            (lambda ()
-              (add-hook 'eldoc-documentation-functions
-                        #'+lsp/eldoc-diagnostics nil t))))
 
 ;; =============================================================================
 ;; Toggle LSP Command

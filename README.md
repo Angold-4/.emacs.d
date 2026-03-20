@@ -19,13 +19,13 @@ need a language server running just to read code.
 | Keybindings | Centralized in one file | Scattered everywhere |
 | Theme Toggle | `M-x +theme/toggle` | Usually manual |
 
-### Package Summary (~55 packages)
+### Package Summary (~58 packages)
 
 | Category | Packages | Purpose |
 |----------|----------|---------|
 | **Core** | straight.el, use-package | Package management |
 | **Evil** | evil, evil-collection, key-chord | Vim emulation |
-| **Completion** | company, yasnippet | Auto-completion |
+| **Completion** | vertico, orderless, marginalia, company, yasnippet | Fuzzy minibuffer + in-buffer completion |
 | **LSP** | lsp-mode, lsp-ui | Language servers (on-demand) |
 | **Languages** | rust-mode, go-mode, typescript-mode, etc. | Language support |
 | **Syntax** | Built-in tree-sitter (Emacs 30) | Highlighting |
@@ -76,7 +76,7 @@ C-x l   ; Start LSP manually
 │   ├── init-ui.el          # Fonts, ligatures, fringes (180 lines)
 │   ├── init-themes.el      # Dark/light theme toggle (157 lines)
 │   ├── init-evil.el        # Evil + ALL keybindings (230 lines)
-│   ├── init-completion.el  # Company mode (86 lines)
+│   ├── init-completion.el  # Vertico, Orderless, Company (191 lines)
 │   ├── init-lsp.el         # LSP-mode on-demand (163 lines)
 │   ├── init-languages.el   # Language modes, tree-sitter (288 lines)
 │   ├── init-org.el         # Org-mode config (166 lines)
@@ -107,7 +107,7 @@ Total: ~1,976 lines of well-documented Elisp
 
 | Key | Action |
 |-----|--------|
-| `C-p` | Find file in project (Projectile) |
+| `C-p` | Find file in project (fuzzy match via Vertico) |
 | `C-c C-f` | Search with ripgrep |
 | `C-c r` | Rename buffer |
 | `C-x b` | Switch buffer (persp-aware) |

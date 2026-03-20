@@ -141,9 +141,29 @@
 
 (use-package typescript-mode
   :straight t
-  :mode "\\.tsx?\\'"
+  :mode "\\.ts\\'"
   :config
   (setq typescript-indent-level 2))
+
+;; TypeScript tree-sitter modes (Emacs 30 built-in)
+;; When tree-sitter grammars are installed, .ts opens in typescript-ts-mode
+;; and .tsx opens in tsx-ts-mode (via auto-mode-alist below).
+;; These modes don't read typescript-indent-level, so we set indentation via hooks.
+(add-hook 'typescript-ts-mode-hook
+          (lambda ()
+            (setq-local tab-width 2)
+            (setq-local typescript-ts-mode-indent-offset 2)))
+
+(add-hook 'tsx-ts-mode-hook
+          (lambda ()
+            (setq-local tab-width 2)
+            (setq-local typescript-ts-mode-indent-offset 2)))
+
+;; Ensure .tsx files open in tsx-ts-mode when the tsx grammar is available.
+;; Without this, .tsx files would fall through to typescript-ts-mode (wrong grammar).
+(when (and (fboundp 'treesit-language-available-p)
+           (treesit-language-available-p 'tsx))
+  (add-to-list 'auto-mode-alist '("\\.tsx\\'" . tsx-ts-mode)))
 
 (use-package js
   :straight (:type built-in)

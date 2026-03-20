@@ -368,7 +368,9 @@ Supports WSL by using powershell.exe to access Windows clipboard."
   ;; Use native indexing for better performance
   (setq projectile-indexing-method 'hybrid
         projectile-enable-caching t
-        projectile-sort-order 'recently-active)
+        projectile-sort-order 'recently-active
+        ;; Use default completing-read (enhanced by Vertico + Orderless)
+        projectile-completion-system 'default)
   
   ;; Recognize common project roots
   (setq projectile-project-root-files-bottom-up

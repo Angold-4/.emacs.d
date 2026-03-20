@@ -78,6 +78,28 @@ LSP is **not auto-enabled**. It must be toggled on manually per buffer.
 | Python | `pyright` / `pylsp` | |
 | TypeScript/JS | `typescript-language-server` | |
 
+## Minibuffer Completion (Vertico + Orderless)
+
+Vertico provides a vertical completion UI for all `completing-read` prompts.
+Orderless enables fuzzy, multi-component matching — type space-separated
+patterns in any order.
+
+| Key | Action |
+|-----|--------|
+| `C-p` | Find file in project (uses Vertico) |
+| `M-x` | Execute command (fuzzy matched) |
+| `C-x b` | Switch buffer (fuzzy matched) |
+| `C-n` / `C-p` | Next / previous candidate in minibuffer |
+| `RET` | Select candidate |
+| `C-g` | Cancel |
+
+**Fuzzy matching examples:**
+- `binance ts` matches `hybrid/src/libs/exchanges/core/binance.ts`
+- `init lang` matches `core/init-languages.el`
+
+Marginalia adds rich annotations next to candidates (file sizes, docstrings,
+keybindings).
+
 ## Autocomplete (Company)
 
 Company mode is enabled globally on startup.

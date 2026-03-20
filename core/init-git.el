@@ -470,6 +470,7 @@ Makes the diff buffer behave as a clean read-only review surface."
   ;; The code executed but produced no visible improvement — likely due
   ;; to Emacs display-engine caching or overlay/face composition order.
   ;; Delta's own background colors are acceptable as-is.
+  )  ; end use-package magit-delta
 
 ;; =============================================================================
 ;; Untracked Files: Show Full Diff (with proper magit sections)
