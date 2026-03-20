@@ -142,6 +142,7 @@
     init-languages  ; Language-specific settings
     init-org        ; Org-mode configuration
     init-tools      ; Development tools
+    init-git        ; Git diff review system
     )
   "List of configuration modules to load.")
 

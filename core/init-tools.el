@@ -328,18 +328,29 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 
 (use-package magit
   :straight t
-  :commands (magit-status magit-dispatch)
+  :commands (magit-status magit-dispatch magit-diff-working-tree
+             magit-diff-staged magit-diff-range magit-log-current)
   :bind (("C-x g" . magit-status)
          ("C-x M-g" . magit-dispatch))
   :config
   ;; Show diff when committing
   (setq magit-commit-show-diff t)
-  
+
   ;; Don't ask before saving buffers
   (setq magit-save-repository-buffers 'dontask)
-  
-  ;; Show granular diffs
-  (setq magit-diff-refine-hunk 'all))
+
+  ;; Show granular diffs (word-level refinement)
+  (setq magit-diff-refine-hunk 'all)
+
+  ;; Show process buffer only on errors (less noise)
+  (setq magit-process-popup-time -1)
+
+  ;; Auto-revert tracked buffers after git operations
+  (setq magit-auto-revert-mode t)
+  (setq auto-revert-use-notify nil)
+
+  ;; Show full untracked file content in status buffer
+  (setq magit-diff-options '("--no-ext-diff")))
 
 ;; =============================================================================
 ;; Projectile (Project Management)

@@ -200,27 +200,48 @@ This command does the inverse of `fill-region'."
         browse-url-browser-function 'browse-url-generic))
 
 ;; =============================================================================
-;; Clipboard Integration
+;; Clipboard Integration (via tmux paste buffer)
 ;; =============================================================================
 
+;; Strategy: Use tmux's paste buffer as a shared clipboard between panes.
+;;
+;;   Emacs C-y (visual mode)  →  copies text to tmux paste buffer
+;;   tmux  C-a P              →  pastes from tmux buffer into active pane
+;;
+;; This works reliably over SSH without requiring OSC 52 terminal support.
+;; The clipboard lives on the server and is shared between all tmux panes
+;; (e.g. Emacs in one pane, OpenCode in another).
+
 (defun +copy-to-system-clipboard (beg end)
-  "Copy region from BEG to END to the system clipboard."
+  "Copy visible region text from BEG to END to tmux paste buffer.
+Filters invisible text (e.g. collapsed magit sections).
+The text can then be pasted in any tmux pane with C-a P."
   (interactive "r")
-  (cond
-   ;; macOS
-   ((eq system-type 'darwin)
-    (shell-command-on-region beg end "pbcopy"))
-   ;; Linux with X11
-   ((and (eq system-type 'gnu/linux) (executable-find "xclip"))
-    (shell-command-on-region beg end "xclip -selection clipboard"))
-   ;; Linux with Wayland
-   ((and (eq system-type 'gnu/linux) (executable-find "wl-copy"))
-    (shell-command-on-region beg end "wl-copy"))
-   ;; WSL
-   ((and (eq system-type 'gnu/linux) (executable-find "clip.exe"))
-    (shell-command-on-region beg end "clip.exe"))
-   (t
-    (kill-ring-save beg end)))
-  (message "Copied to clipboard"))
+  (let ((text (buffer-substring-no-properties beg end)))
+    ;; In buffers with invisible text, extract only visible portion
+    (when (next-single-property-change beg 'invisible nil end)
+      (setq text
+            (let ((result "")
+                  (pos beg))
+              (while (< pos end)
+                (let* ((next-change (or (next-single-property-change
+                                        pos 'invisible nil end)
+                                       end))
+                       (inv (invisible-p (get-text-property pos 'invisible))))
+                  (unless inv
+                    (setq result (concat result
+                                        (buffer-substring-no-properties
+                                         pos next-change))))
+                  (setq pos next-change)))
+              result)))
+    ;; Add to Emacs kill ring
+    (kill-new text)
+    ;; Also write to tmux paste buffer so C-p in tmux can paste it
+    (when (getenv "TMUX")
+      (let ((process-connection-type nil))
+        (let ((proc (start-process "tmux-copy" nil "tmux" "load-buffer" "-")))
+          (process-send-string proc text)
+          (process-send-eof proc))))
+    (message "Copied %d chars (C-a P in tmux to paste)" (length text))))
 
 ;;; init-core.el ends here

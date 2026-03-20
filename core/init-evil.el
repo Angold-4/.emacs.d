@@ -59,10 +59,20 @@
 ;; │ Misc                                                             │
 ;; ├─────────────────────────────────────────────────────────────────┤
 ;; │ jk          : Escape to normal mode (insert mode)                │
-;; │ C-y         : Copy to system clipboard (visual mode)             │
+;; │ C-y         : Copy to tmux buffer (visual); C-a P to paste     │
 ;; │ M-RET       : Toggle fullscreen                                  │
 ;; │ s-`         : Select treemacs window                             │
 ;; │ C-x t t     : Toggle treemacs                                    │
+;; ├─────────────────────────────────────────────────────────────────┤
+;; │ Git Review (C-c g prefix)                                        │
+;; ├─────────────────────────────────────────────────────────────────┤
+;; │ C-c g r     : Review working-tree changes (all diffs)            │
+;; │ C-c g s     : Review staged changes                              │
+;; │ C-c g c     : Review a specific commit                           │
+;; │ C-c g l     : Compact git log                                    │
+;; │ C-c g g     : Magit status                                       │
+;; │ In diff: n/p = next/prev file, N/P = next/prev hunk             │
+;; │ In diff: RET = open file, TAB = toggle, +/- = context            │
 ;; └─────────────────────────────────────────────────────────────────┘
 
 ;;; Code:
@@ -106,6 +116,8 @@
        (string-match-p "microsoft\\|WSL" (shell-command-to-string "uname -r")))
   "Non-nil if running inside WSL.")
 
+;; Clipboard PASTE: read from Windows clipboard via powershell.
+;; (OSC 52 read is unreliable across terminals, so we keep this.)
 (defun +clipboard/get ()
   "Get text from system clipboard. Works in WSL, Linux, and macOS."
   (cond
@@ -127,47 +139,12 @@
    (t
     (ignore-errors (gui-get-selection 'CLIPBOARD)))))
 
-(defun +clipboard/set (text)
-  "Set TEXT to system clipboard. Works in WSL, Linux, and macOS."
-  (cond
-   ;; WSL: use clip.exe to set Windows clipboard (with path fallback)
-   (+is-wsl
-    (let ((clip-exe (or (executable-find "clip.exe")
-                        "/mnt/c/Windows/System32/clip.exe")))
-      (if (file-exists-p clip-exe)
-          (let ((process-connection-type nil))
-            (let ((proc (start-process "clip" nil clip-exe)))
-              (process-send-string proc text)
-              (process-send-eof proc)))
-        (message "Warning: clip.exe not found. System clipboard sync skipped."))))
-   ;; macOS
-   ((eq system-type 'darwin)
-    (let ((process-connection-type nil))
-      (let ((proc (start-process "pbcopy" nil "pbcopy")))
-        (process-send-string proc text)
-        (process-send-eof proc))))
-   ;; Linux with X11 - use xclip or xsel
-   ((and (eq system-type 'gnu/linux)
-         (getenv "DISPLAY"))
-    (cond
-     ((executable-find "xclip")
-      (let ((process-connection-type nil))
-        (let ((proc (start-process "xclip" nil "xclip" "-selection" "clipboard")))
-          (process-send-string proc text)
-          (process-send-eof proc))))
-     ((executable-find "xsel")
-      (let ((process-connection-type nil))
-        (let ((proc (start-process "xsel" nil "xsel" "--clipboard" "--input")))
-          (process-send-string proc text)
-          (process-send-eof proc))))))
-   ;; Fallback to Emacs built-in
-   (t
-    (gui-set-selection 'CLIPBOARD text))))
-
-;; Override interprogram paste/copy for WSL
+;; Clipboard COPY: handled by `+copy-to-system-clipboard' in init-core.el.
+;; It writes to tmux's paste buffer via `tmux load-buffer -'.
+;; Use C-a P in tmux to paste into any pane.
+;; We only need to set the paste function here.
 (when +is-wsl
-  (setq interprogram-paste-function '+clipboard/get
-        interprogram-cut-function '+clipboard/set))
+  (setq interprogram-paste-function '+clipboard/get))
 
 ;; =============================================================================
 ;; Evil Collection (consistent bindings across modes)
@@ -181,6 +158,7 @@
   ;; Setup evil-collection for common modes
   ;; Note: Only include modes that exist in evil-collection
   (evil-collection-init '(magit
+                          diff-mode
                           dired
                           ibuffer
                           help
@@ -279,6 +257,8 @@ This ensures C-h/j/k/l work for window navigation in all buffers."
 (dolist (hook '(org-mode-hook
                 org-agenda-mode-hook
                 magit-mode-hook
+                magit-diff-mode-hook
+                magit-revision-mode-hook
                 compilation-mode-hook
                 shell-mode-hook
                 help-mode-hook
@@ -314,9 +294,10 @@ This ensures C-h/j/k/l work for window navigation in all buffers."
     "/"  'org-agenda-filter-by-tag))
 
 ;; Magit specific bindings
+;; Note: Enhanced diff review keybindings are in init-git.el
 (with-eval-after-load 'magit
-  (evil-define-key 'normal magit-mode-map (kbd "g") 'magit-refresh)
-  (evil-define-key 'normal magit-mode-map (kbd "0") 'magit-discard))
+  (evil-define-key 'normal magit-mode-map (kbd "gr") 'magit-refresh)
+  (evil-define-key 'normal magit-mode-map (kbd "x") 'magit-discard))
 
 ;; Shell mode (for history navigation)
 (add-hook 'shell-mode-hook
