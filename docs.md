@@ -178,6 +178,10 @@ documentation on task management, time tracking, and calendar sync.
 | `C-c d` | Set deadline |
 | `C-c s` | Schedule |
 | `C-c f` | Cleanup: refile DONE tasks from Inbox to Completed, normalize formatting |
+| `C-c o w` | Open `weids/tasks.org` |
+| `C-c o z` | Open `zynerise/tasks.org` |
+| `C-c o a` | Open `agenda/tasks.org` |
+| `C-c o g` | Open `gcal.org` |
 | `C-c C-t` | Cycle TODO state |
 | `TAB` | Cycle visibility |
 

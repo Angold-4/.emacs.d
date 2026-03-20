@@ -25,6 +25,10 @@
 ;;   C-c d     Set deadline     (org-mode)
 ;;   C-c s     Schedule         (org-mode)
 ;;   C-c f     Cleanup: refile DONE tasks, normalize formatting (org-mode)
+;;   C-c o w   Open weids/tasks.org       (global)
+;;   C-c o z   Open zynerise/tasks.org    (global)
+;;   C-c o a   Open agenda/tasks.org      (global)
+;;   C-c o g   Open gcal.org              (global)
 ;;   TAB       Cycle visibility (org-mode)
 
 ;;; Code:
@@ -247,6 +251,24 @@
   (define-key org-mode-map (kbd "C-c d") 'org-deadline)
   (define-key org-mode-map (kbd "C-c s") 'org-schedule)
   (define-key org-mode-map (kbd "C-c f") '+org/cleanup))
+
+;; =============================================================================
+;; Quick Task File Navigation (C-c o prefix — global)
+;; =============================================================================
+
+(defvar +org/nav-map (make-sparse-keymap)
+  "Keymap for quick navigation to org task files.")
+
+(global-set-key (kbd "C-c o") +org/nav-map)
+
+(define-key +org/nav-map (kbd "w")
+  (lambda () (interactive) (find-file +org/weids-tasks)))
+(define-key +org/nav-map (kbd "z")
+  (lambda () (interactive) (find-file +org/zynerise-tasks)))
+(define-key +org/nav-map (kbd "a")
+  (lambda () (interactive) (find-file +org/personal-tasks)))
+(define-key +org/nav-map (kbd "g")
+  (lambda () (interactive) (find-file +org/gcal-file)))
 
 ;; =============================================================================
 ;; Org Bullets (prettier headings)
@@ -619,6 +641,8 @@ Auto-saves any org buffers dirtied by the operation."
     "Find the position of a mirror entry in gcal.org.
 First searches by :source-id: property (stable). Falls back to heading
 text match if SOURCE-ID is nil or not found, and HEADING is provided.
+When falling back to heading, prefers entries with :org-gcal-managed: org
+that are NOT under * Completed.
 Returns the point at the beginning of the heading, or nil."
     (with-current-buffer (find-file-noselect +org/gcal-file)
       (save-excursion
@@ -632,12 +656,27 @@ Returns the point at the beginning of the heading, or nil."
                          nil t))
               (org-back-to-heading t)
               (setq found (point))))
-          ;; Fall back to heading text match
+          ;; Fall back to heading text match — find an org-managed mirror
+          ;; not under * Completed
           (when (and (not found) heading)
             (goto-char (point-min))
-            (when (search-forward heading nil t)
-              (org-back-to-heading t)
-              (setq found (point))))
+            ;; Find the boundary of * Completed (if any) so we skip it
+            (let ((completed-beg (save-excursion
+                                   (when (re-search-forward "^\\* Completed$" nil t)
+                                     (line-beginning-position)))))
+              (goto-char (point-min))
+              (while (and (not found)
+                          (search-forward heading nil t))
+                (org-back-to-heading t)
+                (let ((pos (point)))
+                  ;; Only match if this is a top-level heading, org-managed,
+                  ;; and not inside * Completed
+                  (when (and (= (org-outline-level) 1)
+                             (string= (or (org-entry-get nil "org-gcal-managed") "") "org")
+                             (or (null completed-beg) (< pos completed-beg)))
+                    (setq found pos))
+                  ;; Move past this heading to continue searching
+                  (org-end-of-subtree t)))))
           found))))
 
   (defun +org-gcal/clock-range ()
@@ -725,8 +764,8 @@ mirror back to the task stably (survives heading renames)."
               (let ((gcal-buf (find-file-noselect +org/gcal-file))
                     (mirror-pos nil))
                 (with-current-buffer gcal-buf
-                  ;; Find existing mirror by source-id, or create new
-                  (let ((existing (+org-gcal/find-mirror source-id)))
+                  ;; Find existing mirror by source-id, fall back to heading text
+                  (let ((existing (+org-gcal/find-mirror source-id heading)))
                     (if existing
                         ;; Update existing mirror
                         (progn
@@ -758,6 +797,11 @@ mirror back to the task stably (survives heading renames)."
                     (org-entry-put nil "calendar-id" "awang@weids.dev"))
                   (unless (org-entry-get nil "source-id")
                     (org-entry-put nil "source-id" source-id))
+                  ;; Clear stale ETag so org-gcal sends PATCH without
+                  ;; If-Match — avoids 412 when we've updated the timestamp
+                  ;; locally.  org-gcal will store the fresh ETag from the
+                  ;; server response automatically.
+                  (org-entry-delete nil "ETag")
                   (save-buffer)
                   ;; Post to Google Calendar
                   (goto-char mirror-pos)
@@ -812,10 +856,12 @@ any refile moves the entry -- then pushes via idle timer."
                              ;; Backfill :source-id: if missing
                              (when (and source-id (not (org-entry-get nil "source-id")))
                                (org-entry-put nil "source-id" source-id)
-                               (message "[gcal-update] backfilled source-id"))
+                             (message "[gcal-update] backfilled source-id"))
                              ;; Ensure :calendar-id: is set
                              (unless (org-entry-get nil "calendar-id")
                                (org-entry-put nil "calendar-id" "awang@weids.dev"))
+                             ;; Clear stale ETag to avoid 412 on PATCH
+                             (org-entry-delete nil "ETag")
                              (when new-ts
                                (let ((bound (save-excursion (org-end-of-subtree t) (point))))
                                  (message "[gcal-update] searching for timestamp in range %d-%d" (point) bound)

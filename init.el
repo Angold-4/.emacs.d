@@ -142,7 +142,6 @@
     init-languages  ; Language-specific settings
     init-org        ; Org-mode configuration
     init-tools      ; Development tools
-    init-opencode   ; OpenCode vterm integration
     )
   "List of configuration modules to load.")
 

@@ -50,6 +50,10 @@
 ;; │ C-c a       : Org agenda                                         │
 ;; │ C-c d       : Set deadline                                       │
 ;; │ C-c s       : Schedule                                           │
+;; │ C-c o w     : Open weids/tasks.org                               │
+;; │ C-c o z     : Open zynerise/tasks.org                            │
+;; │ C-c o a     : Open agenda/tasks.org                              │
+;; │ C-c o g     : Open gcal.org                                      │
 ;; │ TAB         : Cycle visibility (in org-mode)                     │
 ;; ├─────────────────────────────────────────────────────────────────┤
 ;; │ Misc                                                             │
