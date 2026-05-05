@@ -21,7 +21,19 @@
 (use-package vertico
   :straight t
   :hook (after-init . vertico-mode)
+  :bind (:map vertico-map
+              ;; TAB moves the highlight down (instead of inserting the
+              ;; first candidate's text into the minibuffer).  S-TAB up.
+              ("TAB"       . vertico-next)
+              ("<tab>"     . vertico-next)
+              ("<backtab>" . vertico-previous)
+              ;; RET on a directory drills into it for further completion;
+              ;; on a file it just opens.  Falls through to vertico-exit
+              ;; in non-file contexts (M-x, switch-buffer, etc.).
+              ("RET"       . vertico-directory-enter)
+              ("<return>"  . vertico-directory-enter))
   :config
+  (require 'vertico-directory)
   (setq vertico-count 15           ; Show 15 candidates
         vertico-cycle t            ; Cycle at top/bottom
         vertico-resize nil))       ; Fixed height (no resizing)
