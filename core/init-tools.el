@@ -317,6 +317,16 @@ Supports WSL by using powershell.exe to access Windows clipboard."
       (lambda () (interactive)
         (vterm-send-string (current-kill 0))))
 
+    ;; Special keys that evil's insert-state map shadows by default.
+    ;; Without these, RET / TAB / Backspace try to edit the (read-only)
+    ;; vterm buffer instead of being forwarded to the shell.
+    (evil-local-set-key 'insert (kbd "RET")         #'vterm-send-return)
+    (evil-local-set-key 'insert (kbd "<return>")    #'vterm-send-return)
+    (evil-local-set-key 'insert (kbd "TAB")         #'vterm-send-tab)
+    (evil-local-set-key 'insert (kbd "<tab>")       #'vterm-send-tab)
+    (evil-local-set-key 'insert (kbd "DEL")         #'vterm-send-backspace)
+    (evil-local-set-key 'insert (kbd "<backspace>") #'vterm-send-backspace)
+
     ;; Force the current buffer into insert state.  `evil-set-initial-state'
     ;; above only affects future buffers; on macOS the very first vterm
     ;; opens in normal state without this explicit switch.
