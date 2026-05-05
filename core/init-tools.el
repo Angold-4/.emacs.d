@@ -315,7 +315,12 @@ Supports WSL by using powershell.exe to access Windows clipboard."
     ;; C-v to paste in insert mode
     (evil-local-set-key 'insert (kbd "C-v")
       (lambda () (interactive)
-        (vterm-send-string (current-kill 0))))))
+        (vterm-send-string (current-kill 0))))
+
+    ;; Force the current buffer into insert state.  `evil-set-initial-state'
+    ;; above only affects future buffers; on macOS the very first vterm
+    ;; opens in normal state without this explicit switch.
+    (evil-insert-state)))
 
 (add-hook 'vterm-mode-hook #'+vterm/evil-setup)
 
