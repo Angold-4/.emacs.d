@@ -50,7 +50,7 @@
 ;; Toggle Google Calendar (org-gcal) integration.  Set to nil on machines
 ;; where the OAuth flow isn't available — e.g. the macos branch with a
 ;; Google Workspace account that blocks third-party apps.
-(defvar +org/enable-gcal t
+(defvar +org/enable-gcal nil
   "When non-nil, enable org-gcal Google Calendar integration.")
 
 (use-package org
