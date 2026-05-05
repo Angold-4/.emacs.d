@@ -47,6 +47,12 @@
 (defvar +org/personal-tasks (expand-file-name "tasks.org" +org/agenda-dir))
 (defvar +org/gcal-file      (expand-file-name "gcal.org"  "~/org/"))
 
+;; Toggle Google Calendar (org-gcal) integration.  Set to nil on machines
+;; where the OAuth flow isn't available — e.g. the macos branch with a
+;; Google Workspace account that blocks third-party apps.
+(defvar +org/enable-gcal t
+  "When non-nil, enable org-gcal Google Calendar integration.")
+
 (use-package org
   :straight (:type built-in)
   :defer t
@@ -98,10 +104,10 @@
   ;; Only the 3 central task files + gcal feed into agenda.
   ;; Notes files in each directory are NOT included — they stay free-form.
   (setq org-agenda-files
-        (list +org/weids-tasks
-              +org/zynerise-tasks
-              +org/personal-tasks
-              +org/gcal-file))
+        (delq nil (list +org/weids-tasks
+                        +org/zynerise-tasks
+                        +org/personal-tasks
+                        (and +org/enable-gcal +org/gcal-file))))
 
   (setq org-default-notes-file (expand-file-name "notes.org" +org/agenda-dir))
 
@@ -512,6 +518,7 @@ Only operates on task files with Inbox and Completed headings."
 ;; Credentials are set in :init (before load) so oauth2-auto can register
 ;; the provider at load time.
 
+(when +org/enable-gcal
 (use-package org-gcal
   :straight t
   :defer t
@@ -899,6 +906,6 @@ any refile moves the entry -- then pushes via idle timer."
   (add-hook 'emacs-startup-hook
             (lambda ()
               (run-with-idle-timer 10 nil #'org-gcal-fetch)
-              (run-with-timer 900 900 #'org-gcal-sync))))
+              (run-with-timer 900 900 #'org-gcal-sync)))))
 
 ;;; init-org.el ends here
