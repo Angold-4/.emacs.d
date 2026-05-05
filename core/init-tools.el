@@ -297,15 +297,10 @@ Supports WSL by using powershell.exe to access Windows clipboard."
     (evil-local-set-key 'insert (kbd "C-j") 'windmove-down)
     (evil-local-set-key 'insert (kbd "C-k") 'windmove-up)
 
-    ;; i/a in normal mode → go to end and switch to insert
-    (evil-local-set-key 'normal (kbd "i")
-      (lambda () (interactive)
-        (goto-char (point-max))
-        (evil-insert-state)))
-    (evil-local-set-key 'normal (kbd "a")
-      (lambda () (interactive)
-        (goto-char (point-max))
-        (evil-insert-state)))
+    ;; i/a left to evil-collection's smart versions
+    ;; (`evil-collection-vterm-insert' / `evil-collection-vterm-append'),
+    ;; which align the shell cursor to point via `vterm-goto-char' instead
+    ;; of jumping to end-of-buffer.
 
     ;; Paste from clipboard in normal mode
     (evil-local-set-key 'normal (kbd "p")
