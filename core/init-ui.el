@@ -36,6 +36,12 @@
 (setq frame-resize-pixelwise t
       window-resize-pixelwise t)
 
+;; Wide-screen friendly: prefer side-by-side splits over top/bottom.
+;; nil disables vertical (top/bottom) splits entirely; the width
+;; threshold encourages right-splits whenever the frame is wide enough.
+(setq split-height-threshold nil
+      split-width-threshold 100)
+
 ;; =============================================================================
 ;; Font Configuration
 ;; =============================================================================

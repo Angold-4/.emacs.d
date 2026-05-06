@@ -93,30 +93,22 @@
   (setq magit-diff-paint-whitespace-lines 'both)
 
   ;; Adjust diff arguments for cleaner output
-  (setq magit-diff-arguments '("--stat" "--no-ext-diff"))
+  (setq magit-diff-arguments '("--no-ext-diff"))
 
   ;; --- Status buffer: show everything ---
   ;; Show fine (word-level) diffs inline
   (setq magit-diff-refine-ignore-whitespace t)
 
-  ;; In status buffer, show diff for all sections by default
-  (setq magit-status-sections-hook
-        '(magit-insert-status-headers
-          magit-insert-merge-log
-          magit-insert-rebase-sequence
-          magit-insert-am-sequence
-          magit-insert-sequencer-sequence
-          magit-insert-bisect-output
-          magit-insert-bisect-rest
-          magit-insert-bisect-log
-          magit-insert-untracked-files
-          magit-insert-unstaged-changes
-          magit-insert-staged-changes
-          magit-insert-stashes
-          magit-insert-unpushed-to-pushremote
-          magit-insert-unpushed-to-upstream
-          magit-insert-unpulled-from-pushremote
-          magit-insert-unpulled-from-upstream))
+  ;; Disabled: hand-rolled `magit-status-sections-hook' was a verbatim
+  ;; copy of an older magit's default.  In current magit some of those
+  ;; function names changed (e.g. `magit-insert-unpushed-to-upstream'
+  ;; → `magit-insert-unpushed-to-upstream-or-recent'); calling a
+  ;; non-existent function in `run-hooks' aborts buffer construction
+  ;; mid-way, leaving the status buffer blank.  Magit's own default
+  ;; already includes everything we want.
+  ;; (setq magit-status-sections-hook
+  ;;       '(magit-insert-status-headers
+  ;;         ...))
 
   ;; --- Performance: limit diff size for huge repos ---
   (setq magit-diff-highlight-hunk-region-functions
@@ -192,7 +184,7 @@ giving a complete picture of what the AI (or you) changed."
   (require 'magit)
   (let ((default-directory (or (magit-toplevel)
                                (user-error "Not inside a Git repository"))))
-    (magit-diff-staged nil '("--stat" "--no-ext-diff" "-U6"))))
+    (magit-diff-staged nil '("--no-ext-diff" "-U6"))))
 
 (defun +git/review-commit (&optional commit)
   "Open a clean diff review buffer for a specific COMMIT.
@@ -203,7 +195,7 @@ If COMMIT is nil, prompt for one."
   (let ((default-directory (or (magit-toplevel)
                                (user-error "Not inside a Git repository"))))
     (magit-diff-range (format "%s~..%s" commit commit)
-                      '("--stat" "--no-ext-diff" "-U6"))))
+                      '("--no-ext-diff" "-U6"))))
 
 (defun +git/log-oneline ()
   "Show a compact one-line-per-commit git log."
@@ -439,8 +431,14 @@ Makes the diff buffer behave as a clean read-only review surface."
 (use-package magit-delta
   :straight t
   :after magit
+  ;; Only activate when the `delta' binary is actually on PATH.
+  ;; Otherwise the wash-diffs hook errors with "file-missing" and the
+  ;; status/diff buffer renders blank.  Install with: `brew install git-delta'.
+  :if (executable-find "delta")
   :custom
-  (magit-delta-delta-executable "/home/awang/.cargo/bin/delta")
+  ;; Let magit-delta resolve `delta' via PATH instead of hardcoding it
+  ;; (the previous "/home/awang/.cargo/bin/delta" was a Linux path that
+  ;; doesn't exist on macOS).
   (magit-delta-default-dark-theme "Nord")
   (magit-delta-default-light-theme "GitHub")
   (magit-delta-hide-plus-minus-markers t)
@@ -471,6 +469,200 @@ Makes the diff buffer behave as a clean read-only review surface."
   ;; to Emacs display-engine caching or overlay/face composition order.
   ;; Delta's own background colors are acceptable as-is.
   )  ; end use-package magit-delta
+
+;; =============================================================================
+;; magit-todos — Surface TODO/FIXME/HACK in magit-status
+;; =============================================================================
+;; Adds a "TODOs" section to the magit-status buffer scanning the working
+;; tree for keyword comments.  Particularly useful for AI-generated code,
+;; which tends to leave placeholder TODO/FIXME notes that should not slip
+;; into a commit unnoticed.  Scanning uses ripgrep when available
+;; (falls back to `git grep'); requires `brew install ripgrep'.
+
+(use-package magit-todos
+  :straight t
+  :after magit
+  ;; Only load if a scanner is available — otherwise the section can
+  ;; error mid-render and leave magit-status blank.
+  :if (or (executable-find "rg") (executable-find "ag"))
+  :config
+  (setq magit-todos-keywords '("TODO" "FIXME" "HACK" "XXX" "NOTE")
+        magit-todos-max-items 50
+        magit-todos-recursive t
+        magit-todos-exclude-globs '(".git/" "node_modules/" "target/" "dist/"))
+  (magit-todos-mode 1))
+
+;; =============================================================================
+;; difftastic — AST-aware structural diffs
+;; =============================================================================
+;; Difftastic understands code structure, so renaming a variable or
+;; reflowing a block doesn't show up as a wall of red/green noise.  Much
+;; cleaner for reviewing AI rewrites that touch the same region twice.
+;;
+;; Adds two suffixes to the magit-diff transient (press `d' in magit-status):
+;;   D  — difftastic dwim diff (working tree, staged, range — depending on context)
+;;   S  — difftastic show (for a specific commit, like magit-show)
+;;
+;; Requires the `difft' CLI: `brew install difftastic'.
+;; The diff opens in its own buffer (`difftastic-mode'); press `q' to bury.
+
+(use-package difftastic
+  :straight t
+  :after magit
+  ;; No-op if `difft' isn't installed — keeps the transient clean.
+  :if (executable-find "difft")
+  ;; Required: without `:demand', use-package defers loading and the
+  ;; `transient-append-suffix' below never runs (no `:bind' / `:hook' /
+  ;; `:commands' to trigger loading otherwise).
+  :demand t
+  :config
+  ;; Side-by-side layout makes much better use of wide-screen real estate
+  ;; than the default inline (single-column) view.  difftastic.el doesn't
+  ;; emit `--display' itself, so the env var is honored.
+  ;; (DFT_BACKGROUND is *not* honored — difftastic.el always emits an
+  ;; explicit `--background=<frame-bg>' flag based on the frame, which
+  ;; overrides any env var.)
+  (setenv "DFT_DISPLAY" "side-by-side")
+
+  ;; Color overrides.
+  ;;
+  ;; difftastic maps ANSI red/green to `magit-diff-removed' and
+  ;; `magit-diff-added' (see `difftastic-normal-colors-vector' default).
+  ;; In this config those faces are background-only with very dark tints
+  ;; — appropriate for line-level diffs in magit, but invisible for
+  ;; token-level highlighting in difftastic.  Use bright foreground
+  ;; faces here, matching the accent colors used elsewhere (TODO/DONE
+  ;; in init-org.el) for visual consistency.
+  (defface +difftastic/removed
+    '((t (:foreground "#ff6c6b" :weight bold)))
+    "Bright red for difftastic removed tokens (token-level, fg-only).")
+  (defface +difftastic/added
+    '((t (:foreground "#98be65" :weight bold)))
+    "Bright green for difftastic added tokens (token-level, fg-only).")
+
+  (setq difftastic-normal-colors-vector
+        (vector (aref ansi-color-normal-colors-vector 0)
+                '+difftastic/removed
+                '+difftastic/added
+                'magit-diff-file-heading
+                'font-lock-comment-face
+                'font-lock-string-face
+                'font-lock-warning-face
+                (aref ansi-color-normal-colors-vector 7))
+        difftastic-bright-colors-vector
+        (vector (aref ansi-color-bright-colors-vector 0)
+                '+difftastic/removed
+                '+difftastic/added
+                'magit-diff-file-heading
+                'font-lock-comment-face
+                'font-lock-string-face
+                'font-lock-warning-face
+                (aref ansi-color-bright-colors-vector 7))
+        ;; Disable the highlight-face remapping since our new faces
+        ;; don't have separate highlight variants.  difftastic falls
+        ;; back to its default underline for emphasized changes.
+        difftastic-highlight-alist nil)
+
+  ;; Direct keybindings — skip magit's `d' transient, which has lots
+  ;; of options that aren't useful for an AI-review workflow:
+  ;;   D  Difftastic diff of the entire working tree
+  ;;   d  Difftastic diff for the file at point (falls back to full)
+  ;;   q  Quit + kill the difftastic buffer (in difftastic-mode)
+  ;; These shadow evil-collection's `d' (transient) in magit buffers.
+
+  ;; Reuse the existing difftastic window in-place rather than splitting
+  ;; a new one each time, AND kill the stale buffer once the new one is
+  ;; placed.  Doing the kill from inside this function (rather than from
+  ;; a wrapper around `difftastic-magit-diff') is critical: difftastic
+  ;; runs the diff asynchronously and only invokes this display fn from
+  ;; the process sentinel, after the new buffer has content.  Killing
+  ;; the old buffer earlier orphans the difftastic window (it'd switch
+  ;; to magit-status), and the new diff would then pop up in a third
+  ;; window — that's the "extra magit review + difftastic" symptom.
+  (setq difftastic-display-buffer-function
+        (lambda (buffer _requested-width)
+          (let* ((existing-win
+                  (cl-find-if
+                   (lambda (w)
+                     (and (not (eq (window-buffer w) buffer))
+                          (with-current-buffer (window-buffer w)
+                            (derived-mode-p 'difftastic-mode))))
+                   (window-list)))
+                 (existing-buf
+                  (cl-find-if
+                   (lambda (b)
+                     (and (not (eq b buffer))
+                          (with-current-buffer b
+                            (derived-mode-p 'difftastic-mode))))
+                   (buffer-list))))
+            ;; Place the new buffer first.
+            (if existing-win
+                (progn (set-window-buffer existing-win buffer)
+                       (select-window existing-win))
+              (pop-to-buffer buffer))
+            ;; Then drop the stale buffer (its window is already showing
+            ;; the new buffer above).
+            (when existing-buf
+              (kill-buffer existing-buf)))))
+
+  (defun +difftastic/full ()
+    "Show a difftastic diff of the entire working tree."
+    (interactive)
+    (difftastic-magit-diff nil nil))
+
+  (defun +difftastic/at-point ()
+    "Show a difftastic diff restricted to the file at point.
+Falls back to `+difftastic/full' when point isn't on a file."
+    (interactive)
+    (let ((file (magit-file-at-point)))
+      (if file
+          (difftastic-magit-diff nil (list file))
+        (+difftastic/full))))
+
+  (defun +difftastic/quit ()
+    "Quit and kill the current difftastic buffer + close its window.
+Custom rather than `quit-window' because reusing the difftastic window
+via `set-window-buffer' (in our display fn) clobbers the window's
+`quit-restore' parameter, so `quit-window' no longer recognises it
+as a popup and falls back to showing whatever was previously in
+that window (typically magit-status).  Just delete the window
+explicitly when there's more than one in the frame."
+    (interactive)
+    (let ((win (selected-window)))
+      (kill-buffer (current-buffer))
+      (when (and (window-live-p win)
+                 (not (one-window-p)))
+        (delete-window win))))
+
+  (defun +difftastic/setup-evil-keys ()
+    "Bind `D' / `d' to difftastic shortcuts in magit buffers."
+    (when (bound-and-true-p evil-mode)
+      (evil-local-set-key 'normal (kbd "D") '+difftastic/full)
+      (evil-local-set-key 'normal (kbd "d") '+difftastic/at-point)))
+
+  (defun +difftastic/setup-buffer-keys ()
+    "Inside a difftastic buffer, bind `q' to quit + kill."
+    (when (bound-and-true-p evil-mode)
+      (evil-local-set-key 'normal (kbd "q") '+difftastic/quit))
+    ;; Also set in the global keymap so non-evil callers get q.
+    (local-set-key (kbd "q") '+difftastic/quit))
+
+  (dolist (hook '(magit-status-mode-hook
+                  magit-diff-mode-hook
+                  magit-revision-mode-hook))
+    (add-hook hook #'+difftastic/setup-evil-keys))
+
+  (add-hook 'difftastic-mode-hook #'+difftastic/setup-buffer-keys)
+
+  (with-eval-after-load 'magit-diff
+    ;; Append to both `magit-diff' (the dispatch transient you get from
+    ;; magit-status with `d') and `magit-diff-refresh' (the transient
+    ;; you get with `d' from inside an already-open diff buffer), so
+    ;; `D'/`S' work in either context.
+    (dolist (prefix '(magit-diff magit-diff-refresh))
+      (transient-append-suffix prefix '(-1 -1)
+        [("D" "Difftastic diff (dwim)" difftastic-magit-diff)
+         ("S" "Difftastic show"        difftastic-magit-show)]))))
 
 ;; =============================================================================
 ;; Untracked Files: Show Full Diff (with proper magit sections)
@@ -555,7 +747,14 @@ working-tree diff buffers (created by `+git/review')."
                     (insert "\n")))))
             (insert "\n")))))))
 
-(with-eval-after-load 'magit
-  (add-hook 'magit-diff-sections-hook #'+git/insert-untracked-diff-sections t))
+;; Disabled: this hand-rolled inserter creates `hunk' sections with nil
+;; position markers under some conditions, which breaks
+;; `magit-section-post-command-hook' with
+;;   (wrong-type-argument number-or-marker-p nil)
+;; magit's built-in untracked-files section already shows new files in
+;; magit-status; re-enable this only if you want full-content green
+;; diffs for untracked files in `+git/review' buffers.
+;; (with-eval-after-load 'magit
+;;   (add-hook 'magit-diff-sections-hook #'+git/insert-untracked-diff-sections t))
 
 ;;; init-git.el ends here
