@@ -192,10 +192,28 @@
 (setq epg-pinentry-mode 'loopback
       epa-pinentry-mode 'loopback)
 
-;; Set PATH from shell (important for LSP servers)
-(when (memq window-system '(mac ns x))
-  (let ((shell-path (shell-command-to-string "bash -c 'echo -n $PATH'")))
-    (setenv "PATH" shell-path)
-    (setq exec-path (split-string shell-path ":"))))
+;; Set PATH from shell so external tools (LSP servers, delta, difft, rg,
+;; brew-installed binaries) are findable in both GUI and terminal Emacs.
+;;
+;; On macOS, GUI launches inherit a stripped PATH from launchd that
+;; excludes Homebrew. The previous version of this block only ran for
+;; GUI Emacs and used `bash -c' non-interactively, so a zsh user with
+;; Homebrew configured in `.zprofile' would still end up with a stripped
+;; PATH (and `executable-find' would miss difft, delta, rg, etc.).
+;;
+;; Use the user's actual login shell with `-lc' so it sources the right
+;; profile file, and run it on all macOS so terminal Emacs benefits too.
+(when (eq system-type 'darwin)
+  (let* ((shell (or (getenv "SHELL") "/bin/zsh"))
+         (shell-path
+          (string-trim
+           (shell-command-to-string
+            (format "%s -lc 'printf %%s \"$PATH\"'"
+                    (shell-quote-argument shell))))))
+    (when (and shell-path
+               (not (string-empty-p shell-path))
+               (string-match-p ":" shell-path))
+      (setenv "PATH" shell-path)
+      (setq exec-path (split-string shell-path ":")))))
 
 ;;; init.el ends here
