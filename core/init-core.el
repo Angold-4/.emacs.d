@@ -162,7 +162,8 @@ This command does the inverse of `fill-region'."
 
 ;; Auto-refresh buffers when files change on disk
 (global-auto-revert-mode 1)
-(setq auto-revert-verbose nil)
+(setq auto-revert-verbose nil
+      auto-revert-avoid-polling t)
 
 ;; =============================================================================
 ;; Built-in Package Configuration

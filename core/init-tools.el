@@ -357,7 +357,6 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 
   ;; Auto-revert tracked buffers after git operations
   (setq magit-auto-revert-mode t)
-  (setq auto-revert-use-notify nil)
 
   ;; Show full untracked file content in status buffer
   (setq magit-diff-options '("--no-ext-diff")))
