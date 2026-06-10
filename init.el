@@ -61,7 +61,7 @@
 (setq org-html-head "
 <style>
   body {
-    max-width: 800px;
+    max-width: 880px;
     margin: auto;
     padding: 1em;
     font-family: sans-serif;
@@ -215,5 +215,22 @@
                (string-match-p ":" shell-path))
       (setenv "PATH" shell-path)
       (setq exec-path (split-string shell-path ":")))))
+
+;; =============================================================================
+;; Startup buffer: open Magit in the current directory
+;; =============================================================================
+
+;; When launched as a bare `emacs' (no file arguments) inside a git repo,
+;; jump straight to `magit-status' for the working directory instead of the
+;; scratch buffer. If no files were passed but we're not in a repo, fall back
+;; to the normal startup buffer. Skipped for the daemon (no initial frame).
+(add-hook 'emacs-startup-hook
+          (lambda ()
+            (when (and (not (daemonp))
+                       ;; No file was visited on the command line.
+                       (not (seq-some #'buffer-file-name (buffer-list))))
+              (when (require 'magit nil t)
+                (when (magit-toplevel)
+                  (magit-status default-directory))))))
 
 ;;; init.el ends here

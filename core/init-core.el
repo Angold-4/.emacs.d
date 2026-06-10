@@ -214,11 +214,25 @@ This command does the inverse of `fill-region'."
 ;; (e.g. Emacs in one pane, OpenCode in another).
 
 (defun +copy-to-system-clipboard (beg end)
-  "Copy visible region text from BEG to END to tmux paste buffer.
+  "Copy visible region text from BEG to END to the system clipboard.
 Filters invisible text (e.g. collapsed magit sections).
-The text can then be pasted in any tmux pane with C-a P."
+
+Writes through three channels (those that are available):
+  - Emacs kill ring                      (always)
+  - macOS system clipboard via `pbcopy'  (when on darwin)
+  - tmux paste buffer                    (when running inside tmux)
+
+This is more reliable than relying on Emacs's `select-enable-clipboard'
+in terminal Emacs, which goes through OSC 52 and only works if the
+host terminal opts into it."
   (interactive "r")
-  (let ((text (buffer-substring-no-properties beg end)))
+  (let* ((text (buffer-substring-no-properties beg end))
+         (pipe-to (lambda (program &rest args)
+                    "Pipe TEXT to PROGRAM via stdin."
+                    (let ((process-connection-type nil))
+                      (let ((proc (apply #'start-process program nil program args)))
+                        (process-send-string proc text)
+                        (process-send-eof proc))))))
     ;; In buffers with invisible text, extract only visible portion
     (when (next-single-property-change beg 'invisible nil end)
       (setq text
@@ -235,14 +249,15 @@ The text can then be pasted in any tmux pane with C-a P."
                                          pos next-change))))
                   (setq pos next-change)))
               result)))
-    ;; Add to Emacs kill ring
+    ;; Emacs kill ring
     (kill-new text)
-    ;; Also write to tmux paste buffer so C-p in tmux can paste it
-    (when (getenv "TMUX")
-      (let ((process-connection-type nil))
-        (let ((proc (start-process "tmux-copy" nil "tmux" "load-buffer" "-")))
-          (process-send-string proc text)
-          (process-send-eof proc))))
-    (message "Copied %d chars (C-a P in tmux to paste)" (length text))))
+    ;; macOS system clipboard via pbcopy (works in terminal Emacs without
+    ;; relying on iTerm2's OSC 52 support)
+    (when (and (eq system-type 'darwin) (executable-find "pbcopy"))
+      (funcall pipe-to "pbcopy"))
+    ;; tmux paste buffer for cross-pane sharing (C-a P to paste elsewhere)
+    (when (and (getenv "TMUX") (executable-find "tmux"))
+      (funcall pipe-to "tmux" "load-buffer" "-"))
+    (message "Copied %d chars" (length text))))
 
 ;;; init-core.el ends here

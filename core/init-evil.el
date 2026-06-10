@@ -158,6 +158,7 @@
   ;; Setup evil-collection for common modes
   ;; Note: Only include modes that exist in evil-collection
   (evil-collection-init '(magit
+                          forge
                           diff-mode
                           dired
                           ibuffer

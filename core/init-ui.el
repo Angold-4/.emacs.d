@@ -133,6 +133,17 @@
 
 (add-hook 'window-setup-hook #'window-divider-mode)
 
+;; Draw the separator between side-by-side windows as a continuous box-drawing
+;; line (│) instead of the default broken-looking glyph. This is the border
+;; between vertical splits in terminal Emacs; colors are set in init-themes.el
+;; (after the theme loads, so they aren't clobbered).
+(when standard-display-table
+  (set-display-table-slot standard-display-table 'vertical-border (make-glyph-code ?│)))
+
+;; Force a full redraw. Bound for the occasional tmux/iTerm2 redraw glitch
+;; where stale text or border fragments linger after switching windows.
+(global-set-key (kbd "C-c R") #'redraw-display)
+
 ;; =============================================================================
 ;; Fringes
 ;; =============================================================================

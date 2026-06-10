@@ -233,6 +233,12 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 ;; Vterm (Full Terminal Emulator via libvterm)
 ;; =============================================================================
 
+(defvar +vterm/counter 0
+  "Monotonic counter for naming terminals created by `+vterm/new' (1sh, 2sh...).")
+
+(defvar +vterm/last-buffer nil
+  "Most recently created terminal buffer, used by `+vterm/goto-last' (:v).")
+
 (use-package vterm
   :straight t
   :commands (vterm vterm-other-window vterm-mode)
@@ -270,13 +276,54 @@ Supports WSL by using powershell.exe to access Windows clipboard."
                                (buffer-list))
                               (vterm))))
         (select-window (split-window-below -15))
-        (switch-to-buffer vterm-buffer))))
+        (switch-to-buffer vterm-buffer)))))
 
-  ;; Open new vterm
-  (defun +vterm/new ()
-    "Open a new vterm buffer."
-    (interactive)
-    (vterm t)))
+;; -----------------------------------------------------------------------------
+;; Terminal workflow: :vterm opens a new numbered terminal, :v jumps to it
+;; -----------------------------------------------------------------------------
+;; Stock `vterm' reuses the single `*vterm*' buffer, so a second one needs a
+;; manual rename first.  Instead:
+;;   :vterm  -> always open a NEW terminal in the current dir (1sh, 2sh, ...)
+;;   :v      -> jump to the most recently created terminal
+;;
+;; Defined at top level (not in vterm's :config) and requiring vterm itself,
+;; so the ex commands work even before vterm has loaded for the first time.
+(defun +vterm/new ()
+  "Open a new terminal in the current directory with a numbered name.
+Buffers are named 1sh, 2sh, 3sh, ... instead of the default *vterm*, so
+several can coexist without renaming.  The new buffer is recorded as the
+most-recently-created terminal for `+vterm/goto-last' (:v)."
+  (interactive)
+  (require 'vterm)
+  (setq +vterm/counter (1+ +vterm/counter))
+  (let ((dir default-directory)
+        (buf (generate-new-buffer (format "%dsh" +vterm/counter))))
+    (with-current-buffer buf
+      (setq default-directory dir)
+      (vterm-mode))
+    (setq +vterm/last-buffer buf)
+    (pop-to-buffer-same-window buf)
+    buf))
+
+(defun +vterm/goto-last ()
+  "Switch to the most recently created terminal (see `+vterm/new').
+If it's gone, fall back to any live terminal, or create a new one."
+  (interactive)
+  (cond
+   ((buffer-live-p +vterm/last-buffer)
+    (pop-to-buffer-same-window +vterm/last-buffer))
+   ((let ((vt (cl-find-if (lambda (b)
+                            (with-current-buffer b (eq major-mode 'vterm-mode)))
+                          (buffer-list))))
+      (when vt
+        (setq +vterm/last-buffer vt)
+        (pop-to-buffer-same-window vt)
+        t)))
+   (t (+vterm/new))))
+
+(with-eval-after-load 'evil
+  (evil-ex-define-cmd "vterm" #'+vterm/new)
+  (evil-ex-define-cmd "v" #'+vterm/goto-last))
 
 ;; Evil integration for vterm
 (defun +vterm/evil-setup ()
@@ -349,8 +396,10 @@ Supports WSL by using powershell.exe to access Windows clipboard."
   ;; Don't ask before saving buffers
   (setq magit-save-repository-buffers 'dontask)
 
-  ;; Show granular diffs (word-level refinement)
-  (setq magit-diff-refine-hunk 'all)
+  ;; Word-level refinement only on the hunk at point ('t), not every hunk
+  ;; ('all). Refining all hunks is a major cost when a status/diff buffer
+  ;; has many files, and is the main reason refresh stalls past ~30 files.
+  (setq magit-diff-refine-hunk t)
 
   ;; Show process buffer only on errors (less noise)
   (setq magit-process-popup-time -1)
