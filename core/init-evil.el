@@ -95,6 +95,10 @@
         save-interprogram-paste-before-kill t)  ; Save clipboard to kill ring
   ;; Use C-u for scroll (like vim)
   (setq evil-want-C-u-scroll nil)  ; Keep C-u for universal-argument
+  ;; Make * / # search the whole SYMBOL under point (includes _), so
+  ;; pressing * on funding_payment_dto searches the full identifier rather
+  ;; than just the `funding' word fragment.
+  (setq evil-symbol-word-search t)
   :config
   (evil-mode 1)
   

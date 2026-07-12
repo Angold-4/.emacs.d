@@ -470,7 +470,11 @@ Reads the edition from Cargo.toml and passes it to rustfmt."
 
 ;; Override C-c f in rust-mode to use cargo fmt
 (with-eval-after-load 'rust-mode
-  (define-key rust-mode-map (kbd "C-c f") '+rust/format-buffer))
+  (define-key rust-mode-map (kbd "C-c f") '+rust/format-buffer)
+  ;; rust-mode binds C-c C-f to `rust-format-buffer', which shadows the
+  ;; global `projectile-ripgrep' (C-c C-f) in Rust buffers. Formatting is
+  ;; already on C-c f, so unbind it here to let project search fall through.
+  (define-key rust-mode-map (kbd "C-c C-f") nil))
 (with-eval-after-load 'rust-ts-mode
   (when (boundp 'rust-ts-mode-map)
     (define-key rust-ts-mode-map (kbd "C-c f") '+rust/format-buffer)))

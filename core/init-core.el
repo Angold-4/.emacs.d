@@ -150,6 +150,27 @@ This command does the inverse of `fill-region'."
  ;; Selection replaces region when typing
  delete-selection-mode t)
 
+;; =============================================================================
+;; Large / long-line file performance
+;; =============================================================================
+
+;; The usual cause of "Emacs lags when there's lots of text" is a buffer with
+;; very long lines (minified code, generated files, big JSON, logs). Emacs's
+;; redisplay and font-lock get quadratically slow on long lines. `so-long'
+;; detects these buffers and automatically turns off the expensive minor modes
+;; (font-lock, ligatures, rainbow-delimiters, hl-todo, line numbers, ...),
+;; which removes the lag. Toggle a buffer back with M-x so-long-revert.
+(global-so-long-mode 1)
+;; Trip so-long a bit earlier than the 10k default so heavy files are caught.
+(setq so-long-threshold 5000)
+
+;; Smoother scrolling through big buffers: don't pause to fully fontify/lay out
+;; while scrolling fast (Emacs catches up when you stop).
+(setq fast-but-imprecise-scrolling t)
+;; Defer syntax highlighting of off-screen text until idle, so typing and
+;; scrolling stay responsive in large files.
+(setq jit-lock-defer-time 0)
+
 ;; Remember cursor position in files
 (save-place-mode 1)
 
