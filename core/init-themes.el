@@ -41,6 +41,16 @@
 ;; Theme Functions
 ;; =============================================================================
 
+(defun +theme/style-borders (divider)
+  "Recolor window borders/dividers with DIVIDER as the line color.
+Set after the theme loads so the theme's own (often invisible-on-black)
+border faces don't win. Covers both the vertical-split separator
+(`vertical-border') and the window-divider faces."
+  (set-face-attribute 'vertical-border nil :foreground divider :background 'unspecified)
+  (dolist (face '(window-divider window-divider-first-pixel window-divider-last-pixel))
+    (when (facep face)
+      (set-face-attribute face nil :foreground divider))))
+
 (defun +theme/load-dark ()
   "Load the dark theme."
   (interactive)
@@ -49,6 +59,8 @@
   ;; Force pure black background for OLED screens
   (custom-set-faces
    '(default ((t (:background "#000000")))))
+  ;; Clear, subtle gray borders that read well against pure black.
+  (+theme/style-borders "#454545")
   (setq +theme/current 'dark)
   (message "Loaded dark theme: %s" +theme/dark-theme))
 
@@ -57,6 +69,7 @@
   (interactive)
   (mapc #'disable-theme custom-enabled-themes)
   (load-theme +theme/light-theme t)
+  (+theme/style-borders "#c8c8c8")
   (setq +theme/current 'light)
   (message "Loaded light theme: %s" +theme/light-theme))
 

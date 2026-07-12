@@ -76,8 +76,11 @@
 
 (with-eval-after-load 'magit
   ;; --- Diff display ---
-  ;; Show word-level granularity on all hunks (not just selected)
-  (setq magit-diff-refine-hunk 'all)
+  ;; Word-level granularity on the hunk at point only ('t), not every hunk
+  ;; ('all). 'all re-runs refinement across the whole buffer on each refresh,
+  ;; which is what makes staging/refresh crawl once a repo has many changed
+  ;; files. 't keeps the nice inline word-diff where your cursor is.
+  (setq magit-diff-refine-hunk t)
 
   ;; Start with a generous amount of context (like GitHub's default)
   (setq magit-diff-extra-context 6)
@@ -209,10 +212,39 @@ If COMMIT is nil, prompt for one."
 ;; Review Buffer Navigation & Actions
 ;; =============================================================================
 
-(defun +git/open-file-at-point ()
+(cl-defun +git/open-file-at-point ()
   "Open the file at point in a side window (right split).
-Jump to the exact line in the diff if possible."
+Jump to the exact line in the diff if possible.
+
+When point is on a forge topic (PR or issue) in magit-status, dispatch
+to forge's visit function instead — for PRs, the `forge-visit-pullreq'
+advice will redirect to a difftastic diff."
   (interactive)
+  ;; In a PR-review diff buffer, RET on a file is intentionally disabled:
+  ;; the local file likely differs from the PR version, so opening it
+  ;; would show stale/misleading content.  Use `d' to drill into the
+  ;; file with difftastic instead.
+  (when (bound-and-true-p +forge/pr-review-buffer)
+    (user-error "RET is disabled in PR review — use `d' for a difftastic diff of this file"))
+  ;; Forge topic at point? Dispatch to forge first.  This makes RET on a
+  ;; PR row in magit-status open the PR's diff (via the advice on
+  ;; `forge-visit-pullreq') instead of erroring `No file at point'.
+  (when-let ((topic (and (fboundp 'forge-current-topic)
+                         (forge-current-topic))))
+    (cond
+     ((and (fboundp 'forge-pullreq-p) (forge-pullreq-p topic))
+      (forge-visit-pullreq topic)
+      (cl-return-from +git/open-file-at-point))
+     ((and (fboundp 'forge-issue-p) (forge-issue-p topic))
+      (forge-visit-issue topic)
+      (cl-return-from +git/open-file-at-point))))
+  ;; Commit at point (e.g., in the "Recent commits" section of
+  ;; magit-status, or on a log line).  Open the commit's diff and
+  ;; message in a magit-revision buffer.
+  (when-let ((commit (and (fboundp 'magit-commit-at-point)
+                          (magit-commit-at-point))))
+    (magit-show-commit commit)
+    (cl-return-from +git/open-file-at-point))
   (let ((file (magit-file-at-point))
         (line nil))
     (unless file
@@ -221,7 +253,7 @@ Jump to the exact line in the diff if possible."
         (when (re-search-backward "^diff --git a/\\(.+\\) b/" nil t)
           (setq file (match-string 1)))))
     (unless file
-      (user-error "No file at point"))
+      (user-error "No file or topic at point"))
     ;; Try to extract the line number from the hunk header or diff line
     (save-excursion
       (let ((current-pos (point)))
@@ -442,8 +474,13 @@ Makes the diff buffer behave as a clean read-only review surface."
   (magit-delta-default-dark-theme "Nord")
   (magit-delta-default-light-theme "GitHub")
   (magit-delta-hide-plus-minus-markers t)
-  :hook
-  (magit-mode . magit-delta-mode)
+  ;; NOTE: previously hooked onto `magit-mode' so every magit buffer ran
+  ;; delta. delta is an external process invoked to wash each diff, so on a
+  ;; status/diff buffer with many files it re-shells out on every refresh —
+  ;; a big part of the multi-second stalls. Now it's on-demand: toggle with
+  ;; `M-x magit-delta-mode' in a diff buffer when you want delta's rendering.
+  ;; The custom magit-diff faces above provide green/red backgrounds the rest
+  ;; of the time, and difftastic (D/d) remains the primary review path.
   :config
   ;; --- Fix 1: Undo face remapping ---
   ;; magit-delta remaps diff faces (added/removed/context) to `default',
@@ -469,6 +506,110 @@ Makes the diff buffer behave as a clean read-only review surface."
   ;; to Emacs display-engine caching or overlay/face composition order.
   ;; Delta's own background colors are acceptable as-is.
   )  ; end use-package magit-delta
+
+;; =============================================================================
+;; forge — GitHub/GitLab pull requests & issues inside magit
+;; =============================================================================
+;; Adds "Pull requests" and "Issues" sections to magit-status and a top-level
+;; `@' transient for fetching, viewing, creating, and reviewing PRs.  Topic
+;; metadata is cached locally in `~/.emacs.d/forge-database.sqlite' so each
+;; `magit-status' refresh only pulls deltas instead of refetching the entire
+;; history (which would burn through GitHub's hourly API rate limit).
+;;
+;; First-time setup (once per machine):
+;;   1. Authenticate.  Easiest: `gh auth login' in a shell — forge will reuse
+;;      the gh CLI's token automatically.  Alternative: put a line in
+;;      ~/.authinfo (or ~/.authinfo.gpg) like:
+;;        machine api.github.com login YOUR_USERNAME^forge password TOKEN
+;;      Token needs `repo' scope, plus `read:org' for private orgs.
+;;   2. In any cloned repo, `M-x forge-pull' once to seed the cache.
+;;
+;; After that, opening `magit-status' in that repo auto-shows topics, and
+;; subsequent fetches are incremental.
+
+(use-package forge
+  :straight t
+  :after magit
+  :init
+  ;; Skip forge's default binding injection: in current magit, the
+  ;; transient slot it targets (`"o"' in magit-dispatch) has moved or
+  ;; been removed, so the injection prints
+  ;;   Cannot insert ("N" "Forge" forge-dispatch) into magit-dispatch; o not found
+  ;; evil-collection-forge sets this to nil too, but only *after* the
+  ;; failing injection has already run.  Setting it in `:init' runs
+  ;; before forge loads, so the error never fires.
+  (setq forge-add-default-bindings nil)
+  :config
+  ;; When RET-ing a PR row from `magit-status', show a clean difftastic
+  ;; diff (base..head) instead of opening the forge topic buffer with
+  ;; description/comments.  This is the lightweight "open PR like a diff
+  ;; tool, read-only" review path.
+  ;;
+  ;; The topic buffer (description, comments, review threads) is still
+  ;; reachable via `M-x forge-visit-pullreq' from anywhere outside
+  ;; magit-status, or via `forge-list-pullreqs'.
+  (defun +forge/resolve-ref (raw-name)
+    "Return a locally-resolvable git ref for RAW-NAME, fetching if needed.
+Tries RAW-NAME directly, then `origin/RAW-NAME', then fetches from
+origin and retries.  Returns nil if nothing resolves."
+    (or (and raw-name (magit-rev-verify raw-name) raw-name)
+        (and raw-name (magit-rev-verify (format "origin/%s" raw-name))
+             (format "origin/%s" raw-name))
+        (when raw-name
+          (message "Fetching %s from origin..." raw-name)
+          (magit-call-git "fetch" "origin" raw-name)
+          (or (and (magit-rev-verify raw-name) raw-name)
+              (and (magit-rev-verify (format "origin/%s" raw-name))
+                   (format "origin/%s" raw-name))))))
+
+  (defun +forge/visit-pullreq-around (orig-fn pullreq)
+    "When invoked from magit-status, show PULLREQ as a magit overview diff
+(file list with +/- stats, expandable hunks).  Otherwise fall back to
+ORIG-FN (the default topic-buffer view).
+
+Use `d' inside the overview to drill into a single file with
+difftastic (per-file AST diff is fast even when the overall PR is huge).
+RET on a file in this buffer is disabled — the local file likely
+differs from the PR version, so opening it would be misleading.
+
+Handles both same-repo and cross-repo (fork) PRs by fetching missing
+refs on demand: base via `git fetch origin <branch>', head via GitHub's
+magic `refs/pull/N/head' ref into a stable local `refs/forge-review/N'.
+Falls back to the topic buffer on any unresolvable ref or diff error."
+    (if (derived-mode-p 'magit-status-mode)
+        (let* ((number (oref pullreq number))
+               (base (+forge/resolve-ref (oref pullreq base-ref)))
+               (raw-head (oref pullreq head-ref))
+               (head-ref-local (format "refs/forge-review/%s" number))
+               (head (cond
+                      ((and raw-head (magit-rev-verify raw-head)) raw-head)
+                      ((magit-rev-verify head-ref-local) head-ref-local)
+                      (t
+                       (message "Fetching PR #%s..." number)
+                       (magit-call-git
+                        "fetch" "origin"
+                        (format "refs/pull/%s/head:%s" number head-ref-local))
+                       (and (magit-rev-verify head-ref-local)
+                            head-ref-local)))))
+          (cond
+           ((and base head)
+            (condition-case err
+                (progn
+                  (magit-diff-range (format "%s...%s" base head)
+                                    (list "--stat" "--no-ext-diff"))
+                  ;; Mark the resulting diff buffer as a PR-review buffer
+                  ;; so `+git/open-file-at-point' knows to disable RET.
+                  (setq-local +forge/pr-review-buffer t))
+              (error
+               (message "Diff failed (%s); falling back to topic buffer"
+                        (error-message-string err))
+               (funcall orig-fn pullreq))))
+           (t
+            (message "Couldn't resolve PR #%s refs; falling back to topic buffer"
+                     number)
+            (funcall orig-fn pullreq))))
+      (funcall orig-fn pullreq)))
+  (advice-add 'forge-visit-pullreq :around #'+forge/visit-pullreq-around))
 
 ;; =============================================================================
 ;; magit-todos — Surface TODO/FIXME/HACK in magit-status
@@ -523,6 +664,14 @@ Makes the diff buffer behave as a clean read-only review surface."
   ;; explicit `--background=<frame-bg>' flag based on the frame, which
   ;; overrides any env var.)
   (setenv "DFT_DISPLAY" "side-by-side")
+
+  ;; Bump parse limits so large PR files keep syntax highlighting.
+  ;; Difft's defaults (1 MB / ~1M AST nodes / ~3M graph nodes) cause it
+  ;; to fall back to a plain LCS diff with no colors on hefty files.
+  ;; 10x headroom is enough for almost any source file in practice.
+  (setenv "DFT_BYTE_LIMIT"  "10485760")   ; 10 MB
+  (setenv "DFT_NODE_LIMIT"  "10000000")   ; 10M AST nodes
+  (setenv "DFT_GRAPH_LIMIT" "30000000")   ; 30M graph nodes
 
   ;; Color overrides.
   ;;

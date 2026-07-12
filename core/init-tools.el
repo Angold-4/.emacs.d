@@ -233,6 +233,12 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 ;; Vterm (Full Terminal Emulator via libvterm)
 ;; =============================================================================
 
+(defvar +vterm/counter 0
+  "Monotonic counter for naming terminals created by `+vterm/new' (1sh, 2sh...).")
+
+(defvar +vterm/last-buffer nil
+  "Most recently created terminal buffer, used by `+vterm/goto-last' (:v).")
+
 (use-package vterm
   :straight t
   :commands (vterm vterm-other-window vterm-mode)
@@ -270,13 +276,123 @@ Supports WSL by using powershell.exe to access Windows clipboard."
                                (buffer-list))
                               (vterm))))
         (select-window (split-window-below -15))
-        (switch-to-buffer vterm-buffer))))
+        (switch-to-buffer vterm-buffer)))))
 
-  ;; Open new vterm
-  (defun +vterm/new ()
-    "Open a new vterm buffer."
-    (interactive)
-    (vterm t)))
+;; -----------------------------------------------------------------------------
+;; Terminal workflow: :vterm opens a new numbered terminal, :v jumps to it
+;; -----------------------------------------------------------------------------
+;; Stock `vterm' reuses the single `*vterm*' buffer, so a second one needs a
+;; manual rename first.  Instead:
+;;   :vterm  -> always open a NEW terminal in the current dir (1sh, 2sh, ...)
+;;   :v      -> jump to the most recently created terminal
+;;
+;; Defined at top level (not in vterm's :config) and requiring vterm itself,
+;; so the ex commands work even before vterm has loaded for the first time.
+(defun +vterm/new ()
+  "Open a new terminal in the current directory with a numbered name.
+Buffers are named 1sh, 2sh, 3sh, ... instead of the default *vterm*, so
+several can coexist without renaming.  The new buffer is recorded as the
+most-recently-created terminal for `+vterm/goto-last' (:v)."
+  (interactive)
+  (require 'vterm)
+  (setq +vterm/counter (1+ +vterm/counter))
+  (let ((dir default-directory)
+        (buf (generate-new-buffer (format "%dsh" +vterm/counter))))
+    (with-current-buffer buf
+      (setq default-directory dir)
+      (vterm-mode))
+    ;; Explicitly attach to the current perspective so the new terminal
+    ;; reliably shows up in the persp-aware C-x b switcher (the after-major-
+    ;; mode auto-add can miss buffers created with `generate-new-buffer').
+    (when (and (bound-and-true-p persp-mode) (fboundp 'persp-add-buffer))
+      (persp-add-buffer buf))
+    (setq +vterm/last-buffer buf)
+    (pop-to-buffer-same-window buf)
+    buf))
+
+(defun +vterm/live-terminals ()
+  "Return all live terminal buffers, most-recently-used first.
+Uses the global buffer list, so terminals in *every* perspective are
+included (persp-mode partitions buffers per perspective otherwise)."
+  (cl-remove-if-not
+   (lambda (b)
+     (and (buffer-live-p b)
+          (with-current-buffer b (derived-mode-p 'vterm-mode))))
+   (buffer-list)))
+
+(defun +vterm/goto-last ()
+  "Switch to the most recently created terminal (see `+vterm/new').
+If it's gone, fall back to the most recent live terminal, or create one."
+  (interactive)
+  (let ((target (if (buffer-live-p +vterm/last-buffer)
+                    +vterm/last-buffer
+                  (car (+vterm/live-terminals)))))
+    (if target
+        (progn (setq +vterm/last-buffer target)
+               (pop-to-buffer-same-window target))
+      (+vterm/new))))
+
+(defun +vterm/switch ()
+  "Switch to any live terminal across ALL perspectives.
+This never hides a terminal the way the persp-aware C-x b can."
+  (interactive)
+  (let ((names (mapcar #'buffer-name (+vterm/live-terminals))))
+    (if names
+        (let ((choice (completing-read "Terminal: " names nil t nil nil (car names))))
+          (when (and choice (not (string-empty-p choice)))
+            (setq +vterm/last-buffer (get-buffer choice))
+            (switch-to-buffer choice)))
+      (+vterm/new))))
+
+;; Note: C-c v is bound to +vterm/toggle (a command, not a prefix), so we
+;; can't hang C-c v v off it. The terminal switcher is reached via :vt.
+(with-eval-after-load 'evil
+  (evil-ex-define-cmd "vterm" #'+vterm/new)
+  (evil-ex-define-cmd "v" #'+vterm/goto-last)
+  (evil-ex-define-cmd "vt" #'+vterm/switch))
+
+;; In evil normal/visual state, keep the Emacs scroll position when vterm
+;; redraws (new agent output, window resize, switching away for C-p, etc.).
+;; Do NOT pause the PTY — that blocks interactive CLI agents.  Redraw still
+;; updates buffer text; we only restore window-start/point afterward.
+(defvar +vterm/scroll-advice-installed nil)
+
+(defun +vterm/should-preserve-scroll-p ()
+  "Non-nil when reading scrollback in evil normal/visual state."
+  (and (derived-mode-p 'vterm-mode)
+       (bound-and-true-p evil-mode)
+       (or (evil-normal-state-p) (evil-visual-state-p))))
+
+(defun +vterm/capture-window-positions (buffer)
+  (let (positions)
+    (dolist (w (get-buffer-window-list buffer nil t))
+      (when (window-live-p w)
+        (push (list w (window-point w) (window-start w)) positions)))
+    positions))
+
+(defun +vterm/restore-window-positions (positions)
+  (dolist (entry positions)
+    (pcase-let ((`(,w ,pt ,ws) entry))
+      (when (and (window-live-p w)
+                 (eq (window-buffer w) (current-buffer)))
+        (set-window-start w ws t)
+        (set-window-point w pt)))))
+
+(defun +vterm/advice-delayed-redraw (orig-fn buffer)
+  (if (with-current-buffer buffer (+vterm/should-preserve-scroll-p))
+      (let ((positions (+vterm/capture-window-positions buffer)))
+        (funcall orig-fn buffer)
+        (with-current-buffer buffer
+          (+vterm/restore-window-positions positions)))
+    (funcall orig-fn buffer)))
+
+(defun +vterm/install-scroll-advice ()
+  (unless +vterm/scroll-advice-installed
+    (setq +vterm/scroll-advice-installed t)
+    (advice-add #'vterm--delayed-redraw :around #'+vterm/advice-delayed-redraw)))
+
+(with-eval-after-load 'vterm
+  (+vterm/install-scroll-advice))
 
 ;; Evil integration for vterm
 (defun +vterm/evil-setup ()
@@ -349,15 +465,16 @@ Supports WSL by using powershell.exe to access Windows clipboard."
   ;; Don't ask before saving buffers
   (setq magit-save-repository-buffers 'dontask)
 
-  ;; Show granular diffs (word-level refinement)
-  (setq magit-diff-refine-hunk 'all)
+  ;; Word-level refinement only on the hunk at point ('t), not every hunk
+  ;; ('all). Refining all hunks is a major cost when a status/diff buffer
+  ;; has many files, and is the main reason refresh stalls past ~30 files.
+  (setq magit-diff-refine-hunk t)
 
   ;; Show process buffer only on errors (less noise)
   (setq magit-process-popup-time -1)
 
   ;; Auto-revert tracked buffers after git operations
   (setq magit-auto-revert-mode t)
-  (setq auto-revert-use-notify nil)
 
   ;; Show full untracked file content in status buffer
   (setq magit-diff-options '("--no-ext-diff")))
@@ -375,17 +492,27 @@ Supports WSL by using powershell.exe to access Windows clipboard."
   :config
   (projectile-mode +1)
   
-  ;; Use native indexing for better performance
-  (setq projectile-indexing-method 'hybrid
-        projectile-enable-caching t
+  ;; 'alien indexing shells out to `git ls-files -zco --exclude-standard'
+  ;; (fast even on huge repos, respects .gitignore, and includes new
+  ;; untracked-but-not-ignored files). It's quick enough that we DON'T need
+  ;; the file-list cache — disabling caching means new files appear in C-p
+  ;; immediately instead of after a manual `C-c p i'. (The old 'hybrid +
+  ;; caching combo was the reason new files didn't show up until invalidated.)
+  (setq projectile-indexing-method 'alien
+        projectile-enable-caching nil
         projectile-sort-order 'recently-active
         ;; Use default completing-read (enhanced by Vertico + Orderless)
         projectile-completion-system 'default)
   
-  ;; Recognize common project roots
+  ;; Project root = the VCS root only (the whole repo), NOT the nearest
+  ;; language manifest. Projectile walks upward and stops at the first marker
+  ;; it finds, so listing Cargo.toml/package.json/etc. here made each Rust
+  ;; crate (or JS package) its own "project" — C-p would then only see that
+  ;; crate. Keeping just .git/.projectile makes C-p search the entire repo
+  ;; (e.g. ~/Work3/dragon) regardless of which crate the file lives in. Drop
+  ;; a `.projectile' file somewhere if you ever want a non-git root.
   (setq projectile-project-root-files-bottom-up
-        '(".projectile" ".git" "Cargo.toml" "go.mod" "package.json"
-          "pyproject.toml" "setup.py" "Makefile" "CMakeLists.txt"))
+        '(".projectile" ".git" ".hg" ".svn"))
   
   ;; Evil keybinding for projectile
   (with-eval-after-load 'evil
@@ -490,7 +617,12 @@ Supports WSL by using powershell.exe to access Windows clipboard."
   (setq persp-keymap-prefix (kbd "C-c w")
         persp-nil-name "⊥")  ; Name for the default perspective
   :config
-  (setq persp-autokill-buffer-on-remove 'kill-weak
+  ;; Do NOT kill buffers when they're removed from a perspective. With the
+  ;; old 'kill-weak, a non-file buffer (like a vterm terminal) got reaped the
+  ;; moment its perspective was killed or shuffled — which is exactly how
+  ;; long-running agent terminals were silently disappearing. nil keeps them
+  ;; alive; reach any of them with :vt / C-c v v.
+  (setq persp-autokill-buffer-on-remove nil
         persp-reset-windows-on-nil-window-conf nil
         persp-add-buffer-on-after-change-major-mode t
         persp-set-last-persp-for-new-frames t
