@@ -111,8 +111,46 @@
   (setq evil-kill-on-visual-paste nil))  ; Don't replace clipboard when pasting over selection
 
 ;; Clipboard helpers live in init-core.el (`+clipboard/get', `+clipboard/set',
-;; `+copy-to-system-clipboard').  WSL sets `interprogram-paste-function' there
-;; so C-y (yank) in insert mode reads the Windows clipboard.
+;; `+clipboard/paste', `+copy-to-system-clipboard').  In terminal Emacs, `p'
+;; and `C-v` paste from the host clipboard; visual `C-y` copies to it.
+
+;; =============================================================================
+;; Terminal clipboard paste (evil)
+;; =============================================================================
+
+(defun +evil/terminal-clipboard-paste-p ()
+  "Non-nil in terminal Emacs where OSC 52 clipboard is unreliable."
+  (not (display-graphic-p)))
+
+(defun +evil/sync-yank-to-clipboard ()
+  "After evil yank, mirror text to the host clipboard (terminal only)."
+  (when (and (+evil/terminal-clipboard-paste-p) (car kill-ring))
+    (+clipboard/set (car kill-ring))))
+
+(defun +evil/paste (count)
+  "Paste in evil: prefer host clipboard when it differs from the kill ring.
+In terminal Emacs this makes external copy → `p' work; internal `y' then `p'
+still uses the kill ring once yank has synced via `+evil/sync-yank-to-clipboard'."
+  (interactive "P")
+  (let ((count (or count 1)))
+    (if (+evil/terminal-clipboard-paste-p)
+        (let ((clip (+clipboard/get))
+              (kill (and kill-ring (current-kill 0))))
+          (if (and clip (not (string-empty-p clip))
+                   (or (null kill) (not (string= clip kill))))
+              (progn (kill-new clip) (evil-paste count 'no-autoselect))
+            (evil-paste count)))
+      (evil-paste count))))
+
+(with-eval-after-load 'evil
+  (dolist (fn '(evil-yank evil-yank-window evil-yank-line evil-copy))
+    (advice-add fn :after #'+evil/sync-yank-to-clipboard))
+  (when (+evil/terminal-clipboard-paste-p)
+    (define-key evil-normal-state-map (kbd "p") #'+evil/paste)
+    (define-key evil-normal-state-map (kbd "P") #'+evil/paste)
+    (define-key evil-visual-state-map (kbd "p") #'+evil/paste)
+    (define-key evil-visual-state-map (kbd "P") #'+evil/paste)
+    (define-key evil-insert-state-map (kbd "C-v") #'+clipboard/paste)))
 
 ;; =============================================================================
 ;; Evil Collection (consistent bindings across modes)

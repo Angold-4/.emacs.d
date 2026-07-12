@@ -291,14 +291,21 @@ Checks Emacs `exec-path'/PATH first, then standard System32 locations."
             (+is-wsl
              (let ((ps (+clipboard/wsl-executable "powershell.exe")))
                (when ps
-                 (shell-command-to-string
-                  (format "%s -NoProfile -Command \"Get-Clipboard -Raw\" 2>/dev/null"
-                          (shell-quote-argument ps)))))
+                 (or (shell-command-to-string
+                      (format "%s -NoProfile -STA -Command \"Get-Clipboard -Raw\" 2>/dev/null"
+                              (shell-quote-argument ps)))
+                     (shell-command-to-string
+                      (format "%s -NoProfile -STA -Command \"Get-Clipboard\" 2>/dev/null"
+                              (shell-quote-argument ps))))))
             ((eq system-type 'darwin)
              (when (executable-find "pbpaste")
                (shell-command-to-string "pbpaste")))
             ((and (eq system-type 'gnu/linux) (executable-find "wl-paste"))
              (shell-command-to-string "wl-paste --no-newline 2>/dev/null"))
+            ((and (eq system-type 'gnu/linux) (executable-find "xclip"))
+             (shell-command-to-string "xclip -selection clipboard -o 2>/dev/null"))
+            ((and (eq system-type 'gnu/linux) (executable-find "xsel"))
+             (shell-command-to-string "xsel --clipboard --output 2>/dev/null"))
             ((and (eq system-type 'gnu/linux) (getenv "DISPLAY"))
              (gui-get-selection 'CLIPBOARD))
             (t
@@ -307,8 +314,26 @@ Checks Emacs `exec-path'/PATH first, then standard System32 locations."
         ;; Windows / PowerShell often appends a trailing CRLF.
         (string-trim-right clip "[\r\n]+"))))))
 
-;; Terminal Emacs on WSL: make C-y (yank) read the Windows clipboard.
-(when (and +is-wsl (+clipboard/wsl-executable "powershell.exe"))
+(defun +clipboard/paste ()
+  "Insert text from the host system clipboard at point."
+  (interactive)
+  (if-let ((clip (+clipboard/get)))
+      (progn (kill-new clip) (insert clip))
+    (message "System clipboard is empty")))
+
+(defun +clipboard/paste-available-p ()
+  "Non-nil when `+clipboard/get' can read from a host clipboard backend."
+  (cond (+is-wsl (+clipboard/wsl-executable "powershell.exe"))
+        ((eq system-type 'darwin) (executable-find "pbpaste"))
+        ((eq system-type 'gnu/linux)
+         (or (executable-find "wl-paste")
+             (executable-find "xclip")
+             (executable-find "xsel")
+             (getenv "DISPLAY")))
+        (t nil)))
+
+;; Terminal Emacs: C-y (yank) and friends read the host clipboard.
+(when (+clipboard/paste-available-p)
   (setq interprogram-paste-function '+clipboard/get))
 
 (defun +copy-to-system-clipboard (beg end)
