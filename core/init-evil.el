@@ -135,17 +135,19 @@
    ;; macOS
    ((eq system-type 'darwin)
     (shell-command-to-string "pbpaste"))
-   ;; Linux with X11
-   ((and (eq system-type 'gnu/linux)
-         (getenv "DISPLAY"))
+   ;; Linux: Wayland, then X11
+   ((and (eq system-type 'gnu/linux) (executable-find "wl-paste"))
+    (let ((clip (shell-command-to-string "wl-paste --no-newline 2>/dev/null")))
+      (when (and clip (not (string-empty-p clip))) clip)))
+   ((and (eq system-type 'gnu/linux) (getenv "DISPLAY"))
     (ignore-errors (gui-get-selection 'CLIPBOARD)))
    ;; Fallback
    (t
     (ignore-errors (gui-get-selection 'CLIPBOARD)))))
 
 ;; Clipboard COPY: handled by `+copy-to-system-clipboard' in init-core.el.
-;; It writes to tmux's paste buffer via `tmux load-buffer -'.
-;; Use C-a P in tmux to paste into any pane.
+;; It writes to the system clipboard (pbcopy / wl-copy / xclip) and the tmux
+;; paste buffer when available. Use C-a P in tmux to paste into another pane.
 ;; We only need to set the paste function here.
 (when +is-wsl
   (setq interprogram-paste-function '+clipboard/get))

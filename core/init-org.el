@@ -1,12 +1,12 @@
-;;; init-org.el --- Minimal org-mode configuration (macos branch) -*- lexical-binding: t -*-
+;;; init-org.el --- Minimal org-mode configuration -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2024-2026 Ango Wang
-;; Description: Plain note-taking with org-mode.  All notes live under
-;; ~/orgw/.  No calendar sync, no multi-project scaffolding, no ICS
-;; export — just normal org.
+;; Description: Plain note-taking with org-mode.  Notes live under ~/org/
+;; on Linux and ~/orgw/ on macOS.  No calendar sync, no multi-project
+;; scaffolding, no ICS export — just normal org.
 
 ;;; Commentary:
-;; All .org files anywhere under ~/orgw/ feed into the agenda.
+;; All .org files anywhere under the platform org root feed into the agenda.
 ;;
 ;; Keybindings (see also init-evil.el for global C-c l/a/c):
 ;;   C-c a   Org agenda
@@ -16,8 +16,10 @@
 
 ;;; Code:
 
-(defvar +org/root (expand-file-name "~/orgw/")
-  "Root directory for all org files on this machine.")
+(defvar +org/root
+  (expand-file-name (if (eq system-type 'darwin) "~/orgw/" "~/org/"))
+  "Root directory for all org files on this machine.
+macOS uses ~/orgw/; Linux and other platforms use ~/org/.")
 
 ;; Make sure the root exists so first-launch capture/agenda don't error.
 (unless (file-directory-p +org/root)
@@ -54,7 +56,7 @@
           ("DONE"        . (:foreground "#98be65" :weight bold))
           ("CANCELLED"   . (:foreground "#5B6268" :weight bold))))
 
-  ;; ── Agenda: every .org file under ~/orgw/ (recursive) ────────────
+  ;; ── Agenda: every .org file under +org/root (recursive) ──────────
   (setq org-agenda-files
         (when (file-directory-p +org/root)
           (directory-files-recursively +org/root "\\.org\\'"))

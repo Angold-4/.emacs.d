@@ -238,10 +238,12 @@ This command does the inverse of `fill-region'."
   "Copy visible region text from BEG to END to the system clipboard.
 Filters invisible text (e.g. collapsed magit sections).
 
-Writes through three channels (those that are available):
-  - Emacs kill ring                      (always)
-  - macOS system clipboard via `pbcopy'  (when on darwin)
-  - tmux paste buffer                    (when running inside tmux)
+Writes through every channel that is available:
+  - Emacs kill ring                         (always)
+  - macOS system clipboard via `pbcopy'     (darwin)
+  - Linux system clipboard via `wl-copy' or
+    `xclip' / `xsel'                         (gnu/linux)
+  - tmux paste buffer                       (when running inside tmux)
 
 This is more reliable than relying on Emacs's `select-enable-clipboard'
 in terminal Emacs, which goes through OSC 52 and only works if the
@@ -276,6 +278,14 @@ host terminal opts into it."
     ;; relying on iTerm2's OSC 52 support)
     (when (and (eq system-type 'darwin) (executable-find "pbcopy"))
       (funcall pipe-to "pbcopy"))
+    ;; Linux system clipboard (Wayland wl-copy, then X11 xclip/xsel)
+    (when (eq system-type 'gnu/linux)
+      (cond ((executable-find "wl-copy")
+             (funcall pipe-to "wl-copy"))
+            ((executable-find "xclip")
+             (funcall pipe-to "xclip" "-selection" "clipboard"))
+            ((executable-find "xsel")
+             (funcall pipe-to "xsel" "--clipboard" "--input"))))
     ;; tmux paste buffer for cross-pane sharing (C-a P to paste elsewhere)
     (when (and (getenv "TMUX") (executable-find "tmux"))
       (funcall pipe-to "tmux" "load-buffer" "-"))
