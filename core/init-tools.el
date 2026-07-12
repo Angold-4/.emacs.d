@@ -418,15 +418,15 @@ This never hides a terminal the way the persp-aware C-x b can."
     ;; which align the shell cursor to point via `vterm-goto-char' instead
     ;; of jumping to end-of-buffer.
 
-    ;; Paste from clipboard in normal mode
+    ;; Paste from host clipboard in normal mode (WSL → Windows, etc.)
     (evil-local-set-key 'normal (kbd "p")
       (lambda () (interactive)
-        (vterm-send-string (current-kill 0))))
+        (vterm-send-string (or (+clipboard/get) (current-kill 0)))))
 
     ;; C-v to paste in insert mode
     (evil-local-set-key 'insert (kbd "C-v")
       (lambda () (interactive)
-        (vterm-send-string (current-kill 0))))
+        (vterm-send-string (or (+clipboard/get) (current-kill 0)))))
 
     ;; Special keys that evil's insert-state map shadows by default.
     ;; Without these, RET / TAB / Backspace try to edit the (read-only)

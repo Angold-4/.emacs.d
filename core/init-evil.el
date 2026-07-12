@@ -110,47 +110,9 @@
   ;; Make evil use system clipboard for yank/paste
   (setq evil-kill-on-visual-paste nil))  ; Don't replace clipboard when pasting over selection
 
-;; =============================================================================
-;; WSL/System Clipboard Support
-;; =============================================================================
-
-;; Detect if running in WSL
-(defvar +is-wsl
-  (and (eq system-type 'gnu/linux)
-       (string-match-p "microsoft\\|WSL" (shell-command-to-string "uname -r")))
-  "Non-nil if running inside WSL.")
-
-;; Clipboard PASTE: read from Windows clipboard via powershell.
-;; (OSC 52 read is unreliable across terminals, so we keep this.)
-(defun +clipboard/get ()
-  "Get text from system clipboard. Works in WSL, Linux, and macOS."
-  (cond
-   ;; WSL: use powershell to get Windows clipboard
-   (+is-wsl
-    (let ((clip (shell-command-to-string
-                 "powershell.exe -Command Get-Clipboard 2>/dev/null")))
-      ;; Remove trailing \r\n that Windows adds
-      (when (and clip (not (string-empty-p clip)))
-        (string-trim-right clip "[\r\n]+"))))
-   ;; macOS
-   ((eq system-type 'darwin)
-    (shell-command-to-string "pbpaste"))
-   ;; Linux: Wayland, then X11
-   ((and (eq system-type 'gnu/linux) (executable-find "wl-paste"))
-    (let ((clip (shell-command-to-string "wl-paste --no-newline 2>/dev/null")))
-      (when (and clip (not (string-empty-p clip))) clip)))
-   ((and (eq system-type 'gnu/linux) (getenv "DISPLAY"))
-    (ignore-errors (gui-get-selection 'CLIPBOARD)))
-   ;; Fallback
-   (t
-    (ignore-errors (gui-get-selection 'CLIPBOARD)))))
-
-;; Clipboard COPY: handled by `+copy-to-system-clipboard' in init-core.el.
-;; It writes to the system clipboard (pbcopy / wl-copy / xclip) and the tmux
-;; paste buffer when available. Use C-a P in tmux to paste into another pane.
-;; We only need to set the paste function here.
-(when +is-wsl
-  (setq interprogram-paste-function '+clipboard/get))
+;; Clipboard helpers live in init-core.el (`+clipboard/get', `+clipboard/set',
+;; `+copy-to-system-clipboard').  WSL sets `interprogram-paste-function' there
+;; so C-y (yank) in insert mode reads the Windows clipboard.
 
 ;; =============================================================================
 ;; Evil Collection (consistent bindings across modes)

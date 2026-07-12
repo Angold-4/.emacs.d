@@ -211,28 +211,82 @@ This command does the inverse of `fill-region'."
 (add-hook 'project-find-functions #'+project-find-go-module)
 
 ;; =============================================================================
-;; WSL2 Browser Integration
+;; WSL detection & host integration
 ;; =============================================================================
-;; Open URLs in the Windows host browser (Chrome) from WSL2.
-;; This is required for OAuth flows (org-gcal) and general browse-url usage.
 
-(when (and (eq system-type 'gnu/linux)
-           (string-match-p "microsoft\\|WSL" (shell-command-to-string "uname -r")))
+(defvar +is-wsl
+  (and (eq system-type 'gnu/linux)
+       (string-match-p "microsoft\\|WSL" (shell-command-to-string "uname -r")))
+  "Non-nil if running inside WSL.")
+
+;; Open URLs in the Windows host browser (Chrome) from WSL2.
+(when +is-wsl
   (setq browse-url-generic-program "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"
         browse-url-browser-function 'browse-url-generic))
 
 ;; =============================================================================
-;; Clipboard Integration (via tmux paste buffer)
+;; Clipboard integration
 ;; =============================================================================
+;;
+;; C-y in evil visual mode (`+copy-to-system-clipboard') and normal yank (C-y in
+;; insert) share these helpers so WSL Emacs can exchange text with the Windows
+;; host clipboard (clip.exe / PowerShell), macOS (pbcopy/pbpaste), and native
+;; Linux (wl-copy/xclip).  tmux paste buffer is an extra channel when in tmux.
 
-;; Strategy: Use tmux's paste buffer as a shared clipboard between panes.
-;;
-;;   Emacs C-y (visual mode)  →  copies text to tmux paste buffer
-;;   tmux  C-a P              →  pastes from tmux buffer into active pane
-;;
-;; This works reliably over SSH without requiring OSC 52 terminal support.
-;; The clipboard lives on the server and is shared between all tmux panes
-;; (e.g. Emacs in one pane, OpenCode in another).
+(defun +clipboard/pipe-to (text program &rest args)
+  "Pipe TEXT to PROGRAM via stdin."
+  (let ((process-connection-type nil))
+    (let ((proc (apply #'start-process program nil program args)))
+      (process-send-string proc text)
+      (process-send-eof proc))))
+
+(defun +clipboard/set (text)
+  "Put TEXT on the host system clipboard when a backend is available."
+  (when (and text (not (string-empty-p text)))
+    (let ((pipe (lambda (program &rest args)
+                  (apply #'+clipboard/pipe-to text program args))))
+      (cond
+       ;; WSL → Windows clipboard (clip.exe is the fast path; PowerShell fallback)
+       (+is-wsl
+        (cond ((executable-find "clip.exe")
+               (funcall pipe "clip.exe"))
+              (t
+               (+clipboard/pipe-to text "powershell.exe" "-NoProfile" "-Command"
+                                   "$input = [Console]::In.ReadToEnd(); Set-Clipboard -Value $input"))))
+       ((eq system-type 'darwin)
+        (when (executable-find "pbcopy")
+          (funcall pipe "pbcopy")))
+       ((eq system-type 'gnu/linux)
+        (cond ((executable-find "wl-copy")
+               (funcall pipe "wl-copy"))
+              ((executable-find "xclip")
+               (funcall pipe "xclip" "-selection" "clipboard"))
+              ((executable-find "xsel")
+               (funcall pipe "xsel" "--clipboard" "--input"))))))))
+
+(defun +clipboard/get ()
+  "Return text from the host system clipboard, or nil if unavailable."
+  (let ((clip
+         (cond
+          ;; WSL → Windows clipboard
+          (+is-wsl
+           (shell-command-to-string
+            "powershell.exe -NoProfile -Command \"Get-Clipboard -Raw\" 2>/dev/null"))
+          ((eq system-type 'darwin)
+           (shell-command-to-string "pbpaste"))
+          ((and (eq system-type 'gnu/linux) (executable-find "wl-paste"))
+           (shell-command-to-string "wl-paste --no-newline 2>/dev/null"))
+          ((and (eq system-type 'gnu/linux) (getenv "DISPLAY"))
+           (ignore-errors (gui-get-selection 'CLIPBOARD)))
+          (t
+           (ignore-errors (gui-get-selection 'CLIPBOARD))))))
+    (when (and clip (not (string-empty-p clip)))
+      ;; Windows / PowerShell often appends a trailing CRLF.
+      (string-trim-right clip "[\r\n]+"))))
+
+;; Terminal Emacs on WSL: make C-y (yank) read the Windows clipboard.
+(when +is-wsl
+  (setq interprogram-paste-function '+clipboard/get))
 
 (defun +copy-to-system-clipboard (beg end)
   "Copy visible region text from BEG to END to the system clipboard.
@@ -240,22 +294,17 @@ Filters invisible text (e.g. collapsed magit sections).
 
 Writes through every channel that is available:
   - Emacs kill ring                         (always)
+  - Windows clipboard via clip.exe          (WSL)
   - macOS system clipboard via `pbcopy'     (darwin)
   - Linux system clipboard via `wl-copy' or
-    `xclip' / `xsel'                         (gnu/linux)
+    `xclip' / `xsel'                         (native gnu/linux)
   - tmux paste buffer                       (when running inside tmux)
 
 This is more reliable than relying on Emacs's `select-enable-clipboard'
 in terminal Emacs, which goes through OSC 52 and only works if the
 host terminal opts into it."
   (interactive "r")
-  (let* ((text (buffer-substring-no-properties beg end))
-         (pipe-to (lambda (program &rest args)
-                    "Pipe TEXT to PROGRAM via stdin."
-                    (let ((process-connection-type nil))
-                      (let ((proc (apply #'start-process program nil program args)))
-                        (process-send-string proc text)
-                        (process-send-eof proc))))))
+  (let ((text (buffer-substring-no-properties beg end)))
     ;; In buffers with invisible text, extract only visible portion
     (when (next-single-property-change beg 'invisible nil end)
       (setq text
@@ -272,23 +321,12 @@ host terminal opts into it."
                                          pos next-change))))
                   (setq pos next-change)))
               result)))
-    ;; Emacs kill ring
+    ;; Emacs kill ring + host clipboard
     (kill-new text)
-    ;; macOS system clipboard via pbcopy (works in terminal Emacs without
-    ;; relying on iTerm2's OSC 52 support)
-    (when (and (eq system-type 'darwin) (executable-find "pbcopy"))
-      (funcall pipe-to "pbcopy"))
-    ;; Linux system clipboard (Wayland wl-copy, then X11 xclip/xsel)
-    (when (eq system-type 'gnu/linux)
-      (cond ((executable-find "wl-copy")
-             (funcall pipe-to "wl-copy"))
-            ((executable-find "xclip")
-             (funcall pipe-to "xclip" "-selection" "clipboard"))
-            ((executable-find "xsel")
-             (funcall pipe-to "xsel" "--clipboard" "--input"))))
+    (+clipboard/set text)
     ;; tmux paste buffer for cross-pane sharing (C-a P to paste elsewhere)
     (when (and (getenv "TMUX") (executable-find "tmux"))
-      (funcall pipe-to "tmux" "load-buffer" "-"))
+      (+clipboard/pipe-to text "tmux" "load-buffer" "-"))
     (message "Copied %d chars" (length text))))
 
 ;;; init-core.el ends here
