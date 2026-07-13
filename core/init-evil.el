@@ -122,7 +122,7 @@
   "Non-nil in terminal Emacs where OSC 52 clipboard is unreliable."
   (not (display-graphic-p)))
 
-(defun +evil/sync-yank-to-clipboard ()
+(defun +evil/sync-yank-to-clipboard (&rest _)
   "After evil yank, mirror text to the host clipboard (terminal only)."
   (when (and (+evil/terminal-clipboard-paste-p) (car kill-ring))
     (+clipboard/set (car kill-ring))))
@@ -143,7 +143,9 @@ still uses the kill ring once yank has synced via `+evil/sync-yank-to-clipboard'
       (evil-paste count))))
 
 (with-eval-after-load 'evil
-  (dolist (fn '(evil-yank evil-yank-window evil-yank-line evil-copy))
+  ;; Only hook explicit yank commands — not evil-copy (visual C-y already
+  ;; calls `+copy-to-system-clipboard') or delete paths that reuse yank internals.
+  (dolist (fn '(evil-yank evil-yank-window evil-yank-line))
     (advice-add fn :after #'+evil/sync-yank-to-clipboard))
   (when (+evil/terminal-clipboard-paste-p)
     (define-key evil-normal-state-map (kbd "p") #'+evil/paste)

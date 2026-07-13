@@ -248,15 +248,18 @@ Checks Emacs `exec-path'/PATH first, then standard System32 locations."
 
 (defun +clipboard/pipe-to (text program &rest args)
   "Pipe TEXT to PROGRAM via stdin, silently skipping if PROGRAM is missing."
-  (when (and program (file-executable-p program))
+  (when-let ((cmd (or (and (file-name-absolute-p program)
+                           (file-executable-p program)
+                           program)
+                      (executable-find program))))
     (condition-case err
         (let ((process-connection-type nil))
-          (let ((proc (apply #'start-process program nil program args)))
+          (let ((proc (apply #'start-process program nil cmd args)))
             (process-send-string proc text)
             (process-send-eof proc)))
       (error
        (message "Clipboard copy failed (%s): %s"
-                program (error-message-string err))))))
+                cmd (error-message-string err))))))
 
 (defun +clipboard/set (text)
   "Put TEXT on the host system clipboard when a backend is available."
