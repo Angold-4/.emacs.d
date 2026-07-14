@@ -44,8 +44,11 @@
 
 ;; Orderless lets you type space-separated patterns in any order.
 ;; e.g., "binance ts" matches "hybrid/src/libs/exchanges/core/binance.ts"
+;; Demand a load: nothing autoloads orderless, so a deferred `:config' would
+;; never run and `completion-styles' would keep its default prefix-only value.
 (use-package orderless
   :straight t
+  :demand t
   :config
   (setq completion-styles '(orderless basic)
         completion-category-defaults nil
