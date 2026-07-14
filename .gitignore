@@ -4,8 +4,13 @@
 # =============================================================================
 # Package Management (straight.el)
 # =============================================================================
-# These are auto-generated/downloaded on first run
-straight/
+# These are auto-generated/downloaded on first run, except the version lockfile:
+# it pins every package to an exact commit so all machines install the same
+# tree.  Without it Straight floats each package independently, which lets a
+# dependency drift out of sync with its dependents (e.g. Vertico requiring a
+# newer Compat than the one checked out) and breaks completion.
+straight/*
+!straight/versions/
 
 # =============================================================================
 # Native Compilation Cache (Emacs 29+)
