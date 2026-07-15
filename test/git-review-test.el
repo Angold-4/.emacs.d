@@ -1,9 +1,10 @@
-;;; git-review-test.el --- ERT tests for Git review Phase 0 -*- lexical-binding: t -*-
+;;; git-review-test.el --- ERT tests for Git review Phase 0/1 -*- lexical-binding: t -*-
 
 ;;; Commentary:
 ;; Phase 0 foundation tests: temporary Git fixtures and the baseline
-;; measurement helper.  No production Magit/Forge behavior is changed, and
-;; measurements run under a hard network guard.
+;; measurement helper.  Phase 1 navigation/ownership tests are loaded
+;; from `git-review-phase1.el'.  Measurements run under a hard network
+;; guard.
 
 ;;; Code:
 
@@ -344,6 +345,9 @@
        (should (git-review-test--stats-shape-p stats))
        (should (not (git-review-baseline--advice-installed-p)))
        (git-review-baseline-cleanup-repo-buffers root)))))
+
+;; Phase 1 foundation tests.
+(require 'git-review-phase1)
 
 (provide 'git-review-test)
 
