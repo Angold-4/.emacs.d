@@ -1,15 +1,18 @@
 # Local Git Review Workbench
 
-Status: **Draft for review**  
-Date: 2026-07-14  
-Proposed implementation branch: `feat/local-git-review-workbench`
+Status: **Refined product and implementation plan**
+Date: 2026-07-15
+Implementation status: **Not started; owner decisions required**
 
 This document describes the current Git architecture in this Emacs
 configuration and proposes a local-first architecture for reviewing branches,
 commits, pull requests, issues, checks, and diffs without leaving Emacs.
 
-No implementation should begin until the decisions in [Review checklist](#review-checklist)
-have been reviewed.
+The delivery order is intentionally local-first. The first usable milestone fixes
+Magit windowing, Evil navigation, native file visiting, and unified diff rendering.
+The shared-origin PR/issue system follows only after that daily review loop is
+stable. No implementation should begin until the decisions in
+[Owner decision gate](#11-owner-decision-gate) have been reviewed.
 
 ## 1. Goals
 
@@ -17,9 +20,9 @@ The workbench should provide:
 
 1. A consistent Emacs-buffer experience for every Git object:
    repository status, branch, commit, pull request, issue, and diff.
-2. Consistent Evil behavior in generated review buffers:
-   normal state for navigation and insert state when requested, with `TAB` and
-   `RET` available in both states.
+2. Consistent Evil behavior in generated review buffers: normal state is the
+   complete navigation and action interface; editing transitions to a real
+   writable source or Markdown buffer.
 3. Fast local navigation after one explicit batch synchronization.
 4. One remote fetch per canonical repository, even when the same repository is
    cloned into multiple directories.
@@ -30,6 +33,10 @@ The workbench should provide:
    refs, and CI summaries.
 8. Exact navigation from a review item to the corresponding source or Markdown
    composition buffer.
+9. A useful local working-tree, staged, and commit-review workflow before any
+   custom remote cache or PR workspace is introduced.
+10. A collapsible folder tree of all changed files with persistent, local
+    reviewed/unreviewed checkmarks.
 
 ## 2. Core invariants
 
@@ -53,30 +60,49 @@ Opening the same shared PR, issue, remote commit, or immutable diff again should
 reuse its existing buffer. Branch and working-tree buffers must remain local to
 their clone.
 
-### 2.2 Network access is explicit
+### 2.2 Navigation replaces the selected buffer
+
+Opening status, logs, commits, Forge topics, and unified diffs replaces the
+buffer in the selected window. It does not create a new window. This is the
+default navigation path, equivalent to following a link inside one Vim window.
+
+Creating another window is always explicit:
+
+- `o` opens the target in a right-hand window.
+- `|` opens or toggles the two-window detailed comparison.
+- process buffers may use a non-selected utility window only when requested or
+  when an operation fails.
+
+`q` buries the generated buffer and restores its caller when possible. Reopening
+an existing review buffer reuses it instead of creating another buffer or
+window.
+
+### 2.3 Network access is explicit
 
 Opening a status, PR, issue, commit, or diff buffer must never fetch from a
-remote. Only the synchronization commands `@` and `C-c g f` may contact the
-network.
+remote. Only the synchronization commands `@`, `C-c g f`, and `C-c g F` may
+contact the network.
 
 `gr` means "re-render from local Git objects and caches." It must remain fast
 and useful while offline.
 
-### 2.3 Shared remote data and local work state are different
+### 2.4 Shared remote data and local work state are different
 
 Remote repository data is shared by canonical repository identity. Worktree,
 index, branch, reflog, and uncommitted changes belong to a particular local Git
 context and must never be shared accidentally.
 
-### 2.4 Generated views are not source files
+### 2.5 Generated views are not source files
 
 PR, issue, commit, status, and diff overview buffers are reconstructed from Git
 objects or caches. They remain read-only because inserting arbitrary text into
 them would not change Git or GitHub and would disappear on refresh.
 
-Evil may still enter insert state in these buffers. Local insert-state bindings
-make `TAB`, `S-TAB`, `RET`, and `ESC` work consistently; other editing attempts
-receive the normal read-only error.
+Generated review buffers start and remain in Evil normal state. Entering insert
+state in a read-only rendering is misleading because typed text cannot have a
+durable meaning. Commands such as `e`, `c`, and `r` transition to an appropriate
+writable buffer, which starts in insert state when composition is the immediate
+task.
 
 Real editing happens in ordinary writable buffers:
 
@@ -169,8 +195,8 @@ Forge adds PR and issue sections to `magit-status` and stores topic data in:
 ~/.emacs.d/forge-database.sqlite
 ```
 
-The current database file is not ignored by Git and appears as an untracked
-file in this repository.
+The current database file is not ignored by Git. It is absent in the audited
+worktree, but would appear as an untracked file as soon as Forge creates it.
 
 Forge itself identifies repositories using forge host, owner, and repository
 name. This already allows one database record to represent the same remote
@@ -224,6 +250,13 @@ several independent clones and worktrees simultaneously.
    invalid Magit section markers.
 9. `forge-database.sqlite` is not ignored.
 10. CI/check state is not cached or rendered in the current PR flow.
+11. Magit's default display function intentionally opens status and diff buffers
+    in other windows; no project-level buffer/window policy overrides it.
+12. The custom `n`/`p` and `N`/`P` bindings replace standard Vim search
+    navigation with section navigation.
+13. `+git/next-file` and `+git/prev-file` move between section siblings, so their
+    meaning changes depending on whether point is in a file, hunk, or child
+    section.
 
 ## 4. Target architecture
 
@@ -341,36 +374,66 @@ filesystem.
 | Uncommitted changes | local Git context | local `.git` and files |
 | Active edit destination | shared PR buffer + selected context | buffer-local selection |
 
-### 4.6 Consistent review-buffer mode
+### 4.6 Buffer and window contract
+
+The workbench has two display actions. Every command must choose one explicitly:
+
+| Action | Used for | Window behavior |
+|---|---|---|
+| Navigate | status, log, topic, commit, unified diff, source/blob | replace selected window |
+| Compare | explicit `o` or `|`, before/after source | create/reuse one right-hand window |
+
+The Magit integration installs a project display function through
+`magit-display-buffer-function`. It displays interactive Magit and Forge
+navigation buffers in the selected window, including `magit-status-mode`,
+`magit-diff-mode`, and `magit-revision-mode`. It must not advise individual
+opening commands to repair window placement.
+
+The contract is tested as a state transition:
+
+```text
+source A --C-c g--> status --RET--> commit/diff --q--> status --q--> source A
+```
+
+No transition above increases the window count. The explicit comparison path
+may increase it by one, reuses that window while stepping files, and restores
+the original layout on quit.
+
+### 4.7 Consistent review-buffer mode
 
 `+git-review-buffer-mode` is a minor mode enabled in generated Magit, Forge,
 PR, issue, commit, and diff review buffers.
 
-It provides one Evil interaction vocabulary:
+It provides one Evil normal-state interaction vocabulary:
 
 | Key | Action |
 |---|---|
 | `TAB` | Toggle section at point |
 | `S-TAB` | Cycle visibility of all sections |
 | `RET` | Expand a container or visit its primary target |
-| `n` / `p` | Next/previous item at the current review level |
-| `N` / `P` | Next/previous hunk or difference |
+| `j` / `k` | Move one display line |
+| `J` / `K` | Move eight display lines |
 | `] f` / `[ f` | Next/previous changed file |
+| `] h` / `[ h` | Next/previous hunk or difference |
 | `] c` / `[ c` | Next/previous commit |
+| `n` / `N` | Next/previous Vim search result |
 | `e` | Open the writable source/comment target |
+| `o` | Open the primary target in a right-hand window |
+| `|` | Toggle side-by-side/stacked detailed comparison |
 | `L` | Select active local context |
 | `gr` | Refresh only from local state |
 | `@` | Synchronize shared remote state |
 | `/` | Search current buffer |
 | `q` | Bury buffer and return to caller |
 
-`TAB`, `S-TAB`, and `RET` receive local bindings in both Evil normal and insert
-states. Generated review buffers start in normal state.
+Generated review buffers start in normal state. They do not redefine insert
+state because they are read-only. Source buffers keep normal Evil behavior, and
+Markdown composition buffers may start in insert state.
 
-### 4.7 Git dispatch
+### 4.8 Git dispatch
 
-Replace the passive `C-c g` prefix with a Transient command that opens or
-selects Magit status and then presents:
+Replace the passive `C-c g` prefix with one command that opens or selects Magit
+status in the current window and then presents a small Transient:
 
 ```text
 g  status
@@ -381,11 +444,12 @@ b  branch review
 p  pull-request list/review
 i  issue list
 f  synchronize repository
+F  synchronize all registered repositories
 ```
 
 Keep `C-x g` as direct, standard `magit-status`.
 
-### 4.8 Status and branch buffer
+### 4.9 Status and branch buffer
 
 Do not replace Magit's default status section hook. Add a small section using
 `magit-add-section-hook`:
@@ -406,7 +470,7 @@ unpushed, recent commits, PRs, and issues.
 A branch buffer is tied to its local context because two same-origin clones can
 have different branches or different commits under the same branch name.
 
-### 4.9 PR buffer
+### 4.10 PR buffer
 
 A PR buffer is shared by canonical repository and PR number:
 
@@ -435,7 +499,7 @@ All sections are collapsible. `RET` behaves according to the row:
 The active local context affects editing, testing, and worktree creation. It
 does not affect the cached PR content or immutable diff.
 
-### 4.10 Commit and diff buffers
+### 4.11 Commit and diff buffers
 
 A commit buffer contains metadata, message, parent selection, changed files,
 and a unified Magit diff. PR commits appear oldest-to-newest for review.
@@ -451,11 +515,64 @@ Range semantics:
 New, deleted, renamed, copied, submodule, and binary files require explicit
 handling. No feature may infer file/line identity by parsing display text.
 
-### 4.11 Side-by-side source review
+### 4.12 Changes tree
 
-The primary detailed view uses ordinary source/blob buffers displayed left and
-right with a vertical divider. Built-in Ediff may provide difference mapping,
-but it must use plain same-frame windows and no separate control frame.
+Every working-tree, staged, commit, branch, and PR review provides a separate
+Changes Tree buffer. It groups changed files by directory and shows review
+progress without mixing that progress with Git staging state:
+
+```text
+Changes  12/18 reviewed  ·  +842 -193
+
+[✓] src/
+    [✓] api/
+        [✓] users.ts                 M   +24  -3
+        [✓] sessions.ts              A   +91  -0
+    [✓] domain/
+        [✓] account.ts               R   +12  -8
+[ ] tests/
+    [✓] api/
+        [✓] users.test.ts            M   +44 -12
+    [ ] integration/
+        [ ] login.test.ts            M  +103 -19
+[ ] README.md                        M    +7  -2
+```
+
+Requirements:
+
+- Directories are collapsible `magit-section` sections with aggregate file and
+  line counts.
+- Files show reviewed state, Git status (`A`, `M`, `D`, `R`, `C`, binary, or
+  submodule), additions, and deletions.
+- `SPC` toggles the reviewed checkbox at point. Toggling a directory applies to
+  its descendants; a directory displays partial state when only some children
+  are reviewed.
+- `RET` opens the file's unified diff in the current window; `o` opens it in the
+  explicit right-hand window; `|` opens detailed side-by-side comparison.
+- `TAB` expands/collapses a directory, and `[ f` / `] f` move between files.
+- `/` searches paths, and an optional filter shows only unreviewed files.
+- Review checkmarks are local metadata. They never stage, unstage, discard, or
+  submit a GitHub review.
+- Progress is keyed by repository, review target, base object, and head object.
+  When the head changes, files whose content changed become unreviewed while
+  unchanged files retain their state.
+- Large trees render lazily and do not generate diffs until a file is opened.
+
+The tree is available from a review buffer with `t`, and `q` returns to that
+review buffer without changing the window count.
+
+### 4.13 Diff presentation and side-by-side source review
+
+The unified Magit diff is the overview and default reading surface. It renders
+in one buffer with a pure black default background, white readable context,
+dark-red removed lines, dark-green added lines, and brighter refined changes.
+It never invokes Delta or Difftastic during render or refresh.
+
+The explicit detailed view uses ordinary source/blob buffers displayed left and
+right with a vertical divider. This preserves a fast one-buffer overview while
+providing exact source-aware comparison only for the active file. Built-in
+Ediff may provide difference mapping, but it must use plain same-frame windows
+and no separate control frame.
 
 ```text
 BEFORE: base:path/to/file       │ AFTER: head:path/to/file
@@ -481,10 +598,12 @@ For worktree review, the after buffer can be the real editable file. For a
 remote PR, both revisions are immutable until the user selects or creates a
 local edit context.
 
-### 4.12 Batch synchronization
+### 4.14 Batch synchronization
 
-`@` and `C-c g f` start one asynchronous synchronization per canonical
-repository:
+`@` and `C-c g f` start one asynchronous synchronization for the current
+canonical repository. `C-c g F` starts the same operation for every registered
+repository with a bounded concurrency limit; duplicate identities still
+coalesce to one job:
 
 ```text
 resolve canonical identity
@@ -514,121 +633,169 @@ Failure requirements:
 
 ```text
 core/init-git.el
-  Magit package configuration, faces, dispatch, top-level integration
+  Package declarations, top-level dispatch, module loading
 
-core/init-git-repository.el
-  Canonical identity, local-context registry, bare mirrors, sync coalescing
+core/init-git-ui.el
+  Display contract, review mode, Evil maps, faces, local/commit review
 
-core/init-git-review.el
-  Review-session model, branch/commit/diff buffers, source navigation
+core/init-git-store.el
+  Canonical identity, local contexts, mirror, cache, sync coalescing
 
 core/init-forge.el
   Forge configuration, PR/issue buffers, checks cache, topic actions
-
-core/init-git-keys.el
-  +git-review-buffer-mode and Evil normal/insert bindings
 
 docs/git.md
   Architecture, plan, decisions, workflow, and acceptance criteria
 ```
 
-If five modules prove unnecessarily granular during implementation,
-`init-git-keys.el` may be folded into `init-git-review.el`. Repository identity
-and synchronization should remain isolated because they have the strongest
-correctness and test requirements.
+The four-module boundary is deliberate. Keys and window behavior belong to the
+UI contract and should not become a separate grab-bag. Repository identity and
+synchronization remain isolated because they have the strongest correctness and
+concurrency requirements. `init-tools.el` no longer owns Git configuration.
 
 ## 6. Implementation plan
 
-All implementation occurs on `feat/local-git-review-workbench`, created from a
-reviewed, clean `main`. Preserve the existing Forge database.
+The work is delivered as sequential, reviewable phase branches. Each branch is
+based on the last accepted phase, and each phase must leave `C-x g` usable. A
+phase is not accepted on code inspection alone: its automated checks, manual
+workflow script, and before/after timings must pass.
 
-### Phase 0: Baseline and hygiene
+### Phase 0: Decision lock, baseline, and hygiene
 
 - Add `forge-database.sqlite*` to `.gitignore`.
-- Confirm no tracked work is overwritten.
-- Add a repeatable performance fixture.
-- Record warm status, cached topic, unified diff, and Difftastic timings.
-- Document installed Magit, Forge, Git, Emacs, `gh`, and Difftastic versions.
+- Preserve the Forge database and confirm no tracked work is overwritten.
+- Record the audited package revisions (Emacs 30.2, Magit `1288f65`, Forge
+  `9628f76`, Evil `729d9a5`, Evil Collection `cd6cdf3`).
+- Add fixtures for a small repository and a large AI-style change set.
+- Record window count, warm status time, unified diff time, and refresh time.
+- Turn the decisions in Section 11 into checked acceptance assumptions.
 
 Commit: `chore(git): ignore local review state and add baselines`
 
-### Phase 1: Consolidate the current configuration
+Gate: the baseline is reproducible and the owner has approved Section 11.
 
-- Move review-specific ownership out of `init-tools.el`.
-- Remove duplicate Magit variable assignments.
-- Split the large `init-git.el` by the ownership described above.
-- Preserve current user-visible behavior during this phase.
-- Add batch-load and byte-compilation checks.
+### Phase 1: Daily-flow repair — buffers, Evil, and native visits
 
-Commit: `refactor(git): separate review and repository concerns`
+- Move all Git ownership out of `init-tools.el` and remove duplicate settings.
+- Install the same-window navigation contract through
+  `magit-display-buffer-function`.
+- Implement `+git-review-buffer-mode` with one normal-state keymap and stable
+  `j/k`, `J/K`, search, section, file, hunk, and quit behavior.
+- Replace manual diff-header and line-count parsing with
+  `magit-diff-visit-file` and `magit-diff-visit-worktree-file`.
+- Remove the on-open network fetch and `forge-visit-pullreq` advice. Restore the
+  normal cached Forge topic buffer.
+- Add batch-load, byte-compilation, ERT keymap tests, and window-transition tests.
 
-### Phase 2: Consistent buffer interaction
+Commit: `feat(git): enforce buffer-first review navigation`
 
-- Implement `+git-review-buffer-mode`.
-- Set generated review buffers to initial Evil normal state.
-- Bind `TAB`, `S-TAB`, and `RET` in normal and insert states.
-- Add stable buffer identity/reuse.
-- Replace manual file/hunk display parsing with native Magit APIs.
-- Add writable source and Markdown composition transitions.
+Gate: status, log, commit, Forge topic, and unified diff navigation never opens
+an extra window; `q` returns correctly; no open or `gr` action contacts the
+network.
 
-Commit: `feat(git): unify review buffer interaction`
+### Phase 2: Daily-flow review — local changes and visual diff
 
-### Phase 3: Repository identity and local contexts
+- Make working-tree, staged, commit, and branch review consistent vertical
+  slices using native Magit sections.
+- Implement the reusable Changes Tree for local, staged, branch, and commit
+  ranges, including reviewed checkmarks and exact diff opening.
+- Render the unified overview on black with white context, dark-red removals,
+  dark-green additions, and bright refined changes in GUI and terminal Emacs.
+- Ensure refresh invokes neither Delta nor Difftastic. Remove `magit-delta` and
+  its face-remapping advice after visual equivalence is accepted.
+- Handle untracked files using valid native sections or a tested Git-produced
+  diff; do not synthesize incomplete Magit section objects.
+- Give new, deleted, renamed, copied, binary, and submodule entries explicit
+  behavior and fallback messages.
+- Add stable buffer identity for local status/diff/commit views.
 
-- Normalize forge and non-forge remotes.
-- Discover independent clones and Git worktrees using Git directory/common
-  directory identity.
-- Register multiple local contexts under one canonical repository.
+Commit: `feat(git): deliver local code review workflow`
+
+Gate: the owner can perform the full daily loop—review, visit, edit, return,
+stage, refresh, and re-review—without PR/cache features. This is the first
+production-usable milestone.
+
+### Phase 3: Canonical repository identity and storage
+
+- Use Forge's repository identity for supported forges and normalized fetch URLs
+  elsewhere; never use a push URL or local basename.
+- Discover independent clones and linked worktrees through `git-dir` and
+  `git-common-dir`.
+- Register several local contexts under one canonical repository identity.
 - Add active-context selection to shared buffers.
-- Test SSH/HTTPS equivalence and cross-host separation.
+- Keep Forge SQLite authoritative for PRs, issues, and comments. Add only a thin
+  review registry/cache keyed by the same canonical identity; do not modify
+  Forge's schema.
+- Test SSH/HTTPS equivalence, cross-host separation, rename, fork, and deleted
+  context behavior.
 
 Commit: `feat(git): add canonical repository registry`
 
-### Phase 4: Shared mirror and deduplicated sync
+Gate: two same-origin clones resolve to one remote record while retaining
+distinct worktree, index, branch, and buffer state.
+
+### Phase 4: Shared mirror and explicit batch synchronization
 
 - Seed and maintain one bare mirror per canonical repository.
 - Fetch remote branches/tags/PR refs only into the mirror.
 - Coalesce concurrent sync requests.
-- Add filesystem locking and atomic cache updates.
+- Add filesystem locking, generation IDs, atomic cache updates, bounded global
+  sync concurrency, cancellation, and stale/error state.
+- Implement current-repository sync and all-registered-repositories sync.
 - Fetch clone-local PR objects from the mirror when explicitly requested.
-- Remove on-open PR fetches and the `forge-visit-pullreq` advice.
+- Prove by process logging that two same-origin contexts issue one remote Git
+  fetch and one Forge update.
 
-Commit: `feat(git): share remote objects across local clones`
+Commit: `feat(git): deduplicate repository synchronization`
 
-### Phase 5: Branch, commit, and diff review
+Gate: after one sync, every cached remote view opens offline; an interrupted or
+partially failed sync preserves the previous successful generation.
 
-- Add current-branch review section without replacing Magit defaults.
-- Implement branch and commit buffers with stable identity.
-- Implement PR and per-commit ranges.
-- Implement consistent file/commit/hunk navigation.
-- Handle new/deleted/renamed/copied/binary/submodule cases.
-- Add exact blob/worktree visiting.
+### Phase 5: Shared PR workspace
 
-Commit: `feat(git): add branch and commit review sessions`
+- Build the PR buffer from cached Forge data and mirror objects.
+- Reuse the Changes Tree for the PR range and persist progress by base/head
+  object IDs.
+- Render summary, changed files, oldest-first commits, description, conversation,
+  and cached check rollup as collapsible sections.
+- Reuse one buffer per canonical repository and PR number across all clones.
+- Implement exact PR and per-commit ranges, including forks and merge commits.
+- Select an existing local context before editing or running commands; never
+  silently edit whichever clone Forge last remembered.
+- Open replies and edits in writable Markdown composition buffers.
 
-### Phase 6: Side-by-side review
+Commit: `feat(forge): add shared pull-request workspace`
+
+Gate: the same PR buffer is reused from two clones, performs no network call,
+and preserves the chosen edit context.
+
+### Phase 6: Source-aware side-by-side detail
 
 - Configure same-frame, plain-window Ediff/source comparison.
 - Apply dark red/green and fine-difference faces after each theme change.
-- Support file and commit stepping without rebuilding unrelated buffers.
+- Parse and render only the active file.
+- Support file and commit stepping without rebuilding unrelated buffers or
+  creating additional windows.
 - Preserve/restore the caller's window configuration.
 - Keep Difftastic as the optional structural view.
-- Remove magit-delta and its face-remapping advice after equivalence testing.
+- Fall back visibly for binary, oversized, or unavailable blobs.
 
 Commit: `feat(git): add source-aware side-by-side review`
 
-### Phase 7: PR, issue, comments, and CI
+Gate: stepping a normal file is under 300 ms when objects are local, and quit
+restores the exact pre-comparison layout.
 
-- Restore normal cached PR/topic opening from status.
-- Build the shared PR workspace and section order.
-- Render Forge Markdown and cached conversations.
-- Add async CI rollup snapshot during explicit sync.
+### Phase 7: Issues, comments, and CI completion
+
+- Add shared issue buffers and complete cached conversation actions.
+- Add an asynchronous GitHub CI rollup adapter during explicit sync.
 - Add cached check details and explicit failed-log retrieval.
-- Keep comment/reply/edit actions inside Emacs Markdown buffers.
 - Bind Forge dispatch explicitly without relying on its failing transient
   insertion point.
+- Keep provider-specific CI code behind an adapter; GitHub is the first
+  implementation and other forges degrade to "checks unavailable."
 
-Commit: `feat(forge): add local PR workspace and checks`
+Commit: `feat(forge): complete issue and check review`
 
 ### Phase 8: Verification and documentation
 
@@ -642,6 +809,25 @@ Commit: `feat(forge): add local PR workspace and checks`
 
 Commit: `test(git): verify local-first review workflow`  
 Commit: `docs(git): document review workbench usage`
+
+### Worker delivery contract
+
+Every implementation worker receives exactly one phase with its gate and must
+return:
+
+1. A focused branch with no unrelated configuration changes.
+2. A short design note naming the native Magit/Forge APIs used and any advice
+   added. New advice requires explicit justification.
+3. ERT coverage for state, identity, and key/window behavior appropriate to the
+   phase.
+4. A manual tmux/terminal walkthrough and, for visual phases, a screenshot of
+   the black/red/green result.
+5. Before/after timings plus a process log proving whether network and external
+   diff tools ran.
+6. Known limitations and a clean rollback description.
+
+The reviewer first verifies the phase gate, then checks maintainability and
+visual quality. Later workers do not begin on top of an unaccepted phase.
 
 ## 7. Test matrix
 
@@ -676,11 +862,18 @@ Commit: `docs(git): document review workbench usage`
 ### 7.4 Buffer and Evil behavior
 
 - `TAB`, `S-TAB`, and `RET` in normal state.
-- `TAB`, `S-TAB`, and `RET` in insert state in generated review buffers.
+- `i` does not enter insert state in generated read-only buffers.
+- Source/comment actions enter the correct writable buffer; composition may
+  start in insert state.
 - Source buffers retain indentation/newline behavior in insert state.
 - Stable buffers are reused rather than duplicated.
 - `q` returns to the correct caller and restores windows.
+- Navigation through status, log, topic, commit, and unified diff preserves the
+  window count.
+- `o` and `|` create at most one comparison window and reuse it.
 - Search, copy, file stepping, commit stepping, and hunk stepping.
+- Changes Tree directory collapse, file opening, path search, reviewed toggles,
+  partial directory state, and review progress after a changed PR head.
 
 ### 7.5 Diff correctness
 
@@ -711,6 +904,10 @@ Commit: `docs(git): document review workbench usage`
 6. Remote synchronization is asynchronous and never blocks redisplay.
 7. A second same-repository sync request joins the first job.
 8. Large/binary limits produce a visible fallback instead of a frozen buffer.
+9. Same-window navigation never increases window count; repeated explicit
+   comparison never exceeds two review windows.
+10. Phase 2 local review remains fully usable when Forge, `gh`, Delta, and
+    Difftastic are unavailable.
 
 The worker must report before/after timings in the branch description. If a
 fixed threshold is unreliable across machines, the implementation must at
@@ -722,8 +919,8 @@ unchanged operations.
 - Do not delete or reset `forge-database.sqlite`.
 - Do not rewrite existing clones' remotes or Git alternates.
 - Keep `C-x g` operational throughout the migration.
-- Land phases as separate commits so the shared mirror, PR workspace, or
-  side-by-side renderer can be reverted independently.
+- Land phases as separate reviewed branches/commits so the shared mirror, PR
+  workspace, or side-by-side renderer can be reverted independently.
 - Retain the current Difftastic path until the new detailed view passes its
   correctness and performance tests.
 - Do not remove the old root `git.md` until this document is approved.
@@ -739,28 +936,52 @@ unchanged operations.
 - Reproducing every GitHub web feature before the local review path is fast and
   reliable.
 
-## 11. Review checklist
+## 11. Owner decision gate
 
-Please review these decisions before implementation:
+These defaults follow the buffer-first philosophy and are recommended unless
+the owner changes them:
 
-- [ ] Generated review buffers may enter Evil insert state, but remain
-      read-only; code/comment editing opens the real writable buffer.
-- [ ] `TAB`, `S-TAB`, and `RET` have review actions in both normal and insert
-      states only in generated review buffers.
-- [ ] `C-c g` opens Magit status and a Git Transient; `C-x g` remains direct
-      Magit status.
-- [ ] PRs/issues/remote commits are shared by canonical repository identity;
-      branches, index, and worktree diffs remain local-context-specific.
-- [ ] A central bare mirror is the only network fetch target for remote Git
-      objects and PR refs.
-- [ ] Existing clones are not rewritten to depend on the mirror.
-- [ ] Opening or locally refreshing a buffer never contacts the network.
-- [ ] Forge remains the authoritative PR/issue/comment database.
-- [ ] GitHub CLI JSON supplies the cached CI/check adapter.
-- [ ] Side-by-side source review is primary; Difftastic remains optional.
-- [ ] `magit-delta` is removed after the replacement passes verification.
-- [ ] The implementation waits for approval and occurs only on
-      `feat/local-git-review-workbench` off `main`.
+- [ ] **Window model:** every normal navigation action replaces the selected
+      buffer. Only `o` and `|` create/reuse a second window.
+- [ ] **Evil state model:** generated status/review/topic buffers stay read-only
+      and in normal state. Editing opens a real source or Markdown buffer.
+- [ ] **Key model:** preserve Vim `n`/`N` search behavior; use bracket motions
+      for files, hunks, and commits; retain `J`/`K` as eight-line movement.
+- [ ] **Diff model:** a fast unified red/green/black Magit buffer is the default
+      overview; `|` opens the source-aware two-window detail; `D` is optional
+      Difftastic.
+- [ ] **Entry point:** `C-c g` opens status in the current window and presents
+      the Git Transient; `C-x g` remains direct status.
+- [ ] **Data model:** Forge SQLite remains the single authoritative store for
+      shared PR, issue, and comment metadata. The workbench adds a canonical
+      repository registry, Git-object mirror, and CI snapshot cache without
+      extending Forge's schema.
+- [ ] **Local/remote boundary:** PRs, issues, remote commits, and immutable diffs
+      are shared by canonical identity; branch, index, and working-tree state
+      remain local-context-specific.
+- [ ] **Network model:** opening and `gr` are offline-only. `@` syncs the current
+      repository; `C-c g F` syncs all registered repositories asynchronously.
+- [ ] **Clone safety:** existing clones are never rewritten to depend on the
+      mirror. Importing objects into a clone is an explicit local copy.
+- [ ] **Provider scope:** GitHub is the first complete CI adapter. Forge topic
+      support remains provider-neutral and other providers degrade cleanly.
+- [ ] **Dependency cleanup:** remove `magit-delta` after Phase 2 visual approval;
+      retain Difftastic as an optional, explicit structural view.
+- [ ] **Edit context:** version one selects from existing clones/worktrees and
+      never creates a new worktree automatically.
+- [ ] **Delivery:** use sequential phase branches, accepting each gate before
+      the next worker builds on it.
+
+Three decisions have the largest product impact and should be answered
+explicitly:
+
+1. Should generated read-only buffers reject insert state as recommended, or
+   should `i` enter a read-only insert state with navigation commands rebound?
+2. Should unified diff remain the default overview with side-by-side on `|`, or
+   should every changed file open side-by-side by default?
+3. Should global sync cover every repository ever registered, or only a
+   user-maintained allowlist of active repositories? The allowlist is safer for
+   credentials, archived projects, and API usage.
 
 ## 12. Expected result
 
