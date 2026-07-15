@@ -10,6 +10,14 @@
 ;; - `q' unwinds a per-buffer caller stack and restores layout.
 ;; - Generated review buffers share one Evil normal-state vocabulary.
 ;; - File visiting uses Magit native APIs, never rendered-text parsers.
+;;
+;; Phase 2 local review:
+;; - Explicit `+git-review-target' values for worktree/staged/commit/branch.
+;; - Machine-readable changed-file model (NUL Git parsers, never Magit text).
+;; - Changes Tree (`+git-changes-tree-mode') with reviewed checkmarks.
+;; - Atomic local review-state persistence under `.cache/git-review/state/'.
+;; - Exact per-file unified diffs reused by target+path.
+;; - Theme-safe black/red/green native Magit faces (no Delta/Difftastic).
 
 ;;; Code:
 
@@ -139,25 +147,69 @@ non-selected utility window."
   (+git-review--install-display))
 
 ;; =============================================================================
-;; Diff faces
+;; Diff faces (theme-safe, native Magit only)
 ;; =============================================================================
 
-(with-eval-after-load 'magit
-  ;; Background-only faces for added/removed/context lines.  No :foreground
-  ;; on added/removed so syntax highlighting can tint code on top.
+(defun +git-review-apply-diff-faces ()
+  "Apply Phase 2 native unified-diff faces for terminal and graphical Emacs.
+
+Default/context uses an effectively black background with readable gray
+text.  Added/removed lines use dark green/red backgrounds with near-white
+foregrounds.  Refined regions are brighter.  File headings stay prominent;
+hunk headings stay quieter.  Does not enable Delta or Difftastic."
   (custom-set-faces
-   '(magit-diff-added ((t (:background "#0a1a0a" :extend t))))
-   '(magit-diff-added-highlight ((t (:background "#0f220f" :extend t))))
-   '(magit-diff-removed ((t (:background "#1a0a0a" :extend t))))
-   '(magit-diff-removed-highlight ((t (:background "#220f0f" :extend t))))
-   '(magit-diff-context ((t (:foreground "#888888" :extend t))))
-   '(magit-diff-context-highlight ((t (:foreground "#999999" :background "#111111" :extend t))))
-   '(magit-diff-file-heading ((t (:foreground "#e0e0e0" :weight bold :extend t))))
-   '(magit-diff-file-heading-highlight ((t (:foreground "#ffffff" :background "#1a1a2e" :weight bold :extend t))))
-   '(magit-diff-hunk-heading ((t (:foreground "#8888bb" :background "#1a1a22" :extend t))))
-   '(magit-diff-hunk-heading-highlight ((t (:foreground "#aaaadd" :background "#222233" :extend t))))
-   '(magit-section-heading ((t (:foreground "#c0a040" :weight bold))))
-   '(magit-section-highlight ((t (:background "#0a0a0a"))))))
+   '(magit-diff-added
+     ((t (:foreground "#e8ffe8" :background "#0a2a12" :extend t))))
+   '(magit-diff-added-highlight
+     ((t (:foreground "#f5fff5" :background "#0f3a18" :extend t))))
+   '(magit-diff-removed
+     ((t (:foreground "#ffe8e8" :background "#2a0a0a" :extend t))))
+   '(magit-diff-removed-highlight
+     ((t (:foreground "#fff5f5" :background "#3a0f0f" :extend t))))
+   '(magit-diff-context
+     ((t (:foreground "#b0b0b0" :background "#000000" :extend t))))
+   '(magit-diff-context-highlight
+     ((t (:foreground "#c8c8c8" :background "#0a0a0a" :extend t))))
+   '(magit-diff-file-heading
+     ((t (:foreground "#f0f0f0" :background "#000000" :weight bold :extend t))))
+   '(magit-diff-file-heading-highlight
+     ((t (:foreground "#ffffff" :background "#12121a" :weight bold :extend t))))
+   '(magit-diff-hunk-heading
+     ((t (:foreground "#8a8aaa" :background "#101018" :extend t))))
+   '(magit-diff-hunk-heading-highlight
+     ((t (:foreground "#a0a0c0" :background "#181828" :extend t))))
+   '(magit-diff-lines-heading
+     ((t (:foreground "#ffffff" :background "#2a2a40" :extend t))))
+   '(smerge-refined-added
+     ((t (:foreground "#ffffff" :background "#1a5c28" :extend t))))
+   '(smerge-refined-removed
+     ((t (:foreground "#ffffff" :background "#6c1a1a" :extend t))))
+   '(diff-refine-added
+     ((t (:foreground "#ffffff" :background "#1a5c28" :extend t))))
+   '(diff-refine-removed
+     ((t (:foreground "#ffffff" :background "#6c1a1a" :extend t))))
+   '(magit-section-heading
+     ((t (:foreground "#d0b060" :weight bold))))
+   '(magit-section-highlight
+     ((t (:background "#0a0a0a"))))))
+
+(with-eval-after-load 'magit
+  (+git-review-apply-diff-faces))
+
+;; Re-apply after theme toggles so review readability is not erased.
+(defun +git-review--reapply-faces-after-theme (&rest _)
+  "Re-apply review diff faces after a theme change."
+  (+git-review-apply-diff-faces))
+
+;; init-themes loads before this module; re-apply after owner theme toggles.
+(when (fboundp '+theme/load-dark)
+  (advice-add '+theme/load-dark :after #'+git-review--reapply-faces-after-theme))
+(when (fboundp '+theme/load-light)
+  (advice-add '+theme/load-light :after #'+git-review--reapply-faces-after-theme))
+
+;; Themes may load before Magit; apply once Magit is present.
+(when (featurep 'magit)
+  (+git-review-apply-diff-faces))
 
 ;; =============================================================================
 ;; Diff-hl
@@ -303,43 +355,78 @@ branch must be updated."
 (defun +git-review-visit ()
   "Primary visit in the selected window via Magit/Forge remappings."
   (interactive)
-  (let ((state (+git-review--capture-return))
-        (before (current-buffer)))
-    (+git-review--call-visit-thing)
-    (+git-review--apply-return before state)))
+  (if (derived-mode-p '+git-changes-tree-mode)
+      (+git-changes-tree-visit-file)
+    (let ((state (+git-review--capture-return))
+          (before (current-buffer)))
+      (+git-review--call-visit-thing)
+      (+git-review--apply-return before state))))
 
 (defun +git-review-visit-other-window ()
   "Primary visit in the reusable right-hand window."
   (interactive)
-  (let ((state (+git-review--capture-return))
-        (before (current-buffer)))
-    (+git-review--call-visit-thing-other-window)
-    (+git-review--apply-return before state)))
-(defun +git-review-visit-worktree ()
-  "Visit the writable worktree file for the diff at point.
-Signals a clear user error when no writable worktree target exists.
-Does not force Insert state."
-  (interactive)
-  (let* ((rel (and (fboundp 'magit-diff--file)
-                   (ignore-errors (magit-diff--file))))
-         (root (and (fboundp 'magit-toplevel) (magit-toplevel)))
-         (full (and rel root (expand-file-name rel root))))
-    (unless (and full (file-exists-p full) (not (file-directory-p full)))
-      (user-error "No writable worktree target at point"))
+  (if (derived-mode-p '+git-changes-tree-mode)
+      (+git-changes-tree-visit-other-window)
     (let ((state (+git-review--capture-return))
           (before (current-buffer)))
-      (condition-case err
-          (magit-diff-visit-worktree-file nil)
-        (error
-         (let ((msg (error-message-string err)))
-           (if (string-match-p
-                "Cannot determine file\\|No file\\|does not exist\\|not exist"
-                msg)
-               (user-error "No writable worktree target at point")
-             (signal (car err) (cdr err))))))
-      (let ((after (current-buffer)))
-        (when (and (not (eq after before)) (buffer-live-p after))
-          (+git-review--enable-return-on-buffer after state))))))
+      (+git-review--call-visit-thing-other-window)
+      (+git-review--apply-return before state))))
+(defun +git-review-visit-worktree ()
+  "Visit the writable worktree file for the diff or tree file at point.
+Signals a clear user error when no writable worktree target exists.
+Does not force Insert state.  Generated per-file buffers may fall back to
+buffer-local `+git-review-file-path' when Magit file sections are missing."
+  (interactive)
+  (if (derived-mode-p '+git-changes-tree-mode)
+      (let* ((file (+git-review--file-at-tree-point))
+             (root (and +git-review-target
+                        (+git-review-target-root +git-review-target)))
+             (rel (and file (+git-review-file-path file)))
+             (full (and rel root (expand-file-name rel root))))
+        (unless (and full (file-exists-p full) (not (file-directory-p full)))
+          (user-error "No writable worktree target at point"))
+        (let ((state (+git-review--capture-return))
+              (before (current-buffer)))
+          (find-file full)
+          (let ((after (current-buffer)))
+            (when (and (not (eq after before)) (buffer-live-p after))
+              (+git-review--enable-return-on-buffer after state)))))
+    (let* ((root (or (and +git-review-target
+                          (+git-review-target-root +git-review-target))
+                     (and (fboundp 'magit-toplevel) (magit-toplevel))))
+           (magit-file (and (fboundp 'magit-diff--file)
+                            (ignore-errors (magit-diff--file))))
+           (rel (or (and magit-file root
+                         (file-relative-name magit-file root))
+                    (and (bound-and-true-p +git-review-file-path)
+                         +git-review-file-path)))
+           (full (and rel root (expand-file-name rel root))))
+      (cond
+       ((eq +git-review--presented-status 'submodule)
+        (user-error
+         "Submodule/gitlink `%s' - open that repository separately to review its commits"
+         (or rel +git-review-file-path "unknown")))
+       ((and full (file-directory-p full))
+        (user-error "No writable worktree file at `%s'" (or rel full)))
+       ((not (and full (file-exists-p full)))
+        (user-error "No writable worktree target at point"))
+       (t
+        (let ((state (+git-review--capture-return))
+              (before (current-buffer)))
+          (condition-case err
+              (if magit-file
+                  (magit-diff-visit-worktree-file nil)
+                (find-file full))
+            (error
+             (let ((msg (error-message-string err)))
+               (if (string-match-p
+                    "Cannot determine file\\|No file\\|does not exist\\|not exist"
+                    msg)
+                   (find-file full)
+                 (signal (car err) (cdr err))))))
+          (let ((after (current-buffer)))
+            (when (and (not (eq after before)) (buffer-live-p after))
+              (+git-review--enable-return-on-buffer after state)))))))))
 
 (defun +git-review-quit (&optional _kill-buffer)
   "Return to the recorded caller/layout, or bury the Magit buffer.
@@ -366,11 +453,12 @@ Does not kill user source buffers."
       (quit-window nil)))))
 
 (defun +git-review-refresh ()
-  "Refresh the current local Magit buffer only."
+  "Refresh the current local Magit or Changes Tree buffer only."
   (interactive)
-  (if (derived-mode-p 'magit-mode)
-      (magit-refresh)
-    (user-error "Nothing to refresh")))
+  (cond
+   ((derived-mode-p '+git-changes-tree-mode 'magit-mode)
+    (magit-refresh))
+   (t (user-error "Nothing to refresh"))))
 
 (defun +git-review-section-toggle ()
   "Toggle the Magit section at point."
@@ -413,9 +501,10 @@ Does not kill user source buffers."
     (+git-review--enter-normal-state)))
 
 (defun +git-review--maybe-enable ()
-  "Enable `+git-review-buffer-mode' in Magit/Forge generated views."
+  "Enable `+git-review-buffer-mode' in Magit/Forge/Changes Tree views."
   (when (or (derived-mode-p 'magit-mode)
             (derived-mode-p 'forge-topic-mode)
+            (derived-mode-p '+git-changes-tree-mode)
             (bound-and-true-p magit-blob-mode))
     (+git-review-buffer-mode 1)))
 
@@ -433,6 +522,7 @@ Does not kill user source buffers."
       "e" #'+git-review-visit-worktree
       "o" #'+git-review-visit-other-window
       "|" #'+git-review-visit-other-window
+      "t" #'+git-review-open-changes-tree
       "]f" #'+git-review-next-file
       "[f" #'+git-review-prev-file
       "]h" #'+git-review-next-hunk
@@ -466,7 +556,8 @@ Does not kill user source buffers."
                   magit-log-mode
                   magit-refs-mode
                   magit-stash-mode
-                  magit-process-mode))
+                  magit-process-mode
+                  +git-changes-tree-mode))
     (evil-set-initial-state mode 'normal)))
 
 (with-eval-after-load 'forge-topic
@@ -477,6 +568,1459 @@ Does not kill user source buffers."
                 magit-blob-mode-hook
                 forge-topic-mode-hook))
   (add-hook hook #'+git-review--maybe-enable))
+
+;; =============================================================================
+;; Phase 2 — Local review targets, Changes Tree, persistence, file diffs
+;; =============================================================================
+;; Ownership: local review / Changes Tree / diff faces belong in this module
+;; per `git-plan.md'.  Kept as one file so Phase 2 stays reviewable against
+;; that ownership table without introducing a premature store layer.
+
+(defconst +git-review-empty-tree
+  "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+  "Git's well-known empty-tree object ID (SHA-1).")
+
+(defcustom +git-review-state-directory
+  (expand-file-name ".cache/git-review/state/" user-emacs-directory)
+  "Directory for atomically persisted local review checkmarks.
+Tests should bind this to a temporary directory."
+  :type 'directory
+  :group 'magit)
+
+(defvar +git-review--git-process-count 0
+  "Number of Git processes started by Phase 2 model/collection helpers.
+Reset around instrumented public commands in tests.")
+
+(defvar +git-review--max-git-processes-per-refresh 12
+  "Hard upper bound for Git processes during one tree refresh.
+Far below N-files so accidental per-file loops fail tests loudly.")
+
+(defvar-local +git-review-target nil
+  "Buffer-local `+git-review-target' for overview, tree, and file diffs.")
+
+(defvar-local +git-review-file-path nil
+  "Buffer-local relative path for a per-file review diff buffer.")
+
+(defvar-local +git-review--files nil
+  "Buffer-local list of `+git-review-file' records for the Changes Tree.")
+
+(defvar-local +git-review--reviewed-map nil
+  "Buffer-local hash table: path -> fingerprint for currently reviewed files.")
+
+(cl-defstruct (+git-review-target
+               (:constructor +git-review-target--create)
+               (:copier nil))
+  "Explicit local review target.  Never reconstructed from rendered text."
+  root           ; absolute repository root
+  scope          ; worktree | staged | commit | branch
+  base-ref       ; symbolic base label (or nil)
+  base-oid       ; resolved base object ID
+  head-ref       ; symbolic head label (or nil)
+  head-oid       ; resolved head object ID (nil for mutable worktree tip)
+  family-id      ; stable target-family identity
+  overview-id    ; stable overview buffer identity
+  mutable-p)     ; non-nil when stage/unstage/discard are allowed
+
+(cl-defstruct (+git-review-file
+               (:constructor +git-review-file-create)
+               (:copier nil))
+  "One changed-file record from machine-readable Git output."
+  path           ; current path
+  old-path       ; previous path for rename/copy, else nil
+  status         ; modified|added|deleted|renamed|copied|untracked|binary|submodule
+  additions      ; integer or the symbol `binary'
+  deletions      ; integer or the symbol `binary'
+  old-mode
+  new-mode
+  old-oid
+  new-oid
+  fingerprint)  ; content fingerprint for review-state persistence
+
+;; ---------------------------------------------------------------------------
+;; Git process helpers (argument lists only; NUL-safe; counted)
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--call-git (root &rest args)
+  "Run git ARGS in ROOT; return (exit-code . stdout-string).
+Increments `+git-review--git-process-count'.  Never builds a shell string."
+  (cl-incf +git-review--git-process-count)
+  (with-temp-buffer
+    (let* ((default-directory (file-name-as-directory (expand-file-name root)))
+           (process-environment
+            (append '("GIT_TERMINAL_PROMPT=0") process-environment))
+           (exit (apply #'call-process "git" nil t nil args)))
+      (cons exit (buffer-string)))))
+
+(defun +git-review--git-ok (root &rest args)
+  "Run git ARGS in ROOT and return stdout, signaling on non-zero exit."
+  (let* ((result (apply #'+git-review--call-git root args))
+         (exit (car result))
+         (out (cdr result)))
+    (unless (eq exit 0)
+      (error "git %s failed in %s (exit %s): %s"
+             (mapconcat #'identity args " ") root exit out))
+    out))
+
+(defun +git-review--git-ok-allow (root allowed-exits &rest args)
+  "Like `+git-review--git-ok' but tolerate exit codes in ALLOWED-EXITS."
+  (let* ((result (apply #'+git-review--call-git root args))
+         (exit (car result))
+         (out (cdr result)))
+    (unless (or (eq exit 0) (memq exit allowed-exits))
+      (error "git %s failed in %s (exit %s): %s"
+             (mapconcat #'identity args " ") root exit out))
+    out))
+
+(defun +git-review--git-items (root &rest args)
+  "Run git ARGS in ROOT and split NUL-delimited stdout into a list."
+  (let ((out (apply #'+git-review--git-ok-allow root '(1) args)))
+    (split-string out "\0" t)))
+
+(defun +git-review--rev-parse (root &rest args)
+  "Return `git rev-parse' stdout for ROOT trimmed, or nil on failure."
+  (let* ((result (apply #'+git-review--call-git root
+                        (append '("rev-parse" "--verify") args)))
+         (exit (car result))
+         (out (string-trim-right (cdr result))))
+    (and (eq exit 0) (not (string-empty-p out)) out)))
+
+(defun +git-review--assert-bounded-processes (context &optional start-count)
+  "Signal when Git processes since START-COUNT exceed the Phase 2 bound."
+  (let* ((start (or start-count 0))
+         (used (- +git-review--git-process-count start)))
+    (when (> used +git-review--max-git-processes-per-refresh)
+      (error "Phase 2 %s used %d Git processes (bound %d); likely N-per-file"
+             context
+             used
+             +git-review--max-git-processes-per-refresh))))
+
+;; ---------------------------------------------------------------------------
+;; Review-target construction
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--normalize-root (root)
+  "Return ROOT as an absolute directory path with trailing slash removed."
+  (directory-file-name (expand-file-name root)))
+
+(defun +git-review--make-ids (root scope base-ref head-ref base-oid head-oid)
+  "Return (FAMILY-ID . OVERVIEW-ID) for ROOT and SCOPE.
+
+FAMILY-ID is the persistence identity.  For worktree/staged and symbolic
+branch reviews it stays stable when resolved object IDs advance.  Commit
+reviews key by resolved HEAD OID.
+
+OVERVIEW-ID is the immutable buffer-reuse identity.  Worktree/staged keep
+a stable overview id so refresh reuses buffers.  Branch and commit
+overviews include resolved object IDs so advancing a branch creates a
+new review buffer while persistence still finds prior checkmarks."
+  (let* ((root (+git-review--normalize-root root))
+         (family (pcase scope
+                   ((or 'worktree 'staged)
+                    (format "git-review:%s:%s" scope root))
+                   ('commit
+                    (format "git-review:commit:%s:%s" root head-oid))
+                   ('branch
+                    (format "git-review:branch:%s:%s:%s"
+                            root
+                            (or base-ref "")
+                            (or head-ref "")))
+                   (_ (error "Unknown review scope: %S" scope))))
+         (overview (pcase scope
+                     ((or 'worktree 'staged)
+                      (concat family ":overview"))
+                     ('commit
+                      (format "git-review:commit:%s:%s:overview"
+                              root head-oid))
+                     ('branch
+                      (format "git-review:branch:%s:%s:%s:overview"
+                              root base-oid head-oid))
+                     (_ (error "Unknown review scope: %S" scope)))))
+    (cons family overview)))
+
+(defun +git-review-make-target (root scope &optional base-ref head-ref
+                                     base-oid head-oid)
+  "Construct a `+git-review-target' for ROOT and SCOPE.
+BASE-REF/HEAD-REF are display labels and persistence selectors.
+BASE-OID/HEAD-OID are resolved object IDs when applicable."
+  (let* ((root (+git-review--normalize-root root))
+         (mutable (and (memq scope '(worktree staged)) t))
+         (ids (+git-review--make-ids root scope base-ref head-ref
+                                     base-oid head-oid)))
+    (+git-review-target--create
+     :root root
+     :scope scope
+     :base-ref base-ref
+     :base-oid base-oid
+     :head-ref head-ref
+     :head-oid head-oid
+     :family-id (car ids)
+     :overview-id (cdr ids)
+     :mutable-p mutable)))
+
+(defun +git-review--require-root ()
+  "Return the Magit toplevel or signal a user error."
+  (require 'magit)
+  (or (magit-toplevel)
+      (user-error "Not inside a Git repository")))
+
+(defun +git-review-target-for-worktree (&optional root)
+  "Build a worktree review target for ROOT (default: current repository)."
+  (let* ((root (+git-review--normalize-root
+                (or root (+git-review--require-root))))
+         (head (or (+git-review--rev-parse root "HEAD")
+                   +git-review-empty-tree)))
+    (+git-review-make-target root 'worktree "HEAD" nil head nil)))
+
+(defun +git-review-target-for-staged (&optional root)
+  "Build a staged review target for ROOT."
+  (let* ((root (+git-review--normalize-root
+                (or root (+git-review--require-root))))
+         (head (or (+git-review--rev-parse root "HEAD")
+                   +git-review-empty-tree)))
+    (+git-review-make-target root 'staged "HEAD" "index" head nil)))
+
+(defun +git-review-target-for-commit (commit &optional root)
+  "Build a commit review target for COMMIT in ROOT.
+Root commits use `+git-review-empty-tree' as the base."
+  (let* ((root (+git-review--normalize-root
+                (or root (+git-review--require-root))))
+         (head-oid (or (+git-review--rev-parse root commit)
+                       (user-error "Cannot resolve commit %s" commit)))
+         (parent (+git-review--rev-parse root (concat head-oid "^")))
+         (base-oid (or parent +git-review-empty-tree))
+         (base-ref (if parent (concat commit "^") "empty-tree")))
+    (+git-review-make-target root 'commit base-ref commit
+                             base-oid head-oid)))
+
+(defun +git-review-target-for-branch (base head &optional root)
+  "Build a branch review target for merge-base(BASE,HEAD)..HEAD."
+  (let* ((root (+git-review--normalize-root
+                (or root (+git-review--require-root))))
+         (base-oid (or (+git-review--rev-parse root base)
+                       (user-error "Cannot resolve base %s" base)))
+         (head-oid (or (+git-review--rev-parse root head)
+                       (user-error "Cannot resolve head %s" head)))
+         (merge-base (or (string-trim-right
+                          (+git-review--git-ok root "merge-base"
+                                               base-oid head-oid))
+                         (user-error "No merge-base for %s and %s"
+                                     base head))))
+    (+git-review-make-target root 'branch base head
+                             merge-base head-oid)))
+
+(defun +git-review-target-range-args (target)
+  "Return (RANGE TYPEARG) Git diff arguments for TARGET.
+RANGE is a string or nil.  TYPEARG is \"--cached\" or nil."
+  (pcase (+git-review-target-scope target)
+    ('worktree (list (+git-review-target-base-oid target) nil))
+    ('staged (list (+git-review-target-base-oid target) "--cached"))
+    ((or 'commit 'branch)
+     (list (format "%s..%s"
+                   (+git-review-target-base-oid target)
+                   (+git-review-target-head-oid target))
+           nil))
+    (_ (error "Unknown review scope: %S"
+              (+git-review-target-scope target)))))
+
+(defun +git-review-target-diff-args (_target)
+  "Return Magit/Git diff argument list for TARGET overview/file buffers."
+  (list "--no-ext-diff"
+        (format "-U%d" (if (boundp '+git/review-context-lines)
+                           +git/review-context-lines
+                         6))
+        "-M"
+        "-C"
+        "--find-copies-harder"))
+
+;; ---------------------------------------------------------------------------
+;; Changed-file model (NUL parsers; bounded Git processes)
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--status-from-code (code)
+  "Map a Git name-status CODE character/string to a status symbol."
+  (let ((c (if (stringp code) (aref code 0) code)))
+    (pcase c
+      (?M 'modified)
+      (?A 'added)
+      (?D 'deleted)
+      (?R 'renamed)
+      (?C 'copied)
+      (?T 'modified)
+      (?U 'modified)
+      (?\? 'untracked)
+      (_ 'modified))))
+
+(defun +git-review--parse-name-status-items (items)
+  "Parse NUL `git diff --name-status -z' ITEMS into an alist of records.
+Each record is (PATH OLD-PATH STATUS-CODE)."
+  (let ((i 0)
+        (n (length items))
+        records)
+    (while (< i n)
+      (let* ((status (nth i items))
+             (code (and status (substring status 0 1))))
+        (cond
+         ((member code '("R" "C"))
+          (when (>= (+ i 2) n)
+            (error "Truncated rename/copy name-status at %S" status))
+          (push (list (nth (+ i 2) items)  ; new path
+                      (nth (+ i 1) items)  ; old path
+                      code)
+                records)
+          (setq i (+ i 3)))
+         (t
+          (when (>= (+ i 1) n)
+            (error "Truncated name-status at %S" status))
+          (push (list (nth (+ i 1) items) nil code) records)
+          (setq i (+ i 2))))))
+    (nreverse records)))
+
+(defun +git-review--parse-numstat-items (items)
+  "Parse NUL `git diff --numstat -z' ITEMS into hash PATH -> (ADD . DEL).
+
+Ordinary records are one NUL field `ADDS\\tDELS\\tPATH'.  Rename/copy
+records are `ADDS\\tDELS\\t' followed by two more NUL fields (old path,
+then new path).  Binary files map to (binary . binary)."
+  (let ((table (make-hash-table :test #'equal))
+        (i 0)
+        (n (length items)))
+    (while (< i n)
+      (let ((item (nth i items)))
+        (if (not (string-match-p "\\`[-0-9]+\t[-0-9]+\t" item))
+            (setq i (1+ i))
+          (let* ((parts (split-string item "\t"))
+                 (adds (nth 0 parts))
+                 (dels (nth 1 parts))
+                 (path (nth 2 parts))
+                 (counts (if (or (equal adds "-") (equal dels "-"))
+                             (cons 'binary 'binary)
+                           (cons (string-to-number adds)
+                                 (string-to-number dels)))))
+            (setq i (1+ i))
+            (cond
+             ((and path (not (string-empty-p path)))
+              (puthash path counts table))
+             (t
+              (when (>= (+ i 1) n)
+                (error "Truncated rename/copy numstat near %S" item))
+              (let ((_old (nth i items))
+                    (new (nth (1+ i) items)))
+                (puthash new counts table)
+                (setq i (+ i 2)))))))))
+    table))
+
+(defun +git-review--parse-raw-items (items)
+  "Parse NUL `git diff --raw -z' ITEMS into hash PATH -> plist.
+Plist keys: :old-mode :new-mode :old-oid :new-oid :status :old-path."
+  (let ((table (make-hash-table :test #'equal))
+        (i 0)
+        (n (length items)))
+    (while (< i n)
+      (let* ((meta (nth i items)))
+        (unless (and meta (string-prefix-p ":" meta))
+          (error "Unexpected raw diff item: %S" meta))
+        (let* ((parts (split-string (substring meta 1) " " t))
+               (old-mode (nth 0 parts))
+               (new-mode (nth 1 parts))
+               (old-oid (nth 2 parts))
+               (new-oid (nth 3 parts))
+               (status (nth 4 parts))
+               (code (and status (substring status 0 1))))
+          (cond
+           ((member code '("R" "C"))
+            (let ((old-path (nth (+ i 1) items))
+                  (new-path (nth (+ i 2) items)))
+              (puthash new-path
+                       (list :old-mode old-mode :new-mode new-mode
+                             :old-oid old-oid :new-oid new-oid
+                             :status code :old-path old-path)
+                       table)
+              (setq i (+ i 3))))
+           (t
+            (let ((path (nth (+ i 1) items)))
+              (puthash path
+                       (list :old-mode old-mode :new-mode new-mode
+                             :old-oid old-oid :new-oid new-oid
+                             :status code :old-path nil)
+                       table)
+              (setq i (+ i 2))))))))
+    table))
+
+(defun +git-review--hash-paths (root paths)
+  "Return hash table PATH -> object ID for PATHS under ROOT in one process.
+Uses a single `git hash-object --stdin-paths' invocation.
+Paths are LF-separated (safe for spaces and Unicode; Git's
+`--stdin-paths' does not accept `-z' on all Git versions)."
+  (let ((table (make-hash-table :test #'equal)))
+    (when paths
+      (cl-incf +git-review--git-process-count)
+      (with-temp-buffer
+        (dolist (p paths)
+          (when (string-match-p "\n" p)
+            (error "Path contains newline; cannot batch-hash: %S" p))
+          (insert p "\n"))
+        (let* ((default-directory
+                (file-name-as-directory (expand-file-name root)))
+               (exit (call-process-region
+                      (point-min) (point-max)
+                      "git" t t nil
+                      "hash-object" "--stdin-paths")))
+          (unless (eq exit 0)
+            (error "git hash-object --stdin-paths failed in %s: %s"
+                   root (buffer-string)))
+          (let ((oids (split-string (buffer-string) "\n" t)))
+            (unless (= (length oids) (length paths))
+              (error "hash-object returned %d ids for %d paths"
+                     (length oids) (length paths)))
+            (cl-loop for path in paths
+                     for oid in oids
+                     do (puthash path oid table))))))
+    table))
+(defun +git-review--zero-oid-p (oid)
+  "Return non-nil when OID is missing or an all-zero placeholder."
+  (or (null oid)
+      (string-match-p "\\`0+\\'" oid)))
+
+(defun +git-review--classify-file (status-code raw-meta _num adds _dels)
+  "Return status symbol from STATUS-CODE, RAW-META, and ADD counts."
+  (let* ((mode (or (plist-get raw-meta :new-mode)
+                   (plist-get raw-meta :old-mode)))
+         (binary (eq adds 'binary)))
+    (cond
+     ((and mode (string-prefix-p "160000" mode)) 'submodule)
+     ((equal status-code "?") 'untracked)
+     (binary 'binary)
+     (t (+git-review--status-from-code status-code)))))
+
+(defun +git-review-collect-files (target)
+  "Return a list of `+git-review-file' for TARGET using batched Git calls.
+Never parses Magit buffer text.  Asserts a bounded process count."
+  (let* ((root (+git-review-target-root target))
+         (scope (+git-review-target-scope target))
+         (start-count +git-review--git-process-count)
+         (range-type (+git-review-target-range-args target))
+         (range (car range-type))
+         (typearg (cadr range-type))
+         (diff-base (append (list "diff" "--no-ext-diff" "-M" "-C"
+                                  "--find-copies-harder" "-z")
+                            (and typearg (list typearg))
+                            (list range)))
+         (ns-items (apply #'+git-review--git-items root
+                          (append diff-base '("--name-status"))))
+         (num-items (apply #'+git-review--git-items root
+                           (append diff-base '("--numstat"))))
+         (raw-items (apply #'+git-review--git-items root
+                           (append diff-base '("--raw"))))
+         (ns-records (+git-review--parse-name-status-items ns-items))
+         (num-table (+git-review--parse-numstat-items num-items))
+         (raw-table (+git-review--parse-raw-items raw-items))
+         (untracked
+          (when (eq scope 'worktree)
+            (+git-review--git-items
+             root "ls-files" "-z" "--others" "--exclude-standard")))
+         (need-hash nil)
+         files)
+    (dolist (rec ns-records)
+      (pcase-let* ((`(,path ,old-path ,code) rec)
+                   (raw (gethash path raw-table))
+                   (num (or (gethash path num-table)
+                            (and old-path (gethash old-path num-table))))
+                   (adds (car num))
+                   (dels (cdr num))
+                   (status (+git-review--classify-file code raw num adds dels))
+                   (old-oid (plist-get raw :old-oid))
+                   (new-oid (plist-get raw :new-oid))
+                   (fp nil))
+        (cond
+         ((eq status 'untracked)
+          (push path need-hash))
+         ((and (eq scope 'worktree)
+               (not (eq status 'deleted))
+               (or (+git-review--zero-oid-p new-oid)
+                   (eq status 'modified)))
+          (push path need-hash))
+         ((not (+git-review--zero-oid-p new-oid))
+          (setq fp new-oid))
+         ((not (+git-review--zero-oid-p old-oid))
+          (setq fp old-oid))
+         (t (setq fp (format "%s:%s" status path))))
+        (push (+git-review-file-create
+               :path path
+               :old-path (or old-path (plist-get raw :old-path))
+               :status status
+               :additions (or adds 0)
+               :deletions (or dels 0)
+               :old-mode (plist-get raw :old-mode)
+               :new-mode (plist-get raw :new-mode)
+               :old-oid old-oid
+               :new-oid new-oid
+               :fingerprint fp)
+              files)))
+    (dolist (path untracked)
+      (push path need-hash)
+      (push (+git-review-file-create
+             :path path
+             :old-path nil
+             :status 'untracked
+             :additions 0
+             :deletions 0
+             :old-mode nil
+             :new-mode nil
+             :old-oid nil
+             :new-oid nil
+             :fingerprint nil)
+            files))
+    (setq need-hash (cl-delete-duplicates need-hash :test #'equal))
+    (let ((hashes (+git-review--hash-paths root need-hash)))
+      (dolist (file files)
+        (unless (+git-review-file-fingerprint file)
+          (setf (+git-review-file-fingerprint file)
+                (or (gethash (+git-review-file-path file) hashes)
+                    (format "missing:%s"
+                            (+git-review-file-path file)))))))
+    ;; Line counts for untracked: treat whole file as additions via wc
+    ;; using one batched approach — read sizes from hash-object already
+    ;; done; approximate with `git diff --numstat --no-index' would be
+    ;; N processes.  Instead count lines in-process for untracked only
+    ;; when the set is small enough; for large trees leave 0 and let the
+    ;; file diff show the patch.  Prefer a single Python/awk-free loop:
+    (dolist (file files)
+      (when (eq (+git-review-file-status file) 'untracked)
+        (let* ((full (expand-file-name (+git-review-file-path file) root))
+               (attrs (and (file-regular-p full) (file-attributes full)))
+               (size (and attrs (file-attribute-size attrs))))
+          (cond
+           ((null attrs)
+            (setf (+git-review-file-additions file) 0))
+           ((or (not size) (> size (* 2 1024 1024)))
+            (setf (+git-review-file-additions file) 'binary)
+            (setf (+git-review-file-deletions file) 'binary)
+            (setf (+git-review-file-status file) 'binary))
+           (t
+            (with-temp-buffer
+              (insert-file-contents full)
+              (setf (+git-review-file-additions file)
+                    (count-lines (point-min) (point-max)))
+              (setf (+git-review-file-deletions file) 0)))))))
+    (+git-review--assert-bounded-processes
+     (format "collect-files (+%d)"
+             (- +git-review--git-process-count start-count))
+     start-count)
+    (cl-sort files #'string< :key #'+git-review-file-path)))
+
+;; ---------------------------------------------------------------------------
+;; Review-state persistence (atomic; fingerprint keyed)
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--state-file (target)
+  "Return the absolute state filename for TARGET."
+  (let* ((raw (+git-review-target-family-id target))
+         (hash (secure-hash 'sha256 raw)))
+    (expand-file-name (concat hash ".eld")
+                      (file-name-as-directory +git-review-state-directory))))
+
+(defun +git-review--ensure-state-dir ()
+  "Create `+git-review-state-directory' when missing."
+  (make-directory +git-review-state-directory t))
+
+(defun +git-review-state-load (target)
+  "Load reviewed path->fingerprint map for TARGET.
+Malformed state degrades to empty (all-unreviewed) with a message."
+  (let ((file (+git-review--state-file target))
+        (table (make-hash-table :test #'equal)))
+    (when (file-readable-p file)
+      (condition-case err
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (let* ((data (read (current-buffer)))
+                   (entries (cdr (assq 'entries data))))
+              (unless (and (listp data) (assq 'version data) (listp entries))
+                (error "Malformed review state"))
+              (dolist (pair entries)
+                (when (and (consp pair)
+                           (stringp (car pair))
+                           (stringp (cdr pair)))
+                  (puthash (car pair) (cdr pair) table)))))
+        (error
+         (message "Ignoring malformed Git review state %s: %s"
+                  file (error-message-string err))
+         (clrhash table))))
+    table))
+
+(defun +git-review-state-save (target reviewed-map)
+  "Atomically persist REVIEWED-MAP for TARGET.
+Writes a temporary file in the same directory, then renames into place."
+  (+git-review--ensure-state-dir)
+  (let* ((file (+git-review--state-file target))
+         (dir (file-name-directory file))
+         (tmp (make-temp-file
+               (expand-file-name ".git-review-state-" dir) nil ".tmp"))
+         (entries nil))
+    (maphash (lambda (path fp)
+               (push (cons path fp) entries))
+             reviewed-map)
+    (setq entries (cl-sort entries #'string< :key #'car))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (let ((print-level nil)
+                  (print-length nil))
+              (prin1 (list (cons 'version 1)
+                           (cons 'family-id
+                                 (+git-review-target-family-id target))
+                           (cons 'entries entries))
+                     (current-buffer))
+              (insert "\n")))
+          (rename-file tmp file t)
+          (setq tmp nil))
+      (when (and tmp (file-exists-p tmp))
+        (ignore-errors (delete-file tmp)))))
+  reviewed-map)
+
+(defun +git-review--file-reviewed-p (file reviewed-map)
+  "Return non-nil when FILE is reviewed under REVIEWED-MAP."
+  (let ((fp (gethash (+git-review-file-path file) reviewed-map)))
+    (and fp (equal fp (+git-review-file-fingerprint file)))))
+
+(defun +git-review--sync-reviewed-map (files reviewed-map)
+  "Drop stale paths from REVIEWED-MAP and keep fingerprint matches in FILES.
+Returns a new hash table."
+  (let ((next (make-hash-table :test #'equal)))
+    (dolist (file files)
+      (when (+git-review--file-reviewed-p file reviewed-map)
+        (puthash (+git-review-file-path file)
+                 (+git-review-file-fingerprint file)
+                 next)))
+    next))
+
+;; ---------------------------------------------------------------------------
+;; Folder tree model
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--path-segments (path)
+  "Split PATH into directory segments, dropping empties."
+  (split-string path "/" t))
+
+(defun +git-review--tree-insert (root-alist file)
+  "Insert FILE into nested ROOT-ALIST tree keyed by path segments.
+Directory nodes are plists with keys :dirs :files :name :path.
+`:path' is the complete repository-relative directory path.
+File nodes store the `+git-review-file' under :file."
+  (let* ((parts (+git-review--path-segments (+git-review-file-path file)))
+         (dirs (butlast parts))
+         (name (car (last parts)))
+         (node root-alist)
+         (prefix ""))
+    (dolist (dir dirs)
+      (setq prefix (if (string-empty-p prefix)
+                       dir
+                     (concat prefix "/" dir)))
+      (let ((child (assoc dir (plist-get node :dirs))))
+        (unless child
+          (setq child (cons dir (list :name dir
+                                      :path prefix
+                                      :dirs nil
+                                      :files nil)))
+          (setf (plist-get node :dirs)
+                (append (plist-get node :dirs) (list child))))
+        (setq node (cdr child))))
+    (setf (plist-get node :files)
+          (append (plist-get node :files)
+                  (list (cons name (list :name name :file file)))))
+    root-alist))
+
+(defun +git-review--build-tree (files)
+  "Build a nested directory alist from FILES."
+  (let ((root (list :name "" :dirs nil :files nil)))
+    (dolist (file files)
+      (+git-review--tree-insert root file))
+    root))
+
+(defun +git-review--sum-counts (a b)
+  "Add count values A and B, preserving `binary' dominance."
+  (cond
+   ((or (eq a 'binary) (eq b 'binary)) 'binary)
+   ((and (numberp a) (numberp b)) (+ a b))
+   ((numberp a) a)
+   ((numberp b) b)
+   (t 0)))
+
+(defun +git-review--node-stats (node reviewed-map)
+  "Return plist (:adds :dels :total :reviewed :state) for NODE."
+  (let ((adds 0)
+        (dels 0)
+        (total 0)
+        (reviewed 0))
+    (dolist (pair (plist-get node :files))
+      (let* ((file (plist-get (cdr pair) :file)))
+        (setq adds (+git-review--sum-counts
+                    adds (+git-review-file-additions file)))
+        (setq dels (+git-review--sum-counts
+                    dels (+git-review-file-deletions file)))
+        (cl-incf total)
+        (when (+git-review--file-reviewed-p file reviewed-map)
+          (cl-incf reviewed))))
+    (dolist (pair (plist-get node :dirs))
+      (let ((st (+git-review--node-stats (cdr pair) reviewed-map)))
+        (setq adds (+git-review--sum-counts adds (plist-get st :adds)))
+        (setq dels (+git-review--sum-counts dels (plist-get st :dels)))
+        (cl-incf total (plist-get st :total))
+        (cl-incf reviewed (plist-get st :reviewed))))
+    (list :adds adds
+          :dels dels
+          :total total
+          :reviewed reviewed
+          :state (cond
+                  ((= total 0) 'unreviewed)
+                  ((= reviewed 0) 'unreviewed)
+                  ((= reviewed total) 'reviewed)
+                  (t 'partial)))))
+
+(defun +git-review--status-glyph (status)
+  "Return a short status glyph for STATUS."
+  (pcase status
+    ('modified "M")
+    ('added "A")
+    ('deleted "D")
+    ('renamed "R")
+    ('copied "C")
+    ('untracked "?")
+    ('binary "BINARY")
+    ('submodule "SUBMODULE")
+    (_ "?")))
+
+(defun +git-review--checkbox (state)
+  "Return checkbox text for reviewed STATE."
+  (pcase state
+    ('reviewed "[x]")
+    ('partial "[-]")
+    (_ "[ ]")))
+
+(defun +git-review--format-counts (adds dels &optional binary-status)
+  "Format ADD/DEL counts for tree display."
+  (cond
+   ((or (eq adds 'binary) (eq dels 'binary) (eq binary-status 'binary))
+    "BINARY")
+   ((eq binary-status 'submodule) "SUBMODULE")
+   (t (format "+%s -%s" adds dels))))
+
+(defun +git-review--pad-to-width (string width)
+  "Pad STRING with ASCII spaces to at least display WIDTH via `string-width'."
+  (let ((pad (- width (string-width string))))
+    (if (> pad 0)
+        (concat string (make-string pad ?\s))
+      string)))
+
+(defun +git-review--tree-indent (depth)
+  "Return ASCII indentation for hierarchy DEPTH (4 spaces per level)."
+  (make-string (* (max 0 depth) 4) ?\s))
+
+(defun +git-changes-tree--format-file-heading (depth state name status counts)
+  "Format a Changes Tree file heading at DEPTH."
+  (concat (+git-review--tree-indent depth)
+          (+git-review--checkbox state)
+          " "
+          (+git-review--pad-to-width name 20)
+          "  "
+          (+git-review--pad-to-width status 6)
+          "  "
+          counts
+          "\n"))
+
+(defun +git-changes-tree--format-dir-heading (depth state name counts)
+  "Format a Changes Tree directory heading at DEPTH."
+  (concat (+git-review--tree-indent depth)
+          (+git-review--checkbox state)
+          " "
+          (+git-review--pad-to-width name 28)
+          "  "
+          counts
+          "\n"))
+
+;; ---------------------------------------------------------------------------
+;; Changes Tree mode (valid Magit sections; lazy — no per-file diffs)
+;; ---------------------------------------------------------------------------
+
+(define-derived-mode +git-changes-tree-mode magit-mode "Git-Tree"
+  "Mode for the local Changes Tree review buffer."
+  :interactive nil
+  :group 'magit
+  (magit-hack-dir-local-variables)
+  (setq truncate-lines t)
+  (+git-review-buffer-mode 1))
+
+(cl-defmethod magit-buffer-value (&context (major-mode +git-changes-tree-mode))
+  (list 'git-changes-tree
+        (and +git-review-target
+             (+git-review-target-overview-id +git-review-target))))
+
+(defvar +git-changes-tree-file-section-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [remap magit-visit-thing] #'+git-changes-tree-visit-file)
+    map)
+  "Keymap for Changes Tree file sections.")
+
+(defvar +git-changes-tree-dir-section-map
+  (let ((map (make-sparse-keymap)))
+    map)
+  "Keymap for Changes Tree directory sections.")
+
+(defun +git-changes-tree--insert-file (file reviewed-map &optional depth)
+  "Insert a Magit section for FILE using REVIEWED-MAP at DEPTH.
+DEPTH defaults to 0 (root).  Section value remains the full relative path."
+  (let* ((depth (or depth 0))
+         (reviewed (+git-review--file-reviewed-p file reviewed-map))
+         (state (if reviewed 'reviewed 'unreviewed))
+         (status (+git-review-file-status file))
+         (counts (+git-review--format-counts
+                  (+git-review-file-additions file)
+                  (+git-review-file-deletions file)
+                  status)))
+    (magit-insert-section section (file (+git-review-file-path file))
+      (oset section keymap '+git-changes-tree-file-section-map)
+      (magit-insert-heading
+        (+git-changes-tree--format-file-heading
+         depth
+         state
+         (file-name-nondirectory (+git-review-file-path file))
+         (+git-review--status-glyph status)
+         counts)))))
+
+(defun +git-changes-tree--insert-dir (path node reviewed-map &optional hide depth)
+  "Insert directory PATH from NODE with REVIEWED-MAP at DEPTH.
+PATH is the complete repository-relative directory path (section value).
+The heading displays only the basename.  HIDE non-nil collapses the
+directory initially.  DEPTH defaults to 0 (root).  Children are rendered
+at DEPTH+1.  Children are section bodies only — no file-diff buffers or
+per-file Git diffs."
+  (let* ((depth (or depth 0))
+         (stats (+git-review--node-stats node reviewed-map))
+         (counts (+git-review--format-counts
+                  (plist-get stats :adds)
+                  (plist-get stats :dels)))
+         (base (if (or (null path) (string-empty-p path))
+                   "."
+                 (file-name-nondirectory (directory-file-name path))))
+         (label (concat base "/")))
+    (magit-insert-section section (directory path hide)
+      (oset section keymap '+git-changes-tree-dir-section-map)
+      (magit-insert-heading
+        (+git-changes-tree--format-dir-heading
+         depth
+         (plist-get stats :state)
+         label
+         counts))
+      (dolist (pair (plist-get node :dirs))
+        (let* ((child (cdr pair))
+               (child-path (or (plist-get child :path)
+                               (if (or (null path) (string-empty-p path))
+                                   (car pair)
+                                 (concat path "/" (car pair))))))
+          (+git-changes-tree--insert-dir
+           child-path child reviewed-map t (1+ depth))))
+      (dolist (pair (plist-get node :files))
+        (+git-changes-tree--insert-file
+         (plist-get (cdr pair) :file) reviewed-map (1+ depth))))))
+
+(defun +git-changes-tree-refresh-buffer ()
+  "Refresh the current Changes Tree from local Git + persisted state.
+Does not generate per-file diff buffers."
+  (unless +git-review-target
+    (user-error "Changes Tree has no review target"))
+  (let* ((target +git-review-target)
+         (default-directory
+          (file-name-as-directory (+git-review-target-root target)))
+         (files (+git-review-collect-files target))
+         (reviewed (+git-review--sync-reviewed-map
+                    files
+                    (or +git-review--reviewed-map
+                        (+git-review-state-load target))))
+         (tree (+git-review--build-tree files))
+         (stats (+git-review--node-stats tree reviewed)))
+    (setq +git-review--files files
+          +git-review--reviewed-map reviewed)
+    (+git-review-state-save target reviewed)
+    (magit-set-header-line-format
+     (format "Changes  %d/%d reviewed  |  %s"
+             (plist-get stats :reviewed)
+             (plist-get stats :total)
+             (+git-review--format-counts
+              (plist-get stats :adds)
+              (plist-get stats :dels))))
+    (magit-insert-section (changes-tree)
+      (magit-insert-heading
+        (format "Changes  %d/%d reviewed  |  %s\n"
+                (plist-get stats :reviewed)
+                (plist-get stats :total)
+                (+git-review--format-counts
+                 (plist-get stats :adds)
+                 (plist-get stats :dels))))
+      (dolist (pair (plist-get tree :dirs))
+        (let* ((child (cdr pair))
+               (child-path (or (plist-get child :path) (car pair))))
+          (+git-changes-tree--insert-dir child-path child reviewed t 0)))
+      (dolist (pair (plist-get tree :files))
+        (+git-changes-tree--insert-file
+         (plist-get (cdr pair) :file) reviewed 0)))))
+
+(defun +git-changes-tree-setup-buffer (target)
+  "Create or reuse the Changes Tree buffer for TARGET and display it.
+Locks Magit buffer identity to `overview-id' so advancing an immutable
+branch creates a new tree while worktree/staged still reuse."
+  (require 'magit)
+  (let* ((default-directory
+          (file-name-as-directory (+git-review-target-root target)))
+         (buf
+          (magit-setup-buffer #'+git-changes-tree-mode t
+            (+git-review-target target)
+            (+git-review--reviewed-map nil)
+            (+git-review--files nil))))
+    (with-current-buffer buf
+      (setq-local +git-review-target target)
+      (+git-review--enter-normal-state))
+    buf))
+
+;; ---------------------------------------------------------------------------
+;; Overview + entry openers (buffer reuse)
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--find-buffers-for-target (target &optional pred)
+  "Return live buffers matching TARGET's immutable overview identity.
+Optional PRED is called with each buffer and must return non-nil to keep it.
+Persistence uses `family-id'; buffer reuse uses `overview-id'."
+  (let ((id (+git-review-target-overview-id target))
+        found)
+    (dolist (buf (buffer-list))
+      (when (and (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (and (bound-and-true-p +git-review-target)
+                        (equal (+git-review-target-overview-id
+                                +git-review-target)
+                               id)
+                        (or (null pred) (funcall pred buf)))))
+        (push buf found)))
+    (nreverse found)))
+
+(defun +git-review--attach-target (target &optional file-path)
+  "Attach TARGET (and optional FILE-PATH) to the current buffer."
+  (setq-local +git-review-target target)
+  (when file-path
+    (setq-local +git-review-file-path file-path))
+  (+git-review--install-immutable-guards)
+  (+git-review--maybe-install-untracked-overview target file-path)
+  (+git-review-buffer-mode 1)
+  (+git-review--enter-normal-state))
+
+(defun +git-review--sync-magit-diff-state (target &optional files)
+  "Update Magit buffer-local diff variables from TARGET before refresh.
+FILES when non-nil replaces `magit-buffer-diff-files'."
+  (pcase-let* ((`(,range ,typearg) (+git-review-target-range-args target))
+               (args (+git-review-target-diff-args target))
+               (dtype (pcase (+git-review-target-scope target)
+                        ('staged 'staged)
+                        ('worktree 'committed)
+                        (_ 'committed))))
+    (setq-local +git-review-target target)
+    (setq-local magit-buffer-range range)
+    (setq-local magit-buffer-typearg typearg)
+    (setq-local magit-buffer-diff-args args)
+    (setq-local magit-buffer-diff-type dtype)
+    (when files
+      (setq-local magit-buffer-diff-files files))
+    (setq-local magit-buffer-range-hashed
+                (and range (fboundp 'magit-hash-range)
+                     (magit-hash-range range)))))
+
+(defun +git-review--insert-untracked-overview ()
+  "Insert valid Git-produced --no-index diffs for untracked worktree files.
+Uses Magit's washer so section markers stay complete."
+  (when (and (bound-and-true-p +git-review-target)
+             (eq (+git-review-target-scope +git-review-target) 'worktree)
+             (null +git-review-file-path))
+    (let* ((root (+git-review-target-root +git-review-target))
+           (paths (+git-review--git-items
+                   root "ls-files" "-z" "--others" "--exclude-standard"))
+           (null-device (if (eq system-type 'windows-nt) "NUL" "/dev/null"))
+           (args (+git-review-target-diff-args +git-review-target)))
+      (dolist (path paths)
+        (let ((full (expand-file-name path root)))
+          (when (and (file-exists-p full) (not (file-directory-p full)))
+            (magit--insert-diff 'wash-anyway
+              "diff" "--no-index" "-p" "--no-prefix"
+              args "--"
+              (magit-convert-filename-for-git null-device)
+              (magit-convert-filename-for-git full))))))))
+
+(defun +git-review--maybe-install-untracked-overview (target file-path)
+  "Install or remove the untracked overview section hook for TARGET."
+  (setq-local magit-diff-sections-hook
+              (remq '+git-review--insert-untracked-overview
+                    (copy-sequence (or magit-diff-sections-hook
+                                       (default-value
+                                        'magit-diff-sections-hook)))))
+  (when (and (eq (+git-review-target-scope target) 'worktree)
+             (null file-path))
+    (add-hook 'magit-diff-sections-hook
+              #'+git-review--insert-untracked-overview t t)))
+
+(defun +git-review--magit-diff-locked-p (target &optional files)
+  "Return non-nil when Magit should lock the buffer to its value.
+Immutable commit/branch reviews always lock so advancing resolved OIDs
+creates a new buffer.  File-specific diffs lock so they do not steal the
+overview buffer (`magit-diff-buffer-file-locked' convention)."
+  (or (memq (+git-review-target-scope target) '(commit branch))
+      (and files t)))
+
+(defun +git-review--open-overview (target)
+  "Open or reuse the Magit unified overview for TARGET."
+  (require 'magit)
+  (let* ((default-directory
+          (file-name-as-directory (+git-review-target-root target)))
+         (args (+git-review-target-diff-args target))
+         (range-type (+git-review-target-range-args target))
+         (range (car range-type))
+         (typearg (cadr range-type))
+         (existing
+          (car (+git-review--find-buffers-for-target
+                target
+                (lambda (buf)
+                  (with-current-buffer buf
+                    (and (derived-mode-p 'magit-diff-mode)
+                         (null +git-review-file-path)))))))
+         buffer)
+    (if existing
+        (progn
+          (setq buffer existing)
+          (magit-display-buffer buffer)
+          (with-current-buffer buffer
+            (+git-review--sync-magit-diff-state target nil)
+            (+git-review--maybe-install-untracked-overview target nil)
+            (magit-refresh)
+            (+git-review--enter-normal-state)))
+      (setq buffer
+            (magit-diff-setup-buffer
+             range typearg args nil
+             (pcase (+git-review-target-scope target)
+               ('staged 'staged)
+               ('worktree 'committed)
+               (_ 'committed))
+             (+git-review--magit-diff-locked-p target)))
+      (with-current-buffer buffer
+        (+git-review--attach-target target)
+        (when (eq (+git-review-target-scope target) 'worktree)
+          ;; Re-refresh so the untracked hook runs after attachment.
+          (magit-refresh))))
+    buffer))
+
+(defun +git-review-open-worktree ()
+  "Open the reusable working-tree review overview."
+  (interactive)
+  (+git-review--open-overview (+git-review-target-for-worktree)))
+
+(defun +git-review-open-staged ()
+  "Open the reusable staged review overview."
+  (interactive)
+  (+git-review--open-overview (+git-review-target-for-staged)))
+
+(defun +git-review-open-commit (commit)
+  "Open the reusable commit review overview for COMMIT."
+  (interactive
+   (list (magit-read-branch-or-commit "Review commit")))
+  (+git-review--open-overview (+git-review-target-for-commit commit)))
+
+(defun +git-review-open-branch (base head)
+  "Open the reusable branch review for BASE..HEAD via merge-base."
+  (interactive
+   (list (magit-read-branch-or-commit "Review base")
+         (magit-read-branch-or-commit "Review head")))
+  (+git-review--open-overview (+git-review-target-for-branch base head)))
+
+(defun +git-review-open-changes-tree (&optional target)
+  "Open or reuse the Changes Tree for TARGET or the current buffer target."
+  (interactive)
+  (let ((target (or target
+                    (and (bound-and-true-p +git-review-target)
+                         +git-review-target)
+                    (+git-review-target-for-worktree))))
+    (+git-changes-tree-setup-buffer target)))
+
+;; ---------------------------------------------------------------------------
+;; Per-file unified diffs
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--file-at-tree-point ()
+  "Return the `+git-review-file' at point in the Changes Tree, or nil."
+  (let* ((section (magit-current-section))
+         (path (and section
+                    (magit-section-match 'file section)
+                    (oref section value))))
+    (and path
+         (cl-find path +git-review--files
+                  :key #'+git-review-file-path
+                  :test #'equal))))
+
+(defun +git-review--find-file-diff-buffer (target path)
+  "Return an existing file-diff buffer for TARGET and PATH, or nil."
+  (car (+git-review--find-buffers-for-target
+        target
+        (lambda (buf)
+          (with-current-buffer buf
+            (and (derived-mode-p 'magit-diff-mode)
+                 (equal +git-review-file-path path)))))))
+
+(defvar-local +git-review--presented-status nil
+  "Status symbol for specialized per-file presentation (copy/binary/submodule).")
+
+(defvar-local +git-review--presented-old-path nil
+  "Old path for rename/copy presentation in the current file-diff buffer.")
+
+(defun +git-review--file-section-for-path (path)
+  "Return the Magit file section whose value equals PATH, or nil."
+  (and path magit-root-section
+       (cl-find-if (lambda (sec)
+                     (and (magit-file-section-p sec)
+                          (equal (oref sec value) path)))
+                   (oref magit-root-section children))))
+
+(defun +git-review--rewrite-heading-status (section from-status to-status)
+  "Rewrite FROM-STATUS to TO-STATUS in SECTION's heading.
+Preserves Magit text properties by keeping the %-11s field width."
+  (let* ((from (format "%-11s" from-status))
+         (to (format "%-11s" to-status))
+         (inhibit-read-only t))
+    (when (= (length from) (length to))
+      (save-excursion
+        (goto-char (oref section start))
+        (when (looking-at (regexp-quote from))
+          (replace-match to t t))))))
+
+(defun +git-review--insert-section-note (section text)
+  "Insert TEXT as a child note inside SECTION without replacing it."
+  (let ((inhibit-read-only t)
+        (magit-insert-section--parent section)
+        (magit-insert-section--current section))
+    (save-excursion
+      (goto-char (oref section content))
+      (magit-insert-section (hunk '(git-review-note))
+        (insert (propertize text 'font-lock-face 'magit-diff-context)))
+      (oset section end (copy-marker (max (marker-position (oref section end))
+                                          (point))
+                                     t))
+      (magit-section--set-section-properties section))))
+
+(defun +git-review--fallback-body (kind path &optional old-path)
+  "Return clear fallback/notice text for KIND at PATH."
+  (pcase kind
+    ('binary
+     (format "BINARY\nBinary file `%s' changed.\nNo textual unified diff is shown.\n"
+             path))
+    ('submodule
+     (format "SUBMODULE\nSubmodule/gitlink `%s' changed.\nThis is not a regular file diff.\nOpen the submodule repository separately to review its commits.\n"
+             path))
+    ('copied
+     (format "copy from %s\ncopy to %s\n"
+             (or old-path path) path))
+    (_ (format "No textual diff available for `%s' (%s).\n" path kind))))
+
+(defun +git-review--ensure-file-section (path)
+  "Return a Magit file section for PATH, creating one only if Magit omitted it."
+  (or (+git-review--file-section-for-path path)
+      (let ((inhibit-read-only t)
+            (kind +git-review--presented-status)
+            (old +git-review--presented-old-path))
+        (erase-buffer)
+        (magit-insert-section (diffbuf)
+          (magit-diff-insert-file-section
+           path
+           (and (eq kind 'copied) old)
+           (pcase kind
+             ('copied "copied")
+             ('binary "modified")
+             ('submodule "submodule")
+             (_ "modified"))
+           nil
+           (and (eq kind 'copied)
+                (format "copy from %s\ncopy to %s\n" old path))
+           (format "diff --git %s %s\n" (or old path) path)
+           (eq kind 'binary)
+           (pcase kind
+             ('binary "binary")
+             ('submodule "submodule/gitlink")
+             (_ nil))))
+        (setq magit-root-section
+              (or magit-insert-section--current magit-root-section))
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)
+        (+git-review--file-section-for-path path))))
+
+(defun +git-review--ensure-status-presentation ()
+  "Annotate Magit's native file section; never replace it with bare text.
+Survives `gr'/`magit-refresh' because Magit rebuilds sections first."
+  (when (and +git-review--presented-status +git-review-file-path)
+    (let* ((path +git-review-file-path)
+           (kind +git-review--presented-status)
+           (old +git-review--presented-old-path)
+           (section (+git-review--ensure-file-section path))
+           (case-fold-search nil))
+      (when section
+        ;; Collapsed empty bodies still accept child notes at `content'.
+        (when (oref section hidden)
+          (magit-section-show section))
+        (pcase kind
+          ('copied
+           (+git-review--rewrite-heading-status section "new file" "copied")
+           (unless (save-excursion
+                     (goto-char (oref section start))
+                     (re-search-forward "^copy from " (oref section end) t))
+             (+git-review--insert-section-note
+              section (+git-review--fallback-body kind path old))))
+          ('binary
+           (unless (save-excursion
+                     (goto-char (oref section start))
+                     (re-search-forward "Binary file `" (oref section end) t))
+             (+git-review--insert-section-note
+              section (+git-review--fallback-body kind path))))
+          ('submodule
+           (+git-review--rewrite-heading-status section "new file" "submodule")
+           (+git-review--rewrite-heading-status section "modified" "submodule")
+           (unless (save-excursion
+                     (goto-char (oref section start))
+                     (re-search-forward "Submodule/gitlink `"
+                                        (oref section end) t))
+             (+git-review--insert-section-note
+              section (+git-review--fallback-body kind path))))
+          (_ nil))
+        (goto-char (oref section start))
+        (set-buffer-modified-p nil)))))
+
+(defun +git-review--install-status-presentation (status &optional old-path)
+  "Install STATUS presentation that re-applies after Magit refresh."
+  (setq-local +git-review--presented-status status)
+  (setq-local +git-review--presented-old-path old-path)
+  (add-hook 'magit-refresh-buffer-hook
+            #'+git-review--ensure-status-presentation t t)
+  (+git-review--ensure-status-presentation))
+
+(defun +git-review--insert-fallback-diff (title body)
+  "Insert a single valid Magit section with TITLE and BODY text."
+  (magit-insert-section (file title)
+    (magit-insert-heading (concat title "\n"))
+    (insert (propertize body 'face 'magit-diff-context))
+    (insert "\n")))
+
+(defun +git-review--open-untracked-diff (target file)
+  "Open a Git-produced --no-index diff for untracked FILE."
+  (let* ((root (+git-review-target-root target))
+         (path (+git-review-file-path file))
+         (full (expand-file-name path root))
+         (null-device (if (eq system-type 'windows-nt) "NUL" "/dev/null"))
+         (files (list (magit-convert-filename-for-git null-device)
+                      (magit-convert-filename-for-git full))))
+    (magit-diff-setup-buffer
+     nil "--no-index"
+     (+git-review-target-diff-args target)
+     files
+     'undefined
+     (+git-review--magit-diff-locked-p target files))))
+
+(defun +git-review--file-diff-pathspecs (file)
+  "Return Magit `magit-buffer-diff-files' pathspecs for FILE.
+Rename/copy entries include both old and new paths so Git preserves
+rename metadata instead of rendering a pure add."
+  (let ((path (+git-review-file-path file))
+        (old (+git-review-file-old-path file)))
+    (if (and old (not (string-empty-p old)) (not (equal old path)))
+        (list old path)
+      (list path))))
+
+(defun +git-review-open-file-diff (target file &optional other-window)
+  "Open or reuse the exact unified diff for FILE under TARGET.
+OTHER-WINDOW non-nil uses the reusable right-hand window.
+Binary, submodule, and copy entries get clear visible presentation that
+survives `gr'."
+  (require 'magit)
+  (let* ((path (+git-review-file-path file))
+         (status (+git-review-file-status file))
+         (old-path (+git-review-file-old-path file))
+         (default-directory
+          (file-name-as-directory (+git-review-target-root target)))
+         (existing (+git-review--find-file-diff-buffer target path))
+         (display (if other-window
+                      (lambda (buffer)
+                        (+git-review--record-return-for-buffer buffer)
+                        (+git-review--display-in-other-window buffer))
+                    nil))
+         (pathspecs (+git-review--file-diff-pathspecs file))
+         buffer)
+    (cond
+     (existing
+      (setq buffer existing)
+      (if other-window
+          (funcall display buffer)
+        (magit-display-buffer buffer))
+      (with-current-buffer buffer
+        (cond
+         ((eq status 'untracked)
+          (setq-local +git-review-target target)
+          (magit-refresh))
+         ((memq status '(binary submodule))
+          (+git-review--attach-target target path)
+          (+git-review--install-status-presentation status old-path))
+         (t
+          (+git-review--sync-magit-diff-state target pathspecs)
+          (magit-refresh)
+          (when (eq status 'copied)
+            (+git-review--install-status-presentation status old-path))))
+        (+git-review--enter-normal-state)))
+     ((eq status 'untracked)
+      (let ((magit-display-buffer-function
+             (or display magit-display-buffer-function)))
+        (setq buffer (+git-review--open-untracked-diff target file)))
+      (with-current-buffer buffer
+        (+git-review--attach-target target path)))
+     ((memq status '(binary submodule))
+      (let ((magit-display-buffer-function
+             (or display magit-display-buffer-function)))
+        (pcase-let* ((`(,range ,typearg)
+                      (+git-review-target-range-args target))
+                     (args (+git-review-target-diff-args target)))
+          (setq buffer
+                (magit-diff-setup-buffer
+                 range typearg args pathspecs
+                 (pcase (+git-review-target-scope target)
+                   ('staged 'staged)
+                   (_ 'committed))
+                 (+git-review--magit-diff-locked-p target pathspecs)))))
+      (with-current-buffer buffer
+        (+git-review--attach-target target path)
+        (+git-review--install-status-presentation status old-path)))
+     (t
+      (pcase-let* ((`(,range ,typearg)
+                    (+git-review-target-range-args target))
+                   (args (+git-review-target-diff-args target)))
+        (let ((magit-display-buffer-function
+               (or display magit-display-buffer-function)))
+          (setq buffer
+                (magit-diff-setup-buffer
+                 range typearg args pathspecs
+                 (pcase (+git-review-target-scope target)
+                   ('staged 'staged)
+                   (_ 'committed))
+                 (+git-review--magit-diff-locked-p target pathspecs))))
+        (with-current-buffer buffer
+          (+git-review--attach-target target path)
+          (when (eq status 'copied)
+            (+git-review--install-status-presentation status old-path))))))
+    buffer))
+
+(defun +git-changes-tree-visit-file (&optional other-window)
+  "Visit the unified diff for the Changes Tree file at point."
+  (interactive "P")
+  (let ((file (+git-review--file-at-tree-point)))
+    (unless file
+      (user-error "No changed file at point"))
+    (+git-review-open-file-diff +git-review-target file other-window)))
+
+(defun +git-changes-tree-visit-other-window ()
+  "Visit the file diff at point in the reusable right-hand window."
+  (interactive)
+  (+git-changes-tree-visit-file t))
+
+;; ---------------------------------------------------------------------------
+;; Reviewed toggles (never mutate Git state)
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--descendant-files (section)
+  "Return `+git-review-file' records under SECTION (file or directory)."
+  (cond
+   ((magit-section-match 'file section)
+    (let* ((path (oref section value))
+           (file (cl-find path +git-review--files
+                          :key #'+git-review-file-path
+                          :test #'equal)))
+      (and file (list file))))
+   ((magit-section-match 'directory section)
+    (let* ((prefix (oref section value))
+           (prefix (if (or (null prefix) (string-empty-p prefix))
+                       ""
+                     (concat prefix "/"))))
+      (cl-remove-if-not
+       (lambda (file)
+         (or (string-empty-p prefix)
+             (string-prefix-p prefix (+git-review-file-path file))))
+       +git-review--files)))
+   (t nil)))
+
+(defun +git-changes-tree-toggle-reviewed ()
+  "Toggle reviewed state for the file or folder at point.
+Never stages, unstages, discards, or modifies Git files."
+  (interactive)
+  (unless (derived-mode-p '+git-changes-tree-mode)
+    (user-error "Not in a Changes Tree buffer"))
+  (let* ((section (magit-current-section))
+         (files (+git-review--descendant-files section))
+         (map (or +git-review--reviewed-map
+                  (setq +git-review--reviewed-map
+                        (make-hash-table :test #'equal)))))
+    (unless files
+      (user-error "No reviewable file or folder at point"))
+    (let* ((all-reviewed
+            (cl-every (lambda (f) (+git-review--file-reviewed-p f map))
+                      files)))
+      (dolist (file files)
+        (let ((path (+git-review-file-path file))
+              (fp (+git-review-file-fingerprint file)))
+          (if all-reviewed
+              (remhash path map)
+            (puthash path fp map))))
+      (setq +git-review--reviewed-map map)
+      (+git-review-state-save +git-review-target map)
+      (magit-refresh))))
+
+(with-eval-after-load 'evil
+  (when (fboundp 'evil-define-key)
+    (evil-define-key 'normal +git-changes-tree-mode-map
+      (kbd "SPC") #'+git-changes-tree-toggle-reviewed
+      "t" #'+git-review-open-changes-tree
+      "o" #'+git-changes-tree-visit-other-window
+      (kbd "RET") #'+git-changes-tree-visit-file)))
+
+;; ---------------------------------------------------------------------------
+;; Immutable staging guards
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--immutable-target-p ()
+  "Return non-nil when the current buffer's review target is immutable."
+  (and (bound-and-true-p +git-review-target)
+       (not (+git-review-target-mutable-p +git-review-target))))
+
+(defun +git-review--reject-immutable-mutation (&rest _)
+  "Signal when stage/unstage/discard is attempted on an immutable review."
+  (when (+git-review--immutable-target-p)
+    (user-error
+     "Cannot stage, unstage, or discard from an immutable %s review"
+     (+git-review-target-scope +git-review-target))))
+
+(defvar +git-review--mutation-commands
+  '(magit-stage
+    magit-stage-file
+    magit-stage-files
+    magit-unstage
+    magit-unstage-file
+    magit-unstage-files
+    magit-discard
+    magit-discard-files)
+  "Magit commands that mutate the index or worktree.")
+
+(defun +git-review--install-immutable-guards ()
+  "Ensure immutable-target guards are advised onto mutation commands."
+  (dolist (cmd +git-review--mutation-commands)
+    (when (fboundp cmd)
+      (advice-add cmd :before #'+git-review--reject-immutable-mutation))))
+
+(with-eval-after-load 'magit
+  (+git-review--install-immutable-guards))
 
 ;; =============================================================================
 ;; Syntax Highlighting in Diff Buffers (via magit-delta)
@@ -592,10 +2136,9 @@ Does not kill user source buffers."
         (delete-window win))))
 
   (defun +difftastic/setup-evil-keys ()
-    "Bind `D' / `d' to difftastic shortcuts in magit buffers."
+    "Bind explicit `D' to difftastic in Magit buffers (not `d')."
     (when (bound-and-true-p evil-mode)
-      (evil-local-set-key 'normal (kbd "D") #'+difftastic/full)
-      (evil-local-set-key 'normal (kbd "d") #'+difftastic/at-point)))
+      (evil-local-set-key 'normal (kbd "D") #'+difftastic/full)))
 
   (defun +difftastic/setup-buffer-keys ()
     "Inside a difftastic buffer, bind `q' to quit + kill."

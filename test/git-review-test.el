@@ -349,6 +349,9 @@
 ;; Phase 1 foundation tests.
 (require 'git-review-phase1)
 
+;; Phase 2 local review / Changes Tree tests.
+(require 'git-review-phase2)
+
 (provide 'git-review-test)
 
 ;;; git-review-test.el ends here

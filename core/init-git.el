@@ -16,7 +16,12 @@
 ;;   +git/review          — working-tree review
 ;;   +git/review-staged   — staged review
 ;;   +git/review-commit   — one commit
+;;   +git/review-branch   — branch merge-base..head review
 ;;   +git/log-oneline     — compact log
+;;
+;; Phase 2 local review targets and the Changes Tree live in
+;; `init-git-ui.el'.  These entry points only construct targets and
+;; open the reusable overview buffers.
 
 ;;; Code:
 
@@ -86,32 +91,31 @@
 Use +/- in the review buffer to adjust.")
 
 (defun +git/review ()
-  "Open a clean diff review buffer showing all working-tree changes."
+  "Open a reusable working-tree review overview (HEAD vs worktree/index)."
   (interactive)
-  (require 'magit)
-  (let ((default-directory (or (magit-toplevel)
-                               (user-error "Not inside a Git repository"))))
-    (magit-diff-working-tree "HEAD" '("--stat" "--no-ext-diff"
-                                      "-U6"))))
+  (+git-review-open-worktree))
 
 (defun +git/review-staged ()
-  "Open a clean diff review buffer showing staged changes only."
+  "Open a reusable staged review overview (HEAD vs index)."
   (interactive)
-  (require 'magit)
-  (let ((default-directory (or (magit-toplevel)
-                               (user-error "Not inside a Git repository"))))
-    (magit-diff-staged nil '("--no-ext-diff" "-U6"))))
+  (+git-review-open-staged))
 
 (defun +git/review-commit (&optional commit)
-  "Open a clean diff review buffer for a specific COMMIT.
-If COMMIT is nil, prompt for one."
+  "Open a reusable commit review overview for COMMIT.
+If COMMIT is nil, prompt for one.  Root commits use Git's empty tree."
   (interactive
    (progn (require 'magit)
           (list (magit-read-branch-or-commit "Review commit"))))
-  (let ((default-directory (or (magit-toplevel)
-                               (user-error "Not inside a Git repository"))))
-    (magit-diff-range (format "%s~..%s" commit commit)
-                      '("--no-ext-diff" "-U6"))))
+  (+git-review-open-commit commit))
+
+(defun +git/review-branch (&optional base head)
+  "Open a reusable branch review for merge-base(BASE, HEAD)..HEAD.
+Prompt for BASE and HEAD when omitted."
+  (interactive
+   (progn (require 'magit)
+          (list (magit-read-branch-or-commit "Review base")
+                (magit-read-branch-or-commit "Review head"))))
+  (+git-review-open-branch base head))
 
 (defun +git/log-oneline ()
   "Show a compact one-line-per-commit git log."
@@ -155,7 +159,8 @@ Does not fetch, pull, push, or contact Forge remotes."
    ["Review"
     ("r" "working-tree review" +git/review)
     ("s" "staged review" +git/review-staged)
-    ("c" "review one commit" +git/review-commit)
+    ("c" "commit review" +git/review-commit)
+    ("b" "branch review" +git/review-branch)
     ("l" "compact log" +git/log-oneline)]])
 
 (global-set-key (kbd "C-c g") #'+git-dispatch)
