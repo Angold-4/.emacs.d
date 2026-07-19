@@ -1,6 +1,6 @@
 # Git Review Authentication
 
-Git fetches may use SSH, but Forge needs a Github API token for pull-request,
+Git fetches may use SSH, but Forge needs a GitHub API token for pull-request,
 issue, review, and conversation metadata.  The Git review workbench supports
 ordinary Emacs Auth Source credentials and an optional 1Password provider.
 
@@ -10,20 +10,20 @@ Requirements:
 
 1. Install 1Password CLI (`op`) on the workstation.
 2. Connect it to the signed-in 1Password desktop app.
-3. Store the Github token in a concealed field on a 1Password item.
+3. Store the GitHub token in a concealed field on a 1Password item.
 4. Copy that field's secret reference.  It has this shape:
 
    ```text
    op://Employee/GitHub Forge/token
    ```
 
-5. Configure the non-secret Github username expected by Ghub:
+5. Configure the non-secret GitHub username expected by Ghub:
 
    ```bash
    git config --global github.user Angold-4
    ```
 
-   Use your own Github login in place of `Angold-4`. SSH authentication does
+   Use your own GitHub login in place of `Angold-4`. SSH authentication does
    not provide this API username automatically.
 
 Configure only that non-secret reference:

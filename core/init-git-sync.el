@@ -60,7 +60,7 @@ An empty list means synchronize nothing (never \"all registered\")."
   :group 'magit)
 
 (defcustom +git-sync-stale-lock-seconds 1800
-"Age threshold for explicit `+git-sync-clear-stale-lock' maintenance.
+  "Age threshold for explicit `+git-sync-clear-stale-lock' maintenance.
 Ordinary acquisition may reclaim a well-formed same-host lock immediately
 when its owner PID is dead.  Live or unknown locks are never cleared."
   :type 'integer
@@ -614,7 +614,8 @@ Unknown and non-stale locks are treated as live.  Stale locks are not."
 (defun +git-sync-acquire-lock (repository-id)
   "Acquire lock for REPOSITORY-ID.
 Return the owner nonce on success, or nil when the lock is busy
-(including when a stale lock remains from a crashed process)."
+(including when it belongs to a live or unknown owner).  A confirmed
+same-host dead-owner lock is reclaimed by the underlying acquisition."
   (let* ((result (+git-sync-try-acquire-lock repository-id))
          (status (car result))
          (nonce (cdr result)))

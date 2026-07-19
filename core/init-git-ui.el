@@ -349,16 +349,6 @@ branch must be updated."
       (let ((+git-review--prefer-other-window t))
         (call-interactively cmd))))))
 
-(defun +git-review-move-visual-lines-down (&optional n)
-  "Move down N groups of eight visual lines (default one group)."
-  (interactive "p")
-  (evil-next-visual-line (* (or n 1) 8)))
-
-(defun +git-review-move-visual-lines-up (&optional n)
-  "Move up N groups of eight visual lines (default one group)."
-  (interactive "p")
-  (evil-previous-visual-line (* (or n 1) 8)))
-
 (defun +git-review-visit ()
   "Primary visit in the selected window via Magit/Forge remappings."
   (interactive)
@@ -1262,7 +1252,7 @@ retargeting.  Returns the chosen `+git-store-local-context'."
     ctx))
 
 (defun +git-review-select-edit-context (&optional context-id)
-  "Select the active edit context for the current shareable review (`L').
+  "Select the active edit context for the current shareable review.
 With CONTEXT-ID, select noninteractively.  Otherwise prompt among
 eligible live contexts.  Preserves Phase 1 same-window and `q' return
 behavior (selection does not change windows)."
@@ -1273,7 +1263,7 @@ behavior (selection does not change windows)."
          (repo-id (+git-review-target-repository-id target)))
     (unless (+git-review--shareable-p target)
       (user-error
-       "Worktree, staged, and local branch reviews are fixed to their originating context (%s); L only applies to shared commit/PR reviews"
+       "Worktree, staged, and local branch reviews are fixed to their originating context (%s); context selection only applies to shared commit/PR reviews"
        (+git-review-target-root target)))
     (let* ((oids (+git-review--edit-context-oids target))
            (eligible (if oids

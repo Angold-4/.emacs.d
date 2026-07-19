@@ -22,7 +22,7 @@
 ;;   +git/log-oneline     — compact log
 ;;
 ;; Explicit sync (network-capable):
-;;   C-c g f / @          — synchronize current repository
+;;   C-c g f              — synchronize current repository
 ;;   C-c g F              — synchronize allowlisted repositories
 ;;
 ;; Phase 2 local review targets and the Changes Tree live in
@@ -94,7 +94,7 @@
 
 (defvar +git/review-context-lines 6
   "Number of context lines to show around each change.
-Use +/- in the review buffer to adjust.")
+Use `+git/increase-context' or `+git/decrease-context' to adjust.")
 
 (defun +git/review ()
   "Open a reusable working-tree review overview (HEAD vs worktree/index)."

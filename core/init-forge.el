@@ -94,7 +94,7 @@ Only the non-secret `op://` reference is stored in Emacs configuration.
 When Ghub cannot find its PACKAGE token through ordinary Auth Source,
 Emacs runs `op read REFERENCE' and caches the returned token in memory
 for the rest of the Emacs session.  Set the environment variable
-FORGE_GITHUB_TOKEN_OP_REF for the common Github.com case instead of
+FORGE_GITHUB_TOKEN_OP_REF for the common GitHub.com case instead of
 customizing this variable."
   :type '(alist :key-type string :value-type string)
   :group 'magit)

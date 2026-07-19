@@ -1,8 +1,11 @@
 # Git Review Workbench — Hands-on Delivery Plan
 
-Status: ready for owner approval and phased implementation
+Status: **Phases 0–5 complete on PR #5; Phase 6 is the next planned phase**
 Architecture: `docs/git.md`
 Current user guide: `git.md`
+
+This file is delivery history plus the remaining roadmap. It is not the
+current behavior reference; use `docs/git.md` for that.
 
 ## Outcome
 
@@ -38,7 +41,8 @@ the `C-c g` synchronization entries are the explicit network boundary.
 
 ## Delivery rules
 
-1. Implement one phase per branch, based on the last accepted phase.
+1. Implement one accepted phase at a time. Phases 1–5 were ultimately
+   consolidated on PR #5 at the owner's request.
 2. Keep `C-x g` usable at every commit.
 3. Do not delete or migrate `forge-database.sqlite`.
 4. Do not rewrite clone remotes or configure Git alternates.
@@ -48,30 +52,30 @@ the `C-c g` synchronization entries are the explicit network boundary.
 7. Stop at every phase gate for owner use and review. Do not stack later work
    on an unaccepted interaction model.
 
-Current repository note: `docs/git.md` already contains uncommitted planning
-changes. Workers must preserve them. The planning files should be committed or
-moved to a planning branch before Phase 0 begins.
-
 ## Target file ownership
 
 | File | Responsibility |
 |---|---|
 | `core/init-git.el` | Magit package/configuration, top-level Transient |
 | `core/init-git-ui.el` | display policy, Evil review mode, local review, Changes Tree, diff faces |
-| `core/init-git-store.el` | canonical identity, local contexts, mirror, cache, synchronization |
-| `core/init-forge.el` | Forge package/configuration, PR/issue buffers, comments, checks |
-| `test/git-review-test.el` | fast ERT unit and buffer behavior tests |
-| `test/git-review-integration-test.el` | temporary repositories, clones, worktrees, sync tests |
-| `docs/git.md` | architecture and decisions |
-| `git.md` | concise end-user workflow after implementation stabilizes |
+| `core/init-git-store.el` | canonical identity, local contexts, persistent registry |
+| `core/init-git-sync.el` | mirror, cache generations, locks, synchronization, publication |
+| `core/init-forge.el` | Forge package/configuration, cached PR adapter, authentication adapter |
+| `core/init-git-pr.el` | PR workspace, model refresh, file/commit navigation |
+| `test/git-review-test.el` | complete ERT suite entry point |
+| `test/git-review-integration-test.el` | repository, clone, worktree, identity tests |
+| `test/git-review-sync-test.el` | mirror, lock, sync, publication, Forge async tests |
+| `test/git-review-pr-test.el` | PR model, UI, range, navigation, authentication tests |
+| `test/git-review-doc-test.el` | current command contract and local documentation links |
+| `docs/git.md` | current architecture and behavior reference |
+| `git.md` | concise tested end-user workflow |
 
 `init.el` loads the modules in dependency order:
 
 ```text
-init-git -> init-git-store -> init-git-ui -> init-forge
+init-git -> init-git-store -> init-git-sync -> init-git-ui
+         -> init-forge -> init-git-pr
 ```
-
-Modules not yet implemented may be omitted until their phase begins.
 
 ## Standard verification
 
@@ -132,6 +136,8 @@ behavior has changed yet.
 ## Phase 1 — Fix buffer navigation and Evil behavior
 
 Branch: `feat/git-review-01-buffer-foundation`
+
+Status: **COMPLETE**
 
 This phase fixes the most immediate pain: Magit behaves like the rest of the
 buffer-based Emacs environment.
@@ -200,6 +206,8 @@ placement and navigation must be accepted before visual or PR work begins.
 
 Branch: `feat/git-review-02-local-review`
 
+Status: **COMPLETE**
+
 This is the first daily-usable milestone. It must work without Forge, `gh`,
 Delta, or Difftastic.
 
@@ -240,7 +248,7 @@ Delta, or Difftastic.
   - file/hunk headings: clear but visually quieter than changed code.
 - Ensure terminal truecolor and graphical Emacs are both readable.
 - Remove `magit-delta` and its face-remapping advice after owner visual approval.
-- Keep Difftastic only on explicit `D`.
+- Keep Difftastic only behind its Magit Transient or `M-x` commands.
 - Replace the disabled hand-built untracked section with tested native sections
   or Git-produced diffs. Never create incomplete Magit section markers.
 
@@ -275,6 +283,8 @@ return paths; adjust Phase 2 until it is comfortable enough for daily use.
 
 Branch: `feat/git-review-03-repository-store`
 
+Status: **COMPLETE**
+
 ### Change
 
 - Create `init-git-store.el` with explicit structures for canonical repository,
@@ -305,6 +315,8 @@ status, branch, staging, and working changes remain unquestionably local.
 ## Phase 4 — Shared mirror and explicit synchronization
 
 Branch: `feat/git-review-04-sync`
+
+Status: **COMPLETE**
 
 ### Change
 
@@ -344,6 +356,8 @@ from the network and continue reviewing all synchronized data.
 ## Phase 5 — Build the clean PR overview
 
 Branch: `feat/git-review-05-pr-workspace`
+
+Status: **COMPLETE**
 
 ### Change
 
@@ -457,8 +471,8 @@ Branch: `chore/git-review-08-hardening`
   cache age, and active syncs.
 - Remove dead functions, obsolete key documentation, disabled section code, and
   any temporary compatibility shims.
-- Replace root `git.md` with the concise, tested user workflow. Keep
-  `docs/git.md` as architecture and this file as delivery history.
+- Keep root `git.md` as the concise, tested user workflow and `docs/git.md` as
+  the current architecture reference. Both were established after Phase 5.
 - Record final timings against Phase 0; unchanged operations may not regress by
   more than 20% without owner approval.
 
@@ -479,6 +493,6 @@ workflow and the old Git review implementation is no longer loaded.
 | Phase 6 | polished side-by-side source detail | colors, speed, or window restoration fail |
 | Phase 7 | complete GitHub review/comment/check loop | leaving Emacs is still required for core review |
 
-The next implementation action is **Phase 1 only**. Its buffer/window gate is
-measured against the Phase 0 terminal sequence `2 -> 3 -> 4`, with a target of
-`2 -> 2 -> 2` for ordinary navigation.
+The next implementation action is **Phase 6 only**. Phases 0–5 remain the
+accepted foundation on PR #5; Phase 6 must preserve the same-window and
+offline-navigation contracts.

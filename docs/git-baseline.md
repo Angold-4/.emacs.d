@@ -29,8 +29,9 @@ values. Package revisions come from the existing local Straight checkouts and
 | `delta` | not on `PATH` | MEASURED unavailable |
 | `difft` | not on `PATH` | MEASURED unavailable |
 
-These Magit/Forge/Evil/Evil Collection revisions match the audited pins named
-in `docs/git.md` Phase 0 notes and in `straight/versions/default.el`.
+These are the historical Phase 0 revisions. Current pins remain recorded in
+`straight/versions/default.el`; this baseline is not an assertion that package
+versions have never changed since measurement.
 
 ### Commands used to collect environment data
 

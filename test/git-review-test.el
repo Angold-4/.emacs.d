@@ -360,6 +360,7 @@
 
 ;; Phase 5 shared pull-request workspace tests.
 (require 'git-review-pr-test)
+(require 'git-review-doc-test)
 
 (provide 'git-review-test)
 

@@ -999,7 +999,7 @@ PARENT-OID selects a non-default merge parent when provided.
     (cdr (assoc pick choices))))
 
 (defun +git-pr-select-parent ()
-  "Choose an explicit merge parent for the current PR commit (`P')."
+  "Choose an explicit merge parent for the current PR commit."
   (interactive)
   (unless (and (bound-and-true-p +git-pr--model)
                (integerp +git-pr--commit-index))
