@@ -793,33 +793,62 @@ PR-NUMBER is required when SCOPE is `pullreq'."
   (or (magit-toplevel)
       (user-error "Not inside a Git repository")))
 
+(defun +git-review--inside-worktree-p (root)
+  "Return non-nil when ROOT is a Git worktree rather than a bare repository."
+  (equal (ignore-errors
+           (string-trim
+            (+git-review--git-ok
+             root "rev-parse" "--is-inside-work-tree")))
+         "true"))
+
+(defun +git-review--local-entry-root ()
+  "Return the local worktree root for a new worktree/staged review.
+PR buffers intentionally bind `default-directory' to the shared bare
+mirror for object correctness.  When a local review is launched from
+such a buffer, use its active edit context instead of treating the mirror
+as a worktree."
+  (let* ((target (and (bound-and-true-p +git-review-target)
+                      +git-review-target))
+         (root (if (and target (+git-review--pr-backed-p target))
+                   (+git-review--active-edit-root target)
+                 (+git-review--require-root))))
+    (unless (+git-review--inside-worktree-p root)
+      (user-error
+       "Local worktree review requires a clone/worktree, not bare repository %s"
+       root))
+    root))
+
 (defun +git-review--context-for-root (root)
   "Register/refresh ROOT in the store and return its local context."
   (+git-store-context-for-root root))
 
 (defun +git-review-target-for-worktree (&optional root)
   "Build a worktree review target for ROOT (default: current repository)."
-  (let* ((root (+git-review--normalize-root
-                (or root (+git-review--require-root))))
-         (ctx (+git-review--context-for-root root))
-         (head (or (+git-review--rev-parse root "HEAD")
-                   +git-review-empty-tree)))
-    (+git-review-make-target
-     root 'worktree "HEAD" nil head nil
-     (+git-store-local-context-repository-id ctx)
-     (+git-store-local-context-context-id ctx))))
+  (let ((root (+git-review--normalize-root
+               (or root (+git-review--local-entry-root)))))
+    (unless (+git-review--inside-worktree-p root)
+      (user-error "Working-tree review cannot use bare repository %s" root))
+    (let* ((ctx (+git-review--context-for-root root))
+           (head (or (+git-review--rev-parse root "HEAD")
+                     +git-review-empty-tree)))
+      (+git-review-make-target
+       root 'worktree "HEAD" nil head nil
+       (+git-store-local-context-repository-id ctx)
+       (+git-store-local-context-context-id ctx)))))
 
 (defun +git-review-target-for-staged (&optional root)
   "Build a staged review target for ROOT."
-  (let* ((root (+git-review--normalize-root
-                (or root (+git-review--require-root))))
-         (ctx (+git-review--context-for-root root))
-         (head (or (+git-review--rev-parse root "HEAD")
-                   +git-review-empty-tree)))
-    (+git-review-make-target
-     root 'staged "HEAD" "index" head nil
-     (+git-store-local-context-repository-id ctx)
-     (+git-store-local-context-context-id ctx))))
+  (let ((root (+git-review--normalize-root
+               (or root (+git-review--local-entry-root)))))
+    (unless (+git-review--inside-worktree-p root)
+      (user-error "Staged review cannot use bare repository %s" root))
+    (let* ((ctx (+git-review--context-for-root root))
+           (head (or (+git-review--rev-parse root "HEAD")
+                     +git-review-empty-tree)))
+      (+git-review-make-target
+       root 'staged "HEAD" "index" head nil
+       (+git-store-local-context-repository-id ctx)
+       (+git-store-local-context-context-id ctx)))))
 
 (defun +git-review-target-for-commit (commit &optional root)
   "Build a commit review target for COMMIT in ROOT.

@@ -1225,6 +1225,40 @@ the range."
          (git-review-pr--cleanup a)
          (git-review-pr--cleanup (plist-get g :work)))))))
 
+(ert-deftest git-review-pr-local-review-from-mirror-uses-edit-context ()
+  "C-c g r from a PR buffer must never treat the bare mirror as a worktree."
+  (git-review-pr--with-dirs
+   (lambda (_reg _state)
+     (let* ((g (git-review-pr--make-merged-squash-graph "local-entry"))
+            (work (plist-get g :work))
+            (bare (plist-get g :bare))
+            (url (plist-get g :url)))
+       (unwind-protect
+           (let* ((ctx (git-review-pr--register work url bare))
+                  (id (+git-store-local-context-repository-id ctx))
+                  (ctx-id (+git-store-local-context-context-id ctx))
+                  (mirror (git-review-pr--publish-mirror id bare))
+                  (pr-target
+                   (+git-review-target-for-pullreq
+                    id 16 (plist-get g :base) (plist-get g :p4)
+                    work ctx-id "main" "feature")))
+             (with-temp-buffer
+               (setq-local +git-review-target pr-target)
+               (setq-local +git-review-edit-context-id ctx-id)
+               (setq default-directory (file-name-as-directory mirror))
+               (let ((local-target (+git-review-target-for-worktree)))
+                 (should
+                  (equal (+git-review-target-root local-target)
+                         (+git-review--normalize-root work)))
+                 (should (eq (+git-review-target-scope local-target)
+                             'worktree))
+                 ;; This was the failing operation: untracked discovery must
+                 ;; run in the edit worktree, never in mirror.git.
+                 (should (listp (+git-review-collect-files local-target))))
+               (should-error (+git-review-target-for-worktree mirror)
+                             :type 'user-error)))
+         (git-review-pr--cleanup work))))))
+
 (ert-deftest git-review-pr-sync-waiter-refreshes-model ()
   "A sync waiter rebuilds the PR model without exposing an `@' shortcut."
   (git-review-pr--with-dirs
