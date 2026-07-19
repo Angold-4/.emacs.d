@@ -1,12 +1,12 @@
 # Emacs Configuration
 
-A modular, lightweight Emacs configuration for Emacs 30+ targeting code review, 
+A modular, lightweight Emacs configuration for Emacs 30+ targeting code review,
 note-taking with Org-mode, and a unified buffer experience with Evil mode.
 
 ## Overview
 
-This configuration was refactored from a monolithic setup into a clean, modular 
-architecture. The key insight is that **LSP should be on-demand** - you don't 
+This configuration was refactored from a monolithic setup into a clean, modular
+architecture. The key insight is that **LSP should be on-demand** - you don't
 need a language server running just to read code.
 
 ### What Makes This Different
@@ -16,7 +16,7 @@ need a language server running just to read code.
 | LSP Activation | Manual (`C-x l`) | Auto-enabled |
 | Tree-sitter | Emacs 30 built-in | External package |
 | Startup Time | ~1-2 seconds | Often 3-5+ seconds |
-| Keybindings | Centralized in one file | Scattered everywhere |
+| Keybindings | Shared vocabulary + mode-local maps | Ad hoc per package |
 | Theme Toggle | `M-x +theme/toggle` | Usually manual |
 
 ### Package Summary (~58 packages)
@@ -50,7 +50,7 @@ git clone https://github.com/Angold-4/.emacs.d ~/.emacs.d
 emacs
 ```
 
-On first startup, straight.el will bootstrap and install all packages. 
+On first startup, straight.el will bootstrap and install all packages.
 This takes 2-3 minutes. Subsequent starts are fast (~1-2 seconds).
 
 ### Post-Install Steps
@@ -68,24 +68,29 @@ C-x l   ; Start LSP manually
 
 ```
 ~/.emacs.d/
-├── early-init.el          # GC optimization, disable package.el (66 lines)
-├── init.el                 # Entry point, loads modules (141 lines)
+├── early-init.el          # GC optimization, disable package.el
+├── init.el                 # Entry point, loads modules
 ├── core/
-│   ├── init-core.el        # Macros, utilities (215 lines)
-│   ├── init-straight.el    # Package management (63 lines)
-│   ├── init-ui.el          # Fonts, ligatures, fringes (180 lines)
-│   ├── init-themes.el      # Dark/light theme toggle (157 lines)
-│   ├── init-evil.el        # Evil + ALL keybindings (230 lines)
-│   ├── init-completion.el  # Vertico, Orderless, Company (191 lines)
-│   ├── init-lsp.el         # LSP-mode on-demand (163 lines)
-│   ├── init-languages.el   # Language modes, tree-sitter (288 lines)
-│   ├── init-org.el         # Org-mode config (166 lines)
-│   └── init-tools.el       # Magit, Projectile, etc. (221 lines)
+│   ├── init-core.el        # Macros and utilities
+│   ├── init-straight.el    # Package management
+│   ├── init-ui.el          # Fonts, ligatures, fringes
+│   ├── init-themes.el      # Dark/light theme toggle
+│   ├── init-evil.el        # Evil and global keybindings
+│   ├── init-completion.el  # Vertico, Orderless, Company
+│   ├── init-lsp.el         # LSP-mode on demand
+│   ├── init-languages.el   # Language modes and tree-sitter
+│   ├── init-org.el         # Org-mode configuration
+│   ├── init-tools.el       # Projectile, Treemacs, terminal tools
+│   ├── init-git.el         # Magit ownership and Git review dispatch
+│   ├── init-git-store.el   # Canonical repositories and local contexts
+│   ├── init-git-sync.el    # Durable shared mirror synchronization
+│   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
+│   ├── init-forge.el       # Forge cache and authentication adapter
+│   └── init-git-pr.el      # Cached pull-request workspace
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
 
-Total: ~1,976 lines of well-documented Elisp
 ```
 
 
@@ -112,6 +117,12 @@ Total: ~1,976 lines of well-documented Elisp
 | `C-c r` | Rename buffer |
 | `C-x b` | Switch buffer (persp-aware) |
 | `C-x g` | Magit status |
+| `C-c g` | Git/code-review dispatch |
+
+The Git workbench supports local and cached pull-request review, a collapsible
+Changes Tree, persistent reviewed checkmarks, and explicit offline-capable
+synchronization. See [git.md](git.md) for the daily workflow and
+[docs/git.md](docs/git.md) for the architecture.
 
 ### LSP & Code
 

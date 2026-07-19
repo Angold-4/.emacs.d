@@ -64,15 +64,11 @@
 ;; │ s-`         : Select treemacs window                             │
 ;; │ C-x t t     : Toggle treemacs                                    │
 ;; ├─────────────────────────────────────────────────────────────────┤
-;; │ Git Review (C-c g prefix)                                        │
+;; │ Git Review (owned by init-git / init-git-ui)                     │
 ;; ├─────────────────────────────────────────────────────────────────┤
-;; │ C-c g r     : Review working-tree changes (all diffs)            │
-;; │ C-c g s     : Review staged changes                              │
-;; │ C-c g c     : Review a specific commit                           │
-;; │ C-c g l     : Compact git log                                    │
-;; │ C-c g g     : Magit status                                       │
-;; │ In diff: n/p = next/prev file, N/P = next/prev hunk             │
-;; │ In diff: RET = open file, TAB = toggle, +/- = context            │
+;; │ C-x g       : Magit status                                       │
+;; │ C-c g       : +git-dispatch Transient (status/review/log)        │
+;; │ Review mode : h/j/k/l H/J/K/L TAB RET e o t gf/gF gh/gH gc/gC  │
 ;; └─────────────────────────────────────────────────────────────────┘
 
 ;;; Code:
@@ -302,10 +298,10 @@ This ensures C-h/j/k/l work for window navigation in all buffers."
     "S"  'org-agenda-sunrise-sunset
     "/"  'org-agenda-filter-by-tag))
 
-;; Magit specific bindings
-;; Note: Enhanced diff review keybindings are in init-git.el
+;; Magit review bindings (gr/q/RET/...) are owned by +git-review-buffer-mode
+;; in init-git-ui.el. Keep only discard here as a Magit action not covered
+;; by the Phase 1 review vocabulary.
 (with-eval-after-load 'magit
-  (evil-define-key 'normal magit-mode-map (kbd "gr") 'magit-refresh)
   (evil-define-key 'normal magit-mode-map (kbd "x") 'magit-discard))
 
 ;; Shell mode (for history navigation)

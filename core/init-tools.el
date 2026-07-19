@@ -1,15 +1,15 @@
 ;;; init-tools.el --- Development tools -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2024 Ango Wang
-;; Description: Development tools: Git, project management, file tree
+;; Description: Development tools: project management, file tree, shells
 
 ;;; Commentary:
 ;; This module configures development tools:
-;; - Magit: Git interface
 ;; - Projectile: Project management
 ;; - Treemacs: File tree sidebar
 ;; - Persp-mode: Workspace/perspective management
 ;; - TRAMP: Remote file editing
+;; Magit/Forge ownership lives in init-git.el and init-git-ui.el.
 
 ;;; Code:
 
@@ -446,38 +446,8 @@ This never hides a terminal the way the persp-aware C-x b can."
 (add-hook 'vterm-mode-hook #'+vterm/evil-setup)
 
 ;; =============================================================================
-;; Magit (Git Interface)
+;; Magit lives in init-git.el / init-git-ui.el (single ownership)
 ;; =============================================================================
-
-;; Magit depends on cond-let; pin recipe explicitly to avoid recipe lookup issues.
-(straight-use-package '(cond-let :type git :host github :repo "tarsius/cond-let"))
-
-(use-package magit
-  :straight t
-  :commands (magit-status magit-dispatch magit-diff-working-tree
-             magit-diff-staged magit-diff-range magit-log-current)
-  :bind (("C-x g" . magit-status)
-         ("C-x M-g" . magit-dispatch))
-  :config
-  ;; Show diff when committing
-  (setq magit-commit-show-diff t)
-
-  ;; Don't ask before saving buffers
-  (setq magit-save-repository-buffers 'dontask)
-
-  ;; Word-level refinement only on the hunk at point ('t), not every hunk
-  ;; ('all). Refining all hunks is a major cost when a status/diff buffer
-  ;; has many files, and is the main reason refresh stalls past ~30 files.
-  (setq magit-diff-refine-hunk t)
-
-  ;; Show process buffer only on errors (less noise)
-  (setq magit-process-popup-time -1)
-
-  ;; Auto-revert tracked buffers after git operations
-  (setq magit-auto-revert-mode t)
-
-  ;; Show full untracked file content in status buffer
-  (setq magit-diff-options '("--no-ext-diff")))
 
 ;; =============================================================================
 ;; Projectile (Project Management)

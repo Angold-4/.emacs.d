@@ -114,31 +114,22 @@ Company mode is enabled globally on startup.
 Completion triggers after 2 characters with a 0.2s delay.
 Backends: `company-capf` (integrates with LSP) > `company-dabbrev-code` + keywords + files > `company-dabbrev`.
 
-## Magit (Git)
+## Git and code review
 
 | Key | Action |
 |-----|--------|
-| `C-x g` | Magit status (main entry point) |
-| `C-x M-g` | Magit dispatch (menu of all git commands) |
+| `C-x g` | Magit status |
+| `C-x M-g` | Full Magit dispatch |
+| `C-c g` | Git review dispatch |
 
-### Inside Magit Status Buffer
+The review dispatch provides local worktree/staged/commit/branch review, cached
+pull-request review, compact log, and the explicit synchronization commands.
+Generated review buffers use the shared Evil vocabulary: `TAB`, `RET`, `e`,
+`o`, `t`, `gf/gF`, `gh/gH`, `gc/gC`, `gr`, and `q`.
 
-| Key | Action |
-|-----|--------|
-| `s` | Stage hunk/file |
-| `u` | Unstage hunk/file |
-| `c c` | Commit |
-| `P p` | Push |
-| `F p` | Pull |
-| `TAB` | Expand/collapse diff hunks |
-| `d d` | Show diff |
-| `l l` | Show log |
-| `b b` | Switch branch |
-| `g` | Refresh |
-| `0` | Discard change |
-| `q` | Quit magit buffer |
-
-> **Note:** Git blame is available via `M-x magit-blame-addition` but has no keybinding configured.
+Use Magit status/Transients for staging, committing, pushing, pulling, and other
+Git mutations. See [git.md](git.md) for the tested daily workflow and
+[docs/git.md](docs/git.md) for architecture and storage behavior.
 
 ## Treemacs (File Tree)
 
