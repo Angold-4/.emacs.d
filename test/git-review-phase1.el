@@ -123,8 +123,8 @@
               (should (eq evil-state 'normal))))
          (git-review-baseline-cleanup-repo-buffers root))))))
 
-(ert-deftest git-review-phase1-evil-search-bindings ()
-  "`n'/`N' are Evil search; `J'/`K' move eight visual lines."
+(ert-deftest git-review-phase1-evil-navigation-bindings ()
+  "Review buffers use Vim motion and mnemonic, bracket-free navigation."
   (require 'evil)
   (with-temp-buffer
     (+git-review-buffer-mode 1)
@@ -133,8 +133,22 @@
     (evil-normal-state)
     (should (eq (key-binding "n") #'evil-search-next))
     (should (eq (key-binding "N") #'evil-search-previous))
-    (should (eq (key-binding "J") #'+git-review-move-visual-lines-down))
-    (should (eq (key-binding "K") #'+git-review-move-visual-lines-up))))
+    (should (eq (key-binding "h") #'evil-backward-char))
+    (should (eq (key-binding "l") #'evil-forward-char))
+    (should (eq (key-binding "H") #'evil-beginning-of-line))
+    (should (eq (key-binding "J") #'+evil/move-lines-down))
+    (should (eq (key-binding "K") #'+evil/move-lines-up))
+    (should (eq (key-binding "L") #'evil-end-of-line))
+    (should (eq (key-binding "gf") #'+git-review-next-file))
+    (should (eq (key-binding "gF") #'+git-review-prev-file))
+    (should (eq (key-binding "gh") #'+git-review-next-hunk))
+    (should (eq (key-binding "gH") #'+git-review-prev-hunk))
+    ;; Phase 5 specializes commit stepping when loaded; both commands retain
+    ;; the same next/previous contract outside PR child buffers.
+    (should (memq (key-binding "gc")
+                  '(+git-review-next-commit +git-pr-next-commit)))
+    (should (memq (key-binding "gC")
+                  '(+git-review-prev-commit +git-pr-prev-commit)))))
 
 (ert-deftest git-review-phase1-window-count-preserved ()
   "Source -> status -> diff preserves window count 2 -> 2 -> 2."

@@ -358,6 +358,9 @@
 ;; Phase 4 shared mirror / explicit synchronization tests.
 (require 'git-review-sync-test)
 
+;; Phase 5 shared pull-request workspace tests.
+(require 'git-review-pr-test)
+
 (provide 'git-review-test)
 
 ;;; git-review-test.el ends here

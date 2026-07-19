@@ -68,7 +68,7 @@
 ;; ├─────────────────────────────────────────────────────────────────┤
 ;; │ C-x g       : Magit status                                       │
 ;; │ C-c g       : +git-dispatch Transient (status/review/log)        │
-;; │ Review mode : j/k J/K TAB RET e o | [f]f [h]h [c]c n/N gr q    │
+;; │ Review mode : h/j/k/l H/J/K/L TAB RET e o t gf/gF gh/gH gc/gC  │
 ;; └─────────────────────────────────────────────────────────────────┘
 
 ;;; Code:

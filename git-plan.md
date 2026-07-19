@@ -17,15 +17,16 @@ Repository status
   -> real source or Markdown editor
 ```
 
-Normal navigation replaces the selected buffer. `o` and `|` are the only
-commands that intentionally create a second review window. Generated buffers
+Normal navigation replaces the selected buffer. `o` is the only normal-mode
+command that intentionally creates a second review window. Generated buffers
 are read-only Evil normal-state buffers. Opening and `gr` are offline-only;
-`@` is the explicit network boundary.
+the `C-c g` synchronization entries are the explicit network boundary.
 
 ## Approved working defaults
 
 - Unified black/red/green Magit diff is the default review surface.
-- `|` opens side-by-side source detail; `D` remains optional Difftastic.
+- `o` opens the reusable second view; optional Difftastic stays behind its
+  Transient/`M-x` command.
 - The Changes Tree groups files by folder and uses `SPC` to mark reviewed.
   Review checkmarks never stage or modify Git state.
 - Forge remains authoritative for PR, issue, and comment metadata.
@@ -144,7 +145,7 @@ buffer-based Emacs environment.
 3. Install one `magit-display-buffer-function` implementation:
    - status, log, Forge topic, revision, unified diff, blob, and source
      navigation replace the selected window;
-   - explicit `o` and `|` may create/reuse one right-hand window;
+   - explicit `o` may create/reuse one right-hand window;
    - `q` restores the caller and its window layout.
 4. Implement `+git-review-buffer-mode` for Magit/Forge generated buffers:
 
@@ -155,7 +156,7 @@ buffer-based Emacs environment.
    | `RET` | native primary visit |
    | `e` | visit writable worktree target |
    | `o` | explicit other-window visit |
-   | `[f`/`]f`, `[h`/`]h`, `[c`/`]c` | file, hunk, commit movement |
+   | `gf`/`gF`, `gh`/`gH`, `gc`/`gC` | next/previous file, hunk, commit |
    | `n/N` | retain Evil search next/previous |
    | `gr` | local refresh |
    | `q` | return to caller |
@@ -222,7 +223,7 @@ Delta, or Difftastic.
   status, additions, and deletions.
 - Bind `t` from any review buffer to the tree.
 - In the tree: `SPC` toggles reviewed, `RET` opens unified file diff, `o` opens
-  explicitly on the right, `|` opens comparison later, and `q` returns.
+  explicitly on the right, and `q` returns.
 - Persist review state atomically under `.cache/git-review/state/`. Key state by
   repository, target type, base/head, path, and file-content fingerprint.
   Changed files become unreviewed; unchanged files retain progress.
@@ -320,8 +321,8 @@ queued -> fetching mirror -> pulling Forge -> fetching checks
 
 - Coalesce duplicate in-process requests and use a filesystem lock across Emacs
   instances.
-- `@`/`C-c g f` sync the current repository. `C-c g F` syncs only repositories
-  in the configured active allowlist, with bounded concurrency.
+- `C-c g f` syncs the current repository. `C-c g F` syncs only repositories in
+  the configured active allowlist, with bounded concurrency.
 - Preserve the last successful generation when any step fails. Show stale age
   and a compact error without breaking offline navigation.
 - Copy PR objects from the mirror into a clone only after an explicit checkout
@@ -391,12 +392,13 @@ Branch: `feat/git-review-06-side-by-side`
 
 ### Change
 
-- `|` opens before/after source or blob buffers in two ordinary same-frame
-  windows with the existing vertical divider.
+- An explicit source-detail command opens before/after source or blob buffers
+  in two ordinary same-frame windows; it is not added to the normal-mode map
+  by default.
 - Use the correct major mode and syntax highlighting on both sides.
 - Use Ediff's mapping engine if helpful, but suppress its control frame and keep
   control inside the review buffers.
-- Synchronize `[h`/`]h`, `[f`/`]f`, and scroll position.
+- Synchronize `gh`/`gH`, `gf`/`gF`, and scroll position.
 - Apply dark-red/dark-green region and bright fine-change faces.
 - Parse only the active file. Reuse both windows while stepping files.
 - For local review, allow the after side to be the writable worktree file.

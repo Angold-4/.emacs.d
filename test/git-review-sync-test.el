@@ -364,7 +364,7 @@ Optional DELAY seconds defers completion.  Returns a cancellable handle."
     nonce))
 
 (ert-deftest git-review-sync-cross-process-lock-respected ()
-  "A live foreign lock prevents fetch; stale locks need explicit cleanup."
+  "A live foreign lock blocks fetch; a dead-owner lock is recovered."
   (git-review-sync--with-dirs
    (lambda (_reg)
      (let* ((up (git-review-sync--make-upstream "lock"))
@@ -390,12 +390,10 @@ Optional DELAY seconds defers completion.  Returns a cancellable handle."
                ;; Must not rewrite sync-state without owning the lock.
                (should (equal (car (+git-sync-load-state id))
                               state-before)))
-             ;; Stale lock: acquisition stays busy until explicit clear.
+             ;; Confirmed dead owner: acquisition reclaims it automatically.
              (let ((+git-sync-stale-lock-seconds 0))
                (git-review-sync--write-lock id 2147483646
                                             (- (float-time) 10))
-               (should (eq (car (+git-sync-try-acquire-lock id)) 'busy))
-               (should (+git-sync-clear-stale-lock id))
                (let ((acq (+git-sync-try-acquire-lock id)))
                  (should (eq (car acq) 'acquired))
                  (+git-sync-release-lock id (cdr acq))))
@@ -458,6 +456,31 @@ Optional DELAY seconds defers completion.  Returns a cancellable handle."
                          'cancelled)))
          (git-review-sync--cleanup-root work)
          (git-review-sync--cleanup-root bare))))))
+
+(ert-deftest git-review-sync-clean-exit-releases-owned-state ()
+  "A normal Emacs exit leaves durable data but no process-owned lock."
+  (git-review-sync--with-dirs
+   (lambda (_reg)
+     (let* ((id "github.com/org/clean-exit")
+            (+git-sync--jobs (make-hash-table :test #'equal))
+            (job (+git-sync--get-job id))
+            (nonce (+git-sync-acquire-lock id))
+            (candidate (+git-sync-candidate-directory id))
+            (mirror (+git-sync-mirror-directory id))
+            (state-file (+git-sync-state-file id)))
+       (should nonce)
+       (make-directory candidate t)
+       (make-directory mirror t)
+       (with-temp-file state-file
+         (insert "{\"generation\":1}\n"))
+       (setf (+git-sync-job-candidate-dir job) candidate)
+       (setf (+git-sync-job-lock-held-p job) t)
+       (setf (+git-sync-job-lock-nonce job) nonce)
+       (+git-sync--cleanup-on-emacs-exit)
+       (should-not (file-directory-p (+git-sync-lock-file id)))
+       (should-not (file-directory-p candidate))
+       (should (file-directory-p mirror))
+       (should (file-readable-p state-file))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Generation / failure semantics
@@ -1790,8 +1813,8 @@ Optional DELAY seconds defers completion.  Returns a cancellable handle."
       (unless had-forge
         (setq features (delq 'forge features))))))
 
-(ert-deftest git-review-sync-stale-lock-not-auto-cleared ()
-  "Acquisition never auto-clears stale locks; manual clear is required."
+(ert-deftest git-review-sync-dead-lock-auto-recovered ()
+  "A dead-owner lock is reclaimed safely across racing processes."
   (git-review-sync--with-dirs
    (lambda (reg)
      (let* ((id "github.com/org/stale-manual")
@@ -1815,14 +1838,22 @@ Optional DELAY seconds defers completion.  Returns a cancellable handle."
                    ("timestamp" . 1.0)
                    ("nonce" . ,dead-nonce))))
                (insert "\n"))
-             ;; Auto-acquire path must not remove the stale lock.
+             ;; One-process restart transparently reclaims a dead lock.
              (let ((+git-sync-stale-lock-seconds 0))
-               (should (eq (car (+git-sync-try-acquire-lock id)) 'busy))
-               (should (file-directory-p lock-dir))
-               (should (equal (+git-sync--alist-get
-                               "nonce" (+git-sync--read-lock id))
-                              dead-nonce)))
-             ;; Two processes racing acquire also stay busy (no clear race).
+               (let ((acq (+git-sync-try-acquire-lock id)))
+                 (should (eq (car acq) 'acquired))
+                 (+git-sync-release-lock id (cdr acq))))
+             ;; Replant the dead lock.  Of two racing processes, exactly one
+             ;; may acquire it; the other must observe that live owner.
+             (make-directory lock-dir t)
+             (with-temp-file (+git-sync-lock-owner-file id)
+               (insert
+                (json-encode
+                 `(("pid" . 2147483646)
+                   ("host" . ,(system-name))
+                   ("timestamp" . 1.0)
+                   ("nonce" . ,dead-nonce))))
+               (insert "\n"))
              (dolist (pair (list (cons script-a out-a)
                                  (cons script-b out-b)))
                (with-temp-file (car pair)
@@ -1860,12 +1891,14 @@ Optional DELAY seconds defers completion.  Returns a cancellable handle."
                                 (with-temp-buffer
                                   (insert-file-contents out-b)
                                   (buffer-string))))))
-                 (should (eq sa 'busy))
-                 (should (eq sb 'busy))))
-             ;; Explicit maintenance clear, then exclusive acquire works.
+                 (should (equal (sort (list sa sb)
+                                      (lambda (a b)
+                                        (string< (symbol-name a)
+                                                 (symbol-name b))))
+                                '(acquired busy)))))
+             ;; Both child processes have exited.  Their remaining acquired
+             ;; lock is dead and the next session can reclaim it immediately.
              (let ((+git-sync-stale-lock-seconds 0))
-               (should (+git-sync-clear-stale-lock id))
-               (should-not (file-directory-p lock-dir))
                (let ((acq (+git-sync-try-acquire-lock id)))
                  (should (eq (car acq) 'acquired))
                  (+git-sync-release-lock id (cdr acq)))))

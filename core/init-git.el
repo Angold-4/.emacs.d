@@ -18,6 +18,7 @@
 ;;   +git/review-staged   — staged review
 ;;   +git/review-commit   — one commit
 ;;   +git/review-branch   — branch merge-base..head review
+;;   +git/review-pull-request — cached PR workspace (Phase 5)
 ;;   +git/log-oneline     — compact log
 ;;
 ;; Explicit sync (network-capable):
@@ -25,8 +26,8 @@
 ;;   C-c g F              — synchronize allowlisted repositories
 ;;
 ;; Phase 2 local review targets and the Changes Tree live in
-;; `init-git-ui.el'.  These entry points only construct targets and
-;; open the reusable overview buffers.
+;; `init-git-ui.el'.  Forge ownership lives in `init-forge.el'.
+;; PR workspace lives in `init-git-pr.el'.
 
 ;;; Code:
 
@@ -158,7 +159,7 @@ Prompt for BASE and HEAD when omitted."
 
 (transient-define-prefix +git-dispatch ()
   "Git review dispatch.
-`r/s/c/b/l/g' are local-only.  `f/F' are explicitly network-capable."
+`r/s/c/b/p/l/g' are local-only.  `f/F' are explicitly network-capable."
   [["Status"
     ("g" "status (local)" magit-status)]
    ["Review (local)"
@@ -166,27 +167,13 @@ Prompt for BASE and HEAD when omitted."
     ("s" "staged review" +git/review-staged)
     ("c" "commit review" +git/review-commit)
     ("b" "branch review" +git/review-branch)
+    ("p" "pull request review (cached)" +git/review-pull-request)
     ("l" "compact log" +git/log-oneline)]
    ["Sync (network)"
     ("f" "synchronize repository" +git/sync)
     ("F" "synchronize allowlisted" +git/sync-all)]])
 
 (global-set-key (kbd "C-c g") #'+git-dispatch)
-
-;; =============================================================================
-;; forge — GitHub/GitLab pull requests & issues inside magit
-;; =============================================================================
-;; Topic metadata remains cached in ~/.emacs.d/forge-database.sqlite.
-;; Phase 1 removes on-visit fetch advice: RET opens the cached topic buffer.
-
-(use-package forge
-  :straight t
-  :after magit
-  :init
-  ;; Skip forge's default binding injection: in current magit, the
-  ;; transient slot it targets (`"o"' in magit-dispatch) has moved or
-  ;; been removed.  Setting this in `:init' runs before forge loads.
-  (setq forge-add-default-bindings nil))
 
 ;; =============================================================================
 ;; magit-todos — Surface TODO/FIXME/HACK in magit-status

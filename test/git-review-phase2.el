@@ -664,18 +664,19 @@ Persistence identity (`family-id') stays stable; immutable buffer identity
                   (should-not (+git-review--file-reviewed-p chg2 synced))))
             (git-review-baseline-cleanup-repo-buffers root))))))))
 
-(ert-deftest git-review-phase2-difftastic-d-only ()
-  "Difftastic remains an explicit D action; d is not bound to it."
+(ert-deftest git-review-phase2-difftastic-not-in-normal-map ()
+  "Difftastic remains available through Transient/M-x, not normal keys."
   (let ((ui (expand-file-name "core/init-git-ui.el" user-emacs-directory))
         (case-fold-search nil))
     (with-temp-buffer
       (insert-file-contents ui)
       (goto-char (point-min))
-      (should (re-search-forward
-               "(kbd \"D\") #'\\+difftastic/full" nil t))
-      (goto-char (point-min))
       (should-not (re-search-forward
-                   "(kbd \"d\") #'\\+difftastic/" nil t)))))
+                   "(kbd \"D\") #'\\+difftastic/full" nil t))
+      (goto-char (point-min))
+      (should (re-search-forward
+               "\"Difftastic diff (dwim)\" difftastic-magit-diff"
+               nil t)))))
 
 (ert-deftest git-review-phase2-faces-function-exists ()
   "Named face applicator exists for theme-safe native diffs."

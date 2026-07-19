@@ -68,8 +68,7 @@ default navigation path, equivalent to following a link inside one Vim window.
 
 Creating another window is always explicit:
 
-- `o` opens the target in a right-hand window.
-- `|` opens or toggles the two-window detailed comparison.
+- `o` opens the target in a reusable right-hand window.
 - process buffers may use a non-selected utility window only when requested or
   when an operation fails.
 
@@ -80,8 +79,8 @@ window.
 ### 2.3 Network access is explicit
 
 Opening a status, PR, issue, commit, or diff buffer must never fetch from a
-remote. Only the synchronization commands `@`, `C-c g f`, and `C-c g F` may
-contact the network.
+remote. Only the synchronization commands under `C-c g` may contact the
+network: `C-c g f` for the current repository and `C-c g F` for the allowlist.
 
 `gr` means "re-render from local Git objects and caches." It must remain fast
 and useful while offline.
@@ -381,7 +380,7 @@ The workbench has two display actions. Every command must choose one explicitly:
 | Action | Used for | Window behavior |
 |---|---|---|
 | Navigate | status, log, topic, commit, unified diff, source/blob | replace selected window |
-| Compare | explicit `o` or `|`, before/after source | create/reuse one right-hand window |
+| Compare | explicit `o`, before/after source | create/reuse one right-hand window |
 
 The Magit integration installs a project display function through
 `magit-display-buffer-function`. It displays interactive Magit and Forge
@@ -411,24 +410,28 @@ It provides one Evil normal-state interaction vocabulary:
 | `TAB` | Toggle section at point |
 | `S-TAB` | Cycle visibility of all sections |
 | `RET` | Expand a container or visit its primary target |
-| `j` / `k` | Move one display line |
-| `J` / `K` | Move eight display lines |
-| `] f` / `[ f` | Next/previous changed file |
-| `] h` / `[ h` | Next/previous hunk or difference |
-| `] c` / `[ c` | Next/previous commit |
+| `h` / `l` | Move one character left/right |
+| `j` / `k` | Move one display line down/up |
+| `H` / `L` | Move to beginning/end of line |
+| `J` / `K` | Move eight lines down/up |
+| `gf` / `gF` | Next/previous changed file |
+| `gh` / `gH` | Next/previous hunk or difference |
+| `gc` / `gC` | Next/previous PR commit |
 | `n` / `N` | Next/previous Vim search result |
 | `e` | Open the writable source/comment target |
 | `o` | Open the primary target in a right-hand window |
-| `|` | Toggle side-by-side/stacked detailed comparison |
-| `L` | Select active local context |
 | `gr` | Refresh only from local state |
-| `@` | Synchronize shared remote state |
 | `/` | Search current buffer |
 | `q` | Bury buffer and return to caller |
 
 Generated review buffers start in normal state. They do not redefine insert
 state because they are read-only. Source buffers keep normal Evil behavior, and
 Markdown composition buffers may start in insert state.
+
+Advanced implementation commands, including edit-context selection, composing
+Forge replies, merge-parent selection, and explicit synchronization, are not
+advertised in this normal-mode map.  They remain available through `M-x` or the
+small `C-c g` dispatch when deliberately needed.
 
 ### 4.8 Git dispatch
 
@@ -478,7 +481,7 @@ A PR buffer is shared by canonical repository and PR number:
 PR #42 — Improve transaction execution
 OPEN · review required · main <- feature/transactions
 Repository: github.com/org/dragon
-Edit context: ~/Work/dragon                       [L to switch]
+Edit context: ~/Work/dragon
 Cache: synced 3 minutes ago
 
 Changes (14 files, +381 -97)
@@ -548,8 +551,8 @@ Requirements:
   its descendants; a directory displays partial state when only some children
   are reviewed.
 - `RET` opens the file's unified diff in the current window; `o` opens it in the
-  explicit right-hand window; `|` opens detailed side-by-side comparison.
-- `TAB` expands/collapses a directory, and `[ f` / `] f` move between files.
+  explicit right-hand window.
+- `TAB` expands/collapses a directory, and `gF` / `gf` move between files.
 - `/` searches paths, and an optional filter shows only unreviewed files.
 - Review checkmarks are local metadata. They never stage, unstage, discard, or
   submit a GitHub review.
@@ -590,8 +593,8 @@ Requirements:
 - Dark green background for added regions.
 - Brighter fine-grained token changes.
 - Context remains readable on black.
-- `|` toggles side-by-side/stacked layout.
-- Difftastic remains an optional per-file structural view on `D`.
+- Difftastic remains an optional structural view through its Transient or
+  `M-x` command.
 - Oversized or binary files fall back cleanly instead of blocking redisplay.
 
 For worktree review, the after buffer can be the real editable file. For a
@@ -600,8 +603,8 @@ local edit context.
 
 ### 4.14 Batch synchronization
 
-`@` and `C-c g f` start one asynchronous synchronization for the current
-canonical repository. `C-c g F` starts the same operation for every registered
+`C-c g f` starts one asynchronous synchronization for the current canonical
+repository. `C-c g F` starts the same operation for every allowlisted
 repository with a bounded concurrency limit; duplicate identities still
 coalesce to one job:
 
@@ -870,7 +873,7 @@ visual quality. Later workers do not begin on top of an unaccepted phase.
 - `q` returns to the correct caller and restores windows.
 - Navigation through status, log, topic, commit, and unified diff preserves the
   window count.
-- `o` and `|` create at most one comparison window and reuse it.
+- `o` creates at most one comparison window and reuses it.
 - Search, copy, file stepping, commit stepping, and hunk stepping.
 - Changes Tree directory collapse, file opening, path search, reviewed toggles,
   partial directory state, and review progress after a changed PR head.
@@ -942,14 +945,14 @@ These defaults follow the buffer-first philosophy and are recommended unless
 the owner changes them:
 
 - [ ] **Window model:** every normal navigation action replaces the selected
-      buffer. Only `o` and `|` create/reuse a second window.
+      buffer. Only `o` creates/reuses a second window.
 - [ ] **Evil state model:** generated status/review/topic buffers stay read-only
       and in normal state. Editing opens a real source or Markdown buffer.
-- [ ] **Key model:** preserve Vim `n`/`N` search behavior; use bracket motions
-      for files, hunks, and commits; retain `J`/`K` as eight-line movement.
+- [ ] **Key model:** preserve Vim `n`/`N` search behavior; use mnemonic `g`
+      motions for files, hunks, and commits; retain `H/J/K/L` movement.
 - [ ] **Diff model:** a fast unified red/green/black Magit buffer is the default
-      overview; `|` opens the source-aware two-window detail; `D` is optional
-      Difftastic.
+      overview; `o` opens the explicit second view; optional Difftastic stays
+      behind its Transient/`M-x` command.
 - [ ] **Entry point:** `C-c g` opens status in the current window and presents
       the Git Transient; `C-x g` remains direct status.
 - [ ] **Data model:** Forge SQLite remains the single authoritative store for
@@ -959,8 +962,9 @@ the owner changes them:
 - [ ] **Local/remote boundary:** PRs, issues, remote commits, and immutable diffs
       are shared by canonical identity; branch, index, and working-tree state
       remain local-context-specific.
-- [ ] **Network model:** opening and `gr` are offline-only. `@` syncs the current
-      repository; `C-c g F` syncs all registered repositories asynchronously.
+- [ ] **Network model:** opening and `gr` are offline-only. `C-c g f` syncs the
+      current repository; `C-c g F` syncs allowlisted repositories
+      asynchronously.
 - [ ] **Clone safety:** existing clones are never rewritten to depend on the
       mirror. Importing objects into a clone is an explicit local copy.
 - [ ] **Provider scope:** GitHub is the first complete CI adapter. Forge topic
@@ -977,8 +981,8 @@ explicitly:
 
 1. Should generated read-only buffers reject insert state as recommended, or
    should `i` enter a read-only insert state with navigation commands rebound?
-2. Should unified diff remain the default overview with side-by-side on `|`, or
-   should every changed file open side-by-side by default?
+2. Should unified diff remain the default overview with an explicit second view
+   on `o`, or should every changed file open side-by-side by default?
 3. Should global sync cover every repository ever registered, or only a
    user-maintained allowlist of active repositories? The allowlist is safer for
    credentials, archived projects, and API usage.
@@ -996,7 +1000,7 @@ After one explicit synchronization, the workflow is:
 7. Select a local context and edit the real source in an ordinary buffer.
 8. Write replies or comments in an ordinary Markdown buffer.
 9. Return to the review buffer and refresh locally.
-10. Press `@` only when new remote data is wanted.
+10. Press `C-c g f` only when new remote data is wanted.
 
 The result remains recognizably Emacs and Magit: buffers, sections, modes,
 keys, source files, and local data rather than a browser embedded in the

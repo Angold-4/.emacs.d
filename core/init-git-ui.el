@@ -362,22 +362,42 @@ branch must be updated."
 (defun +git-review-visit ()
   "Primary visit in the selected window via Magit/Forge remappings."
   (interactive)
-  (if (derived-mode-p '+git-changes-tree-mode)
-      (+git-changes-tree-visit-file)
+  (cond
+   ((derived-mode-p '+git-changes-tree-mode)
+    (+git-changes-tree-visit-file))
+   ;; File sections in the PR overview intentionally carry a
+   ;; `+git-review-file' record.  Magit's section-local remapping wins over
+   ;; the PR major-mode remapping and expects a string path, so dispatch the
+   ;; workspace explicitly instead of handing that record to Magit.
+   ((and (derived-mode-p '+git-pr-mode)
+         (fboundp '+git-pr-visit))
+    (let ((state (+git-review--capture-return))
+          (before (current-buffer)))
+      (call-interactively #'+git-pr-visit)
+      (+git-review--apply-return before state)))
+   (t
     (let ((state (+git-review--capture-return))
           (before (current-buffer)))
       (+git-review--call-visit-thing)
-      (+git-review--apply-return before state))))
+      (+git-review--apply-return before state)))))
 
 (defun +git-review-visit-other-window ()
   "Primary visit in the reusable right-hand window."
   (interactive)
-  (if (derived-mode-p '+git-changes-tree-mode)
-      (+git-changes-tree-visit-other-window)
+  (cond
+   ((derived-mode-p '+git-changes-tree-mode)
+    (+git-changes-tree-visit-other-window))
+   ((and (derived-mode-p '+git-pr-mode)
+         (fboundp '+git-pr-visit))
+    (let ((state (+git-review--capture-return))
+          (before (current-buffer)))
+      (+git-pr-visit t)
+      (+git-review--apply-return before state)))
+   (t
     (let ((state (+git-review--capture-return))
           (before (current-buffer)))
       (+git-review--call-visit-thing-other-window)
-      (+git-review--apply-return before state))))
+      (+git-review--apply-return before state)))))
 
 (defun +git-review-quit (&optional _kill-buffer)
   "Return to the recorded caller/layout, or bury the Magit buffer.
@@ -457,10 +477,11 @@ context first so a deleted originating clone does not break `gr'."
     (+git-review--enter-normal-state)))
 
 (defun +git-review--maybe-enable ()
-  "Enable `+git-review-buffer-mode' in Magit/Forge/Changes Tree views."
+  "Enable `+git-review-buffer-mode' in Magit/Forge/Changes Tree/PR views."
   (when (or (derived-mode-p 'magit-mode)
             (derived-mode-p 'forge-topic-mode)
             (derived-mode-p '+git-changes-tree-mode)
+            (derived-mode-p '+git-pr-mode)
             (bound-and-true-p magit-blob-mode))
     (+git-review-buffer-mode 1)))
 
@@ -468,32 +489,30 @@ context first so a deleted originating clone does not break `gr'."
   "Bind the Phase 1 review vocabulary in Evil normal state."
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +git-review-buffer-mode-map
+      "h" #'evil-backward-char
       "j" #'evil-next-visual-line
       "k" #'evil-previous-visual-line
-      "J" #'+git-review-move-visual-lines-down
-      "K" #'+git-review-move-visual-lines-up
+      "l" #'evil-forward-char
+      "H" #'evil-beginning-of-line
+      "J" #'+evil/move-lines-down
+      "K" #'+evil/move-lines-up
+      "L" #'evil-end-of-line
       (kbd "TAB") #'+git-review-section-toggle
       (kbd "<backtab>") #'magit-section-cycle-global
       (kbd "RET") #'+git-review-visit
       "e" #'+git-review-visit-worktree
       "o" #'+git-review-visit-other-window
-      "|" #'+git-review-visit-other-window
       "t" #'+git-review-open-changes-tree
-      "]f" #'+git-review-next-file
-      "[f" #'+git-review-prev-file
-      "]h" #'+git-review-next-hunk
-      "[h" #'+git-review-prev-hunk
-      "]c" #'+git-review-next-commit
-      "[c" #'+git-review-prev-commit
+      "gf" #'+git-review-next-file
+      "gF" #'+git-review-prev-file
+      "gh" #'+git-review-next-hunk
+      "gH" #'+git-review-prev-hunk
+      "gc" #'+git-review-next-commit
+      "gC" #'+git-review-prev-commit
       "n" #'evil-search-next
       "N" #'evil-search-previous
       "gr" #'+git-review-refresh
-      "@" #'+git/sync
-      "L" #'+git-review-select-edit-context
       "q" #'+git-review-quit
-      "+" #'+git/increase-context
-      "=" #'+git/increase-context
-      "-" #'+git/decrease-context
       "/" #'evil-search-forward
       "?" #'evil-search-backward
       (kbd "C-h") #'windmove-left
@@ -566,16 +585,16 @@ Far below N-files so accidental per-file loops fail tests loudly.")
   "Buffer-local hash table: path -> fingerprint for currently reviewed files.")
 
 (defvar-local +git-review-edit-context-id nil
-  "Active edit context id for shared immutable commit review buffers.
+  "Active edit context id for shared immutable review buffers.
 Separate from immutable target identity so reopen/reuse does not mutate
-the reviewed commit identity.")
+the reviewed commit/PR identity.")
 
 (cl-defstruct (+git-review-target
                (:constructor +git-review-target--create)
                (:copier nil))
   "Explicit local review target.  Never reconstructed from rendered text."
   root           ; absolute repository root (originating context)
-  scope          ; worktree | staged | commit | branch
+  scope          ; worktree | staged | commit | branch | pullreq
   base-ref       ; symbolic base label (or nil)
   base-oid       ; resolved base object ID
   head-ref       ; symbolic head label (or nil)
@@ -584,7 +603,8 @@ the reviewed commit identity.")
   overview-id    ; stable overview buffer identity
   mutable-p      ; non-nil when stage/unstage/discard are allowed
   repository-id  ; canonical repository identity (Phase 3)
-  context-id)    ; originating local context identity (Phase 3)
+  context-id     ; originating local context identity (Phase 3)
+  pr-number)     ; Phase 5: integer PR number when scope is pullreq
 
 (cl-defstruct (+git-review-file
                (:constructor +git-review-file-create)
@@ -667,7 +687,8 @@ Increments `+git-review--git-process-count'.  Never builds a shell string."
   "Return ROOT as an absolute directory path with trailing slash removed."
   (directory-file-name (expand-file-name root)))
 
-(defun +git-review--legacy-family-id (root scope base-ref head-ref head-oid)
+(defun +git-review--legacy-family-id (root scope base-ref head-ref head-oid
+                                           &optional pr-number)
   "Return the Phase 2 root-based family id for legacy state migration."
   (let ((root (+git-review--normalize-root root)))
     (pcase scope
@@ -680,22 +701,27 @@ Increments `+git-review--git-process-count'.  Never builds a shell string."
                root
                (or base-ref "")
                (or head-ref "")))
+      ('pullreq
+       (format "git-review:pr:%s:%s" root (or pr-number 0)))
       (_ (error "Unknown review scope: %S" scope)))))
 
 (defun +git-review--make-ids (repository-id context-id root scope
                                             base-ref head-ref
-                                            base-oid head-oid)
+                                            base-oid head-oid
+                                            &optional pr-number)
   "Return (FAMILY-ID . OVERVIEW-ID) for SCOPE under REPOSITORY-ID.
 
 FAMILY-ID is the persistence identity:
 - worktree/staged: repository-id + context-id (never shared across clones)
 - branch: repository-id + context-id + symbolic base/head labels
 - commit: repository-id + resolved head OID (shared across same-origin clones)
+- pullreq: repository-id + PR number (shared; head advance reuses state)
 
 OVERVIEW-ID is the immutable buffer-reuse identity:
 - worktree/staged: stable so refresh reuses buffers
 - branch: includes resolved base/head OIDs so advancing creates a new buffer
 - commit: repository-id + resolved OIDs (shared across same-origin clones)
+- pullreq: repository-id + PR number (stable across head OID changes)
 
 ROOT is retained only for legacy Phase 2 state migration lookups."
   (let* ((repo (or repository-id
@@ -712,6 +738,8 @@ ROOT is retained only for legacy Phase 2 state migration lookups."
                             repo ctx
                             (or base-ref "")
                             (or head-ref "")))
+                   ('pullreq
+                    (format "git-review:pr:%s:%s" repo (or pr-number 0)))
                    (_ (error "Unknown review scope: %S" scope))))
          (overview (pcase scope
                      ((or 'worktree 'staged)
@@ -724,21 +752,27 @@ ROOT is retained only for legacy Phase 2 state migration lookups."
                      ('branch
                       (format "git-review:branch:%s:%s:%s:%s:overview"
                               repo ctx base-oid head-oid))
+                     ('pullreq
+                      (format "git-review:pr:%s:%s:overview"
+                              repo (or pr-number 0)))
                      (_ (error "Unknown review scope: %S" scope)))))
     (cons family overview)))
 
 (defun +git-review-make-target (root scope &optional base-ref head-ref
                                      base-oid head-oid
-                                     repository-id context-id)
+                                     repository-id context-id
+                                     pr-number)
   "Construct a `+git-review-target' for ROOT and SCOPE.
 BASE-REF/HEAD-REF are display labels and persistence selectors.
 BASE-OID/HEAD-OID are resolved object IDs when applicable.
-REPOSITORY-ID and CONTEXT-ID come from the store when available."
+REPOSITORY-ID and CONTEXT-ID come from the store when available.
+PR-NUMBER is required when SCOPE is `pullreq'."
   (let* ((root (+git-review--normalize-root root))
          (mutable (and (memq scope '(worktree staged)) t))
          (ids (+git-review--make-ids repository-id context-id root scope
                                      base-ref head-ref
-                                     base-oid head-oid)))
+                                     base-oid head-oid
+                                     pr-number)))
     (+git-review-target--create
      :root root
      :scope scope
@@ -750,7 +784,8 @@ REPOSITORY-ID and CONTEXT-ID come from the store when available."
      :overview-id (cdr ids)
      :mutable-p mutable
      :repository-id repository-id
-     :context-id context-id)))
+     :context-id context-id
+     :pr-number pr-number)))
 
 (defun +git-review--require-root ()
   "Return the Magit toplevel or signal a user error."
@@ -823,13 +858,33 @@ Root commits use `+git-review-empty-tree' as the base."
      (+git-store-local-context-repository-id ctx)
      (+git-store-local-context-context-id ctx))))
 
+(defun +git-review-target-for-pullreq (repository-id number
+                                                     merge-base-oid head-oid
+                                                     &optional root
+                                                     context-id
+                                                     base-ref head-ref)
+  "Build a read-only PR review target for REPOSITORY-ID and NUMBER.
+MERGE-BASE-OID..HEAD-OID is the exact review range."
+  (let* ((root (+git-review--normalize-root
+                (or root (+git-review--require-root))))
+         (ctx-id (or context-id
+                     (+git-store-local-context-context-id
+                      (+git-review--context-for-root root)))))
+    (+git-review-make-target
+     root 'pullreq
+     (or base-ref "base")
+     (or head-ref (format "PR#%s" number))
+     merge-base-oid head-oid
+     repository-id ctx-id
+     number)))
+
 (defun +git-review-target-range-args (target)
   "Return (RANGE TYPEARG) Git diff arguments for TARGET.
 RANGE is a string or nil.  TYPEARG is \"--cached\" or nil."
   (pcase (+git-review-target-scope target)
     ('worktree (list (+git-review-target-base-oid target) nil))
     ('staged (list (+git-review-target-base-oid target) "--cached"))
-    ((or 'commit 'branch)
+    ((or 'commit 'branch 'pullreq)
      (list (format "%s..%s"
                    (+git-review-target-base-oid target)
                    (+git-review-target-head-oid target))
@@ -848,15 +903,45 @@ RANGE is a string or nil.  TYPEARG is \"--cached\" or nil."
         "--find-copies-harder"))
 
 ;; ---------------------------------------------------------------------------
-;; Active edit context (Phase 3)
+;; Active edit context (Phase 3 / Phase 5)
 ;; ---------------------------------------------------------------------------
 
+(defun +git-review--shareable-p (&optional target)
+  "Return non-nil when TARGET is a shareable immutable review (commit or PR).
+PR commit children (commit scope with a PR number) are shareable too."
+  (let ((target (or target
+                    (and (bound-and-true-p +git-review-target)
+                         +git-review-target))))
+    (and target
+         (or (memq (+git-review-target-scope target) '(commit pullreq))
+             (+git-review--pr-backed-p target)))))
 (defun +git-review--shareable-commit-p (&optional target)
-  "Return non-nil when TARGET is a shareable immutable commit review."
+  "Return non-nil when TARGET is a shareable immutable commit review.
+Kept for callers that need commit-only behavior; prefer
+`+git-review--shareable-p' for edit-context switching."
   (let ((target (or target
                     (and (bound-and-true-p +git-review-target)
                          +git-review-target))))
     (and target (eq (+git-review-target-scope target) 'commit))))
+
+(defun +git-review--pr-backed-p (&optional target)
+  "Return non-nil when TARGET reads Git objects from the published mirror.
+True for `pullreq' scopes and for commit children that carry a PR number."
+  (let ((target (or target
+                    (and (bound-and-true-p +git-review-target)
+                         +git-review-target))))
+    (and target
+         (or (eq (+git-review-target-scope target) 'pullreq)
+             (and (eq (+git-review-target-scope target) 'commit)
+                  (integerp (+git-review-target-pr-number target)))))))
+
+(defun +git-review--edit-context-oids (target)
+  "Return OIDs that must exist in an edit context for TARGET, or nil.
+PR reviews and PR commit children read Git objects from the published
+mirror, so edit-context eligibility is repository-identity only."
+  (when (and (+git-review--shareable-commit-p target)
+             (not (+git-review--pr-backed-p target)))
+    (+git-review--target-required-oids target)))
 
 (defun +git-review--target-required-oids (target)
   "Return object IDs that must exist in an edit context for TARGET.
@@ -868,40 +953,57 @@ Skips the well-known empty tree, which may not be materialized."
    (list (+git-review-target-base-oid target)
          (+git-review-target-head-oid target))))
 
+(defun +git-review--published-mirror-root (repository-id)
+  "Return the published bare mirror for REPOSITORY-ID, or signal."
+  (let ((mirror (and (fboundp '+git-sync-published-mirror-directory)
+                     (+git-sync-published-mirror-directory repository-id))))
+    (unless (and mirror
+                 (file-directory-p mirror)
+                 (file-exists-p (expand-file-name "HEAD" mirror)))
+      (user-error
+       (concat "No published mirror for %s. "
+               "Run C-c g f, wait for sync, then retry.")
+       repository-id))
+    mirror))
+
 (defun +git-review--git-root-for-target (target)
-  "Return the worktree root for Git operations on TARGET.
-Shareable commit reviews use the active/eligible edit context so a
-deleted originating clone does not break refresh.  Local worktree,
-staged, and branch reviews always use the originating root.
-Does not change canonical family-id or overview-id."
-  (if (+git-review--shareable-commit-p target)
-      (let* ((preferred
-              (or (and (bound-and-true-p +git-review-edit-context-id)
-                       +git-review-edit-context-id)
-                  (+git-review-target-context-id target)))
-             (oids (+git-review--target-required-oids target))
-             (repo-id (+git-review-target-repository-id target))
-             (preferred-ctx (and preferred
-                                 (+git-store-get-context preferred)))
-             (ctx
-              (cond
-               ((+git-store-context-eligible-p preferred-ctx repo-id oids)
-                preferred-ctx)
-               (t
-                (+git-store-default-edit-context repo-id preferred oids)))))
-        (unless ctx
-          (user-error
-           "No eligible local context for this commit review"))
-        (when (and (bound-and-true-p +git-review-target)
-                   (equal (+git-review-target-overview-id +git-review-target)
-                          (+git-review-target-overview-id target)))
-          (setq-local +git-review-edit-context-id
-                      (+git-store-local-context-context-id ctx)))
-        (+git-store-local-context-root ctx))
-    (+git-review-target-root target)))
+  "Return the Git directory used for object/diff operations on TARGET.
+PR reviews and PR commit children use the Phase 4 published bare mirror.
+Ordinary shareable commit reviews use the active/eligible edit context.
+Local worktree, staged, and branch reviews always use the originating
+root."
+  (cond
+   ((+git-review--pr-backed-p target)
+    (+git-review--published-mirror-root
+     (+git-review-target-repository-id target)))
+   ((+git-review--shareable-commit-p target)
+    (let* ((preferred
+            (or (and (bound-and-true-p +git-review-edit-context-id)
+                     +git-review-edit-context-id)
+                (+git-review-target-context-id target)))
+           (oids (+git-review--target-required-oids target))
+           (repo-id (+git-review-target-repository-id target))
+           (preferred-ctx (and preferred
+                               (+git-store-get-context preferred)))
+           (ctx
+            (cond
+             ((+git-store-context-eligible-p preferred-ctx repo-id oids)
+              preferred-ctx)
+             (t
+              (+git-store-default-edit-context repo-id preferred oids)))))
+      (unless ctx
+        (user-error
+         "No eligible local context for this commit review"))
+      (when (and (bound-and-true-p +git-review-target)
+                 (equal (+git-review-target-overview-id +git-review-target)
+                        (+git-review-target-overview-id target)))
+        (setq-local +git-review-edit-context-id
+                    (+git-store-local-context-context-id ctx)))
+      (+git-store-local-context-root ctx)))
+   (t (+git-review-target-root target))))
 
 (defun +git-review--bind-operational-directory (root)
-  "Bind Magit and buffer directories to absolute ROOT for refresh/`e'."
+  "Bind Magit and buffer directories to absolute object-operation ROOT."
   (let ((root (file-name-as-directory (expand-file-name root))))
     (setq-local default-directory root)
     (when (boundp 'magit--default-directory)
@@ -910,27 +1012,25 @@ Does not change canonical family-id or overview-id."
 
 (defun +git-review--adopt-reopening-context (target)
   "Adopt TARGET's originating clone as this buffer's active edit context.
-Only for shareable commit reviews, and only when that context is live
-for TARGET's repository and contains the required OIDs.  Updates Magit
-directory locals so refresh and `e' use the reopening clone.  Immutable
-review identity is unchanged."
-  (when (+git-review--shareable-commit-p target)
+Only for shareable immutable reviews, and only when that context is live
+for TARGET's repository.  Then derives Magit's operational directory from
+TARGET: an eligible clone for ordinary commits, or the published mirror for
+PR/PR-commit objects.  Immutable review identity is unchanged."
+  (when (+git-review--shareable-p target)
     (let* ((ctx-id (+git-review-target-context-id target))
            (ctx (+git-store-get-context ctx-id))
-           (oids (+git-review--target-required-oids target))
+           (oids (+git-review--edit-context-oids target))
            (repo-id (+git-review-target-repository-id target)))
       (cond
        ((+git-store-context-eligible-p ctx repo-id oids)
-        (setq-local +git-review-edit-context-id ctx-id)
-        (+git-review--bind-operational-directory
-         (+git-store-local-context-root ctx)))
+        (setq-local +git-review-edit-context-id ctx-id))
        (t
-        (+git-review--ensure-edit-context target)
-        (+git-review--bind-operational-directory
-         (+git-review--git-root-for-target target))))
+        (+git-review--ensure-edit-context target)))
       (+git-store-remember-shared-buffer
        (+git-review-target-repository-id target)
        (current-buffer))))
+  (+git-review--bind-operational-directory
+   (+git-review--git-root-for-target target))
   target)
 
 (defun +git-review--identity-suffix (&optional target edit-context-id)
@@ -951,20 +1051,21 @@ Example: \"repo: github.com/org/dragon | context: ~/work/dragon\""
 
 (defun +git-review--ensure-edit-context (&optional target)
   "Ensure `+git-review-edit-context-id' is set for TARGET in the current buffer.
-For shareable commit reviews, prefer an eligible live context.  For
-local scopes, lock to the originating context."
+For shareable reviews, prefer an eligible live context.  For local scopes,
+lock to the originating context.  PR reviews do not require commit OIDs
+in the edit context."
   (when-let ((target (or target +git-review-target)))
     (let* ((repo-id (+git-review-target-repository-id target))
            (origin (+git-review-target-context-id target))
-           (oids (+git-review--target-required-oids target))
+           (oids (+git-review--edit-context-oids target))
            (chosen
-            (if (+git-review--shareable-commit-p target)
+            (if (+git-review--shareable-p target)
                 (or (+git-store-default-edit-context
                      repo-id
                      (or +git-review-edit-context-id origin)
                      oids)
                     (user-error
-                     "No registered local context contains the reviewed commit"))
+                     "No registered local context for this shared review"))
               (or (+git-store-get-context origin)
                   (+git-store-context-for-root
                    (+git-review-target-root target))))))
@@ -983,13 +1084,12 @@ so Phase 1 Magit status/diff `e' visits keep working."
         (or (and (fboundp 'magit-toplevel) (magit-toplevel))
             (user-error "Not inside a Git repository"))
       (let* ((repo-id (+git-review-target-repository-id target))
-             (oids (and (+git-review--shareable-commit-p target)
-                        (+git-review--target-required-oids target)))
+             (oids (+git-review--edit-context-oids target))
              (ctx (+git-review--ensure-edit-context target)))
         (unless (+git-store-context-eligible-p ctx repo-id oids)
           ;; Originating context disappeared or was re-homed: try another
-          ;; eligible context for shareable commits, otherwise signal.
-          (if (+git-review--shareable-commit-p target)
+          ;; eligible context for shareable reviews, otherwise signal.
+          (if (+git-review--shareable-p target)
               (let ((fallback
                      (+git-store-default-edit-context repo-id nil oids)))
                 (unless fallback
@@ -1005,24 +1105,57 @@ so Phase 1 Magit status/diff `e' visits keep working."
 
 (defun +git-review-visit-worktree ()
   "Visit the writable worktree file for the diff or tree file at point.
-Uses the active edit context root for shared immutable commit reviews.
+Uses the active edit context root for shared immutable commit/PR reviews.
 Signals a clear user error when no writable worktree target exists.
 Does not force Insert state.  Generated per-file buffers may fall back to
 buffer-local `+git-review-file-path' when Magit file sections are missing."
   (interactive)
-  (if (derived-mode-p '+git-changes-tree-mode)
-      (let* ((file (+git-review--file-at-tree-point))
-             (root (+git-review--active-edit-root))
-             (rel (and file (+git-review-file-path file)))
-             (full (and rel root (expand-file-name rel root))))
-        (unless (and full (file-exists-p full) (not (file-directory-p full)))
-          (user-error "No writable worktree target at point"))
+  (cond
+   ((derived-mode-p '+git-pr-mode)
+    (let* ((file (and (fboundp '+git-pr--file-at-point)
+                      (+git-pr--file-at-point)))
+           (root (+git-review--active-edit-root))
+           (rel (and file (+git-review-file-path file)))
+           (full (and rel root (expand-file-name rel root))))
+      (cond
+       ((null file)
+        (user-error "No file at point"))
+       ((eq (+git-review-file-status file) 'deleted)
+        (user-error "File `%s' was deleted in this review; no worktree target"
+                    rel))
+       ((eq (+git-review-file-status file) 'submodule)
+        (user-error
+         "Submodule/gitlink `%s' - open that repository separately"
+         rel))
+       ((not (and full (file-exists-p full) (not (file-directory-p full))))
+        (user-error "No writable worktree file at `%s' in edit context %s"
+                    (or rel "?") root))
+       (t
         (let ((state (+git-review--capture-return))
               (before (current-buffer)))
           (find-file full)
           (let ((after (current-buffer)))
             (when (and (not (eq after before)) (buffer-live-p after))
-              (+git-review--enable-return-on-buffer after state)))))
+              (+git-review--enable-return-on-buffer after state))))))))
+   ((derived-mode-p '+git-changes-tree-mode)
+    (let* ((file (+git-review--file-at-tree-point))
+           (root (+git-review--active-edit-root))
+           (rel (and file (+git-review-file-path file)))
+           (full (and rel root (expand-file-name rel root))))
+      (cond
+       ((and file (eq (+git-review-file-status file) 'deleted))
+        (user-error "File `%s' was deleted in this review; no worktree target"
+                    rel))
+       ((not (and full (file-exists-p full) (not (file-directory-p full))))
+        (user-error "No writable worktree target at point"))
+       (t
+        (let ((state (+git-review--capture-return))
+              (before (current-buffer)))
+          (find-file full)
+          (let ((after (current-buffer)))
+            (when (and (not (eq after before)) (buffer-live-p after))
+              (+git-review--enable-return-on-buffer after state))))))))
+   (t
     (let* ((has-target (bound-and-true-p +git-review-target))
            (root (+git-review--active-edit-root))
            (origin-root (or (and has-target
@@ -1049,12 +1182,8 @@ buffer-local `+git-review-file-path' when Magit file sections are missing."
               (before (current-buffer)))
           (condition-case err
               (cond
-               ;; Phase 3 shareable reviews: always open via the active
-               ;; edit context root, never Magit's originating directory.
-               ((and has-target (+git-review--shareable-commit-p))
+               ((and has-target (+git-review--shareable-p))
                 (find-file full))
-               ;; Prefer Magit's native visit when the edit root matches
-               ;; the Magit repository (Phase 1 / local reviews).
                ((and magit-file (equal root origin-root))
                 (magit-diff-visit-worktree-file nil))
                (t (find-file full)))
@@ -1067,21 +1196,21 @@ buffer-local `+git-review-file-path' when Magit file sections are missing."
                  (signal (car err) (cdr err))))))
           (let ((after (current-buffer)))
             (when (and (not (eq after before)) (buffer-live-p after))
-              (+git-review--enable-return-on-buffer after state)))))))))
+              (+git-review--enable-return-on-buffer after state))))))))))
 
 (defun +git-review-set-edit-context (context-id &optional target)
   "Set the active edit context to CONTEXT-ID for TARGET (noninteractive).
-Shareable commit reviews may select any eligible live context for the
+Shareable commit/PR reviews may select any eligible live context for the
 same canonical repository.  Worktree/staged/branch reviews reject
 retargeting.  Returns the chosen `+git-store-local-context'."
   (let* ((target (or target +git-review-target
                      (user-error "No review target")))
          (repo-id (+git-review-target-repository-id target))
          (ctx (+git-store-get-context context-id))
-         (oids (+git-review--target-required-oids target)))
+         (oids (+git-review--edit-context-oids target)))
     (unless ctx
       (user-error "Unknown local context `%s'" context-id))
-    (unless (+git-review--shareable-commit-p target)
+    (unless (+git-review--shareable-p target)
       (user-error
        "Worktree, staged, and local branch reviews are fixed to their originating context (%s)"
        (+git-review-target-root target)))
@@ -1099,7 +1228,7 @@ retargeting.  Returns the chosen `+git-store-local-context'."
          (+git-store-local-context-root ctx)))))
     (setq-local +git-review-edit-context-id context-id)
     (+git-review--bind-operational-directory
-     (+git-store-local-context-root ctx))
+     (+git-review--git-root-for-target target))
     (message "Edit context: %s" (+git-store-local-context-root ctx))
     ctx))
 
@@ -1113,18 +1242,20 @@ behavior (selection does not change windows)."
     (user-error "No review target in this buffer"))
   (let* ((target +git-review-target)
          (repo-id (+git-review-target-repository-id target)))
-    (unless (+git-review--shareable-commit-p target)
+    (unless (+git-review--shareable-p target)
       (user-error
-       "Worktree, staged, and local branch reviews are fixed to their originating context (%s); L only applies to shared commit reviews"
+       "Worktree, staged, and local branch reviews are fixed to their originating context (%s); L only applies to shared commit/PR reviews"
        (+git-review-target-root target)))
-    (let* ((oids (+git-review--target-required-oids target))
-           (eligible (+git-store-eligible-contexts-for-oids repo-id oids))
+    (let* ((oids (+git-review--edit-context-oids target))
+           (eligible (if oids
+                         (+git-store-eligible-contexts-for-oids repo-id oids)
+                       (+git-store-list-live-contexts repo-id)))
            (chosen-id
             (or context-id
                 (progn
                   (unless eligible
                     (user-error
-                     "No registered local context contains the reviewed commit"))
+                     "No registered local context for this shared review"))
                   (let* ((collection
                           (mapcar
                            (lambda (ctx)
@@ -1438,7 +1569,8 @@ Shareable commit reviews collect from the operational edit-context root."
                   (+git-review-target-scope target)
                   (+git-review-target-base-ref target)
                   (+git-review-target-head-ref target)
-                  (+git-review-target-head-oid target)))
+                  (+git-review-target-head-oid target)
+                  (+git-review-target-pr-number target)))
          (current (+git-review-target-family-id target)))
     (unless (equal legacy current)
       (+git-review--state-file-for-family legacy))))
@@ -1838,8 +1970,6 @@ branch creates a new tree while worktree/staged still reuse."
             (setq-local +git-review-target target)
             (+git-review--adopt-reopening-context target)
             (magit-refresh)
-            (+git-review--bind-operational-directory
-             (+git-review--git-root-for-target target))
             (+git-review--enter-normal-state)))
       (let ((default-directory
              (file-name-as-directory
@@ -1941,10 +2071,11 @@ Uses Magit's washer so section markers stay complete."
 
 (defun +git-review--magit-diff-locked-p (target &optional files)
   "Return non-nil when Magit should lock the buffer to its value.
-Immutable commit/branch reviews always lock so advancing resolved OIDs
-creates a new buffer.  File-specific diffs lock so they do not steal the
-overview buffer (`magit-diff-buffer-file-locked' convention)."
-  (or (memq (+git-review-target-scope target) '(commit branch))
+Immutable commit/branch/PR reviews always lock so advancing resolved OIDs
+creates a new buffer (PR overview identity itself is stable and separate).
+File-specific diffs lock so they do not steal the overview buffer
+(`magit-diff-buffer-file-locked' convention)."
+  (or (memq (+git-review-target-scope target) '(commit branch pullreq))
       (and files t)))
 
 (defun +git-review--open-overview (target)
@@ -1971,8 +2102,6 @@ overview buffer (`magit-diff-buffer-file-locked' convention)."
             (+git-review--sync-magit-diff-state target nil)
             (+git-review--maybe-install-untracked-overview target nil)
             (magit-refresh)
-            (+git-review--bind-operational-directory
-             (+git-review--git-root-for-target target))
             (+git-review--enter-normal-state)))
       (let ((default-directory
              (file-name-as-directory
@@ -2018,11 +2147,17 @@ overview buffer (`magit-diff-buffer-file-locked' convention)."
 (defun +git-review-open-changes-tree (&optional target)
   "Open or reuse the Changes Tree for TARGET or the current buffer target."
   (interactive)
-  (let ((target (or target
-                    (and (bound-and-true-p +git-review-target)
-                         +git-review-target)
-                    (+git-review-target-for-worktree))))
-    (+git-changes-tree-setup-buffer target)))
+  ;; The shared review minor mode owns `t', so PR buffers arrive here before
+  ;; their major-mode binding.  Dispatch explicitly instead of opening a tree
+  ;; from a possibly stale PR target after a mirror generation changes.
+  (if (and (bound-and-true-p +git-pr--model)
+           (fboundp '+git-pr-open-changes-tree))
+      (+git-pr-open-changes-tree)
+    (let ((target (or target
+                      (and (bound-and-true-p +git-review-target)
+                           +git-review-target)
+                      (+git-review-target-for-worktree))))
+      (+git-changes-tree-setup-buffer target))))
 
 ;; ---------------------------------------------------------------------------
 ;; Per-file unified diffs
@@ -2250,8 +2385,6 @@ survives `gr'."
           (magit-refresh)
           (when (eq status 'copied)
             (+git-review--install-status-presentation status old-path))))
-        (+git-review--bind-operational-directory
-         (+git-review--git-root-for-target target))
         (+git-review--enter-normal-state)))
      (t
       ;; Only let-bind default-directory when creating a new Magit buffer.
@@ -2306,10 +2439,25 @@ survives `gr'."
 (defun +git-changes-tree-visit-file (&optional other-window)
   "Visit the unified diff for the Changes Tree file at point."
   (interactive "P")
-  (let ((file (+git-review--file-at-tree-point)))
-    (unless file
-      (user-error "No changed file at point"))
-    (+git-review-open-file-diff +git-review-target file other-window)))
+  (let* ((old-file (+git-review--file-at-tree-point))
+         (path (and old-file (+git-review-file-path old-file))))
+    ;; A mirror can be atomically replaced while this tree remains open.
+    ;; Refresh the cached PR target before handing its range to Magit.
+    (when (and path
+               (bound-and-true-p +git-pr--model)
+               (fboundp '+git-pr--ensure-current-model))
+      (+git-pr--ensure-current-model t))
+    (let ((file (and path
+                     (cl-find path +git-review--files
+                              :key #'+git-review-file-path
+                              :test #'equal))))
+      (unless file
+        (user-error
+         (if path
+             "File %s is no longer part of the current PR range"
+           "No changed file at point")
+         path))
+      (+git-review-open-file-diff +git-review-target file other-window))))
 
 (defun +git-changes-tree-visit-other-window ()
   "Visit the file diff at point in the reusable right-hand window."
@@ -2438,7 +2586,7 @@ Never stages, unstages, discards, or modifies Git files."
   (advice-add 'magit-delta-mode :after #'+git/undo-delta-face-remap))
 
 ;; =============================================================================
-;; difftastic — optional AST-aware structural diffs (explicit D/d only)
+;; difftastic — optional AST-aware structural diffs (Transient/M-x only)
 ;; =============================================================================
 
 (use-package difftastic
@@ -2524,21 +2672,11 @@ Never stages, unstages, discards, or modifies Git files."
                  (not (one-window-p)))
         (delete-window win))))
 
-  (defun +difftastic/setup-evil-keys ()
-    "Bind explicit `D' to difftastic in Magit buffers (not `d')."
-    (when (bound-and-true-p evil-mode)
-      (evil-local-set-key 'normal (kbd "D") #'+difftastic/full)))
-
   (defun +difftastic/setup-buffer-keys ()
     "Inside a difftastic buffer, bind `q' to quit + kill."
     (when (bound-and-true-p evil-mode)
       (evil-local-set-key 'normal (kbd "q") #'+difftastic/quit))
     (local-set-key (kbd "q") #'+difftastic/quit))
-
-  (dolist (hook '(magit-status-mode-hook
-                  magit-diff-mode-hook
-                  magit-revision-mode-hook))
-    (add-hook hook #'+difftastic/setup-evil-keys))
 
   (add-hook 'difftastic-mode-hook #'+difftastic/setup-buffer-keys)
 
@@ -2547,5 +2685,7 @@ Never stages, unstages, discards, or modifies Git files."
       (transient-append-suffix prefix '(-1 -1)
         [("D" "Difftastic diff (dwim)" difftastic-magit-diff)
          ("S" "Difftastic show"        difftastic-magit-show)]))))
+
+(provide 'init-git-ui)
 
 ;;; init-git-ui.el ends here

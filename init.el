@@ -30,6 +30,8 @@
 ;; - init-git-store.el: Canonical repository identity and local contexts
 ;; - init-git-sync.el : Shared mirror and explicit synchronization
 ;; - init-git-ui.el   : Review display, Evil mode, native visits
+;; - init-forge.el    : Forge package ownership and cached PR adapter
+;; - init-git-pr.el   : Shared pull-request review workspace
 
 ;;; Code:
 
@@ -150,6 +152,8 @@
     init-git-store  ; Canonical repository identity and local contexts
     init-git-sync   ; Shared mirror and explicit synchronization
     init-git-ui     ; Review display, Evil mode, native visits
+    init-forge      ; Forge package ownership and cached PR adapter
+    init-git-pr     ; Shared pull-request review workspace
     )
   "List of configuration modules to load.")
 ;; Load all modules

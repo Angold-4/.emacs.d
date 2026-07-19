@@ -13,8 +13,9 @@
 ;;   with a publish-intent + backup restore protocol so state-write failure
 ;;   never leaves a newer mirror visible under an older generation.
 ;; - Exclusive sync.lock.d directory lock with owner nonce.
-;;   Stale locks are never cleared automatically; use
-;;   `+git-sync-clear-stale-lock' for explicit maintenance cleanup.
+;;   A clean Emacs exit releases locks owned by that process.  A later
+;;   session may atomically reclaim a lock whose same-host PID is dead;
+;;   live and malformed locks are never stolen.
 ;; - Per-run attempt IDs; sentinels/callbacks ignore stale attempts.
 ;; - Concurrency slots tracked explicitly (queued does not own a slot).
 ;; - Forge adapter returns a cancellable handle with success and error paths.
@@ -38,6 +39,10 @@
 (declare-function forge-get-repository "forge-repo")
 (declare-function magit-refresh "magit-mode")
 (declare-function magit-toplevel "magit-git")
+(declare-function +git-review-target-p "init-git-ui" (obj))
+(declare-function +git-review-target-repository-id "init-git-ui" (target))
+(declare-function +git-review-target-context-id "init-git-ui" (target))
+(declare-function +git-pr-repository-id "init-git-pr" (pr))
 
 ;; ---------------------------------------------------------------------------
 ;; Customization
@@ -55,9 +60,9 @@ An empty list means synchronize nothing (never \"all registered\")."
   :group 'magit)
 
 (defcustom +git-sync-stale-lock-seconds 1800
-  "Age threshold for `+git-sync-clear-stale-lock' (manual cleanup only).
-Ordinary acquisition never removes locks automatically.  Live or unknown
-locks are never cleared."
+"Age threshold for explicit `+git-sync-clear-stale-lock' maintenance.
+Ordinary acquisition may reclaim a well-formed same-host lock immediately
+when its owner PID is dead.  Live or unknown locks are never cleared."
   :type 'integer
   :group 'magit)
 
@@ -328,16 +333,17 @@ provider PR/MR refs are included, otherwise `unavailable'."
       (cdr (assq (intern key) alist))))
 
 (defun +git-sync--default-state ()
-  "Return a fresh sync-state alist."
-  `(("version" . 1)
-    ("generation" . 0)
-    ("last-success" . nil)
-    ("last-attempt" . nil)
-    ("last-error" . nil)
-    ("forge-status" . "unavailable")
-    ("provider" . "generic")
-    ("pr-refs-status" . "unavailable")
-    ("mirror-format" . 1)))
+  "Return a fresh sync-state alist.
+Always allocate a new list: callers may mutate fields with `setf'."
+  (list (cons "version" 1)
+        (cons "generation" 0)
+        (cons "last-success" nil)
+        (cons "last-attempt" nil)
+        (cons "last-error" nil)
+        (cons "forge-status" "unavailable")
+        (cons "provider" "generic")
+        (cons "pr-refs-status" "unavailable")
+        (cons "mirror-format" 1)))
 
 (defun +git-sync-load-state (repository-id)
   "Load sync-state.json for REPOSITORY-ID.
@@ -439,6 +445,16 @@ previous valid file is preserved and an error is signaled."
            (numberp age)
            (> age +git-sync-stale-lock-seconds))))))
 
+(defun +git-sync--lock-dead-owner-p (lock)
+  "Return non-nil when LOCK has a confirmed dead same-host owner."
+  (and (listp lock)
+       (let ((pid (+git-sync--alist-get "pid" lock))
+             (host (+git-sync--alist-get "host" lock)))
+         (and (equal host (system-name))
+              (integerp pid)
+              (> pid 0)
+              (not (+git-sync--pid-alive-p pid))))))
+
 (defun +git-sync--remove-lock-dir (repository-id)
   "Remove the lock directory for REPOSITORY-ID if present."
   (let ((dir (+git-sync-lock-file repository-id)))
@@ -477,21 +493,48 @@ previous valid file is preserved and an error is signaled."
 
 (defun +git-sync-clear-stale-lock (repository-id)
   "Explicitly remove a stale sync lock for REPOSITORY-ID.
-Ordinary acquisition never clears stale locks — after a crashed Emacs
-leaves `sync.lock.d' behind, call this from maintenance code or
-interactively.  Return non-nil when a stale lock was removed.
-Refuses live and unknown locks.  Re-reads owner metadata immediately
-before deletion; residual races are accepted only on this explicit path."
-  (let ((lock (+git-sync--read-lock repository-id)))
-    (cond
-     ((not (file-directory-p (+git-sync-lock-file repository-id))) nil)
-     ((not (+git-sync--lock-stale-p lock)) nil)
-     (t
-      (let ((again (+git-sync--read-lock repository-id)))
-        (when (and (+git-sync--lock-stale-p again)
-                   (+git-sync--lock-same-owner-p lock again))
-          (+git-sync--remove-lock-dir repository-id)
-          t))))))
+Ordinary acquisition already reclaims confirmed dead-owner locks without
+an age delay.  This maintenance command additionally enforces
+`+git-sync-stale-lock-seconds'.  Return non-nil when a stale lock was
+removed.  Live and unknown locks are always refused."
+  (interactive
+   (list (+git-sync--resolve-repository-id)))
+  (+git-sync--reclaim-dead-lock repository-id t))
+
+(defun +git-sync--reclaim-dead-lock (repository-id &optional require-age)
+  "Atomically reclaim REPOSITORY-ID's confirmed dead-owner lock.
+When REQUIRE-AGE is non-nil, also apply
+`+git-sync-stale-lock-seconds'.  The lock directory is first renamed to
+a unique quarantine path, so a concurrent process can safely acquire the
+canonical lock without being deleted or displaced by this cleanup."
+  (let* ((dir (+git-sync-lock-file repository-id))
+         (observed (+git-sync--read-lock repository-id))
+         (eligible (if require-age
+                       (+git-sync--lock-stale-p observed)
+                     (+git-sync--lock-dead-owner-p observed)))
+         (quarantine
+          (expand-file-name
+           (format ".sync.lock.dead.%s.%s"
+                   (emacs-pid) (+git-sync--new-lock-nonce))
+           (+git-sync-repository-cache-directory repository-id))))
+    (when (and eligible (file-directory-p dir))
+      (condition-case nil
+          (progn
+            (rename-file dir quarantine)
+            (let ((moved (+git-sync--read-lock-at quarantine)))
+              (if (and (+git-sync--lock-same-owner-p observed moved)
+                       (+git-sync--lock-dead-owner-p moved)
+                       (or (not require-age)
+                           (+git-sync--lock-stale-p moved)))
+                  (progn
+                    (ignore-errors (delete-directory quarantine t))
+                    t)
+                ;; Owner metadata changed unexpectedly.  Restore only when
+                ;; no racer has acquired the canonical lock.
+                (unless (file-exists-p dir)
+                  (ignore-errors (rename-file quarantine dir)))
+                nil)))
+        (file-error nil)))))
 
 (defun +git-sync-try-acquire-lock (repository-id &optional nonce)
   "Attempt to acquire the sync lock for REPOSITORY-ID.
@@ -499,11 +542,12 @@ Return `acquired' or `busy'.  NONCE when provided is written as the
 owner token; otherwise a new nonce is generated.  On `acquired', return
 (`acquired' . NONCE).
 
-Never silently steals a live, unknown, or stale lock.  Stale locks from
-crashed processes require explicit `+git-sync-clear-stale-lock'.
+Never steals a live or unknown lock.  A well-formed same-host lock whose
+PID is confirmed dead is atomically quarantined before acquisition.
 Builds a complete temporary lock directory (with owner.json) then
 atomically renames it into place."
   (+git-sync--ensure-cache-dir repository-id)
+  (+git-sync--reclaim-dead-lock repository-id)
   (let* ((dir (+git-sync-lock-file repository-id))
          (nonce (or nonce (+git-sync--new-lock-nonce)))
          (existing (+git-sync--read-lock repository-id))
@@ -950,6 +994,33 @@ Retain backup and publish-intent unless restoration definitely succeeds."
   (when-let ((dir (+git-sync-job-candidate-dir job)))
     (+git-sync--delete-dir dir)
     (setf (+git-sync-job-candidate-dir job) nil)))
+
+(defun +git-sync--cleanup-on-emacs-exit ()
+  "Release processes, candidates, and locks owned by this Emacs.
+Published mirrors, Forge data, PR metadata, and synchronization state
+remain on disk for the next Emacs session.  This hook performs no
+network operations."
+  (maphash
+   (lambda (repository-id job)
+     (condition-case nil
+         (progn
+           (setf (+git-sync-job-cancel-flag job) t)
+           (when-let ((proc (+git-sync-job-process job)))
+             (when (process-live-p proc)
+               (ignore-errors (delete-process proc))))
+           (when-let ((request (+git-sync-job-forge-request job)))
+             (when-let ((cancel (plist-get request :cancel)))
+               (ignore-errors (funcall cancel))))
+           (+git-sync--cleanup-candidate job)
+           (when (+git-sync-job-lock-held-p job)
+             (+git-sync-release-lock
+              repository-id (+git-sync-job-lock-nonce job))
+             (setf (+git-sync-job-lock-held-p job) nil)
+             (setf (+git-sync-job-lock-nonce job) nil)))
+       (error nil)))
+   +git-sync--jobs))
+
+(add-hook 'kill-emacs-hook #'+git-sync--cleanup-on-emacs-exit)
 
 ;; ---------------------------------------------------------------------------
 ;; Async fetch via make-process
@@ -1438,9 +1509,17 @@ writes sync-state.  On state failure, restores the previous mirror."
           (with-current-buffer buf
             (condition-case _
                 (cond
+                 ;; PR workspaces must rebuild from Forge cache + mirror,
+                 ;; not merely redraw the stale in-memory model.
+                 ((and (derived-mode-p '+git-pr-mode)
+                       (fboundp '+git-pr-refresh))
+                  (+git-pr-refresh))
+                 ((and (bound-and-true-p +git-pr--model)
+                       (fboundp '+git-pr--refresh-dispatch))
+                  (+git-pr--refresh-dispatch))
                  ((and (bound-and-true-p +git-review-target)
                        (fboundp '+git-review-refresh))
-                  (+git-review-refresh))
+                 (+git-review-refresh))
                  ((derived-mode-p 'magit-mode)
                   (when (fboundp 'magit-refresh)
                     (magit-refresh)))
@@ -1758,21 +1837,38 @@ another repository."
 ;; ---------------------------------------------------------------------------
 
 (defun +git-sync--resolve-repository-id (&optional root)
-  "Resolve the canonical repository ID for the current review or ROOT."
+  "Resolve the canonical repository ID for the current review or ROOT.
+Uses `+git-review-target' struct accessors when present; never
+`plist-get' on the target object."
   (or
    (and (bound-and-true-p +git-review-target)
         (let ((target +git-review-target))
-          (or (plist-get target :repository-id)
-              (and (plist-get target :context-id)
-                   (when-let ((ctx (+git-store-get-context
-                                    (plist-get target :context-id))))
-                     (+git-store-local-context-repository-id ctx))))))
+          (cond
+           ((and (fboundp '+git-review-target-p)
+                 (+git-review-target-p target))
+            (or (+git-review-target-repository-id target)
+                (and (+git-review-target-context-id target)
+                     (when-let ((ctx (+git-store-get-context
+                                      (+git-review-target-context-id
+                                       target))))
+                       (+git-store-local-context-repository-id ctx)))))
+           ((and (consp target) (keywordp (car target)))
+            (or (plist-get target :repository-id)
+                (and (plist-get target :context-id)
+                     (when-let ((ctx (+git-store-get-context
+                                      (plist-get target :context-id))))
+                       (+git-store-local-context-repository-id ctx))))))))
+   (and (bound-and-true-p +git-pr--model)
+        (fboundp '+git-pr-repository-id)
+        (+git-pr-repository-id +git-pr--model))
    (let* ((root (or root
                     (and (fboundp 'magit-toplevel) (magit-toplevel))
                     (and (fboundp 'projectile-project-root)
                          (ignore-errors (projectile-project-root)))
                     default-directory))
-          (ctx (and root (ignore-errors (+git-store-context-for-root root)))))
+          (ctx (and root
+                    (file-directory-p root)
+                    (ignore-errors (+git-store-context-for-root root)))))
      (and ctx (+git-store-local-context-repository-id ctx)))))
 
 ;; ---------------------------------------------------------------------------
