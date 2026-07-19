@@ -352,6 +352,9 @@
 ;; Phase 2 local review / Changes Tree tests.
 (require 'git-review-phase2)
 
+;; Phase 3 canonical identity / local-context integration tests.
+(require 'git-review-integration-test)
+
 (provide 'git-review-test)
 
 ;;; git-review-test.el ends here

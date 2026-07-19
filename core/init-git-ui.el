@@ -18,11 +18,17 @@
 ;; - Atomic local review-state persistence under `.cache/git-review/state/'.
 ;; - Exact per-file unified diffs reused by target+path.
 ;; - Theme-safe black/red/green native Magit faces (no Delta/Difftastic).
+;;
+;; Phase 3 identity:
+;; - Canonical repository id + local context id from `init-git-store'.
+;; - Worktree/staged/branch state is context-local; commit buffers may share.
+;; - `L' selects the active edit context on shareable immutable reviews.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'init-git-store)
 
 ;; =============================================================================
 ;; Caller / layout stack for nested review navigation
@@ -371,62 +377,6 @@ branch must be updated."
           (before (current-buffer)))
       (+git-review--call-visit-thing-other-window)
       (+git-review--apply-return before state))))
-(defun +git-review-visit-worktree ()
-  "Visit the writable worktree file for the diff or tree file at point.
-Signals a clear user error when no writable worktree target exists.
-Does not force Insert state.  Generated per-file buffers may fall back to
-buffer-local `+git-review-file-path' when Magit file sections are missing."
-  (interactive)
-  (if (derived-mode-p '+git-changes-tree-mode)
-      (let* ((file (+git-review--file-at-tree-point))
-             (root (and +git-review-target
-                        (+git-review-target-root +git-review-target)))
-             (rel (and file (+git-review-file-path file)))
-             (full (and rel root (expand-file-name rel root))))
-        (unless (and full (file-exists-p full) (not (file-directory-p full)))
-          (user-error "No writable worktree target at point"))
-        (let ((state (+git-review--capture-return))
-              (before (current-buffer)))
-          (find-file full)
-          (let ((after (current-buffer)))
-            (when (and (not (eq after before)) (buffer-live-p after))
-              (+git-review--enable-return-on-buffer after state)))))
-    (let* ((root (or (and +git-review-target
-                          (+git-review-target-root +git-review-target))
-                     (and (fboundp 'magit-toplevel) (magit-toplevel))))
-           (magit-file (and (fboundp 'magit-diff--file)
-                            (ignore-errors (magit-diff--file))))
-           (rel (or (and magit-file root
-                         (file-relative-name magit-file root))
-                    (and (bound-and-true-p +git-review-file-path)
-                         +git-review-file-path)))
-           (full (and rel root (expand-file-name rel root))))
-      (cond
-       ((eq +git-review--presented-status 'submodule)
-        (user-error
-         "Submodule/gitlink `%s' - open that repository separately to review its commits"
-         (or rel +git-review-file-path "unknown")))
-       ((and full (file-directory-p full))
-        (user-error "No writable worktree file at `%s'" (or rel full)))
-       ((not (and full (file-exists-p full)))
-        (user-error "No writable worktree target at point"))
-       (t
-        (let ((state (+git-review--capture-return))
-              (before (current-buffer)))
-          (condition-case err
-              (if magit-file
-                  (magit-diff-visit-worktree-file nil)
-                (find-file full))
-            (error
-             (let ((msg (error-message-string err)))
-               (if (string-match-p
-                    "Cannot determine file\\|No file\\|does not exist\\|not exist"
-                    msg)
-                   (find-file full)
-                 (signal (car err) (cdr err))))))
-          (let ((after (current-buffer)))
-            (when (and (not (eq after before)) (buffer-live-p after))
-              (+git-review--enable-return-on-buffer after state)))))))))
 
 (defun +git-review-quit (&optional _kill-buffer)
   "Return to the recorded caller/layout, or bury the Magit buffer.
@@ -453,10 +403,15 @@ Does not kill user source buffers."
       (quit-window nil)))))
 
 (defun +git-review-refresh ()
-  "Refresh the current local Magit or Changes Tree buffer only."
+  "Refresh the current local Magit or Changes Tree buffer only.
+Shareable commit buffers rebind Magit directories to the active edit
+context first so a deleted originating clone does not break `gr'."
   (interactive)
   (cond
    ((derived-mode-p '+git-changes-tree-mode 'magit-mode)
+    (when (bound-and-true-p +git-review-target)
+      (+git-review--bind-operational-directory
+       (+git-review--git-root-for-target +git-review-target)))
     (magit-refresh))
    (t (user-error "Nothing to refresh"))))
 
@@ -532,6 +487,7 @@ Does not kill user source buffers."
       "n" #'evil-search-next
       "N" #'evil-search-previous
       "gr" #'+git-review-refresh
+      "L" #'+git-review-select-edit-context
       "q" #'+git-review-quit
       "+" #'+git/increase-context
       "=" #'+git/increase-context
@@ -573,8 +529,8 @@ Does not kill user source buffers."
 ;; Phase 2 — Local review targets, Changes Tree, persistence, file diffs
 ;; =============================================================================
 ;; Ownership: local review / Changes Tree / diff faces belong in this module
-;; per `git-plan.md'.  Kept as one file so Phase 2 stays reviewable against
-;; that ownership table without introducing a premature store layer.
+;; per `git-plan.md'.  Canonical identity and local contexts live in
+;; `init-git-store.el' (Phase 3).
 
 (defconst +git-review-empty-tree
   "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -607,19 +563,26 @@ Far below N-files so accidental per-file loops fail tests loudly.")
 (defvar-local +git-review--reviewed-map nil
   "Buffer-local hash table: path -> fingerprint for currently reviewed files.")
 
+(defvar-local +git-review-edit-context-id nil
+  "Active edit context id for shared immutable commit review buffers.
+Separate from immutable target identity so reopen/reuse does not mutate
+the reviewed commit identity.")
+
 (cl-defstruct (+git-review-target
                (:constructor +git-review-target--create)
                (:copier nil))
   "Explicit local review target.  Never reconstructed from rendered text."
-  root           ; absolute repository root
+  root           ; absolute repository root (originating context)
   scope          ; worktree | staged | commit | branch
   base-ref       ; symbolic base label (or nil)
   base-oid       ; resolved base object ID
   head-ref       ; symbolic head label (or nil)
   head-oid       ; resolved head object ID (nil for mutable worktree tip)
-  family-id      ; stable target-family identity
+  family-id      ; stable target-family identity (persistence)
   overview-id    ; stable overview buffer identity
-  mutable-p)     ; non-nil when stage/unstage/discard are allowed
+  mutable-p      ; non-nil when stage/unstage/discard are allowed
+  repository-id  ; canonical repository identity (Phase 3)
+  context-id)    ; originating local context identity (Phase 3)
 
 (cl-defstruct (+git-review-file
                (:constructor +git-review-file-create)
@@ -702,26 +665,49 @@ Increments `+git-review--git-process-count'.  Never builds a shell string."
   "Return ROOT as an absolute directory path with trailing slash removed."
   (directory-file-name (expand-file-name root)))
 
-(defun +git-review--make-ids (root scope base-ref head-ref base-oid head-oid)
-  "Return (FAMILY-ID . OVERVIEW-ID) for ROOT and SCOPE.
+(defun +git-review--legacy-family-id (root scope base-ref head-ref head-oid)
+  "Return the Phase 2 root-based family id for legacy state migration."
+  (let ((root (+git-review--normalize-root root)))
+    (pcase scope
+      ((or 'worktree 'staged)
+       (format "git-review:%s:%s" scope root))
+      ('commit
+       (format "git-review:commit:%s:%s" root head-oid))
+      ('branch
+       (format "git-review:branch:%s:%s:%s"
+               root
+               (or base-ref "")
+               (or head-ref "")))
+      (_ (error "Unknown review scope: %S" scope)))))
 
-FAMILY-ID is the persistence identity.  For worktree/staged and symbolic
-branch reviews it stays stable when resolved object IDs advance.  Commit
-reviews key by resolved HEAD OID.
+(defun +git-review--make-ids (repository-id context-id root scope
+                                            base-ref head-ref
+                                            base-oid head-oid)
+  "Return (FAMILY-ID . OVERVIEW-ID) for SCOPE under REPOSITORY-ID.
 
-OVERVIEW-ID is the immutable buffer-reuse identity.  Worktree/staged keep
-a stable overview id so refresh reuses buffers.  Branch and commit
-overviews include resolved object IDs so advancing a branch creates a
-new review buffer while persistence still finds prior checkmarks."
-  (let* ((root (+git-review--normalize-root root))
+FAMILY-ID is the persistence identity:
+- worktree/staged: repository-id + context-id (never shared across clones)
+- branch: repository-id + context-id + symbolic base/head labels
+- commit: repository-id + resolved head OID (shared across same-origin clones)
+
+OVERVIEW-ID is the immutable buffer-reuse identity:
+- worktree/staged: stable so refresh reuses buffers
+- branch: includes resolved base/head OIDs so advancing creates a new buffer
+- commit: repository-id + resolved OIDs (shared across same-origin clones)
+
+ROOT is retained only for legacy Phase 2 state migration lookups."
+  (let* ((repo (or repository-id
+                   (format "local:%s" (+git-review--normalize-root root))))
+         (ctx (or context-id
+                  (format "ctx:%s" (+git-review--normalize-root root))))
          (family (pcase scope
                    ((or 'worktree 'staged)
-                    (format "git-review:%s:%s" scope root))
+                    (format "git-review:%s:%s:%s" scope repo ctx))
                    ('commit
-                    (format "git-review:commit:%s:%s" root head-oid))
+                    (format "git-review:commit:%s:%s" repo head-oid))
                    ('branch
-                    (format "git-review:branch:%s:%s:%s"
-                            root
+                    (format "git-review:branch:%s:%s:%s:%s"
+                            repo ctx
                             (or base-ref "")
                             (or head-ref "")))
                    (_ (error "Unknown review scope: %S" scope))))
@@ -729,22 +715,27 @@ new review buffer while persistence still finds prior checkmarks."
                      ((or 'worktree 'staged)
                       (concat family ":overview"))
                      ('commit
-                      (format "git-review:commit:%s:%s:overview"
-                              root head-oid))
+                      (format "git-review:commit:%s:%s:%s:overview"
+                              repo
+                              (or base-oid +git-review-empty-tree)
+                              head-oid))
                      ('branch
-                      (format "git-review:branch:%s:%s:%s:overview"
-                              root base-oid head-oid))
+                      (format "git-review:branch:%s:%s:%s:%s:overview"
+                              repo ctx base-oid head-oid))
                      (_ (error "Unknown review scope: %S" scope)))))
     (cons family overview)))
 
 (defun +git-review-make-target (root scope &optional base-ref head-ref
-                                     base-oid head-oid)
+                                     base-oid head-oid
+                                     repository-id context-id)
   "Construct a `+git-review-target' for ROOT and SCOPE.
 BASE-REF/HEAD-REF are display labels and persistence selectors.
-BASE-OID/HEAD-OID are resolved object IDs when applicable."
+BASE-OID/HEAD-OID are resolved object IDs when applicable.
+REPOSITORY-ID and CONTEXT-ID come from the store when available."
   (let* ((root (+git-review--normalize-root root))
          (mutable (and (memq scope '(worktree staged)) t))
-         (ids (+git-review--make-ids root scope base-ref head-ref
+         (ids (+git-review--make-ids repository-id context-id root scope
+                                     base-ref head-ref
                                      base-oid head-oid)))
     (+git-review-target--create
      :root root
@@ -755,7 +746,9 @@ BASE-OID/HEAD-OID are resolved object IDs when applicable."
      :head-oid head-oid
      :family-id (car ids)
      :overview-id (cdr ids)
-     :mutable-p mutable)))
+     :mutable-p mutable
+     :repository-id repository-id
+     :context-id context-id)))
 
 (defun +git-review--require-root ()
   "Return the Magit toplevel or signal a user error."
@@ -763,39 +756,56 @@ BASE-OID/HEAD-OID are resolved object IDs when applicable."
   (or (magit-toplevel)
       (user-error "Not inside a Git repository")))
 
+(defun +git-review--context-for-root (root)
+  "Register/refresh ROOT in the store and return its local context."
+  (+git-store-context-for-root root))
+
 (defun +git-review-target-for-worktree (&optional root)
   "Build a worktree review target for ROOT (default: current repository)."
   (let* ((root (+git-review--normalize-root
                 (or root (+git-review--require-root))))
+         (ctx (+git-review--context-for-root root))
          (head (or (+git-review--rev-parse root "HEAD")
                    +git-review-empty-tree)))
-    (+git-review-make-target root 'worktree "HEAD" nil head nil)))
+    (+git-review-make-target
+     root 'worktree "HEAD" nil head nil
+     (+git-store-local-context-repository-id ctx)
+     (+git-store-local-context-context-id ctx))))
 
 (defun +git-review-target-for-staged (&optional root)
   "Build a staged review target for ROOT."
   (let* ((root (+git-review--normalize-root
                 (or root (+git-review--require-root))))
+         (ctx (+git-review--context-for-root root))
          (head (or (+git-review--rev-parse root "HEAD")
                    +git-review-empty-tree)))
-    (+git-review-make-target root 'staged "HEAD" "index" head nil)))
+    (+git-review-make-target
+     root 'staged "HEAD" "index" head nil
+     (+git-store-local-context-repository-id ctx)
+     (+git-store-local-context-context-id ctx))))
 
 (defun +git-review-target-for-commit (commit &optional root)
   "Build a commit review target for COMMIT in ROOT.
 Root commits use `+git-review-empty-tree' as the base."
   (let* ((root (+git-review--normalize-root
                 (or root (+git-review--require-root))))
+         (ctx (+git-review--context-for-root root))
          (head-oid (or (+git-review--rev-parse root commit)
                        (user-error "Cannot resolve commit %s" commit)))
          (parent (+git-review--rev-parse root (concat head-oid "^")))
          (base-oid (or parent +git-review-empty-tree))
          (base-ref (if parent (concat commit "^") "empty-tree")))
-    (+git-review-make-target root 'commit base-ref commit
-                             base-oid head-oid)))
+    (+git-review-make-target
+     root 'commit base-ref commit
+     base-oid head-oid
+     (+git-store-local-context-repository-id ctx)
+     (+git-store-local-context-context-id ctx))))
 
 (defun +git-review-target-for-branch (base head &optional root)
   "Build a branch review target for merge-base(BASE,HEAD)..HEAD."
   (let* ((root (+git-review--normalize-root
                 (or root (+git-review--require-root))))
+         (ctx (+git-review--context-for-root root))
          (base-oid (or (+git-review--rev-parse root base)
                        (user-error "Cannot resolve base %s" base)))
          (head-oid (or (+git-review--rev-parse root head)
@@ -805,8 +815,11 @@ Root commits use `+git-review-empty-tree' as the base."
                                                base-oid head-oid))
                          (user-error "No merge-base for %s and %s"
                                      base head))))
-    (+git-review-make-target root 'branch base head
-                             merge-base head-oid)))
+    (+git-review-make-target
+     root 'branch base head
+     merge-base head-oid
+     (+git-store-local-context-repository-id ctx)
+     (+git-store-local-context-context-id ctx))))
 
 (defun +git-review-target-range-args (target)
   "Return (RANGE TYPEARG) Git diff arguments for TARGET.
@@ -831,6 +844,298 @@ RANGE is a string or nil.  TYPEARG is \"--cached\" or nil."
         "-M"
         "-C"
         "--find-copies-harder"))
+
+;; ---------------------------------------------------------------------------
+;; Active edit context (Phase 3)
+;; ---------------------------------------------------------------------------
+
+(defun +git-review--shareable-commit-p (&optional target)
+  "Return non-nil when TARGET is a shareable immutable commit review."
+  (let ((target (or target
+                    (and (bound-and-true-p +git-review-target)
+                         +git-review-target))))
+    (and target (eq (+git-review-target-scope target) 'commit))))
+
+(defun +git-review--target-required-oids (target)
+  "Return object IDs that must exist in an edit context for TARGET.
+Skips the well-known empty tree, which may not be materialized."
+  (cl-remove-if
+   (lambda (oid)
+     (or (null oid)
+         (equal oid +git-review-empty-tree)))
+   (list (+git-review-target-base-oid target)
+         (+git-review-target-head-oid target))))
+
+(defun +git-review--git-root-for-target (target)
+  "Return the worktree root for Git operations on TARGET.
+Shareable commit reviews use the active/eligible edit context so a
+deleted originating clone does not break refresh.  Local worktree,
+staged, and branch reviews always use the originating root.
+Does not change canonical family-id or overview-id."
+  (if (+git-review--shareable-commit-p target)
+      (let* ((preferred
+              (or (and (bound-and-true-p +git-review-edit-context-id)
+                       +git-review-edit-context-id)
+                  (+git-review-target-context-id target)))
+             (oids (+git-review--target-required-oids target))
+             (repo-id (+git-review-target-repository-id target))
+             (preferred-ctx (and preferred
+                                 (+git-store-get-context preferred)))
+             (ctx
+              (cond
+               ((+git-store-context-eligible-p preferred-ctx repo-id oids)
+                preferred-ctx)
+               (t
+                (+git-store-default-edit-context repo-id preferred oids)))))
+        (unless ctx
+          (user-error
+           "No eligible local context for this commit review"))
+        (when (and (bound-and-true-p +git-review-target)
+                   (equal (+git-review-target-overview-id +git-review-target)
+                          (+git-review-target-overview-id target)))
+          (setq-local +git-review-edit-context-id
+                      (+git-store-local-context-context-id ctx)))
+        (+git-store-local-context-root ctx))
+    (+git-review-target-root target)))
+
+(defun +git-review--bind-operational-directory (root)
+  "Bind Magit and buffer directories to absolute ROOT for refresh/`e'."
+  (let ((root (file-name-as-directory (expand-file-name root))))
+    (setq-local default-directory root)
+    (when (boundp 'magit--default-directory)
+      (setq-local magit--default-directory root))
+    root))
+
+(defun +git-review--adopt-reopening-context (target)
+  "Adopt TARGET's originating clone as this buffer's active edit context.
+Only for shareable commit reviews, and only when that context is live
+for TARGET's repository and contains the required OIDs.  Updates Magit
+directory locals so refresh and `e' use the reopening clone.  Immutable
+review identity is unchanged."
+  (when (+git-review--shareable-commit-p target)
+    (let* ((ctx-id (+git-review-target-context-id target))
+           (ctx (+git-store-get-context ctx-id))
+           (oids (+git-review--target-required-oids target))
+           (repo-id (+git-review-target-repository-id target)))
+      (cond
+       ((+git-store-context-eligible-p ctx repo-id oids)
+        (setq-local +git-review-edit-context-id ctx-id)
+        (+git-review--bind-operational-directory
+         (+git-store-local-context-root ctx)))
+       (t
+        (+git-review--ensure-edit-context target)
+        (+git-review--bind-operational-directory
+         (+git-review--git-root-for-target target))))
+      (+git-store-remember-shared-buffer
+       (+git-review-target-repository-id target)
+       (current-buffer))))
+  target)
+
+(defun +git-review--identity-suffix (&optional target edit-context-id)
+  "Return a compact ASCII identity suffix for TARGET.
+Example: \"repo: github.com/org/dragon | context: ~/work/dragon\""
+  (let* ((target (or target +git-review-target))
+         (repo (and target (+git-review-target-repository-id target)))
+         (ctx-id (or edit-context-id
+                     (and (bound-and-true-p +git-review-edit-context-id)
+                          +git-review-edit-context-id)
+                     (and target (+git-review-target-context-id target))))
+         (ctx (and ctx-id (+git-store-get-context ctx-id)))
+         (root (or (and ctx (+git-store-local-context-root ctx))
+                   (and target (+git-review-target-root target)))))
+    (format "repo: %s | context: %s"
+            (or repo "?")
+            (or root "?"))))
+
+(defun +git-review--ensure-edit-context (&optional target)
+  "Ensure `+git-review-edit-context-id' is set for TARGET in the current buffer.
+For shareable commit reviews, prefer an eligible live context.  For
+local scopes, lock to the originating context."
+  (when-let ((target (or target +git-review-target)))
+    (let* ((repo-id (+git-review-target-repository-id target))
+           (origin (+git-review-target-context-id target))
+           (oids (+git-review--target-required-oids target))
+           (chosen
+            (if (+git-review--shareable-commit-p target)
+                (or (+git-store-default-edit-context
+                     repo-id
+                     (or +git-review-edit-context-id origin)
+                     oids)
+                    (user-error
+                     "No registered local context contains the reviewed commit"))
+              (or (+git-store-get-context origin)
+                  (+git-store-context-for-root
+                   (+git-review-target-root target))))))
+      (setq-local +git-review-edit-context-id
+                  (+git-store-local-context-context-id chosen))
+      chosen)))
+
+(defun +git-review--active-edit-root (&optional target)
+  "Return the absolute root of the active edit context for TARGET.
+When there is no Phase 2/3 review target, fall back to Magit's toplevel
+so Phase 1 Magit status/diff `e' visits keep working."
+  (let ((target (or target
+                    (and (bound-and-true-p +git-review-target)
+                         +git-review-target))))
+    (if (null target)
+        (or (and (fboundp 'magit-toplevel) (magit-toplevel))
+            (user-error "Not inside a Git repository"))
+      (let* ((repo-id (+git-review-target-repository-id target))
+             (oids (and (+git-review--shareable-commit-p target)
+                        (+git-review--target-required-oids target)))
+             (ctx (+git-review--ensure-edit-context target)))
+        (unless (+git-store-context-eligible-p ctx repo-id oids)
+          ;; Originating context disappeared or was re-homed: try another
+          ;; eligible context for shareable commits, otherwise signal.
+          (if (+git-review--shareable-commit-p target)
+              (let ((fallback
+                     (+git-store-default-edit-context repo-id nil oids)))
+                (unless fallback
+                  (user-error
+                   "Active edit context disappeared; no eligible local context remains"))
+                (setq-local +git-review-edit-context-id
+                            (+git-store-local-context-context-id fallback))
+                (setq ctx fallback))
+            (user-error
+             "Local review context `%s' is no longer available"
+             (or (+git-review-target-root target) "?"))))
+        (+git-store-local-context-root ctx)))))
+
+(defun +git-review-visit-worktree ()
+  "Visit the writable worktree file for the diff or tree file at point.
+Uses the active edit context root for shared immutable commit reviews.
+Signals a clear user error when no writable worktree target exists.
+Does not force Insert state.  Generated per-file buffers may fall back to
+buffer-local `+git-review-file-path' when Magit file sections are missing."
+  (interactive)
+  (if (derived-mode-p '+git-changes-tree-mode)
+      (let* ((file (+git-review--file-at-tree-point))
+             (root (+git-review--active-edit-root))
+             (rel (and file (+git-review-file-path file)))
+             (full (and rel root (expand-file-name rel root))))
+        (unless (and full (file-exists-p full) (not (file-directory-p full)))
+          (user-error "No writable worktree target at point"))
+        (let ((state (+git-review--capture-return))
+              (before (current-buffer)))
+          (find-file full)
+          (let ((after (current-buffer)))
+            (when (and (not (eq after before)) (buffer-live-p after))
+              (+git-review--enable-return-on-buffer after state)))))
+    (let* ((has-target (bound-and-true-p +git-review-target))
+           (root (+git-review--active-edit-root))
+           (origin-root (or (and has-target
+                                 (+git-review-target-root +git-review-target))
+                            root))
+           (magit-file (and (fboundp 'magit-diff--file)
+                            (ignore-errors (magit-diff--file))))
+           (rel (or (and magit-file origin-root
+                         (file-relative-name magit-file origin-root))
+                    (and (bound-and-true-p +git-review-file-path)
+                         +git-review-file-path)))
+           (full (and rel root (expand-file-name rel root))))
+      (cond
+       ((eq +git-review--presented-status 'submodule)
+        (user-error
+         "Submodule/gitlink `%s' - open that repository separately to review its commits"
+         (or rel +git-review-file-path "unknown")))
+       ((and full (file-directory-p full))
+        (user-error "No writable worktree file at `%s'" (or rel full)))
+       ((not (and full (file-exists-p full)))
+        (user-error "No writable worktree target at point"))
+       (t
+        (let ((state (+git-review--capture-return))
+              (before (current-buffer)))
+          (condition-case err
+              (cond
+               ;; Phase 3 shareable reviews: always open via the active
+               ;; edit context root, never Magit's originating directory.
+               ((and has-target (+git-review--shareable-commit-p))
+                (find-file full))
+               ;; Prefer Magit's native visit when the edit root matches
+               ;; the Magit repository (Phase 1 / local reviews).
+               ((and magit-file (equal root origin-root))
+                (magit-diff-visit-worktree-file nil))
+               (t (find-file full)))
+            (error
+             (let ((msg (error-message-string err)))
+               (if (string-match-p
+                    "Cannot determine file\\|No file\\|does not exist\\|not exist"
+                    msg)
+                   (find-file full)
+                 (signal (car err) (cdr err))))))
+          (let ((after (current-buffer)))
+            (when (and (not (eq after before)) (buffer-live-p after))
+              (+git-review--enable-return-on-buffer after state)))))))))
+
+(defun +git-review-set-edit-context (context-id &optional target)
+  "Set the active edit context to CONTEXT-ID for TARGET (noninteractive).
+Shareable commit reviews may select any eligible live context for the
+same canonical repository.  Worktree/staged/branch reviews reject
+retargeting.  Returns the chosen `+git-store-local-context'."
+  (let* ((target (or target +git-review-target
+                     (user-error "No review target")))
+         (repo-id (+git-review-target-repository-id target))
+         (ctx (+git-store-get-context context-id))
+         (oids (+git-review--target-required-oids target)))
+    (unless ctx
+      (user-error "Unknown local context `%s'" context-id))
+    (unless (+git-review--shareable-commit-p target)
+      (user-error
+       "Worktree, staged, and local branch reviews are fixed to their originating context (%s)"
+       (+git-review-target-root target)))
+    (unless (+git-store-context-eligible-p ctx repo-id oids)
+      (cond
+       ((not (equal (+git-store-local-context-repository-id ctx) repo-id))
+        (user-error "Context `%s' belongs to a different repository" context-id))
+       ((not (and (+git-store-local-context-available-p ctx)
+                  (file-directory-p (+git-store-local-context-root ctx))))
+        (user-error "Local context `%s' is not available"
+                    (+git-store-local-context-root ctx)))
+       (t
+        (user-error
+         "Context `%s' does not contain a required reviewed object"
+         (+git-store-local-context-root ctx)))))
+    (setq-local +git-review-edit-context-id context-id)
+    (+git-review--bind-operational-directory
+     (+git-store-local-context-root ctx))
+    (message "Edit context: %s" (+git-store-local-context-root ctx))
+    ctx))
+
+(defun +git-review-select-edit-context (&optional context-id)
+  "Select the active edit context for the current shareable review (`L').
+With CONTEXT-ID, select noninteractively.  Otherwise prompt among
+eligible live contexts.  Preserves Phase 1 same-window and `q' return
+behavior (selection does not change windows)."
+  (interactive)
+  (unless (bound-and-true-p +git-review-target)
+    (user-error "No review target in this buffer"))
+  (let* ((target +git-review-target)
+         (repo-id (+git-review-target-repository-id target)))
+    (unless (+git-review--shareable-commit-p target)
+      (user-error
+       "Worktree, staged, and local branch reviews are fixed to their originating context (%s); L only applies to shared commit reviews"
+       (+git-review-target-root target)))
+    (let* ((oids (+git-review--target-required-oids target))
+           (eligible (+git-store-eligible-contexts-for-oids repo-id oids))
+           (chosen-id
+            (or context-id
+                (progn
+                  (unless eligible
+                    (user-error
+                     "No registered local context contains the reviewed commit"))
+                  (let* ((collection
+                          (mapcar
+                           (lambda (ctx)
+                             (cons (+git-store-local-context-root ctx)
+                                   (+git-store-local-context-context-id ctx)))
+                           eligible))
+                         (root (completing-read
+                                "Edit context: "
+                                (mapcar #'car collection)
+                                nil t nil nil
+                                (car (car collection)))))
+                    (cdr (assoc root collection)))))))
+      (+git-review-set-edit-context chosen-id target))))
 
 ;; ---------------------------------------------------------------------------
 ;; Changed-file model (NUL parsers; bounded Git processes)
@@ -994,8 +1299,9 @@ Paths are LF-separated (safe for spaces and Unicode; Git's
 
 (defun +git-review-collect-files (target)
   "Return a list of `+git-review-file' for TARGET using batched Git calls.
-Never parses Magit buffer text.  Asserts a bounded process count."
-  (let* ((root (+git-review-target-root target))
+Never parses Magit buffer text.  Asserts a bounded process count.
+Shareable commit reviews collect from the operational edit-context root."
+  (let* ((root (+git-review--git-root-for-target target))
          (scope (+git-review-target-scope target))
          (start-count +git-review--git-process-count)
          (range-type (+git-review-target-range-args target))
@@ -1109,26 +1415,41 @@ Never parses Magit buffer text.  Asserts a bounded process count."
     (cl-sort files #'string< :key #'+git-review-file-path)))
 
 ;; ---------------------------------------------------------------------------
-;; Review-state persistence (atomic; fingerprint keyed)
+;; Review-state persistence (atomic; fingerprint keyed; Phase 3 migration)
 ;; ---------------------------------------------------------------------------
 
-(defun +git-review--state-file (target)
-  "Return the absolute state filename for TARGET."
-  (let* ((raw (+git-review-target-family-id target))
-         (hash (secure-hash 'sha256 raw)))
+(defun +git-review--state-file-for-family (family-id)
+  "Return the absolute state filename for FAMILY-ID."
+  (let ((hash (secure-hash 'sha256 family-id)))
     (expand-file-name (concat hash ".eld")
                       (file-name-as-directory +git-review-state-directory))))
+
+(defun +git-review--state-file (target)
+  "Return the absolute Phase 3 state filename for TARGET."
+  (+git-review--state-file-for-family
+   (+git-review-target-family-id target)))
+
+(defun +git-review--legacy-state-file (target)
+  "Return the Phase 2 root-based state filename for TARGET, if distinct."
+  (let* ((legacy (+git-review--legacy-family-id
+                  (+git-review-target-root target)
+                  (+git-review-target-scope target)
+                  (+git-review-target-base-ref target)
+                  (+git-review-target-head-ref target)
+                  (+git-review-target-head-oid target)))
+         (current (+git-review-target-family-id target)))
+    (unless (equal legacy current)
+      (+git-review--state-file-for-family legacy))))
 
 (defun +git-review--ensure-state-dir ()
   "Create `+git-review-state-directory' when missing."
   (make-directory +git-review-state-directory t))
 
-(defun +git-review-state-load (target)
-  "Load reviewed path->fingerprint map for TARGET.
-Malformed state degrades to empty (all-unreviewed) with a message."
-  (let ((file (+git-review--state-file target))
-        (table (make-hash-table :test #'equal)))
-    (when (file-readable-p file)
+(defun +git-review--read-state-file (file)
+  "Read path->fingerprint entries from FILE into a new hash table.
+Malformed state returns an empty table after a message."
+  (let ((table (make-hash-table :test #'equal)))
+    (when (and file (file-readable-p file))
       (condition-case err
           (with-temp-buffer
             (insert-file-contents file)
@@ -1146,6 +1467,31 @@ Malformed state degrades to empty (all-unreviewed) with a message."
          (message "Ignoring malformed Git review state %s: %s"
                   file (error-message-string err))
          (clrhash table))))
+    table))
+
+(defun +git-review-state-load (target)
+  "Load reviewed path->fingerprint map for TARGET.
+Uses the Phase 3 canonical/context-aware state file when present.
+Otherwise migrates once from the exact legacy Phase 2 root-based file
+without deleting or rewriting that legacy file."
+  (let* ((new-file (+git-review--state-file target))
+         (legacy-file (+git-review--legacy-state-file target))
+         (table nil)
+         (migrated nil))
+    (cond
+     ((file-readable-p new-file)
+      (setq table (+git-review--read-state-file new-file)))
+     ((and legacy-file (file-readable-p legacy-file))
+      (setq table (+git-review--read-state-file legacy-file)
+            migrated t)
+      ;; Write the new generation atomically; leave the legacy file intact.
+      (when (> (hash-table-count table) 0)
+        (+git-review-state-save target table)))
+     (t
+      (setq table (make-hash-table :test #'equal))))
+    (when migrated
+      (message "Migrated Git review state to canonical identity for %s"
+               (+git-review-target-family-id target)))
     table))
 
 (defun +git-review-state-save (target reviewed-map)
@@ -1169,6 +1515,10 @@ Writes a temporary file in the same directory, then renames into place."
               (prin1 (list (cons 'version 1)
                            (cons 'family-id
                                  (+git-review-target-family-id target))
+                           (cons 'repository-id
+                                 (+git-review-target-repository-id target))
+                           (cons 'context-id
+                                 (+git-review-target-context-id target))
                            (cons 'entries entries))
                      (current-buffer))
               (insert "\n")))
@@ -1429,8 +1779,8 @@ Does not generate per-file diff buffers."
   (unless +git-review-target
     (user-error "Changes Tree has no review target"))
   (let* ((target +git-review-target)
-         (default-directory
-          (file-name-as-directory (+git-review-target-root target)))
+         (root (+git-review--git-root-for-target target))
+         (_dir (+git-review--bind-operational-directory root))
          (files (+git-review-collect-files target))
          (reviewed (+git-review--sync-reviewed-map
                     files
@@ -1441,13 +1791,15 @@ Does not generate per-file diff buffers."
     (setq +git-review--files files
           +git-review--reviewed-map reviewed)
     (+git-review-state-save target reviewed)
+    (+git-review--ensure-edit-context target)
     (magit-set-header-line-format
-     (format "Changes  %d/%d reviewed  |  %s"
+     (format "Changes  %d/%d reviewed  |  %s  |  %s"
              (plist-get stats :reviewed)
              (plist-get stats :total)
              (+git-review--format-counts
               (plist-get stats :adds)
-              (plist-get stats :dels))))
+              (plist-get stats :dels))
+             (+git-review--identity-suffix target)))
     (magit-insert-section (changes-tree)
       (magit-insert-heading
         (format "Changes  %d/%d reviewed  |  %s\n"
@@ -1469,16 +1821,36 @@ Does not generate per-file diff buffers."
 Locks Magit buffer identity to `overview-id' so advancing an immutable
 branch creates a new tree while worktree/staged still reuse."
   (require 'magit)
-  (let* ((default-directory
-          (file-name-as-directory (+git-review-target-root target)))
-         (buf
-          (magit-setup-buffer #'+git-changes-tree-mode t
-            (+git-review-target target)
-            (+git-review--reviewed-map nil)
-            (+git-review--files nil))))
-    (with-current-buffer buf
-      (setq-local +git-review-target target)
-      (+git-review--enter-normal-state))
+  (let* ((existing
+          (car (+git-review--find-buffers-for-target
+                target
+                (lambda (buf)
+                  (with-current-buffer buf
+                    (derived-mode-p '+git-changes-tree-mode))))))
+         buf)
+    (if existing
+        (progn
+          (setq buf existing)
+          (magit-display-buffer buf)
+          (with-current-buffer buf
+            (setq-local +git-review-target target)
+            (+git-review--adopt-reopening-context target)
+            (magit-refresh)
+            (+git-review--bind-operational-directory
+             (+git-review--git-root-for-target target))
+            (+git-review--enter-normal-state)))
+      (let ((default-directory
+             (file-name-as-directory
+              (+git-review--git-root-for-target target))))
+        (setq buf
+              (magit-setup-buffer #'+git-changes-tree-mode t
+                (+git-review-target target)
+                (+git-review--reviewed-map nil)
+                (+git-review--files nil)))
+        (with-current-buffer buf
+          (setq-local +git-review-target target)
+          (+git-review--adopt-reopening-context target)
+          (+git-review--enter-normal-state))))
     buf))
 
 ;; ---------------------------------------------------------------------------
@@ -1507,6 +1879,7 @@ Persistence uses `family-id'; buffer reuse uses `overview-id'."
   (setq-local +git-review-target target)
   (when file-path
     (setq-local +git-review-file-path file-path))
+  (+git-review--adopt-reopening-context target)
   (+git-review--install-immutable-guards)
   (+git-review--maybe-install-untracked-overview target file-path)
   (+git-review-buffer-mode 1)
@@ -1538,7 +1911,7 @@ Uses Magit's washer so section markers stay complete."
   (when (and (bound-and-true-p +git-review-target)
              (eq (+git-review-target-scope +git-review-target) 'worktree)
              (null +git-review-file-path))
-    (let* ((root (+git-review-target-root +git-review-target))
+    (let* ((root (+git-review--git-root-for-target +git-review-target))
            (paths (+git-review--git-items
                    root "ls-files" "-z" "--others" "--exclude-standard"))
            (null-device (if (eq system-type 'windows-nt) "NUL" "/dev/null"))
@@ -1575,9 +1948,7 @@ overview buffer (`magit-diff-buffer-file-locked' convention)."
 (defun +git-review--open-overview (target)
   "Open or reuse the Magit unified overview for TARGET."
   (require 'magit)
-  (let* ((default-directory
-          (file-name-as-directory (+git-review-target-root target)))
-         (args (+git-review-target-diff-args target))
+  (let* ((args (+git-review-target-diff-args target))
          (range-type (+git-review-target-range-args target))
          (range (car range-type))
          (typearg (cadr range-type))
@@ -1594,23 +1965,29 @@ overview buffer (`magit-diff-buffer-file-locked' convention)."
           (setq buffer existing)
           (magit-display-buffer buffer)
           (with-current-buffer buffer
+            (+git-review--adopt-reopening-context target)
             (+git-review--sync-magit-diff-state target nil)
             (+git-review--maybe-install-untracked-overview target nil)
             (magit-refresh)
+            (+git-review--bind-operational-directory
+             (+git-review--git-root-for-target target))
             (+git-review--enter-normal-state)))
-      (setq buffer
-            (magit-diff-setup-buffer
-             range typearg args nil
-             (pcase (+git-review-target-scope target)
-               ('staged 'staged)
-               ('worktree 'committed)
-               (_ 'committed))
-             (+git-review--magit-diff-locked-p target)))
-      (with-current-buffer buffer
-        (+git-review--attach-target target)
-        (when (eq (+git-review-target-scope target) 'worktree)
-          ;; Re-refresh so the untracked hook runs after attachment.
-          (magit-refresh))))
+      (let ((default-directory
+             (file-name-as-directory
+              (+git-review--git-root-for-target target))))
+        (setq buffer
+              (magit-diff-setup-buffer
+               range typearg args nil
+               (pcase (+git-review-target-scope target)
+                 ('staged 'staged)
+                 ('worktree 'committed)
+                 (_ 'committed))
+               (+git-review--magit-diff-locked-p target)))
+        (with-current-buffer buffer
+          (+git-review--attach-target target)
+          (when (eq (+git-review-target-scope target) 'worktree)
+            ;; Re-refresh so the untracked hook runs after attachment.
+            (magit-refresh)))))
     buffer))
 
 (defun +git-review-open-worktree ()
@@ -1811,7 +2188,7 @@ Survives `gr'/`magit-refresh' because Magit rebuilds sections first."
 
 (defun +git-review--open-untracked-diff (target file)
   "Open a Git-produced --no-index diff for untracked FILE."
-  (let* ((root (+git-review-target-root target))
+  (let* ((root (+git-review--git-root-for-target target))
          (path (+git-review-file-path file))
          (full (expand-file-name path root))
          (null-device (if (eq system-type 'windows-nt) "NUL" "/dev/null"))
@@ -1843,8 +2220,6 @@ survives `gr'."
   (let* ((path (+git-review-file-path file))
          (status (+git-review-file-status file))
          (old-path (+git-review-file-old-path file))
-         (default-directory
-          (file-name-as-directory (+git-review-target-root target)))
          (existing (+git-review--find-file-diff-buffer target path))
          (display (if other-window
                       (lambda (buffer)
@@ -1860,6 +2235,7 @@ survives `gr'."
           (funcall display buffer)
         (magit-display-buffer buffer))
       (with-current-buffer buffer
+        (+git-review--adopt-reopening-context target)
         (cond
          ((eq status 'untracked)
           (setq-local +git-review-target target)
@@ -1872,46 +2248,57 @@ survives `gr'."
           (magit-refresh)
           (when (eq status 'copied)
             (+git-review--install-status-presentation status old-path))))
+        (+git-review--bind-operational-directory
+         (+git-review--git-root-for-target target))
         (+git-review--enter-normal-state)))
-     ((eq status 'untracked)
-      (let ((magit-display-buffer-function
-             (or display magit-display-buffer-function)))
-        (setq buffer (+git-review--open-untracked-diff target file)))
-      (with-current-buffer buffer
-        (+git-review--attach-target target path)))
-     ((memq status '(binary submodule))
-      (let ((magit-display-buffer-function
-             (or display magit-display-buffer-function)))
-        (pcase-let* ((`(,range ,typearg)
-                      (+git-review-target-range-args target))
-                     (args (+git-review-target-diff-args target)))
-          (setq buffer
-                (magit-diff-setup-buffer
-                 range typearg args pathspecs
-                 (pcase (+git-review-target-scope target)
-                   ('staged 'staged)
-                   (_ 'committed))
-                 (+git-review--magit-diff-locked-p target pathspecs)))))
-      (with-current-buffer buffer
-        (+git-review--attach-target target path)
-        (+git-review--install-status-presentation status old-path)))
      (t
-      (pcase-let* ((`(,range ,typearg)
-                    (+git-review-target-range-args target))
-                   (args (+git-review-target-diff-args target)))
-        (let ((magit-display-buffer-function
-               (or display magit-display-buffer-function)))
-          (setq buffer
-                (magit-diff-setup-buffer
-                 range typearg args pathspecs
-                 (pcase (+git-review-target-scope target)
-                   ('staged 'staged)
-                   (_ 'committed))
-                 (+git-review--magit-diff-locked-p target pathspecs))))
-        (with-current-buffer buffer
-          (+git-review--attach-target target path)
-          (when (eq status 'copied)
-            (+git-review--install-status-presentation status old-path))))))
+      ;; Only let-bind default-directory when creating a new Magit buffer.
+      ;; Reusing an existing buffer while let-bound would restore the prior
+      ;; root on unwind (buffer-local default-directory gotcha).
+      (let ((default-directory
+             (file-name-as-directory
+              (+git-review--git-root-for-target target))))
+        (cond
+         ((eq status 'untracked)
+          (let ((magit-display-buffer-function
+                 (or display magit-display-buffer-function)))
+            (setq buffer (+git-review--open-untracked-diff target file)))
+          (with-current-buffer buffer
+            (+git-review--attach-target target path)))
+         ((memq status '(binary submodule))
+          (let ((magit-display-buffer-function
+                 (or display magit-display-buffer-function)))
+            (pcase-let* ((`(,range ,typearg)
+                          (+git-review-target-range-args target))
+                         (args (+git-review-target-diff-args target)))
+              (setq buffer
+                    (magit-diff-setup-buffer
+                     range typearg args pathspecs
+                     (pcase (+git-review-target-scope target)
+                       ('staged 'staged)
+                       (_ 'committed))
+                     (+git-review--magit-diff-locked-p target pathspecs)))))
+          (with-current-buffer buffer
+            (+git-review--attach-target target path)
+            (+git-review--install-status-presentation status old-path)))
+         (t
+          (pcase-let* ((`(,range ,typearg)
+                        (+git-review-target-range-args target))
+                       (args (+git-review-target-diff-args target)))
+            (let ((magit-display-buffer-function
+                   (or display magit-display-buffer-function)))
+              (setq buffer
+                    (magit-diff-setup-buffer
+                     range typearg args pathspecs
+                     (pcase (+git-review-target-scope target)
+                       ('staged 'staged)
+                       (_ 'committed))
+                     (+git-review--magit-diff-locked-p target pathspecs))))
+            (with-current-buffer buffer
+              (+git-review--attach-target target path)
+              (when (eq status 'copied)
+                (+git-review--install-status-presentation
+                 status old-path)))))))))
     buffer))
 
 (defun +git-changes-tree-visit-file (&optional other-window)

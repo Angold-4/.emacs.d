@@ -72,16 +72,30 @@ PREFIX is a short label included in the directory name."
 
 (defun git-review-fixtures-with-repo (prefix fn)
   "Call FN with a temporary Git repository root named from PREFIX.
-The temporary tree is deleted afterward via `unwind-protect'."
-  (let ((root (git-review-fixtures-make-temp-root prefix)))
+The temporary tree is deleted afterward via `unwind-protect'.
+Binds `+git-store-registry-directory' to a disposable directory when the
+store module is loaded so tests never touch the owner's registry."
+  (let ((root (git-review-fixtures-make-temp-root prefix))
+        (registry-dir nil)
+        (store-bound (boundp '+git-store-registry-directory)))
     (unwind-protect
         (progn
           (git-review-fixtures--init-repo root)
-          (funcall fn root))
+          (if store-bound
+              (let* ((+git-store-registry-directory
+                      (setq registry-dir
+                            (make-temp-file "git-review-registry " t))))
+                (+git-store-reset-registry)
+                (funcall fn root))
+            (funcall fn root)))
       (ignore-errors
         (delete-directory (file-name-directory
                            (directory-file-name root))
-                          t)))))
+                          t))
+      (when (and registry-dir (file-directory-p registry-dir))
+        (ignore-errors (delete-directory registry-dir t)))
+      (when store-bound
+        (ignore-errors (+git-store-reset-registry))))))
 
 (defun git-review-fixtures-create-small (root)
   "Populate ROOT with a small working tree covering common change kinds.

@@ -13,12 +13,18 @@
 (require 'git-review-baseline)
 
 (defun git-review-phase2--with-state-dir (fn)
-  "Call FN with `+git-review-state-directory' bound to a temp directory."
+  "Call FN with review-state and registry dirs bound to temp directories."
   (let* ((dir (make-temp-file "git-review-state " t))
-         (+git-review-state-directory dir))
+         (reg (make-temp-file "git-review-registry " t))
+         (+git-review-state-directory dir)
+         (+git-store-registry-directory reg))
     (unwind-protect
-        (funcall fn dir)
-      (ignore-errors (delete-directory dir t)))))
+        (progn
+          (+git-store-reset-registry)
+          (funcall fn dir))
+      (ignore-errors (delete-directory dir t))
+      (ignore-errors (delete-directory reg t))
+      (ignore-errors (+git-store-reset-registry)))))
 
 (defun git-review-phase2--file-by-path (files path)
   "Return the `+git-review-file' in FILES whose path equals PATH."
@@ -66,6 +72,8 @@
        (should (equal (+git-review-target-family-id wt)
                       (+git-review-target-family-id
                        (+git-review-target-for-worktree root))))
+       (should (stringp (+git-review-target-repository-id wt)))
+       (should (stringp (+git-review-target-context-id wt)))
        (should (eq (+git-review-target-scope st) 'staged))
        (should (eq (+git-review-target-mutable-p st) t))
        (should (eq (+git-review-target-scope cm) 'commit))
@@ -74,12 +82,14 @@
        (should (eq (+git-review-target-scope br) 'branch))
        (should (null (+git-review-target-mutable-p br)))
        (should (string-match-p
-                (format "git-review:branch:%s:main:feature\\'"
-                        (regexp-quote (+git-review--normalize-root root)))
+                (format "git-review:branch:%s:%s:main:feature\\'"
+                        (regexp-quote (+git-review-target-repository-id br))
+                        (regexp-quote (+git-review-target-context-id br)))
                 (+git-review-target-family-id br)))
        (should (string-match-p
-                (format "git-review:branch:%s:%s:%s:overview\\'"
-                        (regexp-quote (+git-review--normalize-root root))
+                (format "git-review:branch:%s:%s:%s:%s:overview\\'"
+                        (regexp-quote (+git-review-target-repository-id br))
+                        (regexp-quote (+git-review-target-context-id br))
                         (regexp-quote (+git-review-target-base-oid br))
                         (regexp-quote (+git-review-target-head-oid br)))
                 (+git-review-target-overview-id br)))
