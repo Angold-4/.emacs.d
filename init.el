@@ -28,6 +28,7 @@
 ;; - init-tools.el    : Projectile, Treemacs, shells, etc.
 ;; - init-git.el      : Magit package ownership and Git dispatch
 ;; - init-git-store.el: Canonical repository identity and local contexts
+;; - init-git-sync.el : Shared mirror and explicit synchronization
 ;; - init-git-ui.el   : Review display, Evil mode, native visits
 
 ;;; Code:
@@ -147,6 +148,7 @@
     init-tools      ; Development tools (non-Git)
     init-git        ; Magit package ownership and Git dispatch
     init-git-store  ; Canonical repository identity and local contexts
+    init-git-sync   ; Shared mirror and explicit synchronization
     init-git-ui     ; Review display, Evil mode, native visits
     )
   "List of configuration modules to load.")

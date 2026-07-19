@@ -29,6 +29,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'init-git-store)
+(require 'init-git-sync)
 
 ;; =============================================================================
 ;; Caller / layout stack for nested review navigation
@@ -487,6 +488,7 @@ context first so a deleted originating clone does not break `gr'."
       "n" #'evil-search-next
       "N" #'evil-search-previous
       "gr" #'+git-review-refresh
+      "@" #'+git/sync
       "L" #'+git-review-select-edit-context
       "q" #'+git-review-quit
       "+" #'+git/increase-context

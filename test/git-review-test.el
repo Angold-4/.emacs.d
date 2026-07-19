@@ -355,6 +355,9 @@
 ;; Phase 3 canonical identity / local-context integration tests.
 (require 'git-review-integration-test)
 
+;; Phase 4 shared mirror / explicit synchronization tests.
+(require 'git-review-sync-test)
+
 (provide 'git-review-test)
 
 ;;; git-review-test.el ends here

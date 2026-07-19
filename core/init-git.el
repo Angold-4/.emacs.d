@@ -6,10 +6,11 @@
 ;;; Commentary:
 ;; Phase 1 ownership for Magit lives here.  Review UI (display policy, Evil
 ;; review mode, visits, faces, Delta/Difftastic) lives in `init-git-ui.el'.
+;; Synchronization lives in `init-git-sync.el'.
 ;;
 ;; Entry points:
 ;;   C-x g       — magit-status (direct)
-;;   C-c g       — +git-dispatch Transient (local review commands only)
+;;   C-c g       — +git-dispatch Transient
 ;;   C-x M-g     — magit-dispatch
 ;;
 ;; Review helpers:
@@ -18,6 +19,10 @@
 ;;   +git/review-commit   — one commit
 ;;   +git/review-branch   — branch merge-base..head review
 ;;   +git/log-oneline     — compact log
+;;
+;; Explicit sync (network-capable):
+;;   C-c g f / @          — synchronize current repository
+;;   C-c g F              — synchronize allowlisted repositories
 ;;
 ;; Phase 2 local review targets and the Changes Tree live in
 ;; `init-git-ui.el'.  These entry points only construct targets and
@@ -152,16 +157,19 @@ Prompt for BASE and HEAD when omitted."
 ;; =============================================================================
 
 (transient-define-prefix +git-dispatch ()
-  "Git review dispatch for local Magit entry points.
-Does not fetch, pull, push, or contact Forge remotes."
+  "Git review dispatch.
+`r/s/c/b/l/g' are local-only.  `f/F' are explicitly network-capable."
   [["Status"
-    ("g" "status" magit-status)]
-   ["Review"
+    ("g" "status (local)" magit-status)]
+   ["Review (local)"
     ("r" "working-tree review" +git/review)
     ("s" "staged review" +git/review-staged)
     ("c" "commit review" +git/review-commit)
     ("b" "branch review" +git/review-branch)
-    ("l" "compact log" +git/log-oneline)]])
+    ("l" "compact log" +git/log-oneline)]
+   ["Sync (network)"
+    ("f" "synchronize repository" +git/sync)
+    ("F" "synchronize allowlisted" +git/sync-all)]])
 
 (global-set-key (kbd "C-c g") #'+git-dispatch)
 
