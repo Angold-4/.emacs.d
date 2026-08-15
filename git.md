@@ -11,9 +11,10 @@ Open a repository file, then press `C-c g` to open the Git dispatch:
 
 | Key | Action | Network |
 |---|---|---|
-| `g` | Magit status | No |
+| `g` | Current PR home; Magit status when no PR matches | No |
 | `r` | Review working-tree changes | No |
 | `s` | Review staged changes | No |
+| `u` | Review unstaged and untracked changes | No |
 | `c` | Review one commit | No |
 | `b` | Review a base/head branch range | No |
 | `p` | Open a cached pull request by number | No |
@@ -30,6 +31,7 @@ Use one of:
 ```text
 C-c g r    HEAD versus working tree/index, including untracked files
 C-c g s    HEAD versus index
+C-c g u    index versus worktree, including untracked files
 C-c g c    parent versus selected commit
 C-c g b    merge-base(base, head) versus head
 ```
@@ -63,17 +65,22 @@ operations.
 
 ## Review a pull request
 
-### One-time repository setup
+### Authentication
 
-Forge is the local GitHub metadata database used by the PR workspace. Register
-each new remote repository once:
+Forge is the local GitHub metadata database used by the PR workspace. Git may
+authenticate through the 1Password SSH agent, but Forge also needs a GitHub API
+username and token. See [Git review authentication](docs/git-review-auth.md).
 
-```text
-M-x forge-add-repository
-```
+On macOS, run `M-x +forge-store-token-in-macos-keychain` once and paste the
+token at the hidden prompt. Later Emacs launches retrieve it automatically.
+On Linux and WSL, put the Ghub entry in encrypted `~/.authinfo.gpg`. Use
+`M-x +forge-set-session-token` only when no persistent store is approved.
 
-Git fetch may use SSH, but Forge needs a GitHub API username and token. See
-[Git review authentication](docs/git-review-auth.md).
+If 1Password opens during a Git fetch, that is the separate SSH agent signing
+the Git operation; Forge does not call 1Password or its `op` CLI. PAT rotation
+instructions for macOS Keychain and Linux/WSL are in the authentication guide.
+After replacing a token, restart Emacs or run
+`M-x +forge-clear-token-cache` before the next sync.
 
 ### Synchronize and open
 
@@ -82,7 +89,12 @@ From a file or review buffer belonging to the repository:
 ```text
 C-c g f    fetch the shared Git mirror and update Forge
 C-c g p    enter the PR number
+C-c g g    open the current PR home (or local Magit status)
 ```
+
+The first `C-c g f` also registers an unknown repository with Forge inside the
+same explicit network operation. It does not add a pull-request fetch refspec
+to the working clone. Do not use `forge-add-repository` for this workflow.
 
 Synchronization is asynchronous. `fetching-mirror` means it is still running.
 Completion looks like:
@@ -93,6 +105,42 @@ Synced github.com/OWNER/REPOSITORY (generation N, forge: current)
 
 Use `M-x +git/sync-status` for details. `gr` is intentionally different: it
 only rereads the already-published mirror, Forge database, and review state.
+
+### Continue work on the current PR branch
+
+`C-c g g` first matches the checked-out branch name against open or draft PRs
+in the local Forge cache. A differently named local pick-up branch must track
+the provider branch explicitly, for example:
+
+```bash
+git branch --set-upstream-to=origin/feat/rate-limit-runtime-enforcement vp/pr569-runtime
+```
+
+Detection then matches Git's configured upstream; it never guesses from commit
+ancestry and never contacts GitHub. Run `C-c g f` first when the PR is new or
+its cached metadata is stale.
+
+The PR workspace deliberately keeps the cached committed PR range separate
+from work that exists only in the current clone. Its **Local continuation**
+section reports the checked-out branch and four independent layers:
+
+```text
+C    commits after the cached PR head
+s    staged changes only
+u    unstaged tracked changes plus untracked files
+r    all staged, unstaged, and untracked work together
+```
+
+This makes “what reviewers already see” stable while still providing a clean
+view of partially implemented follow-up work. If the branch is behind or has
+diverged from the cached PR head, the workspace reports that relationship
+instead of constructing a misleading local-commit range.
+
+On a matching branch, `C-c g g` always returns to this PR workspace—the home
+for previous PR commits and all local continuation layers. On a branch without
+a matching cached open/draft PR, the same command opens Magit status in the
+active worktree. The internal `mirror.git` path remains the object store for
+the immutable PR range and is never used as a local-command root.
 
 ### File-by-file review
 
@@ -149,6 +197,8 @@ The generated Git/Forge buffers deliberately expose a small vocabulary:
 | `gf` / `gF` | Next/previous changed file |
 | `gh` / `gH` | Next/previous hunk |
 | `gc` / `gC` | Next/previous PR commit |
+| `C` | Review local commits after the cached PR head (PR workspace) |
+| `r` / `s` / `u` | Review combined/staged/unstaged continuation (PR workspace) |
 | `RET` | Visit item or open file diff |
 | `o` | Visit in one reusable review window |
 | `e` | Open the writable worktree file |
@@ -156,7 +206,7 @@ The generated Git/Forge buffers deliberately expose a small vocabulary:
 | `/`, `?`, `n`, `N` | Evil search |
 | `gr` | Local-only refresh |
 | `t` | Open/reuse Changes Tree |
-| `q` | Return to the caller and prior layout |
+| `q` | Return in the selected window; preserve other splits |
 | `C-h/j/k/l` | Move between Emacs windows |
 
 There are no Git-specific normal bindings for `[`/`]`, staging, discarding,
@@ -166,13 +216,15 @@ behind Magit/Forge Transients, `C-c g`, or `M-x`.
 ## Buffers and windows
 
 Ordinary navigation replaces the selected window. It should not create a new
-window. `q` restores the caller and saved layout.
+window. `q` restores the caller only in the selected window and leaves every
+other user-created split and buffer untouched.
 
 `o` is the explicit exception: it creates or reuses one review window. Source
 buffers are never killed by the return mechanism.
 
 The same PR or immutable commit is shared across clones of the same canonical
-remote. Worktree and staged reviews remain specific to one clone/worktree.
+remote. Worktree, staged, and unstaged reviews remain specific to one
+clone/worktree.
 PR Git objects come from the shared bare mirror; `e` opens files from the
 selected writable local context.
 
@@ -189,6 +241,21 @@ The active network process and API token cache are session-local. A clean Emacs
 exit releases its sync process lock. A later Emacs automatically reclaims a
 same-host lock only when the recorded owner PID is confirmed dead; it never
 steals a lock from another live Emacs.
+
+### Configure sync-all
+
+`C-c g F` intentionally does nothing until canonical repository IDs are
+allowlisted. IDs use the normalized `host/owner/repository` form shown by
+`M-x +git/sync-status`, for example:
+
+```elisp
+(setq +git-sync-active-repositories
+      '("github.com/Angold-4/.emacs.d"
+        "github.com/ORG/PROJECT"))
+```
+
+An empty list never means “all repositories.” This keeps global network access
+opt-in and bounded.
 
 ## Diff display
 
@@ -210,10 +277,10 @@ installed.
 
 The Git mirror may be usable while Forge metadata was not updated. Confirm:
 
-1. the repository was registered with `M-x forge-add-repository`;
-2. `github.user` is configured;
-3. Auth Source or 1Password can provide the Forge token;
-4. `C-c g f` ends with `forge: current`.
+1. `github.user` is configured;
+2. macOS Keychain, Linux/WSL Auth Source, or `+forge-set-session-token` can
+   provide the Forge token;
+3. `C-c g f` ends with `forge: current`.
 
 ### `already syncing elsewhere`
 

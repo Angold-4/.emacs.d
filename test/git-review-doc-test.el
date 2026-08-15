@@ -34,27 +34,42 @@
                         git-review-doc-test--files "\n")))
     (dolist (required
              '("C-c g r    HEAD versus working tree/index"
+               "C-c g u    index versus worktree, including untracked files"
                "C-c g f    fetch the shared Git mirror and update Forge"
+               "C-c g g    open the current PR home (or local Magit status)"
+               "`C-c g g` always returns to this PR workspace"
                "C-c g p -> PR number -> c -> RET"
+               "Local continuation"
                "`SPC` toggles the file or folder"
-               "`gr` is intentionally different"))
+               "`gr` is intentionally different"
+               "M-x +forge-set-session-token"
+               "M-x +forge-store-token-in-macos-keychain"
+               "M-x +forge-clear-token-cache"
+               "encrypted `~/.authinfo.gpg`"
+               "Do not use `forge-add-repository`"))
       (should (string-match-p (regexp-quote required) guide)))
     (dolist (required
              '("Status: **Phases 0–5 implemented on PR #5**"
                "core/init-git-store.el"
                "PR and PR-commit object operations use the published bare mirror"
-               "dead-owner restart"))
+               "`+git/home`"
+               "The committed PR range is immutable"
+               "dead-owner restart"
+               "standard Auth Source is enabled by default"))
       (should (string-match-p (regexp-quote required) architecture)))
     (should (string-match-p
              (regexp-quote "The next implementation action is **Phase 6 only**")
              plan))
     (dolist (stale
              '("Implementation status: **Not started"
-               "C-c g g"
                "C-c g f / @"
                "Difftastic is available through `D`"
                "| `n` | Jump to next file"
-               "The next implementation action is **Phase 1 only**"))
+               "Register each new remote repository once"
+               "The next implementation action is **Phase 1 only**"
+               "FORGE_GITHUB_TOKEN_OP_REF"
+               "op://"
+               "+forge-1password"))
       (should-not (string-match-p (regexp-quote stale) all)))))
 
 (ert-deftest git-review-documentation-local-links-resolve ()

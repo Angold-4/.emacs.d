@@ -106,29 +106,51 @@ Use `+git/increase-context' or `+git/decrease-context' to adjust.")
   (interactive)
   (+git-review-open-staged))
 
-(defun +git/review-commit (&optional commit)
+(defun +git/review-unstaged ()
+  "Open a reusable unstaged/untracked review overview (index vs worktree)."
+  (interactive)
+  (+git-review-open-unstaged))
+
+(defun +git/status (&optional root)
+  "Open Magit status for the active local edit context.
+From a PR buffer this deliberately ignores the internal bare mirror."
+  (interactive)
+  (require 'magit)
+  (magit-status
+   (+git-review--normalize-root
+    (or root (+git-review--local-entry-root)))))
+
+(defun +git/review-commit (&optional commit root)
   "Open a reusable commit review overview for COMMIT.
 If COMMIT is nil, prompt for one.  Root commits use Git's empty tree."
-  (interactive
-   (progn (require 'magit)
-          (list (magit-read-branch-or-commit "Review commit"))))
-  (+git-review-open-commit commit))
+  (interactive)
+  (require 'magit)
+  (let* ((root (+git-review--normalize-root
+                (or root (+git-review--local-entry-root))))
+         (commit (or commit
+                     (let ((default-directory
+                            (file-name-as-directory root)))
+                       (magit-read-branch-or-commit "Review commit")))))
+    (+git-review-open-commit commit root)))
 
-(defun +git/review-branch (&optional base head)
+(defun +git/review-branch (&optional base head root)
   "Open a reusable branch review for merge-base(BASE, HEAD)..HEAD.
 Prompt for BASE and HEAD when omitted."
-  (interactive
-   (progn (require 'magit)
-          (list (magit-read-branch-or-commit "Review base")
-                (magit-read-branch-or-commit "Review head"))))
-  (+git-review-open-branch base head))
+  (interactive)
+  (require 'magit)
+  (let* ((root (+git-review--normalize-root
+                (or root (+git-review--local-entry-root))))
+         (default-directory (file-name-as-directory root))
+         (base (or base (magit-read-branch-or-commit "Review base")))
+         (head (or head (magit-read-branch-or-commit "Review head"))))
+    (+git-review-open-branch base head root)))
 
 (defun +git/log-oneline ()
   "Show a compact one-line-per-commit git log."
   (interactive)
   (require 'magit)
-  (let ((default-directory (or (magit-toplevel)
-                               (user-error "Not inside a Git repository"))))
+  (let ((default-directory
+         (file-name-as-directory (+git-review--local-entry-root))))
     (magit-log-current '("--oneline" "--graph" "--decorate") '("-n100"))))
 
 (defun +git/increase-context ()
@@ -159,12 +181,13 @@ Prompt for BASE and HEAD when omitted."
 
 (transient-define-prefix +git-dispatch ()
   "Git review dispatch.
-`r/s/c/b/p/l/g' are local-only.  `f/F' are explicitly network-capable."
+`g/r/s/u/c/b/p/l' are local-only.  `f/F' are explicitly network-capable."
   [["Status"
-    ("g" "status (local)" magit-status)]
+    ("g" "current PR / worktree home" +git/home)]
    ["Review (local)"
     ("r" "working-tree review" +git/review)
     ("s" "staged review" +git/review-staged)
+    ("u" "unstaged + untracked review" +git/review-unstaged)
     ("c" "commit review" +git/review-commit)
     ("b" "branch review" +git/review-branch)
     ("p" "pull request review (cached)" +git/review-pull-request)

@@ -239,6 +239,22 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 (defvar +vterm/last-buffer nil
   "Most recently created terminal buffer, used by `+vterm/goto-last' (:v).")
 
+(defun +vterm/start-directory ()
+  "Return the stable directory in which new vterm shells should start."
+  (let ((dir (and (boundp '+emacs-launch-directory)
+                  +emacs-launch-directory)))
+    (file-name-as-directory
+     (expand-file-name
+      (if (and (stringp dir) (file-directory-p dir))
+          dir
+        user-emacs-directory)))))
+
+(defun +vterm/use-start-directory (&rest _)
+  "Make the current new vterm buffer start in the Emacs launch directory."
+  ;; `default-directory' is permanent-local, so this survives the major-mode
+  ;; reset and is already in force when vterm creates its shell process.
+  (setq-local default-directory (+vterm/start-directory)))
+
 (use-package vterm
   :straight t
   :commands (vterm vterm-other-window vterm-mode)
@@ -248,7 +264,10 @@ Supports WSL by using powershell.exe to access Windows clipboard."
   ;; General settings
   (setq vterm-max-scrollback 10000
         vterm-kill-buffer-on-exit t
-        vterm-timer-delay 0.01)        ; Faster rendering
+        ;; Agent TUIs redraw the whole screen in short bursts.  Coalesce those
+        ;; writes into complete frames instead of painting partial frames at
+        ;; 100 Hz, which appears as a flash on macOS.
+        vterm-timer-delay 0.05)
 
   ;; Shell to use (default to user's shell)
   (setq vterm-shell (or (getenv "SHELL") "/bin/bash"))
@@ -283,20 +302,21 @@ Supports WSL by using powershell.exe to access Windows clipboard."
 ;; -----------------------------------------------------------------------------
 ;; Stock `vterm' reuses the single `*vterm*' buffer, so a second one needs a
 ;; manual rename first.  Instead:
-;;   :vterm  -> always open a NEW terminal in the current dir (1sh, 2sh, ...)
+;;   :vterm  -> always open a NEW terminal in the Emacs launch dir
+;;              (1sh, 2sh, ...)
 ;;   :v      -> jump to the most recently created terminal
 ;;
 ;; Defined at top level (not in vterm's :config) and requiring vterm itself,
 ;; so the ex commands work even before vterm has loaded for the first time.
 (defun +vterm/new ()
-  "Open a new terminal in the current directory with a numbered name.
+  "Open a new terminal in the Emacs launch directory with a numbered name.
 Buffers are named 1sh, 2sh, 3sh, ... instead of the default *vterm*, so
 several can coexist without renaming.  The new buffer is recorded as the
 most-recently-created terminal for `+vterm/goto-last' (:v)."
   (interactive)
   (require 'vterm)
   (setq +vterm/counter (1+ +vterm/counter))
-  (let ((dir default-directory)
+  (let ((dir (+vterm/start-directory))
         (buf (generate-new-buffer (format "%dsh" +vterm/counter))))
     (with-current-buffer buf
       (setq default-directory dir)
@@ -351,53 +371,217 @@ This never hides a terminal the way the persp-aware C-x b can."
   (evil-ex-define-cmd "v" #'+vterm/goto-last)
   (evil-ex-define-cmd "vt" #'+vterm/switch))
 
-;; In evil normal/visual state, keep the Emacs scroll position when vterm
-;; redraws (new agent output, window resize, switching away for C-p, etc.).
-;; Do NOT pause the PTY — that blocks interactive CLI agents.  Redraw still
-;; updates buffer text; we only restore window-start/point afterward.
-(defvar +vterm/scroll-advice-installed nil)
+;; A vterm has two intentionally different display modes:
+;;
+;;   selected insert terminal output owns point and the viewport;
+;;   normal/visual  Emacs owns them, like an ordinary read-only buffer;
+;;   unselected     Emacs freezes that window, regardless of Evil state.
+;;
+;; Keep exactly one snapshot per window.  In particular, never take a fresh
+;; snapshot while vterm redraws: by then libvterm may already have moved point,
+;; and recording that position is what caused the old cursor/view "snap".
+;; The PTY remains live in both modes; this freezes only the Emacs view.
+(defvar +vterm/frozen-views (make-hash-table :test #'eq)
+  "Normal/visual vterm views keyed by window.
+Each value is (BUFFER POINT WINDOW-START).")
 
-(defun +vterm/should-preserve-scroll-p ()
-  "Non-nil when reading scrollback in evil normal/visual state."
-  (and (derived-mode-p 'vterm-mode)
-       (bound-and-true-p evil-mode)
-       (or (evil-normal-state-p) (evil-visual-state-p))))
+(defvar +vterm/command-window nil
+  "Window in which the current command began.")
 
-(defun +vterm/capture-window-positions (buffer)
-  (let (positions)
-    (dolist (w (get-buffer-window-list buffer nil t))
-      (when (window-live-p w)
-        (push (list w (window-point w) (window-start w)) positions)))
-    positions))
+(defvar +vterm/command-buffer nil
+  "Buffer in which the current command began.")
 
-(defun +vterm/restore-window-positions (positions)
-  (dolist (entry positions)
-    (pcase-let ((`(,w ,pt ,ws) entry))
-      (when (and (window-live-p w)
-                 (eq (window-buffer w) (current-buffer)))
-        (set-window-start w ws t)
-        (set-window-point w pt)))))
+(defun +vterm/frozen-state-p (&optional buffer)
+  "Return non-nil when BUFFER's vterm view should behave like a text buffer."
+  (with-current-buffer (or buffer (current-buffer))
+    (and (derived-mode-p 'vterm-mode)
+         (bound-and-true-p evil-mode)
+         (memq evil-state '(normal visual)))))
+
+(defun +vterm/window-vterm-p (window)
+  "Return non-nil when live WINDOW displays a vterm buffer."
+  (and (window-live-p window)
+       (with-current-buffer (window-buffer window)
+         (derived-mode-p 'vterm-mode))))
+
+(defun +vterm/window-should-freeze-p (window)
+  "Return non-nil when WINDOW's vterm viewport belongs to Emacs.
+Every unselected vterm is frozen.  A selected one is frozen only while Evil is
+in normal or visual state."
+  (and (+vterm/window-vterm-p window)
+       (or (not (eq window (selected-window)))
+           (+vterm/frozen-state-p (window-buffer window)))))
+
+(defun +vterm/visible-windows ()
+  "Return visible non-minibuffer windows across all live frames."
+  (let (windows)
+    (dolist (frame (frame-list))
+      (when (frame-live-p frame)
+        (setq windows (nconc (window-list frame 'nomini) windows))))
+    windows))
+
+(defun +vterm/freeze-window-view (window)
+  "Save WINDOW's current Emacs-owned vterm viewport."
+  (when (+vterm/window-should-freeze-p window)
+    (puthash window
+             (list (window-buffer window)
+                   (window-point window)
+                   (window-start window))
+             +vterm/frozen-views)))
+
+(defun +vterm/restore-window-view (window)
+  "Restore WINDOW's frozen vterm viewport, if it still applies."
+  (let ((saved (gethash window +vterm/frozen-views)))
+    (cond
+     ((or (not (window-live-p window))
+          (not (eq (car-safe saved) (window-buffer window)))
+          (not (+vterm/window-should-freeze-p window)))
+      (remhash window +vterm/frozen-views))
+     (saved
+      (let ((buffer (car saved))
+            (saved-point (nth 1 saved))
+            (saved-start (nth 2 saved)))
+        (with-current-buffer buffer
+          (setq saved-point
+                (min (max (point-min) saved-point) (point-max))
+                saved-start
+                (min (max (point-min) saved-start) (point-max))))
+        ;; Conditional setters matter for interactive TUIs: setting an
+        ;; unchanged window position still schedules needless redisplay.
+        (unless (= (window-point window) saved-point)
+          (set-window-point window saved-point))
+        (unless (= (window-start window) saved-start)
+          (set-window-start window saved-start t)))))))
+
+(defun +vterm/freeze-current-buffer-views ()
+  "Freeze every visible window showing the current normal/visual vterm."
+  (when (+vterm/frozen-state-p)
+    (dolist (window (get-buffer-window-list (current-buffer) nil t))
+      (+vterm/freeze-window-view window))))
+
+(defun +vterm/remove-current-buffer-views ()
+  "Remove every frozen view belonging to the current vterm buffer."
+  (let ((buffer (current-buffer))
+        stale)
+    (maphash (lambda (window saved)
+               (when (or (not (window-live-p window))
+                         (eq (car-safe saved) buffer))
+                 (push window stale)))
+             +vterm/frozen-views)
+    (dolist (window stale)
+      (remhash window +vterm/frozen-views))))
+
+(defun +vterm/release-selected-window-view ()
+  "Return the selected insert-state vterm window to its live cursor.
+Unselected windows showing the same buffer retain their independent frozen
+views."
+  (let ((window (selected-window)))
+    (when (and (+vterm/window-vterm-p window)
+               (eq (window-buffer window) (current-buffer)))
+      (when (gethash window +vterm/frozen-views)
+        (remhash window +vterm/frozen-views)
+        ;; A window can remain in insert state while `windmove' selects another
+        ;; split.  On return there is no Evil state transition, so explicitly
+        ;; reconnect point to libvterm's real terminal cursor once.
+        (when (fboundp 'vterm-reset-cursor-point)
+          (vterm-reset-cursor-point))))))
+
+(defun +vterm/buffer-has-frozen-view-p (buffer)
+  "Return non-nil when BUFFER has at least one frozen window snapshot."
+  (let (found)
+    (maphash (lambda (_window saved)
+               (when (eq (car-safe saved) buffer)
+                 (setq found t)))
+             +vterm/frozen-views)
+    found))
+
+(defun +vterm/restore-frozen-views (&optional buffer)
+  "Restore all frozen vterm views, optionally only those for BUFFER."
+  (let (views)
+    ;; Copy first so stale entries can safely be removed while restoring.
+    (maphash (lambda (window saved)
+               (when (or (null buffer) (eq (car-safe saved) buffer))
+                 (push window views)))
+             +vterm/frozen-views)
+    (dolist (window views)
+      (+vterm/restore-window-view window))))
+
+(defun +vterm/before-command ()
+  "Restore stable vterm views before a command and record its origin."
+  (setq +vterm/command-window (selected-window)
+        +vterm/command-buffer (current-buffer))
+  (+vterm/restore-frozen-views))
+
+(defun +vterm/after-command ()
+  "Maintain stable vterm views after a command.
+Only a command that began and ended in the same selected normal/visual vterm
+may advance that window's snapshot.  Other visible vterms are restored."
+  (let ((selected (selected-window)))
+    (dolist (window (+vterm/visible-windows))
+      (when (+vterm/window-vterm-p window)
+        (let ((saved (gethash window +vterm/frozen-views)))
+          (if (+vterm/window-should-freeze-p window)
+              (cond
+               ((and (eq window selected)
+                     (eq window +vterm/command-window)
+                     (eq (window-buffer window) +vterm/command-buffer))
+                (+vterm/freeze-window-view window))
+               ((eq (car-safe saved) (window-buffer window))
+                (+vterm/restore-window-view window))
+               (t
+                (+vterm/freeze-window-view window)))
+            ;; Selected insert-state vterms are live.  Release a snapshot left
+            ;; by the same window while it was unselected.
+            (with-current-buffer (window-buffer window)
+              (+vterm/release-selected-window-view)))))))
+  ;; Also prune stale snapshots belonging to replaced or deleted windows.
+  (+vterm/restore-frozen-views))
 
 (defun +vterm/advice-delayed-redraw (orig-fn buffer)
-  (if (with-current-buffer buffer (+vterm/should-preserve-scroll-p))
-      (let ((positions (+vterm/capture-window-positions buffer)))
+  "Run ORIG-FN for BUFFER without letting redraw move a frozen view."
+  (if (and (buffer-live-p buffer)
+           (+vterm/buffer-has-frozen-view-p buffer))
+      ;; Keep redisplay inhibited across both libvterm's redraw and our
+      ;; restore.  Otherwise macOS can paint the intermediate cursor position
+      ;; as a one-frame flash on every character of agent output.
+      (let ((inhibit-redisplay t))
         (funcall orig-fn buffer)
-        (with-current-buffer buffer
-          (+vterm/restore-window-positions positions)))
+        (+vterm/restore-frozen-views buffer))
     (funcall orig-fn buffer)))
 
-(defun +vterm/install-scroll-advice ()
-  (unless +vterm/scroll-advice-installed
-    (setq +vterm/scroll-advice-installed t)
-    (advice-add #'vterm--delayed-redraw :around #'+vterm/advice-delayed-redraw)))
+(defun +vterm/install-view-stability ()
+  "Install the single-owner vterm viewport policy."
+  ;; Remove names from the earlier implementation when this file is reloaded
+  ;; in a long-running Emacs session.
+  (remove-hook 'pre-command-hook #'+vterm/pre-command-remember-view)
+  (remove-hook 'post-command-hook #'+vterm/post-command-maintain-view)
+  (add-hook 'pre-command-hook #'+vterm/before-command)
+  (add-hook 'post-command-hook #'+vterm/after-command)
+  (when (advice-member-p #'+vterm/advice-delayed-redraw
+                         #'vterm--delayed-redraw)
+    (advice-remove #'vterm--delayed-redraw #'+vterm/advice-delayed-redraw))
+  (advice-add #'vterm--delayed-redraw :around #'+vterm/advice-delayed-redraw))
 
 (with-eval-after-load 'vterm
-  (+vterm/install-scroll-advice))
+  (unless (advice-member-p #'+vterm/use-start-directory 'vterm-mode)
+    (advice-add 'vterm-mode :before #'+vterm/use-start-directory))
+  (+vterm/install-view-stability))
 
 ;; Evil integration for vterm
 (defun +vterm/evil-setup ()
   "Setup Evil keybindings for vterm."
   (when (bound-and-true-p evil-mode)
+    ;; Normal/visual state freezes the Emacs view.  Insert state (and buffer
+    ;; teardown) removes its snapshots so live terminal display resumes.
+    (add-hook 'evil-normal-state-entry-hook
+              #'+vterm/freeze-current-buffer-views nil t)
+    (add-hook 'evil-visual-state-entry-hook
+              #'+vterm/freeze-current-buffer-views nil t)
+    (add-hook 'evil-insert-state-entry-hook
+              #'+vterm/release-selected-window-view nil t)
+    (add-hook 'kill-buffer-hook
+              #'+vterm/remove-current-buffer-views nil t)
+
     ;; Start in insert state (vterm handles its own input)
     (evil-set-initial-state 'vterm-mode 'insert)
 

@@ -445,6 +445,104 @@ same-repository context.  Signals when none remain."
          (root (or (and ctx (+git-store-local-context-root ctx)) "?")))
     (format "Edit context: %s" root)))
 
+(defun +git-pr--branch-name (root)
+  "Return ROOT's checked-out branch name, or nil for detached HEAD."
+  (let* ((result (+git-review--call-git
+                  root "symbolic-ref" "--quiet" "--short" "HEAD"))
+         (branch (string-trim-right (cdr result))))
+    (and (eq (car result) 0)
+         (not (string-empty-p branch))
+         branch)))
+
+(defun +git-pr--upstream-head-ref (root branch)
+  "Return BRANCH's configured upstream head ref in ROOT, or nil.
+This reads Git's explicit `branch.BRANCH.merge' relationship instead of
+inferring PR identity from commit ancestry."
+  (let* ((key (format "branch.%s.merge" branch))
+         (result (+git-review--call-git root "config" "--get" key))
+         (merge-ref (string-trim-right (cdr result))))
+    (when (and (eq (car result) 0)
+               (string-prefix-p "refs/heads/" merge-ref))
+      (string-remove-prefix "refs/heads/" merge-ref))))
+
+(defun +git-pr--current-branch-prs (root repository-id branch)
+  "Return cached PR candidates for BRANCH in ROOT and REPOSITORY-ID.
+An exact head-ref match wins.  Otherwise, a differently named local branch
+must explicitly track the provider branch through Git's upstream config.  This
+function performs no network access and never guesses from commit ancestry."
+  (or (+forge-prs-for-head-ref repository-id branch)
+      (when-let ((upstream (+git-pr--upstream-head-ref root branch)))
+        (+forge-prs-for-head-ref repository-id upstream))))
+
+(defun +git-pr--local-continuation (model)
+  "Return a plist describing MODEL's matching local branch continuation.
+Committed PR state, local commits, staged changes, unstaged changes, and
+untracked files remain separate.  This function performs local Git reads only."
+  (let* ((target (+git-pr-target model))
+         (root (+git-review-target-root target))
+         (branch (and root
+                      (+git-review--inside-worktree-p root)
+                      (+git-pr--branch-name root)))
+         (head-ref (+git-pr-head-ref model))
+         (pr-head (+git-pr-head-oid model))
+         (local-head (and branch (+git-review--rev-parse root "HEAD")))
+         (exact-ref (and branch head-ref (equal branch head-ref)))
+         (upstream-ref (and branch (+git-pr--upstream-head-ref root branch)))
+         (matches (or exact-ref
+                      (and upstream-ref head-ref
+                           (equal upstream-ref head-ref)))))
+    (if (not matches)
+        (list :root root :branch branch :head-ref head-ref :matches nil)
+      (let* ((relation
+              (cond
+               ((equal pr-head local-head) 'current)
+               ((eq 0 (car (+git-review--call-git
+                            root "merge-base" "--is-ancestor"
+                            pr-head local-head)))
+                'ahead)
+               ((eq 0 (car (+git-review--call-git
+                            root "merge-base" "--is-ancestor"
+                            local-head pr-head)))
+                'behind)
+               (t 'diverged)))
+             (local-commits
+              (if (eq relation 'ahead)
+                  (string-to-number
+                   (string-trim
+                    (+git-review--git-ok
+                     root "rev-list" "--count"
+                     (format "%s..%s" pr-head local-head))))
+                0))
+             (staged (+git-review--git-items
+                      root "diff" "--cached" "--name-only" "-z"))
+             (unstaged (+git-review--git-items
+                        root "diff" "--name-only" "-z"))
+             (untracked (+git-review--git-items
+                         root "ls-files" "-z" "--others"
+                         "--exclude-standard")))
+        (list :root root
+              :branch branch
+              :head-ref head-ref
+              :matches t
+              :pr-head pr-head
+              :local-head local-head
+              :relation relation
+              :local-commits local-commits
+              :staged staged
+              :unstaged unstaged
+              :untracked untracked)))))
+
+(defun +git-pr--require-local-continuation ()
+  "Return the current PR's matching local continuation or signal clearly."
+  (let ((info (+git-pr--local-continuation
+               (or +git-pr--model (user-error "No PR model")))))
+    (unless (plist-get info :matches)
+      (user-error
+       "Checked-out branch `%s' does not match PR head `%s'"
+       (or (plist-get info :branch) "detached HEAD")
+       (or (plist-get info :head-ref) "?")))
+    info))
+
 (defun +git-pr--file-rollups (files)
   "Return (COUNT ADDS DELS REVIEWED) for FILES."
   (let ((adds 0)
@@ -550,6 +648,80 @@ same-repository context.  Signals when none remain."
             (setq idx (1+ idx)))))
       (insert "\n"))))
 
+(defun +git-pr--insert-local-continuation (model)
+  "Insert branch-aware local continuation state for MODEL."
+  (let ((info (+git-pr--local-continuation model)))
+    (magit-insert-section (pr-local-continuation nil)
+      (magit-insert-heading "Local continuation")
+      (if (not (plist-get info :matches))
+          (insert
+           (format "  Checked out: %s; PR head: %s (not the same branch)\n"
+                   (or (plist-get info :branch) "detached HEAD")
+                   (or (plist-get info :head-ref) "?")))
+        (let ((relation (plist-get info :relation)))
+          (insert (format "  Branch: %s\n" (plist-get info :branch)))
+          (insert
+           (format "  Local commits after cached PR head: %s\n"
+                   (pcase relation
+                     ('current "0 (up to date)")
+                     ('ahead (number-to-string
+                              (plist-get info :local-commits)))
+                     ('behind "local branch is behind")
+                     (_ "branches have diverged"))))
+          (insert (format "  Staged: %d file%s\n"
+                          (length (plist-get info :staged))
+                          (if (= (length (plist-get info :staged)) 1) "" "s")))
+          (insert (format "  Unstaged: %d tracked file%s\n"
+                          (length (plist-get info :unstaged))
+                          (if (= (length (plist-get info :unstaged)) 1) "" "s")))
+          (insert (format "  Untracked: %d file%s\n"
+                          (length (plist-get info :untracked))
+                          (if (= (length (plist-get info :untracked)) 1) "" "s")))
+          (insert "  Review: C local commits | s staged | u unstaged/untracked | r combined worktree\n")))
+      (insert "\n"))))
+
+(defun +git-pr-review-working-tree ()
+  "Review all staged, unstaged, and untracked continuation work for this PR."
+  (interactive)
+  (let ((root (plist-get (+git-pr--require-local-continuation) :root)))
+    (+git-review--open-overview (+git-review-target-for-worktree root))))
+
+(defun +git-pr-review-staged ()
+  "Review only staged continuation work for this PR's local branch."
+  (interactive)
+  (let ((root (plist-get (+git-pr--require-local-continuation) :root)))
+    (+git-review--open-overview (+git-review-target-for-staged root))))
+
+(defun +git-pr-review-unstaged ()
+  "Review unstaged tracked and untracked continuation work for this PR."
+  (interactive)
+  (let ((root (plist-get (+git-pr--require-local-continuation) :root)))
+    (+git-review--open-overview (+git-review-target-for-unstaged root))))
+
+(defun +git-pr-review-local-commits ()
+  "Review commits on the local branch that are not in the cached PR head."
+  (interactive)
+  (let* ((info (+git-pr--require-local-continuation))
+         (relation (plist-get info :relation)))
+    (unless (eq relation 'ahead)
+      (user-error
+       (pcase relation
+         ('current "Local branch has no commits after the cached PR head")
+         ('behind "Local branch is behind the cached PR head")
+         (_ "Local branch has diverged from the cached PR head"))))
+    (let* ((model +git-pr--model)
+           (old-target (+git-pr-target model))
+           (target
+            (+git-review-make-target
+             (plist-get info :root) 'branch
+             (format "PR#%d cached head" (+git-pr-number model))
+             (plist-get info :branch)
+             (plist-get info :pr-head)
+             (plist-get info :local-head)
+             (+git-pr-repository-id model)
+             (+git-review-target-context-id old-target))))
+      (+git-review--open-overview target))))
+
 (defun +git-pr--insert-checks (_model)
   "Insert Checks placeholder (Phase 7)."
   (magit-insert-section (pr-checks nil t)
@@ -608,6 +780,7 @@ same-repository context.  Signals when none remain."
       (+git-pr--insert-details model)
       (+git-pr--insert-changes model)
       (+git-pr--insert-commits model)
+      (+git-pr--insert-local-continuation model)
       (+git-pr--insert-checks model)
       (+git-pr--insert-description model)
       (+git-pr--insert-conversation model))
@@ -622,6 +795,10 @@ same-repository context.  Signals when none remain."
     (define-key map (kbd "RET") #'+git-pr-visit)
     (define-key map (kbd "t") #'+git-pr-open-changes-tree)
     (define-key map (kbd "c") #'+git-pr-goto-first-commit)
+    (define-key map (kbd "C") #'+git-pr-review-local-commits)
+    (define-key map (kbd "r") #'+git-pr-review-working-tree)
+    (define-key map (kbd "s") #'+git-pr-review-staged)
+    (define-key map (kbd "u") #'+git-pr-review-unstaged)
     (define-key map (kbd "gr") #'+git-pr-refresh)
     (define-key map (kbd "e") #'+git-review-visit-worktree)
     (define-key map (kbd "q") #'+git-review-quit)
@@ -708,6 +885,69 @@ same buffer across same-origin clones."
     buffer))
 
 (defalias '+git/review-pr #'+git/review-pull-request)
+
+(defun +git-pr--current-branch-snapshot (root &optional demand)
+  "Return the cached open/draft PR associated with ROOT, or nil.
+When DEMAND is non-nil, signal a detailed error for detached or unmatched
+branches.  Prompt only in the unusual case of multiple valid cached matches."
+  (let ((branch (+git-pr--branch-name root)))
+    (cond
+     ((null branch)
+      (when demand
+        (user-error "Cannot detect a current PR from detached HEAD")))
+     (t
+      (let* ((ctx (+git-store-context-for-root root))
+             (repository-id (+git-store-local-context-repository-id ctx))
+             (matches (+git-pr--current-branch-prs
+                       root repository-id branch)))
+        (pcase (length matches)
+          (0
+           (when demand
+             (user-error
+              (concat "No cached open/draft PR matches branch `%s' or its "
+                      "configured upstream; run C-c g f and retry")
+              branch)))
+          (1 (car matches))
+          (_
+           (let* ((choices
+                   (mapcar
+                    (lambda (snap)
+                      (cons
+                       (format "#%d  %s%s"
+                               (+forge-pr-snapshot-number snap)
+                               (if (+forge-pr-snapshot-draft snap)
+                                   "DRAFT  "
+                                 "OPEN  ")
+                               (+forge-pr-snapshot-title snap))
+                       snap))
+                    matches))
+                  (choice (completing-read
+                           (format "PR for branch %s: " branch)
+                           choices nil t)))
+             (cdr (assoc choice choices))))))))))
+
+(defun +git/review-current-pull-request (&optional root)
+  "Open the cached open/draft PR associated with ROOT's current branch.
+An exact head-ref match wins; a differently named local branch must track the
+PR head through Git's upstream config.  This is local-only.  Synchronize
+explicitly with `C-c g f' first when the Forge cache lacks the PR."
+  (interactive (list (+git-pr--resolve-root)))
+  (let* ((root (+git-pr--resolve-root root))
+         (snapshot (+git-pr--current-branch-snapshot root t)))
+    (+git/review-pull-request
+     (+forge-pr-snapshot-number snapshot) root)))
+
+(defun +git/home (&optional root)
+  "Open the current PR workspace, or local Magit status when none matches.
+This is the context-sensitive `C-c g g' home command.  It never contacts a
+remote and always resolves local work through the active edit context."
+  (interactive (list (+git-pr--resolve-root)))
+  (let* ((root (+git-pr--resolve-root root))
+         (snapshot (+git-pr--current-branch-snapshot root)))
+    (if snapshot
+        (+git/review-pull-request
+         (+forge-pr-snapshot-number snapshot) root)
+      (+git/status root))))
 
 ;; =============================================================================
 ;; Local refresh vs explicit sync
@@ -859,23 +1099,22 @@ rendered, rebuild the model first so Magit never receives a stale range."
 
 (defun +git-pr--capture-workspace-return (return-buf)
   "Capture return state for RETURN-BUF before opening a PR child.
-Must run before the child buffer is displayed, otherwise the saved
-window configuration already contains the commit/diff layout."
+Must run before the child buffer is displayed so the caller window and point
+are recorded correctly."
   (cond
    ((not (and return-buf (buffer-live-p return-buf))) nil)
    ((eq (current-buffer) return-buf)
     (+git-review--capture-return))
    ((and (bound-and-true-p +git-review--return)
          (eq (plist-get +git-review--return :buffer) return-buf)
-         (window-configuration-p
-          (plist-get +git-review--return :window-config)))
+         (buffer-live-p (plist-get +git-review--return :buffer)))
     ;; Stepping between commits: keep the original workspace capture.
     +git-review--return)
    (t
     (list :buffer return-buf
           :point (with-current-buffer return-buf (point))
-          :window-config nil
-          :selected-window nil))))
+          :selected-window (selected-window)
+          :windows (window-list)))))
 
 (defun +git-pr--insert-revision-diff ()
   "Insert the selected-parent diff into a clean PR revision buffer."
@@ -1049,7 +1288,7 @@ PARENT-OID selects a non-default merge parent when provided.
 (defun +git-pr-quit ()
   "Return from a PR child buffer to the PR workspace when recorded.
 Falls back to `+git-review-quit' for ordinary review buffers.
-Always selects the workspace window after restore so `q' cannot leave
+Always selects the workspace window after return so `q' cannot leave
 the commit/diff buffer displayed."
   (interactive)
   (cond
@@ -1061,20 +1300,10 @@ the commit/diff buffer displayed."
           (child (current-buffer)))
       (setq-local +git-review--return nil)
       (setq-local +git-pr--return-buffer nil)
-      (when (and state
-                 (window-configuration-p (plist-get state :window-config)))
-        (set-window-configuration (plist-get state :window-config)))
-      (when (buffer-live-p ret)
-        (let ((win (or (get-buffer-window ret t)
-                       (and (window-live-p (plist-get state :selected-window))
-                            (plist-get state :selected-window))
-                       (selected-window))))
-          (set-window-buffer win ret)
-          (select-window win)
-          (when (integer-or-marker-p (plist-get state :point))
-            (with-current-buffer ret
-              (goto-char (min (max (point-min) (plist-get state :point))
-                              (point-max)))))))
+      (if state
+          (+git-review--restore-return state)
+        (when (buffer-live-p ret)
+          (set-window-buffer (selected-window) ret)))
       (when (and (buffer-live-p child)
                  (not (eq child ret))
                  (not (get-buffer-window child t)))
@@ -1143,6 +1372,10 @@ explicit Forge action."
       (kbd "RET") #'+git-pr-visit
       "t" #'+git-pr-open-changes-tree
       "c" #'+git-pr-goto-first-commit
+      "C" #'+git-pr-review-local-commits
+      "r" #'+git-pr-review-working-tree
+      "s" #'+git-pr-review-staged
+      "u" #'+git-pr-review-unstaged
       "gc" #'+git-pr-next-commit
       "gC" #'+git-pr-prev-commit
       "gr" #'+git-pr-refresh

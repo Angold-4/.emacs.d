@@ -37,6 +37,7 @@
 
 (declare-function forge--pull "forge-commands" (repo &optional callback since))
 (declare-function forge-get-repository "forge-repo")
+(declare-function +forge-repository-for-explicit-sync "init-forge" (root))
 (declare-function magit-refresh "magit-mode")
 (declare-function magit-toplevel "magit-git")
 (declare-function +git-review-target-p "init-git-ui" (obj))
@@ -426,7 +427,12 @@ previous valid file is preserved and an error is signaled."
   "Return non-nil when PID appears alive on this host."
   (and (integerp pid)
        (> pid 0)
-       (file-exists-p (format "/proc/%d" pid))))
+       ;; `/proc' is available on Linux/WSL but not on macOS.  Emacs'
+       ;; `process-attributes' provides the same read-only existence check on
+       ;; every supported desktop platform and returns nil for a dead PID.
+       (condition-case nil
+           (and (process-attributes pid) t)
+         (error nil))))
 
 (defun +git-sync--lock-stale-p (lock)
   "Return non-nil when LOCK may be removed under the stale policy."
@@ -1274,6 +1280,7 @@ Private dependency: `forge--pull' (internal generic)."
             (setf (+git-sync-forge-ctx-url-buffers ctx) nil)
             (+git-sync--forge-ctx-finish ctx 'cancelled))))
     (ignore-errors (require 'forge nil t))
+    (ignore-errors (require 'init-forge nil t))
     (+git-sync--ensure-forge-advice)
     (cond
      ((not (featurep 'forge))
@@ -1286,33 +1293,32 @@ Private dependency: `forge--pull' (internal generic)."
       (+git-sync--forge-ctx-finish ctx 'unavailable)
       (+git-sync--forge-handle cancel))
      (t
-      (let* ((root (+git-sync--choose-seed-root repository-id))
-             (repo (and root
-                        (ignore-errors
-                          (let ((default-directory
-                                 (file-name-as-directory root)))
-                            (or (forge-get-repository :tracked?)
-                                (forge-get-repository
-                                 root nil :tracked?)))))))
-        (cond
-         ((null repo)
-          (+git-sync--forge-ctx-finish ctx 'untracked)
-          (+git-sync--forge-handle cancel))
-         (t
-          (+git-sync--ensure-forge-advice)
-          (condition-case err
-              (let ((+git-sync--forge-current-ctx ctx))
+      (+git-sync--ensure-forge-advice)
+      (condition-case err
+          (let* ((+git-sync--forge-current-ctx ctx)
+                 (root (+git-sync--choose-seed-root repository-id))
+                 (repo
+                  (and root
+                       (if (fboundp '+forge-repository-for-explicit-sync)
+                           (+forge-repository-for-explicit-sync root)
+                         (let ((default-directory
+                                (file-name-as-directory root)))
+                           (or (forge-get-repository :tracked?)
+                               (forge-get-repository root nil :tracked?)))))))
+            (if (null repo)
+                (+git-sync--forge-ctx-finish ctx 'untracked)
+              (progn
                 (forge--pull
                  repo
                  (+git-sync--forge-wrap-callback
                   ctx
                   (lambda ()
-                    (+git-sync--forge-ctx-finish ctx 'ok)))))
-            (error
-             (+git-sync--forge-ctx-finish
-              ctx
-              (list 'failed (+git-sync--sanitize-error err)))))
-          (+git-sync--forge-handle cancel))))))))
+                    (+git-sync--forge-ctx-finish ctx 'ok)))))))
+        (error
+         (+git-sync--forge-ctx-finish
+          ctx
+          (list 'failed (+git-sync--sanitize-error err)))))
+      (+git-sync--forge-handle cancel)))))
 
 (defun +git-sync--enter-pulling-forge (job)
   "Advance JOB into the Forge pull step."

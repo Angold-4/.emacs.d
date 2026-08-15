@@ -7,12 +7,12 @@
 ;; Phase 1 UI contract:
 ;; - Default Magit/Forge navigation replaces the selected window.
 ;; - Explicit `o' and `|' reuse one right-hand window.
-;; - `q' unwinds a per-buffer caller stack and restores layout.
+;; - `q' unwinds a per-buffer caller stack without changing unrelated splits.
 ;; - Generated review buffers share one Evil normal-state vocabulary.
 ;; - File visiting uses Magit native APIs, never rendered-text parsers.
 ;;
 ;; Phase 2 local review:
-;; - Explicit `+git-review-target' values for worktree/staged/commit/branch.
+;; - Explicit targets for worktree/staged/unstaged/commit/branch/PR review.
 ;; - Machine-readable changed-file model (NUL Git parsers, never Magit text).
 ;; - Changes Tree (`+git-changes-tree-mode') with reviewed checkmarks.
 ;; - Atomic local review-state persistence under `.cache/git-review/state/'.
@@ -21,7 +21,7 @@
 ;;
 ;; Phase 3 identity:
 ;; - Canonical repository id + local context id from `init-git-store'.
-;; - Worktree/staged/branch state is context-local; commit buffers may share.
+;; - Mutable local and branch state is context-local; commit buffers may share.
 ;; - `L' selects the active edit context on shareable immutable reviews.
 
 ;;; Code:
@@ -37,10 +37,12 @@
 
 (defvar-local +git-review--return nil
   "Return state for this review or visited buffer.
-Form: (:buffer BUFFER :point POINT :window-config WINDOW-CONFIGURATION
-       :selected-window WINDOW).
-BUFFER is the caller buffer; WINDOW-CONFIGURATION restores the layout
-as it existed immediately before this buffer was shown.")
+Form: (:buffer BUFFER :point POINT :selected-window WINDOW
+       :windows WINDOWS :created-window WINDOW-OR-NIL).
+BUFFER is the caller buffer.  WINDOWS records which windows existed before
+navigation, so a window created explicitly by `o' can be removed on return.
+Ordinary return never restores a historical whole-frame layout; it replaces
+only the selected review window and preserves the user's current splits.")
 
 (defvar +git-review--prefer-other-window nil
   "Non-nil while an explicit other-window visit is in progress.")
@@ -49,52 +51,79 @@ as it existed immediately before this buffer was shown.")
   "Non-nil to skip recording return state during display.")
 
 (defun +git-review--capture-return ()
-  "Return a plist describing the current selected window and layout."
+  "Return a plist describing the current caller and live windows."
   (list :buffer (current-buffer)
         :point (point)
-        :window-config (current-window-configuration)
-        :selected-window (selected-window)))
+        :selected-window (selected-window)
+        :windows (window-list)))
+
+(defun +git-review--mark-created-return-window (state)
+  "Record on STATE when navigation selected a newly created window."
+  (if (or (null state)
+          (memq (selected-window) (plist-get state :windows)))
+      state
+    (let ((copy (copy-sequence state)))
+      (plist-put copy :created-window (selected-window)))))
+
+(defun +git-review--preserve-created-return-window (state)
+  "Keep the current buffer's live explicit-window marker in STATE."
+  (let ((created (plist-get +git-review--return :created-window)))
+    (if (and (window-live-p created)
+             (eq created (selected-window))
+             (null (plist-get state :created-window)))
+        (plist-put (copy-sequence state) :created-window created)
+      state)))
 
 (defun +git-review--set-return (buffer state)
   "Store return STATE on BUFFER when it is live and STATE is usable."
   (when (and buffer (buffer-live-p buffer) state)
     (with-current-buffer buffer
-      (setq-local +git-review--return state))))
+      ;; Repeated `o' visits can reuse the same dedicated window.  Preserve
+      ;; its ownership marker instead of forgetting that the first visit
+      ;; created it.
+      (setq-local +git-review--return
+                  (+git-review--preserve-created-return-window state)))))
 
 (defun +git-review--record-return-for-buffer (buffer)
-  "Record the current layout as BUFFER's return target."
+  "Record the current caller as BUFFER's return target."
   (unless (or +git-review--suppress-return-record
               +git-review--prefer-other-window
               (not (buffer-live-p buffer))
               (eq (current-buffer) buffer))
     ;; Capture before entering BUFFER; current-buffer is still the caller.
-    (let ((state (+git-review--capture-return)))
-      (with-current-buffer buffer
-        (setq-local +git-review--return state)))))
+    (+git-review--set-return buffer (+git-review--capture-return))))
 
 (defun +git-review--restore-return (state)
-  "Restore layout and point from STATE.  Return non-nil on success."
+  "Restore STATE's caller without changing unrelated windows.
+Return non-nil on success.  Delete only a selected window that an explicit
+other-window review visit created; ordinary returns replace the selected
+window's buffer in place."
   (when state
-    (let ((conf (plist-get state :window-config))
-          (buf (plist-get state :buffer))
+    (let ((buf (plist-get state :buffer))
           (pt (plist-get state :point))
-          (win (plist-get state :selected-window)))
-      (when (and conf (window-configuration-p conf))
-        (set-window-configuration conf))
-      (cond
-       ((and (window-live-p win)
-             (eq (window-buffer win) buf))
-        (select-window win)
-        (when (and (buffer-live-p buf) (integer-or-marker-p pt))
-          (with-current-buffer buf
-            (goto-char (min (max (point-min) pt) (point-max))))))
-       ((buffer-live-p buf)
-        (when (get-buffer-window buf t)
-          (select-window (get-buffer-window buf t)))
-        (when (and (integer-or-marker-p pt)
-                   (eq (current-buffer) buf))
-          (goto-char (min (max (point-min) pt) (point-max))))))
-      t)))
+          (caller-win (plist-get state :selected-window))
+          (created-win (plist-get state :created-window))
+          (current-win (selected-window)))
+      (when (buffer-live-p buf)
+        (if (and (eq current-win created-win)
+                 (window-live-p created-win)
+                 (not (one-window-p t)))
+            (progn
+              (delete-window created-win)
+              (setq current-win
+                    (if (window-live-p caller-win)
+                        caller-win
+                      (selected-window))))
+          (setq current-win (selected-window)))
+        (set-window-buffer current-win buf)
+        (select-window current-win)
+        (when (integer-or-marker-p pt)
+          (let ((position
+                 (with-current-buffer buf
+                   (goto-char (min (max (point-min) pt) (point-max)))
+                   (point))))
+            (set-window-point current-win position))))
+      (buffer-live-p buf))))
 
 ;; =============================================================================
 ;; Same-window Magit display (single owner)
@@ -295,7 +324,8 @@ APIs and never scans rendered text."
   "Install return STATE on BUFFER and enable return mode there."
   (when (and buffer (buffer-live-p buffer) state)
     (with-current-buffer buffer
-      (setq-local +git-review--return state)
+      (setq-local +git-review--return
+                  (+git-review--preserve-created-return-window state))
       (+git-review-return-mode 1)
       ;; Writable worktree targets stay in normal state; do not force Insert.
       (when (bound-and-true-p evil-mode)
@@ -303,7 +333,8 @@ APIs and never scans rendered text."
 
 (defun +git-review--apply-return (before state)
   "Record STATE on the buffer shown after leaving BEFORE, if any."
-  (let ((after (current-buffer)))
+  (let ((after (current-buffer))
+        (state (+git-review--mark-created-return-window state)))
     (when (and (not (eq after before))
                (buffer-live-p after))
       (if (with-current-buffer after
@@ -390,7 +421,7 @@ branch must be updated."
       (+git-review--apply-return before state)))))
 
 (defun +git-review-quit (&optional _kill-buffer)
-  "Return to the recorded caller/layout, or bury the Magit buffer.
+  "Return to the recorded caller in the selected window, or bury Magit.
 Does not kill user source buffers."
   (interactive "P")
   (let ((state +git-review--return)
@@ -527,6 +558,22 @@ context first so a deleted originating clone does not break `gr'."
                   +git-changes-tree-mode))
     (evil-set-initial-state mode 'normal)))
 
+;; Evil Collection installs RET directly in Magit's text-property section
+;; maps, which take precedence over minor-mode maps.  Reassert the unified
+;; review dispatcher after that integration runs; outside a generated review
+;; buffer the dispatcher delegates back to Magit's normal visit command.
+(defun +git-review--reassert-section-return-bindings (&rest _)
+  "Make Magit file/hunk RET use the unified review dispatcher."
+  (when (boundp 'magit-file-section-map)
+    (define-key magit-file-section-map (kbd "RET") #'+git-review-visit))
+  (when (boundp 'magit-hunk-section-map)
+    (define-key magit-hunk-section-map (kbd "RET") #'+git-review-visit)))
+
+(with-eval-after-load 'evil-collection-magit
+  (advice-add 'evil-collection-magit-adjust-section-bindings
+              :after #'+git-review--reassert-section-return-bindings)
+  (+git-review--reassert-section-return-bindings))
+
 (with-eval-after-load 'forge-topic
   (when (bound-and-true-p evil-mode)
     (evil-set-initial-state 'forge-topic-mode 'normal)))
@@ -546,6 +593,19 @@ context first so a deleted originating clone does not break `gr'."
 (defconst +git-review-empty-tree
   "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
   "Git's well-known empty-tree object ID (SHA-1).")
+
+(defun +git-review--magit-hash-range-allow-empty-tree (original range)
+  "Hash RANGE with ORIGINAL, accepting our exact empty-tree endpoint.
+Magit 4.6 requires both endpoints to be commits, while `git diff' validly
+accepts the well-known empty-tree object used for root-commit reviews."
+  (if (and (stringp range)
+           (string-prefix-p (concat +git-review-empty-tree "..") range))
+      range
+    (funcall original range)))
+
+(with-eval-after-load 'magit-git
+  (advice-add 'magit-hash-range :around
+              #'+git-review--magit-hash-range-allow-empty-tree))
 
 (defcustom +git-review-state-directory
   (expand-file-name ".cache/git-review/state/" user-emacs-directory)
@@ -584,7 +644,7 @@ the reviewed commit/PR identity.")
                (:copier nil))
   "Explicit local review target.  Never reconstructed from rendered text."
   root           ; absolute repository root (originating context)
-  scope          ; worktree | staged | commit | branch | pullreq
+  scope          ; worktree | staged | unstaged | commit | branch | pullreq
   base-ref       ; symbolic base label (or nil)
   base-oid       ; resolved base object ID
   head-ref       ; symbolic head label (or nil)
@@ -682,7 +742,7 @@ Increments `+git-review--git-process-count'.  Never builds a shell string."
   "Return the Phase 2 root-based family id for legacy state migration."
   (let ((root (+git-review--normalize-root root)))
     (pcase scope
-      ((or 'worktree 'staged)
+      ((or 'worktree 'staged 'unstaged)
        (format "git-review:%s:%s" scope root))
       ('commit
        (format "git-review:commit:%s:%s" root head-oid))
@@ -702,13 +762,13 @@ Increments `+git-review--git-process-count'.  Never builds a shell string."
   "Return (FAMILY-ID . OVERVIEW-ID) for SCOPE under REPOSITORY-ID.
 
 FAMILY-ID is the persistence identity:
-- worktree/staged: repository-id + context-id (never shared across clones)
+- worktree/staged/unstaged: repository-id + context-id (never shared across clones)
 - branch: repository-id + context-id + symbolic base/head labels
 - commit: repository-id + resolved head OID (shared across same-origin clones)
 - pullreq: repository-id + PR number (shared; head advance reuses state)
 
 OVERVIEW-ID is the immutable buffer-reuse identity:
-- worktree/staged: stable so refresh reuses buffers
+- worktree/staged/unstaged: stable so refresh reuses buffers
 - branch: includes resolved base/head OIDs so advancing creates a new buffer
 - commit: repository-id + resolved OIDs (shared across same-origin clones)
 - pullreq: repository-id + PR number (stable across head OID changes)
@@ -719,7 +779,7 @@ ROOT is retained only for legacy Phase 2 state migration lookups."
          (ctx (or context-id
                   (format "ctx:%s" (+git-review--normalize-root root))))
          (family (pcase scope
-                   ((or 'worktree 'staged)
+                   ((or 'worktree 'staged 'unstaged)
                     (format "git-review:%s:%s:%s" scope repo ctx))
                    ('commit
                     (format "git-review:commit:%s:%s" repo head-oid))
@@ -732,7 +792,7 @@ ROOT is retained only for legacy Phase 2 state migration lookups."
                     (format "git-review:pr:%s:%s" repo (or pr-number 0)))
                    (_ (error "Unknown review scope: %S" scope))))
          (overview (pcase scope
-                     ((or 'worktree 'staged)
+                     ((or 'worktree 'staged 'unstaged)
                       (concat family ":overview"))
                      ('commit
                       (format "git-review:commit:%s:%s:%s:overview"
@@ -758,7 +818,7 @@ BASE-OID/HEAD-OID are resolved object IDs when applicable.
 REPOSITORY-ID and CONTEXT-ID come from the store when available.
 PR-NUMBER is required when SCOPE is `pullreq'."
   (let* ((root (+git-review--normalize-root root))
-         (mutable (and (memq scope '(worktree staged)) t))
+         (mutable (and (memq scope '(worktree staged unstaged)) t))
          (ids (+git-review--make-ids repository-id context-id root scope
                                      base-ref head-ref
                                      base-oid head-oid
@@ -792,7 +852,7 @@ PR-NUMBER is required when SCOPE is `pullreq'."
          "true"))
 
 (defun +git-review--local-entry-root ()
-  "Return the local worktree root for a new worktree/staged review.
+  "Return the local worktree root for a new mutable local review.
 PR buffers intentionally bind `default-directory' to the shared bare
 mirror for object correctness.  When a local review is launched from
 such a buffer, use its active edit context instead of treating the mirror
@@ -837,6 +897,18 @@ as a worktree."
                      +git-review-empty-tree)))
       (+git-review-make-target
        root 'staged "HEAD" "index" head nil
+       (+git-store-local-context-repository-id ctx)
+       (+git-store-local-context-context-id ctx)))))
+
+(defun +git-review-target-for-unstaged (&optional root)
+  "Build an unstaged-plus-untracked review target for ROOT."
+  (let ((root (+git-review--normalize-root
+               (or root (+git-review--local-entry-root)))))
+    (unless (+git-review--inside-worktree-p root)
+      (user-error "Unstaged review cannot use bare repository %s" root))
+    (let ((ctx (+git-review--context-for-root root)))
+      (+git-review-make-target
+       root 'unstaged "index" "worktree" nil nil
        (+git-store-local-context-repository-id ctx)
        (+git-store-local-context-context-id ctx)))))
 
@@ -903,6 +975,7 @@ RANGE is a string or nil.  TYPEARG is \"--cached\" or nil."
   (pcase (+git-review-target-scope target)
     ('worktree (list (+git-review-target-base-oid target) nil))
     ('staged (list (+git-review-target-base-oid target) "--cached"))
+    ('unstaged (list nil nil))
     ((or 'commit 'branch 'pullreq)
      (list (format "%s..%s"
                    (+git-review-target-base-oid target)
@@ -1462,7 +1535,7 @@ Shareable commit reviews collect from the operational edit-context root."
          (diff-base (append (list "diff" "--no-ext-diff" "-M" "-C"
                                   "--find-copies-harder" "-z")
                             (and typearg (list typearg))
-                            (list range)))
+                            (and range (list range))))
          (ns-items (apply #'+git-review--git-items root
                           (append diff-base '("--name-status"))))
          (num-items (apply #'+git-review--git-items root
@@ -1473,7 +1546,7 @@ Shareable commit reviews collect from the operational edit-context root."
          (num-table (+git-review--parse-numstat-items num-items))
          (raw-table (+git-review--parse-raw-items raw-items))
          (untracked
-          (when (eq scope 'worktree)
+          (when (memq scope '(worktree unstaged))
             (+git-review--git-items
              root "ls-files" "-z" "--others" "--exclude-standard")))
          (need-hash nil)
@@ -1492,7 +1565,7 @@ Shareable commit reviews collect from the operational edit-context root."
         (cond
          ((eq status 'untracked)
           (push path need-hash))
-         ((and (eq scope 'worktree)
+         ((and (memq scope '(worktree unstaged))
                (not (eq status 'deleted))
                (or (+git-review--zero-oid-p new-oid)
                    (eq status 'modified)))
@@ -1972,7 +2045,7 @@ Does not generate per-file diff buffers."
 (defun +git-changes-tree-setup-buffer (target)
   "Create or reuse the Changes Tree buffer for TARGET and display it.
 Locks Magit buffer identity to `overview-id' so advancing an immutable
-branch creates a new tree while worktree/staged still reuse."
+branch creates a new tree while worktree/staged/unstaged still reuse."
   (require 'magit)
   (let* ((existing
           (car (+git-review--find-buffers-for-target
@@ -2038,21 +2111,23 @@ Persistence uses `family-id'; buffer reuse uses `overview-id'."
 
 (defun +git-review--sync-magit-diff-state (target &optional files)
   "Update Magit buffer-local diff variables from TARGET before refresh.
-FILES when non-nil replaces `magit-buffer-diff-files'."
+FILES when non-nil replaces `magit-buffer-diff-files'.
+The variable names here are Magit 4.6's mode-specific state API."
   (pcase-let* ((`(,range ,typearg) (+git-review-target-range-args target))
                (args (+git-review-target-diff-args target))
                (dtype (pcase (+git-review-target-scope target)
                         ('staged 'staged)
+                        ('unstaged 'unstaged)
                         ('worktree 'committed)
                         (_ 'committed))))
     (setq-local +git-review-target target)
-    (setq-local magit-buffer-range range)
-    (setq-local magit-buffer-typearg typearg)
+    (setq-local magit-buffer-diff-range range)
+    (setq-local magit-buffer-diff-typearg typearg)
     (setq-local magit-buffer-diff-args args)
     (setq-local magit-buffer-diff-type dtype)
     (when files
       (setq-local magit-buffer-diff-files files))
-    (setq-local magit-buffer-range-hashed
+    (setq-local magit-buffer-diff-range-oids
                 (and range (fboundp 'magit-hash-range)
                      (magit-hash-range range)))))
 
@@ -2060,7 +2135,8 @@ FILES when non-nil replaces `magit-buffer-diff-files'."
   "Insert valid Git-produced --no-index diffs for untracked worktree files.
 Uses Magit's washer so section markers stay complete."
   (when (and (bound-and-true-p +git-review-target)
-             (eq (+git-review-target-scope +git-review-target) 'worktree)
+             (memq (+git-review-target-scope +git-review-target)
+                   '(worktree unstaged))
              (null +git-review-file-path))
     (let* ((root (+git-review--git-root-for-target +git-review-target))
            (paths (+git-review--git-items
@@ -2083,7 +2159,7 @@ Uses Magit's washer so section markers stay complete."
                     (copy-sequence (or magit-diff-sections-hook
                                        (default-value
                                         'magit-diff-sections-hook)))))
-  (when (and (eq (+git-review-target-scope target) 'worktree)
+  (when (and (memq (+git-review-target-scope target) '(worktree unstaged))
              (null file-path))
     (add-hook 'magit-diff-sections-hook
               #'+git-review--insert-untracked-overview t t)))
@@ -2130,12 +2206,14 @@ File-specific diffs lock so they do not steal the overview buffer
                range typearg args nil
                (pcase (+git-review-target-scope target)
                  ('staged 'staged)
+                 ('unstaged 'unstaged)
                  ('worktree 'committed)
                  (_ 'committed))
                (+git-review--magit-diff-locked-p target)))
         (with-current-buffer buffer
           (+git-review--attach-target target)
-          (when (eq (+git-review-target-scope target) 'worktree)
+          (when (memq (+git-review-target-scope target)
+                      '(worktree unstaged))
             ;; Re-refresh so the untracked hook runs after attachment.
             (magit-refresh)))))
     buffer))
@@ -2150,18 +2228,23 @@ File-specific diffs lock so they do not steal the overview buffer
   (interactive)
   (+git-review--open-overview (+git-review-target-for-staged)))
 
-(defun +git-review-open-commit (commit)
+(defun +git-review-open-unstaged ()
+  "Open the reusable unstaged and untracked review overview."
+  (interactive)
+  (+git-review--open-overview (+git-review-target-for-unstaged)))
+
+(defun +git-review-open-commit (commit &optional root)
   "Open the reusable commit review overview for COMMIT."
   (interactive
    (list (magit-read-branch-or-commit "Review commit")))
-  (+git-review--open-overview (+git-review-target-for-commit commit)))
+  (+git-review--open-overview (+git-review-target-for-commit commit root)))
 
-(defun +git-review-open-branch (base head)
+(defun +git-review-open-branch (base head &optional root)
   "Open the reusable branch review for BASE..HEAD via merge-base."
   (interactive
    (list (magit-read-branch-or-commit "Review base")
          (magit-read-branch-or-commit "Review head")))
-  (+git-review--open-overview (+git-review-target-for-branch base head)))
+  (+git-review--open-overview (+git-review-target-for-branch base head root)))
 
 (defun +git-review-open-changes-tree (&optional target)
   "Open or reuse the Changes Tree for TARGET or the current buffer target."
@@ -2430,6 +2513,7 @@ survives `gr'."
                      range typearg args pathspecs
                      (pcase (+git-review-target-scope target)
                        ('staged 'staged)
+                       ('unstaged 'unstaged)
                        (_ 'committed))
                      (+git-review--magit-diff-locked-p target pathspecs)))))
           (with-current-buffer buffer
@@ -2446,6 +2530,7 @@ survives `gr'."
                      range typearg args pathspecs
                      (pcase (+git-review-target-scope target)
                        ('staged 'staged)
+                       ('unstaged 'unstaged)
                        (_ 'committed))
                      (+git-review--magit-diff-locked-p target pathspecs))))
             (with-current-buffer buffer

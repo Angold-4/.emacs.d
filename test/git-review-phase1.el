@@ -214,13 +214,19 @@
                 (+git-review-visit-other-window)
                 (should (= 2 (count-windows)))
                 (should (eq right
-                            (frame-parameter nil '+git-review-other-window))))))
+                            (frame-parameter nil '+git-review-other-window)))
+                ;; `o' owns this one extra window, so q may remove precisely
+                ;; that window while leaving the caller selected.
+                (select-window right)
+                (+git-review-quit)
+                (should (= 1 (count-windows)))
+                (should (derived-mode-p 'magit-diff-mode))))))
          (set-frame-parameter nil '+git-review-other-window nil)
          (git-review-baseline-cleanup-repo-buffers root)
-         (delete-other-windows))))))
+         (delete-other-windows)))))
 
 (ert-deftest git-review-phase1-quit-restores-chain ()
-  "Repeated q unwinds callers and restores the original layout."
+  "Repeated q unwinds callers without discarding newer user splits."
   (require 'magit)
   (git-review-fixtures-with-repo
    "quit-chain"
@@ -229,7 +235,8 @@
      (let* ((default-directory (file-name-as-directory root))
             (source (find-file-noselect
                      (expand-file-name "README.md" root)))
-            (other (get-buffer-create " *git-review-phase1-quit-other*")))
+            (other (get-buffer-create " *git-review-phase1-quit-other*"))
+            (extra (get-buffer-create " *git-review-phase1-quit-extra*")))
        (unwind-protect
            (git-review-baseline--with-instrumentation
             (lambda ()
@@ -243,16 +250,24 @@
               (should (derived-mode-p 'magit-status-mode))
               (magit-diff-working-tree "HEAD" '("--no-ext-diff" "-U3"))
               (should (derived-mode-p 'magit-diff-mode))
+              ;; This split did not exist when Magit navigation began.  It is
+              ;; user-owned and must survive both levels of `q'.
+              (let ((extra-window (split-window-below)))
+                (set-window-buffer extra-window extra))
+              (should (= 3 (count-windows)))
               (+git-review-quit)
               (should (derived-mode-p 'magit-status-mode))
-              (should (= 2 (count-windows)))
-              (should (eq (window-buffer (next-window)) other))
+              (should (= 3 (count-windows)))
+              (should (get-buffer-window other t))
+              (should (get-buffer-window extra t))
               (+git-review-quit)
               (should (eq (current-buffer) source))
-              (should (= 2 (count-windows)))
-              (should (eq (window-buffer (next-window)) other))))
+              (should (= 3 (count-windows)))
+              (should (get-buffer-window other t))
+              (should (get-buffer-window extra t))))
          (git-review-baseline-cleanup-repo-buffers root)
          (when (buffer-live-p other) (kill-buffer other))
+         (when (buffer-live-p extra) (kill-buffer extra))
          (when (buffer-live-p source) (kill-buffer source))
          (delete-other-windows))))))
 

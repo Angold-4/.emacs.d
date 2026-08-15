@@ -362,8 +362,11 @@ repository and pullreq, then calls (FN REPO PULLREQ).  Owner
 ;; ---------------------------------------------------------------------------
 
 (ert-deftest git-review-pr-dispatch-binding ()
-  "C-c g p is bound to pull-request review."
+  "Dispatch exposes numbered/current PR and distinct local-state reviews."
   (should (commandp #'+git/review-pull-request))
+  (should (commandp #'+git/review-current-pull-request))
+  (should (commandp #'+git/home))
+  (should (commandp #'+git/review-unstaged))
   (should (fboundp #'+git-dispatch))
   (let ((suffix (cl-find-if
                  (lambda (s)
@@ -376,6 +379,34 @@ repository and pullreq, then calls (FN REPO PULLREQ).  Owner
     (should (eq (indirect-function #'+git/review-pr)
                 (indirect-function #'+git/review-pull-request)))))
 
+(ert-deftest git-review-pr-matches-cached-open-or-draft-head ()
+  "Current-branch detection excludes closed and differently headed PRs."
+  (let* ((id "github.com/org/project")
+         (open (git-review-pr--stub-snapshot
+                id 11 :head-ref "feature" :state 'open))
+         (draft (git-review-pr--stub-snapshot
+                 id 14 :head-ref "feature" :state 'open :draft t))
+         (closed (git-review-pr--stub-snapshot
+                  id 15 :head-ref "feature" :state 'closed))
+         (other (git-review-pr--stub-snapshot
+                 id 16 :head-ref "other" :state 'open))
+         (+forge-pr-list-function
+          (lambda (rid)
+            (and (equal rid id) (list open draft closed other)))))
+    (should (equal (mapcar #'+forge-pr-snapshot-number
+                           (+forge-prs-for-head-ref id "feature"))
+                   '(14 11)))))
+
+(ert-deftest git-review-pr-home-falls-back-to-local-status ()
+  "The Git home opens local status when no cached current PR matches."
+  (let (status-root)
+    (cl-letf (((symbol-function '+git-pr--current-branch-snapshot)
+               (lambda (_root &optional _demand) nil))
+              ((symbol-function '+git/status)
+               (lambda (&optional root) (setq status-root root))))
+      (+git/home "/tmp/"))
+    (should (equal status-root "/tmp"))))
+
 (ert-deftest git-review-pr-parse-number ()
   "PR number parsing accepts integers, #N, and completion strings."
   (should (= (+forge-parse-pr-number 16) 16))
@@ -386,71 +417,104 @@ repository and pullreq, then calls (FN REPO PULLREQ).  Owner
   (should-error (+forge-parse-pr-number "abc") :type 'user-error)
   (should-error (+forge-parse-pr-number "16a") :type 'user-error))
 
-(ert-deftest git-review-pr-1password-token-provider ()
-  "1Password resolves once, stays in memory, and never enters argv."
-  (let ((+forge-1password-token-references
-         '(("api.github.com" . "op://Employee/GitHub Forge/token")))
-        (+forge-1password-cli-program "op")
-        (+forge--1password-token-cache (make-hash-table :test #'equal))
-        calls)
-    (cl-letf (((symbol-function 'executable-find)
-               (lambda (program)
-                 (and (equal program "op") "/mock/op")))
-              ((symbol-function 'process-file)
-               (lambda (program _infile destination _display &rest args)
-                 (push (cons program args) calls)
-                 (should (eq destination t))
-                 (insert "test-token\n")
-                 0)))
-      (should (equal (+forge--1password-read-token "api.github.com")
-                     "test-token"))
-      (should (equal (+forge--1password-read-token "api.github.com")
-                     "test-token"))
-      (should (= (length calls) 1))
-      (should
-       (equal (car calls)
-              '("op" "read" "op://Employee/GitHub Forge/token")))
-      (should-not (member "test-token" (car calls)))
-      ;; Existing Auth Source remains authoritative; do not invoke `op'.
-      (setq calls nil)
+(ert-deftest git-review-pr-native-token-provider ()
+  "Forge uses session, platform, and Auth Source credentials in order."
+  (let ((+forge-use-macos-keychain nil)
+        (+forge-allow-auth-source t)
+        (+forge--session-token-cache (make-hash-table :test #'equal))
+        auth-calls)
+    (puthash "api.github.com" "session-token" +forge--session-token-cache)
+    (should
+     (equal
+      (+forge--ghub-token-from-native-store
+       (lambda (&rest _)
+         (ert-fail "Auth Source must not be read while session token exists"))
+       "api.github.com" "alice" 'forge nil 'github)
+      "session-token"))
+    (clrhash +forge--session-token-cache)
+    (should
+     (equal
+      (+forge--ghub-token-from-native-store
+       (lambda (&rest args)
+         (push args auth-calls)
+         "auth-source-token")
+       "api.github.com" "alice" 'forge nil 'github)
+      "auth-source-token"))
+    (should (= (length auth-calls) 1))
+    ;; Other Ghub packages retain their original lookup behavior.
+    (should
+     (equal
+      (+forge--ghub-token-from-native-store
+       (lambda (_host _username _package nocreate _forge)
+         (unless nocreate "ordinary-package-token"))
+       "api.github.com" "alice" 'ghub nil 'github)
+      "ordinary-package-token")))
+  ;; A missing token fails clearly when persistent Auth Source is disabled.
+  (let ((+forge-use-macos-keychain nil)
+        (+forge-allow-auth-source nil)
+        (+forge--session-token-cache (make-hash-table :test #'equal)))
+    (should-error
+     (+forge--ghub-token-from-native-store
+      (lambda (&rest _) (ert-fail "Auth Source must not be read"))
+      "api.github.com" "alice" 'forge nil 'github)
+     :type 'user-error)))
+
+(ert-deftest git-review-pr-session-token-provider ()
+  "Manual token entry remains memory-only and clearable."
+  (let ((+forge--session-token-cache (make-hash-table :test #'equal)))
+    (cl-letf (((symbol-function 'read-passwd)
+               (lambda (&rest _) "session-secret"))
+              ((symbol-function 'auth-source-forget-all-cached) #'ignore))
+      (should (+forge-set-session-token "api.github.com"))
+      (should (equal (gethash "api.github.com" +forge--session-token-cache)
+                     "session-secret"))
+      (+forge-clear-token-cache)
+      (should (= (hash-table-count +forge--session-token-cache) 0)))))
+
+(ert-deftest git-review-pr-macos-keychain-provider ()
+  "macOS Keychain retrieval is automatic and setup keeps token out of argv."
+  (require 'auth-source)
+  (let ((system-type 'darwin)
+        (+forge-use-macos-keychain t)
+        searched)
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest spec)
+                 (setq searched spec)
+                 (list (list :secret (lambda () "keychain-token"))))))
       (should
        (equal
-        (+forge--ghub-token-with-1password
-         (lambda (&rest _) "auth-source-token")
-         "api.github.com" "alice" 'forge nil 'github)
-        "auth-source-token"))
-      (should (null calls))
-      ;; Missing Auth Source falls back exactly once to `op'.  The initial
-      ;; lookup is forced non-creating so Ghub cannot raise before fallback.
-      (clrhash +forge--1password-token-cache)
-      (let (original-nocreate)
-        (should
-         (equal
-          (+forge--ghub-token-with-1password
-           (lambda (_host _username _package nocreate _forge)
-             (push nocreate original-nocreate)
-             nil)
-           "api.github.com" "alice" 'forge nil 'github)
-          "test-token"))
-        (should (equal original-nocreate '(t)))
-        (should (= (length calls) 1)))
-      ;; Other Ghub packages never consult the Forge 1Password provider.
-      (setq calls nil)
-      (should
-       (equal
-        (+forge--ghub-token-with-1password
-         (lambda (_host _username _package nocreate _forge)
-           (unless nocreate "ordinary-package-token"))
-         "api.github.com" "alice" 'ghub nil 'github)
-        "ordinary-package-token"))
-      (should (null calls))))
-  ;; A configured provider fails clearly when `op' is unavailable.
-  (let ((+forge-1password-token-references
-         '(("api.github.com" . "op://Employee/GitHub Forge/token")))
-        (+forge--1password-token-cache (make-hash-table :test #'equal)))
-    (cl-letf (((symbol-function 'executable-find) (lambda (_) nil)))
-      (should-error (+forge--1password-read-token "api.github.com")
-                    :type 'user-error))))
+        (+forge--ghub-token-from-native-store
+         (lambda (&rest _) (ert-fail "ordinary Auth Source must not run"))
+         "api.github.com" "Angold-4" 'forge nil 'github)
+        "keychain-token"))
+      (should (equal (plist-get searched :host) "api.github.com"))
+      (should (equal (plist-get searched :user) "Angold-4^forge"))))
+  (let ((system-type 'darwin)
+        (+forge-macos-keychain-label "Emacs Forge GitHub token")
+        input argv)
+    (cl-letf (((symbol-function 'file-executable-p) (lambda (_) t))
+              ((symbol-function 'read-passwd)
+               (lambda (&rest _) (copy-sequence "keychain-secret")))
+              ((symbol-function 'call-process-region)
+               (lambda (start end program delete destination _display
+                              &rest args)
+                 (setq input (buffer-substring-no-properties start end))
+                 (setq argv (cons program args))
+                 (should delete)
+                 (with-current-buffer destination (erase-buffer))
+                 0))
+              ((symbol-function 'auth-source-forget-all-cached) #'ignore))
+      (should (+forge-store-token-in-macos-keychain
+               "api.github.com" "Angold-4"))
+      (should (equal input "keychain-secret\nkeychain-secret\n"))
+      (should (equal argv
+                     '("/usr/bin/security"
+                       "add-internet-password" "-U"
+                       "-a" "Angold-4^forge"
+                       "-s" "api.github.com"
+                       "-l" "Emacs Forge GitHub token"
+                       "-w")))
+      (should-not (member "keychain-secret" argv)))))
 
 (ert-deftest git-review-pr-direct-forge-require ()
   "Direct (require 'forge) works without +forge--ensure-forge-apis.
@@ -468,10 +532,29 @@ autoloaded commands such as `forge-add-repository' can load Forge."
           (should (fboundp 'forge-get-pullreq))
           (should (fboundp 'forge-add-repository))
           (should
-           (advice-member-p #'+forge--ghub-token-with-1password
+           (advice-member-p #'+forge--ghub-token-from-native-store
                             'ghub--token)))
       (error (setq err e)))
     (should (null err))))
+
+(ert-deftest git-review-pr-explicit-sync-registers-without-forge-command ()
+  "First explicit sync inserts the Forge repository without a second pull."
+  (let* (calls
+         (+forge-repository-lookup-function
+          (lambda (&rest args)
+            (push args calls)
+            (pcase args
+              (`(:tracked?) nil)
+              (`(:stub?) 'repository-stub)
+              (`(repository-stub nil :insert!) 'known-repository)
+              (_ (ert-fail (format "Unexpected Forge lookup: %S" args)))))))
+    (should
+     (eq (+forge-repository-for-explicit-sync temporary-file-directory)
+         'known-repository))
+    (should
+     (equal (nreverse calls)
+            '((:tracked?) (:stub?)
+              (repository-stub nil :insert!))))))
 
 (ert-deftest git-review-pr-parse-nested-canonical-id ()
   "Nested GitLab-style repository identities parse to (host owner name)."
@@ -681,6 +764,7 @@ autoloaded commands such as `forge-add-repository' can load Forge."
                  (should (string-match-p "Changes (" text))
                  (should (string-match-p "Changed files" text))
                  (should (string-match-p "Commits (4, oldest first)" text))
+                 (should (string-match-p "Local continuation" text))
                  (should (string-match-p "Checks: unavailable (Phase 7)" text))
                  (should (string-match-p "Description" text))
                  (should (string-match-p "Conversation" text))
@@ -705,6 +789,80 @@ autoloaded commands such as `forge-add-repository' can load Forge."
              (kill-buffer buf))
          (git-review-pr--cleanup a)
          (git-review-pr--cleanup (plist-get g :work)))))))
+
+(ert-deftest git-review-pr-current-branch-local-continuation ()
+  "Current PR keeps committed, staged, unstaged, and untracked work separate."
+  (git-review-pr--with-dirs
+   (lambda (_reg _state)
+     (let* ((g (git-review-pr--make-merged-squash-graph "continuation"))
+            (work (plist-get g :work))
+            (url (plist-get g :url))
+            id pr-buffer local-head)
+       (unwind-protect
+           (progn
+             (git-review-pr--git work "remote" "add" "origin" url)
+             (setq id (+git-store-local-context-repository-id
+                       (git-review-pr--register work url (plist-get g :bare))))
+             (git-review-pr--publish-mirror id work)
+             (git-review-pr--install-stub
+              id 16
+              (list :state 'open
+                    :base-rev (plist-get g :base)
+                    :head-rev (plist-get g :p4)
+                    :head-ref "feature"))
+             ;; A local pick-up branch may have a different name from the
+             ;; provider head ref and then advance with unpublished commits.
+             (git-review-pr--git work "checkout" "-b" "vp/pr16" "feature")
+             (git-review-pr--git work "branch" "--set-upstream-to=feature"
+                                 "vp/pr16")
+             (git-review-fixtures--write-file
+              work "local-commit.txt" "committed locally\n")
+             (git-review-pr--git work "add" "local-commit.txt")
+             (git-review-pr--git work "commit" "-m" "local continuation")
+             (setq local-head (git-review-pr--git work "rev-parse" "HEAD"))
+             (git-review-fixtures--write-file work "staged-local.txt" "staged\n")
+             (git-review-pr--git work "add" "staged-local.txt")
+             (git-review-fixtures--write-file work "a.txt" "unstaged locally\n")
+             (git-review-fixtures--write-file
+              work "untracked-local.txt" "untracked\n")
+
+             ;; Detection is cache-only and routes directly to the matching PR.
+             (setq pr-buffer (+git/home work))
+             (with-current-buffer pr-buffer
+               (let ((text (buffer-string)))
+                 (should (string-match-p "Local continuation" text))
+                 (should (string-match-p "Branch: vp/pr16" text))
+                 (should (string-match-p
+                          "Local commits after cached PR head: 1" text))
+                 (should (string-match-p "Staged: 1 file" text))
+                 (should (string-match-p "Unstaged: 1 tracked file" text))
+                 (should (string-match-p "Untracked: 1 file" text))))
+
+             (let ((overview
+                    (with-current-buffer pr-buffer
+                      (+git-pr-review-local-commits))))
+               (with-current-buffer overview
+                 (should (eq (+git-review-target-scope +git-review-target)
+                             'branch))
+                 (should (equal (+git-review-target-base-oid +git-review-target)
+                                (plist-get g :p4)))
+                 (should (equal (+git-review-target-head-oid +git-review-target)
+                                local-head))))
+
+             (let ((overview
+                    (with-current-buffer pr-buffer
+                      (+git-pr-review-unstaged))))
+               (with-current-buffer overview
+                 (should (eq (+git-review-target-scope +git-review-target)
+                             'unstaged))
+                 (let ((paths (mapcar #'+git-review-file-path
+                                      (+git-review-collect-files
+                                       +git-review-target))))
+                   (should (member "a.txt" paths))
+                   (should (member "untracked-local.txt" paths))
+                   (should-not (member "staged-local.txt" paths)))))
+             (kill-buffer pr-buffer))
+         (git-review-pr--cleanup work))))))
 
 (ert-deftest git-review-pr-tree-and-reviewed-shared ()
   "t reuses Changes Tree; reviewed progress is shared across clones."
@@ -952,7 +1110,7 @@ the range."
          (git-review-pr--cleanup (plist-get g :work)))))))
 
 (ert-deftest git-review-pr-commit-workflow ()
-  "c / gc / gC / q commit workflow uses mirror objects and restores layout."
+  "c / gc / gC / q uses mirror objects and returns without losing splits."
   (git-review-pr--with-dirs
    (lambda (_reg _state)
      (let* ((g (git-review-pr--make-merged-squash-graph "cmt"))
@@ -1226,7 +1384,7 @@ the range."
          (git-review-pr--cleanup (plist-get g :work)))))))
 
 (ert-deftest git-review-pr-local-review-from-mirror-uses-edit-context ()
-  "C-c g r from a PR buffer must never treat the bare mirror as a worktree."
+  "PR dispatch actions must never treat the bare mirror as a worktree."
   (git-review-pr--with-dirs
    (lambda (_reg _state)
      (let* ((g (git-review-pr--make-merged-squash-graph "local-entry"))
@@ -1255,6 +1413,35 @@ the range."
                  ;; This was the failing operation: untracked discovery must
                  ;; run in the edit worktree, never in mirror.git.
                  (should (listp (+git-review-collect-files local-target))))
+               (require 'magit)
+               (let (status-root log-root commit-call branch-call)
+                 (cl-letf (((symbol-function 'magit-status)
+                            (lambda (root) (setq status-root root)))
+                           ((symbol-function 'magit-log-current)
+                            (lambda (&rest _)
+                              (setq log-root default-directory)))
+                           ((symbol-function '+git-review-open-commit)
+                            (lambda (commit &optional root)
+                              (setq commit-call (list commit root))))
+                           ((symbol-function '+git-review-open-branch)
+                            (lambda (base head &optional root)
+                              (setq branch-call (list base head root)))))
+                   (+git/status)
+                   (+git/log-oneline)
+                   (+git/review-commit (plist-get g :p4))
+                   (+git/review-branch "main" "feature"))
+                 (should (stringp status-root))
+                 (should (stringp log-root))
+                 (should (consp commit-call))
+                 (should (consp branch-call))
+                 (should (equal (+git-review--normalize-root status-root)
+                                (+git-review--normalize-root work)))
+                 (should (equal (+git-review--normalize-root log-root)
+                                (+git-review--normalize-root work)))
+                 (should (equal (cadr commit-call)
+                                (+git-review--normalize-root work)))
+                 (should (equal (caddr branch-call)
+                                (+git-review--normalize-root work))))
                (should-error (+git-review-target-for-worktree mirror)
                              :type 'user-error)))
          (git-review-pr--cleanup work))))))
@@ -1491,9 +1678,22 @@ treated as review/approval status."
                  (should (with-current-buffer file-buf
                            (and (derived-mode-p 'magit-diff-mode)
                                 (equal +git-review-file-path "a.txt"))))
-                 (with-current-buffer file-buf
-                   (+git-review-quit))
-                 (should (eq (window-buffer (selected-window)) buf)))
+                 (let* ((extra (get-buffer-create
+                                " *git-review-pr-manual-split*"))
+                        (extra-window (split-window-below)))
+                   (unwind-protect
+                       (progn
+                         (set-window-buffer extra-window extra)
+                         (should (= (length (window-list)) (1+ wcount)))
+                         (with-current-buffer file-buf
+                           (+git-review-quit))
+                         (should (= (length (window-list)) (1+ wcount)))
+                         (should (eq (window-buffer (selected-window)) buf))
+                         (should (eq (window-buffer extra-window) extra)))
+                     (when (window-live-p extra-window)
+                       (delete-window extra-window))
+                     (when (buffer-live-p extra)
+                       (kill-buffer extra)))))
                (with-current-buffer buf
                  (let ((tree (+git-pr-open-changes-tree)))
                    (should (= (length (window-list)) wcount))

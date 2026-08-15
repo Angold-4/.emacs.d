@@ -19,8 +19,9 @@ source or Markdown buffers.
 ### Navigation is same-window by default
 
 Opening a normal review destination replaces the selected window. `o` is the
-explicit reusable-other-window action. `q` restores the recorded caller,
-point, and window configuration when possible.
+explicit reusable-other-window action. `q` restores the recorded caller in
+the selected window, restores its point, and preserves unrelated user-created
+splits and their buffers.
 
 ### Network access is explicit
 
@@ -66,7 +67,7 @@ core/init-git.el
 | `init-git-store.el` | Canonical repository identity, local contexts, persistent registry |
 | `init-git-sync.el` | Shared mirror, locks, async synchronization, publication/recovery, Forge sync adapter |
 | `init-git-ui.el` | Window policy, Evil review mode, review targets, Changes Tree, reviewed state, Magit diffs/faces, optional renderers |
-| `init-forge.el` | Forge package ownership, cond-let compatibility, cached PR adapter, optional 1Password token provider |
+| `init-forge.el` | Forge package ownership, cond-let compatibility, cached PR adapter, native credential providers |
 | `init-git-pr.el` | Shared PR model, overview, PR refresh, file/commit navigation, cached conversation |
 
 Magit package ownership is no longer split with `init-tools.el`. Forge no
@@ -78,9 +79,10 @@ longer advises PR visits to fetch or replace the topic with an ad-hoc range.
 
 | Suffix | Command | Scope | Network |
 |---|---|---|---|
-| `g` | `magit-status` | current local context | No |
+| `g` | `+git/home` | current PR, else active-worktree status | No |
 | `r` | `+git/review` | worktree/index | No |
 | `s` | `+git/review-staged` | index | No |
+| `u` | `+git/review-unstaged` | unstaged + untracked | No |
 | `c` | `+git/review-commit` | immutable commit | No |
 | `b` | `+git/review-branch` | immutable merge-base/head range | No |
 | `p` | `+git/review-pull-request` | cached PR | No |
@@ -111,7 +113,7 @@ and generated review buffers.
 | `/`, `?`, `n`, `N` | Evil search |
 | `gr` | Local-only refresh |
 | `t` | Changes Tree |
-| `q` | Restore caller/layout |
+| `q` | Restore caller in selected window; preserve other splits |
 | `C-h/j/k/l` | Window movement |
 
 Notably absent are the old `n/p` section movement, `N/P` hunk movement,
@@ -137,17 +139,18 @@ pr-number
 |---|---|---|---|
 | `worktree` | `HEAD` vs index/worktree + untracked | repository + context | stable per context |
 | `staged` | `HEAD` vs index | repository + context | stable per context |
+| `unstaged` | index vs worktree + untracked | repository + context | stable per context |
 | `commit` | first parent vs commit; empty tree for root | repository + commit | resolved base/head OIDs |
 | `branch` | merge-base(base, head) vs head | repository + context + labels | resolved base/head OIDs |
 | `pullreq` | cached merge-base vs exact PR head | repository + PR number | stable PR workspace |
 
-Worktree and staged targets are mutable. Commit, branch, and pull-request
-targets reject stage/unstage/discard operations.
+Worktree, staged, and unstaged targets are mutable. Commit, branch, and
+pull-request targets reject stage/unstage/discard operations.
 
 PR and PR-commit object operations use the published bare mirror. `e` resolves
-the selected local edit context independently. If a local `r`/`s` review is
-launched from a PR buffer, it uses that edit worktree and explicitly refuses to
-treat `mirror.git` as a worktree.
+the selected local edit context independently. If a local `r`/`s`/`u` review
+is launched from a PR buffer, it uses that edit worktree and explicitly refuses
+to treat `mirror.git` as a worktree.
 
 ## Changes Tree
 
@@ -158,7 +161,7 @@ machine-readable output:
 git diff --name-status -z
 git diff --numstat -z
 git diff --raw -z
-git ls-files -z --others --exclude-standard    # worktree scope only
+git ls-files -z --others --exclude-standard    # worktree/unstaged scopes
 git hash-object --stdin-paths                  # one batch when needed
 ```
 
@@ -273,8 +276,16 @@ fetches branches, tags, and merge-request heads. Generic providers fetch
 branches/tags and report provider PR refs unavailable.
 
 Forge pull is part of the same explicit job. Git success followed by Forge
-failure does not publish a new generation. The previous mirror and Forge cache
-remain usable offline.
+failure does not publish a new Git generation. Forge updates its live SQLite
+database transactionally per completed provider response, but that database is
+not versioned atomically with the mirror. Exact-OID validation prevents newer
+Forge metadata from being handed to Magit against an older mirror; an existing
+workspace stays visible with an actionable stale-range message.
+
+The first explicit sync also performs Forge's repository-id lookup and local
+registration when necessary, then starts the single Forge pull owned by that
+job. This replaces the network-capable `forge-add-repository` onboarding path
+and never adds a pull-request refspec to a working clone.
 
 The `fetching-checks` state is currently an extension point; it does not fetch
 CI data yet.
@@ -282,8 +293,12 @@ CI data yet.
 ## Pull-request workspace
 
 `C-c g p` reads Forge’s local cache and opens one `+git-pr-mode` buffer keyed by
-canonical repository + PR number. Opening the same PR from another same-origin
-clone reuses the buffer and adopts that clone as edit context.
+canonical repository + PR number. `C-c g g` locally detects an exact cached
+open/draft PR head-ref match first. A differently named pick-up branch must
+explicitly track the provider branch; detection matches Git's standard
+`branch.<name>.merge` upstream setting and never guesses from ancestry. Opening
+the same PR from another same-origin clone reuses the buffer and adopts that
+clone as edit context.
 
 The overview renders:
 
@@ -295,6 +310,7 @@ repository and edit context
 cache generation/age/Forge state
 changes summary
 commits (oldest first)
+local continuation (branch, local commits, staged, unstaged, untracked)
 checks placeholder
 description
 cached conversation/reviews
@@ -304,6 +320,17 @@ The Git range is derived from the cached exact base/head OIDs and the published
 mirror’s merge base. Provider pull refs are discovery inputs; a provider merge
 ref is never substituted for the PR head. Merged and squash-merged PRs retain
 their original review range when the objects remain cached.
+
+The committed PR range is immutable and never absorbs a clone's partial work.
+When the edit context is checked out on the PR head branch, the Local
+continuation section exposes four separate local targets: `C` for commits after
+the cached PR head, `s` for index-only changes, `u` for unstaged tracked plus
+untracked files, and `r` for the combined worktree. Behind and diverged branches
+are reported explicitly instead of being presented as a valid continuation.
+`C-c g g` is the context-sensitive home: it returns to this PR workspace on a
+matching branch and otherwise opens Magit status in the active edit context.
+The PR buffer's internal bare-mirror `default-directory` never leaks into local
+status, log, commit, or branch-review commands.
 
 Before opening a tree/file or refreshing, the workspace verifies that its
 generation, mirror path, and exact range are still valid. A new generation,
@@ -326,22 +353,24 @@ Forge reads remain local. The explicit sync adapter uses Forge’s pull path and
 tracks asynchronous URL/Ghub callbacks so cancellation and errors terminate the
 job rather than leaving it in `pulling-forge`.
 
-Ghub first uses ordinary Auth Source. If no token is found for package `forge`
-and a host has an `op://` reference, the optional adapter runs:
-
-```text
-op read REFERENCE
-```
-
-Only the non-secret reference appears in argv. The token is held in memory for
-the Emacs session and can be cleared with
-`M-x +forge-1password-clear-token-cache`. See
+For Forge requests, a session token set by `+forge-set-session-token` takes
+priority. On macOS, an approved matching Internet Password in Keychain is
+next. On Linux and WSL, standard Auth Source is enabled by default, with
+encrypted `~/.authinfo.gpg` as the recommended persistent store. Cached
+credentials can be cleared with `M-x +forge-clear-token-cache` after rotation.
+The `+forge-allow-auth-source` option can disable the Forge-specific file path;
+it defaults to nil on macOS and non-nil elsewhere. See
 [git-review-auth.md](git-review-auth.md).
+
+Git transport remains separate. A repository SSH remote can still use the
+1Password SSH agent, which can produce an approval prompt during fetch or push;
+Forge itself does not use 1Password or the `op` executable.
 
 ## Safety and failure behavior
 
 - Buffer open and local refresh never fetch.
-- Failed sync preserves the prior published generation.
+- Failed sync preserves the prior published Git generation; Forge's live
+  SQLite transaction boundary is documented separately above.
 - Duplicate sync requests coalesce.
 - A live foreign lock is never stolen.
 - Cancel affects only the selected repository job.
@@ -369,17 +398,23 @@ rtk git diff --check
 
 At the Phase 5 acceptance point, plus the documentation audit:
 
-- 137 ERT tests pass with zero unexpected results;
+- 148 ERT tests pass with zero unexpected results;
 - documentation contract tests reject stale commands and broken local links;
-- warm 100-file Changes Tree rendering is approximately 0.05 seconds;
+- warm 100-file Changes Tree rendering stays below the one-second acceptance
+  threshold (0.271-second median on the 2026-07-20 macOS run);
 - tree refresh uses 10 bounded Git processes and creates no eager file diffs;
-- warm cached PR rendering is approximately 0.05 seconds;
+- warm cached PR rendering stays below the one-second acceptance threshold
+  (0.471 seconds on the same macOS run);
 - offline guards reject network-capable Git, Ghub/URL, `gh`, Delta, and
   Difftastic calls in local paths;
 - cross-process tests cover publication rollback, lock races, clean exit,
   dead-owner restart, cancellation, and late Forge callbacks;
-- 1Password tests cover Auth Source priority, one-shot fallback, memory cache,
-  CLI failure, and token exclusion from argv.
+- credential tests cover memory-token priority, macOS Keychain lookup and
+  stdin-only setup, Linux/WSL Auth Source fallback, session cache clearing,
+  provider isolation, and token exclusion from argv.
+- current-branch PR tests cover exact and explicit upstream matching
+  and keep local commits, staged, unstaged, and untracked continuation work
+  distinct.
 
 The historical pre-customization measurements remain in
 [git-baseline.md](git-baseline.md).

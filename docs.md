@@ -178,6 +178,17 @@ to open a new eshell buffer.
 | `C-c v` | Toggle vterm at bottom |
 | `C-c V` | Open new vterm |
 
+Vterm starts in insert state. A selected insert-mode terminal gives live output
+ownership of its cursor and viewport. Every unselected vterm window is frozen,
+even if that buffer remained in insert state after `windmove`; normal or visual
+state also freezes the selected window like a read-only scrollback buffer.
+Projectile `C-p`, buffer switches, and agent redraws therefore cannot move a
+terminal you are watching in another split. Deliberate normal-mode navigation
+updates only that window's saved view, while returning to a selected insert-mode
+terminal reconnects it to the real terminal cursor. Agent TUI output is
+coalesced into complete 20 FPS redraws to avoid painting partial-frame flashes.
+The underlying PTY remains live throughout.
+
 ## Org-mode
 
 See the [Org-Mode Workflow](#org-mode-workflow) section below for comprehensive

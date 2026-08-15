@@ -5,9 +5,10 @@
 
 ;;; Commentary:
 ;; Phase 5 ownership: Forge lives here so Magit (`init-git.el') and the PR
-;; workspace (`init-git-pr.el') stay separate.  This module never contacts a
-;; network endpoint.  It only reads Forge's local Closql database through
-;; public object APIs (`forge-get-repository', `forge-get-pullreq', `oref').
+;; workspace (`init-git-pr.el') stay separate.  Normal workspace reads use
+;; only Forge's local Closql database through public object APIs
+;; (`forge-get-repository', `forge-get-pullreq', `oref').  The sole network
+;; boundary is repository registration inside an explicit Phase 4 sync job.
 ;;
 ;; There is no handwritten Forge SQL and no second PR metadata store.
 ;; Tests must bind `forge-database-file' to a temporary path or inject
@@ -65,6 +66,11 @@ cond-let 1.1 places on `cond-let--and$'.  Pinned 0.2 keeps that API on
 ;; `user-emacs-directory'.  Phase 1 removed on-visit fetch advice: visiting a
 ;; cached Forge topic never triggers a hidden fetch.
 
+;; Set this before `use-package' expansion.  Evil Collection can autoload Forge
+;; while its own setup runs, which is earlier than a deferred package's
+;; `:init' form on some installations.
+(setq forge-add-default-bindings nil)
+
 (use-package forge
   :straight t
   :after magit
@@ -72,120 +78,189 @@ cond-let 1.1 places on `cond-let--and$'.  Pinned 0.2 keeps that API on
   :init
   ;; Re-assert compat before any deferred/autoloaded Forge load.
   (+forge--ensure-cond-let-compat)
-  ;; Skip forge's default binding injection: in current magit, the
-  ;; transient slot it targets (`"o"' in magit-dispatch) has moved or
-  ;; been removed.  Setting this in `:init' runs before forge loads.
+  ;; Reassert the setting for reloads and unusual package-loading orders.
   (setq forge-add-default-bindings nil))
 
 ;; =============================================================================
-;; Optional 1Password token provider
+;; Native Forge credential providers
 ;; =============================================================================
 
-(defcustom +forge-1password-token-references
-  (when-let ((reference (getenv "FORGE_GITHUB_TOKEN_OP_REF")))
-    `(("api.github.com" . ,reference)))
-  "Alist mapping Forge API hosts to 1Password secret references.
+(defcustom +forge-allow-auth-source (not (eq system-type 'darwin))
+  "Whether Forge may read or create tokens through ordinary Auth Source.
 
-Example:
-
-  ((\"api.github.com\" . \"op://Employee/GitHub Forge/token\"))
-
-Only the non-secret `op://` reference is stored in Emacs configuration.
-When Ghub cannot find its PACKAGE token through ordinary Auth Source,
-Emacs runs `op read REFERENCE' and caches the returned token in memory
-for the rest of the Emacs session.  Set the environment variable
-FORGE_GITHUB_TOKEN_OP_REF for the common GitHub.com case instead of
-customizing this variable."
-  :type '(alist :key-type string :value-type string)
+The default is non-nil on Linux and WSL, where an encrypted
+`~/.authinfo.gpg' is the recommended persistent credential store.  It is nil
+on macOS because `+forge-use-macos-keychain' uses the system Keychain instead.
+This setting is narrow: other Ghub packages keep their normal Auth Source
+behavior."
+  :type 'boolean
   :group 'magit)
 
-(defcustom +forge-1password-cli-program "op"
-  "1Password CLI executable used to resolve Forge token references."
+(defcustom +forge-use-macos-keychain (eq system-type 'darwin)
+  "Whether Forge may retrieve its token from macOS Keychain.
+
+This dedicated provider reads only an Internet Password item matching the
+Forge API host and Ghub account name (`USERNAME^forge').  It does not enable
+ordinary Auth Source files.  The default is non-nil on macOS and nil on
+Linux/WSL, where ordinary Auth Source is enabled by default."
+  :type 'boolean
+  :group 'magit)
+
+(defcustom +forge-macos-keychain-label "Emacs Forge GitHub token"
+  "Label used for the Forge Internet Password item in macOS Keychain."
   :type 'string
   :group 'magit)
 
-(defvar +forge--1password-token-cache (make-hash-table :test #'equal)
-  "Session-only cache of tokens returned by 1Password.
-Keys are secret references.  Values are never persisted by this module.")
+(defvar +forge--session-token-cache (make-hash-table :test #'equal)
+  "Session-only Forge tokens keyed by API host.
+This is the temporary no-disk fallback on every platform.")
 
-(defun +forge--1password-reference (host)
-  "Return the configured 1Password secret reference for HOST."
-  (or (cdr (assoc-string host +forge-1password-token-references t))
-      (and (string-prefix-p "api." host)
-           (cdr (assoc-string
-                 (string-remove-prefix "api." host)
-                 +forge-1password-token-references t)))))
+(defun +forge--ghub-account (username)
+  "Return Ghub's Forge account name for USERNAME."
+  (format "%s^forge" username))
 
-(defun +forge--1password-read-token (host)
-  "Read HOST's Forge token from 1Password and cache it for this session.
-The token is captured from `op' stdout and is never placed in argv,
-messages, process logs, or a file by this module."
-  (let* ((reference (+forge--1password-reference host))
-         (cached (and reference
-                      (gethash reference +forge--1password-token-cache))))
-    (cond
-     (cached cached)
-     ((null reference) nil)
-     ((not (string-prefix-p "op://" reference))
-      (user-error "Forge 1Password reference must begin with op://"))
-     ((not (executable-find +forge-1password-cli-program))
-      (user-error
-       "1Password CLI `%s' is unavailable; install/sign in to `op' or remove the Forge op:// reference"
-       +forge-1password-cli-program))
-     (t
-      (with-temp-buffer
-        (let ((coding-system-for-read 'utf-8-unix)
-              (coding-system-for-write 'utf-8-unix)
-              (status
-               (process-file +forge-1password-cli-program nil t nil
-                             "read" reference)))
-          (if (not (and (integerp status) (zerop status)))
-              (let ((detail (string-trim (buffer-string))))
-                (erase-buffer)
-                (user-error "1Password could not provide the Forge token%s"
-                            (if (string-empty-p detail)
-                                ""
-                              (format ": %s" detail))))
-            (let ((token (string-trim-right (buffer-string))))
-              (erase-buffer)
-              (when (string-empty-p token)
-                (user-error "1Password returned an empty Forge token"))
-              (puthash reference token +forge--1password-token-cache)
-              token))))))))
+(defun +forge--macos-keychain-token (host username)
+  "Return the Forge token for HOST and USERNAME from macOS Keychain.
+Return nil outside macOS, when the provider is disabled, or when no matching
+Internet Password item exists."
+  (when (and +forge-use-macos-keychain
+             (eq system-type 'darwin)
+             (stringp username)
+             (not (string-empty-p username)))
+    (require 'auth-source)
+    (let* ((auth-sources '(macos-keychain-internet))
+           (entry (car (auth-source-search
+                        :max 1
+                        :host host
+                        :user (+forge--ghub-account username)
+                        :require '(:secret))))
+           (secret (and entry (plist-get entry :secret))))
+      (cond
+       ((functionp secret) (funcall secret))
+       ((stringp secret) secret)
+       (t nil)))))
 
-(defun +forge-1password-clear-token-cache ()
-  "Forget all Forge tokens fetched from 1Password in this Emacs session."
+(defun +forge--configured-github-username ()
+  "Return the configured GitHub username, or nil.
+This is a local Git configuration lookup and never contacts GitHub."
+  (or (and (fboundp 'ghub--username)
+           (ignore-errors (ghub--username "api.github.com" 'github)))
+      (car (ignore-errors
+             (process-lines "git" "config" "--get" "github.user")))))
+
+(defun +forge-store-token-in-macos-keychain (&optional host username)
+  "Store a Forge token for HOST and USERNAME in macOS Keychain.
+
+The token is read with `read-passwd' and sent to Apple's `security' command
+through standard input.  It is never placed in process arguments, a file,
+minibuffer history, the kill ring, or messages by this module.  The Keychain
+account is Ghub's `USERNAME^forge' identity.  An existing matching item is
+updated."
   (interactive)
-  (clrhash +forge--1password-token-cache)
+  (unless (eq system-type 'darwin)
+    (user-error "macOS Keychain is available only on macOS"))
+  (unless (file-executable-p "/usr/bin/security")
+    (user-error "Apple's /usr/bin/security command is unavailable"))
+  (let* ((host (or host "api.github.com"))
+         (username
+          (or username
+              (+forge--configured-github-username)
+              (read-string "GitHub username: "))))
+    (when (string-empty-p username)
+      (user-error "GitHub username cannot be empty"))
+    (let* ((account (+forge--ghub-account username))
+           (token (read-passwd (format "Forge token for %s: " host))))
+      (when (string-empty-p token)
+        (user-error "Forge token cannot be empty"))
+      (let ((output (generate-new-buffer " *forge-keychain-output*"))
+            status detail)
+        (unwind-protect
+            (progn
+              (with-temp-buffer
+                ;; `security ... -w' asks for the password and confirmation.
+                ;; Supply the same hidden value twice through stdin.
+                (insert token "\n" token "\n")
+                (setq status
+                      (call-process-region
+                       (point-min) (point-max)
+                       "/usr/bin/security" t output nil
+                       "add-internet-password"
+                       "-U"
+                       "-a" account
+                       "-s" host
+                       "-l" +forge-macos-keychain-label
+                       "-w")))
+              (with-current-buffer output
+                (setq detail (string-trim (buffer-string))))
+              (unless (and (integerp status) (zerop status))
+                (user-error
+                 "Could not store the Forge token in macOS Keychain%s"
+                 (if (string-empty-p detail)
+                     ""
+                   (format ": %s" detail))))
+              (require 'auth-source)
+              (auth-source-forget-all-cached)
+              (message
+               "Stored Forge credential in macOS Keychain for %s (%s)"
+               host account)
+              t)
+          (when (buffer-live-p output)
+            (kill-buffer output))
+          (when (stringp token)
+            (clear-string token)))))))
+
+(defun +forge-set-session-token (&optional host)
+  "Read a Forge token for HOST into memory for this Emacs session only.
+
+This is a temporary fallback when no persistent platform credential store is
+available.  The value is not written to a file, customization, the kill ring,
+minibuffer history, messages, or process arguments by this module."
+  (interactive)
+  (let* ((host (or host "api.github.com"))
+         (token (read-passwd (format "Forge token for %s: " host))))
+    (when (string-empty-p token)
+      (user-error "Forge token cannot be empty"))
+    (puthash host token +forge--session-token-cache)
+    (message "Forge token cached in memory for %s until Emacs exits" host)
+    t))
+
+(defun +forge-clear-token-cache ()
+  "Forget session and Auth Source cached Forge tokens."
+  (interactive)
+  (clrhash +forge--session-token-cache)
   (require 'auth-source)
   (auth-source-forget-all-cached)
   (message "Forgot session-cached Forge tokens"))
 
-(defun +forge--ghub-token-with-1password
+(defun +forge--ghub-token-from-native-store
     (original host username package &optional nocreate forge)
-  "Call ORIGINAL Ghub token lookup, falling back to 1Password.
+  "Provide a Forge token from the configured platform-native store.
 HOST, USERNAME, PACKAGE, NOCREATE, and FORGE are Ghub's private token
-lookup arguments.  Ordinary Auth Source remains authoritative.  The
-1Password provider runs only for PACKAGE `forge' and a configured HOST."
-  (or (funcall original host username package t forge)
-      (and (eq package 'forge)
-           (+forge--1password-reference host)
-           (+forge--1password-read-token host))
-      (funcall original host username package nocreate forge)))
+lookup arguments.  Forge uses, in order, a manually supplied session token,
+macOS Keychain, then ordinary Auth Source when enabled.  Other Ghub packages
+retain ORIGINAL behavior."
+  (if (not (eq package 'forge))
+      (funcall original host username package nocreate forge)
+    (or (gethash host +forge--session-token-cache)
+        (+forge--macos-keychain-token host username)
+        (and +forge-allow-auth-source
+             (funcall original host username package nocreate forge))
+        (user-error
+         "No Forge token for %s; use macOS Keychain, Auth Source, or M-x +forge-set-session-token"
+         host))))
 
-(defun +forge--install-1password-ghub-advice ()
+(defun +forge--install-native-ghub-token-advice ()
   "Install the narrow Ghub token-provider adapter once."
   (when (and (fboundp 'ghub--token)
-             (not (advice-member-p #'+forge--ghub-token-with-1password
+             (not (advice-member-p #'+forge--ghub-token-from-native-store
                                    'ghub--token)))
     ;; Private Ghub seam, isolated here because Ghub has no public token
-    ;; provider hook.  This does not alter requests or authentication when no
-    ;; 1Password reference is configured.
+    ;; provider hook.
     (advice-add 'ghub--token :around
-                #'+forge--ghub-token-with-1password)))
+                #'+forge--ghub-token-from-native-store)))
 
 (with-eval-after-load 'ghub
-  (+forge--install-1password-ghub-advice))
+  (+forge--install-native-ghub-token-advice))
 
 ;; =============================================================================
 ;; Cached PR snapshot
@@ -230,6 +305,9 @@ or signal `user-error'.  Tests may bind a deterministic stub.")
 Called as (FN REPOSITORY-ID).  Must return a list of `+forge-pr-snapshot'.
 Never contacts the network.")
 
+(defvar +forge-repository-lookup-function #'forge-get-repository
+  "Forge repository lookup seam used by explicit synchronization tests.")
+
 ;; ---------------------------------------------------------------------------
 ;; Canonical id <-> Forge host/owner/name
 ;; ---------------------------------------------------------------------------
@@ -269,6 +347,24 @@ or writes the owner's Forge database.  On failure, records
           (error
            (setq +forge--load-error (error-message-string err))
            nil)))))
+
+(defun +forge-repository-for-explicit-sync (root)
+  "Return ROOT's Forge repository, registering it during explicit sync.
+
+This function may contact the forge when the repository is not known yet;
+call it only from the explicit `C-c g f' / `C-c g F' synchronization path.
+Unlike `forge-add-repository', it does not add a pull-request refspec to the
+working clone and does not start a second Forge pull.  The caller owns the
+single pull after this one-time repository-id lookup."
+  (unless (+forge--ensure-forge-apis)
+    (user-error "Forge is unavailable%s"
+                (if +forge--load-error
+                    (format ": %s" +forge--load-error)
+                  "")))
+  (let ((default-directory (file-name-as-directory root)))
+    (or (funcall +forge-repository-lookup-function :tracked?)
+        (when-let ((stub (funcall +forge-repository-lookup-function :stub?)))
+          (funcall +forge-repository-lookup-function stub nil :insert!)))))
 
 (defun +forge--forge-repo-for-canonical (repository-id &optional demand)
   "Return the Forge repository object for REPOSITORY-ID, or nil.
@@ -382,16 +478,16 @@ PR is absent from the local Forge cache.  Never fetches."
              (if +forge--load-error
                  (format " (%s). " +forge--load-error)
                ". ")
-             "Install/load Forge, run M-x forge-add-repository once, then C-c g f.")))
+             "Install/load Forge, then run C-c g f to register and synchronize.")))
   (let ((repo (+forge--forge-repo-for-canonical repository-id :known?)))
     (unless repo
       (user-error
        (concat "Repository is not tracked by Forge. "
-               "Run M-x forge-add-repository once, then C-c g f.")))
+               "Run C-c g f to register and synchronize it.")))
     (unless (eq (+forge--slot repo 'condition) :tracked)
       (user-error
        (concat "Repository is not tracked by Forge. "
-               "Run M-x forge-add-repository once, then C-c g f.")))
+               "Run C-c g f to register and synchronize it.")))
     (let ((pullreq (forge-get-pullreq repo number)))
       (unless pullreq
         (user-error
@@ -420,6 +516,26 @@ Dispatches through `+forge-pr-lookup-function'."
 (defun +forge-list-pr-snapshots (repository-id)
   "Return cached PR snapshots for REPOSITORY-ID for completion."
   (funcall +forge-pr-list-function repository-id))
+
+(defun +forge-open-pr-snapshots (repository-id)
+  "Return cached open or draft PRs in REPOSITORY-ID.
+The result is newest-number-first and performs no network access."
+  (sort
+   (cl-remove-if-not
+    (lambda (snapshot)
+      (memq (+forge-pr-snapshot-state snapshot) '(open draft)))
+    (+forge-list-pr-snapshots repository-id))
+   (lambda (a b)
+     (> (+forge-pr-snapshot-number a)
+        (+forge-pr-snapshot-number b)))))
+
+(defun +forge-prs-for-head-ref (repository-id head-ref)
+  "Return cached open or draft PRs in REPOSITORY-ID for HEAD-REF.
+The result is newest-number-first and performs no network access."
+  (cl-remove-if-not
+   (lambda (snapshot)
+     (equal (+forge-pr-snapshot-head-ref snapshot) head-ref))
+   (+forge-open-pr-snapshots repository-id)))
 
 (defun +forge-pr-completion-candidates (repository-id)
   "Return completion strings for cached PRs in REPOSITORY-ID.

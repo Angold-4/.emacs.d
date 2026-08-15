@@ -35,6 +35,17 @@
 
 ;;; Code:
 
+;; Capture the process launch directory before visiting files or generated
+;; buffers changes `default-directory'.  Long-lived tools such as vterm use
+;; this stable value instead of inheriting a PR mirror or file directory.
+(defvar +emacs-launch-directory
+  (file-name-as-directory
+   (expand-file-name
+    (or (and (boundp 'command-line-default-directory)
+             command-line-default-directory)
+        default-directory)))
+  "Directory from which this Emacs process was launched.")
+
 ;; =============================================================================
 ;; Startup Performance
 ;; =============================================================================

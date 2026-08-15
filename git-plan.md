@@ -152,7 +152,8 @@ buffer-based Emacs environment.
    - status, log, Forge topic, revision, unified diff, blob, and source
      navigation replace the selected window;
    - explicit `o` may create/reuse one right-hand window;
-   - `q` restores the caller and its window layout.
+   - `q` restores the caller in the selected window without changing other
+     user-created splits.
 4. Implement `+git-review-buffer-mode` for Magit/Forge generated buffers:
 
    | Key | Action |
@@ -182,7 +183,8 @@ buffer-based Emacs environment.
 - Navigation through source -> status -> revision -> diff does not increase
   window count.
 - `o` creates at most one extra window and reuses it.
-- `q` restores the previous buffer/window configuration.
+- `q` restores the previous buffer in the selected window and preserves the
+  current window configuration.
 - Native visiting reaches the correct line for added, removed, context,
   renamed, and deleted-file cases.
 - Test instrumentation fails if open, visit, or `gr` invokes `git fetch`, Forge
@@ -380,19 +382,24 @@ conversation
 - Use Forge objects/APIs for metadata and conversation; use mirror objects for
   ranges, blobs, and diffs.
 - Reuse the Phase 2 Changes Tree for the PR merge-base/head range.
+- Detect the cached open/draft PR for the checked-out branch without networking,
+  including a differently named local branch with an explicit Git upstream.
+- Keep the committed PR range immutable while reporting local continuation as
+  separate local commits, staged changes, unstaged changes, and untracked files.
 - `RET` opens the selected item in the same window. `t` opens the tree. `e`
-  selects an existing local context before opening writable source. Reply/edit
-  opens a writable Markdown composition buffer.
+  selects an existing local context before opening writable source.
 - Handle fork PRs and merge commits explicitly.
 
 ### Test
 
 - Opening the same PR from two clones reuses one buffer.
-- Opening, tree navigation, commit navigation, comments, and `gr` perform no
-  network calls.
+- Opening, tree navigation, cached conversation rendering, commit navigation,
+  and `gr` perform no network calls.
 - PR range, oldest-first commit order, fork refs, rename/delete/binary files,
   and context selection are correct.
 - A changed PR head invalidates only reviewed files whose blob changed.
+- Current-branch detection and each local continuation layer remain local-only
+  and cannot be mistaken for the cached committed PR range.
 
 ### Gate and feedback loop
 
@@ -417,7 +424,8 @@ Branch: `feat/git-review-06-side-by-side`
 - Parse only the active file. Reuse both windows while stepping files.
 - For local review, allow the after side to be the writable worktree file.
 - Fall back clearly for binary, oversized, submodule, or unavailable blobs.
-- `q` restores the exact pre-comparison layout.
+- `q` returns to the pre-comparison caller in the selected window while
+  preserving unrelated splits created before or during review.
 
 ### Test
 

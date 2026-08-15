@@ -361,6 +361,7 @@
 ;; Phase 5 shared pull-request workspace tests.
 (require 'git-review-pr-test)
 (require 'git-review-doc-test)
+(require 'vterm-behavior-test)
 
 (provide 'git-review-test)
 

@@ -55,6 +55,9 @@
      (git-review-fixtures-create-small root)
      (let* ((wt (+git-review-target-for-worktree root))
             (st (+git-review-target-for-staged root))
+            (ut (+git-review-target-for-unstaged root))
+            (ut-paths (mapcar #'+git-review-file-path
+                              (+git-review-collect-files ut)))
             (head (string-trim-right
                    (git-review-fixtures--git-ok root "rev-parse" "HEAD")))
             (cm (+git-review-target-for-commit head root))
@@ -76,6 +79,15 @@
        (should (stringp (+git-review-target-context-id wt)))
        (should (eq (+git-review-target-scope st) 'staged))
        (should (eq (+git-review-target-mutable-p st) t))
+       (should (eq (+git-review-target-scope ut) 'unstaged))
+       (should (eq (+git-review-target-mutable-p ut) t))
+       (pcase-let ((`(,range ,typearg) (+git-review-target-range-args ut)))
+         (should (null range))
+         (should (null typearg)))
+       (should (member "README.md" ut-paths))
+       (should (member "untracked.txt" ut-paths))
+       (should-not (member "lib/util.el" ut-paths))
+       (should-not (member "added.el" ut-paths))
        (should (eq (+git-review-target-scope cm) 'commit))
        (should (null (+git-review-target-mutable-p cm)))
        (should (equal (+git-review-target-head-oid cm) head))
@@ -129,7 +141,7 @@ range state to the new HEAD instead of keeping the old object."
                                (with-current-buffer t1 +git-review--files)
                                "README.md"))
                         (f1 (+git-review-open-file-diff target1 file)))
-                   (should (equal (buffer-local-value 'magit-buffer-range o1)
+                   (should (equal (buffer-local-value 'magit-buffer-diff-range o1)
                                   old-head))
                    ;; Commit the staged/worktree mix so HEAD advances.
                    (git-review-fixtures--git-ok root "add" "-A")
@@ -146,9 +158,9 @@ range state to the new HEAD instead of keeping the old object."
                      (should (not (equal old-head new-head)))
                      (should (eq o1 o2))
                      (should (eq f1 f2))
-                     (should (equal (buffer-local-value 'magit-buffer-range o2)
+                     (should (equal (buffer-local-value 'magit-buffer-diff-range o2)
                                     new-head))
-                     (should (equal (buffer-local-value 'magit-buffer-range f2)
+                     (should (equal (buffer-local-value 'magit-buffer-diff-range f2)
                                     new-head))
                      (should (equal
                               (+git-review-target-base-oid
