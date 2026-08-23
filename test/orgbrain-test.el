@@ -752,6 +752,67 @@ workspace that can never leave a project can never replay them."
     (should (equal (+orgbrain--entity-args "emacs-d")
                    '("--entity" "projects/emacs-d")))))
 
+
+;; ---------------------------------------------------------------------------
+;; Pane labelling and the input buffer's fate after a send
+;; ---------------------------------------------------------------------------
+
+(ert-deftest orgbrain-panes-are-labelled-and-only-input-shows-the-mode ()
+  "Each pane names itself, and `mode' appears only where a send is issued."
+  (let ((+orgbrain--project "orgbrain")
+        (+orgbrain--mode 'ask)
+        (+orgbrain--status 'idle)
+        (+orgbrain--projects-source 'server)
+        (+orgbrain-ssh-host "vienna"))
+    (let ((output (+orgbrain--header-line 'output))
+          (input (+orgbrain--header-line 'input)))
+      (should (string-prefix-p "OUTPUT" output))
+      (should (string-prefix-p "INPUT" input))
+      ;; The mode decides what a send does; the transcript issues no sends.
+      (should-not (string-match-p "mode:" output))
+      (should (string-match-p "mode: ask" input))
+      (dolist (line (list output input))
+        (should (string-match-p "project: orgbrain" line))
+        (should (string-match-p "vienna idle" line)))
+      ;; The two panes must not render identically -- that is what made them
+      ;; indistinguishable in use.
+      (should-not (equal output input)))))
+
+(ert-deftest orgbrain-a-successful-send-clears-the-input ()
+  "The brief is cleared only after the transcript holds it."
+  (let ((+orgbrain--project "orgbrain")
+        (+orgbrain--pending (list :mode 'ask)))
+    (unwind-protect
+        (progn
+          (+orgbrain--set-input "what is the progress?")
+          (+orgbrain--finish-send 'ask "what is the progress?"
+                                  orgbrain-test--ask-json nil)
+          (should (equal (+orgbrain--input-text) ""))
+          ;; The transcript keeps what was sent, quoted.
+          (should (string-match-p
+                   (regexp-quote "> what is the progress?")
+                   (with-current-buffer (+orgbrain--buffer 'output)
+                     (buffer-string)))))
+      (dolist (kind '(output input))
+        (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
+(ert-deftest orgbrain-a-failed-send-keeps-the-input ()
+  "A failure must never cost the owner the thought they typed."
+  (let ((+orgbrain--project "orgbrain")
+        (+orgbrain--pending (list :mode 'ask)))
+    (unwind-protect
+        (progn
+          (+orgbrain--set-input "a long brief")
+          (+orgbrain--finish-send 'ask "a long brief" nil "ssh: connect failed")
+          (should (equal (+orgbrain--input-text) "a long brief"))
+          ;; Unparseable output is also a failure: keep the brief.
+          (+orgbrain--finish-send 'ask "a long brief" "not json at all" nil)
+          (should (equal (+orgbrain--input-text) "a long brief")))
+      (dolist (kind '(output input))
+        (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
 (provide 'orgbrain-test)
 
 ;;; orgbrain-test.el ends here

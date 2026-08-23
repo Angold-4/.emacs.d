@@ -194,8 +194,19 @@ The underlying PTY remains live throughout.
 `:orgbrain` (or `M-x +orgbrain/open`) opens a two-buffer client for the OrgBrain
 daemon: `*orgbrain*` on top is the read-only transcript, `*orgbrain-input*`
 below is where the brief is written. Point starts in the input buffer, both
-buffers start in Evil normal state, and the header line reads
-`project: <slug>  |  mode: <mode>  |  <host> <state>`.
+buffers start in Evil normal state, and each pane labels itself in its
+header line:
+
+```
+OUTPUT  |  project: orgbrain  |  vienna idle
+INPUT   |  project: orgbrain  |  mode: ask  |  vienna idle
+```
+
+Only the input pane shows `mode`, since the mode decides what a send does and
+sends are issued from there. A successful send clears the input buffer — the
+transcript above already holds the brief, quoted — while a failed or
+unparseable one leaves it untouched, so a broken tunnel never costs you the
+thought you typed.
 
 | Key | Action |
 |-----|--------|

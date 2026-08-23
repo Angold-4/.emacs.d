@@ -717,22 +717,32 @@ HEADING defaults to the exchange kind."
   "Return the existing workspace buffer for KIND, or nil."
   (get-buffer (+orgbrain--buffer-name kind)))
 
+(defun +orgbrain--header-line (kind)
+  "Return the header line for the KIND pane, `output' or `input'.
+Each pane is labelled, because the two are otherwise indistinguishable
+at a glance -- issue #6's own sketch labels them OUTPUT and INPUT.  Only
+the input pane carries `mode\=': the mode decides what a send does, and a
+send is issued from there, so showing it on the transcript said nothing."
+  (concat
+   (pcase kind ('output "OUTPUT") ('input "INPUT"))
+   (format "  |  project: %s" (or +orgbrain--project "unscoped"))
+   (when (eq kind 'input)
+     (format "  |  mode: %s" (+orgbrain--mode-label +orgbrain--mode)))
+   (format "  |  %s %s"
+           (if (eq +orgbrain-transport #'+orgbrain--transport-local)
+               "local"
+             +orgbrain-ssh-host)
+           +orgbrain--status)
+   (+orgbrain--projects-note +orgbrain--projects-source)))
+
 (defun +orgbrain--refresh-header ()
   "Re-render the header line in both workspace buffers."
-  (let ((line (format "project: %s  |  mode: %s  |  %s %s%s"
-                      (or +orgbrain--project "unscoped")
-                      (+orgbrain--mode-label +orgbrain--mode)
-                      (if (eq +orgbrain-transport #'+orgbrain--transport-local)
-                          "local"
-                        +orgbrain-ssh-host)
-                      +orgbrain--status
-                      (+orgbrain--projects-note +orgbrain--projects-source))))
-    (dolist (kind '(output input))
-      (let ((buf (+orgbrain--live-buffer kind)))
-        (when (buffer-live-p buf)
-          (with-current-buffer buf
-            (setq-local header-line-format line)
-            (force-mode-line-update)))))))
+  (dolist (kind '(output input))
+    (let ((buf (+orgbrain--live-buffer kind)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (setq-local header-line-format (+orgbrain--header-line kind))
+          (force-mode-line-update))))))
 
 (defun +orgbrain--set-status (status)
   "Set the workspace transport STATUS and refresh the header line."
@@ -909,6 +919,9 @@ STDOUT is the raw CLI output when the call succeeded."
       (let ((exchange (plist-put (+orgbrain--record-exchange record) :sent text)))
         (+orgbrain--set-status 'idle)
         (+orgbrain--append (+orgbrain--format-exchange exchange label))
+        ;; Clear the brief only once the transcript holds it, so a failed
+        ;; send never costs the owner the thought they typed.
+        (+orgbrain--set-input "")
         (message "orgbrain %s: done in %s ms" label
                  (+orgbrain--format-count
                   (+orgbrain--dig record "result" "answer_receipt"
