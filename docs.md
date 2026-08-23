@@ -202,6 +202,11 @@ OUTPUT  |  project: orgbrain  |  vienna idle
 INPUT   |  project: orgbrain  |  mode: ask  |  vienna idle
 ```
 
+If the client ever believes a request is outstanding when none is, `:orgbrain-reset`
+clears the state and rebuilds the split. Send also recognises a stale in-flight
+flag on its own — one whose process has died, or which a reloaded module left
+behind — so a lost reply no longer disables sending until Emacs restarts.
+
 Only the input pane shows `mode`, since the mode decides what a send does and
 sends are issued from there. A successful send clears the input buffer — the
 transcript above already holds the brief, quoted — while a failed or
@@ -216,6 +221,7 @@ thought you typed.
 | `<up>` / `<down>` | Replay the previous/next exchange of the current project |
 | `gp` / `C-c C-p` | Switch project (`:orgbrain-project`, `completing-read`) |
 | `q` | Bury the workspace |
+| `:orgbrain-reset` | Clear the request state and rebuild the split (`M-x +orgbrain/reset`) |
 
 The project switcher is on `gp` / `C-c C-p`, not on the `C-x o p` that issue
 #6 sketched: `C-x o` is `other-window` territory, this config navigates windows

@@ -933,29 +933,65 @@ Refuses while another request is in flight: the daemon rejects a write
 while any job is running, and losing a thought is worse than waiting."
   (interactive)
   (when +orgbrain--pending
-    (user-error "orgbrain: %s still in flight; send is disabled until it returns"
-                (+orgbrain--mode-label (plist-get +orgbrain--pending :mode))))
+    ;; A flag can outlive the request it describes -- a reloaded module, or a
+    ;; build that left it set after a signal -- and then the callback that
+    ;; would clear it never runs, so obeying it refuses every later send
+    ;; forever.  A flag is judged stale when it records a process that has
+    ;; died, or records no `:process' key at all (the shape older state has).
+    ;; A flag that records nil is left alone: a transport that returns no
+    ;; process cannot be second-guessed, and `+orgbrain/reset' is the hatch.
+    (if (and (plist-member +orgbrain--pending :process)
+             (let ((proc (plist-get +orgbrain--pending :process)))
+               (or (null proc) (process-live-p proc))))
+        (user-error "orgbrain: %s still in flight; send is disabled until it returns (`M-x +orgbrain/reset' if it is not)"
+                    (+orgbrain--mode-label (plist-get +orgbrain--pending :mode)))
+      (setq +orgbrain--pending nil)))
   (let ((text (+orgbrain--input-text))
         (mode +orgbrain--mode))
     (when (string-empty-p text)
       (user-error "orgbrain: the input buffer is empty"))
     (let* ((request (+orgbrain--build-request mode text +orgbrain--project))
            (label (+orgbrain--mode-label mode)))
-      (setq +orgbrain--pending (list :mode mode :started (float-time)))
+      (setq +orgbrain--pending
+            (list :mode mode :started (float-time) :process nil))
       (+orgbrain--set-status 'working)
       (message "orgbrain %s: sent to %s, waiting (an ask takes 19-25s)"
                label +orgbrain-ssh-host)
       ;; If the dispatch signals, `+orgbrain--pending' must not survive it:
       ;; a stuck pending refuses every later send until Emacs restarts.
       (condition-case signalled
-          (+orgbrain--cli (plist-get request :args)
-                          (plist-get request :stdin)
-                          (lambda (stdout problem)
-                            (+orgbrain--finish-send mode text stdout problem)))
+          (let ((proc (+orgbrain--cli
+                       (plist-get request :args)
+                       (plist-get request :stdin)
+                       (lambda (stdout problem)
+                         (+orgbrain--finish-send mode text stdout problem)))))
+            ;; Record the process so a flag left behind by a lost callback can
+            ;; be recognised as stale.  The reply may already have landed and
+            ;; cleared the flag, hence the guard.
+            (when (and +orgbrain--pending (processp proc))
+              (setq +orgbrain--pending
+                    (plist-put +orgbrain--pending :process proc))))
         (error
          (setq +orgbrain--pending nil)
          (+orgbrain--set-status 'error)
          (signal (car signalled) (cdr signalled)))))))
+
+(defun +orgbrain/reset ()
+  "Clear the workspace's request state and rebuild the split.
+The escape hatch for a client that believes a request is outstanding when
+none is, and for buffers left behind by reloading the module."
+  (interactive)
+  (when (process-live-p (plist-get +orgbrain--pending :process))
+    (ignore-errors (delete-process (plist-get +orgbrain--pending :process))))
+  (setq +orgbrain--pending nil
+        +orgbrain--status 'idle
+        +orgbrain--exchanges nil
+        +orgbrain--exchanges-project nil
+        +orgbrain--exchange-index nil)
+  (+orgbrain/open)
+  (message "orgbrain: reset; project %s, mode %s"
+           (or +orgbrain--project "unscoped")
+           (+orgbrain--mode-label +orgbrain--mode)))
 
 (defun +orgbrain--ensure-exchanges ()
   "Return the cached exchanges for the current project, fetching when stale."
@@ -1027,7 +1063,8 @@ while any job is running, and losing a thought is worse than waiting."
 (with-eval-after-load 'evil
   (when (fboundp 'evil-ex-define-cmd)
     (evil-ex-define-cmd "orgbrain" #'+orgbrain/open)
-    (evil-ex-define-cmd "orgbrain-project" #'+orgbrain/switch-project))
+    (evil-ex-define-cmd "orgbrain-project" #'+orgbrain/switch-project)
+    (evil-ex-define-cmd "orgbrain-reset" #'+orgbrain/reset))
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +orgbrain-mode-map
       (kbd "RET") #'+orgbrain/send

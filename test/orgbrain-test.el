@@ -813,6 +813,79 @@ workspace that can never leave a project can never replay them."
         (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
           (when (buffer-live-p buffer) (kill-buffer buffer)))))))
 
+
+;; ---------------------------------------------------------------------------
+;; Recovering from a lost in-flight flag
+;; ---------------------------------------------------------------------------
+
+(ert-deftest orgbrain-a-stale-in-flight-flag-does-not-refuse-forever ()
+  "A flag whose process is gone is cleared, not obeyed.
+The callback that would clear it will never run, so refusing every later
+send would wedge the client until Emacs restarted."
+  (let ((+orgbrain--project "orgbrain")
+        ;; Exactly the shape an older build left behind: no `:process' key.
+        (+orgbrain--pending (list :mode 'ask :started 0))
+        (sent nil))
+    (unwind-protect
+        (cl-letf (((symbol-function '+orgbrain--cli)
+                   (lambda (&rest _) (setq sent t) nil)))
+          (+orgbrain--set-input "a question")
+          (+orgbrain/send)
+          (should sent))
+      (dolist (kind '(output input))
+        (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
+(ert-deftest orgbrain-a-live-request-still-refuses-a-second-send ()
+  "S4 holds: a genuinely running process blocks a concurrent send."
+  (let* ((proc (start-process "orgbrain-test-sleep" nil "sleep" "30"))
+         (+orgbrain--project "orgbrain")
+         (+orgbrain--pending (list :mode 'ask :started 0 :process proc)))
+    (unwind-protect
+        (progn
+          (+orgbrain--set-input "a question")
+          (should-error (+orgbrain/send) :type 'user-error))
+      (ignore-errors (delete-process proc))
+      (dolist (kind '(output input))
+        (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
+(ert-deftest orgbrain-a-dead-recorded-process-is-also-stale ()
+  "A recorded process that has exited marks the flag stale."
+  (let* ((proc (start-process "orgbrain-test-true" nil "true"))
+         (+orgbrain--project "orgbrain")
+         (sent nil))
+    (while (process-live-p proc) (accept-process-output nil 0.02))
+    (let ((+orgbrain--pending (list :mode 'ask :started 0 :process proc)))
+      (unwind-protect
+          (cl-letf (((symbol-function '+orgbrain--cli)
+                     (lambda (&rest _) (setq sent t) nil)))
+            (+orgbrain--set-input "a question")
+            (+orgbrain/send)
+            (should sent))
+        (dolist (kind '(output input))
+          (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+            (when (buffer-live-p buffer) (kill-buffer buffer))))))))
+
+(ert-deftest orgbrain-reset-clears-the-request-state ()
+  "`+orgbrain/reset' is the escape hatch and leaves the client sendable."
+  (let ((+orgbrain--project "orgbrain")
+        (+orgbrain--pending (list :mode 'ask :started 0))
+        (+orgbrain--status 'working)
+        (+orgbrain--exchange-index 3)
+        (+orgbrain-transport #'orgbrain-test--stub-transport))
+    (unwind-protect
+        (progn
+          (+orgbrain/reset)
+          (should (null +orgbrain--pending))
+          (should (eq +orgbrain--status 'idle))
+          (should (null +orgbrain--exchange-index)))
+      (dolist (kind '(output input))
+        (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+          (when (buffer-live-p buffer) (kill-buffer buffer))))
+      (set-frame-parameter (selected-frame) '+orgbrain-input-window nil)
+      (delete-other-windows))))
+
 (provide 'orgbrain-test)
 
 ;;; orgbrain-test.el ends here
