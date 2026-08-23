@@ -1,225 +1,315 @@
-# Git Diff Review System
+# Git Review Workbench
 
-A clean, read-only git diff review workflow optimized for reviewing
-AI-generated code changes inside Emacs. Built on top of magit.
+This is the daily user guide for the Emacs Git and GitHub review workflow.
+The design and storage reference is in [docs/git.md](docs/git.md), and
+authentication setup is in
+[docs/git-review-auth.md](docs/git-review-auth.md).
 
-## Quick Start
+## Start here
 
-Restart Emacs (or `M-x eval-buffer` on `init.el`), then go to any git repo:
+Open a repository file, then press `C-c g` to open the Git dispatch:
 
+| Key | Action | Network |
+|---|---|---|
+| `g` | Current PR home; Magit status when no PR matches | No |
+| `r` | Review working-tree changes | No |
+| `s` | Review staged changes | No |
+| `u` | Review unstaged and untracked changes | No |
+| `c` | Review one commit | No |
+| `b` | Review a base/head branch range | No |
+| `p` | Open a cached pull request by number | No |
+| `l` | Compact local log | No |
+| `f` | Synchronize this repository | **Yes** |
+| `F` | Synchronize allowlisted repositories | **Yes** |
+
+`C-x g` remains the direct Magit status command.
+
+## Review local changes
+
+Use one of:
+
+```text
+C-c g r    HEAD versus working tree/index, including untracked files
+C-c g s    HEAD versus index
+C-c g u    index versus worktree, including untracked files
+C-c g c    parent versus selected commit
+C-c g b    merge-base(base, head) versus head
 ```
-C-c g r    — Review all working-tree changes (unstaged + untracked)
-C-c g s    — Review staged changes only
-C-c g c    — Review a specific commit (prompts for ref)
-C-c g l    — Compact one-line git log
-C-c g g    — Open magit-status (same as C-x g)
+
+Press `t` in the review overview to open the Changes Tree:
+
+```text
+Changes  1/3 reviewed  |  +24 -8
+[ ] src/                          +20 -7
+    [x] api/                      +8 -2
+        [x] users.ts       M      +8 -2
+    [ ] ui/                       +12 -5
+        [ ] panel.tsx      M      +12 -5
+[ ] test/                         +4 -1
+    [ ] panel-test.ts      A      +4 -1
 ```
 
-## Testing Checklist
+The checkboxes are personal review progress. `SPC` toggles the file or folder
+at point. It does not stage, unstage, discard, edit, commit, or submit
+anything.
 
-Open a terminal, make some changes in a git repo (or let an AI tool
-make changes), then come back to Emacs and test each step:
+A typical local loop is:
 
-### 1. Open the review buffer
-
+```text
+C-c g r -> t -> RET -> read diff -> e -> edit -> q -> SPC
 ```
-C-c g r
+
+Use Magit status for staging, committing, rebasing, and other Git mutations.
+Commit/branch/PR review targets are immutable and reject staging or discard
+operations.
+
+## Review a pull request
+
+### Authentication
+
+Forge is the local GitHub metadata database used by the PR workspace. Git may
+authenticate through the 1Password SSH agent, but Forge also needs a GitHub API
+username and token. See [Git review authentication](docs/git-review-auth.md).
+
+On macOS, run `M-x +forge-store-token-in-macos-keychain` once and paste the
+token at the hidden prompt. Later Emacs launches retrieve it automatically.
+On Linux and WSL, put the Ghub entry in encrypted `~/.authinfo.gpg`. Use
+`M-x +forge-set-session-token` only when no persistent store is approved.
+
+If 1Password opens during a Git fetch, that is the separate SSH agent signing
+the Git operation; Forge does not call 1Password or its `op` CLI. PAT rotation
+instructions for macOS Keychain and Linux/WSL are in the authentication guide.
+After replacing a token, restart Emacs or run
+`M-x +forge-clear-token-cache` before the next sync.
+
+### Synchronize and open
+
+From a file or review buffer belonging to the repository:
+
+```text
+C-c g f    fetch the shared Git mirror and update Forge
+C-c g p    enter the PR number
+C-c g g    open the current PR home (or local Magit status)
 ```
 
-You should see a diff buffer with:
-- File stat summary at the top (files changed, insertions, deletions)
-- Each modified file as a **collapsed** section (press `TAB` to expand)
-- Green lines = added, red lines = removed, with **syntax highlighting**
-- Word-level highlighting within changed lines (refined hunks)
-- Untracked (new) files shown with full content as green diffs
-  (in a collapsible "N untracked files" section — press `TAB` to expand)
+The first `C-c g f` also registers an unknown repository with Forge inside the
+same explicit network operation. It does not add a pull-request fetch refspec
+to the working clone. Do not use `forge-add-repository` for this workflow.
 
-### 2. Navigate with hjkl / J K
+Synchronization is asynchronous. `fetching-mirror` means it is still running.
+Completion looks like:
 
-| Key   | Action                               |
-|-------|--------------------------------------|
-| `j`   | Move down one line                   |
-| `k`   | Move up one line                     |
-| `J`   | Move down 8 lines (quick scroll)     |
-| `K`   | Move up 8 lines (quick scroll)       |
-| `H`   | Beginning of line                    |
-| `L`   | End of line                          |
-| `gg`  | Go to top of buffer                  |
-| `G`   | Go to bottom of buffer               |
+```text
+Synced github.com/OWNER/REPOSITORY (generation N, forge: current)
+```
 
-### 3. Jump between files and hunks
+Use `M-x +git/sync-status` for details. `gr` is intentionally different: it
+only rereads the already-published mirror, Forge database, and review state.
 
-| Key | Action                      |
-|-----|-----------------------------|
-| `n` | Jump to next file section   |
-| `p` | Jump to previous file       |
-| `N` | Jump to next hunk           |
-| `P` | Jump to previous hunk       |
+### Continue work on the current PR branch
 
-### 4. Expand / collapse sections
+`C-c g g` first matches the checked-out branch name against open or draft PRs
+in the local Forge cache. A differently named local pick-up branch must track
+the provider branch explicitly, for example:
 
-| Key       | Action                              |
-|-----------|-------------------------------------|
-| `TAB`     | Toggle section under cursor         |
-| `S-TAB`   | Cycle all sections (expand/collapse)|
+```bash
+git branch --set-upstream-to=origin/feat/rate-limit-runtime-enforcement vp/pr569-runtime
+```
 
-### 5. Adjust context (like GitHub's "expand" button)
+Detection then matches Git's configured upstream; it never guesses from commit
+ancestry and never contacts GitHub. Run `C-c g f` first when the PR is new or
+its cached metadata is stale.
 
-| Key | Action                                 |
-|-----|----------------------------------------|
-| `+` | Show 3 more context lines around hunks |
-| `=` | Same as `+`                            |
-| `-` | Show 3 fewer context lines             |
+The PR workspace deliberately keeps the cached committed PR range separate
+from work that exists only in the current clone. Its **Local continuation**
+section reports the checked-out branch and four independent layers:
 
-Start at 6 lines of context (GitHub default). You can keep pressing `+`
-to see up to 50 lines of surrounding code.
+```text
+C    commits after the cached PR head
+s    staged changes only
+u    unstaged tracked changes plus untracked files
+r    all staged, unstaged, and untracked work together
+```
 
-### 6. Open files from the diff
+This makes “what reviewers already see” stable while still providing a clean
+view of partially implemented follow-up work. If the branch is behind or has
+diverged from the cached PR head, the workspace reports that relationship
+instead of constructing a misleading local-commit range.
 
-| Key   | Action                                                |
-|-------|-------------------------------------------------------|
-| `RET` | Open file at point in a **right side split**          |
-|       | Jumps to the exact line shown in the diff             |
-| `o`   | Open file in other window (simpler split)             |
+On a matching branch, `C-c g g` always returns to this PR workspace—the home
+for previous PR commits and all local continuation layers. On a branch without
+a matching cached open/draft PR, the same command opens Magit status in the
+active worktree. The internal `mirror.git` path remains the object store for
+the immutable PR range and is never used as a local-command root.
 
-This is the core "review then edit" flow:
-1. Read the diff
-2. Press `RET` on a line you want to change
-3. Edit the file in the side window
-4. `C-h` to go back to the diff buffer (windmove left)
-5. Continue reviewing
+### File-by-file review
 
-### 7. Stage / unstage / discard from the review
+This is the default for a small or medium PR:
 
-| Key | Action                          |
-|-----|---------------------------------|
-| `s` | Stage the hunk or file at point |
-| `u` | Unstage hunk or file            |
-| `x`  | Discard hunk or file (careful!) |
-| `gr` | Refresh the diff buffer         |
-| `q`  | Quit the review buffer          |
+```text
+C-c g p -> PR number -> t
+```
 
-### 8. Window navigation
+Then:
 
-`C-h/j/k/l` moves between windows (left/down/up/right), so you can
-quickly switch between the diff buffer and any file you opened.
+1. Move through folders/files with `j` and `k`, or `gf` and `gF`.
+2. Press `RET` for the exact unified file diff.
+3. Press `e` to open that path in the selected local edit context when it
+   exists.
+4. Press `q` to return.
+5. Press `SPC` to mark the file reviewed.
 
-### 9. Search
+Reviewed state is local Emacs metadata. If the PR head advances, files whose
+fingerprint changed become unreviewed; unchanged files keep their state.
 
-| Key | Action          |
-|-----|-----------------|
-| `/` | Search forward  |
-| `?` | Search backward |
+### Commit-by-commit review
 
-### 10. Visual mode (select & copy)
+This is useful when a large PR has meaningful commits:
 
-Press `v` to enter visual mode, select text, then `C-y` to copy
-to tmux's paste buffer. Then switch to any other tmux pane
-(e.g. OpenCode) and press `C-a P` to paste.
+```text
+C-c g p -> PR number -> c -> RET
+```
 
-Flow: **Emacs `C-y`** → tmux buffer → **`C-a P`** → paste into target pane
+`c` moves to the oldest commit row and `RET` opens it. The commit buffer shows
+the author/date, subject, full commit body, summary, and native diff. Use:
 
-## Other Features
+```text
+gc    next commit
+gC    previous commit
+t     Changes Tree for the whole PR
+q     return to the PR workspace
+```
 
-### diff-hl: Gutter indicators
+Merge commits use their first parent by default. Advanced parent selection
+remains an explicit command rather than a normal-mode key.
 
-Every file buffer now shows git change indicators in the left fringe:
-- Green bar = new lines
-- Orange bar = modified lines  
-- Red bar = deleted lines
+## Normal-mode keys
 
-These update live as you edit (flydiff mode).
+The generated Git/Forge buffers deliberately expose a small vocabulary:
 
-### Magit Status (C-x g) improvements
+| Key | Action |
+|---|---|
+| `h/j/k/l` | Evil movement |
+| `H/L` | Beginning/end of line |
+| `J/K` | Move by eight lines |
+| `TAB` | Toggle section |
+| `S-TAB` | Cycle all sections |
+| `gf` / `gF` | Next/previous changed file |
+| `gh` / `gH` | Next/previous hunk |
+| `gc` / `gC` | Next/previous PR commit |
+| `C` | Review local commits after the cached PR head (PR workspace) |
+| `r` / `s` / `u` | Review combined/staged/unstaged continuation (PR workspace) |
+| `RET` | Visit item or open file diff |
+| `o` | Visit in one reusable review window |
+| `e` | Open the writable worktree file |
+| `SPC` | Toggle reviewed state in Changes Tree |
+| `/`, `?`, `n`, `N` | Evil search |
+| `gr` | Local-only refresh |
+| `t` | Open/reuse Changes Tree |
+| `q` | Return in the selected window; preserve other splits |
+| `C-h/j/k/l` | Move between Emacs windows |
 
-The magit-status buffer also has the enhanced navigation:
-- `J/K` for 8-line jumps
-- `RET` opens files in a side split
-- `+/-` adjusts context
-- `gr` refreshes (instead of bare `g` which conflicted with `gg`)
-- `x` discards (instead of `0`)
+There are no Git-specific normal bindings for `[`/`]`, staging, discarding,
+sync, edit-context selection, commenting, or Difftastic. Those operations stay
+behind Magit/Forge Transients, `C-c g`, or `M-x`.
 
-### Diff colors
+## Buffers and windows
 
-The diff faces are tuned for the dark theme (noctilux/black bg):
-- Added: very subtle green tint — light enough for white syntax text
-- Removed: very subtle red tint — same principle
-- Word-level changes: delta highlights changed words/chars with brighter bg
-- Context: dim gray (doesn't distract from changes)
-- File headers: bold white on dark blue
-- Hunk headers: dim blue
-- Section headers: gold/yellow
+Ordinary navigation replaces the selected window. It should not create a new
+window. `q` restores the caller only in the selected window and leaves every
+other user-created split and buffer untouched.
 
-### Syntax highlighting in diffs (via delta)
+`o` is the explicit exception: it creates or reuses one review window. Source
+buffers are never killed by the return mechanism.
 
-Diffs are syntax-highlighted using [delta](https://github.com/dandavison/delta),
-a Rust-based syntax-highlighting pager for git output. The integration uses
-the [magit-delta](https://github.com/dandavison/magit-delta) package which
-pipes raw diff output through `delta --color-only` and converts ANSI colors
-to Emacs overlays.
+The same PR or immutable commit is shared across clones of the same canonical
+remote. Worktree, staged, and unstaged reviews remain specific to one
+clone/worktree.
+PR Git objects come from the shared bare mirror; `e` opens files from the
+selected writable local context.
 
-- Dark theme: **Nord** (light theme: GitHub)
-- `+/-` markers are hidden (replaced with spaces) for cleaner diffs
-- Word-level diff highlighting is handled by delta (magit's `refine-hunk` is
-  disabled when magit-delta is active)
-- Toggle on/off: `M-x magit-delta-mode`
-- When toggled off, falls back to the custom background-only diff faces
+## Persistence and Emacs restarts
 
-**Dependency:** `delta` CLI tool, installed at `~/.cargo/bin/delta`
-(installed via `cargo install git-delta`).
+The following survive Emacs restarts:
 
-### Untracked files (collapsible)
+- Forge PR/issue/comment metadata;
+- the published bare Git mirror and sync generation;
+- canonical repository/local-context registry;
+- reviewed checkmarks.
 
-New untracked files appear at the bottom of `C-c g r` as a collapsible
-"N untracked files" section. Each file is its own sub-section:
-- The outer "untracked files" section starts collapsed — press `TAB` to expand
-- Each file within is also collapsible with `TAB`
-- Content is shown as all-green (+) lines with syntax highlighting
-- Navigate them with `n/p` just like tracked file diffs
+The active network process and API token cache are session-local. A clean Emacs
+exit releases its sync process lock. A later Emacs automatically reclaims a
+same-host lock only when the recorded owner PID is confirmed dead; it never
+steals a lock from another live Emacs.
 
-## Workflow: Reviewing AI Changes
+### Configure sync-all
 
-Typical flow after an AI agent modifies your codebase:
+`C-c g F` intentionally does nothing until canonical repository IDs are
+allowlisted. IDs use the normalized `host/owner/repository` form shown by
+`M-x +git/sync-status`, for example:
 
-1. `C-c g r` — open the review buffer
-2. `n/p` — jump between changed files
-3. `TAB` — collapse files you've already reviewed
-4. `+` — expand context to understand surrounding code
-5. `RET` — jump into a file to make manual fixes
-6. `C-h` — return to diff buffer
-7. `s` — stage hunks you approve
-8. `x` — discard hunks you reject
-9. `C-c g s` — review what you've staged before committing
-10. `C-x g` then `c c` — commit via magit
+```elisp
+(setq +git-sync-active-repositories
+      '("github.com/Angold-4/.emacs.d"
+        "github.com/ORG/PROJECT"))
+```
 
-## Files Changed
+An empty list never means “all repositories.” This keeps global network access
+opt-in and bounded.
 
-| File | What changed |
-|------|-------------|
-| `core/init-git.el` | Review logic, delta-powered syntax-highlighted diffs, collapsible untracked files, diff-hl, keybindings, clipboard comment |
-| `core/init-core.el` | `+copy-to-system-clipboard` — copies to tmux paste buffer via `tmux load-buffer -` |
-| `core/init-evil.el` | Keybinding docs, magit bindings (`gr`/`x`), `C-y` visual copy, clipboard comments |
-| `core/init-tools.el` | Enhanced magit base config (more commands, auto-revert) |
-| `init.el` | Added `init-git` to module load list |
-| `~/.config/tmux/tmux.conf` | `C-a P` = paste-buffer, `C-y` in copy-mode, `set-clipboard external` |
+## Diff display
 
-## Clipboard
+The default surface is native Magit unified diff rendering:
 
-Clipboard sharing between tmux panes (e.g. Emacs ↔ OpenCode):
+- black context background;
+- dark green added lines;
+- dark red removed lines;
+- brighter refined regions;
+- readable file and hunk headings.
 
-| Step | Key | What happens |
-|------|-----|--------------|
-| 1. Select text in Emacs | `v` + motion | Enter visual mode, select region |
-| 2. Copy | `C-y` | Copies to Emacs kill ring + tmux paste buffer |
-| 3. Switch to target pane | `C-a` + arrow/number | Go to the pane where you want to paste |
-| 4. Paste | `C-a P` | Pastes tmux buffer content into the pane |
+Delta is not enabled automatically. Difftastic is optional and available only
+through its Magit Transient or `M-x` commands when the `difft` executable is
+installed.
 
-This works over SSH without requiring OSC 52 terminal support.
+## Troubleshooting
 
-## Dependencies
+### `forge: unavailable`
 
-| Tool | Install | Purpose |
-|------|---------|---------|
-| `delta` | `cargo install git-delta` | Syntax highlighting for diffs |
-| `cargo` | System package or rustup | Needed to install delta |
-| `tmux` | System package | Clipboard sharing between panes |
+The Git mirror may be usable while Forge metadata was not updated. Confirm:
+
+1. `github.user` is configured;
+2. macOS Keychain, Linux/WSL Auth Source, or `+forge-set-session-token` can
+   provide the Forge token;
+3. `C-c g f` ends with `forge: current`.
+
+### `already syncing elsewhere`
+
+Another live Emacs owns the repository sync. Let that job finish or, from a
+buffer in that repository in the Emacs process that started it, run:
+
+```text
+M-x +git/sync-cancel
+```
+
+If the owner process exited, the next `C-c g f` recovers its dead-owner lock
+automatically.
+
+### A PR or range changed remotely
+
+Run `C-c g f`, wait for success, then use `gr` or reopen with `C-c g p`.
+The workspace validates its cached range before giving it to Magit and rebuilds
+when the mirror generation or objects changed.
+
+### Configuration changed while buffers are open
+
+Restart Emacs and reopen the review buffer. Existing buffers can retain old
+buffer-local targets and keymaps after an implementation update.
+
+## Current boundary
+
+Phases 0–5 are implemented: buffer/Evil behavior, local Changes Tree, canonical
+repository contexts, durable synchronization, and cached PR file/commit review.
+
+Checks, full issue/comment workflows, and a native source-aware side-by-side
+view remain later work. The optional Difftastic view is not the canonical
+review interface.

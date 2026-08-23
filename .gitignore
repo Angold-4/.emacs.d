@@ -60,6 +60,9 @@ projectile.cache
 .lsp-session*
 .cache/
 
+# Forge PR/issue metadata cache (local SQLite; never commit or migrate)
+forge-database.sqlite*
+
 # =============================================================================
 # Perspective/Workspace State
 # =============================================================================

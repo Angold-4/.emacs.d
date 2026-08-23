@@ -25,9 +25,26 @@
 ;; - init-lsp.el      : LSP-mode (on-demand, C-x l to start)
 ;; - init-languages.el: Language-specific settings, tree-sitter
 ;; - init-org.el      : Org-mode configuration
-;; - init-tools.el    : Magit, Projectile, Treemacs, etc.
+;; - init-tools.el    : Projectile, Treemacs, shells, etc.
+;; - init-git.el      : Magit package ownership and Git dispatch
+;; - init-git-store.el: Canonical repository identity and local contexts
+;; - init-git-sync.el : Shared mirror and explicit synchronization
+;; - init-git-ui.el   : Review display, Evil mode, native visits
+;; - init-forge.el    : Forge package ownership and cached PR adapter
+;; - init-git-pr.el   : Shared pull-request review workspace
 
 ;;; Code:
+
+;; Capture the process launch directory before visiting files or generated
+;; buffers changes `default-directory'.  Long-lived tools such as vterm use
+;; this stable value instead of inheriting a PR mirror or file directory.
+(defvar +emacs-launch-directory
+  (file-name-as-directory
+   (expand-file-name
+    (or (and (boundp 'command-line-default-directory)
+             command-line-default-directory)
+        default-directory)))
+  "Directory from which this Emacs process was launched.")
 
 ;; =============================================================================
 ;; Startup Performance
@@ -141,11 +158,15 @@
     init-lsp        ; LSP support (on-demand)
     init-languages  ; Language-specific settings
     init-org        ; Org-mode configuration
-    init-tools      ; Development tools
-    init-git        ; Git diff review system
+    init-tools      ; Development tools (non-Git)
+    init-git        ; Magit package ownership and Git dispatch
+    init-git-store  ; Canonical repository identity and local contexts
+    init-git-sync   ; Shared mirror and explicit synchronization
+    init-git-ui     ; Review display, Evil mode, native visits
+    init-forge      ; Forge package ownership and cached PR adapter
+    init-git-pr     ; Shared pull-request review workspace
     )
   "List of configuration modules to load.")
-
 ;; Load all modules
 (dolist (module +init-modules)
   (+load-module module))
