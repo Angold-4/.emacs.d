@@ -20,6 +20,11 @@
 (require 'subr-x)
 (require 'init-orgbrain)
 
+;; persp-mode's own `defcustom' makes this globally special; declare it with a
+;; value here so the module's dynamic `let' actually shadows the test's.  A
+;; valueless `defvar' marks a variable special only inside its own file.
+(defvar persp-switch-to-added-buffer t)
+
 ;; ---------------------------------------------------------------------------
 ;; Fixtures
 ;; ---------------------------------------------------------------------------
@@ -885,6 +890,48 @@ send would wedge the client until Emacs restarted."
           (when (buffer-live-p buffer) (kill-buffer buffer))))
       (set-frame-parameter (selected-frame) '+orgbrain-input-window nil)
       (delete-other-windows))))
+
+
+;; ---------------------------------------------------------------------------
+;; persp-mode: adding a buffer must not steal the selected window
+;; ---------------------------------------------------------------------------
+
+(ert-deftest orgbrain-persp-add-buffer-does-not-clobber-the-split ()
+  "The split survives a `persp-add-buffer' that switches the selected window.
+`persp-switch-to-added-buffer' defaults to t, so `persp-add-buffer' puts
+the buffer it is handed into the selected window.  Building the split
+calls it twice, and the second call used to overwrite the window the
+transcript had just been placed in -- leaving both panes on the input
+buffer and the answer appended to a buffer displayed nowhere.
+
+This is the failure a batch `-Q' run cannot see, because persp-mode is
+not loaded there.  The fake below reproduces only the switching."
+  (let ((persp-switch-to-added-buffer t)
+        (+orgbrain-transport #'orgbrain-test--stub-transport)
+        (+orgbrain--project "orgbrain"))
+    (cl-letf (((symbol-function 'persp-add-buffer)
+               (lambda (buf &rest _)
+                 (when persp-switch-to-added-buffer
+                   (set-window-buffer (selected-window) buf))
+                 buf)))
+      (unwind-protect
+          (progn
+            (delete-other-windows)
+            (set-frame-parameter (selected-frame) '+orgbrain-input-window nil)
+            (+orgbrain/open)
+            (let ((shown (mapcar (lambda (win) (buffer-name (window-buffer win)))
+                                 (window-list))))
+              (should (member (+orgbrain--buffer-name 'output) shown))
+              (should (member (+orgbrain--buffer-name 'input) shown))
+              ;; The transcript must be visible: an invisible output pane is
+              ;; how an answer silently goes nowhere.
+              (should (window-live-p
+                       (get-buffer-window (+orgbrain--buffer-name 'output))))))
+        (dolist (kind '(output input))
+          (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+            (when (buffer-live-p buffer) (kill-buffer buffer))))
+        (set-frame-parameter (selected-frame) '+orgbrain-input-window nil)
+        (delete-other-windows)))))
 
 (provide 'orgbrain-test)
 

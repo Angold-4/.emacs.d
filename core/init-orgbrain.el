@@ -70,6 +70,9 @@
 (require 'seq)
 (require 'windmove)
 
+;; Optional, and only ever touched behind `fboundp' guards.
+(defvar persp-switch-to-added-buffer)
+
 ;; =============================================================================
 ;; Customization
 ;; =============================================================================
@@ -708,9 +711,16 @@ HEADING defaults to the exchange kind."
         ('output (unless (derived-mode-p '+orgbrain-mode) (+orgbrain-mode)))
         ('input (unless (derived-mode-p '+orgbrain-input-mode)
                   (+orgbrain-input-mode)))))
-    ;; persp-mode hides buffers it has never been told about.
+    ;; persp-mode hides buffers it has never been told about.  Bind
+    ;; `persp-switch-to-added-buffer' off: it defaults to t, which makes
+    ;; `persp-add-buffer' switch the SELECTED window to the buffer it was
+    ;; handed.  Building the split calls this twice, so the second call
+    ;; clobbered the window the transcript had just been put in and both
+    ;; panes ended up showing the input buffer -- with the answer appended
+    ;; to a buffer displayed nowhere.
     (when (fboundp 'persp-add-buffer)
-      (ignore-errors (persp-add-buffer buf)))
+      (let ((persp-switch-to-added-buffer nil))
+        (ignore-errors (persp-add-buffer buf))))
     buf))
 
 (defun +orgbrain--live-buffer (kind)
