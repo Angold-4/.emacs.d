@@ -189,6 +189,67 @@ terminal reconnects it to the real terminal cursor. Agent TUI output is
 coalesced into complete 20 FPS redraws to avoid painting partial-frame flashes.
 The underlying PTY remains live throughout.
 
+## OrgBrain
+
+`:orgbrain` (or `M-x +orgbrain/open`) opens a two-buffer client for the OrgBrain
+daemon: `*orgbrain*` on top is the read-only transcript, `*orgbrain-input*`
+below is where the brief is written. Point starts in the input buffer, both
+buffers start in Evil normal state, and the header line reads
+`project: <slug>  |  mode: <mode>  |  <host> <state>`.
+
+| Key | Action |
+|-----|--------|
+| `:orgbrain` | Open the workspace (`M-x +orgbrain/open`) |
+| `TAB` | Cycle the request mode in the input buffer (normal state) |
+| `RET` / `C-c C-c` | Send the input buffer |
+| `<up>` / `<down>` | Replay the previous/next exchange of the current project |
+| `gp` / `C-c C-p` | Switch project (`:orgbrain-project`, `completing-read`) |
+| `q` | Bury the workspace |
+
+The project switcher is on `gp` / `C-c C-p`, not on the `C-x o p` that issue
+#6 sketched: `C-x o` is `other-window` territory, this config navigates windows
+with `C-h/C-j/C-k/C-l`, and a global `C-x o` prefix would shadow a standard
+binding. `:orgbrain-project` does the same thing from the ex line.
+
+The switcher also offers `(unscoped)`, which clears the scope: calls then pass
+no `--entity` and `<up>`/`<down>` walk every exchange. That matters today
+because most jobs in the daemon's history carry `request.entity: null`, so a
+workspace pinned to a project can only replay the handful that were scoped.
+
+Request modes:
+
+| Mode | Runs on the daemon host |
+|------|-------------------------|
+| `ask` | `orgbrain ask - --json --entity projects/<slug>`, brief on stdin |
+| `remember` | the same `ask` call with the text sent as `remember that <text>` |
+| `recall` | `orgbrain recall <text> --json`, raw retrieval with no compose |
+
+`remember` deliberately never calls the `orgbrain remember` verb, which refuses
+text that does not route to a write. Sends are asynchronous and serialised:
+an ask takes 19-25 s, the daemon refuses a write while any job runs, so a
+second send is refused in the echo area until the first returns. The receipt
+fields `grounding`, `citations`, `content_entries`, `gbrain_calls`,
+`latency_ms`, `model_revision`, `failure_class`, and `gaps` are printed plainly
+under every answer.
+
+Calls go through `+orgbrain-transport`, which defaults to SSH:
+`ssh -o BatchMode=yes <host> 'orgbrain ...'`. Set `+orgbrain-ssh-host`
+(default `vienna`) to pick the host, or set `+orgbrain-transport` to
+`+orgbrain--transport-local` when running Emacs on the daemon host itself.
+`+orgbrain-connect-timeout` (default 8 s) bounds the SSH connect, so a down
+tunnel reports a failure instead of freezing Emacs.
+
+`orgbrain project list --json` does not exist on the daemon yet; until it does,
+the project list is derived from `orgbrain history --json` plus
+`+orgbrain-default-projects`, and the header line says `projects: history` or
+`projects: default` so the fallback is never silent. When the verb does land
+and reports its own list as incomplete, the header line says
+`projects: truncated` rather than presenting a short list as the whole set.
+
+`orgbrain history --json` has no project filter, so exchanges are matched
+client-side on `request.entity`; calls made without `--entity` are unscoped and
+so are not replayed under any project.
+
 ## Org-mode
 
 See the [Org-Mode Workflow](#org-mode-workflow) section below for comprehensive

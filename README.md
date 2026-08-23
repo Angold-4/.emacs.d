@@ -86,7 +86,8 @@ C-x l   ; Start LSP manually
 │   ├── init-git-sync.el    # Durable shared mirror synchronization
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
-│   └── init-git-pr.el      # Cached pull-request workspace
+│   ├── init-git-pr.el      # Cached pull-request workspace
+│   └── init-orgbrain.el    # OrgBrain client workspace over SSH
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -162,6 +163,7 @@ synchronization. See [git.md](git.md) for the daily workflow and
 | `C-x t t` | Toggle treemacs |
 | `M-RET` | Toggle fullscreen |
 | `C-y` (visual) | Copy to system clipboard |
+| `:orgbrain` | Open the OrgBrain client workspace |
 
 ## Theme
 
