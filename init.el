@@ -32,6 +32,7 @@
 ;; - init-git-ui.el   : Review display, Evil mode, native visits
 ;; - init-forge.el    : Forge package ownership and cached PR adapter
 ;; - init-git-pr.el   : Shared pull-request review workspace
+;; - init-orgbrain.el : OrgBrain client workspace (`:orgbrain')
 
 ;;; Code:
 
@@ -165,6 +166,7 @@
     init-git-ui     ; Review display, Evil mode, native visits
     init-forge      ; Forge package ownership and cached PR adapter
     init-git-pr     ; Shared pull-request review workspace
+    init-orgbrain   ; OrgBrain client workspace over SSH
     )
   "List of configuration modules to load.")
 ;; Load all modules

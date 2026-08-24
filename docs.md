@@ -189,6 +189,149 @@ terminal reconnects it to the real terminal cursor. Agent TUI output is
 coalesced into complete 20 FPS redraws to avoid painting partial-frame flashes.
 The underlying PTY remains live throughout.
 
+## OrgBrain
+
+`:orgbrain` (or `M-x +orgbrain/open`) opens a two-buffer client for the OrgBrain
+daemon: `*orgbrain*` on top is the read-only transcript, `*orgbrain-input*`
+below is where the brief is written. Point starts in the input buffer, both
+buffers start in Evil normal state, and each pane labels itself in its
+header line:
+
+```
+OUTPUT  |  project: orgbrain  |  vienna idle
+INPUT   |  project: orgbrain  |  mode: ask  |  vienna idle
+... during a send:      |  mode: consult  |  vienna working 137s
+```
+
+If the client ever believes a request is outstanding when none is, `:orgbrain-reset`
+clears the state and rebuilds the split. Send also recognises a stale in-flight
+flag on its own — one whose process has died, or which a reloaded module left
+behind — so a lost reply no longer disables sending until Emacs restarts.
+
+Both panes soft-wrap (`visual-line-mode`) and bind `j`/`k` to the visual-line
+motions, the way `init-git-ui.el`'s review buffers do. A brief or an answer is
+one logical line that wraps over many screen lines — the `\` in the last column
+is the continuation glyph — so linewise `j` leaps the whole paragraph and the
+pane feels as though it has no motion at all. `gj`/`gk` keep the logical
+motions. Emacs' own `C-a`/`C-e`/`C-k` become visual too, which is the half of
+this that is not vim.
+
+Soft wrap, not `auto-fill-mode`: the input buffer is sent verbatim on stdin, so
+hard-wrapping would inject newlines into the question itself.
+
+In the input pane the arrows move point, as they do in every other buffer, and
+the dialogue walk lives on `M-p`/`M-n` — Emacs' input-history idiom. An arrow
+that replaced the buffer contents was the one destructive key on the board.
+Replay also asks before discarding unsent text, unless that text is what a
+previous replay put there.
+
+Only the input pane shows `mode`, since the mode decides what a send does and
+sends are issued from there. A successful send clears the input buffer — the
+transcript above already holds the brief, quoted — while a failed or
+unparseable one leaves it untouched, so a broken tunnel never costs you the
+thought you typed.
+
+| Key | Action |
+|-----|--------|
+| `:orgbrain` | Open the workspace (`M-x +orgbrain/open`) |
+| `TAB` | Cycle the request mode: ask → remember → recall → consult (normal state) |
+| `RET` / `C-c C-c` | Send the input buffer |
+| `j` / `k` | Move by visual line (`gj` / `gk` for logical lines) |
+| `H` / `L` | Beginning / end of line |
+| `<up>` / `<down>` | Move point in the input pane; replay an exchange in the transcript |
+| `M-p` / `M-n` | Replay the previous/next exchange of the current project |
+| `gp` / `C-c C-p` | Switch project (`:orgbrain-project`, `completing-read`) |
+| `gP` | Create a project and select it (`:orgbrain-new-project`) |
+| `q` | Bury the workspace |
+| `:orgbrain-reset` | Clear the request state and rebuild the split (`M-x +orgbrain/reset`) |
+
+The project switcher is on `gp` / `C-c C-p`, not on the `C-x o p` that issue
+#6 sketched: `C-x o` is `other-window` territory, this config navigates windows
+with `C-h/C-j/C-k/C-l`, and a global `C-x o` prefix would shadow a standard
+binding. `:orgbrain-project` does the same thing from the ex line.
+
+`gP` (`:orgbrain-new-project`) prompts for slug, title, and summary, runs
+`orgbrain project new`, and selects the project once the daemon confirms the
+write — not before, so a failed create cannot leave the workspace pointed at a
+project that does not exist. `gp` then lists it, because `project list` runs
+in-process on the daemon host and needs no restart.
+
+It is deliberately not a request mode. Creating a project happens once, and a
+destructive verb should not sit on the TAB cycle. It is also refused while a
+request is in flight: `assert_service_idle` refuses a GBrain write rather than
+queueing it, and what a refusal costs is whatever was just typed.
+
+The summary is not decoration. `project_page_ops` captures a page *and* writes
+one entity-scoped fact built from it, so until something else is remembered that
+sentence is the only thing the project knows and the only thing an ask can cite.
+An ask against an empty project spends about **60 s** to say it has nothing —
+the worker gets tools and three turns, searches, hits the drift gate, and then
+burns further turns on refused reads. Seed a new project with three or four
+`remember` sentences first; they cost about 4 s each.
+
+The switcher also offers `(unscoped)`, which clears the scope: calls then pass
+no `--entity` and `<up>`/`<down>` walk every exchange. That matters today
+because most jobs in the daemon's history carry `request.entity: null`, so a
+workspace pinned to a project can only replay the handful that were scoped.
+
+Request modes:
+
+| Mode | Runs on the daemon host |
+|------|-------------------------|
+| `ask` | `orgbrain ask - --json --entity projects/<slug>`, brief on stdin |
+| `remember` | the same `ask` call with the text sent as `remember that <text>` |
+| `recall` | `orgbrain recall <text> --json`, raw retrieval with no compose |
+| `consult` | `orgbrain ask - --consult --json --entity projects/<slug>` |
+
+`consult` is last in the cycle on purpose. It makes the kernel run one one-shot
+consultant (Grok 4.6 High) after the local answer, append the reply to the
+evidence ledger as a take, and compose once more so the answer can cite it.
+Measured on Vienna: **293 s**, against 20-30 s for a plain ask — and the prompt
+leaves the machine. TAB should have to travel past the three cheap modes to
+reach it. While it runs the header line counts seconds (`vienna working 137s`),
+because a header that says `working` for five minutes is indistinguishable from
+one that is stuck.
+
+`remember` deliberately never calls the `orgbrain remember` verb, which refuses
+text that does not route to a write. Sends are asynchronous and serialised:
+an ask takes 19-25 s, the daemon refuses a write while any job runs, so a
+second send is refused in the echo area until the first returns. The receipt
+fields `grounding`, `citations`, `content_entries`, `gbrain_calls`,
+`latency_ms`, `model_revision`, `failure_class`, and `gaps` are printed plainly
+under every answer.
+
+When a consult ran, the receipt says so and says which citation came from off
+the host — a composite answer is part brain and part consultant, and the
+transcript has to be able to tell you which half is which:
+
+```
+citations:       (13 17)  (17 from consult)
+consults:        ran 1  refused 0  failed 0  trigger owner_requested
+                 NOT PERSISTED (take is job-local)
+```
+
+The `consults` line appears only when one was requested. `NOT PERSISTED` means
+the take never reached GBrain, so it lives for that job only and no later ask
+can cite it (`orgbrain#69`).
+
+Calls go through `+orgbrain-transport`, which defaults to SSH:
+`ssh -o BatchMode=yes <host> 'orgbrain ...'`. Set `+orgbrain-ssh-host`
+(default `vienna`) to pick the host, or set `+orgbrain-transport` to
+`+orgbrain--transport-local` when running Emacs on the daemon host itself.
+`+orgbrain-connect-timeout` (default 8 s) bounds the SSH connect, so a down
+tunnel reports a failure instead of freezing Emacs.
+
+`orgbrain project list --json` does not exist on the daemon yet; until it does,
+the project list is derived from `orgbrain history --json` plus
+`+orgbrain-default-projects`, and the header line says `projects: history` or
+`projects: default` so the fallback is never silent. When the verb does land
+and reports its own list as incomplete, the header line says
+`projects: truncated` rather than presenting a short list as the whole set.
+
+`orgbrain history --json` has no project filter, so exchanges are matched
+client-side on `request.entity`; calls made without `--entity` are unscoped and
+so are not replayed under any project.
+
 ## Org-mode
 
 See the [Org-Mode Workflow](#org-mode-workflow) section below for comprehensive
