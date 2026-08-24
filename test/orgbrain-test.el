@@ -483,6 +483,45 @@ refusal costs is whatever was just typed."
   (should-not (memq '+orgbrain--build-new-project
                     (mapcar (lambda (m) (plist-get (cdr m) :builder)) +orgbrain-modes))))
 
+;; Motion vocabulary and replay safety
+
+(ert-deftest orgbrain-input-mode-soft-wraps-so-visual-motion-is-meaningful ()
+  "A brief is one logical line; without this `j' leaps the whole paragraph."
+  (with-temp-buffer
+    (+orgbrain-input-mode)
+    (should visual-line-mode)
+    (should-not truncate-lines)))
+
+(ert-deftest orgbrain-output-mode-soft-wraps-too ()
+  (with-temp-buffer
+    (+orgbrain-mode)
+    (should visual-line-mode)
+    (should-not truncate-lines)))
+
+(ert-deftest orgbrain-replay-refuses-to-discard-an-unsent-brief ()
+  "Replay overwrites the input buffer; everything else here protects the brief."
+  (let ((+orgbrain--exchanges nil)
+        (+orgbrain--exchange-index nil))
+    (+orgbrain--set-input "half a thought I am still writing")
+    (should (+orgbrain--replay-would-discard-p))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) nil)))
+      (should-error (+orgbrain--confirm-replay) :type 'user-error))
+    (should (equal (+orgbrain--input-text) "half a thought I am still writing"))))
+
+(ert-deftest orgbrain-replay-does-not-nag-over-replayed-text ()
+  "Text a replay put there is not a thought, so walking the dialogue is quiet."
+  (let* ((exchange (list :sent "an older question" :kind "ask" :record nil))
+         (+orgbrain--exchanges (list exchange))
+         (+orgbrain--exchange-index 0))
+    (+orgbrain--set-input "an older question")
+    (should-not (+orgbrain--replay-would-discard-p))
+    (+orgbrain--confirm-replay)))
+
+(ert-deftest orgbrain-replay-does-not-nag-on-an-empty-buffer ()
+  (let ((+orgbrain--exchanges nil) (+orgbrain--exchange-index nil))
+    (+orgbrain--set-input "")
+    (should-not (+orgbrain--replay-would-discard-p))))
+
 ;; R3 — the dialogue abstraction
 ;; ---------------------------------------------------------------------------
 

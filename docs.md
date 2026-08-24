@@ -208,6 +208,23 @@ clears the state and rebuilds the split. Send also recognises a stale in-flight
 flag on its own — one whose process has died, or which a reloaded module left
 behind — so a lost reply no longer disables sending until Emacs restarts.
 
+Both panes soft-wrap (`visual-line-mode`) and bind `j`/`k` to the visual-line
+motions, the way `init-git-ui.el`'s review buffers do. A brief or an answer is
+one logical line that wraps over many screen lines — the `\` in the last column
+is the continuation glyph — so linewise `j` leaps the whole paragraph and the
+pane feels as though it has no motion at all. `gj`/`gk` keep the logical
+motions. Emacs' own `C-a`/`C-e`/`C-k` become visual too, which is the half of
+this that is not vim.
+
+Soft wrap, not `auto-fill-mode`: the input buffer is sent verbatim on stdin, so
+hard-wrapping would inject newlines into the question itself.
+
+In the input pane the arrows move point, as they do in every other buffer, and
+the dialogue walk lives on `M-p`/`M-n` — Emacs' input-history idiom. An arrow
+that replaced the buffer contents was the one destructive key on the board.
+Replay also asks before discarding unsent text, unless that text is what a
+previous replay put there.
+
 Only the input pane shows `mode`, since the mode decides what a send does and
 sends are issued from there. A successful send clears the input buffer — the
 transcript above already holds the brief, quoted — while a failed or
@@ -219,7 +236,10 @@ thought you typed.
 | `:orgbrain` | Open the workspace (`M-x +orgbrain/open`) |
 | `TAB` | Cycle the request mode: ask → remember → recall → consult (normal state) |
 | `RET` / `C-c C-c` | Send the input buffer |
-| `<up>` / `<down>` | Replay the previous/next exchange of the current project |
+| `j` / `k` | Move by visual line (`gj` / `gk` for logical lines) |
+| `H` / `L` | Beginning / end of line |
+| `<up>` / `<down>` | Move point in the input pane; replay an exchange in the transcript |
+| `M-p` / `M-n` | Replay the previous/next exchange of the current project |
 | `gp` / `C-c C-p` | Switch project (`:orgbrain-project`, `completing-read`) |
 | `gP` | Create a project and select it (`:orgbrain-new-project`) |
 | `q` | Bury the workspace |

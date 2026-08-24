@@ -73,6 +73,17 @@
 ;; Optional, and only ever touched behind `fboundp' guards.
 (defvar persp-switch-to-added-buffer)
 
+;; Evil motions named in the keymaps below. Declared rather than left to the
+;; byte-compiler because this file compiled without warnings before the motion
+;; vocabulary was added, and that is a property worth keeping -- `init-git-ui.el'
+;; emits fifty-one of these and they are no longer read.
+(declare-function evil-next-visual-line "evil-commands")
+(declare-function evil-previous-visual-line "evil-commands")
+(declare-function evil-next-line "evil-commands")
+(declare-function evil-previous-line "evil-commands")
+(declare-function evil-beginning-of-line "evil-commands")
+(declare-function evil-end-of-line "evil-commands")
+
 ;; =============================================================================
 ;; Customization
 ;; =============================================================================
@@ -755,6 +766,9 @@ HEADING defaults to the exchange kind."
   :interactive nil
   :group 'orgbrain
   (setq truncate-lines nil)
+  ;; An answer is one long paragraph, so soft-wrap it and make the motion
+  ;; keys agree with what is on screen -- see `+orgbrain-input-mode'.
+  (visual-line-mode 1)
   ;; `global-so-long-mode' would strip font-lock from a single long answer.
   (when (boundp 'so-long-threshold)
     (set (make-local-variable 'so-long-threshold) nil)))
@@ -767,10 +781,23 @@ HEADING defaults to the exchange kind."
   "Keymap for `+orgbrain-input-mode'.")
 
 (define-derived-mode +orgbrain-input-mode text-mode "OrgBrain-Input"
-  "Mode for the editable OrgBrain input buffer."
+  "Mode for the editable OrgBrain input buffer.
+
+`visual-line-mode' because a brief is prose, not code.  A pasted brief is
+one logical line that wraps over twenty screen lines, and Evil\='s `j\=' and
+`k\=' are linewise -- so on that buffer they leap the whole paragraph and
+land at its start or end, which is what makes the pane feel like it has no
+motion at all.  `init-git-ui.el\='s review buffers already bind `j\='/`k\=' to
+the visual variants for exactly this reason; this module simply had not
+followed the convention.
+
+With the mode on, Emacs\=' own `C-a\='/`C-e\='/`C-k\=' become visual too, which
+is the half of the request that is not vim: the pane should behave like any
+other Emacs buffer you type prose into."
   :interactive nil
   :group 'orgbrain
-  (setq truncate-lines nil))
+  (setq truncate-lines nil)
+  (visual-line-mode 1))
 
 (defun +orgbrain--buffer (kind)
   "Return the workspace buffer for KIND, creating and initialising it."
@@ -1188,6 +1215,26 @@ none is, and for buffers left behind by reloading the module."
           +orgbrain--exchange-index nil))
   +orgbrain--exchanges)
 
+(defun +orgbrain--replay-would-discard-p ()
+  "Non-nil when replaying would throw away unsent input.
+
+Replay overwrites the input buffer.  Everything else in this module goes
+out of its way not to cost the owner a thought -- a failed send keeps the
+brief, a successful one clears it only once the transcript holds it -- and
+replay was the exception.  Text already put there by a replay is not a
+thought, so walking the dialogue does not nag."
+  (let ((text (+orgbrain--input-text)))
+    (and (not (string-empty-p text))
+         (let ((current (and +orgbrain--exchange-index
+                            (nth +orgbrain--exchange-index +orgbrain--exchanges))))
+           (not (equal text (string-trim (or (plist-get current :sent) ""))))))))
+
+(defun +orgbrain--confirm-replay ()
+  "Signal a `user-error' unless replay may overwrite the input buffer."
+  (when (+orgbrain--replay-would-discard-p)
+    (unless (yes-or-no-p "Replace the unsent brief with this exchange? ")
+      (user-error "orgbrain: kept the brief"))))
+
 (defun +orgbrain--replay (index)
   "Replay the exchange at INDEX into the input and output buffers."
   (let ((exchange (nth index +orgbrain--exchanges)))
@@ -1205,6 +1252,7 @@ none is, and for buffers left behind by reloading the module."
 (defun +orgbrain/previous-exchange ()
   "Replay the previous exchange in the current project's dialogue."
   (interactive)
+  (+orgbrain--confirm-replay)
   (let* ((exchanges (+orgbrain--ensure-exchanges))
          (count (length exchanges)))
     (when (zerop count)
@@ -1218,6 +1266,7 @@ none is, and for buffers left behind by reloading the module."
 (defun +orgbrain/next-exchange ()
   "Replay the next exchange in the current project's dialogue."
   (interactive)
+  (+orgbrain--confirm-replay)
   (let* ((exchanges (+orgbrain--ensure-exchanges))
          (count (length exchanges)))
     (when (zerop count)
@@ -1254,9 +1303,19 @@ none is, and for buffers left behind by reloading the module."
     (evil-ex-define-cmd "orgbrain-new-project" #'+orgbrain/new-project))
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +orgbrain-mode-map
+      ;; Visual-line motion, matching `init-git-ui.el'. `gj'/`gk' keep the
+      ;; logical-line motions rather than losing them.
+      "j" #'evil-next-visual-line
+      "k" #'evil-previous-visual-line
+      "gj" #'evil-next-line
+      "gk" #'evil-previous-line
+      "H" #'evil-beginning-of-line
+      "L" #'evil-end-of-line
       (kbd "RET") #'+orgbrain/send
       (kbd "<up>") #'+orgbrain/previous-exchange
       (kbd "<down>") #'+orgbrain/next-exchange
+      (kbd "M-p") #'+orgbrain/previous-exchange
+      (kbd "M-n") #'+orgbrain/next-exchange
       "gp" #'+orgbrain/switch-project
       "gP" #'+orgbrain/new-project
       "q" #'+orgbrain/quit
@@ -1267,9 +1326,24 @@ none is, and for buffers left behind by reloading the module."
     (evil-define-key 'normal +orgbrain-input-mode-map
       (kbd "TAB") #'+orgbrain/cycle-mode
       (kbd "<tab>") #'+orgbrain/cycle-mode
+      ;; Visual-line motion, matching `init-git-ui.el'. `gj'/`gk' keep the
+      ;; logical-line motions rather than losing them.
+      "j" #'evil-next-visual-line
+      "k" #'evil-previous-visual-line
+      "gj" #'evil-next-line
+      "gk" #'evil-previous-line
+      "H" #'evil-beginning-of-line
+      "L" #'evil-end-of-line
       (kbd "RET") #'+orgbrain/send
-      (kbd "<up>") #'+orgbrain/previous-exchange
-      (kbd "<down>") #'+orgbrain/next-exchange
+      ;; Arrows move point here.  In every other buffer in this config they
+      ;; do, and this is the pane you type into -- an arrow that replaced the
+      ;; buffer contents was the one destructive key on the board.  The
+      ;; dialogue walk moves to `M-p'/`M-n', which is what Emacs uses for
+      ;; input history everywhere else.
+      (kbd "<up>") #'evil-previous-visual-line
+      (kbd "<down>") #'evil-next-visual-line
+      (kbd "M-p") #'+orgbrain/previous-exchange
+      (kbd "M-n") #'+orgbrain/next-exchange
       "gp" #'+orgbrain/switch-project
       "gP" #'+orgbrain/new-project
       "q" #'+orgbrain/quit
@@ -1280,6 +1354,8 @@ none is, and for buffers left behind by reloading the module."
     ;; The input buffer is edited in insert state, where an unbound C-j
     ;; would insert a newline instead of moving to the window below.
     (evil-define-key 'insert +orgbrain-input-mode-map
+      (kbd "M-p") #'+orgbrain/previous-exchange
+      (kbd "M-n") #'+orgbrain/next-exchange
       (kbd "C-h") #'windmove-left
       (kbd "C-l") #'windmove-right
       (kbd "C-j") #'windmove-down
