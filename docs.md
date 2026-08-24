@@ -260,6 +260,20 @@ fields `grounding`, `citations`, `content_entries`, `gbrain_calls`,
 `latency_ms`, `model_revision`, `failure_class`, and `gaps` are printed plainly
 under every answer.
 
+When a consult ran, the receipt says so and says which citation came from off
+the host — a composite answer is part brain and part consultant, and the
+transcript has to be able to tell you which half is which:
+
+```
+citations:       (13 17)  (17 from consult)
+consults:        ran 1  refused 0  failed 0  trigger owner_requested
+                 NOT PERSISTED (take is job-local)
+```
+
+The `consults` line appears only when one was requested. `NOT PERSISTED` means
+the take never reached GBrain, so it lives for that job only and no later ask
+can cite it (`orgbrain#69`).
+
 Calls go through `+orgbrain-transport`, which defaults to SSH:
 `ssh -o BatchMode=yes <host> 'orgbrain ...'`. Set `+orgbrain-ssh-host`
 (default `vienna`) to pick the host, or set `+orgbrain-transport` to

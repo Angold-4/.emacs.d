@@ -598,18 +598,60 @@ Floats are rounded: raw millisecond timings run to fifteen digits."
               (+orgbrain--format-count (+orgbrain--dig calls "gbrain_ms")))
     "none"))
 
+(defun +orgbrain--consult-rows (result)
+  "Return the ledger entry numbers in RESULT that came from a consult.
+`origin' is what distinguishes a consultant's take from a brain fact, and
+both are ordinary citable rows, so without this the transcript cannot say
+which half of a composite answer came from off the host."
+  (delq nil
+        (mapcar (lambda (entry)
+                  (and (equal (+orgbrain--dig entry "origin") "consult")
+                       (+orgbrain--truthy (+orgbrain--dig entry "n"))))
+                (or (+orgbrain--dig result "evidence_ledger" "entries") nil))))
+
+(defun +orgbrain--format-citations (result)
+  "Return the citation list of RESULT, marking any row that came from a consult."
+  (let* ((cites (or (+orgbrain--truthy (+orgbrain--dig result "citations"))
+                    (+orgbrain--truthy
+                     (+orgbrain--dig result "answer_receipt" "citations"))))
+         (consulted (seq-intersection (and (listp cites) cites)
+                                      (+orgbrain--consult-rows result))))
+    (cond
+     ((not (consp cites)) (+orgbrain--format-count cites))
+     (consulted (format "%s  (%s from consult)"
+                        cites
+                        (mapconcat #'number-to-string consulted ", ")))
+     (t (format "%s" cites)))))
+
+(defun +orgbrain--format-consults (receipt)
+  "Return the `consults' summary line of RECEIPT, or nil when none ran.
+Printed only when a consult was requested: on an ordinary ask the block is
+all zeros and would be noise.  Without it the transcript gives no sign that
+a consult fired at all, which makes the mode unverifiable from the buffer."
+  (let ((consults (+orgbrain--dig receipt "consults")))
+    (when (and (consp consults)
+               (> (or (+orgbrain--truthy (+orgbrain--dig consults "requested")) 0) 0))
+      (format "consults:        ran %s  refused %s  failed %s  trigger %s%s"
+              (+orgbrain--format-count (+orgbrain--dig consults "ran"))
+              (+orgbrain--format-count (+orgbrain--dig consults "refused"))
+              (+orgbrain--format-count (+orgbrain--dig consults "failed"))
+              (+orgbrain--format-count (+orgbrain--dig consults "trigger"))
+              ;; A take that did not reach GBrain lives for this job only.
+              ;; Silence here would make an evaporating take look persisted.
+              (let ((problem (+orgbrain--truthy
+                              (+orgbrain--dig consults "persist_error"))))
+                (if problem "\n                 NOT PERSISTED (take is job-local)" ""))))))
+
 (defun +orgbrain--format-receipt (result)
   "Return the plainly formatted receipt lines for a job RESULT."
   (let ((receipt (+orgbrain--dig result "answer_receipt")))
     (string-join
+     (delq nil
      (list
       "-- receipt --"
       (format "grounding:       %s"
               (+orgbrain--format-count (+orgbrain--dig receipt "grounding")))
-      (format "citations:       %s"
-              (+orgbrain--format-count
-               (or (+orgbrain--dig receipt "citations")
-                   (+orgbrain--dig result "citations"))))
+      (format "citations:       %s" (+orgbrain--format-citations result))
       (format "content_entries: %s"
               (+orgbrain--format-count
                (+orgbrain--dig receipt "utilisation" "content_entries")))
@@ -622,7 +664,8 @@ Floats are rounded: raw millisecond timings run to fifteen digits."
       (format "model_revision:  %s"
               (+orgbrain--format-count (+orgbrain--dig receipt "model_revision")))
       (format "failure_class:   %s"
-              (+orgbrain--format-count (+orgbrain--dig receipt "failure_class"))))
+              (+orgbrain--format-count (+orgbrain--dig receipt "failure_class")))
+      (+orgbrain--format-consults receipt)))
      "\n")))
 
 (defun +orgbrain--format-gaps (result)

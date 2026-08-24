@@ -367,6 +367,57 @@ sit between `ask' and `remember' where a stray TAB lands on it."
     (funcall (timer--function +orgbrain--tick-timer))
     (should-not +orgbrain--tick-timer)))
 
+;; Consult provenance in the transcript
+;;
+;; Fixture is the real receipt of job 80d2797 on Vienna: an `ask --consult'
+;; that cited one brain fact and one consult take.
+
+(defvar orgbrain-test--consulted-receipt
+  "{\"answer\": \"LayerZero Labs is the company behind LayerZero.\",
+     \"citations\": [13, 17],
+     \"evidence_ledger\": {\"entries\": [
+        {\"n\": 13, \"origin\": \"kernel\",  \"text_source\": \"fact\", \"text\": \"Angold works on LayerZero Labs\"},
+        {\"n\": 17, \"origin\": \"consult\", \"text_source\": \"take\", \"holder\": \"cursor-grok-4.6-high\", \"text\": \"omnichain messaging\"}]},
+     \"answer_receipt\": {
+        \"grounding\": \"grounded\", \"latency_ms\": 125170,
+        \"model_revision\": \"qwen3.8-27b-local\", \"failure_class\": null,
+        \"utilisation\": {\"content_entries\": 16, \"consult_entries\": 1},
+        \"consults\": {\"requested\": 1, \"ran\": 1, \"refused\": 0, \"failed\": 0,
+                       \"trigger\": \"owner_requested\",
+                       \"persist_error\": \"No brain directory configured.\"}}}"
+  "A real consulted receipt, trimmed to the fields the renderer reads.")
+
+(ert-deftest orgbrain-receipt-reports-that-a-consult-ran ()
+  "Without this the buffer gives no sign the consult fired at all."
+  (let ((text (+orgbrain--format-receipt
+               (+orgbrain--read-json orgbrain-test--consulted-receipt))))
+    (should (string-match-p "consults:.*ran 1" text))
+    (should (string-match-p "trigger owner_requested" text))))
+
+(ert-deftest orgbrain-receipt-names-which-citation-came-from-off-the-host ()
+  "A composite answer must say which half was not the brain's."
+  (let ((text (+orgbrain--format-receipt
+               (+orgbrain--read-json orgbrain-test--consulted-receipt))))
+    (should (string-match-p "citations:.*(13 17)" text))
+    (should (string-match-p "17 from consult" text))))
+
+(ert-deftest orgbrain-receipt-warns-when-a-take-did-not-persist ()
+  "A take that never reached GBrain lives for one job; silence would hide that."
+  (let ((text (+orgbrain--format-receipt
+               (+orgbrain--read-json orgbrain-test--consulted-receipt))))
+    (should (string-match-p "NOT PERSISTED" text))))
+
+(ert-deftest orgbrain-receipt-omits-the-consult-block-on-an-ordinary-ask ()
+  "All-zero consult counters are noise on the 99% of asks that never consult."
+  (let* ((json (+orgbrain--read-json orgbrain-test--consulted-receipt))
+         (receipt (+orgbrain--dig json "answer_receipt")))
+    (setcdr (assoc "consults" receipt)
+            '(("requested" . 0) ("ran" . 0) ("refused" . 0) ("failed" . 0)))
+    (let ((text (+orgbrain--format-receipt json)))
+      (should-not (string-match-p "consults:" text))
+      ;; the rest of the receipt still renders
+      (should (string-match-p "grounding:       grounded" text)))))
+
 ;; R3 — the dialogue abstraction
 ;; ---------------------------------------------------------------------------
 
