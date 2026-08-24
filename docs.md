@@ -221,6 +221,7 @@ thought you typed.
 | `RET` / `C-c C-c` | Send the input buffer |
 | `<up>` / `<down>` | Replay the previous/next exchange of the current project |
 | `gp` / `C-c C-p` | Switch project (`:orgbrain-project`, `completing-read`) |
+| `gP` | Create a project and select it (`:orgbrain-new-project`) |
 | `q` | Bury the workspace |
 | `:orgbrain-reset` | Clear the request state and rebuild the split (`M-x +orgbrain/reset`) |
 
@@ -228,6 +229,25 @@ The project switcher is on `gp` / `C-c C-p`, not on the `C-x o p` that issue
 #6 sketched: `C-x o` is `other-window` territory, this config navigates windows
 with `C-h/C-j/C-k/C-l`, and a global `C-x o` prefix would shadow a standard
 binding. `:orgbrain-project` does the same thing from the ex line.
+
+`gP` (`:orgbrain-new-project`) prompts for slug, title, and summary, runs
+`orgbrain project new`, and selects the project once the daemon confirms the
+write — not before, so a failed create cannot leave the workspace pointed at a
+project that does not exist. `gp` then lists it, because `project list` runs
+in-process on the daemon host and needs no restart.
+
+It is deliberately not a request mode. Creating a project happens once, and a
+destructive verb should not sit on the TAB cycle. It is also refused while a
+request is in flight: `assert_service_idle` refuses a GBrain write rather than
+queueing it, and what a refusal costs is whatever was just typed.
+
+The summary is not decoration. `project_page_ops` captures a page *and* writes
+one entity-scoped fact built from it, so until something else is remembered that
+sentence is the only thing the project knows and the only thing an ask can cite.
+An ask against an empty project spends about **60 s** to say it has nothing —
+the worker gets tools and three turns, searches, hits the drift gate, and then
+burns further turns on refused reads. Seed a new project with three or four
+`remember` sentences first; they cost about 4 s each.
 
 The switcher also offers `(unscoped)`, which clears the scope: calls then pass
 no `--entity` and `<up>`/`<down>` walk every exchange. That matters today

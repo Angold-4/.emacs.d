@@ -1002,6 +1002,78 @@ Choosing `+orgbrain--unscoped-choice' clears the scope: calls pass no
     (message "orgbrain project: %s (project list from %s)"
              (or +orgbrain--project "unscoped") source)))
 
+(defconst +orgbrain--slug-rule
+  "A project slug is one path segment: no slash, no leading or trailing space."
+  "Mirror of `orgbrain'\''s own rule (`project/knowledge.el'\''s `_slug').
+Checked here so a typo costs no round trip and no `project_slug_invalid'.")
+
+(defun +orgbrain--check-slug (slug)
+  "Signal a `user-error' unless SLUG is a usable project slug."
+  (let ((clean (or slug "")))
+    (when (string-empty-p (string-trim clean))
+      (user-error "orgbrain: a project needs a slug.  %s" +orgbrain--slug-rule))
+    (unless (equal clean (string-trim clean))
+      (user-error "orgbrain: %s" +orgbrain--slug-rule))
+    (when (string-match-p "/" clean)
+      (user-error "orgbrain: %s" +orgbrain--slug-rule))
+    clean))
+
+(defun +orgbrain/new-project ()
+  "Create a project on the daemon and switch the workspace to it.
+
+`orgbrain project new' is not one of `+orgbrain-modes'\'' request modes on
+purpose: creating a project happens once, and a destructive verb should
+not sit on the TAB cycle where a stray keystroke reaches it.
+
+The summary is not decoration.  `project_page_ops' captures a page *and*
+writes one entity-scoped fact built from it, so until you remember
+anything else that sentence is the only thing the project knows, and the
+only thing an ask can cite.
+
+This is a GBrain write, so it is refused while a request is outstanding:
+`assert_service_idle' refuses rather than queues, and what a refusal
+costs is whatever the owner just typed."
+  (interactive)
+  (when +orgbrain--pending
+    (user-error "orgbrain: %s in flight; a write is refused while a job runs"
+                (+orgbrain--mode-label (plist-get +orgbrain--pending :mode))))
+  (let* ((slug (+orgbrain--check-slug
+                (read-string "New project slug (one segment, lowercase): ")))
+         (title (string-trim (read-string (format "Title for %s: " slug) slug)))
+         (summary (string-trim
+                   (read-string "One-sentence summary (becomes the first fact): "))))
+    (when (string-empty-p title)
+      (user-error "orgbrain: a project needs a title"))
+    (when (string-empty-p summary)
+      (unless (yes-or-no-p
+               "No summary means the project's only fact is its title.  Continue? ")
+        (user-error "orgbrain: cancelled")))
+    (+orgbrain--set-status 'working)
+    (message "orgbrain: creating %s..." slug)
+    (+orgbrain--cli
+     (append (list "project" "new" slug "--title" title)
+             (unless (string-empty-p summary) (list "--summary" summary))
+             (list "--json"))
+     nil
+     (lambda (stdout problem)
+       (if problem
+           (progn (+orgbrain--set-status 'error)
+                  (message "orgbrain: %s" problem))
+         ;; Switch scope only once the daemon has confirmed the write, so a
+         ;; failed create cannot leave the workspace pointed at a project
+         ;; that does not exist.
+         (setq +orgbrain--project slug
+               +orgbrain--projects-source 'server
+               +orgbrain--exchanges nil
+               +orgbrain--exchanges-project nil
+               +orgbrain--exchange-index nil)
+         (+orgbrain--set-status 'idle)
+         (+orgbrain--append
+          (format "=== project new  projects/%s  ===\n> %s\n\n%s\n\n"
+                  slug title (string-trim (or stdout ""))))
+         (message "orgbrain: %s created and selected.  TAB to remember, then seed it"
+                  slug))))))
+
 (defun +orgbrain--finish-send (mode text stdout problem)
   "Render the reply to a MODE request of TEXT, or report PROBLEM.
 STDOUT is the raw CLI output when the call succeeded."
@@ -1178,13 +1250,15 @@ none is, and for buffers left behind by reloading the module."
   (when (fboundp 'evil-ex-define-cmd)
     (evil-ex-define-cmd "orgbrain" #'+orgbrain/open)
     (evil-ex-define-cmd "orgbrain-project" #'+orgbrain/switch-project)
-    (evil-ex-define-cmd "orgbrain-reset" #'+orgbrain/reset))
+    (evil-ex-define-cmd "orgbrain-reset" #'+orgbrain/reset)
+    (evil-ex-define-cmd "orgbrain-new-project" #'+orgbrain/new-project))
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +orgbrain-mode-map
       (kbd "RET") #'+orgbrain/send
       (kbd "<up>") #'+orgbrain/previous-exchange
       (kbd "<down>") #'+orgbrain/next-exchange
       "gp" #'+orgbrain/switch-project
+      "gP" #'+orgbrain/new-project
       "q" #'+orgbrain/quit
       (kbd "C-h") #'windmove-left
       (kbd "C-l") #'windmove-right
@@ -1197,6 +1271,7 @@ none is, and for buffers left behind by reloading the module."
       (kbd "<up>") #'+orgbrain/previous-exchange
       (kbd "<down>") #'+orgbrain/next-exchange
       "gp" #'+orgbrain/switch-project
+      "gP" #'+orgbrain/new-project
       "q" #'+orgbrain/quit
       (kbd "C-h") #'windmove-left
       (kbd "C-l") #'windmove-right

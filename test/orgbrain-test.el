@@ -418,6 +418,71 @@ sit between `ask' and `remember' where a stray TAB lands on it."
       ;; the rest of the receipt still renders
       (should (string-match-p "grounding:       grounded" text)))))
 
+;; Project creation
+
+(ert-deftest orgbrain-slug-rule-is-checked-before-the-round-trip ()
+  "The daemon refuses `projects/a/b'; catching it here costs no call."
+  (should-error (+orgbrain--check-slug "a/b") :type 'user-error)
+  (should-error (+orgbrain--check-slug "") :type 'user-error)
+  (should-error (+orgbrain--check-slug "  ") :type 'user-error)
+  (should-error (+orgbrain--check-slug " atlas") :type 'user-error)
+  (should (equal (+orgbrain--check-slug "atlas") "atlas")))
+
+(ert-deftest orgbrain-new-project-builds-the-cli-call-and-selects-on-success ()
+  "Scope moves only after the daemon confirms, and the caches are dropped."
+  (let* ((sent nil)
+         (+orgbrain--project "orgbrain")
+         (+orgbrain--pending nil)
+         (+orgbrain--exchanges '(:stale))
+         (+orgbrain--exchanges-project "orgbrain")
+         (+orgbrain--exchange-index 3)
+         (+orgbrain-transport
+          (lambda (args _stdin cb)
+            (setq sent args)
+            (funcall cb (list :exit 0 :stdout "{\"ok\":true}" :stderr ""))
+            nil)))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (prompt &optional initial &rest _)
+                 (cond ((string-match-p "slug" prompt) "atlas")
+                       ((string-match-p "Title" prompt) "ATLAS")
+                       (t "A verifiable-compute paper")))))
+      (+orgbrain/new-project))
+    (should (equal sent '("project" "new" "atlas" "--title" "ATLAS"
+                          "--summary" "A verifiable-compute paper" "--json")))
+    (should (equal +orgbrain--project "atlas"))
+    (should (eq +orgbrain--projects-source 'server))
+    (should-not +orgbrain--exchanges)
+    (should-not +orgbrain--exchange-index)))
+
+(ert-deftest orgbrain-new-project-keeps-the-old-scope-when-the-write-fails ()
+  "A failed create must not leave the workspace pointed at nothing."
+  (let ((+orgbrain--project "orgbrain")
+        (+orgbrain--pending nil)
+        (+orgbrain-transport
+         (lambda (_args _stdin cb)
+           (funcall cb (list :exit 1 :stdout "" :stderr "project_slug_invalid"))
+           nil)))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (prompt &optional initial &rest _)
+                 (cond ((string-match-p "slug" prompt) "atlas")
+                       ((string-match-p "Title" prompt) "ATLAS")
+                       (t "s")))))
+      (+orgbrain/new-project))
+    (should (equal +orgbrain--project "orgbrain"))
+    (should (eq +orgbrain--status 'error))))
+
+(ert-deftest orgbrain-new-project-is-refused-while-a-job-is-running ()
+  "`assert_service_idle' refuses a GBrain write while any job runs, and what a
+refusal costs is whatever was just typed."
+  (let ((+orgbrain--pending (list :mode 'ask :started (float-time) :process nil)))
+    (should-error (+orgbrain/new-project) :type 'user-error)))
+
+(ert-deftest orgbrain-new-project-is-not-a-request-mode ()
+  "A once-ever destructive verb must not sit on the TAB cycle."
+  (should-not (assq 'new-project +orgbrain-modes))
+  (should-not (memq '+orgbrain--build-new-project
+                    (mapcar (lambda (m) (plist-get (cdr m) :builder)) +orgbrain-modes))))
+
 ;; R3 — the dialogue abstraction
 ;; ---------------------------------------------------------------------------
 
