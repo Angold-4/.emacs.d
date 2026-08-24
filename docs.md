@@ -200,6 +200,7 @@ header line:
 ```
 OUTPUT  |  project: orgbrain  |  vienna idle
 INPUT   |  project: orgbrain  |  mode: ask  |  vienna idle
+... during a send:      |  mode: consult  |  vienna working 137s
 ```
 
 If the client ever believes a request is outstanding when none is, `:orgbrain-reset`
@@ -216,7 +217,7 @@ thought you typed.
 | Key | Action |
 |-----|--------|
 | `:orgbrain` | Open the workspace (`M-x +orgbrain/open`) |
-| `TAB` | Cycle the request mode in the input buffer (normal state) |
+| `TAB` | Cycle the request mode: ask → remember → recall → consult (normal state) |
 | `RET` / `C-c C-c` | Send the input buffer |
 | `<up>` / `<down>` | Replay the previous/next exchange of the current project |
 | `gp` / `C-c C-p` | Switch project (`:orgbrain-project`, `completing-read`) |
@@ -240,6 +241,16 @@ Request modes:
 | `ask` | `orgbrain ask - --json --entity projects/<slug>`, brief on stdin |
 | `remember` | the same `ask` call with the text sent as `remember that <text>` |
 | `recall` | `orgbrain recall <text> --json`, raw retrieval with no compose |
+| `consult` | `orgbrain ask - --consult --json --entity projects/<slug>` |
+
+`consult` is last in the cycle on purpose. It makes the kernel run one one-shot
+consultant (Grok 4.6 High) after the local answer, append the reply to the
+evidence ledger as a take, and compose once more so the answer can cite it.
+Measured on Vienna: **293 s**, against 20-30 s for a plain ask — and the prompt
+leaves the machine. TAB should have to travel past the three cheap modes to
+reach it. While it runs the header line counts seconds (`vienna working 137s`),
+because a header that says `working` for five minutes is indistinguishable from
+one that is stuck.
 
 `remember` deliberately never calls the `orgbrain remember` verb, which refuses
 text that does not route to a write. Sends are asynchronous and serialised:

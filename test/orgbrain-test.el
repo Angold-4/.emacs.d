@@ -163,15 +163,23 @@ RESPONSES maps the first CLI argument to either a stdout string or a
   "TAB walks `ask' -> `remember' -> `recall' and back to `ask'."
   (should (eq (+orgbrain--next-mode 'ask) 'remember))
   (should (eq (+orgbrain--next-mode 'remember) 'recall))
-  (should (eq (+orgbrain--next-mode 'recall) 'ask)))
+  (should (eq (+orgbrain--next-mode 'recall) 'consult))
+  (should (eq (+orgbrain--next-mode 'consult) 'ask)))
 
 (ert-deftest orgbrain-mode-cycle-follows-the-mode-table ()
-  "A mode added to `+orgbrain-modes' joins the cycle with no other change."
-  (let ((+orgbrain-modes (append +orgbrain-modes
-                                 '((digest :label "digest"
-                                           :builder +orgbrain--build-ask
-                                           :hint "test entry")))))
-    (should (eq (+orgbrain--next-mode 'recall) 'digest))
+  "A mode added to `+orgbrain-modes' joins the cycle with no other change.
+
+Position-independent on purpose.  This used to name `recall' as the entry
+the new mode follows, so adding `consult' broke a test that was not about
+`consult'.  `prompt' and `digest' are still coming (orgbrain#58), and the
+property under test -- appending an entry is the whole change -- does not
+depend on how long the table already is."
+  (let* ((last-existing (car (last (mapcar #'car +orgbrain-modes))))
+         (+orgbrain-modes (append +orgbrain-modes
+                                  '((digest :label "digest"
+                                            :builder +orgbrain--build-ask
+                                            :hint "test entry")))))
+    (should (eq (+orgbrain--next-mode last-existing) 'digest))
     (should (eq (+orgbrain--next-mode 'digest) 'ask))
     (should (equal (+orgbrain--mode-label 'digest) "digest"))))
 
@@ -304,6 +312,61 @@ RESPONSES maps the first CLI argument to either a stdout string or a
                               (error-message-string problem))))))
 
 ;; ---------------------------------------------------------------------------
+;; R2b — consult mode
+
+(ert-deftest orgbrain-consult-mode-forces-one-consult-on-the-ask-path ()
+  "`consult' is `ask --consult': same verb, same stdin, one extra flag.
+The kernel owns the trigger (orgbrain#69); the client only says the owner
+asked for it, which is trigger 1 of three and the only one a client can
+legitimately raise."
+  (let ((built (+orgbrain--build-request 'consult "why is this slow" "orgbrain")))
+    (should (equal (plist-get built :args)
+                   '("ask" "-" "--json" "--consult" "--entity" "projects/orgbrain")))
+    (should (equal (plist-get built :stdin) "why is this slow"))))
+
+(ert-deftest orgbrain-consult-mode-is-unscoped-cleanly ()
+  "No project means no --entity, and --consult still stands alone."
+  (should (equal (plist-get (+orgbrain--build-request 'consult "q" nil) :args)
+                 '("ask" "-" "--json" "--consult"))))
+
+(ert-deftest orgbrain-consult-is-the-last-mode-in-the-cycle ()
+  "TAB reaches the expensive mode only after the cheap ones.
+A consulted ask is ~5 min and its prompt leaves the host, so it must not
+sit between `ask' and `remember' where a stray TAB lands on it."
+  (should (eq (car (last (mapcar #'car +orgbrain-modes))) 'consult)))
+
+;; Elapsed clock
+
+(ert-deftest orgbrain-header-shows-elapsed-while-a-request-is-in-flight ()
+  "A five-minute send needs to look different from a stuck one."
+  (let ((+orgbrain--project "orgbrain")
+        (+orgbrain--mode 'consult)
+        (+orgbrain--status 'working)
+        (+orgbrain-ssh-host "vienna")
+        (+orgbrain--projects-source 'server)
+        (+orgbrain--pending (list :mode 'consult :started (- (float-time) 137))))
+    (should (string-match-p "vienna working 13[0-9]s" (+orgbrain--header-line 'input)))))
+
+(ert-deftest orgbrain-header-has-no-clock-when-idle ()
+  (let ((+orgbrain--project "orgbrain")
+        (+orgbrain--mode 'ask)
+        (+orgbrain--status 'idle)
+        (+orgbrain-ssh-host "vienna")
+        (+orgbrain--projects-source 'server)
+        (+orgbrain--pending nil))
+    (should (string-match-p "vienna idle" (+orgbrain--header-line 'input)))
+    (should-not (string-match-p "[0-9]s" (+orgbrain--header-line 'input)))))
+
+(ert-deftest orgbrain-tick-timer-cancels-itself-when-nothing-is-pending ()
+  "A lost callback must not leave a timer running for the session."
+  (let ((+orgbrain--pending nil)
+        (+orgbrain--tick-timer nil))
+    (+orgbrain--start-tick)
+    (should (timerp +orgbrain--tick-timer))
+    ;; The timer body cancels itself on the first fire with nothing pending.
+    (funcall (timer--function +orgbrain--tick-timer))
+    (should-not +orgbrain--tick-timer)))
+
 ;; R3 — the dialogue abstraction
 ;; ---------------------------------------------------------------------------
 

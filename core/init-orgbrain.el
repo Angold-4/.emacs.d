@@ -139,6 +139,11 @@ makes two synchronous calls.  Tests should bind this to a small value."
 A plist with `:mode' and `:started'.  Non-nil blocks a second request:
 the daemon refuses a write while any job is running.")
 
+(defvar +orgbrain--tick-timer nil
+  "Timer refreshing the header line while a request is in flight.
+A consulted ask runs for about five minutes, and a header that says
+`working\=' for five minutes is indistinguishable from one that is stuck.")
+
 (defvar +orgbrain--projects-source nil
   "Where the last project list came from: `server', `history', or `default'.")
 
@@ -369,6 +374,24 @@ is ignored: v0.1.0 recall is raw retrieval across the whole brain."
   (list :args (list "recall" text "--json")
         :stdin nil))
 
+(defun +orgbrain--build-consult (text project)
+  "Build a forced-consult `ask' for TEXT, scoped to PROJECT.
+
+`--consult' makes the kernel run one one-shot consultant after the local
+answer, append its reply to the evidence ledger as a take, and compose
+once more so the answer can cite it.  Measured on Vienna: **293 s**, of
+which the consultant is ~90 s -- an order of magnitude slower than a
+plain ask, and the prompt leaves the machine.  So it is its own mode
+rather than a flag: TAB has to be turned to it deliberately, and the
+label is visible in the header line while it runs.
+
+`orgbrain ask --consult' requires the daemon to carry the consult
+pipeline.  An older one drops the flag and answers locally, which looks
+identical apart from `consults' being absent from the receipt."
+  (list :args (append (list "ask" "-" "--json" "--consult")
+                      (+orgbrain--entity-args project))
+        :stdin text))
+
 (defvar +orgbrain-modes
   '((ask
      :label "ask"
@@ -381,7 +404,11 @@ is ignored: v0.1.0 recall is raw retrieval across the whole brain."
     (recall
      :label "recall"
      :builder +orgbrain--build-recall
-     :hint "raw retrieval, no compose"))
+     :hint "raw retrieval, no compose")
+    (consult
+     :label "consult"
+     :builder +orgbrain--build-consult
+     :hint "local answer, then one Grok take -- ~5 min, leaves the host"))
   "Ordered request modes, each a plist keyed by mode symbol.
 `:builder' is called with the input text and the current project slug and
 returns a plist with `:args' (the CLI argument list) and `:stdin' (a
@@ -738,12 +765,39 @@ send is issued from there, so showing it on the transcript said nothing."
    (format "  |  project: %s" (or +orgbrain--project "unscoped"))
    (when (eq kind 'input)
      (format "  |  mode: %s" (+orgbrain--mode-label +orgbrain--mode)))
-   (format "  |  %s %s"
+   (format "  |  %s %s%s"
            (if (eq +orgbrain-transport #'+orgbrain--transport-local)
                "local"
              +orgbrain-ssh-host)
-           +orgbrain--status)
+           +orgbrain--status
+           ;; Elapsed seconds, not a spinner: the useful question during a
+           ;; long send is "how long has this been going", and a consulted
+           ;; ask legitimately runs into the hundreds.
+           (let ((seconds (+orgbrain--elapsed)))
+             (if seconds (format " %ds" seconds) "")))
    (+orgbrain--projects-note +orgbrain--projects-source)))
+
+(defun +orgbrain--elapsed ()
+  "Whole seconds since the in-flight request started, or nil when idle."
+  (let ((started (plist-get +orgbrain--pending :started)))
+    (and (numberp started) (max 0 (floor (- (float-time) started))))))
+
+(defun +orgbrain--stop-tick ()
+  "Cancel the header-line refresh timer."
+  (when (timerp +orgbrain--tick-timer)
+    (cancel-timer +orgbrain--tick-timer))
+  (setq +orgbrain--tick-timer nil))
+
+(defun +orgbrain--start-tick ()
+  "Refresh the header line every second while a request is outstanding.
+The timer cancels itself when nothing is pending, so a lost callback
+cannot leave it running for the rest of the session."
+  (+orgbrain--stop-tick)
+  (setq +orgbrain--tick-timer
+        (run-at-time 1 1 (lambda ()
+                           (if +orgbrain--pending
+                               (+orgbrain--refresh-header)
+                             (+orgbrain--stop-tick))))))
 
 (defun +orgbrain--refresh-header ()
   "Re-render the header line in both workspace buffers."
@@ -908,6 +962,7 @@ Choosing `+orgbrain--unscoped-choice' clears the scope: calls pass no
 (defun +orgbrain--finish-send (mode text stdout problem)
   "Render the reply to a MODE request of TEXT, or report PROBLEM.
 STDOUT is the raw CLI output when the call succeeded."
+  (+orgbrain--stop-tick)
   (setq +orgbrain--pending nil
         +orgbrain--exchanges nil
         +orgbrain--exchanges-project nil
@@ -965,8 +1020,12 @@ while any job is running, and losing a thought is worse than waiting."
       (setq +orgbrain--pending
             (list :mode mode :started (float-time) :process nil))
       (+orgbrain--set-status 'working)
-      (message "orgbrain %s: sent to %s, waiting (an ask takes 19-25s)"
-               label +orgbrain-ssh-host)
+      (+orgbrain--start-tick)
+      (message "orgbrain %s: sent to %s, waiting (%s)"
+               label +orgbrain-ssh-host
+               (if (eq mode 'consult)
+                   "a consulted ask takes ~5 min"
+                 "an ask takes 19-25s"))
       ;; If the dispatch signals, `+orgbrain--pending' must not survive it:
       ;; a stuck pending refuses every later send until Emacs restarts.
       (condition-case signalled
@@ -982,6 +1041,7 @@ while any job is running, and losing a thought is worse than waiting."
               (setq +orgbrain--pending
                     (plist-put +orgbrain--pending :process proc))))
         (error
+         (+orgbrain--stop-tick)
          (setq +orgbrain--pending nil)
          (+orgbrain--set-status 'error)
          (signal (car signalled) (cdr signalled)))))))
@@ -991,6 +1051,7 @@ while any job is running, and losing a thought is worse than waiting."
 The escape hatch for a client that believes a request is outstanding when
 none is, and for buffers left behind by reloading the module."
   (interactive)
+  (+orgbrain--stop-tick)
   (when (process-live-p (plist-get +orgbrain--pending :process))
     (ignore-errors (delete-process (plist-get +orgbrain--pending :process))))
   (setq +orgbrain--pending nil
