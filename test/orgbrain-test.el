@@ -160,9 +160,9 @@ RESPONSES maps the first CLI argument to either a stdout string or a
 ;; ---------------------------------------------------------------------------
 
 (ert-deftest orgbrain-mode-cycle-wraps-in-order ()
-  "TAB walks `ask' -> `remember' -> `recall' and back to `ask'."
-  (should (eq (+orgbrain--next-mode 'ask) 'remember))
-  (should (eq (+orgbrain--next-mode 'remember) 'recall))
+  "TAB walks `ask' -> `propose' -> `recall' -> `consult' and back to `ask'."
+  (should (eq (+orgbrain--next-mode 'ask) 'propose))
+  (should (eq (+orgbrain--next-mode 'propose) 'recall))
   (should (eq (+orgbrain--next-mode 'recall) 'consult))
   (should (eq (+orgbrain--next-mode 'consult) 'ask)))
 
@@ -191,23 +191,30 @@ depend on how long the table already is."
 ;; R2 — argument construction
 ;; ---------------------------------------------------------------------------
 
+;; The pre-existing argument tests below predate conversations and assert the
+;; degraded shape.  They bind `+orgbrain--conversation-support' explicitly
+;; rather than relying on its global value: `+orgbrain/open' probes and sets it,
+;; so a test elsewhere in this file could otherwise decide what these assert.
 (ert-deftest orgbrain-ask-sends-text-on-stdin-scoped-to-the-project ()
   "`ask' pipes the brief and scopes it with `--entity projects/<slug>'."
-  (let ((request (+orgbrain--build-request 'ask "long brief" "orgbrain")))
+  (let* ((+orgbrain--conversation-support 'no)
+         (request (+orgbrain--build-request 'ask "long brief" "orgbrain")))
     (should (equal (plist-get request :args)
                    '("ask" "-" "--json" "--entity" "projects/orgbrain")))
     (should (equal (plist-get request :stdin) "long brief"))))
 
 (ert-deftest orgbrain-ask-without-a-project-is-unscoped ()
   "A nil project omits `--entity' rather than sending an empty entity."
-  (should (equal (plist-get (+orgbrain--build-request 'ask "brief" nil) :args)
-                 '("ask" "-" "--json")))
-  (should (equal (plist-get (+orgbrain--build-request 'ask "brief" "") :args)
-                 '("ask" "-" "--json"))))
+  (let ((+orgbrain--conversation-support 'no))
+    (should (equal (plist-get (+orgbrain--build-request 'ask "brief" nil) :args)
+                   '("ask" "-" "--json")))
+    (should (equal (plist-get (+orgbrain--build-request 'ask "brief" "") :args)
+                   '("ask" "-" "--json")))))
 
-(ert-deftest orgbrain-remember-goes-through-ask ()
-  "`remember' is an `ask' with a prefix; the `remember' verb is never called."
-  (let* ((request (+orgbrain--build-request 'remember "we chose Groth16" "wrappers"))
+(ert-deftest orgbrain-propose-goes-through-ask ()
+  "`propose' is an `ask' with a prefix; the `remember' verb is never called."
+  (let* ((+orgbrain--conversation-support 'no)
+         (request (+orgbrain--build-request 'propose "we chose Groth16" "wrappers"))
          (args (plist-get request :args)))
     (should (equal args '("ask" "-" "--json" "--entity" "projects/wrappers")))
     (should (equal (car args) "ask"))
@@ -215,12 +222,13 @@ depend on how long the table already is."
     (should (equal (plist-get request :stdin)
                    "remember that we chose Groth16"))))
 
-(ert-deftest orgbrain-remember-matches-ask-except-for-the-prefix ()
-  "The remember builder differs from ask only in the stdin prefix."
-  (let ((remember (+orgbrain--build-request 'remember "x" "orgbrain"))
-        (ask (+orgbrain--build-request 'ask "remember that x" "orgbrain")))
-    (should (equal (plist-get remember :args) (plist-get ask :args)))
-    (should (equal (plist-get remember :stdin) (plist-get ask :stdin)))))
+(ert-deftest orgbrain-propose-matches-ask-except-for-the-prefix ()
+  "The propose builder differs from ask only in the stdin prefix."
+  (let* ((+orgbrain--conversation-support 'no)
+         (propose (+orgbrain--build-request 'propose "x" "orgbrain"))
+         (ask (+orgbrain--build-request 'ask "remember that x" "orgbrain")))
+    (should (equal (plist-get propose :args) (plist-get ask :args)))
+    (should (equal (plist-get propose :stdin) (plist-get ask :stdin)))))
 
 (ert-deftest orgbrain-recall-passes-the-query-positionally ()
   "`recall' takes the query as an argument and sends no stdin."
@@ -319,15 +327,17 @@ depend on how long the table already is."
 The kernel owns the trigger (orgbrain#69); the client only says the owner
 asked for it, which is trigger 1 of three and the only one a client can
 legitimately raise."
-  (let ((built (+orgbrain--build-request 'consult "why is this slow" "orgbrain")))
+  (let* ((+orgbrain--conversation-support 'no)
+         (built (+orgbrain--build-request 'consult "why is this slow" "orgbrain")))
     (should (equal (plist-get built :args)
                    '("ask" "-" "--json" "--consult" "--entity" "projects/orgbrain")))
     (should (equal (plist-get built :stdin) "why is this slow"))))
 
 (ert-deftest orgbrain-consult-mode-is-unscoped-cleanly ()
   "No project means no --entity, and --consult still stands alone."
-  (should (equal (plist-get (+orgbrain--build-request 'consult "q" nil) :args)
-                 '("ask" "-" "--json" "--consult"))))
+  (let ((+orgbrain--conversation-support 'no))
+    (should (equal (plist-get (+orgbrain--build-request 'consult "q" nil) :args)
+                   '("ask" "-" "--json" "--consult")))))
 
 (ert-deftest orgbrain-consult-is-the-last-mode-in-the-cycle ()
   "TAB reaches the expensive mode only after the cheap ones.
@@ -1150,6 +1160,505 @@ not loaded there.  The fake below reproduces only the switching."
             (when (buffer-live-p buffer) (kill-buffer buffer))))
         (set-frame-parameter (selected-frame) '+orgbrain-input-window nil)
         (delete-other-windows)))))
+
+;; ---------------------------------------------------------------------------
+;; Conversations (orgbrain#95)
+;;
+;; The fixtures below are the real evaluation output of `feat/conversational-
+;; memory' (case `mixed_remember'), trimmed to the fields the client reads.
+;; Every key path under test is therefore an observed one.
+;; ---------------------------------------------------------------------------
+
+(defconst orgbrain-test--candidate-hash
+  "e54fa3435a7ff95a91138eb779ca12d140e06c80c7211dcd7ddb5ade58e992dd"
+  "The 64-hex candidate hash from the daemon's own evaluation run.
+Kept literal: its length and character class are what the daemon's
+`_CONFIRM' regexp checks, and a placeholder would not exercise that.")
+
+(defconst orgbrain-test--conversation-json
+  (concat "
+{
+  \"id\": \"9c1de0f2f2f04d8ea2a6cbb8ad04a2f1\",
+  \"kind\": \"ask\",
+  \"state\": \"succeeded\",
+  \"request\": { \"entity\": \"projects/atlas\",
+                 \"text\": \"Remember that ATLAS uses deterministic replay.\" },
+  \"result\": {
+    \"answer\": \"Deterministic replay trades throughput for reproducibility.\",
+    \"answer_receipt\": { \"latency_ms\": 21671, \"grounding\": \"present\" },
+    \"citations\": [1],
+    \"memory_receipt\": { \"status\": \"pending_confirmation\" },
+    \"conversation_receipt\": {
+      \"conversation_id\": \"atlas-20260910T120000\",
+      \"capture\": {
+        \"user\": { \"status\": \"verified\", \"turn_id\": \"7fb96a4b1111\",
+                    \"source\": \"dialogue\", \"error\": null },
+        \"assistant\": { \"status\": \"verified\", \"turn_id\": \"e706977f2222\",
+                         \"source\": \"dialogue\", \"error\": null }
+      },
+      \"knowledge\": {
+        \"status\": \"pending_confirmation\",
+        \"candidate_id\": \"mem_faa3a41bd85a43ce858b34fc5ab72db8\",
+        \"candidate_hash\": \"" orgbrain-test--candidate-hash "\",
+        \"candidate_version\": 1,
+        \"reason\": \"requires_explicit_proposal_approval\",
+        \"proposal\": \"ATLAS uses deterministic replay.\",
+        \"planned\": [ { \"op\": \"remember\", \"entity\": \"projects/atlas\",
+                         \"fact\": \"ATLAS uses deterministic replay.\",
+                         \"kind\": \"fact\" } ],
+        \"confirmation_text\": \"confirm mem_faa3a41bd85a43ce858b34fc5ab72db8 "
+          orgbrain-test--candidate-hash " v1\"
+      },
+      \"answer\": { \"status\": \"succeeded\" },
+      \"delivery\": { \"status\": \"pending\" },
+      \"user_turn_id\": \"7fb96a4b1111\",
+      \"assistant_turn_id\": \"e706977f2222\"
+    }
+  },
+  \"error\": null,
+  \"created_at\": \"2026-09-10T12:00:00.000+00:00\"
+}")
+  "A conversation-aware `ask' that produced a proposal and captured both turns.")
+
+(defconst orgbrain-test--failed-compose-json "
+{
+  \"id\": \"a1b2c3d4\",
+  \"kind\": \"ask\",
+  \"state\": \"succeeded\",
+  \"request\": { \"entity\": \"projects/atlas\", \"text\": \"Remember that X.\" },
+  \"result\": {
+    \"answer\": \"I could not compose an answer for this message.\",
+    \"answer_receipt\": { \"answer_composition\": \"failed\",
+                         \"answer_failure\": \"RuntimeError\",
+                         \"conversation\": {
+      \"conversation_id\": \"atlas-20260910T120000\",
+      \"capture\": { \"user\": { \"status\": \"verified\", \"turn_id\": \"7fb96a4b1111\" } },
+      \"knowledge\": { \"status\": \"pending_confirmation\",
+                       \"proposal\": \"ATLAS uses deterministic replay.\" },
+      \"answer\": { \"status\": \"failed\" },
+      \"delivery\": { \"status\": \"pending\" },
+      \"user_turn_id\": \"7fb96a4b1111\" } }
+  },
+  \"error\": null,
+  \"created_at\": \"2026-09-10T12:01:00.000+00:00\"
+}"
+  "The state the daemon reaches when capture and the proposal outlive COMPOSE.
+A normal outcome, not an error: the memory effect was decided and
+journaled before the model failed to phrase a reply, and no assistant turn
+exists in this state.")
+
+(defconst orgbrain-test--capture-off-json "
+{
+  \"id\": \"d4c3b2a1\",
+  \"kind\": \"ask\",
+  \"state\": \"succeeded\",
+  \"request\": { \"entity\": \"projects/atlas\", \"text\": \"What does PR 850 do?\" },
+  \"result\": {
+    \"answer\": \"It reworks the executor.\",
+    \"answer_receipt\": { \"latency_ms\": 14258 },
+    \"conversation_receipt\": {
+      \"conversation_id\": \"atlas-20260910T120000\",
+      \"capture\": { \"status\": \"disabled\" },
+      \"knowledge\": { \"status\": \"unchanged\" },
+      \"answer\": { \"status\": \"succeeded\" },
+      \"delivery\": { \"status\": \"pending\" }
+    }
+  },
+  \"error\": null,
+  \"created_at\": \"2026-09-10T12:02:00.000+00:00\"
+}"
+  "A conversation-aware ask on a daemon with retention off.
+The client sent a perfect conversation ID and nothing was preserved.")
+
+(defmacro orgbrain-test--with-conversation (&rest body)
+  "Run BODY with a live, supported conversation and no leftover state."
+  (declare (indent 0))
+  `(let ((+orgbrain--conversation-support 'yes)
+         (+orgbrain--conversation "atlas-20260910T120000")
+         (+orgbrain--conversation-project "atlas")
+         (+orgbrain--capture-discussion nil)
+         (+orgbrain--capture-state 'unknown)
+         (+orgbrain--reply-target nil)
+         (+orgbrain--candidate nil)
+         (+orgbrain--project "atlas"))
+     ,@body))
+
+;; --- the blocking finding: no conversation ID, no conversation ------------
+
+(ert-deftest orgbrain-ask-carries-the-conversation-id ()
+  "An `ask' sends `--conversation-id'.
+
+This is the whole finding.  The daemon's `validate_request' returns nil
+for a request with no conversation ID, and `execute_conversation' is
+skipped entirely: the job falls through to the legacy single-turn `_ask',
+which captures nothing, retrieves no dialogue history and issues no
+proposals.  Without this argument every other feature in this file is
+unreachable however well it is rendered."
+  (orgbrain-test--with-conversation
+    (should (equal (plist-get (+orgbrain--build-request 'ask "brief" "atlas") :args)
+                   '("ask" "-" "--json" "--entity" "projects/atlas"
+                     "--conversation-id" "atlas-20260910T120000")))))
+
+(ert-deftest orgbrain-consult-carries-the-conversation-id ()
+  "`consult' rides the `ask' parser, so it is conversational too.
+A five-minute answer is the last one worth dropping out of the dialogue."
+  (orgbrain-test--with-conversation
+    (should (member "--conversation-id"
+                    (plist-get (+orgbrain--build-request 'consult "brief" "atlas")
+                               :args)))))
+
+(ert-deftest orgbrain-recall-never-carries-conversation-flags ()
+  "`recall' has no conversation parser on the daemon, so it is sent none."
+  (orgbrain-test--with-conversation
+    (should (equal (plist-get (+orgbrain--build-request 'recall "q" "atlas") :args)
+                   '("recall" "q" "--json")))))
+
+(ert-deftest orgbrain-conversation-flags-are-dropped-when-unsupported ()
+  "An older daemon gets a plain single-turn ask, not an argparse failure.
+
+`#95' is unmerged.  A daemon without it rejects `--conversation-id' with
+`unrecognized arguments' and a nonzero exit, which would cost the owner
+whatever brief was just typed.  `unknown' degrades the same way as `no':
+a probe that could not run is not evidence that the feature is there."
+  (dolist (support '(no unknown))
+    (orgbrain-test--with-conversation
+      (let ((+orgbrain--conversation-support support))
+        (should (equal (plist-get (+orgbrain--build-request 'ask "b" "atlas") :args)
+                       '("ask" "-" "--json" "--entity" "projects/atlas")))))))
+
+(ert-deftest orgbrain-conversation-flags-are-dropped-for-an-invalid-id ()
+  "An ID outside the daemon's character class is never sent.
+`orgbrain/conversation.py' enforces `[A-Za-z0-9][A-Za-z0-9_-]{0,127}' and
+raises `invalid_conversation_identity' otherwise; failing that check here
+costs no round trip."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--conversation "not/a/valid id"))
+      (should-not (member "--conversation-id"
+                          (plist-get (+orgbrain--build-request 'ask "b" "atlas")
+                                     :args))))))
+
+(ert-deftest orgbrain-conversation-ids-fit-the-daemon-rule ()
+  "Generated IDs satisfy the daemon's rule even from an awkward slug."
+  (dolist (project '(nil "atlas" "a.b/c" "_leading"))
+    (should (+orgbrain--conversation-id-valid-p
+             (+orgbrain--new-conversation-id project))))
+  (should (string-prefix-p "atlas-" (+orgbrain--new-conversation-id "atlas")))
+  (should (string-prefix-p "unscoped-" (+orgbrain--new-conversation-id nil))))
+
+(ert-deftest orgbrain-capture-and-reply-flags-ride-the-ask ()
+  "`--capture-discussion' and `--reply-to-turn-id' are sent when armed."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--capture-discussion t)
+          (+orgbrain--reply-target "7fb96a4b1111"))
+      (let ((args (plist-get (+orgbrain--build-request 'ask "b" "atlas") :args)))
+        (should (member "--capture-discussion" args))
+        (should (equal (cadr (member "--reply-to-turn-id" args)) "7fb96a4b1111"))))))
+
+;; --- the probe ------------------------------------------------------------
+
+(ert-deftest orgbrain-support-is-probed-from-the-daemons-own-help ()
+  "The probe reads `ask --help' and believes only what it finds there."
+  (cl-flet ((probe (help)
+              (let ((+orgbrain-transport
+                     (lambda (_args _stdin _cb)
+                       (list :exit 0 :stdout help :stderr ""))))
+                (+orgbrain--probe-conversation-support))))
+    (should (eq (probe "usage: orgbrain ask ... --conversation-id ID") 'yes))
+    (should (eq (probe "usage: orgbrain ask [--entity ENTITY]") 'no)))
+  ;; A probe that cannot run says `unknown', not `no': a down tunnel is not
+  ;; evidence about the daemon's features, and both degrade identically.
+  (let ((+orgbrain-transport
+         (lambda (_args _stdin _cb) (list :exit 1 :stdout "" :stderr "boom"))))
+    (should (eq (+orgbrain--probe-conversation-support) 'unknown))))
+
+(ert-deftest orgbrain-argparse-refusal-downgrades-the-client ()
+  "A stale probe is corrected by the daemon's own argparse error.
+The next send degrades to a single-turn ask instead of failing the same
+way forever."
+  (let ((+orgbrain--conversation-support 'yes))
+    (should (+orgbrain--note-unsupported-conversation
+             "OrgBrain call failed (exit 2): unrecognized arguments: --conversation-id x"))
+    (should (eq +orgbrain--conversation-support 'no)))
+  ;; An unrelated failure must not silently turn the feature off.
+  (let ((+orgbrain--conversation-support 'yes))
+    (should-not (+orgbrain--note-unsupported-conversation
+                 "OrgBrain call failed (exit 1): assert_service_idle"))
+    (should (eq +orgbrain--conversation-support 'yes))))
+
+;; --- propose, not remember ------------------------------------------------
+
+(ert-deftest orgbrain-propose-does-not-re-prefix-a-remember-request ()
+  "`Remember this' is left alone so its reply target can resolve.
+
+The daemon reads a bare `Remember this' plus a resolved
+`--reply-to-turn-id' as a request to preserve the turn replied to.
+Prefixing it would produce `remember that Remember this', which is
+ordinary prose the daemon reads as a statement, and the reply target would
+never be used."
+  (orgbrain-test--with-conversation
+    (should (equal (plist-get (+orgbrain--build-request 'propose "Remember this" "atlas")
+                              :stdin)
+                   "Remember this"))
+    (should (equal (plist-get (+orgbrain--build-request 'propose "Please save this" "atlas")
+                              :stdin)
+                   "Please save this"))
+    (should (equal (plist-get (+orgbrain--build-request 'propose "we chose Groth16" "atlas")
+                              :stdin)
+                   "remember that we chose Groth16"))))
+
+(ert-deftest orgbrain-propose-mode-is-labelled-honestly ()
+  "The mode says it proposes, because under `#95' it writes nothing.
+Its old hint, \"conversational write through ask\", described a write that
+no longer happens: the turn is captured and a candidate is created in
+`pending_confirmation', and accepted knowledge is unchanged until the
+owner approves that exact candidate."
+  (should (equal (+orgbrain--mode-label 'propose) "propose"))
+  (let ((hint (plist-get (+orgbrain--mode-plist 'propose) :hint)))
+    (should (string-match-p "propose" hint))
+    (should (string-match-p "approval" hint))
+    (should-not (string-match-p "write" hint))))
+
+;; --- approval -------------------------------------------------------------
+
+(ert-deftest orgbrain-approval-sends-the-three-fields-structurally ()
+  "Approval carries the candidate ID, hash, and version, in its conversation.
+The daemon refuses every shortcut around those three -- an ID-only yes, a
+stale hash, a changed replacement target -- so the typing can only be
+automated, never simplified away."
+  (let* ((candidate (list :id "mem_faa3a41bd85a43ce858b34fc5ab72db8"
+                          :hash orgbrain-test--candidate-hash
+                          :version 1 :conversation "atlas-20260910T120000"
+                          :entity "atlas"))
+         (args (plist-get (+orgbrain--build-confirm candidate t) :args)))
+    (should (equal (cadr (member "--confirm-candidate-id" args))
+                   "mem_faa3a41bd85a43ce858b34fc5ab72db8"))
+    (should (equal (cadr (member "--confirm-candidate-hash" args))
+                   orgbrain-test--candidate-hash))
+    (should (equal (cadr (member "--confirm-candidate-version" args)) "1"))
+    ;; The conversation the proposal was made in, not whatever the workspace
+    ;; happens to point at: a different one is `confirmation_scope_mismatch'.
+    (should (equal (cadr (member "--conversation-id" args))
+                   "atlas-20260910T120000"))
+    (should (equal (cadr (member "--entity" args)) "projects/atlas"))))
+
+(ert-deftest orgbrain-approval-body-is-never-empty ()
+  "The confirmation text is sent as the request body.
+
+Not belt and braces: `validate_request' calls `validate_text' before any
+confirm flag is read, and rejects an empty body with
+`empty_conversation_text'.  An `ask' with an empty body carrying only the
+structured fields never reaches the confirmation path at all.  The body
+also has to match the daemon's `_CONFIRM' regexp exactly."
+  (let* ((candidate (list :id "mem_faa3a41bd85a43ce858b34fc5ab72db8"
+                          :hash orgbrain-test--candidate-hash
+                          :version 1 :conversation "c" :entity nil))
+         (body (nth 1 (plist-get (+orgbrain--build-confirm candidate t) :args))))
+    (should (string-match-p
+             (concat "\\`confirm mem_[0-9a-f]\\{8,\\} [0-9a-f]\\{64\\} v1\\'")
+             body))
+    (should (string-match-p
+             (concat "\\`reject mem_[0-9a-f]\\{8,\\} [0-9a-f]\\{64\\} v1\\'")
+             (nth 1 (plist-get (+orgbrain--build-confirm candidate nil) :args))))))
+
+(ert-deftest orgbrain-rejection-sends-no-confirm-flags ()
+  "A rejection carries no `--confirm-candidate-*': the text decides admission.
+The daemon takes `admit' from the `confirm'/`reject' word when the body
+matches `_CONFIRM', so sending the confirm flags on a rejection would say
+both things at once."
+  (let* ((candidate (list :id "mem_aaaaaaaa" :hash orgbrain-test--candidate-hash
+                          :version 1 :conversation "c" :entity nil))
+         (args (plist-get (+orgbrain--build-confirm candidate nil) :args)))
+    (should-not (member "--confirm-candidate-id" args))
+    (should (member "--conversation-id" args))))
+
+;; --- absorbing a receipt --------------------------------------------------
+
+(ert-deftest orgbrain-a-proposal-is-remembered-for-approval ()
+  "The pending candidate is taken from the receipt, field for field."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--reply-target "stale"))
+      (+orgbrain--absorb-conversation
+       (+orgbrain--read-json orgbrain-test--conversation-json))
+      (should (equal (plist-get +orgbrain--candidate :id)
+                     "mem_faa3a41bd85a43ce858b34fc5ab72db8"))
+      (should (equal (plist-get +orgbrain--candidate :hash)
+                     orgbrain-test--candidate-hash))
+      (should (equal (plist-get +orgbrain--candidate :version) 1))
+      (should (equal (plist-get +orgbrain--candidate :conversation)
+                     "atlas-20260910T120000"))
+      (should (equal (plist-get +orgbrain--candidate :entity) "atlas"))
+      (should (eq +orgbrain--capture-state 'on))
+      ;; A reply target names one earlier turn for one send.  A sticky one
+      ;; would silently re-aim the next brief.
+      (should-not +orgbrain--reply-target))))
+
+(ert-deftest orgbrain-capture-off-is-recorded-rather-than-assumed ()
+  "A `disabled' capture block sets the capture state, so the header can say so.
+`ORGBRAIN_CONVERSATION_RETENTION' defaults off, so a perfect conversation
+ID can accumulate no history at all.  Nothing else in a receipt reveals
+that."
+  (orgbrain-test--with-conversation
+    (+orgbrain--absorb-conversation
+     (+orgbrain--read-json orgbrain-test--capture-off-json))
+    (should (eq +orgbrain--capture-state 'disabled))
+    (should-not +orgbrain--candidate)))
+
+(ert-deftest orgbrain-a-single-turn-receipt-changes-no-conversation-state ()
+  "A legacy receipt carries no conversation block and must not fake one."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--capture-state 'on)
+          (+orgbrain--reply-target "keep"))
+      (+orgbrain--absorb-conversation
+       (+orgbrain--read-json orgbrain-test--ask-json))
+      (should (eq +orgbrain--capture-state 'on))
+      (should (equal +orgbrain--reply-target "keep")))))
+
+;; --- rendering the four outcomes ------------------------------------------
+
+(ert-deftest orgbrain-conversation-outcomes-are-all-rendered ()
+  "Capture, knowledge, answer and delivery each appear in the transcript."
+  (let ((text (+orgbrain--format-body
+               (+orgbrain--read-json orgbrain-test--conversation-json))))
+    (should (string-match-p "-- conversation --" text))
+    (should (string-match-p "id:.*atlas-20260910T120000" text))
+    (should (string-match-p "capture:.*user verified.*assistant verified" text))
+    (should (string-match-p "knowledge:.*pending_confirmation" text))
+    (should (string-match-p "requires_explicit_proposal_approval" text))
+    (should (string-match-p "proposal:.*deterministic replay" text))
+    (should (string-match-p "remember projects/atlas" text))
+    (should (string-match-p "answer:.*succeeded" text))
+    (should (string-match-p "delivery:.*pending" text))
+    (should (string-match-p "turns:.*7fb96a4b1111.*e706977f2222" text))))
+
+(ert-deftest orgbrain-the-owner-is-never-asked-to-yank-the-hash ()
+  "The transcript points at the approval command, not at the hex string.
+Making the owner copy a 64-hex hash by hand is exactly the tax this client
+exists to remove."
+  (let ((text (+orgbrain--format-body
+               (+orgbrain--read-json orgbrain-test--conversation-json))))
+    (should (string-match-p "+orgbrain/approve" text))
+    (should-not (string-match-p orgbrain-test--candidate-hash text))))
+
+(ert-deftest orgbrain-a-failed-composition-explains-itself ()
+  "A failed answer above a decided memory effect reads as what it is.
+
+Capture and the proposal are decided and journaled before COMPOSE runs, so
+this is a normal outcome.  Rendered from `answer_receipt.conversation',
+because that is where a failed composition carries the block.  Without
+this the transcript shows `I could not compose an answer' above a receipt
+that says nothing about why, which reads like a client bug."
+  (let ((text (+orgbrain--format-body
+               (+orgbrain--read-json orgbrain-test--failed-compose-json))))
+    (should (string-match-p "answer:.*failed" text))
+    (should (string-match-p "RuntimeError" text))
+    (should (string-match-p "knowledge:.*pending_confirmation" text))
+    ;; No assistant turn exists in this state, and inventing one would be a
+    ;; lie about what was preserved.  The capture line must claim only the
+    ;; user turn, and the turn line must show the assistant one as absent.
+    (should (string-match-p "capture: *user verified$" text))
+    (should (string-match-p "turns:.*assistant none" text))))
+
+(ert-deftest orgbrain-capture-off-is-visible-in-the-transcript-and-header ()
+  "The owner can tell a retained conversation from an unretained one."
+  (let ((text (+orgbrain--format-body
+               (+orgbrain--read-json orgbrain-test--capture-off-json))))
+    (should (string-match-p "capture:.*disabled" text))
+    (should (string-match-p "RETENTION" (upcase text))))
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--capture-state 'disabled))
+      (should (string-match-p "capture: OFF" (+orgbrain--header-line 'output))))
+    (let ((+orgbrain--conversation-support 'no))
+      (should (string-match-p "conv: unsupported"
+                              (+orgbrain--header-line 'output))))))
+
+(ert-deftest orgbrain-a-legacy-receipt-renders-no-conversation-block ()
+  "Nothing conversational is printed for a single-turn answer."
+  (should-not (string-match-p
+               "-- conversation --"
+               (+orgbrain--format-body
+                (+orgbrain--read-json orgbrain-test--ask-json)))))
+
+;; --- reply targets --------------------------------------------------------
+
+(ert-deftest orgbrain-exchanges-carry-their-turn-ids ()
+  "Turn IDs survive the history round trip, so a reply target can be named."
+  (let ((exchange (+orgbrain--record-exchange
+                   (+orgbrain--read-json orgbrain-test--conversation-json))))
+    (should (equal (plist-get exchange :conversation) "atlas-20260910T120000"))
+    (should (equal (plist-get exchange :user-turn) "7fb96a4b1111"))
+    (should (equal (plist-get exchange :assistant-turn) "e706977f2222"))))
+
+(ert-deftest orgbrain-a-reply-target-is-never-guessed ()
+  "With no replayed exchange the command refuses instead of picking the newest.
+
+The daemon explicitly refuses to guess: `Remember this' with no resolved
+target returns exactly one clarification (`ambiguous_reference') and
+commits nothing.  Approximating the target with \"the latest visible
+message\" is the behaviour the server is designed to prevent, so the
+client must not emulate it."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--exchange-index nil)
+          (+orgbrain--exchanges
+           (list (+orgbrain--record-exchange
+                  (+orgbrain--read-json orgbrain-test--conversation-json)))))
+      (should-error (+orgbrain/set-reply-target) :type 'user-error)
+      (should-not +orgbrain--reply-target))))
+
+(ert-deftest orgbrain-a-reply-target-must-be-in-this-conversation ()
+  "A turn from another conversation is refused, not silently carried over."
+  (orgbrain-test--with-conversation
+    (let* ((+orgbrain--exchanges
+            (list (+orgbrain--record-exchange
+                   (+orgbrain--read-json orgbrain-test--conversation-json))))
+           (+orgbrain--exchange-index 0))
+      ;; The default is the assistant turn -- what "remember this" about a
+      ;; replayed answer means -- and a prefix argument says the question
+      ;; instead.  Both are stated; neither is inferred from the phrasing.
+      (+orgbrain/set-reply-target)
+      (should (equal +orgbrain--reply-target "e706977f2222"))
+      (+orgbrain/set-reply-target t)
+      (should (equal +orgbrain--reply-target "7fb96a4b1111"))
+      (setq +orgbrain--reply-target nil)
+      (let ((+orgbrain--conversation "some-other-conversation"))
+        (should-error (+orgbrain/set-reply-target) :type 'user-error)
+        (should-not +orgbrain--reply-target)))))
+
+(ert-deftest orgbrain-a-pre-conversation-exchange-has-no-reply-target ()
+  "An exchange from before conversational memory is refused with a reason."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--exchanges
+           (list (+orgbrain--record-exchange
+                  (+orgbrain--read-json orgbrain-test--ask-json))))
+          (+orgbrain--exchange-index 0))
+      (should-error (+orgbrain/set-reply-target) :type 'user-error))))
+
+;; --- scope ----------------------------------------------------------------
+
+(ert-deftest orgbrain-switching-project-starts-a-new-conversation ()
+  "A conversation is never carried across a project switch.
+
+The daemon binds a conversation ID to owner + transport + project, so the
+next turn under the same ID would be a different scope: confusing history
+and cross-scope rejections.  Starting a fresh one is the honest half of
+the choice; refusing the switch would trap the workspace in whichever
+project it opened in."
+  (orgbrain-test--with-conversation
+    (let ((before +orgbrain--conversation))
+      (setq +orgbrain--project "wrappers")
+      (+orgbrain--ensure-conversation)
+      (should-not (equal +orgbrain--conversation before))
+      (should (equal +orgbrain--conversation-project "wrappers"))
+      (should (string-prefix-p "wrappers-" +orgbrain--conversation))
+      ;; State that belonged to the old scope goes with it.
+      (should-not +orgbrain--candidate)
+      (should-not +orgbrain--reply-target)
+      (should (eq +orgbrain--capture-state 'unknown)))))
+
+(ert-deftest orgbrain-a-conversation-is-not-regenerated-per-send ()
+  "Within one project the ID is stable: that is what makes turns cohere."
+  (orgbrain-test--with-conversation
+    (let ((first (+orgbrain--ensure-conversation)))
+      (should (equal (+orgbrain--ensure-conversation) first)))))
 
 (provide 'orgbrain-test)
 
