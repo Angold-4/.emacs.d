@@ -460,14 +460,25 @@ no `invalid_conversation_identity'.")
   "Non-nil when ID is a conversation ID the daemon will accept."
   (and (stringp id) (string-match-p +orgbrain--conversation-id-rule id)))
 
+(defvar +orgbrain--conversation-serial 0
+  "Counter making every conversation ID of this session distinct.
+A timestamp alone is not enough: two `gn' presses inside the same tick
+would return the same ID, and `gn' would report a new conversation while
+silently continuing the old one, with its turns still cohering.  A
+counter cannot collide within a session, and the timestamp separates
+sessions.")
+
 (defun +orgbrain--new-conversation-id (project)
   "Return a fresh conversation ID for PROJECT.
-A slug plus a timestamp: readable in `history', unique per conversation,
-and within the daemon's character class once the slug is sanitised."
+A slug, a millisecond timestamp, and a per-session counter: readable in
+`history', unique per conversation, and within the daemon's character
+class once the slug is sanitised.  `gn' promises a *fresh* conversation,
+and an ID that silently repeats breaks that invisibly."
   (let* ((stem (or project "unscoped"))
          (safe (replace-regexp-in-string "[^A-Za-z0-9_-]" "-" stem))
          (safe (if (string-match-p "\\`[A-Za-z0-9]" safe) safe (concat "c" safe)))
-         (id (format "%s-%s" safe (format-time-string "%Y%m%dT%H%M%S"))))
+         (id (format "%s-%s-%d" safe (format-time-string "%Y%m%dT%H%M%S%3N")
+                     (cl-incf +orgbrain--conversation-serial))))
     ;; Truncation cannot break the leading-character rule, and 128 characters
     ;; is far more than a slug plus a timestamp needs.
     (substring id 0 (min (length id) 128))))
@@ -556,12 +567,24 @@ retrieves no dialogue history, and issues no proposals."
                       (+orgbrain--conversation-args))
         :stdin text))
 
-(defconst +orgbrain--remember-opener
-  "\\`[ \t\n]*\\(?:\\(?:can\\|could\\|would\\|will\\) you \\)?\\(?:please \\)?\\(?:remember\\|save\\|keep\\|capture\\|store\\)\\b"
-  "Mirror of the openers the daemon reads as a preservation request.
-Taken from `_REQUEST'/`_REFERENCE' in `orgbrain/conversation_memory.py'.
-Used only to decide whether `propose' needs to add a prefix at all -- the
-daemon, not this regexp, decides what is actually preserved.")
+(defconst +orgbrain--remember-supplied
+  "\\`[ \t\n]*\\(?:\\(?:can\\|could\\|would\\|will\\)[ \t\n]+you[ \t\n]+\\)?\\(?:please[ \t\n]+\\)?\\(?:remember\\|save\\|keep\\|capture\\|store\\)\\(?:[ \t\n]*:\\|[ \t\n]+\\(?:this\\|that\\|it\\|the[ \t\n]+\\(?:discussion\\|conversation\\|above\\|following\\)\\)\\b\\)"
+  "Mirror of the daemon's `_PREFIX' + `_SUPPLIED' opener.
+From `orgbrain/conversation_memory.py' on `feat/conversational-memory'.
+
+Deliberately narrow.  Preservation authority requires the turn to supply
+what is preserved: a deictic pointer at the present dialogue, or content
+after a colon.  Matching the verb alone -- `remember', `save', `capture'
+-- is what an earlier version of this file did, and it was wrong in the
+direction that fails silently: `save my notes about the replay decision'
+opens with a preservation verb, so the prefix was skipped, but the daemon
+reads it as a recall and proposes nothing.
+
+Used only to decide whether `propose' needs to add a prefix at all.  The
+daemon, not this regexp, decides what is actually preserved -- and because
+a mirror drifts whenever the server rule moves, the outcome is also
+reported from the receipt by `+orgbrain--propose-warning', which cannot
+drift.")
 
 (defun +orgbrain--build-propose (text project)
   "Build the proposal call for TEXT, scoped to PROJECT.
@@ -575,13 +598,21 @@ conversational `remember that X' captures the dialogue and creates a
 candidate in `pending_confirmation'; accepted knowledge is unchanged until
 the owner approves that exact candidate, which is `+orgbrain/approve'.
 
-The `remember that ' prefix is added only when the text does not already
-open with a preservation request.  That matters for the one phrasing the
-daemon treats specially: `Remember this' with a resolved
-`--reply-to-turn-id' preserves the turn replied to, and prefixing it would
-turn it into ordinary prose the daemon reads as a statement."
+The `remember that ' prefix is added unless the text already supplies what
+is to be preserved.  The case that must be left alone is `Remember this'
+with a resolved `--reply-to-turn-id': that is the daemon\='s designed path
+for preserving the turn replied to, and prefixing it would turn it into
+ordinary prose read as a statement.
+
+Everything else is prefixed, including text that merely opens with a
+preservation verb -- `remember why we chose sequential execution' is a
+recall to the daemon, and left alone it would answer and propose nothing
+while the owner sat in `propose' mode.  The prefixed form can read
+awkwardly, but the receipt prints the exact proposal and its planned
+operations before anything is admitted, so an awkward extraction is caught
+at the gate.  A silent no-op is not caught anywhere."
   (+orgbrain--build-ask
-   (if (string-match-p +orgbrain--remember-opener text)
+   (if (string-match-p +orgbrain--remember-supplied text)
        text
      (concat "remember that " text))
    project))
@@ -1547,6 +1578,34 @@ whether a knowledge proposal is now waiting for approval."
                              (+orgbrain--truthy
                               (+orgbrain--dig record "request" "entity")))))))))
 
+(defun +orgbrain--propose-warning (record)
+  "Return the line saying a `propose' send proposed nothing, or nil.
+
+The mirror in `+orgbrain--remember-supplied' decides whether to add a
+prefix; this decides nothing and only reports what came back.  That is the
+half that cannot drift: when the daemon\='s classifier moves again -- it
+has moved once already -- the mirror will be wrong and this will still be
+right.
+
+`unchanged' is the daemon saying it read the turn as a read, not a
+preservation request.  Inside the receipt it is one undifferentiated line
+among nine, which is no way to learn that the mode the owner deliberately
+selected did not do its job.  `clarification' is not warned about: the
+daemon puts its own question in the answer text, where it is already
+visible."
+  (let* ((result (+orgbrain--dig record "result"))
+         (receipt (+orgbrain--conversation-receipt result))
+         (status (+orgbrain--dig
+                  (or (+orgbrain--truthy (+orgbrain--dig receipt "knowledge"))
+                      (+orgbrain--truthy (+orgbrain--dig result "memory_receipt")))
+                  "status")))
+    (cond
+     ((not (consp receipt))
+      "propose: this was answered single-turn, so nothing was proposed.  The daemon did not receive a conversation ID -- see `conv:' in the header line.")
+     ((equal status "unchanged")
+      "propose: the daemon did not read this as a preservation request, so nothing was proposed.  It needs the turn to supply what is preserved -- a statement to remember, or `this'/`that' with a reply target armed (`gr').")
+     (t nil))))
+
 (defun +orgbrain--note-unsupported-conversation (problem)
   "Downgrade conversation support when PROBLEM is the daemon rejecting the flag.
 The `--help' probe can be out of date -- the host moved, or the daemon was
@@ -1561,11 +1620,13 @@ single-turn ask instead of failing the same way forever."
     (message "orgbrain: this daemon has no conversational memory; falling back to single-turn asks")
     t))
 
-(defun +orgbrain--finish-send (label text stdout problem)
+(defun +orgbrain--finish-send (label text stdout problem &optional expect-proposal)
   "Render the reply to a LABEL request of TEXT, or report PROBLEM.
 STDOUT is the raw CLI output when the call succeeded.  LABEL rather than a
 mode symbol: approvals are not one of `+orgbrain-modes' -- they are not on
-the TAB cycle by design -- but they land in the transcript the same way."
+the TAB cycle by design -- but they land in the transcript the same way.
+With EXPECT-PROPOSAL non-nil, a reply that proposed nothing is called out
+rather than left as one line inside the receipt block."
   (+orgbrain--stop-tick)
   (setq +orgbrain--pending nil
         +orgbrain--exchanges nil
@@ -1585,10 +1646,12 @@ the TAB cycle by design -- but they land in the transcript the same way."
                                  label (string-trim (or stdout "")))))
      (t
       ;; A fresh receipt echoes no request, so keep what was actually sent.
-      (let ((exchange (plist-put (+orgbrain--record-exchange record) :sent text)))
+      (let ((exchange (plist-put (+orgbrain--record-exchange record) :sent text))
+            (warning (and expect-proposal (+orgbrain--propose-warning record))))
         (+orgbrain--absorb-conversation record)
         (+orgbrain--set-status 'idle)
         (+orgbrain--append (+orgbrain--format-exchange exchange label))
+        (when warning (+orgbrain--append (concat "!! " warning "\n\n")))
         ;; Clear the brief only once the transcript holds it, so a failed
         ;; send never costs the owner the thought they typed.
         (+orgbrain--set-input "")
@@ -1596,9 +1659,13 @@ the TAB cycle by design -- but they land in the transcript the same way."
                  (+orgbrain--format-count
                   (+orgbrain--dig record "result" "answer_receipt"
                                   "latency_ms"))
-                 (if +orgbrain--candidate
-                     ".  A proposal is waiting: `gy' approves it, `gN' rejects it"
-                   "")))))))
+                 (cond
+                  (+orgbrain--candidate
+                   ".  A proposal is waiting: `gy' approves it, `gN' rejects it")
+                  ;; Said in the echo area as well as the transcript: the
+                  ;; whole failure mode is that it goes unnoticed.
+                  (warning (concat ".  " warning))
+                  (t ""))))))))
 
 (defun +orgbrain--assert-idle ()
   "Signal a `user-error' when a request is genuinely still outstanding.
@@ -1617,12 +1684,13 @@ second-guessed, and `+orgbrain/reset' is the hatch."
                     (plist-get +orgbrain--pending :label))
       (setq +orgbrain--pending nil))))
 
-(defun +orgbrain--dispatch (label text request wait)
+(defun +orgbrain--dispatch (label text request wait &optional expect-proposal)
   "Send REQUEST, rendering the reply under LABEL and echoing WAIT while it runs.
 TEXT is what the owner sent, kept because a fresh receipt echoes no
 request.  Shared by `+orgbrain/send' and by the approval commands, which
 are deliberately not modes: a destructive verb should not sit on the TAB
-cycle where a stray keystroke reaches it."
+cycle where a stray keystroke reaches it.  EXPECT-PROPOSAL is passed
+through to `+orgbrain--finish-send'."
   (setq +orgbrain--pending
         (list :label label :started (float-time) :process nil))
   (+orgbrain--set-status 'working)
@@ -1639,7 +1707,8 @@ cycle where a stray keystroke reaches it."
                    (plist-get request :args)
                    (plist-get request :stdin)
                    (lambda (stdout problem)
-                     (+orgbrain--finish-send label text stdout problem)))))
+                     (+orgbrain--finish-send label text stdout problem
+                                             expect-proposal)))))
         ;; Record the process so a flag left behind by a lost callback can
         ;; be recognised as stale.  The reply may already have landed and
         ;; cleared the flag, hence the guard.
@@ -1669,7 +1738,8 @@ while any job is running, and losing a thought is worse than waiting."
                          (+orgbrain--build-request mode text +orgbrain--project)
                          (if (eq mode 'consult)
                              "a consulted ask takes ~5 min"
-                           "an ask takes 19-25s"))))
+                           "an ask takes 19-25s")
+                         (eq mode 'propose))))
 
 (defun +orgbrain/new-conversation ()
   "Start a fresh conversation, so later turns do not cohere with earlier ones.

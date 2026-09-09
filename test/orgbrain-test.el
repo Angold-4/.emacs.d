@@ -1387,24 +1387,57 @@ way forever."
 
 ;; --- propose, not remember ------------------------------------------------
 
-(ert-deftest orgbrain-propose-does-not-re-prefix-a-remember-request ()
-  "`Remember this' is left alone so its reply target can resolve.
+(defconst orgbrain-test--propose-inputs
+  '(;; text                                                     leave alone?
+    ("Remember this"                                            t)
+    ("Remember that ATLAS uses deterministic replay."           t)
+    ("Please remember this: ATLAS uses deterministic replay."   t)
+    ("could you save the discussion"                            t)
+    ("capture it"                                               t)
+    ("store: the ordering rationale"                            t)
+    ("ATLAS uses deterministic replay."                         nil)
+    ("remember our previous discussion about replay"            nil)
+    ("save my notes about the replay decision"                  nil)
+    ("keep the sharding numbers from last week"                 nil)
+    ("capture what I just said about fees"                      nil)
+    ("store the ordering rationale"                             nil)
+    ("remember why we chose sequential execution"               nil)
+    ("Could you remember our earlier reasoning about ordering?" nil))
+  "Propose-mode inputs and whether the client must send them unchanged.
 
-The daemon reads a bare `Remember this' plus a resolved
-`--reply-to-turn-id' as a request to preserve the turn replied to.
-Prefixing it would produce `remember that Remember this', which is
-ordinary prose the daemon reads as a statement, and the reply target would
-never be used."
+The rows marked nil are the ones an earlier version of this file got
+wrong.  Its mirror matched the preservation verb alone, so each of these
+was sent verbatim -- and the daemon's `requested()' declined every one of
+them, because preservation authority needs the turn to supply what is
+preserved.  The owner selected `propose', got an ordinary answer, and
+`knowledge: unchanged' sat as one line inside the receipt.
+
+Verified against `requested()' on `feat/conversational-memory' a6c3e25:
+every nil row is false when sent raw and true once prefixed.")
+
+(ert-deftest orgbrain-propose-prefixes-everything-that-does-not-supply-content ()
+  "The prefix is skipped only for text that already supplies what is preserved.
+
+The daemon requires the verb plus a deictic pointer or a colon, not the
+verb alone.  Skipping on the verb alone is the failure that fails quietly:
+the client sends `save my notes about ...' unchanged, the daemon reads a
+recall, and nothing is proposed."
+  (orgbrain-test--with-conversation
+    (dolist (row orgbrain-test--propose-inputs)
+      (let* ((text (car row))
+             (verbatim (cadr row))
+             (sent (plist-get (+orgbrain--build-request 'propose text "atlas")
+                              :stdin)))
+        (should (equal sent (if verbatim text (concat "remember that " text))))))))
+
+(ert-deftest orgbrain-propose-leaves-a-reply-target-phrasing-alone ()
+  "`Remember this' survives untouched so its reply target can resolve.
+This is the whole reason the skip exists: prefixing it would produce
+ordinary prose, and `--reply-to-turn-id' would never be used."
   (orgbrain-test--with-conversation
     (should (equal (plist-get (+orgbrain--build-request 'propose "Remember this" "atlas")
                               :stdin)
-                   "Remember this"))
-    (should (equal (plist-get (+orgbrain--build-request 'propose "Please save this" "atlas")
-                              :stdin)
-                   "Please save this"))
-    (should (equal (plist-get (+orgbrain--build-request 'propose "we chose Groth16" "atlas")
-                              :stdin)
-                   "remember that we chose Groth16"))))
+                   "Remember this"))))
 
 (ert-deftest orgbrain-propose-mode-is-labelled-honestly ()
   "The mode says it proposes, because under `#95' it writes nothing.
@@ -1659,6 +1692,120 @@ project it opened in."
   (orgbrain-test--with-conversation
     (let ((first (+orgbrain--ensure-conversation)))
       (should (equal (+orgbrain--ensure-conversation) first)))))
+
+;; --- the outcome, which is the part that cannot drift ---------------------
+
+(defconst orgbrain-test--proposed-nothing-json "
+{
+  \"id\": \"beef0001\",
+  \"kind\": \"ask\",
+  \"state\": \"succeeded\",
+  \"request\": { \"entity\": \"projects/atlas\",
+                 \"text\": \"save my notes about the replay decision\" },
+  \"result\": {
+    \"answer\": \"Your notes describe a throughput trade-off.\",
+    \"answer_receipt\": { \"latency_ms\": 12000 },
+    \"memory_receipt\": { \"status\": \"unchanged\" },
+    \"conversation_receipt\": {
+      \"conversation_id\": \"atlas-20260910T120000\",
+      \"capture\": { \"user\": { \"status\": \"verified\", \"turn_id\": \"aaaa\" },
+                     \"assistant\": { \"status\": \"verified\", \"turn_id\": \"bbbb\" } },
+      \"knowledge\": { \"status\": \"unchanged\" },
+      \"answer\": { \"status\": \"succeeded\" },
+      \"delivery\": { \"status\": \"pending\" }
+    }
+  },
+  \"error\": null,
+  \"created_at\": \"2026-09-10T12:03:00.000+00:00\"
+}"
+  "A conversational ask the daemon read as a recall, so it proposed nothing.")
+
+(ert-deftest orgbrain-propose-says-when-it-proposed-nothing ()
+  "A `propose' send that changed no knowledge says so at mode level.
+
+This is the half of the fix that cannot drift.  The prefix mirror encodes
+the daemon's current rule and will be wrong again the next time that rule
+moves -- it has moved once already.  This reports what came back, so it
+stays correct either way."
+  (let ((warning (+orgbrain--propose-warning
+                  (+orgbrain--read-json orgbrain-test--proposed-nothing-json))))
+    (should warning)
+    (should (string-match-p "nothing was proposed" warning))
+    ;; It has to say what to do about it, not just that it happened.
+    (should (string-match-p "gr" warning))))
+
+(ert-deftest orgbrain-propose-is-quiet-when-it-did-propose ()
+  "A proposal, or a clarification, is not warned about.
+`pending_confirmation' is the mode working.  A clarification puts the
+daemon's own question in the answer text, where it is already visible."
+  (should-not (+orgbrain--propose-warning
+               (+orgbrain--read-json orgbrain-test--conversation-json))))
+
+(ert-deftest orgbrain-propose-notices-a-single-turn-fallthrough ()
+  "Propose against a daemon with no conversation path says so explicitly.
+`knowledge' cannot be `unchanged' here -- there is no conversation receipt
+at all -- and silence would look identical to a working proposal."
+  (let ((warning (+orgbrain--propose-warning
+                  (+orgbrain--read-json orgbrain-test--ask-json))))
+    (should warning)
+    (should (string-match-p "single-turn" warning))))
+
+(ert-deftest orgbrain-a-propose-send-actually-asks-for-the-warning ()
+  "The warning reaches the transcript through `+orgbrain/send', not just in unit form.
+
+Testing `+orgbrain--propose-warning' alone leaves the wiring untested: cut
+the `(eq mode \'propose)' argument out of the dispatch and every other test
+in this file still passes, while the mode goes back to failing silently.
+This drives the real send path."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--mode 'propose)
+          (+orgbrain--pending nil)
+          (+orgbrain-transport
+           (lambda (_args _stdin callback)
+             (funcall callback (list :exit 0
+                                     :stdout orgbrain-test--proposed-nothing-json
+                                     :stderr ""))
+             nil)))
+      (unwind-protect
+          (progn
+            (+orgbrain--set-input "save my notes about the replay decision")
+            (+orgbrain/send)
+            (with-current-buffer (+orgbrain--buffer 'output)
+              (should (string-match-p "nothing was proposed" (buffer-string)))))
+        (dolist (kind '(output input))
+          (let ((buffer (get-buffer (+orgbrain--buffer-name kind))))
+            (when (buffer-live-p buffer) (kill-buffer buffer))))))))
+
+(ert-deftest orgbrain-only-propose-mode-is-warned-about ()
+  "The warning rides the mode, not the receipt: `ask' proposing nothing is normal."
+  (orgbrain-test--with-conversation
+    (let ((+orgbrain--pending nil))
+      (cl-letf (((symbol-function '+orgbrain--append) #'ignore)
+                ((symbol-function '+orgbrain--set-input) #'ignore))
+        ;; `expect-proposal' nil is the `ask'/`recall'/`consult' path.
+        (+orgbrain--finish-send "ask" "q" orgbrain-test--proposed-nothing-json nil nil)
+        (should-not +orgbrain--candidate)))))
+
+;; --- fresh means fresh ----------------------------------------------------
+
+(ert-deftest orgbrain-conversation-ids-do-not-collide ()
+  "Two `gn' presses in the same second are two different conversations.
+
+A second-resolution timestamp alone made them identical, so `gn' reported
+a new conversation and silently continued the old one, with its turns
+still cohering.  The failure is invisible, which is what makes it worth a
+test."
+  (let ((ids (mapcar (lambda (_) (+orgbrain--new-conversation-id "atlas"))
+                     (number-sequence 1 50))))
+    (should (= (length ids) (length (delete-dups (copy-sequence ids)))))
+    (should (cl-every #'+orgbrain--conversation-id-valid-p ids)))
+  ;; The same exposure on a fast switch back and forth.
+  (orgbrain-test--with-conversation
+    (let ((seen nil))
+      (dolist (project '("atlas" "wrappers" "atlas" "wrappers"))
+        (setq +orgbrain--project project)
+        (push (+orgbrain--ensure-conversation) seen))
+      (should (= (length seen) (length (delete-dups (copy-sequence seen))))))))
 
 (provide 'orgbrain-test)
 
