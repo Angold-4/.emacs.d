@@ -20,15 +20,42 @@
 ;; Adding the coming `prompt' and `digest' modes is one entry each.
 ;;
 ;; - ask       `orgbrain ask - --json --entity projects/<slug>', text on stdin.
-;; - remember  the same `ask' call with `remember that ' prefixed.  The CLI
+;; - propose   the same `ask' call with `remember that ' prefixed.  The CLI
 ;;             `remember' verb is deliberately NOT used: it fails
 ;;             `remember_not_admitted' when the text does not route to a
 ;;             write, and the conversational path through `ask' is the one that
-;;             scopes correctly.
+;;             scopes correctly.  It proposes rather than writes -- see below.
 ;; - recall    `orgbrain recall <text> --json'.  `recall' takes the query as a
 ;;             positional argument, so this mode sends no stdin.  Recall stays
-;;             unscoped (raw retrieval across the brain), matching the v0.1.0
-;;             contract.
+;;             unscoped (raw retrieval across the brain), and is the one verb
+;;             with no conversation parser, so it starts no conversation.
+;;
+;; Conversations (`Angold-4/orgbrain#95'):
+;;
+;; An ask reaches conversational memory only when it carries a
+;; `--conversation-id'.  Without one the daemon's `validate_request' returns
+;; nil and the job falls through to the legacy single-turn `_ask': nothing is
+;; captured, no dialogue history is retrieved, and no proposal is issued.  So
+;; the workspace holds a conversation ID, starts a fresh one on `gn', and
+;; starts one automatically when the project changes -- the daemon binds an ID
+;; to owner + transport + project, and carrying one across a switch makes the
+;; next turn a different scope under the same ID.
+;;
+;; Capture is not knowledge admission, and the two succeed or fail separately.
+;; A conversational `remember that X' captures the dialogue and creates a
+;; candidate in `pending_confirmation'; accepted knowledge is unchanged until
+;; the owner approves that exact candidate.  Hence `propose', not `remember'.
+;; Approval binds the candidate ID, its 64-hex hash, and its version, and the
+;; daemon refuses every shortcut around them -- so `gy' sends the three fields
+;; structurally out of the receipt rather than making the owner yank a hash out
+;; of the transcript, which is exactly the tax this client exists to remove.
+;;
+;; The conversation receipt reports four independent outcomes -- capture,
+;; knowledge, answer, delivery -- and all four are rendered.  A failed
+;; composition is a normal outcome, not an error to hide: capture and the
+;; proposal are decided and journaled before COMPOSE runs, so an answer reading
+;; "I could not compose an answer" can sit above a verified memory effect, and
+;; no assistant turn is captured in that state.
 ;;
 ;; Keys (Evil normal state, inside the workspace buffers):
 ;;
@@ -36,6 +63,11 @@
 ;; - RET, C-c C-c  send
 ;; - <up>/<down>   walk the current project's dialogue and replay an exchange
 ;; - gp, C-c C-p   switch project (`completing-read')
+;; - gn, C-c C-n   start a new conversation
+;; - gy, C-c C-y   approve the pending knowledge proposal;  gN rejects it
+;; - gr, C-c C-r   aim the next send at the replayed exchange's assistant
+;;                 turn; with a prefix argument, at its user turn
+;; - gc            toggle `--capture-discussion'
 ;; - q             bury the workspace
 ;;
 ;; The project switcher is NOT on `C-x o p' as issue #6 sketched: `C-x o' is
@@ -54,6 +86,16 @@
 ;; - `orgbrain history --json' has no project filter, so `+orgbrain-exchanges'
 ;;   filters client-side.  That single function is the swap point for the
 ;;   per-project dialogue store.
+;; - `#95' is unmerged, and a daemon without it fails `--conversation-id' at
+;;   argparse with `unrecognized arguments' and a nonzero exit -- at the cost
+;;   of whatever brief was just typed.  So `ask --help' is probed once at open,
+;;   the flags are dropped when it does not mention them, and the header line
+;;   says `conv: unsupported'.  A send that is refused that way anyway (the
+;;   probe can go stale) downgrades the client rather than repeating itself.
+;; - `ORGBRAIN_CONVERSATION_RETENTION' defaults off on the daemon, so a perfect
+;;   conversation ID can still accumulate no history.  The receipt says so
+;;   (`capture: {"status": "disabled"}') and the header line reports
+;;   `capture: OFF (retention)' rather than letting it look like it worked.
 ;;
 ;; Requests are serialised: `assert_service_idle' refuses a GBrain write while
 ;; any job runs and an ask takes 19-25 s, so exactly one request is in flight
@@ -166,6 +208,49 @@ A consulted ask runs for about five minutes, and a header that says
 
 (defvar +orgbrain--exchange-index nil
   "Index into `+orgbrain--exchanges' of the replayed exchange, or nil.")
+
+(defvar +orgbrain--conversation nil
+  "Conversation ID every scoped call carries, or nil before the first one.
+The ID is what makes turns cohere on the daemon, so it is neither
+regenerated per send nor kept forever: `+orgbrain/new-conversation' starts
+a fresh one, and switching project starts one automatically because the
+daemon binds an ID to owner + transport + project.")
+
+(defvar +orgbrain--conversation-project nil
+  "Project slug `+orgbrain--conversation' was started under.
+A conversation carried into another project is a different scope under the
+same ID, which the daemon rejects and history renders confusingly.")
+
+(defvar +orgbrain--conversation-support 'unknown
+  "Whether the daemon understands `--conversation-id': `yes', `no', `unknown'.
+`unknown' and `no' both send no conversation flags, so an older daemon
+answers single-turn asks instead of failing at argparse.")
+
+(defvar +orgbrain--capture-state 'unknown
+  "What the last conversation receipt said about capture.
+`on' when a turn was captured, `disabled' when the daemon reported capture
+off, `unknown' before any answer.  The daemon defaults
+`ORGBRAIN_CONVERSATION_RETENTION' off, so a perfect conversation ID can
+still accumulate no history; this is the only way the buffer can say so.")
+
+(defvar +orgbrain--capture-discussion nil
+  "Non-nil to pass `--capture-discussion', forcing capture of a plain turn.
+Retention off means an ordinary question preserves nothing.  This asks for
+this turn to be kept anyway; the daemon still needs a conversation source
+configured and refuses `conversation_source_required' when it has none.")
+
+(defvar +orgbrain--reply-target nil
+  "Turn ID the next send replies to, or nil.
+Armed from a replayed exchange by `+orgbrain/set-reply-target' and cleared
+once used.  The daemon refuses to guess a target -- `Remember this' with
+none resolved returns one clarification and commits nothing -- so this is
+never inferred from \"the latest visible message\".")
+
+(defvar +orgbrain--candidate nil
+  "The pending knowledge proposal from the last answer, or nil.
+A plist with `:id', `:hash', `:version', `:text', `:proposal', `:planned',
+`:conversation', and `:entity'.  Approval binds the exact candidate, so
+every field is carried verbatim rather than reconstructed.")
 
 ;; =============================================================================
 ;; Transport
@@ -298,14 +383,15 @@ the transport: set this to `+orgbrain--transport-local' on the daemon host.")
 (defun +orgbrain--cli (args &optional stdin callback)
   "Call the OrgBrain CLI with ARGS and STDIN through `+orgbrain-transport'.
 Synchronously with CALLBACK nil: return stdout, signalling `user-error' on
-failure.  Otherwise call CALLBACK with (STDOUT . ERROR), exactly one of
-which is non-nil."
+failure.  Otherwise call CALLBACK with STDOUT and ERROR.  A failed job
+can supply both: its JSON receipt still describes independently verified
+effects."
   (if callback
       (funcall +orgbrain-transport args stdin
                (lambda (result)
                  (let ((problem (+orgbrain--result-error result)))
                    (funcall callback
-                            (if problem nil (plist-get result :stdout))
+                            (plist-get result :stdout)
                             problem))))
     (let* ((result (funcall +orgbrain-transport args stdin nil))
            (problem (+orgbrain--result-error result)))
@@ -357,6 +443,114 @@ both come back nil; this can."
   (unless (memq value '(:false :null)) value))
 
 ;; =============================================================================
+;; Conversations
+;; =============================================================================
+;;
+;; `Angold-4/orgbrain#95' routes an ask through `execute_conversation' only
+;; when the request carries a conversation ID; `validate_request' returns nil
+;; without one and the job falls back to the legacy single-turn `_ask'.  So the
+;; ID is not a nicety -- it is the whole switch between this client reaching
+;; conversational memory and never reaching it.
+
+(defconst +orgbrain--conversation-id-rule "\\`[A-Za-z0-9][A-Za-z0-9_-]\\{0,127\\}\\'"
+  "Mirror of the daemon's conversation ID rule (`orgbrain/conversation.py').
+Checked here so a slug with a dot or a slash in it costs no round trip and
+no `invalid_conversation_identity'.")
+
+(defun +orgbrain--conversation-id-valid-p (id)
+  "Non-nil when ID is a conversation ID the daemon will accept."
+  (and (stringp id) (string-match-p +orgbrain--conversation-id-rule id)))
+
+(defvar +orgbrain--conversation-serial 0
+  "Counter making every conversation ID of this session distinct.
+A timestamp alone is not enough: two `gn' presses inside the same tick
+would return the same ID, and `gn' would report a new conversation while
+silently continuing the old one, with its turns still cohering.  A
+counter cannot collide within a session, and the timestamp separates
+sessions.")
+
+(defun +orgbrain--new-conversation-id (project)
+  "Return a fresh conversation ID for PROJECT.
+A slug, a millisecond timestamp, and a per-session counter: readable in
+`history', unique per conversation, and within the daemon's character
+class once the slug is sanitised.  `gn' promises a *fresh* conversation,
+and an ID that silently repeats breaks that invisibly."
+  (let* ((stem (or project "unscoped"))
+         (safe (replace-regexp-in-string "[^A-Za-z0-9_-]" "-" stem))
+         (safe (if (string-match-p "\\`[A-Za-z0-9]" safe) safe (concat "c" safe)))
+         (id (format "%s-%s-%d" safe (format-time-string "%Y%m%dt%H%M%S%3N")
+                     (cl-incf +orgbrain--conversation-serial))))
+    ;; Truncation cannot break the leading-character rule, and 128 characters
+    ;; is far more than a slug plus a timestamp needs.
+    ;; GBrain canonicalizes page slugs to lowercase. Preserve the same ID
+    ;; through capture and exact readback instead of emitting an uppercase T.
+    (downcase (substring id 0 (min (length id) 128)))))
+
+(defun +orgbrain--ensure-conversation ()
+  "Return the current conversation ID, starting one when there is none."
+  (unless (and +orgbrain--conversation
+               (equal +orgbrain--conversation-project +orgbrain--project))
+    (setq +orgbrain--conversation (+orgbrain--new-conversation-id +orgbrain--project)
+          +orgbrain--conversation-project +orgbrain--project
+          +orgbrain--capture-state 'unknown
+          +orgbrain--reply-target nil
+          +orgbrain--candidate nil))
+  +orgbrain--conversation)
+
+(defun +orgbrain--probe-conversation-support ()
+  "Ask the daemon whether `ask' takes `--conversation-id', and cache it.
+
+Probed rather than assumed, and probed with `--help' rather than with a
+real send: `#95' is unmerged, and a daemon without it fails
+`--conversation-id' at argparse with a nonzero exit and `unrecognized
+arguments' -- not a friendly error, and at the cost of whatever brief was
+just typed.  This is the same shape as the `project list' fallback: try,
+degrade, and say so in the header line.
+
+A probe that cannot run at all leaves the support state `unknown', which
+sends no conversation flags either, so a down tunnel never turns into a
+wrong answer about the daemon's features."
+  (setq +orgbrain--conversation-support
+        (condition-case nil
+            (let ((help (+orgbrain--cli '("ask" "--help"))))
+              (if (and (stringp help)
+                       (string-match-p "--conversation-id" help))
+                  'yes
+                'no))
+          (error 'unknown))))
+
+(defun +orgbrain--conversation-args ()
+  "Return the conversation flags for a send, or nil when they must be dropped.
+Reads state only; the probe lives in `+orgbrain--probe-conversation-support'
+so the request builders stay pure and testable."
+  (when (and (eq +orgbrain--conversation-support 'yes)
+             (+orgbrain--conversation-id-valid-p +orgbrain--conversation))
+    (append (list "--conversation-id" +orgbrain--conversation)
+            (when +orgbrain--capture-discussion (list "--capture-discussion"))
+            (when +orgbrain--reply-target
+              (list "--reply-to-turn-id" +orgbrain--reply-target)))))
+
+(defun +orgbrain--conversation-receipt (result)
+  "Return the `conversation_receipt' of RESULT, wherever it is carried.
+A succeeded job puts it at the top level; a job whose composition failed
+carries it under `answer_receipt.conversation', which is also where
+`recover_captures' rewrites it after a retried projection."
+  (or (+orgbrain--truthy (+orgbrain--dig result "conversation_receipt"))
+      (+orgbrain--truthy (+orgbrain--dig result "answer_receipt" "conversation"))))
+
+(defun +orgbrain--conversation-note ()
+  "Return the header-line note describing the conversation scope."
+  (pcase +orgbrain--conversation-support
+    ('no "  |  conv: unsupported")
+    ('unknown "  |  conv: unprobed")
+    (_ (format "  |  conv: %s  |  capture: %s"
+               (or +orgbrain--conversation "none")
+               (pcase +orgbrain--capture-state
+                 ('on "on")
+                 ('disabled "OFF (retention)")
+                 (_ "?"))))))
+
+;; =============================================================================
 ;; Request modes
 ;; =============================================================================
 
@@ -366,16 +560,68 @@ both come back nil; this can."
     (list "--entity" (concat "projects/" project))))
 
 (defun +orgbrain--build-ask (text project)
-  "Build an `ask' call sending TEXT on stdin, scoped to PROJECT."
-  (list :args (append (list "ask" "-" "--json") (+orgbrain--entity-args project))
+  "Build an `ask' call sending TEXT on stdin, scoped to PROJECT.
+Carries the conversation flags when the daemon understands them: without a
+`--conversation-id' the daemon\='s `validate_request' returns nil and the
+job falls through to the legacy single-turn path, which captures nothing,
+retrieves no dialogue history, and issues no proposals."
+  (list :args (append (list "ask" "-" "--json")
+                      (+orgbrain--entity-args project)
+                      (+orgbrain--conversation-args))
         :stdin text))
 
-(defun +orgbrain--build-remember (text project)
-  "Build the conversational remember call for TEXT, scoped to PROJECT.
-This is an `ask' with a `remember that ' prefix.  The CLI `remember' verb
-refuses text that does not route to a write (`remember_not_admitted'), so
-it is never used here."
-  (+orgbrain--build-ask (concat "remember that " text) project))
+(defconst +orgbrain--remember-supplied
+  "\\`[ \t\n]*\\(?:\\(?:can\\|could\\|would\\|will\\)[ \t\n]+you[ \t\n]+\\)?\\(?:please[ \t\n]+\\)?\\(?:remember\\|save\\|keep\\|capture\\|store\\)\\(?:[ \t\n]*:\\|[ \t\n]+\\(?:this\\|that\\|it\\|the[ \t\n]+\\(?:discussion\\|conversation\\|above\\|following\\)\\)\\b\\)"
+  "Mirror of the daemon's `_PREFIX' + `_SUPPLIED' opener.
+From `orgbrain/conversation_memory.py' on `feat/conversational-memory'.
+
+Deliberately narrow.  Preservation authority requires the turn to supply
+what is preserved: a deictic pointer at the present dialogue, or content
+after a colon.  Matching the verb alone -- `remember', `save', `capture'
+-- is what an earlier version of this file did, and it was wrong in the
+direction that fails silently: `save my notes about the replay decision'
+opens with a preservation verb, so the prefix was skipped, but the daemon
+reads it as a recall and proposes nothing.
+
+Used only to decide whether `propose' needs to add a prefix at all.  The
+daemon, not this regexp, decides what is actually preserved -- and because
+a mirror drifts whenever the server rule moves, the outcome is also
+reported from the receipt by `+orgbrain--propose-warning', which cannot
+drift.")
+
+(defun +orgbrain--build-propose (text project)
+  "Build the proposal call for TEXT, scoped to PROJECT.
+
+This is an `ask', never the CLI `remember' verb: that verb fails
+`remember_not_admitted' when the text does not route to a write, and the
+conversational path through `ask' is the one that scopes correctly.
+
+What it now does is propose, not write.  Under `orgbrain#95' a
+conversational `remember that X' captures the dialogue and creates a
+candidate in `pending_confirmation'; accepted knowledge is unchanged until
+the owner approves that exact candidate, which is `+orgbrain/approve'.
+
+The `remember that ' prefix is added unless the text already supplies what
+is to be preserved.  The case that must be left alone is `Remember this'
+with a resolved `--reply-to-turn-id': that is the daemon\='s designed path
+for preserving the turn replied to, and prefixing it would turn it into
+ordinary prose read as a statement.
+
+Everything else is prefixed, including text that merely opens with a
+preservation verb -- `remember why we chose sequential execution' is a
+recall to the daemon, and left alone it would answer and propose nothing
+while the owner sat in `propose' mode.  The prefixed form can read
+awkwardly, but the receipt prints the exact proposal and its planned
+operations before anything is admitted, so an awkward extraction is caught
+at the gate.  A silent no-op is not caught anywhere."
+  (unless (and (eq +orgbrain--conversation-support 'yes)
+               (+orgbrain--conversation-id-valid-p +orgbrain--conversation))
+    (user-error "orgbrain: propose requires conversational memory; input kept. Reconnect to an updated daemon"))
+  (+orgbrain--build-ask
+   (if (string-match-p +orgbrain--remember-supplied text)
+       text
+     (concat "remember that " text))
+   project))
 
 (defun +orgbrain--build-recall (text project)
   "Build a `recall' call for TEXT.
@@ -400,18 +646,56 @@ label is visible in the header line while it runs.
 pipeline.  An older one drops the flag and answers locally, which looks
 identical apart from `consults' being absent from the receipt."
   (list :args (append (list "ask" "-" "--json" "--consult")
-                      (+orgbrain--entity-args project))
+                      (+orgbrain--entity-args project)
+                      ;; `consult' rides the `ask' parser, so it takes the
+                      ;; conversation flags too -- and a five-minute answer is
+                      ;; the last one worth losing from the dialogue.
+                      (+orgbrain--conversation-args))
         :stdin text))
+
+(defun +orgbrain--build-confirm (candidate admit)
+  "Build the approval call for CANDIDATE, admitting it when ADMIT is non-nil.
+
+The three `--confirm-candidate-*' fields are sent structurally, straight
+from the receipt, so the owner never yanks a 64-hex hash by hand.  The
+daemon refuses every shortcut around them -- an ID-only \"yes\", a stale
+hash, a changed replacement target -- so this automates the typing and
+nothing else.
+
+The confirmation text is sent as the request body as well, and not because
+belt and braces are pretty: `validate_request' calls `validate_text'
+before any confirm flag is read, and rejects an empty body with
+`empty_conversation_text'.  An `ask \"\"' carrying only the structured
+fields never reaches the confirmation path at all.
+
+`--conversation-id' is the conversation the proposal was made in.  A
+different one is rejected as `confirmation_scope_mismatch', so it is
+carried on the candidate rather than read from the current workspace."
+  (let ((text (format "%s %s %s v%s"
+                      (if admit "confirm" "reject")
+                      (plist-get candidate :id)
+                      (plist-get candidate :hash)
+                      (plist-get candidate :version))))
+    (list :args (append (list "ask" text "--json")
+                        (+orgbrain--entity-args (plist-get candidate :entity))
+                        (list "--conversation-id"
+                              (plist-get candidate :conversation))
+                        (when admit
+                          (list "--confirm-candidate-id" (plist-get candidate :id)
+                                "--confirm-candidate-hash" (plist-get candidate :hash)
+                                "--confirm-candidate-version"
+                                (format "%s" (plist-get candidate :version)))))
+          :stdin nil)))
 
 (defvar +orgbrain-modes
   '((ask
      :label "ask"
      :builder +orgbrain--build-ask
      :hint "compose an answer from the brain")
-    (remember
-     :label "remember"
-     :builder +orgbrain--build-remember
-     :hint "conversational write through ask")
+    (propose
+     :label "propose"
+     :builder +orgbrain--build-propose
+     :hint "propose a fact; approval is a separate step")
     (recall
      :label "recall"
      :builder +orgbrain--build-recall
@@ -554,14 +838,26 @@ the legacy `remember' verb carries `request.fact'."
       ""))
 
 (defun +orgbrain--record-exchange (record)
-  "Return the exchange plist for job RECORD."
-  (list :id (+orgbrain--truthy (+orgbrain--dig record "id"))
-        :kind (or (+orgbrain--truthy (+orgbrain--dig record "kind")) "ask")
-        :state (or (+orgbrain--truthy (+orgbrain--dig record "state")) "unknown")
-        :entity (+orgbrain--truthy (+orgbrain--dig record "request" "entity"))
-        :created (+orgbrain--truthy (+orgbrain--dig record "created_at"))
-        :sent (+orgbrain--record-sent-text record)
-        :record record))
+  "Return the exchange plist for job RECORD.
+The turn IDs are carried because they are the only thing a reply target
+may be built from: the daemon refuses to resolve `Remember this' against
+\"the latest visible message\" and returns a clarification instead, so
+approximating the target here would defeat that guard on purpose."
+  (let ((conversation (+orgbrain--conversation-receipt
+                       (+orgbrain--dig record "result"))))
+    (list :id (+orgbrain--truthy (+orgbrain--dig record "id"))
+          :kind (or (+orgbrain--truthy (+orgbrain--dig record "kind")) "ask")
+          :state (or (+orgbrain--truthy (+orgbrain--dig record "state")) "unknown")
+          :entity (+orgbrain--truthy (+orgbrain--dig record "request" "entity"))
+          :created (+orgbrain--truthy (+orgbrain--dig record "created_at"))
+          :sent (+orgbrain--record-sent-text record)
+          :conversation (+orgbrain--truthy
+                         (+orgbrain--dig conversation "conversation_id"))
+          :user-turn (+orgbrain--truthy
+                      (+orgbrain--dig conversation "user_turn_id"))
+          :assistant-turn (+orgbrain--truthy
+                           (+orgbrain--dig conversation "assistant_turn_id"))
+          :record record)))
 
 (defun +orgbrain--exchanges-from-records (records project)
   "Return the exchanges in RECORDS belonging to PROJECT, oldest first.
@@ -679,6 +975,111 @@ a consult fired at all, which makes the mode unverifiable from the buffer."
       (+orgbrain--format-consults receipt)))
      "\n")))
 
+(defun +orgbrain--capture-summary (capture)
+  "Return the one-line summary of the CAPTURE block of a conversation receipt.
+The block is either `{\"status\": \"disabled\"}' -- capture off, so nothing
+was preserved however good the conversation ID was -- or a map of role to
+that role\\='s own outcome.  A missing `assistant' key is not an omission: a
+failed composition captures the user turn and never reaches an assistant
+one, and saying so is the difference between a normal outcome and what
+reads as a client bug."
+  (cond
+   ((not (consp capture)) "unknown")
+   ((equal (+orgbrain--dig capture "status") "disabled")
+    "disabled -- the daemon is not retaining dialogue (ORGBRAIN_CONVERSATION_RETENTION)")
+   (t
+    (mapconcat
+     (lambda (cell)
+       (let ((role (car cell))
+             (problem (+orgbrain--truthy (+orgbrain--dig (cdr cell) "error"))))
+         (format "%s %s%s" role
+                 (+orgbrain--format-count (+orgbrain--dig (cdr cell) "status"))
+                 (if problem (format " (%s)" problem) ""))))
+     capture "  "))))
+
+(defun +orgbrain--format-planned (planned)
+  "Return the planned knowledge operations PLANNED, one per line, or nil."
+  (when (consp planned)
+    (mapconcat
+     (lambda (op)
+       (format "                 %s %s -- %s"
+               (+orgbrain--format-count (+orgbrain--dig op "op"))
+               (+orgbrain--format-count (+orgbrain--dig op "entity"))
+               (+orgbrain--format-count (+orgbrain--dig op "fact"))))
+     planned "\n")))
+
+(defun +orgbrain--format-knowledge (knowledge)
+  "Return the knowledge lines of a conversation receipt block KNOWLEDGE.
+The proposal statement and its planned operations are printed in full for
+`pending_confirmation', because inspecting exactly what is about to be
+admitted is the entire point of the approval gate."
+  (let ((status (+orgbrain--dig knowledge "status")))
+    (delq nil
+          (list
+           (format "knowledge:       %s%s"
+                   (+orgbrain--format-count status)
+                   (let ((reason (+orgbrain--truthy
+                                  (+orgbrain--dig knowledge "reason"))))
+                     (if reason (format "  (%s)" reason) "")))
+           (let ((proposal (+orgbrain--truthy
+                            (+orgbrain--dig knowledge "proposal"))))
+             (when proposal (format "  proposal:      %s" proposal)))
+           (+orgbrain--format-planned
+            (+orgbrain--truthy (+orgbrain--dig knowledge "planned")))
+           (when (equal status "pending_confirmation")
+             ;; Not the 64-hex confirmation string: yanking that by hand is
+             ;; the tax this client exists to remove.  `+orgbrain/approve'
+             ;; sends the three structured fields verbatim instead.
+             "  approve:       M-x +orgbrain/approve (gy) -- nothing is admitted until you do")))))
+
+(defun +orgbrain--format-conversation (result)
+  "Return the conversation block of RESULT, or nil when it is single-turn.
+
+Capture, knowledge, answer and delivery succeed or fail independently, so
+all four are printed.  The case that most needs it is a failed
+composition: capture and the proposal are decided and journaled before
+COMPOSE runs, so an answer reading `I could not compose an answer' can sit
+above a perfectly good, verified memory outcome."
+  (let ((receipt (+orgbrain--conversation-receipt result)))
+    (when (consp receipt)
+      (string-join
+       (delq nil
+             (append
+              (list
+               "-- conversation --"
+               (format "id:              %s"
+                       (+orgbrain--format-count
+                        (+orgbrain--dig receipt "conversation_id")))
+               (format "capture:         %s"
+                       (+orgbrain--capture-summary
+                        (+orgbrain--dig receipt "capture"))))
+              (+orgbrain--format-knowledge
+               (or (+orgbrain--truthy (+orgbrain--dig receipt "knowledge"))
+                   (+orgbrain--truthy (+orgbrain--dig result "memory_receipt"))))
+              (list
+               (format "answer:          %s%s"
+                       (+orgbrain--format-count
+                        (+orgbrain--dig receipt "answer" "status"))
+                       (let ((why (+orgbrain--truthy
+                                   (+orgbrain--dig result "answer_receipt"
+                                                   "answer_failure"))))
+                         (if why (format "  (%s)" why) "")))
+               (format "delivery:        %s"
+                       (+orgbrain--format-count
+                        (+orgbrain--dig receipt "delivery" "status")))
+               (let ((user (+orgbrain--truthy
+                            (+orgbrain--dig receipt "user_turn_id")))
+                     (assistant (+orgbrain--truthy
+                                 (+orgbrain--dig receipt "assistant_turn_id"))))
+                 (when (or user assistant)
+                   ;; Printed so `+orgbrain/set-reply-target' has something
+                   ;; visible to name, and so a reply target can be checked
+                   ;; against the transcript rather than taken on trust.
+                   (format "turns:           user %s  assistant %s"
+                           (+orgbrain--format-count user)
+                           (+orgbrain--format-count assistant)))))))
+       "\n"))))
+
 (defun +orgbrain--format-gaps (result)
   "Return the `gaps' block of RESULT, or nil when there are none."
   (let ((gaps (or (+orgbrain--truthy (+orgbrain--dig result "gaps"))
@@ -723,6 +1124,7 @@ a consult fired at all, which makes the mode unverifiable from the buffer."
                  (unless (or answer memory problem)
                    "(no answer in this receipt)")
                  (+orgbrain--format-gaps result)
+                 (+orgbrain--format-conversation result)
                  (+orgbrain--format-receipt result)))
      "\n\n")))
 
@@ -755,6 +1157,9 @@ HEADING defaults to the exchange kind."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'+orgbrain/send)
     (define-key map (kbd "C-c C-p") #'+orgbrain/switch-project)
+    (define-key map (kbd "C-c C-n") #'+orgbrain/new-conversation)
+    (define-key map (kbd "C-c C-y") #'+orgbrain/approve)
+    (define-key map (kbd "C-c C-r") #'+orgbrain/set-reply-target)
     (define-key map (kbd "<up>") #'+orgbrain/previous-exchange)
     (define-key map (kbd "<down>") #'+orgbrain/next-exchange)
     (define-key map (kbd "q") #'+orgbrain/quit)
@@ -777,6 +1182,9 @@ HEADING defaults to the exchange kind."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'+orgbrain/send)
     (define-key map (kbd "C-c C-p") #'+orgbrain/switch-project)
+    (define-key map (kbd "C-c C-n") #'+orgbrain/new-conversation)
+    (define-key map (kbd "C-c C-y") #'+orgbrain/approve)
+    (define-key map (kbd "C-c C-r") #'+orgbrain/set-reply-target)
     map)
   "Keymap for `+orgbrain-input-mode'.")
 
@@ -824,6 +1232,10 @@ other Emacs buffer you type prose into."
   "Return the existing workspace buffer for KIND, or nil."
   (get-buffer (+orgbrain--buffer-name kind)))
 
+(defun +orgbrain--short-id (id)
+  "Return the first eight characters of ID, enough to match against a receipt."
+  (if (and (stringp id) (> (length id) 8)) (substring id 0 8) (or id "")))
+
 (defun +orgbrain--header-line (kind)
   "Return the header line for the KIND pane, `output' or `input'.
 Each pane is labelled, because the two are otherwise indistinguishable
@@ -833,8 +1245,17 @@ send is issued from there, so showing it on the transcript said nothing."
   (concat
    (pcase kind ('output "OUTPUT") ('input "INPUT"))
    (format "  |  project: %s" (or +orgbrain--project "unscoped"))
+   ;; The transcript pane carries the conversation identity and whether the
+   ;; daemon is retaining anything; the input pane carries what a send will
+   ;; do with it.  Splitting them keeps either header readable.
+   (when (eq kind 'output) (+orgbrain--conversation-note))
    (when (eq kind 'input)
-     (format "  |  mode: %s" (+orgbrain--mode-label +orgbrain--mode)))
+     (concat
+      (format "  |  mode: %s" (+orgbrain--mode-label +orgbrain--mode))
+      (when +orgbrain--capture-discussion "  |  +capture")
+      (when +orgbrain--reply-target
+        (format "  |  reply->%s" (+orgbrain--short-id +orgbrain--reply-target)))
+      (when +orgbrain--candidate "  |  proposal pending")))
    (format "  |  %s %s%s"
            (if (eq +orgbrain-transport #'+orgbrain--transport-local)
                "local"
@@ -983,11 +1404,20 @@ displayed buffers need this explicitly."
     (let ((projects (+orgbrain-projects)))
       (setq +orgbrain--project (car (car projects))
             +orgbrain--projects-source (cdr projects))))
+  ;; Probed once per workspace, next to the project list and for the same
+  ;; reason: the feature may not be on the daemon, and finding out at send
+  ;; time costs whatever brief was just typed.
+  (when (eq +orgbrain--conversation-support 'unknown)
+    (+orgbrain--probe-conversation-support))
+  (+orgbrain--ensure-conversation)
   (+orgbrain--display-workspace)
   (+orgbrain--refresh-header)
-  (message "orgbrain: %s, mode %s.  TAB cycles mode, RET sends"
+  (message "orgbrain: %s, mode %s, %s.  TAB cycles mode, RET sends"
            (or +orgbrain--project "unscoped")
-           (+orgbrain--mode-label +orgbrain--mode)))
+           (+orgbrain--mode-label +orgbrain--mode)
+           (if (eq +orgbrain--conversation-support 'yes)
+               (format "conversation %s" +orgbrain--conversation)
+             "single-turn (this daemon has no conversational memory)")))
 
 (defun +orgbrain/cycle-mode ()
   "Cycle the request mode to the next entry in `+orgbrain-modes'."
@@ -1025,9 +1455,20 @@ Choosing `+orgbrain--unscoped-choice' clears the scope: calls pass no
             +orgbrain--exchanges nil
             +orgbrain--exchanges-project nil
             +orgbrain--exchange-index nil))
-    (+orgbrain--refresh-header)
-    (message "orgbrain project: %s (project list from %s)"
-             (or +orgbrain--project "unscoped") source)))
+    ;; The daemon binds a conversation ID to owner + transport + project, so
+    ;; carrying one across a switch makes the next turn a different scope
+    ;; under the same ID -- confusing history, and cross-scope rejections.
+    ;; Starting a fresh one is the honest half of the choice: refusing the
+    ;; switch would trap the workspace in whichever project it happened to
+    ;; open in.
+    (let ((previous +orgbrain--conversation))
+      (+orgbrain--ensure-conversation)
+      (+orgbrain--refresh-header)
+      (message "orgbrain project: %s (project list from %s)%s"
+               (or +orgbrain--project "unscoped") source
+               (if (equal previous +orgbrain--conversation)
+                   ""
+                 (format "; new conversation %s" +orgbrain--conversation))))))
 
 (defconst +orgbrain--slug-rule
   "A project slug is one path segment: no slash, no leading or trailing space."
@@ -1063,7 +1504,7 @@ costs is whatever the owner just typed."
   (interactive)
   (when +orgbrain--pending
     (user-error "orgbrain: %s in flight; a write is refused while a job runs"
-                (+orgbrain--mode-label (plist-get +orgbrain--pending :mode))))
+                (plist-get +orgbrain--pending :label)))
   (let* ((slug (+orgbrain--check-slug
                 (read-string "New project slug (one segment, lowercase): ")))
          (title (string-trim (read-string (format "Title for %s: " slug) slug)))
@@ -1101,20 +1542,121 @@ costs is whatever the owner just typed."
          (message "orgbrain: %s created and selected.  TAB to remember, then seed it"
                   slug))))))
 
-(defun +orgbrain--finish-send (mode text stdout problem)
-  "Render the reply to a MODE request of TEXT, or report PROBLEM.
-STDOUT is the raw CLI output when the call succeeded."
+(defun +orgbrain--absorb-conversation (record)
+  "Update the workspace from the conversation receipt in job RECORD.
+
+Three things are learned from an answer and from nowhere else: whether the
+daemon actually retained the turn, which turn IDs this exchange got, and
+whether a knowledge proposal is now waiting for approval."
+  (let* ((result (+orgbrain--dig record "result"))
+         (receipt (+orgbrain--conversation-receipt result))
+         (capture (+orgbrain--dig receipt "capture"))
+         (knowledge (or (+orgbrain--truthy (+orgbrain--dig receipt "knowledge"))
+                        (+orgbrain--truthy
+                         (+orgbrain--dig result "memory_receipt")))))
+    (when (consp receipt)
+      (setq +orgbrain--capture-state
+            (if (equal (+orgbrain--dig capture "status") "disabled")
+                'disabled
+              'on))
+      ;; Consumed, not sticky: a reply target names one earlier turn for one
+      ;; send, and a stale one would silently re-aim the next brief.
+      (setq +orgbrain--reply-target nil)
+      (setq +orgbrain--candidate
+            (cond
+             ((equal (+orgbrain--dig knowledge "status") "pending_confirmation")
+              (list :id (+orgbrain--dig knowledge "candidate_id")
+                    :hash (+orgbrain--dig knowledge "candidate_hash")
+                    :version (or (+orgbrain--truthy
+                                  (+orgbrain--dig knowledge "candidate_version"))
+                                 1)
+                    :proposal (+orgbrain--truthy
+                               (+orgbrain--dig knowledge "proposal"))
+                    :planned (+orgbrain--truthy
+                              (+orgbrain--dig knowledge "planned"))
+                    ;; The conversation and entity the proposal was made in,
+                    ;; not whatever the workspace is pointing at by the time
+                    ;; approval happens: a different conversation is rejected
+                    ;; as `confirmation_scope_mismatch'.
+                    :conversation (or (+orgbrain--truthy
+                                       (+orgbrain--dig receipt "conversation_id"))
+                                      +orgbrain--conversation)
+                    :entity (+orgbrain--strip-project-prefix
+                             (+orgbrain--truthy
+                              (+orgbrain--dig record "request" "entity")))))
+             ((and (equal (+orgbrain--dig knowledge "candidate_id")
+                          (plist-get +orgbrain--candidate :id))
+                   (or (equal (+orgbrain--dig knowledge "status") "verified")
+                       (equal (+orgbrain--dig knowledge "reason") "owner_rejected")))
+              nil)
+             (t +orgbrain--candidate))))))
+
+(defun +orgbrain--propose-warning (record)
+  "Return the line saying a `propose' send proposed nothing, or nil.
+
+The mirror in `+orgbrain--remember-supplied' decides whether to add a
+prefix; this decides nothing and only reports what came back.  That is the
+half that cannot drift: when the daemon\='s classifier moves again -- it
+has moved once already -- the mirror will be wrong and this will still be
+right.
+
+`unchanged' is the daemon saying it read the turn as a read, not a
+preservation request.  Inside the receipt it is one undifferentiated line
+among nine, which is no way to learn that the mode the owner deliberately
+selected did not do its job.  `clarification' is not warned about: the
+daemon puts its own question in the answer text, where it is already
+visible."
+  (let* ((result (+orgbrain--dig record "result"))
+         (receipt (+orgbrain--conversation-receipt result))
+         (status (+orgbrain--dig
+                  (or (+orgbrain--truthy (+orgbrain--dig receipt "knowledge"))
+                      (+orgbrain--truthy (+orgbrain--dig result "memory_receipt")))
+                  "status")))
+    (cond
+     ((not (consp receipt))
+      (format "propose: single-turn response without a conversation receipt; knowledge status: %s. Inspect the outcome before resubmitting." (or status "unknown")))
+     ((equal status "unchanged")
+      "propose: the daemon did not read this as a preservation request, so nothing was proposed.  It needs the turn to supply what is preserved -- a statement to remember, or `this'/`that' with a reply target armed (`gr').")
+     (t nil))))
+
+(defun +orgbrain--note-unsupported-conversation (problem)
+  "Downgrade conversation support when PROBLEM is the daemon rejecting the flag.
+The `--help' probe can be out of date -- the host moved, or the daemon was
+rolled back mid-session -- and argparse\\='s `unrecognized arguments' is the
+only signal that happens.  Caught here so the next send degrades to a
+single-turn ask instead of failing the same way forever."
+  (when (and (stringp problem)
+             (string-match-p "unrecognized arguments" problem)
+             (string-match-p "--conversation-id\\|--confirm-candidate\\|--reply-to-turn-id\\|--capture-discussion"
+                             problem))
+    (setq +orgbrain--conversation-support 'no)
+    (message "orgbrain: this daemon has no conversational memory; falling back to single-turn asks")
+    t))
+
+(defun +orgbrain--finish-send (label text stdout problem &optional expect-proposal)
+  "Render the reply to a LABEL request of TEXT, or report PROBLEM.
+STDOUT is the raw CLI output when the call succeeded.  LABEL rather than a
+mode symbol: approvals are not one of `+orgbrain-modes' -- they are not on
+the TAB cycle by design -- but they land in the transcript the same way.
+With EXPECT-PROPOSAL non-nil, a reply that proposed nothing is called out
+rather than left as one line inside the receipt block."
   (+orgbrain--stop-tick)
   (setq +orgbrain--pending nil
         +orgbrain--exchanges nil
         +orgbrain--exchanges-project nil
         +orgbrain--exchange-index nil)
-  (let ((label (+orgbrain--mode-label mode))
-        (record (and (null problem) (+orgbrain--parse-json stdout))))
+  (let* ((parsed (+orgbrain--parse-json stdout))
+         (record (and (consp parsed)
+                      (or (null problem)
+                          (and (+orgbrain--dig parsed "id")
+                               (member (+orgbrain--dig parsed "state")
+                                       '("failed" "succeeded"))))
+                      parsed)))
     (cond
-     (problem
+     ((and problem (null record))
       (+orgbrain--set-status 'error)
-      (message "orgbrain: %s" problem))
+      (unless (+orgbrain--note-unsupported-conversation problem)
+        (message "orgbrain: %s" problem)))
      ((null record)
       (+orgbrain--set-status 'error)
       (message "orgbrain: could not parse the %s receipt; see %s"
@@ -1123,70 +1665,216 @@ STDOUT is the raw CLI output when the call succeeded."
                                  label (string-trim (or stdout "")))))
      (t
       ;; A fresh receipt echoes no request, so keep what was actually sent.
-      (let ((exchange (plist-put (+orgbrain--record-exchange record) :sent text)))
-        (+orgbrain--set-status 'idle)
+      (let ((exchange (plist-put (+orgbrain--record-exchange record) :sent text))
+            (warning (and expect-proposal (+orgbrain--propose-warning record)))
+            (failed (or problem (equal (+orgbrain--dig record "state") "failed"))))
+        (+orgbrain--absorb-conversation record)
+        (+orgbrain--set-status (if failed 'error 'idle))
         (+orgbrain--append (+orgbrain--format-exchange exchange label))
+        (when warning (+orgbrain--append (concat "!! " warning "\n\n")))
         ;; Clear the brief only once the transcript holds it, so a failed
         ;; send never costs the owner the thought they typed.
-        (+orgbrain--set-input "")
-        (message "orgbrain %s: done in %s ms" label
+        (unless failed (+orgbrain--set-input ""))
+        (message "orgbrain %s: %s in %s ms%s" label
+                 (if failed "failed; receipt shown, input kept" "done")
                  (+orgbrain--format-count
                   (+orgbrain--dig record "result" "answer_receipt"
-                                  "latency_ms"))))))))
+                                  "latency_ms"))
+                 (cond
+                  (+orgbrain--candidate
+                   ".  A proposal is waiting: `gy' approves it, `gN' rejects it")
+                  ;; Said in the echo area as well as the transcript: the
+                  ;; whole failure mode is that it goes unnoticed.
+                  (warning (concat ".  " warning))
+                  (t ""))))))))
+
+(defun +orgbrain--assert-idle ()
+  "Signal a `user-error' when a request is genuinely still outstanding.
+A flag can outlive the request it describes -- a reloaded module, or a
+build that left it set after a signal -- and then the callback that would
+clear it never runs, so obeying it refuses every later send forever.  A
+flag is judged stale when it records a process that has died, or records
+no `:process' key at all (the shape older state has).  A flag that records
+nil is left alone: a transport that returns no process cannot be
+second-guessed, and `+orgbrain/reset' is the hatch."
+  (when +orgbrain--pending
+    (if (and (plist-member +orgbrain--pending :process)
+             (let ((proc (plist-get +orgbrain--pending :process)))
+               (or (null proc) (process-live-p proc))))
+        (user-error "orgbrain: %s still in flight; send is disabled until it returns (`M-x +orgbrain/reset' if it is not)"
+                    (plist-get +orgbrain--pending :label))
+      (setq +orgbrain--pending nil))))
+
+(defun +orgbrain--dispatch (label text request wait &optional expect-proposal)
+  "Send REQUEST, rendering the reply under LABEL and echoing WAIT while it runs.
+TEXT is what the owner sent, kept because a fresh receipt echoes no
+request.  Shared by `+orgbrain/send' and by the approval commands, which
+are deliberately not modes: a destructive verb should not sit on the TAB
+cycle where a stray keystroke reaches it.  EXPECT-PROPOSAL is passed
+through to `+orgbrain--finish-send'."
+  (setq +orgbrain--pending
+        (list :label label :started (float-time) :process nil))
+  (+orgbrain--set-status 'working)
+  (+orgbrain--start-tick)
+  (message "orgbrain %s: sent to %s, waiting (%s)" label
+           (if (eq +orgbrain-transport #'+orgbrain--transport-local)
+               "this host"
+             +orgbrain-ssh-host)
+           wait)
+  ;; If the dispatch signals, `+orgbrain--pending' must not survive it:
+  ;; a stuck pending refuses every later send until Emacs restarts.
+  (condition-case signalled
+      (let ((proc (+orgbrain--cli
+                   (plist-get request :args)
+                   (plist-get request :stdin)
+                   (lambda (stdout problem)
+                     (+orgbrain--finish-send label text stdout problem
+                                             expect-proposal)))))
+        ;; Record the process so a flag left behind by a lost callback can
+        ;; be recognised as stale.  The reply may already have landed and
+        ;; cleared the flag, hence the guard.
+        (when (and +orgbrain--pending (processp proc))
+          (setq +orgbrain--pending
+                (plist-put +orgbrain--pending :process proc))))
+    (error
+     (+orgbrain--stop-tick)
+     (setq +orgbrain--pending nil)
+     (+orgbrain--set-status 'error)
+     (signal (car signalled) (cdr signalled)))))
 
 (defun +orgbrain/send ()
   "Send the input buffer through the current request mode.
 Refuses while another request is in flight: the daemon rejects a write
 while any job is running, and losing a thought is worse than waiting."
   (interactive)
-  (when +orgbrain--pending
-    ;; A flag can outlive the request it describes -- a reloaded module, or a
-    ;; build that left it set after a signal -- and then the callback that
-    ;; would clear it never runs, so obeying it refuses every later send
-    ;; forever.  A flag is judged stale when it records a process that has
-    ;; died, or records no `:process' key at all (the shape older state has).
-    ;; A flag that records nil is left alone: a transport that returns no
-    ;; process cannot be second-guessed, and `+orgbrain/reset' is the hatch.
-    (if (and (plist-member +orgbrain--pending :process)
-             (let ((proc (plist-get +orgbrain--pending :process)))
-               (or (null proc) (process-live-p proc))))
-        (user-error "orgbrain: %s still in flight; send is disabled until it returns (`M-x +orgbrain/reset' if it is not)"
-                    (+orgbrain--mode-label (plist-get +orgbrain--pending :mode)))
-      (setq +orgbrain--pending nil)))
+  (+orgbrain--assert-idle)
   (let ((text (+orgbrain--input-text))
         (mode +orgbrain--mode))
     (when (string-empty-p text)
       (user-error "orgbrain: the input buffer is empty"))
-    (let* ((request (+orgbrain--build-request mode text +orgbrain--project))
-           (label (+orgbrain--mode-label mode)))
-      (setq +orgbrain--pending
-            (list :mode mode :started (float-time) :process nil))
-      (+orgbrain--set-status 'working)
-      (+orgbrain--start-tick)
-      (message "orgbrain %s: sent to %s, waiting (%s)"
-               label +orgbrain-ssh-host
-               (if (eq mode 'consult)
-                   "a consulted ask takes ~5 min"
-                 "an ask takes 19-25s"))
-      ;; If the dispatch signals, `+orgbrain--pending' must not survive it:
-      ;; a stuck pending refuses every later send until Emacs restarts.
-      (condition-case signalled
-          (let ((proc (+orgbrain--cli
-                       (plist-get request :args)
-                       (plist-get request :stdin)
-                       (lambda (stdout problem)
-                         (+orgbrain--finish-send mode text stdout problem)))))
-            ;; Record the process so a flag left behind by a lost callback can
-            ;; be recognised as stale.  The reply may already have landed and
-            ;; cleared the flag, hence the guard.
-            (when (and +orgbrain--pending (processp proc))
-              (setq +orgbrain--pending
-                    (plist-put +orgbrain--pending :process proc))))
-        (error
-         (+orgbrain--stop-tick)
-         (setq +orgbrain--pending nil)
-         (+orgbrain--set-status 'error)
-         (signal (car signalled) (cdr signalled)))))))
+    ;; `recall' is not a conversation verb -- its parser has no
+    ;; `--conversation-id' -- so it neither starts nor needs one.
+    (unless (eq mode 'recall) (+orgbrain--ensure-conversation))
+    (+orgbrain--dispatch (+orgbrain--mode-label mode) text
+                         (+orgbrain--build-request mode text +orgbrain--project)
+                         (if (eq mode 'consult)
+                             "a consulted ask takes ~5 min"
+                           "an ask takes 19-25s")
+                         (eq mode 'propose))))
+
+(defun +orgbrain/new-conversation ()
+  "Start a fresh conversation, so later turns do not cohere with earlier ones.
+The conversation ID is what makes turns cohere on the daemon, which makes
+both extremes wrong: reusing one forever glues unrelated work together,
+and a new one per send is the single-turn behaviour this replaces."
+  (interactive)
+  (setq +orgbrain--conversation (+orgbrain--new-conversation-id +orgbrain--project)
+        +orgbrain--conversation-project +orgbrain--project
+        +orgbrain--capture-state 'unknown
+        +orgbrain--reply-target nil
+        +orgbrain--candidate nil)
+  (+orgbrain--refresh-header)
+  (message "orgbrain: new conversation %s" +orgbrain--conversation))
+
+(defun +orgbrain/toggle-capture ()
+  "Toggle `--capture-discussion' on the next sends.
+With retention off on the daemon an ordinary question preserves nothing.
+This asks for the turn to be kept anyway.  The daemon still needs a
+dedicated conversation source configured, and refuses the send with
+`conversation_source_required' when it has none."
+  (interactive)
+  (setq +orgbrain--capture-discussion (not +orgbrain--capture-discussion))
+  (+orgbrain--refresh-header)
+  (message "orgbrain: capture-discussion %s"
+           (if +orgbrain--capture-discussion "on" "off")))
+
+(defun +orgbrain/set-reply-target (&optional user-turn)
+  "Aim the next send at the exchange currently replayed by `M-p'/`M-n'.
+
+This is what lets `propose' say `Remember this' about a specific earlier
+exchange.  The daemon explicitly refuses to guess: `Remember this' with no
+resolved target returns one clarification and commits nothing.  So this
+refuses too, rather than falling back to the newest exchange -- emulating
+the guess is the behaviour the server is designed to prevent.
+
+An exchange holds two turns.  The default target is the assistant\='s, which
+is what \"remember this\" about a replayed answer normally means; with a
+prefix argument, USER-TURN, it is the question instead.  Stated rather than
+inferred, and echoed on the way out, because which turn is preserved is
+the whole content of the effect."
+  (interactive "P")
+  (let ((exchange (and +orgbrain--exchange-index
+                       (nth +orgbrain--exchange-index +orgbrain--exchanges))))
+    (unless exchange
+      (user-error "orgbrain: replay an exchange with `M-p' first; a reply target is never guessed"))
+    (let ((turn (if user-turn
+                    (plist-get exchange :user-turn)
+                  (or (plist-get exchange :assistant-turn)
+                      (plist-get exchange :user-turn)))))
+      (unless turn
+        (user-error "orgbrain: that exchange has no captured turn to reply to (it predates conversational memory, or capture was off)"))
+      (unless (equal (plist-get exchange :conversation) +orgbrain--conversation)
+        (user-error "orgbrain: that turn belongs to conversation %s, not %s; `gn' starts a new one but cannot move a turn between them"
+                    (or (plist-get exchange :conversation) "none")
+                    (or +orgbrain--conversation "none")))
+      (setq +orgbrain--reply-target turn)
+      (+orgbrain--refresh-header)
+      (message "orgbrain: next send replies to the %s turn %s"
+               (if (equal turn (plist-get exchange :user-turn)) "user" "assistant")
+               (+orgbrain--short-id turn)))))
+
+(defun +orgbrain--describe-candidate (candidate)
+  "Return the text shown before approving CANDIDATE."
+  (concat (format "Proposal: %s\n" (or (plist-get candidate :proposal) "(none stated)"))
+          (let ((planned (+orgbrain--format-planned (plist-get candidate :planned))))
+            (if planned (concat "Planned:\n" planned "\n") ""))
+          (format "Candidate %s v%s in conversation %s"
+                  (plist-get candidate :id)
+                  (plist-get candidate :version)
+                  (plist-get candidate :conversation))))
+
+(defun +orgbrain--decide-candidate (admit)
+  "Approve the pending proposal when ADMIT is non-nil, otherwise reject it.
+The proposal statement and its planned operations are shown first: seeing
+exactly what is about to be admitted is the entire point of the gate."
+  (+orgbrain--assert-idle)
+  (let ((candidate +orgbrain--candidate))
+    (unless candidate
+      (user-error "orgbrain: no proposal is waiting"))
+    (unless (and (plist-get candidate :id) (plist-get candidate :hash))
+      (user-error "orgbrain: the proposal receipt carried no candidate id and hash"))
+    (+orgbrain--append (format "=== proposal ===\n%s\n\n"
+                               (+orgbrain--describe-candidate candidate)))
+    (unless (yes-or-no-p (format "%s this proposal: %s? "
+                                 (if admit "Approve" "Reject")
+                                 (or (plist-get candidate :proposal)
+                                     (plist-get candidate :id))))
+      (user-error "orgbrain: left the proposal pending"))
+    (let ((request (+orgbrain--build-confirm candidate admit)))
+      ;; Retain the exact candidate until a receipt verifies its disposition.
+      ;; A failed submission or lost reply is not an acknowledgement. Server
+      ;; confirmation rechecks and replay guards remain authoritative.
+      ;; The body, not the last argument: `nth 1' is the `ask' positional,
+      ;; which is the confirmation text the daemon actually matched.
+      (+orgbrain--dispatch (if admit "approve" "reject")
+                           (nth 1 (plist-get request :args))
+                           request
+                           "an approval is an ordinary ask, 19-25s"))))
+
+(defun +orgbrain/approve ()
+  "Approve the knowledge proposal from the last answer.
+Sends the candidate ID, hash, and version structurally, so the owner never
+yanks the 64-hex confirmation string out of the transcript by hand.  That
+is the bandwidth argument, not a nicety: the daemon deliberately refuses
+every shortcut around those three fields, so the typing can only be
+automated, never simplified away."
+  (interactive)
+  (+orgbrain--decide-candidate t))
+
+(defun +orgbrain/reject-proposal ()
+  "Reject the knowledge proposal from the last answer, admitting nothing."
+  (interactive)
+  (+orgbrain--decide-candidate nil))
 
 (defun +orgbrain/reset ()
   "Clear the workspace's request state and rebuild the split.
@@ -1200,7 +1888,14 @@ none is, and for buffers left behind by reloading the module."
         +orgbrain--status 'idle
         +orgbrain--exchanges nil
         +orgbrain--exchanges-project nil
-        +orgbrain--exchange-index nil)
+        +orgbrain--exchange-index nil
+        ;; An armed reply target and a pending proposal both describe a
+        ;; conversation the reset is walking away from.  Re-probing is the
+        ;; point of the hatch when the daemon is what changed.
+        +orgbrain--reply-target nil
+        +orgbrain--candidate nil
+        +orgbrain--capture-state 'unknown
+        +orgbrain--conversation-support 'unknown)
   (+orgbrain/open)
   (message "orgbrain: reset; project %s, mode %s"
            (or +orgbrain--project "unscoped")
@@ -1300,7 +1995,12 @@ thought, so walking the dialogue does not nag."
     (evil-ex-define-cmd "orgbrain" #'+orgbrain/open)
     (evil-ex-define-cmd "orgbrain-project" #'+orgbrain/switch-project)
     (evil-ex-define-cmd "orgbrain-reset" #'+orgbrain/reset)
-    (evil-ex-define-cmd "orgbrain-new-project" #'+orgbrain/new-project))
+    (evil-ex-define-cmd "orgbrain-new-project" #'+orgbrain/new-project)
+    (evil-ex-define-cmd "orgbrain-new-conversation" #'+orgbrain/new-conversation)
+    (evil-ex-define-cmd "orgbrain-approve" #'+orgbrain/approve)
+    (evil-ex-define-cmd "orgbrain-reject" #'+orgbrain/reject-proposal)
+    (evil-ex-define-cmd "orgbrain-reply-to" #'+orgbrain/set-reply-target)
+    (evil-ex-define-cmd "orgbrain-capture" #'+orgbrain/toggle-capture))
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +orgbrain-mode-map
       ;; Visual-line motion, matching `init-git-ui.el'. `gj'/`gk' keep the
@@ -1318,6 +2018,13 @@ thought, so walking the dialogue does not nag."
       (kbd "M-n") #'+orgbrain/next-exchange
       "gp" #'+orgbrain/switch-project
       "gP" #'+orgbrain/new-project
+      ;; The conversation verbs.  Approval is `gy'/`gN' rather than a mode:
+      ;; TAB must not be able to reach a verb that admits knowledge.
+      "gn" #'+orgbrain/new-conversation
+      "gy" #'+orgbrain/approve
+      "gN" #'+orgbrain/reject-proposal
+      "gr" #'+orgbrain/set-reply-target
+      "gc" #'+orgbrain/toggle-capture
       "q" #'+orgbrain/quit
       (kbd "C-h") #'windmove-left
       (kbd "C-l") #'windmove-right
@@ -1346,6 +2053,13 @@ thought, so walking the dialogue does not nag."
       (kbd "M-n") #'+orgbrain/next-exchange
       "gp" #'+orgbrain/switch-project
       "gP" #'+orgbrain/new-project
+      ;; The conversation verbs.  Approval is `gy'/`gN' rather than a mode:
+      ;; TAB must not be able to reach a verb that admits knowledge.
+      "gn" #'+orgbrain/new-conversation
+      "gy" #'+orgbrain/approve
+      "gN" #'+orgbrain/reject-proposal
+      "gr" #'+orgbrain/set-reply-target
+      "gc" #'+orgbrain/toggle-capture
       "q" #'+orgbrain/quit
       (kbd "C-h") #'windmove-left
       (kbd "C-l") #'windmove-right
