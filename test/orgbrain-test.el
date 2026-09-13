@@ -213,10 +213,14 @@ depend on how long the table already is."
 
 (ert-deftest orgbrain-propose-goes-through-ask ()
   "`propose' is an `ask' with a prefix; the `remember' verb is never called."
-  (let* ((+orgbrain--conversation-support 'no)
+  (let* ((+orgbrain--conversation-support 'yes)
+         (+orgbrain--conversation "test-conversation")
+         (+orgbrain--capture-discussion nil)
+         (+orgbrain--reply-target nil)
          (request (+orgbrain--build-request 'propose "we chose Groth16" "wrappers"))
          (args (plist-get request :args)))
-    (should (equal args '("ask" "-" "--json" "--entity" "projects/wrappers")))
+    (should (equal args '("ask" "-" "--json" "--entity" "projects/wrappers"
+                         "--conversation-id" "test-conversation")))
     (should (equal (car args) "ask"))
     (should-not (member "remember" args))
     (should (equal (plist-get request :stdin)
@@ -224,7 +228,10 @@ depend on how long the table already is."
 
 (ert-deftest orgbrain-propose-matches-ask-except-for-the-prefix ()
   "The propose builder differs from ask only in the stdin prefix."
-  (let* ((+orgbrain--conversation-support 'no)
+  (let* ((+orgbrain--conversation-support 'yes)
+         (+orgbrain--conversation "test-conversation")
+         (+orgbrain--capture-discussion nil)
+         (+orgbrain--reply-target nil)
          (propose (+orgbrain--build-request 'propose "x" "orgbrain"))
          (ask (+orgbrain--build-request 'ask "remember that x" "orgbrain")))
     (should (equal (plist-get propose :args) (plist-get ask :args)))
@@ -1806,6 +1813,74 @@ test."
         (setq +orgbrain--project project)
         (push (+orgbrain--ensure-conversation) seen))
       (should (= (length seen) (length (delete-dups (copy-sequence seen))))))))
+
+
+(ert-deftest orgbrain-propose-refuses-unsafe-legacy-fallback ()
+  (dolist (support '(no unknown))
+    (let ((+orgbrain--conversation-support support)
+          (+orgbrain--conversation "test-conversation"))
+      (should-error (+orgbrain--build-propose "ATLAS uses replay." "atlas")
+                    :type 'user-error))))
+
+(ert-deftest orgbrain-failed-job-keeps-stdout-and-renders-effects ()
+  (let* ((record (+orgbrain--read-json orgbrain-test--conversation-json))
+         (output "") (input "keep this brief") status
+         (+orgbrain--candidate nil)
+         (+orgbrain--pending nil)
+         (+orgbrain--conversation "atlas-20260910T120000"))
+    (setcdr (assoc "state" record) "failed")
+    (setcdr (assoc "error" record) "unstructured_attributions")
+    (setcdr (assoc "status" (+orgbrain--dig record "result" "conversation_receipt" "answer")) "failed")
+    (let ((+orgbrain-transport
+           (lambda (_args _stdin callback)
+             (funcall callback (list :exit 1 :stderr "" :stdout (json-encode record))))))
+      (cl-letf (((symbol-function '+orgbrain--stop-tick) #'ignore)
+                ((symbol-function '+orgbrain--set-status) (lambda (value) (setq status value)))
+                ((symbol-function '+orgbrain--append) (lambda (value) (setq output (concat output value))))
+                ((symbol-function '+orgbrain--set-input) (lambda (value) (setq input value))))
+        (+orgbrain--cli '("ask" "-" "--json") input
+                       (lambda (stdout problem)
+                         (should stdout)
+                         (should problem)
+                         (+orgbrain--finish-send "ask" input stdout problem)))
+        (should (eq status 'error))
+        (should (equal input "keep this brief"))
+        (should (string-match-p "answer: *failed" output))
+        (should (string-match-p "knowledge:.*pending_confirmation" output))
+        (should (string-match-p "capture:.*verified" output))
+        (should +orgbrain--candidate)))))
+
+(ert-deftest orgbrain-approval-failure-keeps-exact-candidate ()
+  (let* ((candidate (list :id "mem_aaaaaaaa" :hash orgbrain-test--candidate-hash
+                          :version 1 :conversation "test" :entity "atlas"))
+         (+orgbrain--candidate candidate))
+    (cl-letf (((symbol-function '+orgbrain--assert-idle) #'ignore)
+              ((symbol-function '+orgbrain--append) #'ignore)
+              ((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+              ((symbol-function '+orgbrain--dispatch) (lambda (&rest _) (error "No connection"))))
+      (should-error (+orgbrain--decide-candidate t))
+      (should (equal +orgbrain--candidate candidate)))))
+
+(ert-deftest orgbrain-only-confirmed-disposition-clears-candidate ()
+  (let* ((record (+orgbrain--read-json orgbrain-test--conversation-json))
+         (knowledge (+orgbrain--dig record "result" "conversation_receipt" "knowledge"))
+         (+orgbrain--candidate nil))
+    (+orgbrain--absorb-conversation record)
+    (let ((candidate +orgbrain--candidate))
+      (setcdr (assoc "status" knowledge) "unchanged")
+      (+orgbrain--absorb-conversation record)
+      (should (equal +orgbrain--candidate candidate))
+      (setcdr (assoc "status" knowledge) "failed")
+      (+orgbrain--absorb-conversation record)
+      (should (equal +orgbrain--candidate candidate))
+      (setcdr (assoc "status" knowledge) "verified")
+      (+orgbrain--absorb-conversation record)
+      (should-not +orgbrain--candidate))))
+
+
+(ert-deftest orgbrain-generated-ids-survive-gbrain-slug-normalization ()
+  (let ((id (+orgbrain--new-conversation-id "ATLAS")))
+    (should (equal id (downcase id)))))
 
 (provide 'orgbrain-test)
 

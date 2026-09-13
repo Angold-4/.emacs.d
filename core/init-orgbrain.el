@@ -383,14 +383,15 @@ the transport: set this to `+orgbrain--transport-local' on the daemon host.")
 (defun +orgbrain--cli (args &optional stdin callback)
   "Call the OrgBrain CLI with ARGS and STDIN through `+orgbrain-transport'.
 Synchronously with CALLBACK nil: return stdout, signalling `user-error' on
-failure.  Otherwise call CALLBACK with (STDOUT . ERROR), exactly one of
-which is non-nil."
+failure.  Otherwise call CALLBACK with STDOUT and ERROR.  A failed job
+can supply both: its JSON receipt still describes independently verified
+effects."
   (if callback
       (funcall +orgbrain-transport args stdin
                (lambda (result)
                  (let ((problem (+orgbrain--result-error result)))
                    (funcall callback
-                            (if problem nil (plist-get result :stdout))
+                            (plist-get result :stdout)
                             problem))))
     (let* ((result (funcall +orgbrain-transport args stdin nil))
            (problem (+orgbrain--result-error result)))
@@ -477,11 +478,13 @@ and an ID that silently repeats breaks that invisibly."
   (let* ((stem (or project "unscoped"))
          (safe (replace-regexp-in-string "[^A-Za-z0-9_-]" "-" stem))
          (safe (if (string-match-p "\\`[A-Za-z0-9]" safe) safe (concat "c" safe)))
-         (id (format "%s-%s-%d" safe (format-time-string "%Y%m%dT%H%M%S%3N")
+         (id (format "%s-%s-%d" safe (format-time-string "%Y%m%dt%H%M%S%3N")
                      (cl-incf +orgbrain--conversation-serial))))
     ;; Truncation cannot break the leading-character rule, and 128 characters
     ;; is far more than a slug plus a timestamp needs.
-    (substring id 0 (min (length id) 128))))
+    ;; GBrain canonicalizes page slugs to lowercase. Preserve the same ID
+    ;; through capture and exact readback instead of emitting an uppercase T.
+    (downcase (substring id 0 (min (length id) 128)))))
 
 (defun +orgbrain--ensure-conversation ()
   "Return the current conversation ID, starting one when there is none."
@@ -611,6 +614,9 @@ while the owner sat in `propose' mode.  The prefixed form can read
 awkwardly, but the receipt prints the exact proposal and its planned
 operations before anything is admitted, so an awkward extraction is caught
 at the gate.  A silent no-op is not caught anywhere."
+  (unless (and (eq +orgbrain--conversation-support 'yes)
+               (+orgbrain--conversation-id-valid-p +orgbrain--conversation))
+    (user-error "orgbrain: propose requires conversational memory; input kept. Reconnect to an updated daemon"))
   (+orgbrain--build-ask
    (if (string-match-p +orgbrain--remember-supplied text)
        text
@@ -1557,7 +1563,8 @@ whether a knowledge proposal is now waiting for approval."
       ;; send, and a stale one would silently re-aim the next brief.
       (setq +orgbrain--reply-target nil)
       (setq +orgbrain--candidate
-            (when (equal (+orgbrain--dig knowledge "status") "pending_confirmation")
+            (cond
+             ((equal (+orgbrain--dig knowledge "status") "pending_confirmation")
               (list :id (+orgbrain--dig knowledge "candidate_id")
                     :hash (+orgbrain--dig knowledge "candidate_hash")
                     :version (or (+orgbrain--truthy
@@ -1576,7 +1583,13 @@ whether a knowledge proposal is now waiting for approval."
                                       +orgbrain--conversation)
                     :entity (+orgbrain--strip-project-prefix
                              (+orgbrain--truthy
-                              (+orgbrain--dig record "request" "entity")))))))))
+                              (+orgbrain--dig record "request" "entity")))))
+             ((and (equal (+orgbrain--dig knowledge "candidate_id")
+                          (plist-get +orgbrain--candidate :id))
+                   (or (equal (+orgbrain--dig knowledge "status") "verified")
+                       (equal (+orgbrain--dig knowledge "reason") "owner_rejected")))
+              nil)
+             (t +orgbrain--candidate))))))
 
 (defun +orgbrain--propose-warning (record)
   "Return the line saying a `propose' send proposed nothing, or nil.
@@ -1601,7 +1614,7 @@ visible."
                   "status")))
     (cond
      ((not (consp receipt))
-      "propose: this was answered single-turn, so nothing was proposed.  The daemon did not receive a conversation ID -- see `conv:' in the header line.")
+      (format "propose: single-turn response without a conversation receipt; knowledge status: %s. Inspect the outcome before resubmitting." (or status "unknown")))
      ((equal status "unchanged")
       "propose: the daemon did not read this as a preservation request, so nothing was proposed.  It needs the turn to supply what is preserved -- a statement to remember, or `this'/`that' with a reply target armed (`gr').")
      (t nil))))
@@ -1632,9 +1645,15 @@ rather than left as one line inside the receipt block."
         +orgbrain--exchanges nil
         +orgbrain--exchanges-project nil
         +orgbrain--exchange-index nil)
-  (let ((record (and (null problem) (+orgbrain--parse-json stdout))))
+  (let* ((parsed (+orgbrain--parse-json stdout))
+         (record (and (consp parsed)
+                      (or (null problem)
+                          (and (+orgbrain--dig parsed "id")
+                               (member (+orgbrain--dig parsed "state")
+                                       '("failed" "succeeded"))))
+                      parsed)))
     (cond
-     (problem
+     ((and problem (null record))
       (+orgbrain--set-status 'error)
       (unless (+orgbrain--note-unsupported-conversation problem)
         (message "orgbrain: %s" problem)))
@@ -1647,15 +1666,17 @@ rather than left as one line inside the receipt block."
      (t
       ;; A fresh receipt echoes no request, so keep what was actually sent.
       (let ((exchange (plist-put (+orgbrain--record-exchange record) :sent text))
-            (warning (and expect-proposal (+orgbrain--propose-warning record))))
+            (warning (and expect-proposal (+orgbrain--propose-warning record)))
+            (failed (or problem (equal (+orgbrain--dig record "state") "failed"))))
         (+orgbrain--absorb-conversation record)
-        (+orgbrain--set-status 'idle)
+        (+orgbrain--set-status (if failed 'error 'idle))
         (+orgbrain--append (+orgbrain--format-exchange exchange label))
         (when warning (+orgbrain--append (concat "!! " warning "\n\n")))
         ;; Clear the brief only once the transcript holds it, so a failed
         ;; send never costs the owner the thought they typed.
-        (+orgbrain--set-input "")
-        (message "orgbrain %s: done in %s ms%s" label
+        (unless failed (+orgbrain--set-input ""))
+        (message "orgbrain %s: %s in %s ms%s" label
+                 (if failed "failed; receipt shown, input kept" "done")
                  (+orgbrain--format-count
                   (+orgbrain--dig record "result" "answer_receipt"
                                   "latency_ms"))
@@ -1830,10 +1851,9 @@ exactly what is about to be admitted is the entire point of the gate."
                                      (plist-get candidate :id))))
       (user-error "orgbrain: left the proposal pending"))
     (let ((request (+orgbrain--build-confirm candidate admit)))
-      ;; Cleared before dispatch: whatever the daemon answers, this exact
-      ;; candidate has now been decided, and a second approval of a candidate
-      ;; already applied is refused as stale rather than being a no-op.
-      (setq +orgbrain--candidate nil)
+      ;; Retain the exact candidate until a receipt verifies its disposition.
+      ;; A failed submission or lost reply is not an acknowledgement. Server
+      ;; confirmation rechecks and replay guards remain authoritative.
       ;; The body, not the last argument: `nth 1' is the `ask' positional,
       ;; which is the confirmation text the daemon actually matched.
       (+orgbrain--dispatch (if admit "approve" "reject")
