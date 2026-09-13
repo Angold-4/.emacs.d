@@ -1,0 +1,701 @@
+{
+  "client_revision": "74362176b686a871e01f3299167b26dbd90259ee",
+  "orgbrain_revision": "df5263d86deb8b869bac35911a7b7b4f78670c63",
+  "gbrain_revision": "4deee227be3b9d9ae6322d5f5bd06d3df0088b07",
+  "model": "qwen3.8-27b-local",
+  "method": "real named Emacs daemon, local CLI transport, isolated OrgBrain daemon and GBrain; sequential dependent workflow",
+  "client_tests": {
+    "run": 116,
+    "failed": 0
+  },
+  "cases": [
+    {
+      "job_id": "892bf245a28041f9b1f395d4038efb7a",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": null,
+        "confirm_candidate_id": null,
+        "confirm_candidate_version": null,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t110938913-2",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "Why did we keep sequential execution for deterministic replay?",
+        "transport": "cli"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": "PR 850 adds deterministic replay. The ledger does not state why sequential execution was kept for deterministic replay.",
+      "memory_status": "unchanged",
+      "conversation_receipt": {
+        "answer": {
+          "status": "succeeded"
+        },
+        "assistant_turn_id": "e68286f6e20e5be9862794f4e6ca7ffb",
+        "capture": {
+          "assistant": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/e68286f6e20e5be9862794f4e6ca7ffb",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "e68286f6e20e5be9862794f4e6ca7ffb"
+          },
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/9a087d8f0a135674a060980d495f10b6",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "9a087d8f0a135674a060980d495f10b6"
+          }
+        },
+        "conversation_id": "atlas-20260913t110938913-2",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "status": "unchanged"
+        },
+        "user_turn_id": "9a087d8f0a135674a060980d495f10b6"
+      },
+      "failure_class": null,
+      "rejected_drafts": [
+        "{\"schema_version\":2,\"answer\":\"I couldn't find evidence to answer this in the available context.\",\"citations\":[],\"gaps\":[\"No ledger rows explain why sequential execution was kept for deterministic replay; the only row states that PR 850 adds deterministic replay.\"],\"grounding\":\"absent\",\"attributions\":[]}"
+      ],
+      "latency_ms": 21280,
+      "answer_attribution": {
+        "attributions": [
+          {
+            "citations": [
+              1
+            ],
+            "role": "recollection",
+            "text": "PR 850 adds deterministic replay."
+          },
+          {
+            "citations": null,
+            "role": "reasoning",
+            "text": "The ledger does not state why sequential execution was kept for deterministic replay."
+          }
+        ],
+        "schema_version": 2,
+        "verification": "declared_roles_and_references_only"
+      }
+    },
+    {
+      "job_id": "2799dd88eec64a95a5e6df025e7d171c",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": null,
+        "confirm_candidate_id": null,
+        "confirm_candidate_version": null,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t110938913-2",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "remember that ATLAS uses deterministic replay.",
+        "transport": "cli"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": "The ledger records that PR 850 adds deterministic replay. It also records a prior owner statement that sequential execution was kept because deterministic replay requires stable ordering. I have noted that ATLAS uses deterministic replay.\n\nI saved the discussion.\n\nProposed knowledge change: ATLAS uses deterministic replay.\nTo approve this exact proposal: confirm mem_36fa2c8c47bc44009ce70c97c51d1ade 9ee412d43f06a7be594371fa060d0c32d3df8b0f976c3c02cd424309aba08e55 v1",
+      "memory_status": "pending_confirmation",
+      "conversation_receipt": {
+        "answer": {
+          "status": "succeeded"
+        },
+        "assistant_turn_id": "376417ec3dd254edac8655d83368450f",
+        "capture": {
+          "assistant": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/376417ec3dd254edac8655d83368450f",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "376417ec3dd254edac8655d83368450f"
+          },
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/75910f931d7f5d8d89970024e6c50b8a",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "75910f931d7f5d8d89970024e6c50b8a"
+          }
+        },
+        "conversation_id": "atlas-20260913t110938913-2",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "candidate_hash": "9ee412d43f06a7be594371fa060d0c32d3df8b0f976c3c02cd424309aba08e55",
+          "candidate_id": "mem_36fa2c8c47bc44009ce70c97c51d1ade",
+          "candidate_version": 1,
+          "confirmation_text": "confirm mem_36fa2c8c47bc44009ce70c97c51d1ade 9ee412d43f06a7be594371fa060d0c32d3df8b0f976c3c02cd424309aba08e55 v1",
+          "operation_receipts": null,
+          "planned": [
+            {
+              "entity": "projects/atlas",
+              "fact": "ATLAS uses deterministic replay.",
+              "kind": "fact",
+              "op": "remember",
+              "provenance": "orgbrain cli local",
+              "ttl": null,
+              "visibility": "world"
+            }
+          ],
+          "proposal": "ATLAS uses deterministic replay.",
+          "reason": "requires_explicit_proposal_approval",
+          "source_turn_ids": [
+            "75910f931d7f5d8d89970024e6c50b8a"
+          ],
+          "status": "pending_confirmation"
+        },
+        "user_turn_id": "75910f931d7f5d8d89970024e6c50b8a"
+      },
+      "failure_class": null,
+      "rejected_drafts": [
+        "```json\n{\n  \"schema_version\": 2,\n  \"answer\": \"I couldn't find evidence to answer this in the available context.\",\n  \"citations\": [],\n  \"gaps\": [\n    \"No ledger row records the owner's request to remember that ATLAS uses deterministic replay.\",\n    \"No ledger row records a memory write or confirmation for the statement that ATLAS uses deterministic replay.\"\n  ],\n  \"grounding\": \"absent\",\n  \"attributions\": []\n}\n```"
+      ],
+      "latency_ms": 26670,
+      "answer_attribution": {
+        "attributions": [
+          {
+            "citations": [
+              1
+            ],
+            "role": "recollection",
+            "text": "The ledger records that PR 850 adds deterministic replay."
+          },
+          {
+            "citations": [
+              4
+            ],
+            "role": "recollection",
+            "text": "It also records a prior owner statement that sequential execution was kept because deterministic replay requires stable ordering."
+          },
+          {
+            "citations": [
+              1
+            ],
+            "role": "accepted_knowledge",
+            "text": "I have noted that ATLAS uses deterministic replay."
+          }
+        ],
+        "schema_version": 2,
+        "verification": "declared_roles_and_references_only"
+      }
+    },
+    {
+      "job_id": "87682a33f8dd44f484bb6c3acc6658f5",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": "9ee412d43f06a7be594371fa060d0c32d3df8b0f976c3c02cd424309aba08e55",
+        "confirm_candidate_id": "mem_36fa2c8c47bc44009ce70c97c51d1ade",
+        "confirm_candidate_version": 1,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t110938913-2",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "confirm mem_36fa2c8c47bc44009ce70c97c51d1ade 9ee412d43f06a7be594371fa060d0c32d3df8b0f976c3c02cd424309aba08e55 v1",
+        "transport": "cli"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": "I could not compose an answer for this message. The memory outcome below was decided independently and is verified as stated.\n\nI saved the discussion.\n\nThe approved knowledge change is verified.",
+      "memory_status": "verified",
+      "conversation_receipt": {
+        "answer": {
+          "status": "failed"
+        },
+        "capture": {
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/ae1102bddfa25fe88dab7737d1ba3ef4",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "ae1102bddfa25fe88dab7737d1ba3ef4"
+          }
+        },
+        "conversation_id": "atlas-20260913t110938913-2",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "candidate_hash": "9ee412d43f06a7be594371fa060d0c32d3df8b0f976c3c02cd424309aba08e55",
+          "candidate_id": "mem_36fa2c8c47bc44009ce70c97c51d1ade",
+          "candidate_version": 1,
+          "operation_receipts": [
+            {
+              "degraded_dedup": true,
+              "entity_slug": "projects/atlas",
+              "fact_id": "2",
+              "id": "2",
+              "kind": "fact",
+              "op": "remember",
+              "operation_key": "c2c431e30ee15f596ac8e05deb523238de7fb71b30f2a0f0a53200aad1c1094b",
+              "protocol_version": 1,
+              "readback_hash": "2f2ba0ef452ec35a6570ffa2139a0ab1e70f9f750cf34643e7b5b10a0cd6fabf",
+              "requested_kind": "fact",
+              "requested_ttl": null,
+              "status": "inserted",
+              "status_text": "remembered as fact #2",
+              "valid_until": null,
+              "verification": "id",
+              "verified": true,
+              "visibility": "world"
+            }
+          ],
+          "planned": [
+            {
+              "entity": "projects/atlas",
+              "fact": "ATLAS uses deterministic replay.",
+              "kind": "fact",
+              "op": "remember",
+              "provenance": "orgbrain cli local",
+              "ttl": null,
+              "visibility": "world"
+            }
+          ],
+          "proposal": "ATLAS uses deterministic replay.",
+          "reason": "verified_readback",
+          "source_turn_ids": [
+            "75910f931d7f5d8d89970024e6c50b8a"
+          ],
+          "status": "verified"
+        },
+        "user_turn_id": "ae1102bddfa25fe88dab7737d1ba3ef4"
+      },
+      "failure_class": "unstructured_answer",
+      "rejected_drafts": [
+        "{\"schema_version\":2,\"answer\":\"The memory mem_36fa2c8c47bc44009ce70c97c51d1ade is confirmed as verified. The ledger records that ATLAS uses deterministic replay, and that PR 850 adds deterministic replay.\",\"citations\":[2,1],\"gaps\":[],\"grounding\":\"grounded\",\"attributions\":[{\"role\":\"recollection\",\"text\":\"The memory mem_36fa2c8c47bc44009ce70c97c51d1ade is confirmed as verified.\",\"citations\":[]},{\"role\":\"recollection\",\"text\":\"The ledger records that ATLAS uses deterministic replay, and that PR 850 adds deterministic replay.\",\"citations\":[2,1]}]}"
+      ],
+      "latency_ms": 17333,
+      "answer_attribution": null
+    },
+    {
+      "job_id": "246acc09d96c40cf91e67edfc19d0a7c",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": null,
+        "confirm_candidate_id": null,
+        "confirm_candidate_version": null,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t111044973-3",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "What do we know about ATLAS and deterministic replay?",
+        "transport": "cli"
+      },
+      "job_state": "failed",
+      "error": "unstructured_attributions",
+      "answer": "",
+      "memory_status": null,
+      "conversation_receipt": {
+        "answer": {
+          "status": "failed"
+        },
+        "capture": {
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/279706c593005bdba2d55cbd2dafdd76",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "279706c593005bdba2d55cbd2dafdd76"
+          }
+        },
+        "conversation_id": "atlas-20260913t111044973-3",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "status": "unchanged"
+        },
+        "user_turn_id": "279706c593005bdba2d55cbd2dafdd76"
+      },
+      "failure_class": "unstructured_attributions",
+      "rejected_drafts": [
+        "{\n  \"schema_version\": 2,\n  \"answer\": \"ATLAS uses deterministic replay, and PR 850 adds it. A prior owner statement noted that sequential execution was kept because deterministic replay requires stable ordering.\",\n  \"citations\": [2, 1, \"sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/376417ec3dd254edac8655d83368450f\"],\n  \"gaps\": [],\n  \"grounding\": \"grounded\",\n  \"attributions\": [\n    {\n      \"role\": \"recollection\",\n      \"text\": \"ATLAS uses deterministic replay, and PR 850 adds it.\",\n      \"citations\": [2, 1]\n    },\n    {\n      \"role\": \"recollection\",\n      \"text\": \"A prior owner statement noted that sequential execution was kept because deterministic replay requires stable ordering.\",\n      \"citations\": [\"sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/376417ec3dd254edac8655d83368450f\"]\n    }\n  ]\n}",
+        "{\n  \"schema_version\": 2,\n  \"answer\": \"ATLAS uses deterministic replay, and PR 850 adds it. A prior owner statement noted that sequential execution was kept because deterministic replay requires stable ordering.\",\n  \"citations\": [2, 1, \"sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/376417ec3dd254edac8655d83368450f\"],\n  \"gaps\": [],\n  \"grounding\": \"grounded\",\n  \"attributions\": [\n    {\n      \"role\": \"recollection\",\n      \"text\": \"ATLAS uses deterministic replay, and PR 850 adds it.\",\n      \"citations\": [2, 1]\n    },\n    {\n      \"role\": \"recollection\",\n      \"text\": \"A prior owner statement noted that sequential execution was kept because deterministic replay requires stable ordering.\",\n      \"citations\": [\"sessions/34fccd0d35b0f186/atlas-20260913t110938913-2/376417ec3dd254edac8655d83368450f\"]\n    }\n  ]\n}"
+      ],
+      "latency_ms": 24035,
+      "answer_attribution": null
+    },
+    {
+      "job_id": "2f854502e6e54ba1a654439c0cae3a6c",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": null,
+        "confirm_candidate_id": null,
+        "confirm_candidate_version": null,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t111044973-3",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "remember that ATLAS uses a blue review badge.",
+        "transport": "cli"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": "I couldn't find evidence to answer this in the available context.\n\nI saved the discussion.\n\nProposed knowledge change: ATLAS uses a blue review badge.\nTo approve this exact proposal: confirm mem_720fee68fb5f4c9e9f1e7529069f8bfe 636e6d32fc9b7e0b24b2cee90f00165acf1a44f7d439986ca61c03fdcd034910 v1",
+      "memory_status": "pending_confirmation",
+      "conversation_receipt": {
+        "answer": {
+          "status": "succeeded"
+        },
+        "assistant_turn_id": "40c0efaf61275e2cb915d843f6c8256b",
+        "capture": {
+          "assistant": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/40c0efaf61275e2cb915d843f6c8256b",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "40c0efaf61275e2cb915d843f6c8256b"
+          },
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/b4658f50a76951af8408b210a71af744",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "b4658f50a76951af8408b210a71af744"
+          }
+        },
+        "conversation_id": "atlas-20260913t111044973-3",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "candidate_hash": "636e6d32fc9b7e0b24b2cee90f00165acf1a44f7d439986ca61c03fdcd034910",
+          "candidate_id": "mem_720fee68fb5f4c9e9f1e7529069f8bfe",
+          "candidate_version": 1,
+          "confirmation_text": "confirm mem_720fee68fb5f4c9e9f1e7529069f8bfe 636e6d32fc9b7e0b24b2cee90f00165acf1a44f7d439986ca61c03fdcd034910 v1",
+          "operation_receipts": null,
+          "planned": [
+            {
+              "entity": "projects/atlas",
+              "fact": "ATLAS uses a blue review badge.",
+              "kind": "fact",
+              "op": "remember",
+              "provenance": "orgbrain cli local",
+              "ttl": null,
+              "visibility": "world"
+            }
+          ],
+          "proposal": "ATLAS uses a blue review badge.",
+          "reason": "requires_explicit_proposal_approval",
+          "source_turn_ids": [
+            "b4658f50a76951af8408b210a71af744"
+          ],
+          "status": "pending_confirmation"
+        },
+        "user_turn_id": "b4658f50a76951af8408b210a71af744"
+      },
+      "failure_class": null,
+      "rejected_drafts": [
+        "```json\n{\n  \"schema_version\": 2,\n  \"answer\": \"I couldn't find evidence to answer this in the available context.\",\n  \"citations\": [],\n  \"gaps\": [\n    \"No ledger entry records that ATLAS uses a blue review badge.\",\n    \"The ledger only contains facts about ATLAS using deterministic replay and PR 850 adding deterministic replay.\"\n  ],\n  \"grounding\": \"absent\",\n  \"attributions\": []\n}\n```"
+      ],
+      "latency_ms": 24835,
+      "answer_attribution": {
+        "attributions": null,
+        "schema_version": 2,
+        "verification": "declared_roles_and_references_only"
+      }
+    },
+    {
+      "job_id": "73bb8c4b86db4e139e0cb81069bf8599",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": null,
+        "confirm_candidate_id": null,
+        "confirm_candidate_version": null,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t111044973-3",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "reject mem_720fee68fb5f4c9e9f1e7529069f8bfe 636e6d32fc9b7e0b24b2cee90f00165acf1a44f7d439986ca61c03fdcd034910 v1",
+        "transport": "cli"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": "I couldn't find evidence to answer this in the available context.\n\nI saved the discussion.\n\nAccepted knowledge is unchanged; the memory operation was rejected (owner_rejected).",
+      "memory_status": "rejected",
+      "conversation_receipt": {
+        "answer": {
+          "status": "succeeded"
+        },
+        "assistant_turn_id": "b97aa8bd82de55c887168eccd5b6fe69",
+        "capture": {
+          "assistant": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/b97aa8bd82de55c887168eccd5b6fe69",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "b97aa8bd82de55c887168eccd5b6fe69"
+          },
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/cebd176ce23c5103800f6cb91df661b1",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "cebd176ce23c5103800f6cb91df661b1"
+          }
+        },
+        "conversation_id": "atlas-20260913t111044973-3",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "candidate_hash": "636e6d32fc9b7e0b24b2cee90f00165acf1a44f7d439986ca61c03fdcd034910",
+          "candidate_id": "mem_720fee68fb5f4c9e9f1e7529069f8bfe",
+          "candidate_version": 1,
+          "operation_receipts": null,
+          "planned": [
+            {
+              "entity": "projects/atlas",
+              "fact": "ATLAS uses a blue review badge.",
+              "kind": "fact",
+              "op": "remember",
+              "provenance": "orgbrain cli local",
+              "ttl": null,
+              "visibility": "world"
+            }
+          ],
+          "proposal": "ATLAS uses a blue review badge.",
+          "reason": "owner_rejected",
+          "source_turn_ids": [
+            "b4658f50a76951af8408b210a71af744"
+          ],
+          "status": "rejected"
+        },
+        "user_turn_id": "cebd176ce23c5103800f6cb91df661b1"
+      },
+      "failure_class": null,
+      "rejected_drafts": [
+        "{\"schema_version\":2,\"answer\":\"I couldn't find evidence to answer this in the available context.\",\"citations\":[],\"gaps\":[\"No ledger entry references mem_720fee68fb5f4c9e9f1e7529069f8bfe or 636e6d32fc9b7e0b24b2cee90f00165acf1a44f7d439986ca61c03fdcd034910\",\"No evidence of a rejection action or outcome for the specified memory ID\"],\"grounding\":\"absent\",\"attributions\":[]}"
+      ],
+      "latency_ms": 23395,
+      "answer_attribution": {
+        "attributions": null,
+        "schema_version": 2,
+        "verification": "declared_roles_and_references_only"
+      }
+    },
+    {
+      "job_id": "b6b2950fd5844f37966d513f85abbf8f",
+      "request": {
+        "budget_tokens": 2000,
+        "entity": null,
+        "query": "ATLAS"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": null,
+      "memory_status": null,
+      "conversation_receipt": {},
+      "failure_class": null,
+      "rejected_drafts": [],
+      "latency_ms": 703,
+      "answer_attribution": null
+    },
+    {
+      "job_id": "04349d56a45a4d558a4a9eeb47013e7e",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": null,
+        "confirm_candidate_id": null,
+        "confirm_candidate_version": null,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t111044973-3",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "Please remember this: ATLAS uses deterministic replay. Explain the throughput trade-off and challenge the decision.",
+        "transport": "cli"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": "ATLAS uses deterministic replay, and PR 850 adds deterministic replay. The ledger does not state a throughput trade-off or the rationale for the decision, so I cannot explain the trade-off or challenge the decision from the available evidence.\n\nI saved the discussion.\n\nProposed knowledge change: ATLAS uses deterministic replay.\nTo approve this exact proposal: confirm mem_0c66b5f719824a949d7464c098374817 7d7bd4d2e5f3e51053307c6921aa814d110bd782d4b2e309447fee287c905370 v1",
+      "memory_status": "pending_confirmation",
+      "conversation_receipt": {
+        "answer": {
+          "status": "succeeded"
+        },
+        "assistant_turn_id": "2f8e7fa65bd1592f9c84f04f2ccf22ba",
+        "capture": {
+          "assistant": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/2f8e7fa65bd1592f9c84f04f2ccf22ba",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "2f8e7fa65bd1592f9c84f04f2ccf22ba"
+          },
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/9e71feb6a11e5498aedc3c4da2fe913f",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "9e71feb6a11e5498aedc3c4da2fe913f"
+          }
+        },
+        "conversation_id": "atlas-20260913t111044973-3",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "candidate_hash": "7d7bd4d2e5f3e51053307c6921aa814d110bd782d4b2e309447fee287c905370",
+          "candidate_id": "mem_0c66b5f719824a949d7464c098374817",
+          "candidate_version": 1,
+          "confirmation_text": "confirm mem_0c66b5f719824a949d7464c098374817 7d7bd4d2e5f3e51053307c6921aa814d110bd782d4b2e309447fee287c905370 v1",
+          "operation_receipts": null,
+          "planned": [
+            {
+              "entity": "projects/atlas",
+              "fact": "ATLAS uses deterministic replay.",
+              "kind": "fact",
+              "op": "remember",
+              "provenance": "orgbrain cli local",
+              "ttl": null,
+              "visibility": "world"
+            }
+          ],
+          "proposal": "ATLAS uses deterministic replay.",
+          "reason": "requires_explicit_proposal_approval",
+          "source_turn_ids": [
+            "9e71feb6a11e5498aedc3c4da2fe913f"
+          ],
+          "status": "pending_confirmation"
+        },
+        "user_turn_id": "9e71feb6a11e5498aedc3c4da2fe913f"
+      },
+      "failure_class": null,
+      "rejected_drafts": [],
+      "latency_ms": 22443,
+      "answer_attribution": {
+        "attributions": [
+          {
+            "citations": [
+              2,
+              1
+            ],
+            "role": "recollection",
+            "text": "ATLAS uses deterministic replay, and PR 850 adds deterministic replay."
+          },
+          {
+            "citations": null,
+            "role": "reasoning",
+            "text": "The ledger does not state a throughput trade-off or the rationale for the decision, so I cannot explain the trade-off or challenge the decision from the available evidence."
+          }
+        ],
+        "schema_version": 2,
+        "verification": "declared_roles_and_references_only"
+      }
+    },
+    {
+      "job_id": "f662a2ce11984b0090a540c5ef5de411",
+      "request": {
+        "budget_tokens": 2000,
+        "capture_discussion": "false",
+        "confirm_candidate_hash": null,
+        "confirm_candidate_id": null,
+        "confirm_candidate_version": null,
+        "consult": "false",
+        "conversation_id": "atlas-20260913t111044973-3",
+        "entity": "projects/atlas",
+        "identity": "local",
+        "owner_authorized": true,
+        "reply_to_turn_id": null,
+        "text": "Could you remember our previous discussion about replay?",
+        "transport": "cli"
+      },
+      "job_state": "succeeded",
+      "error": null,
+      "answer": "Our previous discussion about replay was in the ATLAS project. You asked me to remember that ATLAS uses deterministic replay, and to explain the throughput trade-off and challenge the decision. I responded that the ledger did not state a throughput trade-off or the rationale for the decision, so I could not explain the trade-off or challenge the decision from the available evidence.",
+      "memory_status": "unchanged",
+      "conversation_receipt": {
+        "answer": {
+          "status": "succeeded"
+        },
+        "assistant_turn_id": "acda3a3a695a5b12b87cde02e3746bdd",
+        "capture": {
+          "assistant": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/acda3a3a695a5b12b87cde02e3746bdd",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "acda3a3a695a5b12b87cde02e3746bdd"
+          },
+          "user": {
+            "error": null,
+            "slug": "sessions/34fccd0d35b0f186/atlas-20260913t111044973-3/7b39f101a45c540692ac068cea9db6de",
+            "source": "dialogue",
+            "status": "verified",
+            "turn_id": "7b39f101a45c540692ac068cea9db6de"
+          }
+        },
+        "conversation_id": "atlas-20260913t111044973-3",
+        "delivery": {
+          "status": "pending"
+        },
+        "knowledge": {
+          "status": "unchanged"
+        },
+        "user_turn_id": "7b39f101a45c540692ac068cea9db6de"
+      },
+      "failure_class": null,
+      "rejected_drafts": [],
+      "latency_ms": 16174,
+      "answer_attribution": {
+        "attributions": [
+          {
+            "citations": [
+              3
+            ],
+            "role": "recollection",
+            "text": "Our previous discussion about replay was in the ATLAS project. You asked me to remember that ATLAS uses deterministic replay, and to explain the throughput trade-off and challenge the decision."
+          },
+          {
+            "citations": [
+              4
+            ],
+            "role": "recollection",
+            "text": "I responded that the ledger did not state a throughput trade-off or the rationale for the decision, so I could not explain the trade-off or challenge the decision from the available evidence."
+          }
+        ],
+        "schema_version": 2,
+        "verification": "declared_roles_and_references_only"
+      }
+    }
+  ],
+  "accepted_facts": [
+    "ATLAS uses deterministic replay.",
+    "PR 850 adds deterministic replay."
+  ],
+  "dialogue_fact_count": 0,
+  "protected_unchanged": true,
+  "limitations": [
+    "Initial uppercase-ID run exposed unverified capture and is not counted as a passing workflow.",
+    "A stale bytecode startup repeated the uppercase defect before explicit source reload.",
+    "One cross-conversation ask failed on slug-valued attribution citations.",
+    "Approval verified its effect despite failed optional composition.",
+    "Mixed request returned a proposal but declined substantive trade-off analysis.",
+    "First rationale answer missed the available historical rationale.",
+    "These are dependent sequential requests, not an independent quality-rate estimate."
+  ]
+}

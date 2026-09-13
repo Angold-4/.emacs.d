@@ -74,3 +74,27 @@ The lowercase rule was found by the real stack test: GBrain canonicalizes
 return successfully while every capture stayed `pending_retry`. New IDs now
 remain lowercase, including the project stem. Existing uppercase IDs are not
 rewritten: use `gn` to start a new conversation after updating the client.
+
+## Measured result, 2026-09-13
+
+[Recorded outcomes and rejected drafts](orgbrain-live-evidence.json) cover nine
+requests through client `7436217` and OrgBrain `df5263d`: eight returned job
+results and one failed. This is not nine successful answers or a clean quality
+acceptance. The first rationale answer missed historical evidence, approval's
+optional composition failed while its knowledge effect verified, and the mixed
+remember/advice answer declined the requested trade-off analysis. The failed
+cross-conversation ask cited a page slug instead of a numbered ledger row on
+both compose attempts; the client displayed the failed receipt and kept input.
+
+Propose, exact approval, rejection and raw recall all reached the actual daemon.
+Final accepted knowledge held only the seed and the explicitly approved replay
+fact. The rejected badge claim was absent; dialogue contained zero fact rows.
+Capture was verified for the new lowercase-ID turns (a failed composition has
+no assistant turn to capture). Production GBrain, agenda and protected-file
+fingerprints were unchanged. All 116 ERT tests passed; byte-compilation and
+whitespace checks passed.
+
+An initial uppercase-ID run and one stale-bytecode launch are retained in local
+logs, not counted as passing evidence. The latter is why the instructions above
+load source explicitly. Client fixes are pushed; the remaining answer failures
+belong to PR #95. No production service was restarted or retention enabled.
