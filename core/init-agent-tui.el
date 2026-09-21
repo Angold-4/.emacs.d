@@ -5,19 +5,26 @@
 ;;; Commentary:
 ;;
 ;; OpenCode and Claude Code are full-screen TUIs (Bubble Tea and a custom
-;; Ink-style renderer) that we run inside vterm.  Their own cursor is moved
-;; with the arrow keys and PageUp/PageDown, which is awkward from Evil normal
-;; state.  This module turns those keys into the Vim vocabulary we already use
-;; for buffers:
+;; Ink-style renderer) that we run inside vterm.  Scrolling their output and
+;; moving around it means reaching for PageUp/PageDown, which is awkward from
+;; Evil normal state, and sending them arrow keys is worse: their arrow keys
+;; drive the agent's own focus and history (OpenCode drops you into the input
+;; box), not a cursor over the transcript.
 ;;
-;;   j / k    send <down> / <up>       and nudge Emacs point with them
-;;   h / l    send <left> / <right>    and nudge Emacs point with them
-;;   J / K    send <next> / <prior>    (PageDown / PageUp)
+;; So this module treats the frozen screen like a buffer and moves the real
+;; Emacs cursor over it, while leaving the agent's own keys for paging:
+;;
+;;   j / k    move the cursor down / up a line (smooth, no keys sent)
+;;   h / l    move the cursor left / right a character
+;;   J / K    send <next> / <prior>  (PageDown / PageUp) to page the agent
 ;;   RET      click the terminal cell under point (SGR mouse)
 ;;   i / a    enter insert state so real keys reach the agent
 ;;   p        paste the clipboard into the agent's input
 ;;   yy       yank the current line, stripped of TUI box drawing
 ;;   q        bury the buffer
+;;
+;; init-tools.el already freezes the selected vterm viewport in normal state,
+;; so the cursor stays over a stable screen and the app cannot scroll it away.
 ;;
 ;; Both agents enable xterm mouse tracking once their session is live
 ;; (verified: OpenCode emits ?1000h/?1002h/?1003h/?1006h on startup, Claude
@@ -27,9 +34,8 @@
 ;;
 ;; A synthetic click is sent as an SGR sequence directly to the PTY
 ;; (`process-send-string'), bypassing libvterm, because emacs-libvterm does
-;; not forward mouse events.  The cell is computed from the frozen viewport
-;; that init-tools.el maintains in normal state, so the click lands on the
-;; row Emacs is showing.
+;; not forward mouse events.  The cell is computed from the frozen viewport,
+;; so the click lands on the row Emacs is showing.
 ;;
 ;; Auto-enabled for vterm buffers named "*opencode*" / "*claude*" (see
 ;; `+agent-tui-buffer-name-regexp') and for any buffer whose terminal title
@@ -52,6 +58,8 @@
 (declare-function evil-normal-state "evil" (&optional arg))
 (declare-function evil-next-line "evil-commands" (&optional count))
 (declare-function evil-previous-line "evil-commands" (&optional count))
+(declare-function evil-backward-char "evil-commands" (&optional count))
+(declare-function evil-forward-char "evil-commands" (&optional count))
 (declare-function evil-delete "evil-commands" (beg end &optional type register yank-handler))
 (declare-function +clipboard/get "init-core" (&optional arg))
 
@@ -181,33 +189,29 @@ PRESS non-nil means a button press, nil a release.  Coordinates are
 ;; Navigation commands
 ;; =============================================================================
 
+;; j/k/h/l move the Emacs cursor over the frozen screen instead of poking the
+;; agent.  The agent's arrow keys change its own focus and history (OpenCode
+;; jumps to the input box), which is not what "move the cursor" should mean.
+
 (defun +agent-tui-down (count)
-  "Send COUNT Down keys to the agent, moving point along."
+  "Move the cursor COUNT lines down over the frozen agent screen."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<down>")
-    (ignore-errors (forward-line 1))))
+  (evil-next-line (or count 1)))
 
 (defun +agent-tui-up (count)
-  "Send COUNT Up keys to the agent, moving point along."
+  "Move the cursor COUNT lines up over the frozen agent screen."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<up>")
-    (ignore-errors (forward-line -1))))
+  (evil-previous-line (or count 1)))
 
 (defun +agent-tui-left (count)
-  "Send COUNT Left keys to the agent, moving point along."
+  "Move the cursor COUNT characters left over the frozen agent screen."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<left>")
-    (ignore-errors (backward-char 1))))
+  (evil-backward-char (or count 1)))
 
 (defun +agent-tui-right (count)
-  "Send COUNT Right keys to the agent, moving point along."
+  "Move the cursor COUNT characters right over the frozen agent screen."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<right>")
-    (ignore-errors (forward-char 1))))
+  (evil-forward-char (or count 1)))
 
 (defun +agent-tui-page-down (count)
   "Send COUNT PageDown keys to the agent, moving point along."

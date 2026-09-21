@@ -127,14 +127,15 @@ synchronization. See [git.md](git.md) for the daily workflow and
 
 ### Agent TUIs (OpenCode / Claude Code)
 
-In a vterm running OpenCode or Claude Code, Evil normal state drives the
-agent's own cursor instead of the frozen buffer:
+In a vterm running OpenCode or Claude Code, Evil normal state moves a cursor
+over the frozen screen (the agent's own arrow keys drive its focus and history,
+not a cursor, so we leave those alone):
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Agent Down / Up (arrow keys) |
-| `h` / `l` | Agent Left / Right |
-| `J` / `K` | Agent PageDown / PageUp |
+| `j` / `k` | Move cursor down / up a line |
+| `h` / `l` | Move cursor left / right |
+| `J` / `K` | Page the agent (PageDown / PageUp) |
 | `RET` | Click the cell under the cursor (falls back to Return) |
 | `i` / `a` | Insert state (real keystrokes reach the agent) |
 | `p` | Paste the clipboard into the agent |
