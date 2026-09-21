@@ -55,6 +55,21 @@
   (should-not (+agent-tui-mouse-mode-after-output nil "plain output")))
 
 ;; =============================================================================
+;; Alternate-screen detection
+;; =============================================================================
+
+(ert-deftest agent-tui-alt-screen-enter-and-leave ()
+  "Entering and leaving the alternate screen is tracked."
+  (should (+agent-tui-alt-screen-after-output nil "\e[?1049h"))
+  (should-not (+agent-tui-alt-screen-after-output t "\e[?1049l"))
+  (should (+agent-tui-alt-screen-after-output nil "\e[?1047h")))
+
+(ert-deftest agent-tui-alt-screen-absent-for-inline ()
+  "Inline renderers never set an alt-screen mode."
+  (should-not (+agent-tui-alt-screen-after-output nil "\e[?2004h\e[?1004h"))
+  (should-not (+agent-tui-alt-screen-after-output nil "plain output")))
+
+;; =============================================================================
 ;; Title detection
 ;; =============================================================================
 

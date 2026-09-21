@@ -27,6 +27,19 @@
 ;; init-tools.el already freezes the selected vterm viewport in normal state,
 ;; so the cursor stays over a stable screen and the app cannot scroll it away.
 ;;
+;; Both agents also have an inline (non-alternate-screen) mode, where the
+;; transcript flows into the terminal scrollback instead:
+;;
+;;   Claude Code:  CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude
+;;   OpenCode:     opencode --mini
+;;
+;; We track whether the app took the alternate screen from its output.  When
+;; it did not, this buffer is an ordinary scrollback buffer, so j/k/h/l walk
+;; the whole transcript, J/K page it with evil-scroll-page-down/up, and RET
+;; simply sends Return rather than trying to click a cell that may be history.
+;; The launchers use the inline modes by default where they do not lose
+;; features (see `+agent-tui-claude-command' / `+agent-tui-opencode-command').
+;;
 ;; Both agents enable xterm mouse tracking once their session is live
 ;; (verified: OpenCode emits ?1000h/?1002h/?1003h/?1006h on startup, Claude
 ;; Code after the trust prompt).  We watch terminal output for those DECSET
@@ -61,6 +74,8 @@
 (declare-function evil-previous-line "evil-commands" (&optional count))
 (declare-function evil-backward-char "evil-commands" (&optional count))
 (declare-function evil-forward-char "evil-commands" (&optional count))
+(declare-function evil-scroll-page-down "evil-commands" (&optional count))
+(declare-function evil-scroll-page-up "evil-commands" (&optional count))
 (declare-function evil-delete "evil-commands" (beg end &optional type register yank-handler))
 (declare-function +clipboard/get "init-core" (&optional arg))
 
@@ -97,10 +112,13 @@ Titles end with BEL or the ST sequence ESC backslash.")
 (defconst +agent-tui--mouse-modes '("1000" "1002" "1003")
   "DEC private modes that make an application report mouse events.")
 
-(defun +agent-tui-mouse-mode-after-output (current input)
-  "Return mouse-tracking state after terminal INPUT, given CURRENT state.
-INPUT is a raw chunk of terminal output.  Returns non-nil when the most
-recent DECSET mouse mode was an enable, nil when it was a disable."
+(defconst +agent-tui--alt-screen-modes '("1047" "1049")
+  "DEC private modes that switch an application to the alternate screen.")
+
+(defun +agent-tui-decset-state-after-output (modes current input)
+  "Return the state of MODES after terminal INPUT, given CURRENT state.
+MODES is a list of DEC private mode numbers.  Returns non-nil when the
+most recent set (`h') or reset (`l') among them was a set."
   (let ((mode current)
         (start 0))
     (while (string-match +agent-tui--decset-regexp input start)
@@ -109,10 +127,18 @@ recent DECSET mouse mode was an enable, nil when it was a disable."
       (let* ((param-string (match-string 1 input))
              (enabled (string= "h" (match-string 2 input)))
              (params (split-string param-string ";" t)))
-        (when (seq-intersection params +agent-tui--mouse-modes)
+        (when (seq-intersection params modes)
           (setq mode enabled)))
       (setq start (match-end 0)))
     mode))
+
+(defun +agent-tui-mouse-mode-after-output (current input)
+  "Return mouse-tracking state after terminal INPUT, given CURRENT state."
+  (+agent-tui-decset-state-after-output +agent-tui--mouse-modes current input))
+
+(defun +agent-tui-alt-screen-after-output (current input)
+  "Return alternate-screen state after terminal INPUT, given CURRENT state."
+  (+agent-tui-decset-state-after-output +agent-tui--alt-screen-modes current input))
 
 (defun +agent-tui-title-matches-p (input)
   "Return non-nil when terminal INPUT sets an agent TUI title."
@@ -134,6 +160,11 @@ recent DECSET mouse mode was an enable, nil when it was a disable."
 
 (defvar-local +agent-tui-mouse-tracking nil
   "Non-nil when the running application enables mouse reporting.")
+
+(defvar-local +agent-tui-alt-screen nil
+  "Non-nil when the running application owns the alternate screen.
+When nil the agent renders inline, so the transcript accumulates in the
+terminal scrollback and this buffer behaves like an ordinary text buffer.")
 
 ;; =============================================================================
 ;; Sending input
@@ -214,30 +245,37 @@ PRESS non-nil means a button press, nil a release.  Coordinates are
 ;; Navigation commands
 ;; =============================================================================
 
-;; j/k/h/l move the Emacs cursor over the frozen screen instead of poking the
-;; agent.  The agent's arrow keys change its own focus and history (OpenCode
-;; jumps to the input box), which is not what "move the cursor" should mean.
-;; The frozen buffer is only one screen tall, so at the top/bottom edge j/k
-;; scroll the agent itself (wheel, or a page key without mouse support) and the
-;; cursor stays on the edge while the transcript moves past it.
+;; j/k/h/l move the Emacs cursor instead of poking the agent.  The agent's
+;; arrow keys change its own focus and history (OpenCode jumps to the input
+;; box), which is not what "move the cursor" should mean.
+;;
+;; On the alternate screen the frozen buffer is only one page tall, so at the
+;; top/bottom edge j/k scroll the agent itself (wheel, or a page key without
+;; mouse support) and the cursor stays on the edge while the transcript moves
+;; past it.  In inline mode the whole transcript is already in the buffer, so
+;; j/k are ordinary line motions through it.
 
 (defun +agent-tui-down (count)
   "Move the cursor COUNT lines down, scrolling the agent at the bottom edge."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (let ((line (line-number-at-pos)))
-      (ignore-errors (evil-next-line 1))
-      (when (= line (line-number-at-pos))
-        (+agent-tui--scroll 'down 1)))))
+  (if (not +agent-tui-alt-screen)
+      (evil-next-line (or count 1))
+    (dotimes (_ (or count 1))
+      (let ((line (line-number-at-pos)))
+        (ignore-errors (evil-next-line 1))
+        (when (= line (line-number-at-pos))
+          (+agent-tui--scroll 'down 1))))))
 
 (defun +agent-tui-up (count)
   "Move the cursor COUNT lines up, scrolling the agent at the top edge."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (let ((line (line-number-at-pos)))
-      (ignore-errors (evil-previous-line 1))
-      (when (= line (line-number-at-pos))
-        (+agent-tui--scroll 'up 1)))))
+  (if (not +agent-tui-alt-screen)
+      (evil-previous-line (or count 1))
+    (dotimes (_ (or count 1))
+      (let ((line (line-number-at-pos)))
+        (ignore-errors (evil-previous-line 1))
+        (when (= line (line-number-at-pos))
+          (+agent-tui--scroll 'up 1))))))
 
 (defun +agent-tui-left (count)
   "Move the cursor COUNT characters left over the frozen agent screen."
@@ -249,30 +287,37 @@ PRESS non-nil means a button press, nil a release.  Coordinates are
   (interactive "p")
   (evil-forward-char (or count 1)))
 
-;; J/K send exactly the same keys as the real PageDown/PageUp, and nothing
-;; else.  Moving point as well would scroll the view a second time on top of
-;; the agent's own scroll and make the result stutter.
+;; On the alternate screen J/K send exactly the same keys as the real
+;; PageDown/PageUp, and nothing else: moving point as well would scroll the
+;; view a second time on top of the agent's own scroll and make it stutter.
+;; Inline buffers have real scrollback, so J/K page the buffer directly.
 
 (defun +agent-tui-page-down (count)
-  "Send COUNT PageDown keys to the agent."
+  "Page the agent, or the buffer, down COUNT times."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<next>")))
+  (if (not +agent-tui-alt-screen)
+      (evil-scroll-page-down (or count 1))
+    (dotimes (_ (or count 1))
+      (+agent-tui--send-key "<next>"))))
 
 (defun +agent-tui-page-up (count)
-  "Send COUNT PageUp keys to the agent."
+  "Page the agent, or the buffer, up COUNT times."
   (interactive "p")
-  (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<prior>")))
+  (if (not +agent-tui-alt-screen)
+      (evil-scroll-page-up (or count 1))
+    (dotimes (_ (or count 1))
+      (+agent-tui--send-key "<prior>"))))
 
 (defun +agent-tui-click ()
-  "Click the terminal cell under point, or send Return when unsupported.
-A click is synthesised only for applications that enabled mouse tracking,
-because an unsupported SGR sequence would otherwise be typed as input."
+  "Click the terminal cell under point, or send Return when that cannot work.
+A click is synthesised only on the alternate screen for applications that
+enabled mouse tracking, because an unsupported SGR sequence would otherwise
+be typed as input, and because in inline mode the cell under point may be
+scrolled-back history rather than something live to click."
   (interactive)
   (unless (+agent-tui--live-p)
     (user-error "Not a live vterm buffer"))
-  (if +agent-tui-mouse-tracking
+  (if (and +agent-tui-alt-screen +agent-tui-mouse-tracking)
       (let ((cell (+agent-tui-screen-cell)))
         (unless cell
           (user-error "Point is not on a terminal cell"))
@@ -416,6 +461,8 @@ Installed as :before advice on `vterm--filter'."
   (let ((buffer (process-buffer process)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
+        (setq +agent-tui-alt-screen
+              (+agent-tui-alt-screen-after-output +agent-tui-alt-screen input))
         (unless (and +agent-tui-p +agent-tui-mouse-tracking)
           (setq +agent-tui-mouse-tracking
                 (+agent-tui-mouse-mode-after-output
@@ -433,6 +480,23 @@ Installed as :before advice on `vterm--filter'."
 ;; Launchers
 ;; =============================================================================
 
+(defcustom +agent-tui-opencode-command "opencode"
+  "Shell command used by `+agent-tui-opencode'.
+OpenCode's full TUI uses the alternate screen, which limits the buffer to
+one page.  Set this to \"opencode --mini\" for the inline renderer, whose
+transcript stays in the terminal scrollback."
+  :type 'string
+  :group 'tools)
+
+(defcustom +agent-tui-claude-command
+  "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude"
+  "Shell command used by `+agent-tui-claude'.
+Claude Code's inline mode keeps the transcript in the terminal scrollback,
+so the vterm buffer behaves like a normal Emacs buffer.  Drop the environment
+variable to get the full-screen alternate-screen renderer instead."
+  :type 'string
+  :group 'tools)
+
 (defun +agent-tui--open (name command)
   "Show the agent terminal NAME, starting COMMAND when it does not exist."
   (require 'vterm)
@@ -449,12 +513,12 @@ Installed as :before advice on `vterm--filter'."
 (defun +agent-tui-opencode ()
   "Open or focus OpenCode in a dedicated vterm buffer."
   (interactive)
-  (+agent-tui--open "*opencode*" "opencode"))
+  (+agent-tui--open "*opencode*" +agent-tui-opencode-command))
 
 (defun +agent-tui-claude ()
   "Open or focus Claude Code in a dedicated vterm buffer."
   (interactive)
-  (+agent-tui--open "*claude*" "claude"))
+  (+agent-tui--open "*claude*" +agent-tui-claude-command))
 
 (global-set-key (kbd "C-c o") #'+agent-tui-opencode)
 (global-set-key (kbd "C-c O") #'+agent-tui-claude)

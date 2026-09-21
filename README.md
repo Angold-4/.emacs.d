@@ -142,15 +142,30 @@ not a cursor, so we leave those alone):
 | `yy` / visual `y` | Yank a line / region with TUI decorations stripped |
 | `q` | Bury the terminal |
 
-The frozen screen is one page tall, so `j`/`k` scroll the agent itself
-(synthesised mouse-wheel events, or a page key without mouse support) once the
-cursor reaches the top or bottom edge. `C-c o` opens OpenCode and `C-c O` opens
-Claude Code. A vterm named
+`C-c o` opens OpenCode and `C-c O` opens Claude Code. A vterm named
 `*opencode*` / `*claude*`, or one whose terminal title names either agent, is
 picked up automatically; `M-x +agent-tui-setup` enables an arbitrary vterm by
-hand. The click is an SGR mouse event sent straight to the PTY, and is only
-synthesised for apps that enabled mouse tracking (both do once a session is
-live) — otherwise `RET` sends a plain Return.
+hand.
+
+**Inline mode (recommended).** A full-screen TUI on the alternate screen only
+keeps one page in the buffer, so text you scroll past cannot be selected. Both
+agents can render inline instead, leaving the whole transcript in the terminal
+scrollback, where this buffer is an ordinary one: `j`/`k`/`h`/`l` walk the
+transcript, `J`/`K` page it, and Evil visual mode plus `G`/`yy` copy across
+pages:
+
+| Agent | Inline command |
+|-------|----------------|
+| Claude Code | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude` (the default) |
+| OpenCode | `opencode --mini` |
+
+`+agent-tui-claude-command` already uses Claude Code's inline mode; set
+`+agent-tui-opencode-command` to `"opencode --mini"` to opt OpenCode in.
+
+On the alternate screen `j`/`k` scroll the agent itself at the page edge
+(synthesised mouse-wheel events, or a page key without mouse support), and
+`RET` synthesises an SGR mouse click at the cell under the cursor — only for
+apps that enabled mouse tracking, otherwise it sends Return.
 
 ### LSP & Code
 

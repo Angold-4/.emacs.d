@@ -191,37 +191,46 @@ The underlying PTY remains live throughout.
 
 ### Agent TUIs (OpenCode / Claude Code)
 
-OpenCode and Claude Code run as full-screen TUIs inside vterm, where reaching
-for PageUp/PageDown to read back through the transcript is awkward from Evil
-normal state. Sending them arrow keys is not the answer either: those keys
-drive the agent's own focus and history (OpenCode moves you into the input
-box). So `init-agent-tui.el` moves a real Emacs cursor over the frozen screen
-and reserves the agent's own keys for paging:
+OpenCode and Claude Code run inside vterm, where reaching for PageUp/PageDown
+to read back through the transcript is awkward from Evil normal state. Sending
+them arrow keys is not the answer either: those keys drive the agent's own
+focus and history (OpenCode moves you into the input box). So
+`init-agent-tui.el` moves a real Emacs cursor and lets the agent keep its own
+keys:
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Move the cursor down / up a line; scrolls the agent at the edge |
+| `j` / `k` | Move the cursor down / up a line |
 | `h` / `l` | Move the cursor left / right |
-| `J` / `K` | Page the agent (PageDown / PageUp) |
-| `RET` | Click the terminal cell under point |
+| `J` / `K` | Page down / up |
+| `RET` | Click the terminal cell under point (or send Return) |
 | `i` / `a` | Enter insert state |
 | `p` | Paste the clipboard |
 | `yy` / visual `y` | Yank a line / region, cleaned |
 | `q` | Bury the buffer |
 
-`init-tools.el` freezes the selected vterm viewport in normal state, so the
-cursor stays put while the agent streams and while `J`/`K` page its output.
-The frozen buffer is only one screen tall, so at its top or bottom edge `j`/`k`
-scroll the agent itself by synthesising mouse-wheel events (or a page key when
-mouse tracking is off), and the cursor stays on the edge while the transcript
-moves past it.
-`RET` synthesises an SGR mouse click at the cell under point by writing the
-escape sequence directly to the PTY, because emacs-libvterm does not forward
-mouse events; the click is only sent when the terminal has enabled mouse
-tracking (OpenCode does on startup, Claude Code after the trust prompt — both
-verified), and otherwise `RET` falls back to a plain Return. Mouse support is
-detected per buffer by `init-agent-tui.el` watching `vterm--filter` output for
-the DECSET mouse modes.
+There are two rendering modes, and the module detects which one the app is in
+by watching `vterm--filter` output for the DECSET alt-screen modes
+(`?1047h`/`?1049h`):
+
+- **Inline (no alternate screen).** The transcript flows into the terminal
+  scrollback, so the vterm buffer is an ordinary scrollback buffer: `j`/`k`/
+  `h`/`l` walk the whole conversation, `J`/`K` page it with
+  `evil-scroll-page-down`/`up`, Evil visual mode and `G`/`yy` select and copy
+  across every page, and `RET` sends Return. This is what makes cross-page
+  selection work at the Emacs level, with nothing recorded on the side.
+  Claude Code's launcher uses
+  `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude` by default; set
+  `+agent-tui-opencode-command` to `"opencode --mini"` to opt OpenCode in.
+- **Alternate screen (full TUI).** The buffer holds one page, so `init-tools.el`
+  freezes the viewport in normal state. At the top or bottom edge `j`/`k` scroll
+  the agent itself by synthesising mouse-wheel events (or a page key when mouse
+  tracking is off), the cursor staying on the edge while the transcript moves
+  past it. `RET` synthesises an SGR mouse click at the cell under point by
+  writing the escape sequence directly to the PTY, because emacs-libvterm does
+  not forward mouse events; the click is only sent when the terminal has
+  enabled mouse tracking (OpenCode does on startup, Claude Code after the trust
+  prompt — both verified), and otherwise `RET` falls back to a plain Return.
 
 `C-c o` opens OpenCode and `C-c O` opens Claude Code in dedicated `*opencode*`
 / `*claude*` buffers. Buffers whose name matches
