@@ -200,13 +200,31 @@ over the Agent Client Protocol. `init-agent-shell.el` is a short
 |-----|--------|
 | `C-c o` | OpenCode session (`opencode acp`) |
 | `C-c O` | Claude Code session (`claude-agent-acp`) |
+| `M-x ashell` | Default agent (OpenCode) |
 | `M-x agent-shell` | Pick any ACP agent found on PATH |
+| `C-c A s` | Switch between agent-shell buffers |
+| `C-c A n` | Start another session |
+| `C-c A m` | Choose the session model |
+| `C-c A i` | Interrupt the session |
 
 Because agent-shell is built on shell-maker/comint, a session is ordinary
 buffer text. There is no vterm, no alternate screen, and no key forwarding, so
 Evil motions (`j`/`k`/`h`/`l`, `J`/`K`, `G`), visual selection, `yy`, search
 and narrowing all work over the entire conversation — text you have scrolled
 past is still in the buffer and can be selected and copied normally.
+
+Sessions start in insert state. In insert state `RET` adds a newline and
+`C-<return>` or `M-RET` sends; in normal state `RET` sends. Diff-review buffers
+open in Emacs state so `y`/`n`/`p`/`q` act on the diff directly.
+
+Slash commands come from the agent over ACP, and ACP only carries the agent's
+*skills*. OpenCode advertises `/delegate`, `/review`, `/init`, `/docs` and the
+rest of its skills (the full list is shown under "Available /commands"), but
+its TUI commands — `/sessions`, `/models`, `/new`, `/share` — are not part of
+ACP and are not available in an agent-shell buffer. Their agent-shell
+equivalents are the `C-c A` bindings above, plus `M-x
+agent-shell-resume-session`, `C-u C-u M-x agent-shell` (pick an existing
+shell), and `C-c C-v` / `C-c C-m` inside a session.
 
 OpenCode is the default agent (`agent-shell-preferred-agent-config`) and
 `~/.opencode/bin` is added to `exec-path`, so it reuses `opencode auth login`.

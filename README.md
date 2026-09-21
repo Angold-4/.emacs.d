@@ -138,7 +138,22 @@ alternate screen, no key forwarding.
 |-----|--------|
 | `C-c o` | OpenCode session (`opencode acp`) |
 | `C-c O` | Claude Code session (`claude-agent-acp`) |
+| `M-x ashell` | Default agent (OpenCode) |
 | `M-x agent-shell` | Pick any ACP agent found on PATH |
+| `C-c A s` / `C-c A n` | Switch between shells / start another |
+| `C-c A m` / `C-c A i` | Session model / interrupt |
+
+**Evil.** Sessions start in insert state. `RET` in insert adds a newline;
+`C-<return>` or `M-RET` sends the prompt. In normal state `RET` sends it, and
+the usual motions, visual selection, `G` and `yy` work over the transcript.
+
+**Slash commands.** ACP exposes only the agent's *skills* as `/commands`
+(see the "Available /commands" section in the shell). OpenCode advertises
+`/delegate`, `/review`, `/init`, and friends, but its TUI commands such as
+`/sessions`, `/models` and `/new` are not part of ACP and cannot be typed
+here. Use `C-c A s` / `M-x agent-shell-resume-session` /
+`C-u C-u M-x agent-shell` for sessions, `C-c A n` for a new one, `C-c A m`
+(or `C-c C-v`) for the model, and `C-c C-m` for the mode.
 
 OpenCode is the default agent and reuses `opencode auth login`; Claude Code
 reuses the `claude` CLI's login. Claude Code needs its ACP bridge installed
