@@ -160,6 +160,10 @@ Each session shows a compact Emacs header line with just what matters here:
 the current model, the PR id (from the git workbench's cached forge
 snapshots), the branch, and the context window left.
 
+**Model memory.** The model chosen with `C-c k m` is persisted to
+`~/.emacs.d/.cache/agent-shell-opencode-model` and applied to every later
+OpenCode session, so you never switch it twice.
+
 **Evil.** Sessions start in insert state. `RET` in insert adds a newline;
 `C-<return>` or `M-RET` sends the prompt. In normal state `RET` sends it, and
 the usual motions, visual selection, `G` and `yy` work over the transcript.

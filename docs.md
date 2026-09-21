@@ -218,6 +218,14 @@ Inside a session (`C-c k`):
 
 The same commands remain on the global `C-c A` prefix.
 
+**Model memory.** `C-c k m` records the chosen model id to
+`~/.emacs.d/.cache/agent-shell-opencode-model` and restores it as
+`agent-shell-opencode-default-model-id` before the next session, so OpenCode
+always starts on the model you last used. The recording is done by advising
+`agent-shell--config-option-set-model-id`, the single path shared by session
+initialization and `agent-shell-set-session-model`, gated on the buffer's agent
+identifier being `opencode`.
+
 **Top bar.** agent-shell's SVG header and its mode-line copy are turned off
 (`agent-shell-header-style` nil, `agent-shell--setup-modeline` neutralised).
 `+agent-shell/header-line` installs a buffer-local `header-line-format` that

@@ -48,8 +48,11 @@
 (require 'project)
 
 (declare-function agent-shell--state "agent-shell")
+(declare-function agent-shell-get-config "agent-shell" (buffer))
 (declare-function agent-shell-get-model-name "agent-shell" (state))
 (declare-function agent-shell-set-session-model "agent-shell" (&optional on-success))
+(declare-function agent-shell--config-option-set-model-id "agent-shell"
+                  (&key model-id on-success on-failure))
 (declare-function agent-shell-switch-buffer "agent-shell" ())
 (declare-function agent-shell-new-shell "agent-shell" ())
 (declare-function agent-shell-interrupt "agent-shell" (&optional force))
@@ -162,6 +165,46 @@ Cached so the header line does not hit Git or forge on every redisplay.")
       "")))
 
 ;; =============================================================================
+;; Remember the OpenCode model
+;; =============================================================================
+
+(defcustom +agent-shell-opencode-model-file
+  (locate-user-emacs-file ".cache/agent-shell-opencode-model")
+  "File remembering the last OpenCode model chosen in agent-shell."
+  :type 'file
+  :group 'tools)
+
+(defun +agent-shell--load-opencode-model ()
+  "Restore the remembered OpenCode model as the session default."
+  (when (and (boundp 'agent-shell-opencode-default-model-id)
+             (file-readable-p +agent-shell-opencode-model-file))
+    (let ((model-id (with-temp-buffer
+                      (insert-file-contents +agent-shell-opencode-model-file)
+                      (string-trim (buffer-string)))))
+      (unless (string-empty-p model-id)
+        (setq agent-shell-opencode-default-model-id model-id)))))
+
+(defun +agent-shell--remember-opencode-model (model-id)
+  "Persist MODEL-ID and make it the default for later OpenCode sessions."
+  (when (and (stringp model-id) (not (string-empty-p model-id)))
+    (setq agent-shell-opencode-default-model-id model-id)
+    (ignore-errors
+      (make-directory (file-name-directory +agent-shell-opencode-model-file) t)
+      (with-temp-file +agent-shell-opencode-model-file
+        (insert model-id "\n")))))
+
+(defun +agent-shell--advise-opencode-model (orig-fn &rest args)
+  "Run ORIG-FN, remembering MODEL-ID for OpenCode buffers.
+Advises `agent-shell--config-option-set-model-id', the single path both
+session initialization and `agent-shell-set-session-model' use."
+  (when-let ((model-id (plist-get args :model-id)))
+    (when (eq (ignore-errors
+                (map-elt (agent-shell-get-config (current-buffer)) :identifier))
+              'opencode)
+      (+agent-shell--remember-opencode-model model-id)))
+  (apply orig-fn args))
+
+;; =============================================================================
 ;; Session commands (C-c k)
 ;; =============================================================================
 
@@ -219,6 +262,8 @@ Cached so the header line does not hit Git or forge on every redisplay.")
   ;; Our top bar replaces agent-shell's mode-line copy of the same data.
   (when (fboundp 'agent-shell--setup-modeline)
     (advice-add 'agent-shell--setup-modeline :override #'ignore))
+  (advice-add 'agent-shell--config-option-set-model-id
+              :around #'+agent-shell--advise-opencode-model)
   (define-key agent-shell-mode-map (kbd "C-c k m") #'agent-shell-set-session-model)
   (define-key agent-shell-mode-map (kbd "C-c k r") #'+agent-shell/resume-latest)
   (define-key agent-shell-mode-map (kbd "C-c k R") #'+agent-shell/resume-choose)
@@ -230,11 +275,15 @@ Cached so the header line does not hit Git or forge on every redisplay.")
 ;; Launchers
 ;; =============================================================================
 
+(with-eval-after-load 'agent-shell-opencode
+  (+agent-shell--load-opencode-model))
+
 (defun +agent-shell/opencode ()
   "Open an OpenCode ACP session in a native Emacs buffer."
   (interactive)
   (require 'agent-shell)
   (require 'agent-shell-opencode)
+  (+agent-shell--load-opencode-model)
   (agent-shell-opencode-start-agent))
 
 (defun +agent-shell/claude ()
