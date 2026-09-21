@@ -58,10 +58,9 @@
 (declare-function agent-shell-interrupt "agent-shell" (&optional force))
 (declare-function agent-shell--format-number-compact "agent-shell" (number))
 (declare-function agent-shell--context-usage-face "agent-shell-usage" (percentage))
-(declare-function magit-toplevel "magit-git" (&optional directory))
 (declare-function +git-store-context-for-root "init-git-store" (root))
 (declare-function +git-store-local-context-repository-id "init-git-store" (context))
-(declare-function +git-pr--branch-name "init-git-pr" (root))
+(declare-function +git-store-local-context-current-branch "init-git-store" (context))
 (declare-function +forge-prs-for-head-ref "init-forge" (repository-id head-ref))
 (declare-function +forge-pr-snapshot-number "init-forge" (snapshot))
 
@@ -109,10 +108,10 @@ Cached so the header line does not hit Git or forge on every redisplay.")
 
 (defun +agent-shell--git-info (directory)
   "Return a (:branch BRANCH :pr NUMBER) plist for DIRECTORY, or nil."
-  (when-let ((root (ignore-errors (magit-toplevel directory))))
+  (when-let ((root (locate-dominating-file directory ".git")))
     (when-let* ((context (ignore-errors (+git-store-context-for-root root)))
                 (repository (+git-store-local-context-repository-id context))
-                (branch (ignore-errors (+git-pr--branch-name root))))
+                (branch (+git-store-local-context-current-branch context)))
       (list :branch branch
             :pr (when (fboundp '+forge-prs-for-head-ref)
                   (when-let ((prs (ignore-errors
