@@ -196,16 +196,36 @@ OpenCode and Claude Code run as native Emacs buffers, not terminals, through
 over the Agent Client Protocol. `init-agent-shell.el` is a short
 `use-package` block around it:
 
+Launch:
+
 | Key | Action |
 |-----|--------|
 | `C-c o` | OpenCode session (`opencode acp`) |
 | `C-c O` | Claude Code session (`claude-agent-acp`) |
 | `M-x ashell` | Default agent (OpenCode) |
 | `M-x agent-shell` | Pick any ACP agent found on PATH |
-| `C-c A s` | Switch between agent-shell buffers |
-| `C-c A n` | Start another session |
-| `C-c A m` | Choose the session model |
-| `C-c A i` | Interrupt the session |
+
+Inside a session (`C-c k`):
+
+| Key | Action |
+|-----|--------|
+| `C-c k m` | Choose the session model |
+| `C-c k r` | Resume the most recent session in this workspace |
+| `C-c k R` | Pick a session in this workspace to resume |
+| `C-c k n` | Start another session |
+| `C-c k s` | Switch between agent-shell buffers |
+| `C-c k i` | Interrupt the session |
+
+The same commands remain on the global `C-c A` prefix.
+
+**Top bar.** agent-shell's SVG header and its mode-line copy are turned off
+(`agent-shell-header-style` nil, `agent-shell--setup-modeline` neutralised).
+`+agent-shell/header-line` installs a buffer-local `header-line-format` that
+shows only the current model, the PR id, the branch, and the context window
+left. The PR id comes from the git workbench's cached forge snapshots
+(`+git-store-context-for-root` → `+forge-prs-for-head-ref`), so it appears
+without a network call when a cached PR matches the branch; branch and PR are
+memoised per directory so redisplay stays cheap.
 
 Because agent-shell is built on shell-maker/comint, a session is ordinary
 buffer text. There is no vterm, no alternate screen, and no key forwarding, so
@@ -221,10 +241,9 @@ Slash commands come from the agent over ACP, and ACP only carries the agent's
 *skills*. OpenCode advertises `/delegate`, `/review`, `/init`, `/docs` and the
 rest of its skills (the full list is shown under "Available /commands"), but
 its TUI commands — `/sessions`, `/models`, `/new`, `/share` — are not part of
-ACP and are not available in an agent-shell buffer. Their agent-shell
-equivalents are the `C-c A` bindings above, plus `M-x
-agent-shell-resume-session`, `C-u C-u M-x agent-shell` (pick an existing
-shell), and `C-c C-v` / `C-c C-m` inside a session.
+ACP and are not available in an agent-shell buffer; the `C-c k` bindings cover
+them. ACP also scopes `session/list` to the workspace directory, so `C-c k r`
+and `C-c k R` only see sessions for the current workspace.
 
 OpenCode is the default agent (`agent-shell-preferred-agent-config`) and
 `~/.opencode/bin` is added to `exec-path`, so it reuses `opencode auth login`.

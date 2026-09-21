@@ -134,14 +134,31 @@ works: `j`/`k`/`h`/`l`, `J`/`K`, `G`, visual selection, `yy`, search, and
 narrowing all copy and move across the whole conversation — no vterm, no
 alternate screen, no key forwarding.
 
+Launch:
+
 | Key | Action |
 |-----|--------|
 | `C-c o` | OpenCode session (`opencode acp`) |
 | `C-c O` | Claude Code session (`claude-agent-acp`) |
 | `M-x ashell` | Default agent (OpenCode) |
 | `M-x agent-shell` | Pick any ACP agent found on PATH |
-| `C-c A s` / `C-c A n` | Switch between shells / start another |
-| `C-c A m` / `C-c A i` | Session model / interrupt |
+
+Inside a session (`C-c k`):
+
+| Key | Action |
+|-----|--------|
+| `C-c k m` | Switch model |
+| `C-c k r` | Resume the most recent session in this workspace |
+| `C-c k R` | Pick a session in this workspace to resume |
+| `C-c k n` / `C-c k s` | New session / switch shells |
+| `C-c k i` | Interrupt |
+
+The same commands remain on the global `C-c A` prefix.
+
+**Top bar.** agent-shell's own SVG header and mode-line copy are disabled.
+Each session shows a compact Emacs header line with just what matters here:
+the current model, the PR id (from the git workbench's cached forge
+snapshots), the branch, and the context window left.
 
 **Evil.** Sessions start in insert state. `RET` in insert adds a newline;
 `C-<return>` or `M-RET` sends the prompt. In normal state `RET` sends it, and
@@ -151,9 +168,9 @@ the usual motions, visual selection, `G` and `yy` work over the transcript.
 (see the "Available /commands" section in the shell). OpenCode advertises
 `/delegate`, `/review`, `/init`, and friends, but its TUI commands such as
 `/sessions`, `/models` and `/new` are not part of ACP and cannot be typed
-here. Use `C-c A s` / `M-x agent-shell-resume-session` /
-`C-u C-u M-x agent-shell` for sessions, `C-c A n` for a new one, `C-c A m`
-(or `C-c C-v`) for the model, and `C-c C-m` for the mode.
+here — use the `C-c k` bindings above. Note that ACP scopes `session/list` to
+the workspace directory, so `r`/`R` only see sessions in the current
+workspace.
 
 OpenCode is the default agent and reuses `opencode auth login`; Claude Code
 reuses the `claude` CLI's login. Claude Code needs its ACP bridge installed
