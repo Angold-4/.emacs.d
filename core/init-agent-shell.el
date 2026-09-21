@@ -81,8 +81,12 @@
   (setq agent-shell-anthropic-authentication
         (agent-shell-anthropic-make-authentication :login t))
 
-  ;; We render our own top bar (see `+agent-shell/setup').
+  ;; We render our own top bar (see `+agent-shell/setup' and the
+  ;; `agent-shell--update-header-and-mode-line' advice below).
   (setq agent-shell-header-style nil)
+  ;; Keep a writable prompt for the whole turn so you can type while the
+  ;; agent works; submitting mid-turn queues by default (type-ahead).
+  (setq agent-shell-persistent-prompt-enabled t)
 
   ;; Evil: type in insert state, read/yank the transcript in normal state.
   (evil-set-initial-state 'agent-shell-mode 'insert)
@@ -257,8 +261,19 @@ session initialization and `agent-shell-set-session-model' use."
   "Install the top bar in agent-shell buffers."
   (setq-local header-line-format '(:eval (+agent-shell/header-line))))
 
+(defun +agent-shell--header-around (orig-fn &rest args)
+  "Let ORIG-FN update agent-shell, then install our own top bar.
+agent-shell draws its header in `header-line-format', so the only place to
+replace it is after each of its own header updates."
+  (apply orig-fn args)
+  (when (derived-mode-p 'agent-shell-mode)
+    (setq header-line-format '(:eval (+agent-shell/header-line)))
+    (force-mode-line-update)))
+
 (with-eval-after-load 'agent-shell
   (add-hook 'agent-shell-mode-hook #'+agent-shell/setup)
+  (advice-add 'agent-shell--update-header-and-mode-line
+              :around #'+agent-shell--header-around)
   ;; Our top bar replaces agent-shell's mode-line copy of the same data.
   (when (fboundp 'agent-shell--setup-modeline)
     (advice-add 'agent-shell--setup-modeline :override #'ignore))
