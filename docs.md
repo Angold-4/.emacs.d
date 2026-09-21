@@ -189,6 +189,38 @@ terminal reconnects it to the real terminal cursor. Agent TUI output is
 coalesced into complete 20 FPS redraws to avoid painting partial-frame flashes.
 The underlying PTY remains live throughout.
 
+### Agent TUIs (OpenCode / Claude Code)
+
+OpenCode and Claude Code run as full-screen TUIs inside vterm. Their own
+cursor is driven by the arrow and PageUp/PageDown keys, which is awkward from
+Evil normal state, so `init-agent-tui.el` maps the Vim vocabulary onto it:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Send Down / Up to the agent |
+| `h` / `l` | Send Left / Right to the agent |
+| `J` / `K` | Send PageDown / PageUp |
+| `RET` | Click the terminal cell under point |
+| `i` / `a` | Enter insert state |
+| `p` | Paste the clipboard |
+| `yy` / visual `y` | Yank a line / region, cleaned |
+| `q` | Bury the buffer |
+
+Point is nudged alongside the arrow keys so the block cursor stays over the row
+the agent highlights. `RET` synthesises an SGR mouse click at the cell under
+point by writing the escape sequence directly to the PTY, because
+emacs-libvterm does not forward mouse events; the click is only sent when the
+terminal has enabled mouse tracking (OpenCode does on startup, Claude Code
+after the trust prompt — both verified), and otherwise `RET` falls back to a
+plain Return. Mouse support is detected per buffer by `init-agent-tui.el`
+watching `vterm--filter` output for the DECSET mouse modes.
+
+`C-c o` opens OpenCode and `C-c O` opens Claude Code in dedicated `*opencode*`
+/ `*claude*` buffers. Buffers whose name matches
+`+agent-tui-buffer-name-regexp`, or whose terminal title names either agent,
+are configured automatically; `M-x +agent-tui-setup` enables an existing vterm
+by hand.
+
 ## Org-mode
 
 See the [Org-Mode Workflow](#org-mode-workflow) section below for comprehensive

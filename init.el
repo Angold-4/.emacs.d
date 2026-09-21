@@ -31,7 +31,8 @@
 ;; - init-git-sync.el : Shared mirror and explicit synchronization
 ;; - init-git-ui.el   : Review display, Evil mode, native visits
 ;; - init-forge.el    : Forge package ownership and cached PR adapter
-;; - init-git-pr.el   : Shared pull-request review workspace
+;; - init-git-pr.el    : Shared pull-request review workspace
+;; - init-agent-tui.el : Vim keys for OpenCode / Claude Code in vterm
 
 ;;; Code:
 
@@ -159,6 +160,7 @@
     init-languages  ; Language-specific settings
     init-org        ; Org-mode configuration
     init-tools      ; Development tools (non-Git)
+    init-agent-tui  ; Vim keys for OpenCode / Claude Code in vterm
     init-git        ; Magit package ownership and Git dispatch
     init-git-store  ; Canonical repository identity and local contexts
     init-git-sync   ; Shared mirror and explicit synchronization

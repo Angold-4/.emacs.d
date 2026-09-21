@@ -86,7 +86,8 @@ C-x l   ; Start LSP manually
 │   ├── init-git-sync.el    # Durable shared mirror synchronization
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
-│   └── init-git-pr.el      # Cached pull-request workspace
+│   ├── init-git-pr.el      # Cached pull-request workspace
+│   └── init-agent-tui.el   # Vim keys for OpenCode / Claude Code in vterm
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -123,6 +124,29 @@ The Git workbench supports local and cached pull-request review, a collapsible
 Changes Tree, persistent reviewed checkmarks, and explicit offline-capable
 synchronization. See [git.md](git.md) for the daily workflow and
 [docs/git.md](docs/git.md) for the architecture.
+
+### Agent TUIs (OpenCode / Claude Code)
+
+In a vterm running OpenCode or Claude Code, Evil normal state drives the
+agent's own cursor instead of the frozen buffer:
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Agent Down / Up (arrow keys) |
+| `h` / `l` | Agent Left / Right |
+| `J` / `K` | Agent PageDown / PageUp |
+| `RET` | Click the cell under the cursor (falls back to Return) |
+| `i` / `a` | Insert state (real keystrokes reach the agent) |
+| `p` | Paste the clipboard into the agent |
+| `yy` / visual `y` | Yank a line / region with TUI decorations stripped |
+| `q` | Bury the terminal |
+
+`C-c o` opens OpenCode and `C-c O` opens Claude Code. A vterm named
+`*opencode*` / `*claude*`, or one whose terminal title names either agent, is
+picked up automatically; `M-x +agent-tui-setup` enables an arbitrary vterm by
+hand. The click is an SGR mouse event sent straight to the PTY, and is only
+synthesised for apps that enabled mouse tracking (both do once a session is
+live) — otherwise `RET` sends a plain Return.
 
 ### LSP & Code
 
