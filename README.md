@@ -86,7 +86,8 @@ C-x l   ; Start LSP manually
 │   ├── init-git-sync.el    # Durable shared mirror synchronization
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
-│   └── init-git-pr.el      # Cached pull-request workspace
+│   ├── init-git-pr.el      # Cached pull-request workspace
+│   └── init-agent-shell.el # OpenCode / Claude Code as native Emacs buffers
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -123,6 +124,61 @@ The Git workbench supports local and cached pull-request review, a collapsible
 Changes Tree, persistent reviewed checkmarks, and explicit offline-capable
 synchronization. See [git.md](git.md) for the daily workflow and
 [docs/git.md](docs/git.md) for the architecture.
+
+### AI Agents (OpenCode / Claude Code)
+
+OpenCode and Claude Code run as **native Emacs buffers**, not terminals, via
+[agent-shell](https://github.com/xenodium/agent-shell) over the Agent Client
+Protocol. The transcript is ordinary buffer text, so every Vim habit already
+works: `j`/`k`/`h`/`l`, `J`/`K`, `G`, visual selection, `yy`, search, and
+narrowing all copy and move across the whole conversation — no vterm, no
+alternate screen, no key forwarding.
+
+Launch:
+
+| Key | Action |
+|-----|--------|
+| `C-c o` | OpenCode session (`opencode acp`) |
+| `C-c O` | Claude Code session (`claude-agent-acp`) |
+| `M-x ashell` | Default agent (OpenCode) |
+| `M-x agent-shell` | Pick any ACP agent found on PATH |
+
+Inside a session (`C-c k`):
+
+| Key | Action |
+|-----|--------|
+| `C-c k m` | Switch model |
+| `C-c k r` | Resume the most recent session in this workspace |
+| `C-c k R` | Pick a session in this workspace to resume |
+| `C-c k n` / `C-c k s` | New session / switch shells |
+| `C-c k i` | Interrupt |
+
+The same commands remain on the global `C-c A` prefix.
+
+**Top bar.** agent-shell's own SVG header and mode-line copy are disabled.
+Each session shows a compact Emacs header line with just what matters here:
+the current model, the PR id (from the git workbench's cached forge
+snapshots), the branch, and the context window left.
+
+**Evil.** Sessions start in insert state. `RET` in insert adds a newline;
+`C-<return>` or `M-RET` sends the prompt. In normal state `RET` sends it, and
+the usual motions, visual selection, `G` and `yy` work over the transcript.
+
+**Slash commands.** ACP exposes only the agent's *skills* as `/commands`
+(see the "Available /commands" section in the shell). OpenCode advertises
+`/delegate`, `/review`, `/init`, and friends, but its TUI commands such as
+`/sessions`, `/models` and `/new` are not part of ACP and cannot be typed
+here — use the `C-c k` bindings above. Note that ACP scopes `session/list` to
+the workspace directory, so `r`/`R` only see sessions in the current
+workspace.
+
+OpenCode is the default agent and reuses `opencode auth login`; Claude Code
+reuses the `claude` CLI's login. Claude Code needs its ACP bridge installed
+once:
+
+```bash
+npm install -g @agentclientprotocol/claude-agent-acp
+```
 
 ### LSP & Code
 
