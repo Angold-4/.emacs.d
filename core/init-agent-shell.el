@@ -48,6 +48,10 @@
   (require 'agent-shell-anthropic)
   (agent-shell-anthropic-start-claude-code))
 
+;; Short names for M-x.
+(defalias 'ashell 'agent-shell)
+(defalias 'ashell-claude '+agent-shell/claude)
+
 (global-set-key (kbd "C-c o") #'+agent-shell/opencode)
 (global-set-key (kbd "C-c O") #'+agent-shell/claude)
 
