@@ -87,7 +87,7 @@ C-x l   ; Start LSP manually
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
 │   ├── init-git-pr.el      # Cached pull-request workspace
-│   └── init-agent-tui.el   # Vim keys for OpenCode / Claude Code in vterm
+│   └── init-agent-shell.el # OpenCode / Claude Code as native Emacs buffers
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -125,47 +125,28 @@ Changes Tree, persistent reviewed checkmarks, and explicit offline-capable
 synchronization. See [git.md](git.md) for the daily workflow and
 [docs/git.md](docs/git.md) for the architecture.
 
-### Agent TUIs (OpenCode / Claude Code)
+### AI Agents (OpenCode / Claude Code)
 
-In a vterm running OpenCode or Claude Code, Evil normal state moves a cursor
-over the frozen screen (the agent's own arrow keys drive its focus and history,
-not a cursor, so we leave those alone):
+OpenCode and Claude Code run as **native Emacs buffers**, not terminals, via
+[agent-shell](https://github.com/xenodium/agent-shell) over the Agent Client
+Protocol. The transcript is ordinary buffer text, so every Vim habit already
+works: `j`/`k`/`h`/`l`, `J`/`K`, `G`, visual selection, `yy`, search, and
+narrowing all copy and move across the whole conversation — no vterm, no
+alternate screen, no key forwarding.
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Move cursor down / up a line (scrolls the agent at the edge) |
-| `h` / `l` | Move cursor left / right |
-| `J` / `K` | Page the agent (PageDown / PageUp) |
-| `RET` | Click the cell under the cursor (falls back to Return) |
-| `i` / `a` | Insert state (real keystrokes reach the agent) |
-| `p` | Paste the clipboard into the agent |
-| `yy` / visual `y` | Yank a line / region with TUI decorations stripped |
-| `q` | Bury the terminal |
+| `C-c o` | OpenCode session (`opencode acp`) |
+| `C-c O` | Claude Code session (`claude-agent-acp`) |
+| `M-x agent-shell` | Pick any ACP agent found on PATH |
 
-`C-c o` opens OpenCode and `C-c O` opens Claude Code. A vterm named
-`*opencode*` / `*claude*`, or one whose terminal title names either agent, is
-picked up automatically; `M-x +agent-tui-setup` enables an arbitrary vterm by
-hand.
+OpenCode is the default agent and reuses `opencode auth login`; Claude Code
+reuses the `claude` CLI's login. Claude Code needs its ACP bridge installed
+once:
 
-**Inline mode (recommended).** A full-screen TUI on the alternate screen only
-keeps one page in the buffer, so text you scroll past cannot be selected. Both
-agents can render inline instead, leaving the whole transcript in the terminal
-scrollback, where this buffer is an ordinary one: `j`/`k`/`h`/`l` walk the
-transcript, `J`/`K` page it, and Evil visual mode plus `G`/`yy` copy across
-pages:
-
-| Agent | Inline command |
-|-------|----------------|
-| Claude Code | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude` (the default) |
-| OpenCode | `opencode --mini` |
-
-`+agent-tui-claude-command` already uses Claude Code's inline mode; set
-`+agent-tui-opencode-command` to `"opencode --mini"` to opt OpenCode in.
-
-On the alternate screen `j`/`k` scroll the agent itself at the page edge
-(synthesised mouse-wheel events, or a page key without mouse support), and
-`RET` synthesises an SGR mouse click at the cell under the cursor — only for
-apps that enabled mouse tracking, otherwise it sends Return.
+```bash
+npm install -g @agentclientprotocol/claude-agent-acp
+```
 
 ### LSP & Code
 
