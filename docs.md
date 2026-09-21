@@ -200,7 +200,7 @@ and reserves the agent's own keys for paging:
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Move the cursor down / up a line |
+| `j` / `k` | Move the cursor down / up a line; scrolls the agent at the edge |
 | `h` / `l` | Move the cursor left / right |
 | `J` / `K` | Page the agent (PageDown / PageUp) |
 | `RET` | Click the terminal cell under point |
@@ -211,6 +211,10 @@ and reserves the agent's own keys for paging:
 
 `init-tools.el` freezes the selected vterm viewport in normal state, so the
 cursor stays put while the agent streams and while `J`/`K` page its output.
+The frozen buffer is only one screen tall, so at its top or bottom edge `j`/`k`
+scroll the agent itself by synthesising mouse-wheel events (or a page key when
+mouse tracking is off), and the cursor stays on the edge while the transcript
+moves past it.
 `RET` synthesises an SGR mouse click at the cell under point by writing the
 escape sequence directly to the PTY, because emacs-libvterm does not forward
 mouse events; the click is only sent when the terminal has enabled mouse

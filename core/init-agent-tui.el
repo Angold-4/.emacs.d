@@ -14,7 +14,8 @@
 ;; So this module treats the frozen screen like a buffer and moves the real
 ;; Emacs cursor over it, while leaving the agent's own keys for paging:
 ;;
-;;   j / k    move the cursor down / up a line (smooth, no keys sent)
+;;   j / k    move the cursor down / up a line; at the top/bottom edge,
+;;            scroll the agent's transcript so you can keep going
 ;;   h / l    move the cursor left / right a character
 ;;   J / K    send <next> / <prior>  (PageDown / PageUp) to page the agent
 ;;   RET      click the terminal cell under point (SGR mouse)
@@ -179,6 +180,30 @@ init-tools.el in normal state makes row 1 the top of the terminal screen."
                          (goto-char point)
                          (current-column))))))
 
+(defun +agent-tui-viewport-cell (&optional window)
+  "Return (ROW . COL), 1-based, at the middle of WINDOW's screen.
+Wheel events are sent here because the transcript, not the input box or a
+sidebar at the cursor, is the surface that scrolls."
+  (let* ((window (or window (selected-window)))
+         (height (window-body-height window))
+         (width (window-body-width window)))
+    (cons (max 1 (/ height 2)) (max 1 (/ width 2)))))
+
+(defun +agent-tui--scroll (direction &optional count)
+  "Scroll the agent transcript by COUNT notches in DIRECTION.
+DIRECTION is `down' or `up'.  Uses the mouse wheel when the app reports the
+mouse, and a page key otherwise (for example Claude Code before the trust
+prompt, which enables no mouse mode)."
+  (if +agent-tui-mouse-tracking
+      (let ((cell (+agent-tui-viewport-cell)))
+        (when cell
+          (let ((button (if (eq direction 'down) 65 64))
+                (row (car cell))
+                (col (cdr cell)))
+            (dotimes (_ (or count 1))
+              (+agent-tui--send-string (+agent-tui-sgr-mouse button row col t))))))
+    (+agent-tui--send-key (if (eq direction 'down) "<next>" "<prior>"))))
+
 (defun +agent-tui-sgr-mouse (button row col press)
   "Return the SGR mouse escape sequence for BUTTON at ROW/COL.
 PRESS non-nil means a button press, nil a release.  Coordinates are
@@ -192,16 +217,27 @@ PRESS non-nil means a button press, nil a release.  Coordinates are
 ;; j/k/h/l move the Emacs cursor over the frozen screen instead of poking the
 ;; agent.  The agent's arrow keys change its own focus and history (OpenCode
 ;; jumps to the input box), which is not what "move the cursor" should mean.
+;; The frozen buffer is only one screen tall, so at the top/bottom edge j/k
+;; scroll the agent itself (wheel, or a page key without mouse support) and the
+;; cursor stays on the edge while the transcript moves past it.
 
 (defun +agent-tui-down (count)
-  "Move the cursor COUNT lines down over the frozen agent screen."
+  "Move the cursor COUNT lines down, scrolling the agent at the bottom edge."
   (interactive "p")
-  (evil-next-line (or count 1)))
+  (dotimes (_ (or count 1))
+    (let ((line (line-number-at-pos)))
+      (ignore-errors (evil-next-line 1))
+      (when (= line (line-number-at-pos))
+        (+agent-tui--scroll 'down 1)))))
 
 (defun +agent-tui-up (count)
-  "Move the cursor COUNT lines up over the frozen agent screen."
+  "Move the cursor COUNT lines up, scrolling the agent at the top edge."
   (interactive "p")
-  (evil-previous-line (or count 1)))
+  (dotimes (_ (or count 1))
+    (let ((line (line-number-at-pos)))
+      (ignore-errors (evil-previous-line 1))
+      (when (= line (line-number-at-pos))
+        (+agent-tui--scroll 'up 1)))))
 
 (defun +agent-tui-left (count)
   "Move the cursor COUNT characters left over the frozen agent screen."

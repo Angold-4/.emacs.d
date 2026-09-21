@@ -93,6 +93,11 @@
   (should (equal (+agent-tui-sgr-mouse 0 5 10 t) "\e[<0;10;5M"))
   (should (equal (+agent-tui-sgr-mouse 0 5 10 nil) "\e[<0;10;5m")))
 
+(ert-deftest agent-tui-sgr-mouse-wheel-codes ()
+  "Wheel up is button 64 and wheel down is button 65, press only."
+  (should (equal (+agent-tui-sgr-mouse 64 5 10 t) "\e[<64;10;5M"))
+  (should (equal (+agent-tui-sgr-mouse 65 5 10 t) "\e[<65;10;5M")))
+
 ;; =============================================================================
 ;; Clean yanks
 ;; =============================================================================

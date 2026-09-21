@@ -133,7 +133,7 @@ not a cursor, so we leave those alone):
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Move cursor down / up a line |
+| `j` / `k` | Move cursor down / up a line (scrolls the agent at the edge) |
 | `h` / `l` | Move cursor left / right |
 | `J` / `K` | Page the agent (PageDown / PageUp) |
 | `RET` | Click the cell under the cursor (falls back to Return) |
@@ -142,7 +142,10 @@ not a cursor, so we leave those alone):
 | `yy` / visual `y` | Yank a line / region with TUI decorations stripped |
 | `q` | Bury the terminal |
 
-`C-c o` opens OpenCode and `C-c O` opens Claude Code. A vterm named
+The frozen screen is one page tall, so `j`/`k` scroll the agent itself
+(synthesised mouse-wheel events, or a page key without mouse support) once the
+cursor reaches the top or bottom edge. `C-c o` opens OpenCode and `C-c O` opens
+Claude Code. A vterm named
 `*opencode*` / `*claude*`, or one whose terminal title names either agent, is
 picked up automatically; `M-x +agent-tui-setup` enables an arbitrary vterm by
 hand. The click is an SGR mouse event sent straight to the PTY, and is only
