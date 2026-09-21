@@ -213,19 +213,21 @@ PRESS non-nil means a button press, nil a release.  Coordinates are
   (interactive "p")
   (evil-forward-char (or count 1)))
 
+;; J/K send exactly the same keys as the real PageDown/PageUp, and nothing
+;; else.  Moving point as well would scroll the view a second time on top of
+;; the agent's own scroll and make the result stutter.
+
 (defun +agent-tui-page-down (count)
-  "Send COUNT PageDown keys to the agent, moving point along."
+  "Send COUNT PageDown keys to the agent."
   (interactive "p")
   (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<next>")
-    (ignore-errors (forward-line (window-body-height)))))
+    (+agent-tui--send-key "<next>")))
 
 (defun +agent-tui-page-up (count)
-  "Send COUNT PageUp keys to the agent, moving point along."
+  "Send COUNT PageUp keys to the agent."
   (interactive "p")
   (dotimes (_ (or count 1))
-    (+agent-tui--send-key "<prior>")
-    (ignore-errors (forward-line (- (window-body-height))))))
+    (+agent-tui--send-key "<prior>")))
 
 (defun +agent-tui-click ()
   "Click the terminal cell under point, or send Return when unsupported.
