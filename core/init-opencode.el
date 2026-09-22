@@ -68,7 +68,14 @@
   :config
   (setq opencode-command (or (executable-find "opencode") "opencode"))
   ;; Start a headless server on demand when none is running.
-  (setq opencode-auto-start-server t))
+  (setq opencode-auto-start-server t)
+  ;; A server started with `OPENCODE_SERVER_PASSWORD' set requires basic auth,
+  ;; and the package only reads those variables when *it* starts the server.
+  ;; Reuse the environment so an already-running server accepts us.
+  (setq opencode-server-username (or (getenv "OPENCODE_SERVER_USERNAME")
+                                     opencode-server-username))
+  (setq opencode-server-password (or +opencode-server-password
+                                     (getenv "OPENCODE_SERVER_PASSWORD"))))
 
 ;; =============================================================================
 ;; Hide the thinking trace
@@ -94,6 +101,13 @@ one insertion point and its region re-render is skipped."
 ;; =============================================================================
 ;; Separate input buffer
 ;; =============================================================================
+
+(defcustom +opencode-server-password nil
+  "Password for a password-protected OpenCode server.
+When nil, `OPENCODE_SERVER_PASSWORD' from the environment is used.  Set it
+here when Emacs is not launched from a shell that exports that variable."
+  :type '(choice (const :tag "Use environment" nil) string)
+  :group 'tools)
 
 (defcustom +opencode-input-buffer-name "*OpenCode Input*"
   "Name of the buffer composed for an OpenCode session.

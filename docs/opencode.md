@@ -47,6 +47,15 @@ instead:
 The session manager (vtable) starts in normal state so `j`/`k` and the
 package's own bindings work.
 
+## Connecting
+
+The module reuses `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` from
+the environment when connecting. The package only reads those variables when it
+*starts* a server, so without this a server that is already running (started by
+another Emacs or a shell with the password exported) answers `/global/health`
+with 401 and autoconnect refuses. Set `+opencode-server-password` when Emacs is
+not launched from a shell that exports the variable.
+
 ## Reasoning
 
 Reasoning/thinking blocks are hidden by default (`+opencode-show-reasoning`,
