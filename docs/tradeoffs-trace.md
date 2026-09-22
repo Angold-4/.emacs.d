@@ -223,9 +223,18 @@ Emacs ──unix socket <run>/conductor.sock──▶ Conductor daemon (Node, de
 - Each agent is a child `pi --mode rpc --extension tradeoffs-trace.ts` process
   in its own process group, spoken to over Pi's RPC protocol. The extension
   provides `submit_phase`, `submit_review` and the guards in §9.5.
-- Reviewers run with read-only built-in tools only (`--tools
-  read,grep,find,ls`) and no shell. Checks are the conductor's job, not
-  theirs.
+- Reviewers run with read-only built-in tools and no shell: `--tools
+  read,grep,find,ls,submit_discovery,submit_review`. Pi's `--tools`
+  allowlist applies to extension tools too, so the submission tools must be
+  named explicitly, or reviewers could never submit. Checks are the
+  conductor's job, not theirs.
+- **Tool-set assertion.** Before dispatching any prompt, the conductor obtains
+  the agent's actual active tool set and refuses to dispatch unless it equals
+  the expected set for that role exactly. RPC `get_state` does not include
+  tools in Pi 0.87.0 (checked), so the extension reports
+  `pi.getActiveTools()` over the run socket at `session_start`. Worker: `read, edit, write, grep, find,
+  ls, sh, submit_phase`, with no `bash`. Reviewer: the list above. A mismatch
+  is a launch failure, not a warning.
 
 ### 2.2 The conductor owns every shell command
 
@@ -244,17 +253,28 @@ the Pi group was killed, the shell kept running. So:
   ends them.
 
 Ownership alone does not rule out an escaped descendant, for example one that
-calls `setsid`. Two further measures deal with that:
+calls `setsid`. The prototype **assumes cooperative workers**: agents that do
+not deliberately evade control. For those, two measures are cleanup and
+detection. They are not containment:
 
-- **Sweep.** After any cancellation, and before freezing a candidate, the
-  conductor lists processes whose working directory or open files lie under
-  the worktree (`lsof +D <worktree>`), kills them, and records what it
-  killed.
-- **Freeze makes survivors harmless to evidence.** Checks and reviews never
-  read the live worktree (§6.2). A process that survives the sweep can dirty
-  the worktree, but not a frozen candidate. A sweep that found survivors marks
-  the worktree `tainted`, and the next attempt starts from a clean checkout of
-  the last candidate.
+- **Sweep (cleanup).** After any cancellation, and before freezing a candidate,
+  the conductor lists processes whose working directory or open files lie
+  under the worktree (`lsof +D <worktree>`), kills them, and records what it
+  killed. A sweep that found survivors marks the worktree `tainted`, and the
+  next attempt starts from a clean checkout of the last candidate. A detached
+  process can change directory, close its files and reopen a path later, so
+  an empty sweep does not prove no process survived.
+- **Integrity verification (detection).** Checks and reviews never read the
+  live worktree (§6.2). Before and after every check and review, the
+  conductor verifies that the checkout still matches its candidate commit
+  exactly (no modified, added or deleted files, ignored build output
+  excepted). A mismatch invalidates that gate's result and marks the run
+  `integrity-violated` for the owner.
+
+A process running under the same OS account can still write to any path the
+owner can, including candidate checkouts. Read-only permissions protect against
+accidents, not adversaries. Real containment needs a separate user, container
+or sandbox (§9.5).
 
 ## 3. Decisions
 
@@ -338,8 +358,8 @@ A reviewer's allegation that the candidate is wrong:
   the tests miss is the typical case.
 - `contract`: the candidate violates the phase's goal, acceptance or a
   recorded accepted decision.
-- `integration`: the phase passed on its own but failed once integrated
-  (§6.4). The conductor raises this kind itself.
+- `integration`: the candidate passed on its own but failed its integration
+  probe (§6.4). The conductor raises this kind itself.
 
 A finding needs evidence: file and line, a scenario, a check result, or a plan
 clause. It has a severity. `blocking` is the default, and only the owner can
@@ -363,10 +383,11 @@ that fails as claimed marks the finding `reproduced`. One that passes does
 | **accepted** | **the owner only**. For `contract`, this means amending the contract (§7.3); for `defect`, a recorded risk acceptance with its scope | owner command, bound to versions |
 
 Other reviewers can agree or disagree in their reviews, and the view shows it.
-They cannot close someone else's finding. For `integration` findings the
-"raising reviewer" is the conductor, which confirms by rerunning the
-integration checks. If a finding is still open when the phase's repair budget
-runs out, it becomes an owner request.
+They cannot close someone else's finding. An `integration` finding closes as
+repaired when a later candidate's integration probe passes (§6.4). The probe
+runs before acceptance, so closing it never depends on acceptance. If a finding
+is still open when the phase's repair budget runs out, it becomes an owner
+request.
 
 ### 4.3 The worked example, correctly routed
 
@@ -445,6 +466,11 @@ FREEZING      quiesce worker, sweep, commit, create read-only candidate (§6.2)
 CHECKING      CHECKS in a fresh disposable checkout of candidate C
   │ any failure ─────────────────────────────────────────────▶ REPAIRING
   ▼
+PROBING       merge C onto the integration head H on a disposable probe
+  │           branch, giving I; CHECKS on a fresh checkout of I (§6.4)
+  │ conflict or failure → raise `integration` finding ──────▶ REPAIRING
+  │ success → close open `integration` findings as repaired
+  ▼
 REVIEWING     M, A, B review C under contract K (two turns each)
   ▼
 RESOLVING     decisions voted; findings, owner requests, corrections open?
@@ -452,12 +478,9 @@ RESOLVING     decisions voted; findings, owner requests, corrections open?
   │ open items remain, budget exhausted ─────────────────────▶ AWAITING_OWNER
   │ accept(C, K) holds (§6.3)
   ▼
-ACCEPTED(C)
+ACCEPTED(C)   atomically: corrections addressed by C recorded resolved
   ▼
-INTEGRATING   merge C onto the integration branch, giving I (§6.4)
-  ▼
-INTEGRATION_CHECKS   CHECKS in a fresh checkout of I
-  │ failure → reset branch, raise `integration` finding ────▶ REPAIRING
+PUBLISHING    move the integration branch from H to the probed I (§6.4)
   ▼
 DONE(I)       the next phase starts from I
 
@@ -498,32 +521,60 @@ the only way a phase reaches `ACCEPTED`:
 ```text
 accept(C, K) ⇔
       every CHECKS command passed on a fresh checkout of C
+  ∧   the integration probe of C onto the current head H passed, giving I
   ∧   M, A and B each submitted a valid review bound to (C, K)
         — required even when there are no decisions to vote on
   ∧   no finding is open with severity blocking
   ∧   every decision on C is detail, passed by vote bound to (C, K),
         or resolved by the owner bound to (C, K)
   ∧   no owner request is open
-  ∧   no owner correction is open (§7.5)
+  ∧   every open owner correction X satisfies addressed(X, C, K)
+
+addressed(X, C, K) ⇔
+      X is bound to contract K
+  ∧   M, A and B each stated, in their review bound to (C, K),
+        that X is honored — none states it is not
 ```
 
+Corrections are assessed, not closed, before acceptance, so the predicate never
+depends on its own outcome. The `ACCEPTED(C)` event itself records every
+addressed correction as `resolved`, in the same log append.
+
 ```text
-done(phase) ⇔ accept(C, K) ∧ C is merged into integration commit I
-                           ∧ every CHECKS command passed on a fresh checkout of I
+done(phase) ⇔ accept(C, K) ∧ the integration branch points at the probed I
 ```
+
+Every input to `accept` is evaluated before `ACCEPTED`. Nothing it requires is
+produced by acceptance or after it. That is the property that keeps the
+lifecycle free of circular dependencies, and phase 0 of the implementation
+plan tests it.
 
 ### 6.4 Integration
 
-Phases are serial, and each phase's worktree starts from the current
-integration head, so a phase is normally a fast-forward. The conductor:
+Integration is split into a **probe** before acceptance and a **publish** after
+it, so that the integration result is part of the evidence acceptance requires.
 
-1. records `integrate.intent` with the pre-merge sha;
-2. merges C, with trailer `TT-Action: <id>`, giving I;
-3. runs `CHECKS` on a fresh checkout of I;
-4. on success records `DONE(I)`. On failure, or on a merge conflict, it resets
-   the integration branch to the pre-merge sha, raises a blocking
-   `integration` finding with the output, and returns the phase to
-   `REPAIRING`.
+**Probe** (state `PROBING`):
+
+1. Record `probe.intent` with C and the current integration head H.
+2. Create the disposable branch `tt/<run>/probe/<C>` at H, and merge C into it
+   with trailer `TT-Action: <id>`, giving I. Phases are serial and each
+   worktree starts from H, so this is normally a fast-forward and I equals C.
+3. Run `CHECKS` on a fresh checkout of I.
+4. On success, record `probe.passed(C, H, I)` and close open `integration`
+   findings as repaired. On a conflict or failure, raise a blocking
+   `integration` finding with the output and return the phase to
+   `REPAIRING`. The integration branch is never touched by a probe.
+
+**Publish** (state `PUBLISHING`, after `ACCEPTED`):
+
+1. Record `publish.intent(H, I)`.
+2. Move the integration branch from H to I **only if it still points at H**
+   (`git update-ref <branch> I H`). The published commit is exactly the one
+   the probe checked, so no further checks are needed.
+3. Record `DONE(I)`. If the branch no longer points at H, which cannot happen
+   with serial phases but is checked anyway, the probe result is stale: the
+   phase returns to `PROBING` against the new head.
 
 ## 7. Versions and authority
 
@@ -640,10 +691,12 @@ conversational feedback into a new requirement on its own authority:
    acted on.
 4. The worker session gets a repair attempt containing the original contract,
    the decision and its evidence, and the correction **verbatim**.
-5. The new candidate goes through the whole lifecycle (§6). The correction is
-   closed when the candidate is accepted **and** no reviewer reports it
-   unaddressed. Each review of that candidate must state whether the
-   correction is honored. Any reviewer saying "not honored" keeps it open,
+5. The new candidate goes through the whole lifecycle (§6). Each review of
+   that candidate must state whether the correction is honored. The
+   correction counts as **addressed** by the candidate when all three reviews
+   say it is honored and none says it is not (§6.3). Acceptance requires every
+   open correction to be addressed, and the `ACCEPTED` event records it as
+   `resolved`. A single "not honored" keeps the candidate from being accepted,
    exactly like a finding. If the new allowance runs out, it becomes an owner
    request.
 
@@ -651,9 +704,11 @@ conversational feedback into a new requirement on its own authority:
 depends on the corrected one:
 
 - If the corrected phase is `DONE` and **no later phase has been integrated**,
-  the conductor cancels the later phase's in-flight attempt, resets the
-  integration branch to the corrected phase's pre-merge sha, and reopens the
-  corrected phase. The later phase restarts from the new integration head.
+  the conductor cancels the later phase's in-flight attempt, moves the
+  integration branch back to the head H recorded in the corrected phase's
+  publish event, and reopens the corrected phase. Its repaired candidate is
+  probed and published as usual, and the later phase restarts from the new
+  integration head.
 - If **a later phase has been integrated**, rebuilding that chain is not
   supported in v1. The revise buffer says so before submission and offers to
   start a new run from an amended plan instead.
@@ -678,6 +733,7 @@ Every stage below has a conductor-enforced deadline:
 | each `sh` command the worker runs | 10 min | kill its group | tool result `timeout` returned to the worker |
 | freeze (quiesce, sweep, commit) | 2 min | force-kill, sweep, mark worktree `tainted` | attempt failed |
 | each check command | 10 min | kill its group | check `failed: timeout` |
+| integration probe (merge plus its checks) | as for checks, per command | kill its group; discard the probe branch | `integration` finding: timeout |
 | each review | 15 min | cancel, re-dispatch once | then the phase is `BLOCKED: reviewer unavailable` |
 | reproduction command | 5 min | kill its group | reproduction `inconclusive` |
 | repair rounds per phase | 3, plus 3 per owner correction | — | open items become owner requests |
@@ -751,7 +807,8 @@ Each has a reconciliation for "intent recorded, completion missing":
 | agent attempt | kill the Pi group and every recorded shell group; sweep. Mark the attempt `interrupted`. Worker: new attempt on the same session file with an interruption note. Reviewer: discard; start a new review |
 | freeze commit | worktree HEAD carries trailer `TT-Action: <id>` → record it; otherwise redo the freeze |
 | check run | mark `interrupted` and rerun (checks are required to be rerunnable) |
-| integrate | integration branch has a commit with trailer `TT-Action: <id>` → continue with integration checks; otherwise reset to the recorded pre-merge sha and retry |
+| probe | discard the probe branch and its checkout; mark the probe `interrupted`; probe again (the integration branch was never touched) |
+| publish | integration branch points at I → record `DONE(I)`; still at H → retry the compare-and-swap; anywhere else → the probe is stale, return to `PROBING` |
 
 **Owner commands come in two kinds, with different guarantees:**
 
@@ -824,8 +881,10 @@ The worker's extension:
 These hooks are **workflow guards, not a security boundary**. A shell command
 can still get around a path check. Protecting control state needs filesystem
 and process permissions, which v1 does not implement. This is recorded as a
-known gap, not claimed as done. The freeze boundary (§6.2) is what keeps a
-misbehaving worker from corrupting evidence in v1.
+known gap, not claimed as done. In v1 the freeze boundary (§6.2) stops a
+**cooperative** worker's continued edits from reaching evidence, and
+integrity verification (§2.2) **detects** tampering with a candidate checkout.
+Neither contains a process that deliberately evades control.
 
 ### 9.6 Keys
 
@@ -949,7 +1008,8 @@ One phase, end to end, on a real repository:
 
 open the plan → `C-c m r` → run a worker → freeze its candidate → check it →
 review it (M, A, B) → surface at least one decision → **resolve it, and in a
-second run revise it** → integrate → integration checks → `DONE`.
+second run revise it** → integration probe → publish → `DONE`. It must also
+recover from one deliberately failing integration probe.
 
 It must include, deliberately triggered:
 
@@ -983,7 +1043,7 @@ Out of scope:
 | --- | --- | --- | --- |
 | A1 | Pi RPC agents can be run, bounded and killed from a conductor | forced timeouts at every stage; the force-kill test in §9.3 | a process outlives cancellation; a hang passes a deadline; session state is lost across repairs |
 | A2 | Extension hooks force structured submission, and the `sh` replacement is usable | attempts ending `no_submission`; the worker completes real tasks through `sh` | workers regularly fail to submit, loop on reminders, or cannot work without the built-in bash |
-| A3 | The freeze boundary holds | modify the worktree after submit, from a surviving process | any check or review sees a change made after the freeze |
+| A3 | The freeze boundary holds for cooperative workers, and tampering is detected | modify the live worktree after submit; separately, modify a candidate checkout during a check | a check or review sees a live-worktree change; a modified checkout is not flagged `integrity-violated` |
 | A4 | Recovery behaves as specified | the `TT_CRASH_AT` suite | any criterion in §9.3 fails |
 | A5 | The live trace and views work across restarts | reopen after Emacs restart mid-turn | live stream missing; history not rebuilt; views stale |
 | A6 | Revise closes the loop | a correction on an accepted decision reaches `resolved` with no further owner action | the correction is lost, silently reinterpreted, or cannot act because of an exhausted budget |
@@ -1016,13 +1076,21 @@ small tasks.
 
 ### 11.5 Build order
 
-1. **Milestone 1 (§11.1).** Conductor daemon, plan snapshot, one worker over
-   RPC with `sh`, freeze, checks, three reviewers, one decision with
-   resolve/revise, integration, deadlines, cancellation, recovery, minimal
-   status and decision views. Tests A1–A6.
-2. **Multi-phase.** Serial phases, the master reviewer across phases,
-   corrections on integrated phases, full workspace and decision view.
-3. **Comparative pilot (§11.4).**
+The concrete phases, deliverables and required evidence are in
+[the implementation plan](tradeoffs-trace-plan.md). In summary:
+
+0. **Executable contracts.** Pure state machine, schemas and pinned Pi tool
+   configuration, with tests showing the lifecycle has no circular
+   dependency.
+1. **Execution foundation.** A single-phase conductor: log, Pi adapter,
+   conductor-owned shell, deadlines, frozen candidates, probe and publish,
+   recovery.
+2. **Review and correction loop.** Three reviewers, findings, voting, owner
+   requests, resolve and revise.
+3. **Minimal Emacs experience.** `C-c m r/s/d`, live trace, the decision view.
+   Phases 1–3 together are the milestone in §11.1.
+4. **Multi-phase execution.**
+5. **Comparative pilot (§11.4).**
 
 ## 12. Open questions
 
