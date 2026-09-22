@@ -30,6 +30,21 @@ inside OpenCode buffers:
 `:opencode` / `:oc` (Evil ex) open the global list. Set `+opencode-prefix` to
 something outside `C-c`, e.g. `s-o`, if preferred.
 
+## Editing vs sending (Evil)
+
+The package leaves a session buffer in Emacs state, so every key reaches comint
+and `RET` sends the moment it is typed. Here it is an ordinary Evil buffer
+instead:
+
+- sessions open in **insert state** — type and edit freely; `RET` inserts a
+  newline, so a prompt can be several lines.
+- **normal state** is for reading, motions, visual selection, and sending:
+  `RET` (or `C-<return>`) sends the input to the agent.
+- `C-<return>` in insert state also sends, for one-keystroke submit.
+
+The session manager (vtable) starts in normal state so `j`/`k` and the
+package's own bindings work.
+
 ## Global session list
 
 `C-c m m` aggregates `/project` and `/session` into one vtable with **Project ·

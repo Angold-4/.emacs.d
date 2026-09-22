@@ -137,7 +137,10 @@ buffers via sczi/opencode.el — no terminal, no alternate screen.
 | `C-c l` (in a session) | List the project's sessions |
 | `/` (at a prompt) | Run a slash command |
 
-The modeline shows the agent, model, variant and context used.
+Sessions are ordinary Evil buffers: they open in insert state, where `RET`
+inserts a newline and you edit normally; pressing `RET` in **normal state**
+sends the input to the agent (`C-<return>` sends from insert too). The modeline
+shows the agent, model, variant and context used.
 
 ### LSP & Code
 

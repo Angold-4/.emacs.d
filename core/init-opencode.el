@@ -110,6 +110,14 @@ Set it to something outside `C-c', for example \"s-o\", if you prefer."
   (make-directory +opencode-sessions-directory t)
   (dired +opencode-sessions-directory))
 
+(defun +opencode/send ()
+  "Send the session's current input to the agent.
+Bound to RET in normal state so editing stays in insert state."
+  (interactive)
+  (unless (derived-mode-p 'opencode-session-mode)
+    (user-error "Not in an OpenCode session"))
+  (comint-send-input))
+
 ;; =============================================================================
 ;; Global session list
 ;; =============================================================================
@@ -292,7 +300,21 @@ holds metadata plus the full markdown transcript."
 ;; C-c map would otherwise shadow it.
 (with-eval-after-load 'opencode
   (define-key opencode-session-mode-map (kbd +opencode-prefix) +opencode-command-map)
-  (define-key opencode-session-control-mode-map (kbd +opencode-prefix) +opencode-command-map))
+  (define-key opencode-session-control-mode-map (kbd +opencode-prefix) +opencode-command-map)
+
+  ;; The package leaves the session buffer in Emacs state, so every key reaches
+  ;; comint and RET sends the moment it is typed.  Run it as an ordinary Evil
+  ;; buffer instead: edit in insert state, and send deliberately from normal
+  ;; state.
+  (evil-set-initial-state 'opencode-session-mode 'insert)
+  (evil-define-key 'insert opencode-session-mode-map (kbd "RET") #'newline)
+  (evil-define-key 'insert opencode-session-mode-map (kbd "C-<return>") #'+opencode/send)
+  (evil-define-key 'normal opencode-session-mode-map (kbd "RET") #'+opencode/send)
+  (evil-define-key 'normal opencode-session-mode-map (kbd "C-<return>") #'+opencode/send)
+
+  ;; The session manager is a vtable; normal state lets j/k and the package's
+  ;; own evil bindings (r/n/gv) work.
+  (evil-set-initial-state 'opencode-session-control-mode 'normal))
 
 (provide 'init-opencode)
 ;;; init-opencode.el ends here
