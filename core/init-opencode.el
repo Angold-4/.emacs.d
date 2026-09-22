@@ -15,12 +15,17 @@
 ;;
 ;;   C-c m m   global session list (every project)  +opencode/sessions
 ;;   C-c m o   project session manager              +opencode/open
+;;   C-c m i   compose in a dedicated input buffer   +opencode/input
 ;;   C-c m n   new session                          +opencode/new
 ;;   C-c m M   select model                         +opencode/model
 ;;   C-c m a   provider, then model                 +opencode/provider
 ;;   C-c m v   select model variant                 +opencode/variant
 ;;   C-c m s   save this session as an org file     +opencode/save
 ;;   C-c m d   open the saved-sessions directory    +opencode/open-directory
+;;
+;; The model's reasoning/thinking blocks are hidden (`+opencode-show-reasoning'
+;; nil); the package has no switch for this, so reasoning is dropped at its one
+;; insertion point and its re-render is skipped.
 ;;
 ;; Sessions as files: `+opencode/save' writes a session to
 ;; `+opencode-sessions-directory' as org with metadata (id, directory,
@@ -64,6 +69,97 @@
   (setq opencode-command (or (executable-find "opencode") "opencode"))
   ;; Start a headless server on demand when none is running.
   (setq opencode-auto-start-server t))
+
+;; =============================================================================
+;; Hide the thinking trace
+;; =============================================================================
+
+(defcustom +opencode-show-reasoning nil
+  "Whether to show the model's reasoning/thinking blocks.
+The package has no switch for this; when nil, reasoning is dropped at the
+one insertion point and its region re-render is skipped."
+  :type 'boolean
+  :group 'tools)
+
+(defun +opencode--hide-reasoning-insert (orig-fn text)
+  "Call ORIG-FN on TEXT only when reasoning is shown."
+  (when +opencode-show-reasoning
+    (funcall orig-fn text)))
+
+(defun +opencode--hide-reasoning-region (orig-fn type start &optional end)
+  "Call ORIG-FN unless TYPE is `reasoning' and reasoning is hidden."
+  (when (or +opencode-show-reasoning (not (eq type 'reasoning)))
+    (funcall orig-fn type start end)))
+
+;; =============================================================================
+;; Separate input buffer
+;; =============================================================================
+
+(defcustom +opencode-input-buffer-name "*OpenCode Input*"
+  "Name of the buffer composed for an OpenCode session.
+One input buffer per session is created from this plus the session id."
+  :type 'string
+  :group 'tools)
+
+(defvar-local +opencode-input-session nil
+  "Session buffer the current input buffer sends to.")
+
+(defun +opencode--session-buffer ()
+  "Return a session buffer to act on: the current one, or the most recent."
+  (or (and (derived-mode-p 'opencode-session-mode) (current-buffer))
+      (seq-find (lambda (buffer)
+                  (with-current-buffer buffer
+                    (derived-mode-p 'opencode-session-mode)))
+                (buffer-list))))
+
+(defun +opencode--input-buffer (session)
+  "Return the input buffer belonging to SESSION, creating it if needed."
+  (let ((id (with-current-buffer session (or opencode-session-id "session"))))
+    (get-buffer-create (format "%s <%s>" +opencode-input-buffer-name id))))
+
+(defun +opencode/send-input ()
+  "Send the input buffer's text to its session, then clear it.
+Uses the package's own `opencode-session--send-synthetic-input', so the
+session's model, agent and context are untouched and a send works while
+the agent is still working."
+  (interactive)
+  (let ((session +opencode-input-session)
+        (text (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
+    (unless (buffer-live-p session)
+      (user-error "This input buffer is not attached to a session"))
+    (when (string-empty-p text)
+      (user-error "Nothing to send"))
+    (with-current-buffer session
+      (opencode-session--send-synthetic-input text))
+    (let ((inhibit-read-only t))
+      (erase-buffer))
+    (message "Sent to %s" session)))
+
+(defvar +opencode-input-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-<return>") #'+opencode/send-input)
+    (define-key map (kbd "C-c C-c") #'+opencode/send-input)
+    map)
+  "Keymap for the OpenCode input buffer.")
+
+(define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
+  "Major mode for composing an OpenCode prompt in its own buffer.")
+
+(defun +opencode/input ()
+  "Open the input buffer for the current (or most recent) session."
+  (interactive)
+  (require 'opencode)
+  (let ((session (+opencode--session-buffer)))
+    (unless (buffer-live-p session)
+      (user-error "No OpenCode session"))
+    (let ((buffer (+opencode--input-buffer session)))
+      (with-current-buffer buffer
+        (unless (derived-mode-p '+opencode-input-mode)
+          (+opencode-input-mode))
+        (setq +opencode-input-session session))
+      (display-buffer buffer '(display-buffer-below-selected
+                               (window-height . 12)))
+      (pop-to-buffer buffer))))
 
 ;; =============================================================================
 ;; Prefix command map
@@ -331,6 +427,7 @@ holds metadata plus the full markdown transcript."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "m") #'+opencode/sessions)
     (define-key map (kbd "o") #'+opencode/open)
+    (define-key map (kbd "i") #'+opencode/input)
     (define-key map (kbd "n") #'+opencode/new)
     (define-key map (kbd "M") #'+opencode/model)
     (define-key map (kbd "a") #'+opencode/provider)
@@ -344,7 +441,11 @@ holds metadata plus the full markdown transcript."
 
 (with-eval-after-load 'evil
   (evil-ex-define-cmd "opencode" #'+opencode/sessions)
-  (evil-ex-define-cmd "oc" #'+opencode/sessions))
+  (evil-ex-define-cmd "oc" #'+opencode/sessions)
+  ;; The input buffer is a normal buffer: insert state to write, normal RET to
+  ;; send.  No comint, so typing while the agent works costs nothing.
+  (evil-set-initial-state '+opencode-input-mode 'insert)
+  (evil-define-key 'normal +opencode-input-mode-map (kbd "RET") #'+opencode/send-input))
 
 ;; Keep the prefix consistent inside OpenCode buffers, where the package's own
 ;; C-c map would otherwise shadow it.
@@ -364,7 +465,13 @@ holds metadata plus the full markdown transcript."
 
   ;; The session manager is a vtable; normal state lets j/k and the package's
   ;; own evil bindings (r/n/gv) work.
-  (evil-set-initial-state 'opencode-session-control-mode 'normal))
+  (evil-set-initial-state 'opencode-session-control-mode 'normal)
+
+  ;; Hide the model's thinking trace.
+  (advice-add 'opencode--insert-reasoning-block
+              :around #'+opencode--hide-reasoning-insert)
+  (advice-add 'opencode--render-region
+              :around #'+opencode--hide-reasoning-region))
 
 (provide 'init-opencode)
 ;;; init-opencode.el ends here

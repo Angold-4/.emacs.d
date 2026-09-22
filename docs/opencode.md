@@ -21,6 +21,7 @@ inside OpenCode buffers:
 |-----|---------|---------|
 | `C-c m m` | `+opencode/sessions` | Global session list, every project |
 | `C-c m o` | `+opencode/open` | Session manager for the current project |
+| `C-c m i` | `+opencode/input` | Compose in a dedicated input buffer |
 | `C-c m n` | `+opencode/new` | New session |
 | `C-c m M` | `+opencode/model` | Select model (flattened across providers) |
 | `C-c m a` | `+opencode/provider` | Select provider, then a model from it |
@@ -45,6 +46,23 @@ instead:
 
 The session manager (vtable) starts in normal state so `j`/`k` and the
 package's own bindings work.
+
+## Reasoning
+
+Reasoning/thinking blocks are hidden by default (`+opencode-show-reasoning`,
+nil). The package has no option for this, so the trace is dropped at
+`opencode--insert-reasoning-block` and `opencode--render-region` skips the
+`reasoning` type. Set the option to `t` to show it again.
+
+## Input buffer
+
+`C-c m i` (`+opencode/input`) opens a plain buffer, one per session, for
+writing a prompt away from the transcript. It is an ordinary Evil buffer
+(insert state to write, normal `RET` or `C-<return>` / `C-c C-c` to send) and
+it never shares a buffer with streaming output, so you can compose at any time,
+including while the agent is working. Sending calls the package's own
+`opencode-session--send-synthetic-input`, so the session's agent, model and
+context are used unchanged; the buffer is cleared on success.
 
 ## Global session list
 

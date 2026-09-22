@@ -134,6 +134,7 @@ buffers via sczi/opencode.el — no terminal, no alternate screen.
 |-----|--------|
 | `C-c o` / `:opencode` / `:oc` | Global session list, every project |
 | `C-c m o` | Session manager for the current project |
+| `C-c m i` | Compose in a dedicated input buffer (type even while the agent works) |
 | `C-c m M` / `C-c m a` | Pick a model / pick a provider then a model |
 | `C-c m v` | Pick a model variant |
 | `C-c m s` / `C-c m d` | Save session as an org file / open the sessions directory |
@@ -142,7 +143,8 @@ buffers via sczi/opencode.el — no terminal, no alternate screen.
 Sessions are ordinary Evil buffers: they open in insert state, where `RET`
 inserts a newline and you edit normally; pressing `RET` in **normal state**
 sends the input to the agent (`C-<return>` sends from insert too). The modeline
-shows the agent, model, variant and context used.
+shows the agent, model, variant and context used, and the model's
+reasoning/thinking trace is hidden by default.
 
 ### LSP & Code
 
