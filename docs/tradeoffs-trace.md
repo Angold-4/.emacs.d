@@ -2,9 +2,10 @@
 
 Status: **Proposal for review.** Nothing here is implemented. It describes the
 first workflow built on the rationale in
-[Human judgment and programmed agent workflows](agent-evaluation-and-programmed-workflows.md),
-and scopes a first version whose only job is to work end to end and test the
-assumptions the design rests on.
+[Human judgment and programmed agent workflows](agent-evaluation-and-programmed-workflows.md).
+The first milestone is a single-phase prototype that tests the hard
+integration boundaries (§11.1). A multi-phase interface and a comparison
+against the current workflow follow only if that prototype holds.
 
 ## 0. What this is
 
@@ -13,17 +14,18 @@ a prompt-driven loop cannot promise:
 
 1. It **enforces the loop**. Checks run, reviews happen, every stage has a
    deadline, and a phase advances only when recorded evidence satisfies a
-   predicate that code evaluates. It never advances because a model thinks the
-   work "looks good enough".
+   predicate that code evaluates (§6.3). It never advances because a model
+   thinks the work "looks good enough".
 2. It **traces trade-offs**. Choices made during implementation are collected
    as decision records from several independent sources, reviewed by
-   independent agents, and presented in one Emacs view the owner can read
-   instead of transcripts.
+   independent agents, and presented in one Emacs view where the owner can
+   accept them or **correct them mid-run** (§7.5).
 
 What it does **not** promise is that every consequential choice is caught. The
 worker may not disclose a choice, reviewers can share blind spots, and triggers
-only see declared boundaries. Completeness is something this workflow
-**measures** (§3.5, §9.3), not something it guarantees.
+only see declared boundaries. The workflow reports an **observed miss rate**
+from sampling and audits (§3.5, §11.4). It does not claim to know how many
+choices went undiscovered.
 
 ### A skill here is a program, not a prompt
 
@@ -92,8 +94,9 @@ be tagged `:provisional:` and are revised as implementation teaches us things.
   ...
 ```
 
-- `CHECKS` are shell commands the conductor runs itself. They must be safe to
-  rerun, because resume may rerun an interrupted check (§7).
+- `CHECKS` are shell commands the conductor runs itself, always in a fresh
+  checkout of a frozen candidate (§6.2). They must be safe to rerun, because
+  recovery may rerun an interrupted check (§9.3).
 - `BOUNDARIES` are path globs whose modification automatically creates a
   decision record (§3.3).
 - `RESERVED` names choices that must always reach the owner, in addition to the
@@ -113,11 +116,11 @@ validate      – next phase has ID, CHECKS, goal, acceptance; globs parse
 snapshot      – copy to <run>/plan/v1.org; record its sha256
     │           the run never reads the original file again
     ▼
-create run    – run id, run directory, conductor lock, meta.json (plan path,
-    │           plan sha, mode, created, status)
+create run    – run id, run directory, meta.json (plan path, plan sha, mode,
+    │           created, status)
     ▼
-start         – conductor process; ask: delegate or co-work (switchable later)
-    │
+start         – launch the conductor as a detached daemon (§2.1); ask:
+    │           delegate or co-work (switchable later)
     ▼
 open workspace – a tab-bar tab "tt:<project>/<run-id>" with the layout below;
                  status is shown automatically
@@ -138,7 +141,7 @@ One tab per run:
 │ > reading src/cancel.ts                │                                 │
 │ Moving removal under the book lock…    │ p1 extract cancel   DONE        │
 │ ▸ tool: edit src/cancel.ts (folded)    │ p2 race-free        REVIEWING   │
-│ ▸ tool: bash npm test -- cancel        │    round 2/3 · cand 7c1e0a4     │
+│ ▸ tool: sh npm test -- cancel          │    round 2/3 · cand 7c1e0a4     │
 │                                        │    checks ✓ 2/2                 │
 │ follows the active agent; `a` picks    │    reviews M ✓  A ⧗  B ⧗        │
 │ another agent of this run              │    open: 1 finding, 0 decisions │
@@ -151,28 +154,28 @@ One tab per run:
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Trace** (left): a read-only rendering of the active agent's Pi session
-  (§8.3). It follows whichever agent is running; `a` chooses a specific agent
-  of the run.
-- **Status** (right): rendered from the log. `RET` on a phase opens its diff;
-  `c` its check output; `d` its decisions; `m` switches mode; `p` pauses.
+- **Trace** (left): the live stream of the active agent (§9.4). It follows
+  whichever agent is running; `a` chooses a specific agent of the run.
+- **Status** (right): rendered from the control log. `RET` on a phase opens its
+  diff; `c` its check output; `d` its decisions; `m` switches mode; `p`
+  pauses.
 - **Input** (bottom): the text is sent as a **steer** to the worker currently
-  running, bound to that worker's attempt (§6). If no worker is running, the
-  text becomes an **owner note**, shown in status and delivered at the start
-  of the next worker attempt. Reviewers cannot be steered. Their independence
-  is the point of having them.
+  running, bound to that worker's attempt (§7.4). If no worker is running,
+  the text becomes an **owner note**, shown in status and delivered at the
+  start of the next worker attempt. Reviewers cannot be steered. Their
+  independence is the point of having them.
 
 `C-c m s` focuses the run's tab. If the tab or any of its windows has been
 closed, it rebuilds the layout. After an Emacs restart, the same command
-reopens it from the run directory.
+reconnects to the run's conductor and reopens it from the run directory.
 
 ### 1.4 Which run a command means
 
 Several plans and runs can be open at once. Every `C-c m` command resolves its
 run the same way:
 
-1. A tradeoffs-trace buffer (trace, status, input, decisions, session view)
-   has a buffer-local run id. Use it.
+1. A tradeoffs-trace buffer (trace, status, input, decisions, revise, session
+   view) has a buffer-local run id. Use it.
 2. A plan buffer: use the most recent run whose `meta.json` records this
    plan's path. If more than one of them is active, ask.
 3. Anywhere else: `completing-read` over runs, sorted by last activity, active
@@ -186,10 +189,10 @@ separate registry to fall out of sync.
 
 | Role | Lifetime | Sees | Produces |
 | --- | --- | --- | --- |
-| **Conductor** (code, not a model) | whole run | everything | the log, worktrees, candidate commits, projections |
-| **Worker** | one phase; resumed for its own repairs | phase contract, repository, prior accepted decisions, owner notes | code in its phase worktree; `submit_phase` |
+| **Conductor** (code, not a model) | whole run | everything | the control log, worktrees, candidates, projections |
+| **Worker** | one phase; resumed for its own repairs | phase contract, repository, prior accepted decisions, owner notes and corrections | code in its phase worktree; `submit_phase` |
 | **Master reviewer** M | whole run, one Pi session | plan, every phase's diff and records, its own earlier reviews | `submit_review` |
-| **Fresh reviewers** A, B | one phase (kept across that phase's repair rounds) | phase contract, repository, diff, records under review | `submit_review` |
+| **Fresh reviewers** A, B | one phase (kept across that phase's repair rounds) | phase contract, frozen candidate, diff, records under review | `submit_review` |
 
 The master reviewer is the one intentionally stateful agent. It carries the
 plan's intent across phases, so it can notice when phase 4 quietly undoes a
@@ -204,15 +207,54 @@ trade-off: repairs converge on the objections that were actually raised,
 rather than chasing a new reviewer's taste every round. It is a pilot
 hypothesis, like the whole master-plus-fresh arrangement.
 
-### Each agent is its own process
+### 2.1 Processes
 
-The conductor starts each agent as a child `pi --mode rpc --extension
-tradeoffs-trace.ts` process in **its own process group**, and talks to it over
-Pi's RPC protocol. Pi also offers an in-process SDK, which is why this needs
-stating. Separate processes are what make deadlines enforceable: killing a
-process group ends the agent and every command its bash tool started, and an
-agent crash cannot take the conductor down with it. The extension provides the
-`submit_phase` and `submit_review` tools and the guards in §8.4.
+```text
+Emacs ──unix socket <run>/conductor.sock──▶ Conductor daemon (Node, detached)
+  │  live events in, commands out                │
+  │  inbox/ files when the daemon is down        ├─ pi --mode rpc  (worker)
+  └─ reads views/ and sessions/ to rebuild       ├─ pi --mode rpc  (M, A, B)
+                                                 └─ shell commands it owns (§2.2)
+```
+
+- The conductor is a **detached daemon**, not a child of Emacs. The run
+  survives closing buffers or restarting Emacs. It holds `conductor.lock` with
+  `flock`, so there is exactly one conductor per run.
+- Each agent is a child `pi --mode rpc --extension tradeoffs-trace.ts` process
+  in its own process group, spoken to over Pi's RPC protocol. The extension
+  provides `submit_phase`, `submit_review` and the guards in §9.5.
+- Reviewers run with read-only built-in tools only (`--tools
+  read,grep,find,ls`) and no shell. Checks are the conductor's job, not
+  theirs.
+
+### 2.2 The conductor owns every shell command
+
+Killing Pi's process group does **not** kill the commands Pi started. Pi's
+built-in bash tool spawns each command `detached` (its own process group) on
+non-Windows platforms. An isolated probe against Pi 0.87.0 confirmed it: after
+the Pi group was killed, the shell kept running. So:
+
+- Workers run with the built-in bash tool disabled (`--exclude-tools bash`).
+- The extension registers a replacement shell tool, `sh`. It forwards each
+  command to the conductor over the run's socket and streams the output back.
+- The **conductor** spawns the command in a new process group and records the
+  pgid in an intent event *before* the command starts. It applies the
+  per-command deadline (§8.1) and kills the group on expiry or cancellation.
+- Pi's `edit`, `write` and `read` tools run inside the Pi process, so killing Pi
+  ends them.
+
+Ownership alone does not rule out an escaped descendant, for example one that
+calls `setsid`. Two further measures deal with that:
+
+- **Sweep.** After any cancellation, and before freezing a candidate, the
+  conductor lists processes whose working directory or open files lie under
+  the worktree (`lsof +D <worktree>`), kills them, and records what it
+  killed.
+- **Freeze makes survivors harmless to evidence.** Checks and reviews never
+  read the live worktree (§6.2). A process that survives the sweep can dirty
+  the worktree, but not a frozen candidate. A sweep that found survivors marks
+  the worktree `tainted`, and the next attempt starts from a clean checkout of
+  the last candidate.
 
 ## 3. Decisions
 
@@ -236,8 +278,8 @@ with any of them empty:
 - **alternatives**, each with its consequence.
 - **recommendation**, and the reason for it.
 
-The conductor checks that the fields are present, not that they are good. The
-quality of these fields is part of what the pilot measures (A5).
+The conductor checks that the fields are present, not that they are good. Their
+quality is part of what the prototype and the pilot measure (§11).
 
 ### 3.3 Where decisions come from
 
@@ -269,20 +311,22 @@ and **only the owner may lower it**:
 
 No vote can pass a reserved decision.
 
-### 3.5 Measuring what the classifier might hide
+### 3.5 Sampling what the classifier might hide
 
 A `detail` label skips the vote, so the classifier could hide exactly the
-choices the owner cares about. The decision view (§9) therefore always includes
-a **sample**, drawn by the conductor rather than a model:
+choices the owner cares about. The decision view (§10) therefore always
+includes a **sample**, drawn by the conductor rather than a model:
 
-- a share of `detail` decisions (v1: all of them in the pilot, since volume is
-  unknown);
+- a share of `detail` decisions (in the prototype and pilot: all of them,
+  since volume is unknown);
 - **unreferenced changes**: diff hunks that no decision or finding cites. The
   conductor computes these mechanically from hunk ranges and record citations;
 - a share of unanimously accepted decisions.
 
 When the owner marks a sampled item "should have been surfaced", that is a
-recorded miss, and the miss rate is the completeness measurement.
+recorded miss. The miss rate within the sample is an **observed** rate. Misses
+outside the sample are estimated by the independent audit in §11.4, not by
+this sample.
 
 ## 4. Findings
 
@@ -294,19 +338,21 @@ A reviewer's allegation that the candidate is wrong:
   the tests miss is the typical case.
 - `contract`: the candidate violates the phase's goal, acceptance or a
   recorded accepted decision.
+- `integration`: the phase passed on its own but failed once integrated
+  (§6.4). The conductor raises this kind itself.
 
 A finding needs evidence: file and line, a scenario, a check result, or a plan
-clause. It has a severity. `blocking` is the default for both kinds, and only
-the owner can lower a finding to `advisory`.
+clause. It has a severity. `blocking` is the default, and only the owner can
+lower a finding to `advisory`.
 
 A ballot on a decision can carry the objection "this violates the contract".
 When it does, the conductor opens a linked `contract` finding and **suspends the
 vote** on that decision until the finding is closed.
 
 A reviewer may attach a proposed reproduction (a test file or a command). The
-conductor runs it against a scratch copy of the candidate. A reproduction that
-fails as claimed marks the finding `reproduced`. One that passes does **not**
-close the finding; it is shown to the raising reviewer as evidence.
+conductor runs it against a fresh checkout of the candidate. A reproduction
+that fails as claimed marks the finding `reproduced`. One that passes does
+**not** close the finding; it is shown to the raising reviewer as evidence.
 
 ### 4.2 How a finding closes
 
@@ -314,11 +360,13 @@ close the finding; it is shown to the raising reviewer as evidence.
 | --- | --- | --- |
 | **repaired** | a new candidate; checks pass on it; the **raising reviewer** confirms, in its review of that candidate, that the finding no longer holds | candidate, confirming review |
 | **disproved** | counter-evidence (a citation, or a test demonstrating the property); the **raising reviewer** withdraws the finding | the evidence, the withdrawal |
-| **accepted** | **the owner only**. For `contract`, this means amending the contract (§6.3); for `defect`, a recorded risk acceptance with its scope | owner command, bound to versions |
+| **accepted** | **the owner only**. For `contract`, this means amending the contract (§7.3); for `defect`, a recorded risk acceptance with its scope | owner command, bound to versions |
 
 Other reviewers can agree or disagree in their reviews, and the view shows it.
-They cannot close someone else's finding. If a finding is still open when the
-phase's repair budget runs out, it becomes an owner request.
+They cannot close someone else's finding. For `integration` findings the
+"raising reviewer" is the conductor, which confirms by rerunning the
+integration checks. If a finding is still open when the phase's repair budget
+runs out, it becomes an owner request.
 
 ### 4.3 The worked example, correctly routed
 
@@ -359,14 +407,14 @@ ordinary code.
 
 - A missing, malformed or evidence-free ballot counts as **reject**, following
   the "missing support is FAIL" rule in OrgBrain #96.
-- A ballot is bound to its versions (§6.1). A ballot on a superseded candidate
+- A ballot is bound to its versions (§7.1). A ballot on a superseded candidate
   is discarded, not counted.
 
 ### 5.2 When a decision fails
 
 The rejecting ballots go to the worker's session as a repair request: change
 the implementation, or keep it and answer the objection with evidence. The
-next candidate is checked and reviewed again in full (§6.2). A decision that
+next candidate goes through the whole lifecycle again (§6). A decision that
 keeps failing until the budget runs out becomes an owner request carrying every
 ballot.
 
@@ -378,9 +426,108 @@ claim? That is the claim-to-evidence shape OrgBrain #96 pilots. It would run
 first in observation mode, and become enforcing only if it measurably catches
 unsupported claims.
 
-## 6. Versions and authority
+## 6. Phase lifecycle and acceptance
 
-### 6.1 Everything is bound to what it evaluated
+This section is the single authoritative account of how a phase moves from
+ready to done. Every other section refers to it.
+
+### 6.1 Transitions
+
+```text
+READY
+  │ start worker attempt n (worktree based on the integration head)
+  ▼
+IMPLEMENTING ──deadline / no_submission──▶ attempt failed ──▶ REPAIRING
+  │ submit_phase
+  ▼
+FREEZING      quiesce worker, sweep, commit, create read-only candidate (§6.2)
+  ▼
+CHECKING      CHECKS in a fresh disposable checkout of candidate C
+  │ any failure ─────────────────────────────────────────────▶ REPAIRING
+  ▼
+REVIEWING     M, A, B review C under contract K (two turns each)
+  ▼
+RESOLVING     decisions voted; findings, owner requests, corrections open?
+  │ open items remain and budget remains ────────────────────▶ REPAIRING
+  │ open items remain, budget exhausted ─────────────────────▶ AWAITING_OWNER
+  │ accept(C, K) holds (§6.3)
+  ▼
+ACCEPTED(C)
+  ▼
+INTEGRATING   merge C onto the integration branch, giving I (§6.4)
+  ▼
+INTEGRATION_CHECKS   CHECKS in a fresh checkout of I
+  │ failure → reset branch, raise `integration` finding ────▶ REPAIRING
+  ▼
+DONE(I)       the next phase starts from I
+
+REPAIRING     the same worker session, a new attempt with the open items
+              ──▶ IMPLEMENTING (consumes one repair round)
+AWAITING_OWNER  parked; no execution; leaves only through an owner command
+BLOCKED         explicit terminal state with cause and evidence
+```
+
+Every transition is an event in the control log naming the evidence and the
+rule version that allowed it.
+
+### 6.2 The freeze boundary
+
+A commit hash does not freeze a live worktree: the worker, or anything it
+started, could keep editing files while they are being checked. So when
+`submit_phase` arrives, the conductor:
+
+1. **Quiesces the worker.** It returns the tool result, sends RPC `abort`,
+   waits for `agent_settled`, and ends the worker process. The session file
+   remains, and a repair resumes it in a new process. A worker process never
+   outlives its attempt.
+2. **Sweeps** the worktree for surviving processes (§2.2).
+3. **Commits** the worktree itself, with trailer `TT-Action: <id>`. The worker
+   cannot commit. That commit is the candidate C.
+4. **Materializes** a read-only checkout of C under `<run>/candidates/<sha>/`
+   for reviewers. Each check or reproduction gets its own disposable checkout
+   of C, created fresh and deleted afterwards, because builds write files.
+
+Checks and reviews only ever see checkouts of C. Nothing reads the live
+worktree after the freeze.
+
+### 6.3 The acceptance predicate
+
+Code evaluates this predicate for candidate C under contract version K. It is
+the only way a phase reaches `ACCEPTED`:
+
+```text
+accept(C, K) ⇔
+      every CHECKS command passed on a fresh checkout of C
+  ∧   M, A and B each submitted a valid review bound to (C, K)
+        — required even when there are no decisions to vote on
+  ∧   no finding is open with severity blocking
+  ∧   every decision on C is detail, passed by vote bound to (C, K),
+        or resolved by the owner bound to (C, K)
+  ∧   no owner request is open
+  ∧   no owner correction is open (§7.5)
+```
+
+```text
+done(phase) ⇔ accept(C, K) ∧ C is merged into integration commit I
+                           ∧ every CHECKS command passed on a fresh checkout of I
+```
+
+### 6.4 Integration
+
+Phases are serial, and each phase's worktree starts from the current
+integration head, so a phase is normally a fast-forward. The conductor:
+
+1. records `integrate.intent` with the pre-merge sha;
+2. merges C, with trailer `TT-Action: <id>`, giving I;
+3. runs `CHECKS` on a fresh checkout of I;
+4. on success records `DONE(I)`. On failure, or on a merge conflict, it resets
+   the integration branch to the pre-merge sha, raises a blocking
+   `integration` finding with the output, and returns the phase to
+   `REPAIRING`.
+
+## 7. Versions and authority
+
+### 7.1 Everything is bound to what it evaluated
 
 Every ballot, review, finding disposition and owner command carries:
 
@@ -388,8 +535,7 @@ Every ballot, review, finding disposition and owner command carries:
 run id · phase id · candidate sha · contract version · record id · record version
 ```
 
-- **candidate sha**: at `submit_phase`, the conductor commits the worktree
-  itself (the worker does not commit). That commit is the candidate.
+- **candidate sha**: the freeze commit (§6.2).
 - **contract version**: the plan snapshot number, plus the sha256 of the
   phase's section in it.
 - **record version**: increments whenever a record's content, class or linked
@@ -400,164 +546,288 @@ gets a log event, a message in the echo area, and a line in status saying what
 changed ("decision D-7 changed v2 → v3 since you viewed it"), and the view is
 refreshed. Nothing is applied to a version the sender did not see.
 
-### 6.2 v1: a new candidate invalidates all of the phase's evidence
+### 7.2 v1: a new candidate invalidates all of the phase's evidence
 
 Deciding which evidence survives a change is hard to get right. In v1, any new
-candidate reruns **all** of the phase's checks and **all three** reviews.
-Every ballot and closure confirmation on the old candidate is discarded. Open
-findings carry forward, to be re-examined by their raising reviewer on the new
-candidate. Steering therefore costs a full re-review if it changes code, and
-that cost is intended.
+candidate goes through the full lifecycle again: all checks and all three
+reviews. Every ballot and closure confirmation on the old candidate is
+discarded. Open findings carry forward, to be re-examined by their raising
+reviewer on the new candidate. Steering therefore costs a full re-review if it
+changes code, and that cost is intended.
 
-### 6.3 Amending the contract
+### 7.3 Amending the contract
 
 `amend` writes a new plan snapshot. For v1:
 
 - The current phase's evidence is entirely invalidated, and the phase returns
   to checks and review under the new contract version.
 - Provisional later phases simply read the new snapshot.
-- Amending the contract of a phase **already integrated** is out of scope for
-  v1. It requires a new run, because it would mean re-verifying integrated
-  work.
+- Amending the contract of a phase **already integrated** follows the same rule
+  as correcting one (§7.5): supported only while no later phase has been
+  integrated; otherwise a new run is required.
 
-### 6.4 Owner commands
+### 7.4 Owner commands
 
-| Command | Effect | Bound to |
-| --- | --- | --- |
-| steer | message delivered to the running worker through Pi's steer | worker attempt id |
-| note | queued for the next worker attempt | phase |
-| resolve | answer an owner request (choose an option or write one) | request id and version, candidate, contract |
-| override | approve or reject a delegated decision; recorded **beside** the ballots | decision version, candidate, contract |
-| accept-finding | the owner's disposition of a finding (§4.2) | finding version, candidate, contract |
-| amend | new contract version (§6.3) | contract version being replaced |
-| pause / resume / mode | control only | run |
+Commands differ in where their effect lands, and that decides what recovery can
+promise (§9.3):
 
-Steering, overriding and amending are deliberately separate. Asking "would a
-queue help here?" is conversation. Rejecting the queue is a decision. Changing
+| Command | Effect | Kind | Bound to |
+| --- | --- | --- | --- |
+| steer | message delivered to the running worker through Pi's RPC `steer` | **external delivery** | worker attempt id |
+| note | queued for the next worker attempt | conductor state | phase |
+| resolve | answer an owner request (choose an option or write one) | conductor state | request id and version, candidate, contract |
+| override | approve or reject a delegated decision; recorded **beside** the ballots | conductor state | decision version, candidate, contract |
+| accept-finding | the owner's disposition of a finding (§4.2) | conductor state | finding version, candidate, contract |
+| revise | correct a decision or finding and repair the phase (§7.5) | conductor state (then its own attempt) | record version, candidate, contract |
+| amend | new contract version (§7.3) | conductor state | contract version being replaced |
+| unneeded | mark an owner request as "did not need me" (a pilot metric) | conductor state | request id |
+| pause / resume / mode | control only | conductor state | run |
+
+Steering, overriding, revising and amending are deliberately separate. Asking
+"would a queue help here?" is conversation. Rejecting the queue is a decision.
+"This trade-off doesn't make sense; do it this way" is a correction. Changing
 what "cancelled" means is a contract revision. The log keeps them apart.
 
-## 7. Bounds, cancellation and termination
+### 7.5 Correcting a decision mid-run: revise
 
-### 7.1 Every stage has a deadline
+From any entry in the decision view (pending, accepted, sampled `detail`, or a
+finding), the owner can press `r`, say what does not make sense, and describe
+the intended change. The conductor applies the correction and the pipeline
+continues on its own.
+
+**The revise buffer** shows the consequence before anything is sent:
+
+```text
+Revise: Batch cancels per tick instead of one lock per request     [p2 · D-p2-05 v2]
+
+Your correction:
+  A lone cancellation must not wait for the next tick. Keep immediate
+  handling even if batching improves throughput.
+
+This changes the contract?   [ ] no, it's feedback within the contract
+
+Submitting will:
+  - pause phase 2 (cancel review round 2 in progress)
+  - start a repair attempt with your correction, the original contract and
+    the decision's evidence; grant 3 new repair rounds
+  - rerun checks and all three reviews on the new candidate
+  - phase 3 has not started; nothing else is affected
+
+C-c C-c submit      C-c C-k cancel
+```
+
+**Feedback versus a changed requirement.** A correction is feedback within the
+existing contract unless the owner says otherwise. The conductor never turns
+conversational feedback into a new requirement on its own authority:
+
+- If the owner ticks "this changes the contract", the buffer shows the proposed
+  edit to the phase's section of the plan as a diff. Submitting then performs
+  an `amend` (§7.3) together with the correction, as one explicit act.
+- If the owner leaves it unticked but a reviewer or the worker judges that the
+  correction conflicts with the contract, the conductor does not guess. It
+  raises an owner request showing the conflict and the contract edit that would
+  resolve it.
+
+**What happens on submit:**
+
+1. The correction becomes a record linked to the decision. The original
+   decision is preserved and marked `superseded by correction C-…`.
+2. Affected execution is paused. A running worker attempt or review is
+   cancelled (§8.2), and its partial results are discarded.
+3. A **new repair allowance** is granted: 3 rounds, recorded as
+   `budget.granted by correction C-…`. It is independent of any exhausted
+   budget, so a correction made after three failed attempts can still be
+   acted on.
+4. The worker session gets a repair attempt containing the original contract,
+   the decision and its evidence, and the correction **verbatim**.
+5. The new candidate goes through the whole lifecycle (§6). The correction is
+   closed when the candidate is accepted **and** no reviewer reports it
+   unaddressed. Each review of that candidate must state whether the
+   correction is honored. Any reviewer saying "not honored" keeps it open,
+   exactly like a finding. If the new allowance runs out, it becomes an owner
+   request.
+
+**Already integrated work.** Phases are serial in v1, so every later phase
+depends on the corrected one:
+
+- If the corrected phase is `DONE` and **no later phase has been integrated**,
+  the conductor cancels the later phase's in-flight attempt, resets the
+  integration branch to the corrected phase's pre-merge sha, and reopens the
+  corrected phase. The later phase restarts from the new integration head.
+- If **a later phase has been integrated**, rebuilding that chain is not
+  supported in v1. The revise buffer says so before submission and offers to
+  start a new run from an amended plan instead.
+
+The entry in the decision view then tracks the correction:
+
+```text
+Correction received → repairing → checking → reviewing → resolved
+original: D-p2-05 v2 (preserved)   replacement: candidate 91be3d0 · D-p2-05 v3
+```
+
+## 8. Bounds, cancellation and termination
+
+### 8.1 Every stage has a deadline
 
 Every stage below has a conductor-enforced deadline:
 
 | Stage | Default (plan may override) | On expiry | Resulting state |
 | --- | --- | --- | --- |
-| worker attempt, start to `submit_phase` | 45 min, plus a per-attempt token cap | cancel (§7.2) | attempt `timed_out`; consumes a repair round |
+| worker attempt, start to `submit_phase` | 45 min, plus a per-attempt token cap | cancel (§8.2) | attempt `timed_out`; consumes a repair round |
 | settle reminders | 2 continuations | attempt fails | attempt `no_submission`; consumes a repair round |
-| each check command | 10 min | cancel | check `failed: timeout` |
+| each `sh` command the worker runs | 10 min | kill its group | tool result `timeout` returned to the worker |
+| freeze (quiesce, sweep, commit) | 2 min | force-kill, sweep, mark worktree `tainted` | attempt failed |
+| each check command | 10 min | kill its group | check `failed: timeout` |
 | each review | 15 min | cancel, re-dispatch once | then the phase is `BLOCKED: reviewer unavailable` |
-| reproduction command | 5 min | cancel | reproduction `inconclusive` |
-| repair rounds per phase | 3 | — | open items become owner requests |
+| reproduction command | 5 min | kill its group | reproduction `inconclusive` |
+| repair rounds per phase | 3, plus 3 per owner correction | — | open items become owner requests |
 | run execution budget | from `TT_BUDGET` (wall and tokens) | stop dispatching | run `PAUSED: budget` until the owner resumes it with more budget |
 
 The execution budget counts only time spent executing. A phase parked in
 `AWAITING_OWNER` consumes nothing, because waiting for a person is an explicit
 state, not work.
 
-### 7.2 Cancellation
+### 8.2 Cancellation
 
-- **Agent**: send RPC `abort`, wait 30 s, then `SIGTERM` the process group,
-  wait 10 s, then `SIGKILL` it. The worktree is left as it is, for inspection.
-- **Check or reproduction**: started in its own process group; `SIGTERM`, 10 s,
-  `SIGKILL`.
-- Every cancellation writes an event naming the stage, the reason and the
-  signals sent.
+- **Agent**: send RPC `abort`, wait 30 s, then `SIGTERM` the Pi process group,
+  wait 10 s, then `SIGKILL` it. Then kill every shell group the conductor
+  started for that agent (§2.2), then sweep the worktree.
+- **Check or reproduction**: started by the conductor in its own process group;
+  `SIGTERM`, 10 s, `SIGKILL`; the disposable checkout is deleted.
+- Every cancellation writes an event naming the stage, the reason, the signals
+  sent and anything the sweep killed.
 
-### 7.3 Why an unattended run terminates
+### 8.3 Why an unattended run terminates
 
-The phase list is finite. Each phase has at most 1 + 3 candidate rounds. Each
-round is bounded by the worker, check and review deadlines, and the execution
+The phase list is finite. Each phase has at most 1 + 3 candidate rounds, plus 3
+per owner correction, and corrections only arrive from the owner. Each round is
+bounded by the worker, freeze, check and review deadlines, and the execution
 budget caps the total. So an unattended run always reaches one of `DONE`,
 `BLOCKED`, `PAUSED: budget`, or `AWAITING_OWNER` in bounded execution time.
 None of those states advances without a recorded cause.
 
-## 8. State, recovery and the Emacs surface
+## 9. State, recovery and the Emacs surface
 
-### 8.1 The run directory
+### 9.1 The run directory
 
 ```text
 ~/.tradeoffs-trace/<project>/<run-id>/
   meta.json         plan path, plan sha, mode, status, created, last activity
   conductor.lock    held with flock by the one conductor for this run
+  conductor.sock    live events and commands
   plan/v1.org …     immutable plan snapshots
-  events.jsonl      append-only, fsync per event; the only source of truth
+  events.jsonl      control log: state transitions only, fsync per event
+  stream/           live agent events, one file per agent; not fsynced, rotated
   views/            status.org, decisions.org — regenerated, never edited
   inbox/            owner commands, one file each: <command-id>.json
   inbox/applied/    commands already applied
   sessions/         Pi session files, one per agent
+  candidates/       read-only checkouts of frozen candidates
   checks/           check and reproduction output, by candidate
 ```
 
-Workers cannot write here. Their `tool_call` guard blocks it (§8.4), with the
+Workers cannot write here. Their `tool_call` guard blocks it (§9.5), within the
 limit stated there.
 
-### 8.2 Crash-safe resume
+### 9.2 Two logs with different jobs
 
-**One conductor per run**: the conductor holds `conductor.lock` with `flock`
-for its lifetime. Emacs refuses to start a second one, and a crashed
-conductor's lock releases with its process.
+- **`events.jsonl`, the control log.** Every state transition, intent,
+  completion and applied command. It is fsynced per event and is the only
+  source of truth for recovery. It stays small.
+- **`stream/`.** Token deltas, tool progress and other high-volume RPC events,
+  forwarded to Emacs over the socket and appended here without fsync, so that a
+  reopened trace can show the tail of a live turn. Losing the stream loses
+  display detail, never state.
 
-**Every external effect has an ID, an intent event and a completion event**,
-and a defined reconciliation for "intent recorded, completion missing":
+### 9.3 Crash-safe recovery
+
+**One conductor per run** (§2.1). Every external effect has an **action ID**, an
+**intent event** written before it and a **completion event** written after.
+Each has a reconciliation for "intent recorded, completion missing":
 
 | Effect | Reconciliation on restart |
 | --- | --- |
 | create worktree | path exists at the recorded base → record done; otherwise remove the partial worktree and recreate it |
-| agent attempt | kill the orphaned process group (its pgid is in the intent). Mark the attempt `interrupted`. Worker: new attempt on the same session file with an interruption note. Reviewer: discard; start a new review |
-| candidate commit | worktree HEAD carries trailer `TT-Action: <id>` → record it; otherwise commit again |
+| agent attempt | kill the Pi group and every recorded shell group; sweep. Mark the attempt `interrupted`. Worker: new attempt on the same session file with an interruption note. Reviewer: discard; start a new review |
+| freeze commit | worktree HEAD carries trailer `TT-Action: <id>` → record it; otherwise redo the freeze |
 | check run | mark `interrupted` and rerun (checks are required to be rerunnable) |
-| integrate | integration branch has a commit with trailer `TT-Action: <id>` → done; otherwise reset to the recorded pre-merge sha and retry |
-| owner command | command id already in the log → only move the file to `applied/`; otherwise apply it, log it, then move it |
+| integrate | integration branch has a commit with trailer `TT-Action: <id>` → continue with integration checks; otherwise reset to the recorded pre-merge sha and retry |
 
-Owner command IDs are generated by Emacs (a UUID in the file name), so a
-command is applied at most once whatever happens to the file.
+**Owner commands come in two kinds, with different guarantees:**
+
+- **Conductor-state commands** (everything in §7.4 except steer). Applying one
+  *is* appending its event to the control log. If the command ID is already in
+  the log, the command is only moved to `applied/`. Otherwise it is applied
+  (logged), then moved. These are applied **exactly once**, because the log
+  append is the effect.
+- **External delivery** (steer). The conductor writes `deliver.intent` with the
+  command ID, sends the RPC `steer`, and writes `deliver.done` when Pi
+  acknowledges it. Pi has no receiver-side deduplication, so a crash between
+  send and acknowledgement leaves the outcome unknown. Recovery **does not
+  resend**. By then the attempt it was bound to has been interrupted anyway.
+  The command is marked `delivery uncertain` in status, with one key to re-send
+  its text as a note to the next attempt. **Steering is at most once, or
+  explicitly uncertain. It is never "exactly once".**
 
 **Gates have three outcomes: `passed`, `failed` and `interrupted`.** Only a
 recorded completion event counts as `passed`. A gate whose completion cannot be
 established is `interrupted` and is rerun or reconciled; it is never assumed.
 
-Recovery is tested by fault injection. `TT_CRASH_AT=<boundary>` makes the
-conductor exit at a named point: before an effect, after the effect but before
-its completion event, after the event but before the inbox file moves. The
-suite runs every boundary and asserts that no effect happens twice and the
-final state is the same as an uninterrupted run.
+**Fault injection.** `TT_CRASH_AT=<boundary>` makes the conductor exit at a
+named point: before an effect, after the effect but before its completion
+event, after a command event but before its inbox file moves, and between
+`steer` and its acknowledgement. The suite runs every boundary and asserts:
 
-### 8.3 Viewing agent sessions
+- no conductor-state effect is applied twice;
+- no steer is delivered twice; uncertain deliveries are marked as such;
+- interrupted checks, reviews and attempts may rerun, and are never counted as
+  passed;
+- the final accepted state equals that of an uninterrupted run, apart from the
+  reruns.
+
+A separate test force-kills Pi (`SIGKILL`) while a worker `sh` command is
+running, then asserts that the command's group is gone, the sweep finds nothing
+under the worktree, and the frozen candidate checkout is unchanged.
+
+### 9.4 The live trace and session history
+
+Pi writes a message to its session file only when the message ends. Live text
+and tool progress exist only as RPC events. So the trace has two sources:
+
+- **Live:** the conductor forwards each agent's RPC events over
+  `conductor.sock`, and the trace buffer renders them as they arrive.
+- **History:** when a trace is reopened after a restart, it is rebuilt from the
+  agent's Pi session file (completed messages) plus `stream/` for the tail of a
+  turn still in progress.
 
 Pilish's `pilish-open-session-file` resumes a session file as a **live** Pi
-process. Opening a session the conductor still owns would put two writers on
-one file, and even opening a finished one would change a record kept as
-evidence. So tradeoffs-trace needs its own viewer, and that is an explicit
-integration task:
+process. Opening a session the conductor owns would put two writers on one
+file, and even opening a finished one would change a record kept as evidence.
+So the trace and `tt-session-view` are tradeoffs-trace's own read-only
+renderers: message text, and tool calls folded to one line each. No Pilish
+command that resumes or mutates a session is reachable from these buffers.
 
-- `tt-session-view` reads a Pi session JSONL file and renders it read-only:
-  message text, and tool calls folded to one line each. It follows appended
-  lines with `file-notify` and never starts a process.
-- No Pilish command that mutates or resumes a session is reachable from these
-  buffers.
-- **Continue in Pilish** (only after the run is finished, and deliberately
-  invoked): copy the session file into Pi's session directory as a new file,
-  then open *the copy* with Pilish. The run's original stays unchanged.
+**Continue in Pilish** (only after the run is finished, and deliberately
+invoked): copy the session file into Pi's session directory as a new file,
+then open *the copy* with Pilish. The run's original stays unchanged.
 
-The trace column of the workspace is this viewer, pointed at the active agent.
-
-### 8.4 Worker guards, and their limit
+### 9.5 Worker guards, and their limit
 
 The worker's extension:
 
 - blocks writes outside its worktree and to the phase's acceptance files, and
   blocks `git push`, `git commit` and anything under the run directory
-  (`tool_call`);
-- refuses to settle without `submit_phase` (`agent_before_settle`, bounded).
+  (`tool_call`, applied to `edit`, `write` and `sh`);
+- refuses to settle without `submit_phase` (`agent_before_settle`, bounded);
+- replaces the built-in bash tool with the conductor-owned `sh` (§2.2).
 
-These hooks are **workflow guards, not a security boundary**. A worker with a
-bash tool can get around them. Protecting control state needs filesystem and
-process permissions, which v1 does not implement. This is recorded as a known
-gap, not claimed as done.
+These hooks are **workflow guards, not a security boundary**. A shell command
+can still get around a path check. Protecting control state needs filesystem
+and process permissions, which v1 does not implement. This is recorded as a
+known gap, not claimed as done. The freeze boundary (§6.2) is what keeps a
+misbehaving worker from corrupting evidence in v1.
 
-### 8.5 Keys
+### 9.6 Keys
 
 These extend the `C-c m` prefix from the Pilish integration (#12):
 
@@ -565,23 +835,25 @@ These extend the `C-c m` prefix from the Pilish integration (#12):
 | --- | --- |
 | `C-c m r` | in a plan buffer: validate, snapshot, create and start a run; open its workspace |
 | `C-c m s` | focus or rebuild the run's workspace (resolved per §1.4) |
-| `C-c m d` | open the run's decision view (§9) |
+| `C-c m d` | open the run's decision view (§10) |
 
-## 9. The decision view: `C-c m d`
+## 10. The decision view: `C-c m d`
 
-### 9.1 What it is
+### 10.1 What it is
 
 `*tt-decisions: <project>/<run-id>*` is a read-only Org buffer in
-`tt-decisions-mode`. It is rendered from the log into `views/decisions.org`, so
-it outlives Emacs. After a restart, `C-c m d` resolves the run as described in
-§1.4 (finished runs included) and renders it again. You act through keys, never
-by editing text, and every key sends a version-bound command (§6).
+`tt-decisions-mode`. It is rendered from the control log into
+`views/decisions.org`, so it outlives Emacs. After a restart, `C-c m d`
+resolves the run as described in §1.4 (finished runs included) and renders it
+again. You act through keys, never by editing text, and every key sends a
+version-bound command (§7).
 
 It is ordered by what needs the owner:
 
 ```text
 Needs you (1)            owner requests, blocking
 Open findings (1)        blocking findings not yet closed, and who raised them
+Corrections (1)          your revisions and where each one is in the lifecycle
 Accepted with dissent    passed votes where a reviewer rejected
 Accepted                 passed votes, unanimous
 For sampling             detail decisions, unreferenced changes (§3.5)
@@ -590,7 +862,7 @@ For sampling             detail decisions, unreferenced changes (§3.5)
 Each entry leads with what a person needs in order to judge it. Ballots,
 hashes, logs and evidence sit in a folded **Details** subtree, with links.
 
-### 9.2 A pending decision
+### 10.2 A pending decision
 
 ```org
 * NEEDS-YOU Cancel may be acknowledged before fills stop               :p2:
@@ -614,14 +886,15 @@ Disagreement: the worker and reviewer A preferred option 2 for
 throughput. Reviewer B and the master say it breaks the stated guarantee.
 Three repair rounds did not settle it.
 
-You: 1 / 2 choose · w write your own · RET evidence · phase 2 waits on this
+You: 1 / 2 choose · w write your own · r revise · RET evidence
+     phase 2 waits on this
 
 ** Details
    - finding F-p2-02 (contract) · candidate 7c1e0a4 · contract v1#9e2c
    - ballots, reviews, check output, worker session → links
 ```
 
-### 9.3 An automatically accepted trade-off
+### 10.3 An automatically accepted trade-off
 
 ```org
 * ACCEPTED Batch cancels per tick instead of one lock per request      :p2:
@@ -636,99 +909,137 @@ the phase benchmark.
 Dissent: reviewer A worried a lone cancel can wait up to one tick
 (≤1 ms). The master and reviewer B judged that within the latency budget.
 
-You: nothing required · o reopen (override) · RET evidence
+You: nothing required · r revise · o override · RET evidence
 
 ** Details
    - decision D-p2-05 v2 · delegated · M approve, A reject, B approve
    - candidate 7c1e0a4 · contract v1#9e2c · links to ballots and diff hunks
 ```
 
-### 9.4 Keys in the view
+If the owner agrees with reviewer A, `r` on this entry opens the revise buffer
+in §7.5. The entry then moves to **Corrections** and shows its progress there.
+
+### 10.4 Keys in the view
 
 | Key | Action |
 | --- | --- |
 | `1`–`9`, `w` | resolve an owner request with an option, or write one |
-| `o` | override a decision (approve or reject) |
+| `r` | revise: correct this decision or finding and repair the phase (§7.5) |
+| `o` | override a decision (approve or reject) without further explanation |
 | `x` | accept a finding (§4.2), with a required scope note |
 | `s` | on a sampled item: "should have been surfaced" (records a miss) |
+| `u` | on an owner request: "did not need me" (records an unneeded escalation) |
 | `RET` | open the evidence at point: diff hunk, file:line, check output, session |
 | `TAB` | expand or collapse details |
 | `g` | refresh |
 
-## 10. v1: make it work, and test the assumptions
+## 11. Prototype first, then compare
 
-v1 is judged on one question: **does the pipeline run end to end on a real
-task, and are the design's assumptions about Pi, Emacs and review true?**
-Polish, performance and cost optimization come later.
+Two different questions, answered in order:
 
-### 10.1 In scope
+1. **Does it work?** Can the difficult integration boundaries hold on a real
+   task? This is §11.1.
+2. **Is it better?** Does it save the owner's attention compared with the
+   current workflow, at an acceptable cost? This is §11.4. It cannot be
+   answered by running one task in two modes.
+
+### 11.1 Milestone 1: a single-phase end-to-end prototype
+
+One phase, end to end, on a real repository:
+
+open the plan → `C-c m r` → run a worker → freeze its candidate → check it →
+review it (M, A, B) → surface at least one decision → **resolve it, and in a
+second run revise it** → integrate → integration checks → `DONE`.
+
+It must include, deliberately triggered:
+
+- a forced cancellation of a worker while an `sh` command runs;
+- a conductor crash and restart at the boundaries in §9.3;
+- an Emacs restart mid-run, followed by `C-c m s` and `C-c m d`.
+
+The multi-phase interface, the master reviewer's cross-phase role and the pilot
+are not built until this prototype holds.
+
+### 11.2 Scope
+
+In v1, after the prototype:
 
 - One run at a time, phases serial, one worker per phase.
-- Plan validation and snapshot, and the workspace (§1).
-- Conductor with the log, lock, deadlines, cancellation and crash-safe resume
-  (§7, §8.2).
-- Deterministic checks; decisions from all three sources; findings with
-  dispositions; the M + A + B vote; version binding; full re-review on a new
-  candidate.
-- Both modes; steer, note, resolve, override, accept-finding, pause.
-- `C-c m r/s/d`, the read-only session viewer, the decision view with sampling.
+- Everything in §1–§10, including revise.
 
-### 10.2 Out of scope
+Out of scope:
 
 - OrgBrain integration (context in, admission of decisions out). Keep the
   record shape admission-friendly so this is a later write, not a redesign.
 - Jev / SemIf gates (§5.3).
 - Two independent implementations per phase with a judge.
-- Parallel phases, concurrent runs of one plan, amending integrated phases.
-- Permission sandboxing of workers (§8.4).
+- Parallel phases, concurrent runs of one plan, and corrections or amendments
+  once a later phase has been integrated.
+- Permission sandboxing of workers (§9.5).
 
-### 10.3 Assumptions v1 must test
+### 11.3 Assumptions the prototype must test
 
-| # | Assumption | How v1 tests it | What would falsify it |
+| # | Assumption | Test | What would falsify it |
 | --- | --- | --- | --- |
-| A1 | Pi RPC agents can be run, bounded and killed for hours from a conductor | a real multi-phase run; forced timeouts at every stage | orphaned processes, hangs past a deadline, lost session state across repairs |
-| A2 | Extension hooks can force structured submission | count attempts ending `no_submission` | workers regularly fail to submit, or loop on reminders |
-| A3 | Reviewers find what the worker did not disclose | count `reviewer-discovered` decisions and findings; owner sampling misses (§3.5) | zero discoveries while sampling finds undisclosed choices |
-| A4 | The vote and the finding split change outcomes usefully | rejected-then-repaired decisions; findings closed as repaired vs disproved; owner agreement on a sample | votes always unanimous; findings rarely confirmed; owner disagrees with most outcomes |
-| A5 | The decision view costs less attention than transcripts | owner time to review a finished run; how often a transcript had to be opened | owner routinely needs transcripts to understand an entry |
-| A6 | Emacs can show live trace and status for a run without disturbing it | use both modes on the pilot run | viewer breaks on a file being appended; refresh churn is unusable |
-| A7 | Resume is crash-safe | the `TT_CRASH_AT` suite, and one manual kill during the pilot | any effect applied twice, or a divergent final state |
+| A1 | Pi RPC agents can be run, bounded and killed from a conductor | forced timeouts at every stage; the force-kill test in §9.3 | a process outlives cancellation; a hang passes a deadline; session state is lost across repairs |
+| A2 | Extension hooks force structured submission, and the `sh` replacement is usable | attempts ending `no_submission`; the worker completes real tasks through `sh` | workers regularly fail to submit, loop on reminders, or cannot work without the built-in bash |
+| A3 | The freeze boundary holds | modify the worktree after submit, from a surviving process | any check or review sees a change made after the freeze |
+| A4 | Recovery behaves as specified | the `TT_CRASH_AT` suite | any criterion in §9.3 fails |
+| A5 | The live trace and views work across restarts | reopen after Emacs restart mid-turn | live stream missing; history not rebuilt; views stale |
+| A6 | Revise closes the loop | a correction on an accepted decision reaches `resolved` with no further owner action | the correction is lost, silently reinterpreted, or cannot act because of an exhausted budget |
 
-A falsified assumption is a useful result. It changes the design before more is
-built on top of it.
+### 11.4 The comparative pilot
 
-### 10.4 Build order
+Only after the prototype holds. Run **several similar tasks** (at least three
+per arm, matched in size and kind) through the current skill-based `/delegate`
+workflow and through tradeoffs-trace, and record for every task:
 
-Each step is usable on its own:
+| Measure | How |
+| --- | --- |
+| active owner minutes | time the owner spends in the run's buffers or the old workflow's transcripts, from a simple Emacs activity timer, plus self-report |
+| unnecessary escalations | owner requests marked `u` |
+| missed consequential choices | after each task, an **independent audit** of the raw diff (the owner, helped by a separate audit agent that has seen none of the run's records) lists consequential choices; each one not surfaced during the run is a miss |
+| escaped defects | defects found after acceptance, for a fixed period |
+| elapsed time | plan start to done |
+| model usage | tokens and cost per role, from Pi's usage events |
 
-1. **Conductor skeleton.** Plan validation and snapshot, one worker per phase in
-   a worktree over RPC, checks, deadlines, cancellation, log with
-   intent/completion, lock, crash suite, `status.org`. Tests A1 and A7.
-2. **Submission and triggers.** `submit_phase`, the settle and tool guards,
-   boundary triggers. Tests A2.
-3. **Review.** M, A and B with the two-turn review, findings with dispositions,
-   the vote, version binding, bounded repair. Tests A3 and A4.
-4. **Emacs surface.** `C-c m r/s/d`, workspace, session viewer, decision view,
-   inbox commands, both modes. Tests A5 and A6.
-5. **Pilot.** One real task of three or more phases, run once in delegate mode
-   and once in co-work mode, with the §10.3 table filled in from the results.
+Sampling misses (§3.5) are reported separately, as the **observed miss rate in
+the sample**. The audit is the only estimate of misses outside the sample.
 
-## 11. Open questions
+The review overhead is real and must be measured, not assumed away. With the
+two-turn review, each candidate round is one worker prompt plus six reviewer
+prompts: for three phases, 21 role-level prompts with no repairs, and 84 if
+every phase uses all four rounds, before tool continuations or retries. If the
+pilot shows that this pays for itself only on consequential work, the
+reviewer count gets tied to a phase risk tag rather than being the default for
+small tasks.
+
+### 11.5 Build order
+
+1. **Milestone 1 (§11.1).** Conductor daemon, plan snapshot, one worker over
+   RPC with `sh`, freeze, checks, three reviewers, one decision with
+   resolve/revise, integration, deadlines, cancellation, recovery, minimal
+   status and decision views. Tests A1–A6.
+2. **Multi-phase.** Serial phases, the master reviewer across phases,
+   corrections on integrated phases, full workspace and decision view.
+3. **Comparative pilot (§11.4).**
+
+## 12. Open questions
 
 - **The master reviewer on long runs.** Its session will compact. Should its
-  prompt be rebuilt at each phase from the plan plus the log, keeping the
-  session for continuity but not as the source of truth?
+  prompt be rebuilt at each phase from the plan plus the control log, keeping
+  the session for continuity but not as the source of truth?
 - **A stubborn raising reviewer.** Only the raising reviewer can confirm a
   repair or withdraw a finding. If it never does, the budget sends the finding
-  to the owner. Is that the right escape, or should a finding that has been
-  `reproduced`-then-fixed close on the passing reproduction alone?
+  to the owner. Is that the right escape, or should a `reproduced` finding
+  close when its reproduction passes on the new candidate?
 - **Decision de-duplication.** Reviewers describe the same choice differently.
   v1 lets them attach to an existing record ID; whether that is reliable is
-  part of A3.
-- **Default deadlines and budgets.** The §7.1 numbers are placeholders to be
-  calibrated from the pilot.
-- **Cost.** Three reviewers per round with full re-review. Is the reviewer count
-  tied to a phase risk tag from the start, or measured at full strength first?
+  measured in the pilot.
+- **Default deadlines and budgets.** The §8.1 numbers are placeholders to be
+  calibrated from the prototype.
+- **`lsof +D` cost.** It is slow on large trees. If the sweep is too slow, an
+  alternative is to track descendants by the conductor-assigned session ID.
 - **Where the code lives.** In this repository next to `init-pilish.el`, or as
   its own package that the Emacs module launches.
 
@@ -742,7 +1053,10 @@ Each step is usable on its own:
   contract behind "missing support is FAIL" and the later validity gate.
 - [Pi RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
   and [extensions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md):
-  `--mode rpc`, `--extension`, `abort`, `steer`, `tool_call`,
-  `agent_before_settle`.
+  `--mode rpc`, `--extension`, `--exclude-tools`, `abort`, `steer`,
+  `tool_call`, `agent_before_settle`.
+- [Pi bash tool](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/bash.ts):
+  spawns commands `detached`, which is why §2.2 moves shell ownership to the
+  conductor.
 - [Pilish](https://github.com/dnouri/pilish): `pilish-open-session-file` resumes
-  a live session, which is why §8.3 specifies a separate viewer.
+  a live session, which is why §9.4 specifies a separate viewer.
