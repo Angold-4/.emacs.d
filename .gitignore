@@ -125,3 +125,6 @@ request/
 # =============================================================================
 .vscode/
 .idea/
+
+# OpenCode session transcripts (may contain secrets)
+opencode-sessions/

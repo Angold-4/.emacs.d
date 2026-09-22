@@ -86,7 +86,8 @@ C-x l   ; Start LSP manually
 │   ├── init-git-sync.el    # Durable shared mirror synchronization
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
-│   └── init-git-pr.el      # Cached pull-request workspace
+│   ├── init-git-pr.el      # Cached pull-request workspace
+│   └── init-opencode.el    # OpenCode sessions as native Emacs buffers
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -123,6 +124,32 @@ The Git workbench supports local and cached pull-request review, a collapsible
 Changes Tree, persistent reviewed checkmarks, and explicit offline-capable
 synchronization. See [git.md](git.md) for the daily workflow and
 [docs/git.md](docs/git.md) for the architecture.
+
+### OpenCode
+
+OpenCode runs headless (`opencode serve`) and is driven from native Emacs
+buffers via sczi/opencode.el — no terminal, no alternate screen.
+
+| Key | Action |
+|-----|--------|
+| `C-c m m` / `:opencode` / `:oc` | Global session list, every project |
+| `C-c m o` | Session manager for the current project |
+| `C-c m c` | Compose a new session (created on first send, titled by date + branch) |
+| `C-c m i` | Focus the input buffer (shown automatically; start typing as a session opens) |
+| `C-c m M` / `C-c m a` | Pick a model / pick a provider then a model |
+| `C-c m v` | Pick a model variant |
+| `C-c m s` / `C-c m d` | Save session as an org file / open the sessions directory |
+| `RET` (normal state) | Send the input to the agent |
+
+Sessions are ordinary Evil buffers: they open in insert state, where `RET`
+inserts a newline and you edit normally; pressing `RET` in **normal state**
+sends the input to the agent (`C-<return>` sends from insert too). The input
+buffer opens full, and only the first send splits its window to add the
+transcript below; the mode line shows the input's destination, and the
+session's model, variant and context left. Reasoning is hidden. Each session is
+written to one merged org file automatically when a turn completes, and
+`C-c m m` lists live sessions next to those files (`C` on a file seeds a new
+session from it).
 
 ### LSP & Code
 
