@@ -20,6 +20,21 @@ From phase 4 onwards, each phase is written as a tradeoffs-trace plan and run
 through the pipeline built in phases 0 to 3. That is the first real use of the
 system on non-trivial work, and its records feed the pilot in phase 5.
 
+**The runner is frozen while it builds itself.** A run that works on
+tradeoffs-trace must not execute the code under review:
+
+- The conductor, the Pi extension and the Emacs module used for a run come
+  from an **installed runner**: a checkout of an accepted revision at
+  `~/.tradeoffs-trace/runner/<sha>/`, outside every worker's worktree.
+  `C-c m r` launches from there, never from the repository being edited.
+- The runner sha is recorded in the run's `meta.json` and first event. A
+  restart or repair of that run reuses the same runner, and a conductor whose
+  own revision does not match the recorded sha refuses to resume.
+- The runner is upgraded only **between runs**, and only to a revision
+  accepted through that phase's exit gate: `tt runner install <sha>`.
+- `/delegate` stays available to repair a broken runner, because the pipeline
+  cannot be relied on to fix itself.
+
 ## Conventions
 
 | Topic | Choice |
@@ -29,8 +44,15 @@ system on non-trivial work, and its records feed the pilot in phase 5.
 | Pi | pinned to **0.87.0**. The version is asserted at conductor start, and an upgrade is a deliberate PR that reruns the phase 0 contract tests |
 | Tests | `node --test` for TypeScript; ERT in batch mode (`emacs -batch`) for Emacs Lisp; one `make check` target runs both |
 | Structure | **functional core, imperative shell.** All state transitions, predicates, the tally and version binding are pure functions over the event log, tested without Pi, git or a filesystem. Effects (Pi, shell, git, files, socket) are thin adapters around that core |
-| Fake agent | `test/fake-pi/`: an executable speaking Pi's RPC protocol that replays a script (tool calls, submissions, hangs, crashes). Deterministic tests use it; live Pi runs are a separate, opt-in suite |
+| Fake agent | `test/fake-pi/`: an executable speaking Pi's RPC protocol that replays a script (tool calls, submissions, hangs, crashes). Deterministic tests use it. Live tests with real Pi and real models are opt-in for ordinary CI, but **mandatory recorded evidence** at the exit gates that name them (see below) |
 | Plan parsing | Emacs parses the plan with `org-element` at `C-c m r` and writes `plan/v<n>.json` beside the Org snapshot. The conductor validates the JSON against a schema and never parses Org itself. Tests use JSON fixtures |
+
+**Live evidence is part of the gate.** A test marked *required, recorded*
+must have been run against real Pi and real models, with its log, candidate
+shas and outcome committed under `test/live/records/<phase>/`, before that
+phase is accepted. Passing fake-agent tests never substitutes for it. If
+credentials or models are unavailable, the gate stays **incomplete**. It is
+not waived, and the phase is not reported as done.
 
 ```text
 tradeoffs-trace/
@@ -68,9 +90,11 @@ lifecycle can always finish, before any process is started.
 - `extension/tradeoffs-trace.ts`, skeleton only: registers `sh`,
   `submit_phase`, `submit_discovery` and `submit_review`, and reports
   `pi.getActiveTools()` at `session_start`.
-- The launch commands for each role, recorded as constants: worker
-  `--exclude-tools bash`; reviewers `--tools
-  read,grep,find,ls,submit_discovery,submit_review`.
+- The launch commands for each role, recorded as constants, both as explicit
+  allowlists: worker `--tools read,edit,write,grep,find,ls,sh,submit_phase`;
+  reviewers `--tools read,grep,find,ls,submit_discovery,submit_review`. Do
+  not use `--exclude-tools`. Against Pi 0.87.0 it leaves the worker with
+  `submit_discovery` and `submit_review` and without `grep`, `find` and `ls`.
 
 **Tasks**
 
@@ -89,7 +113,7 @@ lifecycle can always finish, before any process is started.
 | --- | --- |
 | `correction-closure` | a correction raised on candidate C1 is addressed by C2 whose three reviews say "honored"; `accept(C2)` holds; the `ACCEPTED` event marks it `resolved`. The reverse case, where one review says "not honored", does not accept |
 | `integration-recovery` | probe of C1 fails → `integration` finding → repair → C2 probe passes → finding repaired → accept → publish moves the branch from H to I only via compare-and-swap |
-| `reviewer-submission` | the real Pi reviewer launch has exactly `read, grep, find, ls, submit_discovery, submit_review`; the worker has `sh` and `submit_phase` and no `bash` |
+| `role-tool-sets` | against the real installed Pi, the reviewer launch reports exactly `read, grep, find, ls, submit_discovery, submit_review`, and the worker launch exactly `read, edit, write, grep, find, ls, sh, submit_phase`. Any extra or missing tool fails, including `bash` or another role's submission tool |
 | `no-circularity` | a property test: for random event sequences that the owner and reviewers eventually satisfy, every phase reaches `DONE`, `BLOCKED`, `AWAITING_OWNER` or `PAUSED`, and `accept` never reads a fact that only acceptance or later produces |
 | `vote-table` | all eight M/A/B combinations, plus missing, malformed and evidence-free ballots counting as reject |
 | `stale-binding` | a ballot or command bound to a superseded candidate, contract or record version is rejected with a visible reason |
@@ -140,7 +164,7 @@ happened. Reviews are stubbed: the fake agent submits scripted reviews.
 | `integrity-detect` | modifying a candidate checkout during a check invalidates that check and flags `integrity-violated` |
 | `checked-equals-candidate` | for every recorded check, the checkout tree hash equals the candidate commit's tree |
 | `crash-suite` | every `TT_CRASH_AT` boundary: no conductor-state effect applied twice, interrupted gates rerun and are never counted as passed, and the final state equals an uninterrupted run apart from reruns |
-| `live-single-phase` (opt-in, real model) | one small real phase in a scratch repository reaches `DONE` through the real worker and stub reviews |
+| `live-single-phase` (real model; **required**, recorded) | one small real phase in a scratch repository reaches `DONE` through the real worker and stub reviews |
 
 **Owner decisions:** D1-1 default deadlines for the pilot repository
 (design §8.1 placeholders). D1-2: which scratch repository and phase to use
@@ -181,7 +205,7 @@ resolves, and lets the pipeline continue with no further owner action.
 | `contract-objection` | the cancellation example from design §4.3: M and A approve, B objects on contract, and the phase does not accept until B confirms a repair or the owner acts |
 | `steer-uncertain` | a crash between `steer` and its acknowledgement yields `delivery uncertain`, and the steer is never resent automatically |
 | `unreferenced-hunks` | a diff hunk no record cites appears in the sample |
-| `live-review` (opt-in, real models) | one real phase with real M, A and B produces at least one decision record with every required plain-language field filled |
+| `live-review` (real models; **required**, recorded) | one real phase with real M, A and B produces at least one decision record with every required plain-language field filled |
 
 **Owner decisions:** D2-1 model assignment for M, A and B. D2-2: the stubborn
 raising reviewer question (design §12). Keep the budget escape, or let a passing
@@ -208,6 +232,10 @@ restart. Phases 1 to 3 together are the single-phase prototype in design
   No Pilish command that resumes or mutates a session is reachable from these
   buffers.
 - `C-c m s` focus-or-rebuild; run resolution across buffers (design §1.4).
+- The frozen runner (see "How this plan is executed"): `tt runner install
+  <sha>`, launching from the installed runner, recording the runner sha in
+  `meta.json`, and refusing to resume under a different revision. It is
+  needed before phase 4 can run on tradeoffs-trace itself.
 - `C-c m d`: the decision view with sections, entries and keys as in design
   §10, and the revise buffer with its consequence preview (design §7.5).
 
@@ -216,6 +244,7 @@ restart. Phases 1 to 3 together are the single-phase prototype in design
 | Test | Asserts |
 | --- | --- |
 | ERT `plan-validation` | invalid plans produce the errors buffer with correct line positions and start no run |
+| `runner-pinned` | a run started from runner X refuses to resume under runner Y, and a worker editing the repository's `tradeoffs-trace/` does not change the code the running conductor executes |
 | ERT `run-resolution` | the three resolution rules in design §1.4, including the prompt when a plan has several active runs |
 | ERT `decision-render` | the pending and accepted fixtures render as in design §10.2 and §10.3, with details folded |
 | ERT `commands-bound` | every key in the decision view writes a command carrying the full binding tuple; stale commands show the "changed since you viewed it" message |

@@ -232,9 +232,17 @@ Emacs ──unix socket <run>/conductor.sock──▶ Conductor daemon (Node, de
   the agent's actual active tool set and refuses to dispatch unless it equals
   the expected set for that role exactly. RPC `get_state` does not include
   tools in Pi 0.87.0 (checked), so the extension reports
-  `pi.getActiveTools()` over the run socket at `session_start`. Worker: `read, edit, write, grep, find,
-  ls, sh, submit_phase`, with no `bash`. Reviewer: the list above. A mismatch
+  `pi.getActiveTools()` over the run socket at `session_start`. A mismatch
   is a launch failure, not a warning.
+- **Every role uses an explicit allowlist**, never a denylist. The extension
+  registers all of its tools in every agent, and Pi's default set omits
+  `grep`, `find` and `ls`. So `--exclude-tools bash` gives a worker the
+  reviewer submission tools and no search tools. Launch sets:
+
+  | Role | `--tools` |
+  | --- | --- |
+  | worker | `read,edit,write,grep,find,ls,sh,submit_phase` |
+  | reviewer | `read,grep,find,ls,submit_discovery,submit_review` |
 
 ### 2.2 The conductor owns every shell command
 
@@ -243,7 +251,8 @@ built-in bash tool spawns each command `detached` (its own process group) on
 non-Windows platforms. An isolated probe against Pi 0.87.0 confirmed it: after
 the Pi group was killed, the shell kept running. So:
 
-- Workers run with the built-in bash tool disabled (`--exclude-tools bash`).
+- Workers run without the built-in bash tool: it is simply absent from their
+  `--tools` allowlist (§2.1).
 - The extension registers a replacement shell tool, `sh`. It forwards each
   command to the conductor over the run's socket and streams the output back.
 - The **conductor** spawns the command in a new process group and records the
@@ -1121,7 +1130,7 @@ The concrete phases, deliverables and required evidence are in
   contract behind "missing support is FAIL" and the later validity gate.
 - [Pi RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
   and [extensions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md):
-  `--mode rpc`, `--extension`, `--exclude-tools`, `abort`, `steer`,
+  `--mode rpc`, `--extension`, `--tools`, `abort`, `steer`,
   `tool_call`, `agent_before_settle`.
 - [Pi bash tool](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/bash.ts):
   spawns commands `detached`, which is why §2.2 moves shell ownership to the
