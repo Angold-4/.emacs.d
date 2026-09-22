@@ -17,7 +17,6 @@
 ;;   C-c m o   project session manager              +opencode/open
 ;;   C-c m i   compose in a dedicated input buffer   +opencode/input
 ;;   C-c m c   new session in this workspace         +opencode/new
-;;   C-c m n   same as c                             +opencode/new
 ;;   C-c m M   select model                         +opencode/model
 ;;   C-c m a   provider, then model                 +opencode/provider
 ;;   C-c m v   select model variant                 +opencode/variant
@@ -347,7 +346,6 @@ Bound to RET in normal state so editing stays in insert state."
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "g") #'+opencode/sessions-refresh)
     ;; New session in this workspace (same as `C-c m c').
-    (define-key map (kbd "n") #'+opencode/new)
     (define-key map (kbd "c") #'+opencode/new)
     (define-key map (kbd "q") #'quit-window)
     map)
@@ -505,7 +503,6 @@ holds metadata plus the full markdown transcript."
     (define-key map (kbd "o") #'+opencode/open)
     (define-key map (kbd "i") #'+opencode/input)
     (define-key map (kbd "c") #'+opencode/new)
-    (define-key map (kbd "n") #'+opencode/new)
     (define-key map (kbd "M") #'+opencode/model)
     (define-key map (kbd "a") #'+opencode/provider)
     (define-key map (kbd "v") #'+opencode/variant)

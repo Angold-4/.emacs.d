@@ -22,7 +22,7 @@ inside OpenCode buffers:
 | `C-c m m` | `+opencode/sessions` | Global session list, every project |
 | `C-c m o` | `+opencode/open` | Session manager for the current project |
 | `C-c m i` | `+opencode/input` | Compose in a dedicated input buffer |
-| `C-c m c` / `C-c m n` | `+opencode/new` | New session in this workspace |
+| `C-c m c` | `+opencode/new` | New session in this workspace |
 | `C-c m M` | `+opencode/model` | Select model (flattened across providers) |
 | `C-c m a` | `+opencode/provider` | Select provider, then a model from it |
 | `C-c m v` | `+opencode/variant` | Select model variant |
@@ -87,9 +87,9 @@ cleared on success.
 
 ## New sessions
 
-`C-c m c` (or `C-c m n`) starts a session in the current workspace — the current
-session's directory, else the project root. In the global list, `n` and `c` do
-the same, and `RET`/`o` opens the session at point.
+`C-c m c` starts a session in the current workspace — the current session's
+directory, else the project root. In the global list, `c` does the same, and
+`RET`/`o` opens the session at point.
 
 ## Global session list
 
