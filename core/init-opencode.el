@@ -175,8 +175,18 @@ one insertion point and its region re-render is skipped."
     map)
   "Keymap for the OpenCode input buffer.")
 
+(defun +opencode--input-header ()
+  "Header line for the input buffer: its name and where a send will go."
+  (concat " " (buffer-name)
+          (cond ((buffer-live-p +opencode-input-session)
+                 (format " · to %s" (buffer-name +opencode-input-session)))
+                (+opencode-input-title
+                 (format " · new: %s" +opencode-input-title))
+                (t " · draft"))))
+
 (define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
-  "Major mode for composing an OpenCode prompt in its own buffer.")
+  "Major mode for composing an OpenCode prompt in its own buffer."
+  (setq-local header-line-format '(:eval (+opencode--input-header))))
 
 (defun +opencode--session-buffer ()
   "Return a session buffer to act on: the current one, or the most recent."
@@ -277,12 +287,34 @@ An empty session is never created: this only runs on the first send."
     (with-current-buffer session
       (+opencode--display-input default-directory t))))
 
+(defun +opencode--output-header ()
+  "Header line for a session buffer: model, variant, context left, status."
+  (let* ((agent opencode-session-agent)
+         (model (ignore-errors (opencode--current-model)))
+         (name (or (alist-get 'name model) ""))
+         (variant (alist-get 'variant agent))
+         (limit (map-nested-elt model '(limit context)))
+         (used opencode-session-tokens)
+         (live (and (numberp limit) (numberp used) (> limit 0)))
+         (left (and live (- limit used)))
+         (pct (and live (* 100.0 (/ (float used) limit)))))
+    (concat " " name
+            (when variant (format " %s" variant))
+            (when left
+              (format " · %s left (%.0f%%)"
+                      (if (>= left 1000)
+                          (format "%.0fk" (/ left 1000.0))
+                        (number-to-string left))
+                      (- 100.0 pct)))
+            (format " · %s " (or opencode-session-status "idle")))))
+
 (defun +opencode--show-input (buffer)
   "Show and focus the input buffer for a session just opened in BUFFER.
 The session is the transcript; the input box is where work starts."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'opencode-session-mode)
+        (setq-local header-line-format '(:eval (+opencode--output-header)))
         (ignore-errors (+opencode--display-input default-directory t)))))
   buffer)
 
@@ -413,10 +445,65 @@ Bound to RET in normal state so editing stays in insert state."
 ;; Sessions as org files
 ;; =============================================================================
 
+(defvar +opencode--save-timer nil
+  "Pending debounce timer for an automatic session save.")
+
+(defun +opencode--org-time (milliseconds)
+  "Format MILLISECONDS since the epoch, or nil."
+  (when (numberp milliseconds)
+    (format-time-string "%Y-%m-%d %H:%M" (/ milliseconds 1000))))
+
+(defun +opencode--messages-to-org (messages)
+  "Render MESSAGES as an org transcript of `Prompt' and `Response' sections.
+Reasoning is omitted (see `+opencode-show-reasoning'); tool calls become a
+single line so the file stays readable."
+  (let (lines)
+    (dolist (message messages)
+      (let* ((info (alist-get 'info message))
+             (role (alist-get 'role info))
+             (time (alist-get 'created (alist-get 'time info)))
+             (model (alist-get 'model info)))
+        (push (format "* %s%s%s"
+                      (if (equal role "user") "Prompt" "Response")
+                      (if time (concat " " (+opencode--org-time time)) "")
+                      (if-let ((id (alist-get 'modelID model)))
+                          (format "  [%s/%s%s]"
+                                  (alist-get 'providerID model) id
+                                  (if-let ((v (alist-get 'variant model)))
+                                      (format ":%s" v) ""))
+                        ""))
+              lines)
+        (dolist (part (alist-get 'parts message))
+          (pcase (alist-get 'type part)
+            ("text"
+             (let ((text (string-trim (or (alist-get 'text part) ""))))
+               (unless (string-empty-p text)
+                 (push text lines))))
+            ("tool"
+             (push (format "- tool: %s %s"
+                           (or (alist-get 'tool part) "?")
+                           (or (alist-get 'status (alist-get 'state part)) ""))
+                   lines))
+            (_ nil)))
+        (push "" lines)))
+    (string-join (nreverse lines) "\n")))
+
+(defun +opencode--session-file (session id)
+  "Return the org file path for SESSION with ID."
+  (let* ((directory (file-name-as-directory
+                     (expand-file-name (or (alist-get 'directory session)
+                                           default-directory))))
+         (project (file-name-nondirectory (directory-file-name directory)))
+         (title (or (alist-get 'title session) "session"))
+         (slug (replace-regexp-in-string "[^[:alnum:]_.-]+" "-" title))
+         (short (substring id (max 0 (- (length id) 6)))))
+    (expand-file-name (format "%s-%s.org" slug short)
+                      (expand-file-name project +opencode-sessions-directory))))
+
 (defun +opencode/save-session (&optional session)
-  "Write SESSION (or the current session) to an org file.
-The file lands in `+opencode-sessions-directory' under the project name and
-holds metadata plus the full markdown transcript."
+  "Write SESSION (or the current session) to its merged org file.
+The file holds metadata plus the whole conversation, so one file per
+session is self-contained and portable."
   (interactive)
   (require 'opencode)
   (let ((id (or (alist-get 'id session)
@@ -426,17 +513,13 @@ holds metadata plus the full markdown transcript."
     (opencode-api-session-messages id
         messages
       (let* ((directory (file-name-as-directory
-                         (expand-file-name
-                          (or (alist-get 'directory session) default-directory))))
-             (project (file-name-nondirectory (directory-file-name directory)))
+                         (expand-file-name (or (alist-get 'directory session)
+                                               default-directory))))
              (title (or (alist-get 'title session) "session"))
-             (slug (replace-regexp-in-string "[^[:alnum:]_.-]+" "-" title))
-             (short (substring id (max 0 (- (length id) 6))))
-             (branch (let ((default-directory directory))
-                       (ignore-errors (magit-get-current-branch))))
-             (target-dir (expand-file-name project +opencode-sessions-directory))
-             (file (expand-file-name (format "%s-%s.org" slug short) target-dir)))
-        (make-directory target-dir t)
+             (branch (or (alist-get 'branch session)
+                         (ignore-errors (+opencode--branch-name directory))))
+             (file (+opencode--session-file session id)))
+        (make-directory (file-name-directory file) t)
         (with-temp-file file
           (insert "#+title: " title "\n")
           (insert "#+opencode_id: " id "\n")
@@ -444,14 +527,38 @@ holds metadata plus the full markdown transcript."
           (insert "#+opencode_directory: " directory "\n")
           (when branch
             (insert "#+opencode_branch: " branch "\n"))
-          (insert "#+opencode_saved: " (format-time-string "%Y-%m-%d %H:%M") "\n\n")
-          (insert (opencode--conversation-to-markdown messages) "\n"))
-        (message "Saved OpenCode session to %s" file)))))
+          (insert "#+opencode_updated: " (format-time-string "%Y-%m-%d %H:%M") "\n\n")
+          (insert (+opencode--messages-to-org messages) "\n"))
+        (message "Saved session to %s" file)))))
 
 (defun +opencode/save ()
   "Save the current session as an org file."
   (interactive)
   (+opencode/save-session nil))
+
+(defun +opencode--save-by-id (session-id)
+  "Save SESSION-ID without requiring its buffer to be current."
+  (ignore-errors
+    (opencode--with-session-buffer session-id
+      (+opencode/save-session nil))))
+
+(defun +opencode--schedule-save (session-id)
+  "Coalesce automatic saves for SESSION-ID."
+  (when +opencode--save-timer
+    (cancel-timer +opencode--save-timer))
+  (setq +opencode--save-timer
+        (run-at-time 1 nil
+                     (lambda ()
+                       (setq +opencode--save-timer nil)
+                       (+opencode--save-by-id session-id)))))
+
+(defun +opencode--auto-save (orig-fn info)
+  "Run ORIG-FN, then save the session when a turn completes."
+  (funcall orig-fn info)
+  (when (and (equal (map-nested-elt info '(role)) "assistant")
+             (map-nested-elt info '(time completed)))
+    (when-let ((id (map-nested-elt info '(sessionID))))
+      (+opencode--schedule-save id))))
 
 ;; =============================================================================
 ;; Global session list
@@ -505,7 +612,7 @@ holds metadata plus the full markdown transcript."
     (let ((pending (length projects))
           (rows nil))
       (if (zerop pending)
-          (+opencode--sessions-render nil)
+          (+opencode--sessions-render (+opencode--archived-sessions))
         (dolist (project projects)
           (let ((default-directory
                   (file-name-as-directory
@@ -522,10 +629,46 @@ holds metadata plus the full markdown transcript."
                     (unless (gethash (alist-get 'id session) seen)
                       (puthash (alist-get 'id session) t seen)
                       (push session unique)))
-                  (+opencode--sessions-render (nreverse unique)))))))))))
+                  (+opencode--sessions-render
+                   (append (nreverse unique) (+opencode--archived-sessions))))))))))))
+
+(defun +opencode--file-keyword (file key)
+  "Return FILE's `#+KEY' value, or nil."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (when (re-search-forward
+           (format "^#\\+%s:[ \t]*\\(.*\\)$" (regexp-quote key)) nil t)
+      (string-trim (match-string-no-properties 1)))))
+
+(defun +opencode--file-body (file)
+  "Return FILE's transcript, from its first `* ' heading."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (buffer-substring-no-properties
+     (if (re-search-forward "^\\* " nil t) (match-beginning 0) (point-min))
+     (point-max))))
+
+(defun +opencode--archived-sessions ()
+  "Return rows read from the session org files in the sessions directory."
+  (let (rows)
+    (when (file-directory-p +opencode-sessions-directory)
+      (dolist (file (directory-files-recursively +opencode-sessions-directory
+                                                 "\\.org\\'"))
+        (push (list (cons 'kind 'archived)
+                    (cons 'file file)
+                    (cons 'id (+opencode--file-keyword file "OPENCODE_ID"))
+                    (cons 'title (or (+opencode--file-keyword file "OPENCODE_TITLE")
+                                     (file-name-base file)))
+                    (cons 'directory (+opencode--file-keyword file "OPENCODE_DIRECTORY"))
+                    (cons 'branch (+opencode--file-keyword file "OPENCODE_BRANCH"))
+                    (cons 'updated (+opencode--file-keyword file "OPENCODE_UPDATED")))
+              rows)))
+    (nreverse rows)))
 
 (defun +opencode--sessions-render (rows)
-  "Render ROWS, a list of OpenCode session alists, in the global list."
+  "Render ROWS, live sessions and archived files, in the global list."
   (with-current-buffer (get-buffer-create +opencode--sessions-buffer)
     (let ((inhibit-read-only t)
           (cache (make-hash-table :test #'equal)))
@@ -533,42 +676,92 @@ holds metadata plus the full markdown transcript."
       (if (null rows)
           (insert "No OpenCode sessions.\n")
         (make-vtable
-         :columns '((:name "Project" :min-width 12)
+         :columns '((:name "Source" :width 6)
+                    (:name "Project" :min-width 12)
                     (:name "Branch" :min-width 8)
-                    (:name "Last Updated" :width 12
-                     :formatter opencode--format-time-ago
-                     :primary ascend)
+                    (:name "Updated" :width 17 :primary ascend)
                     "Title")
          :objects rows
-         :actions '("o" +opencode--open-session
-                    "RET" +opencode--open-session
+         :actions '("o" +opencode--open-row
+                    "RET" +opencode--open-row
+                    "C" +opencode--continue-row
                     "s" +opencode--save-session
-                    "x" opencode-kill-session)
+                    "x" +opencode--kill-row)
          :getter (lambda (object column vtable)
-                   (let-alist object
-                     (pcase (vtable-column vtable column)
-                       ("Project"
-                        (if .directory
-                            (file-name-nondirectory (directory-file-name .directory))
-                          "-"))
-                       ("Branch"
-                        (if (and .directory (file-exists-p .directory))
-                            (let ((default-directory .directory))
-                              (with-memoization (gethash .directory cache)
-                                (magit-get-current-branch)))
-                          "-"))
-                       ("Last Updated" (opencode--time-ago object 'updated))
-                       ("Title" (or .title "(untitled)")))))
+                   (let ((col (vtable-column vtable column)))
+                     (if (eq (alist-get 'kind object) 'archived)
+                         (pcase col
+                           ("Source" "file")
+                           ("Project"
+                            (let ((dir (alist-get 'directory object)))
+                              (if dir
+                                  (file-name-nondirectory (directory-file-name dir))
+                                "-")))
+                           ("Branch" (or (alist-get 'branch object) "-"))
+                           ("Updated" (or (alist-get 'updated object) "-"))
+                           ("Title" (or (alist-get 'title object) "(untitled)")))
+                       (let-alist object
+                         (pcase col
+                           ("Source" "live")
+                           ("Project"
+                            (if .directory
+                                (file-name-nondirectory (directory-file-name .directory))
+                              "-"))
+                           ("Branch"
+                            (if (and .directory (file-exists-p .directory))
+                                (with-memoization (gethash .directory cache)
+                                  (or (+opencode--branch-name .directory) "-"))
+                              "-"))
+                           ("Updated" (opencode--format-time-ago
+                                       (opencode--time-ago object 'updated)))
+                           ("Title" (or .title "(untitled)")))))))
          :separator-width 3
          :keymap +opencode-global-mode-map)))))
 
-(defun +opencode--open-session (session)
-  "Open SESSION from the global list."
-  (opencode-open-session session))
+(defun +opencode--open-row (row)
+  "Open ROW: resume a live session, or visit an archived file."
+  (if (eq (alist-get 'kind row) 'archived)
+      (find-file (alist-get 'file row))
+    (opencode-open-session row)))
 
-(defun +opencode--save-session (session)
-  "Save SESSION from the global list."
-  (+opencode/save-session session))
+(defun +opencode--continue-row (row)
+  "Seed a new session from an archived ROW."
+  (unless (eq (alist-get 'kind row) 'archived)
+    (user-error "Only archived sessions can be continued"))
+  (+opencode/continue-from-file (alist-get 'file row)))
+
+(defun +opencode--kill-row (row)
+  "Delete ROW's server session; archived files are refused."
+  (if (eq (alist-get 'kind row) 'archived)
+      (user-error "Delete the file to remove an archived session")
+    (opencode-kill-session row)))
+
+(defun +opencode--save-session (row)
+  "Save live ROW; archived files are already on disk."
+  (if (eq (alist-get 'kind row) 'archived)
+      (message "Already on disk: %s" (alist-get 'file row))
+    (+opencode/save-session row)))
+
+(defun +opencode/continue-from-file (file)
+  "Seed a new session from the archived session FILE."
+  (interactive "fSession file: ")
+  (let* ((directory (or (+opencode--file-keyword file "OPENCODE_DIRECTORY")
+                        default-directory))
+         (title (or (+opencode--file-keyword file "OPENCODE_TITLE")
+                    (file-name-base file)))
+         (buffer (+opencode--input-buffer directory)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p '+opencode-input-mode)
+        (+opencode-input-mode))
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Continue the session archived at %s.\n\n%s"
+                        file (+opencode--file-body file))))
+      (setq +opencode-input-session nil
+            +opencode-input-directory directory
+            +opencode-input-title (format "%s (cont.)" title)))
+    (+opencode--display-input directory t)
+    (message "Review, then RET to create the continued session")))
 
 ;; =============================================================================
 ;; Prefix map and installation
@@ -625,6 +818,10 @@ holds metadata plus the full markdown transcript."
   ;; Show the input buffer under every session that opens, so it is visible
   ;; without having to remember a key.
   (advice-add 'opencode-open-session :filter-return #'+opencode--show-input)
+
+  ;; Auto-store: write the session's org file when a turn completes.
+  (advice-add 'opencode-session--message-updated
+              :around #'+opencode--auto-save)
 
   ;; Hide the model's thinking trace.
   (advice-add 'opencode--insert-reasoning-block

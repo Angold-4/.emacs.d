@@ -143,9 +143,11 @@ buffers via sczi/opencode.el — no terminal, no alternate screen.
 
 Sessions are ordinary Evil buffers: they open in insert state, where `RET`
 inserts a newline and you edit normally; pressing `RET` in **normal state**
-sends the input to the agent (`C-<return>` sends from insert too). The modeline
-shows the agent, model, variant and context used, and the model's
-reasoning/thinking trace is hidden by default.
+sends the input to the agent (`C-<return>` sends from insert too). The input
+buffer's header line shows its name and destination; the session's shows the
+model, variant and context left. Reasoning is hidden. Each session is written
+to one merged org file automatically when a turn completes, and `C-c m m` lists
+live sessions next to those files (`C` on a file seeds a new session from it).
 
 ### LSP & Code
 

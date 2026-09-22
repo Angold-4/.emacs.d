@@ -106,18 +106,18 @@ The server owns the `ses_…` id; we control the readable parts:
 
 ## Global session list
 
-`C-c m m` aggregates `/project` and `/session` into one vtable with **Project ·
-Branch · Last Updated · Title**. The server scopes `session/list` to the
-`x-opencode-directory` header, so one request is made per project worktree;
-worktrees share a repository, so the results are de-duplicated by session id.
-`RET`/`o` opens a session, `s` saves it, `x` deletes it, `g` refreshes.
+`C-c m m` aggregates `/project` and `/session` into one vtable with **Source ·
+Project · Branch · Updated · Title**, appending the archived org files below the
+live sessions. The server scopes `session/list` to the `x-opencode-directory`
+header, so one request is made per project worktree; worktrees share a
+repository, so the results are de-duplicated by session id. `g` refreshes.
 
 ## Sessions as files
 
-`C-c m s` writes the current session to
-`+opencode-sessions-directory` (default `~/.emacs.d/opencode-sessions/`) as an
-org file under the project directory, named for the session title plus the last
-six characters of its id:
+Each session has one **merged** org file under
+`+opencode-sessions-directory` (default `~/.emacs.d/opencode-sessions/`), named
+for its title plus the last six characters of its id. It is written
+automatically when a turn completes, and `C-c m s` rewrites it on demand:
 
 ```org
 #+title: 2026-09-22 feat/openc
@@ -125,13 +125,41 @@ six characters of its id:
 #+opencode_title: 2026-09-22 feat/openc
 #+opencode_directory: /path/to/project/
 #+opencode_branch: feat/opencode-emacs
-#+opencode_saved: 2026-09-22 16:00
+#+opencode_updated: 2026-09-22 16:01
 
-<markdown transcript from the session messages>
+* Prompt 2026-09-22 16:00  [opencode/big-pickle]
+what does this do?
+
+* Response 2026-09-22 16:01  [opencode/big-pickle:high]
+it does X
+- tool: bash completed
 ```
 
-The file persists, commits, and can be sent to another machine. Re-importing a
-file back into OpenCode is deliberately out of scope for now.
+One file per session, so it persists, commits, and can be sent to another
+machine. Reasoning is omitted; tool calls are one line each.
+
+## Archived sessions
+
+`C-c m m` lists both **live** sessions (from OpenCode) and **archived** ones
+(the org files), in a `Source` column:
+
+| Source | `RET` / `o` | `C` | `x` |
+|---|---|---|---|
+| `live` | resume via the API | — | delete the server session |
+| `file` | visit the org file | **continue**: open an input buffer seeded with the transcript, then `RET` creates a new session | — |
+
+A session is read from OpenCode while it is live, and from its file when it is
+not. `+opencode/continue-from-file` is the portability path: it seeds a new
+session from an archived file rather than pretending to restore the old one.
+
+## Header bars
+
+The two buffers carry different information:
+
+- **input** (`*OpenCode Input*`): its own buffer name and where a send goes —
+  `· draft`, `· new: <title>`, or `· to <session buffer>`.
+- **output** (a session): the model and variant, the context window **left**,
+  and the busy/idle status.
 
 ## Roadmap
 
