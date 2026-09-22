@@ -274,9 +274,8 @@ An empty session is never created: this only runs on the first send."
        (opencode--download-slash-commands default-directory)
        (opencode-api-create-session (list (cons 'title title))
            session
-         (opencode-open-session
+         (+opencode--open-session-undisplayed
           session
-          :callback
           (lambda (opened)
             (let ((session-buffer (current-buffer)))
               (opencode-session--send-synthetic-input text)
@@ -796,11 +795,21 @@ session is self-contained and portable."
          :separator-width 3
          :keymap +opencode-global-mode-map)))))
 
+(defun +opencode--open-session-undisplayed (session &optional callback)
+  "Build SESSION's buffer without letting `opencode-open-session' show it.
+The caller arranges the windows, so the session must not pick one itself;
+otherwise the output ends up displayed twice."
+  (cl-letf (((symbol-function 'pop-to-buffer)
+             (lambda (buffer &rest _) (if (bufferp buffer) buffer (current-buffer))))
+            ((symbol-function 'switch-to-buffer)
+             (lambda (buffer &rest _) (if (bufferp buffer) buffer (current-buffer)))))
+    (opencode-open-session session :callback callback)))
+
 (defun +opencode--open-row (row)
   "Open ROW: resume a live session as input over transcript, or visit a file."
   (if (eq (alist-get 'kind row) 'archived)
       (find-file (alist-get 'file row))
-    (let ((session (opencode-open-session row)))
+    (let ((session (+opencode--open-session-undisplayed row)))
       (when (buffer-live-p session)
         (let ((input (+opencode--prepare-input
                       (with-current-buffer session default-directory))))
