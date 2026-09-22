@@ -155,13 +155,18 @@ one insertion point and its region re-render is skipped."
 ;; =============================================================================
 
 (defcustom +opencode-input-buffer-name "*OpenCode Input*"
-  "Base name for a session's input buffer.
-One buffer per session is created from this plus the session id."
+  "Base name for a workspace's input buffer."
   :type 'string
   :group 'tools)
 
 (defvar-local +opencode-input-session nil
-  "Session buffer the current input buffer sends to.")
+  "Session buffer this input buffer sends to, or nil for one not yet created.")
+
+(defvar-local +opencode-input-directory nil
+  "Workspace directory a not-yet-created session belongs to.")
+
+(defvar-local +opencode-input-title nil
+  "Readable title to give the session when it is first created.")
 
 (defvar +opencode-input-mode-map
   (let ((map (make-sparse-keymap)))
@@ -181,36 +186,81 @@ One buffer per session is created from this plus the session id."
                     (derived-mode-p 'opencode-session-mode)))
                 (buffer-list))))
 
-(defun +opencode--input-buffer (session)
-  "Return the input buffer belonging to SESSION, creating it if needed."
-  (let ((id (with-current-buffer session (or opencode-session-id "session"))))
-    (get-buffer-create (format "%s <%s>" +opencode-input-buffer-name id))))
+(defun +opencode--branch-name (directory)
+  "Return DIRECTORY's checked-out branch, or nil."
+  (when-let ((root (locate-dominating-file directory ".git")))
+    (when-let ((context (ignore-errors (+git-store-context-for-root root))))
+      (ignore-errors (+git-store-local-context-current-branch context)))))
+
+(defun +opencode--session-title (directory)
+  "Return a readable title for a new session in DIRECTORY.
+The creation date and the first ten characters of the branch."
+  (let ((branch (or (+opencode--branch-name directory) "no-branch")))
+    (format "%s %s"
+            (format-time-string "%Y-%m-%d")
+            (substring branch 0 (min 10 (length branch))))))
+
+(defun +opencode--input-buffer (directory)
+  "Return DIRECTORY's input buffer, creating it if needed."
+  (let ((name (file-name-nondirectory
+               (directory-file-name
+                (file-name-as-directory (expand-file-name directory))))))
+    (get-buffer-create (format "%s <%s>" +opencode-input-buffer-name name))))
 
 (defun +opencode/send-input ()
-  "Send the input buffer's text to its session, then clear it.
-Uses the package's own `opencode-session--send-synthetic-input', so the
-session's model, agent and context are untouched and a send works while
-the agent is still working."
+  "Send the input buffer's text, creating the session on the first send.
+Sending reuses the package's own `opencode-session--send-synthetic-input',
+so the session's model, agent and context are untouched and a send works
+while the agent is still working."
   (interactive)
-  (let ((session +opencode-input-session)
-        (text (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
-    (unless (buffer-live-p session)
-      (user-error "This input buffer is not attached to a session"))
+  (let ((text (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
     (when (string-empty-p text)
       (user-error "Nothing to send"))
-    (with-current-buffer session
-      (opencode-session--send-synthetic-input text))
-    (let ((inhibit-read-only t))
-      (erase-buffer))
-    (message "Sent to %s" session)))
+    (cond
+     ((buffer-live-p +opencode-input-session)
+      (with-current-buffer +opencode-input-session
+        (opencode-session--send-synthetic-input text))
+      (let ((inhibit-read-only t))
+        (erase-buffer))
+      (message "Sent to %s" +opencode-input-session))
+     ((and +opencode-input-directory +opencode-input-title)
+      (+opencode--create-session-and-send +opencode-input-directory
+                                          +opencode-input-title
+                                          text))
+     (t
+      (user-error "This input buffer is not attached to a session")))))
 
-(defun +opencode--display-input (session &optional select)
-  "Show SESSION's input buffer below.  Select it when SELECT is non-nil."
-  (let ((buffer (+opencode--input-buffer session)))
+(defun +opencode--create-session-and-send (directory title text)
+  "Create a session in DIRECTORY titled TITLE, send TEXT, and save it.
+An empty session is never created: this only runs on the first send."
+  (let ((default-directory (file-name-as-directory (expand-file-name directory)))
+        (input (current-buffer)))
+    (opencode-autoconnect
+     (lambda ()
+       (opencode--download-slash-commands default-directory)
+       (opencode-api-create-session (list (cons 'title title))
+           session
+         (opencode-open-session
+          session
+          :callback
+          (lambda (opened)
+            (let ((session-buffer (current-buffer)))
+              (opencode-session--send-synthetic-input text)
+              (when (buffer-live-p input)
+                (with-current-buffer input
+                  (setq +opencode-input-session session-buffer
+                        +opencode-input-directory nil
+                        +opencode-input-title nil)
+                  (let ((inhibit-read-only t))
+                    (erase-buffer))))
+              (+opencode/save-session opened)))))))))
+
+(defun +opencode--display-input (directory &optional select)
+  "Show DIRECTORY's input buffer below.  Select it when SELECT is non-nil."
+  (let ((buffer (+opencode--input-buffer directory)))
     (with-current-buffer buffer
       (unless (derived-mode-p '+opencode-input-mode)
-        (+opencode-input-mode))
-      (setq +opencode-input-session session))
+        (+opencode-input-mode)))
     (let ((window (display-buffer buffer '((display-buffer-below-selected)
                                            (window-height . 12)))))
       (when (and select window)
@@ -224,7 +274,8 @@ the agent is still working."
   (let ((session (+opencode--session-buffer)))
     (unless (buffer-live-p session)
       (user-error "No OpenCode session open yet"))
-    (+opencode--display-input session t)))
+    (with-current-buffer session
+      (+opencode--display-input default-directory t))))
 
 (defun +opencode--show-input (buffer)
   "Show and focus the input buffer for a session just opened in BUFFER.
@@ -232,7 +283,7 @@ The session is the transcript; the input box is where work starts."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'opencode-session-mode)
-        (ignore-errors (+opencode--display-input buffer t)))))
+        (ignore-errors (+opencode--display-input default-directory t)))))
   buffer)
 
 ;; =============================================================================
@@ -267,11 +318,22 @@ The current session's directory, else the current project root, else
    (t default-directory)))
 
 (defun +opencode/new ()
-  "Start a new OpenCode session in the current workspace."
+  "Compose a new session in the current workspace.
+The OpenCode session itself is created on the first send, so an empty one
+is never recorded."
   (interactive)
   (require 'opencode)
-  (let ((default-directory (+opencode/workspace-directory)))
-    (call-interactively #'opencode-new-session)))
+  (let* ((directory (+opencode/workspace-directory))
+         (title (+opencode--session-title directory))
+         (buffer (+opencode--input-buffer directory)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p '+opencode-input-mode)
+        (+opencode-input-mode))
+      (setq +opencode-input-session nil
+            +opencode-input-directory directory
+            +opencode-input-title title))
+    (+opencode--display-input directory t)
+    (message "New %s (created on first send)" title)))
 
 (defun +opencode/model ()
   "Choose the model for the current session."
@@ -367,14 +429,18 @@ holds metadata plus the full markdown transcript."
                          (expand-file-name
                           (or (alist-get 'directory session) default-directory))))
              (project (file-name-nondirectory (directory-file-name directory)))
+             (title (or (alist-get 'title session) "session"))
+             (slug (replace-regexp-in-string "[^[:alnum:]_.-]+" "-" title))
+             (short (substring id (max 0 (- (length id) 6))))
              (branch (let ((default-directory directory))
                        (ignore-errors (magit-get-current-branch))))
              (target-dir (expand-file-name project +opencode-sessions-directory))
-             (file (expand-file-name (format "%s.org" id) target-dir)))
+             (file (expand-file-name (format "%s-%s.org" slug short) target-dir)))
         (make-directory target-dir t)
         (with-temp-file file
-          (insert "#+title: OpenCode session " id "\n")
+          (insert "#+title: " title "\n")
           (insert "#+opencode_id: " id "\n")
+          (insert "#+opencode_title: " title "\n")
           (insert "#+opencode_directory: " directory "\n")
           (when branch
             (insert "#+opencode_branch: " branch "\n"))

@@ -85,11 +85,24 @@ Sending calls the package's own `opencode-session--send-synthetic-input`, so
 the session's agent, model and context are used unchanged; the buffer is
 cleared on success.
 
-## New sessions
+## New sessions and naming
 
-`C-c m c` starts a session in the current workspace — the current session's
-directory, else the project root. In the global list, `c` does the same, and
-`RET`/`o` opens the session at point.
+`C-c m c` starts **composing** a session in the current workspace — the current
+session's directory, else the project root. In the global list, `c` does the
+same, and `RET`/`o` opens the session at point.
+
+The OpenCode session is **created only on the first send**, so an empty session
+is never created server-side or written to disk. That is why `C-c m c` opens an
+input buffer with no session behind it yet.
+
+The server owns the `ses_…` id; we control the readable parts:
+
+- **title**: `<date> <first 10 chars of branch>` — e.g. `2026-09-22 feat/openc`.
+  A new session is created with this title, so the session list and the session
+  buffer name read sensibly.
+- **org file**: `<date>-<branch10>-<last 6 of id>.org` under the project
+  directory, with `#+opencode_title` alongside the id/directory/branch/saved
+  metadata.
 
 ## Global session list
 
@@ -103,14 +116,16 @@ worktrees share a repository, so the results are de-duplicated by session id.
 
 `C-c m s` writes the current session to
 `+opencode-sessions-directory` (default `~/.emacs.d/opencode-sessions/`) as an
-org file under the project directory:
+org file under the project directory, named for the session title plus the last
+six characters of its id:
 
 ```org
-#+title: OpenCode session ses_...
+#+title: 2026-09-22 feat/openc
 #+opencode_id: ses_...
+#+opencode_title: 2026-09-22 feat/openc
 #+opencode_directory: /path/to/project/
-#+opencode_branch: feature/x
-#+opencode_saved: 2026-09-21 16:00
+#+opencode_branch: feat/opencode-emacs
+#+opencode_saved: 2026-09-22 16:00
 
 <markdown transcript from the session messages>
 ```
