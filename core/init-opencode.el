@@ -175,15 +175,38 @@ one insertion point and its region re-render is skipped."
     map)
   "Keymap for the OpenCode input buffer.")
 
+(defun +opencode--model-label (model)
+  "Return a short label for MODEL, preferring its name over its ids."
+  (when model
+    (let* ((provider (alist-get 'providerID model))
+           (id (alist-get 'modelID model))
+           (variant (alist-get 'variant model))
+           (catalog (and (boundp 'opencode-providers)
+                         (seq-find (lambda (p) (equal (alist-get 'id p) provider))
+                                   opencode-providers)))
+           (name (cdr (assoc id (alist-get 'models catalog)))))
+      (concat (or (alist-get 'name name) (format "%s/%s" provider id))
+              (and variant (format ":%s" variant))))))
+
+(defun +opencode--input-model ()
+  "Return the model the input buffer will send with.
+A live session's own model, else the model remembered for new sessions."
+  (cond
+   ((buffer-live-p +opencode-input-session)
+    (with-current-buffer +opencode-input-session
+      (and (boundp 'opencode-session-agent) opencode-session-agent
+           (alist-get 'model opencode-session-agent))))
+   ((boundp 'opencode-last-model) opencode-last-model)))
+
 (defun +opencode--input-bar ()
-  "Mode-line segment for the input buffer: its name and its destination.
-The buffer name is already in the mode line; this adds where a send goes."
-  (concat " " (buffer-name)
-          (cond ((buffer-live-p +opencode-input-session)
-                 (format " → %s" (buffer-name +opencode-input-session)))
-                (+opencode-input-title
-                 (format " → new: %s" +opencode-input-title))
-                (t " → draft"))))
+  "Mode-line segment for the input buffer: model, session title, state.
+The buffer name itself is already in the mode line."
+  (let ((model (+opencode--input-model))
+        (title +opencode-input-title))
+    (concat (when model (format " %s" (+opencode--model-label model)))
+            (when title (format " · %s" title))
+            (format " · %s "
+                    (if (buffer-live-p +opencode-input-session) "live" "draft")))))
 
 (define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
   "Major mode for composing an OpenCode prompt in its own buffer."
@@ -264,7 +287,7 @@ An empty session is never created: this only runs on the first send."
                         +opencode-input-title nil)
                   (let ((inhibit-read-only t))
                     (erase-buffer)))
-                (+opencode--arrange input session-buffer))
+                (+opencode--arrange input session-buffer (alist-get 'title opened)))
               (+opencode/save-session opened)))))))))
 
 (defun +opencode--prepare-input (directory)
@@ -285,25 +308,29 @@ An empty session is never created: this only runs on the first send."
     (pop-to-buffer (+opencode--prepare-input
                     (with-current-buffer session default-directory)))))
 
+(defun +opencode--compact-number (n)
+  "Format N compactly, e.g. 171000 as \"171k\"."
+  (if (and (numberp n) (>= n 1000))
+      (format "%.0fk" (/ n 1000.0))
+    (number-to-string (or n 0))))
+
 (defun +opencode--output-bar ()
-  "Mode-line segment for a session buffer: model, variant, context left, status."
+  "Mode-line segment for a session buffer: model, context used, status."
   (let* ((agent opencode-session-agent)
          (model (ignore-errors (opencode--current-model)))
          (name (or (alist-get 'name model) ""))
          (variant (alist-get 'variant agent))
          (limit (map-nested-elt model '(limit context)))
          (used opencode-session-tokens)
-         (live (and (numberp limit) (numberp used) (> limit 0)))
-         (left (and live (- limit used)))
-         (pct (and live (* 100.0 (/ (float used) limit)))))
+         (known (and (numberp limit) (numberp used) (> limit 0)))
+         (pct (and known (* 100.0 (/ (float used) limit)))))
     (concat " " name
             (when variant (format " %s" variant))
-            (when left
-              (format " · %s left (%.0f%%)"
-                      (if (>= left 1000)
-                          (format "%.0fk" (/ left 1000.0))
-                        (number-to-string left))
-                      (- 100.0 pct)))
+            (when known
+              (format " · ctx %s/%s (%.0f%%)"
+                      (+opencode--compact-number used)
+                      (+opencode--compact-number limit)
+                      pct))
             (format " · %s " (or opencode-session-status "idle")))))
 
 (defun +opencode--show-input (buffer)
@@ -314,10 +341,15 @@ An empty session is never created: this only runs on the first send."
         (setq-local mode-line-process '(:eval (+opencode--output-bar))))))
   buffer)
 
-(defun +opencode--arrange (input session)
+(defun +opencode--arrange (input session &optional title)
   "Show INPUT on top and SESSION below, by splitting INPUT's window.
 Other windows are left alone; the input buffer is full until a session
-exists, and the transcript only appears once there is one."
+exists, and the transcript only appears once there is one.  TITLE, when
+given, is the OpenCode session title shown in the input's mode line."
+  (with-current-buffer input
+    (setq +opencode-input-session session)
+    (when title
+      (setq +opencode-input-title title)))
   (let ((window (or (get-buffer-window input (selected-frame))
                     (selected-window))))
     (select-window window)
@@ -735,9 +767,7 @@ session is self-contained and portable."
       (when (buffer-live-p session)
         (let ((input (+opencode--prepare-input
                       (with-current-buffer session default-directory))))
-          (with-current-buffer input
-            (setq +opencode-input-session session))
-          (+opencode--arrange input session)))
+          (+opencode--arrange input session (alist-get 'title row))))
       session)))
 
 (defun +opencode--continue-row (row)
@@ -761,6 +791,7 @@ session is self-contained and portable."
 (defun +opencode/continue-from-file (file)
   "Seed a new session from the archived session FILE."
   (interactive "fSession file: ")
+  (require 'opencode)
   (let* ((directory (or (+opencode--file-keyword file "OPENCODE_DIRECTORY")
                         default-directory))
          (title (or (+opencode--file-keyword file "OPENCODE_TITLE")

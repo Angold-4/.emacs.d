@@ -162,10 +162,11 @@ the input, and the two are arranged once (other windows are untouched).
 There is no header line. Each buffer carries its information in the
 **mode line** (the bottom bar):
 
-- **input** (`*OpenCode Input*`): the buffer name and where a send goes —
-  `→ draft`, `→ new: <title>`, or `→ <session buffer>`.
-- **output** (a session): the model and variant, the context window **left**,
-  and the busy/idle status.
+- **input** (`*OpenCode Input*`): the model it will send with (the session's
+  model when live, else the remembered one) and the session title, then
+  `draft` or `live`.
+- **output** (a session): the model and variant, the context window **used**
+  (`ctx 171k/200k (86%)`), and the busy/idle status.
 
 ## Roadmap
 
