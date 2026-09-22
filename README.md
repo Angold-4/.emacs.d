@@ -170,20 +170,16 @@ synchronization. See [git.md](git.md) for the daily workflow and
 Pi is a minimal, extensible coding agent; [Pilish](https://github.com/dnouri/pilish)
 renders a Pi session as Markdown in one window and the prompt in an ordinary
 Emacs buffer in another. No terminal, no PTY. `C-c m` is the dedicated prefix,
-matching the OpenCode integration:
+a deliberately small subset matching the OpenCode integration:
 
 | Key | Action |
 |-----|--------|
-| `C-c m m` | Session browser, every project |
-| `C-c m c` | Start or focus a session in this workspace |
-| `C-c m i` | Focus this session's input buffer |
-| `C-c m o` | Hide/show this project's session windows |
-| `C-c m M` / `C-c m a` | Select model (provider-aware picker) |
-| `C-c m v` | Select thinking level |
-| `C-c m n` | Start a new session (reset) |
-| `C-c m s` / `C-c m d` | Export session to HTML / open sessions directory |
-| `C-c m r` / `C-c m t` | Reload the pi process / conversation tree browser |
-| `C-c m q` | Close this session |
+| `C-c m c` | Create (start or focus) a session in this workspace |
+| `C-c m m` | Browse every previous session (all projects) |
+| `C-c m a` | Pick the agent's model |
+
+Everything else stays on the `M-x pilish-*` commands and Pilish's own
+in-buffer keys.
 
 Models are served through the **Vercel AI Gateway** (`vercel-ai-gateway`).
 The `pi` CLI is a subprocess of Emacs, so its credentials live with Pi, not in

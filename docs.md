@@ -197,26 +197,18 @@ agent, through [Pilish](https://github.com/dnouri/pilish). Pilish talks to the
 window and the prompt is an ordinary Emacs buffer in the other: Evil motions,
 yank, search and narrowing all work, and no PTY or key forwarding is involved.
 
-`C-c m` is the dedicated prefix, matching the OpenCode integration:
+`C-c m` is the dedicated prefix, a deliberately small subset matching the
+OpenCode integration:
 
 | Key | Action |
 |-----|--------|
-| `C-c m m` | Session browser (every project) |
-| `C-c m c` | Start or focus a session in this workspace |
-| `C-c m i` | Focus this session's input buffer |
-| `C-c m o` | Hide/show this project's session windows |
-| `C-c m M` / `C-c m a` | Select model (provider-aware picker) |
-| `C-c m v` | Select thinking level |
-| `C-c m n` | Start a new session (reset) |
-| `C-c m s` / `C-c m d` | Export session to HTML / open `~/.pi/agent/sessions/` |
-| `C-c m r` / `C-c m t` | Reload the pi process / conversation tree browser |
-| `C-c m q` | Close this session |
-| `M-x pilish` | Start or focus the current project's session |
-| `M-x pilish-open-session-file` | Open a JSONL session file as a live session |
+| `C-c m c` | Create (start or focus) a session in this workspace |
+| `C-c m m` | Browse every previous session (all projects) |
+| `C-c m a` | Pick the agent's model |
 
-Within a session, Pilish binds `C-c C-c` (send, queued as a follow-up while
-busy), `C-c C-s` (steering), `C-c C-k` (abort), `C-c C-p` (transient menu) and
-`C-c C-r` (session browser); `M-p`/`M-n` move through prompt history.
+Everything else is available as `M-x pilish-*` and on Pilish's own in-buffer
+keys (`C-c C-c` send, `C-c C-s` steering, `C-c C-k` abort, `C-c C-p` menu,
+`C-c C-r` sessions; `M-p`/`M-n` move through prompt history).
 
 Models are served through the **Vercel AI Gateway**. Pi's provider id is
 `vercel-ai-gateway`, so authenticate it in Pi's own store — either export

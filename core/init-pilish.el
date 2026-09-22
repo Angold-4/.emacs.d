@@ -21,26 +21,17 @@
 ;; `+pilish-provider' and `+pilish-model' forward `--provider'/`--model' to
 ;; the CLI; set either to nil to let Pi choose.
 ;;
-;; One dedicated prefix, `C-c m', mirrors the OpenCode integration:
+;; One dedicated prefix, `C-c m', mirrors the OpenCode integration with a
+;; deliberately small surface:
 ;;
-;;   C-c m m   global session browser (all projects)
-;;   C-c m c   start or focus a session in this workspace
-;;   C-c m i   focus this session's input buffer
-;;   C-c m o   hide/show this project's session windows
-;;   C-c m M   select model
-;;   C-c m a   select model (provider-aware picker)
-;;   C-c m v   select thinking level
-;;   C-c m n   start a new session (reset)
-;;   C-c m s   export this session to HTML
-;;   C-c m d   open Pi's sessions directory
-;;   C-c m r   reload the pi process
-;;   C-c m t   conversation tree browser
-;;   C-c m q   close this session
+;;   C-c m c   create (start or focus) a session in this workspace
+;;   C-c m m   browse every previous session (all projects)
+;;   C-c m a   pick the agent's model
 ;;
-;; Pilish binds its own in-buffer keys (C-c C-c send, C-c C-s steering,
-;; C-c C-k abort, C-c C-p menu, C-c C-r sessions); see its README.  This
-;; module is deferred, so nothing loads until a command or key above is
-;; used.
+;; Everything else Pilish offers stays on its own keys (C-c C-c send,
+;; C-c C-s steering, C-c C-k abort, C-c C-p menu, C-c C-r sessions) and the
+;; `M-x pilish-*' commands.  This module is deferred, so nothing loads until
+;; one of the keys or commands above is used.
 
 ;;; Code:
 
@@ -67,51 +58,18 @@ provider, for example \"openai/gpt-5-mini\" for the Vercel AI Gateway."
   (append (when +pilish-provider (list "--provider" +pilish-provider))
           (when +pilish-model (list "--model" +pilish-model))))
 
-;;;; Sessions directory
-
-(defun +pilish/agent-directory ()
-  "Return Pi's data directory, honouring `PI_CODING_AGENT_DIR'."
-  (file-name-as-directory
-   (expand-file-name (or (getenv "PI_CODING_AGENT_DIR") "~/.pi/agent"))))
-
-(defun +pilish/open-sessions-directory ()
-  "Open Pi's session archive directory in Dired."
-  (interactive)
-  (let ((dir (expand-file-name "sessions/" (+pilish/agent-directory))))
-    (unless (file-directory-p dir)
-      (make-directory dir t))
-    (dired dir)))
-
 ;;;; Pilish
 
 (use-package pilish
   :straight t
   :commands (pilish
-             pilish-open-input
-             pilish-toggle
-             pilish-new-session
              pilish-session-browser
-             pilish-tree-browser
-             pilish-select-model
-             pilish-select-thinking
-             pilish-export-html
-             pilish-reload
-             pilish-quit)
-  :bind (("C-c m m" . pilish-session-browser)
-         ("C-c m c" . pilish)
-         ("C-c m i" . pilish-open-input)
-         ("C-c m o" . pilish-toggle)
-         ("C-c m M" . pilish-select-model)
-         ("C-c m a" . pilish-select-model)
-         ("C-c m v" . pilish-select-thinking)
-         ("C-c m n" . pilish-new-session)
-         ("C-c m s" . pilish-export-html)
-         ("C-c m d" . +pilish/open-sessions-directory)
-         ("C-c m r" . pilish-reload)
-         ("C-c m t" . pilish-tree-browser)
-         ("C-c m q" . pilish-quit))
+             pilish-select-model)
+  :bind (("C-c m c" . pilish)
+         ("C-c m m" . pilish-session-browser)
+         ("C-c m a" . pilish-select-model))
   :config
-  ;; Point Pi at the Vercel AI Gateway and let `C-c m m' span every project.
+  ;; Point Pi at the Vercel AI Gateway; `C-c m m' spans every project.
   (setq pilish-extra-args (+pilish--extra-args)
         pilish-session-browser-default-scope 'all)
   (defalias 'pi 'pilish))
