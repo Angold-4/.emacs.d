@@ -198,15 +198,20 @@ A live session's own model, else the model remembered for new sessions."
            (alist-get 'model opencode-session-agent))))
    ((boundp 'opencode-last-model) opencode-last-model)))
 
+(defun +opencode--mode-line-escape (string)
+  "Double % in STRING so a literal percent survives mode-line processing."
+  (replace-regexp-in-string "%" "%%" string))
+
 (defun +opencode--input-bar ()
   "Mode-line segment for the input buffer: model, session title, state.
 The buffer name itself is already in the mode line."
   (let ((model (+opencode--input-model))
         (title +opencode-input-title))
-    (concat (when model (format " %s" (+opencode--model-label model)))
-            (when title (format " · %s" title))
-            (format " · %s "
-                    (if (buffer-live-p +opencode-input-session) "live" "draft")))))
+    (+opencode--mode-line-escape
+     (concat (when model (format " %s" (+opencode--model-label model)))
+             (when title (format " · %s" title))
+             (format " · %s "
+                     (if (buffer-live-p +opencode-input-session) "live" "draft"))))))
 
 (define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
   "Major mode for composing an OpenCode prompt in its own buffer."
@@ -354,19 +359,23 @@ lifetime total and must not be used."
          (name (or (alist-get 'name model) ""))
          (variant (alist-get 'variant agent))
          (used +opencode--context-used)
-         (limit +opencode--context-limit)
+         (limit (or +opencode--context-limit
+                    (let ((m (alist-get 'model agent)))
+                      (+opencode--model-limit (alist-get 'providerID m)
+                                              (alist-get 'modelID m)))))
          (known (and (numberp used) (numberp limit) (> limit 0))))
-    (concat " " name
-            (when variant (format " %s" variant))
-            (cond ((and known (<= used limit))
-                   (format " · ctx %s/%s (%.0f%%)"
-                           (+opencode--compact-number used)
-                           (+opencode--compact-number limit)
-                           (* 100.0 (/ (float used) limit))))
-                  ((numberp used)
-                   (format " · ctx %s" (+opencode--compact-number used)))
-                  (t ""))
-            (format " · %s " (or opencode-session-status "idle")))))
+    (+opencode--mode-line-escape
+     (concat " " name
+             (when variant (format " %s" variant))
+             (cond ((and known (<= used limit))
+                    (format " · ctx %s/%s (%.0f%%)"
+                            (+opencode--compact-number used)
+                            (+opencode--compact-number limit)
+                            (* 100.0 (/ (float used) limit))))
+                   ((numberp used)
+                    (format " · ctx %s" (+opencode--compact-number used)))
+                   (t ""))
+             (format " · %s " (or opencode-session-status "idle"))))))
 
 (defun +opencode--show-input (buffer)
   "Give a session just opened in BUFFER its mode-line status bar."
@@ -520,6 +529,25 @@ Bound to RET in normal state so editing stays in insert state."
 ;; =============================================================================
 ;; Sessions as org files
 ;; =============================================================================
+
+(defcustom +opencode-replay-limit 40
+  "How many of a session's newest messages to render when opening it.
+The package replays the whole transcript synchronously while opening, which
+takes tens of seconds on a long session.  The server keeps the full history
+and the session's org file has all of it, so rendering only the tail keeps
+opening quick.  nil renders every message."
+  :type '(choice (const :tag "All messages" nil) integer)
+  :group 'tools)
+
+(defun +opencode--limit-replay (orig-fn messages)
+  "Replay only the newest messages, per `+opencode-replay-limit'."
+  (if (or (null +opencode-replay-limit)
+          (<= (length messages) +opencode-replay-limit))
+      (funcall orig-fn messages)
+    (let ((omitted (- (length messages) +opencode-replay-limit)))
+      (funcall orig-fn (last messages +opencode-replay-limit))
+      (message "OpenCode: newest %d messages shown (%d older omitted)"
+               +opencode-replay-limit omitted))))
 
 (defvar +opencode--save-timer nil
   "Pending debounce timer for an automatic session save.")
@@ -915,6 +943,10 @@ otherwise the output ends up displayed twice."
   ;; Auto-store: write the session's org file when a turn completes.
   (advice-add 'opencode-session--message-updated
               :around #'+opencode--auto-save)
+
+  ;; Opening a session replays the whole transcript; cap that.
+  (advice-add 'opencode--replay-session-messages
+              :around #'+opencode--limit-replay)
 
   ;; Hide the model's thinking trace.
   (advice-add 'opencode--insert-reasoning-block

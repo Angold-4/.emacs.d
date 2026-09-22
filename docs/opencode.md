@@ -104,6 +104,18 @@ The server owns the `ses_…` id; we control the readable parts:
   directory, with `#+opencode_title` alongside the id/directory/branch/saved
   metadata.
 
+## Resuming a session
+
+Opening a session replays its transcript, and the package replays **all** of
+it synchronously — a 511-message session is a 7 MB fetch plus 511 markdown
+renders, i.e. ~20 s. `+opencode-replay-limit` (default 40) caps the render to
+the newest messages and says how many were omitted; set it to nil for the full
+transcript. The server keeps the complete history, and the session's org file
+has all of it, so nothing is lost.
+
+(The mode-line strings are escaped for `%`, since a literal percent in a
+mode-line string must be `%%`.)
+
 ## Global session list
 
 `C-c m m` aggregates `/project` and `/session` into one vtable with **Source ·
