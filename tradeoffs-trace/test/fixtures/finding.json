@@ -1,0 +1,12 @@
+{
+  "id": "F-p2-02",
+  "version": 1,
+  "phaseId": "p2",
+  "kind": "contract",
+  "severity": "blocking",
+  "evidence": "cancel can acknowledge before fills stop (src/cancel.ts:42)",
+  "raisedBy": "B",
+  "linkedDecisionId": "D-p2-05",
+  "status": "open",
+  "boundCandidateSha": "7c1e0a4"
+}

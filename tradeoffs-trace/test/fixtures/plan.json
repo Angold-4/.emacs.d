@@ -1,0 +1,15 @@
+{
+  "title": "matching-engine cancellation refactor",
+  "checks": ["npm test && npm run lint"],
+  "phases": [
+    {
+      "id": "p1",
+      "goal": "move cancellation logic out of orderbook.ts without behavior change.",
+      "acceptance": ["existing cancel tests pass unchanged", "no change to public API types"],
+      "checks": ["npm test -- cancel"],
+      "boundaries": ["src/api/**", "src/schema/**"],
+      "reserved": ["public API types", "persistence format"],
+      "provisional": false
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/submission",
+  "title": "Submission",
+  "description": "Model-facing shapes for the submit_phase and submit_discovery tools (design §3.2): the plain-language decision-disclosure fields a worker or reviewer can supply, before the conductor assigns id, version, phaseId, source, boundCandidateSha and boundContractVersion once a candidate exists (see decision.schema.json, and README's phase-1 note on that step). decisionDisclosure's choice/whyItMatters/alternatives/recommendation fields, and the Alternative/Recommendation $defs, are kept identical to decision.schema.json's own — a contract test (test/contract/submission-schema.test.ts) enforces that. submit_review needs no such split: schemas/review.schema.json is used for it directly, since a Review carries no conductor-assigned binding fields at all.",
+  "$defs": {
+    "Alternative": {
+      "type": "object",
+      "required": ["option", "consequence"],
+      "additionalProperties": false,
+      "properties": {
+        "option": { "type": "string", "minLength": 1 },
+        "consequence": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Recommendation": {
+      "type": "object",
+      "required": ["choice", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "choice": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "decisionDisclosure": {
+      "type": "object",
+      "required": ["choice", "whyItMatters", "alternatives", "recommendation", "classProposal"],
+      "additionalProperties": true,
+      "properties": {
+        "choice": { "type": "string", "minLength": 1 },
+        "whyItMatters": { "type": "string", "minLength": 1 },
+        "alternatives": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Alternative" }
+        },
+        "recommendation": { "$ref": "#/$defs/Recommendation" },
+        "classProposal": { "enum": ["detail", "delegated", "reserved"] }
+      }
+    },
+    "submitPhase": {
+      "type": "object",
+      "required": ["decisions", "assumptions", "deviations"],
+      "additionalProperties": true,
+      "properties": {
+        "decisions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/decisionDisclosure" }
+        },
+        "assumptions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "deviations": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "submitDiscovery": {
+      "type": "object",
+      "required": ["discoveries"],
+      "additionalProperties": true,
+      "properties": {
+        "discoveries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/decisionDisclosure" }
+        }
+      }
+    }
+  }
+}

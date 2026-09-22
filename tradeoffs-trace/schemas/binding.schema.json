@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/binding",
+  "title": "Binding tuple",
+  "description": "design §7.1: run id · phase id · candidate sha · contract version · record id · record version. Every ballot, review, finding disposition and owner command carries one.",
+  "type": "object",
+  "required": ["runId", "phaseId", "candidateSha", "contractVersion", "recordId", "recordVersion"],
+  "additionalProperties": false,
+  "properties": {
+    "runId": { "type": "string", "minLength": 1 },
+    "phaseId": { "type": "string", "minLength": 1 },
+    "candidateSha": { "type": "string", "minLength": 1 },
+    "contractVersion": { "$ref": "#/$defs/ContractVersion" },
+    "recordId": { "type": "string", "minLength": 1 },
+    "recordVersion": { "type": "integer" }
+  },
+  "$defs": {
+    "ContractVersion": {
+      "type": "object",
+      "required": ["snapshot", "sectionSha256"],
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": { "type": "integer" },
+        "sectionSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/correction",
+  "title": "Correction",
+  "description": "design §7.5 (revise).",
+  "type": "object",
+  "required": [
+    "id", "version", "phaseId", "targetRecordId", "correctionText",
+    "contractChange", "status", "boundContractVersion", "grantedRounds"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer" },
+    "phaseId": { "type": "string", "minLength": 1 },
+    "targetRecordId": { "type": "string", "minLength": 1 },
+    "correctionText": { "type": "string", "minLength": 1 },
+    "contractChange": { "type": "boolean" },
+    "status": { "enum": ["open", "addressed", "resolved"] },
+    "boundContractVersion": { "$ref": "#/$defs/ContractVersion" },
+    "grantedRounds": { "type": "integer" }
+  },
+  "$defs": {
+    "ContractVersion": {
+      "type": "object",
+      "required": ["snapshot", "sectionSha256"],
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": { "type": "integer" },
+        "sectionSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

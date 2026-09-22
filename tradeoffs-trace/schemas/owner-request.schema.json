@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/owner-request",
+  "title": "Owner request",
+  "description": "'this needs the owner's authority' — resolved by the owner only (design §0).",
+  "type": "object",
+  "required": ["id", "version", "phaseId", "reason", "origin", "options", "status"],
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer" },
+    "phaseId": { "type": "string", "minLength": 1 },
+    "reason": { "type": "string", "minLength": 1 },
+    "origin": { "enum": ["failed_vote", "open_finding", "repair_budget_exhausted", "amend_conflict", "reserved_decision", "unaddressed_correction"] },
+    "linkedDecisionId": { "type": "string", "minLength": 1 },
+    "linkedFindingId": { "type": "string", "minLength": 1 },
+    "linkedCorrectionId": { "type": "string", "minLength": 1 },
+    "relatedBallots": { "type": "array" },
+    "boundCandidateSha": { "type": "string", "minLength": 1 },
+    "boundContractVersion": { "$ref": "#/$defs/ContractVersion" },
+    "options": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "label": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "status": { "enum": ["open", "resolved", "unneeded"] },
+    "resolution": {
+      "type": "object",
+      "required": ["option"],
+      "additionalProperties": true,
+      "properties": {
+        "option": { "type": "string", "minLength": 1 },
+        "note": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "ContractVersion": {
+      "type": "object",
+      "required": ["snapshot", "sectionSha256"],
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": { "type": "integer" },
+        "sectionSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

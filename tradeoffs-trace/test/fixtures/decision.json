@@ -1,0 +1,15 @@
+{
+  "id": "D-p2-05",
+  "version": 2,
+  "phaseId": "p2",
+  "source": "worker",
+  "class": "delegated",
+  "choice": "Batch cancels per tick instead of one lock per request",
+  "whyItMatters": "fewer lock acquisitions under load, without changing the cancel guarantee",
+  "alternatives": [
+    { "option": "a lock per request", "consequence": "simpler, but twice the contention in the phase benchmark" }
+  ],
+  "recommendation": { "choice": "batch per tick", "reason": "stays inside the phase's latency budget" },
+  "boundCandidateSha": "7c1e0a4",
+  "boundContractVersion": { "snapshot": 1, "sectionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+}
