@@ -3,7 +3,19 @@
 Status: **Design rationale for discussion.** This document explains the direction
 for agent work in Emacs; it does not describe an implemented orchestrator.
 
-## The problem: output grows faster than human attention
+## The problem: the same agents can produce very different outcomes
+
+Two developers using the same agents can produce very different results. The
+difference is not explained by their initial prompts alone. It also comes from
+their judgment throughout execution: which assumptions they challenge, which
+decisions they recognize as wrong for the goal, which compromises they accept,
+and when they redirect the work.
+
+A clear prompt helps establish direction. Skills help agents apply useful
+methods. Neither settles every choice that a large project will reveal during
+implementation. Final quality depends on the evaluation and correction loop,
+including the human's ability to recognize when an apparently good solution is
+solving the wrong problem or paying the wrong price for the intended result.
 
 When agents perform nearly all of the coding, the developer's scarce resource
 becomes attention: expressing intent, recognizing consequential choices, and
@@ -30,8 +42,9 @@ has to remember which obligations remain outstanding.
 
 Two claims motivate a different approach:
 
-1. Human judgment remains the authority for goals and consequential trade-offs,
-   even when agents perform much of the technical evaluation.
+1. Human judgment inside the loop shapes the quality of the result: achieving a
+   particular goal requires particular trade-offs, and the owner must recognize
+   whether the work is making the right ones for that goal.
 2. Workflow obligations need executable enforcement, even when models become
    more capable and better at following instructions.
 
@@ -39,13 +52,52 @@ The objective is to increase both human and agent bandwidth: let many tasks
 advance without constant supervision, while making the decisions that need
 human judgment visible at the time that judgment can still change the outcome.
 
-## 1. What it means for evaluation to remain human
+## 1. Quality depends on judgment throughout the loop
 
-“AI cannot evaluate better than a human” is too broad as a claim about technical
-ability. An agent may find a defect a person misses, identify an inconsistency,
-or supply a better argument. A test runner can establish an observed result
-more reliably than a person reading a transcript. None of this transfers the
-authority to define what the work is for.
+The important human contribution is more than permission to approve the final
+output. It is the ability to judge the work against its purpose while there is
+still an opportunity to change it. A developer who cannot recognize unsuitable
+trade-offs can approve a polished implementation that undermines the goal. A
+developer who notices them can use the same agents to produce a better result.
+
+For example, two developers ask the same agent to make a service faster. Both
+receive a cache that improves the benchmark. One accepts the improvement; the
+other notices that stale results would violate the service's purpose and asks
+for a different approach. For a different service, bounded staleness might be
+exactly the right compromise. The judgment is about the relationship between
+the goal and the cost of the improvement, not whether caching is generally a
+good technique.
+
+### A goal gives a trade-off its meaning
+
+There is no universally best balance of speed, consistency, compatibility,
+maintainability and delivery time. Achieving a specific goal requires choosing
+which properties to protect and which costs to accept. The owner often knows
+why the project exists, what failure would mean, and which obligations matter
+in ways that are only partially expressed in a prompt. Implementation also
+reveals constraints the owner could not have specified beforehand.
+
+An agent evaluates against the objective and context available to it. Better
+reasoning can improve that evaluation, but it does not by itself establish that
+the objective captures the owner's actual priorities. When the representation
+is incomplete, the agent may optimize an apparently sensible criterion while
+moving the project away from its purpose.
+
+This is the useful meaning of keeping evaluation human: consequential trade-offs
+must remain connected to the owner's understanding of the goal, and that
+understanding must be able to correct the work as it develops. It is not a
+claim that every human judgment is better than every agent judgment. An agent
+can expose a trade-off the owner misunderstood and help the owner change their
+mind. Nor does it require the owner to make every implementation choice; clear
+priorities and explicit delegation let agents handle many choices well.
+
+### Technical evaluation and goal judgment are different
+
+“AI can never evaluate better than a human” would overstate the argument. An
+agent may find a defect a person misses, identify an inconsistency, or supply a
+better argument. A test runner can establish an observed result more reliably
+than a person reading a transcript. These capabilities support judgment; they
+do not establish that an unexamined compromise serves the owner's goal.
 
 There are three different questions inside evaluation:
 
@@ -72,19 +124,40 @@ Consider a disagreement between a developer and an agent:
 3. **The agent is right and persuades the human.** The human changes the decision
    because the agent exposed something useful.
 
-In all three cases, the human retains authority over the intended outcome. This
-does not establish human infallibility or a permanent ceiling on AI's technical
-evaluation ability. It establishes the need to distinguish **evidence,
-judgment, and authorization**.
+In all three cases, the human's judgment affects what is ultimately delivered,
+including when that judgment is mistaken. The value of the loop is that evidence
+can improve the judgment before the choice becomes part of the result. Merely
+obtaining approval does not make the evaluation good. Keep **evidence,
+judgment, and authorization** distinct.
 
 The system should therefore help the human make better decisions, including by
 challenging the human. Agreement alone is a weak acceptance criterion: both
 parties can agree on something false. A useful evaluation record preserves the
 supporting evidence, unresolved objections and the scope of any accepted risk.
 
+### The evaluation pipeline also embodies judgment
+
+Choosing what to test, what reviewers should inspect, which findings block
+delivery, and which decisions reach the owner determines what the workflow
+treats as quality. If the pipeline rewards only benchmark speed, it may
+consistently accept changes that break freshness guarantees. More review rounds
+against that same incomplete criterion need not expose the problem.
+
+A weak evaluation process can therefore make a capable agent reliably produce
+the wrong outcome. Fancy prompts cannot compensate for acceptance criteria
+that miss the goal. A programmed pipeline cannot compensate for them either:
+it can enforce the chosen checks faithfully while enforcing the wrong standard.
+The human must be able to inspect and revise that standard as evidence arrives.
+
+This matters especially in large projects, where individual changes can look
+reasonable while their combined trade-offs undermine the intended system.
+Evaluation needs both local correctness checks and opportunities to reconsider
+whether the integrated result still serves the goal.
+
 ## 2. The most dangerous failure is an unexposed decision
 
-The three disagreement cases assume that the human sees the issue. A more
+The value of judgment depends on having something meaningful to judge. The
+three disagreement cases assume that the human sees the issue. A more
 dangerous case happens before disagreement is even possible:
 
 ```text
@@ -167,6 +240,11 @@ human decisions and external side effects. Those need explicit coordination.
 Repeatedly asking a model whether a known process exited successfully spends
 time and tokens on something ordinary code can establish. Persisting the result
 also avoids asking a future session to reconstruct it from conversation.
+
+The pipeline's long-term role is to make this evaluation loop dependable: gather
+evidence, expose consequential choices, apply the agreed standard, and preserve
+the opportunity to revise that standard. It makes judgment usable across many
+tasks without requiring a person to watch every agent turn.
 
 More capable agents may make oversight more important because they can make
 more changes before a person reads the output. The useful scaling target is
@@ -294,9 +372,11 @@ started hiding decisions. More gates alone are not success either: they can
 consume attention without catching meaningful failures. Compare both the
 quality of delivered work and the human effort needed to obtain it.
 
-The durable principle is that stronger models expand what can be delegated.
+The durable principle is that stronger models expand what can be delegated,
+while judgment determines whether that work advances the intended goal.
 Explicit authority, inspectable evidence and executable workflow obligations
-make that delegation manageable at scale.
+make that judgment usable at scale. Their success depends on exposing the right
+choices and applying a standard that the human can challenge and improve.
 
 ## Related project context
 

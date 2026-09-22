@@ -42,8 +42,9 @@ need a language server running just to read code.
 
 The rationale for extending this buffer experience to agent workflows is in
 [Human judgment and programmed agent workflows](docs/agent-evaluation-and-programmed-workflows.md).
-It explains human evaluation authority, the risk of unexposed decisions, and
-why workflow obligations need executable control as models become more capable.
+It explains how human judgment during execution shapes results from the same
+agents, the risk of unexposed trade-offs, and why evaluation loops need
+executable control as models become more capable.
 
 ## Quick Start
 
