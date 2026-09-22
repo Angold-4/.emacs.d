@@ -22,7 +22,8 @@ inside OpenCode buffers:
 | `C-c m m` | `+opencode/sessions` | Global session list, every project |
 | `C-c m o` | `+opencode/open` | Session manager for the current project |
 | `C-c m n` | `+opencode/new` | New session |
-| `C-c m M` | `+opencode/model` | Select model |
+| `C-c m M` | `+opencode/model` | Select model (flattened across providers) |
+| `C-c m a` | `+opencode/provider` | Select provider, then a model from it |
 | `C-c m v` | `+opencode/variant` | Select model variant |
 | `C-c m s` | `+opencode/save` | Save this session as an org file |
 | `C-c m d` | `+opencode/open-directory` | Dired the saved-sessions directory |

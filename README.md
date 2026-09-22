@@ -132,10 +132,12 @@ buffers via sczi/opencode.el — no terminal, no alternate screen.
 
 | Key | Action |
 |-----|--------|
-| `C-c o` / `:opencode` | Session manager for the current project |
-| `C-c m` (in a session) | Pick the model |
-| `C-c l` (in a session) | List the project's sessions |
-| `/` (at a prompt) | Run a slash command |
+| `C-c o` / `:opencode` / `:oc` | Global session list, every project |
+| `C-c m o` | Session manager for the current project |
+| `C-c m M` / `C-c m a` | Pick a model / pick a provider then a model |
+| `C-c m v` | Pick a model variant |
+| `C-c m s` / `C-c m d` | Save session as an org file / open the sessions directory |
+| `RET` (normal state) | Send the input to the agent |
 
 Sessions are ordinary Evil buffers: they open in insert state, where `RET`
 inserts a newline and you edit normally; pressing `RET` in **normal state**

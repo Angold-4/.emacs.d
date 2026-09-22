@@ -17,6 +17,7 @@
 ;;   C-c m o   project session manager              +opencode/open
 ;;   C-c m n   new session                          +opencode/new
 ;;   C-c m M   select model                         +opencode/model
+;;   C-c m a   provider, then model                 +opencode/provider
 ;;   C-c m v   select model variant                 +opencode/variant
 ;;   C-c m s   save this session as an org file     +opencode/save
 ;;   C-c m d   open the saved-sessions directory    +opencode/open-directory
@@ -109,6 +110,54 @@ Set it to something outside `C-c', for example \"s-o\", if you prefer."
   (interactive)
   (make-directory +opencode-sessions-directory t)
   (dired +opencode-sessions-directory))
+
+(defun +opencode--provider-candidates ()
+  "Completion candidates for `opencode-providers', provider-first."
+  (cl-loop for provider in opencode-providers
+           collect (list (or (alist-get 'name provider)
+                             (alist-get 'id provider))
+                         provider
+                         (alist-get 'id provider))))
+
+(defun +opencode--model-candidates (provider)
+  "Completion candidates for PROVIDER's models."
+  (let (candidates)
+    (dolist (entry (alist-get 'models provider))
+      (let ((model (cdr entry)))
+        (push (list (or (alist-get 'name model)
+                        (alist-get 'id model))
+                    model
+                    (alist-get 'id model))
+              candidates)))
+    (nreverse candidates)))
+
+(defun +opencode/provider ()
+  "Choose the model provider, then a model from it.
+Unlike `opencode-select-model', which flattens every provider into one
+list, this asks for the provider first."
+  (interactive)
+  (require 'opencode)
+  (unless (derived-mode-p 'opencode-session-mode)
+    (user-error "Not in an OpenCode session"))
+  (unless opencode-session-agent
+    (user-error "No agent in this session"))
+  (unless opencode-providers
+    (user-error "No providers reported by the server"))
+  (when-let ((provider (opencode--annotated-completion
+                        "Provider: " (+opencode--provider-candidates))))
+    (when-let ((model (opencode--annotated-completion
+                       "Model: " (+opencode--model-candidates provider))))
+      (let ((entry `((providerID . ,(alist-get 'id provider))
+                     (modelID . ,(alist-get 'id model)))))
+        (setf (alist-get 'model opencode-session-agent) entry
+              opencode-last-model entry)
+        ;; Drop a variant the new model does not offer.
+        (when-let ((variant (alist-get 'variant opencode-session-agent)))
+          (unless (alist-get variant (alist-get 'variants model))
+            (setq opencode-session-agent
+                  (assq-delete-all 'variant opencode-session-agent))))
+        (message "Model: %s/%s"
+                 (alist-get 'id provider) (alist-get 'id model))))))
 
 (defun +opencode/send ()
   "Send the session's current input to the agent.
@@ -284,6 +333,7 @@ holds metadata plus the full markdown transcript."
     (define-key map (kbd "o") #'+opencode/open)
     (define-key map (kbd "n") #'+opencode/new)
     (define-key map (kbd "M") #'+opencode/model)
+    (define-key map (kbd "a") #'+opencode/provider)
     (define-key map (kbd "v") #'+opencode/variant)
     (define-key map (kbd "s") #'+opencode/save)
     (define-key map (kbd "d") #'+opencode/open-directory)
