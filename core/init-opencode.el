@@ -16,7 +16,8 @@
 ;;   C-c m m   global session list (every project)  +opencode/sessions
 ;;   C-c m o   project session manager              +opencode/open
 ;;   C-c m i   compose in a dedicated input buffer   +opencode/input
-;;   C-c m n   new session                          +opencode/new
+;;   C-c m c   new session in this workspace         +opencode/new
+;;   C-c m n   same as c                             +opencode/new
 ;;   C-c m M   select model                         +opencode/model
 ;;   C-c m a   provider, then model                 +opencode/provider
 ;;   C-c m v   select model variant                 +opencode/variant
@@ -195,21 +196,33 @@ the agent is still working."
 (define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
   "Major mode for composing an OpenCode prompt in its own buffer.")
 
+(defun +opencode--display-input (session)
+  "Show SESSION's input buffer below, without selecting it."
+  (let ((buffer (+opencode--input-buffer session)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p '+opencode-input-mode)
+        (+opencode-input-mode))
+      (setq +opencode-input-session session))
+    (display-buffer buffer '((display-buffer-below-selected)
+                             (window-height . 12)))
+    buffer))
+
 (defun +opencode/input ()
-  "Open the input buffer for the current (or most recent) session."
+  "Focus the input buffer for the current (or most recent) session."
   (interactive)
   (require 'opencode)
   (let ((session (+opencode--session-buffer)))
     (unless (buffer-live-p session)
-      (user-error "No OpenCode session"))
-    (let ((buffer (+opencode--input-buffer session)))
-      (with-current-buffer buffer
-        (unless (derived-mode-p '+opencode-input-mode)
-          (+opencode-input-mode))
-        (setq +opencode-input-session session))
-      (display-buffer buffer '(display-buffer-below-selected
-                               (window-height . 12)))
-      (pop-to-buffer buffer))))
+      (user-error "No OpenCode session open yet"))
+    (pop-to-buffer (+opencode--display-input session))))
+
+(defun +opencode--show-input (buffer)
+  "Display the input buffer for a session just opened, keeping BUFFER selected."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'opencode-session-mode)
+        (ignore-errors (+opencode--display-input buffer)))))
+  buffer)
 
 ;; =============================================================================
 ;; Prefix command map
@@ -233,11 +246,21 @@ Set it to something outside `C-c', for example \"s-o\", if you prefer."
   (require 'opencode)
   (call-interactively #'opencode))
 
+(defun +opencode/workspace-directory ()
+  "Return the directory a new session should belong to.
+The current session's directory, else the current project root, else
+`default-directory'."
+  (cond
+   ((derived-mode-p 'opencode-session-mode) default-directory)
+   ((project-current) (project-root (project-current)))
+   (t default-directory)))
+
 (defun +opencode/new ()
-  "Start a new OpenCode session."
+  "Start a new OpenCode session in the current workspace."
   (interactive)
   (require 'opencode)
-  (call-interactively #'opencode-new-session))
+  (let ((default-directory (+opencode/workspace-directory)))
+    (call-interactively #'opencode-new-session)))
 
 (defun +opencode/model ()
   "Choose the model for the current session."
@@ -323,6 +346,9 @@ Bound to RET in normal state so editing stays in insert state."
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "g") #'+opencode/sessions-refresh)
+    ;; New session in this workspace (same as `C-c m c').
+    (define-key map (kbd "n") #'+opencode/new)
+    (define-key map (kbd "c") #'+opencode/new)
     (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for the global OpenCode session list.")
@@ -478,6 +504,7 @@ holds metadata plus the full markdown transcript."
     (define-key map (kbd "m") #'+opencode/sessions)
     (define-key map (kbd "o") #'+opencode/open)
     (define-key map (kbd "i") #'+opencode/input)
+    (define-key map (kbd "c") #'+opencode/new)
     (define-key map (kbd "n") #'+opencode/new)
     (define-key map (kbd "M") #'+opencode/model)
     (define-key map (kbd "a") #'+opencode/provider)
@@ -520,6 +547,10 @@ holds metadata plus the full markdown transcript."
   ;; Re-read the server's credentials before every connect attempt: the server
   ;; may have been started (or restarted) after this module loaded.
   (advice-add 'opencode-autoconnect :before #'+opencode--resolve-credentials)
+
+  ;; Show the input buffer under every session that opens, so it is visible
+  ;; without having to remember a key.
+  (advice-add 'opencode-open-session :filter-return #'+opencode--show-input)
 
   ;; Hide the model's thinking trace.
   (advice-add 'opencode--insert-reasoning-block

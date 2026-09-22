@@ -134,7 +134,8 @@ buffers via sczi/opencode.el — no terminal, no alternate screen.
 |-----|--------|
 | `C-c o` / `:opencode` / `:oc` | Global session list, every project |
 | `C-c m o` | Session manager for the current project |
-| `C-c m i` | Compose in a dedicated input buffer (type even while the agent works) |
+| `C-c m c` / `C-c m n` | New session in the current workspace |
+| `C-c m i` | Focus the input buffer (shown automatically; type even while the agent works) |
 | `C-c m M` / `C-c m a` | Pick a model / pick a provider then a model |
 | `C-c m v` | Pick a model variant |
 | `C-c m s` / `C-c m d` | Save session as an org file / open the sessions directory |
