@@ -134,13 +134,24 @@ Set it to something outside `C-c', for example \"s-o\", if you prefer."
   (let ((buffer (get-buffer-create +opencode--sessions-buffer)))
     (with-current-buffer buffer
       (unless (derived-mode-p '+opencode-global-mode)
-        (+opencode-global-mode))
-      (+opencode/sessions-refresh))
-    (pop-to-buffer buffer)))
+        (+opencode-global-mode)))
+    (pop-to-buffer buffer)
+    (+opencode/sessions-refresh)))
 
 (defun +opencode/sessions-refresh ()
-  "Refresh the global session list."
+  "Refresh the global session list, connecting to a server first."
   (interactive)
+  (require 'opencode)
+  (let ((buffer (get-buffer-create +opencode--sessions-buffer)))
+    ;; `opencode-api-url' is only set by the connect flow, and the request
+    ;; callbacks error without it, so reuse or start a server before asking.
+    (opencode-autoconnect
+     (lambda ()
+       (with-current-buffer buffer
+         (+opencode--sessions-fetch))))))
+
+(defun +opencode--sessions-fetch ()
+  "Fill the global session list.  Assumes a live server connection."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (insert "Loading OpenCode sessions...\n"))
