@@ -61,6 +61,8 @@
 (defvar pilish-chat-mode-map)
 (defvar pilish-input-mode-map)
 (defvar pilish-evil-chat-state)
+(defvar pilish--chat-buffer)
+(defvar pilish--process)
 
 (declare-function pilish-evil-setup "pilish-evil")
 (declare-function pilish-evil-insert-input "pilish-evil")
@@ -68,6 +70,9 @@
 (declare-function pilish-visit-file "pilish-render")
 (declare-function pilish-toggle-tool-section "pilish-render")
 (declare-function pilish--update-state-from-response "pilish-core")
+(declare-function pilish--browse-switch-session "pilish-browse")
+(declare-function pilish--session-live-process-p "pilish-ui")
+(declare-function pilish-open-session-file "pilish")
 (declare-function evil-define-key* "evil-core")
 
 ;; Native Evil state for the chat buffer, set before `pilish-evil' loads.
@@ -156,11 +161,34 @@ Runs as :after advice on `pilish--update-state-from-response'."
             (ignore-errors (+pilish--persist-model provider id))))))))
 
 (defun +pilish--install-advice ()
-  "Advise Pi's state update so model changes are remembered."
+  "Install the two Pilish advices this module relies on."
   (unless (advice-member-p #'+pilish--remember-model
                            'pilish--update-state-from-response)
     (advice-add 'pilish--update-state-from-response
-                :after #'+pilish--remember-model)))
+                :after #'+pilish--remember-model))
+  (unless (advice-member-p #'+pilish--browse-switch-session
+                           'pilish--browse-switch-session)
+    (advice-add 'pilish--browse-switch-session
+                :around #'+pilish--browse-switch-session)))
+
+;;;; Open a browsed session when none is live
+
+(defun +pilish--browse-switch-session (orig path &rest args)
+  "Switch to PATH, opening it when no live session is linked.
+Pilish's session browser reads its archive from disk with no live
+process, but its RET guard (`pilish--browse-switch-session') requires a
+live linked chat buffer and otherwise signals \"No pi session to switch
+to\".  When there is no live session, open the session file directly
+instead, so `C-c m m' then RET works without starting a throwaway
+session first."
+  (let* ((chat-buf (and (boundp 'pilish--chat-buffer) pilish--chat-buffer))
+         (proc (and (buffer-live-p chat-buf)
+                    (buffer-local-value 'pilish--process chat-buf))))
+    (if (and (stringp path)
+             (not (and (buffer-live-p chat-buf)
+                       (pilish--session-live-process-p proc))))
+        (pilish-open-session-file path)
+      (apply orig path args))))
 
 ;;;; Remove Pilish's own prefix keys
 

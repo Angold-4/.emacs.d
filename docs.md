@@ -206,6 +206,13 @@ OpenCode integration:
 | `C-c m m` | Browse every previous session (all projects) |
 | `C-c m a` | Pick the agent's model |
 
+`C-c m m` reads Pi's session archive from disk, so it works with no live
+process; RET resumes the session at point. Pilish's own RET guard requires a
+live linked chat buffer and would otherwise signal "No pi session to switch
+to" when you go straight to the browser, so `init-pilish.el` advises
+`pilish--browse-switch-session` to call `pilish-open-session-file` on the
+selected session when no live process is linked (or its process has died).
+
 Pilish's own `C-c C-*` bindings (`C-c C-c` send, `C-c C-s` steering,
 `C-c C-k` abort, `C-c C-p` menu, `C-c C-r` sessions, `C-c C-e` export,
 `C-c C-m` model, `C-c C-t` thinking, `C-c C-y` copy last, `C-c C-n` new) are
