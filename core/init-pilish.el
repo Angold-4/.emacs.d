@@ -72,6 +72,7 @@
 (declare-function pilish--update-state-from-response "pilish-core")
 (declare-function pilish--browse-switch-session "pilish-browse")
 (declare-function pilish--session-live-process-p "pilish-ui")
+(declare-function pilish-project-buffers "pilish-ui")
 (declare-function pilish-open-session-file "pilish")
 (declare-function evil-define-key* "evil-core")
 
@@ -190,6 +191,19 @@ session first."
         (pilish-open-session-file path)
       (apply orig path args))))
 
+(defun +pilish/sessions ()
+  "Browse every previous session, starting a session first if needed.
+Pilish's browser is meant to be opened from a live session and its RET
+guard needs one, so when this project has no session, start/reuse one
+with `pilish' first (the documented sequence); RET then resumes any
+session in the list.  When a session already exists, nothing new is
+started."
+  (interactive)
+  (require 'pilish)
+  (unless (pilish-project-buffers)
+    (pilish))
+  (pilish-session-browser))
+
 ;;;; Remove Pilish's own prefix keys
 
 (defvar +pilish-strip-keys
@@ -233,7 +247,7 @@ TAB folds a tool/thinking block."
              pilish-session-browser
              pilish-select-model)
   :bind (("C-c m c" . pilish)
-         ("C-c m m" . pilish-session-browser)
+         ("C-c m m" . +pilish/sessions)
          ("C-c m a" . pilish-select-model))
   :config
   ;; Vercel AI Gateway; `C-c m m' spans every project.

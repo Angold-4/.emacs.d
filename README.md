@@ -178,9 +178,10 @@ a deliberately small subset matching the OpenCode integration:
 | `C-c m m` | Browse every previous session (all projects) |
 | `C-c m a` | Pick the agent's model |
 
-`C-c m m` reads Pi's archive from disk, so it lists sessions even with nothing
-running; RET resumes the selected one, opening it directly when no session is
-live (otherwise Pilish would refuse with "No pi session to switch to").
+`C-c m m` opens the session browser and, when this project has no session yet,
+starts/reuses one first — Pilish's browser is meant to be opened from a live
+session, and its RET guard needs one. RET then resumes any session in the list;
+with no live session linked, RET also opens the selected session directly.
 
 Pilish's own `C-c C-*` bindings are removed so this config's global `C-c`
 keys apply inside its buffers; a prompt is sent with RET in the input buffer's
