@@ -308,34 +308,65 @@ An empty session is never created: this only runs on the first send."
     (pop-to-buffer (+opencode--prepare-input
                     (with-current-buffer session default-directory)))))
 
+(defvar-local +opencode--context-used nil
+  "Context tokens of the latest turn, from the assistant message.")
+(defvar-local +opencode--context-limit nil
+  "Context window of the model the latest turn ran on.")
+
 (defun +opencode--compact-number (n)
   "Format N compactly, e.g. 171000 as \"171k\"."
   (if (and (numberp n) (>= n 1000))
       (format "%.0fk" (/ n 1000.0))
     (number-to-string (or n 0))))
 
+(defun +opencode--model-limit (provider-id model-id)
+  "Return the context window of PROVIDER-ID/MODEL-ID, or nil."
+  (when (and provider-id model-id (boundp 'opencode-providers))
+    (let ((provider (seq-find (lambda (p) (equal (alist-get 'id p) provider-id))
+                              opencode-providers)))
+      (map-nested-elt (cdr (assoc model-id (alist-get 'models provider)))
+                      '(limit context)))))
+
+(defun +opencode--record-context (info)
+  "Record the per-turn context size and limit from assistant INFO.
+`input'+`cache.read'+`cache.write' is the prompt this turn sent, which is
+the context actually in use; the session's own `tokens' field is a
+lifetime total and must not be used."
+  (let* ((tokens (map-nested-elt info '(tokens)))
+         (input (alist-get 'input tokens))
+         (cache (alist-get 'cache tokens))
+         (used (and (numberp input)
+                    (+ input (or (alist-get 'read cache) 0)
+                       (or (alist-get 'write cache) 0)))))
+    (when (and used (> used 0))
+      (when-let ((id (map-nested-elt info '(sessionID))))
+        (let ((limit (+opencode--model-limit (map-nested-elt info '(providerID))
+                                             (map-nested-elt info '(modelID)))))
+          (ignore-errors
+            (opencode--with-session-buffer id
+              (setq +opencode--context-used used
+                    +opencode--context-limit limit)
+              (force-mode-line-update))))))))
+
 (defun +opencode--output-bar ()
-  "Mode-line segment for a session buffer: model, usage, status.
-The server reports only cumulative token counters, so a context percentage
-would be meaningless; a percentage is shown only when it is inside the
-model's context limit, and the raw cumulative total otherwise."
+  "Mode-line segment for a session buffer: model, context used, status."
   (let* ((agent opencode-session-agent)
          (model (ignore-errors (opencode--current-model)))
          (name (or (alist-get 'name model) ""))
          (variant (alist-get 'variant agent))
-         (limit (map-nested-elt model '(limit context)))
-         (used opencode-session-tokens)
-         (known (and (numberp limit) (numberp used) (> limit 0) (> used 0)))
-         (usage (cond ((and known (<= used limit))
-                       (format "ctx %s/%s (%.0f%%)"
-                               (+opencode--compact-number used)
-                               (+opencode--compact-number limit)
-                               (* 100.0 (/ (float used) limit))))
-                      (known (format "tokens %s" (+opencode--compact-number used)))
-                      (t nil))))
+         (used +opencode--context-used)
+         (limit +opencode--context-limit)
+         (known (and (numberp used) (numberp limit) (> limit 0))))
     (concat " " name
             (when variant (format " %s" variant))
-            (when usage (format " · %s" usage))
+            (cond ((and known (<= used limit))
+                   (format " · ctx %s/%s (%.0f%%)"
+                           (+opencode--compact-number used)
+                           (+opencode--compact-number limit)
+                           (* 100.0 (/ (float used) limit))))
+                  ((numberp used)
+                   (format " · ctx %s" (+opencode--compact-number used)))
+                  (t ""))
             (format " · %s " (or opencode-session-status "idle")))))
 
 (defun +opencode--show-input (buffer)
@@ -599,12 +630,13 @@ session is self-contained and portable."
                        (+opencode--save-by-id session-id)))))
 
 (defun +opencode--auto-save (orig-fn info)
-  "Run ORIG-FN, then save the session when a turn completes."
+  "Run ORIG-FN, record the turn's context, and save on completion."
   (funcall orig-fn info)
-  (when (and (equal (map-nested-elt info '(role)) "assistant")
-             (map-nested-elt info '(time completed)))
-    (when-let ((id (map-nested-elt info '(sessionID))))
-      (+opencode--schedule-save id))))
+  (when (equal (map-nested-elt info '(role)) "assistant")
+    (+opencode--record-context info)
+    (when (map-nested-elt info '(time completed))
+      (when-let ((id (map-nested-elt info '(sessionID))))
+        (+opencode--schedule-save id)))))
 
 ;; =============================================================================
 ;; Global session list

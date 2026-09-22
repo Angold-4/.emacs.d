@@ -166,7 +166,15 @@ There is no header line. Each buffer carries its information in the
   model when live, else the remembered one) and the session title, then
   `draft` or `live`.
 - **output** (a session): the model and variant, the context window **used**
-  (`ctx 171k/200k (86%)`), and the busy/idle status.
+  (`ctx 795k/1049k (76%)`), and the busy/idle status.
+
+The context figure is per turn, not the session lifetime: it is the latest
+assistant message's `input + cache.read + cache.write`, which is the prompt
+that turn actually sent. It is divided by the **model that turn ran on**
+(resolved from the catalog by the message's `providerID`/`modelID`), *not* by
+whatever model is currently selected — a session on a 1M-context model would
+otherwise be measured against a 200k one. A zero-token update is ignored so
+the figure cannot collapse to 0.
 
 ## Roadmap
 
