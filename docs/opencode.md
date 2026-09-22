@@ -76,9 +76,9 @@ nil). The package has no option for this, so the trace is dropped at
 ## Input buffer
 
 `C-c m i` (`+opencode/input`) focuses a plain buffer, one per session, for
-writing a prompt away from the transcript. It is shown automatically beneath
-each session (`opencode-open-session` is advised), so there is nothing to
-remember. It is an ordinary Evil buffer (insert state to write, normal `RET` or
+writing a prompt away from the transcript. It is shown **and focused**
+automatically beneath each session (`opencode-open-session` is advised), so a
+session opens with the cursor in the input box, ready to type. It is an ordinary Evil buffer (insert state to write, normal `RET` or
 `C-<return>` / `C-c C-c` to send) and it never shares a buffer with streaming
 output, so you can compose at any time, including while the agent is working.
 Sending calls the package's own `opencode-session--send-synthetic-input`, so

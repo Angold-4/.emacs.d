@@ -204,16 +204,18 @@ the agent is still working."
       (erase-buffer))
     (message "Sent to %s" session)))
 
-(defun +opencode--display-input (session)
-  "Show SESSION's input buffer below, without selecting it."
+(defun +opencode--display-input (session &optional select)
+  "Show SESSION's input buffer below.  Select it when SELECT is non-nil."
   (let ((buffer (+opencode--input-buffer session)))
     (with-current-buffer buffer
       (unless (derived-mode-p '+opencode-input-mode)
         (+opencode-input-mode))
       (setq +opencode-input-session session))
-    (display-buffer buffer '((display-buffer-below-selected)
-                             (window-height . 12)))
-    buffer))
+    (let ((window (display-buffer buffer '((display-buffer-below-selected)
+                                           (window-height . 12)))))
+      (when (and select window)
+        (select-window window))
+      buffer)))
 
 (defun +opencode/input ()
   "Focus the input buffer for the current (or most recent) session."
@@ -222,14 +224,15 @@ the agent is still working."
   (let ((session (+opencode--session-buffer)))
     (unless (buffer-live-p session)
       (user-error "No OpenCode session open yet"))
-    (pop-to-buffer (+opencode--display-input session))))
+    (+opencode--display-input session t)))
 
 (defun +opencode--show-input (buffer)
-  "Display the input buffer for a session just opened, keeping BUFFER selected."
+  "Show and focus the input buffer for a session just opened in BUFFER.
+The session is the transcript; the input box is where work starts."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'opencode-session-mode)
-        (ignore-errors (+opencode--display-input buffer)))))
+        (ignore-errors (+opencode--display-input buffer t)))))
   buffer)
 
 ;; =============================================================================
