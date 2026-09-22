@@ -132,7 +132,7 @@ buffers via sczi/opencode.el — no terminal, no alternate screen.
 
 | Key | Action |
 |-----|--------|
-| `C-c o` / `:opencode` / `:oc` | Global session list, every project |
+| `C-c m m` / `:opencode` / `:oc` | Global session list, every project |
 | `C-c m o` | Session manager for the current project |
 | `C-c m c` | Compose a new session (created on first send, titled by date + branch) |
 | `C-c m i` | Focus the input buffer (shown automatically; start typing as a session opens) |

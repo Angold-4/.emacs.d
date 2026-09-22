@@ -75,15 +75,20 @@ nil). The package has no option for this, so the trace is dropped at
 
 ## Input buffer
 
-`C-c m i` (`+opencode/input`) focuses a plain buffer, one per session, for
-writing a prompt away from the transcript. It is shown **and focused**
-automatically beneath each session (`opencode-open-session` is advised), so a
-session opens with the cursor in the input box, ready to type. It is an ordinary Evil buffer (insert state to write, normal `RET` or
+`C-c m i` (`+opencode/input`) focuses a plain buffer, **one per workspace
+directory** (not per session), for writing a prompt away from the transcript.
+It is an ordinary Evil buffer (insert state to write, normal `RET` or
 `C-<return>` / `C-c C-c` to send) and it never shares a buffer with streaming
 output, so you can compose at any time, including while the agent is working.
 Sending calls the package's own `opencode-session--send-synthetic-input`, so
 the session's agent, model and context are used unchanged; the buffer is
 cleared on success.
+
+Sessions opened through this module's paths (`C-c m c`, `C-c m m` → `RET`) are
+arranged as **input on top, transcript below**, with the input selected.  The
+package's own per-project manager (`C-c m o`) does not arrange the pair.  Two
+sessions in the same project share the one input buffer; sending follows the
+session that was opened last.
 
 ## New sessions and naming
 
@@ -147,8 +152,11 @@ it does X
 - tool: bash completed
 ```
 
-One file per session, so it persists, commits, and can be sent to another
-machine. Reasoning is omitted; tool calls are one line each.
+One file per session, so it persists and can be sent to another machine.  It
+is written under `+opencode-sessions-directory`, which defaults to
+`~/.local/share/opencode-sessions/` — **outside** this repository, because
+transcripts can contain secrets; `opencode-sessions/` is gitignored in case it
+is pointed back inside.  Reasoning is omitted; tool calls are one line each.
 
 ## Archived sessions
 
@@ -190,7 +198,6 @@ the figure cannot collapse to 0.
 
 ## Roadmap
 
-- Import a saved org file back into a new OpenCode session.
 - Evil-native bindings inside sessions (the package ships its own `C-c` map).
 - Surface branch/PR next to the session title, as the git workbench already
   knows them.
