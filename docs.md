@@ -189,6 +189,32 @@ terminal reconnects it to the real terminal cursor. Agent TUI output is
 coalesced into complete 20 FPS redraws to avoid painting partial-frame flashes.
 The underlying PTY remains live throughout.
 
+### OpenCode (native sessions)
+
+For OpenCode, `init-opencode.el` uses
+[sczi/opencode.el](https://codeberg.org/sczi/opencode.el) against a headless
+`opencode serve`, so sessions are ordinary Emacs buffers rather than a
+terminal: the modeline shows the agent, model, variant and context used, and
+Evil motions, visual selection, yank, search and narrowing all work.
+
+| Key | Action |
+|-----|--------|
+| `:opencode` / `:oc` | Session manager for the current project |
+| `C-c o` | Same as `:opencode` |
+| `M-x opencode-connect` | Attach to a running server |
+| `M-x opencode-select-project` | Pick another project's sessions |
+| `M-x opencode-add-region` / `-buffer-dwim` / `-file-dwim` | Add context |
+| `M-x opencode-visit-last-idle` | Jump to the session that just finished |
+
+Within a session, `C-c C-c` cancels the request, `C-c m` picks the model,
+`C-c l` lists the project's sessions, `/` runs a slash command and `@`
+references a sub-agent. A headless `opencode` server is started on demand
+(`opencode-auto-start-server`) and found via `~/.opencode/bin`; nothing needs a
+PTY or the alternate screen.
+
+The `plz` stack that sczi/opencode.el needs is not on MELPA, so `plz`,
+`plz-media-type` and `plz-event-source` are pinned from GitHub in the module.
+
 ## Org-mode
 
 See the [Org-Mode Workflow](#org-mode-workflow) section below for comprehensive

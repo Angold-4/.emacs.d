@@ -86,7 +86,8 @@ C-x l   ; Start LSP manually
 │   ├── init-git-sync.el    # Durable shared mirror synchronization
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
-│   └── init-git-pr.el      # Cached pull-request workspace
+│   ├── init-git-pr.el      # Cached pull-request workspace
+│   └── init-opencode.el    # OpenCode sessions as native Emacs buffers
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -123,6 +124,20 @@ The Git workbench supports local and cached pull-request review, a collapsible
 Changes Tree, persistent reviewed checkmarks, and explicit offline-capable
 synchronization. See [git.md](git.md) for the daily workflow and
 [docs/git.md](docs/git.md) for the architecture.
+
+### OpenCode
+
+OpenCode runs headless (`opencode serve`) and is driven from native Emacs
+buffers via sczi/opencode.el — no terminal, no alternate screen.
+
+| Key | Action |
+|-----|--------|
+| `C-c o` / `:opencode` | Session manager for the current project |
+| `C-c m` (in a session) | Pick the model |
+| `C-c l` (in a session) | List the project's sessions |
+| `/` (at a prompt) | Run a slash command |
+
+The modeline shows the agent, model, variant and context used.
 
 ### LSP & Code
 
