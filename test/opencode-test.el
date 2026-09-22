@@ -206,5 +206,29 @@ targets are autoloads here and `func-arity' reports `(0 . many)' for those."
                 opencode--time-ago))
     (should (fboundp fn))))
 
+;; ---------------------------------------------------------------------------
+;; Stale permission responses
+;; ---------------------------------------------------------------------------
+
+(ert-deftest opencode-stale-permission-404-is-demoted ()
+  "A PermissionNotFoundError does not escape the plz callback."
+  (+opencode--quiet-stale-permission
+   (lambda (&rest _)
+     (error "error requesting /session/x/permissions/y: PermissionNotFoundError"))
+   nil nil nil)
+  (should t))
+
+(ert-deftest opencode-stale-permission-can-be-loud ()
+  "The behaviour is switchable."
+  (let ((+opencode-quiet-stale-permissions nil))
+    (should-error
+     (+opencode--quiet-stale-permission
+      (lambda (&rest _) (error "PermissionNotFoundError")) nil nil nil))))
+
+(ert-deftest opencode-unrelated-plz-error-still-signals ()
+  "Only the missing-permission error is demoted."
+  (should-error
+   (+opencode--quiet-stale-permission (lambda (&rest _) (error "boom")) nil nil nil)))
+
 (provide 'opencode-test)
 ;;; opencode-test.el ends here

@@ -147,6 +147,28 @@ Runs as :before advice on `opencode-autoconnect', hence the ignored args."
       (+opencode--discover-credentials))))
 
 ;; =============================================================================
+;; Permission responses
+;; =============================================================================
+
+(defcustom +opencode-quiet-stale-permissions t
+  "Demote a missing-permission 404 to a message.
+Responding to a permission the server has already resolved (answered in the
+TUI, or a duplicate click) otherwise raises out of a plz timer and looks like
+a crash."
+  :type 'boolean
+  :group 'tools)
+
+(defun +opencode--quiet-stale-permission (orig-fn process buffer status)
+  "Run ORIG-FN, demoting a PermissionNotFoundError to a message."
+  (condition-case err
+      (funcall orig-fn process buffer status)
+    (error
+     (if (and +opencode-quiet-stale-permissions
+              (string-match-p "PermissionNotFoundError" (error-message-string err)))
+         (message "OpenCode: that permission request was already resolved")
+       (signal (car err) (cdr err))))))
+
+;; =============================================================================
 ;; Hide the thinking trace
 ;; =============================================================================
 
@@ -1068,6 +1090,10 @@ to a live session; otherwise it replaces that text after confirmation."
   "Prefix map for OpenCode commands.")
 
 (global-set-key (kbd +opencode-prefix) +opencode-command-map)
+
+(with-eval-after-load 'plz
+  (unless (advice-member-p #'+opencode--quiet-stale-permission #'plz--respond)
+    (advice-add #'plz--respond :around #'+opencode--quiet-stale-permission)))
 
 (with-eval-after-load 'evil
   (evil-ex-define-cmd "opencode" #'+opencode/sessions)
