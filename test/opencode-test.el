@@ -182,5 +182,29 @@ ROLE, TIME, PROVIDER and MODEL go into `info'; PARTS are `(type text)'."
     (maphash (lambda (_ timer) (cancel-timer timer)) +opencode--save-timers)
     (clrhash +opencode--save-timers)))
 
+;; ---------------------------------------------------------------------------
+;; Advised-target drift
+;; ---------------------------------------------------------------------------
+
+(ert-deftest opencode-advised-targets-exist ()
+  "Every advised or directly-called package function still exists.
+Pinning in straight/versions/default.el is the real mitigation; this fails
+loudly if an upgrade removes or renames one.  Arity is not asserted: the
+targets are autoloads here and `func-arity' reports `(0 . many)' for those."
+  (dolist (fn '(opencode-autoconnect
+                opencode-open-session
+                opencode-session--message-updated
+                opencode-session--set-status
+                opencode--replay-session-messages
+                opencode--insert-reasoning-block
+                opencode--render-region
+                opencode--download-slash-commands
+                opencode--annotated-completion
+                opencode--with-session-buffer
+                opencode--format-time-ago
+                opencode--current-model
+                opencode--time-ago))
+    (should (fboundp fn))))
+
 (provide 'opencode-test)
 ;;; opencode-test.el ends here
