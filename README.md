@@ -178,13 +178,20 @@ a deliberately small subset matching the OpenCode integration:
 | `C-c m m` | Browse every previous session (all projects) |
 | `C-c m a` | Pick the agent's model |
 
-Everything else stays on the `M-x pilish-*` commands and Pilish's own
-in-buffer keys. The read-only chat buffer runs in Evil **normal** state, so
-hjkl, `w`, `H`/`L`, `J`/`K`, visual selection and yank work as in any other
-buffer; `i`/`a` focus the input, RET visits a file, TAB folds a block. Chat and
-input share one frame with the input in the lower third and scroll
-independently (a window parked at the end follows new output, one scrolled up
-stays put).
+Pilish's own `C-c C-*` bindings are removed so this config's global `C-c`
+keys apply inside its buffers; a prompt is sent with RET in the input buffer's
+normal state (type, ESC, RET), which also queues it while the agent is busy.
+Everything else stays on `M-x pilish-*`.
+
+The read-only chat buffer runs in Evil **normal** state, so hjkl, `w`, `H`/`L`,
+`J`/`K`, visual selection and yank work as in any other buffer; `i`/`a` focus
+the input, RET visits a file, TAB folds a block. Chat and input share one frame
+with the input in the lower third and scroll independently (a window parked at
+the end follows new output, one scrolled up stays put).
+
+The model picked with `C-c m a` is remembered: it is written to Pi's own
+`~/.pi/agent/settings.json` (`defaultProvider`/`defaultModel`), so every new
+session starts on it. Disable with `+pilish-remember-model` nil.
 
 Models are served through the **Vercel AI Gateway** (`vercel-ai-gateway`).
 The `pi` CLI is a subprocess of Emacs, so its credentials live with Pi, not in

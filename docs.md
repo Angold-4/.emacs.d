@@ -206,9 +206,14 @@ OpenCode integration:
 | `C-c m m` | Browse every previous session (all projects) |
 | `C-c m a` | Pick the agent's model |
 
-Everything else is available as `M-x pilish-*` and on Pilish's own in-buffer
-keys (`C-c C-c` send, `C-c C-s` steering, `C-c C-k` abort, `C-c C-p` menu,
-`C-c C-r` sessions; `M-p`/`M-n` move through prompt history).
+Pilish's own `C-c C-*` bindings (`C-c C-c` send, `C-c C-s` steering,
+`C-c C-k` abort, `C-c C-p` menu, `C-c C-r` sessions, `C-c C-e` export,
+`C-c C-m` model, `C-c C-t` thinking, `C-c C-y` copy last, `C-c C-n` new) are
+removed from both buffers, so this config's global `C-c` bindings apply inside
+Pilish buffers. A prompt is sent with RET in the input buffer's normal state
+(type, ESC, RET); RET in insert state still inserts a newline. Prompt history
+(`M-p`/`M-n`), path/command completion (`TAB`) and the `M-x pilish-*` commands
+are unchanged.
 
 The read-only chat buffer is switched from Pilish's default Evil *motion*
 state to **normal** state, so this config's normal-state map applies: hjkl and
@@ -244,6 +249,15 @@ read that file. `+pilish-provider` (default `"vercel-ai-gateway"`) and
 authenticated provider. The `pi` CLI comes from
 `npm install -g @earendil-works/pi-coding-agent`; Pilish offers to install the
 Markdown tree-sitter grammars on first run.
+
+Pi's RPC `set_model` does not persist a default, so a model picked with
+`C-c m a` would be forgotten by the next session. `init-pilish.el` therefore
+advises `pilish--update-state-from-response' and, on a successful `set_model`
+or `cycle_model`, writes `defaultProvider` and `defaultModel` into Pi's own
+`~/.pi/agent/settings.json` (read-modify-write, atomic, mode 0600), preserving
+every other key. Pi then applies the remembered model to each new session
+through its normal resolution order. Set `+pilish-remember-model` to nil to
+opt out; `+pilish-model` still forces an explicit model for the CLI.
 
 ## Org-mode
 
