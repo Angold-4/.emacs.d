@@ -43,8 +43,10 @@
 (require 'project)
 (require 'vtable)
 
-;; Keep the executable reachable before anything tries to resolve it.
+;; Keep the executable reachable before anything tries to resolve it, and make
+;; `lsof' discoverable (it lives in /usr/sbin on macOS).
 (add-to-list 'exec-path (expand-file-name "~/.opencode/bin/"))
+(add-to-list 'exec-path "/usr/sbin")
 
 ;; sczi/opencode.el needs the plz stack; none of it is on MELPA, so pin the
 ;; recipes before the package below resolves its dependencies.
@@ -70,12 +72,8 @@
   ;; Start a headless server on demand when none is running.
   (setq opencode-auto-start-server t)
   ;; A server started with `OPENCODE_SERVER_PASSWORD' set requires basic auth,
-  ;; and the package only reads those variables when *it* starts the server.
-  ;; Reuse the environment so an already-running server accepts us.
-  (setq opencode-server-username (or (getenv "OPENCODE_SERVER_USERNAME")
-                                     opencode-server-username))
-  (setq opencode-server-password (or +opencode-server-password
-                                     (getenv "OPENCODE_SERVER_PASSWORD"))))
+  ;; and the package only reads that variable when *it* starts the server.
+  (+opencode--resolve-credentials))
 
 ;; =============================================================================
 ;; Hide the thinking trace
@@ -104,10 +102,48 @@ one insertion point and its region re-render is skipped."
 
 (defcustom +opencode-server-password nil
   "Password for a password-protected OpenCode server.
-When nil, `OPENCODE_SERVER_PASSWORD' from the environment is used.  Set it
-here when Emacs is not launched from a shell that exports that variable."
-  :type '(choice (const :tag "Use environment" nil) string)
+When nil, the password is taken from `OPENCODE_SERVER_PASSWORD', and failing
+that from the environment of the server process already listening on
+`opencode-port'.  Set it here only to override both."
+  :type '(choice (const :tag "Discover" nil) string)
   :group 'tools)
+
+(defun +opencode--listening-pid ()
+  "Return the PID listening on `opencode-port', or nil."
+  (ignore-errors
+    (let ((out (string-trim
+                (shell-command-to-string
+                 (format "%s -ti tcp:%d -sTCP:LISTEN 2>/dev/null"
+                         (or (executable-find "lsof") "/usr/sbin/lsof")
+                         opencode-port)))))
+      (unless (string-empty-p out)
+        (car (split-string out "\n"))))))
+
+(defun +opencode--server-process-var (name)
+  "Return NAME from the listening OpenCode server's environment, or nil.
+The server carries its own credentials, so this works even when Emacs was
+started without them (a daemon, or a GUI launch).  Both `lsof' and the
+capital `E' of `ps -Eww' matter here: lowercase `e' does not show the
+environment on macOS."
+  (when-let ((pid (+opencode--listening-pid)))
+    (ignore-errors
+      (with-temp-buffer
+        (call-process (or (executable-find "ps") "/bin/ps") nil t nil "-Eww" "-p" pid)
+        (goto-char (point-min))
+        (when (re-search-forward (format "%s=\\([^ ]+\\)" (regexp-quote name)) nil t)
+          (match-string 1))))))
+
+(defun +opencode--resolve-credentials (&rest _)
+  "Set the credential variables from the server, if they are not already set.
+Also runs as :before advice on `opencode-autoconnect', hence the arguments."
+  (setq opencode-server-username
+        (or (getenv "OPENCODE_SERVER_USERNAME")
+            (+opencode--server-process-var "OPENCODE_SERVER_USERNAME")
+            opencode-server-username))
+  (setq opencode-server-password
+        (or +opencode-server-password
+            (getenv "OPENCODE_SERVER_PASSWORD")
+            (+opencode--server-process-var "OPENCODE_SERVER_PASSWORD"))))
 
 (defcustom +opencode-input-buffer-name "*OpenCode Input*"
   "Name of the buffer composed for an OpenCode session.
@@ -480,6 +516,10 @@ holds metadata plus the full markdown transcript."
   ;; The session manager is a vtable; normal state lets j/k and the package's
   ;; own evil bindings (r/n/gv) work.
   (evil-set-initial-state 'opencode-session-control-mode 'normal)
+
+  ;; Re-read the server's credentials before every connect attempt: the server
+  ;; may have been started (or restarted) after this module loaded.
+  (advice-add 'opencode-autoconnect :before #'+opencode--resolve-credentials)
 
   ;; Hide the model's thinking trace.
   (advice-add 'opencode--insert-reasoning-block

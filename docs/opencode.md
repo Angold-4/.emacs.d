@@ -49,12 +49,22 @@ package's own bindings work.
 
 ## Connecting
 
-The module reuses `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` from
-the environment when connecting. The package only reads those variables when it
-*starts* a server, so without this a server that is already running (started by
-another Emacs or a shell with the password exported) answers `/global/health`
-with 401 and autoconnect refuses. Set `+opencode-server-password` when Emacs is
-not launched from a shell that exports the variable.
+The package reads `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` only
+when it *starts* a server, so connecting to one that is already running (a
+shell with the password exported, or a previous Emacs) answers
+`/global/health` with 401 and autoconnect refuses.
+
+Credentials are resolved before every connect attempt, in order:
+
+1. `+opencode-server-password` (override; set it only if the rest somehow fail)
+2. the process environment
+3. **the environment of the server already listening on `opencode-port`**,
+   read with `lsof` + `ps -Eww`, which works even when Emacs never had the
+   variable (a daemon, or a GUI launch)
+
+On macOS the capital `E` matters — `ps -eww` does not show the environment —
+and `lsof` lives in `/usr/sbin`, which is why the module adds it to
+`exec-path`.
 
 ## Reasoning
 
