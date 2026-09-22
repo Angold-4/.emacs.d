@@ -181,10 +181,7 @@ one insertion point and its region re-render is skipped."
     (let* ((provider (alist-get 'providerID model))
            (id (alist-get 'modelID model))
            (variant (alist-get 'variant model))
-           (catalog (and (boundp 'opencode-providers)
-                         (seq-find (lambda (p) (equal (alist-get 'id p) provider))
-                                   opencode-providers)))
-           (name (cdr (assoc id (alist-get 'models catalog)))))
+           (name (+opencode--model-entry provider id)))
       (concat (or (alist-get 'name name) (format "%s/%s" provider id))
               (and variant (format ":%s" variant))))))
 
@@ -323,13 +320,17 @@ An empty session is never created: this only runs on the first send."
       (format "%.0fk" (/ n 1000.0))
     (number-to-string (or n 0))))
 
-(defun +opencode--model-limit (provider-id model-id)
-  "Return the context window of PROVIDER-ID/MODEL-ID, or nil."
+(defun +opencode--model-entry (provider-id model-id)
+  "Return the catalog entry for PROVIDER-ID/MODEL-ID, or nil.
+The catalog keys models by `intern'ed id, the way the package looks them up."
   (when (and provider-id model-id (boundp 'opencode-providers))
     (let ((provider (seq-find (lambda (p) (equal (alist-get 'id p) provider-id))
                               opencode-providers)))
-      (map-nested-elt (cdr (assoc model-id (alist-get 'models provider)))
-                      '(limit context)))))
+      (cdr (assoc (intern model-id) (alist-get 'models provider))))))
+
+(defun +opencode--model-limit (provider-id model-id)
+  "Return the context window of PROVIDER-ID/MODEL-ID, or nil."
+  (map-nested-elt (+opencode--model-entry provider-id model-id) '(limit context)))
 
 (defun +opencode--record-context (info)
   "Record the per-turn context size and limit from assistant INFO.
