@@ -179,7 +179,12 @@ a deliberately small subset matching the OpenCode integration:
 | `C-c m a` | Pick the agent's model |
 
 Everything else stays on the `M-x pilish-*` commands and Pilish's own
-in-buffer keys.
+in-buffer keys. The read-only chat buffer runs in Evil **normal** state, so
+hjkl, `w`, `H`/`L`, `J`/`K`, visual selection and yank work as in any other
+buffer; `i`/`a` focus the input, RET visits a file, TAB folds a block. Chat and
+input share one frame with the input in the lower third and scroll
+independently (a window parked at the end follows new output, one scrolled up
+stays put).
 
 Models are served through the **Vercel AI Gateway** (`vercel-ai-gateway`).
 The `pi` CLI is a subprocess of Emacs, so its credentials live with Pi, not in

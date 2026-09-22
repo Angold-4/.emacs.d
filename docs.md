@@ -210,6 +210,24 @@ Everything else is available as `M-x pilish-*` and on Pilish's own in-buffer
 keys (`C-c C-c` send, `C-c C-s` steering, `C-c C-k` abort, `C-c C-p` menu,
 `C-c C-r` sessions; `M-p`/`M-n` move through prompt history).
 
+The read-only chat buffer is switched from Pilish's default Evil *motion*
+state to **normal** state, so this config's normal-state map applies: hjkl and
+`w` motions, `H`/`L` beginning/end of line, `J`/`K` the 8-line jumps, `v`/`V`
+visual selection and yank. Only the Pilish keys that normal state would shadow
+and that matter in a read-only transcript are re-asserted: `i`/`a` focus the
+input window, RET visits the file at point, TAB folds a tool/thinking block.
+Message motion (`n`/`p`) and fork (`f`) fall through to Evil's native
+bindings; the `M-x pilish-*` commands still cover them.
+
+Chat and input are two windows in one frame — chat on top and the input in the
+lower third (`pilish-input-window-height` 0.3, `pilish-input-window-display`
+`always`) — and each keeps its own point and scroll. Pilish's follow logic
+makes that independent: a window parked at the buffer end follows new output
+while a window you scrolled up in stays put. They are not merged into a single
+buffer, because the chat is read-only rendered Markdown (tree-sitter,
+foldable tool sections) while the input is editable text; a split window pair
+already gives per-window scrolling.
+
 Models are served through the **Vercel AI Gateway**. Pi's provider id is
 `vercel-ai-gateway`, so authenticate it in Pi's own store — either export
 `AI_GATEWAY_API_KEY` in the environment Emacs launches from, or add
