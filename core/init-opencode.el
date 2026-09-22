@@ -315,22 +315,27 @@ An empty session is never created: this only runs on the first send."
     (number-to-string (or n 0))))
 
 (defun +opencode--output-bar ()
-  "Mode-line segment for a session buffer: model, context used, status."
+  "Mode-line segment for a session buffer: model, usage, status.
+The server reports only cumulative token counters, so a context percentage
+would be meaningless; a percentage is shown only when it is inside the
+model's context limit, and the raw cumulative total otherwise."
   (let* ((agent opencode-session-agent)
          (model (ignore-errors (opencode--current-model)))
          (name (or (alist-get 'name model) ""))
          (variant (alist-get 'variant agent))
          (limit (map-nested-elt model '(limit context)))
          (used opencode-session-tokens)
-         (known (and (numberp limit) (numberp used) (> limit 0)))
-         (pct (and known (* 100.0 (/ (float used) limit)))))
+         (known (and (numberp limit) (numberp used) (> limit 0) (> used 0)))
+         (usage (cond ((and known (<= used limit))
+                       (format "ctx %s/%s (%.0f%%)"
+                               (+opencode--compact-number used)
+                               (+opencode--compact-number limit)
+                               (* 100.0 (/ (float used) limit))))
+                      (known (format "tokens %s" (+opencode--compact-number used)))
+                      (t nil))))
     (concat " " name
             (when variant (format " %s" variant))
-            (when known
-              (format " · ctx %s/%s (%.0f%%)"
-                      (+opencode--compact-number used)
-                      (+opencode--compact-number limit)
-                      pct))
+            (when usage (format " · %s" usage))
             (format " · %s " (or opencode-session-status "idle")))))
 
 (defun +opencode--show-input (buffer)
