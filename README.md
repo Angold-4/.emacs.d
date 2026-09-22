@@ -40,6 +40,17 @@ need a language server running just to read code.
 3. **Modular** - Each feature in its own file under `core/`
 4. **Easy Setup** - Clone, open Emacs, packages install automatically
 
+The rationale for extending this buffer experience to agent workflows is in
+[Human judgment and programmed agent workflows](docs/agent-evaluation-and-programmed-workflows.md).
+It explains how human judgment during execution shapes results from the same
+agents, the risk of unexposed trade-offs, and why evaluation loops need
+executable control as models become more capable.
+
+The first workflow built on that rationale is proposed in
+[tradeoffs-trace](docs/tradeoffs-trace.md): a programmed Pi pipeline that
+enforces checks, reviews and deadlines, and surfaces the trade-offs and
+findings from implementation in one Emacs decision view.
+
 ## Quick Start
 
 ```bash
