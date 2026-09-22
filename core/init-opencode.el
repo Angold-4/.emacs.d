@@ -13,25 +13,29 @@
 ;; One dedicated prefix, `+opencode-prefix' (default "C-c m"), is bound both
 ;; globally and inside OpenCode buffers:
 ;;
-;;   C-c m m   global session list (every project)  +opencode/sessions
-;;   C-c m o   project session manager              +opencode/open
-;;   C-c m i   compose in a dedicated input buffer   +opencode/input
+;;   C-c m m   global session list (every project)   +opencode/sessions
+;;   C-c m o   project session manager               +opencode/open
+;;   C-c m i   focus the input buffer                +opencode/input
 ;;   C-c m c   new session in this workspace         +opencode/new
-;;   C-c m M   select model                         +opencode/model
-;;   C-c m a   provider, then model                 +opencode/provider
-;;   C-c m v   select model variant                 +opencode/variant
-;;   C-c m s   save this session as an org file     +opencode/save
-;;   C-c m d   open the saved-sessions directory    +opencode/open-directory
+;;   C-c m M   select model                          +opencode/model
+;;   C-c m a   provider, then model                  +opencode/provider
+;;   C-c m v   select model variant                  +opencode/variant
+;;   C-c m s   save this session as an org file      +opencode/save
+;;   C-c m d   open the saved-sessions directory     +opencode/open-directory
 ;;
 ;; The model's reasoning/thinking blocks are hidden (`+opencode-show-reasoning'
 ;; nil); the package has no switch for this, so reasoning is dropped at its one
 ;; insertion point and its re-render is skipped.
 ;;
+;; A session opens in Evil insert state; `RET` there is an ordinary newline and
+;; normal-state `RET` sends.  A plain input buffer is shown under each session
+;; so a prompt can be written while the agent is still working.
+;;
 ;; Sessions as files: `+opencode/save' writes a session to
-;; `+opencode-sessions-directory' as org with metadata (id, directory,
-;; branch, saved time) followed by the markdown transcript.  The file
-;; persists, commits and travels to another machine; re-importing a file
-;; into OpenCode is deliberately out of scope for now.
+;; `+opencode-sessions-directory' as org with metadata (id, directory, branch,
+;; saved time) followed by the markdown transcript.  The file persists, commits
+;; and travels to another machine; re-importing a file into OpenCode is
+;; deliberately out of scope for now.
 ;;
 ;; The package and its `plz' dependencies are not on MELPA, so all four are
 ;; pinned here.  OpenCode itself is found via `~/.opencode/bin'.
@@ -41,6 +45,7 @@
 ;;; Code:
 
 (require 'project)
+(require 'seq)
 (require 'vtable)
 
 ;; Keep the executable reachable before anything tries to resolve it, and make
@@ -68,36 +73,13 @@
              opencode-visit-last-idle opencode-add-buffer-dwim
              opencode-add-region opencode-add-file-dwim)
   :config
-  (setq opencode-command (or (executable-find "opencode") "opencode"))
-  ;; Start a headless server on demand when none is running.
-  (setq opencode-auto-start-server t)
-  ;; A server started with `OPENCODE_SERVER_PASSWORD' set requires basic auth,
-  ;; and the package only reads that variable when *it* starts the server.
+  (setq opencode-command (or (executable-find "opencode") "opencode")
+        ;; Start a headless server on demand when none is running.
+        opencode-auto-start-server t)
   (+opencode--resolve-credentials))
 
 ;; =============================================================================
-;; Hide the thinking trace
-;; =============================================================================
-
-(defcustom +opencode-show-reasoning nil
-  "Whether to show the model's reasoning/thinking blocks.
-The package has no switch for this; when nil, reasoning is dropped at the
-one insertion point and its region re-render is skipped."
-  :type 'boolean
-  :group 'tools)
-
-(defun +opencode--hide-reasoning-insert (orig-fn text)
-  "Call ORIG-FN on TEXT only when reasoning is shown."
-  (when +opencode-show-reasoning
-    (funcall orig-fn text)))
-
-(defun +opencode--hide-reasoning-region (orig-fn type start &optional end)
-  "Call ORIG-FN unless TYPE is `reasoning' and reasoning is hidden."
-  (when (or +opencode-show-reasoning (not (eq type 'reasoning)))
-    (funcall orig-fn type start end)))
-
-;; =============================================================================
-;; Separate input buffer
+;; Server connection
 ;; =============================================================================
 
 (defcustom +opencode-server-password nil
@@ -121,9 +103,9 @@ that from the environment of the server process already listening on
 
 (defun +opencode--server-process-var (name)
   "Return NAME from the listening OpenCode server's environment, or nil.
-The server carries its own credentials, so this works even when Emacs was
-started without them (a daemon, or a GUI launch).  Both `lsof' and the
-capital `E' of `ps -Eww' matter here: lowercase `e' does not show the
+The package only reads its credential variables when it *starts* a server,
+so a server that is already running has to be asked directly.  Both `lsof'
+and the capital `E' of `ps -Eww' matter: lowercase `e' does not show the
 environment on macOS."
   (when-let ((pid (+opencode--listening-pid)))
     (ignore-errors
@@ -134,8 +116,10 @@ environment on macOS."
           (match-string 1))))))
 
 (defun +opencode--resolve-credentials (&rest _)
-  "Set the credential variables from the server, if they are not already set.
-Also runs as :before advice on `opencode-autoconnect', hence the arguments."
+  "Fill the package's credential variables for a running server.
+Precedence: `+opencode-server-password', the process environment, then the
+listening server's environment.  Runs as :before advice on
+`opencode-autoconnect', hence the ignored arguments."
   (setq opencode-server-username
         (or (getenv "OPENCODE_SERVER_USERNAME")
             (+opencode--server-process-var "OPENCODE_SERVER_USERNAME")
@@ -145,14 +129,49 @@ Also runs as :before advice on `opencode-autoconnect', hence the arguments."
             (getenv "OPENCODE_SERVER_PASSWORD")
             (+opencode--server-process-var "OPENCODE_SERVER_PASSWORD"))))
 
+;; =============================================================================
+;; Hide the thinking trace
+;; =============================================================================
+
+(defcustom +opencode-show-reasoning nil
+  "Whether to show the model's reasoning/thinking blocks.
+The package has no switch for this; when nil, reasoning is dropped at the
+one insertion point and its region re-render is skipped."
+  :type 'boolean
+  :group 'tools)
+
+(defun +opencode--hide-reasoning-insert (orig-fn text)
+  "Call ORIG-FN on TEXT only when reasoning is shown."
+  (when +opencode-show-reasoning
+    (funcall orig-fn text)))
+
+(defun +opencode--hide-reasoning-region (orig-fn type start &optional end)
+  "Call ORIG-FN unless TYPE is `reasoning' and reasoning is hidden."
+  (when (or +opencode-show-reasoning (not (eq type 'reasoning)))
+    (funcall orig-fn type start end)))
+
+;; =============================================================================
+;; Input buffer
+;; =============================================================================
+
 (defcustom +opencode-input-buffer-name "*OpenCode Input*"
-  "Name of the buffer composed for an OpenCode session.
-One input buffer per session is created from this plus the session id."
+  "Base name for a session's input buffer.
+One buffer per session is created from this plus the session id."
   :type 'string
   :group 'tools)
 
 (defvar-local +opencode-input-session nil
   "Session buffer the current input buffer sends to.")
+
+(defvar +opencode-input-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-<return>") #'+opencode/send-input)
+    (define-key map (kbd "C-c C-c") #'+opencode/send-input)
+    map)
+  "Keymap for the OpenCode input buffer.")
+
+(define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
+  "Major mode for composing an OpenCode prompt in its own buffer.")
 
 (defun +opencode--session-buffer ()
   "Return a session buffer to act on: the current one, or the most recent."
@@ -185,16 +204,6 @@ the agent is still working."
       (erase-buffer))
     (message "Sent to %s" session)))
 
-(defvar +opencode-input-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-<return>") #'+opencode/send-input)
-    (define-key map (kbd "C-c C-c") #'+opencode/send-input)
-    map)
-  "Keymap for the OpenCode input buffer.")
-
-(define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
-  "Major mode for composing an OpenCode prompt in its own buffer.")
-
 (defun +opencode--display-input (session)
   "Show SESSION's input buffer below, without selecting it."
   (let ((buffer (+opencode--input-buffer session)))
@@ -224,7 +233,7 @@ the agent is still working."
   buffer)
 
 ;; =============================================================================
-;; Prefix command map
+;; Session commands
 ;; =============================================================================
 
 (defcustom +opencode-prefix "C-c m"
@@ -272,12 +281,6 @@ The current session's directory, else the current project root, else
   (interactive)
   (require 'opencode)
   (call-interactively #'opencode-select-variant))
-
-(defun +opencode/open-directory ()
-  "Open `+opencode-sessions-directory' in Dired."
-  (interactive)
-  (make-directory +opencode-sessions-directory t)
-  (dired +opencode-sessions-directory))
 
 (defun +opencode--provider-candidates ()
   "Completion candidates for `opencode-providers', provider-first."
@@ -335,6 +338,52 @@ Bound to RET in normal state so editing stays in insert state."
     (user-error "Not in an OpenCode session"))
   (comint-send-input))
 
+(defun +opencode/open-directory ()
+  "Open `+opencode-sessions-directory' in Dired."
+  (interactive)
+  (make-directory +opencode-sessions-directory t)
+  (dired +opencode-sessions-directory))
+
+;; =============================================================================
+;; Sessions as org files
+;; =============================================================================
+
+(defun +opencode/save-session (&optional session)
+  "Write SESSION (or the current session) to an org file.
+The file lands in `+opencode-sessions-directory' under the project name and
+holds metadata plus the full markdown transcript."
+  (interactive)
+  (require 'opencode)
+  (let ((id (or (alist-get 'id session)
+                (and (boundp 'opencode-session-id) opencode-session-id))))
+    (unless id
+      (user-error "Not in an OpenCode session"))
+    (opencode-api-session-messages id
+        messages
+      (let* ((directory (file-name-as-directory
+                         (expand-file-name
+                          (or (alist-get 'directory session) default-directory))))
+             (project (file-name-nondirectory (directory-file-name directory)))
+             (branch (let ((default-directory directory))
+                       (ignore-errors (magit-get-current-branch))))
+             (target-dir (expand-file-name project +opencode-sessions-directory))
+             (file (expand-file-name (format "%s.org" id) target-dir)))
+        (make-directory target-dir t)
+        (with-temp-file file
+          (insert "#+title: OpenCode session " id "\n")
+          (insert "#+opencode_id: " id "\n")
+          (insert "#+opencode_directory: " directory "\n")
+          (when branch
+            (insert "#+opencode_branch: " branch "\n"))
+          (insert "#+opencode_saved: " (format-time-string "%Y-%m-%d %H:%M") "\n\n")
+          (insert (opencode--conversation-to-markdown messages) "\n"))
+        (message "Saved OpenCode session to %s" file)))))
+
+(defun +opencode/save ()
+  "Save the current session as an org file."
+  (interactive)
+  (+opencode/save-session nil))
+
 ;; =============================================================================
 ;; Global session list
 ;; =============================================================================
@@ -345,7 +394,6 @@ Bound to RET in normal state so editing stays in insert state."
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "g") #'+opencode/sessions-refresh)
-    ;; New session in this workspace (same as `C-c m c').
     (define-key map (kbd "c") #'+opencode/new)
     (define-key map (kbd "q") #'quit-window)
     map)
@@ -408,7 +456,7 @@ Bound to RET in normal state so editing stays in insert state."
                   (+opencode--sessions-render (nreverse unique)))))))))))
 
 (defun +opencode--sessions-render (rows)
-  "Render ROWS, a list of session alists tagged with a `project' key."
+  "Render ROWS, a list of OpenCode session alists, in the global list."
   (with-current-buffer (get-buffer-create +opencode--sessions-buffer)
     (let ((inhibit-read-only t)
           (cache (make-hash-table :test #'equal)))
@@ -454,47 +502,7 @@ Bound to RET in normal state so editing stays in insert state."
   (+opencode/save-session session))
 
 ;; =============================================================================
-;; Sessions as org files
-;; =============================================================================
-
-(defun +opencode/save-session (&optional session)
-  "Write SESSION (or the current session) to an org file.
-The file lands in `+opencode-sessions-directory' under the project name and
-holds metadata plus the full markdown transcript."
-  (interactive)
-  (require 'opencode)
-  (let ((id (or (alist-get 'id session)
-                (and (boundp 'opencode-session-id) opencode-session-id))))
-    (unless id
-      (user-error "Not in an OpenCode session"))
-    (opencode-api-session-messages id
-        messages
-      (let* ((directory (file-name-as-directory
-                         (expand-file-name
-                          (or (alist-get 'directory session) default-directory))))
-             (project (file-name-nondirectory (directory-file-name directory)))
-             (branch (let ((default-directory directory))
-                       (ignore-errors (magit-get-current-branch))))
-             (target-dir (expand-file-name project +opencode-sessions-directory))
-             (file (expand-file-name (format "%s.org" id) target-dir)))
-        (make-directory target-dir t)
-        (with-temp-file file
-          (insert "#+title: OpenCode session " id "\n")
-          (insert "#+opencode_id: " id "\n")
-          (insert "#+opencode_directory: " directory "\n")
-          (when branch
-            (insert "#+opencode_branch: " branch "\n"))
-          (insert "#+opencode_saved: " (format-time-string "%Y-%m-%d %H:%M") "\n\n")
-          (insert (opencode--conversation-to-markdown messages) "\n"))
-        (message "Saved OpenCode session to %s" file)))))
-
-(defun +opencode/save ()
-  "Save the current session as an org file."
-  (interactive)
-  (+opencode/save-session nil))
-
-;; =============================================================================
-;; Keys
+;; Prefix map and installation
 ;; =============================================================================
 
 (defvar +opencode-command-map
