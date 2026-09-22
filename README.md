@@ -46,6 +46,11 @@ It explains how human judgment during execution shapes results from the same
 agents, the risk of unexposed trade-offs, and why evaluation loops need
 executable control as models become more capable.
 
+The first workflow built on that rationale is proposed in
+[tradeoffs-trace](docs/tradeoffs-trace.md): a programmed Pi pipeline that
+enforces checks and reviews, and collects every consequential decision, with
+reviewer votes, into one Org buffer.
+
 ## Quick Start
 
 ```bash
