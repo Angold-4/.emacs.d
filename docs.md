@@ -223,6 +223,23 @@ Pilish buffers. A prompt is sent with RET in the input buffer's normal state
 (`M-p`/`M-n`), path/command completion (`TAB`) and the `M-x pilish-*` commands
 are unchanged.
 
+### Multiple sessions
+
+Pilish supports several live sessions in one project. `C-u C-c m c` calls
+`pilish` with a prefix argument, which prompts for a session name; each named
+session is a separate buffer pair (`*pilish-chat:dir<name>*` /
+`*pilish-input:dir<name>*`) with its own `pi` process, so sessions run
+concurrently (verified: `alpha` and `beta` in one directory yield two live
+processes and two buffer pairs). Without a name, `C-c m c` reuses the unnamed
+session.
+
+`M-x pilish RET name` re-focuses a named session's buffers; `M-x pilish-toggle`
+hides/shows the project's session in the current frame. Since tabs and frames
+each carry their own window configuration, the practical way to watch two at
+once is one session pair per tab (`M-x tab-bar-new-tab`, then start or focus the
+session there) or per frame. The session browser (`C-c m m`) reads persisted
+sessions from disk, so each named session also appears there as its own file.
+
 The read-only chat buffer is switched from Pilish's default Evil *motion*
 state to **normal** state, so this config's normal-state map applies: hjkl and
 `w` motions, `H`/`L` beginning/end of line, `J`/`K` the 8-line jumps, `v`/`V`

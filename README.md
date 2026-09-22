@@ -183,6 +183,12 @@ starts/reuses one first — Pilish's browser is meant to be opened from a live
 session, and its RET guard needs one. RET then resumes any session in the list;
 with no live session linked, RET also opens the selected session directly.
 
+For several sessions at once, `C-u C-c m c` prompts for a name; each named
+session gets its own chat/input buffers and its own `pi` process, so `alpha`
+and `beta` run concurrently in the same project. Put each pair in its own tab
+(`M-x tab-bar-new-tab`) or frame to watch them side by side; `M-x pilish RET
+name` focuses a named session.
+
 Pilish's own `C-c C-*` bindings are removed so this config's global `C-c`
 keys apply inside its buffers; a prompt is sent with RET in the input buffer's
 normal state (type, ESC, RET), which also queues it while the agent is busy.
