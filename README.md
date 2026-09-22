@@ -30,6 +30,7 @@ need a language server running just to read code.
 | **Languages** | rust-mode, go-mode, typescript-mode, etc. | Language support |
 | **Syntax** | Built-in tree-sitter (Emacs 30) | Highlighting |
 | **Org** | org-bullets, htmlize | Note-taking & export |
+| **Agents** | pilish | Pi coding agent as native buffers |
 | **Tools** | magit, projectile, treemacs | Development |
 | **UI** | ligature, rainbow-delimiters | Visual polish |
 
@@ -86,7 +87,8 @@ C-x l   ; Start LSP manually
 │   ├── init-git-sync.el    # Durable shared mirror synchronization
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
-│   └── init-git-pr.el      # Cached pull-request workspace
+│   ├── init-git-pr.el      # Cached pull-request workspace
+│   └── init-pilish.el      # Pi coding agent (Pilish) as native buffers
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -162,6 +164,36 @@ synchronization. See [git.md](git.md) for the daily workflow and
 | `C-x t t` | Toggle treemacs |
 | `M-RET` | Toggle fullscreen |
 | `C-y` (visual) | Copy to system clipboard |
+
+### Pi Agent (Pilish)
+
+Pi is a minimal, extensible coding agent; [Pilish](https://github.com/dnouri/pilish)
+renders a Pi session as Markdown in one window and the prompt in an ordinary
+Emacs buffer in another. No terminal, no PTY. `C-c m` is the dedicated prefix,
+matching the OpenCode integration:
+
+| Key | Action |
+|-----|--------|
+| `C-c m m` | Session browser, every project |
+| `C-c m c` | Start or focus a session in this workspace |
+| `C-c m i` | Focus this session's input buffer |
+| `C-c m o` | Hide/show this project's session windows |
+| `C-c m M` / `C-c m a` | Select model (provider-aware picker) |
+| `C-c m v` | Select thinking level |
+| `C-c m n` | Start a new session (reset) |
+| `C-c m s` / `C-c m d` | Export session to HTML / open sessions directory |
+| `C-c m r` / `C-c m t` | Reload the pi process / conversation tree browser |
+| `C-c m q` | Close this session |
+
+Models are served through the **Vercel AI Gateway** (`vercel-ai-gateway`).
+The `pi` CLI is a subprocess of Emacs, so its credentials live with Pi, not in
+this repository: set `AI_GATEWAY_API_KEY` in the environment Emacs sees, or add
+the key to Pi's own `~/.pi/agent/auth.json` under the `vercel-ai-gateway` entry.
+OpenCode's store (`~/.local/share/opencode/auth.json`, provider id `vercel`) is
+a different file and is **not** read by Pi. Override the default provider/model
+with `+pilish-provider` and `+pilish-model` (`M-x customize-group RET tools`).
+Pilish needs the `pi` CLI (`npm install -g @earendil-works/pi-coding-agent`)
+and its Markdown tree-sitter grammars, installed on first run.
 
 ## Theme
 

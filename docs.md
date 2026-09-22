@@ -189,6 +189,52 @@ terminal reconnects it to the real terminal cursor. Agent TUI output is
 coalesced into complete 20 FPS redraws to avoid painting partial-frame flashes.
 The underlying PTY remains live throughout.
 
+## Pi Agent (Pilish)
+
+`init-pilish.el` drives [Pi](https://pi.dev), a minimal and extensible coding
+agent, through [Pilish](https://github.com/dnouri/pilish). Pilish talks to the
+`pi` CLI over its JSON-RPC mode, so the conversation is rendered Markdown in one
+window and the prompt is an ordinary Emacs buffer in the other: Evil motions,
+yank, search and narrowing all work, and no PTY or key forwarding is involved.
+
+`C-c m` is the dedicated prefix, matching the OpenCode integration:
+
+| Key | Action |
+|-----|--------|
+| `C-c m m` | Session browser (every project) |
+| `C-c m c` | Start or focus a session in this workspace |
+| `C-c m i` | Focus this session's input buffer |
+| `C-c m o` | Hide/show this project's session windows |
+| `C-c m M` / `C-c m a` | Select model (provider-aware picker) |
+| `C-c m v` | Select thinking level |
+| `C-c m n` | Start a new session (reset) |
+| `C-c m s` / `C-c m d` | Export session to HTML / open `~/.pi/agent/sessions/` |
+| `C-c m r` / `C-c m t` | Reload the pi process / conversation tree browser |
+| `C-c m q` | Close this session |
+| `M-x pilish` | Start or focus the current project's session |
+| `M-x pilish-open-session-file` | Open a JSONL session file as a live session |
+
+Within a session, Pilish binds `C-c C-c` (send, queued as a follow-up while
+busy), `C-c C-s` (steering), `C-c C-k` (abort), `C-c C-p` (transient menu) and
+`C-c C-r` (session browser); `M-p`/`M-n` move through prompt history.
+
+Models are served through the **Vercel AI Gateway**. Pi's provider id is
+`vercel-ai-gateway`, so authenticate it in Pi's own store — either export
+`AI_GATEWAY_API_KEY` in the environment Emacs launches from, or add
+
+```json
+{ "vercel-ai-gateway": { "type": "api_key", "key": "<your-key>" } }
+```
+
+to `~/.pi/agent/auth.json`. This is deliberately separate from OpenCode's
+`~/.local/share/opencode/auth.json`, whose provider id is `vercel`; Pi does not
+read that file. `+pilish-provider` (default `"vercel-ai-gateway"`) and
+`+pilish-model` (default nil) are forwarded to the CLI as `--provider` and
+`--model`; set either to nil to let Pi choose, and its picker still lists every
+authenticated provider. The `pi` CLI comes from
+`npm install -g @earendil-works/pi-coding-agent`; Pilish offers to install the
+Markdown tree-sitter grammars on first run.
+
 ## Org-mode
 
 See the [Org-Mode Workflow](#org-mode-workflow) section below for comprehensive
