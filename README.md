@@ -30,6 +30,7 @@ need a language server running just to read code.
 | **Languages** | rust-mode, go-mode, typescript-mode, etc. | Language support |
 | **Syntax** | Built-in tree-sitter (Emacs 30) | Highlighting |
 | **Org** | org-bullets, htmlize | Note-taking & export |
+| **Agents** | pilish | Pi coding agent as native buffers |
 | **Tools** | magit, projectile, treemacs | Development |
 | **UI** | ligature, rainbow-delimiters | Visual polish |
 
@@ -97,7 +98,8 @@ C-x l   ; Start LSP manually
 │   ├── init-git-sync.el    # Durable shared mirror synchronization
 │   ├── init-git-ui.el      # Evil review buffers, Changes Tree, diffs
 │   ├── init-forge.el       # Forge cache and authentication adapter
-│   └── init-git-pr.el      # Cached pull-request workspace
+│   ├── init-git-pr.el      # Cached pull-request workspace
+│   └── init-pilish.el      # Pi coding agent (Pilish) as native buffers
 └── themes/
     ├── noctilux-theme.el       # Dark theme (existing)
     └── minimal-light-theme.el  # Light theme (new)
@@ -173,6 +175,56 @@ synchronization. See [git.md](git.md) for the daily workflow and
 | `C-x t t` | Toggle treemacs |
 | `M-RET` | Toggle fullscreen |
 | `C-y` (visual) | Copy to system clipboard |
+
+### Pi Agent (Pilish)
+
+Pi is a minimal, extensible coding agent; [Pilish](https://github.com/dnouri/pilish)
+renders a Pi session as Markdown in one window and the prompt in an ordinary
+Emacs buffer in another. No terminal, no PTY. `C-c m` is the dedicated prefix,
+a deliberately small subset matching the OpenCode integration:
+
+| Key | Action |
+|-----|--------|
+| `C-c m c` | Create (start or focus) a session in this workspace |
+| `C-c m m` | Browse every previous session (all projects) |
+| `C-c m a` | Pick the agent's model |
+
+`C-c m m` opens the session browser and, when this project has no session yet,
+starts/reuses one first — Pilish's browser is meant to be opened from a live
+session, and its RET guard needs one. RET then resumes any session in the list;
+with no live session linked, RET also opens the selected session directly.
+
+For several sessions at once, `C-u C-c m c` prompts for a name; each named
+session gets its own chat/input buffers and its own `pi` process, so `alpha`
+and `beta` run concurrently in the same project. To watch more than one, put
+each pair in its own frame (`M-x make-frame`) or workspace (`C-c w s`, this
+config's persp-mode; tab-bar is disabled here); `M-x pilish RET name` focuses
+a named session.
+
+Pilish's own `C-c C-*` bindings are removed so this config's global `C-c`
+keys apply inside its buffers; a prompt is sent with RET in the input buffer's
+normal state (type, ESC, RET), which also queues it while the agent is busy.
+Everything else stays on `M-x pilish-*`.
+
+The read-only chat buffer runs in Evil **normal** state, so hjkl, `w`, `H`/`L`,
+`J`/`K`, visual selection and yank work as in any other buffer; `i`/`a` focus
+the input, RET visits a file, TAB folds a block. Chat and input share one frame
+with the input in the lower third and scroll independently (a window parked at
+the end follows new output, one scrolled up stays put).
+
+The model picked with `C-c m a` is remembered: it is written to Pi's own
+`~/.pi/agent/settings.json` (`defaultProvider`/`defaultModel`), so every new
+session starts on it. Disable with `+pilish-remember-model` nil.
+
+Models are served through the **Vercel AI Gateway** (`vercel-ai-gateway`).
+The `pi` CLI is a subprocess of Emacs, so its credentials live with Pi, not in
+this repository: set `AI_GATEWAY_API_KEY` in the environment Emacs sees, or add
+the key to Pi's own `~/.pi/agent/auth.json` under the `vercel-ai-gateway` entry.
+OpenCode's store (`~/.local/share/opencode/auth.json`, provider id `vercel`) is
+a different file and is **not** read by Pi. Override the default provider/model
+with `+pilish-provider` and `+pilish-model` (`M-x customize-group RET tools`).
+Pilish needs the `pi` CLI (`npm install -g @earendil-works/pi-coding-agent`)
+and its Markdown tree-sitter grammars, installed on first run.
 
 ## Theme
 

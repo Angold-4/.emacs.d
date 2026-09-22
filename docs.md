@@ -189,6 +189,102 @@ terminal reconnects it to the real terminal cursor. Agent TUI output is
 coalesced into complete 20 FPS redraws to avoid painting partial-frame flashes.
 The underlying PTY remains live throughout.
 
+## Pi Agent (Pilish)
+
+`init-pilish.el` drives [Pi](https://pi.dev), a minimal and extensible coding
+agent, through [Pilish](https://github.com/dnouri/pilish). Pilish talks to the
+`pi` CLI over its JSON-RPC mode, so the conversation is rendered Markdown in one
+window and the prompt is an ordinary Emacs buffer in the other: Evil motions,
+yank, search and narrowing all work, and no PTY or key forwarding is involved.
+
+`C-c m` is the dedicated prefix, a deliberately small subset matching the
+OpenCode integration:
+
+| Key | Action |
+|-----|--------|
+| `C-c m c` | Create (start or focus) a session in this workspace |
+| `C-c m m` | Browse every previous session (all projects) |
+| `C-c m a` | Pick the agent's model |
+
+`C-c m m` runs `+pilish/sessions`: when this project has no live session it
+first starts/reuses one with `pilish` (Pilish's browser is meant to be opened
+from a live session, and its RET guard needs a live linked chat buffer), then
+opens `pilish-session-browser`. RET resumes any session in the list. As a
+safety net for the no-session-linked case, `init-pilish.el` also advises
+`pilish--browse-switch-session` to call `pilish-open-session-file` on the
+selected session when no live process is linked (or its process has died).
+
+Pilish's own `C-c C-*` bindings (`C-c C-c` send, `C-c C-s` steering,
+`C-c C-k` abort, `C-c C-p` menu, `C-c C-r` sessions, `C-c C-e` export,
+`C-c C-m` model, `C-c C-t` thinking, `C-c C-y` copy last, `C-c C-n` new) are
+removed from both buffers, so this config's global `C-c` bindings apply inside
+Pilish buffers. A prompt is sent with RET in the input buffer's normal state
+(type, ESC, RET); RET in insert state still inserts a newline. Prompt history
+(`M-p`/`M-n`), path/command completion (`TAB`) and the `M-x pilish-*` commands
+are unchanged.
+
+### Multiple sessions
+
+Pilish supports several live sessions in one project. `C-u C-c m c` calls
+`pilish` with a prefix argument, which prompts for a session name; each named
+session is a separate buffer pair (`*pilish-chat:dir<name>*` /
+`*pilish-input:dir<name>*`) with its own `pi` process, so sessions run
+concurrently (verified: `alpha` and `beta` in one directory yield two live
+processes and two buffer pairs). Without a name, `C-c m c` reuses the unnamed
+session.
+
+`M-x pilish RET name` re-focuses a named session's buffers; `M-x pilish-toggle`
+hides/shows the project's session in the current frame. To watch two at once,
+give each session pair its own frame (`M-x make-frame`) or its own workspace:
+this config uses persp-mode (`C-c w s` switch, `C-c w l` list, `C-c w n`/`p`
+next/prev) and disables tab-bar, and Pilish's buffers join the current
+perspective automatically. The session browser (`C-c m m`) reads persisted
+sessions from disk, so each named session also appears there as its own file.
+
+The read-only chat buffer is switched from Pilish's default Evil *motion*
+state to **normal** state, so this config's normal-state map applies: hjkl and
+`w` motions, `H`/`L` beginning/end of line, `J`/`K` the 8-line jumps, `v`/`V`
+visual selection and yank. Only the Pilish keys that normal state would shadow
+and that matter in a read-only transcript are re-asserted: `i`/`a` focus the
+input window, RET visits the file at point, TAB folds a tool/thinking block.
+Message motion (`n`/`p`) and fork (`f`) fall through to Evil's native
+bindings; the `M-x pilish-*` commands still cover them.
+
+Chat and input are two windows in one frame — chat on top and the input in the
+lower third (`pilish-input-window-height` 0.3, `pilish-input-window-display`
+`always`) — and each keeps its own point and scroll. Pilish's follow logic
+makes that independent: a window parked at the buffer end follows new output
+while a window you scrolled up in stays put. They are not merged into a single
+buffer, because the chat is read-only rendered Markdown (tree-sitter,
+foldable tool sections) while the input is editable text; a split window pair
+already gives per-window scrolling.
+
+Models are served through the **Vercel AI Gateway**. Pi's provider id is
+`vercel-ai-gateway`, so authenticate it in Pi's own store — either export
+`AI_GATEWAY_API_KEY` in the environment Emacs launches from, or add
+
+```json
+{ "vercel-ai-gateway": { "type": "api_key", "key": "<your-key>" } }
+```
+
+to `~/.pi/agent/auth.json`. This is deliberately separate from OpenCode's
+`~/.local/share/opencode/auth.json`, whose provider id is `vercel`; Pi does not
+read that file. `+pilish-provider` (default `"vercel-ai-gateway"`) and
+`+pilish-model` (default nil) are forwarded to the CLI as `--provider` and
+`--model`; set either to nil to let Pi choose, and its picker still lists every
+authenticated provider. The `pi` CLI comes from
+`npm install -g @earendil-works/pi-coding-agent`; Pilish offers to install the
+Markdown tree-sitter grammars on first run.
+
+Pi's RPC `set_model` does not persist a default, so a model picked with
+`C-c m a` would be forgotten by the next session. `init-pilish.el` therefore
+advises `pilish--update-state-from-response' and, on a successful `set_model`
+or `cycle_model`, writes `defaultProvider` and `defaultModel` into Pi's own
+`~/.pi/agent/settings.json` (read-modify-write, atomic, mode 0600), preserving
+every other key. Pi then applies the remembered model to each new session
+through its normal resolution order. Set `+pilish-remember-model` to nil to
+opt out; `+pilish-model` still forces an explicit model for the CLI.
+
 ## Org-mode
 
 See the [Org-Mode Workflow](#org-mode-workflow) section below for comprehensive
