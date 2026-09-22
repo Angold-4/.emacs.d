@@ -48,8 +48,8 @@ executable control as models become more capable.
 
 The first workflow built on that rationale is proposed in
 [tradeoffs-trace](docs/tradeoffs-trace.md): a programmed Pi pipeline that
-enforces checks and reviews, and collects every consequential decision, with
-reviewer votes, into one Org buffer.
+enforces checks, reviews and deadlines, and surfaces the trade-offs and
+findings from implementation in one Emacs decision view.
 
 ## Quick Start
 
