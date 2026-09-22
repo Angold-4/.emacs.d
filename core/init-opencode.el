@@ -175,18 +175,19 @@ one insertion point and its region re-render is skipped."
     map)
   "Keymap for the OpenCode input buffer.")
 
-(defun +opencode--input-header ()
-  "Header line for the input buffer: its name and where a send will go."
+(defun +opencode--input-bar ()
+  "Mode-line segment for the input buffer: its name and its destination.
+The buffer name is already in the mode line; this adds where a send goes."
   (concat " " (buffer-name)
           (cond ((buffer-live-p +opencode-input-session)
-                 (format " · to %s" (buffer-name +opencode-input-session)))
+                 (format " → %s" (buffer-name +opencode-input-session)))
                 (+opencode-input-title
-                 (format " · new: %s" +opencode-input-title))
-                (t " · draft"))))
+                 (format " → new: %s" +opencode-input-title))
+                (t " → draft"))))
 
 (define-derived-mode +opencode-input-mode text-mode "OpenCode-Input"
   "Major mode for composing an OpenCode prompt in its own buffer."
-  (setq-local header-line-format '(:eval (+opencode--input-header))))
+  (setq-local mode-line-process '(:eval (+opencode--input-bar))))
 
 (defun +opencode--session-buffer ()
   "Return a session buffer to act on: the current one, or the most recent."
@@ -262,20 +263,17 @@ An empty session is never created: this only runs on the first send."
                         +opencode-input-directory nil
                         +opencode-input-title nil)
                   (let ((inhibit-read-only t))
-                    (erase-buffer))))
+                    (erase-buffer)))
+                (+opencode--arrange input session-buffer))
               (+opencode/save-session opened)))))))))
 
-(defun +opencode--display-input (directory &optional select)
-  "Show DIRECTORY's input buffer below.  Select it when SELECT is non-nil."
+(defun +opencode--prepare-input (directory)
+  "Return DIRECTORY's input buffer, ready to use."
   (let ((buffer (+opencode--input-buffer directory)))
     (with-current-buffer buffer
       (unless (derived-mode-p '+opencode-input-mode)
         (+opencode-input-mode)))
-    (let ((window (display-buffer buffer '((display-buffer-below-selected)
-                                           (window-height . 12)))))
-      (when (and select window)
-        (select-window window))
-      buffer)))
+    buffer))
 
 (defun +opencode/input ()
   "Focus the input buffer for the current (or most recent) session."
@@ -284,11 +282,11 @@ An empty session is never created: this only runs on the first send."
   (let ((session (+opencode--session-buffer)))
     (unless (buffer-live-p session)
       (user-error "No OpenCode session open yet"))
-    (with-current-buffer session
-      (+opencode--display-input default-directory t))))
+    (pop-to-buffer (+opencode--prepare-input
+                    (with-current-buffer session default-directory)))))
 
-(defun +opencode--output-header ()
-  "Header line for a session buffer: model, variant, context left, status."
+(defun +opencode--output-bar ()
+  "Mode-line segment for a session buffer: model, variant, context left, status."
   (let* ((agent opencode-session-agent)
          (model (ignore-errors (opencode--current-model)))
          (name (or (alist-get 'name model) ""))
@@ -309,14 +307,25 @@ An empty session is never created: this only runs on the first send."
             (format " · %s " (or opencode-session-status "idle")))))
 
 (defun +opencode--show-input (buffer)
-  "Show and focus the input buffer for a session just opened in BUFFER.
-The session is the transcript; the input box is where work starts."
+  "Give a session just opened in BUFFER its mode-line status bar."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'opencode-session-mode)
-        (setq-local header-line-format '(:eval (+opencode--output-header)))
-        (ignore-errors (+opencode--display-input default-directory t)))))
+        (setq-local mode-line-process '(:eval (+opencode--output-bar))))))
   buffer)
+
+(defun +opencode--arrange (input session)
+  "Show INPUT on top and SESSION below, by splitting INPUT's window.
+Other windows are left alone; the input buffer is full until a session
+exists, and the transcript only appears once there is one."
+  (let ((window (or (get-buffer-window input (selected-frame))
+                    (selected-window))))
+    (select-window window)
+    (set-window-buffer window input)
+    (let ((below (split-window-below)))
+      (set-window-buffer below session)
+      (set-window-start below (point-min)))
+    (select-window window)))
 
 ;; =============================================================================
 ;; Session commands
@@ -364,7 +373,7 @@ is never recorded."
       (setq +opencode-input-session nil
             +opencode-input-directory directory
             +opencode-input-title title))
-    (+opencode--display-input directory t)
+    (pop-to-buffer buffer)
     (message "New %s (created on first send)" title)))
 
 (defun +opencode/model ()
@@ -719,10 +728,17 @@ session is self-contained and portable."
          :keymap +opencode-global-mode-map)))))
 
 (defun +opencode--open-row (row)
-  "Open ROW: resume a live session, or visit an archived file."
+  "Open ROW: resume a live session as input over transcript, or visit a file."
   (if (eq (alist-get 'kind row) 'archived)
       (find-file (alist-get 'file row))
-    (opencode-open-session row)))
+    (let ((session (opencode-open-session row)))
+      (when (buffer-live-p session)
+        (let ((input (+opencode--prepare-input
+                      (with-current-buffer session default-directory))))
+          (with-current-buffer input
+            (setq +opencode-input-session session))
+          (+opencode--arrange input session)))
+      session)))
 
 (defun +opencode--continue-row (row)
   "Seed a new session from an archived ROW."
@@ -760,7 +776,7 @@ session is self-contained and portable."
       (setq +opencode-input-session nil
             +opencode-input-directory directory
             +opencode-input-title (format "%s (cont.)" title)))
-    (+opencode--display-input directory t)
+    (pop-to-buffer buffer)
     (message "Review, then RET to create the continued session")))
 
 ;; =============================================================================

@@ -152,12 +152,18 @@ A session is read from OpenCode while it is live, and from its file when it is
 not. `+opencode/continue-from-file` is the portability path: it seeds a new
 session from an archived file rather than pretending to restore the old one.
 
-## Header bars
+## Layout and mode-line bars
 
-The two buffers carry different information:
+`C-c m c` opens the input buffer as an ordinary buffer in a window — full
+until a session exists — rather than a forced bottom strip. Nothing is split
+until the first send: only then does the session appear, as the window below
+the input, and the two are arranged once (other windows are untouched).
 
-- **input** (`*OpenCode Input*`): its own buffer name and where a send goes —
-  `· draft`, `· new: <title>`, or `· to <session buffer>`.
+There is no header line. Each buffer carries its information in the
+**mode line** (the bottom bar):
+
+- **input** (`*OpenCode Input*`): the buffer name and where a send goes —
+  `→ draft`, `→ new: <title>`, or `→ <session buffer>`.
 - **output** (a session): the model and variant, the context window **left**,
   and the busy/idle status.
 
