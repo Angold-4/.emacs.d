@@ -40,6 +40,11 @@ need a language server running just to read code.
 3. **Modular** - Each feature in its own file under `core/`
 4. **Easy Setup** - Clone, open Emacs, packages install automatically
 
+The rationale for extending this buffer experience to agent workflows is in
+[Human judgment and programmed agent workflows](docs/agent-evaluation-and-programmed-workflows.md).
+It explains human evaluation authority, the risk of unexposed decisions, and
+why workflow obligations need executable control as models become more capable.
+
 ## Quick Start
 
 ```bash
