@@ -234,10 +234,11 @@ processes and two buffer pairs). Without a name, `C-c m c` reuses the unnamed
 session.
 
 `M-x pilish RET name` re-focuses a named session's buffers; `M-x pilish-toggle`
-hides/shows the project's session in the current frame. Since tabs and frames
-each carry their own window configuration, the practical way to watch two at
-once is one session pair per tab (`M-x tab-bar-new-tab`, then start or focus the
-session there) or per frame. The session browser (`C-c m m`) reads persisted
+hides/shows the project's session in the current frame. To watch two at once,
+give each session pair its own frame (`M-x make-frame`) or its own workspace:
+this config uses persp-mode (`C-c w s` switch, `C-c w l` list, `C-c w n`/`p`
+next/prev) and disables tab-bar, and Pilish's buffers join the current
+perspective automatically. The session browser (`C-c m m`) reads persisted
 sessions from disk, so each named session also appears there as its own file.
 
 The read-only chat buffer is switched from Pilish's default Evil *motion*

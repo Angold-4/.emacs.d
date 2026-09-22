@@ -185,9 +185,10 @@ with no live session linked, RET also opens the selected session directly.
 
 For several sessions at once, `C-u C-c m c` prompts for a name; each named
 session gets its own chat/input buffers and its own `pi` process, so `alpha`
-and `beta` run concurrently in the same project. Put each pair in its own tab
-(`M-x tab-bar-new-tab`) or frame to watch them side by side; `M-x pilish RET
-name` focuses a named session.
+and `beta` run concurrently in the same project. To watch more than one, put
+each pair in its own frame (`M-x make-frame`) or workspace (`C-c w s`, this
+config's persp-mode; tab-bar is disabled here); `M-x pilish RET name` focuses
+a named session.
 
 Pilish's own `C-c C-*` bindings are removed so this config's global `C-c`
 keys apply inside its buffers; a prompt is sent with RET in the input buffer's
