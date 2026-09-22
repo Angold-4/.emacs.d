@@ -205,6 +205,7 @@ OpenCode integration:
 | `C-c m c` | Create (start or focus) a session in this workspace |
 | `C-c m m` | Browse every previous session (all projects) |
 | `C-c m a` | Pick the agent's model |
+| `C-c C-p` | Pi menu (in a Pilish buffer): new/rename/compact/fork/tree/export/thinking/skills |
 
 `C-c m m` runs `+pilish/sessions`: when this project has no live session it
 first starts/reuses one with `pilish` (Pilish's browser is meant to be opened
@@ -215,13 +216,27 @@ safety net for the no-session-linked case, `init-pilish.el` also advises
 selected session when no live process is linked (or its process has died).
 
 Pilish's own `C-c C-*` bindings (`C-c C-c` send, `C-c C-s` steering,
-`C-c C-k` abort, `C-c C-p` menu, `C-c C-r` sessions, `C-c C-e` export,
-`C-c C-m` model, `C-c C-t` thinking, `C-c C-y` copy last, `C-c C-n` new) are
-removed from both buffers, so this config's global `C-c` bindings apply inside
-Pilish buffers. A prompt is sent with RET in the input buffer's normal state
-(type, ESC, RET); RET in insert state still inserts a newline. Prompt history
+`C-c C-k` abort, `C-c C-r` sessions, `C-c C-e` export, `C-c C-m` model,
+`C-c C-t` thinking, `C-c C-y` copy last, `C-c C-n` new) are removed from both
+buffers, so this config's global `C-c` bindings apply inside Pilish buffers.
+A prompt is sent with RET in the input buffer's normal state (type, ESC,
+RET); RET in insert state still inserts a newline. Prompt history
 (`M-p`/`M-n`), path/command completion (`TAB`) and the `M-x pilish-*` commands
 are unchanged.
+
+The exception is `C-c C-p`, Pilish's transient menu, which is kept (set
+`+pilish-keep-menu` nil to strip it). It is the one discoverable surface for
+the rest of the Pi harness — new session, reload, rename, compact, fork, tree
+browser, export, model, thinking, session stats, prompt images, skills, prompt
+templates and extension commands — and does not collide with any global key
+here; the only real collision, `C-c C-k`, stays with this config's LSP
+diagnostic command.
+
+Pilish's startup header is suppressed by default: `+pilish-startup-header`
+defaults to nil because the header advertises the `C-c C-*` keys this config
+strips and would therefore be misleading. Set it to `banner` to keep only the
+version/details line (whose TAB still expands context files, skills and prompt
+templates), or to `full` for Pilish's own header.
 
 ### Multiple sessions
 
@@ -249,6 +264,14 @@ and that matter in a read-only transcript are re-asserted: `i`/`a` focus the
 input window, RET visits the file at point, TAB folds a tool/thinking block.
 Message motion (`n`/`p`) and fork (`f`) fall through to Evil's native
 bindings; the `M-x pilish-*` commands still cover them.
+
+Completed assistant thinking is removed by default (`+pilish-show-thinking`
+nil): Pilish would collapse it to a `> Thinking hidden...` stub, so this
+module advises `pilish--thinking-hidden-stub` to render the empty string,
+which Pilish's renderer treats as a block removal. The transcript stays on
+prompts, answers, and tool output. Live thinking still streams while the
+agent is working and disappears when the turn completes; set
+`+pilish-show-thinking` non-nil to keep completed blocks.
 
 Chat and input are two windows in one frame — chat on top and the input in the
 lower third (`pilish-input-window-height` 0.3, `pilish-input-window-display`

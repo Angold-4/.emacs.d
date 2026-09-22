@@ -20,7 +20,14 @@
 ;; Pilish's own `C-c C-*' bindings are removed so this config's global
 ;; `C-c' bindings apply inside its buffers; sending is RET in the input
 ;; buffer's normal state (type, ESC, RET), which is also how a prompt is
-;; sent while the agent is busy.  The rest of Pilish is on `M-x pilish-*'.
+;; sent while the agent is busy.  The one exception is `C-c C-p', Pilish's
+;; transient menu, which collides with nothing global here (only `C-c C-k'
+;; does, and it stays with LSP) and is the single discoverable surface for
+;; the rest of the Pi harness.  Disable with `+pilish-keep-menu' nil; the
+;; rest of Pilish is on `M-x pilish-*'.  Pilish's startup header is
+;; suppressed (`+pilish-startup-header' nil) because it advertises the
+;; stripped keys; completed thinking is removed (`+pilish-show-thinking'
+;; nil) so the transcript stays on prompts, answers, and tool output.
 ;;
 ;; Chat buffer: Pilish's optional Evil integration normally puts the
 ;; read-only transcript in *motion* state.  We use the normal state instead
@@ -61,6 +68,7 @@
 (defvar pilish-chat-mode-map)
 (defvar pilish-input-mode-map)
 (defvar pilish-evil-chat-state)
+(defvar pilish-thinking-display)
 (defvar pilish--chat-buffer)
 (defvar pilish--process)
 
@@ -74,6 +82,10 @@
 (declare-function pilish--session-live-process-p "pilish-ui")
 (declare-function pilish-project-buffers "pilish-ui")
 (declare-function pilish-open-session-file "pilish")
+(declare-function pilish--display-startup-header "pilish-ui")
+(declare-function pilish--append-to-chat "pilish-ui")
+(declare-function pilish--format-startup-banner-compact "pilish-ui")
+(declare-function pilish--thinking-hidden-stub "pilish-render")
 (declare-function evil-define-key* "evil-core")
 
 ;; Native Evil state for the chat buffer, set before `pilish-evil' loads.
@@ -102,6 +114,35 @@ The provider and model are written to Pi's global
 keys Pi's own TUI writes.  Pi, not Emacs, then applies it on the next
 session."
   :type 'boolean
+  :group 'tools)
+
+(defcustom +pilish-show-thinking nil
+  "When non-nil, show completed assistant thinking in the transcript.
+The default removes completed thinking blocks entirely, so the chat stays
+on prompts, answers, and tool output.  Pilish itself would render them as
+a `> Thinking hidden...' stub; this module advises
+`pilish--thinking-hidden-stub' to render nothing instead, which Pilish's
+renderer supports as a block removal.  Live thinking is still streamed
+while the agent works (Pilish always shows that), and it disappears when
+the turn completes."
+  :type 'boolean
+  :group 'tools)
+
+(defcustom +pilish-startup-header nil
+  "Startup header Pilish may render when a new session is created.
+
+`nil' shows nothing at all.  `banner' shows only the compact
+version/details line, whose TAB still expands context files, skills and
+prompt templates.  `full' is Pilish's own header.
+
+The default is `nil': Pilish's header advertises its `C-c C-*' keys
+(`C-c C-c' send prompt, `C-c C-k' abort, ...), all of which this module
+strips, so it would be actively misleading.  Use `banner' when the
+version and resource summary is still wanted without the stale key
+hints."
+  :type '(choice (const :tag "Nothing" nil)
+                 (const :tag "Version/details line only" banner)
+                 (const :tag "Pilish default" full))
   :group 'tools)
 
 (defun +pilish--extra-args ()
@@ -161,12 +202,39 @@ Runs as :after advice on `pilish--update-state-from-response'."
           (when (and provider id)
             (ignore-errors (+pilish--persist-model provider id))))))))
 
+(defun +pilish--display-startup-header (orig)
+  "Render the startup header according to `+pilish-startup-header'.
+Runs as :around advice on `pilish--display-startup-header'."
+  (pcase +pilish-startup-header
+    ('full (funcall orig))
+    ('banner (pilish--append-to-chat
+              (pilish--format-startup-banner-compact)))
+    (_ nil)))
+
+(defun +pilish--thinking-hidden-stub (orig normalized)
+  "Return the completed-thinking stub, or nothing when thinking is dropped.
+Runs as :around advice on `pilish--thinking-hidden-stub'.  With
+`+pilish-show-thinking' nil, returning the empty string makes
+`pilish--replace-thinking-region' remove the block instead of leaving a
+stub line."
+  (if +pilish-show-thinking
+      (funcall orig normalized)
+    ""))
+
 (defun +pilish--install-advice ()
-  "Install the two Pilish advices this module relies on."
+  "Install the Pilish advices this module relies on."
   (unless (advice-member-p #'+pilish--remember-model
                            'pilish--update-state-from-response)
     (advice-add 'pilish--update-state-from-response
                 :after #'+pilish--remember-model))
+  (unless (advice-member-p #'+pilish--thinking-hidden-stub
+                           'pilish--thinking-hidden-stub)
+    (advice-add 'pilish--thinking-hidden-stub
+                :around #'+pilish--thinking-hidden-stub))
+  (unless (advice-member-p #'+pilish--display-startup-header
+                           'pilish--display-startup-header)
+    (advice-add 'pilish--display-startup-header
+                :around #'+pilish--display-startup-header))
   (unless (advice-member-p #'+pilish--browse-switch-session
                            'pilish--browse-switch-session)
     (advice-add 'pilish--browse-switch-session
@@ -211,13 +279,27 @@ started."
     "C-c C-n" "C-c C-e" "C-c C-m" "C-c C-t" "C-c C-y")
   "Pilish in-buffer keys removed so this config's globals apply.
 Send is RET in the input buffer's normal state; the commands remain on
-`M-x pilish-*'.")
+`M-x pilish-*'.  `C-c C-p' is kept when `+pilish-keep-menu' is non-nil.")
+
+(defcustom +pilish-keep-menu t
+  "When non-nil, keep Pilish's `C-c C-p' transient menu.
+The menu is the one discoverable surface for the rest of the Pi harness:
+new session, reload, rename, compact, fork, tree browser, export, model,
+thinking, session stats, prompt image, skills, prompt templates and
+extension commands.  `C-c C-p' collides with nothing global in this
+config (unlike `C-c C-k', which stays with LSP), so it is a single key
+that makes every other command reachable without hunting through `M-x'."
+  :type 'boolean
+  :group 'tools)
 
 (defun +pilish--strip-default-keys ()
-  "Unbind Pilish's `C-c C-*' keys from the chat and input keymaps."
+  "Unbind Pilish's `C-c C-*' keys from the chat and input keymaps.
+`C-c C-p' (the transient menu) is spared when `+pilish-keep-menu' is
+non-nil."
   (dolist (map (list pilish-chat-mode-map pilish-input-mode-map))
     (dolist (key +pilish-strip-keys)
-      (ignore-errors (define-key map (kbd key) nil)))))
+      (unless (and +pilish-keep-menu (equal key "C-c C-p"))
+        (ignore-errors (define-key map (kbd key) nil))))))
 
 ;;;; Native Evil chat buffer
 
@@ -257,6 +339,9 @@ TAB folds a tool/thinking block."
   ;; each window keeps its own point and scroll.
   (setq pilish-input-window-display 'always
         pilish-input-window-height 0.3)
+  ;; Completed thinking is removed by default (see the stub advice); when
+  ;; shown, Pilish's default visible mode is used.
+  (setq pilish-thinking-display (if +pilish-show-thinking 'visible 'hidden))
   (defalias 'pi 'pilish)
   (+pilish--strip-default-keys)
   (+pilish--install-advice)
