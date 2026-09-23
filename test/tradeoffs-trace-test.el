@@ -317,5 +317,62 @@
       (should (string-match-p "too late — refused: the phase is DONE (note)" text))
       (should (string-match-p "waiting — not picked up (note)" text)))))
 
+(ert-deftest tradeoffs-trace-program-parse ()
+  "Phase 4: a program file lists plan files with their dependencies."
+  (let* ((dir (make-temp-file "tt-ert-prog" t))
+         (plan-a (expand-file-name "a.org" dir))
+         (plan-b (expand-file-name "b.org" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file plan-a (insert +tt-test--valid-plan))
+          (with-temp-file plan-b (insert (replace-regexp-in-string "p1" "q1" +tt-test--valid-plan)))
+          (with-temp-buffer
+            (insert "#+TITLE: plan 13\n#+TT_PROGRAM: 4\n#+TT_CHECK_MINUTES: 40\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
+            (setq buffer-file-name (expand-file-name "program.org" dir) default-directory dir)
+            (org-mode)
+            (let* ((parsed (+tt-parse-program))
+                   (program (plist-get parsed :program))
+                   (entries (alist-get 'entries program)))
+              (set-buffer-modified-p nil) (setq buffer-file-name nil)
+              (should (null (plist-get parsed :errors)))
+              (should (= (alist-get 'maxParallel program) 4))
+              (should (equal (alist-get 'branches program) "stack"))
+              (should (equal (mapcar (lambda (e) (alist-get 'id e)) entries) '("13a" "13c")))
+              (should (equal (alist-get 'after (aref entries 1)) ["13a"]))
+              (should (equal (alist-get 'title (alist-get 'plan (aref entries 0))) "sum validation"))
+              ;; the program's time limits reach every entry's plan
+              (should (= (alist-get 'checkMs (alist-get 'deadlines (alist-get 'plan (aref entries 1)))) 2400000))))
+          ;; A missing plan file is an error at the entry's line.
+          (with-temp-buffer
+            (insert "#+TITLE: bad\n#+TT_PROGRAM: 2\n* x\n  :PROPERTIES:\n  :PLAN: missing.org\n  :END:\n")
+            (setq buffer-file-name (expand-file-name "bad.org" dir) default-directory dir)
+            (org-mode)
+            (let ((errors (plist-get (+tt-parse-program) :errors)))
+              (set-buffer-modified-p nil) (setq buffer-file-name nil)
+              (should (seq-find (lambda (e) (and (= (car e) 3) (string-match-p "missing.org not found" (cdr e)))) errors))))
+          ;; A plan with two phases (not a program) becomes one entry: its phases run in order.
+          (with-temp-buffer
+            (insert (replace-regexp-in-string ":provisional:" "" +tt-test--valid-plan)
+                    "  :PROPERTIES:\n  :ID: p2\n  :CHECKS: true\n  :END:\n  Goal: g\n  Acceptance:\n  - a\n")
+            (setq buffer-file-name (expand-file-name "multi.org" dir) default-directory dir)
+            (org-mode)
+            (let ((program (plist-get (+tt-parse-program) :program)))
+              (set-buffer-modified-p nil) (setq buffer-file-name nil)
+              (should (= (length (alist-get 'entries program)) 1))
+              (should (= (length (alist-get 'phases (alist-get 'plan (aref (alist-get 'entries program) 0)))) 2)))))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-plan-deadlines ()
+  "Per-plan time limits reach the JSON plan in ms; none means no field."
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n"
+                                                   +tt-test--valid-plan))
+                          :plan))
+         (d (alist-get 'deadlines plan)))
+    (should (= (alist-get 'shCommandMs d) 900000))
+    (should (= (alist-get 'checkMs d) 1800000))
+    (should (= (alist-get 'probeMs d) 1800000))
+    (should (= (alist-get 'workerAttemptMs d) 5400000))
+    (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
