@@ -33,6 +33,7 @@
 ;; - init-forge.el    : Forge package ownership and cached PR adapter
 ;; - init-git-pr.el   : Shared pull-request review workspace
 ;; - init-pilish.el   : Pi coding agent (Pilish) as native Emacs buffers
+;; - init-tradeoffs-trace.el : programmed Pi review pipeline (C-c m r/s/d)
 
 ;;; Code:
 
@@ -167,6 +168,7 @@
     init-forge      ; Forge package ownership and cached PR adapter
     init-git-pr     ; Shared pull-request review workspace
     init-pilish     ; Pi coding agent (Pilish) as native Emacs buffers
+    init-tradeoffs-trace ; Programmed Pi review pipeline (C-c m r/s/d)
     )
   "List of configuration modules to load.")
 ;; Load all modules
