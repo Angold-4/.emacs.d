@@ -1750,7 +1750,7 @@ export class Conductor {
     if (!candidate) return;
     const K = this.#state.phase.contract.contractVersion;
     for (const decision of this.#state.phase.decisions) {
-      if (decision.class !== "delegated") continue;
+      if (decision.class !== "delegated" && decision.class !== "reserved") continue;
       if (decision.boundCandidateSha !== candidate.sha || !sameVersion(decision.boundContractVersion, K)) continue;
       if (this.#state.phase.ballots.some((b) => b.reviewer === reviewer && b.decisionId === decision.id && b.boundCandidateSha === candidate.sha)) {
         continue; // already voted on this decision for this candidate
@@ -1928,7 +1928,7 @@ export class Conductor {
       // Plan 2c: a ballot on a record that is not votable (unknown,
       // superseded, or not 'delegated') is skipped and logged rather than
       // failing the whole review, which would cost the reviewer a resubmit.
-      if (!decision || !isLiveDecision(decision) || decision.class !== "delegated") {
+      if (!decision || !isLiveDecision(decision) || (decision.class !== "delegated" && decision.class !== "reserved")) {
         this.#log.append("ballot_ignored", {
           reviewer: review.reviewer,
           decisionId: bd.decisionId,
@@ -3015,7 +3015,7 @@ export class Conductor {
     lines.push(
       "",
       "Call submit_review with:",
-      "- `ballots`: one ballot for EVERY record above whose class is 'delegated' (approve or reject, a rationale, at least one evidence citation). A ballot with contractObjection=true opens a contract finding and suspends that vote.",
+      "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation). A ballot with contractObjection=true opens a contract finding and suspends that vote.",
       "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it.",
       own.length > 0
         ? `- \`discoveryMatches\`: for each of YOUR discoveries (${own.map((d) => d.id).join(", ")}) that is the same choice as another record above, give {discoveryId, sameAs}.`

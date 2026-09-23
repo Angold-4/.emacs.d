@@ -45,9 +45,16 @@ export function isBoundCurrent(
   );
 }
 
-/** Only `delegated` decisions with no *open* linked finding are votable. */
+/** Reviewers vote on `delegated` and `reserved` decisions (owner-optional:
+ * a reserved decision is voted like any other and only flagged for the
+ * owner, never held for them); a `detail` is not voted on. A decision with
+ * an *open* linked finding is not votable. */
+export function isVotedClass(decision: Decision): boolean {
+  return decision.class === "delegated" || decision.class === "reserved";
+}
+
 export function isVotable(decision: Decision, findings: Finding[]): boolean {
-  if (decision.class !== "delegated") return false;
+  if (!isVotedClass(decision)) return false;
   if (!decision.linkedFindingId) return true;
   const finding = findings.find((f) => f.id === decision.linkedFindingId);
   return Boolean(finding) && finding!.status !== "open";
@@ -81,7 +88,7 @@ export function tally(
   candidateSha: string,
   contractVersion: ContractVersion,
 ): TallyResult {
-  if (decision.class !== "delegated") return "not_votable";
+  if (!isVotedClass(decision)) return "not_votable";
   if (decision.linkedFindingId) {
     const finding = findings.find((f) => f.id === decision.linkedFindingId);
     if (!finding || finding.status === "open") return "suspended";

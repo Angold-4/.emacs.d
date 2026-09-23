@@ -300,6 +300,9 @@ export interface RunView {
   boundaryFilesChanged: number;
   liveDecisions: number;
   failedDecisions: number;
+  /** Reserved decisions on the current candidate: voted like any other,
+   * flagged so the owner can look (and override through the input box). */
+  flaggedDecisions: number;
   openFindings: number;
   needsYou: number;
   /** Minutes since the active agent last produced an event (agent stages only). */
@@ -351,6 +354,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   const needsYou = phase.ownerRequests.filter((r) => r.status === "open").length;
   const live = phase.decisions.filter((d) => isLiveDecision(d) && d.source !== "trigger");
   const failed = live.filter((d) => decisionStatus(d, phase).status === "failed").length;
+  const flagged = live.filter((d) => d.class === "reserved" && d.boundCandidateSha === C).length;
   const openFindings = phase.findings.filter((f) => f.status === "open").length;
 
   let attention: string | undefined;
@@ -381,6 +385,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     boundaryFilesChanged: phase.decisions.filter((d) => d.source === "trigger" && d.boundCandidateSha === C).length,
     liveDecisions: live.length,
     failedDecisions: failed,
+    flaggedDecisions: flagged,
     openFindings,
     needsYou,
     idleMinutes,

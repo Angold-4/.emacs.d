@@ -110,6 +110,13 @@ on disk after a stop.
 | review (both turns) | 15 min | the reviewer is re-dispatched once, then the phase is BLOCKED |
 | repair rounds | 3 | then AWAITING_OWNER |
 
+**The owner is never waited for by default.** Reserved decisions (the plan's
+`RESERVED` list, and choices that change an interface, a persistence format or
+a dependency) are voted on by M, A and B like any other and marked
+`⚑ FLAGGED` in the decision view; the status counts them ("N flagged for
+you"). Read them if you care and override one through the input box. A run
+stops for you only when its repair rounds are exhausted.
+
 ## Outcomes
 
 - **DONE:** the result is on the local `TT_BRANCH`. Review it, then push and open or update the PR yourself.
@@ -140,18 +147,10 @@ Each row was observed in a real run.
 | checks fail on a test that passes alone | load-sensitive test under the parallel suite | rerun; if it repeats, mark the test for the plan's worker to fix |
 | freeze fails with "failed to copy file … objects" | a concurrent `git gc` in the source repository | nothing: the clone retries once |
 | review shows many decisions for a small change | every reviewer discovers up to 5 more | expected; read only REJECTED and flagged ones |
-| "needs you" with only reserved decisions | see the known limitation below | approve through the inbox, or apply `plans/owner-optional.org` |
 | `tt stop` reports the lock still held | conductor killed hard | wait a moment and rerun `tt stop`; `tt list` shows the real state |
 
 ## Known limitations
 
-- **Reserved decisions wait for the owner.** A decision in the plan's
-  `RESERVED` list (or one that changes an interface, a persistence format or a
-  dependency) is settled only by the owner. The conductor also spends repair
-  rounds on it that the worker cannot use (run b46255dc). Until
-  `plans/owner-optional.org` lands (reserved decisions voted on by M, A and B
-  and flagged for the owner, never held), **leave `RESERVED` empty** for
-  unattended runs.
 - **One phase per run.** Multi-phase plans (plans 4a and 4b) are not implemented yet; run one plan file per phase.
 - **Publishing is local.** Pushing and PRs stay manual.
 - **Stopping during reviewer dispatch** can log `ERR_STREAM_WRITE_AFTER_END` from a late prompt write; the run is still stopped.

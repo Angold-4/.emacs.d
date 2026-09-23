@@ -604,9 +604,10 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
     (+tt--status-row "verdict" (alist-get 'verdict v)
                      (if (equal name "DONE") 'success 'warning))
     (+tt--status-row "records"
-                     (format "%d decisions%s · %d open findings%s"
+                     (format "%d decisions%s%s · %d open findings%s"
                              (alist-get 'liveDecisions v)
                              (let ((f (alist-get 'failedDecisions v))) (if (> f 0) (format " (%d failed)" f) ""))
+                             (let ((f (or (alist-get 'flaggedDecisions v) 0))) (if (> f 0) (format " · %d flagged for you" f) ""))
                              (alist-get 'openFindings v)
                              (let ((b (alist-get 'boundaryFilesChanged v)))
                                (if (> b 0) (format " · boundary files changed: %d (reviewers classify)" b) ""))))
@@ -765,13 +766,16 @@ with the reason shown here."
   (let ((dissent (seq-some (lambda (b) (and (equal (alist-get 'decisionId b) (alist-get 'id d))
                                             (equal (alist-get 'vote b) "reject")))
                            (alist-get 'ballots phase))))
-    (pcase (alist-get 'status status)
-      ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
-      ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
-      ("suspended" "SUSPENDED")
-      ("owner" "NEEDS YOU")
-      ("detail" "DETAIL")
-      (_ "PENDING"))))
+    (concat
+     (pcase (alist-get 'status status)
+       ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
+       ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
+       ("suspended" "SUSPENDED")
+       ("owner" "NEEDS YOU")
+       ("detail" "DETAIL")
+       (_ "PENDING"))
+     ;; A reserved decision: voted like any other, flagged for the owner.
+     (if (eq (alist-get 'flagged status) t) " ⚑ FLAGGED" ""))))
 
 (defun +tt--decision-block (d status phase)
   "Insert decision D (tally STATUS) as one self-contained Org entry."
