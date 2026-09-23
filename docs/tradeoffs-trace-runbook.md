@@ -58,6 +58,15 @@ readlink ~/.tradeoffs-trace/runner/current
 
 From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
 
+- **Reference documents.** Every `*.md` file the plan names that exists
+  (relative to the plan, or under `~`), plus anything in `#+TT_REFS`, is copied
+  into `<run>/refs/` when the run starts, and every agent's prompt lists those
+  paths. Agents may `find`/`grep`/`ls` only inside their checkout and `refs/`,
+  so no agent searches your home directory for a document.
+- **Shallow clones are refused.** A run (or a program node) won't start on a
+  shallow clone, because candidate checkouts can't be made from one. Run
+  `git fetch --unshallow` first.
+
 ## Run several phases or plans: programs
 
 A **program** runs several plans, and plans with several phases, as one
@@ -113,6 +122,8 @@ and runs independent phases in parallel.
 |---|---|
 | program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. `RET` opens a node's run workspace (status, trace, decisions, input box), `k` stops the program, `R` resumes it. |
 | CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program stop <id>`, `tt program resume <id>` |
+
+**Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
 
 **Rules the scheduler follows:**
 - A node starts only when all its dependencies are **DONE**. A node that needs you, or whose run was stopped, keeps its slot and holds back its dependents until it finishes. Correct it or resume it as for any run.
@@ -198,7 +209,7 @@ stops for you only when its repair rounds are exhausted.
 
 ## Outcomes
 
-- **DONE:** the result is on the local `TT_BRANCH`. Review it, then push and open or update the PR yourself.
+- **DONE:** the result is on the local `TT_BRANCH`. `tt summary <run>` writes the PR body (`<run>/views/pr.md`): the review outcome, blocking findings fixed during review, flagged decisions, **every open advisory finding** (accepted, not fixed) and tests removed from surviving files. Push and open the PR yourself. For a program, `tt program prs <id>` writes each DONE node's body and prints the `git push` and `gh pr create` commands with the stacked bases.
 - **AWAITING_OWNER ("needs you"):** repair rounds are exhausted. Read the verdict, then type a correction (it grants 3 more rounds), or `tt stop`.
 - **BLOCKED:** the run cannot continue, for example a reviewer is unavailable twice. The reason is in the status buffer. Fix the cause and start a new run.
 

@@ -16,7 +16,8 @@ import { fileURLToPath } from "node:url";
 import { decisionStatus } from "./core/predicate.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
-import { buildView, timingReport, timingText } from "./view.ts";
+import { buildView, prSummary, timingReport, timingText } from "./view.ts";
+import { removedTestsBetween } from "./effects/git.ts";
 import type { ProgramFile } from "./core/program.ts";
 import {
   appendProgramEvent,
@@ -33,7 +34,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -80,6 +81,31 @@ function resolveProgramDir(idOrDir: string, root: string): string {
   return path.join(programsRoot(root), idOrDir);
 }
 
+/** Skill fix 3: the PR body for a finished run — the review outcome, the
+ * blocking findings fixed on the way, flagged decisions, every open advisory
+ * finding (accepted, not fixed) and tests removed from surviving files.
+ * Also written to <run>/views/pr.md. */
+function runSummary(runDir: string): string {
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  let removed: string[] = [];
+  const C = state.phase.candidate?.sha;
+  if (C) {
+    try {
+      removed = removedTestsBetween(plan.repo, state.phase.integrationHead, C);
+    } catch {
+      removed = [];
+    }
+  }
+  const md = prSummary(runDir, plan, { removedTests: removed });
+  try {
+    writeFileSync(path.join(runPaths(runDir).views, "pr.md"), md);
+  } catch {
+    // views/ may be missing on a very old run; printing is what matters
+  }
+  return md;
+}
+
 async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean): Promise<void> {
   if (sub === "start") {
     if (args.length !== 1) usage();
@@ -120,6 +146,26 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     }
     launchProgramScheduler(dir);
     process.stdout.write(`resumed program ${path.basename(dir)}\n`);
+  } else if (sub === "prs") {
+    // Skill fix 3: one PR per DONE node, stacked on its dependency's branch.
+    // Prints the commands; pushing and opening PRs stay the owner's call.
+    if (args.length !== 1) usage();
+    const dir = resolveProgramDir(args[0], root);
+    const { program, nodes, state } = foldProgram(dir);
+    const out: string[] = [];
+    for (const n of nodes) {
+      const s = state.nodes[n.id];
+      if (s.status !== "done" || !s.runId || !s.branch) continue;
+      const runDir = path.join(root, s.runId);
+      runSummary(runDir);
+      const entry = program.entries.find((e) => e.id === n.entry)!;
+      // A join's base is its first parent; a root's is its plan's TT_BRANCH.
+      const base = (s.base ?? entry.plan.integrationBranch).split(" + ")[0];
+      const title = `${entry.plan.title}`.replace(/"/g, "'");
+      out.push(`git -C ${entry.plan.repo} push -u origin ${s.branch}`);
+      out.push(`(cd ${entry.plan.repo} && gh pr create --base ${base} --head ${s.branch} --title "${title}" --body-file ${path.join(runDir, "views", "pr.md")})`);
+    }
+    process.stdout.write(out.length > 0 ? `${out.join("\n")}\n` : "no DONE nodes yet\n");
   } else if (sub === "list") {
     let ids: string[] = [];
     try {
@@ -475,6 +521,9 @@ async function main(): Promise<void> {
     await cmdProgram(positional[0], positional.slice(1), runRoot, json);
   } else if (cmd === "list") {
     cmdList(runRoot, json);
+  } else if (cmd === "summary") {
+    if (positional.length !== 1) usage();
+    process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));
   } else if (cmd === "timing") {
     if (positional.length !== 1) usage();
     const times = timingReport(resolveRunDir(positional[0], runRoot));

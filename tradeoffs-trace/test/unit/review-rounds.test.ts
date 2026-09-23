@@ -166,3 +166,46 @@ test("launchArgs continues the previous session only when asked (repair attempts
   assert.ok(!launchArgs("worker", { sessionDir: "/s" }).includes("--continue"));
   assert.ok(!launchArgs("worker", { noSession: true, continueSession: true }).includes("--continue"));
 });
+
+test("carried ballots: a kept decision that passed keeps its ballots in the next round; a fresh ballot overrides", () => {
+  const passed = makeDecision({ id: "D-pass", source: "worker" });
+  const failed = makeDecision({ id: "D-fail", source: "worker" });
+  const changed = makeDecision({ id: "D-chg", source: "worker", choice: "old" });
+  const vote = (id: string, reviewer: "M" | "A" | "B", v: "approve" | "reject" = "approve") =>
+    makeBallot({ decisionId: id, reviewer, vote: v, boundCandidateSha: "C1" });
+  const s0 = baseState({
+    phase: "IMPLEMENTING",
+    attempt: { n: 2 },
+    candidate: { sha: "C1", contractVersion: K },
+    decisions: [passed, failed, changed],
+    ballots: [
+      vote("D-pass", "M"), vote("D-pass", "A"), vote("D-pass", "B"),
+      vote("D-fail", "M", "reject"), vote("D-fail", "A"), vote("D-fail", "B"),
+      vote("D-chg", "M"), vote("D-chg", "A"), vote("D-chg", "B"),
+    ],
+    round: 1,
+  });
+  let s = step(s0, {
+    type: "SUBMIT_PHASE",
+    disclosures: [],
+    prior: [
+      { id: "D-pass", status: "kept" },
+      { id: "D-fail", status: "kept" },
+      { id: "D-chg", status: "changed", choice: "new" },
+    ],
+  });
+  s = step(s, { type: "FREEZE_COMPLETED", candidateSha: "C2", decisions: [] });
+  const byId = new Map(s.phase.decisions.map((d) => [d.id, d]));
+  const onC2 = (id: string) => s.phase.ballots.filter((b) => b.decisionId === id && b.boundCandidateSha === "C2");
+  assert.equal(onC2("D-pass").length, 3, "the passed, kept decision carries all three ballots");
+  assert.ok(onC2("D-pass").every((b) => b.carriedFrom === "C1" && b.boundRecordVersion === byId.get("D-pass")!.version));
+  assert.equal(onC2("D-fail").length, 0, "a decision that failed is voted again");
+  assert.equal(onC2("D-chg").length, 0, "a changed decision is voted again");
+
+  // A fresh ballot is appended after the carried one and wins.
+  const fresh = makeBallot({ decisionId: "D-pass", reviewer: "M", vote: "reject", boundCandidateSha: "C2", boundRecordVersion: byId.get("D-pass")!.version });
+  const phase = { ...s.phase, ballots: [...s.phase.ballots, fresh] };
+  const reviews = { M: { review: approvingReview("M", "C2", K) }, A: { review: approvingReview("A", "C2", K) }, B: { review: approvingReview("B", "C2", K) } };
+  assert.equal(decisionStatus(byId.get("D-pass")!, { ...s.phase, reviews }).status, "passed", "carried ballots pass it with no new vote");
+  assert.equal(decisionStatus(byId.get("D-pass")!, { ...phase, reviews }).reason, "M veto", "M's fresh reject overrides its carried approve");
+});

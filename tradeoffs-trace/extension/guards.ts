@@ -178,6 +178,25 @@ function readEnv(name: string): string | undefined {
   return v && v.length > 0 ? v : undefined;
 }
 
+/** Where `find`/`grep`/`ls` may look (`TT_SEARCH_ROOTS`: the agent's
+ * checkout and the run's reference copies). A search elsewhere is refused
+ * with the roots named: run aea875c4's reviewers ran recursive `find` searches over the
+ * whole home directory for 6 minutes looking for the plan's documents. An
+ * unset list allows everything. */
+export function guardedSearchPath(targetPath: string | undefined, cwd: string, roots: string[]): string | undefined {
+  if (roots.length === 0) return undefined;
+  const target = canonicalize(resolvePath(cwd, targetPath ?? "."));
+  if (roots.some((r) => isUnder(target, canonicalize(r)))) return undefined;
+  return `search only inside your checkout or the plan's reference documents (${roots.join(", ")}); ${targetPath} is outside them. The plan's documents are listed in your prompt: read them directly.`;
+}
+
+export function readSearchRootsFromEnv(): string[] {
+  return (readEnv("TT_SEARCH_ROOTS") ?? "")
+    .split(":")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
 export function readGuardConfigFromEnv(): GuardConfig {
   return {
     worktree: readEnv("TT_WORKTREE"),

@@ -142,7 +142,14 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       record({ type: "NODE_BLOCKED", node: id, reason: prepared.reason });
       continue;
     }
-    const runDir = createRun(opts.runRoot, plan);
+    let runDir: string;
+    try {
+      runDir = createRun(opts.runRoot, plan);
+    } catch (err) {
+      // e.g. a shallow clone: the node cannot start, and says why.
+      record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });
+      continue;
+    }
     fs.writeFileSync(
       path.join(runDir, "program.json"),
       JSON.stringify({ programId: path.basename(dir), node: id }),

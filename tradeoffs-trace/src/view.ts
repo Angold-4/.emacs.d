@@ -441,3 +441,54 @@ export function reviewLineFor(phase: PhaseState): string {
     .map((r) => r.label)
     .join("   ");
 }
+
+// ---------------------------------------------------------------------------
+// PR summary (skill fix 3): what a reviewer of the PR needs, including the
+// advisory findings the loop accepted without fixing — run 9120dca7 (12c)
+// finished with 9 of them, and nothing carried them past the run.
+// ---------------------------------------------------------------------------
+
+export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTests?: string[] } = {}): string {
+  const v = buildView(runDir, plan, false);
+  const phase = v.timeline.state.phase;
+  const C = phase.candidate?.sha;
+  const goal = phase.contract.goal.length > 600 ? `${phase.contract.goal.slice(0, 599)}…` : phase.contract.goal;
+  const live = phase.decisions.filter((d) => isLiveDecision(d) && d.source !== "trigger" && d.boundCandidateSha === C);
+  const flagged = live.filter((d) => d.class === "reserved");
+  const advisories = phase.findings.filter((f) => f.status === "open" && f.severity === "advisory");
+  const fixed = phase.findings.filter((f) => f.severity === "blocking" && f.status === "repaired");
+  const lines = [
+    `## ${phase.phaseId}`,
+    "",
+    goal,
+    "",
+    "### Review (tradeoffs-trace)",
+    "",
+    `- Pipeline: ${v.pipeline}`,
+    `- Reviews on the accepted candidate ${C ? C.slice(0, 9) : "?"}: ${v.reviewLine}`,
+    `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
+    `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
+  ];
+  if (fixed.length > 0) {
+    lines.push("", "### Blocking findings fixed during review", "");
+    for (const f of fixed) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 300)}`);
+  }
+  if (flagged.length > 0) {
+    lines.push("", "### Flagged decisions (reserved: worth an owner's look)", "");
+    for (const d of flagged) lines.push(`- ${d.choice} — ${decisionStatus(d, phase).status}`);
+  }
+  if (advisories.length > 0) {
+    lines.push("", `### Open advisory findings (${advisories.length}) — accepted, not fixed`, "");
+    for (const f of advisories) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 400)}`);
+  }
+  if (extra.removedTests && extra.removedTests.length > 0) {
+    lines.push("", `### Tests removed from files that still exist (${extra.removedTests.length})`, "");
+    for (const t of extra.removedTests) lines.push(`- ${t}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function oneLine(text: string, max: number): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}

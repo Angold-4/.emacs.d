@@ -21,7 +21,8 @@
 // `isLiveDecision`).
 
 import { isLiveDecision } from "./predicate.ts";
-import type { Decision, PriorDecisionStatement } from "./types.ts";
+import { currentBallot, tally } from "./tally.ts";
+import type { Ballot, ContractVersion, Decision, Finding, PriorDecisionStatement } from "./types.ts";
 
 export function carryDecisionsForward(
   decisions: Decision[],
@@ -55,4 +56,42 @@ export function carryDecisionsForward(
           : `candidate ${short}: ${d.source} record from an earlier round`;
     return { ...d, supersededBy: why, version: d.version + 1 };
   });
+}
+
+/** Skill fix 5: ballots a new round inherits. When the worker keeps a
+ * decision unchanged (`kept`) and it PASSED its vote on the previous
+ * candidate, each reviewer's ballot carries over, rebound to the new
+ * candidate and record version and marked `carriedFrom`. Reviewers see the
+ * record as carried and vote again only if the new changes affect it; a
+ * fresh ballot is appended after the carried one, so it wins (currentBallot
+ * takes the latest). Run 0a35ae40 (12b) re-cast every ballot in each of its
+ * three rounds, 47 in the last one alone.
+ *
+ * `prevDecisions`/`prevBallots`/`findings` are the phase before the freeze;
+ * `carried` is carryDecisionsForward's result. */
+export function carryBallotsForward(
+  prevDecisions: Decision[],
+  prevBallots: Ballot[],
+  findings: Finding[],
+  prior: PriorDecisionStatement[] | undefined,
+  prevCandidateSha: string | undefined,
+  contractVersion: ContractVersion,
+  carried: Decision[],
+  newCandidateSha: string,
+): Ballot[] {
+  if (!prevCandidateSha) return [];
+  const kept = new Set((prior ?? []).filter((p) => p.status === "kept").map((p) => p.id));
+  const out: Ballot[] = [];
+  for (const d of carried) {
+    if (!kept.has(d.id) || d.boundCandidateSha !== newCandidateSha) continue;
+    const before = prevDecisions.find((x) => x.id === d.id);
+    if (!before || before.boundCandidateSha !== prevCandidateSha) continue;
+    if (tally(before, prevBallots, findings, prevCandidateSha, contractVersion) !== "pass") continue;
+    for (const reviewer of ["M", "A", "B"] as const) {
+      const b = currentBallot(prevBallots, d.id, reviewer, prevCandidateSha, contractVersion, before.version);
+      if (!b) continue;
+      out.push({ ...b, boundCandidateSha: newCandidateSha, boundRecordVersion: d.version, carriedFrom: prevCandidateSha });
+    }
+  }
+  return out;
 }

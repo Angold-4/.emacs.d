@@ -28,7 +28,7 @@ import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { guardedShCommand, guardedWritePath, readGuardConfigFromEnv } from "./guards.ts";
+import { guardedSearchPath, guardedShCommand, guardedWritePath, readGuardConfigFromEnv, readSearchRootsFromEnv } from "./guards.ts";
 
 import { validate, type JSONSchema } from "../src/core/schema.ts";
 import { reviewIngestionIssue } from "../src/core/predicate.ts";
@@ -341,7 +341,7 @@ export default function (pi: ExtensionAPI) {
     submit_discovery:
       "You have not called submit_discovery yet. List the behavioural choices you see in the diff and call submit_discovery before finishing. Do not call any other submission tool in this turn.",
     submit_review:
-      "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every decision listed in the prompt, your findings, and your statements. submit_review is the only submission tool you may use now.",
+      "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every decision listed in the prompt (ones marked carried are optional), your findings, and your statements. submit_review is the only submission tool you may use now.",
   };
 
   pi.on("session_start", async () => {
@@ -369,6 +369,11 @@ export default function (pi: ExtensionAPI) {
   // guards, not a security boundary — see guardedWritePath/guardedShCommand.
   pi.on("tool_call", (event) => {
     const cwd = readEnv("TT_WORKTREE") ?? process.cwd();
+    if (event.toolName === "find" || event.toolName === "grep" || event.toolName === "ls") {
+      const target = (event.input as { path?: string }).path;
+      const reason = guardedSearchPath(target, process.cwd(), readSearchRootsFromEnv());
+      return reason ? { block: true, reason } : undefined;
+    }
     if (isToolCallEventType("edit", event) || isToolCallEventType("write", event)) {
       const targetPath = (event.input as { path?: string }).path;
       if (typeof targetPath === "string") {
