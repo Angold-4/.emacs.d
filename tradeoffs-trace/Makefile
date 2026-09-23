@@ -1,9 +1,13 @@
-.PHONY: check test live crash
+.PHONY: check test ert live crash
 
 # Node 25 runs TypeScript natively (type stripping) — no build step.
 # `cd` first so the quoted glob always resolves the same way regardless of
 # the caller's cwd (see README).
-check: test
+check: test ert
+
+# The Emacs front end (core/init-tradeoffs-trace.el) under ERT in batch mode.
+ert:
+	cd $(CURDIR)/.. && emacs --batch -Q -L core -L test -l test/tradeoffs-trace-test.el -f ert-run-tests-batch-and-exit
 
 # `test/**/*.test.ts` already includes test/crash/crash-suite.test.ts and
 # test/live/*.test.ts. Without TT_CRASH_FULL=1, crash-suite.test.ts only

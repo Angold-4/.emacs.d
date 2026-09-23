@@ -1,0 +1,18 @@
+#+TITLE: tradeoffs-trace 2b: apply owner commands from the inbox
+#+TT_CHECKS: make -C tradeoffs-trace check
+
+* Phase 2b: owner commands
+  :PROPERTIES:
+  :ID:          p2b-owner-commands
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  tradeoffs-trace/src/core/** tradeoffs-trace/schemas/**
+  :RESERVED:    the binding tuple fields; the acceptance predicate in src/core/predicate.ts
+  :END:
+  Goal: the conductor applies owner commands that Emacs writes to <run>/inbox/<id>.json, exactly once, so the decision view's keys (resolve, override, accept-finding, revise, note, unneeded, miss) change the run, as in docs/tradeoffs-trace.md §7.4 and §9.3.
+  Acceptance:
+  - the conductor reads inbox/*.json on start and while running, applies each command by appending its core event to events.jsonl, then moves the file to inbox/applied/ (design §9.3 conductor-state commands)
+  - a command whose id is already in the log is only moved, never applied twice (restart between the log append and the file move applies it once)
+  - a command whose binding no longer matches (candidate, contract or record version) is rejected visibly: a rejection record in the log and the file moved to inbox/rejected/ with the reason
+  - resolve, override, accept-finding, revise, amend, note, unneeded and miss map to the existing core events in src/core/types.ts; note is delivered in the next worker attempt's prompt
+  - AWAITING_OWNER leaves after a resolving command and the run continues without further owner action
+  - new tests under tradeoffs-trace/test/conductor/ cover exactly-once application, stale rejection and a resolve that unparks an AWAITING_OWNER phase; all existing tests still pass
