@@ -19,7 +19,7 @@ ert:
 # adapters, without the slow real-process conductor, crash and live tests.
 # The phase CHECKS stay the full `make check`, run by the conductor itself.
 test-fast:
-	cd $(CURDIR) && node --test --test-timeout=60000 'test/unit/**/*.test.ts' 'test/contract/**/*.test.ts' 'test/effects/**/*.test.ts' 'test/fake-pi/**/*.test.ts'
+	cd $(CURDIR) && node --test --test-force-exit --test-timeout=60000 'test/unit/**/*.test.ts' 'test/contract/**/*.test.ts' 'test/effects/**/*.test.ts' 'test/fake-pi/**/*.test.ts'
 
 test:
 	# 180s: this packet's tt-start-happy-path and deadline-every-stage
@@ -27,13 +27,13 @@ test:
 	# `tt start`-launched daemon through production DEFAULT_DEADLINES —
 	# dominated by the freeze's default 30s abortGraceMs; the latter is
 	# 11 sub-tests, several of which wait out a real deadline).
-	cd $(CURDIR) && node --test --test-timeout=180000 'test/**/*.test.ts'
+	cd $(CURDIR) && node --test --test-force-exit --test-concurrency=4 --test-timeout=180000 'test/**/*.test.ts'
 
 # The full crash-suite (every phase-1 TT_CRASH_AT boundary, not just
 # `make check`'s 3-boundary FAST_SUBSET), for a reviewer who wants full
 # boundary coverage without the rest of `make check`'s own slow tests.
 crash:
-	cd $(CURDIR) && TT_CRASH_FULL=1 node --test --test-timeout=180000 'test/crash/**/*.test.ts'
+	cd $(CURDIR) && TT_CRASH_FULL=1 node --test --test-force-exit --test-timeout=180000 'test/crash/**/*.test.ts'
 
 # Live smoke tests against the real installed Pi and a real model (opt-in:
 # TT_LIVE=1 is required, or each live test skips itself with a printed
@@ -44,4 +44,4 @@ crash:
 # 20-minute bound makes this target noticeably slower than before this
 # packet. See README's "Live tests" section.
 live:
-	cd $(CURDIR) && TT_LIVE=1 node --test --test-timeout=1260000 test/live/live-submission.test.ts test/live/live-single-phase.test.ts test/live/live-review.test.ts
+	cd $(CURDIR) && TT_LIVE=1 node --test --test-force-exit --test-timeout=1260000 test/live/live-submission.test.ts test/live/live-single-phase.test.ts test/live/live-review.test.ts

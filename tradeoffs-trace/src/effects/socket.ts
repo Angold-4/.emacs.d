@@ -70,6 +70,9 @@ export interface RunSocketHandlers {
    * (design §2.2) — this is where the caller logs the intent event. Must be
    * awaited by the caller before resuming (runCommand does this itself). */
   onShIntent?: (agentId: string, commandId: string, pgid: number) => void | Promise<void>;
+  /** Called once the command's process group has finished (exit, timeout or
+   * cancel), so the caller stops tracking the pgid. */
+  onShExit?: (agentId: string, commandId: string, pgid: number) => void;
   /** Per-command deadline (design §8.1's "each `sh` command the worker
    * runs"). Defaults live here so tests can override with ms-scale values. */
   shDeadline?: ShDeadlineOptions;
@@ -181,12 +184,14 @@ export class RunSocketServer {
     const agentId = conn.agentId ?? "unknown";
     const cwd = this.#handlers.cwdFor(agentId);
     const deadline = this.#handlers.shDeadline ?? {};
+    let groupId: number | undefined;
     const running = runCommand({
       command: msg.command,
       cwd: msg.cwd ?? cwd,
       deadlineMs: deadline.deadlineMs,
       termGraceMs: deadline.termGraceMs,
       onIntent: async ({ pgid }) => {
+        groupId = pgid;
         await this.#handlers.onShIntent?.(agentId, msg.commandId, pgid);
       },
       onOutput: (chunk, stream) => {
@@ -194,6 +199,7 @@ export class RunSocketServer {
       },
     });
     const result = await running.result;
+    if (groupId !== undefined) this.#handlers.onShExit?.(agentId, msg.commandId, groupId);
     if (result.timedOut) {
       this.#write(conn.socket, {
         type: "sh_output",

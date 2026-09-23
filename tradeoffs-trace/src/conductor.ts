@@ -466,6 +466,13 @@ export class Conductor {
    * survived — before the auto-stop it raced against had actually
    * finished killing the reviewers. */
   #stopping: Promise<void> | undefined;
+  /** Every agent `sh` process group still running, across all agents —
+   * including ones whose handle is already gone (a force-killed worker's
+   * orphaned command). Removed when the command exits, so `stop()` only
+   * ever signals groups this conductor knows are live, never a recycled pgid
+   * from an old log record. */
+  #liveShGroups = new Set<number>();
+  #stopRequested = false;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
    * #onSubmit, consumed by #runFreeze (the "freeze" action's dispatch runs
@@ -596,6 +603,7 @@ export class Conductor {
       onSubmit: (agentId, msg) => this.#onSubmit(agentId, msg),
       cwdFor: (agentId) => this.#cwdFor(agentId),
       onShIntent: (agentId, commandId, pgid) => this.#onShIntent(agentId, commandId, pgid),
+      onShExit: (_agentId, _commandId, pgid) => void this.#liveShGroups.delete(pgid),
       shDeadline: { deadlineMs: this.#deadlines.shCommandMs, termGraceMs: this.#deadlines.termGraceMs },
       onNoSubmission: (agentId) => this.#onNoSubmission(agentId),
     });
@@ -845,6 +853,7 @@ export class Conductor {
   }
 
   async #doStop(): Promise<void> {
+    this.#stopRequested = true;
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
     if (this.#inboxTimer) clearInterval(this.#inboxTimer);
     // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
@@ -855,7 +864,7 @@ export class Conductor {
     } catch {
       // the log may already be closed (a second stop call); never fatal.
     }
-    const killed = new Set<number>();
+    await this.#killLiveShGroups();
     for (const handle of this.#agents.values()) {
       // Plan 2d: a clean stop uses the short stopAbortGraceMs, not the
       // 30 s cancellation grace — `tt stop` must finish within 15 s.
@@ -868,31 +877,12 @@ export class Conductor {
       // (round-of-review item 1) includes these, not just the agent
       // processes themselves.
       for (const pgid of handle.shGroups) {
-        killed.add(pgid);
         await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
       }
     }
-    // design §2.2/§9.3: a conductor-owned shell group can outlive its
-    // agent's in-memory handle — a force-killed worker leaves a detached
-    // group whose pgid was recorded as an `sh-<agent>-<pgid>` intent but
-    // never reached a live handle's `shGroups` set (the handle was already
-    // deleted). Kill every recorded group as well, so a clean stop never
-    // leaves a process running (this is what makes `make check`'s
-    // SIGKILLed-worker test exit promptly instead of waiting out its own
-    // `sleep 300`).
-    try {
-      const { records } = readLog(this.#paths.events);
-      for (const rec of records) {
-        if (rec.kind !== "intent" || typeof rec.actionId !== "string" || !rec.actionId.startsWith("sh-")) continue;
-        const pgid = (rec.event as { pgid?: unknown }).pgid;
-        if (typeof pgid === "number" && Number.isFinite(pgid) && !killed.has(pgid)) {
-          killed.add(pgid);
-          await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-        }
-      }
-    } catch {
-      // Best effort: never let a stale sh group block a clean stop.
-    }
+    // A group whose agent handle was already dropped (a force-killed
+    // worker's orphaned command), or one that started while stopping.
+    await this.#killLiveShGroups();
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
@@ -1891,7 +1881,22 @@ export class Conductor {
     });
   }
 
+  async #killLiveShGroups(): Promise<void> {
+    const groups = [...this.#liveShGroups];
+    this.#liveShGroups.clear();
+    await Promise.all(
+      groups.map((pgid) => killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined)),
+    );
+  }
+
   #onShIntent(agentId: string, _commandId: string, pgid: number): void {
+    if (this.#stopRequested) {
+      // runCommand resumes the group (SIGCONT) right after this returns;
+      // killing it first would make that resume fail. Kill it just after.
+      setImmediate(() => void killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined));
+      return;
+    }
+    this.#liveShGroups.add(pgid);
     this.#agents.get(agentId)?.shGroups.add(pgid);
     this.#log.append("intent", { agentId, pgid }, `sh-${agentId}-${pgid}`);
   }
@@ -2929,7 +2934,7 @@ function buildWorkerPrompt(
   lines.push(
     "",
     "How to work:",
-    `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target).`,
+    `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target). With node --test, pass --test-force-exit so a test that leaks a process cannot hold the command open.`,
     "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",
     "- Edit files with the edit and write tools.",
     "- In submit_phase, write each decision's choice as one plain sentence of at most 20 words; put the reasoning in whyItMatters and the alternatives. Disclose choices that change behaviour, interfaces, guarantees or cost.",
