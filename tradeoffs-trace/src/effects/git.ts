@@ -135,7 +135,18 @@ export function findCommitByTrailer(worktree: string, actionId: string): string 
 
 function cloneCheckout(repo: string, sha: string, dir: string): void {
   fs.mkdirSync(path.dirname(dir), { recursive: true });
-  git(["clone", "-q", "--no-hardlinks", "--no-checkout", repo, dir]);
+  // A local clone copies the object files one by one; a concurrent gc in
+  // the origin repo can delete a loose object mid-copy ("failed to copy
+  // file ... No such file or directory", run 0c99b1ff's first freeze). One
+  // retry after the repack settles. (`--no-local` would avoid the race but
+  // only transfers objects reachable from refs, and candidates are not.)
+  const clone = () => git(["clone", "-q", "--no-hardlinks", "--no-checkout", repo, dir]);
+  try {
+    clone();
+  } catch {
+    fs.rmSync(dir, { recursive: true, force: true });
+    clone();
+  }
   git(["-C", dir, "checkout", "-q", "--detach", sha]);
 }
 

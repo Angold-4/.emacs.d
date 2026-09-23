@@ -190,5 +190,64 @@
             (should (string-match-p "▸ tool: sh" out))))
       (delete-file f))))
 
+(defun +tt-test--input-state (phase &optional alive blocked requests)
+  "A minimal `tt state' for the input-header tests."
+  `((conductorAlive . ,(if alive t :false))
+    (ownerInputs)
+    (pendingOwnerInputs)
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . ,phase)
+                  (attempt (n . 2))
+                  (blockedReason . ,blocked)
+                  (ownerRequests . ,requests)))))
+
+(ert-deftest tradeoffs-trace-input-header ()
+  "Design §7.4/§7.5: the input header states what sending will do now."
+  (should (string-match-p "refused: the run is DONE"
+                          (+tt--input-header (+tt-test--input-state "DONE" t))))
+  (should (string-match-p "refused: the phase is BLOCKED (reviewer unavailable)"
+                          (+tt--input-header (+tt-test--input-state "BLOCKED" t "reviewer unavailable"))))
+  (should (string-match-p "Cannot deliver input"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" nil))))
+  (should (string-match-p "steers worker attempt 2"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t))))
+  (should (string-match-p "notes the next worker attempt"
+                          (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
+  (should (string-match-p "corrects the phase: resolves 2 open owner request"
+                          (+tt--input-header
+                           (+tt-test--input-state
+                            "AWAITING_OWNER" t nil
+                            '(((id . "OR-1") (status . "open"))
+                              ((id . "OR-2") (status . "open"))))))))
+
+(defconst +tt-test--owner-input-state
+  '((meta (title . "sum validation"))
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "IMPLEMENTING")
+                  (attempt (n . 1)) (repairRoundsUsed . 0) (repairRoundsGranted . 3)
+                  (reviews) (decisions) (findings) (ownerRequests)))
+    (ownerInputs ((id . "c1") (kind . "steer") (state . "delivered") (text . "steer this"))
+                 ((id . "c2") (kind . "note") (state . "noted") (text . "note that"))
+                 ((id . "c3") (kind . "correction") (state . "correction-started") (text . "correct it"))
+                 ((id . "c4") (kind . "steer") (state . "delivery-uncertain") (text . "maybe")
+                  (reason . "the conductor restarted"))
+                 ((id . "c5") (kind . "note") (state . "refused") (text . "too late")
+                  (reason . "the phase is DONE")))
+    (pendingOwnerInputs ((id . "p1") (kind . "note") (text . "waiting") (at . "2000-01-01T00:00:00.000Z"))))
+  "A fixture with one owner input in each recorded state, plus a stale pending one.")
+
+(ert-deftest tradeoffs-trace-owner-input-section ()
+  "The status buffer's Owner input section shows each recorded state."
+  (with-temp-buffer
+    (+tt--render-owner-inputs +tt-test--owner-input-state)
+    (let ((text (buffer-string)))
+      (should (string-match-p "Owner input (6)" text))
+      (should (string-match-p "steer this — delivered (steer)" text))
+      (should (string-match-p "note that — noted (note)" text))
+      (should (string-match-p "correct it — correction started (correction)" text))
+      (should (string-match-p "maybe — delivery uncertain (the conductor restarted) (steer)" text))
+      (should (string-match-p "too late — refused: the phase is DONE (note)" text))
+      (should (string-match-p "waiting — not picked up (note)" text)))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

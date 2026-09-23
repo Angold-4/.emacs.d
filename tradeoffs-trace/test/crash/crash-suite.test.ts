@@ -365,15 +365,18 @@ for (const boundary of BOUNDARIES_TO_RUN) {
   });
 }
 
-test("crash-suite: phase-2 boundaries are named but never exercised in phase 1", () => {
+test("crash-suite: phase-2 inbox-move and steer-acknowledgement boundaries are wired in", () => {
   assert.deepEqual([...PHASE_2_CRASH_BOUNDARIES], ["before_inbox_move", "before_steer_ack"]);
-  // Nothing in src/ ever calls crashAt() with one of these names — phase 1
-  // has no inbox or steer mechanism to crash inside of. This is a static
-  // documentation check (the boundary list itself), not a live one: a live
-  // "assert it fires" test is meaningless for a mechanism that does not
-  // exist yet, and is exactly what "do NOT fake them" in the brief rules out.
+  // Plan 2d implemented both boundaries: a crash after an owner-command
+  // event but before its inbox file moves, and one between the steer RPC
+  // and its acknowledgement. This is a static "they are actually wired"
+  // check; the live behaviour is covered by
+  // test/conductor/owner-input.test.ts (steer-uncertain).
   const conductorSrc = fs.readFileSync(fileURLToPath(new URL("../../src/conductor.ts", import.meta.url)), "utf8");
   for (const phase2Boundary of PHASE_2_CRASH_BOUNDARIES) {
-    assert.ok(!conductorSrc.includes(`crashAt("${phase2Boundary}")`), `phase 1 must not fire the phase-2 boundary ${phase2Boundary}`);
+    assert.ok(
+      conductorSrc.includes(`crashAt("${phase2Boundary}")`),
+      `phase 2d must fire the phase-2 boundary ${phase2Boundary}`,
+    );
   }
 });

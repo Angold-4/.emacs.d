@@ -1,0 +1,8 @@
+{"seq":1,"ts":"2026-09-23T14:37:12.036Z","kind":"init","event":{"runId":"7a7afdd5","integrationHead":"6a8d650b05c37a34ae44eb1020319b74080c3442","runnerRevision":"859bc48886d4257af676788d5e19a519bdc39bbd"}}
+{"seq":2,"ts":"2026-09-23T14:37:12.043Z","kind":"intent","actionId":"create-worktree","event":{"worktree":"~/.tradeoffs-trace/cda2b8a9/worktree","baseSha":"6a8d650b05c37a34ae44eb1020319b74080c3442"}}
+{"seq":3,"ts":"2026-09-23T14:37:12.092Z","kind":"completion","actionId":"create-worktree","event":{"created":true,"baseSha":"6a8d650b05c37a34ae44eb1020319b74080c3442"}}
+{"seq":4,"ts":"2026-09-23T14:37:12.100Z","kind":"event","event":{"type":"ATTEMPT_STARTED"}}
+{"seq":5,"ts":"2026-09-23T14:37:12.104Z","kind":"event","event":{"type":"ACTION_STARTED","action":"dispatch_worker","actionId":"dispatch_worker-5-86d70dab"}}
+{"seq":6,"ts":"2026-09-23T14:37:12.110Z","kind":"intent","actionId":"dispatch_worker-5-86d70dab","event":{"agentId":"worker-1-dispatch_worker-5-86d70dab","pgid":58648,"sessionDir":"~/.tradeoffs-trace/cda2b8a9/sessions/worker-v1-validate"}}
+{"seq":7,"ts":"2026-09-23T14:37:27.010Z","kind":"stop","event":{"reason":"conductor stopped","at":"2026-09-23T14:37:27.010Z"}}
+{"seq":8,"ts":"2026-09-23T14:37:27.022Z","kind":"completion","actionId":"dispatch_worker-5-86d70dab","event":{"outcome":"settled"}}

@@ -113,8 +113,23 @@ test("force-kill-shell: SIGKILLing the worker's process group mid-`sh` is notice
     );
   } finally {
     await setup.conductor.stop();
+    // The interrupted attempt is re-dispatched and runs the same `sleep 300`
+    // again; stop() must kill that command too, or it outlives the test (and
+    // keeps `node --test` from exiting for five minutes).
+    await waitFor(() => !processMentions(marker), 5_000).catch(() => undefined);
+    const leaked = processMentions(marker);
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
     cleanupDir(markerDir);
+    assert.equal(leaked, false, "stop() left an agent's sh command running");
   }
 });
+
+function processMentions(text: string): boolean {
+  try {
+    execFileSync("pgrep", ["-f", text], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}

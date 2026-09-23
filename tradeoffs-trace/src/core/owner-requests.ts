@@ -11,7 +11,7 @@
 // named by a stable id, never by its label — see owner-commands.ts for what
 // choosing each one does.
 
-import { addressed, decisionSettled, isLiveDecision } from "./predicate.ts";
+import { addressed, decisionSettled, isLiveDecision, reviewsComplete } from "./predicate.ts";
 import type { OwnerRequest, OwnerRequestOption, PhaseState } from "./types.ts";
 
 function hasOpenRequestLinkedTo(phase: PhaseState, matches: (r: OwnerRequest) => boolean): boolean {
@@ -109,7 +109,14 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
     // `decisionSettled` (not a raw tally check) so a decision already
     // settled via "accept the decision as implemented" or an override is
     // never asked about again (round-3 review item 1's closing test).
+    // Only once the reviews of C are in: a decision nobody voted on (checks
+    // or the probe failed before review) did not fail a vote, and asking the
+    // owner to settle it misstates what happened (run 0c99b1ff: five "failed
+    // its vote" requests after a checks failure, no review ever ran). The
+    // budget gate below covers that case.
+    const voted = reviewsComplete(phase, C, K);
     for (const d of phase.decisions) {
+      if (!voted) break;
       if (!isLiveDecision(d) || d.class !== "delegated") continue;
       if (decisionSettled(d, phase, C, K)) continue;
       if (hasOpenRequestLinkedTo(phase, (r) => r.linkedDecisionId === d.id)) continue;

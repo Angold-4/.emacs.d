@@ -242,15 +242,25 @@ function dumpDebugState(runDir: string): void {
   }
 }
 
-/** Polls `check()` until it returns true or `timeoutMs` elapses. `debugRunDir`
- * (work packet 2a addition), if given, is dumped via `dumpDebugState` on
- * timeout — see its own doc comment. */
+/** Plan 2d: the minimum budget every `waitFor` gets. `node --test` runs
+ * test files in parallel, so under a full `make check` the host can be
+ * several times slower than a single-file run; a correct run whose
+ * transition takes 40 s instead of 3 s must not be reported as a failure
+ * just because the host was busy. A genuinely stuck run still fails, just
+ * after at least this many milliseconds. */
+export const WAIT_FOR_FLOOR_MS = 90_000;
+
+/** Polls `check()` until it returns true or its (load-tolerant) budget
+ * elapses. `debugRunDir` (work packet 2a addition), if given, is dumped via
+ * `dumpDebugState` on timeout — see its own doc comment. `timeoutMs` is a
+ * floor; see `WAIT_FOR_FLOOR_MS`. */
 export async function waitFor(check: () => boolean, timeoutMs = 15_000, intervalMs = 50, debugRunDir?: string): Promise<void> {
+  const budget = Math.max(timeoutMs, WAIT_FOR_FLOOR_MS);
   const start = Date.now();
   while (!check()) {
-    if (Date.now() - start > timeoutMs) {
+    if (Date.now() - start > budget) {
       if (debugRunDir) dumpDebugState(debugRunDir);
-      throw new Error("waitFor: timed out");
+      throw new Error(`waitFor: timed out after ${budget}ms`);
     }
     await sleep(intervalMs);
   }

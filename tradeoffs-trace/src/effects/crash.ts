@@ -45,6 +45,10 @@ export const PHASE_2_CRASH_BOUNDARIES = ["before_inbox_move", "before_steer_ack"
 
 export type Phase2CrashBoundary = (typeof PHASE_2_CRASH_BOUNDARIES)[number];
 
+/** Every boundary `crashAt` accepts: phase 1's effect boundaries plus phase
+ * 2's inbox-move and steer-acknowledgement ones (design §9.3). */
+export type AnyCrashBoundary = CrashBoundary | Phase2CrashBoundary;
+
 /** A distinctive exit code (never one a normal `process.exit` in this
  * codebase uses) so a test can tell "the conductor reached this boundary and
  * crashed there" apart from any other reason the process might have ended. */
@@ -56,7 +60,7 @@ export const CRASH_EXIT_CODE = 87;
  * boundary — which is always true outside this packet's own crash-suite, so
  * this is safe to leave wired into the conductor's normal code paths
  * unconditionally. */
-export function crashAt(boundary: CrashBoundary): void {
+export function crashAt(boundary: AnyCrashBoundary): void {
   if (process.env.TT_CRASH_AT === boundary) {
     process.exit(CRASH_EXIT_CODE);
   }

@@ -167,3 +167,21 @@ test("owner-requests: a repeat entry does not duplicate an already-open request 
   assert.equal(open.length, 1, "must not duplicate the existing open request");
   assert.equal(open[0].id, "OR-existing");
 });
+
+test("owner-requests: checks failing with the budget spent asks for the budget, not for decisions nobody voted on (run 0c99b1ff)", () => {
+  const state = baseState({
+    phase: "CHECKING",
+    candidate: { sha: "C1", contractVersion: K },
+    decisions: [makeDecision({ id: "D1", class: "delegated" }), makeDecision({ id: "D2", class: "delegated" })],
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+  });
+  const result = reduce(state, { type: "CHECKS_FAILED" });
+  assert.equal(result.ok, true, !result.ok ? result.reason : "");
+  assert.equal(result.state.phase.phase, "AWAITING_OWNER");
+  assertWellFormedRequests(result.state);
+  const open = openRequests(result.state);
+  assert.equal(open.length, 1, "no per-decision request before any review ran");
+  assert.equal(open[0].origin, "repair_budget_exhausted");
+  assert.deepEqual(open[0].options.map((o) => o.id), ["grant", "stop"]);
+});

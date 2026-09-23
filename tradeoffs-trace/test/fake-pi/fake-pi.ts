@@ -300,6 +300,10 @@ async function main(): Promise<void> {
           if (cmd.type === "prompt" && readEnv("FAKE_PI_PROMPT_LOG")) {
             appendFileSync(readEnv("FAKE_PI_PROMPT_LOG")!, `${String(cmd.message)}\n=====\n`);
           }
+          // Plan 2d test-only steer capture (opt-in via FAKE_PI_STEER_LOG).
+          if (cmd.type === "steer" && readEnv("FAKE_PI_STEER_LOG")) {
+            appendFileSync(readEnv("FAKE_PI_STEER_LOG")!, `${String(cmd.message)}\n=====\n`);
+          }
           if (cmd.type === "prompt") {
             if (!ranOnce) {
               ranOnce = true;

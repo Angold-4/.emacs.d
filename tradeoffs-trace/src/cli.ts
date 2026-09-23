@@ -8,19 +8,20 @@
 // run id immediately rather than blocking for the whole run.
 
 import { execFileSync, spawn } from "node:child_process";
-import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readdirSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { decisionStatus } from "./core/predicate.ts";
+import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -204,6 +205,97 @@ async function cmdStatus(runIdOrDir: string, root: string): Promise<void> {
   process.stdout.write(renderStatus(runDir));
 }
 
+function pidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Plan 2d: `tt stop <run>` ends a run's conductor cleanly within 15 s —
+ * SIGTERM to the recorded pid, then wait for the process to exit and the
+ * run lock to be released. The conductor itself logs the stop event (see
+ * `Conductor#doStop`). A run with no live conductor is a no-op. */
+async function cmdStop(runIdOrDir: string, root: string): Promise<void> {
+  const runDir = resolveRunDir(runIdOrDir, root);
+  const p = runPaths(runDir);
+  let pid = 0;
+  try {
+    pid = Number(readFileSync(path.join(runDir, "conductor.pid"), "utf8"));
+  } catch {
+    pid = 0;
+  }
+  if (!pidAlive(pid)) {
+    process.stdout.write(`run ${path.basename(runDir)} has no running conductor\n`);
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // raced with the conductor exiting on its own; fall through to the wait
+  }
+  const deadline = Date.now() + 15_000;
+  while (pidAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (pidAlive(pid)) {
+    process.stderr.write(`conductor ${pid} did not stop within 15s\n`);
+    process.exitCode = 1;
+    return;
+  }
+  // The lock's flock is released by the OS when the conductor (and its perl
+  // helper) die; prove it by taking and immediately releasing it (design
+  // §9.1: exactly one conductor per run). Retry briefly: a SIGKILLed
+  // conductor's helper may need a beat to notice its stdin closed.
+  for (;;) {
+    try {
+      const lock = await acquireLock(p.lock);
+      await lock.release();
+      process.stdout.write(`stopped ${path.basename(runDir)}\n`);
+      return;
+    } catch {
+      if (Date.now() >= deadline) {
+        process.stderr.write(`conductor ${pid} exited but the run lock is still held\n`);
+        process.exitCode = 1;
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
+/** Plan 2d: pending owner-input files the conductor has not yet picked up
+ * (design §7.4/§9.3). `tt state` carries them so the status buffer can show
+ * a command the owner sent while no conductor was running as "not picked
+ * up" after 30 s, rather than silently losing it. */
+function pendingOwnerInputs(runDir: string): Array<{ id: string; kind: string; text: string; at: string }> {
+  let names: string[];
+  try {
+    names = readdirSync(path.join(runDir, "inbox"));
+  } catch {
+    return [];
+  }
+  const out: Array<{ id: string; kind: string; text: string; at: string }> = [];
+  for (const name of names.sort()) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const raw = JSON.parse(readFileSync(path.join(runDir, "inbox", name), "utf8")) as Record<string, unknown>;
+      const kind = typeof raw.type === "string" ? raw.type : typeof raw.kind === "string" ? raw.kind : undefined;
+      if (kind !== "steer" && kind !== "note" && kind !== "correction") continue;
+      if (typeof raw.text !== "string") continue;
+      const at = statSync(path.join(runDir, "inbox", name)).mtime.toISOString();
+      out.push({ id: name.slice(0, -".json".length), kind, text: raw.text, at });
+    } catch {
+      // A file still being written, or malformed: the conductor will reject
+      // it; not this view's job to guess.
+    }
+  }
+  return out;
+}
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === RUN_CONDUCTOR_FLAG) {
@@ -221,6 +313,9 @@ async function main(): Promise<void> {
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
     launchDetached(resolveRunDir(positional[0], runRoot));
+  } else if (cmd === "stop") {
+    if (positional.length !== 1) usage();
+    await cmdStop(positional[0], runRoot);
   } else if (cmd === "state") {
     // Machine-readable run state for the Emacs front end: meta, plan and
     // the state rebuilt by folding the control log (never a stored snapshot).
@@ -247,7 +342,10 @@ async function main(): Promise<void> {
       state.phase.decisions.map((d) => [d.id, decisionStatus(d, state.phase)]),
     );
     const round = state.phase.round ?? 0;
-    process.stdout.write(`${JSON.stringify({ runDir, meta, plan, state, round, decisionStatuses, conductorAlive: alive })}\n`);
+    const ownerInputs = state.phase.ownerInputs ?? [];
+    process.stdout.write(
+      `${JSON.stringify({ runDir, meta, plan, state, round, decisionStatuses, conductorAlive: alive, ownerInputs, pendingOwnerInputs: pendingOwnerInputs(runDir) })}\n`,
+    );
   } else if (cmd === "runner" && positional[0] === "install") {
     // `tt runner install <sha>`: freeze an accepted revision outside every
     // worktree at <root>/runner/<sha>/, so a run that edits tradeoffs-trace

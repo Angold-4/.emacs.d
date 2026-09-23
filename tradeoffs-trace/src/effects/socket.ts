@@ -70,6 +70,9 @@ export interface RunSocketHandlers {
    * (design §2.2) — this is where the caller logs the intent event. Must be
    * awaited by the caller before resuming (runCommand does this itself). */
   onShIntent?: (agentId: string, commandId: string, pgid: number) => void | Promise<void>;
+  /** Called once the command's process group has finished (exit, timeout or
+   * cancel), so the caller stops tracking the pgid. */
+  onShExit?: (agentId: string, commandId: string, pgid: number) => void;
   /** Per-command deadline (design §8.1's "each `sh` command the worker
    * runs"). Defaults live here so tests can override with ms-scale values. */
   shDeadline?: ShDeadlineOptions;
@@ -181,6 +184,7 @@ export class RunSocketServer {
     const agentId = conn.agentId ?? "unknown";
     const cwd = this.#handlers.cwdFor(agentId);
     const deadline = this.#handlers.shDeadline ?? {};
+    let groupId: number | undefined;
     const running = runCommand({
       command: msg.command,
       cwd: msg.cwd ?? cwd,
@@ -191,6 +195,7 @@ export class RunSocketServer {
       deadlineMs: deadline.deadlineMs,
       termGraceMs: deadline.termGraceMs,
       onIntent: async ({ pgid }) => {
+        groupId = pgid;
         await this.#handlers.onShIntent?.(agentId, msg.commandId, pgid);
       },
       onOutput: (chunk, stream) => {
@@ -198,11 +203,12 @@ export class RunSocketServer {
       },
     });
     const result = await running.result;
+    if (groupId !== undefined) this.#handlers.onShExit?.(agentId, msg.commandId, groupId);
     if (result.timedOut) {
       this.#write(conn.socket, {
         type: "sh_output",
         commandId: msg.commandId,
-        chunk: "\n[tt: command timed out and was killed]\n",
+        chunk: shTimeoutNote(deadline.deadlineMs),
         stream: "stderr",
       });
     }
@@ -237,4 +243,17 @@ export class RunSocketServer {
     for (const conn of this.#connections) conn.socket.destroy();
     await new Promise<void>((resolve) => this.#server.close(() => resolve()));
   }
+}
+
+/** What an agent reads when its command hits the per-command limit. A bare
+ * "timed out" made agents rerun the same command (run b46255dc: a test file
+ * that could not finish inside the limit, piped through `tail`, returned no
+ * output three times in a row), so say what to do instead. */
+export function shTimeoutNote(deadlineMs: number | undefined): string {
+  const limit = deadlineMs === undefined ? "the time limit" : `${Math.round(deadlineMs / 1000)} s`;
+  return (
+    `\n[tt: command killed after ${limit} (the per-command limit). The same command will be killed again. ` +
+    "Narrow it (one test: --test-name-pattern) or find why it does not finish (a test waiting for an event that never comes). " +
+    "Output piped through tail or head is lost when a command is killed.]\n"
+  );
 }

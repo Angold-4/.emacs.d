@@ -227,6 +227,18 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
       },
     );
     const c = child;
+    // design §2.2: the pgid is known the moment the process exists —
+    // `detached: true` makes it a process-group leader, so its pid IS the
+    // pgid. Record it synchronously here (before the STOP handshake, and so
+    // before the command's first side effect) so a concurrent `stop()` can
+    // never miss a group that already exists. The old placement — inside
+    // `waitUntilStopped` — left a window in which a just-spawned command's
+    // group existed but was neither in a live handle's set nor in the log,
+    // so `stop()` could leave it running (found when the force-kill-shell
+    // SIGKILLed-worker test waited out its own `sleep 300`).
+    if (c.pid !== undefined) resolvedPgid = c.pid;
+    const intentRecorded =
+      c.pid !== undefined ? Promise.resolve(options.onIntent?.({ pgid: c.pid })) : Promise.resolve();
 
     c.stdout.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
@@ -248,7 +260,9 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
       .then(async () => {
         resolvedPgid = c.pid!;
         pgidResolve(resolvedPgid);
-        await options.onIntent?.({ pgid: resolvedPgid });
+        // The intent was recorded at spawn; await it here so it is durable
+        // before SIGCONT lets the command run.
+        await intentRecorded;
         if (cancelRequested) {
           // cancel() ran while we were waiting on onIntent; terminate()
           // already tried and found nothing alive yet because the group

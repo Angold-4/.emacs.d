@@ -35,6 +35,8 @@ import type {
   FindingDisclosure,
   InFlightKey,
   OwnerCommand,
+  OwnerInputKind,
+  OwnerInputState,
   PhaseContract,
   PhaseState,
   Review,
@@ -99,6 +101,11 @@ export interface Deadlines {
   reproductionMs: number;
   abortGraceMs: number;
   termGraceMs: number;
+  /** Plan 2d: how long `stop()` waits for an agent to exit after abort before
+   * escalating to SIGTERM. Much shorter than `abortGraceMs` (design §8.2's
+   * mid-run cancellation grace): `tt stop` must release the run within 15 s,
+   * and a clean stop has no reason to wait out the full cancellation grace. */
+  stopAbortGraceMs: number;
   /** design §9.3: how often the conductor re-reads `<run>/inbox/*.json`
    * while running. Owner commands are conductor state, so the conductor
    * must pick one up even when parked in AWAITING_OWNER (when `next()`
@@ -132,6 +139,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
   termGraceMs: 10_000,
+  stopAbortGraceMs: 2_000,
   inboxPollMs: 1_000,
 };
 
@@ -459,6 +467,13 @@ export class Conductor {
    * survived — before the auto-stop it raced against had actually
    * finished killing the reviewers. */
   #stopping: Promise<void> | undefined;
+  /** Every agent `sh` process group still running, across all agents —
+   * including ones whose handle is already gone (a force-killed worker's
+   * orphaned command). Removed when the command exits, so `stop()` only
+   * ever signals groups this conductor knows are live, never a recycled pgid
+   * from an old log record. */
+  #liveShGroups = new Set<number>();
+  #stopRequested = false;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
    * #onSubmit, consumed by #runFreeze (the "freeze" action's dispatch runs
@@ -475,6 +490,10 @@ export class Conductor {
    * from the log at `start()` and updated on every apply. A file whose id is
    * in this set is only moved to applied/, never applied a second time. */
   #appliedCommandIds = new Set<string>();
+  /** Plan 2d: steer command ids whose RPC send is in flight. A second scan
+   * must leave the file alone (it is neither applied nor failed yet), and
+   * only the acknowledgement/failure path moves it to applied/. */
+  #steerInFlight = new Set<string>();
   /** The inbox poll timer; cleared by `#doStop`. */
   #inboxTimer: NodeJS.Timeout | undefined;
 
@@ -585,6 +604,7 @@ export class Conductor {
       onSubmit: (agentId, msg) => this.#onSubmit(agentId, msg),
       cwdFor: (agentId) => this.#cwdFor(agentId),
       onShIntent: (agentId, commandId, pgid) => this.#onShIntent(agentId, commandId, pgid),
+      onShExit: (_agentId, _commandId, pgid) => void this.#liveShGroups.delete(pgid),
       shDeadline: { deadlineMs: this.#deadlines.shCommandMs, termGraceMs: this.#deadlines.termGraceMs },
       onNoSubmission: (agentId) => this.#onNoSubmission(agentId),
     });
@@ -834,10 +854,24 @@ export class Conductor {
   }
 
   async #doStop(): Promise<void> {
+    this.#stopRequested = true;
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
     if (this.#inboxTimer) clearInterval(this.#inboxTimer);
+    // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
+    // is logged (with why) before anything is torn down, so the record is
+    // durable even if a later step is slow or fails.
+    try {
+      this.#log?.append("stop", { reason: "conductor stopped", at: new Date().toISOString() });
+    } catch {
+      // the log may already be closed (a second stop call); never fatal.
+    }
+    await this.#killLiveShGroups();
     for (const handle of this.#agents.values()) {
-      await handle.agent.terminate().catch(() => undefined);
+      // Plan 2d: a clean stop uses the short stopAbortGraceMs, not the
+      // 30 s cancellation grace — `tt stop` must finish within 15 s.
+      await handle.agent
+        .terminate({ abortGraceMs: this.#deadlines.stopAbortGraceMs })
+        .catch(() => undefined);
       // design §2.2's "conductor-owned shell": an `sh` command's process
       // group is separate from its agent's own — killing the agent does
       // not touch it. `stop()` releasing "every handle ... children"
@@ -847,6 +881,9 @@ export class Conductor {
         await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
       }
     }
+    // A group whose agent handle was already dropped (a force-killed
+    // worker's orphaned command), or one that started while stopping.
+    await this.#killLiveShGroups();
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
@@ -918,6 +955,144 @@ export class Conductor {
     }
   }
 
+  /** Rejects one inbox file visibly: a `command_rejected` log record plus
+   * the file moved to rejected/ with the reason beside it. */
+  #rejectInboxFile(file: string, commandId: string, reason: string): void {
+    const trimmed = reason.length > 500 ? `${reason.slice(0, 500)}…` : reason;
+    this.#log.append("command_rejected", { commandId, reason: trimmed });
+    try {
+      fs.writeFileSync(path.join(this.#paths.inboxRejected, `${commandId}.reason.txt`), `${trimmed}\n`);
+    } catch (err) {
+      this.#log.append("error", { where: "inbox_rejection_note", error: String((err as Error)?.message ?? err) });
+    }
+    this.#moveInboxFile(file, this.#paths.inboxRejected);
+  }
+
+  /** Plan 2d: the three input-box kinds (design §7.4), detected by shape in
+   * either the flat `kind` form or the decision view's `type` form. */
+  #ownerInputKindOf(raw: unknown): OwnerInputKind | undefined {
+    if (!raw || typeof raw !== "object") return undefined;
+    const r = raw as Record<string, unknown>;
+    const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
+    return kind === "steer" || kind === "note" || kind === "correction" ? kind : undefined;
+  }
+
+  /** Plan 2d: records one owner input's actually-observed effect. Record-
+   * only; keyed by the inbox command id so a later, more definitive record
+   * (e.g. a recovered steer's `delivered`) updates rather than duplicates. */
+  #recordOwnerInput(
+    id: string,
+    kind: OwnerInputKind,
+    text: string,
+    state: OwnerInputState,
+    attemptId?: string,
+    reason?: string,
+  ): void {
+    this.#applyEvent({
+      type: "OWNER_INPUT_RECORDED",
+      input: {
+        id,
+        kind,
+        text,
+        state,
+        ...(attemptId ? { attemptId } : {}),
+        ...(reason ? { reason } : {}),
+        at: new Date().toISOString(),
+      },
+    });
+  }
+
+  /** Plan 2d (design §7.4/§9.3): external delivery of one steer. The intent
+   * is logged before the RPC `steer`, the completion after Pi acknowledges
+   * it. Pi has no receiver-side dedup, so a crash in between leaves the
+   * outcome unknown: on restart an intent with no completion is recorded
+   * `delivery-uncertain` and never resent — steering is at most once, or
+   * explicitly uncertain. */
+  #processSteerCommand(file: string, commandId: string, raw: unknown, text: string): void {
+    const r = raw as Record<string, unknown>;
+    const binding = r.binding && typeof r.binding === "object" ? (r.binding as Record<string, unknown>) : undefined;
+    const boundAttemptId =
+      typeof r.boundAttemptId === "string"
+        ? r.boundAttemptId
+        : binding && typeof binding.attemptId === "string"
+          ? binding.attemptId
+          : undefined;
+    const actionId = `deliver-${commandId}`;
+    let records: LogRecord[];
+    try {
+      records = readLog(this.#paths.events).records;
+    } catch (err) {
+      this.#logUnexpected("read_log_steer", err);
+      return;
+    }
+    const intent = records.find((rec) => rec.kind === "intent" && rec.actionId === actionId);
+    const completion = records.find((rec) => rec.kind === "completion" && rec.actionId === actionId);
+    const recorded = (this.#state.phase.ownerInputs ?? []).find((i) => i.id === commandId);
+
+    if (intent) {
+      if (!recorded) {
+        if (completion) {
+          const outcome = completion.event as { agentId?: string; attemptId?: string };
+          this.#recordOwnerInput(commandId, "steer", text, "delivered", outcome.attemptId ?? boundAttemptId);
+        } else {
+          this.#recordOwnerInput(
+            commandId,
+            "steer",
+            text,
+            "delivery-uncertain",
+            boundAttemptId,
+            "the conductor restarted between sending the steer and Pi acknowledging it; it is never resent automatically",
+          );
+        }
+      }
+      this.#appliedCommandIds.add(commandId);
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+      return;
+    }
+
+    const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
+    if (!worker) {
+      const reason = "no worker attempt is running; the conductor refused the steer (it was not delivered)";
+      this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, reason);
+      this.#rejectInboxFile(file, commandId, reason);
+      return;
+    }
+    const attemptId = boundAttemptId ?? worker.agentId;
+    // Mark in flight (NOT applied): the file must stay in the inbox until the
+    // acknowledgement decides its fate, so a crash here can still recover it.
+    this.#steerInFlight.add(commandId);
+    this.#log.intent(actionId, { commandId, agentId: worker.agentId, attemptId, text });
+    const ack = worker.agent.steer(text);
+    // design §9.3: the boundary between sending the steer and its
+    // acknowledgement — a crash here leaves the outcome unknown.
+    crashAt("before_steer_ack");
+    const finish = (state: "delivered" | "delivery-uncertain", reason?: string): void => {
+      this.#steerInFlight.delete(commandId);
+      this.#appliedCommandIds.add(commandId);
+      this.#recordOwnerInput(commandId, "steer", text, state, attemptId, reason);
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+    };
+    void ack.then(
+      () => {
+        if (this.#closed) return;
+        this.#log.completion(actionId, { outcome: "steer-acknowledged", agentId: worker.agentId, attemptId });
+        finish("delivered");
+      },
+      (err) => {
+        if (this.#closed) return;
+        this.#log.completion(actionId, {
+          outcome: "steer-failed",
+          agentId: worker.agentId,
+          attemptId,
+          error: String((err as Error)?.message ?? err),
+        });
+        finish("delivery-uncertain", "Pi could not accept the steer");
+      },
+    );
+  }
+
   /** One inbox file. The command id is the filename's basename (design §9.1
    * — schemas/owner-command.schema.json's bodies carry no `id`), never part
    * of the JSON body. Ordering is deliberate: (1) an id already in the log
@@ -935,23 +1110,13 @@ export class Conductor {
       this.#moveInboxFile(file, this.#paths.inboxApplied);
       return;
     }
-
-    const reject = (reason: string): void => {
-      const trimmed = reason.length > 500 ? `${reason.slice(0, 500)}…` : reason;
-      this.#log.append("command_rejected", { commandId, reason: trimmed });
-      try {
-        fs.writeFileSync(path.join(this.#paths.inboxRejected, `${commandId}.reason.txt`), `${trimmed}\n`);
-      } catch (err) {
-        this.#log.append("error", { where: "inbox_rejection_note", error: String((err as Error)?.message ?? err) });
-      }
-      this.#moveInboxFile(file, this.#paths.inboxRejected);
-    };
+    if (this.#steerInFlight.has(commandId)) return;
 
     let text: string;
     try {
       text = fs.readFileSync(file, "utf8");
     } catch (err) {
-      reject(`could not read owner command file: ${String((err as Error)?.message ?? err)}`);
+      this.#rejectInboxFile(file, commandId, `could not read owner command file: ${String((err as Error)?.message ?? err)}`);
       return;
     }
     // A writer may still be mid-write (an empty or whitespace-only document
@@ -964,9 +1129,34 @@ export class Conductor {
     try {
       raw = JSON.parse(text);
     } catch (err) {
-      reject(`could not parse owner command JSON: ${String((err as Error)?.message ?? err)}`);
+      this.#rejectInboxFile(file, commandId, `could not parse owner command JSON: ${String((err as Error)?.message ?? err)}`);
       return;
     }
+
+    // Plan 2d: the input box's kinds are handled before the conductor-state
+    // mapping. A steer is external delivery, not a core event. A note or
+    // correction is a core event but also carries the owner-input record
+    // the status view shows. Input after the phase is terminal is refused
+    // with the reason — never silently dropped.
+    const inputKind = this.#ownerInputKindOf(raw);
+    if (inputKind) {
+      const inputText = (raw as { text?: unknown }).text;
+      if (typeof inputText !== "string" || inputText.trim().length === 0) {
+        this.#rejectInboxFile(file, commandId, "an owner input must carry non-empty text");
+        return;
+      }
+      if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+        const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, reason);
+        this.#rejectInboxFile(file, commandId, reason);
+        return;
+      }
+      if (inputKind === "steer") {
+        this.#processSteerCommand(file, commandId, raw, inputText);
+        return;
+      }
+    }
+
     // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
     // `kind` form (a `tt cmd`/test front end), and the decision view's
     // `type` + `binding` form (design §10.4 — what Emacs actually writes).
@@ -980,19 +1170,19 @@ export class Conductor {
     if (looksFlat) {
       const flat = validate(OWNER_COMMAND_SCHEMA, raw);
       if (!flat.valid) {
-        reject(`owner command fails schemas/owner-command.schema.json: ${flat.errors.join("; ")}`);
+        this.#rejectInboxFile(file, commandId, `owner command fails schemas/owner-command.schema.json: ${flat.errors.join("; ")}`);
         return;
       }
       const command = raw as OwnerCommand;
       event = ownerCommandToEvent(command, commandId);
       if (!event) {
-        reject(`owner command kind '${command.kind}' is not a conductor-state command this phase applies`);
+        this.#rejectInboxFile(file, commandId, `owner command kind '${command.kind}' is not a conductor-state command this phase applies`);
         return;
       }
     } else {
       const normalized = normalizeDecisionViewCommand(raw, commandId);
       if (!normalized.ok) {
-        reject(normalized.reason);
+        this.#rejectInboxFile(file, commandId, normalized.reason);
         return;
       }
       event = normalized.event;
@@ -1002,20 +1192,30 @@ export class Conductor {
     // The decision view's binding carries run/phase ids too (design §7.1); a
     // command for another run or phase is stale by the same rule.
     if (boundRunId && boundRunId !== this.#state.phase.runId) {
-      reject(`command is bound to run ${boundRunId}, but this run is ${this.#state.phase.runId}`);
+      this.#rejectInboxFile(file, commandId, `command is bound to run ${boundRunId}, but this run is ${this.#state.phase.runId}`);
       return;
     }
     if (boundPhaseId && boundPhaseId !== this.#state.phase.phaseId) {
-      reject(`command is bound to phase ${boundPhaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
+      this.#rejectInboxFile(file, commandId, `command is bound to phase ${boundPhaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
       return;
     }
     const result = reduce(this.#state, event);
     if (!result.ok) {
-      reject(result.reason);
+      this.#rejectInboxFile(file, commandId, result.reason);
       return;
     }
     this.#appliedCommandIds.add(commandId);
     this.#applyEvent(event, commandId);
+    // The recorded effect for the input box's status view: a note is queued
+    // for the next attempt the moment it is applied; a correction has just
+    // resolved the open requests and started a repair.
+    const recordedText = (raw as { text?: unknown }).text;
+    if (event.type === "NOTE_ADDED" && typeof recordedText === "string") {
+      this.#recordOwnerInput(commandId, "note", recordedText, "noted");
+    } else if (event.type === "OWNER_CORRECTION" && typeof recordedText === "string") {
+      this.#recordOwnerInput(commandId, "correction", recordedText, "correction-started");
+    }
+    crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
   }
 
@@ -1682,7 +1882,22 @@ export class Conductor {
     });
   }
 
+  async #killLiveShGroups(): Promise<void> {
+    const groups = [...this.#liveShGroups];
+    this.#liveShGroups.clear();
+    await Promise.all(
+      groups.map((pgid) => killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined)),
+    );
+  }
+
   #onShIntent(agentId: string, _commandId: string, pgid: number): void {
+    if (this.#stopRequested) {
+      // runCommand resumes the group (SIGCONT) right after this returns;
+      // killing it first would make that resume fail. Kill it just after.
+      setImmediate(() => void killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined));
+      return;
+    }
+    this.#liveShGroups.add(pgid);
     this.#agents.get(agentId)?.shGroups.add(pgid);
     this.#log.append("intent", { agentId, pgid }, `sh-${agentId}-${pgid}`);
   }
@@ -2745,7 +2960,7 @@ function buildWorkerPrompt(
   lines.push(
     "",
     "How to work:",
-    `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target).`,
+    `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target). With node --test, pass --test-force-exit so a test that leaks a process cannot hold the command open. Do not pipe test output through tail or head: a command killed at the per-command time limit then returns nothing. If a test file is slow, run one test at a time with --test-name-pattern.`,
     "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",
     "- Edit files with the edit and write tools.",
     "- In submit_phase, write each decision's choice as one plain sentence of at most 20 words; put the reasoning in whyItMatters and the alternatives. Disclose choices that change behaviour, interfaces, guarantees or cost.",

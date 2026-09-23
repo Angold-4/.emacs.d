@@ -5,6 +5,7 @@
   "description": "design §7.4: every owner command kind, each bound to what it evaluated. The flat 'kind' forms below are the conductor's own encoding; the decision view (design §10.4, core/init-tradeoffs-trace.el) writes the alternative `type` + binding form, accepted by the same conductor (see the DV* defs, each with its own required binding so the published schema validates what it names).",
   "oneOf": [
     { "$ref": "#/$defs/Steer" },
+    { "$ref": "#/$defs/Correction" },
     { "$ref": "#/$defs/Note" },
     { "$ref": "#/$defs/Resolve" },
     { "$ref": "#/$defs/Override" },
@@ -20,6 +21,8 @@
     { "$ref": "#/$defs/DVRevise" },
     { "$ref": "#/$defs/DVAmend" },
     { "$ref": "#/$defs/DVNote" },
+    { "$ref": "#/$defs/DVSteer" },
+    { "$ref": "#/$defs/DVCorrection" },
     { "$ref": "#/$defs/DVUnneeded" },
     { "$ref": "#/$defs/DVMiss" }
   ],
@@ -116,6 +119,26 @@
         "binding": { "$ref": "#/$defs/NoteBinding" }
       }
     },
+    "DVSteer": {
+      "description": "Plan 2d (design §7.4): deliver the owner's text to the running worker attempt as a Pi RPC steer. Bound to the run and phase; the conductor binds the delivered record to the live attempt id.",
+      "type": "object",
+      "required": ["type", "binding", "text"],
+      "properties": {
+        "type": { "const": "steer" },
+        "text": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/NoteBinding" }
+      }
+    },
+    "DVCorrection": {
+      "description": "Plan 2d (design §7.5): the owner's correction while the phase is AWAITING_OWNER. Resolves the open owner requests, grants 3 repair rounds and repairs the phase with the text verbatim.",
+      "type": "object",
+      "required": ["type", "binding", "text"],
+      "properties": {
+        "type": { "const": "correction" },
+        "text": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/NoteBinding" }
+      }
+    },
     "DVUnneeded": {
       "description": "Decision view (design §10.4): record an owner request as \"did not need me\".",
       "type": "object",
@@ -161,6 +184,16 @@
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "note" },
+        "text": { "type": "string", "minLength": 1 },
+        "phaseId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Correction": {
+      "type": "object",
+      "required": ["kind", "text", "phaseId"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "correction" },
         "text": { "type": "string", "minLength": 1 },
         "phaseId": { "type": "string", "minLength": 1 }
       }

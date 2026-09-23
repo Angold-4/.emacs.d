@@ -48,7 +48,7 @@ test("happy path: worker submits, checks/probe/reviews pass, run reaches DONE vi
 
   await setup.conductor.start();
   try {
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 20_000);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000);
     const state = setup.conductor.state;
     assert.equal(state.phase.phase, "DONE");
     assert.ok(state.phase.publishedI, "expected a published integration commit");

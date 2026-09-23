@@ -71,6 +71,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "INTEGRITY_VIOLATED",
   "DECISION_ADDED",
   "NOTE_ADDED",
+  "OWNER_INPUT_RECORDED",
+  "OWNER_CORRECTION",
   "OWNER_REQUEST_MARKED_UNNEEDED",
   "MISS_RECORDED",
   "NOTES_DELIVERED",
@@ -342,6 +344,27 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, "a note must carry non-empty text");
       }
       return ok({ ...state, phase: { ...p, ownerNotes: [...(p.ownerNotes ?? []), event.text] } });
+    }
+
+    case "OWNER_INPUT_RECORDED": {
+      // Plan 2d (§7.4/§9.3): the recorded effect of one input the owner
+      // sent. Record-only (moves no phase state); keyed by the inbox
+      // command id so a later, more definitive record (e.g. a recovered
+      // steer's `delivered` after its `delivery-uncertain`) updates rather
+      // than duplicates. Newest wins — the conductor only ever writes this
+      // after observing the effect, so the later record is the truer one.
+      const input = event.input;
+      if (!input || typeof input.id !== "string" || input.id.length === 0) {
+        return rejected(state, "an owner-input record must name its inbox command id");
+      }
+      if (typeof input.text !== "string" || input.text.trim().length === 0) {
+        return rejected(state, "an owner-input record must carry the text the owner sent");
+      }
+      const existing = p.ownerInputs ?? [];
+      const ownerInputs = existing.some((i) => i.id === input.id)
+        ? existing.map((i) => (i.id === input.id ? { ...i, ...input } : i))
+        : [...existing, input];
+      return ok({ ...state, phase: { ...p, ownerInputs } });
     }
 
     case "OWNER_REQUEST_MARKED_UNNEEDED": {
