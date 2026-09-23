@@ -235,6 +235,16 @@ export class PiAgent {
       // Agent may already be unreachable (e.g. killed out from under us) —
       // proceed straight to signals.
     }
+    // Plan 2c: an RPC-mode Pi does not exit after `abort` — it waits for the
+    // next command — so without this every termination (each freeze, each
+    // finished reviewer) waited out the whole abort grace before SIGTERM
+    // (32 of 85 s in a live run). Closing stdin ends the RPC session and Pi
+    // exits cleanly; the grace below still bounds an agent that does not.
+    try {
+      this.#child.stdin.end();
+    } catch {
+      // already closed
+    }
 
     const exited = await raceExit(this.#exitPromise, this.#abortGraceMs);
     if (exited || this.#exited) return { signalsSent };
