@@ -46,6 +46,8 @@ import {
 import { PI_VERSION, ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer } from "../../src/core/types.ts";
 import { readLog, type LogRecord } from "../../src/effects/log.ts";
+import { disposableCheckout } from "../../src/effects/git.ts";
+import { verifySubtractFeature } from "./published-behavior.ts";
 
 const PROVIDER = "vercel-ai-gateway";
 const MODEL = "deepseek/deepseek-v4.1-flash";
@@ -299,6 +301,20 @@ function runLiveSingePhase(): void {
       const checksFailedEvt = eventTypes.includes("CHECKS_FAILED");
       const streamSummary = summarizeWorkerStream(runDir);
 
+      // R2.behavior: on a *fresh checkout of the published I*, actually
+      // exercise the feature (subtract on positive/negative/zero inputs, and
+      // that sum still works) instead of only searching the event log for
+      // CHECKS_PASSED. Runs before the fixtures below are deleted.
+      let behavior: { ok: boolean; detail: string } | undefined;
+      if (publishCompleted) {
+        const checkout = disposableCheckout(repo.dir, publishCompleted.newHead);
+        try {
+          behavior = verifySubtractFeature(checkout.dir);
+        } finally {
+          checkout.dispose();
+        }
+      }
+
       // No orphan process: every pgid this run ever reported must be dead
       // now that the conductor has stopped.
       const survivors = [...seenPgids].filter((pgid) => {
@@ -319,6 +335,7 @@ function runLiveSingePhase(): void {
         candidateSha: freezeCompleted?.candidateSha,
         publishedI: publishCompleted?.newHead,
         checks: { passed: checksPassedEvt, failed: checksFailedEvt },
+        publishedBehavior: behavior,
         workerToolCallCounts: streamSummary.toolCallCounts,
         lastWorkerUsage: streamSummary.lastUsage,
         durationMs: Date.now() - startedAt,
@@ -367,6 +384,10 @@ function runLiveSingePhase(): void {
       assert.equal(eventTypes.filter((t) => t === "REVIEW_SUBMITTED").length >= 3, true, "all three stub reviews should have been submitted");
       assert.ok(eventTypes.includes("ACCEPTED"), "the candidate should have been accepted");
       assert.ok(publishCompleted, "publish (compare-and-swap) should have completed");
+      assert.ok(
+        behavior?.ok,
+        `the published I must actually implement subtract and keep sum working (published-behavior verifier): ${behavior?.detail ?? "verifier did not run"}`,
+      );
       assert.equal(survivors.length, 0, `no leftover pi process should survive the run; still alive: ${survivors.join(",")}`);
     },
   );
