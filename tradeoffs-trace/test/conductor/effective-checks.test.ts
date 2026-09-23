@@ -140,6 +140,9 @@ test("R2.global-fails: a failing global check fails the gate, and the effective 
     phaseChecks: [duplicateCommand, phaseOnlyCommand],
     workerScript: submitOnlyWorker,
     reviewerScriptFor: reviewerFor(),
+    // (c) asserts the checks run on *both* gates (C and the probed I), so it
+    // must not take 2c's probe-reuse shortcut for an identical tree.
+    probeReuse: false,
     deadlines: FAST_DEADLINES,
   });
   await setup.conductor.start();
@@ -166,6 +169,9 @@ test("R2.probe: a phase check passing on C but failing on the merged I yields PR
     phaseChecks: [command],
     workerScript: submitOnlyWorker,
     reviewerScriptFor: reviewerFor(),
+    // The phase check must actually re-run on the probed I (and so fail
+    // there), so this test cannot take 2c's probe-reuse shortcut.
+    probeReuse: false,
     deadlines: FAST_DEADLINES,
   });
   await setup.conductor.start();
@@ -290,6 +296,10 @@ test("R2.nested-negative: a nested passing `node --test` check is CHECKS_PASSED 
           "",
         ].join("\n"),
       ),
+    // This check passes, so the run proceeds past CHECKS_PASSED into the
+    // review stage; give the reviewers a script so `stop()` can terminate
+    // them cleanly (the sibling failing test stops before reviews start).
+    reviewerScriptFor: reviewerFor(),
     deadlines: NESTED_DEADLINES,
   });
   await setup.conductor.start();
@@ -300,6 +310,9 @@ test("R2.nested-negative: a nested passing `node --test` check is CHECKS_PASSED 
     assert.match(log, /known passing test/, "the log must show the known test name");
     assert.match(log, /pass 1/, "the log must show the real pass count");
     assert.ok(!log.includes("recursively within a test file"), "the recursion-skip warning must not appear");
+    // In the merged stack the review loop runs after CHECKS_PASSED; let it
+    // finish so `stop()` does not race a reviewer dispatch mid-teardown.
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 30_000);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
