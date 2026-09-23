@@ -1,5 +1,6 @@
 #+TITLE: tradeoffs-trace 2b: apply owner commands from the inbox
 #+TT_CHECKS: make -C tradeoffs-trace check
+#+TT_BRANCH: feat/tradeoffs-trace-p4-dogfood
 
 * Phase 2b: owner commands
   :PROPERTIES:

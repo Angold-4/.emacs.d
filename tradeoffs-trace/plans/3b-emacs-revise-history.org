@@ -1,0 +1,19 @@
+#+TITLE: tradeoffs-trace 3b: revise buffer, history and continue-in-Pilish
+#+TT_CHECKS: make -C tradeoffs-trace check
+#+TT_BRANCH: feat/tradeoffs-trace-p4-dogfood
+
+* Phase 3b: Emacs revise and history
+  :PROPERTIES:
+  :ID:          p3b-emacs-revise
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  core/init-tradeoffs-trace.el init.el
+  :RESERVED:    the C-c m key prefix and existing Pilish bindings
+  :END:
+  Goal: in core/init-tradeoffs-trace.el, pressing r in the decision view opens a revise buffer that previews the consequence before anything is sent, and a finished run's agent history can be read and continued in Pilish without touching the run's evidence, as in docs/tradeoffs-trace.md §7.5, §9.4 and §10.
+  Acceptance:
+  - r opens a *tt-revise* buffer showing the record, a correction text area, a "this changes the contract" toggle and a "Submitting will" list (what pauses, rounds granted, reruns); C-c C-c writes the revise command with its binding tuple, C-c C-k cancels
+  - after submission the decision view lists the correction under Corrections with its lifecycle state (received, repairing, checking, reviewing, resolved) rendered from tt state
+  - the trace buffer rebuilds history from the agent's Pi session file plus stream/ when reopened after an Emacs restart; no Pilish command that resumes or mutates a run session is reachable from tradeoffs-trace buffers
+  - M-x +tt-continue-in-pilish on a finished run copies the chosen session file into Pi's session directory and opens the copy with Pilish; the run's original is unchanged
+  - RET on a decision or finding opens its evidence (diff hunk or file:line in the candidate checkout)
+  - new ERT tests in test/tradeoffs-trace-test.el cover the revise buffer command, history rebuild from a session fixture and continue-in-Pilish copying; make -C tradeoffs-trace ert passes

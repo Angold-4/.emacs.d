@@ -1,0 +1,21 @@
+#+TITLE: tradeoffs-trace 2c: steering and revise close the loop
+#+TT_CHECKS: make -C tradeoffs-trace check
+#+TT_BRANCH: feat/tradeoffs-trace-p4-dogfood
+
+* Phase 2c: steer and revise
+  :PROPERTIES:
+  :ID:          p2c-steer-revise
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  tradeoffs-trace/src/core/** tradeoffs-trace/schemas/**
+  :RESERVED:    the acceptance predicate in src/core/predicate.ts; the binding tuple fields
+  :END:
+  Goal: an owner can steer the running worker and revise a decision from the inbox, and a revised decision reaches resolved with no further owner action, as in docs/tradeoffs-trace.md §7.4, §7.5 and §9.3.
+  Acceptance:
+  - a steer command in the inbox is delivered to the running worker attempt through Pi RPC steer, bound to that attempt id; with no running worker it becomes an owner note for the next attempt
+  - steer delivery writes deliver.intent before sending and deliver.done on acknowledgement; after a crash between them the command is marked delivery uncertain and is never resent automatically
+  - a revise command cancels the in-flight attempt or review, records the correction linked to the decision, grants 3 new repair rounds even when the budget was exhausted, and starts a repair attempt whose prompt contains the correction verbatim
+  - the new candidate goes through checks, probe and all three reviews; each review states whether the correction is honored; ACCEPTED marks it resolved
+  - tests named correction-e2e, correction-after-budget and steer-uncertain exist under tradeoffs-trace/test/ and pass
+  - the TT_CRASH_AT boundaries for the inbox move and for steer acknowledgement, already named in src/effects/crash.ts, are exercised by the crash suite
+  - tt stop <run> ends a run's conductor cleanly (agents terminated, lock released) and records a stop event; the run can later be resumed with tt resume; observed need: stopping a run currently requires SIGTERM on the pid and takes about 40 s
+  - all existing tests still pass

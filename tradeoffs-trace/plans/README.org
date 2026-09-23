@@ -1,0 +1,27 @@
+#+TITLE: tradeoffs-trace dogfood plans
+
+These plans finish the implementation plan (docs/tradeoffs-trace-plan.md)
+by running tradeoffs-trace on itself. Each file is a single-phase plan
+(the v1 conductor runs one phase per run). Run them in order; every run
+publishes onto =feat/tradeoffs-trace-p4-dogfood=, so each one starts from
+the previous run's published result.
+
+| order | plan                          | what it adds                                          |
+|-------+-------------------------------+-------------------------------------------------------|
+|     1 | 2b-owner-commands.org         | the conductor applies inbox commands (decision keys)  |
+|     2 | 2c-steer-revise.org           | steer, revise closing the loop, tt stop               |
+|     3 | 3b-emacs-revise-history.org   | revise buffer with preview, history, continue-in-Pilish |
+|     4 | 4a-multiphase.org             | serial multi-phase runs, master reviewer continuity   |
+|     5 | 4b-correct-earlier-phase.org  | corrections to an already integrated phase            |
+
+* Running one
+1. Open the plan file in the PR-20 Emacs, =C-c m r=.
+2. Watch: =C-c m s= (trace | status | input); =C-c m d= once reviews start.
+3. When the status shows DONE, BLOCKED or "needs you", hand the run id to the
+   reviewing agent: "review tradeoffs-trace run <id>".
+
+* Between runs
+The runner is frozen while it builds itself. After a run is reviewed and
+accepted, upgrade the runner to the new dogfood head before the next run:
+: node ~/.tradeoffs-trace/runner/current/tradeoffs-trace/src/cli.ts runner install <sha>
+Never upgrade while a run is in flight.

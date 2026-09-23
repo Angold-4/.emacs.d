@@ -1,0 +1,19 @@
+#+TITLE: tradeoffs-trace 4a: serial multi-phase runs
+#+TT_CHECKS: make -C tradeoffs-trace check
+#+TT_BRANCH: feat/tradeoffs-trace-p4-dogfood
+
+* Phase 4a: multi-phase sequencing
+  :PROPERTIES:
+  :ID:          p4a-multiphase
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  tradeoffs-trace/src/core/** tradeoffs-trace/schemas/**
+  :RESERVED:    the acceptance predicate in src/core/predicate.ts; the binding tuple fields
+  :END:
+  Goal: one run executes every non-provisional phase of its plan serially, each phase starting from the previous phase's published head, with the master reviewer carrying the plan's intent across phases, as in docs/tradeoffs-trace-plan.md phase 4.
+  Acceptance:
+  - the conductor's state holds one phase state per plan phase; when a phase reaches DONE the next non-provisional phase becomes READY with its worktree based on the published head I of the previous phase
+  - a provisional phase becomes executable only when its contract validates (id, checks, goal, acceptance); otherwise the run stops with a visible reason
+  - the master reviewer M keeps one Pi session for the run and its prompt is rebuilt at each phase from the plan plus the control log (accepted decisions of earlier phases)
+  - tt status and tt state report every phase; the Emacs status buffer lists all phases (it may keep its current single-phase rendering if the state shape stays compatible, but must not break)
+  - tests named three-phase (three serial phases reach DONE, each from the previous published head) and master-continuity (M's phase-2 prompt contains a phase-1 accepted decision) pass with fake agents
+  - the crash suite and all existing tests still pass

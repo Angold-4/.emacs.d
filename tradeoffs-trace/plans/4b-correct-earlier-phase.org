@@ -1,0 +1,18 @@
+#+TITLE: tradeoffs-trace 4b: corrections to an already integrated phase
+#+TT_CHECKS: make -C tradeoffs-trace check
+#+TT_BRANCH: feat/tradeoffs-trace-p4-dogfood
+
+* Phase 4b: correct an earlier phase
+  :PROPERTIES:
+  :ID:          p4b-correct-earlier
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  tradeoffs-trace/src/core/** tradeoffs-trace/schemas/**
+  :RESERVED:    the acceptance predicate in src/core/predicate.ts; the binding tuple fields
+  :END:
+  Goal: a revise or amend of a DONE phase while no later phase has been integrated cancels the later phase, moves the integration branch back to the corrected phase's recorded head, reopens and republishes the corrected phase, and restarts the later phase from the new head; with a later phase integrated it is refused, as in docs/tradeoffs-trace.md §7.3 and §7.5.
+  Acceptance:
+  - correcting phase 1 while phase 2 is in flight cancels phase 2's attempt, moves the branch back to phase 1's recorded H with a compare-and-swap, reopens phase 1, republishes it, and restarts phase 2 from the new head
+  - with phase 2 already integrated the correction is refused with a visible reason and nothing changes (branch, events, phase states)
+  - tests named correct-earlier-phase and correct-after-later-integrated pass with fake agents
+  - the Emacs revise buffer (if present) says before submission when a correction would be refused and offers starting a new run instead
+  - the crash suite and all existing tests still pass
