@@ -1,0 +1,9 @@
+{
+  "phaseId": "p1",
+  "contractVersion": { "snapshot": 1, "sectionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "goal": "move cancellation logic out of orderbook.ts without behavior change.",
+  "acceptance": ["existing cancel tests pass unchanged"],
+  "checks": ["npm test -- cancel"],
+  "boundaries": ["src/api/**"],
+  "reserved": ["public API types"]
+}

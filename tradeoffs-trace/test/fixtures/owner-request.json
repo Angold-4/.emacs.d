@@ -1,0 +1,12 @@
+{
+  "id": "OR-p2-01",
+  "version": 1,
+  "phaseId": "p2",
+  "reason": "the repair budget ran out with an open contract finding",
+  "origin": "repair_budget_exhausted",
+  "options": [
+    { "id": "grant", "label": "grant 3 more repair rounds" },
+    { "id": "stop", "label": "stop the phase" }
+  ],
+  "status": "open"
+}

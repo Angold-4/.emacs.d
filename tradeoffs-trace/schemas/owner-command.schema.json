@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/owner-command",
+  "title": "Owner command",
+  "description": "design §7.4: every owner command kind, each bound to what it evaluated.",
+  "oneOf": [
+    { "$ref": "#/$defs/Steer" },
+    { "$ref": "#/$defs/Note" },
+    { "$ref": "#/$defs/Resolve" },
+    { "$ref": "#/$defs/Override" },
+    { "$ref": "#/$defs/AcceptFinding" },
+    { "$ref": "#/$defs/Revise" },
+    { "$ref": "#/$defs/Amend" },
+    { "$ref": "#/$defs/Unneeded" },
+    { "$ref": "#/$defs/PauseResumeMode" }
+  ],
+  "$defs": {
+    "ContractVersion": {
+      "type": "object",
+      "required": ["snapshot", "sectionSha256"],
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": { "type": "integer" },
+        "sectionSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "Steer": {
+      "type": "object",
+      "required": ["kind", "text", "boundAttemptId"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "steer" },
+        "text": { "type": "string", "minLength": 1 },
+        "boundAttemptId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Note": {
+      "type": "object",
+      "required": ["kind", "text", "phaseId"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "note" },
+        "text": { "type": "string", "minLength": 1 },
+        "phaseId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Resolve": {
+      "type": "object",
+      "required": ["kind", "requestId", "requestVersion", "option", "boundCandidateSha", "boundContractVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "resolve" },
+        "requestId": { "type": "string", "minLength": 1 },
+        "requestVersion": { "type": "integer" },
+        "option": { "type": "string", "minLength": 1 },
+        "boundCandidateSha": { "type": "string", "minLength": 1 },
+        "boundContractVersion": { "$ref": "#/$defs/ContractVersion" }
+      }
+    },
+    "Override": {
+      "type": "object",
+      "required": ["kind", "decisionId", "decisionVersion", "vote", "boundCandidateSha", "boundContractVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "override" },
+        "decisionId": { "type": "string", "minLength": 1 },
+        "decisionVersion": { "type": "integer" },
+        "vote": { "enum": ["approve", "reject"] },
+        "boundCandidateSha": { "type": "string", "minLength": 1 },
+        "boundContractVersion": { "$ref": "#/$defs/ContractVersion" }
+      }
+    },
+    "AcceptFinding": {
+      "type": "object",
+      "required": ["kind", "findingId", "findingVersion", "scope", "boundCandidateSha", "boundContractVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "accept-finding" },
+        "findingId": { "type": "string", "minLength": 1 },
+        "findingVersion": { "type": "integer" },
+        "scope": { "type": "string", "minLength": 1 },
+        "boundCandidateSha": { "type": "string", "minLength": 1 },
+        "boundContractVersion": { "$ref": "#/$defs/ContractVersion" }
+      }
+    },
+    "Revise": {
+      "type": "object",
+      "required": [
+        "kind", "targetRecordId", "targetRecordVersion", "correctionText",
+        "contractChange", "boundCandidateSha", "boundContractVersion"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "revise" },
+        "targetRecordId": { "type": "string", "minLength": 1 },
+        "targetRecordVersion": { "type": "integer" },
+        "correctionText": { "type": "string", "minLength": 1 },
+        "contractChange": { "type": "boolean" },
+        "boundCandidateSha": { "type": "string", "minLength": 1 },
+        "boundContractVersion": { "$ref": "#/$defs/ContractVersion" }
+      }
+    },
+    "Amend": {
+      "type": "object",
+      "required": ["kind", "phaseId", "replacingContractVersion", "newContractVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "amend" },
+        "phaseId": { "type": "string", "minLength": 1 },
+        "replacingContractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "newContractVersion": { "$ref": "#/$defs/ContractVersion" }
+      }
+    },
+    "Unneeded": {
+      "type": "object",
+      "required": ["kind", "requestId"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "unneeded" },
+        "requestId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "PauseResumeMode": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["pause", "resume", "mode"] },
+        "mode": { "enum": ["delegate", "co-work"] }
+      }
+    }
+  }
+}

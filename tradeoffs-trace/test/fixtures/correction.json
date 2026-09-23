@@ -1,0 +1,11 @@
+{
+  "id": "C-p2-01",
+  "version": 1,
+  "phaseId": "p2",
+  "targetRecordId": "D-p2-05",
+  "correctionText": "A lone cancellation must not wait for the next tick.",
+  "contractChange": false,
+  "status": "open",
+  "boundContractVersion": { "snapshot": 1, "sectionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "grantedRounds": 3
+}

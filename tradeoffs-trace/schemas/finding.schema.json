@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/finding",
+  "title": "Finding",
+  "description": "design §4.1, §4.2.",
+  "type": "object",
+  "required": ["id", "version", "phaseId", "kind", "severity", "evidence", "raisedBy", "status", "boundCandidateSha"],
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer" },
+    "phaseId": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["defect", "contract", "integration"] },
+    "severity": { "enum": ["blocking", "advisory"] },
+    "evidence": { "type": "string", "minLength": 1 },
+    "raisedBy": { "enum": ["M", "A", "B", "conductor"] },
+    "linkedDecisionId": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["open", "repaired", "disproved", "accepted"] },
+    "boundCandidateSha": { "type": "string", "minLength": 1 },
+    "reproduction": {
+      "type": "object",
+      "required": ["command", "result"],
+      "additionalProperties": false,
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "result": { "enum": ["reproduced", "inconclusive"] }
+      }
+    },
+    "repairedByCandidateSha": { "type": "string", "minLength": 1 },
+    "disprovedEvidence": { "type": "string", "minLength": 1 },
+    "acceptedScope": { "type": "string", "minLength": 1 }
+  }
+}

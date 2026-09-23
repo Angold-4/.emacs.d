@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/review",
+  "title": "Review",
+  "description": "design §6.3: per-reviewer, bound to (candidate, contract version), with per-correction honored/not_honored and per-finding confirm/withdraw statements.",
+  "type": "object",
+  "required": ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
+  "additionalProperties": true,
+  "properties": {
+    "reviewer": { "enum": ["M", "A", "B"] },
+    "phaseId": { "type": "string", "minLength": 1 },
+    "candidateSha": { "type": "string", "minLength": 1 },
+    "contractVersion": { "$ref": "#/$defs/ContractVersion" },
+    "correctionStatements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["correctionId", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "correctionId": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["honored", "not_honored"] }
+        }
+      }
+    },
+    "findingStatements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["findingId", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "findingId": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["confirm", "withdraw"] },
+          "evidence": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "ContractVersion": {
+      "type": "object",
+      "required": ["snapshot", "sectionSha256"],
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": { "type": "integer" },
+        "sectionSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

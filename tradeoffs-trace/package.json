@@ -1,0 +1,13 @@
+{
+  "name": "tradeoffs-trace",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A programmed review pipeline for Pi in Emacs (see docs/tradeoffs-trace.md).",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'"
+  }
+}

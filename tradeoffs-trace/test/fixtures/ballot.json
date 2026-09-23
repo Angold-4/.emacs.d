@@ -1,0 +1,10 @@
+{
+  "reviewer": "M",
+  "decisionId": "D-p2-05",
+  "vote": "approve",
+  "rationale": "stays within the phase's latency budget",
+  "evidence": ["src/cancel.ts:42"],
+  "boundCandidateSha": "7c1e0a4",
+  "boundContractVersion": { "snapshot": 1, "sectionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "boundRecordVersion": 2
+}

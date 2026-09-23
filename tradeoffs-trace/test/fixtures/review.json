@@ -1,0 +1,8 @@
+{
+  "reviewer": "M",
+  "phaseId": "p2",
+  "candidateSha": "7c1e0a4",
+  "contractVersion": { "snapshot": 1, "sectionSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "correctionStatements": [ { "correctionId": "C-p2-01", "status": "honored" } ],
+  "findingStatements": [ { "findingId": "F-p2-02", "status": "confirm" } ]
+}
