@@ -121,7 +121,10 @@ test("owner-requests: RESOLVING_INCOMPLETE with budget exhausted records one req
 
   const open = openRequests(result.state);
   const origins = open.map((r) => r.origin).sort();
-  assert.deepEqual(origins, ["failed_vote", "open_finding", "reserved_decision", "unaddressed_correction"]);
+  // owner-optional: the unvoted reserved decision failed its vote like any
+  // other decision; there is no reserved_decision request any more.
+  assert.deepEqual(origins, ["failed_vote", "failed_vote", "open_finding", "unaddressed_correction"]);
+  assert.ok(open.some((r) => r.linkedDecisionId === "D-reserved"));
 
   const failedVoteRequest = open.find((r) => r.origin === "failed_vote")!;
   assert.equal(failedVoteRequest.linkedDecisionId, "D-fail");

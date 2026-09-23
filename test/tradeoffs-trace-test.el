@@ -114,81 +114,149 @@
 (defconst +tt-test--state
   '((meta (title . "sum validation"))
     (state (run . "RUN_ACTIVE")
-           (phase (runId . "r1") (phaseId . "p1") (phase . "AWAITING_OWNER")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "IMPLEMENTING")
+                  (attempt (n . 2))
                   (candidate (sha . "7c1e0a4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
                   (contract (contractVersion (snapshot . 1) (sectionSha256 . "9e2c")))
-                  (decisions ((id . "D-p1-01") (version . 2) (class . "delegated") (source . "worker")
+                  (decisions ((id . "D-p1-7c1e0a4a-1") (version . 2) (class . "delegated") (source . "worker")
                               (choice . "Batch cancels per tick")
                               (whyItMatters . "fewer lock acquisitions under load")
-                              (alternatives ((option . "a lock per request") (consequence . "twice the contention")))
-                              (recommendation (choice . "batch") (reason . "inside the latency budget")))
-                             ((id . "D-p1-02") (version . 1) (class . "detail") (source . "worker")
-                              (choice . "helper renamed") (whyItMatters . "readability")
-                              (alternatives ((option . "keep") (consequence . "none")))
-                              (recommendation (choice . "rename") (reason . "clearer"))))
-                  (ballots ((decisionId . "D-p1-01") (reviewer . "A") (vote . "reject") (rationale . "a lone cancel waits a tick"))
-                           ((decisionId . "D-p1-01") (reviewer . "M") (vote . "approve") (rationale . "within budget")))
-                  (findings ((id . "F-p1-02") (version . 1) (kind . "contract") (status . "open") (raisedBy . "B")
-                             (severity . "blocking") (evidence . "no fill after cancel")))
-                  (ownerRequests ((id . "R-1") (version . 1) (status . "open") (origin . "open_finding")
-                                  (options ((id . "repair") (label . "repair (grant 3 rounds)")))))
-                  (corrections))))
+                              (alternatives ((option . "batch per tick") (consequence . "one lock per tick"))
+                                            ((option . "a lock per request") (consequence . "twice the contention")))
+                              (recommendation (choice . "batch per tick") (reason . "inside the latency budget")))
+                             ((id . "D-p1-7c1e0a4a-disc-A-2") (version . 1) (class . "delegated")
+                              (source . "reviewer-discovered") (alsoSeenBy "M")
+                              (choice . "Errors are thrown, not returned") (whyItMatters . "callers must catch")
+                              (alternatives ((option . "throw") (consequence . "loud")))
+                              (recommendation (choice . "throw") (reason . "fail fast")))
+                             ((id . "D-p1-old-1") (version . 3) (class . "delegated") (source . "worker")
+                              (supersededBy . "candidate 7c1e0a4: not carried forward")
+                              (choice . "an old choice") (whyItMatters . "x")
+                              (alternatives ((option . "a") (consequence . "b"))))
+                             ((id . "D-p1-7c1e0a4a-trigger-3") (version . 1) (class . "delegated") (source . "trigger")
+                              (choice . "Diff touches boundary path src/api") (whyItMatters . "boundary")
+                              (alternatives ((option . "a") (consequence . "b")))))
+                  (ballots ((decisionId . "D-p1-7c1e0a4a-1") (reviewer . "A") (vote . "reject") (rationale . "a lone cancel waits a tick"))
+                           ((decisionId . "D-p1-7c1e0a4a-1") (reviewer . "M") (vote . "approve") (rationale . "within budget")))
+                  (findings ((id . "F-p1-M-4") (version . 1) (kind . "defect") (status . "open") (raisedBy . "M")
+                             (alsoRaisedBy "B") (severity . "blocking")
+                             (evidence . "src/sum.js:12 accepts NaN. It returns NaN to callers.")))
+                  (ownerRequests)
+                  (corrections)))
+    (decisionStatuses (D-p1-7c1e0a4a-1 (status . "failed") (reason . "M veto"))
+                      (D-p1-7c1e0a4a-disc-A-2 (status . "passed") (flagged . t))
+                      (D-p1-old-1 (status . "superseded") (reason . "not carried forward"))
+                      (D-p1-7c1e0a4a-trigger-3 (status . "pending")))
+    (view (round . 2) (reviewLine . "M ✗ 1 blocking   A ✗ 1 reject   B ✓")
+          (verdict . "not accepted: D-1 vetoed by M; blocking finding F-M-4 open → repair attempt 2")
+          (addressing "D-1 vetoed by M" "blocking finding F-M-4 open")
+          (needsYou . 0)
+          (rounds ((round . 1) (candidateSha . "1234567aaaa") (outcome . "not accepted: checks failed")))))
   "A fixture `tt state' for the decision view.")
 
 (ert-deftest tradeoffs-trace-decision-render ()
-  "The decision view has the §10.1 sections and plain-language fields, details folded."
+  "Plan 3b: only current-round decisions, as self-contained blocks labelled by the tally."
   (with-temp-buffer
     (+tt--render-decisions +tt-test--state)
     (let ((text (buffer-string)))
-      (dolist (s '("Needs you (1)" "Open findings (1)" "Corrections (0)"
-                   "Accepted with dissent / pending vote (1)" "For sampling (1 detail)"))
-        (should (string-match-p (regexp-quote s) text)))
+      (should (string-match-p "Round 2 · candidate 7c1e0a4 · attempt 2 — addressing: D-1 vetoed by M; blocking finding F-M-4 open" text))
+      ;; the tally's result, not the ballots: M's veto rejects it although M approved nothing else
+      (should (string-match-p "\\* REJECTED (M veto)  Batch cancels per tick" text))
+      (should (string-match-p "\\* ACCEPTED ⚑ FLAGGED  Errors are thrown, not returned" text))
+      (should (string-match-p "raised by reviewer A (discovered); also seen by M" text))
       (should (string-match-p "Why it matters: fewer lock acquisitions under load" text))
-      (should (string-match-p "a lock per request — twice the contention" text))
-      (should (string-match-p "Recommendation: batch. inside the latency budget" text))
-      (should (string-match-p "A reject: a lone cancel waits a tick" text))
-      (should (string-match-p "\\*\\* Details" text)))))
+      (should (string-match-p "● batch per tick — one lock per tick" text))
+      (should (string-match-p "○ a lock per request — twice the contention" text))
+      (should (string-match-p "A reject — a lone cancel waits a tick" text))
+      ;; superseded records and boundary triggers are not listed as decisions
+      (should-not (string-match-p "an old choice" text))
+      (should-not (string-match-p "Diff touches boundary" text))
+      ;; findings grouped by location with also-raised-by; earlier rounds one line
+      (should (string-match-p "\\* src/sum.js" text))
+      (should (string-match-p "BLOCKING src/sum.js:12 accepts NaN — M; also raised by B" text))
+      (should (string-match-p "\\* Round 1 · 1234567 · not accepted: checks failed" text)))))
 
-(ert-deftest tradeoffs-trace-commands-bound ()
-  "Every decision-view command carries the full binding tuple (design §7.1)."
-  (let* ((run (make-temp-file "tt-ert-run" t)))
-    (unwind-protect
-        (with-temp-buffer
-          (+tt--render-decisions +tt-test--state)
-          (setq +tt--run-dir run +tt--decision-state +tt-test--state)
-          (goto-char (point-min))
-          (search-forward "DISSENT Batch cancels")
-          (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "reject")))
-            (+tt-decision-override))
-          (let* ((files (directory-files (expand-file-name "inbox" run) t "\\.json\\'"))
-                 (cmd (json-read-file (car files)))
-                 (binding (alist-get 'binding cmd)))
-            (should (= (length files) 1))
-            (should (equal (alist-get 'type cmd) "override"))
-            (should (equal (alist-get 'vote cmd) "reject"))
-            (should (equal (alist-get 'runId binding) "r1"))
-            (should (equal (alist-get 'phaseId binding) "p1"))
-            (should (string-prefix-p "7c1e0a4" (alist-get 'candidateSha binding)))
-            (should (equal (alist-get 'recordId binding) "D-p1-01"))
-            (should (equal (alist-get 'recordVersion binding) 2))
-            (should (alist-get 'contractVersion binding))))
-      (delete-directory run t))))
+(ert-deftest tradeoffs-trace-decision-view-read-only ()
+  "The decision view has no action keys: g, TAB and q only."
+  (should-not (fboundp '+tt-decision-override))
+  (should-not (fboundp '+tt-decision-resolve))
+  (dolist (key '("r" "o" "x" "s" "u" "w" "1" "2" "3"))
+    (should-not (keymap-lookup +tt-decisions-mode-map key)))
+  (should (eq (keymap-lookup +tt-decisions-mode-map "g") '+tt-decisions-refresh)))
 
-(ert-deftest tradeoffs-trace-stream-render ()
-  "The trace renders text deltas and folds tool calls to one line."
+(defun +tt-test--stream (lines)
+  "A temporary stream file holding LINES."
   (let ((f (make-temp-file "tt-ert-stream" nil ".jsonl")))
+    (with-temp-file f (insert (mapconcat #'identity lines "\n") "\n"))
+    f))
+
+(ert-deftest tradeoffs-trace-trace-lines ()
+  "Plan 3b: one line per tool call with time, verb, result and duration; file changes under it."
+  (let* ((root (make-temp-file "tt-ert-run" t))
+         (dir (expand-file-name "stream" root))
+         (f (progn (make-directory dir) (expand-file-name "worker-1.jsonl" dir))))
     (unwind-protect
         (progn
           (with-temp-file f
-            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:01.377Z\",\"event\":{\"type\":\"agent_start\"}}\n"
-                    "{\"agentId\":\"worker-1\",\"event\":{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"Moving removal \"}}}\n"
-                    "{\"agentId\":\"worker-1\",\"event\":{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"under the lock\"}}}\n"
-                    "{\"agentId\":\"worker-1\",\"event\":{\"type\":\"tool_execution_start\",\"toolName\":\"sh\",\"args\":{\"command\":\"npm test\"}}}\n"))
-          (let ((out (+tt--render-stream f)))
-            (should (string-match-p "\\[worker-1 · 06:52\\]" out))
-            (should (string-match-p "Moving removal under the lock" out))
-            (should (string-match-p "▸ tool: sh" out))))
-      (delete-file f))))
+            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:01.000Z\",\"event\":{\"type\":\"agent_start\"}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:02.000Z\",\"event\":{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"x\"}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Now I run the narrow test.\"}]}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:04.000Z\",\"event\":{\"type\":\"tool_execution_start\",\"toolCallId\":\"t1\",\"toolName\":\"sh\",\"args\":{\"command\":\"node --test test.js\"}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:08.500Z\",\"event\":{\"type\":\"tool_execution_end\",\"toolCallId\":\"t1\",\"isError\":true,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok 1\\nnot ok 2 - rejects NaN\\n\"}],\"details\":{\"exitCode\":1}}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:09.000Z\",\"event\":{\"type\":\"tool_execution_start\",\"toolCallId\":\"t2\",\"toolName\":\"edit\",\"args\":{\"path\":\"sum.js\"}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:09.200Z\",\"event\":{\"type\":\"tool_execution_end\",\"toolCallId\":\"t2\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:09.300Z\",\"event\":{\"type\":\"tt_file_changes\",\"toolCallId\":\"t2\",\"files\":[{\"path\":\"sum.js\",\"added\":12,\"removed\":3}]}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:10.000Z\",\"event\":{\"type\":\"tool_execution_start\",\"toolCallId\":\"t3\",\"toolName\":\"sh\",\"args\":{\"command\":\"sleep 20\"}}}\n"))
+          (with-temp-buffer
+            (+tt-trace-mode)
+            (setq +tt--run-dir root)
+            (+tt--render-trace)
+            (let ((text (buffer-string)))
+              (should (string-match-p "── worker-1 · " text))
+              (should (string-match-p "» Now I run the narrow test." text))
+              (should (string-match-p "\\$ node --test test.js ✗1 4s · not ok 2 - rejects NaN" text))
+              (should (string-match-p "edit sum.js ✓ 0s" text))
+              (should (string-match-p "sum.js \\+12 −3" text))
+              (should-not (string-match-p "\n\n" text)))
+            ;; the running call is in the header, marked as polling
+            (should (string-match-p "⧗ \\$ sleep 20  (polling)" header-line-format))
+            ;; incremental: a later append renders only the new part
+            (with-temp-file f
+              (insert-file-contents f)
+              (goto-char (point-max))
+              (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:30.000Z\",\"event\":{\"type\":\"tool_execution_end\",\"toolCallId\":\"t3\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}}\n"))
+            (+tt--render-trace)
+            (should (string-match-p "\\$ sleep 20  (polling) ✓ 20s" (buffer-string)))
+            (should (= 1 (how-many "edit sum.js" (point-min) (point-max))))))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-status-rows ()
+  "Plan 3b: the status shows the pipeline, the time line, outcomes and the verdict."
+  (with-temp-buffer
+    (+tt--render-status-from
+     `((meta (title . "sum validation"))
+       (conductorAlive . t)
+       (ownerInputs) (pendingOwnerInputs)
+       (state (run . "RUN_ACTIVE")
+              (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 1))
+                     (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
+       (view (elapsed . "1m02s") (round . 1)
+             (pipeline . "implement 30s → freeze 1s → checks 1s → probe 0s → review 12s… (14m48s left)")
+             (time . "reviewer-M: model 80% · polling 0% · full tests 0%")
+             (gates . "checks ✓ · probe ✓ (reused)")
+             (reviewLine . "M ✗ 2 reject · 1 blocking   A ✓   B ⧗")
+             (liveDecisions . 4) (failedDecisions . 0) (flaggedDecisions . 2) (openFindings . 1) (boundaryFilesChanged . 2)))
+     "/tmp/tt-ert/abcd1234")
+    (let ((text (buffer-string)))
+      (should (string-match-p "run abcd1234 · conductor running · 1m02s" text))
+      (should (string-match-p "pipeline  implement 30s → freeze 1s" text))
+      (should (string-match-p "time      reviewer-M: model 80%" text))
+      (should (string-match-p "reviews   M ✗ 2 reject · 1 blocking   A ✓   B ⧗" text))
+      (should (string-match-p "4 decisions · 2 flagged for you · 1 open findings" text))
+      (should (string-match-p "boundary files changed: 2 (reviewers classify)" text))
+      ;; empty sections are not shown
+      (should-not (string-match-p "Owner input" text))
+      (should-not (string-match-p "verdict" text)))))
 
 (defun +tt-test--input-state (phase &optional alive blocked requests)
   "A minimal `tt state' for the input-header tests."

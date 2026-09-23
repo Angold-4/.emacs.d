@@ -1,0 +1,26 @@
+worker-1-dispatch_worker-5-2054d024  14:57:38–14:57:58  elapsed 20s · tools 0s · model 20s (99%)
+  narrow tests     1 calls       0s    1%
+  reads/greps      4 calls       0s    0%
+  other            1 calls       0s    0%
+  file writes      2 calls       0s    0%
+         0s  sh: node --test --test-force-exit
+         0s  submit_phase: 
+         0s  read: test.js
+reviewer-A-dispatch_review_A-27-7b21a3b2  14:58:00–14:58:37  elapsed 36s · tools 0s · model 36s (100%)
+  other            2 calls       0s    0%
+  reads/greps      2 calls       0s    0%
+         0s  submit_review: 
+         0s  submit_discovery: 
+         0s  read: ~/.tradeoffs-trace/643ee336/candidates/e59e687bb021424865e65c6639152a7bc5
+reviewer-B-dispatch_review_B-29-181a6b61  14:58:00–14:58:41  elapsed 41s · tools 0s · model 41s (100%)
+  other            2 calls       0s    0%
+  reads/greps      2 calls       0s    0%
+         0s  submit_review: 
+         0s  submit_discovery: 
+         0s  read: ~/.tradeoffs-trace/643ee336/candidates/e59e687bb021424865e65c6639152a7bc5
+reviewer-M-dispatch_review_M-25-5028d60b  14:58:00–14:58:49  elapsed 48s · tools 0s · model 48s (99%)
+  other            2 calls       0s    1%
+  reads/greps      4 calls       0s    0%
+         0s  submit_review: 
+         0s  submit_discovery: 
+         0s  read: ~/.tradeoffs-trace/643ee336/candidates/e59e687bb021424865e65c6639152a7bc5

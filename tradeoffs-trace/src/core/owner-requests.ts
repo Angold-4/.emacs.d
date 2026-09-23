@@ -117,7 +117,7 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
     const voted = reviewsComplete(phase, C, K);
     for (const d of phase.decisions) {
       if (!voted) break;
-      if (!isLiveDecision(d) || d.class !== "delegated") continue;
+      if (!isLiveDecision(d) || (d.class !== "delegated" && d.class !== "reserved")) continue;
       if (decisionSettled(d, phase, C, K)) continue;
       if (hasOpenRequestLinkedTo(phase, (r) => r.linkedDecisionId === d.id)) continue;
       if (created.some((r) => r.linkedDecisionId === d.id)) continue;
@@ -155,25 +155,8 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
       });
     }
 
-    // one per unsettled reserved decision (no existing request for it)
-    for (const d of phase.decisions) {
-      if (!isLiveDecision(d) || d.class !== "reserved") continue;
-      if (decisionSettled(d, phase, C, K)) continue;
-      if (hasOpenRequestLinkedTo(phase, (r) => r.linkedDecisionId === d.id)) continue;
-      if (created.some((r) => r.linkedDecisionId === d.id)) continue;
-      created.push({
-        id: nextId("reserved"),
-        version: 1,
-        phaseId: phase.phaseId,
-        reason: `decision ${d.id} ("${d.choice}") is reserved and needs the owner`,
-        origin: "reserved_decision",
-        linkedDecisionId: d.id,
-        boundCandidateSha: C,
-        boundContractVersion: K,
-        options: RESERVED_DECISION_OPTIONS,
-        status: "open",
-      });
-    }
+    // Reserved decisions get no owner request of their own (owner-optional):
+    // they are voted like delegated ones above and only flagged for the owner.
   }
 
   if (created.length === 0) {

@@ -93,12 +93,15 @@ test("vote-table: a ballot bound to a superseded decision (record) version is di
   assert.equal(tally(decision, ballots, [], C, K), "fail");
 });
 
-test("vote-table: only `delegated` decisions with no open linked finding are votable", () => {
+test("vote-table: `delegated` and `reserved` decisions are voted; `detail` is not", () => {
   const detail = makeDecision({ class: "detail" });
   const reserved = makeDecision({ class: "reserved" });
   const ballots = [ballot("M", "approve"), ballot("A", "approve"), ballot("B", "approve")];
   assert.equal(tally(detail, ballots, [], C, K), "not_votable");
-  assert.equal(tally(reserved, ballots, [], C, K), "not_votable");
+  // owner-optional: a reserved decision is voted like any other (and only
+  // flagged for the owner), so the reviewers can settle it.
+  assert.equal(tally(reserved, ballots, [], C, K), "pass");
+  assert.equal(tally(reserved, [ballot("M", "reject"), ballot("A", "approve"), ballot("B", "approve")], [], C, K), "fail");
 });
 
 test("vote-table: a decision with an open linked contract finding is suspended", () => {

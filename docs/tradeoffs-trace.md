@@ -99,8 +99,9 @@ be tagged `:provisional:` and are revised as implementation teaches us things.
   recovery may rerun an interrupted check (§9.3).
 - `BOUNDARIES` are path globs whose modification automatically creates a
   decision record (§3.3).
-- `RESERVED` names choices that must always reach the owner, in addition to the
-  standing reserved classes in §3.4.
+- `RESERVED` names choices the owner wants flagged, in addition to the
+  standing reserved classes in §3.4. They are voted like any other decision;
+  the owner is never waited for (owner-optional).
 - The goal and acceptance list are given to the worker and to every reviewer
   word for word.
 
@@ -336,9 +337,13 @@ and **only the owner may lower it**:
 | --- | --- | --- |
 | `detail` | local helper structure, naming | recorded, not voted; **sampled** (§3.5) |
 | `delegated` | a trade-off inside the contract's stated intent | voted by reviewers (§5) |
-| `reserved` | changes a requirement, public interface, guarantee in the acceptance list, persistence format, dependency, or anything in `RESERVED` | owner request, in every mode |
+| `reserved` | changes a requirement, public interface, guarantee in the acceptance list, persistence format, dependency, or anything in `RESERVED` | voted by reviewers like `delegated` (§5), and **flagged** for the owner in the status and decision view |
 
-No vote can pass a reserved decision.
+A reserved decision never waits for the owner: a long-running run must not
+stall on someone who is not watching. The owner reviews flagged decisions if
+they care, and overrides one through the input box (§7.4). (Before
+owner-optional, a reserved decision was settled only by an owner request, and
+a run whose reviewers approved everything still stopped for the owner.)
 
 ### 3.5 Sampling what the classifier might hide
 

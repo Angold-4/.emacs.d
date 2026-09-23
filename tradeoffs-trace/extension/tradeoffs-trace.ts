@@ -126,7 +126,7 @@ const ContractVersionParam = Type.Object({
 });
 
 const BallotParam = Type.Object({
-  decisionId: Type.String({ description: "The delegated decision this ballot votes on" }),
+  decisionId: Type.String({ description: "The delegated or reserved decision this ballot votes on" }),
   vote: StringEnum(["approve", "reject"] as const),
   rationale: Type.String({ description: "Why you voted this way" }),
   evidence: Type.Array(Type.String(), { minItems: 1, description: "At least one citation" }),

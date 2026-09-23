@@ -144,22 +144,21 @@ export function isLiveDecision(decision: Decision): boolean {
 export function decisionSettled(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): boolean {
   if (decision.class === "detail") return true;
 
-  if (decision.class === "delegated") {
-    if (tally(decision, phase.ballots, phase.findings, C, K) === "pass") return true;
-    const overridden = phase.overrides.some(
-      (o) =>
-        o.decisionId === decision.id &&
-        o.vote === "approve" &&
-        o.boundCandidateSha === C &&
-        sameVersion(o.boundContractVersion, K) &&
-        o.boundRecordVersion === decision.version,
-    );
-    if (overridden) return true;
-    return settledByOwnerRequest(phase, "failed_vote", decision.id, "accept_as_implemented", C, K);
-  }
-
-  // reserved: settled only by the "approve" option of a resolved
-  // reserved_decision request bound to (C, K).
+  // delegated and reserved alike: the reviewers' vote, an owner override,
+  // or the owner accepting it after a failed vote. A reserved decision is
+  // flagged for the owner (DecisionStatus.flagged), never held for them.
+  if (tally(decision, phase.ballots, phase.findings, C, K) === "pass") return true;
+  const overridden = phase.overrides.some(
+    (o) =>
+      o.decisionId === decision.id &&
+      o.vote === "approve" &&
+      o.boundCandidateSha === C &&
+      sameVersion(o.boundContractVersion, K) &&
+      o.boundRecordVersion === decision.version,
+  );
+  if (overridden) return true;
+  if (settledByOwnerRequest(phase, "failed_vote", decision.id, "accept_as_implemented", C, K)) return true;
+  // A reserved_decision request resolved before owner-optional (older runs).
   return settledByOwnerRequest(phase, "reserved_decision", decision.id, "approve", C, K);
 }
 
@@ -226,6 +225,8 @@ export function done(phase: PhaseState): boolean {
 export interface DecisionStatus {
   status: "superseded" | "detail" | "passed" | "failed" | "suspended" | "pending" | "owner";
   reason?: string;
+  /** A reserved decision: voted like any other, shown to the owner. */
+  flagged?: boolean;
 }
 
 export function decisionStatus(decision: Decision, phase: PhaseState): DecisionStatus {
@@ -235,11 +236,11 @@ export function decisionStatus(decision: Decision, phase: PhaseState): DecisionS
   const C = phase.candidate?.sha;
   const K = phase.contract.contractVersion;
   if (!C || decision.boundCandidateSha !== C) return { status: "pending", reason: "not bound to the current candidate" };
-  if (decision.class === "reserved") {
-    return decisionSettled(decision, phase, C, K)
-      ? { status: "passed", reason: "approved by the owner" }
-      : { status: "owner", reason: "reserved: needs the owner" };
-  }
+  const flag = decision.class === "reserved" ? { flagged: true } : {};
+  return { ...votedStatus(decision, phase, C, K), ...flag };
+}
+
+function votedStatus(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): DecisionStatus {
   if (decisionSettled(decision, phase, C, K)) {
     const t = tally(decision, phase.ballots, phase.findings, C, K);
     return { status: "passed", reason: t === "pass" ? "vote passed" : "settled by the owner" };
