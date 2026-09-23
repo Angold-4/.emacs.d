@@ -133,7 +133,7 @@ export interface Finding {
   linkedDecisionId?: string;
   status: FindingStatus;
   boundCandidateSha: string; // the candidate the finding was raised against
-  reproduction?: { command: string; result: "reproduced" | "inconclusive" };
+  reproduction?: { command: string; result: "reproduced" | "not_reproduced" | "inconclusive" };
   repairedByCandidateSha?: string;
   disprovedEvidence?: string;
   acceptedScope?: string; // required scope note (§4.2, §10.4 `x`)
@@ -239,6 +239,29 @@ export interface Override {
 export type HonoredStatus = "honored" | "not_honored";
 export type FindingStatement = "confirm" | "withdraw";
 
+/** Work packet 2a addition (pure, additive): the second turn of a real
+ * two-turn review (design §6.1's REVIEWING/§5) adds a ballot per votable
+ * decision and any newly raised findings to the same submit_review call.
+ * Both are plain-language disclosures the conductor assembles into bound
+ * `Ballot`/`Finding` records (id/version/boundCandidateSha/... assigned by
+ * the conductor, exactly like a worker's decision disclosure) — a reviewer
+ * never supplies those binding fields itself. */
+export interface BallotDisclosure {
+  decisionId: string;
+  vote: Vote;
+  rationale: string;
+  evidence: string[];
+  contractObjection?: boolean;
+}
+
+export interface FindingDisclosure {
+  kind: FindingKind;
+  severity: FindingSeverity;
+  evidence: string;
+  linkedDecisionId?: string;
+  reproduction?: { command: string };
+}
+
 export interface Review {
   reviewer: Reviewer;
   phaseId: string;
@@ -246,6 +269,12 @@ export interface Review {
   contractVersion: ContractVersion;
   correctionStatements: { correctionId: string; status: HonoredStatus }[];
   findingStatements: { findingId: string; status: FindingStatement; evidence?: string }[];
+  /** Work packet 2a addition: present on a real reviewer's turn-2
+   * submission; absent (or empty) for phase 1's stub reviews, which cast
+   * ballots outside the Review record entirely (see conductor.ts's
+   * `#castStubBallots`, kept for `stubReviews: true` runs). */
+  ballots?: BallotDisclosure[];
+  findings?: FindingDisclosure[];
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +683,23 @@ export interface EvIntegrityViolated {
   evidence?: string;
 }
 
+/** Work packet 2a addition (pure, additive — a record-only event, like
+ * BALLOT_CAST/FINDING_RAISED: no phase-state-name change, no new
+ * transitions.ts row). Design §3.3's other two decision sources besides a
+ * worker's disclosure: a reviewer-discovered decision (source
+ * `reviewer-discovered`, from `submit_discovery`'s second decision source)
+ * or a conductor-computed boundary trigger (source `trigger`, design §3.3's
+ * "boundary triggers ... a trigger record a reviewer must classify"). The
+ * conductor assembles+binds `decision` (id/version/boundCandidateSha/
+ * boundContractVersion) exactly as it does for a worker's disclosure at
+ * freeze time — see `Conductor#assembleDiscoveredDecision`/
+ * `#computeBoundaryTriggers` — and validates it against
+ * schemas/decision.schema.json before emitting this. */
+export interface EvDecisionAdded {
+  type: "DECISION_ADDED";
+  decision: Decision;
+}
+
 export type Event =
   | EvAttemptStarted
   | EvSubmitPhase
@@ -694,7 +740,8 @@ export type Event =
   | EvRunBudgetExceeded
   | EvRunResumed
   | EvLaunchFailed
-  | EvIntegrityViolated;
+  | EvIntegrityViolated
+  | EvDecisionAdded;
 
 export type EventType = Event["type"];
 

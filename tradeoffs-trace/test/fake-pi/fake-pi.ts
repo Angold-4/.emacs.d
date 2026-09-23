@@ -20,14 +20,18 @@
 //       { "kind": "sleep", "ms": 10 },
 //       { "kind": "hang-until-abort" },
 //       { "kind": "hang-forever" },
-//       { "kind": "crash", "code": 7 }
+//       { "kind": "crash", "code": 7 },
+//       { "kind": "wait-for-prompt" }
 //     ]
 //   }
 //
 // `hello` is sent once at startup (mirroring `session_start`), if
 // `TT_SOCKET` is set. Steps run once, in order, after the first `prompt`
 // command is received; unless a step hangs or crashes, the run finishes
-// with an automatic `agent_end` + `agent_settled`.
+// with an automatic `agent_end` + `agent_settled`. Work packet 2a's real
+// two-turn review sends a SECOND `prompt` (turn 2) to the same process —
+// `wait-for-prompt` pauses the step list until that second (or any later)
+// `prompt` arrives, so one script can cover both turns.
 
 import { createConnection, type Socket } from "node:net";
 import { readFileSync, statSync } from "node:fs";
@@ -50,7 +54,13 @@ type Step =
   | { kind: "sleep"; ms: number }
   | { kind: "hang-until-abort" }
   | { kind: "hang-forever" }
-  | { kind: "crash"; code: number };
+  | { kind: "crash"; code: number }
+  // Work packet 2a: a real two-turn review is one `steps` array spanning
+  // two `prompt` RPC commands (the conductor's own turn-1/turn-2 prompts) —
+  // this step pauses `runSteps` until the SECOND (and any later) `prompt`
+  // arrives, so a script can run turn-1 steps, wait, then run turn-2 steps,
+  // all as one continuous script (see `RunSocket`'s own doc comment).
+  | { kind: "wait-for-prompt" };
 
 interface Script {
   hello?: HelloSpec;
@@ -193,6 +203,7 @@ async function main(): Promise<void> {
 
   let abortRequested = false;
   let resolveAbortWait: (() => void) | undefined;
+  let resolveNextPromptWait: (() => void) | undefined;
   const rpcDecoder = new JSONLDecoder();
   let ranOnce = false;
 
@@ -252,6 +263,16 @@ async function main(): Promise<void> {
           return;
         case "crash":
           process.exit(step.code);
+        case "wait-for-prompt":
+          // Like real Pi, the current turn settles before the next prompt
+          // starts a new one (the conductor waits for this settle).
+          writeStdout({ type: "agent_end", messages: [], willRetry: false });
+          writeStdout({ type: "agent_settled" });
+          await new Promise<void>((resolve) => {
+            resolveNextPromptWait = resolve;
+          });
+          writeStdout({ type: "agent_start" });
+          break;
       }
     }
     writeStdout({ type: "agent_end", messages: [], willRetry: false });
@@ -267,9 +288,15 @@ async function main(): Promise<void> {
         case "steer":
         case "follow_up":
           writeStdout({ type: "response", id, command: cmd.type, success: true });
-          if (cmd.type === "prompt" && !ranOnce) {
-            ranOnce = true;
-            void runSteps();
+          if (cmd.type === "prompt") {
+            if (!ranOnce) {
+              ranOnce = true;
+              void runSteps();
+            } else if (resolveNextPromptWait) {
+              const resolve = resolveNextPromptWait;
+              resolveNextPromptWait = undefined;
+              resolve();
+            }
           }
           break;
         case "abort":

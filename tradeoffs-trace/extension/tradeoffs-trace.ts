@@ -123,6 +123,26 @@ const ContractVersionParam = Type.Object({
   sectionSha256: Type.String(),
 });
 
+const BallotParam = Type.Object({
+  decisionId: Type.String({ description: "The delegated decision this ballot votes on" }),
+  vote: StringEnum(["approve", "reject"] as const),
+  rationale: Type.String({ description: "Why you voted this way" }),
+  evidence: Type.Array(Type.String(), { minItems: 1, description: "At least one citation" }),
+  contractObjection: Type.Optional(
+    Type.Boolean({ description: "Opens a linked contract finding and suspends this vote" }),
+  ),
+});
+
+const FindingParam = Type.Object({
+  kind: StringEnum(["defect", "contract", "integration"] as const),
+  severity: StringEnum(["blocking", "advisory"] as const),
+  evidence: Type.String({ description: "file:line, scenario, check result or plan clause — required, non-empty" }),
+  linkedDecisionId: Type.Optional(Type.String()),
+  reproduction: Type.Optional(
+    Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
+  ),
+});
+
 const submitPhaseFields: Record<string, TSchema> = {
   decisions: Type.Array(DecisionParam),
   assumptions: Type.Array(Type.String(), { description: "Assumptions made while implementing" }),
@@ -144,6 +164,8 @@ const submitReviewFields: Record<string, TSchema> = {
   contractVersion: ContractVersionParam,
   correctionStatements: Type.Array(CorrectionStatementParam),
   findingStatements: Type.Array(FindingStatementParam),
+  ballots: Type.Optional(Type.Array(BallotParam, { description: "One per votable decision (design §5), turn 2 of a real review" })),
+  findings: Type.Optional(Type.Array(FindingParam, { description: "Newly raised findings, turn 2 of a real review" })),
 };
 const SubmitReviewParams = Type.Object(
   Object.fromEntries(SUBMIT_REVIEW_PARAMS.properties.map((key) => [key, submitReviewFields[key]])),
@@ -271,9 +293,32 @@ export default function (pi: ExtensionAPI) {
   const client = new RunSocketClient();
   const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
-  let submitPhaseAccepted = false;
-  let settleContinuationsUsed = 0;
+  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | undefined) ?? "worker";
+  const accepted = new Set<string>();
+  // A reviewer's turn 2 starts with the first agent_start after its
+  // discovery (turn 1) was accepted; before that, turn 1 is still running.
+  let reviewTurnStarted = false;
+  const remindersUsed = new Map<string, number>();
   const MAX_SETTLE_CONTINUATIONS = 2;
+
+  /** The submission the current turn still owes, or undefined when the turn
+   * is satisfied. Worker: submit_phase. Reviewer: submit_discovery in turn
+   * 1, then submit_review in turn 2 (design §3.3 two-turn review). */
+  function owedSubmission(): string | undefined {
+    if (role === "worker") return accepted.has("submit_phase") ? undefined : "submit_phase";
+    if (!accepted.has("submit_discovery")) return "submit_discovery";
+    if (reviewTurnStarted && !accepted.has("submit_review")) return "submit_review";
+    return undefined;
+  }
+
+  const REMINDER_TEXT: Record<string, string> = {
+    submit_phase:
+      "You have not called submit_phase yet. The phase cannot finish without it — call submit_phase with your decisions, assumptions and deviations before finishing.",
+    submit_discovery:
+      "You have not called submit_discovery yet. List the behavioural choices you see in the diff and call submit_discovery before finishing. Do not call any other submission tool in this turn.",
+    submit_review:
+      "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every decision listed in the prompt, your findings, and your statements. submit_review is the only submission tool you may use now.",
+  };
 
   pi.on("session_start", async () => {
     activeTools = pi.getActiveTools();
@@ -284,7 +329,7 @@ export default function (pi: ExtensionAPI) {
       const hello: HelloMessage = {
         type: "hello",
         agentId: readEnv("TT_AGENT_ID") ?? "unknown",
-        role: (readEnv("TT_ROLE") as "worker" | "reviewer" | undefined) ?? "worker",
+        role,
         tools: activeTools,
         piVersion: readEnv("TT_PI_VERSION"),
       };
@@ -322,9 +367,15 @@ export default function (pi: ExtensionAPI) {
   // two continuations, after which the extension reports `no_submission`
   // (a pure protocol addition — see NoSubmissionMessage) so the conductor
   // does not have to wait out the full attempt deadline.
+  pi.on("agent_start", async () => {
+    if (role === "reviewer" && accepted.has("submit_discovery")) reviewTurnStarted = true;
+  });
+
   pi.on("agent_before_settle", async (event) => {
-    if (submitPhaseAccepted) return undefined;
-    if (settleContinuationsUsed >= MAX_SETTLE_CONTINUATIONS) {
+    const owed = owedSubmission();
+    if (!owed) return undefined;
+    const used = remindersUsed.get(owed) ?? 0;
+    if (used >= MAX_SETTLE_CONTINUATIONS) {
       if (client.connected) {
         const msg: NoSubmissionMessage = { type: "no_submission", agentId: readEnv("TT_AGENT_ID") ?? "unknown" };
         try {
@@ -336,15 +387,14 @@ export default function (pi: ExtensionAPI) {
       }
       return undefined;
     }
-    settleContinuationsUsed += 1;
+    remindersUsed.set(owed, used + 1);
     return {
       entries: [
         ...event.entries,
         {
           type: "custom_message" as const,
           customType: "tt-submit-reminder",
-          content:
-            "You have not called submit_phase yet. The phase cannot finish without it — call submit_phase with your decisions, assumptions and deviations before finishing.",
+          content: REMINDER_TEXT[owed],
           display: false,
         },
       ],
@@ -380,7 +430,7 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: reply.reason ?? "submission rejected" }],
         };
       }
-      if (tool === "submit_phase") submitPhaseAccepted = true;
+      accepted.add(tool);
       return { content: [{ type: "text" as const, text: "submission accepted" }] };
     } catch (err) {
       return {

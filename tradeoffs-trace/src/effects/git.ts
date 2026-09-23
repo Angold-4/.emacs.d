@@ -441,3 +441,46 @@ export function publishCAS(repo: string, branch: string, I: string, H: string): 
   const actualHead = git(["-C", repo, "rev-parse", ref]);
   return { ok: false, actualHead };
 }
+
+// ---------------------------------------------------------------------------
+// Diff introspection (work packet 2a: boundary triggers, §3.5 sampling)
+// ---------------------------------------------------------------------------
+
+/** Every path touched between `base` and `candidateSha` (design §3.3's
+ * boundary-trigger inputs and §3.5's unreferenced-hunk sampling both start
+ * from the same diff). Both shas must already be reachable in `repo`'s own
+ * object database (true for a freeze commit made on a worktree of `repo`). */
+export function diffNameOnly(repo: string, base: string, candidateSha: string): string[] {
+  const out = git(["-C", repo, "diff", "--name-only", `${base}..${candidateSha}`]);
+  return out.length === 0 ? [] : out.split("\n").filter((l) => l.length > 0);
+}
+
+/** The raw unified diff between `base` and `candidateSha`, for showing a
+ * reviewer at turn 1 (design §3.3). */
+export function diffText(repo: string, base: string, candidateSha: string): string {
+  return git(["-C", repo, "diff", `${base}..${candidateSha}`]);
+}
+
+export interface DiffHunk {
+  file: string;
+  header: string; // the "@@ -a,b +c,d @@" line, verbatim
+}
+
+/** Parses `git diff -U0`'s own hunk headers into one entry per hunk, per
+ * file (design §3.5: "diff hunks no decision/finding cites"). Deliberately
+ * coarse — it does not track individual line numbers beyond the header
+ * text itself, which is enough to name a hunk in the sample for a human or
+ * phase 3's renderer to look at. */
+export function diffHunks(repo: string, base: string, candidateSha: string): DiffHunk[] {
+  const out = git(["-C", repo, "diff", "-U0", `${base}..${candidateSha}`]);
+  const hunks: DiffHunk[] = [];
+  let file = "";
+  for (const line of out.split("\n")) {
+    if (line.startsWith("+++ b/")) {
+      file = line.slice("+++ b/".length);
+    } else if (line.startsWith("@@ ")) {
+      hunks.push({ file, header: line });
+    }
+  }
+  return hunks;
+}

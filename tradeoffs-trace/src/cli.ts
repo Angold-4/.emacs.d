@@ -7,8 +7,8 @@
 // `<run>/conductor.log`, so the parent (this CLI invocation) returns the
 // run id immediately rather than blocking for the whole run.
 
-import { spawn } from "node:child_process";
-import { readFileSync, existsSync, openSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -52,7 +52,12 @@ const RUN_CONDUCTOR_FLAG = "__run-conductor";
 async function cmdStart(planPath: string, root: string): Promise<void> {
   const plan = JSON.parse(readFileSync(planPath, "utf8")) as RunPlanFile;
   if (!plan.repo) usage();
-  const runDir = createRun(root, plan);
+  launchDetached(createRun(root, plan));
+}
+
+/** Relaunch the conductor for an existing run (after a crash or reboot);
+ * the conductor rebuilds state from the log and reconciles pending intents. */
+function launchDetached(runDir: string): void {
   const p = runPaths(runDir);
   const thisScript = fileURLToPath(import.meta.url);
   const out = openSync(p.log, "a");
@@ -126,6 +131,19 @@ function testDeadlines(): Partial<Deadlines> | undefined {
   return undefined;
 }
 
+/** Work packet 2a: same `TT_TEST_MODE=1` gate as `testPiInjection`/
+ * `testDeadlines` — `tt start`'s pre-existing exit-gate tests
+ * (`tt-start-happy-path`, the crash suite) predate the real two-turn
+ * review protocol and script a stub reviewer with no `submit_discovery`
+ * call at all; `TT_TEST_STUB_REVIEWS=1` opts a detached `__run-conductor`
+ * process into `Conductor`'s own `stubReviews: true`, the same way a
+ * directly-constructed test `Conductor` does. Never on by default — a real
+ * `tt start` run gets real reviewers unless a test explicitly asks for the
+ * stub path. */
+function testStubReviews(): boolean {
+  return process.env.TT_TEST_MODE === "1" && process.env.TT_TEST_STUB_REVIEWS === "1";
+}
+
 /** The detached conductor's own entry point: `tt __run-conductor <runDir>`,
  * spawned by `cmdStart` above with stdio redirected to `<run>/conductor.log`.
  * Not a user-facing subcommand — kept in this file (rather than a separate
@@ -135,7 +153,9 @@ async function runConductorProcess(runDir: string): Promise<void> {
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const { piCommand, piArgsPrefix } = testPiInjection();
   const deadlines = testDeadlines();
-  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, deadlines });
+  const stubReviews = testStubReviews();
+  writeFileSync(path.join(runDir, "conductor.pid"), String(process.pid));
+  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, deadlines, stubReviews });
   process.on("SIGTERM", () => void conductor.stop().then(() => process.exit(0)));
   process.on("SIGINT", () => void conductor.stop().then(() => process.exit(0)));
   await conductor.start();
@@ -197,6 +217,46 @@ async function main(): Promise<void> {
   } else if (cmd === "status") {
     if (positional.length !== 1) usage();
     await cmdStatus(positional[0], runRoot);
+  } else if (cmd === "resume") {
+    if (positional.length !== 1) usage();
+    launchDetached(resolveRunDir(positional[0], runRoot));
+  } else if (cmd === "state") {
+    // Machine-readable run state for the Emacs front end: meta, plan and
+    // the state rebuilt by folding the control log (never a stored snapshot).
+    if (positional.length !== 1) usage();
+    const runDir = resolveRunDir(positional[0], runRoot);
+    const p = runPaths(runDir);
+    const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
+    const meta = JSON.parse(readFileSync(p.meta, "utf8"));
+    const state = rebuildState(runDir, plan);
+    let alive = false;
+    try {
+      const pid = Number(readFileSync(path.join(runDir, "conductor.pid"), "utf8"));
+      if (pid > 0) {
+        process.kill(pid, 0);
+        alive = true;
+      }
+    } catch {
+      alive = false;
+    }
+    process.stdout.write(`${JSON.stringify({ runDir, meta, plan, state, conductorAlive: alive })}\n`);
+  } else if (cmd === "runner" && positional[0] === "install") {
+    // `tt runner install <sha>`: freeze an accepted revision outside every
+    // worktree at <root>/runner/<sha>/, so a run that edits tradeoffs-trace
+    // never executes the code under review.
+    const sha = positional[1];
+    if (!sha) usage();
+    const pkgRoot = fileURLToPath(new URL("..", import.meta.url));
+    const repo = execFileSync("git", ["-C", pkgRoot, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+    const full = execFileSync("git", ["-C", repo, "rev-parse", "--verify", `${sha}^{commit}`], { encoding: "utf8" }).trim();
+    const dest = path.join(runRoot, "runner", full);
+    mkdirSync(dest, { recursive: true });
+    execFileSync("/bin/sh", ["-c", `git -C "$1" archive "$2" tradeoffs-trace | tar -x -C "$3"`, "sh", repo, full, dest]);
+    writeFileSync(path.join(dest, "tradeoffs-trace", "RUNNER_SHA"), `${full}\n`);
+    const current = path.join(runRoot, "runner", "current");
+    rmSync(current, { force: true });
+    symlinkSync(full, current);
+    process.stdout.write(`${path.join(dest, "tradeoffs-trace")}\n`);
   } else {
     usage();
   }

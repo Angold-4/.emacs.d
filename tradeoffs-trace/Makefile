@@ -27,8 +27,11 @@ crash:
 
 # Live smoke tests against the real installed Pi and a real model (opt-in:
 # TT_LIVE=1 is required, or each live test skips itself with a printed
-# reason). Writes one record per role to test/live/records/phase-0/, and a
-# record + relativized events.jsonl to test/live/records/phase-1/. See
-# README's "Live tests" section.
+# reason). Writes one record per role to test/live/records/phase-0/, a
+# record + relativized events.jsonl to test/live/records/phase-1/, and
+# (work packet 2a) the same to test/live/records/phase-2/ for the real
+# two-turn review protocol (real M/A/B, not stub reviewers) — its own
+# 20-minute bound makes this target noticeably slower than before this
+# packet. See README's "Live tests" section.
 live:
-	cd $(CURDIR) && TT_LIVE=1 node --test test/live/live-submission.test.ts test/live/live-single-phase.test.ts
+	cd $(CURDIR) && TT_LIVE=1 node --test --test-timeout=1260000 test/live/live-submission.test.ts test/live/live-single-phase.test.ts test/live/live-review.test.ts

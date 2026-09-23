@@ -99,6 +99,7 @@ test("tt-start-happy-path: `tt start` returns a run id immediately, the detached
     TT_TEST_MODE: "1",
     TT_TEST_PI_COMMAND: process.execPath,
     TT_TEST_PI_ARGS_PREFIX: JSON.stringify([FAKE_PI_PATH]),
+    TT_TEST_STUB_REVIEWS: "1",
     FAKE_PI_SCRIPT: scriptsDir,
   };
 
