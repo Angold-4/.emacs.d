@@ -24,7 +24,7 @@ import {
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
-import { sameVersion } from "./predicate.ts";
+import { reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
 import type { BindingTuple, ContractVersion, Event, InFlightKey, ReduceResult, State } from "./types.ts";
 
@@ -352,6 +352,14 @@ export function reduce(state: State, event: unknown): ReduceResult {
           return rejected(state, `finding ${findingId} is already ${finding.status}, not open`);
         }
       }
+    }
+
+    // A review that states the same correction's disposition twice is
+    // malformed at ingestion (F02): reject it before it can become state,
+    // so `addressed` never has to choose between contradictory statements.
+    if (ev.type === "REVIEW_SUBMITTED") {
+      const issue = reviewIngestionIssue(ev.review);
+      if (issue) return rejected(state, issue);
     }
 
     // The raw disclosures alongside SUBMIT_PHASE are stashed before the
