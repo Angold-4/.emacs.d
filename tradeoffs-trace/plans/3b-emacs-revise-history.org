@@ -17,6 +17,8 @@
   - M-x +tt-continue-in-pilish on a finished run copies the chosen session file into Pi's session directory and opens the copy with Pilish; the run's original is unchanged
   - RET on a decision or finding opens its evidence (diff hunk or file:line in the candidate checkout)
   - the trace renders each tool call as one line: a verb (the sh command prefixed by $, read/grep/edit/write with their path and range or pattern), a result mark (✓ or ✗ with exit code) from tool_execution_end, the duration, and the last line of output; a running call shows ⧗ with elapsed time; sleep/tail polling loops are marked "polling"; no blank lines between tools; TAB on a line expands its full output
+  - the trace shows the files each tool call changed in the worker's worktree as one line per file, "path +added −removed" (from git diff --numstat before and after the call), with no diff content; this includes files written by sh commands (heredocs, redirects), not only edit/write calls
+  - every trace line carries its time (HH:MM:SS) and a finished tool call its duration
   - the trace shows a tool call as its readable argument (the sh command line, the edited file path), not a raw alist; observed in run 4ec5e0f8: ▸ tool: sh ((command . node --test …
   - the status buffer lists the files changed in the live worktree (git status of the run's worktree), because workers often write files through sh heredocs, which the trace shows only as shell commands
   - new ERT tests in test/tradeoffs-trace-test.el cover the revise buffer command, history rebuild from a session fixture and continue-in-Pilish copying; make -C tradeoffs-trace ert passes
