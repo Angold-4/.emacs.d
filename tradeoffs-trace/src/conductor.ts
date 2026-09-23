@@ -13,7 +13,7 @@
 // intent/completion discipline log.ts and next.ts's own docs describe.
 
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,6 +45,7 @@ import type {
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
 import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
 import { decisionStatus, isLiveDecision, sameVersion } from "./core/predicate.ts";
+import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
@@ -105,6 +106,12 @@ export interface Deadlines {
    * mid-run cancellation grace): `tt stop` must release the run within 15 s,
    * and a clean stop has no reason to wait out the full cancellation grace. */
   stopAbortGraceMs: number;
+  /** Plan 3b stall watchdog: an agent that is mid-turn (prompted, not yet
+   * settled), has no `sh` command of its own running, and produced no event
+   * for this long is steered once ("continue, or submit what you have");
+   * silent for this long again, its attempt or review ends as timed out
+   * instead of waiting out workerAttemptMs/reviewMs. */
+  stallMs: number;
   /** design §9.3: how often the conductor re-reads `<run>/inbox/*.json`
    * while running. Owner commands are conductor state, so the conductor
    * must pick one up even when parked in AWAITING_OWNER (when `next()`
@@ -130,15 +137,16 @@ export interface Deadlines {
 export const DEFAULT_DEADLINES: Deadlines = {
   helloTimeoutMs: 10_000,
   workerAttemptMs: 45 * 60_000,
-  shCommandMs: 10 * 60_000,
+  shCommandMs: 3 * 60_000,
   freezeMs: 2 * 60_000,
-  checkMs: 10 * 60_000,
+  checkMs: 5 * 60_000,
   probeMs: 10 * 60_000,
   reviewMs: 15 * 60_000,
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
   termGraceMs: 10_000,
   stopAbortGraceMs: 2_000,
+  stallMs: 3 * 60_000,
   inboxPollMs: 1_000,
 };
 
@@ -363,6 +371,44 @@ export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?
   return foldEvents(initialState(runId, plan.phases[0], integrationHead), records, opts.lenient === true);
 }
 
+/** Plan 3b: one entry per phase-state change, and one per finished review
+ * round (the round's candidate and why it was not accepted, or "accepted").
+ * Folded the same lenient way as the read-only `rebuildState`. */
+export interface Timeline {
+  state: State;
+  phases: Array<{ phase: string; at: string }>;
+  rounds: Array<{ round: number; candidateSha: string; outcome: string }>;
+}
+
+export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
+  const { records } = readLog(runPaths(runDir).events);
+  const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string } | undefined;
+  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "");
+  const phases: Timeline["phases"] = [];
+  const rounds: Timeline["rounds"] = [];
+  for (const record of records) {
+    if (record.kind !== "event") continue;
+    const before = state;
+    const result = reduce(state, record.event);
+    if (!result.ok) continue;
+    state = result.state;
+    const type = (record.event as { type?: string }).type;
+    const prevC = before.phase.candidate?.sha;
+    if (type === "FREEZE_COMPLETED" && prevC) {
+      const reasons = notAcceptedReasons(before.phase);
+      rounds.push({
+        round: rounds.length + 1,
+        candidateSha: prevC,
+        outcome: reasons.length > 0 ? `not accepted: ${reasons.join("; ")}` : "not accepted",
+      });
+    }
+    if (state.phase.phase !== before.phase.phase || phases.length === 0) {
+      phases.push({ phase: state.phase.phase, at: record.ts });
+    }
+  }
+  return { state, phases, rounds };
+}
+
 /** Folds every `"event"`-kind record in `records` (in order) through
  * `reduce()` onto `base`. Throws if one no longer reduces cleanly — see
  * `rebuildState`'s doc comment for why that is always a bug, not something
@@ -384,6 +430,35 @@ function foldEvents(base: State, records: readonly LogRecord[], lenient = false)
     state = result.state;
   }
   return state;
+}
+
+/** Per-file `git diff --numstat` totals of a worktree against its HEAD,
+ * untracked files counted as all-added lines; undefined if git fails. */
+function worktreeNumstat(worktree: string): Promise<Map<string, [number, number]> | undefined> {
+  const run = (args: string[]) =>
+    new Promise<string | undefined>((resolve) =>
+      execFile("git", ["-C", worktree, ...args], { maxBuffer: 16 * 1024 * 1024 }, (err, out) => resolve(err ? undefined : out)),
+    );
+  return Promise.all([run(["diff", "--numstat", "HEAD"]), run(["ls-files", "--others", "--exclude-standard", "-z"])]).then(
+    ([diff, untracked]) => {
+      if (diff === undefined) return undefined;
+      const totals = new Map<string, [number, number]>();
+      for (const line of diff.split("\n")) {
+        const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+        if (m) totals.set(m[3], [m[1] === "-" ? 0 : Number(m[1]), m[2] === "-" ? 0 : Number(m[2])]);
+      }
+      for (const file of (untracked ?? "").split("\0")) {
+        if (!file) continue;
+        try {
+          const text = fs.readFileSync(path.join(worktree, file), "utf8");
+          totals.set(file, [text.length === 0 ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0), 0]);
+        } catch {
+          // vanished between listing and reading
+        }
+      }
+      return totals;
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,6 +1341,110 @@ export class Conductor {
    * Once the run-wide total (the sum over every agent) exceeds
    * `runBudgetTokens`, this triggers the same RUN_BUDGET_EXCEEDED path the
    * wall-clock budget uses. */
+  /** Plan 3b: per worker, the worktree's `git diff --numstat` totals after
+   * its last tool call, and the queue that keeps the snapshots in order. */
+  #fileSnapshots = new Map<string, { totals: Map<string, [number, number]>; queue: Promise<void> }>();
+
+  /** Plan 3b: after each worker tool call, append one `tt_file_changes`
+   * record to its stream naming the files that call changed ("path +a −r",
+   * from `git diff --numstat` before and after — so edits made through sh
+   * heredocs and redirects show too). Display only; never run state. */
+  #trackFileChanges(agentId: string, streamFile: string, event: { type: string; toolCallId?: unknown }): void {
+    if (event.type !== "tool_execution_end" && event.type !== "agent_start") return;
+    let entry = this.#fileSnapshots.get(agentId);
+    if (!entry) {
+      entry = { totals: new Map(), queue: Promise.resolve() };
+      this.#fileSnapshots.set(agentId, entry);
+    }
+    const snap = entry;
+    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+    snap.queue = snap.queue.then(async () => {
+      if (this.#closed) return;
+      const totals = await worktreeNumstat(this.#paths.worktree);
+      if (!totals) return;
+      const files: Array<{ path: string; added: number; removed: number }> = [];
+      for (const [file, [a, r]] of totals) {
+        const [pa, pr] = snap.totals.get(file) ?? [0, 0];
+        if (a !== pa || r !== pr) files.push({ path: file, added: a - pa, removed: r - pr });
+      }
+      for (const [file, [pa, pr]] of snap.totals) {
+        if (!totals.has(file) && (pa !== 0 || pr !== 0)) files.push({ path: file, added: -pa, removed: -pr });
+      }
+      snap.totals = totals;
+      if (event.type === "agent_start" || files.length === 0) return;
+      const record = { agentId, ts: new Date().toISOString(), event: { type: "tt_file_changes", toolCallId, files } };
+      try {
+        fs.appendFileSync(streamFile, `${JSON.stringify(record)}\n`);
+      } catch {
+        // display only
+      }
+    });
+  }
+
+  /** Plan 3b stall watchdog state, per agent. `busy`: prompted and not yet
+   * settled — the only time silence means anything. */
+  #activity = new Map<string, { lastAt: number; busy: boolean }>();
+
+  #noteActivity(agentId: string, event: { type: string }): void {
+    const a = this.#activity.get(agentId) ?? { lastAt: Date.now(), busy: true };
+    a.lastAt = Date.now();
+    if (event.type === "agent_start" || event.type === "turn_start") a.busy = true;
+    if (event.type === "agent_end" || event.type === "agent_settled") a.busy = false;
+    this.#activity.set(agentId, a);
+  }
+
+  /** Races `deadline` against the stall watchdog: resolves "timeout" early
+   * when the agent stalls twice (see `Deadlines.stallMs`). Watching starts
+   * now, just after the agent was prompted. */
+  #withStallWatch(
+    agentId: string,
+    agent: PiAgent,
+    deadline: { promise: Promise<"timeout">; cancel: () => void },
+    nudge: string,
+  ): { promise: Promise<"timeout">; cancel: () => void } {
+    const stallMs = this.#deadlines.stallMs;
+    const a = this.#activity.get(agentId) ?? { lastAt: Date.now(), busy: true };
+    a.lastAt = Date.now();
+    a.busy = true;
+    this.#activity.set(agentId, a);
+    let nudged = false;
+    let timer: NodeJS.Timeout | undefined;
+    const stalled = new Promise<"timeout">((resolve) => {
+      timer = setInterval(
+        () => {
+          const now = Date.now();
+          const act = this.#activity.get(agentId);
+          if (!act || !act.busy || this.#closed) return;
+          const handle = this.#agents.get(agentId);
+          // Its own command is running: the per-command sh limit owns that.
+          if (handle && [...handle.shGroups].some((g) => this.#liveShGroups.has(g))) {
+            act.lastAt = now;
+            return;
+          }
+          if (now - act.lastAt < stallMs) return;
+          if (!nudged) {
+            nudged = true;
+            act.lastAt = now;
+            this.#log.append("stall_nudge", { agentId, quietMs: stallMs });
+            agent.steer(nudge).catch(() => undefined);
+            return;
+          }
+          this.#log.append("stalled", { agentId, quietMs: 2 * stallMs });
+          resolve("timeout");
+        },
+        Math.max(50, Math.min(15_000, Math.floor(stallMs / 4))),
+      );
+      timer.unref();
+    });
+    return {
+      promise: Promise.race([deadline.promise, stalled]),
+      cancel: () => {
+        deadline.cancel();
+        if (timer) clearInterval(timer);
+      },
+    };
+  }
+
   #trackRunTokens(agentId: string, event: { type: string; usage?: unknown }): void {
     if (event.type !== "message_update") return;
     const total = extractTokenTotal(event.usage);
@@ -2033,7 +2212,11 @@ export class Conductor {
       streamFile,
       abortGraceMs: this.#deadlines.abortGraceMs,
       termGraceMs: this.#deadlines.termGraceMs,
-      onEvent: (event) => this.#trackRunTokens(agentId, event),
+      onEvent: (event) => {
+        this.#noteActivity(agentId, event);
+        this.#trackRunTokens(agentId, event);
+        this.#trackFileChanges(agentId, streamFile, event);
+      },
     });
 
     const handle: AgentHandle = {
@@ -2108,7 +2291,12 @@ export class Conductor {
         this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: undelivered.length });
       }
 
-      const workerTimeout = cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const);
+      const workerTimeout = this.#withStallWatch(
+        agentId,
+        agent,
+        cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const),
+        "Owner (conductor): no progress for a while. Continue the work now, or call submit_phase with what you have and disclose what is unfinished.",
+      );
       const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap">> = [
         donePromise.then(() => "submitted" as const),
         agent.waitSettled().then(() => "settled" as const),
@@ -2550,6 +2738,7 @@ export class Conductor {
       abortGraceMs: this.#deadlines.abortGraceMs,
       termGraceMs: this.#deadlines.termGraceMs,
       onEvent: (event) => {
+        this.#noteActivity(agentId, event);
         this.#trackRunTokens(agentId, event);
         if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
       },
@@ -2601,7 +2790,12 @@ export class Conductor {
         return;
       }
 
-      const reviewTimeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      const reviewTimeout = this.#withStallWatch(
+        agentId,
+        agent,
+        cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const),
+        "Owner (conductor): no progress for a while. Finish this review turn now and call the submit tool it asks for.",
+      );
 
       if (this.#stubReviews) {
         await agent.prompt(buildReviewerPrompt(this.#state.phase, reviewer));

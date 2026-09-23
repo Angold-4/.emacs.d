@@ -16,27 +16,31 @@ import { fileURLToPath } from "node:url";
 import { decisionStatus } from "./core/predicate.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
+import { buildView, timingReport, timingText } from "./view.ts";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
 
-function parseArgs(argv: string[]): { positional: string[]; root?: string } {
+function parseArgs(argv: string[]): { positional: string[]; root?: string; json: boolean } {
   const positional: string[] = [];
   let root: string | undefined;
+  let json = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--root") {
       root = argv[++i];
+    } else if (argv[i] === "--json") {
+      json = true;
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root };
+  return { positional, root, json };
 }
 
 function resolveRunDir(rootOrId: string, root: string): string {
@@ -197,7 +201,72 @@ function renderStatus(runDir: string): string {
   lines.push(`open owner requests: ${openRequests.length}`);
   if (phase.blockedReason) lines.push(`blocked: ${phase.blockedReason}`);
   if (phase.publishedI) lines.push(`published: ${phase.publishedI}`);
+  // Plan 3b: the same readable view the status buffer shows.
+  const view = buildView(runDir, plan, conductorAlive(runDir));
+  lines.push(`pipeline: ${view.pipeline}`);
+  lines.push(`reviews: ${view.reviewLine}`);
+  if (view.verdict) lines.push(`verdict: ${view.verdict}`);
+  if (view.time) lines.push(`time: ${view.time}`);
   return `${lines.join("\n")}\n`;
+}
+
+function conductorAlive(runDir: string): boolean {
+  try {
+    return pidAlive(Number(readFileSync(path.join(runDir, "conductor.pid"), "utf8")));
+  } catch {
+    return false;
+  }
+}
+
+function readPlan(runDir: string): RunPlanFile {
+  return JSON.parse(readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
+}
+
+/** Plan 3b: `tt list` — one line per run (newest activity first), the
+ * summary the Emacs runs list and mode-line indicator render. */
+function cmdList(root: string, json: boolean): void {
+  let names: string[] = [];
+  try {
+    names = readdirSync(root).filter((n) => existsSync(path.join(root, n, "meta.json")));
+  } catch {
+    names = [];
+  }
+  const rows = names
+    .map((n) => {
+      const runDir = path.join(root, n);
+      try {
+        const alive = conductorAlive(runDir);
+        const meta = JSON.parse(readFileSync(runPaths(runDir).meta, "utf8")) as { title?: string };
+        const v = buildView(runDir, readPlan(runDir), alive);
+        return {
+          id: n,
+          runDir,
+          title: meta.title ?? "",
+          phase: v.timeline.state.phase.phase,
+          stage: v.stage,
+          stageElapsed: v.stageElapsed,
+          elapsed: v.elapsed,
+          reviews: v.reviewLine,
+          attention: v.attention ?? null,
+          needsYou: v.needsYou,
+          alive,
+          activity: statSync(runPaths(runDir).events).mtimeMs,
+        };
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== undefined)
+    .sort((a, b) => b.activity - a.activity);
+  if (json) {
+    process.stdout.write(`${JSON.stringify(rows)}\n`);
+    return;
+  }
+  for (const r of rows) {
+    process.stdout.write(
+      `${r.id}  ${(r.alive ? "●" : "○")} ${r.stage.padEnd(10)} ${r.stageElapsed.padStart(7)}  ${r.reviews}  ${r.attention ? `⚑ ${r.attention}  ` : ""}${r.title}\n`,
+    );
+  }
 }
 
 async function cmdStatus(runIdOrDir: string, root: string): Promise<void> {
@@ -302,7 +371,7 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root } = parseArgs(rest);
+  const { positional, root, json } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
@@ -313,6 +382,12 @@ async function main(): Promise<void> {
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
     launchDetached(resolveRunDir(positional[0], runRoot));
+  } else if (cmd === "list") {
+    cmdList(runRoot, json);
+  } else if (cmd === "timing") {
+    if (positional.length !== 1) usage();
+    const times = timingReport(resolveRunDir(positional[0], runRoot));
+    process.stdout.write(json ? `${JSON.stringify(times)}\n` : `${timingText(times)}\n`);
   } else if (cmd === "stop") {
     if (positional.length !== 1) usage();
     await cmdStop(positional[0], runRoot);
@@ -343,8 +418,9 @@ async function main(): Promise<void> {
     );
     const round = state.phase.round ?? 0;
     const ownerInputs = state.phase.ownerInputs ?? [];
+    const { timeline: _timeline, ...view } = buildView(runDir, plan, alive);
     process.stdout.write(
-      `${JSON.stringify({ runDir, meta, plan, state, round, decisionStatuses, conductorAlive: alive, ownerInputs, pendingOwnerInputs: pendingOwnerInputs(runDir) })}\n`,
+      `${JSON.stringify({ runDir, meta, plan, state, round, decisionStatuses, conductorAlive: alive, ownerInputs, pendingOwnerInputs: pendingOwnerInputs(runDir), view })}\n`,
     );
   } else if (cmd === "runner" && positional[0] === "install") {
     // `tt runner install <sha>`: freeze an accepted revision outside every

@@ -16,7 +16,8 @@
 ;;             its workspace
 ;;   C-c m s   focus or rebuild a run's workspace (trace, status, input);
 ;;             offers to resume a run whose conductor is not running
-;;   C-c m d   the run's decision view
+;;   C-c m d   the run's decision view (read-only; intervene via the input box)
+;;   C-c m l   every run: open (RET), stop (k), resume (R)
 ;;
 ;; The conductor always comes from the *installed runner*
 ;; (`<root>/runner/current/tradeoffs-trace', see `tt runner install <sha>'),
@@ -24,9 +25,12 @@
 ;; tradeoffs-trace itself does not execute the code under review.
 ;;
 ;; The workspace polls the run directory every `+tt-refresh-interval'
-;; seconds; the trace renders the most recently active agent's stream file.
-;; An agent with no activity for `+tt-idle-minutes' while the phase is not
-;; terminal is flagged IDLE in the status buffer.
+;; seconds.  The trace appends one line per tool call of the most recently
+;; active agent, with the files each call changed; the status shows the
+;; pipeline with stage times, where the active agent's time goes, each
+;; reviewer's outcome and why the phase did or did not accept (all computed
+;; by `tt state', see tradeoffs-trace/src/view.ts).  The conductor itself
+;; nudges, then ends, an agent that stalls mid-turn; the status flags it.
 
 ;;; Code:
 
@@ -55,10 +59,6 @@ Nil means `<+tt-root>/runner/current/tradeoffs-trace'."
 
 (defcustom +tt-refresh-interval 2
   "Seconds between workspace refreshes."
-  :type 'number)
-
-(defcustom +tt-idle-minutes 5
-  "Minutes without agent activity after which a running phase is flagged idle."
   :type 'number)
 
 (defconst +tt--terminal-phases '("DONE" "BLOCKED" "AWAITING_OWNER")
@@ -348,6 +348,17 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
 
 ;;;;; Trace
 
+;; The trace is rendered incrementally: only bytes appended to the followed
+;; agent's stream file since the last refresh are read, and the large,
+;; frequent `message_update' records are skipped without being parsed.  Each
+;; tool call becomes one line when it finishes; the call still running is
+;; shown in the header line with its elapsed time.
+
+(defvar-local +tt--trace-file nil "Stream file the trace buffer renders.")
+(defvar-local +tt--trace-offset 0 "Bytes of `+tt--trace-file' already rendered.")
+(defvar-local +tt--trace-partial "" "Trailing incomplete line from the last read.")
+(defvar-local +tt--trace-open nil "Hash of running tool calls: id -> (TS NAME ARG).")
+
 (defun +tt--stream-files (run-dir)
   "Agent stream files of RUN-DIR, most recently written first."
   (let ((dir (expand-file-name "stream" run-dir)))
@@ -356,45 +367,138 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
             (lambda (a b) (time-less-p (file-attribute-modification-time (file-attributes b))
                                        (file-attribute-modification-time (file-attributes a))))))))
 
-(defun +tt--render-stream (file)
-  "Render agent stream FILE as readable text: messages, tools folded."
-  (let ((out nil) (text ""))
-    (with-temp-buffer
-      (insert-file-contents file)
-      (dolist (line (split-string (buffer-string) "\n" t))
-        (let* ((rec (ignore-errors (json-parse-string line :object-type 'alist :null-object nil)))
-               (ev (alist-get 'event rec))
-               (type (alist-get 'type ev)))
-          (pcase type
-            ("agent_start" (push (format "\n[%s · %s]\n" (alist-get 'agentId rec)
-                                         (substring (or (alist-get 'ts rec) "") 11 16))
-                                 out))
-            ("message_update"
-             (let ((ame (alist-get 'assistantMessageEvent ev)))
-               (when (equal (alist-get 'type ame) "text_delta")
-                 (setq text (concat text (alist-get 'delta ame))))))
-            ("message_end" (unless (string-empty-p text) (push (concat text "\n") out) (setq text "")))
-            ("tool_execution_start"
-             (unless (string-empty-p text) (push (concat text "\n") out) (setq text ""))
-             (push (format "▸ tool: %s %s\n" (alist-get 'toolName ev)
-                           (truncate-string-to-width
-                            (replace-regexp-in-string "\n" " " (format "%s" (or (alist-get 'args ev) "")))
-                            90 nil nil "…"))
-                   out))
-            ("agent_settled" (push "· settled\n" out))))))
-    (concat (apply #'concat (nreverse out)) text)))
+(defun +tt--hms (ts)
+  "Local HH:MM:SS of ISO timestamp TS."
+  (or (ignore-errors (format-time-string "%H:%M:%S" (date-to-time ts))) "--:--:--"))
+
+(defun +tt--secs-between (from to)
+  "Seconds from ISO timestamp FROM to TO (nil TO means now)."
+  (or (ignore-errors
+        (- (float-time (if to (date-to-time to) nil)) (float-time (date-to-time from))))
+      0))
+
+(defun +tt--dur (secs)
+  "Short human duration for SECS."
+  (let ((s (max 0 (round secs))))
+    (cond ((< s 60) (format "%ds" s))
+          ((< s 3600) (format "%dm%02ds" (/ s 60) (% s 60)))
+          (t (format "%dh%02dm" (/ s 3600) (/ (% s 3600) 60))))))
+
+(defun +tt--one-line (text width)
+  "TEXT on one line, truncated to WIDTH."
+  (truncate-string-to-width
+   (string-trim (replace-regexp-in-string "[\n\t ]+" " " (or text ""))) width nil nil "…"))
+
+(defun +tt--tool-verb (name arg)
+  "Short rendering of tool NAME with ARG: `$ cmd' for sh, else `name arg'."
+  (let ((polling (and (member name '("sh" "bash"))
+                      (string-match-p "\\bsleep\\b\\|\\btail -f\\b" (or arg "")))))
+    (concat (if (member name '("sh" "bash")) "$ " (concat name " "))
+            (+tt--one-line arg 72)
+            (if polling "  (polling)" ""))))
+
+(defun +tt--tool-arg (args)
+  "The one argument that identifies a tool call in ARGS."
+  (let ((v (or (alist-get 'command args) (alist-get 'path args) (alist-get 'pattern args) "")))
+    (if (stringp v) v (format "%s" v))))
+
+(defun +tt--result-tail (ev)
+  "Last non-empty output line of a tool_execution_end event EV."
+  (let* ((content (alist-get 'content (alist-get 'result ev)))
+         (text (and (listp content) (alist-get 'text (car content)))))
+    (when (stringp text)
+      (let ((lines (seq-remove #'string-blank-p (split-string text "\n"))))
+        (when lines (+tt--one-line (car (last lines)) 60))))))
+
+(defun +tt--trace-line (rec)
+  "Rendered text for stream record REC, or nil to show nothing."
+  (let* ((ev (alist-get 'event rec))
+         (type (alist-get 'type ev))
+         (ts (alist-get 'ts rec)))
+    (pcase type
+      ("agent_start" (format "── %s · %s ──\n" (alist-get 'agentId rec) (+tt--hms ts)))
+      ("message_end"
+       (let* ((msg (alist-get 'message ev))
+              (texts (and (equal (alist-get 'role msg) "assistant")
+                          (seq-keep (lambda (c) (and (equal (alist-get 'type c) "text") (alist-get 'text c)))
+                                    (alist-get 'content msg)))))
+         (when (and texts (not (string-blank-p (string-join texts " "))))
+           (format "%s » %s\n" (+tt--hms ts) (+tt--one-line (string-join texts " ") 110)))))
+      ("tool_execution_start"
+       (puthash (alist-get 'toolCallId ev)
+                (list ts (alist-get 'toolName ev) (+tt--tool-arg (alist-get 'args ev)))
+                +tt--trace-open)
+       nil)
+      ("tool_execution_end"
+       (let ((start (gethash (alist-get 'toolCallId ev) +tt--trace-open)))
+         (remhash (alist-get 'toolCallId ev) +tt--trace-open)
+         (when start
+           (let* ((err (eq (alist-get 'isError ev) t))
+                  (code (+tt--get ev 'result 'details 'exitCode))
+                  (tail (+tt--result-tail ev)))
+             (format "%s %s %s %s%s\n"
+                     (+tt--hms (nth 0 start))
+                     (+tt--tool-verb (nth 1 start) (nth 2 start))
+                     (if err (propertize (format "✗%s" (if (numberp code) code "")) 'face 'error) "✓")
+                     (+tt--dur (+tt--secs-between (nth 0 start) ts))
+                     (if (and tail (member (nth 1 start) '("sh" "bash"))) (concat " · " tail) ""))))))
+      ("tt_file_changes"
+       (mapconcat (lambda (f)
+                    (format "           %s %s\n" (alist-get 'path f)
+                            (propertize (format "+%d −%d" (alist-get 'added f) (alist-get 'removed f))
+                                        'face 'shadow)))
+                  (alist-get 'files ev) ""))
+      ("agent_settled" "· settled\n"))))
+
+(defun +tt--trace-header ()
+  "Header line: the followed agent and the tool call still running, if any."
+  (let ((running nil))
+    (when +tt--trace-open
+      (maphash (lambda (_ v) (push v running)) +tt--trace-open))
+    (concat (if +tt--trace-file (file-name-base +tt--trace-file) "no agent yet")
+            (if +tt--trace-agent "  (pinned; a picks)" "  (following the active agent; a pins)")
+            (mapconcat (lambda (v)
+                         (format "   ⧗ %s %s" (+tt--tool-verb (nth 1 v) (nth 2 v))
+                                 (+tt--dur (+tt--secs-between (nth 0 v) nil))))
+                       running ""))))
 
 (defun +tt--render-trace (&optional win)
-  "Re-render the trace buffer in WIN from the followed agent's stream file."
+  "Append whatever the followed agent's stream gained since the last refresh."
   (let* ((files (+tt--stream-files +tt--run-dir))
          (file (if +tt--trace-agent
                    (seq-find (lambda (f) (string-prefix-p +tt--trace-agent (file-name-nondirectory f))) files)
-                 (car files))))
+                 (car files)))
+         (inhibit-read-only t))
+    (unless (equal file +tt--trace-file)
+      (erase-buffer)
+      (setq +tt--trace-file file +tt--trace-offset 0 +tt--trace-partial ""
+            +tt--trace-open (make-hash-table :test 'equal)))
     (when file
-      (let ((at-end (and win (>= (window-point win) (1- (point-max)))))
-            (inhibit-read-only t))
-        (erase-buffer)
-        (insert (+tt--render-stream file))
+      (let* ((size (file-attribute-size (file-attributes file)))
+             (from +tt--trace-offset)   ; buffer-local: read it here, not in the temp buffer
+             (at-end (or (not win) (>= (window-point win) (1- (point-max)))))
+             (chunk (when (> size from)
+                      (with-temp-buffer
+                        (set-buffer-multibyte nil)
+                        (insert-file-contents-literally file nil from size)
+                        (decode-coding-string (buffer-string) 'utf-8)))))
+        (when chunk
+          (setq +tt--trace-offset size)
+          (let* ((lines (split-string (concat +tt--trace-partial chunk) "\n"))
+                 (out nil))
+            (setq +tt--trace-partial (car (last lines)))
+            (dolist (line (butlast lines))
+              (unless (or (string-empty-p line) (string-search "\"message_update\"" line))
+                (when-let* ((rec (ignore-errors
+                                   (json-parse-string line :object-type 'alist :array-type 'list
+                                                      :null-object nil :false-object :false)))
+                            (text (+tt--trace-line rec)))
+                  (push text out))))
+            (when out
+              (save-excursion
+                (goto-char (point-max))
+                (insert (apply #'concat (nreverse out)))))))
+        (setq header-line-format (+tt--trace-header))
         (when (and win at-end) (set-window-point win (point-max)))))))
 
 (defun +tt-trace-pick-agent ()
@@ -411,15 +515,10 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
   "g" #'+tt--refresh-all)
 
 (define-derived-mode +tt-trace-mode special-mode "tt-trace"
-  "Live trace of a tradeoffs-trace agent (read-only).")
+  "Live trace of a tradeoffs-trace agent (read-only)."
+  (setq truncate-lines t))
 
 ;;;;; Status
-
-(defun +tt--idle-minutes (run-dir)
-  "Minutes since any agent of RUN-DIR produced an event."
-  (let ((f (car (+tt--stream-files run-dir))))
-    (if (not f) 0
-      (/ (float-time (time-subtract nil (file-attribute-modification-time (file-attributes f)))) 60))))
 
 (defun +tt--owner-input-state-label (state reason)
   "Human label for a recorded owner-input STATE, with REASON when present."
@@ -437,10 +536,10 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
     (> (- (float-time) (float-time (date-to-time at))) 30)))
 
 (defun +tt--render-owner-inputs (s)
-  "Insert the Owner input section (design §7.4/§9.3) from state S.
-Recorded effects come from the conductor (`ownerInputs`); anything still
-sitting in the inbox (`pendingOwnerInputs`) is shown as sent, or `not
-picked up` once 30 s have passed. Nothing is inferred beyond that."
+  "Insert the Owner input section (design §7.4/§9.3) from state S, if any.
+Recorded effects come from the conductor (`ownerInputs'); anything still
+sitting in the inbox (`pendingOwnerInputs') is shown as sent, or `not
+picked up' once 30 s have passed.  Nothing is inferred beyond that."
   (let* ((recorded (or (alist-get 'ownerInputs s) nil))
          (pending (or (alist-get 'pendingOwnerInputs s) nil))
          (entries (append
@@ -451,16 +550,16 @@ picked up` once 30 s have passed. Nothing is inferred beyond that."
                              (let ((at (alist-get 'at r)))
                                (cons (if (and at (+tt--not-picked-up-p at)) "not picked up" "sent") r)))
                            pending))))
-    (insert (format "Owner input (%d)\n" (length entries)))
-    (dolist (e entries)
-      (let* ((r (cdr e))
-             (text (or (alist-get 'text r) ""))
-             (kind (alist-get 'kind r)))
-        (insert (format "  - %s — %s%s\n"
-                        (truncate-string-to-width text 70 nil nil "…")
-                        (car e)
-                        (if kind (format " (%s)" kind) "")))))
-    (insert "\n")))
+    (when entries
+      (insert (format "\nOwner input (%d)\n" (length entries)))
+      (dolist (e entries)
+        (let* ((r (cdr e))
+               (text (or (alist-get 'text r) ""))
+               (kind (alist-get 'kind r)))
+          (insert (format "  - %s — %s%s\n"
+                          (truncate-string-to-width text 70 nil nil "…")
+                          (car e)
+                          (if kind (format " (%s)" kind) ""))))))))
 
 (defun +tt--render-input-header ()
   "Recompute the *tt-input* header line from the current run state."
@@ -469,45 +568,63 @@ picked up` once 30 s have passed. Nothing is inferred beyond that."
             (+tt--input-header (+tt--state +tt--run-dir))
           (error (format "Cannot deliver input: %s" (error-message-string err))))))
 
-(defun +tt--render-status ()
-  "Render the status buffer from `tt state'."
-  (let* ((s (+tt--state +tt--run-dir))
-         (phase (+tt--get s 'state 'phase))
+(defun +tt--status-row (label value &optional face)
+  "Insert one status row: LABEL padded, then VALUE (in FACE)."
+  (when (and value (not (string-empty-p value)))
+    (insert (propertize (format "%-10s" label) 'face 'shadow)
+            (if face (propertize value 'face face) value) "\n")))
+
+(defun +tt--render-status-from (s run-dir)
+  "Insert the status of RUN-DIR from `tt state' S (plan 3b layout)."
+  (let* ((phase (+tt--get s 'state 'phase))
          (name (alist-get 'phase phase))
          (alive (eq (alist-get 'conductorAlive s) t))
-         (reviews (alist-get 'reviews phase))
-         (decisions (alist-get 'decisions phase))
-         (findings (seq-filter (lambda (f) (equal (alist-get 'status f) "open")) (alist-get 'findings phase)))
-         (requests (seq-filter (lambda (r) (equal (alist-get 'status r) "open")) (alist-get 'ownerRequests phase)))
-         (idle (+tt--idle-minutes +tt--run-dir))
-         (inhibit-read-only t))
-    (erase-buffer)
-    (insert (format "%s\n" (+tt--get s 'meta 'title))
-            (format "run %s   conductor %s   run %s\n\n"
-                    (file-name-nondirectory (directory-file-name +tt--run-dir))
-                    (if alive "running" "STOPPED") (+tt--get s 'state 'run))
-            (format "%s  %s\n" (alist-get 'phaseId phase) (propertize (or name "?") 'face 'bold))
-            (format "   attempt %s · repair rounds %s/%s\n"
-                    (+tt--get phase 'attempt 'n) (alist-get 'repairRoundsUsed phase)
-                    (alist-get 'repairRoundsGranted phase)))
-    (when-let* ((c (+tt--get phase 'candidate 'sha))) (insert (format "   candidate %s\n" (substring c 0 7))))
-    (when-let* ((ch (alist-get 'checks phase)))
-      (insert (format "   checks %s\n" (if (eq (alist-get 'passed ch) t) "✓" "✗"))))
-    (when-let* ((pr (alist-get 'probe phase)))
-      (insert (format "   probe %s\n" (if (eq (alist-get 'passed pr) t) "✓" "✗"))))
-    (insert (format "   reviews %s\n"
-                    (mapconcat (lambda (w) (format "%s %s" w (if (alist-get 'review (alist-get w reviews)) "✓" "⧗")))
-                               '(M A B) "  ")))
-    (insert (format "   decisions %d · open findings %d\n" (length decisions) (length findings)))
-    (when-let* ((why (alist-get 'blockedReason phase))) (insert (format "   blocked: %s\n" why)))
-    (insert "\n")
+         (v (alist-get 'view s))
+         (attention (alist-get 'attention v)))
+    (insert (propertize (or (+tt--get s 'meta 'title) "") 'face 'bold) "\n")
+    (insert (propertize
+             (format "run %s · %s · %s\n\n"
+                     (file-name-nondirectory (directory-file-name run-dir))
+                     (if alive "conductor running" "conductor stopped")
+                     (alist-get 'elapsed v))
+             'face 'shadow))
+    (+tt--status-row "phase"
+                     (format "%s · %s · round %s · attempt %s · repairs %s/%s"
+                             (alist-get 'phaseId phase) name (alist-get 'round v)
+                             (+tt--get phase 'attempt 'n) (alist-get 'repairRoundsUsed phase)
+                             (alist-get 'repairRoundsGranted phase)))
+    (+tt--status-row "pipeline" (alist-get 'pipeline v))
+    (+tt--status-row "time" (alist-get 'time v))
+    (+tt--status-row "gates" (alist-get 'gates v))
+    (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)
+    (+tt--status-row "reviews" (alist-get 'reviewLine v))
+    (+tt--status-row "verdict" (alist-get 'verdict v)
+                     (if (equal name "DONE") 'success 'warning))
+    (+tt--status-row "records"
+                     (format "%d decisions%s · %d open findings%s"
+                             (alist-get 'liveDecisions v)
+                             (let ((f (alist-get 'failedDecisions v))) (if (> f 0) (format " (%d failed)" f) ""))
+                             (alist-get 'openFindings v)
+                             (let ((b (alist-get 'boundaryFilesChanged v)))
+                               (if (> b 0) (format " · boundary files changed: %d (reviewers classify)" b) ""))))
+    (when-let* ((why (alist-get 'blockedReason phase)))
+      (+tt--status-row "blocked" why 'error))
     (+tt--render-owner-inputs s)
-    (when (and alive (not (member name +tt--terminal-phases)) (> idle +tt-idle-minutes))
-      (insert (propertize (format "\n   IDLE: no agent activity for %.0f min\n" idle) 'face 'warning)))
-    (unless (or alive (member name '("DONE")))
-      (insert (propertize "\n   conductor not running — M-x +tt-resume\n" 'face 'warning)))
-    (when requests
-      (insert (propertize (format "\n⚑ needs you: %d   (C-c m d)\n" (length requests)) 'face 'error)))))
+    (when attention
+      (insert "\n" (propertize (format "⚑ %s%s" attention
+                                       (cond ((equal attention "needs you")
+                                              " — type a correction in the input box (C-c m d to read the decisions)")
+                                             ((equal attention "conductor stopped") " — M-x +tt-resume")
+                                             (t "")))
+                               'face 'error)
+              "\n"))))
+
+(defun +tt--render-status ()
+  "Render the status buffer from `tt state'."
+  (let ((s (+tt--state +tt--run-dir))
+        (inhibit-read-only t))
+    (erase-buffer)
+    (+tt--render-status-from s +tt--run-dir)))
 
 (defvar-keymap +tt-status-mode-map
   :parent special-mode-map
@@ -633,84 +750,120 @@ with the reason shown here."
 
 ;;;; Decision view
 
-(defun +tt--binding (s record)
-  "The design §7.1 binding tuple for RECORD in state S."
-  (let ((phase (+tt--get s 'state 'phase)))
-    `((runId . ,(alist-get 'runId phase))
-      (phaseId . ,(alist-get 'phaseId phase))
-      (candidateSha . ,(+tt--get phase 'candidate 'sha))
-      (contractVersion . ,(+tt--get phase 'contract 'contractVersion))
-      (recordId . ,(alist-get 'id record))
-      (recordVersion . ,(alist-get 'version record)))))
+;; Read-only (plan 3b): only decisions, each a self-contained block, for the
+;; current round; earlier rounds collapse to one line each.  The owner
+;; intervenes only through the input box.  Every state label comes from the
+;; tally (`decisionStatuses' in `tt state'), never from individual ballots.
 
-(defun +tt--ballots-for (phase decision-id)
-  "Ballots in PHASE on DECISION-ID."
-  (seq-filter (lambda (b) (equal (alist-get 'decisionId b) decision-id)) (alist-get 'ballots phase)))
+(defun +tt--decision-label (status d phase)
+  "Heading label for decision D with tally STATUS in PHASE."
+  (let ((dissent (seq-some (lambda (b) (and (equal (alist-get 'decisionId b) (alist-get 'id d))
+                                            (equal (alist-get 'vote b) "reject")))
+                           (alist-get 'ballots phase))))
+    (pcase (alist-get 'status status)
+      ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
+      ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
+      ("suspended" "SUSPENDED")
+      ("owner" "NEEDS YOU")
+      ("detail" "DETAIL")
+      (_ "PENDING"))))
 
-(defun +tt--decision-entry (keyword d phase)
-  "Insert decision D under KEYWORD with its plain-language fields."
-  (let ((start (point)))
-    (insert (format "* %s %s    :%s:\n" keyword (alist-get 'choice d) (alist-get 'phaseId phase)))
-    (insert (format "%s · %s · %s\n\n" (alist-get 'class d) (alist-get 'source d) (alist-get 'id d)))
-    (insert (format "Why it matters: %s\n\n" (alist-get 'whyItMatters d)))
+(defun +tt--decision-block (d status phase)
+  "Insert decision D (tally STATUS) as one self-contained Org entry."
+  (let* ((choice (or (alist-get 'choice d) ""))
+         (short (truncate-string-to-width (+tt--one-line choice 200) 80 nil nil "…"))
+         (source (alist-get 'source d))
+         (seen (alist-get 'alsoSeenBy d))
+         (rec (alist-get 'recommendation d))
+         (chosen (and rec (alist-get 'choice rec)))
+         (ballots (seq-filter (lambda (b) (equal (alist-get 'decisionId b) (alist-get 'id d)))
+                              (alist-get 'ballots phase))))
+    (insert (format "* %s  %s\n" (+tt--decision-label status d phase) short))
+    (unless (equal short (+tt--one-line choice 200)) (insert (format "  %s\n" choice)))
+    (insert (format "  raised by %s%s\n"
+                    (if (equal source "reviewer-discovered")
+                        (format "reviewer %s (discovered)"
+                                (or (alist-get 'discoveredBy d)
+                                    (and (string-match "-\\([MAB]\\)-[0-9]+\\'" (alist-get 'id d))
+                                         (match-string 1 (alist-get 'id d)))
+                                    "?"))
+                      "the worker")
+                    (if seen (format "; also seen by %s" (string-join seen ", ")) "")))
+    (insert (format "  Why it matters: %s\n" (alist-get 'whyItMatters d)))
     (dolist (a (alist-get 'alternatives d))
-      (insert (format "  - %s — %s\n" (alist-get 'option a) (alist-get 'consequence a))))
-    (when-let* ((r (alist-get 'recommendation d)))
-      (insert (format "\nRecommendation: %s. %s\n" (alist-get 'choice r) (alist-get 'reason r))))
-    (let ((ballots (+tt--ballots-for phase (alist-get 'id d))))
-      (insert "\n** Details\n")
-      (insert (format "   - decision %s v%s\n" (alist-get 'id d) (alist-get 'version d)))
-      (dolist (b ballots)
-        (insert (format "   - %s %s: %s\n" (alist-get 'reviewer b) (alist-get 'vote b) (alist-get 'rationale b)))))
-    (insert "\n")
-    (put-text-property start (point) '+tt-record (cons 'decision d))))
+      (let ((opt (alist-get 'option a)))
+        (insert (format "  %s %s — %s\n" (if (and chosen (string-prefix-p (downcase opt) (downcase chosen))) "●" "○")
+                        opt (alist-get 'consequence a)))))
+    (when rec
+      (insert (format "  Recommendation: %s. %s\n" (alist-get 'choice rec) (or (alist-get 'reason rec) ""))))
+    (dolist (b ballots)
+      (insert (format "  %s %s — %s\n" (alist-get 'reviewer b) (alist-get 'vote b)
+                      (+tt--one-line (alist-get 'rationale b) 160))))
+    (insert "\n")))
 
-(defun +tt--dissent-p (phase d)
-  "Non-nil when some ballot on D rejected."
-  (seq-some (lambda (b) (equal (alist-get 'vote b) "reject")) (+tt--ballots-for phase (alist-get 'id d))))
+(defun +tt--finding-location (f)
+  "The file part of finding F's evidence, or \"(general)\"."
+  (let ((ev (or (alist-get 'evidence f) "")))
+    (if (string-match "\\([[:alnum:]_./-]+\\.[[:alnum:]]+\\)\\(:[0-9]+\\)?" ev)
+        (match-string 1 ev)
+      "(general)")))
+
+(defun +tt--render-findings (findings)
+  "Insert FINDINGS grouped by location, evidence folded under each."
+  (let ((groups nil))
+    (dolist (f findings)
+      (let ((loc (+tt--finding-location f)))
+        (setf (alist-get loc groups nil nil #'equal) (append (alist-get loc groups nil nil #'equal) (list f)))))
+    (dolist (g (nreverse groups))
+      (insert (format "* %s\n" (car g)))
+      (dolist (f (cdr g))
+        (let* ((ev (or (alist-get 'evidence f) ""))
+               (first (car (split-string ev "\\. " t))))
+          (insert (format "** %s %s — %s%s\n" (upcase (or (alist-get 'severity f) ""))
+                          (+tt--one-line first 90)
+                          (alist-get 'raisedBy f)
+                          (let ((also (alist-get 'alsoRaisedBy f)))
+                            (if also (format "; also raised by %s" (string-join also ", ")) ""))))
+          (insert (format "   %s\n" ev)))))
+    (insert "\n")))
 
 (defun +tt--render-decisions (s)
-  "Insert the decision view for state S (design §10.1 sections)."
+  "Insert the decision view for state S."
   (let* ((phase (+tt--get s 'state 'phase))
-         (requests (seq-filter (lambda (r) (equal (alist-get 'status r) "open")) (alist-get 'ownerRequests phase)))
+         (v (alist-get 'view s))
+         (statuses (alist-get 'decisionStatuses s))
+         (candidate (+tt--get phase 'candidate 'sha))
+         (current (seq-filter (lambda (d)
+                                (and (not (equal (alist-get 'source d) "trigger"))
+                                     (not (equal (alist-get 'status (alist-get (intern (alist-get 'id d)) statuses))
+                                                 "superseded"))))
+                              (alist-get 'decisions phase)))
          (findings (seq-filter (lambda (f) (equal (alist-get 'status f) "open")) (alist-get 'findings phase)))
-         (corrections (alist-get 'corrections phase))
-         (decisions (alist-get 'decisions phase))
-         (details (seq-filter (lambda (d) (equal (alist-get 'class d) "detail")) decisions))
-         (others (seq-remove (lambda (d) (equal (alist-get 'class d) "detail")) decisions)))
-    (insert (format "#+TITLE: decisions — %s\n\n" (+tt--get s 'meta 'title)))
-    (insert (format "Needs you (%d)\n\n" (length requests)))
-    (dolist (r requests)
-      (let ((start (point)))
-        (insert (format "* NEEDS-YOU %s\n" (or (alist-get 'question r) (alist-get 'origin r))))
-        (let ((i 0))
-          (dolist (o (alist-get 'options r))
-            (setq i (1+ i))
-            (insert (format "  %d. %s\n" i (alist-get 'label o)))))
-        (insert "\n")
-        (put-text-property start (point) '+tt-record (cons 'request r))))
-    (insert (format "Open findings (%d)\n\n" (length findings)))
-    (dolist (f findings)
-      (let ((start (point)))
-        (insert (format "* FINDING %s — raised by %s · %s\n  %s\n\n"
-                        (alist-get 'kind f) (alist-get 'raisedBy f) (alist-get 'severity f)
-                        (alist-get 'evidence f)))
-        (put-text-property start (point) '+tt-record (cons 'finding f))))
-    (insert (format "Corrections (%d)\n\n" (length corrections)))
-    (dolist (c corrections)
-      (insert (format "* CORRECTION %s — %s\n  %s\n\n" (alist-get 'id c) (alist-get 'status c)
-                      (alist-get 'text c))))
-    (let ((dissent (seq-filter (lambda (d) (+tt--dissent-p phase d)) others)))
-      (insert (format "Accepted with dissent / pending vote (%d)\n\n" (length dissent)))
-      (dolist (d dissent) (+tt--decision-entry "DISSENT" d phase))
-      (insert (format "Decisions (%d)\n\n" (- (length others) (length dissent))))
-      (dolist (d (seq-remove (lambda (d) (+tt--dissent-p phase d)) others))
-        (+tt--decision-entry "DECISION" d phase)))
-    (insert (format "For sampling (%d detail)\n\n" (length details)))
-    (dolist (d details) (+tt--decision-entry "SAMPLE" d phase))))
-
-(defvar-local +tt--decision-state nil
-  "The `tt state' the decision view was rendered from (for bindings).")
+         (addressing (alist-get 'addressing v))
+         (needs (alist-get 'needsYou v)))
+    (insert (format "#+TITLE: decisions — %s\n" (+tt--get s 'meta 'title)))
+    (insert (format "Round %s · candidate %s · attempt %s%s\n"
+                    (alist-get 'round v) (if candidate (substring candidate 0 7) "none yet")
+                    (+tt--get phase 'attempt 'n)
+                    (if addressing (format " — addressing: %s" (string-join addressing "; ")) "")))
+    (insert (format "Reviews: %s\n" (alist-get 'reviewLine v)))
+    (when (alist-get 'verdict v) (insert (format "Verdict: %s\n" (alist-get 'verdict v))))
+    (when (and needs (> needs 0))
+      (insert (format "⚑ %d owner request(s) open — type a correction in the input box\n" needs)))
+    (insert "\n")
+    (if current
+        (dolist (d current)
+          (+tt--decision-block d (alist-get (intern (alist-get 'id d)) statuses) phase))
+      (insert "No decisions on this candidate yet.\n\n"))
+    (when findings
+      (insert (format "Findings (%d open)\n" (length findings)))
+      (+tt--render-findings findings))
+    (let ((rounds (alist-get 'rounds v)))
+      (when rounds
+        (insert "Earlier rounds\n")
+        (dolist (r rounds)
+          (insert (format "* Round %s · %s · %s\n" (alist-get 'round r)
+                          (substring (alist-get 'candidateSha r) 0 7) (alist-get 'outcome r))))))))
 
 ;;;###autoload
 (defun +tt-decisions ()
@@ -724,87 +877,159 @@ with the reason shown here."
         (erase-buffer)
         (+tt--render-decisions s))
       (+tt-decisions-mode)
-      (setq +tt--run-dir run +tt--decision-state s)
-      (org-overview)
-      (org-cycle-hide-drawers 'all)
+      (setq +tt--run-dir run)
+      (org-content 1)
       (goto-char (point-min)))
     (pop-to-buffer buf)))
 
-(defun +tt--record-at-point ()
-  "Return (KIND . RECORD) at point, or signal."
-  (or (get-text-property (point) '+tt-record) (user-error "No record at point")))
-
-(defun +tt--queue (type &rest fields)
-  "Queue an owner command TYPE for the record at point with FIELDS."
-  (pcase-let ((`(,kind . ,rec) (+tt--record-at-point)))
-    (let ((id (+tt--write-command
-               +tt--run-dir
-               `((type . ,type) (recordKind . ,(symbol-name kind))
-                 (binding . ,(+tt--binding +tt--decision-state rec)) ,@fields))))
-      (message "tradeoffs-trace: queued %s (%s); refresh with g" type id))))
-
-(defun +tt-decision-revise ()
-  "Revise the decision or finding at point: describe the correction."
+(defun +tt-decisions-refresh ()
+  "Re-render this decision view, keeping point roughly in place."
   (interactive)
-  (+tt--queue "revise" (cons 'text (read-string "Correction (what should change): "))
-              (cons 'changesContract (if (y-or-n-p "Does this change the contract? ") t :false))))
-
-(defun +tt-decision-override ()
-  "Override the delegated decision at point."
-  (interactive)
-  (+tt--queue "override" (cons 'vote (completing-read "Override: " '("approve" "reject") nil t))))
-
-(defun +tt-decision-accept-finding ()
-  "Accept the finding at point, with a scope note."
-  (interactive)
-  (+tt--queue "accept-finding" (cons 'scope (read-string "Scope of the accepted risk: "))))
-
-(defun +tt-decision-resolve (n)
-  "Resolve the owner request at point with option N (or write one with 0)."
-  (interactive "p")
-  (pcase-let ((`(,_ . ,rec) (+tt--record-at-point)))
-    (let* ((opt (nth (1- n) (alist-get 'options rec)))
-           (id (or (alist-get 'id opt) (read-string "Your option: ")))
-           (fields (list (cons 'option id))))
-      ;; Accepting the risk of an open finding requires the scope note the
-      ;; core enforces (design §4.2); collect it here so the offered
-      ;; `accept_risk` option actually applies instead of being rejected.
-      (when (equal id "accept_risk")
-        (push (cons 'note (read-string "Scope of the accepted risk: ")) fields))
-      (apply #'+tt--queue "resolve" fields))))
-
-(defun +tt-decision-miss ()
-  "Mark the sampled item at point as \"should have been surfaced\"."
-  (interactive)
-  (+tt--queue "miss"))
-
-(defun +tt-decision-unneeded ()
-  "Mark the owner request at point as \"did not need me\"."
-  (interactive)
-  (+tt--queue "unneeded"))
+  (let ((pt (point)) (run +tt--run-dir))
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (+tt--render-decisions (+tt--state run)))
+    (setq +tt--run-dir run)
+    (org-content 1)
+    (goto-char (min pt (point-max)))))
 
 (defvar-keymap +tt-decisions-mode-map
-  "r" #'+tt-decision-revise
-  "o" #'+tt-decision-override
-  "x" #'+tt-decision-accept-finding
-  "s" #'+tt-decision-miss
-  "u" #'+tt-decision-unneeded
-  "w" (lambda () (interactive) (+tt-decision-resolve 0))
-  "1" (lambda () (interactive) (+tt-decision-resolve 1))
-  "2" (lambda () (interactive) (+tt-decision-resolve 2))
-  "3" (lambda () (interactive) (+tt-decision-resolve 3))
-  "g" #'+tt-decisions
-  "TAB" #'org-cycle)
+  "g" #'+tt-decisions-refresh
+  "TAB" #'org-cycle
+  "q" #'quit-window)
 
 (define-derived-mode +tt-decisions-mode org-mode "tt-decisions"
-  "Read-only decision view of a tradeoffs-trace run; act with keys."
-  (setq buffer-read-only t))
+  "Read-only decision view of a tradeoffs-trace run.
+\\<+tt-decisions-mode-map>\\[+tt-decisions-refresh] refreshes, \\[org-cycle] folds, \\[quit-window] quits.
+To intervene, type into the run's input box."
+  (setq buffer-read-only t)
+  (when (fboundp 'evil-define-key)
+    (evil-define-key 'normal +tt-decisions-mode-map
+      "g" #'+tt-decisions-refresh (kbd "TAB") #'org-cycle "q" #'quit-window)))
+
+;;;; Runs list and mode line
+
+;; Plan 3b: one place to see every run (`C-c m l'), and a display-only
+;; mode-line indicator while any run is active.  Both come from one
+;; `tt list --json' call, never one `tt state' per run.
+
+(defun +tt--list ()
+  "Parsed `tt list --json'."
+  (json-parse-string (+tt--cli "list" "--json") :object-type 'alist :array-type 'list
+                     :null-object nil :false-object :false))
+
+(defun +tt--attention-face (row)
+  "Face for ROW's attention, or nil."
+  (when (alist-get 'attention row) 'error))
+
+(defun +tt--runs-entries ()
+  "Tabulated-list entries for every run."
+  (mapcar (lambda (r)
+            (let ((face (+tt--attention-face r)))
+              (list (alist-get 'runDir r)
+                    (vector (alist-get 'id r)
+                            (if (eq (alist-get 'alive r) t) "●" "○")
+                            (alist-get 'stage r)
+                            (alist-get 'stageElapsed r)
+                            (alist-get 'reviews r)
+                            (if (alist-get 'attention r)
+                                (propertize (concat "⚑ " (alist-get 'attention r)) 'face face)
+                              "")
+                            (alist-get 'title r)))))
+          (+tt--list)))
+
+(defun +tt-runs-open ()
+  "Open the workspace of the run at point."
+  (interactive)
+  (when-let* ((run (tabulated-list-get-id))) (+tt--workspace run)))
+
+(defun +tt-runs-stop ()
+  "Stop the conductor of the run at point (`tt stop')."
+  (interactive)
+  (when-let* ((run (tabulated-list-get-id)))
+    (when (y-or-n-p (format "Stop run %s? " (file-name-nondirectory run)))
+      (message "%s" (+tt--cli "stop" run))
+      (tabulated-list-revert))))
+
+(defun +tt-runs-resume ()
+  "Relaunch the conductor of the run at point (`tt resume')."
+  (interactive)
+  (when-let* ((run (tabulated-list-get-id)))
+    (+tt--cli "resume" run)
+    (message "tradeoffs-trace: conductor relaunched for %s" (file-name-nondirectory run))))
+
+(defvar-keymap +tt-runs-mode-map
+  :parent tabulated-list-mode-map
+  "RET" #'+tt-runs-open
+  "k" #'+tt-runs-stop
+  "R" #'+tt-runs-resume)
+
+(define-derived-mode +tt-runs-mode tabulated-list-mode "tt-runs"
+  "Every tradeoffs-trace run.  \\<+tt-runs-mode-map>\\[+tt-runs-open] opens, \\[+tt-runs-stop] stops, \\[+tt-runs-resume] resumes, g refreshes."
+  (setq tabulated-list-format [("run" 9 t) ("" 1 nil) ("stage" 10 t) ("for" 7 nil)
+                               ("reviews" 26 nil) ("attention" 20 t) ("title" 0 t)]
+        tabulated-list-entries #'+tt--runs-entries)
+  (tabulated-list-init-header)
+  (when (fboundp 'evil-define-key)
+    (evil-define-key 'normal +tt-runs-mode-map
+      (kbd "RET") #'+tt-runs-open "k" #'+tt-runs-stop "R" #'+tt-runs-resume "g" #'tabulated-list-revert)))
+
+;;;###autoload
+(defun +tt-runs ()
+  "List every tradeoffs-trace run."
+  (interactive)
+  (let ((buf (get-buffer-create "*tt-runs*")))
+    (with-current-buffer buf
+      (+tt-runs-mode)
+      (tabulated-list-print))
+    (pop-to-buffer buf)))
+
+(defvar +tt--mode-line-string ""
+  "The mode-line indicator text (display only).")
+(put '+tt--mode-line-string 'risky-local-variable t)
+
+(defvar +tt--mode-line-timer nil)
+
+(defun +tt--live-run-p (run-dir)
+  "Non-nil when RUN-DIR's conductor process is alive (no Node call)."
+  (let* ((f (expand-file-name "conductor.pid" run-dir))
+         (pid (and (file-exists-p f)
+                   (string-to-number (with-temp-buffer (insert-file-contents f) (buffer-string))))))
+    (and pid (> pid 0) (process-attributes pid) t)))
+
+(defun +tt--mode-line-update ()
+  "Refresh the mode-line indicator from `tt list' when any run is live."
+  (setq +tt--mode-line-string
+        (if (not (seq-some #'+tt--live-run-p (ignore-errors (+tt--runs))))
+            ""
+          (let ((rows (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t) (equal (alist-get 'attention r) "needs you")))
+                                  (ignore-errors (+tt--list)))))
+            (if (null rows) ""
+              (concat " ["
+                      (mapconcat
+                       (lambda (r)
+                         (propertize (format "tt:%s %s %s %s" (substring (alist-get 'id r) 0 4)
+                                             (alist-get 'stage r) (alist-get 'stageElapsed r)
+                                             (replace-regexp-in-string " +" "" (alist-get 'reviews r)))
+                                     'face (+tt--attention-face r)))
+                       rows " | ")
+                      "]")))))
+  (force-mode-line-update t))
+
+(defun +tt--ensure-mode-line ()
+  "Install the display-only mode-line indicator and its timer."
+  (unless (memq '+tt--mode-line-string global-mode-string)
+    (setq global-mode-string (append global-mode-string '(+tt--mode-line-string))))
+  (unless (timerp +tt--mode-line-timer)
+    (setq +tt--mode-line-timer (run-with-timer 1 10 #'+tt--mode-line-update))))
 
 ;;;; Keys
 
 (keymap-global-set "C-c m r" #'+tt-run)
 (keymap-global-set "C-c m s" #'+tt-show)
 (keymap-global-set "C-c m d" #'+tt-decisions)
+(keymap-global-set "C-c m l" #'+tt-runs)
+(+tt--ensure-mode-line)
 
 (provide 'init-tradeoffs-trace)
 ;;; init-tradeoffs-trace.el ends here
