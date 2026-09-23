@@ -1,0 +1,8 @@
+{"ts":"2026-09-23T17:05:38.654Z","event":{"type":"NODE_STARTED","node":"a","runId":"82c0f190","branch":"main--a","base":"main"}}
+{"ts":"2026-09-23T17:06:43.692Z","event":{"type":"NODE_STATUS","node":"a","status":"done"}}
+{"ts":"2026-09-23T17:06:43.813Z","event":{"type":"NODE_STARTED","node":"b","runId":"ea2c9038","branch":"main--b","base":"main--a"}}
+{"ts":"2026-09-23T17:06:43.868Z","event":{"type":"NODE_STARTED","node":"c","runId":"5c3a1aac","branch":"main--c","base":"main--a"}}
+{"ts":"2026-09-23T17:07:53.893Z","event":{"type":"NODE_STATUS","node":"b","status":"done"}}
+{"ts":"2026-09-23T17:08:03.896Z","event":{"type":"NODE_STATUS","node":"c","status":"done"}}
+{"ts":"2026-09-23T17:08:04.076Z","event":{"type":"NODE_STARTED","node":"d","runId":"a5a8ec75","branch":"main--d","base":"main--b + main--c"}}
+{"ts":"2026-09-23T17:09:49.126Z","event":{"type":"NODE_STATUS","node":"d","status":"done"}}

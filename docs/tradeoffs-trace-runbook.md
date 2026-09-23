@@ -58,6 +58,73 @@ readlink ~/.tradeoffs-trace/runner/current
 
 From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
 
+## Run several phases or plans: programs
+
+A **program** runs several plans, and plans with several phases, as one
+dependency graph. It's a wrapper around the loop above: every phase is still
+one ordinary run with the same three reviewers and three repair rounds. A
+detached scheduler starts each phase when everything it depends on is DONE,
+and runs independent phases in parallel.
+
+**Write a program file** next to the plans:
+
+```org
+#+TITLE: plan 13
+#+TT_PROGRAM: 4                 max phases running at once
+#+TT_BRANCHES: stack            default; "shared" publishes every phase to TT_BRANCH
+
+* 13a
+  :PROPERTIES:
+  :PLAN:   13a_shared_markets.org
+  :END:
+* 13b
+  :PROPERTIES:
+  :PLAN:   13b_adapter_contract.org
+  :AFTER:  13a
+  :END:
+* 13c
+  :PROPERTIES:
+  :PLAN:   13c_vendor_pyth.org
+  :AFTER:  13b
+  :END:
+# … 13d–13f likewise after 13b …
+* 13g
+  :PROPERTIES:
+  :PLAN:   13g_calculator_blend.org
+  :AFTER:  13c 13d 13e 13f
+  :END:
+```
+
+- Each heading is an **entry**: `:PLAN:` is a plan file (relative to the program file), and `:AFTER:` lists the entries it waits for (all of their phases).
+- A plan file with several phases expands into one node per phase, run in order. Pressing `C-c m r` on such a plan (no program file) runs its phases in order.
+- Start: `C-c m r` in the program buffer, or `tt program start <program.json>`.
+
+**Branches (stack mode, the default).** Every node publishes to its own branch,
+`<TT_BRANCH>--<node>`:
+- A node with no dependencies is cut from `TT_BRANCH`.
+- A node with one dependency is cut from that dependency's branch, so a chain like 12a → 12b → 12c → 12d becomes **four stacked PRs**.
+- A **join** (13g after 13c–13f) is cut from a merge commit of all its parents. If that merge conflicts, the node stops as blocked, with the files named.
+- `TT_BRANCH` itself is never moved. Push the branches and open the PRs yourself: each node's PR base is shown in the program status.
+- Parallel phases work in separate worktrees and publish to separate branches, so they never touch each other's files on disk.
+
+**Watch and control:**
+
+| Where | What |
+|---|---|
+| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. `RET` opens a node's run workspace (status, trace, decisions, input box), `k` stops the program, `R` resumes it. |
+| CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program stop <id>`, `tt program resume <id>` |
+
+**Rules the scheduler follows:**
+- A node starts only when all its dependencies are **DONE**. A node that needs you, or whose run was stopped, keeps its slot and holds back its dependents until it finishes. Correct it or resume it as for any run.
+- A **blocked** node never finishes. Its dependents wait, independent branches of the graph continue, and the program ends `stuck` when nothing else can run.
+- The scheduler's state is folded from `~/.tradeoffs-trace/programs/<id>/events.jsonl`. `tt program resume` continues after a restart and never recreates an existing node branch.
+
+**Before an unattended program:**
+1. `TT_BRANCH` exists in the repository, and nothing has it or a node branch checked out.
+2. Every plan's check command finishes in a few minutes (the checks limit is 5).
+3. The runner is installed at the revision you want (`readlink ~/.tradeoffs-trace/runner/current`).
+4. Credentials the checks need (for example vendor keys) are exported in the shell that starts Emacs or `tt`.
+
 ## Watch it
 
 | Where | What you see |
@@ -151,7 +218,7 @@ Each row was observed in a real run.
 
 ## Known limitations
 
-- **One phase per run.** Multi-phase plans (plans 4a and 4b) are not implemented yet; run one plan file per phase.
+- **One phase per run.** A multi-phase plan or several plans run as a program (see above), where each phase is still its own run.
 - **Publishing is local.** Pushing and PRs stay manual.
 - **Stopping during reviewer dispatch** can log `ERR_STREAM_WRITE_AFTER_END` from a late prompt write; the run is still stopped.
 - **The write guard checks paths, not git commands.** A worker's `git worktree add /tmp/...` is not refused. Clean up with `git worktree prune`.

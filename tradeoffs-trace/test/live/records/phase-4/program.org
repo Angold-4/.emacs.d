@@ -1,0 +1,22 @@
+#+TITLE: live p4: tiny math library
+#+TT_PROGRAM: 2
+
+* a
+  :PROPERTIES:
+  :PLAN: a.org
+  :END:
+* b
+  :PROPERTIES:
+  :PLAN: b.org
+  :AFTER: a
+  :END:
+* c
+  :PROPERTIES:
+  :PLAN: c.org
+  :AFTER: a
+  :END:
+* d
+  :PROPERTIES:
+  :PLAN: d.org
+  :AFTER: b c
+  :END:
