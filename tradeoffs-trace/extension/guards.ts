@@ -38,7 +38,16 @@ export function guardedWritePath(targetPath: string, cwd: string, config: GuardC
   if (config.worktree && !isUnder(abs, config.worktree)) {
     return `edit/write outside the worktree (${config.worktree}) is blocked: ${targetPath}`;
   }
-  if (config.runDir && isUnder(abs, config.runDir)) {
+  // The worker's worktree lives inside the run directory (<run>/worktree), so
+  // the run-directory rule must exempt it: otherwise every edit/write in the
+  // worktree is refused and workers fall back to sh heredocs (observed in
+  // dogfood run 4ec5e0f8 and live-single-phase).
+  const insideWorktree =
+    config.worktree !== undefined &&
+    config.runDir !== undefined &&
+    isUnder(config.worktree, config.runDir) &&
+    isUnder(abs, config.worktree);
+  if (config.runDir && isUnder(abs, config.runDir) && !insideWorktree) {
     return `edit/write under the run directory (${config.runDir}) is blocked: ${targetPath}`;
   }
   for (const p of config.protectedPaths ?? []) {

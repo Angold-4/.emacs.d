@@ -32,6 +32,15 @@ test("guardedWritePath blocks a write under the run directory even if it is insi
   assert.match(reason ?? "", /run directory/);
 });
 
+test("guardedWritePath allows a write in the worktree when the worktree lives inside the run directory (the real layout)", () => {
+  const config = { worktree: "/r/run1/worktree", runDir: "/r/run1" };
+  assert.equal(guardedWritePath("tradeoffs-trace/src/core/types.ts", "/r/run1/worktree", config), undefined);
+  assert.equal(guardedWritePath("/r/run1/worktree/a.ts", "/r/run1/worktree", config), undefined);
+  // the rest of the run directory stays protected
+  assert.match(guardedWritePath("/r/run1/events.jsonl", "/r/run1/worktree", config) ?? "", /outside the worktree|run directory/);
+  assert.match(guardedWritePath("../inbox/x.json", "/r/run1/worktree", config) ?? "", /outside the worktree|run directory/);
+});
+
 test("guardedWritePath blocks a write to a protected acceptance file", () => {
   const reason = guardedWritePath("ACCEPTANCE.md", "/run/worktree", {
     worktree: "/run/worktree",

@@ -8,16 +8,19 @@ the previous run's published result.
 
 | order | plan                          | what it adds                                          |
 |-------+-------------------------------+-------------------------------------------------------|
-|     1 | 2b-owner-commands.org         | the conductor applies inbox commands (decision keys)  |
-|     2 | 2c-steer-revise.org           | input box = the one way to intervene; model discipline |
-|     3 | 3b-emacs-revise-history.org   | minimal readable decision view, trace, timing, pipeline |
-|     4 | 4a-multiphase.org             | serial multi-phase runs, master reviewer continuity   |
-|     5 | 4b-correct-earlier-phase.org  | corrections to an already integrated phase            |
+|     1 | 2b-owner-commands.org         | DONE (run 4ec5e0f8, commit e0e80c0)                   |
+|     2 | 2c-review-loop-speed.org      | review loop can converge; rounds spent on work, not waiting |
+|     3 | 2d-owner-input.org            | input box = the one way to intervene, transparently   |
+|     4 | 3b-emacs-revise-history.org   | minimal readable decision view, trace, timing, pipeline |
+|     5 | 4a-multiphase.org             | serial multi-phase runs, master reviewer continuity   |
+|     6 | 4b-correct-earlier-phase.org  | corrections to an already integrated phase            |
 
 * The owner's interface
 Read the decision view (C-c m d); if a decision does not make sense, type into
 the input box. That is the only way to intervene: it steers a running worker,
 notes the next attempt, or corrects a phase waiting for you.
+
+Writing a plan: see ~/orgw/PLAN_TEMPLATE.md.
 
 * Running one
 1. Open the plan file in the PR-20 Emacs, =C-c m r=.
