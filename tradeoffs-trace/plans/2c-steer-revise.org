@@ -6,10 +6,10 @@
   :PROPERTIES:
   :ID:          p2c-steer-revise
   :CHECKS:      make -C tradeoffs-trace check
-  :BOUNDARIES:  tradeoffs-trace/src/core/** tradeoffs-trace/schemas/**
+  :BOUNDARIES:  tradeoffs-trace/src/core/** tradeoffs-trace/schemas/** core/init-tradeoffs-trace.el
   :RESERVED:    the acceptance predicate in src/core/predicate.ts; the binding tuple fields
   :END:
-  Goal: an owner can steer the running worker and revise a decision from the inbox, and a revised decision reaches resolved with no further owner action, as in docs/tradeoffs-trace.md §7.4, §7.5 and §9.3.
+  Goal: owner input is transparent end to end: before sending, the Emacs input buffer states what C-c C-c will do now, and after sending the status buffer shows each command's real state as recorded by the conductor. An owner can steer the running worker and revise a decision from the inbox, and a revised decision reaches resolved with no further owner action, as in docs/tradeoffs-trace.md §7.4, §7.5 and §9.3.
   Acceptance:
   - a steer command in the inbox is delivered to the running worker attempt through Pi RPC steer, bound to that attempt id; with no running worker it becomes an owner note for the next attempt
   - steer delivery writes deliver.intent before sending and deliver.done on acknowledgement; after a crash between them the command is marked delivery uncertain and is never resent automatically
@@ -18,4 +18,10 @@
   - tests named correction-e2e, correction-after-budget and steer-uncertain exist under tradeoffs-trace/test/ and pass
   - the TT_CRASH_AT boundaries for the inbox move and for steer acknowledgement, already named in src/effects/crash.ts, are exercised by the crash suite
   - tt stop <run> ends a run's conductor cleanly (agents terminated, lock released) and records a stop event; the run can later be resumed with tt resume; observed need: stopping a run currently requires SIGTERM on the pid and takes about 40 s
+  - the worker prompt states that the conductor runs the phase CHECKS itself on a fresh checkout after submit_phase, so the worker should run only the narrow tests for what it changed, never the full suite, never in the background (nohup/&); observed in run 4ec5e0f8: the worker ran the full suite twice concurrently for 10+ minutes before submitting
+  - the sh guard refuses commands that background work (a trailing or embedded &, nohup, setsid, disown) with a tool error explaining that the conductor enforces per-command deadlines; observed in run 4ec5e0f8: nohup test runs escaped the 10-minute sh deadline and the worker polled /tmp logs with sleep loops
+  - the conductor records every owner command it sees as a log event with its state (received, applied, delivered, rejected with reason, delivery uncertain), and tt state exposes the list
+  - the *tt-input* buffer shows a header line, recomputed on refresh, stating what C-c C-c will do right now: steer the named running worker attempt, queue a note for the next attempt, or refuse because the runner cannot deliver input; RET inserts a newline, C-c C-c sends
+  - the status buffer has an "Owner input" section listing each sent command with its text and state (queued, delivered, applied, rejected: reason, delivery uncertain); a command the conductor has not picked up within 30 s is shown as "not picked up" rather than as queued
+  - ERT tests in test/tradeoffs-trace-test.el cover the header states and the Owner input section from a fixture tt state
   - all existing tests still pass
