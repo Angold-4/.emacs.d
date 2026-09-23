@@ -23,7 +23,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { existsSync, unlinkSync } from "node:fs";
 
 import { JSONLDecoder, encodeLine, type HelloMessage, type RunSocketMessage, type ShMessage, type SubmitMessage } from "../core/protocol.ts";
-import { runCommand } from "./shell.ts";
+import { childEnv, runCommand } from "./shell.ts";
 
 const MAX_SOCKET_PATH_BYTES = 104;
 
@@ -188,6 +188,10 @@ export class RunSocketServer {
     const running = runCommand({
       command: msg.command,
       cwd: msg.cwd ?? cwd,
+      // F13: a worker's `sh` command may itself run `node --test`; isolate
+      // it from the test runner's own recursion markers exactly like checks
+      // and the probe (see `childEnv`'s doc comment).
+      env: childEnv(),
       deadlineMs: deadline.deadlineMs,
       termGraceMs: deadline.termGraceMs,
       onIntent: async ({ pgid }) => {

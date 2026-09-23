@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { reduce } from "./core/reduce.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
+import { effectiveChecks } from "./core/checks.ts";
 import type {
   Action,
   Ballot,
@@ -51,7 +52,7 @@ import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireLock, type Lock } from "./effects/lock.ts";
-import { killGroup, runCommand } from "./effects/shell.ts";
+import { killGroup, childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
 import { sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
@@ -2541,6 +2542,20 @@ export class Conductor {
 
   // -- checks ---------------------------------------------------------------
 
+  /** Records one gate command's evidence: its command string, the identity
+   * it ran against (the enclosing directory name) and its outcome, in the
+   * same `<checks>/<sha>/<sanitized command>.log` shape the C path has
+   * always used. Called for every executed command in both gates, so the
+   * candidate C and the probed integration I each get one file per
+   * command. */
+  #recordCheck(outDir: string, command: string, result: RunCommandResult): void {
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(outDir, `${sanitize(command)}.log`),
+      `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
+    );
+  }
+
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
@@ -2553,7 +2568,10 @@ export class Conductor {
       let integrityViolated = !before;
       let timedOut = false;
       if (before) {
-        for (const command of this.#plan.checks) {
+        // F04: the effective list is the global plan checks followed by the
+        // phase contract's own checks, deduped by exact command string — the
+        // same list `#runProbe` executes against the merged integration I.
+        for (const command of effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
           // design §8.1: "each check command | 10 min | kill its group |
           // check failed: timeout" — runCommand's own deadlineMs already
           // kills the command's process group on expiry (shell.ts); this
@@ -2561,15 +2579,16 @@ export class Conductor {
           const running = runCommand({
             command,
             cwd: checkoutDir.dir,
+            // F13: isolate the child from the Node test runner's own
+            // recursion markers so a check that runs `node --test` actually
+            // runs (and can fail) instead of silently skipping.
+            env: childEnv(),
             deadlineMs: this.#deadlines.checkMs,
             termGraceMs: this.#deadlines.termGraceMs,
           });
           const result = await running.result;
           if (result.timedOut) timedOut = true;
-          fs.writeFileSync(
-            path.join(outDir, `${sanitize(command)}.log`),
-            `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
-          );
+          this.#recordCheck(outDir, command, result);
           const after = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
           if (!after) integrityViolated = true;
           if (result.exitCode !== 0 || result.timedOut || !after) {
@@ -2614,6 +2633,10 @@ export class Conductor {
     }
     let passed = true;
     let timedOutCommand: string | undefined;
+    // F04: the probe executes the same effective list as the C gate, on its
+    // own fresh checkout of the merged integration I, and records each
+    // command's evidence under a probe-specific directory keyed by that I.
+    const outDir = path.join(this.#paths.checks, "probe", result.I);
     // Plan 2c: when the probed integration I has exactly the candidate's
     // tree (the normal fast-forward case, design §6.4 step 2) and the checks
     // already passed on that candidate, rerunning them on I cannot give a
@@ -2623,7 +2646,7 @@ export class Conductor {
     const sameTree = treeOf(this.#plan.repo, result.I) === treeOf(this.#plan.repo, candidateSha);
     const reuse = this.#probeReuse && sameTree && checks?.candidateSha === candidateSha && checks.passed === true;
     if (reuse) this.#log.append("probe_checks_reused", { candidateSha, I: result.I, reason: "I has the candidate's tree; checks passed on the candidate" });
-    for (const command of reuse ? [] : this.#plan.checks) {
+    for (const command of reuse ? [] : effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
       // design §8.1: "integration probe (merge plus its checks) | as for
       // checks, per command | kill its group; discard the probe branch |
       // 'integration' finding: timeout" — runCommand's deadlineMs already
@@ -2632,10 +2655,13 @@ export class Conductor {
       const running = runCommand({
         command,
         cwd: result.checkoutDir,
+        // F13: same test-runner-marker isolation as the C gate (see childEnv).
+        env: childEnv(),
         deadlineMs: this.#deadlines.probeMs,
         termGraceMs: this.#deadlines.termGraceMs,
       });
       const commandResult = await running.result;
+      this.#recordCheck(outDir, command, commandResult);
       if (commandResult.exitCode !== 0 || commandResult.timedOut) {
         if (commandResult.timedOut) timedOutCommand = command;
         passed = false;

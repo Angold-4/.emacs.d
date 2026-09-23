@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -267,6 +268,113 @@ test("probe: a genuine conflict leaves the integration branch untouched and disc
   assert.equal(branches, "", "the probe branch must be discarded on conflict");
   const worktrees = git(["worktree", "list", "--porcelain"], repo);
   assert.ok(!worktrees.includes("tt-probe-"), "the probe checkout must be discarded on conflict");
+});
+
+test("R3.symlink: materialization/cleanup never chmods or replaces external symlink targets", () => {
+  const sha = git(["rev-parse", "HEAD"], repo);
+  const disposable = disposableCheckout(repo, sha);
+  const dir = disposable.dir;
+
+  // An external target referenced by an absolute symlink and one
+  // referenced by a relative symlink, plus a dangling link.
+  const extAbs = path.join(root, "external-abs.txt");
+  fs.writeFileSync(extAbs, "external-abs\n");
+  fs.chmodSync(extAbs, 0o600);
+  const extRel = path.join(root, "external-rel.txt");
+  fs.writeFileSync(extRel, "external-rel\n");
+  fs.chmodSync(extRel, 0o640);
+  fs.symlinkSync(extAbs, path.join(dir, "link-abs"));
+  fs.symlinkSync(path.relative(dir, extRel), path.join(dir, "link-rel"));
+  fs.symlinkSync(path.join(root, "missing-target.txt"), path.join(dir, "link-dangling"));
+
+  const absBefore = { content: fs.readFileSync(extAbs, "utf8"), mode: fs.statSync(extAbs).mode & 0o7777 };
+  const relBefore = { content: fs.readFileSync(extRel, "utf8"), mode: fs.statSync(extRel).mode & 0o7777 };
+
+  try {
+    // Simulate materialization (read-only) and then cleanup (writable).
+    setTreeWritable(dir, false);
+    assert.deepEqual(
+      { content: fs.readFileSync(extAbs, "utf8"), mode: fs.statSync(extAbs).mode & 0o7777 },
+      absBefore,
+      "an absolute symlink target must not be chmod'ed by materialization",
+    );
+    assert.deepEqual(
+      { content: fs.readFileSync(extRel, "utf8"), mode: fs.statSync(extRel).mode & 0o7777 },
+      relBefore,
+      "a relative symlink target must not be chmod'ed by materialization",
+    );
+
+    // The links must still be links, not copies of their targets.
+    assert.ok(fs.lstatSync(path.join(dir, "link-abs")).isSymbolicLink(), "link-abs must stay a symlink");
+    assert.equal(fs.readlinkSync(path.join(dir, "link-abs")), extAbs);
+    assert.ok(fs.lstatSync(path.join(dir, "link-rel")).isSymbolicLink(), "link-rel must stay a symlink");
+    assert.equal(fs.readlinkSync(path.join(dir, "link-rel")), path.relative(dir, extRel));
+    assert.ok(fs.lstatSync(path.join(dir, "link-dangling")).isSymbolicLink(), "dangling link must stay a symlink");
+    assert.equal(fs.readFileSync(path.join(dir, "link-abs"), "utf8"), absBefore.content);
+  } finally {
+    disposable.dispose();
+  }
+
+  assert.equal(fs.existsSync(dir), false, "the disposable checkout itself is removed");
+  assert.deepEqual(
+    { content: fs.readFileSync(extAbs, "utf8"), mode: fs.statSync(extAbs).mode & 0o7777 },
+    absBefore,
+    "cleanup must not chmod an external symlink target",
+  );
+  assert.deepEqual(
+    { content: fs.readFileSync(extRel, "utf8"), mode: fs.statSync(extRel).mode & 0o7777 },
+    relBefore,
+    "cleanup must not chmod an external symlink target",
+  );
+  assert.equal(fs.existsSync(extAbs), true, "the link's target is never replaced or removed");
+  assert.equal(fs.existsSync(extRel), true, "the link's target is never replaced or removed");
+});
+
+function snapshotTree(dir: string): Map<string, { mode: number; hash: string }> {
+  const out = new Map<string, { mode: number; hash: string }>();
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.isFile()) {
+        out.set(path.relative(dir, full), {
+          mode: fs.statSync(full).mode & 0o7777,
+          hash: createHash("sha256").update(fs.readFileSync(full)).digest("hex"),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+test("R3.executable: a tracked 0755 script stays executable and verifiable; the origin repo is untouched", () => {
+  const scriptRel = path.join("scripts", "run.sh");
+  fs.mkdirSync(path.join(repo, "scripts"));
+  fs.writeFileSync(path.join(repo, scriptRel), "#!/bin/sh\necho hi\n");
+  fs.chmodSync(path.join(repo, scriptRel), 0o755);
+  git(["add", "-A"], repo);
+  git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "add 0755 script"], repo);
+  const sha = git(["rev-parse", "HEAD"], repo);
+  assert.equal(git(["ls-files", "-s", scriptRel], repo).split(/\s+/)[0], "100755", "git recorded the exec bit");
+
+  const originObjectsBefore = snapshotTree(path.join(repo, ".git", "objects"));
+  const originScriptModeBefore = fs.statSync(path.join(repo, scriptRel)).mode & 0o7777;
+
+  const candidateDir = path.join(root, "candidate-exec");
+  materializeCandidate(repo, sha, candidateDir);
+
+  const materializedMode = fs.statSync(path.join(candidateDir, scriptRel)).mode & 0o7777;
+  assert.notEqual(materializedMode & 0o111, 0, `materialization must keep the script executable (mode ${materializedMode.toString(8)})`);
+  assert.equal(treeHashOf(repo, candidateDir, sha), git(["rev-parse", `${sha}^{tree}`], repo), "tree hash must equal the commit's tree");
+  assert.equal(verifyIntegrity(repo, candidateDir, sha), true, "integrity must still match the commit");
+
+  // The original repository's own files and objects are never touched.
+  assert.equal(git(["ls-files", "-s", scriptRel], repo).split(/\s+/)[0], "100755");
+  assert.equal(fs.statSync(path.join(repo, scriptRel)).mode & 0o7777, originScriptModeBefore, "the origin repo's tracked file mode is unchanged");
+  assert.deepEqual(snapshotTree(path.join(repo, ".git", "objects")), originObjectsBefore, "the origin repo's object files are unchanged");
 });
 
 test("publishCAS: success moves the branch, stale head reports the mismatch and leaves it untouched", () => {

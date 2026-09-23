@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { killGroup, runCommand } from "../../src/effects/shell.ts";
+import { childEnv, killGroup, runCommand } from "../../src/effects/shell.ts";
 
 let dir: string;
 
@@ -136,6 +136,63 @@ test("output capture, streamed and accumulated", async () => {
   assert.ok(outcome.output.includes("world"));
   assert.ok(streamed.join("").includes("hello"));
   assert.ok(streamed.join("").includes("world"));
+});
+
+test("R2.F13 childEnv: strips exactly the test-runner recursion markers, preserving ordinary configuration", () => {
+  const source: NodeJS.ProcessEnv = {
+    PATH: "/x/y",
+    HOME: "/home/u",
+    NODE_OPTIONS: "--no-warnings",
+    TT_SOCKET: "/tmp/s",
+    FAKE_PI_SCRIPT: "/tmp/s.json",
+    FOO: "bar",
+    NODE_TEST_CONTEXT: "child-v8",
+    NODE_TEST_WORKER_ID: "1",
+  };
+  const env = childEnv(source);
+  assert.equal(env.NODE_TEST_CONTEXT, undefined);
+  assert.equal(env.NODE_TEST_WORKER_ID, undefined);
+  assert.equal(env.PATH, "/x/y");
+  assert.equal(env.HOME, "/home/u");
+  assert.equal(env.NODE_OPTIONS, "--no-warnings");
+  assert.equal(env.TT_SOCKET, "/tmp/s");
+  assert.equal(env.FAKE_PI_SCRIPT, "/tmp/s.json");
+  assert.equal(env.FOO, "bar");
+  // The caller's object is not mutated.
+  assert.equal(source.NODE_TEST_CONTEXT, "child-v8");
+  assert.equal(JSON.stringify(Object.keys(env).sort()), JSON.stringify(["FAKE_PI_SCRIPT", "FOO", "HOME", "NODE_OPTIONS", "PATH", "TT_SOCKET"]));
+});
+
+// The real-Node proof: with the markers inherited, a nested `node --test`
+// prints the recursion warning and exits 0 (a real failure reported as a
+// pass); with `childEnv` applied, the same file actually runs and exits
+// nonzero. No mocked env object: this invokes the installed Node binary.
+test("R2.F13 childEnv: a real nested `node --test` runs and fails instead of silently skipping", () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "tt-childenv-"));
+  try {
+    fs.writeFileSync(
+      path.join(work, "fail.test.js"),
+      "const test = require('node:test');\nconst assert = require('node:assert/strict');\ntest('deliberately fails', () => { assert.equal(1, 2); });\n",
+    );
+    const inherited = spawnSync(process.execPath, ["--test"], {
+      cwd: work,
+      env: { ...process.env, NODE_TEST_CONTEXT: "child-v8", NODE_TEST_WORKER_ID: "1" },
+      encoding: "utf8",
+    });
+    assert.equal(inherited.status, 0, "with the markers inherited, the nested run skips and exits 0");
+    assert.match(`${inherited.stdout}${inherited.stderr}`, /recursively within a test file/);
+
+    const isolated = spawnSync(process.execPath, ["--test"], {
+      cwd: work,
+      env: childEnv({ ...process.env, NODE_TEST_CONTEXT: "child-v8", NODE_TEST_WORKER_ID: "1" }),
+      encoding: "utf8",
+    });
+    assert.notEqual(isolated.status, 0, "with childEnv applied, the failing test actually runs");
+    assert.match(`${isolated.stdout}${isolated.stderr}`, /fail 1/);
+    assert.ok(!`${isolated.stdout}${isolated.stderr}`.includes("recursively within a test file"));
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 });
 
 test("killGroup terminates a previously recorded pgid (recovery path)", async () => {
