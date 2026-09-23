@@ -469,12 +469,18 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
 ;;;;; Input
 
 (defun +tt--write-command (run-dir command)
-  "Write owner COMMAND (an alist) into RUN-DIR's inbox; return its id."
+  "Write owner COMMAND (an alist) into RUN-DIR's inbox; return its id.
+The document is written to a temporary name and renamed into place, so a
+conductor poll can never observe a truncated or half-written file (which it
+would otherwise reject permanently as malformed)."
   (let* ((id (format "cmd-%s-%04x" (format-time-string "%Y%m%dT%H%M%S") (random 65536)))
-         (inbox (expand-file-name "inbox" run-dir)))
+         (inbox (expand-file-name "inbox" run-dir))
+         (final (expand-file-name (concat id ".json") inbox))
+         (tmp (expand-file-name (concat id ".json.tmp") inbox))
+         (payload (json-encode (cons (cons 'commandId id) command))))
     (make-directory inbox t)
-    (with-temp-file (expand-file-name (concat id ".json") inbox)
-      (insert (json-encode (cons (cons 'commandId id) command))))
+    (write-region payload nil tmp nil 'silent)
+    (rename-file tmp final t)
     id))
 
 (defun +tt-input-send ()
@@ -650,8 +656,15 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
   "Resolve the owner request at point with option N (or write one with 0)."
   (interactive "p")
   (pcase-let ((`(,_ . ,rec) (+tt--record-at-point)))
-    (let ((opt (nth (1- n) (alist-get 'options rec))))
-      (+tt--queue "resolve" (cons 'option (or (alist-get 'id opt) (read-string "Your option: ")))))))
+    (let* ((opt (nth (1- n) (alist-get 'options rec)))
+           (id (or (alist-get 'id opt) (read-string "Your option: ")))
+           (fields (list (cons 'option id))))
+      ;; Accepting the risk of an open finding requires the scope note the
+      ;; core enforces (design §4.2); collect it here so the offered
+      ;; `accept_risk` option actually applies instead of being rejected.
+      (when (equal id "accept_risk")
+        (push (cons 'note (read-string "Scope of the accepted risk: ")) fields))
+      (apply #'+tt--queue "resolve" fields))))
 
 (defun +tt-decision-miss ()
   "Mark the sampled item at point as \"should have been surfaced\"."

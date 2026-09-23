@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { decisionStatus } from "./core/predicate.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
@@ -170,7 +171,7 @@ async function runConductorProcess(runDir: string): Promise<void> {
 function renderStatus(runDir: string): string {
   const p = runPaths(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
-  const state = rebuildState(runDir, plan);
+  const state = rebuildState(runDir, plan, { lenient: true });
   const phase = state.phase as unknown as Record<string, unknown>;
   const lines: string[] = [];
   lines.push(`run: ${path.basename(runDir)}`);
@@ -228,7 +229,7 @@ async function main(): Promise<void> {
     const p = runPaths(runDir);
     const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
     const meta = JSON.parse(readFileSync(p.meta, "utf8"));
-    const state = rebuildState(runDir, plan);
+    const state = rebuildState(runDir, plan, { lenient: true });
     let alive = false;
     try {
       const pid = Number(readFileSync(path.join(runDir, "conductor.pid"), "utf8"));
@@ -239,7 +240,14 @@ async function main(): Promise<void> {
     } catch {
       alive = false;
     }
-    process.stdout.write(`${JSON.stringify({ runDir, meta, plan, state, conductorAlive: alive })}\n`);
+    // Plan 2c: the tally's view of every decision on the current candidate
+    // (passed / failed with its reason / suspended / pending / superseded),
+    // so front ends never infer it from individual ballots.
+    const decisionStatuses = Object.fromEntries(
+      state.phase.decisions.map((d) => [d.id, decisionStatus(d, state.phase)]),
+    );
+    const round = state.phase.round ?? 0;
+    process.stdout.write(`${JSON.stringify({ runDir, meta, plan, state, round, decisionStatuses, conductorAlive: alive })}\n`);
   } else if (cmd === "runner" && positional[0] === "install") {
     // `tt runner install <sha>`: freeze an accepted revision outside every
     // worktree at <root>/runner/<sha>/, so a run that edits tradeoffs-trace

@@ -1,4 +1,4 @@
-.PHONY: check test ert live crash
+.PHONY: check test test-fast ert live crash
 
 # Node 25 runs TypeScript natively (type stripping) — no build step.
 # `cd` first so the quoted glob always resolves the same way regardless of
@@ -15,6 +15,12 @@ ert:
 # each, see that file's own header comment), not the full 12-boundary
 # sweep; both opt-in live tests skip themselves without TT_LIVE=1. So this
 # costs only the rest of the suite's own genuinely-slow tests.
+# Fast feedback for a worker (plan 2c): the pure core, schemas and effect
+# adapters, without the slow real-process conductor, crash and live tests.
+# The phase CHECKS stay the full `make check`, run by the conductor itself.
+test-fast:
+	cd $(CURDIR) && node --test --test-timeout=60000 'test/unit/**/*.test.ts' 'test/contract/**/*.test.ts' 'test/effects/**/*.test.ts' 'test/fake-pi/**/*.test.ts'
+
 test:
 	# 180s: this packet's tt-start-happy-path and deadline-every-stage
 	# exit-gate tests are both genuinely slow (the former drives a real

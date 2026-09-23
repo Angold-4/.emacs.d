@@ -24,7 +24,7 @@ import {
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
-import { reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { isLiveDecision, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
 import type { BindingTuple, ContractVersion, Event, InFlightKey, ReduceResult, State } from "./types.ts";
 
@@ -70,6 +70,12 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "LAUNCH_FAILED",
   "INTEGRITY_VIOLATED",
   "DECISION_ADDED",
+  "NOTE_ADDED",
+  "OWNER_REQUEST_MARKED_UNNEEDED",
+  "MISS_RECORDED",
+  "NOTES_DELIVERED",
+  "DECISION_MATCHED",
+  "FINDING_ALSO_RAISED",
 ]);
 
 function ok(state: State): ReduceResult {
@@ -129,6 +135,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // decision's current record version.
       const check = checkBallotBinding(event.ballot, p);
       if (!check.ok) return rejected(state, check.reason!);
+      const target = p.decisions.find((d) => d.id === event.ballot.decisionId);
+      if (target && !isLiveDecision(target)) {
+        return rejected(state, `decision ${target.id} is superseded (${target.supersededBy ?? "by correction"}) and is not votable`);
+      }
 
       let next = { ...p, ballots: [...p.ballots, event.ballot] };
       if (event.ballot.contractObjection) {
@@ -322,6 +332,104 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return undefined;
     }
 
+    case "NOTE_ADDED": {
+      // §7.4 `note` (conductor state): queued for the next worker attempt's
+      // prompt. Record-only — it moves no phase.
+      if (event.phaseId !== p.phaseId) {
+        return rejected(state, `note is for phase ${event.phaseId}, but this run is on phase ${p.phaseId}`);
+      }
+      if (!event.text || event.text.trim().length === 0) {
+        return rejected(state, "a note must carry non-empty text");
+      }
+      return ok({ ...state, phase: { ...p, ownerNotes: [...(p.ownerNotes ?? []), event.text] } });
+    }
+
+    case "OWNER_REQUEST_MARKED_UNNEEDED": {
+      // §7.4 `unneeded` / §11.4's "unnecessary escalations" pilot metric:
+      // recorded, not resolved (nothing was answered). Record-only, and the
+      // request deliberately STAYS `open`: closing it would (a) reject a
+      // follow-up OWNER_REQUEST_RESOLVED as "already unneeded" and (b) for
+      // the record-less fallback request (no candidate/decision/finding)
+      // leave AWAITING_OWNER with no open request and no command that can
+      // unstick it — the blocking finding on this candidate. The metric
+      // lives in `unneededRequestIds`, so the owner can still grant/stop/
+      // repair the request afterwards.
+      const request = p.ownerRequests.find((r) => r.id === event.requestId);
+      if (!request) return rejected(state, `unknown owner request ${event.requestId}`);
+      if (request.status !== "open") {
+        return rejected(state, `owner request ${event.requestId} is already ${request.status}, not open`);
+      }
+      const already = p.unneededRequestIds ?? [];
+      if (already.includes(event.requestId)) {
+        return rejected(state, `owner request ${event.requestId} is already marked unneeded`);
+      }
+      return ok({ ...state, phase: { ...p, unneededRequestIds: [...already, event.requestId] } });
+    }
+
+    case "NOTES_DELIVERED": {
+      // §7.4 `note`: the conductor delivered the first `count` queued notes
+      // in a worker attempt's prompt; later attempts send only the rest, so
+      // a note reaches the NEXT attempt and does not keep steering every
+      // one (finding F-p2b-...-B-2). Record-only.
+      if (event.phaseId !== p.phaseId) {
+        return rejected(state, `notes are for phase ${event.phaseId}, but this run is on phase ${p.phaseId}`);
+      }
+      if (!Number.isInteger(event.count) || event.count <= 0) {
+        return rejected(state, "a notes-delivered event must carry a positive integer count");
+      }
+      return ok({ ...state, phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count } });
+    }
+
+    case "DECISION_MATCHED": {
+      // Plan 2c (design §3.3): a reviewer's own discovery is the same choice
+      // as another listed record. The discovery stops being a separate,
+      // votable record; the reviewer is recorded on the matched record.
+      const discovery = p.decisions.find((d) => d.id === event.decisionId);
+      const target = p.decisions.find((d) => d.id === event.sameAs);
+      if (!discovery) return rejected(state, `unknown decision ${event.decisionId}`);
+      if (!target) return rejected(state, `unknown decision ${event.sameAs}`);
+      if (discovery.id === target.id) return rejected(state, "a decision cannot match itself");
+      if (discovery.source !== "reviewer-discovered") {
+        return rejected(state, `only a reviewer-discovered record can be matched, not ${discovery.source} ${discovery.id}`);
+      }
+      if (!isLiveDecision(discovery) || !isLiveDecision(target)) {
+        return rejected(state, `cannot match superseded records (${discovery.id} → ${target.id})`);
+      }
+      const decisions = p.decisions.map((d) => {
+        if (d.id === discovery.id) return { ...d, supersededBy: `same as ${target.id}`, version: d.version + 1 };
+        if (d.id === target.id) {
+          const seen = d.alsoSeenBy ?? [];
+          return seen.includes(event.reviewer) ? d : { ...d, alsoSeenBy: [...seen, event.reviewer] };
+        }
+        return d;
+      });
+      return ok({ ...state, phase: { ...p, decisions } });
+    }
+
+    case "FINDING_ALSO_RAISED": {
+      // Plan 2c: "same as F-…" — the reviewer agrees with an open finding
+      // instead of filing a duplicate. Record-only.
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      if (finding.status !== "open") return rejected(state, `finding ${finding.id} is ${finding.status}, not open`);
+      const also = finding.alsoRaisedBy ?? [];
+      if (finding.raisedBy === event.reviewer || also.includes(event.reviewer)) return ok(state);
+      const findings = p.findings.map((f) => (f.id === finding.id ? { ...f, alsoRaisedBy: [...also, event.reviewer] } : f));
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "MISS_RECORDED": {
+      // §3.5/§10.4 `s`: the observed miss sample. Record-only.
+      if (!event.recordId || event.recordId.trim().length === 0) {
+        return rejected(state, "a miss must name the sampled record it refers to");
+      }
+      const misses = p.misses ?? [];
+      if (misses.includes(event.recordId)) {
+        return rejected(state, `record ${event.recordId} is already marked as a miss`);
+      }
+      return ok({ ...state, phase: { ...p, misses: [...misses, event.recordId] } });
+    }
+
     default:
       return undefined;
   }
@@ -386,7 +494,7 @@ export function reduce(state: State, event: unknown): ReduceResult {
     // pending until FREEZE_COMPLETED assembles and binds them.
     let working = state;
     if (ev.type === "SUBMIT_PHASE") {
-      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures } };
+      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior } };
     }
 
     const rows = rowsFor(working, ev.type);

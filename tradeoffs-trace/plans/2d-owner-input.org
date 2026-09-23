@@ -1,0 +1,22 @@
+#+TITLE: tradeoffs-trace 2d: the input box is the owner's one way to intervene
+#+TT_CHECKS: make -C tradeoffs-trace check
+#+TT_BRANCH: feat/tradeoffs-trace-p4-dogfood
+
+* Phase 2d: owner input
+  :PROPERTIES:
+  :ID:          p2d-owner-input
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  tradeoffs-trace/schemas/**
+  :RESERVED:    the acceptance predicate in src/core/predicate.ts; the binding tuple fields
+  :END:
+  Goal: the owner intervenes only through the Emacs input box, and every intervention is transparent: before sending, the input buffer states what sending will do now; after sending, the status buffer shows what actually happened as recorded by the conductor. Priorities: never claim an effect that did not happen; at-most-once delivery for steering; a stopped run can always be resumed. Plan 2b's inbox commands are the mechanism. Design references: docs/tradeoffs-trace.md §7.4, §7.5, §9.3.
+  Acceptance:
+  - input sent while a worker attempt is running is delivered to that attempt as a Pi RPC steer (deliver.intent before sending, deliver.done on acknowledgement); after a crash between them the command is shown as delivery uncertain and never resent automatically
+  - input sent while no worker is running (checking, probing, reviewing) is a note delivered once at the start of the next worker attempt
+  - input sent while the phase is AWAITING_OWNER is an owner correction: it resolves the open owner requests, grants 3 repair rounds (independent of the exhausted budget) and starts a repair attempt whose prompt contains the text verbatim
+  - input sent after the phase is DONE or BLOCKED is refused with the reason shown in the input buffer
+  - the *tt-input* header line, recomputed on refresh, states which of these will happen now and to which attempt, or that the runner cannot deliver input; in Evil normal state RET sends, in insert state RET inserts a newline, C-c C-c sends from either state
+  - the status buffer has an "Owner input" section listing each sent text with its recorded state (delivered, noted, correction started, refused: reason, delivery uncertain); a command not picked up within 30 s is shown as "not picked up"
+  - tt stop <run> ends a run's conductor cleanly (agents terminated, lock released, stop event logged) within 15 s, and tt resume continues it (observed: stopping a run by SIGTERM took about 64 s)
+  - tests cover steer delivery and delivery uncertain (steer-uncertain), the AWAITING_OWNER correction path (correction-after-budget), refusal after DONE and tt stop; ERT tests cover the input header states and the Owner input section from a fixture
+  - all existing tests still pass

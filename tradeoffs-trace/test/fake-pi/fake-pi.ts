@@ -34,7 +34,7 @@
 // `prompt` arrives, so one script can cover both turns.
 
 import { createConnection, type Socket } from "node:net";
-import { readFileSync, statSync } from "node:fs";
+import { appendFileSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -66,6 +66,8 @@ interface Script {
   hello?: HelloSpec;
   steps: Step[];
 }
+
+let hangingForever = false;
 
 function readEnv(name: string): string | undefined {
   const v = process.env[name];
@@ -256,6 +258,10 @@ async function main(): Promise<void> {
           writeStdout({ type: "agent_settled" });
           return;
         case "hang-forever":
+          // An unresponsive agent ignores abort AND stdin EOF (plan 2c:
+          // terminate() now closes stdin after abort), so escalation to
+          // SIGTERM/SIGKILL is still exercised.
+          hangingForever = true;
           await new Promise(() => {
             // never resolves — survives abort by design, for phase 1's
             // escalation-to-SIGTERM/SIGKILL tests.
@@ -288,6 +294,12 @@ async function main(): Promise<void> {
         case "steer":
         case "follow_up":
           writeStdout({ type: "response", id, command: cmd.type, success: true });
+          // Test-only prompt capture (opt-in via FAKE_PI_PROMPT_LOG): lets a
+          // conductor test assert what the conductor actually sent — e.g.
+          // that a queued `note` reached the next worker attempt's prompt.
+          if (cmd.type === "prompt" && readEnv("FAKE_PI_PROMPT_LOG")) {
+            appendFileSync(readEnv("FAKE_PI_PROMPT_LOG")!, `${String(cmd.message)}\n=====\n`);
+          }
           if (cmd.type === "prompt") {
             if (!ranOnce) {
               ranOnce = true;
@@ -322,6 +334,7 @@ async function main(): Promise<void> {
   process.stdin.on("end", () => {
     // A real pi process would exit on stdin EOF; match that so tests can
     // rely on process exit as a signal.
+    if (hangingForever) return;
     process.exit(0);
   });
 }

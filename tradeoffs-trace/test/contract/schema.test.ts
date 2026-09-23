@@ -176,6 +176,69 @@ test("schema: owner-command rejects an unknown kind", () => {
   assert.equal(result.valid, false);
 });
 
+test("schema: owner-command accepts a miss command", () => {
+  const result = validate(schema("owner-command"), { kind: "miss", recordId: "D-p1-1", sample: "detail" });
+  assert.equal(result.valid, true, result.errors.join("; "));
+});
+
+test("schema: owner-command rejects a miss without a recordId", () => {
+  const result = validate(schema("owner-command"), { kind: "miss" });
+  assert.equal(result.valid, false);
+});
+
+test("schema: owner-command accepts the decision view's type + binding encoding", () => {
+  const result = validate(schema("owner-command"), {
+    commandId: "cmd-1",
+    type: "override",
+    recordKind: "decision",
+    vote: "reject",
+    binding: {
+      runId: "r1",
+      phaseId: "p1",
+      candidateSha: "C1",
+      contractVersion: { snapshot: 1, sectionSha256: "a".repeat(64) },
+      recordId: "D-1",
+      recordVersion: 2,
+    },
+  });
+  assert.equal(result.valid, true, result.errors.join("; "));
+});
+
+test("schema: owner-command rejects a decision-view command whose binding omits the record tuple", () => {
+  const result = validate(schema("owner-command"), {
+    commandId: "cmd-1",
+    type: "resolve",
+    recordKind: "request",
+    option: "grant",
+    binding: { runId: "r1", phaseId: "p1" },
+  });
+  assert.equal(result.valid, false);
+});
+
+test("schema: owner-command rejects a decision-view override without a vote", () => {
+  const result = validate(schema("owner-command"), {
+    type: "override",
+    binding: {
+      runId: "r1",
+      phaseId: "p1",
+      candidateSha: "C1",
+      contractVersion: { snapshot: 1, sectionSha256: "a".repeat(64) },
+      recordId: "D-1",
+      recordVersion: 2,
+    },
+  });
+  assert.equal(result.valid, false);
+});
+
+test("schema: owner-command accepts a decision-view note bound only to run and phase", () => {
+  const result = validate(schema("owner-command"), {
+    type: "note",
+    text: "keep it fast",
+    binding: { runId: "r1", phaseId: "p1" },
+  });
+  assert.equal(result.valid, true, result.errors.join("; "));
+});
+
 test("schema: binding accepts a valid fixture", () => {
   const result = validate(schema("binding"), fixture("binding"));
   assert.equal(result.valid, true, result.errors.join("; "));
@@ -197,6 +260,10 @@ test("schema: event accepts every known event type and rejects an unknown one", 
     { type: "REPAIR_ATTEMPT_STARTED" },
     { type: "RUN_RESUMED" },
     { type: "LAUNCH_FAILED", role: "worker", expected: ["read"], missing: [], extra: ["write"] },
+    { type: "NOTE_ADDED", phaseId: "p1", text: "keep it fast" },
+    { type: "OWNER_REQUEST_MARKED_UNNEEDED", requestId: "OR-1" },
+    { type: "MISS_RECORDED", recordId: "D-p1-1" },
+    { type: "NOTES_DELIVERED", phaseId: "p1", count: 1 },
   ];
   for (const sample of knownSamples) {
     const result = validate(eventSchema, sample);

@@ -19,6 +19,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
 import type {
@@ -30,8 +31,10 @@ import type {
   DecisionDisclosure,
   Event,
   Finding,
+  PriorDecisionStatement,
   FindingDisclosure,
   InFlightKey,
+  OwnerCommand,
   PhaseContract,
   PhaseState,
   Review,
@@ -40,7 +43,7 @@ import type {
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
 import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
-import { sameVersion } from "./core/predicate.ts";
+import { decisionStatus, isLiveDecision, sameVersion } from "./core/predicate.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
@@ -77,6 +80,9 @@ const DECISION_SCHEMA: Record<string, unknown> = JSON.parse(
 const FINDING_SCHEMA: Record<string, unknown> = JSON.parse(
   fs.readFileSync(new URL("../schemas/finding.schema.json", import.meta.url), "utf8"),
 );
+const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
+  fs.readFileSync(new URL("../schemas/owner-command.schema.json", import.meta.url), "utf8"),
+);
 
 // ---------------------------------------------------------------------------
 // Config — design §8.1 defaults, overridable per run.
@@ -93,6 +99,11 @@ export interface Deadlines {
   reproductionMs: number;
   abortGraceMs: number;
   termGraceMs: number;
+  /** design §9.3: how often the conductor re-reads `<run>/inbox/*.json`
+   * while running. Owner commands are conductor state, so the conductor
+   * must pick one up even when parked in AWAITING_OWNER (when `next()`
+   * dispatches nothing at all). */
+  inboxPollMs: number;
   /** Wall-clock run execution budget (design §8.1's "run execution budget").
    * Unset (default) = unbounded. The clock counts only time spent
    * *executing* (design §8.2's own text): it pauses whenever the phase is
@@ -121,6 +132,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
   termGraceMs: 10_000,
+  inboxPollMs: 1_000,
 };
 
 export interface RunPlanPhase {
@@ -185,6 +197,10 @@ export interface ConductorOptions {
    * carrying real `ballots`/`findings`) are processed for real (design §3,
    * §4, §5, §6.1). */
   stubReviews?: boolean;
+  /** Plan 2c: reuse the candidate's passed checks for the integration probe
+   * when the probed integration has exactly the candidate's tree (default
+   * true). Tests that exercise the probe's own command handling turn it off. */
+  probeReuse?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +221,9 @@ export function runPaths(runDir: string) {
     sessions: path.join(runDir, "sessions"),
     candidates: path.join(runDir, "candidates"),
     checks: path.join(runDir, "checks"),
+    inbox: path.join(runDir, "inbox"),
+    inboxApplied: path.join(runDir, "inbox", "applied"),
+    inboxRejected: path.join(runDir, "inbox", "rejected"),
     worktree: path.join(runDir, "worktree"),
   };
 }
@@ -286,7 +305,7 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   const runDir = path.join(root, runId);
   fs.mkdirSync(runDir, { recursive: false });
   const p = runPaths(runDir);
-  for (const dir of [p.plan, p.stream, p.views, p.sessions, p.candidates, p.checks]) {
+  for (const dir of [p.plan, p.stream, p.views, p.sessions, p.candidates, p.checks, p.inbox, p.inboxApplied, p.inboxRejected]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(plan, null, 2));
@@ -318,7 +337,9 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
  * on every restart). `tt status` (cli.ts) calls this directly; so does
  * `Conductor.start()`. Throws if a logged event no longer reduces cleanly
  * from the same base — a conductor/log bug, not something to paper over. */
-export function rebuildState(runDir: string, plan: RunPlanFile): State {
+/** `lenient`: for read-only views (tt state/status) of runs written by an
+ * older runner revision; recovery always folds strictly. */
+export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?: boolean } = {}): State {
   const p = runPaths(runDir);
   const { records } = readLog(p.events);
   const initRecord = records.find((r) => r.kind === "init");
@@ -332,18 +353,24 @@ export function rebuildState(runDir: string, plan: RunPlanFile): State {
     runId = randomUUID().slice(0, 8);
     integrationHead = currentHead(plan.repo, plan.integrationBranch);
   }
-  return foldEvents(initialState(runId, plan.phases[0], integrationHead), records);
+  return foldEvents(initialState(runId, plan.phases[0], integrationHead), records, opts.lenient === true);
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
  * `reduce()` onto `base`. Throws if one no longer reduces cleanly — see
  * `rebuildState`'s doc comment for why that is always a bug, not something
  * to paper over. */
-function foldEvents(base: State, records: readonly LogRecord[]): State {
+function foldEvents(base: State, records: readonly LogRecord[], lenient = false): State {
   let state = base;
   for (const record of records) {
     if (record.kind !== "event") continue;
     const result = reduce(state, record.event);
+    if (!result.ok && lenient) {
+      // Read-only views of a run written by an older runner revision: skip
+      // what the current core refuses (e.g. ballots on records it now
+      // supersedes) instead of failing to show the run at all.
+      continue;
+    }
     if (!result.ok) {
       throw new Error(`recovery: logged event ${JSON.stringify(record.event)} no longer reduces: ${result.reason}`);
     }
@@ -389,6 +416,7 @@ export class Conductor {
   #extraEnv: NodeJS.ProcessEnv;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
+  #probeReuse: boolean;
   #log!: EventLog;
   #lock: Lock | undefined;
   #socket!: RunSocketServer;
@@ -443,6 +471,12 @@ export class Conductor {
    * call (which reuses this directory instead of minting a fresh one, and
    * appends an interruption note to the prompt), then cleared. */
   #recoveredSessionDir: string | undefined;
+  /** design §9.3: the inbox command ids already appended to the log, seeded
+   * from the log at `start()` and updated on every apply. A file whose id is
+   * in this set is only moved to applied/, never applied a second time. */
+  #appliedCommandIds = new Set<string>();
+  /** The inbox poll timer; cleared by `#doStop`. */
+  #inboxTimer: NodeJS.Timeout | undefined;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -456,6 +490,7 @@ export class Conductor {
     this.#extraEnv = opts.extraEnv ?? {};
     this.#piEnvFor = opts.piEnvFor;
     this.#stubReviews = opts.stubReviews ?? false;
+    this.#probeReuse = opts.probeReuse ?? true;
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -528,6 +563,15 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head);
     }
     this.#state = foldEvents(this.#state, records);
+    // design §9.3: "If the command ID is already in the log, the command is
+    // only moved to applied/." Every applied conductor-state command's event
+    // carries its inbox id, so the applied set is rebuilt from the log alone
+    // after a restart — the log append is the effect, the file move is not.
+    for (const record of records) {
+      if (record.kind !== "event") continue;
+      const id = (record.event as { commandId?: unknown } | null | undefined)?.commandId;
+      if (typeof id === "string") this.#appliedCommandIds.add(id);
+    }
 
     // design §9.3's "create worktree" reconciliation — physical-effect
     // bookkeeping only, never a core Event (the worktree exists before the
@@ -557,6 +601,20 @@ export class Conductor {
     await this.#reconcileInFlight();
 
     this.#syncBudgetTimer();
+
+    // design §9.3's conductor-state commands: read the inbox once on start
+    // (a crash may have left a command un-moved), then poll while running; a
+    // command is applied by appending its event to the log, so the poll must
+    // run even when the phase is parked and `next()` dispatches nothing.
+    this.#ensureInboxDirs();
+    this.#scanInbox();
+    // Reconcile above can itself reach a terminal state and fire the
+    // auto-stop, so only arm the poll timer if `stop()` has not already run
+    // (`#doStop` would have cleared an unset timer, and arming one here
+    // afterwards would keep the process alive forever).
+    if (!this.#closed) {
+      this.#inboxTimer = setInterval(() => this.#scanInbox(), this.#deadlines.inboxPollMs);
+    }
 
     this.drive();
   }
@@ -777,6 +835,7 @@ export class Conductor {
 
   async #doStop(): Promise<void> {
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
+    if (this.#inboxTimer) clearInterval(this.#inboxTimer);
     for (const handle of this.#agents.values()) {
       await handle.agent.terminate().catch(() => undefined);
       // design §2.2's "conductor-owned shell": an `sh` command's process
@@ -800,22 +859,177 @@ export class Conductor {
    * full state snapshot), reduce(), and re-drive. Throws if reduce rejects
    * it (a conductor bug, since every event this file emits should always be
    * exactly what next() asked for). */
-  #applyEvent(event: Event): void {
+  #applyEvent(event: Event, commandId?: string): void {
     // Once `stop()` has started tearing down (or a prior auto-stop already
     // ran), a straggling background dispatch (e.g. `#runWorkerAttempt` for
     // an agent `stop()` just terminated) must not append to an already-
     // closed log or resume driving — see round-of-review item 1.
     if (this.#closed) return;
-    const result = reduce(this.#state, event);
-    this.#log.append("event", event);
+    // design §9.3: an applied inbox command's event carries its inbox
+    // command id, so recovery can tell "already applied" from the log
+    // without a second record. reduce() ignores the extra field.
+    const logged: Event = commandId === undefined ? event : ({ ...event, commandId } as Event);
+    const result = reduce(this.#state, logged);
+    this.#log.append("event", logged);
     if (!result.ok) {
-      this.#log.append("rejected", { event, reason: result.reason });
+      this.#log.append("rejected", { event: logged, reason: result.reason });
       throw new Error(`conductor emitted an event reduce() rejected: ${result.reason}`);
     }
     this.#state = result.state;
     this.#syncBudgetTimer();
     this.drive();
     this.#maybeAutoStop();
+  }
+
+  // -- inbox: owner commands (design §7.4, §9.3) --------------------------
+
+  /** Creates `<run>/inbox/`, `applied/` and `rejected/` if missing — a run
+   * created before this packet, or a run directory assembled by hand, still
+   * gets them on its next start. */
+  #ensureInboxDirs(): void {
+    for (const dir of [this.#paths.inbox, this.#paths.inboxApplied, this.#paths.inboxRejected]) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  /** design §9.3: read every pending `<id>.json` owner command, name-sorted
+   * first (so two commands written in one poll window apply in a stable
+   * order), and apply or reject each exactly once. Synchronous by design: a
+   * scan never interleaves with another, and `#applyEvent`'s own `drive()`
+   * runs inside the same tick. */
+  #scanInbox(): void {
+    if (this.#closed) return;
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.#paths.inbox);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      this.#logUnexpected("scan_inbox", err);
+      return;
+    }
+    for (const name of names.sort()) {
+      if (this.#closed) return;
+      if (!name.endsWith(".json")) continue;
+      try {
+        this.#processInboxFile(path.join(this.#paths.inbox, name));
+      } catch (err) {
+        this.#logUnexpected("process_inbox", err);
+      }
+    }
+  }
+
+  /** One inbox file. The command id is the filename's basename (design §9.1
+   * — schemas/owner-command.schema.json's bodies carry no `id`), never part
+   * of the JSON body. Ordering is deliberate: (1) an id already in the log
+   * is only moved; (2) a command that fails to parse/validate, names an
+   * unsupported kind, or whose binding no longer matches is rejected
+   * visibly — a `command_rejected` log record plus the file moved to
+   * rejected/ with the reason beside it; (3) otherwise the event is appended
+   * (the effect), the id is remembered, and only then is the file moved. */
+  #processInboxFile(file: string): void {
+    if (this.#closed) return;
+    const name = path.basename(file);
+    const commandId = name.endsWith(".json") ? name.slice(0, -".json".length) : name;
+
+    if (this.#appliedCommandIds.has(commandId)) {
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+      return;
+    }
+
+    const reject = (reason: string): void => {
+      const trimmed = reason.length > 500 ? `${reason.slice(0, 500)}…` : reason;
+      this.#log.append("command_rejected", { commandId, reason: trimmed });
+      try {
+        fs.writeFileSync(path.join(this.#paths.inboxRejected, `${commandId}.reason.txt`), `${trimmed}\n`);
+      } catch (err) {
+        this.#log.append("error", { where: "inbox_rejection_note", error: String((err as Error)?.message ?? err) });
+      }
+      this.#moveInboxFile(file, this.#paths.inboxRejected);
+    };
+
+    let text: string;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch (err) {
+      reject(`could not read owner command file: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    // A writer may still be mid-write (an empty or whitespace-only document
+    // is indistinguishable from the truncate window of an in-place write).
+    // That is transient, not malformed: leave the file for the next poll
+    // rather than rejecting it permanently. A genuinely malformed
+    // (non-empty) document is still rejected below.
+    if (text.trim().length === 0) return;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      reject(`could not parse owner command JSON: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
+    // `kind` form (a `tt cmd`/test front end), and the decision view's
+    // `type` + `binding` form (design §10.4 — what Emacs actually writes).
+    // Either reduces to the same core event.
+    // Detect the encoding by shape, not by schema validity: the schema now
+    // accepts BOTH forms, so validity alone cannot say which mapping to use.
+    let event: Event | undefined;
+    let boundRunId: string | undefined;
+    let boundPhaseId: string | undefined;
+    const looksFlat = raw !== null && typeof raw === "object" && typeof (raw as { kind?: unknown }).kind === "string";
+    if (looksFlat) {
+      const flat = validate(OWNER_COMMAND_SCHEMA, raw);
+      if (!flat.valid) {
+        reject(`owner command fails schemas/owner-command.schema.json: ${flat.errors.join("; ")}`);
+        return;
+      }
+      const command = raw as OwnerCommand;
+      event = ownerCommandToEvent(command, commandId);
+      if (!event) {
+        reject(`owner command kind '${command.kind}' is not a conductor-state command this phase applies`);
+        return;
+      }
+    } else {
+      const normalized = normalizeDecisionViewCommand(raw, commandId);
+      if (!normalized.ok) {
+        reject(normalized.reason);
+        return;
+      }
+      event = normalized.event;
+      boundRunId = normalized.runId;
+      boundPhaseId = normalized.phaseId;
+    }
+    // The decision view's binding carries run/phase ids too (design §7.1); a
+    // command for another run or phase is stale by the same rule.
+    if (boundRunId && boundRunId !== this.#state.phase.runId) {
+      reject(`command is bound to run ${boundRunId}, but this run is ${this.#state.phase.runId}`);
+      return;
+    }
+    if (boundPhaseId && boundPhaseId !== this.#state.phase.phaseId) {
+      reject(`command is bound to phase ${boundPhaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
+      return;
+    }
+    const result = reduce(this.#state, event);
+    if (!result.ok) {
+      reject(result.reason);
+      return;
+    }
+    this.#appliedCommandIds.add(commandId);
+    this.#applyEvent(event, commandId);
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Moves an inbox file into `destDir`. A missing source is a no-op (it was
+   * already moved); any other error is logged, never thrown, so one bad file
+   * cannot stop the poll. */
+  #moveInboxFile(file: string, destDir: string): void {
+    const dest = path.join(destDir, path.basename(file));
+    try {
+      fs.renameSync(file, dest);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      this.#logUnexpected("inbox_move", err);
+    }
   }
 
   /** design §8.1/§8.2: "the execution budget counts only time spent
@@ -1029,8 +1243,20 @@ export class Conductor {
       // #runFreeze. The tool result below still goes back to the worker
       // before that sequence's first side effect (the RPC abort).
       const args = msg.args as SubmitPhaseArgs;
+      // Plan 2c: prior-decision statements must name live worker records;
+      // anything else is a model mistake the worker can fix and resubmit.
+      const prior = args.priorDecisions ?? [];
+      for (const st of prior) {
+        const d = this.#state.phase.decisions.find((x) => x.id === st.id);
+        if (!d || d.source !== "worker" || !isLiveDecision(d)) {
+          return { ok: false, reason: `priorDecisions: ${st.id} is not one of your prior decisions listed in the prompt` };
+        }
+        if (st.status === "changed" && !st.choice) {
+          return { ok: false, reason: `priorDecisions: ${st.id} is 'changed' but gives no new choice` };
+        }
+      }
       this.#activeWorkerHandle = handle;
-      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures: args.decisions ?? [] });
+      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures: args.decisions ?? [], ...(prior.length > 0 ? { prior } : {}) });
       // Unblocks #runWorkerAttempt's race with outcome "submitted" (rather
       // than falling through to "settled" once the freeze's own abort makes
       // the agent settle, which would misreport this as no_submission).
@@ -1181,6 +1407,12 @@ export class Conductor {
   #applyDiscoveries(discoveries: DecisionDisclosure[], reviewer: Reviewer): string | undefined {
     const candidate = this.#state.phase.candidate;
     if (!candidate) return "no candidate exists yet to bind a discovered decision to";
+    if (this.#discoveryClosed()) {
+      // Plan 2c no-unshown-ballots: the other reviewers are already voting on
+      // the merged list, so a record added now could never get their ballots.
+      this.#log.append("late_discovery", { reviewer, candidateSha: candidate.sha, discoveries });
+      return undefined;
+    }
     const K = this.#state.phase.contract.contractVersion;
     for (const d of discoveries) {
       const decision: Decision = {
@@ -1279,16 +1511,51 @@ export class Conductor {
     if (!candidate) return "no candidate exists yet to bind ballots/findings to";
     const K = this.#state.phase.contract.contractVersion;
 
+    // Plan 2c: a reviewer's own discovery that repeats another record is
+    // matched to it, before ballots, so the duplicate never needs a vote.
+    for (const m of review.discoveryMatches ?? []) {
+      const discovery = this.#state.phase.decisions.find((d) => d.id === m.discoveryId);
+      const target = this.#state.phase.decisions.find((d) => d.id === m.sameAs);
+      if (
+        !discovery ||
+        !target ||
+        !discovery.id.includes(`-disc-${review.reviewer}-`) ||
+        !isLiveDecision(discovery) ||
+        !isLiveDecision(target) ||
+        discovery.id === target.id
+      ) {
+        this.#log.append("match_ignored", { reviewer: review.reviewer, ...m });
+        continue;
+      }
+      this.#applyEvent({ type: "DECISION_MATCHED", decisionId: discovery.id, sameAs: target.id, reviewer: review.reviewer });
+    }
+
     for (const fd of review.findings ?? []) {
-      const error = await this.#raiseFinding(fd, review.reviewer, candidate.sha);
+      // Plan 2c: "same as F-…" records agreement instead of a duplicate.
+      if (fd.sameAs) {
+        const existing = this.#state.phase.findings.find((f) => f.id === fd.sameAs && f.status === "open");
+        if (existing) {
+          this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer: review.reviewer });
+          continue;
+        }
+      }
+      const { sameAs: _sameAs, ...disclosure } = fd;
+      const error = await this.#raiseFinding(disclosure, review.reviewer, candidate.sha);
       if (error) return error;
     }
 
     for (const bd of review.ballots ?? []) {
       const decision = this.#state.phase.decisions.find((d) => d.id === bd.decisionId);
-      if (!decision) return `ballot references unknown decision ${bd.decisionId}`;
-      if (decision.class !== "delegated") {
-        return `ballot on ${bd.decisionId} is not votable (class '${decision.class}', not 'delegated')`;
+      // Plan 2c: a ballot on a record that is not votable (unknown,
+      // superseded, or not 'delegated') is skipped and logged rather than
+      // failing the whole review, which would cost the reviewer a resubmit.
+      if (!decision || !isLiveDecision(decision) || decision.class !== "delegated") {
+        this.#log.append("ballot_ignored", {
+          reviewer: review.reviewer,
+          decisionId: bd.decisionId,
+          reason: !decision ? "unknown decision" : !isLiveDecision(decision) ? `superseded: ${decision.supersededBy ?? decision.supersededByCorrection}` : `class ${decision.class}`,
+        });
+        continue;
       }
       const ballot: Ballot = {
         reviewer: review.reviewer,
@@ -1499,8 +1766,14 @@ export class Conductor {
     // (once) instead of minting a fresh one.
     const resumedSessionDir = this.#recoveredSessionDir;
     this.#recoveredSessionDir = undefined;
-    const sessionDir = resumedSessionDir ?? path.join(this.#paths.sessions, agentId);
+    // Plan 2c / design §6.1: "REPAIRING — the same worker session, a new
+    // attempt". One session directory per role per phase; a later attempt
+    // continues the most recent session in it, so the worker keeps its own
+    // reasoning about what it built (dogfood run 4ec5e0f8's repair ran in a
+    // fresh session and spent its first half re-deriving its own work).
+    const sessionDir = resumedSessionDir ?? path.join(this.#paths.sessions, `worker-${this.#state.phase.phaseId}`);
     fs.mkdirSync(sessionDir, { recursive: true });
+    const continueSession = hasSessionFile(sessionDir);
 
     const protectedPaths = contract.acceptance.filter((a) => a.includes("/")).join(",");
     const env: NodeJS.ProcessEnv = {
@@ -1533,6 +1806,7 @@ export class Conductor {
         ...this.#resolvePiArgsPrefix("worker"),
         ...launchArgs("worker", {
           sessionDir,
+          continueSession,
           noSession: workerPiCommand !== undefined,
           provider: workerProviderModel?.provider,
           model: workerProviderModel?.model,
@@ -1598,7 +1872,27 @@ export class Conductor {
       const interruptionNote = resumedSessionDir
         ? "Note: your previous attempt was interrupted by a conductor restart, before it could observe your outcome. Continue from where you left off."
         : undefined;
-      await agent.prompt(buildWorkerPrompt(contract, this.#plan.ownerNotes, interruptionNote));
+      // design §7.4 `note` (conductor state): a note is queued for the NEXT
+      // worker attempt. Deliver only the notes not yet delivered — tracked
+      // by `deliveredNoteCount` and recorded as NOTES_DELIVERED once the
+      // prompt has been sent — so a note does not keep steering every later
+      // attempt (the advisory finding on this candidate). Plan-level notes
+      // are static and are always included.
+      const allNotes = this.#state.phase.ownerNotes ?? [];
+      const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
+      const undelivered = allNotes.slice(deliveredCount);
+      const queuedNotes = undelivered.join("\n");
+      const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
+      await agent.prompt(
+        buildWorkerPrompt(contract, ownerNotes.length > 0 ? ownerNotes : undefined, interruptionNote, this.#repairContext()),
+      );
+      // Record delivery only after the prompt was sent; a crash between the
+      // prompt and this append re-delivers on the next attempt (at-least-
+      // once for the first delivery), which is safer than silently losing
+      // the note.
+      if (undelivered.length > 0) {
+        this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: undelivered.length });
+      }
 
       const workerTimeout = cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const);
       const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap">> = [
@@ -1661,6 +1955,48 @@ export class Conductor {
     } finally {
       if (!submittedKeepHandle) this.#agents.delete(agentId);
     }
+  }
+
+  /** Plan 2c: the repair request for the next worker attempt, built from the
+   * last reviewed candidate's findings, votes and corrections. `undefined`
+   * before any candidate has been reviewed (first attempt, or a retry of an
+   * attempt that never produced a candidate). */
+  #repairContext(): RepairContext | undefined {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha;
+    if (!C) return undefined;
+    const reviewed = (["M", "A", "B"] as const).some((w) => phase.reviews[w]?.review?.candidateSha === C);
+    const checksFailed = phase.checks?.candidateSha === C && phase.checks.passed === false;
+    const probeFailed = phase.probe?.candidateSha === C && phase.probe.passed === false;
+    if (!reviewed && !checksFailed && !probeFailed) return undefined;
+    const clip = (t: string, n = 600) => (t.length > n ? `${t.slice(0, n)}…` : t);
+    const findingLine = (f: Finding) =>
+      `${f.id} (${f.kind}, raised by ${f.raisedBy}${f.alsoRaisedBy?.length ? ` and ${f.alsoRaisedBy.join(", ")}` : ""}): ${clip(f.evidence)}`;
+    const open = phase.findings.filter((f) => f.status === "open");
+    const blocking = open.filter((f) => f.severity === "blocking").map(findingLine);
+    if (checksFailed) blocking.unshift("The phase checks failed on the candidate (see the check output in your worktree by rerunning the failing test).");
+    if (probeFailed) blocking.unshift("The integration probe failed: the candidate does not merge cleanly or fails the checks when merged onto the integration branch.");
+    const failedDecisions: string[] = [];
+    for (const d of phase.decisions) {
+      if (!isLiveDecision(d) || d.class === "detail") continue;
+      const st = decisionStatus(d, phase);
+      if (st.status !== "failed" && st.status !== "suspended" && st.status !== "owner") continue;
+      const rejections = phase.ballots
+        .filter((b) => b.decisionId === d.id && b.vote === "reject" && b.boundCandidateSha === C)
+        .map((b) => `${b.reviewer}: "${clip(b.rationale, 300)}"`);
+      failedDecisions.push(`${d.id} "${d.choice}" — ${st.reason ?? st.status}${rejections.length ? `. ${rejections.join("; ")}` : ""}`);
+    }
+    return {
+      round: phase.round ?? 1,
+      previousCandidate: C,
+      blocking,
+      failedDecisions,
+      advisory: open.filter((f) => f.severity === "advisory").map(findingLine),
+      corrections: phase.corrections.filter((c) => c.status === "open").map((c) => c.correctionText),
+      priorDecisions: phase.decisions
+        .filter((d) => d.source === "worker" && isLiveDecision(d))
+        .map((d) => ({ id: d.id, choice: d.choice })),
+    };
   }
 
   async #sweepAndClear(handle: AgentHandle): Promise<void> {
@@ -1898,7 +2234,16 @@ export class Conductor {
     // own fresh checkout of the merged integration I, and records each
     // command's evidence under a probe-specific directory keyed by that I.
     const outDir = path.join(this.#paths.checks, "probe", result.I);
-    for (const command of effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+    // Plan 2c: when the probed integration I has exactly the candidate's
+    // tree (the normal fast-forward case, design §6.4 step 2) and the checks
+    // already passed on that candidate, rerunning them on I cannot give a
+    // different answer. Record the reuse instead of spending another full
+    // check run (≈2.5 min per round in dogfood run 4ec5e0f8).
+    const checks = this.#state.phase.checks;
+    const sameTree = treeOf(this.#plan.repo, result.I) === treeOf(this.#plan.repo, candidateSha);
+    const reuse = this.#probeReuse && sameTree && checks?.candidateSha === candidateSha && checks.passed === true;
+    if (reuse) this.#log.append("probe_checks_reused", { candidateSha, I: result.I, reason: "I has the candidate's tree; checks passed on the candidate" });
+    for (const command of reuse ? [] : effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
       // design §8.1: "integration probe (merge plus its checks) | as for
       // checks, per command | kill its group; discard the probe branch |
       // 'integration' finding: timeout" — runCommand's deadlineMs already
@@ -1991,6 +2336,9 @@ export class Conductor {
     const reviewerPiCommand = this.#resolvePiCommand("reviewer");
     const sessionDir = path.join(this.#paths.sessions, `reviewer-${reviewer}`);
     fs.mkdirSync(sessionDir, { recursive: true });
+    // design §2: M keeps one session for the run; A and B are kept across
+    // the phase's repair rounds. Continue the previous round's session.
+    const continueSession = hasSessionFile(sessionDir);
     const reviewerProviderModel = this.#providerModelFor?.("reviewer");
 
     const agent = spawnPiAgent({
@@ -1999,6 +2347,7 @@ export class Conductor {
         ...this.#resolvePiArgsPrefix("reviewer"),
         ...launchArgs("reviewer", {
           sessionDir,
+          continueSession,
           noSession: reviewerPiCommand !== undefined,
           provider: reviewerProviderModel?.provider,
           model: reviewerProviderModel?.model,
@@ -2112,6 +2461,27 @@ export class Conductor {
         this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
         return;
       }
+      // Plan 2c discovery barrier (design §3.3): no reviewer gets turn 2
+      // until all three have finished turn 1 on this candidate, so every
+      // turn-2 prompt lists the same merged set of records and every
+      // reviewer can ballot on every other reviewer's discoveries. Without
+      // it, M's turn 2 in dogfood run 4ec5e0f8 ran before A and B had
+      // discovered anything, so M never balloted 16 records and the tally
+      // failed on missing ballots. The wait counts against this reviewer's
+      // own review deadline.
+      const candidateForBarrier = this.#state.phase.candidate?.sha ?? "";
+      this.#arriveAtDiscoveryBarrier(reviewer, candidateForBarrier);
+      const barrier = await Promise.race([
+        this.#discoveryBarrierReleased(candidateForBarrier).then(() => "released" as const),
+        reviewTimeout.promise,
+      ]);
+      if (barrier === "timeout") {
+        reviewTimeout.cancel();
+        await agent.terminate();
+        this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (waiting for the other reviewers' discovery)" });
+        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        return;
+      }
       const settled2 = nextSettle();
       await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer));
       const turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled2]);
@@ -2130,6 +2500,51 @@ export class Conductor {
     }
   }
 
+  // -- plan 2c: discovery barrier ------------------------------------------
+
+  #discoveryBarrier: { candidate: string; arrived: Set<Reviewer>; released: boolean; waiters: Array<() => void> } | undefined;
+
+  #barrierFor(candidate: string) {
+    if (!this.#discoveryBarrier || this.#discoveryBarrier.candidate !== candidate) {
+      this.#discoveryBarrier = { candidate, arrived: new Set(), released: false, waiters: [] };
+    }
+    return this.#discoveryBarrier;
+  }
+
+  /** True once every reviewer has either finished turn 1 on `candidate` in
+   * this conductor, or already has a submitted review for it (a restarted
+   * conductor must not wait for a reviewer that is already done). */
+  #barrierComplete(candidate: string): boolean {
+    const b = this.#barrierFor(candidate);
+    const phase = this.#state.phase;
+    return (["M", "A", "B"] as const).every((w) => b.arrived.has(w) || phase.reviews[w]?.review?.candidateSha === candidate);
+  }
+
+  #arriveAtDiscoveryBarrier(reviewer: Reviewer, candidate: string): void {
+    const b = this.#barrierFor(candidate);
+    b.arrived.add(reviewer);
+    if (!b.released && this.#barrierComplete(candidate)) {
+      b.released = true;
+      this.#log.append("discovery_barrier_released", { candidateSha: candidate, arrived: [...b.arrived] });
+      for (const w of b.waiters.splice(0)) w();
+    }
+  }
+
+  #discoveryBarrierReleased(candidate: string): Promise<void> {
+    const b = this.#barrierFor(candidate);
+    if (b.released) return Promise.resolve();
+    return new Promise<void>((resolve) => b.waiters.push(resolve));
+  }
+
+  /** True once the barrier for the current candidate has released: any
+   * discovery submitted after that (a reviewer re-dispatched after a
+   * timeout) could not be balloted by the reviewers already in turn 2, so
+   * it is logged as a late observation instead of a votable record. */
+  #discoveryClosed(): boolean {
+    const C = this.#state.phase.candidate?.sha;
+    return !!C && this.#discoveryBarrier?.candidate === C && this.#discoveryBarrier.released;
+  }
+
   // -- work packet 2a: two-turn reviewer prompts ---------------------------
 
   /** Turn 1 (design §3.3): the contract verbatim, the read-only candidate
@@ -2145,44 +2560,62 @@ export class Conductor {
     } catch {
       // best-effort — the reviewer still has the candidate checkout itself.
     }
-    const otherRecords = phase.decisions.filter((d) => d.source !== "worker");
     return [
-      `You are reviewer ${reviewer}, turn 1 of 2 (design §3.3): discover behavioral choices from the diff BEFORE seeing the worker's own disclosure.`,
+      `You are reviewer ${reviewer}. Turn 1 of 2: discover the behavioural choices in this candidate BEFORE you see what the worker disclosed (design §3.3).`,
       `Goal: ${phase.contract.goal}`,
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       `Candidate checkout (read-only): ${this.#candidateDir()}`,
-      `Diff vs. phase base (${phase.integrationHead}):`,
+      `Diff vs. phase base (${phase.integrationHead.slice(0, 7)}):`,
       "```diff",
       diff,
       "```",
-      otherRecords.length > 0
-        ? `Records already on record (not the worker's own disclosure): ${JSON.stringify(otherRecords.map((d) => ({ id: d.id, source: d.source, choice: d.choice })))}`
-        : "No non-worker records exist yet.",
-      "Call submit_discovery with any behavioral choices you find in the diff — an empty discoveries list is fine if you find none. You will see the worker's own disclosure only after this.",
+      "Call submit_discovery with at most 5 choices that change behaviour, interfaces, guarantees or cost where the plan left room. Each choice is one plain sentence of at most 20 words. Do not list implementation details (helper structure, naming, file layout) and do not give review advice here — correctness problems are findings, which you raise in turn 2. An empty list is fine.",
     ].join("\n");
   }
 
-  /** Turn 2 (design §6.1): the worker's disclosed decisions, open findings
-   * to re-examine, and open corrections — only sent once turn 1's
-   * submit_discovery has been accepted (see `#runReview`). Requires
-   * submit_review with a ballot per votable decision. */
+  /** Turn 2 (design §6.1): every live record on this candidate (the worker's
+   * disclosures, all reviewers' discoveries after the discovery barrier, and
+   * triggers), open findings and open corrections. */
   #buildReviewerTurn2Prompt(reviewer: Reviewer): string {
     const phase = this.#state.phase;
+    const C = phase.candidate?.sha ?? "";
     const K = phase.contract.contractVersion;
-    const votable = phase.decisions.filter((d) => d.class === "delegated" && !d.supersededByCorrection);
-    const workerDecisions = phase.decisions.filter((d) => d.source === "worker");
+    const live = phase.decisions.filter((d) => isLiveDecision(d) && d.boundCandidateSha === C);
+    const record = (d: Decision) => {
+      const who = d.source === "worker" ? "worker" : d.source === "trigger" ? "trigger" : `discovered by ${d.id.includes(`-disc-${reviewer}-`) ? "YOU" : "a reviewer"}`;
+      return `- ${d.id} [${d.class}, ${who}]: ${d.choice}\n    why: ${d.whyItMatters}\n    alternatives: ${d.alternatives.map((a) => `${a.option} → ${a.consequence}`).join(" | ")}`;
+    };
+    const own = live.filter((d) => d.id.includes(`-disc-${reviewer}-`));
     const openFindings = phase.findings.filter((f) => f.status === "open");
     const openCorrections = phase.corrections.filter((c) => c.status === "open");
-    return [
-      `Turn 2 of 2: the worker's disclosed decisions, open findings and open corrections for candidate ${phase.candidate?.sha}.`,
-      `Contract version: snapshot ${K.snapshot}`,
-      `Worker's disclosed decisions: ${JSON.stringify(workerDecisions)}`,
-      `Every currently votable decision (class 'delegated'): ${JSON.stringify(votable.map((d) => ({ id: d.id, version: d.version, choice: d.choice })))}`,
-      `Open findings to re-examine: ${JSON.stringify(openFindings)}`,
-      `Open corrections: ${JSON.stringify(openCorrections)}`,
-      "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, findingStatements, a ballot (in `ballots`) for every currently votable decision, and any newly raised findings (in `findings`, each with evidence + severity; a contract objection on a ballot opens a linked finding and suspends that vote).",
-    ].join("\n");
+    const lines = [
+      `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
+      "Records:",
+      ...(live.length > 0 ? live.map(record) : ["- (none)"]),
+    ];
+    if (openFindings.length > 0) {
+      lines.push(
+        "Open findings:",
+        ...openFindings.map((f) => `- ${f.id} [${f.severity} ${f.kind}, raised by ${f.raisedBy}]: ${f.evidence}`),
+      );
+    }
+    if (openCorrections.length > 0) {
+      lines.push("Open owner corrections (state honored / not_honored for each):", ...openCorrections.map((c) => `- ${c.id}: ${c.correctionText}`));
+    }
+    lines.push(
+      "",
+      "Call submit_review with:",
+      "- `ballots`: one ballot for EVERY record above whose class is 'delegated' (approve or reject, a rationale, at least one evidence citation). A ballot with contractObjection=true opens a contract finding and suspends that vote.",
+      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it.",
+      own.length > 0
+        ? `- \`discoveryMatches\`: for each of YOUR discoveries (${own.map((d) => d.id).join(", ")}) that is the same choice as another record above, give {discoveryId, sameAs}.`
+        : "- `discoveryMatches`: none needed (you have no discoveries on this list).",
+      "- `findingStatements` for findings YOU raised: `confirm` if this candidate fixes it, `withdraw` only if the finding was wrong in the first place.",
+      "- `correctionStatements` for each open owner correction.",
+      `- reviewer ${reviewer}, phaseId ${phase.phaseId}, candidateSha ${C}, contractVersion ${JSON.stringify(K)}.`,
+    );
+    return lines.join("\n");
   }
 
   // -- publish --------------------------------------------------------------
@@ -2207,6 +2640,7 @@ export class Conductor {
 
 interface SubmitPhaseArgs {
   decisions?: DecisionDisclosure[];
+  priorDecisions?: PriorDecisionStatement[];
   assumptions?: string[];
   deviations?: string[];
 }
@@ -2262,23 +2696,63 @@ function sanitize(command: string): string {
   return command.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 60) || "check";
 }
 
-function buildWorkerPrompt(contract: PhaseContract, ownerNotes?: string, interruptionNote?: string): string {
-  return [
+/** Plan 2c: what a repair attempt must know about the candidate that was
+ * not accepted (design §5.2 "the rejecting ballots go to the worker's
+ * session as a repair request", §4.2, §7.5). */
+export interface RepairContext {
+  round: number;
+  previousCandidate: string;
+  blocking: string[];
+  failedDecisions: string[];
+  advisory: string[];
+  corrections: string[];
+  priorDecisions: Array<{ id: string; choice: string }>;
+}
+
+function buildWorkerPrompt(
+  contract: PhaseContract,
+  ownerNotes?: string,
+  interruptionNote?: string,
+  repair?: RepairContext,
+): string {
+  const lines: string[] = [
     `Goal: ${contract.goal}`,
     "",
     "Acceptance criteria:",
     ...contract.acceptance.map((a) => `- ${a}`),
+  ];
+  if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
+  if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
+  if (interruptionNote) lines.push("", interruptionNote);
+  if (repair) {
+    lines.push(
+      "",
+      `REPAIR (round ${repair.round + 1}): your previous candidate ${repair.previousCandidate.slice(0, 7)} was reviewed and NOT accepted. Fix what blocks acceptance; keep what was approved.`,
+    );
+    if (repair.blocking.length > 0) lines.push("Blocking (must be fixed):", ...repair.blocking.map((b) => `- ${b}`));
+    if (repair.failedDecisions.length > 0) {
+      lines.push("Decisions whose vote failed (change them, or keep them and answer the objection with evidence):", ...repair.failedDecisions.map((d) => `- ${d}`));
+    }
+    if (repair.corrections.length > 0) lines.push("Owner corrections (verbatim, must be honored):", ...repair.corrections.map((c) => `- ${c}`));
+    if (repair.advisory.length > 0) lines.push("Advisory findings (fix if cheap and safe):", ...repair.advisory.map((a) => `- ${a}`));
+    if (repair.priorDecisions.length > 0) {
+      lines.push(
+        "Your prior decisions. In submit_phase, list EACH one in `priorDecisions` with status kept, changed (give the new choice, whyItMatters, alternatives, recommendation) or withdrawn; put only genuinely new choices in `decisions`:",
+        ...repair.priorDecisions.map((d) => `- ${d.id}: ${d.choice}`),
+      );
+    }
+  }
+  lines.push(
     "",
-    "Boundaries:",
-    ...contract.boundaries.map((b) => `- ${b}`),
-    "",
-    ownerNotes ? `Owner notes: ${ownerNotes}` : "",
-    interruptionNote ? interruptionNote : "",
+    "How to work:",
+    `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target).`,
+    "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",
+    "- Edit files with the edit and write tools.",
+    "- In submit_phase, write each decision's choice as one plain sentence of at most 20 words; put the reasoning in whyItMatters and the alternatives. Disclose choices that change behaviour, interfaces, guarantees or cost.",
     "",
     "When finished, call submit_phase with your decisions, assumptions and deviations.",
-  ]
-    .filter((l) => l !== "")
-    .join("\n");
+  );
+  return lines.join("\n");
 }
 
 function buildReviewerPrompt(phase: PhaseState, reviewer: Reviewer): string {
@@ -2288,6 +2762,25 @@ function buildReviewerPrompt(phase: PhaseState, reviewer: Reviewer): string {
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
     "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
   ].join("\n");
+}
+
+/** The tree object id of `rev` in `repo`, or undefined if it cannot be read. */
+function treeOf(repo: string, rev: string): string | undefined {
+  try {
+    return execFileSync("git", ["-C", repo, "rev-parse", `${rev}^{tree}`], { encoding: "utf8" }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** True iff `dir` already holds a Pi session file (a previous attempt or
+ * round of this role), so the next launch should `--continue` it. */
+function hasSessionFile(dir: string): boolean {
+  try {
+    return fs.readdirSync(dir).some((f) => f.endsWith(".jsonl"));
+  } catch {
+    return false;
+  }
 }
 
 function currentHead(repo: string, branch: string): string {

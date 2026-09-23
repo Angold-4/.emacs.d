@@ -19,7 +19,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { accept } from "../../src/core/predicate.ts";
+import { accept, isLiveDecision } from "../../src/core/predicate.ts";
 import { next } from "../../src/core/next.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "../../src/core/owner-requests.ts";
 import { reduce } from "../../src/core/reduce.ts";
@@ -315,7 +315,19 @@ function driveOnce(rng: () => number): RunResult {
             const disclosures: DecisionDisclosure[] = [];
             const count = rng() < 0.5 ? 0 : rng() < 0.7 ? 1 : 2;
             for (let d = 0; d < count; d++) disclosures.push(randomDisclosure(rng));
-            state = step(state, { type: "SUBMIT_PHASE", disclosures });
+            // Plan 2c: a repairing worker states kept/changed/withdrawn for
+            // some of its prior (live, worker-disclosed) records.
+            const prior = state.phase.decisions
+              .filter((d) => d.source === "worker" && isLiveDecision(d) && rng() < 0.6)
+              .map((d) => {
+                const r2 = rng();
+                return r2 < 0.5
+                  ? { id: d.id, status: "kept" as const }
+                  : r2 < 0.8
+                    ? { id: d.id, status: "changed" as const, choice: `${d.choice} (revised)` }
+                    : { id: d.id, status: "withdrawn" as const };
+              });
+            state = step(state, { type: "SUBMIT_PHASE", disclosures, prior });
           }
           break;
         }
@@ -415,6 +427,7 @@ function driveOnce(rng: () => number): RunResult {
           // reviewer at its current version.
           for (const d of state.phase.decisions) {
             if (d.class !== "delegated") continue;
+            if (!isLiveDecision(d)) continue;
             if (d.boundCandidateSha !== C) continue;
             const already = state.phase.ballots.some(
               (b) => b.decisionId === d.id && b.reviewer === reviewer && b.boundRecordVersion === d.version,

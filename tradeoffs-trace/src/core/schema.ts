@@ -1,6 +1,6 @@
 // A minimal JSON Schema validator supporting only the keywords the schemas
 // under schemas/*.schema.json actually use: type, required, properties,
-// additionalProperties, items, enum, const, minLength, minItems, pattern,
+// additionalProperties, items, enum, const, minLength, minItems, maxItems, pattern,
 // oneOf, anyOf, and $ref to a local $defs entry ("#/$defs/Name"). No ajv:
 // tradeoffs-trace runs with zero npm dependencies (see README).
 
@@ -96,6 +96,9 @@ function validateNode(schema: JSONSchema, data: unknown, root: JSONSchema, path:
   if (Array.isArray(data)) {
     if (typeof schema.minItems === "number" && data.length < schema.minItems) {
       errors.push(`${path}: has ${data.length} items, below minItems ${schema.minItems}`);
+    }
+    if (typeof schema.maxItems === "number" && data.length > schema.maxItems) {
+      errors.push(`${path}: has ${data.length} items, above maxItems ${schema.maxItems}`);
     }
     if (schema.items) {
       data.forEach((item, i) => validateNode(schema.items as JSONSchema, item, root, `${path}[${i}]`, errors));

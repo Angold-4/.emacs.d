@@ -48,6 +48,15 @@ test("guardedWritePath blocks run metadata beside the worktree (real nested layo
   assert.equal(guardedWritePath("src/a.ts", worktree, { worktree, runDir }), undefined);
 });
 
+test("guardedWritePath allows a write in the worktree when the worktree lives inside the run directory (the real layout)", () => {
+  const config = { worktree: "/r/run1/worktree", runDir: "/r/run1" };
+  assert.equal(guardedWritePath("tradeoffs-trace/src/core/types.ts", "/r/run1/worktree", config), undefined);
+  assert.equal(guardedWritePath("/r/run1/worktree/a.ts", "/r/run1/worktree", config), undefined);
+  // the rest of the run directory stays protected
+  assert.match(guardedWritePath("/r/run1/events.jsonl", "/r/run1/worktree", config) ?? "", /outside the worktree|run directory/);
+  assert.match(guardedWritePath("../inbox/x.json", "/r/run1/worktree", config) ?? "", /outside the worktree|run directory/);
+});
+
 test("guardedWritePath blocks a write to a protected acceptance file", () => {
   const reason = guardedWritePath("ACCEPTANCE.md", "/run/worktree", {
     worktree: "/run/worktree",
@@ -82,6 +91,38 @@ test("guardedShCommand allows an ordinary command", () => {
 test("guardedShCommand blocks a command mentioning the run directory", () => {
   const reason = guardedShCommand("cat /run/tt-run/events.jsonl", { runDir: "/run/tt-run" });
   assert.match(reason ?? "", /run directory/);
+});
+
+// Plan 2c: backgrounding and long sleeps (observed: 40–60% of each worker
+// attempt in dogfood run 4ec5e0f8 went to nohup'd suite runs and polling).
+test("guardedShCommand blocks backgrounded work and long sleeps, but not && or redirections", () => {
+  const cfg = { worktree: "/r/run1/worktree", runDir: "/r/run1" };
+  for (const blocked of [
+    "node --test 'test/**/*.test.ts' > /tmp/all.log 2>&1 &",
+    "nohup make check > /tmp/x.log",
+    "setsid node server.js",
+    "make check & echo started",
+    "sleep 150; tail /tmp/all.log",
+    "sleep 2m",
+  ]) {
+    assert.ok(guardedShCommand(blocked, cfg), `expected blocked: ${blocked}`);
+  }
+  for (const allowed of [
+    "npm test && npm run lint",
+    "node --test test/unit/x.test.ts 2>&1 | tail -20",
+    "make check &> /tmp/out.log",
+    "echo 'a & b' && grep -n '&' src/x.ts",
+    "sleep 2 && cat /tmp/x",
+    "sleep 30",
+  ]) {
+    assert.equal(guardedShCommand(allowed, cfg), undefined, `expected allowed: ${allowed}`);
+  }
+});
+
+test("guardedShCommand allows commands that mention the worktree inside the run directory", () => {
+  const cfg = { worktree: "/r/run1/worktree", runDir: "/r/run1" };
+  assert.equal(guardedShCommand("cat /r/run1/worktree/src/a.ts", cfg), undefined);
+  assert.match(guardedShCommand("cat /r/run1/events.jsonl", cfg) ?? "", /run directory/);
 });
 
 // --- R3 gates: real nested layout + canonicalization -----------------------

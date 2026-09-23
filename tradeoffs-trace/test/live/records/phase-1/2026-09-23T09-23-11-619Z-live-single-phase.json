@@ -1,0 +1,60 @@
+{
+  "piVersion": "0.87.0",
+  "provider": "vercel-ai-gateway",
+  "model": "deepseek/deepseek-v4.1-flash",
+  "runId": "6ffc16b6",
+  "eventTypes": [
+    "ATTEMPT_STARTED",
+    "ACTION_STARTED",
+    "SUBMIT_PHASE",
+    "ACTION_STARTED",
+    "FREEZE_COMPLETED",
+    "ACTION_STARTED",
+    "CHECKS_PASSED",
+    "ACTION_STARTED",
+    "PROBE_PASSED",
+    "ACTION_STARTED",
+    "ACTION_STARTED",
+    "ACTION_STARTED",
+    "REVIEW_SUBMITTED",
+    "REVIEW_SUBMITTED",
+    "REVIEW_SUBMITTED",
+    "ACCEPTED",
+    "PUBLISH_INTENT",
+    "ACTION_STARTED",
+    "PUBLISH_COMPLETED"
+  ],
+  "candidateSha": "b7873c0a262d6133b52413bb8a7871d1731d3674",
+  "publishedI": "b7873c0a262d6133b52413bb8a7871d1731d3674",
+  "checks": {
+    "passed": true,
+    "failed": false
+  },
+  "workerToolCallCounts": {
+    "ls": 1,
+    "read": 2,
+    "edit": 2,
+    "sh": 5,
+    "submit_phase": 1
+  },
+  "lastWorkerUsage": {
+    "input": 203,
+    "output": 736,
+    "cacheRead": 5888,
+    "cacheWrite": 0,
+    "totalTokens": 6827,
+    "cost": {
+      "input": 0.000060899999999999996,
+      "output": 0.0008832,
+      "cacheRead": 0.000041216,
+      "cacheWrite": 0,
+      "total": 0.000985316
+    },
+    "cacheWrite1h": 0
+  },
+  "durationMs": 81109,
+  "outcome": "DONE",
+  "terminalPhase": "DONE",
+  "openOwnerRequests": [],
+  "survivorPgids": []
+}

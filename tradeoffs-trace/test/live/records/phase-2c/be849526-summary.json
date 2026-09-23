@@ -1,0 +1,201 @@
+{
+  "run": "be849526",
+  "runner": "8db4b60",
+  "model": "vercel-ai-gateway/deepseek/deepseek-v4.1-flash (worker, M, A, B)",
+  "outcome": "DONE",
+  "round": 1,
+  "decisions": [
+    {
+      "source": "worker",
+      "class": "detail",
+      "choice": "Non-numeric arguments make sum throw a TypeError synchronously.",
+      "status": {
+        "status": "detail"
+      },
+      "alsoSeenBy": [
+        "A"
+      ]
+    },
+    {
+      "source": "worker",
+      "class": "detail",
+      "choice": "Treat NaN as invalid and require typeof 'number'.",
+      "status": {
+        "status": "detail"
+      },
+      "alsoSeenBy": [
+        "A"
+      ]
+    },
+    {
+      "source": "worker",
+      "class": "detail",
+      "choice": "Document the policy in a comment in sum.js.",
+      "status": {
+        "status": "detail"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "Non-numeric arguments throw an exception rather than returning NaN or coercing.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-9"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "NaN arguments are also rejected, not just non-number types.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-11"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "Numeric strings like '2' are rejected instead of being parsed.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-10"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "The thrown error is specifically a TypeError, not a generic Error.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-9"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "The error message names the offending argument slot and describes the bad value.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-12"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "delegated",
+      "choice": "Non-numeric arguments cause sum() to throw a TypeError instead of coercing or returning NaN.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-1"
+      },
+      "alsoSeenBy": [
+        "B",
+        "M"
+      ]
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "delegated",
+      "choice": "No type coercion: numeric strings like '2' are rejected rather than parsed.",
+      "status": {
+        "status": "passed",
+        "reason": "vote passed"
+      },
+      "alsoSeenBy": [
+        "B",
+        "M"
+      ]
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "delegated",
+      "choice": "NaN is treated as invalid input and throws, rather than being propagated.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-2"
+      },
+      "alsoSeenBy": [
+        "B",
+        "M"
+      ]
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "The thrown error message names which argument was bad and describes its type/value.",
+      "status": {
+        "status": "detail"
+      },
+      "alsoSeenBy": [
+        "B",
+        "M"
+      ]
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "Both arguments are validated and the bad one reported, with the first failure winning.",
+      "status": {
+        "status": "detail"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "Non-numeric arguments are rejected by throwing a TypeError rather than coercing or returning NaN.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-9"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "NaN is treated as non-numeric and rejected, while Infinity and -Infinity are accepted as valid numbers.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-11"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "Numeric strings such as '2' are rejected as non-numeric rather than parsed.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-10"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "delegated",
+      "choice": "Boxed Number objects (new Number(3)) are rejected because typeof is 'object', not coerced.",
+      "status": {
+        "status": "passed",
+        "reason": "vote passed"
+      },
+      "alsoSeenBy": null
+    },
+    {
+      "source": "reviewer-discovered",
+      "class": "detail",
+      "choice": "Validation is performed argument-by-argument so the error names which argument was bad and describes its type.",
+      "status": {
+        "status": "superseded",
+        "reason": "same as D-v1-validate-b734405c-disc-A-12"
+      },
+      "alsoSeenBy": null
+    }
+  ],
+  "findings": []
+}

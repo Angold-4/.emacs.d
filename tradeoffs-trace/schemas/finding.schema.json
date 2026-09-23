@@ -28,6 +28,7 @@
     },
     "repairedByCandidateSha": { "type": "string", "minLength": 1 },
     "disprovedEvidence": { "type": "string", "minLength": 1 },
-    "acceptedScope": { "type": "string", "minLength": 1 }
+    "acceptedScope": { "type": "string", "minLength": 1 },
+    "alsoRaisedBy": { "type": "array", "items": { "enum": ["M", "A", "B"] } }
   }
 }

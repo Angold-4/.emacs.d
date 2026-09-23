@@ -11,7 +11,7 @@
 // named by a stable id, never by its label — see owner-commands.ts for what
 // choosing each one does.
 
-import { addressed, decisionSettled } from "./predicate.ts";
+import { addressed, decisionSettled, isLiveDecision } from "./predicate.ts";
 import type { OwnerRequest, OwnerRequestOption, PhaseState } from "./types.ts";
 
 function hasOpenRequestLinkedTo(phase: PhaseState, matches: (r: OwnerRequest) => boolean): boolean {
@@ -110,7 +110,7 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
     // settled via "accept the decision as implemented" or an override is
     // never asked about again (round-3 review item 1's closing test).
     for (const d of phase.decisions) {
-      if (d.supersededByCorrection || d.class !== "delegated") continue;
+      if (!isLiveDecision(d) || d.class !== "delegated") continue;
       if (decisionSettled(d, phase, C, K)) continue;
       if (hasOpenRequestLinkedTo(phase, (r) => r.linkedDecisionId === d.id)) continue;
       if (created.some((r) => r.linkedDecisionId === d.id)) continue;
@@ -150,7 +150,7 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
 
     // one per unsettled reserved decision (no existing request for it)
     for (const d of phase.decisions) {
-      if (d.supersededByCorrection || d.class !== "reserved") continue;
+      if (!isLiveDecision(d) || d.class !== "reserved") continue;
       if (decisionSettled(d, phase, C, K)) continue;
       if (hasOpenRequestLinkedTo(phase, (r) => r.linkedDecisionId === d.id)) continue;
       if (created.some((r) => r.linkedDecisionId === d.id)) continue;

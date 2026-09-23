@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "tradeoffs-trace/owner-command",
   "title": "Owner command",
-  "description": "design §7.4: every owner command kind, each bound to what it evaluated.",
+  "description": "design §7.4: every owner command kind, each bound to what it evaluated. The flat 'kind' forms below are the conductor's own encoding; the decision view (design §10.4, core/init-tradeoffs-trace.el) writes the alternative `type` + binding form, accepted by the same conductor (see the DV* defs, each with its own required binding so the published schema validates what it names).",
   "oneOf": [
     { "$ref": "#/$defs/Steer" },
     { "$ref": "#/$defs/Note" },
@@ -12,9 +12,130 @@
     { "$ref": "#/$defs/Revise" },
     { "$ref": "#/$defs/Amend" },
     { "$ref": "#/$defs/Unneeded" },
-    { "$ref": "#/$defs/PauseResumeMode" }
+    { "$ref": "#/$defs/Miss" },
+    { "$ref": "#/$defs/PauseResumeMode" },
+    { "$ref": "#/$defs/DVResolve" },
+    { "$ref": "#/$defs/DVOverride" },
+    { "$ref": "#/$defs/DVAcceptFinding" },
+    { "$ref": "#/$defs/DVRevise" },
+    { "$ref": "#/$defs/DVAmend" },
+    { "$ref": "#/$defs/DVNote" },
+    { "$ref": "#/$defs/DVUnneeded" },
+    { "$ref": "#/$defs/DVMiss" }
   ],
   "$defs": {
+    "RecordBinding": {
+      "description": "The design §7.1 binding tuple for a record-level decision-view command (design §10.4): the full tuple, so the published schema — not only the conductor's normalizer — rejects a command that names no record version, candidate or contract.",
+      "type": "object",
+      "required": ["runId", "phaseId", "candidateSha", "contractVersion", "recordId", "recordVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "runId": { "type": "string", "minLength": 1 },
+        "phaseId": { "type": "string", "minLength": 1 },
+        "candidateSha": { "type": "string", "minLength": 1 },
+        "contractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "recordId": { "type": "string", "minLength": 1 },
+        "recordVersion": { "type": "integer" }
+      }
+    },
+    "NoteBinding": {
+      "description": "A note is bound only to the run and phase it is queued for (design §7.4): no candidate exists and no record is targeted.",
+      "type": "object",
+      "required": ["runId", "phaseId"],
+      "additionalProperties": false,
+      "properties": {
+        "runId": { "type": "string", "minLength": 1 },
+        "phaseId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "DVResolve": {
+      "description": "Decision view (design §10.4): resolve an owner request by option id. `note` carries the scope an open_finding accept_risk option requires (design §4.2).",
+      "type": "object",
+      "required": ["type", "binding", "option"],
+      "properties": {
+        "type": { "const": "resolve" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "option": { "type": "string", "minLength": 1 },
+        "note": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
+    "DVOverride": {
+      "description": "Decision view (design §10.4): override a delegated decision.",
+      "type": "object",
+      "required": ["type", "binding", "vote"],
+      "properties": {
+        "type": { "const": "override" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "vote": { "enum": ["approve", "reject"] },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
+    "DVAcceptFinding": {
+      "description": "Decision view (design §10.4): accept a finding with a required scope.",
+      "type": "object",
+      "required": ["type", "binding", "scope"],
+      "properties": {
+        "type": { "const": "accept-finding" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
+    "DVRevise": {
+      "description": "Decision view (design §10.4): correct a decision or finding and repair.",
+      "type": "object",
+      "required": ["type", "binding", "text"],
+      "properties": {
+        "type": { "const": "revise" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "text": { "type": "string", "minLength": 1 },
+        "changesContract": { "type": "boolean" },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
+    "DVAmend": {
+      "description": "Decision view (design §10.4): amend the phase contract to a new version.",
+      "type": "object",
+      "required": ["type", "binding", "newContractVersion"],
+      "properties": {
+        "type": { "const": "amend" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "replacingContractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "newContractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
+    "DVNote": {
+      "description": "Decision view (design §10.4): queue a note for the next worker attempt.",
+      "type": "object",
+      "required": ["type", "binding", "text"],
+      "properties": {
+        "type": { "const": "note" },
+        "text": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/NoteBinding" }
+      }
+    },
+    "DVUnneeded": {
+      "description": "Decision view (design §10.4): record an owner request as \"did not need me\".",
+      "type": "object",
+      "required": ["type", "binding"],
+      "properties": {
+        "type": { "const": "unneeded" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
+    "DVMiss": {
+      "description": "Decision view (design §10.4): mark a sampled record as a miss.",
+      "type": "object",
+      "required": ["type", "binding"],
+      "properties": {
+        "type": { "const": "miss" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
     "ContractVersion": {
       "type": "object",
       "required": ["snapshot", "sectionSha256"],
@@ -53,6 +174,7 @@
         "requestId": { "type": "string", "minLength": 1 },
         "requestVersion": { "type": "integer" },
         "option": { "type": "string", "minLength": 1 },
+        "note": { "type": "string", "minLength": 1 },
         "boundCandidateSha": { "type": "string", "minLength": 1 },
         "boundContractVersion": { "$ref": "#/$defs/ContractVersion" }
       }
@@ -118,6 +240,16 @@
       "properties": {
         "kind": { "const": "unneeded" },
         "requestId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Miss": {
+      "type": "object",
+      "required": ["kind", "recordId"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "miss" },
+        "recordId": { "type": "string", "minLength": 1 },
+        "sample": { "type": "string", "minLength": 1 }
       }
     },
     "PauseResumeMode": {
