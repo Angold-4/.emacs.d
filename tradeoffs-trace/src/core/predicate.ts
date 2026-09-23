@@ -30,23 +30,49 @@
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
 import { tally } from "./tally.ts";
-import type { ContractVersion, Correction, Decision, PhaseState } from "./types.ts";
+import type { ContractVersion, Correction, Decision, PhaseState, Review } from "./types.ts";
 
 export function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
   return a.snapshot === b.snapshot && a.sectionSha256 === b.sectionSha256;
 }
 
-/** addressed(X, C, K): true iff M, A and B each stated in a review bound to
- * (C, K) that correction X is honored, and none stated it is not. */
+/** A single review's correction statements must not state a disposition for
+ * the same correction more than once: §6.3's addressed speaks of "stated ...
+ * that X is honored — none states it is not", so a doubly-stated correction
+ * (contradictory or merely repeated) is malformed, not order-decided. This
+ * is the shared, pure ingestion check used by reduce() for REVIEW_SUBMITTED
+ * and by the extension's submit_review validation; returns a
+ * human-readable reason, or undefined when the review is well-formed. */
+export function reviewIngestionIssue(review: Review): string | undefined {
+  const statements = review?.correctionStatements;
+  if (!Array.isArray(statements)) {
+    return `review by ${String(review?.reviewer)} has no correctionStatements array`;
+  }
+  const seen = new Set<string>();
+  for (const statement of statements) {
+    const id = statement?.correctionId;
+    if (seen.has(id)) {
+      return `review by ${String(review?.reviewer)} states a disposition for correction ${String(id)} more than once; a correction must be stated at most once`;
+    }
+    seen.add(id);
+  }
+  return undefined;
+}
+
+/** addressed(X, C, K): true iff M, A and B each stated, in a review bound to
+ * (C, K), that correction X is honored — and none stated it is not. Fails
+ * closed on malformed or legacy data: a missing statement, more than one
+ * statement for X (identical or contradictory, in either order), or any
+ * status that is not exactly `"honored"` all make it false. */
 export function addressed(correction: Correction, phase: PhaseState, C: string, K: ContractVersion): boolean {
   if (!sameVersion(correction.boundContractVersion, K)) return false;
   for (const who of ["M", "A", "B"] as const) {
     const review = phase.reviews[who]?.review;
     if (!review) return false;
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
-    const statement = review.correctionStatements.find((s) => s.correctionId === correction.id);
-    if (!statement) return false;
-    if (statement.status === "not_honored") return false;
+    const matching = (review.correctionStatements ?? []).filter((s) => s.correctionId === correction.id);
+    if (matching.length !== 1) return false;
+    if (matching[0].status !== "honored") return false;
   }
   return true;
 }

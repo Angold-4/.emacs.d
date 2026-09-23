@@ -7,14 +7,18 @@
 //
 // extension/tradeoffs-trace.ts wires these into the `tool_call` hook.
 
-import { resolve as resolvePath, sep as pathSep } from "node:path";
+import * as fs from "node:fs";
+import { resolve as resolvePath, dirname, basename, join as joinPath, sep as pathSep } from "node:path";
 
 export interface GuardConfig {
   /** The worker's live worktree (`TT_WORKTREE`). Writes outside it are
    * blocked. */
   worktree?: string;
-  /** The run directory (`TT_RUN_DIR`). Writes under it, and `sh` commands
-   * that mention it, are blocked. */
+  /** The run directory (`TT_RUN_DIR`). Paths under it that are *not* under
+   * the worktree are run metadata and are blocked; `sh` commands that
+   * mention it are blocked. (The real layout nests the worktree inside the
+   * run directory, so metadata protection is "under runDir but not under
+   * worktree" — see `guardedWritePath`.) */
   runDir?: string;
   /** Paths (relative to `worktree`, or absolute) `edit`/`write` may never
    * touch — the phase's own acceptance files (`TT_PROTECTED`, comma
@@ -22,28 +26,75 @@ export interface GuardConfig {
   protectedPaths?: string[];
 }
 
+/** Canonicalizes `pathname` the way the filesystem sees it, tolerating a
+ * path whose final components do not exist yet (a new file's parent may not
+ * exist). The nearest existing ancestor is resolved with `realpath` and the
+ * nonexistent suffix appended. A symlink — including a dangling one — is
+ * resolved to its target, so an escape to an external target is visible.
+ *
+ * Why this matters: on macOS `/tmp` is a symlink to `/private/tmp`, so a
+ * lexical `resolve` makes an allowed path and its canonical spelling compare
+ * unequal. Both the target and the configured roots go through here, so
+ * canonical aliases of an allowed path are allowed. Bounded to avoid a
+ * symlink cycle. (Still just accidental-write prevention, not a security
+ * boundary — see the module comment.) */
+function canonicalize(pathname: string, depth = 0): string {
+  const abs = resolvePath(pathname);
+  if (depth > 64) return abs;
+  try {
+    return fs.realpathSync(abs);
+  } catch {
+    // Absent, or a dangling symlink.
+  }
+  try {
+    if (fs.lstatSync(abs).isSymbolicLink()) {
+      const linkTarget = fs.readlinkSync(abs);
+      return canonicalize(resolvePath(dirname(abs), linkTarget), depth + 1);
+    }
+  } catch {
+    // Nothing at all at `abs`.
+  }
+  const parent = dirname(abs);
+  if (parent === abs) return abs; // filesystem root
+  return joinPath(canonicalize(parent, depth + 1), basename(abs));
+}
+
 function isUnder(candidate: string, root: string): boolean {
-  const c = resolvePath(candidate);
-  const r = resolvePath(root);
-  return c === r || c.startsWith(r.endsWith(pathSep) ? r : r + pathSep);
+  return candidate === root || candidate.startsWith(root.endsWith(pathSep) ? root : root + pathSep);
 }
 
 /** True iff writing to `targetPath` (an `edit`/`write` tool's `path`
  * argument, resolved against `cwd` if relative) must be blocked: outside
- * the worktree, under the run directory, or one of the phase's protected
- * acceptance files. Returns a human-readable reason, or `undefined` if the
- * write is allowed. */
+ * the worktree, run-directory metadata (under the run directory but not
+ * under the worktree — the real layout nests `worktree` *inside* `runDir`),
+ * or one of the phase's protected acceptance files. Returns a
+ * human-readable reason, or `undefined` if the write is allowed.
+ *
+ * The target and the configured roots are canonicalized through their
+ * nearest existing ancestor (see `canonicalize`), so a new file is allowed
+ * inside the worktree, canonical aliases resolve consistently, and a
+ * symlink that escapes the worktree is denied. This is accidental-write
+ * prevention, not a security boundary. */
 export function guardedWritePath(targetPath: string, cwd: string, config: GuardConfig): string | undefined {
-  const abs = resolvePath(cwd, targetPath);
-  if (config.worktree && !isUnder(abs, config.worktree)) {
-    return `edit/write outside the worktree (${config.worktree}) is blocked: ${targetPath}`;
-  }
-  if (config.runDir && isUnder(abs, config.runDir)) {
+  const requested = resolvePath(cwd, targetPath);
+  const target = canonicalize(requested);
+  const worktree = config.worktree ? canonicalize(config.worktree) : undefined;
+  const runDir = config.runDir ? canonicalize(config.runDir) : undefined;
+
+  const inWorktree = worktree !== undefined && isUnder(target, worktree);
+
+  // Run metadata: under the run directory but *not* under the worktree.
+  // Checked before the general worktree rule so the reason names run
+  // metadata rather than a plain outside-the-worktree rejection.
+  if (runDir !== undefined && isUnder(target, runDir) && !inWorktree) {
     return `edit/write under the run directory (${config.runDir}) is blocked: ${targetPath}`;
   }
+  if (worktree !== undefined && !inWorktree) {
+    return `edit/write outside the worktree (${config.worktree}) is blocked: ${targetPath}`;
+  }
   for (const p of config.protectedPaths ?? []) {
-    const protectedAbs = resolvePath(config.worktree ?? cwd, p);
-    if (abs === protectedAbs) {
+    const protectedAbs = canonicalize(resolvePath(config.worktree ?? cwd, p));
+    if (target === protectedAbs) {
       return `edit/write to the phase's protected acceptance file is blocked: ${targetPath}`;
     }
   }

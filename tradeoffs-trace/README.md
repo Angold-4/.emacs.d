@@ -466,6 +466,43 @@ exercises exactly one worker attempt with no repair round and no owner
 request — a real model needing a second attempt, or the phase reaching
 `AWAITING_OWNER`, is not covered by any live test yet.
 
+**R2 repair — effective `CHECKS` and nested-test isolation.** Two
+regression fixes, with tests that fail on the unfixed behavior. (F04) The
+check loops in `Conductor#runChecks` (candidate C) and `Conductor#runProbe`
+(probed integration I) each iterated the global plan checks only, silently
+ignoring the phase contract's own `:CHECKS:`. They now resolve one effective
+list — global commands first, then the phase's own, with exact duplicate
+command strings dropped at their later occurrence (no splitting,
+normalization or reordering) — via the pure helper `src/core/checks.ts`'s
+`effectiveChecks`, so both gates execute the same list. Each executed
+command's evidence is recorded per gate: the C path keeps
+`<checks>/<candidateSha>/<sanitized command>.log`, and the probe now writes
+the same shape under `<checks>/probe/<probedI>/`. (F13) A check (or probe or
+worker `sh`) command that itself runs `node --test` used to inherit the
+Node test runner's own `NODE_TEST_CONTEXT`/`NODE_TEST_WORKER_ID` when the
+conductor was launched under `node --test`; the child then printed
+`node:test run() is being called recursively within a test file. skipping
+running files.` and exited 0, recording a real failure as a pass.
+`effects/shell.ts`'s `childEnv` removes exactly those two test-runner-only
+markers (PATH, HOME, `NODE_OPTIONS`, provider/credential and `TT_*` all
+survive) and is applied to checks, the probe and the worker `sh` path;
+there is still no reproduction-command path in phase 1 to adapt.
+`test/conductor/effective-checks.test.ts` is the F04 gate (a failing
+phase-only check fails and never accepts; a failing global check fails; the
+dedup rule proven by a real once-per-gate side effect; a phase check that
+passes on C but fails on I yields `PROBE_FAILED` and blocks publication,
+with a DONE control). Its F13 sub-tests drive a conductor whose check runs
+`node --test` over a deliberately failing (and, separately, passing) test
+and assert the log shows the real test name and `fail 1`/`pass 1` with no
+recursion warning; `test/effects/shell.test.ts` additionally invokes the
+real Node binary with and without `childEnv` to show the skip-vs-run
+difference. `test/live/published-behavior.ts` is a shared verifier that
+runs the feature's real API (`subtract` on positive/negative/zero inputs,
+and `sum` still working) on a fresh checkout of the published I — wired
+into `live-single-phase.test.ts` before its fixtures are deleted, with a
+normal-suite test proving it accepts a correct candidate and rejects a
+no-op one.
+
 ## Running the tests
 
 ```sh

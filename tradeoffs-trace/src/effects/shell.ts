@@ -32,6 +32,27 @@ const DEFAULT_TERM_GRACE_MS = 10_000;
 const STOP_POLL_INTERVAL_MS = 5;
 const STOP_POLL_TIMEOUT_MS = 5_000;
 
+/** The Node test runner sets two variables on the processes it launches —
+ * `NODE_TEST_CONTEXT` and `NODE_TEST_WORKER_ID` — purely to coordinate its
+ * own recursive file discovery. They are test-runner-only: they carry no
+ * configuration any ordinary child process needs. When a check (or probe,
+ * `sh`, reproduction) itself spawns `node --test`, inheriting them makes the
+ * child's `node --test` believe it is already inside a test file and print
+ * `node:test run() is being called recursively within a test file. skipping
+ * running files.` and exit 0 — a real failing test is reported as a pass.
+ *
+ * `childEnv` removes exactly those two markers and nothing else: PATH, HOME,
+ * NODE_OPTIONS, provider/credential variables and `TT_*` all survive, so
+ * ordinary child configuration is untouched. One shared helper is used for
+ * every command the conductor spawns (checks, probe and the worker `sh`
+ * path), so all of them are isolated identically. */
+export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const copy: NodeJS.ProcessEnv = { ...env };
+  delete copy.NODE_TEST_CONTEXT;
+  delete copy.NODE_TEST_WORKER_ID;
+  return copy;
+}
+
 export type EndReason = "exit" | "timeout" | "cancelled";
 
 export interface RunCommandOptions {
