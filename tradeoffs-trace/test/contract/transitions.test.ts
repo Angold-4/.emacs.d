@@ -54,7 +54,7 @@ interface Fixture {
 
 const BUILD: Record<string, Fixture> = {
   "start-attempt": { state: baseState({ phase: "READY" }), event: { type: "ATTEMPT_STARTED" } },
-  "submit-phase": { state: baseState({ phase: "IMPLEMENTING" }), event: { type: "SUBMIT_PHASE", decisions: [] } },
+  "submit-phase": { state: baseState({ phase: "IMPLEMENTING" }), event: { type: "SUBMIT_PHASE", disclosures: [] } },
   "attempt-timed-out-to-repairing": {
     state: baseState({ phase: "IMPLEMENTING" }),
     event: { type: "ATTEMPT_TIMED_OUT" },
@@ -77,7 +77,7 @@ const BUILD: Record<string, Fixture> = {
   },
   "freeze-completed": {
     state: baseState({ phase: "FREEZING", inFlight: { freeze: { actionId: "a1" } } }),
-    event: { type: "FREEZE_COMPLETED", candidateSha: "C1" },
+    event: { type: "FREEZE_COMPLETED", candidateSha: "C1", decisions: [] },
   },
   "freeze-timed-out-to-repairing": {
     state: baseState({ phase: "FREEZING" }),
@@ -226,6 +226,14 @@ const BUILD: Record<string, Fixture> = {
   "run-resumed": {
     state: baseState({ phase: "READY" }, "RUN_PAUSED_BUDGET"),
     event: { type: "RUN_RESUMED" },
+  },
+  "launch-failed-from-implementing": {
+    state: baseState({ phase: "IMPLEMENTING", inFlight: { dispatch_worker: { actionId: "a1" } } }),
+    event: { type: "LAUNCH_FAILED", role: "worker", expected: ["read", "edit"], missing: ["edit"], extra: ["submit_review"] },
+  },
+  "launch-failed-from-reviewing": {
+    state: baseState({ phase: "REVIEWING", candidate: C1, inFlight: { review_A: { actionId: "a1" } } }),
+    event: { type: "LAUNCH_FAILED", role: "reviewer", reviewer: "A", expected: ["read"], missing: [], extra: ["write"] },
   },
 };
 
@@ -930,8 +938,8 @@ test("next(): REVIEWING dispatches only the reviewers still missing a valid revi
 test("next(): a state rebuilt by folding the same events from scratch gives the same next() (recovery property)", () => {
   const events: Event[] = [
     { type: "ATTEMPT_STARTED" },
-    { type: "SUBMIT_PHASE", decisions: [] },
-    { type: "FREEZE_COMPLETED", candidateSha: "C1" },
+    { type: "SUBMIT_PHASE", disclosures: [] },
+    { type: "FREEZE_COMPLETED", candidateSha: "C1", decisions: [] },
   ];
 
   let incremental = baseState({ phase: "READY" });

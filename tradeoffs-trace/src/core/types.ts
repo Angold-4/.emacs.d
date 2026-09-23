@@ -81,6 +81,22 @@ export interface DecisionRecommendation {
   reason: string;
 }
 
+/** Phase 1b addition (pure, additive): the plain-language fields a worker
+ * discloses with `submit_phase` (design §3.2), before the conductor assigns
+ * id/version/phaseId/source/boundCandidateSha/boundContractVersion once a
+ * candidate exists. Matches schemas/submission.schema.json's
+ * `$defs.decisionDisclosure` and extension/param-shapes.ts's
+ * `DECISION_DISCLOSURE_PARAMS` exactly. See SUBMIT_PHASE/FREEZE_COMPLETED
+ * below for why the split exists: SUBMIT_PHASE records the raw disclosure;
+ * FREEZE_COMPLETED is what turns it into real, bound Decision records. */
+export interface DecisionDisclosure {
+  choice: string;
+  whyItMatters: string;
+  alternatives: DecisionAlternative[];
+  recommendation: DecisionRecommendation;
+  classProposal: DecisionClass;
+}
+
 export interface Decision {
   id: string;
   version: number;
@@ -403,6 +419,13 @@ export interface PhaseState {
    * half). Cleared by the matching completion event, or by REVISE's
    * cancel_in_flight (design §7.5 step 2). */
   inFlight: Partial<Record<InFlightKey, InFlightEntry>>;
+  /** Phase 1b addition (pure, additive): the raw decision disclosures a
+   * SUBMIT_PHASE carried, held here until FREEZE_COMPLETED assigns each one
+   * an id/version/boundCandidateSha/boundContractVersion and moves it into
+   * `decisions` (design §6.2's freeze boundary — a decision is not bound to
+   * a real candidate until the freeze that produces that candidate
+   * completes). Cleared once FREEZE_COMPLETED consumes it. */
+  pendingDisclosures?: DecisionDisclosure[];
   worktreeTainted?: boolean;
   integrityViolated?: boolean;
   repairRoundsUsed: number;
@@ -426,9 +449,15 @@ export interface State {
 export interface EvAttemptStarted {
   type: "ATTEMPT_STARTED";
 }
+/** Phase 1b addition (pure, additive — round of review item 3): carries the
+ * *raw* disclosures, not assembled Decision records. A worker's submit_phase
+ * happens before any candidate exists (the freeze it triggers is what
+ * produces one), so a Decision's binding fields cannot be filled in yet.
+ * reduce.ts stashes these in `phase.pendingDisclosures`; FREEZE_COMPLETED is
+ * what assembles and binds them (design §6.2, §7.1). */
 export interface EvSubmitPhase {
   type: "SUBMIT_PHASE";
-  decisions: Decision[];
+  disclosures: DecisionDisclosure[];
 }
 export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
@@ -439,9 +468,18 @@ export interface EvAttemptNoSubmission {
 export interface EvAttemptInterrupted {
   type: "ATTEMPT_INTERRUPTED";
 }
+/** Phase 1b addition (pure, additive): `decisions` are the fully assembled,
+ * bound Decision records the conductor built from `phase.pendingDisclosures`
+ * once `candidateSha` was known (each must validate against
+ * schemas/decision.schema.json — the conductor's job, not reduce.ts's).
+ * `tainted` is design §2.2's "a sweep that found survivors marks the
+ * worktree tainted" outcome for *this* freeze; omitted or `false` clears any
+ * earlier taint (a clean freeze means the worktree is trustworthy again). */
 export interface EvFreezeCompleted {
   type: "FREEZE_COMPLETED";
   candidateSha: string;
+  decisions: Decision[];
+  tainted?: boolean;
 }
 export interface EvFreezeTimedOut {
   type: "FREEZE_TIMED_OUT";
@@ -584,6 +622,37 @@ export interface EvRunBudgetExceeded {
 export interface EvRunResumed {
   type: "RUN_RESUMED";
 }
+/** Phase 1b addition (pure, additive — round of review item 4): a launch
+ * failure (design §2.1: "a mismatch is a launch failure, not a warning") for
+ * a worker or a reviewer's tool set, moving the phase straight to BLOCKED
+ * rather than being retried as an ordinary attempt/review failure — a wrong
+ * `--tools` allowlist cannot be fixed by another attempt, so consuming a
+ * repair round on it is pointless. Carries the full detail (expected,
+ * missing, extra) for whoever looks at BLOCKED next. */
+export interface EvLaunchFailed {
+  type: "LAUNCH_FAILED";
+  role: "worker" | "reviewer";
+  reviewer?: Reviewer; // set when role === "reviewer"
+  expected: string[];
+  missing: string[];
+  extra: string[];
+}
+
+/** Phase 1b work-packet addition (pure, additive — item 3): design §2.2's
+ * "a mismatch invalidates that gate's result and marks the run
+ * integrity-violated for the owner." A record-only event (no phase-state-
+ * name change; handled by reduce.ts's applyRecordEvent, like BALLOT_CAST) so
+ * `phase.integrityViolated` is a *logged* fact — it survives a conductor
+ * restart via `rebuildState` folding the log, unlike an in-memory-only flag.
+ * `stage` names what was being verified (e.g. "checks"); the conductor
+ * emits this *before* the stage's own outcome event (e.g. CHECKS_FAILED),
+ * so the affected gate's own result already reflects "not passed" — see
+ * conductor.ts's `#runChecks`. */
+export interface EvIntegrityViolated {
+  type: "INTEGRITY_VIOLATED";
+  stage: string;
+  evidence?: string;
+}
 
 export type Event =
   | EvAttemptStarted
@@ -623,7 +692,9 @@ export type Event =
   | EvRevise
   | EvAmend
   | EvRunBudgetExceeded
-  | EvRunResumed;
+  | EvRunResumed
+  | EvLaunchFailed
+  | EvIntegrityViolated;
 
 export type EventType = Event["type"];
 

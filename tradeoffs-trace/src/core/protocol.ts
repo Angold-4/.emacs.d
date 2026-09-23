@@ -217,10 +217,25 @@ export interface ShExitMessage {
   signal?: string | null;
 }
 
+/** Phase 1b addition (pure addition, no change to any existing message or
+ * row): sent by the worker's extension when `agent_before_settle` has
+ * already requested its two allowed continuations (design §3.3 item 1) and
+ * the worker still has not had `submit_phase` accepted. This is the
+ * explicit signal design's "report `no_submission` to the conductor" asks
+ * for; the conductor also treats an `agent_settled` RPC event with no prior
+ * accepted submission as the same condition, so a worker whose extension
+ * cannot reach the socket at all does not stall the attempt's deadline. See
+ * test/effects/socket-no-submission.test.ts. */
+export interface NoSubmissionMessage {
+  type: "no_submission";
+  agentId: string;
+}
+
 export type RunSocketMessage =
   | HelloMessage
   | SubmitMessage
   | SubmitReply
   | ShMessage
   | ShOutputMessage
-  | ShExitMessage;
+  | ShExitMessage
+  | NoSubmissionMessage;

@@ -192,9 +192,11 @@ test("schema: event accepts every known event type and rejects an unknown one", 
   const eventSchema = schema("event");
   const knownSamples: unknown[] = [
     { type: "ATTEMPT_STARTED" },
-    { type: "SUBMIT_PHASE", decisions: [] },
+    { type: "SUBMIT_PHASE", disclosures: [] },
+    { type: "FREEZE_COMPLETED", candidateSha: "C1", decisions: [] },
     { type: "REPAIR_ATTEMPT_STARTED" },
     { type: "RUN_RESUMED" },
+    { type: "LAUNCH_FAILED", role: "worker", expected: ["read"], missing: [], extra: ["write"] },
   ];
   for (const sample of knownSamples) {
     const result = validate(eventSchema, sample);

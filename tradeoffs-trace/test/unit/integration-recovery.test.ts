@@ -29,10 +29,10 @@ function driveToReviewing(): { ctx: { state: State }; step: (event: unknown) => 
   step({ type: "ATTEMPT_STARTED" });
   assert.equal(ctx.state.phase.phase, "IMPLEMENTING");
 
-  step({ type: "SUBMIT_PHASE", decisions: [] });
+  step({ type: "SUBMIT_PHASE", disclosures: [] });
   assert.equal(ctx.state.phase.phase, "FREEZING");
 
-  step({ type: "FREEZE_COMPLETED", candidateSha: "C1" });
+  step({ type: "FREEZE_COMPLETED", candidateSha: "C1", decisions: [] });
   assert.equal(ctx.state.phase.phase, "CHECKING");
   assert.equal(ctx.state.phase.candidate?.sha, "C1");
 
@@ -54,8 +54,8 @@ function driveToReviewing(): { ctx: { state: State }; step: (event: unknown) => 
   assert.equal(ctx.state.phase.phase, "IMPLEMENTING");
   assert.equal(ctx.state.phase.repairRoundsUsed, 1);
 
-  step({ type: "SUBMIT_PHASE", decisions: [] });
-  step({ type: "FREEZE_COMPLETED", candidateSha: "C2" });
+  step({ type: "SUBMIT_PHASE", disclosures: [] });
+  step({ type: "FREEZE_COMPLETED", candidateSha: "C2", decisions: [] });
   assert.equal(ctx.state.phase.candidate?.sha, "C2");
 
   step({ type: "CHECKS_PASSED" });

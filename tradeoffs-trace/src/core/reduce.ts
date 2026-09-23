@@ -67,6 +67,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "AMEND",
   "RUN_BUDGET_EXCEEDED",
   "RUN_RESUMED",
+  "LAUNCH_FAILED",
+  "INTEGRITY_VIOLATED",
 ]);
 
 function ok(state: State): ReduceResult {
@@ -285,9 +287,19 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: applyOwnerRequestResolved(p, event) });
     }
 
+    case "INTEGRITY_VIOLATED": {
+      // design §2.2: a checkout that no longer matches its candidate commit
+      // invalidates that gate's result (never counted as passed) and marks
+      // the run integrity-violated for the owner. Idempotent: once set, a
+      // second occurrence (e.g. a repair round's own check) is still just
+      // `true`.
+      return ok({ ...state, phase: { ...p, integrityViolated: true } });
+    }
+
     case "SUBMIT_PHASE": {
-      // Decisions disclosed with the submission are recorded; the freeze
-      // transition itself (submit-phase row) moves IMPLEMENTING -> FREEZING.
+      // The raw disclosures are stashed on the phase; the submit-phase row
+      // itself moves IMPLEMENTING -> FREEZING. FREEZE_COMPLETED is what
+      // assembles these into bound Decision records (design §6.2, §7.1).
       return undefined;
     }
 
@@ -350,11 +362,12 @@ export function reduce(state: State, event: unknown): ReduceResult {
       if (issue) return rejected(state, issue);
     }
 
-    // Decisions disclosed alongside SUBMIT_PHASE are recorded before the
-    // phase-table row (which only moves phase -> FREEZING) runs.
+    // The raw disclosures alongside SUBMIT_PHASE are stashed before the
+    // phase-table row (which only moves phase -> FREEZING) runs. They stay
+    // pending until FREEZE_COMPLETED assembles and binds them.
     let working = state;
     if (ev.type === "SUBMIT_PHASE") {
-      working = { ...state, phase: { ...state.phase, decisions: [...state.phase.decisions, ...ev.decisions] } };
+      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures } };
     }
 
     const rows = rowsFor(working, ev.type);

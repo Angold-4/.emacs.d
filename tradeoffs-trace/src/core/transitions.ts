@@ -239,11 +239,21 @@ addRow({
     return withPhase(s, {
       phase: "CHECKING",
       candidate: { sha: e.candidateSha, contractVersion: s.phase.contract.contractVersion },
+      // design §6.2/§7.1: the disclosures pending since SUBMIT_PHASE are now
+      // fully assembled, bound Decision records (the conductor's job — see
+      // conductor.ts's #runFreeze) and move into `decisions`; nothing stays
+      // pending once a freeze completes.
+      decisions: [...s.phase.decisions, ...e.decisions],
+      pendingDisclosures: undefined,
       checks: undefined,
       probe: undefined,
       reviews: {},
       ballots: [],
       overrides: [],
+      // design §2.2: a clean freeze (no survivors this time) clears any
+      // earlier taint; one that found survivors sets it, so the next
+      // attempt starts from a clean checkout of this candidate.
+      worktreeTainted: e.tainted ?? false,
       inFlight: clearInFlight(s.phase, "freeze"),
     });
   },
@@ -974,6 +984,53 @@ addAwaitingOwnerRecordCommandRows(
 addAwaitingOwnerRecordCommandRows("awaiting-owner-finding-accepted", "FINDING_ACCEPTED_BY_OWNER", () => true, findingAcceptedByOwner);
 
 addAwaitingOwnerRecordCommandRows("awaiting-owner-override", "OVERRIDE_CAST", () => true, overrideCast);
+
+// --- launch failure (§2.1): a tool-set mismatch is a launch failure, not a
+// warning — straight to BLOCKED, no repair round spent (phase-1b round of
+// review item 4; a pure, additive core change — see EvLaunchFailed). -------
+function launchFailedReason(e: Extract<Event, { type: "LAUNCH_FAILED" }>): string {
+  const who = e.role === "reviewer" && e.reviewer ? `reviewer ${e.reviewer}` : e.role;
+  return `launch failure: tool set mismatch (${who}) — expected [${e.expected.join(", ")}], missing [${e.missing.join(", ")}], extra [${e.extra.join(", ")}]`;
+}
+
+addRow({
+  id: "launch-failed-from-implementing",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "LAUNCH_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "LAUNCH_FAILED" }>;
+    return withPhase(s, {
+      phase: "BLOCKED",
+      blockedReason: launchFailedReason(e),
+      inFlight: clearInFlight(s.phase, "dispatch_worker"),
+    });
+  },
+});
+
+addRow({
+  id: "launch-failed-from-reviewing",
+  axis: "phase",
+  from: "REVIEWING",
+  trigger: "LAUNCH_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "LAUNCH_FAILED" }>;
+    const key = e.reviewer ? (`review_${e.reviewer}` as InFlightKey) : undefined;
+    return withPhase(s, {
+      phase: "BLOCKED",
+      blockedReason: launchFailedReason(e),
+      inFlight: key ? clearInFlight(s.phase, key) : s.phase.inFlight,
+    });
+  },
+});
 
 // --- run execution budget (§8.1) --------------------------------------
 addRow({
