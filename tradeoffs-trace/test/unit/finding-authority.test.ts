@@ -206,7 +206,25 @@ test("finding-authority: FINDING_RAISED rejects a finding with no evidence", () 
 });
 
 test("finding-authority: only the owner can accept a finding", () => {
-  const state = withOpenFinding("B");
+  // A `defect` finding, not `contract`: a contract finding's only
+  // disposition is amending the contract (design §4.2), covered by
+  // test/unit/r1-contract-authority.test.ts.
+  const finding: Finding = {
+    id: "F1",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: "race in cancel path",
+    raisedBy: "B",
+    status: "open",
+    boundCandidateSha: "C1",
+  };
+  const state = baseState({
+    phase: "RESOLVING",
+    candidate: { sha: "C1", contractVersion: K },
+    findings: [finding],
+  });
   const binding = { boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 };
   const notOwner = reduce(state, {
     type: "FINDING_ACCEPTED_BY_OWNER",

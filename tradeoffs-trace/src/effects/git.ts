@@ -139,6 +139,10 @@ function cloneCheckout(repo: string, sha: string, dir: string): void {
   git(["-C", dir, "checkout", "-q", "--detach", sha]);
 }
 
+/** Collects regular files and directories under `root`, **never following
+ * symlinks**: a symlink is neither a file to chmod nor a directory to
+ * descend into. (A symlink's own mode is irrelevant on every platform this
+ * runs on, and `chmod` would otherwise follow it to an external target.) */
 function walkPaths(root: string): { files: string[]; dirs: string[] } {
   const files: string[] = [];
   const dirs: string[] = [];
@@ -148,7 +152,8 @@ function walkPaths(root: string): { files: string[]; dirs: string[] } {
     const entries = fs.readdirSync(current, { withFileTypes: true });
     for (const entry of entries) {
       const full = path.join(current, entry.name);
-      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+      if (entry.isSymbolicLink()) continue; // never follow or chmod a link
+      if (entry.isDirectory()) {
         dirs.push(full);
         stack.push(full);
       } else {
@@ -160,22 +165,40 @@ function walkPaths(root: string): { files: string[]; dirs: string[] } {
   return { files, dirs };
 }
 
-/** Recursively chmods every file and directory under `dir` writable
- * (`u+w`) or read-only (files `0444`, dirs `0555`) for the owning user.
- * Exported so tests can force a materialized candidate writable again
- * before tampering with it (the `integrity-detect` exit-gate test does
- * exactly that). */
+/** Toggles just the owning user's write bit on `p`, preserving every other
+ * permission bit (executable bits above all: git records a tracked file's
+ * exec bit in its tree, so losing it would corrupt the tree hash). Symlinks
+ * are skipped entirely — `chmod` follows them and would change an external
+ * target's mode. */
+function setOwnerWriteBit(p: string, writable: boolean): void {
+  const st = fs.lstatSync(p);
+  if (st.isSymbolicLink()) return;
+  const perms = st.mode & 0o7777;
+  const next = writable ? perms | 0o200 : perms & ~0o200;
+  if (next !== perms) fs.chmodSync(p, next);
+}
+
+/** Recursively toggles the owner-write bit on every regular file and
+ * directory under `dir`, making a tree writable (`u+w`) or read-only
+ * (clearing `u+w`). Executable and all other bits are preserved, and
+ * symlinks are never chmod'ed or followed. Exported so tests can force a
+ * materialized candidate writable again before tampering with it (the
+ * `integrity-detect` exit-gate test does exactly that). */
 export function setTreeWritable(dir: string, writable: boolean): void {
   const { files, dirs } = walkPaths(dir);
   for (const file of files) {
     try {
-      fs.chmodSync(file, writable ? 0o644 : 0o444);
+      setOwnerWriteBit(file, writable);
     } catch {
-      // Best effort — a broken symlink target, etc.
+      // Best effort — a file removed mid-walk, etc.
     }
   }
   for (const d of dirs) {
-    fs.chmodSync(d, writable ? 0o755 : 0o555);
+    try {
+      setOwnerWriteBit(d, writable);
+    } catch {
+      // Best effort.
+    }
   }
 }
 
