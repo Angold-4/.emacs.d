@@ -222,7 +222,15 @@ function driveOnce(rng: () => number): RunResult {
         const findingVersion = (id: string) => state.phase.findings.find((f) => f.id === id)?.version ?? 1;
 
         const choice = rng();
-        if (request.origin === "open_finding" && request.linkedFindingId && choice < 0.25) {
+        // A `contract` finding's only disposition is AMEND (design §4.2),
+        // handled by the branch above; direct acceptance is valid only for
+        // a non-contract finding.
+        if (
+          request.origin === "open_finding" &&
+          request.linkedFindingId &&
+          linkedFinding?.kind !== "contract" &&
+          choice < 0.25
+        ) {
           // FINDING_ACCEPTED_BY_OWNER directly, bypassing the request's own
           // "accept_risk" option — an equally valid way to settle it.
           state = step(state, {
