@@ -6,7 +6,7 @@
   :PROPERTIES:
   :ID:          p4a-multiphase
   :CHECKS:      make -C tradeoffs-trace check
-  :BOUNDARIES:  tradeoffs-trace/src/core/** tradeoffs-trace/schemas/**
+  :BOUNDARIES:  tradeoffs-trace/schemas/**
   :RESERVED:    the acceptance predicate in src/core/predicate.ts; the binding tuple fields
   :END:
   Goal: one run executes every non-provisional phase of its plan serially, each phase starting from the previous phase's published head, with the master reviewer carrying the plan's intent across phases, as in docs/tradeoffs-trace-plan.md phase 4.

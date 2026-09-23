@@ -1,28 +1,24 @@
-#+TITLE: tradeoffs-trace 3b: revise buffer, history and continue-in-Pilish
+#+TITLE: tradeoffs-trace 3b: a minimal, readable Emacs surface
 #+TT_CHECKS: make -C tradeoffs-trace check
 #+TT_BRANCH: feat/tradeoffs-trace-p4-dogfood
 
-* Phase 3b: Emacs revise and history
+* Phase 3b: minimal readable surface
   :PROPERTIES:
-  :ID:          p3b-emacs-revise
+  :ID:          p3b-minimal-surface
   :CHECKS:      make -C tradeoffs-trace check
-  :BOUNDARIES:  core/init-tradeoffs-trace.el init.el
+  :BOUNDARIES:  init.el
   :RESERVED:    the C-c m key prefix and existing Pilish bindings
   :END:
-  Goal: in core/init-tradeoffs-trace.el, pressing r in the decision view opens a revise buffer that previews the consequence before anything is sent, and a finished run's agent history can be read and continued in Pilish without touching the run's evidence, as in docs/tradeoffs-trace.md §7.5, §9.4 and §10.
+  Goal: core/init-tradeoffs-trace.el stays small and read-only apart from the input box: the decision view lists only decisions, each self-contained so the owner can pick it up in seconds; the trace and status show what agents are doing and where the time goes, without clicks or extra commands. The owner intervenes only through the input box (plan 2c).
   Acceptance:
-  - r opens a *tt-revise* buffer showing the record, a correction text area, a "this changes the contract" toggle and a "Submitting will" list (what pauses, rounds granted, reruns); C-c C-c writes the revise command with its binding tuple, C-c C-k cancels
-  - after submission the decision view lists the correction under Corrections with its lifecycle state (received, repairing, checking, reviewing, resolved) rendered from tt state
-  - the trace buffer rebuilds history from the agent's Pi session file plus stream/ when reopened after an Emacs restart; no Pilish command that resumes or mutates a run session is reachable from tradeoffs-trace buffers
-  - M-x +tt-continue-in-pilish on a finished run copies the chosen session file into Pi's session directory and opens the copy with Pilish; the run's original is unchanged
-  - RET on a decision or finding opens its evidence (diff hunk or file:line in the candidate checkout)
-  - the trace renders each tool call as one line: a verb (the sh command prefixed by $, read/grep/edit/write with their path and range or pattern), a result mark (✓ or ✗ with exit code) from tool_execution_end, the duration, and the last line of output; a running call shows ⧗ with elapsed time; sleep/tail polling loops are marked "polling"; no blank lines between tools; TAB on a line expands its full output
-  - the trace shows the files each tool call changed in the worker's worktree as one line per file, "path +added −removed" (from git diff --numstat before and after the call), with no diff content; this includes files written by sh commands (heredocs, redirects), not only edit/write calls
-  - tt timing <run> (CLI, JSON with --json) reports per agent: elapsed, tool time vs model time, time per category (sleep/poll, full test suite, narrow tests, file writes, reads/greps, other), and the slowest calls, computed by pairing tool_execution_start/end in stream/*.jsonl; plus the control-log phase timeline; ~/.tradeoffs-trace/tools/tt-timing is the reference behaviour
-  - the status buffer has a "Time" section for the active agent, refreshed live: elapsed in this attempt, share spent on sleep/poll and full test runs, the currently running tool and how long it has run, and a warning when polling exceeds a quarter of the attempt
-  - the status buffer shows the phase pipeline as one line of stages (READY, IMPLEMENTING, FREEZING, CHECKING, PROBING, REVIEWING, RESOLVING, PUBLISHING, DONE) with completed stages marked and their durations from the control log, the current stage with live elapsed time, the attempt number, repair rounds used and time until the stage deadline
-  - a global mode-line indicator (on by default while any run is active, toggled by +tt-mode-line) shows the active run's short id, stage and elapsed time, reviewer progress during REVIEWING, and a warning face for IDLE, excessive polling, BLOCKED or needs-you; clicking it opens the run's workspace
-  - every trace line carries its time (HH:MM:SS) and a finished tool call its duration
-  - the trace shows a tool call as its readable argument (the sh command line, the edited file path), not a raw alist; observed in run 4ec5e0f8: ▸ tool: sh ((command . node --test …
-  - the status buffer lists the files changed in the live worktree (git status of the run's worktree), because workers often write files through sh heredocs, which the trace shows only as shell commands
-  - new ERT tests in test/tradeoffs-trace-test.el cover the revise buffer command, history rebuild from a session fixture and continue-in-Pilish copying; make -C tradeoffs-trace ert passes
+  - C-c m d lists only decisions (worker-disclosed and reviewer-discovered); no action keys other than g (refresh), TAB (fold) and q (quit); the r/o/x/1-3/w/s/u keys and their commands are removed
+  - a header line states the phase and review progress, e.g. "p2c · REVIEWING · M ✓ A ⧗ B ⧗ — votes not cast yet"
+  - each decision is one self-contained block: a heading with its state (PENDING, ACCEPTED, ACCEPTED with dissent, REJECTED, SUSPENDED) and the choice (at most 80 characters, full sentence in the body); who raised it (worker, or reviewer M/A/B discovered); why it matters; the options with consequences, the chosen one marked; the recommendation; one line per reviewer ballot with its rationale; reviewers who independently discovered the same choice listed as "also seen by"
+  - boundary triggers are not listed as decisions; the status buffer shows one line "boundary files changed: N (reviewers classify)"
+  - empty sections are not shown
+  - the trace renders each tool call as one line: time (HH:MM:SS), a verb ($ command for sh; read/grep/edit/write with path and range or pattern), ✓ or ✗ with exit code, duration and the last output line; a running call shows ⧗ with elapsed time; sleep/tail polling is marked "polling"; no blank lines between tools (observed: raw alists like "▸ tool: sh ((command . …" and blank lines)
+  - the trace shows the files each tool call changed in the worker's worktree as one line per file, "path +added −removed" (git diff --numstat before and after), including files written by sh heredocs and redirects; no diff content
+  - tt timing <run> (CLI, --json available) reports per agent: elapsed, tool vs model time, time per category (polling, full test runs, narrow tests, file writes, reads/greps, other) and the slowest calls; ~/.tradeoffs-trace/tools/tt-timing is the reference behaviour
+  - the status buffer shows the phase pipeline as one line of stages with completed stages' durations, the current stage's live elapsed time, attempt and repair rounds, time to the stage deadline, and a Time line for the active agent (model %, polling %, full-test %, the running tool and its elapsed time, a warning when polling exceeds a quarter of the attempt)
+  - a display-only mode-line indicator, shown while a run is active, gives the short run id, stage, elapsed time, reviewer progress and a warning face for IDLE, heavy polling, BLOCKED or needs-you; it is not clickable
+  - ERT tests in test/tradeoffs-trace-test.el cover the decision block rendering from a fixture (states, also-seen-by, no triggers), the trace line rendering including file change lines, and the pipeline/Time lines; the removed keys' tests are removed; make -C tradeoffs-trace ert passes
