@@ -44,8 +44,19 @@ export const SUBMIT_DISCOVERY_PARAMS: ParamShape = {
 
 /** Matches schemas/review.schema.json's top level exactly — a Review
  * carries no conductor-assigned binding fields, so the model supplies
- * every field the record itself needs. */
+ * every field the record itself needs. `ballots`/`findings` (work packet
+ * 2a) are optional: a real reviewer's turn-2 submission includes them; a
+ * phase-1 stub review omits them (see conductor.ts's `stubReviews`). */
 export const SUBMIT_REVIEW_PARAMS: ParamShape = {
-  properties: ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
+  properties: [
+    "reviewer",
+    "phaseId",
+    "candidateSha",
+    "contractVersion",
+    "correctionStatements",
+    "findingStatements",
+    "ballots",
+    "findings",
+  ],
   required: ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
 };

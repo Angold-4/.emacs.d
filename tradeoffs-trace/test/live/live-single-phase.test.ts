@@ -266,6 +266,10 @@ function runLiveSingePhase(): void {
         piArgsPrefixFor: (role) => (role === "reviewer" ? [FAKE_PI_PATH] : []),
         providerModelFor: (role) => (role === "worker" ? { provider: PROVIDER, model: MODEL } : undefined),
         piEnvFor: (role) => (role === "reviewer" ? { FAKE_PI_SCRIPT: reviewerScript } : undefined),
+        // Phase 1c's own scope: a real worker with fake-pi stub reviewers,
+        // pre-dating work packet 2a's real two-turn review protocol — see
+        // that packet's live-review test for real M/A/B reviewers instead.
+        stubReviews: true,
       });
 
       const seenPgids = new Set<number>();

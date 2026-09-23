@@ -238,6 +238,7 @@ async function runBaseline(): Promise<RunOutcome> {
     TT_TEST_MODE: "1",
     TT_TEST_PI_COMMAND: process.execPath,
     TT_TEST_PI_ARGS_PREFIX: JSON.stringify([FAKE_PI_PATH]),
+    TT_TEST_STUB_REVIEWS: "1",
     TT_TEST_DEADLINES: JSON.stringify(FAST_DEADLINES),
     FAKE_PI_SCRIPT: scriptsDir,
   };
@@ -260,6 +261,7 @@ async function runCrashCycle(boundary: CrashBoundary): Promise<{ outcome: RunOut
     TT_TEST_MODE: "1",
     TT_TEST_PI_COMMAND: process.execPath,
     TT_TEST_PI_ARGS_PREFIX: JSON.stringify([FAKE_PI_PATH]),
+    TT_TEST_STUB_REVIEWS: "1",
     TT_TEST_DEADLINES: JSON.stringify(FAST_DEADLINES),
     FAKE_PI_SCRIPT: scriptsDir,
   };

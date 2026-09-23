@@ -24,10 +24,13 @@ import { effectiveChecks } from "./core/checks.ts";
 import type {
   Action,
   Ballot,
+  BallotDisclosure,
   ContractVersion,
   Decision,
   DecisionDisclosure,
   Event,
+  Finding,
+  FindingDisclosure,
   InFlightKey,
   PhaseContract,
   PhaseState,
@@ -35,6 +38,7 @@ import type {
   Reviewer,
   State,
 } from "./core/types.ts";
+import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
 import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
 import { sameVersion } from "./core/predicate.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
@@ -46,6 +50,9 @@ import { killGroup, childEnv, runCommand, type RunCommandResult } from "./effect
 import { sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
+  diffHunks,
+  diffNameOnly,
+  diffText,
   disposableCheckout,
   discardProbeByBranch,
   freezeCommit,
@@ -66,6 +73,9 @@ export type { CrashBoundary } from "./effects/crash.ts";
 
 const DECISION_SCHEMA: Record<string, unknown> = JSON.parse(
   fs.readFileSync(new URL("../schemas/decision.schema.json", import.meta.url), "utf8"),
+);
+const FINDING_SCHEMA: Record<string, unknown> = JSON.parse(
+  fs.readFileSync(new URL("../schemas/finding.schema.json", import.meta.url), "utf8"),
 );
 
 // ---------------------------------------------------------------------------
@@ -167,6 +177,14 @@ export interface ConductorOptions {
   /** Per-agent environment override — tests use this to give each fake-pi
    * agent (worker, reviewer M/A/B) its own `FAKE_PI_SCRIPT`. */
   piEnvFor?: (role: Role, agentId: string) => NodeJS.ProcessEnv | undefined;
+  /** Work packet 2a: phase 1's `#castStubBallots` behavior (every reviewer
+   * auto-approves every delegated decision on submit_review, no real
+   * ballots/findings/discovery) — kept, opt-in, for existing tests that
+   * predate the real two-turn review protocol. Default `false`: a real
+   * reviewer's `submit_discovery` (turn 1) and `submit_review` (turn 2,
+   * carrying real `ballots`/`findings`) are processed for real (design §3,
+   * §4, §5, §6.1). */
+  stubReviews?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,13 +219,25 @@ export function runPaths(runDir: string) {
  * and refusing to proceed on a mismatch, is phase 3's frozen-runner
  * enforcement, not this one's. */
 export function runnerRevision(): string {
+  const packageRoot = fileURLToPath(new URL("..", import.meta.url));
+  // An installed (frozen) runner carries RUNNER_SHA, written by
+  // `tt runner install` (plan: "The runner is frozen while it builds itself").
   try {
-    const packageRoot = fileURLToPath(new URL("..", import.meta.url));
+    const pinned = fs.readFileSync(path.join(packageRoot, "RUNNER_SHA"), "utf8").trim();
+    if (pinned) return pinned;
+  } catch {
+    // not an installed runner
+  }
+  try {
     return execFileSync("git", ["-C", packageRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   } catch {
     return "unknown";
   }
 }
+
+/** A conductor whose own revision differs from the one the run was started
+ * under refuses to resume it (plan, "How this plan is executed"). */
+export class RunnerMismatchError extends Error {}
 
 export function contractVersionFor(phase: RunPlanPhase, snapshot = 1): ContractVersion {
   const sectionSha256 = createHash("sha256").update(JSON.stringify(phase)).digest("hex");
@@ -338,6 +368,12 @@ interface AgentHandle {
    * waiting on timeouts/no_submission for this dispatch. */
   doneResolve: () => void;
   donePromise: Promise<void>;
+  /** Work packet 2a: resolved once a real reviewer's turn-1 `submit_discovery`
+   * has been accepted (see #onSubmit) — `#runReview`'s two-turn flow awaits
+   * this before ever sending the turn-2 prompt. Unused in `stubReviews`
+   * mode or for a worker handle. */
+  discoveryResolve: () => void;
+  discoveryPromise: Promise<void>;
 }
 
 export class Conductor {
@@ -352,11 +388,16 @@ export class Conductor {
   #providerModelFor: ((role: Role) => { provider?: string; model?: string } | undefined) | undefined;
   #extraEnv: NodeJS.ProcessEnv;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
+  #stubReviews: boolean;
   #log!: EventLog;
   #lock: Lock | undefined;
   #socket!: RunSocketServer;
   #state!: State;
   #agents = new Map<string, AgentHandle>();
+  /** Work packet 2a: agent ids (reviewer dispatches) whose turn-1
+   * `submit_discovery` has already been accepted — gates `submit_review`
+   * (turn 2) in non-stub mode. See `#onSubmit`. */
+  #discoverySubmitted = new Set<string>();
   #driving = false;
   #redriveRequested = false;
   #runStartedAt = Date.now();
@@ -414,6 +455,7 @@ export class Conductor {
     this.#piArgsPrefix = opts.piArgsPrefix ?? [];
     this.#extraEnv = opts.extraEnv ?? {};
     this.#piEnvFor = opts.piEnvFor;
+    this.#stubReviews = opts.stubReviews ?? false;
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -471,7 +513,13 @@ export class Conductor {
     const { records } = readLog(this.#paths.events);
     const initRecord = records.find((r) => r.kind === "init");
     if (initRecord) {
-      const init = initRecord.event as { runId: string; integrationHead: string };
+      const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string };
+      const mine = runnerRevision();
+      if (init.runnerRevision && init.runnerRevision !== mine && process.env.TT_ALLOW_RUNNER_MISMATCH !== "1") {
+        throw new RunnerMismatchError(
+          `run was started under runner ${init.runnerRevision}; this conductor is ${mine} — refusing to resume (reinstall that runner, or start a new run)`,
+        );
+      }
       this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead);
     } else {
       const head = currentHead(this.#plan.repo, this.#integrationBranch);
@@ -618,6 +666,7 @@ export class Conductor {
         const decisions = this.#assembleDecisions(found);
         this.#log.completion(actionId, { candidateSha: found, tainted: sweepResult.tainted, recovered: true });
         this.#applyEvent({ type: "FREEZE_COMPLETED", candidateSha: found, decisions, tainted: sweepResult.tainted });
+        this.#recordBoundaryDataAndSample(found);
       } else {
         this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
         this.#applyEvent({ type: "FREEZE_INTERRUPTED" });
@@ -996,16 +1045,81 @@ export class Conductor {
       if (review.candidateSha !== this.#state.phase.candidate?.sha) {
         return { ok: false, reason: "submit_review candidateSha does not match the current candidate" };
       }
-      this.#applyEvent({ type: "REVIEW_SUBMITTED", review });
-      this.#castStubBallots(review.reviewer);
+      if (!this.#stubReviews && !this.#discoverySubmitted.has(agentId)) {
+        // Work packet 2a, design §6.1: turn 2 must not be accepted before
+        // turn 1 (submit_discovery) was — this is the two-turn ordering
+        // guarantee itself, enforced structurally (the conductor's own
+        // #runReview never even sends the turn-2 prompt first), but it is
+        // cheap and worth also rejecting here in case a script/model races
+        // ahead of its own prompt.
+        return { ok: false, reason: "submit_review called before submit_discovery was accepted (turn order)" };
+      }
+      if (this.#stubReviews) {
+        this.#applyEvent({ type: "REVIEW_SUBMITTED", review });
+        this.#castStubBallots(review.reviewer);
+      } else {
+        // Ordering matters, and in TWO conflicting directions at once — a
+        // real bug this packet's own contract-objection test caught: if
+        // REVIEW_SUBMITTED is applied first and this happens to be the
+        // LAST of the three reviews, `#applyEvent`'s own synchronous
+        // `drive()` can see `reviewsComplete()` go true and recommend
+        // `accept` immediately — reading `phase.findings`/`phase.ballots`
+        // as they stood BEFORE this reviewer's own ballots/findings (e.g.
+        // a contract objection) were ever recorded, so a candidate could
+        // be accepted with the very ballot that should have blocked it
+        // still unapplied. So: findings + ballots (from `#applyReviewFindingsAndBallots`)
+        // are applied FIRST — any contract objection's linked finding is
+        // already open before REVIEW_SUBMITTED can trigger acceptance.
+        // Only the findingStatements-derived confirm/withdraw
+        // (`#applyReviewFindingStatements`) needs `phase.reviews[reviewer]
+        // .review` to already exist (reduce.ts's own
+        // FINDING_CONFIRMED_REPAIRED guard, design §4.2) — so that step
+        // runs LAST, after REVIEW_SUBMITTED.
+        let error: string | undefined;
+        try {
+          error = await this.#applyReviewFindingsAndBallots(review);
+        } catch (err) {
+          error = `threw: ${String((err as Error)?.message ?? err)}`;
+        }
+        if (error) {
+          this.#log.append("review_outcome_error", { reviewer: review.reviewer, error });
+          return { ok: false, reason: error };
+        }
+        this.#applyEvent({ type: "REVIEW_SUBMITTED", review });
+        try {
+          this.#applyReviewFindingStatements(review);
+        } catch (err) {
+          // Best-effort: a confirm/withdraw statement that reduce.ts's own
+          // guard would reject (e.g. arrived on the same candidate it was
+          // raised on) is not a submission-fatal error — the review itself
+          // is already recorded above.
+          this.#log.append("error", { where: "review_finding_statements", error: String((err as Error)?.message ?? err) });
+        }
+      }
       handle.doneResolve();
       return { ok: true };
     }
     if (msg.tool === "submit_discovery") {
-      // Phase 2 (the real discovery/correction loop) turns this into
-      // recorded decisions/findings; phase 1's stub reviewers are not
-      // expected to call it. Accepted as a no-op so a scripted call does
-      // not fail a test outright.
+      if (this.#stubReviews) {
+        // Phase 1's stub reviewers are not expected to call it — accepted
+        // as a no-op so a scripted call does not fail a test outright.
+        return { ok: true };
+      }
+      if (handle.role !== "reviewer" || this.#state.phase.phase !== "REVIEWING") {
+        return { ok: false, reason: `submit_discovery is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      const discoveries = (msg.args as { discoveries?: DecisionDisclosure[] }).discoveries ?? [];
+      const reviewer = this.#reviewerFromAgentId(agentId);
+      const error = this.#applyDiscoveries(discoveries, reviewer);
+      if (error) return { ok: false, reason: error };
+      this.#discoverySubmitted.add(agentId);
+      // Log-only record (not a core Event — same precedent as the
+      // "sampling"/"sweep" kinds): a discovery with zero findings produces
+      // no DECISION_ADDED event at all, so this is the only durable trace
+      // that turn 1 actually happened for this reviewer — a live test
+      // checks it directly.
+      this.#log.append("discovery_submitted", { agentId, reviewer, count: discoveries.length });
+      handle.discoveryResolve();
       return { ok: true };
     }
     return { ok: false, reason: `unknown submission tool ${msg.tool}` };
@@ -1051,6 +1165,256 @@ export class Conductor {
     }
   }
 
+  // -- work packet 2a: real reviewer discovery/ballots/findings -----------
+
+  #reviewerFromAgentId(agentId: string): Reviewer {
+    return (agentId.match(/^reviewer-([MAB])-/)?.[1] as Reviewer | undefined) ?? "M";
+  }
+
+  /** design §3.3's second decision source: a reviewer's turn-1
+   * `submit_discovery`, made before it is shown the worker's own
+   * disclosure. v1 matching (design §12 notes dedup precision is measured
+   * later): every discovery becomes a *new* `reviewer-discovered` record —
+   * no attach-to-existing-id matching yet. Assembles+binds each one exactly
+   * like a worker's disclosure (id/version/boundCandidateSha/
+   * boundContractVersion), validates it, and emits `DECISION_ADDED`. */
+  #applyDiscoveries(discoveries: DecisionDisclosure[], reviewer: Reviewer): string | undefined {
+    const candidate = this.#state.phase.candidate;
+    if (!candidate) return "no candidate exists yet to bind a discovered decision to";
+    const K = this.#state.phase.contract.contractVersion;
+    for (const d of discoveries) {
+      const decision: Decision = {
+        id: `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-${this.#state.phase.decisions.length + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        source: "reviewer-discovered",
+        class: d.classProposal,
+        choice: d.choice,
+        whyItMatters: d.whyItMatters,
+        alternatives: d.alternatives,
+        recommendation: d.recommendation,
+        boundCandidateSha: candidate.sha,
+        boundContractVersion: K,
+      };
+      const result = validate(DECISION_SCHEMA, decision);
+      if (!result.valid) {
+        return `discovered decision fails schemas/decision.schema.json: ${result.errors.join("; ")}`;
+      }
+      this.#applyEvent({ type: "DECISION_ADDED", decision });
+    }
+    return undefined;
+  }
+
+  /** design §4.1: assembles+binds one reviewer-raised finding
+   * (id/version/boundCandidateSha; kind/severity/evidence/linkedDecisionId
+   * copied through), runs its optional reproduction command (design §8.1's
+   * `reproductionMs` deadline, in a fresh disposable checkout — never the
+   * live worktree or the reviewer's own read-only candidate checkout) if
+   * one was given, and emits `FINDING_RAISED`. Returns an error string
+   * instead of throwing, like `#applyDiscoveries`. */
+  async #raiseFinding(fd: FindingDisclosure, reviewer: Reviewer, candidateSha: string): Promise<string | undefined> {
+    let reproduction: Finding["reproduction"];
+    if (fd.reproduction) {
+      const result = await this.#runReproduction(fd.reproduction.command, candidateSha);
+      reproduction = { command: fd.reproduction.command, result };
+    }
+    const finding: Finding = {
+      id: `F-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-${reviewer}-${this.#state.phase.findings.length + 1}`,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      kind: fd.kind,
+      severity: fd.severity,
+      evidence: fd.evidence,
+      raisedBy: reviewer,
+      status: "open",
+      boundCandidateSha: candidateSha,
+      // Optional fields are omitted entirely rather than set to
+      // `undefined` — schema.ts's minimal validator treats a PRESENT key
+      // whose value is `undefined` as "wrong type", not "absent" (a real
+      // bug this test caught: M's finding with no linkedDecisionId failed
+      // validation with "expected type string, got undefined").
+      ...(fd.linkedDecisionId !== undefined ? { linkedDecisionId: fd.linkedDecisionId } : {}),
+      ...(reproduction !== undefined ? { reproduction } : {}),
+    };
+    const result = validate(FINDING_SCHEMA, finding);
+    if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
+    this.#applyEvent({ type: "FINDING_RAISED", finding });
+    return undefined;
+  }
+
+  /** design §8.1's reproduction-command deadline: runs `command` in a fresh
+   * disposable checkout of `candidateSha` (never the reviewer's own
+   * read-only checkout — a reproduction command might itself be
+   * destructive), bounded by `reproductionMs`. Exit 0 = the described
+   * behavior reproduced; a non-zero, non-timeout exit = it did not; a
+   * timeout is inconclusive (killed, like every other conductor-run
+   * command, via its own process group). */
+  async #runReproduction(command: string, candidateSha: string): Promise<"reproduced" | "not_reproduced" | "inconclusive"> {
+    const checkout = disposableCheckout(this.#plan.repo, candidateSha);
+    try {
+      const running = runCommand({
+        command,
+        cwd: checkout.dir,
+        deadlineMs: this.#deadlines.reproductionMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+      });
+      const result = await running.result;
+      if (result.timedOut) return "inconclusive";
+      return result.exitCode === 0 ? "reproduced" : "not_reproduced";
+    } finally {
+      checkout.dispose();
+    }
+  }
+
+  /** design §5/§6.1's real turn-2 review outcome: a ballot per votable
+   * decision plus any newly raised findings, replacing phase 1's
+   * `#castStubBallots`. Findings are raised before ballots are cast so a
+   * ballot's own `contractObjection` (handled by reduce.ts's BALLOT_CAST
+   * case — it opens its own linked finding and bumps the decision's
+   * version) always sees the decision's latest version. Returns an error
+   * string (never throws) so `#onSubmit` can reject the submission back to
+   * the model as an ordinary tool error. */
+  async #applyReviewFindingsAndBallots(review: Review): Promise<string | undefined> {
+    const candidate = this.#state.phase.candidate;
+    if (!candidate) return "no candidate exists yet to bind ballots/findings to";
+    const K = this.#state.phase.contract.contractVersion;
+
+    for (const fd of review.findings ?? []) {
+      const error = await this.#raiseFinding(fd, review.reviewer, candidate.sha);
+      if (error) return error;
+    }
+
+    for (const bd of review.ballots ?? []) {
+      const decision = this.#state.phase.decisions.find((d) => d.id === bd.decisionId);
+      if (!decision) return `ballot references unknown decision ${bd.decisionId}`;
+      if (decision.class !== "delegated") {
+        return `ballot on ${bd.decisionId} is not votable (class '${decision.class}', not 'delegated')`;
+      }
+      const ballot: Ballot = {
+        reviewer: review.reviewer,
+        decisionId: bd.decisionId,
+        vote: bd.vote,
+        rationale: bd.rationale,
+        evidence: bd.evidence,
+        contractObjection: bd.contractObjection,
+        boundCandidateSha: candidate.sha,
+        boundContractVersion: K,
+        boundRecordVersion: decision.version,
+      };
+      this.#applyEvent({ type: "BALLOT_CAST", ballot });
+    }
+    return undefined;
+  }
+
+  /** design §4.2/§6.1: "per-finding confirm/withdraw statements for its own
+   * raised findings" — only the raising reviewer's own statement on its own
+   * open finding is ever acted on; everything else is silently ignored
+   * rather than rejected outright (a stale findingId, or a statement about
+   * someone else's finding, is not this reviewer's own review to fail
+   * over). `confirm` needs a NEW candidate with passing checks (design
+   * §4.2's own wording, mirrored by reduce.ts's own
+   * FINDING_CONFIRMED_REPAIRED guard) — checked here too so a premature
+   * "confirm" (same candidate, or checks not yet passed) is a quiet no-op
+   * instead of a thrown, unrecoverable #applyEvent rejection. MUST be
+   * called after `REVIEW_SUBMITTED` for this review — reduce.ts's own
+   * FINDING_CONFIRMED_REPAIRED guard reads `phase.reviews[reviewer].review`
+   * for the confirming statement (see #onSubmit's own ordering comment). */
+  #applyReviewFindingStatements(review: Review): void {
+    const candidate = this.#state.phase.candidate;
+    if (!candidate) return;
+    for (const stmt of review.findingStatements ?? []) {
+      const finding = this.#state.phase.findings.find((f) => f.id === stmt.findingId);
+      if (!finding || finding.raisedBy !== review.reviewer || finding.status !== "open") continue;
+      if (stmt.status === "withdraw") {
+        this.#applyEvent({
+          type: "FINDING_DISPROVED",
+          findingId: finding.id,
+          byReviewer: review.reviewer,
+          evidence: stmt.evidence && stmt.evidence.trim().length > 0 ? stmt.evidence : "reviewer withdrew the finding",
+        });
+      } else if (stmt.status === "confirm") {
+        const checksOk = this.#state.phase.checks?.candidateSha === candidate.sha && this.#state.phase.checks?.passed === true;
+        if (candidate.sha !== finding.boundCandidateSha && checksOk) {
+          this.#applyEvent({ type: "FINDING_CONFIRMED_REPAIRED", findingId: finding.id, byReviewer: review.reviewer, candidateSha: candidate.sha });
+        }
+      }
+    }
+  }
+
+  // -- work packet 2a: boundary triggers + §3.5 sampling data --------------
+
+  /** design §3.3's boundary triggers and §3.5's sampling, computed once a
+   * candidate exists (freeze time) from the diff between the phase's base
+   * (its `integrationHead` when the attempt started) and the candidate.
+   * Pure matching/citation logic lives in `core/boundaries.ts`; this method
+   * is only the imperative shell (git diff, assembling+binding trigger
+   * Decision records, logging the sample). Never throws on a bad diff —
+   * best-effort, since a run should not fail over sampling data. */
+  #recordBoundaryDataAndSample(candidateSha: string): void {
+    let paths: string[];
+    let hunks: ReturnType<typeof diffHunks>;
+    try {
+      paths = diffNameOnly(this.#plan.repo, this.#state.phase.integrationHead, candidateSha);
+      hunks = diffHunks(this.#plan.repo, this.#state.phase.integrationHead, candidateSha);
+    } catch (err) {
+      this.#log.append("sampling_error", { candidateSha, error: String((err as Error)?.message ?? err) });
+      return;
+    }
+
+    const contract = this.#state.phase.contract;
+    const acceptanceFiles = contract.acceptance.filter((a) => a.includes("/"));
+    const citationTexts = [
+      ...this.#state.phase.decisions.flatMap((d) => [d.choice, d.whyItMatters, ...d.alternatives.map((a) => `${a.option} ${a.consequence}`)]),
+      ...this.#state.phase.findings.map((f) => f.evidence),
+    ];
+
+    const triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
+    const K = contract.contractVersion;
+    for (const p of triggerPaths) {
+      const decision: Decision = {
+        id: `D-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-trigger-${this.#state.phase.decisions.length + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        source: "trigger",
+        // design §3.4: worker proposes, reviewer may raise, only the owner
+        // lowers — a conductor-computed trigger has no worker proposal at
+        // all, so it starts at `delegated` (a real M+A/B vote is required
+        // before it settles, unlike `detail`) rather than the maximum
+        // `reserved` (owner-mandatory, 2b's scope): a reviewer's own vote
+        // on it (via its ballot, this packet's "classify" mechanism for a
+        // trigger — see README) is what a real reviewer would use to raise
+        // it further with a `reserved`-requesting finding, or simply
+        // approve it as adequately covered. Only the owner may still lower
+        // it to `detail` later (2b, via DECISION_CLASS_LOWERED).
+        class: "delegated",
+        choice: `Diff touches boundary/dependency/acceptance-relevant path '${p}' with no decision or finding citing it`,
+        whyItMatters: "Boundary-relevant paths need an explicit review disposition (design §3.3/§3.4) — silence here is not the same as approval.",
+        alternatives: [
+          { option: "treat it as already covered", consequence: "a boundary or dependency change could go unreviewed" },
+          { option: "classify and review it explicitly", consequence: "costs one more decision to settle before acceptance" },
+        ],
+        recommendation: { choice: "classify and review this trigger explicitly", reason: `'${p}' matched a boundary/dependency/acceptance rule with no citing record` },
+        boundCandidateSha: candidateSha,
+        boundContractVersion: K,
+      };
+      const result = validate(DECISION_SCHEMA, decision);
+      if (!result.valid) {
+        this.#log.append("sampling_error", { candidateSha, error: `trigger decision invalid: ${result.errors.join("; ")}` });
+        continue;
+      }
+      this.#applyEvent({ type: "DECISION_ADDED", decision });
+    }
+
+    const unreferencedHunks = computeUnreferencedHunks(hunks, citationTexts);
+    const detailDecisionIds = this.#state.phase.decisions.filter((d) => d.class === "detail").map((d) => d.id);
+    this.#log.append("sampling", {
+      candidateSha,
+      unreferencedHunks: unreferencedHunks.map((h) => ({ file: h.file, header: h.header })),
+      detailDecisionIds,
+      triggerPaths,
+    });
+  }
+
   #onShIntent(agentId: string, _commandId: string, pgid: number): void {
     this.#agents.get(agentId)?.shGroups.add(pgid);
     this.#log.append("intent", { agentId, pgid }, `sh-${agentId}-${pgid}`);
@@ -1058,7 +1422,9 @@ export class Conductor {
 
   #onNoSubmission(agentId: string): void {
     const handle = this.#agents.get(agentId);
-    if (handle) handle.doneResolve();
+    // A reviewer's missing submission is detected from agent_settled in
+    // #runReview; resolving donePromise here would count it as submitted.
+    if (handle && handle.role === "worker") handle.doneResolve();
   }
 
   #cwdFor(agentId: string): string | undefined {
@@ -1154,6 +1520,10 @@ export class Conductor {
     const donePromise = new Promise<void>((resolve) => {
       doneResolve = resolve;
     });
+    let discoveryResolve!: () => void;
+    const discoveryPromise = new Promise<void>((resolve) => {
+      discoveryResolve = resolve;
+    });
 
     const workerPiCommand = this.#resolvePiCommand("worker");
     const workerProviderModel = this.#providerModelFor?.("worker");
@@ -1187,6 +1557,8 @@ export class Conductor {
       shGroups: new Set(),
       doneResolve,
       donePromise,
+      discoveryResolve,
+      discoveryPromise,
     };
     this.#agents.set(agentId, handle);
     let submittedKeepHandle = false;
@@ -1371,10 +1743,27 @@ export class Conductor {
     })();
 
     const deadline = cancelableTimeout(this.#deadlines.freezeMs, "timeout" as const);
-    const outcome = await Promise.race([work, deadline.promise]);
+    // design §8.1: "any freeze error must end in a logged failure, never an
+    // in-flight entry with no completion" (work packet 2a fix — a real bug:
+    // if `work` above threw synchronously, e.g. `freezeCommit` erroring on
+    // a repair attempt, `Promise.race` itself rejected, which propagated
+    // straight out of `#runFreeze` past every completion/event call below —
+    // the dispatch call site's own `.catch` only logged an "error" record,
+    // leaving the `freeze` action permanently in-flight with no
+    // FREEZE_TIMED_OUT/FREEZE_COMPLETED ever emitted, so the phase could
+    // never move again). A thrown `work` is now treated exactly like an
+    // ordinary timeout: force-kill, sweep, taint, and FREEZE_TIMED_OUT —
+    // the attempt fails and consumes a repair round instead of hanging.
+    let outcome: { candidateSha: string; decisions: Decision[]; tainted: boolean } | undefined | "timeout" | "error";
+    try {
+      outcome = await Promise.race([work, deadline.promise]);
+    } catch (err) {
+      outcome = "error";
+      this.#log.append("error", { where: "freeze", error: String((err as Error)?.message ?? err) });
+    }
     deadline.cancel();
 
-    if (outcome === "timeout") {
+    if (outcome === "timeout" || outcome === "error") {
       timedOut = true;
       if (handle) {
         await handle.agent.terminate().catch(() => undefined);
@@ -1382,7 +1771,7 @@ export class Conductor {
       }
       const sweepResult: SweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
       this.#log.append("sweep", sweepResult);
-      this.#log.completion(actionId, { timedOut: true, tainted: true });
+      this.#log.completion(actionId, { timedOut: true, tainted: true, reason: outcome });
       this.#applyEvent({ type: "FREEZE_TIMED_OUT" });
       return;
     }
@@ -1405,6 +1794,11 @@ export class Conductor {
       decisions: outcome.decisions,
       tainted: outcome.tainted,
     });
+    // Work packet 2a: boundary triggers (design §3.3) and §3.5's sampling
+    // data need a real candidate (for the diff, and for DECISION_ADDED's
+    // own binding check) — only possible once FREEZE_COMPLETED above has
+    // set phase.candidate.
+    this.#recordBoundaryDataAndSample(outcome.candidateSha);
   }
 
   // -- checks ---------------------------------------------------------------
@@ -1579,10 +1973,37 @@ export class Conductor {
     const donePromise = new Promise<void>((resolve) => {
       doneResolve = resolve;
     });
+    let discoveryResolve!: () => void;
+    const discoveryPromise = new Promise<void>((resolve) => {
+      discoveryResolve = resolve;
+    });
+
+    // design §2's "A and B are fixed for the phase (kept across its repair
+    // rounds)": a real Pi process is spawned fresh per dispatch either way
+    // (there is no long-lived RPC connection to hand across repair rounds),
+    // but a stable, reviewer-keyed session directory (not one keyed by this
+    // dispatch's own actionId, unlike a worker attempt's per-attempt
+    // session) lets Pi's own session resume carry the conversation forward
+    // across them — reused for every dispatch of the SAME reviewer in this
+    // run, exactly like the worker's session directory is reused across a
+    // crash-recovered attempt. `noSession` (no persistence at all) only for
+    // fake-pi, which does not understand sessions.
+    const reviewerPiCommand = this.#resolvePiCommand("reviewer");
+    const sessionDir = path.join(this.#paths.sessions, `reviewer-${reviewer}`);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const reviewerProviderModel = this.#providerModelFor?.("reviewer");
 
     const agent = spawnPiAgent({
-      command: this.#resolvePiCommand("reviewer"),
-      args: [...this.#resolvePiArgsPrefix("reviewer"), ...launchArgs("reviewer", { noSession: true })],
+      command: reviewerPiCommand,
+      args: [
+        ...this.#resolvePiArgsPrefix("reviewer"),
+        ...launchArgs("reviewer", {
+          sessionDir,
+          noSession: reviewerPiCommand !== undefined,
+          provider: reviewerProviderModel?.provider,
+          model: reviewerProviderModel?.model,
+        }),
+      ],
       cwd: candidateDir,
       env,
       role: "reviewer",
@@ -1590,8 +2011,17 @@ export class Conductor {
       streamFile,
       abortGraceMs: this.#deadlines.abortGraceMs,
       termGraceMs: this.#deadlines.termGraceMs,
-      onEvent: (event) => this.#trackRunTokens(agentId, event),
+      onEvent: (event) => {
+        this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
     });
+    // A reviewer that settles without the submission its turn owes must fail
+    // fast (re-dispatch once, then BLOCKED), not wait out reviewMs: observed
+    // live with deepseek, where two reviewers settled after turn 2 without
+    // calling submit_review and the run idled for the full review deadline.
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
 
     const handle: AgentHandle = {
       agent,
@@ -1602,6 +2032,8 @@ export class Conductor {
       shGroups: new Set(),
       doneResolve,
       donePromise,
+      discoveryResolve,
+      discoveryPromise,
     };
     this.#agents.set(agentId, handle);
     // design §9.3's "agent attempt" reconciliation applies to a reviewer's
@@ -1631,23 +2063,126 @@ export class Conductor {
         return;
       }
 
-      await agent.prompt(buildReviewerPrompt(this.#state.phase, reviewer));
-
       const reviewTimeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
-      const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
-      reviewTimeout.cancel();
 
-      if (outcome === "submitted") {
+      if (this.#stubReviews) {
+        await agent.prompt(buildReviewerPrompt(this.#state.phase, reviewer));
+        const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
+        reviewTimeout.cancel();
+        if (outcome === "submitted") {
+          await agent.terminate();
+          this.#log.completion(actionId, { reviewer, ok: true });
+          return;
+        }
+        await agent.terminate();
+        this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout" });
+        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        return;
+      }
+
+      // Work packet 2a's real two-turn review (design §6.1's REVIEWING, §3.3):
+      // turn 1 shows the candidate/diff/records EXCEPT the worker's own
+      // disclosure and requires submit_discovery; only once that is
+      // accepted (#onSubmit resolves discoveryPromise) does turn 2 — the
+      // worker's disclosed decisions, open findings/corrections — ever get
+      // sent, and only then is submit_review (with a real ballot per
+      // votable decision) accepted at all (#onSubmit's own turn-order
+      // check). One shared `reviewMs` deadline covers both turns.
+      const settled1 = nextSettle();
+      await agent.prompt(this.#buildReviewerTurn1Prompt(reviewer));
+      const turn1 = await Promise.race([discoveryPromise.then(() => "discovered" as const), reviewTimeout.promise, settled1]);
+      if (turn1 !== "discovered") {
+        reviewTimeout.cancel();
+        await agent.terminate();
+        const why = turn1 === "settled" ? "settled without submit_discovery (turn 1)" : "timeout (turn 1: submit_discovery)";
+        this.#log.completion(actionId, { reviewer, ok: false, reason: why });
+        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        return;
+      }
+
+      // Turn 2 is a fresh prompt only after turn 1 has fully settled: sending
+      // it while the reviewer is still finishing turn 1 makes Pi queue it as
+      // a follow-up of turn 1 (observed live: reviewers then repeated
+      // submit_discovery or settled without submit_review).
+      const turn1Settled = await Promise.race([settled1, reviewTimeout.promise]);
+      if (turn1Settled === "timeout") {
+        reviewTimeout.cancel();
+        await agent.terminate();
+        this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (turn 1 did not settle)" });
+        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        return;
+      }
+      const settled2 = nextSettle();
+      await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer));
+      const turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled2]);
+      reviewTimeout.cancel();
+      if (turn2 === "submitted") {
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: true });
         return;
       }
       await agent.terminate();
-      this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout" });
+      const why2 = turn2 === "settled" ? "settled without submit_review (turn 2)" : "timeout (turn 2: submit_review)";
+      this.#log.completion(actionId, { reviewer, ok: false, reason: why2 });
       this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
     } finally {
       this.#agents.delete(agentId);
     }
+  }
+
+  // -- work packet 2a: two-turn reviewer prompts ---------------------------
+
+  /** Turn 1 (design §3.3): the contract verbatim, the read-only candidate
+   * checkout path, the diff vs. the phase's base, and every record under
+   * review EXCEPT the worker's own disclosure (`source === "worker"`) — a
+   * reviewer must discover its own choices from the diff before ever seeing
+   * what the worker disclosed. */
+  #buildReviewerTurn1Prompt(reviewer: Reviewer): string {
+    const phase = this.#state.phase;
+    let diff = "(diff unavailable)";
+    try {
+      diff = diffText(this.#plan.repo, phase.integrationHead, phase.candidate!.sha);
+    } catch {
+      // best-effort — the reviewer still has the candidate checkout itself.
+    }
+    const otherRecords = phase.decisions.filter((d) => d.source !== "worker");
+    return [
+      `You are reviewer ${reviewer}, turn 1 of 2 (design §3.3): discover behavioral choices from the diff BEFORE seeing the worker's own disclosure.`,
+      `Goal: ${phase.contract.goal}`,
+      "Acceptance criteria:",
+      ...phase.contract.acceptance.map((a) => `- ${a}`),
+      `Candidate checkout (read-only): ${this.#candidateDir()}`,
+      `Diff vs. phase base (${phase.integrationHead}):`,
+      "```diff",
+      diff,
+      "```",
+      otherRecords.length > 0
+        ? `Records already on record (not the worker's own disclosure): ${JSON.stringify(otherRecords.map((d) => ({ id: d.id, source: d.source, choice: d.choice })))}`
+        : "No non-worker records exist yet.",
+      "Call submit_discovery with any behavioral choices you find in the diff — an empty discoveries list is fine if you find none. You will see the worker's own disclosure only after this.",
+    ].join("\n");
+  }
+
+  /** Turn 2 (design §6.1): the worker's disclosed decisions, open findings
+   * to re-examine, and open corrections — only sent once turn 1's
+   * submit_discovery has been accepted (see `#runReview`). Requires
+   * submit_review with a ballot per votable decision. */
+  #buildReviewerTurn2Prompt(reviewer: Reviewer): string {
+    const phase = this.#state.phase;
+    const K = phase.contract.contractVersion;
+    const votable = phase.decisions.filter((d) => d.class === "delegated" && !d.supersededByCorrection);
+    const workerDecisions = phase.decisions.filter((d) => d.source === "worker");
+    const openFindings = phase.findings.filter((f) => f.status === "open");
+    const openCorrections = phase.corrections.filter((c) => c.status === "open");
+    return [
+      `Turn 2 of 2: the worker's disclosed decisions, open findings and open corrections for candidate ${phase.candidate?.sha}.`,
+      `Contract version: snapshot ${K.snapshot}`,
+      `Worker's disclosed decisions: ${JSON.stringify(workerDecisions)}`,
+      `Every currently votable decision (class 'delegated'): ${JSON.stringify(votable.map((d) => ({ id: d.id, version: d.version, choice: d.choice })))}`,
+      `Open findings to re-examine: ${JSON.stringify(openFindings)}`,
+      `Open corrections: ${JSON.stringify(openCorrections)}`,
+      "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, findingStatements, a ballot (in `ballots`) for every currently votable decision, and any newly raised findings (in `findings`, each with evidence + severity; a contract objection on a ballot opens a linked finding and suspends that vote).",
+    ].join("\n");
   }
 
   // -- publish --------------------------------------------------------------

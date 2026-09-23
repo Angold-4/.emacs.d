@@ -69,6 +69,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "RUN_RESUMED",
   "LAUNCH_FAILED",
   "INTEGRITY_VIOLATED",
+  "DECISION_ADDED",
 ]);
 
 function ok(state: State): ReduceResult {
@@ -171,6 +172,24 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, "a finding must carry evidence; got none");
       }
       return ok({ ...state, phase: { ...p, findings: [...p.findings, event.finding] } });
+    }
+
+    case "DECISION_ADDED": {
+      // Work packet 2a: a reviewer-discovered decision or a conductor
+      // boundary trigger — the other two decision sources besides a
+      // worker's disclosure (design §3.3). Bound to the phase's current
+      // candidate/contract, same as any other record design §7.1 binds.
+      const { decision } = event;
+      if (p.decisions.some((d) => d.id === decision.id)) {
+        return rejected(state, `decision ${decision.id} already exists`);
+      }
+      if (!p.candidate || decision.boundCandidateSha !== p.candidate.sha) {
+        return rejected(state, `decision ${decision.id} must be bound to the current candidate`);
+      }
+      if (!sameVersion(decision.boundContractVersion, p.contract.contractVersion)) {
+        return rejected(state, `decision ${decision.id} must be bound to the current contract version`);
+      }
+      return ok({ ...state, phase: { ...p, decisions: [...p.decisions, decision] } });
     }
 
     case "FINDING_CONFIRMED_REPAIRED": {

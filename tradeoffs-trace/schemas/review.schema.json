@@ -35,6 +35,43 @@
           "evidence": { "type": "string" }
         }
       }
+    },
+    "ballots": {
+      "type": "array",
+      "description": "Work packet 2a: turn 2 of a real review — a ballot per votable decision.",
+      "items": {
+        "type": "object",
+        "required": ["decisionId", "vote", "rationale", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "decisionId": { "type": "string", "minLength": 1 },
+          "vote": { "enum": ["approve", "reject"] },
+          "rationale": { "type": "string", "minLength": 1 },
+          "evidence": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+          "contractObjection": { "type": "boolean" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Work packet 2a: newly raised findings, with evidence + severity (design §4.1).",
+      "items": {
+        "type": "object",
+        "required": ["kind", "severity", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["defect", "contract", "integration"] },
+          "severity": { "enum": ["blocking", "advisory"] },
+          "evidence": { "type": "string", "minLength": 1 },
+          "linkedDecisionId": { "type": "string", "minLength": 1 },
+          "reproduction": {
+            "type": "object",
+            "required": ["command"],
+            "additionalProperties": false,
+            "properties": { "command": { "type": "string", "minLength": 1 } }
+          }
+        }
+      }
     }
   },
   "$defs": {

@@ -90,6 +90,7 @@ test("a spawned conductor process for a fake-pi happy path exits by itself short
       plan,
       piCommand: process.execPath,
       piArgsPrefix: [fakePiPath],
+      stubReviews: true,
       piEnvFor: (role, agentId) => {
         if (role === "worker") return { FAKE_PI_SCRIPT: workerScriptPath };
         const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1]) ?? "M";

@@ -106,6 +106,12 @@ export async function setupConductor(opts: {
    * `["true"]`. */
   phaseChecks?: string[];
   workerScript: (setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
+  /** Work packet 2a: an attempt-aware alternative to the static
+   * `workerScript` — needed by tests where a repair round's second attempt
+   * must submit different (or empty) decisions than the first (e.g.
+   * contract-objection.test.ts, so the repair does not re-disclose a
+   * duplicate decision). Takes precedence over `workerScript` when given. */
+  workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
   deadlines?: ConductorOptions["deadlines"];
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
@@ -113,6 +119,21 @@ export async function setupConductor(opts: {
    * marker in every agent process's command line (`ps`/`pgrep -f`), e.g.
    * for a test that must assert no orphan process remains afterwards. */
   extraPiArgsPrefix?: string[];
+  /** Work packet 2a: `Conductor`'s own default is real reviewers
+   * (`stubReviews: false`); this harness defaults to `true` instead, so the
+   * ~30 pre-existing conductor tests (whose reviewer scripts predate the
+   * real two-turn discovery/review protocol) keep working unchanged. Tests
+   * exercising the real protocol pass `stubReviews: false` explicitly. */
+  stubReviews?: boolean;
+  /** Work packet 2a: BOUNDARIES globs for the phase's contract, so a test
+   * can exercise conductor-computed boundary triggers (design §3.3).
+   * Defaults to `[]` (no boundaries), exactly as before this option
+   * existed. */
+  boundaries?: string[];
+  /** Work packet 2a: path-shaped acceptance criteria, exercising the
+   * "acceptance files" boundary-trigger input. Appended after the fixed
+   * `"it works"` acceptance criterion. */
+  acceptanceFiles?: string[];
 }): Promise<TestConductorSetup> {
   const repo = makeRepo();
   const runRoot = makeRunRoot();
@@ -127,16 +148,17 @@ export async function setupConductor(opts: {
       {
         id: "p1",
         goal: "do the thing",
-        acceptance: ["it works"],
+        acceptance: ["it works", ...(opts.acceptanceFiles ?? [])],
         checks: opts.phaseChecks ?? opts.checks ?? ["true"],
-        boundaries: [],
+        boundaries: opts.boundaries ?? [],
         reserved: [],
       },
     ],
   };
 
   const runDir = createRun(runRoot, plan);
-  const workerScriptPath = writeScript(scriptsDir, "worker", opts.workerScript({ repo }));
+  const workerScriptPath = opts.workerScriptForAttempt ? undefined : writeScript(scriptsDir, "worker", opts.workerScript({ repo }));
+  const workerScriptPaths = new Map<number, string>();
 
   const reviewerScriptPaths = new Map<string, string>();
 
@@ -150,8 +172,18 @@ export async function setupConductor(opts: {
     // flags and refuse to start.
     piArgsPrefix: [FAKE_PI_PATH, ...(opts.extraPiArgsPrefix ?? [])],
     deadlines: opts.deadlines,
+    stubReviews: opts.stubReviews ?? true,
     piEnvFor: (role, agentId) => {
-      if (role === "worker") return { FAKE_PI_SCRIPT: workerScriptPath };
+      if (role === "worker") {
+        if (opts.workerScriptForAttempt) {
+          const attempt = Number(agentId.match(/^worker-(\d+)-/)?.[1] ?? "1");
+          if (!workerScriptPaths.has(attempt)) {
+            workerScriptPaths.set(attempt, writeScript(scriptsDir, `worker-${attempt}`, opts.workerScriptForAttempt(attempt, { repo })));
+          }
+          return { FAKE_PI_SCRIPT: workerScriptPaths.get(attempt)! };
+        }
+        return { FAKE_PI_SCRIPT: workerScriptPath! };
+      }
       const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1] ?? "M") as Reviewer;
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {
         const script = opts.reviewerScriptFor(reviewer, conductor.state);
@@ -173,11 +205,42 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Polls `check()` until it returns true or `timeoutMs` elapses. */
-export async function waitFor(check: () => boolean, timeoutMs = 15_000, intervalMs = 50): Promise<void> {
+/** Dumps the tail of `<runDir>/events.jsonl` plus each agent's last few raw
+ * RPC stream lines (`<runDir>/stream/*.jsonl`) to stderr — for a
+ * `waitFor` timeout on a real (non-fake) reviewer flow, where the failure
+ * otherwise gives no clue which side (conductor vs. the scripted agent)
+ * stopped responding. */
+function dumpDebugState(runDir: string): void {
+  try {
+    const eventsPath = runPaths(runDir).events;
+    if (fs.existsSync(eventsPath)) {
+      const tail = fs.readFileSync(eventsPath, "utf8").split("\n").filter(Boolean).slice(-30);
+      console.error(`--- waitFor timeout: tail of ${eventsPath} ---`);
+      for (const line of tail) console.error(line);
+    }
+    const streamDir = runPaths(runDir).stream;
+    if (fs.existsSync(streamDir)) {
+      for (const file of fs.readdirSync(streamDir)) {
+        const lines = fs.readFileSync(path.join(streamDir, file), "utf8").split("\n").filter(Boolean);
+        console.error(`--- waitFor timeout: last events of ${file} (${lines.length} total) ---`);
+        for (const line of lines.slice(-8)) console.error(line);
+      }
+    }
+  } catch (err) {
+    console.error(`waitFor timeout debug dump failed: ${String((err as Error)?.message ?? err)}`);
+  }
+}
+
+/** Polls `check()` until it returns true or `timeoutMs` elapses. `debugRunDir`
+ * (work packet 2a addition), if given, is dumped via `dumpDebugState` on
+ * timeout — see its own doc comment. */
+export async function waitFor(check: () => boolean, timeoutMs = 15_000, intervalMs = 50, debugRunDir?: string): Promise<void> {
   const start = Date.now();
   while (!check()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
+    if (Date.now() - start > timeoutMs) {
+      if (debugRunDir) dumpDebugState(debugRunDir);
+      throw new Error("waitFor: timed out");
+    }
     await sleep(intervalMs);
   }
 }

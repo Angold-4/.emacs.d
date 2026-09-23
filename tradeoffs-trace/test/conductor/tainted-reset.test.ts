@@ -113,6 +113,7 @@ test("tainted-reset: after a tainted freeze, the next attempt's worktree is rese
     plan,
     piCommand: process.execPath,
     piArgsPrefix: [FAKE_PI_PATH],
+    stubReviews: true,
     deadlines: {
       abortGraceMs: 500,
       termGraceMs: 500,
