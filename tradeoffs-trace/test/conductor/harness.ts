@@ -95,7 +95,16 @@ export interface TestConductorSetup {
  * this by the conductor; fake-pi has to be handed it via its script file
  * instead). */
 export async function setupConductor(opts: {
+  /** Shorthand: sets both the global and phase check lists to this value
+   * (the harness's historical behavior). Use `globalChecks`/`phaseChecks`
+   * for a run whose two lists differ. */
   checks?: string[];
+  /** The plan's global `TT_CHECKS` list. Defaults to `checks`, then
+   * `["true"]`. */
+  globalChecks?: string[];
+  /** The phase contract's own `:CHECKS:` list. Defaults to `checks`, then
+   * `["true"]`. */
+  phaseChecks?: string[];
   workerScript: (setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
   /** Work packet 2a: an attempt-aware alternative to the static
    * `workerScript` — needed by tests where a repair round's second attempt
@@ -134,13 +143,13 @@ export async function setupConductor(opts: {
     title: "test plan",
     repo: repo.dir,
     integrationBranch: "main",
-    checks: opts.checks ?? ["true"],
+    checks: opts.globalChecks ?? opts.checks ?? ["true"],
     phases: [
       {
         id: "p1",
         goal: "do the thing",
         acceptance: ["it works", ...(opts.acceptanceFiles ?? [])],
-        checks: opts.checks ?? ["true"],
+        checks: opts.phaseChecks ?? opts.checks ?? ["true"],
         boundaries: opts.boundaries ?? [],
         reserved: [],
       },
