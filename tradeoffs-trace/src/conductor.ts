@@ -174,6 +174,10 @@ export interface RunPlanFile {
   checks: string[];
   phases: RunPlanPhase[];
   ownerNotes?: string;
+  /** Per-plan time limits (plan keywords TT_SH_MINUTES, TT_CHECK_MINUTES,
+   * TT_ATTEMPT_MINUTES), for repositories whose builds and suites take
+   * longer than the defaults (e.g. a Rust workspace). */
+  deadlines?: Partial<Deadlines>;
 }
 
 export interface ConductorOptions {
@@ -2174,6 +2178,9 @@ export class Conductor {
       ...this.#extraEnv,
       ...this.#piEnvFor?.("worker", agentId),
       TT_SOCKET: this.#paths.sock,
+      // The extension waits this long for a command's result: the conductor's
+      // per-command limit plus room for the kill and its report.
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
       TT_WORKTREE: this.#paths.worktree,
       TT_RUN_DIR: this.#runDir,
       TT_PROTECTED: protectedPaths,
@@ -2695,6 +2702,9 @@ export class Conductor {
       ...this.#extraEnv,
       ...this.#piEnvFor?.("reviewer", agentId),
       TT_SOCKET: this.#paths.sock,
+      // The extension waits this long for a command's result: the conductor's
+      // per-command limit plus room for the kill and its report.
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
       TT_RUN_DIR: this.#runDir,
       // Phase 1b work-packet item 6: a `tt start`-launched, CLI-driven
       // conductor has no in-process JS hook (unlike setupConductor's

@@ -535,7 +535,8 @@ export default function (pi: ExtensionAPI) {
       }
       const chunks: string[] = [];
       try {
-        const exit = await client.runShell(params.command, params.cwd, (msg) => chunks.push(msg.chunk));
+        const waitMs = Number(process.env.TT_SH_WAIT_MS) || 300_000;
+        const exit = await client.runShell(params.command, params.cwd, (msg) => chunks.push(msg.chunk), waitMs);
         return {
           isError: exit.code !== 0,
           content: [{ type: "text" as const, text: chunks.join("") || `(no output, exit ${exit.code})` }],

@@ -237,7 +237,10 @@ async function runConductorProcess(runDir: string): Promise<void> {
   const p = runPaths(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const { piCommand, piArgsPrefix } = testPiInjection();
-  const deadlines = testDeadlines();
+  // A plan's own limits (TT_*_MINUTES), then the test-only override.
+  const planDeadlines = plan.deadlines ?? {};
+  const t = testDeadlines();
+  const deadlines = t || Object.keys(planDeadlines).length > 0 ? { ...planDeadlines, ...(t ?? {}) } : undefined;
   const stubReviews = testStubReviews();
   writeFileSync(path.join(runDir, "conductor.pid"), String(process.pid));
   const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, deadlines, stubReviews });

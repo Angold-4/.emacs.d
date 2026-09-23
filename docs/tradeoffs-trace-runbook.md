@@ -119,6 +119,18 @@ and runs independent phases in parallel.
 - A **blocked** node never finishes. Its dependents wait, independent branches of the graph continue, and the program ends `stuck` when nothing else can run.
 - The scheduler's state is folded from `~/.tradeoffs-trace/programs/<id>/events.jsonl`. `tt program resume` continues after a restart and never recreates an existing node branch.
 
+**Time limits per plan.** A repository whose builds and suites take longer than
+the defaults sets its own limits: `#+TT_SH_MINUTES` (one agent command),
+`#+TT_CHECK_MINUTES` (checks and the probe) and `#+TT_ATTEMPT_MINUTES` (one worker
+attempt). Put them in a plan file, or in the program file, where they apply
+to every entry that doesn't set its own. For Rust, also share one cargo target
+directory across worktrees and checkouts. Otherwise every fresh checkout
+rebuilds from scratch:
+
+```elisp
+(setenv "CARGO_TARGET_DIR" (expand-file-name "~/.cache/dragon-target"))  ; before C-c m r
+```
+
 **Before an unattended program:**
 1. `TT_BRANCH` exists in the repository, and nothing has it or a node branch checked out.
 2. Every plan's check command finishes in a few minutes (the checks limit is 5).

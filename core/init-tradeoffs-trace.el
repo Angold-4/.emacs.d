@@ -171,6 +171,18 @@ The goal ends at a blank line, a list item or the \"Acceptance:\" line."
             (provisional . ,(if provisional t :false)))
           (nreverse errors))))
 
+(defun +tt--plan-deadlines ()
+  "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES and
+#+TT_ATTEMPT_MINUTES, as the conductor's deadline fields in ms (or nil).
+For repositories whose builds and suites outlast the defaults (3, 5, 45)."
+  (let ((ms (lambda (kw) (let ((v (+tt--keyword kw)))
+                           (and v (string-match-p "\\`[0-9]+\\'" v) (* 60000 (string-to-number v))))))
+        (out nil))
+    (when-let* ((v (funcall ms "TT_SH_MINUTES"))) (push (cons 'shCommandMs v) out))
+    (when-let* ((v (funcall ms "TT_CHECK_MINUTES"))) (push (cons 'checkMs v) out) (push (cons 'probeMs v) out))
+    (when-let* ((v (funcall ms "TT_ATTEMPT_MINUTES"))) (push (cons 'workerAttemptMs v) out))
+    (nreverse out)))
+
 (defun +tt-parse-plan ()
   "Parse the current Org plan buffer.
 Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
@@ -202,7 +214,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   (repo . ,(or repo ""))
                   (integrationBranch . ,(or branch ""))
                   (checks . ,(vconcat (and global-checks (list global-checks))))
-                  (phases . ,(vconcat (nreverse phases))))
+                  (phases . ,(vconcat (nreverse phases)))
+                  ,@(let ((d (+tt--plan-deadlines)))
+                      (and d `((deadlines . ,d)))))
           :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
 
 (defun +tt--show-plan-errors (file errors)
@@ -345,6 +359,9 @@ several phases runs them in order."
          (title (or (+tt--keyword "TITLE") (file-name-base file)))
          (max (let ((v (+tt--keyword "TT_PROGRAM"))) (if (and v (string-match-p "\\`[0-9]+\\'" v)) (string-to-number v) 1)))
          (branches (or (+tt--keyword "TT_BRANCHES") "stack"))
+         ;; TT_*_MINUTES in the program file: the default for every entry
+         ;; whose plan does not set its own.
+         (defaults (+tt--plan-deadlines))
          (entries nil) (errors nil))
     (if (not (+tt--keyword "TT_PROGRAM"))
         (let ((parsed (+tt-parse-plan)))
@@ -364,6 +381,8 @@ several phases runs them in order."
                (t
                 (pcase-let ((`(,plan . ,errs) (+tt--plan-of-file (expand-file-name plan-file dir))))
                   (dolist (e errs) (push (cons line (cdr e)) errors))
+                  (when (and defaults (not (assq 'deadlines plan)))
+                    (setq plan (append plan `((deadlines . ,defaults)))))
                   (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
     (unless entries (push (cons 1 "program has no entries") errors))
     (list :program `((title . ,title) (maxParallel . ,max) (branches . ,branches)
