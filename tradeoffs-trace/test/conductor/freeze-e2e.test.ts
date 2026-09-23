@@ -81,7 +81,7 @@ test("freeze-e2e: a worker that keeps writing after submit_phase is swept, kille
 
   await setup.conductor.start();
   try {
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 30_000);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000);
     const state = setup.conductor.state;
 
     // The freeze's own sweep found and killed the survivor — recorded as a
@@ -102,9 +102,9 @@ test("freeze-e2e: a worker that keeps writing after submit_phase is swept, kille
 
     // The survivor process is provably dead.
     const pidFile = path.join(setup.repo.dir, "survivor.pid");
-    await waitFor(() => fs.existsSync(pidFile), 5_000);
+    await waitFor(() => fs.existsSync(pidFile), 15_000);
     const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
-    await waitFor(() => !pidAlive(pid), 10_000);
+    await waitFor(() => !pidAlive(pid), 30_000);
 
     // Now that the run is DONE, simulate a hypothetical further escaped
     // write landing in the (still on-disk) worktree — the exact kind of

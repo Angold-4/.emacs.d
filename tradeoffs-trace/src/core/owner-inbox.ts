@@ -74,6 +74,8 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
       };
     case "note":
       return { type: "NOTE_ADDED", phaseId: command.phaseId, text: command.text };
+    case "correction":
+      return { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: command.text };
     case "unneeded":
       return { type: "OWNER_REQUEST_MARKED_UNNEEDED", requestId: command.requestId };
     case "miss":
@@ -215,6 +217,18 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
       if (typeof r.text !== "string" || r.text.trim().length === 0) return { ok: false, reason: "a note command needs a non-empty 'text'" };
       if (b.phaseId === "") return { ok: false, reason: "a note command needs 'binding.phaseId'" };
       return { ok: true, runId: b.runId, phaseId: b.phaseId, event: { type: "NOTE_ADDED", phaseId: b.phaseId, text: r.text } };
+    }
+    case "correction": {
+      if (typeof r.text !== "string" || r.text.trim().length === 0) {
+        return { ok: false, reason: "a correction command needs a non-empty 'text'" };
+      }
+      if (b.phaseId === "") return { ok: false, reason: "a correction command needs 'binding.phaseId'" };
+      return {
+        ok: true,
+        runId: b.runId,
+        phaseId: b.phaseId,
+        event: { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: r.text },
+      };
     }
     case "unneeded": {
       if (b.recordId === "") return { ok: false, reason: "an unneeded command needs 'binding.recordId'" };

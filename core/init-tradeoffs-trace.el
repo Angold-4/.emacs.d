@@ -340,7 +340,8 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
           (setq any t)
           (ignore-errors
             (cond ((derived-mode-p '+tt-trace-mode) (+tt--render-trace win))
-                  ((derived-mode-p '+tt-status-mode) (+tt--render-status)))))))
+                  ((derived-mode-p '+tt-status-mode) (+tt--render-status))
+                  ((derived-mode-p '+tt-input-mode) (+tt--render-input-header)))))))
     (unless any
       (when (timerp +tt--timer) (cancel-timer +tt--timer))
       (setq +tt--timer nil))))
@@ -420,6 +421,54 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
     (if (not f) 0
       (/ (float-time (time-subtract nil (file-attribute-modification-time (file-attributes f)))) 60))))
 
+(defun +tt--owner-input-state-label (state reason)
+  "Human label for a recorded owner-input STATE, with REASON when present."
+  (pcase state
+    ("delivered" "delivered")
+    ("noted" "noted")
+    ("correction-started" "correction started")
+    ("delivery-uncertain" (format "delivery uncertain%s" (if reason (format " (%s)" reason) "")))
+    ("refused" (format "refused: %s" (or reason "not accepted")))
+    (_ (or state "sent"))))
+
+(defun +tt--not-picked-up-p (at)
+  "True when ISO time AT is more than 30 s in the past."
+  (ignore-errors
+    (> (- (float-time) (float-time (date-to-time at))) 30)))
+
+(defun +tt--render-owner-inputs (s)
+  "Insert the Owner input section (design §7.4/§9.3) from state S.
+Recorded effects come from the conductor (`ownerInputs`); anything still
+sitting in the inbox (`pendingOwnerInputs`) is shown as sent, or `not
+picked up` once 30 s have passed. Nothing is inferred beyond that."
+  (let* ((recorded (or (alist-get 'ownerInputs s) nil))
+         (pending (or (alist-get 'pendingOwnerInputs s) nil))
+         (entries (append
+                   (mapcar (lambda (r)
+                             (cons (+tt--owner-input-state-label (alist-get 'state r) (alist-get 'reason r)) r))
+                           recorded)
+                   (mapcar (lambda (r)
+                             (let ((at (alist-get 'at r)))
+                               (cons (if (and at (+tt--not-picked-up-p at)) "not picked up" "sent") r)))
+                           pending))))
+    (insert (format "Owner input (%d)\n" (length entries)))
+    (dolist (e entries)
+      (let* ((r (cdr e))
+             (text (or (alist-get 'text r) ""))
+             (kind (alist-get 'kind r)))
+        (insert (format "  - %s — %s%s\n"
+                        (truncate-string-to-width text 70 nil nil "…")
+                        (car e)
+                        (if kind (format " (%s)" kind) "")))))
+    (insert "\n")))
+
+(defun +tt--render-input-header ()
+  "Recompute the *tt-input* header line from the current run state."
+  (setq header-line-format
+        (condition-case err
+            (+tt--input-header (+tt--state +tt--run-dir))
+          (error (format "Cannot deliver input: %s" (error-message-string err))))))
+
 (defun +tt--render-status ()
   "Render the status buffer from `tt state'."
   (let* ((s (+tt--state +tt--run-dir))
@@ -451,6 +500,8 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                                '(M A B) "  ")))
     (insert (format "   decisions %d · open findings %d\n" (length decisions) (length findings)))
     (when-let* ((why (alist-get 'blockedReason phase))) (insert (format "   blocked: %s\n" why)))
+    (insert "\n")
+    (+tt--render-owner-inputs s)
     (when (and alive (not (member name +tt--terminal-phases)) (> idle +tt-idle-minutes))
       (insert (propertize (format "\n   IDLE: no agent activity for %.0f min\n" idle) 'face 'warning)))
     (unless (or alive (member name '("DONE")))
@@ -483,25 +534,81 @@ would otherwise reject permanently as malformed)."
     (rename-file tmp final t)
     id))
 
+(defun +tt--input-header (s)
+  "One line stating what sending the input will do now, from state S.
+Design §7.4/§7.5: a steer while a worker runs, a note otherwise, a
+correction while the phase is AWAITING_OWNER, a refusal after DONE/BLOCKED
+— or that the conductor cannot deliver input at all."
+  (let* ((phase (+tt--get s 'state 'phase))
+         (name (alist-get 'phase phase))
+         (attempt (+tt--get phase 'attempt 'n))
+         (alive (eq (alist-get 'conductorAlive s) t))
+         (requests (seq-filter (lambda (r) (equal (alist-get 'status r) "open"))
+                               (alist-get 'ownerRequests phase))))
+    (cond
+     ((equal name "DONE")
+      "Sending is refused: the run is DONE.")
+     ((equal name "BLOCKED")
+      (let ((why (alist-get 'blockedReason phase)))
+        (format "Sending is refused: the phase is BLOCKED%s."
+                (if why (format " (%s)" why) ""))))
+     ((not alive)
+      "Cannot deliver input: no conductor is running for this run (resume it to deliver).")
+     ((equal name "AWAITING_OWNER")
+      (format "Sending corrects the phase: resolves %d open owner request(s), grants 3 repair rounds, starts a repair attempt with your text verbatim."
+              (length requests)))
+     ((member name '("IMPLEMENTING" "FREEZING"))
+      (format "Sending steers worker attempt %s now (at most once; C-c C-c or RET)." attempt))
+     (t
+      (format "Sending notes the next worker attempt (phase %s)." (or name "?"))))))
+
 (defun +tt-input-send ()
-  "Queue the input buffer's text as an owner note for the next worker attempt."
+  "Queue the input buffer's text as the owner input its phase calls for.
+Design §7.4/§7.5: a steer to a running worker, a correction while the
+phase is AWAITING_OWNER, a note otherwise; refused after DONE or BLOCKED,
+with the reason shown here."
   (interactive)
-  (let ((text (string-trim (buffer-string))))
+  (let* ((text (string-trim (buffer-string)))
+         (s (ignore-errors (+tt--state +tt--run-dir)))
+         (phase (and s (+tt--get s 'state 'phase)))
+         (name (and phase (alist-get 'phase phase))))
     (when (string-empty-p text) (user-error "Nothing to send"))
-    (let ((s (+tt--state +tt--run-dir)))
-      (+tt--write-command
-       +tt--run-dir
-       `((type . "note") (text . ,text)
-         (binding . ((runId . ,(+tt--get s 'state 'phase 'runId))
-                     (phaseId . ,(+tt--get s 'state 'phase 'phaseId)))))))
-    (erase-buffer)
-    (message "tradeoffs-trace: note queued for the next worker attempt")))
+    (unless s (user-error "Cannot read this run's state"))
+    (cond
+     ((equal name "DONE")
+      (user-error "Refused: the run is DONE; it accepts no further owner input"))
+     ((equal name "BLOCKED")
+      (let ((why (alist-get 'blockedReason phase)))
+        (user-error "Refused: the phase is BLOCKED%s" (if why (format " (%s)" why) ""))))
+     (t
+      (let* ((binding `((runId . ,(+tt--get phase 'runId)) (phaseId . ,(+tt--get phase 'phaseId))))
+             (kind (cond ((equal name "AWAITING_OWNER") "correction")
+                         ((member name '("IMPLEMENTING" "FREEZING")) "steer")
+                         (t "note")))
+             (id (+tt--write-command
+                  +tt--run-dir
+                  `((type . ,kind) (text . ,text) (binding . ,binding)))))
+        (erase-buffer)
+        (message "tradeoffs-trace: %s queued in the inbox (%s); see Owner input in the status buffer" kind id))))))
+
+(defun +tt-input-ret ()
+  "RET in the input buffer: send in Evil normal state, else insert a newline."
+  (interactive)
+  (if (eq (and (boundp 'evil-state) (symbol-value 'evil-state)) 'insert)
+      (newline)
+    (+tt-input-send)))
 
 (defvar-keymap +tt-input-mode-map
-  "C-c C-c" #'+tt-input-send)
+  "C-c C-c" #'+tt-input-send
+  "RET" #'+tt-input-ret)
 
 (define-derived-mode +tt-input-mode text-mode "tt-input"
-  "Owner input for a tradeoffs-trace run.  \\<+tt-input-mode-map>\\[+tt-input-send] sends.")
+  "Owner input for a tradeoffs-trace run.  \\<+tt-input-mode-map>\\[+tt-input-send] sends."
+  ;; In Evil normal state RET must send; in insert state it must insert a
+  ;; newline (the mode-map RET binding covers emacs/insert, this covers
+  ;; normal). Guarded so loading this file never requires Evil.
+  (when (fboundp 'evil-define-key)
+    (evil-define-key 'normal +tt-input-mode-map (kbd "RET") #'+tt-input-send)))
 
 ;;;; Show, resume
 

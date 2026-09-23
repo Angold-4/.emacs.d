@@ -888,6 +888,27 @@ BUILD["awaiting-owner-override-stays"] = {
   },
 };
 
+BUILD["owner-correction-from-awaiting-owner"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "the repair budget ran out while items remained open",
+        origin: "repair_budget_exhausted",
+        boundCandidateSha: "C1",
+        boundContractVersion: K,
+        options: [{ id: "grant", label: "grant 3 more repair rounds" }, { id: "stop", label: "stop the phase" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: { type: "OWNER_CORRECTION", correctionId: "cmd-correction-1", text: "do it the other way" },
+};
+
 test("transition table: every row in transitions.ts has a covering fixture", () => {
   const missing = TRANSITIONS.filter((r) => !BUILD[r.id]).map((r) => r.id);
   assert.deepEqual(missing, [], `rows with no test fixture: ${missing.join(", ")}`);

@@ -217,14 +217,14 @@ export class PiAgent {
    * was harmless in effect but left two overlapping timers each racing the
    * same `#exitPromise` — exactly the kind of leftover handle round-of-
    * review item 1 asks not to have outlive a terminal state. */
-  terminate(): Promise<TerminateResult> {
+  terminate(opts?: { abortGraceMs?: number; termGraceMs?: number }): Promise<TerminateResult> {
     if (!this.#terminating) {
-      this.#terminating = this.#doTerminate();
+      this.#terminating = this.#doTerminate(opts?.abortGraceMs ?? this.#abortGraceMs, opts?.termGraceMs ?? this.#termGraceMs);
     }
     return this.#terminating;
   }
 
-  async #doTerminate(): Promise<TerminateResult> {
+  async #doTerminate(abortGraceMs: number, termGraceMs: number): Promise<TerminateResult> {
     const signalsSent: TerminateReason[] = [];
     if (this.#exited) return { signalsSent: ["already-exited"] };
 
@@ -246,7 +246,7 @@ export class PiAgent {
       // already closed
     }
 
-    const exited = await raceExit(this.#exitPromise, this.#abortGraceMs);
+    const exited = await raceExit(this.#exitPromise, abortGraceMs);
     if (exited || this.#exited) return { signalsSent };
 
     if (groupAlive(this.pgid)) {
@@ -257,7 +257,7 @@ export class PiAgent {
         // already gone
       }
     }
-    const exitedAfterTerm = await raceExit(this.#exitPromise, this.#termGraceMs);
+    const exitedAfterTerm = await raceExit(this.#exitPromise, termGraceMs);
     if (exitedAfterTerm || this.#exited) return { signalsSent };
 
     if (groupAlive(this.pgid)) {

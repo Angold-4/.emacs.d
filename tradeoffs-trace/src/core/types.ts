@@ -396,8 +396,19 @@ export interface PauseResumeModeCommand {
   mode?: "delegate" | "co-work";
 }
 
+/** §7.4/§9.3 (plan 2d): an owner's correction typed into the input box while
+ * the phase is AWAITING_OWNER. It is not bound to a single record (the owner
+ * is answering whatever the phase is parked on), so it carries only the
+ * text and the conductor resolves the open owner requests itself. */
+export interface CorrectionCommand {
+  kind: "correction";
+  text: string;
+  phaseId: string;
+}
+
 export type OwnerCommand =
   | SteerCommand
+  | CorrectionCommand
   | NoteCommand
   | ResolveCommand
   | OverrideCommand
@@ -428,6 +439,34 @@ export type PhaseStateName =
   | "BLOCKED";
 
 export type RunStateName = "RUN_ACTIVE" | "RUN_PAUSED_BUDGET";
+
+// ---------------------------------------------------------------------------
+// §7.4/§9.3 (plan 2d): owner input, recorded
+// ---------------------------------------------------------------------------
+
+export type OwnerInputKind = "steer" | "note" | "correction";
+
+/** The state the conductor actually recorded for one owner input. `sent` is
+ * never logged: it is derived by the read-only views from a pending inbox
+ * file that the conductor has not picked up yet ("not picked up" once 30 s
+ * have passed). Every other state is an explicit `OWNER_INPUT_RECORDED`
+ * event. */
+export type OwnerInputState =
+  | "delivered" // steer acknowledged by Pi (deliver.done)
+  | "noted" // note queued for the next worker attempt
+  | "correction-started" // AWAITING_OWNER correction: requests resolved, repair started
+  | "delivery-uncertain" // steer intent recorded, no acknowledgement (never resent)
+  | "refused"; // conductor refused: terminal phase, or no running worker for a steer
+
+export interface OwnerInputRecord {
+  id: string; // the inbox command id (<run>/inbox/<id>.json)
+  kind: OwnerInputKind;
+  text: string; // the text the owner sent, verbatim
+  state: OwnerInputState;
+  attemptId?: string; // steer: the worker attempt id it was bound to
+  reason?: string; // refused / delivery-uncertain detail
+  at: string; // ISO timestamp the conductor recorded
+}
 
 export interface Attempt {
   n: number;
@@ -534,6 +573,11 @@ export interface PhaseState {
    * stays `open` (so it can still be resolved and is never duplicated or
    * stranded); this list is the metric, not a resolution. */
   unneededRequestIds?: string[];
+  /** Plan 2d (§7.4/§9.3): every text the owner sent through the input box,
+   * with the effect the conductor actually recorded for it. The status
+   * buffer's "Owner input" section renders this — never an inferred or
+   * optimistic state. Ordered by id (stable across a restart). */
+  ownerInputs?: OwnerInputRecord[];
 }
 
 export type RunStatus = RunStateName;
@@ -752,6 +796,26 @@ export interface EvNoteAdded {
   text: string;
 }
 
+/** Plan 2d (§7.4/§9.3): records — or updates, keyed by `input.id` — one
+ * owner input and the effect the conductor actually observed for it. A
+ * record-only event (no phase-state-name change): the status buffer shows
+ * exactly what happened, never what was hoped for. */
+export interface EvOwnerInputRecorded {
+  type: "OWNER_INPUT_RECORDED";
+  input: OwnerInputRecord;
+}
+
+/** Plan 2d (§7.5/§7.4): the owner's correction typed while the phase is
+ * AWAITING_OWNER. It resolves every open owner request, grants a fresh
+ * 3-round repair allowance (independent of any exhausted budget), queues
+ * the text as an owner note so the very next worker attempt's prompt
+ * carries it verbatim, and moves the phase to REPAIRING. */
+export interface EvOwnerCorrection {
+  type: "OWNER_CORRECTION";
+  correctionId: string; // the inbox command id
+  text: string;
+}
+
 /** §7.4 `unneeded` / §11.4's "unnecessary escalations" metric: marks an
  * OPEN owner request as `unneeded` ("did not need me"). Record-only. */
 export interface EvOwnerRequestMarkedUnneeded {
@@ -871,6 +935,8 @@ export type Event =
   | EvIntegrityViolated
   | EvDecisionAdded
   | EvNoteAdded
+  | EvOwnerInputRecorded
+  | EvOwnerCorrection
   | EvOwnerRequestMarkedUnneeded
   | EvMissRecorded
   | EvNotesDelivered

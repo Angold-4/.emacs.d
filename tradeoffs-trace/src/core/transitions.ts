@@ -813,6 +813,47 @@ addRow({
   apply: (s, ev) => applyReviseCorrection(s, ev),
 });
 
+/** Plan 2d (§7.5/§7.4): an owner correction typed into the input box while
+ * the phase is parked on owner requests. Unlike REVISE it is not bound to a
+ * single record, so it answers everything the phase is waiting on at once:
+ * every open owner request is resolved, a fresh 3-round allowance is granted
+ * (independent of any exhausted budget), and the owner's words are queued as
+ * a note so the repair attempt's prompt carries them verbatim. */
+function applyOwnerCorrection(s: State, ev: Event): State {
+  const e = ev as Extract<Event, { type: "OWNER_CORRECTION" }>;
+  const C = s.phase.candidate?.sha;
+  const K = s.phase.contract.contractVersion;
+  const ownerRequests = s.phase.ownerRequests.map((r) =>
+    r.status === "open"
+      ? {
+          ...r,
+          status: "resolved" as const,
+          resolution: { option: "correction", note: e.text },
+          resolvedBinding: C ? { candidateSha: C, contractVersion: K } : undefined,
+        }
+      : r,
+  );
+  return withPhase(s, {
+    phase: "REPAIRING",
+    ownerRequests,
+    repairRoundsGranted: s.phase.repairRoundsGranted + 3,
+    ownerNotes: [...(s.phase.ownerNotes ?? []), e.text],
+    inFlight: {},
+  });
+}
+
+addRow({
+  id: "owner-correction-from-awaiting-owner",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "OWNER_CORRECTION",
+  guardName: "always",
+  guard: () => true,
+  to: "REPAIRING",
+  actions: REPAIR_ATTEMPT_ACTIONS,
+  apply: applyOwnerCorrection,
+});
+
 // --- AWAITING_OWNER: OWNER_REQUEST_RESOLVED, FINDING_ACCEPTED_BY_OWNER and
 // OVERRIDE_CAST move the phase, but only once no owner request remains open
 // after applying them (item 2, round 2). Otherwise the command is still
