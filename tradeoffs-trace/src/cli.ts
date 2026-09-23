@@ -17,12 +17,23 @@ import { decisionStatus } from "./core/predicate.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { buildView, timingReport, timingText } from "./view.ts";
+import type { ProgramFile } from "./core/program.ts";
+import {
+  appendProgramEvent,
+  createProgram,
+  foldProgram,
+  programPaths,
+  programPidAlive,
+  programsRoot,
+  programStatusLines,
+  runScheduler,
+} from "./program.ts";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -54,6 +65,74 @@ function resolveRunDir(rootOrId: string, root: string): string {
 }
 
 const RUN_CONDUCTOR_FLAG = "__run-conductor";
+const RUN_PROGRAM_FLAG = "__run-program";
+
+/** Phase 4: starts a program's scheduler as a detached process. */
+function launchProgramScheduler(dir: string): void {
+  const thisScript = fileURLToPath(import.meta.url);
+  const out = openSync(programPaths(dir).log, "a");
+  const child = spawn(process.execPath, [thisScript, RUN_PROGRAM_FLAG, dir], { detached: true, stdio: ["ignore", out, out] });
+  child.unref();
+}
+
+function resolveProgramDir(idOrDir: string, root: string): string {
+  if (existsSync(path.join(idOrDir, "program.json"))) return path.resolve(idOrDir);
+  return path.join(programsRoot(root), idOrDir);
+}
+
+async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean): Promise<void> {
+  if (sub === "start") {
+    if (args.length !== 1) usage();
+    const program = JSON.parse(readFileSync(args[0], "utf8")) as ProgramFile;
+    const dir = createProgram(root, program);
+    launchProgramScheduler(dir);
+    process.stdout.write(`${path.basename(dir)}\n`);
+  } else if (sub === "status") {
+    if (args.length !== 1) usage();
+    process.stdout.write(`${programStatusLines(resolveProgramDir(args[0], root)).join("\n")}\n`);
+  } else if (sub === "state") {
+    if (args.length !== 1) usage();
+    const dir = resolveProgramDir(args[0], root);
+    const { program, nodes, state } = foldProgram(dir);
+    process.stdout.write(
+      `${JSON.stringify({ dir, title: program.title, maxParallel: program.maxParallel, nodes, state, schedulerAlive: programPidAlive(dir), lines: programStatusLines(dir) })}\n`,
+    );
+  } else if (sub === "stop") {
+    if (args.length !== 1) usage();
+    const dir = resolveProgramDir(args[0], root);
+    appendProgramEvent(dir, { type: "PROGRAM_STOPPED" });
+    try {
+      process.kill(Number(readFileSync(programPaths(dir).pid, "utf8")), "SIGTERM");
+    } catch {
+      // not running
+    }
+    const { state } = foldProgram(dir);
+    for (const n of Object.values(state.nodes)) {
+      if (n.runId && ["running", "needs-you"].includes(n.status)) await cmdStop(n.runId, root);
+    }
+    process.stdout.write(`stopped program ${path.basename(dir)}\n`);
+  } else if (sub === "resume") {
+    if (args.length !== 1) usage();
+    const dir = resolveProgramDir(args[0], root);
+    if (programPidAlive(dir)) {
+      process.stdout.write(`program ${path.basename(dir)} is already running\n`);
+      return;
+    }
+    launchProgramScheduler(dir);
+    process.stdout.write(`resumed program ${path.basename(dir)}\n`);
+  } else if (sub === "list") {
+    let ids: string[] = [];
+    try {
+      ids = readdirSync(programsRoot(root));
+    } catch {
+      ids = [];
+    }
+    const rows = ids.map((id) => programStatusLines(path.join(programsRoot(root), id)).slice(0, 2).join(" · "));
+    process.stdout.write(json ? `${JSON.stringify(ids)}\n` : rows.map((r) => `${r}\n`).join(""));
+  } else {
+    usage();
+  }
+}
 
 async function cmdStart(planPath: string, root: string): Promise<void> {
   const plan = JSON.parse(readFileSync(planPath, "utf8")) as RunPlanFile;
@@ -367,6 +446,13 @@ function pendingOwnerInputs(runDir: string): Array<{ id: string; kind: string; t
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (cmd === RUN_PROGRAM_FLAG) {
+    // <root>/programs/<id>: node runs live in <root>, like any other run.
+    const dir = rest[0];
+    const outcome = await runScheduler(dir, { runRoot: path.dirname(path.dirname(dir)), launch: launchDetached });
+    process.stdout.write(`program ${path.basename(dir)}: ${outcome}\n`);
+    return;
+  }
   if (cmd === RUN_CONDUCTOR_FLAG) {
     await runConductorProcess(rest[0]);
     return;
@@ -382,6 +468,8 @@ async function main(): Promise<void> {
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
     launchDetached(resolveRunDir(positional[0], runRoot));
+  } else if (cmd === "program") {
+    await cmdProgram(positional[0], positional.slice(1), runRoot, json);
   } else if (cmd === "list") {
     cmdList(runRoot, json);
   } else if (cmd === "timing") {

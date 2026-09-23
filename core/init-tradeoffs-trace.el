@@ -18,6 +18,8 @@
 ;;             offers to resume a run whose conductor is not running
 ;;   C-c m d   the run's decision view (read-only; intervene via the input box)
 ;;   C-c m l   every run: open (RET), stop (k), resume (R)
+;;   C-c m p   a program (several plans / phases as one graph): RET opens a
+;;             phase's run, k stops, R resumes
 ;;
 ;; The conductor always comes from the *installed runner*
 ;; (`<root>/runner/current/tradeoffs-trace', see `tt runner install <sha>'),
@@ -259,9 +261,18 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
 
 ;;;###autoload
 (defun +tt-run ()
-  "Validate the plan in this buffer, start a run, and open its workspace."
+  "Validate the plan in this buffer, start a run, and open its workspace.
+A program file (#+TT_PROGRAM) or a plan with several phases starts a
+program instead: one run per phase, in dependency order (see `+tt-program')."
   (interactive)
   (unless (derived-mode-p 'org-mode) (user-error "Not an Org plan buffer"))
+  (if (or (+tt--keyword "TT_PROGRAM")
+          (> (length (alist-get 'phases (plist-get (+tt-parse-plan) :plan))) 1))
+      (+tt-program-start)
+    (+tt--run-single)))
+
+(defun +tt--run-single ()
+  "Start a single-phase run from the plan in this buffer."
   (let* ((parsed (+tt-parse-plan))
          (errors (plist-get parsed :errors))
          (file buffer-file-name))
@@ -288,6 +299,162 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
 (defun +tt--phase-name (state)
   "Return the phase state name in STATE."
   (+tt--get state 'state 'phase 'phase))
+
+;;;; Programs (phase 4)
+
+;; A program runs several plans, and plans with several phases, as one
+;; dependency graph: every phase is an ordinary run (same review loop), a
+;; phase starts only when what it depends on is DONE, and independent phases
+;; run in parallel.  By default each phase publishes to its own branch cut
+;; from its dependencies' branches ("<TT_BRANCH>--<id>"), so every phase is
+;; its own stacked PR.  A program file:
+;;
+;;   #+TITLE: plan 13
+;;   #+TT_PROGRAM: 4                  max phases in parallel
+;;   #+TT_BRANCHES: stack             or "shared": all publish to TT_BRANCH
+;;   * 13a
+;;     :PROPERTIES:
+;;     :PLAN:   13a_shared_markets.org
+;;     :END:
+;;   * 13c
+;;     :PROPERTIES:
+;;     :PLAN:   13c_vendor_pyth.org
+;;     :AFTER:  13b
+;;     :END:
+
+(defun +tt--plan-of-file (file)
+  "Parse the plan FILE; return (PLAN . ERRORS), errors prefixed with FILE."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (setq buffer-file-name file default-directory (file-name-directory file))
+    (delay-mode-hooks (org-mode))
+    (let ((parsed (+tt-parse-plan)))
+      (set-buffer-modified-p nil)
+      (setq buffer-file-name nil)
+      (cons (plist-get parsed :plan)
+            (mapcar (lambda (e) (cons (car e) (format "%s:%d: %s" (file-name-nondirectory file) (car e) (cdr e))))
+                    (plist-get parsed :errors))))))
+
+(defun +tt-parse-program ()
+  "Parse the current buffer as a program.
+Return a plist (:program ALIST :errors ((LINE . MESSAGE) ...)).  A plan
+buffer that is not a program becomes a program of one entry, so a plan with
+several phases runs them in order."
+  (let* ((file (or buffer-file-name default-directory))
+         (dir (file-name-directory (expand-file-name file)))
+         (title (or (+tt--keyword "TITLE") (file-name-base file)))
+         (max (let ((v (+tt--keyword "TT_PROGRAM"))) (if (and v (string-match-p "\\`[0-9]+\\'" v)) (string-to-number v) 1)))
+         (branches (or (+tt--keyword "TT_BRANCHES") "stack"))
+         (entries nil) (errors nil))
+    (if (not (+tt--keyword "TT_PROGRAM"))
+        (let ((parsed (+tt-parse-plan)))
+          (setq errors (plist-get parsed :errors))
+          (push `((id . ,(file-name-base file)) (after . []) (plan . ,(plist-get parsed :plan))) entries))
+      (org-element-map (org-element-parse-buffer 'headline) 'headline
+        (lambda (hl)
+          (when (= (org-element-property :level hl) 1)
+            (let* ((line (line-number-at-pos (org-element-property :begin hl)))
+                   (id (or (org-element-property :ID hl) (org-element-property :raw-value hl)))
+                   (plan-file (org-element-property :PLAN hl))
+                   (after (split-string (or (org-element-property :AFTER hl) "") "[ ,]+" t)))
+              (cond
+               ((not plan-file) (push (cons line (format "entry %s has no :PLAN:" id)) errors))
+               ((not (file-exists-p (expand-file-name plan-file dir)))
+                (push (cons line (format "entry %s: plan file %s not found" id plan-file)) errors))
+               (t
+                (pcase-let ((`(,plan . ,errs) (+tt--plan-of-file (expand-file-name plan-file dir))))
+                  (dolist (e errs) (push (cons line (cdr e)) errors))
+                  (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
+    (unless entries (push (cons 1 "program has no entries") errors))
+    (list :program `((title . ,title) (maxParallel . ,max) (branches . ,branches)
+                     (entries . ,(vconcat (nreverse entries))))
+          :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
+
+(defvar-local +tt--program-dir nil "Program directory shown by this buffer.")
+
+(defun +tt-program-start ()
+  "Validate the program (or multi-phase plan) in this buffer and start it."
+  (interactive)
+  (let* ((parsed (+tt-parse-program))
+         (errors (plist-get parsed :errors)))
+    (if errors
+        (+tt--show-plan-errors (or buffer-file-name (buffer-name)) errors)
+      (let* ((json-file (make-temp-file "tt-program-" nil ".json" (json-encode (plist-get parsed :program))))
+             (id (car (last (split-string (+tt--cli "program" "start" json-file) "\n" t)))))
+        (delete-file json-file)
+        (message "tradeoffs-trace: started program %s" id)
+        (+tt-program (expand-file-name (concat "programs/" id) +tt-root))))))
+
+(defun +tt--program-state (dir)
+  "Parsed `tt program state' of DIR."
+  (json-parse-string (+tt--cli "program" "state" dir) :object-type 'alist :array-type 'list
+                     :null-object nil :false-object :false))
+
+(defun +tt--render-program ()
+  "Render the program buffer from `tt program state'."
+  (let* ((s (+tt--program-state +tt--program-dir))
+         (nodes (alist-get 'nodes (alist-get 'state s)))
+         (inhibit-read-only t)
+         (pt (point)))
+    (erase-buffer)
+    (dolist (line (alist-get 'lines s))
+      (let ((start (point)))
+        (insert line "\n")
+        ;; RET on a node's line opens its run.
+        (when (string-match "\\`[^ ]+ \\([^ ]+\\)" line)
+          (let ((run (alist-get 'runId (alist-get (intern (match-string 1 line)) nodes))))
+            (when run (put-text-property start (point) '+tt-run-id run))))))
+    (goto-char (min pt (point-max)))))
+
+(defun +tt-program-open-node ()
+  "Open the workspace of the node's run at point."
+  (interactive)
+  (let ((run (get-text-property (point) '+tt-run-id)))
+    (unless run (user-error "No run on this line"))
+    (+tt--workspace (expand-file-name run +tt-root))))
+
+(defun +tt-program-stop ()
+  "Stop this program: its scheduler and every running node."
+  (interactive)
+  (when (y-or-n-p "Stop this program and its running phases? ")
+    (message "%s" (+tt--cli "program" "stop" +tt--program-dir))
+    (+tt--render-program)))
+
+(defun +tt-program-resume ()
+  "Restart this program's scheduler."
+  (interactive)
+  (message "%s" (+tt--cli "program" "resume" +tt--program-dir))
+  (+tt--render-program))
+
+(defvar-keymap +tt-program-mode-map
+  :parent special-mode-map
+  "RET" #'+tt-program-open-node
+  "k" #'+tt-program-stop
+  "R" #'+tt-program-resume
+  "g" #'+tt--refresh-all)
+
+(define-derived-mode +tt-program-mode special-mode "tt-program"
+  "A tradeoffs-trace program.  \\<+tt-program-mode-map>\\[+tt-program-open-node] opens a phase's run, \\[+tt-program-stop] stops, \\[+tt-program-resume] resumes."
+  (visual-line-mode 1)
+  (when (fboundp 'evil-define-key)
+    (evil-define-key 'normal +tt-program-mode-map
+      (kbd "RET") #'+tt-program-open-node "k" #'+tt-program-stop "R" #'+tt-program-resume "g" #'+tt--refresh-all)))
+
+;;;###autoload
+(defun +tt-program (&optional dir)
+  "Show the program in DIR, or choose one."
+  (interactive)
+  (let* ((dir (or dir
+                  (let ((ids (directory-files (expand-file-name "programs" +tt-root) nil "\\`[^.]")))
+                    (unless ids (user-error "No programs under %s" +tt-root))
+                    (expand-file-name (concat "programs/" (completing-read "Program: " (reverse ids) nil t)) +tt-root))))
+         (buf (get-buffer-create (format "*tt-program: %s*" (file-name-nondirectory (directory-file-name dir))))))
+    (with-current-buffer buf
+      (+tt-program-mode)
+      (setq +tt--program-dir dir +tt--run-dir dir)
+      (+tt--render-program))
+    (pop-to-buffer buf)
+    (+tt--ensure-timer)))
 
 ;;;; Workspace
 
@@ -341,7 +508,8 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
           (ignore-errors
             (cond ((derived-mode-p '+tt-trace-mode) (+tt--render-trace win))
                   ((derived-mode-p '+tt-status-mode) (+tt--render-status))
-                  ((derived-mode-p '+tt-input-mode) (+tt--render-input-header)))))))
+                  ((derived-mode-p '+tt-input-mode) (+tt--render-input-header))
+                  ((derived-mode-p '+tt-program-mode) (+tt--render-program)))))))
     (unless any
       (when (timerp +tt--timer) (cancel-timer +tt--timer))
       (setq +tt--timer nil))))
@@ -1039,6 +1207,7 @@ To intervene, type into the run's input box."
 (keymap-global-set "C-c m s" #'+tt-show)
 (keymap-global-set "C-c m d" #'+tt-decisions)
 (keymap-global-set "C-c m l" #'+tt-runs)
+(keymap-global-set "C-c m p" #'+tt-program)
 (+tt--ensure-mode-line)
 
 (provide 'init-tradeoffs-trace)
