@@ -394,7 +394,7 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
   (let ((polling (and (member name '("sh" "bash"))
                       (string-match-p "\\bsleep\\b\\|\\btail -f\\b" (or arg "")))))
     (concat (if (member name '("sh" "bash")) "$ " (concat name " "))
-            (+tt--one-line arg 72)
+            (+tt--one-line arg 300)
             (if polling "  (polling)" ""))))
 
 (defun +tt--tool-arg (args)
@@ -423,7 +423,7 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                           (seq-keep (lambda (c) (and (equal (alist-get 'type c) "text") (alist-get 'text c)))
                                     (alist-get 'content msg)))))
          (when (and texts (not (string-blank-p (string-join texts " "))))
-           (format "%s » %s\n" (+tt--hms ts) (+tt--one-line (string-join texts " ") 110)))))
+           (format "%s » %s\n" (+tt--hms ts) (+tt--one-line (string-join texts " ") 400)))))
       ("tool_execution_start"
        (puthash (alist-get 'toolCallId ev)
                 (list ts (alist-get 'toolName ev) (+tt--tool-arg (alist-get 'args ev)))
@@ -516,7 +516,7 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
 
 (define-derived-mode +tt-trace-mode special-mode "tt-trace"
   "Live trace of a tradeoffs-trace agent (read-only)."
-  (setq truncate-lines t))
+  (visual-line-mode 1))
 
 ;;;;; Status
 
@@ -571,8 +571,11 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
 (defun +tt--status-row (label value &optional face)
   "Insert one status row: LABEL padded, then VALUE (in FACE)."
   (when (and value (not (string-empty-p value)))
-    (insert (propertize (format "%-10s" label) 'face 'shadow)
-            (if face (propertize value 'face face) value) "\n")))
+    (let ((start (point)))
+      (insert (propertize (format "%-10s" label) 'face 'shadow)
+              (if face (propertize value 'face face) value) "\n")
+      ;; A row longer than the window wraps under its value, not its label.
+      (put-text-property start (point) 'wrap-prefix (make-string 10 ?\s)))))
 
 (defun +tt--render-status-from (s run-dir)
   "Insert the status of RUN-DIR from `tt state' S (plan 3b layout)."
@@ -632,7 +635,8 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
   "g" #'+tt--refresh-all)
 
 (define-derived-mode +tt-status-mode special-mode "tt-status"
-  "Status of a tradeoffs-trace run.")
+  "Status of a tradeoffs-trace run."
+  (visual-line-mode 1))
 
 ;;;;; Input
 
@@ -721,6 +725,7 @@ with the reason shown here."
 
 (define-derived-mode +tt-input-mode text-mode "tt-input"
   "Owner input for a tradeoffs-trace run.  \\<+tt-input-mode-map>\\[+tt-input-send] sends."
+  (visual-line-mode 1)
   ;; In Evil normal state RET must send; in insert state it must insert a
   ;; newline (the mode-map RET binding covers emacs/insert, this covers
   ;; normal). Guarded so loading this file never requires Evil.
@@ -903,6 +908,7 @@ with the reason shown here."
 \\<+tt-decisions-mode-map>\\[+tt-decisions-refresh] refreshes, \\[org-cycle] folds, \\[quit-window] quits.
 To intervene, type into the run's input box."
   (setq buffer-read-only t)
+  (visual-line-mode 1)
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +tt-decisions-mode-map
       "g" #'+tt-decisions-refresh (kbd "TAB") #'org-cycle "q" #'quit-window)))

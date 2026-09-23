@@ -256,7 +256,7 @@ export function timeLine(t: AgentTime): string {
   if (t.running) {
     const verb = t.running.name === "sh" ? "$" : t.running.name;
     const arg = t.running.arg.replace(/\s+/g, " ");
-    parts.push(`⧗ ${verb} ${arg.length > 60 ? `${arg.slice(0, 59)}…` : arg} ${formatDuration(t.running.ms)}`);
+    parts.push(`⧗ ${verb} ${arg.length > 200 ? `${arg.slice(0, 199)}…` : arg} ${formatDuration(t.running.ms)}`);
   }
   const warn = t.byCategory.polling.ms > t.elapsedMs / 4 ? "  ⚠ polling over a quarter of the attempt" : "";
   return `${role}: ${parts.join(" · ")}${warn}`;
