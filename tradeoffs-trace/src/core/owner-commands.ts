@@ -122,6 +122,21 @@ export function checkFindingAcceptedByOwner(phase: PhaseState, event: EvFindingA
   if (event.by !== "owner") return { ok: false, reason: `only the owner may accept a finding, not '${String(event.by)}'` };
   const finding = phase.findings.find((f) => f.id === event.findingId);
   if (!finding) return { ok: false, reason: `unknown finding ${event.findingId}` };
+  // design §4.2: for a `contract` finding, accepting "means amending the
+  // contract" — the only disposition is AMEND (§7.3), never a direct
+  // acceptance. Reject it here so both reduce()'s record-event path and
+  // transitions.ts's AWAITING_OWNER rows share the same rule.
+  if (finding.kind === "contract") {
+    return {
+      ok: false,
+      reason: `finding ${event.findingId} is a contract finding; accepting it means amending the contract (AMEND), not FINDING_ACCEPTED_BY_OWNER`,
+    };
+  }
+  // design §4.2/§10.4: acceptance must record the scope it was accepted
+  // under — a blank or whitespace-only scope is no scope at all.
+  if (!event.scope || event.scope.trim().length === 0) {
+    return { ok: false, reason: `accepting finding ${event.findingId} requires a non-empty scope note` };
+  }
   const tuple = bindingTuple(phase, event.findingId, event.boundCandidateSha, event.boundContractVersion, event.boundRecordVersion);
   return checkTupleBinding(tuple, phase);
 }

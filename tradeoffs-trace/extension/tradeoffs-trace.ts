@@ -31,6 +31,8 @@ import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-codin
 import { guardedShCommand, guardedWritePath, readGuardConfigFromEnv } from "./guards.ts";
 
 import { validate, type JSONSchema } from "../src/core/schema.ts";
+import { reviewIngestionIssue } from "../src/core/predicate.ts";
+import type { Review } from "../src/core/types.ts";
 import {
   JSONLDecoder,
   encodeLine,
@@ -499,6 +501,11 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params) {
       const error = validateOrError(REVIEW_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
+      // The same shared ingestion rule reduce() applies for
+      // REVIEW_SUBMITTED (F02): a correction stated twice is rejected back
+      // to the reviewer here, before it ever reaches the socket.
+      const issue = reviewIngestionIssue(params as Review);
+      if (issue) return { isError: true, content: [{ type: "text", text: `invalid arguments: ${issue}` }] };
       return submitTool("submit_review", params);
     },
   });
