@@ -17,17 +17,17 @@
         "DECISION_CLASS_LOWERED", "OWNER_REQUEST_OPENED", "OWNER_REQUEST_RESOLVED", "ACCEPTED",
         "PUBLISH_INTENT", "PUBLISH_COMPLETED", "PUBLISH_STALE", "REPAIR_ATTEMPT_STARTED",
         "REPAIR_BUDGET_EXHAUSTED", "RESOLVING_INCOMPLETE", "REVISE", "AMEND",
-        "RUN_BUDGET_EXCEEDED", "RUN_RESUMED"
+        "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED"
       ]
     }
   },
   "oneOf": [
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_STARTED" } } },
-    { "type": "object", "required": ["type", "decisions"], "properties": { "type": { "const": "SUBMIT_PHASE" }, "decisions": { "type": "array" } } },
+    { "type": "object", "required": ["type", "disclosures"], "properties": { "type": { "const": "SUBMIT_PHASE" }, "disclosures": { "type": "array" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_TIMED_OUT" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_NO_SUBMISSION" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_INTERRUPTED" } } },
-    { "type": "object", "required": ["type", "candidateSha"], "properties": { "type": { "const": "FREEZE_COMPLETED" }, "candidateSha": { "type": "string", "minLength": 1 } } },
+    { "type": "object", "required": ["type", "candidateSha", "decisions"], "properties": { "type": { "const": "FREEZE_COMPLETED" }, "candidateSha": { "type": "string", "minLength": 1 }, "decisions": { "type": "array" }, "tainted": { "type": "boolean" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "FREEZE_TIMED_OUT" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "FREEZE_INTERRUPTED" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "CHECKS_PASSED" } } },
@@ -59,6 +59,8 @@
     { "type": "object", "required": ["type", "correctionId", "targetRecordId", "correctionText", "contractChange", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "REVISE" }, "correctionId": { "type": "string", "minLength": 1 }, "targetRecordId": { "type": "string", "minLength": 1 }, "correctionText": { "type": "string", "minLength": 1 }, "contractChange": { "type": "boolean" } } },
     { "type": "object", "required": ["type", "replacingContractVersion", "newContractVersion"], "properties": { "type": { "const": "AMEND" }, "replacingContractVersion": { "type": "object" }, "newContractVersion": { "type": "object" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_BUDGET_EXCEEDED" } } },
-    { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_RESUMED" } } }
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_RESUMED" } } },
+    { "type": "object", "required": ["type", "role", "expected", "missing", "extra"], "properties": { "type": { "const": "LAUNCH_FAILED" }, "role": { "enum": ["worker", "reviewer"] }, "reviewer": { "enum": ["M", "A", "B"] }, "expected": { "type": "array" }, "missing": { "type": "array" }, "extra": { "type": "array" } } },
+    { "type": "object", "required": ["type", "stage"], "properties": { "type": { "const": "INTEGRITY_VIOLATED" }, "stage": { "type": "string", "minLength": 1 }, "evidence": { "type": "string" } } }
   ]
 }

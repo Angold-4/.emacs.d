@@ -30,7 +30,8 @@
 // with an automatic `agent_end` + `agent_settled`.
 
 import { createConnection, type Socket } from "node:net";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { JSONLDecoder, encodeLine, type RunSocketMessage } from "../../src/core/protocol.ts";
@@ -61,10 +62,52 @@ function readEnv(name: string): string | undefined {
   return v && v.length > 0 ? v : undefined;
 }
 
+/** Phase 1b work-packet item 6: a `call-submit` step's `args` is a static
+ * JSON script, but a `tt start`-launched (as opposed to in-process-test)
+ * reviewer script has no other way to learn a value the conductor only
+ * knows at dispatch time, such as the live candidate sha — a real reviewer
+ * is simply told this directly. Any string value that is *exactly* one of
+ * these tokens is substituted with the named env var at the moment the
+ * step runs (recursing into objects and arrays; every other value, and a
+ * token naming an unset env var, passes through unchanged). Keeps this to
+ * a small, explicit allowlist rather than a general `$VAR` syntax, so a
+ * script's own literal string content is never at risk of accidental
+ * substitution. */
+const ENV_TOKENS = ["$TT_CANDIDATE_SHA", "$TT_REVIEWER"] as const;
+
+function substituteEnvTokens(value: unknown): unknown {
+  if (typeof value === "string") {
+    if ((ENV_TOKENS as readonly string[]).includes(value)) {
+      const name = value.slice(1);
+      const v = process.env[name];
+      return v !== undefined && v.length > 0 ? v : value;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(substituteEnvTokens);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = substituteEnvTokens(v);
+    return out;
+  }
+  return value;
+}
+
+/** Phase 1b work-packet item 6: a `tt start`-launched conductor has no
+ * `piEnvFor` hook to give the worker and each reviewer their own
+ * `FAKE_PI_SCRIPT`, only whatever env it inherited once for the whole run.
+ * If `FAKE_PI_SCRIPT` names a directory (rather than a file) instead of one
+ * shared script for every role, this reads `<dir>/<TT_ROLE>.json` — `TT_ROLE`
+ * is always set by the conductor at spawn time (pi-rpc.ts), so a plan that
+ * needs the worker and reviewers to behave differently can still use one
+ * env var for the whole run. */
 function loadScript(): Script {
-  const path = readEnv("FAKE_PI_SCRIPT");
-  if (!path) throw new Error("FAKE_PI_SCRIPT is required");
-  return JSON.parse(readFileSync(path, "utf8")) as Script;
+  const scriptPath = readEnv("FAKE_PI_SCRIPT");
+  if (!scriptPath) throw new Error("FAKE_PI_SCRIPT is required");
+  const resolved = statSync(scriptPath).isDirectory()
+    ? join(scriptPath, `${readEnv("TT_ROLE") ?? "worker"}.json`)
+    : scriptPath;
+  return JSON.parse(readFileSync(resolved, "utf8")) as Script;
 }
 
 function writeStdout(obj: unknown): void {
@@ -162,8 +205,9 @@ async function main(): Promise<void> {
           break;
         case "call-submit": {
           const toolCallId = randomUUID();
-          writeStdout({ type: "tool_execution_start", toolCallId, toolName: step.tool, args: step.args });
-          const reply = await runSocket.submit(step.tool, step.args);
+          const args = substituteEnvTokens(step.args);
+          writeStdout({ type: "tool_execution_start", toolCallId, toolName: step.tool, args });
+          const reply = await runSocket.submit(step.tool, args);
           const ok = reply.type === "submit_reply" && reply.ok;
           writeStdout({
             type: "tool_execution_end",

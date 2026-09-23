@@ -33,7 +33,7 @@ test("reduce: rejects null/undefined/non-object input explicitly, without throwi
 
 test("reduce: rejects an out-of-order event (SUBMIT_PHASE while READY)", () => {
   const state = baseState({ phase: "READY" });
-  const result = reduce(state, { type: "SUBMIT_PHASE", decisions: [] });
+  const result = reduce(state, { type: "SUBMIT_PHASE", disclosures: [] });
   assert.equal(result.ok, false);
   assert.match(result.reason, /out of order|no rule/);
   assert.equal(result.state.phase.phase, "READY");
@@ -56,4 +56,25 @@ test("reduce: a valid transition is idempotent-safe — the input state object i
   const before = JSON.stringify(state);
   reduce(state, { type: "ATTEMPT_STARTED" });
   assert.equal(JSON.stringify(state), before);
+});
+
+// Phase 1b work-packet item 3: INTEGRITY_VIOLATED is a logged fact (design
+// §2.2), not an in-memory-only flag — a record-only event (no phase-state
+// change) that reduce.ts's applyRecordEvent handles, like BALLOT_CAST.
+test("reduce: INTEGRITY_VIOLATED sets phase.integrityViolated without changing the phase state name", () => {
+  const state = baseState({ phase: "CHECKING" });
+  assert.equal(state.phase.integrityViolated, undefined);
+  const result = reduce(state, { type: "INTEGRITY_VIOLATED", stage: "checks" });
+  assert.equal(result.ok, true);
+  assert.equal(result.state.phase.integrityViolated, true);
+  assert.equal(result.state.phase.phase, "CHECKING");
+});
+
+test("reduce: INTEGRITY_VIOLATED is accepted from any phase state (a record event, not a transition)", () => {
+  for (const phase of ["IMPLEMENTING", "FREEZING", "CHECKING", "PROBING", "REVIEWING"] as const) {
+    const state = baseState({ phase });
+    const result = reduce(state, { type: "INTEGRITY_VIOLATED", stage: "checks" });
+    assert.equal(result.ok, true, `expected INTEGRITY_VIOLATED to be accepted from ${phase}`);
+    assert.equal(result.state.phase.integrityViolated, true);
+  }
 });

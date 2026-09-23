@@ -26,13 +26,16 @@ import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { Type, type TSchema } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+import { guardedShCommand, guardedWritePath, readGuardConfigFromEnv } from "./guards.ts";
 
 import { validate, type JSONSchema } from "../src/core/schema.ts";
 import {
   JSONLDecoder,
   encodeLine,
   type HelloMessage,
+  type NoSubmissionMessage,
   type RunSocketMessage,
   type ShExitMessage,
   type ShOutputMessage,
@@ -266,7 +269,11 @@ class RunSocketClient {
 
 export default function (pi: ExtensionAPI) {
   const client = new RunSocketClient();
+  const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
+  let submitPhaseAccepted = false;
+  let settleContinuationsUsed = 0;
+  const MAX_SETTLE_CONTINUATIONS = 2;
 
   pi.on("session_start", async () => {
     activeTools = pi.getActiveTools();
@@ -285,6 +292,64 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // connection failed — submission/sh tools report this per call.
     }
+  });
+
+  // design §9.5: block edit/write outside the worktree, to the phase's
+  // protected acceptance files, or under the run directory; block `sh`
+  // commands that commit/push or mention the run directory. Workflow
+  // guards, not a security boundary — see guardedWritePath/guardedShCommand.
+  pi.on("tool_call", (event) => {
+    const cwd = readEnv("TT_WORKTREE") ?? process.cwd();
+    if (isToolCallEventType("edit", event) || isToolCallEventType("write", event)) {
+      const targetPath = (event.input as { path?: string }).path;
+      if (typeof targetPath === "string") {
+        const reason = guardedWritePath(targetPath, cwd, guardConfig);
+        if (reason) return { block: true, reason };
+      }
+      return undefined;
+    }
+    if (event.toolName === "sh") {
+      const command = (event.input as { command?: string }).command;
+      if (typeof command === "string") {
+        const reason = guardedShCommand(command, guardConfig);
+        if (reason) return { block: true, reason };
+      }
+    }
+    return undefined;
+  });
+
+  // design §3.3 item 1: refuse to settle without `submit_phase`, bounded to
+  // two continuations, after which the extension reports `no_submission`
+  // (a pure protocol addition — see NoSubmissionMessage) so the conductor
+  // does not have to wait out the full attempt deadline.
+  pi.on("agent_before_settle", async (event) => {
+    if (submitPhaseAccepted) return undefined;
+    if (settleContinuationsUsed >= MAX_SETTLE_CONTINUATIONS) {
+      if (client.connected) {
+        const msg: NoSubmissionMessage = { type: "no_submission", agentId: readEnv("TT_AGENT_ID") ?? "unknown" };
+        try {
+          client.send(msg);
+        } catch {
+          // conductor will also infer no_submission from agent_settled
+          // arriving with no accepted submission — see socket.ts.
+        }
+      }
+      return undefined;
+    }
+    settleContinuationsUsed += 1;
+    return {
+      entries: [
+        ...event.entries,
+        {
+          type: "custom_message" as const,
+          customType: "tt-submit-reminder",
+          content:
+            "You have not called submit_phase yet. The phase cannot finish without it — call submit_phase with your decisions, assumptions and deviations before finishing.",
+          display: false,
+        },
+      ],
+      continue: true,
+    };
   });
 
   function validateOrError(schema: JSONSchema, args: unknown): string | undefined {
@@ -315,6 +380,7 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: reply.reason ?? "submission rejected" }],
         };
       }
+      if (tool === "submit_phase") submitPhaseAccepted = true;
       return { content: [{ type: "text" as const, text: "submission accepted" }] };
     } catch (err) {
       return {

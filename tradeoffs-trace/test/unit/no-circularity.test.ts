@@ -29,6 +29,7 @@ import type {
   Correction,
   Decision,
   DecisionClass,
+  DecisionDisclosure,
   Event,
   Finding,
   PhaseState,
@@ -88,19 +89,17 @@ function randomDecisionClass(rng: () => number): DecisionClass {
   return "reserved";
 }
 
-function randomDecision(rng: () => number, candidateSha: string, contractVersion: ContractVersion): Decision {
+/** Phase 1b: SUBMIT_PHASE now carries raw disclosures (no candidate exists
+ * yet at disclosure time — see DecisionDisclosure), assembled into bound
+ * Decision records only once FREEZE_COMPLETED knows the real candidateSha
+ * (see the "freeze" case below). */
+function randomDisclosure(rng: () => number): DecisionDisclosure {
   return {
-    id: freshId("D"),
-    version: 1,
-    phaseId: "p1",
-    source: "worker",
-    class: randomDecisionClass(rng),
     choice: "a randomly generated trade-off",
     whyItMatters: "exercises the vote/override/owner-request paths",
     alternatives: [{ option: "alternative", consequence: "some consequence" }],
     recommendation: { choice: "the chosen option", reason: "plausible reason" },
-    boundCandidateSha: candidateSha,
-    boundContractVersion: contractVersion,
+    classProposal: randomDecisionClass(rng),
   };
 }
 
@@ -305,16 +304,10 @@ function driveOnce(rng: () => number): RunResult {
           else if (r < 0.13) state = step(state, { type: "ATTEMPT_NO_SUBMISSION" });
           else if (r < 0.16) state = step(state, { type: "ATTEMPT_INTERRUPTED" });
           else {
-            const decisions: Decision[] = [];
+            const disclosures: DecisionDisclosure[] = [];
             const count = rng() < 0.5 ? 0 : rng() < 0.7 ? 1 : 2;
-            for (let d = 0; d < count; d++) {
-              // boundCandidateSha is filled in once FREEZE_COMPLETED assigns
-              // the real candidate; the worker doesn't know it yet, so this
-              // uses a placeholder the freeze doesn't need to match (decisions
-              // aren't candidate-checked at disclosure time, only at vote time).
-              decisions.push(randomDecision(rng, "pending", state.phase.contract.contractVersion));
-            }
-            state = step(state, { type: "SUBMIT_PHASE", decisions });
+            for (let d = 0; d < count; d++) disclosures.push(randomDisclosure(rng));
+            state = step(state, { type: "SUBMIT_PHASE", disclosures });
           }
           break;
         }
@@ -327,20 +320,26 @@ function driveOnce(rng: () => number): RunResult {
           else {
             candidateCounter += 1;
             const sha = `C${candidateCounter}`;
-            state = step(state, { type: "FREEZE_COMPLETED", candidateSha: sha });
+            // Phase 1b: the conductor's job — assemble+bind each pending
+            // disclosure into a real Decision only once the candidate (sha)
+            // is known, exactly as FREEZE_COMPLETED's contract requires.
+            const decisions: Decision[] = (state.phase.pendingDisclosures ?? []).map((d) => ({
+              id: freshId("D"),
+              version: 1,
+              phaseId: "p1",
+              source: "worker",
+              class: d.classProposal,
+              choice: d.choice,
+              whyItMatters: d.whyItMatters,
+              alternatives: d.alternatives,
+              recommendation: d.recommendation,
+              boundCandidateSha: sha,
+              boundContractVersion: state.phase.contract.contractVersion,
+            }));
+            state = step(state, { type: "FREEZE_COMPLETED", candidateSha: sha, decisions });
             // A new candidate discards all prior evidence (design §7.2), so
             // an earlier settlement no longer applies to it.
             settledKeys.clear();
-            // Backfill the placeholder candidate on freshly disclosed decisions.
-            state = {
-              ...state,
-              phase: {
-                ...state.phase,
-                decisions: state.phase.decisions.map((d) =>
-                  d.boundCandidateSha === "pending" ? { ...d, boundCandidateSha: sha } : d,
-                ),
-              },
-            };
           }
           break;
         }
