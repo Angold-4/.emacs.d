@@ -26,7 +26,9 @@
     "linkedFindingId": { "type": "string", "minLength": 1 },
     "boundCandidateSha": { "type": "string", "minLength": 1 },
     "boundContractVersion": { "$ref": "#/$defs/ContractVersion" },
-    "supersededByCorrection": { "type": "string", "minLength": 1 }
+    "supersededByCorrection": { "type": "string", "minLength": 1 },
+    "supersededBy": { "type": "string", "minLength": 1 },
+    "alsoSeenBy": { "type": "array", "items": { "enum": ["M", "A", "B"] } }
   },
   "$defs": {
     "Alternative": {

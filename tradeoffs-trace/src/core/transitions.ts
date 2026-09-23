@@ -12,6 +12,7 @@
 // distinguishes rows that share a trigger, and `apply` computes the new
 // state. `actions` is what `next()` of the resulting state must equal.
 
+import { carryDecisionsForward } from "./rounds.ts";
 import {
   applyFindingAcceptedByOwner,
   applyOverrideCast,
@@ -243,8 +244,13 @@ addRow({
       // fully assembled, bound Decision records (the conductor's job — see
       // conductor.ts's #runFreeze) and move into `decisions`; nothing stays
       // pending once a freeze completes.
-      decisions: [...s.phase.decisions, ...e.decisions],
+      // Plan 2c: records from an earlier candidate carry forward only if the
+      // worker kept or changed them (core/rounds.ts); the rest are superseded
+      // and can no longer block acceptance.
+      decisions: [...carryDecisionsForward(s.phase.decisions, s.phase.pendingPrior, e.candidateSha), ...e.decisions],
       pendingDisclosures: undefined,
+      pendingPrior: undefined,
+      round: (s.phase.round ?? 0) + 1,
       checks: undefined,
       probe: undefined,
       reviews: {},

@@ -116,10 +116,16 @@ export async function setupConductor(opts: {
    * real two-turn discovery/review protocol) keep working unchanged. Tests
    * exercising the real protocol pass `stubReviews: false` explicitly. */
   stubReviews?: boolean;
+  /** Plan 2c: pass `false` to make the integration probe rerun the checks
+   * even when the probed tree equals the candidate's. */
+  probeReuse?: boolean;
   /** Phase 2b: extra env vars merged into every fake-pi worker's
    * environment (e.g. `FAKE_PI_PROMPT_LOG`, to capture the prompt text the
    * conductor actually sent). */
   extraWorkerEnv?: NodeJS.ProcessEnv;
+  /** Plan 2c: extra env vars per reviewer (e.g. a per-reviewer
+   * `FAKE_PI_PROMPT_LOG`). */
+  extraReviewerEnv?: (reviewer: Reviewer) => NodeJS.ProcessEnv | undefined;
   /** Work packet 2a: BOUNDARIES globs for the phase's contract, so a test
    * can exercise conductor-computed boundary triggers (design §3.3).
    * Defaults to `[]` (no boundaries), exactly as before this option
@@ -168,6 +174,7 @@ export async function setupConductor(opts: {
     piArgsPrefix: [FAKE_PI_PATH, ...(opts.extraPiArgsPrefix ?? [])],
     deadlines: opts.deadlines,
     stubReviews: opts.stubReviews ?? true,
+    probeReuse: opts.probeReuse,
     piEnvFor: (role, agentId) => {
       if (role === "worker") {
         if (opts.workerScriptForAttempt) {
@@ -185,7 +192,7 @@ export async function setupConductor(opts: {
         reviewerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
       }
       const p = reviewerScriptPaths.get(agentId);
-      return p ? { FAKE_PI_SCRIPT: p } : undefined;
+      return p ? { FAKE_PI_SCRIPT: p, ...(opts.extraReviewerEnv?.(reviewer) ?? {}) } : undefined;
     },
   });
 

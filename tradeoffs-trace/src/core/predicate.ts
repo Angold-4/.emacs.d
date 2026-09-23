@@ -29,7 +29,7 @@
 // itself, or directly) rather than re-deriving the same facts — round-1
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
-import { tally } from "./tally.ts";
+import { currentBallot, isValidBallot, tally } from "./tally.ts";
 import type { ContractVersion, Correction, Decision, PhaseState } from "./types.ts";
 
 export function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
@@ -106,6 +106,15 @@ function settledByOwnerRequest(
  * settled only by a resolved `reserved_decision` owner request bound to
  * (C, K) whose chosen option was "approve" — the other option ("reject and
  * repair") does not settle it. */
+/** Plan 2c: a record that still describes the current candidate and can be
+ * voted on. Superseded records (by a correction, by a newer candidate the
+ * worker did not carry them to, by the worker's withdrawal, or by a
+ * reviewer matching its discovery to another record) never block
+ * acceptance and are never votable. */
+export function isLiveDecision(decision: Decision): boolean {
+  return !decision.supersededByCorrection && !decision.supersededBy;
+}
+
 export function decisionSettled(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): boolean {
   if (decision.class === "detail") return true;
 
@@ -162,7 +171,7 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     // historical: the correction, not the original decision's vote or
     // owner resolution, is what acceptance now depends on (via the
     // corrections/addressed check below).
-    if (decision.supersededByCorrection) continue;
+    if (!isLiveDecision(decision)) continue;
     if (!decisionSettled(decision, phase, C, K)) return false;
   }
 
@@ -183,4 +192,48 @@ export function done(phase: PhaseState): boolean {
   if (!phase.candidate || !phase.probe?.probedI) return false;
   if (!accept(phase, phase.candidate.sha, phase.contract.contractVersion)) return false;
   return phase.publishedI === phase.probe.probedI;
+}
+
+/** Plan 2c: the state of one decision record for the current candidate, as
+ * the tally and the owner rules see it — exposed through `tt state` so the
+ * status and decision views never infer it from individual ballots. */
+export interface DecisionStatus {
+  status: "superseded" | "detail" | "passed" | "failed" | "suspended" | "pending" | "owner";
+  reason?: string;
+}
+
+export function decisionStatus(decision: Decision, phase: PhaseState): DecisionStatus {
+  if (decision.supersededByCorrection) return { status: "superseded", reason: `by correction ${decision.supersededByCorrection}` };
+  if (decision.supersededBy) return { status: "superseded", reason: decision.supersededBy };
+  if (decision.class === "detail") return { status: "detail" };
+  const C = phase.candidate?.sha;
+  const K = phase.contract.contractVersion;
+  if (!C || decision.boundCandidateSha !== C) return { status: "pending", reason: "not bound to the current candidate" };
+  if (decision.class === "reserved") {
+    return decisionSettled(decision, phase, C, K)
+      ? { status: "passed", reason: "approved by the owner" }
+      : { status: "owner", reason: "reserved: needs the owner" };
+  }
+  if (decisionSettled(decision, phase, C, K)) {
+    const t = tally(decision, phase.ballots, phase.findings, C, K);
+    return { status: "passed", reason: t === "pass" ? "vote passed" : "settled by the owner" };
+  }
+  const t = tally(decision, phase.ballots, phase.findings, C, K);
+  if (t === "suspended") return { status: "suspended", reason: `linked finding ${decision.linkedFindingId} is open` };
+  const vote = (who: "M" | "A" | "B") => {
+    const b = currentBallot(phase.ballots, decision.id, who, C, K, decision.version);
+    return isValidBallot(b) ? b.vote : undefined;
+  };
+  const reviewsDone = (["M", "A", "B"] as const).every((w) => phase.reviews[w]?.review?.candidateSha === C);
+  const m = vote("M");
+  const a = vote("A");
+  const b = vote("B");
+  if (!reviewsDone && (m === undefined || (a === undefined && b === undefined))) return { status: "pending", reason: "votes not cast yet" };
+  const reasons: string[] = [];
+  if (m === undefined) reasons.push("missing ballot from M");
+  else if (m === "reject") reasons.push("M veto");
+  if (a !== "approve" && b !== "approve") {
+    reasons.push(a === undefined && b === undefined ? "no ballot from A or B" : "neither A nor B approved");
+  }
+  return { status: "failed", reason: reasons.join("; ") || "vote failed" };
 }

@@ -18,7 +18,7 @@
         "PUBLISH_INTENT", "PUBLISH_COMPLETED", "PUBLISH_STALE", "REPAIR_ATTEMPT_STARTED",
         "REPAIR_BUDGET_EXHAUSTED", "RESOLVING_INCOMPLETE", "REVISE", "AMEND",
         "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED",
-        "NOTE_ADDED", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED"
+        "NOTE_ADDED", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED"
       ]
     }
   },
@@ -66,6 +66,8 @@
     { "type": "object", "required": ["type", "phaseId", "text"], "properties": { "type": { "const": "NOTE_ADDED" }, "phaseId": { "type": "string", "minLength": 1 }, "text": { "type": "string", "minLength": 1 } } },
     { "type": "object", "required": ["type", "requestId"], "properties": { "type": { "const": "OWNER_REQUEST_MARKED_UNNEEDED" }, "requestId": { "type": "string", "minLength": 1 } } },
     { "type": "object", "required": ["type", "recordId"], "properties": { "type": { "const": "MISS_RECORDED" }, "recordId": { "type": "string", "minLength": 1 }, "sample": { "type": "string" } } },
-    { "type": "object", "required": ["type", "phaseId", "count"], "properties": { "type": { "const": "NOTES_DELIVERED" }, "phaseId": { "type": "string", "minLength": 1 }, "count": { "type": "integer" } } }
+    { "type": "object", "required": ["type", "phaseId", "count"], "properties": { "type": { "const": "NOTES_DELIVERED" }, "phaseId": { "type": "string", "minLength": 1 }, "count": { "type": "integer" } } },
+    { "type": "object", "required": ["type", "decisionId", "sameAs", "reviewer"], "properties": { "type": { "const": "DECISION_MATCHED" }, "decisionId": { "type": "string", "minLength": 1 }, "sameAs": { "type": "string", "minLength": 1 }, "reviewer": { "enum": ["M", "A", "B"] } } },
+    { "type": "object", "required": ["type", "findingId", "reviewer"], "properties": { "type": { "const": "FINDING_ALSO_RAISED" }, "findingId": { "type": "string", "minLength": 1 }, "reviewer": { "enum": ["M", "A", "B"] } } }
   ]
 }

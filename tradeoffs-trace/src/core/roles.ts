@@ -41,6 +41,10 @@ export interface LaunchOptions {
   /** Defaults to true: contract tests and role launches never send a
    * prompt or need a session on disk. */
   noSession?: boolean;
+  /** Plan 2c: resume the most recent session in `sessionDir` (Pi's
+   * `--continue`), so a repair attempt or a later review round keeps the
+   * agent's own earlier reasoning (design §2, §6.1). */
+  continueSession?: boolean;
 }
 
 /** Builds the full `pi` argv (everything after the `pi` binary itself) for
@@ -65,6 +69,7 @@ export function launchArgs(role: Role, opts: LaunchOptions = {}): string[] {
   if (opts.model) args.push("--model", opts.model);
   if (opts.sessionDir && !opts.noSession) {
     args.push("--session-dir", opts.sessionDir);
+    if (opts.continueSession) args.push("--continue");
   } else {
     args.push("--no-session");
   }

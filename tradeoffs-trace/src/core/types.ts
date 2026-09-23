@@ -111,6 +111,30 @@ export interface Decision {
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   supersededByCorrection?: string; // correction id, once superseded (§7.5)
+  /** Plan 2c: the record no longer describes the current candidate and is
+   * never votable again. Set when a new candidate is frozen and the worker
+   * did not carry the record forward ("candidate <sha>: not carried
+   * forward"), when the worker withdrew it, or when a reviewer matched its
+   * own discovery to another record ("same as <id>"). */
+  supersededBy?: string;
+  /** Plan 2c: reviewers who independently discovered this same choice and
+   * matched their discovery to this record (design §3.3, §10). */
+  alsoSeenBy?: Reviewer[];
+}
+
+/** Plan 2c: in a repair attempt the worker states, for each of its prior
+ * decisions (shown by id in the repair prompt), whether the new candidate
+ * keeps it, changes it (with the new plain-language text) or withdraws it.
+ * FREEZE_COMPLETED rebinds kept and changed records to the new candidate;
+ * every other record from a superseded candidate is marked superseded, so a
+ * record that no longer describes the code can never block acceptance. */
+export interface PriorDecisionStatement {
+  id: string;
+  status: "kept" | "changed" | "withdrawn";
+  choice?: string;
+  whyItMatters?: string;
+  alternatives?: DecisionAlternative[];
+  recommendation?: DecisionRecommendation;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +161,9 @@ export interface Finding {
   repairedByCandidateSha?: string;
   disprovedEvidence?: string;
   acceptedScope?: string; // required scope note (§4.2, §10.4 `x`)
+  /** Plan 2c: other reviewers who raised the same finding ("same as F-…")
+   * instead of filing a duplicate. */
+  alsoRaisedBy?: Reviewer[];
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +287,9 @@ export interface FindingDisclosure {
   evidence: string;
   linkedDecisionId?: string;
   reproduction?: { command: string };
+  /** Plan 2c: the id of an already-open finding this one repeats; the
+   * conductor records the reviewer on that finding instead of a duplicate. */
+  sameAs?: string;
 }
 
 export interface Review {
@@ -275,6 +305,9 @@ export interface Review {
    * `#castStubBallots`, kept for `stubReviews: true` runs). */
   ballots?: BallotDisclosure[];
   findings?: FindingDisclosure[];
+  /** Plan 2c: this reviewer's own turn-1 discoveries that are the same
+   * choice as another listed record. */
+  discoveryMatches?: Array<{ discoveryId: string; sameAs: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +505,12 @@ export interface PhaseState {
    * a real candidate until the freeze that produces that candidate
    * completes). Cleared once FREEZE_COMPLETED consumes it. */
   pendingDisclosures?: DecisionDisclosure[];
+  /** Plan 2c: the worker's kept/changed/withdrawn statements about its prior
+   * decisions, carried by SUBMIT_PHASE and consumed by FREEZE_COMPLETED. */
+  pendingPrior?: PriorDecisionStatement[];
+  /** Plan 2c: the number of candidates frozen in this phase so far (the
+   * review round); 0 before the first freeze. */
+  round?: number;
   worktreeTainted?: boolean;
   integrityViolated?: boolean;
   repairRoundsUsed: number;
@@ -522,6 +561,8 @@ export interface EvAttemptStarted {
 export interface EvSubmitPhase {
   type: "SUBMIT_PHASE";
   disclosures: DecisionDisclosure[];
+  /** Plan 2c: statements about prior decisions (repair attempts only). */
+  prior?: PriorDecisionStatement[];
 }
 export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
@@ -736,6 +777,24 @@ export interface EvNotesDelivered {
   count: number;
 }
 
+/** Plan 2c: a reviewer matched its own discovery to another listed record
+ * (design §3.3): the discovery is superseded by that record, and the
+ * reviewer is recorded on it as "also seen by". Record-only. */
+export interface EvDecisionMatched {
+  type: "DECISION_MATCHED";
+  decisionId: string;
+  sameAs: string;
+  reviewer: Reviewer;
+}
+
+/** Plan 2c: a reviewer raised a finding that repeats an already-open one;
+ * the reviewer is recorded on the existing finding. Record-only. */
+export interface EvFindingAlsoRaised {
+  type: "FINDING_ALSO_RAISED";
+  findingId: string;
+  reviewer: Reviewer;
+}
+
 /** Phase 1b work-packet addition (pure, additive — item 3): design §2.2's
  * "a mismatch invalidates that gate's result and marks the run
  * integrity-violated for the owner." A record-only event (no phase-state-
@@ -814,7 +873,9 @@ export type Event =
   | EvNoteAdded
   | EvOwnerRequestMarkedUnneeded
   | EvMissRecorded
-  | EvNotesDelivered;
+  | EvNotesDelivered
+  | EvDecisionMatched
+  | EvFindingAlsoRaised;
 
 export type EventType = Event["type"];
 

@@ -228,6 +228,9 @@ test("deadline-every-stage", async (t) => {
       // the very same command runs (during PROBING, against the probed
       // integration checkout) it sleeps long enough to hit probeMs.
       checks: [`test -f ${probeMarkerFile} && { echo START-${mark}; sleep 300; } || touch ${probeMarkerFile}`],
+      // The probe must actually rerun the checks for this case (plan 2c
+      // otherwise reuses the candidate's passed checks on a fast-forward).
+      probeReuse: false,
       workerScript: () => ({
         hello: defaultWorkerHello(),
         steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],

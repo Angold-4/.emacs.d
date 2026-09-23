@@ -64,12 +64,26 @@
           "severity": { "enum": ["blocking", "advisory"] },
           "evidence": { "type": "string", "minLength": 1 },
           "linkedDecisionId": { "type": "string", "minLength": 1 },
+          "sameAs": { "type": "string", "minLength": 1 },
           "reproduction": {
             "type": "object",
             "required": ["command"],
             "additionalProperties": false,
             "properties": { "command": { "type": "string", "minLength": 1 } }
           }
+        }
+      }
+    },
+    "discoveryMatches": {
+      "type": "array",
+      "description": "Plan 2c: for each of this reviewer's own turn-1 discoveries that is the same choice as another listed record, {discoveryId, sameAs}.",
+      "items": {
+        "type": "object",
+        "required": ["discoveryId", "sameAs"],
+        "additionalProperties": false,
+        "properties": {
+          "discoveryId": { "type": "string", "minLength": 1 },
+          "sameAs": { "type": "string", "minLength": 1 }
         }
       }
     }

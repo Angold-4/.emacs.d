@@ -24,7 +24,7 @@ import {
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
-import { sameVersion } from "./predicate.ts";
+import { isLiveDecision, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
 import type { BindingTuple, ContractVersion, Event, InFlightKey, ReduceResult, State } from "./types.ts";
 
@@ -74,6 +74,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "OWNER_REQUEST_MARKED_UNNEEDED",
   "MISS_RECORDED",
   "NOTES_DELIVERED",
+  "DECISION_MATCHED",
+  "FINDING_ALSO_RAISED",
 ]);
 
 function ok(state: State): ReduceResult {
@@ -133,6 +135,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // decision's current record version.
       const check = checkBallotBinding(event.ballot, p);
       if (!check.ok) return rejected(state, check.reason!);
+      const target = p.decisions.find((d) => d.id === event.ballot.decisionId);
+      if (target && !isLiveDecision(target)) {
+        return rejected(state, `decision ${target.id} is superseded (${target.supersededBy ?? "by correction"}) and is not votable`);
+      }
 
       let next = { ...p, ballots: [...p.ballots, event.ballot] };
       if (event.ballot.contractObjection) {
@@ -374,6 +380,44 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count } });
     }
 
+    case "DECISION_MATCHED": {
+      // Plan 2c (design §3.3): a reviewer's own discovery is the same choice
+      // as another listed record. The discovery stops being a separate,
+      // votable record; the reviewer is recorded on the matched record.
+      const discovery = p.decisions.find((d) => d.id === event.decisionId);
+      const target = p.decisions.find((d) => d.id === event.sameAs);
+      if (!discovery) return rejected(state, `unknown decision ${event.decisionId}`);
+      if (!target) return rejected(state, `unknown decision ${event.sameAs}`);
+      if (discovery.id === target.id) return rejected(state, "a decision cannot match itself");
+      if (discovery.source !== "reviewer-discovered") {
+        return rejected(state, `only a reviewer-discovered record can be matched, not ${discovery.source} ${discovery.id}`);
+      }
+      if (!isLiveDecision(discovery) || !isLiveDecision(target)) {
+        return rejected(state, `cannot match superseded records (${discovery.id} → ${target.id})`);
+      }
+      const decisions = p.decisions.map((d) => {
+        if (d.id === discovery.id) return { ...d, supersededBy: `same as ${target.id}`, version: d.version + 1 };
+        if (d.id === target.id) {
+          const seen = d.alsoSeenBy ?? [];
+          return seen.includes(event.reviewer) ? d : { ...d, alsoSeenBy: [...seen, event.reviewer] };
+        }
+        return d;
+      });
+      return ok({ ...state, phase: { ...p, decisions } });
+    }
+
+    case "FINDING_ALSO_RAISED": {
+      // Plan 2c: "same as F-…" — the reviewer agrees with an open finding
+      // instead of filing a duplicate. Record-only.
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      if (finding.status !== "open") return rejected(state, `finding ${finding.id} is ${finding.status}, not open`);
+      const also = finding.alsoRaisedBy ?? [];
+      if (finding.raisedBy === event.reviewer || also.includes(event.reviewer)) return ok(state);
+      const findings = p.findings.map((f) => (f.id === finding.id ? { ...f, alsoRaisedBy: [...also, event.reviewer] } : f));
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
     case "MISS_RECORDED": {
       // §3.5/§10.4 `s`: the observed miss sample. Record-only.
       if (!event.recordId || event.recordId.trim().length === 0) {
@@ -442,7 +486,7 @@ export function reduce(state: State, event: unknown): ReduceResult {
     // pending until FREEZE_COMPLETED assembles and binds them.
     let working = state;
     if (ev.type === "SUBMIT_PHASE") {
-      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures } };
+      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior } };
     }
 
     const rows = rowsFor(working, ev.type);

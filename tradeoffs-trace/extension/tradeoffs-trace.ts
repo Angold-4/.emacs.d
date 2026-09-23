@@ -138,20 +138,37 @@ const FindingParam = Type.Object({
   severity: StringEnum(["blocking", "advisory"] as const),
   evidence: Type.String({ description: "file:line, scenario, check result or plan clause — required, non-empty" }),
   linkedDecisionId: Type.Optional(Type.String()),
+  sameAs: Type.Optional(
+    Type.String({ description: "Id of an already-open finding this repeats; you are recorded on it instead of a duplicate" }),
+  ),
   reproduction: Type.Optional(
     Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
   ),
+});
+
+const PriorDecisionParam = Type.Object({
+  id: Type.String({ description: "The prior decision's id, as listed in the repair prompt" }),
+  status: StringEnum(["kept", "changed", "withdrawn"] as const),
+  choice: Type.Optional(Type.String({ description: "changed only: the new choice, one plain sentence" })),
+  whyItMatters: Type.Optional(Type.String()),
+  alternatives: Type.Optional(Type.Array(Type.Object({ option: Type.String(), consequence: Type.String() }))),
+  recommendation: Type.Optional(Type.Object({ choice: Type.String(), reason: Type.String() })),
 });
 
 const submitPhaseFields: Record<string, TSchema> = {
   decisions: Type.Array(DecisionParam),
   assumptions: Type.Array(Type.String(), { description: "Assumptions made while implementing" }),
   deviations: Type.Array(Type.String(), { description: "Deviations from the plan" }),
+  priorDecisions: Type.Optional(
+    Type.Array(PriorDecisionParam, {
+      description: "Repair attempts only: for each prior decision listed in the prompt, kept, changed (with the new text) or withdrawn",
+    }),
+  ),
 };
 const SubmitPhaseParams = Type.Object(Object.fromEntries(SUBMIT_PHASE_PARAMS.properties.map((key) => [key, submitPhaseFields[key]])));
 
 const submitDiscoveryFields: Record<string, TSchema> = {
-  discoveries: Type.Array(DecisionParam),
+  discoveries: Type.Array(DecisionParam, { maxItems: 5, description: "At most 5 behavioural choices" }),
 };
 const SubmitDiscoveryParams = Type.Object(
   Object.fromEntries(SUBMIT_DISCOVERY_PARAMS.properties.map((key) => [key, submitDiscoveryFields[key]])),
@@ -166,6 +183,11 @@ const submitReviewFields: Record<string, TSchema> = {
   findingStatements: Type.Array(FindingStatementParam),
   ballots: Type.Optional(Type.Array(BallotParam, { description: "One per votable decision (design §5), turn 2 of a real review" })),
   findings: Type.Optional(Type.Array(FindingParam, { description: "Newly raised findings, turn 2 of a real review" })),
+  discoveryMatches: Type.Optional(
+    Type.Array(Type.Object({ discoveryId: Type.String(), sameAs: Type.String() }), {
+      description: "For each of YOUR turn-1 discoveries that is the same choice as another listed record: {discoveryId, sameAs}",
+    }),
+  ),
 };
 const SubmitReviewParams = Type.Object(
   Object.fromEntries(SUBMIT_REVIEW_PARAMS.properties.map((key) => [key, submitReviewFields[key]])),
