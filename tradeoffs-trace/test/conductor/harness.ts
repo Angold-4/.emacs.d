@@ -116,6 +116,10 @@ export async function setupConductor(opts: {
    * real two-turn discovery/review protocol) keep working unchanged. Tests
    * exercising the real protocol pass `stubReviews: false` explicitly. */
   stubReviews?: boolean;
+  /** Phase 2b: extra env vars merged into every fake-pi worker's
+   * environment (e.g. `FAKE_PI_PROMPT_LOG`, to capture the prompt text the
+   * conductor actually sent). */
+  extraWorkerEnv?: NodeJS.ProcessEnv;
   /** Work packet 2a: BOUNDARIES globs for the phase's contract, so a test
    * can exercise conductor-computed boundary triggers (design §3.3).
    * Defaults to `[]` (no boundaries), exactly as before this option
@@ -171,9 +175,9 @@ export async function setupConductor(opts: {
           if (!workerScriptPaths.has(attempt)) {
             workerScriptPaths.set(attempt, writeScript(scriptsDir, `worker-${attempt}`, opts.workerScriptForAttempt(attempt, { repo })));
           }
-          return { FAKE_PI_SCRIPT: workerScriptPaths.get(attempt)! };
+          return { FAKE_PI_SCRIPT: workerScriptPaths.get(attempt)!, ...(opts.extraWorkerEnv ?? {}) };
         }
-        return { FAKE_PI_SCRIPT: workerScriptPath! };
+        return { FAKE_PI_SCRIPT: workerScriptPath!, ...(opts.extraWorkerEnv ?? {}) };
       }
       const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1] ?? "M") as Reviewer;
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {

@@ -19,6 +19,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import type {
   Action,
@@ -31,6 +32,7 @@ import type {
   Finding,
   FindingDisclosure,
   InFlightKey,
+  OwnerCommand,
   PhaseContract,
   PhaseState,
   Review,
@@ -76,6 +78,9 @@ const DECISION_SCHEMA: Record<string, unknown> = JSON.parse(
 const FINDING_SCHEMA: Record<string, unknown> = JSON.parse(
   fs.readFileSync(new URL("../schemas/finding.schema.json", import.meta.url), "utf8"),
 );
+const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
+  fs.readFileSync(new URL("../schemas/owner-command.schema.json", import.meta.url), "utf8"),
+);
 
 // ---------------------------------------------------------------------------
 // Config — design §8.1 defaults, overridable per run.
@@ -92,6 +97,11 @@ export interface Deadlines {
   reproductionMs: number;
   abortGraceMs: number;
   termGraceMs: number;
+  /** design §9.3: how often the conductor re-reads `<run>/inbox/*.json`
+   * while running. Owner commands are conductor state, so the conductor
+   * must pick one up even when parked in AWAITING_OWNER (when `next()`
+   * dispatches nothing at all). */
+  inboxPollMs: number;
   /** Wall-clock run execution budget (design §8.1's "run execution budget").
    * Unset (default) = unbounded. The clock counts only time spent
    * *executing* (design §8.2's own text): it pauses whenever the phase is
@@ -120,6 +130,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
   termGraceMs: 10_000,
+  inboxPollMs: 1_000,
 };
 
 export interface RunPlanPhase {
@@ -204,6 +215,9 @@ export function runPaths(runDir: string) {
     sessions: path.join(runDir, "sessions"),
     candidates: path.join(runDir, "candidates"),
     checks: path.join(runDir, "checks"),
+    inbox: path.join(runDir, "inbox"),
+    inboxApplied: path.join(runDir, "inbox", "applied"),
+    inboxRejected: path.join(runDir, "inbox", "rejected"),
     worktree: path.join(runDir, "worktree"),
   };
 }
@@ -285,7 +299,7 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   const runDir = path.join(root, runId);
   fs.mkdirSync(runDir, { recursive: false });
   const p = runPaths(runDir);
-  for (const dir of [p.plan, p.stream, p.views, p.sessions, p.candidates, p.checks]) {
+  for (const dir of [p.plan, p.stream, p.views, p.sessions, p.candidates, p.checks, p.inbox, p.inboxApplied, p.inboxRejected]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(plan, null, 2));
@@ -442,6 +456,12 @@ export class Conductor {
    * call (which reuses this directory instead of minting a fresh one, and
    * appends an interruption note to the prompt), then cleared. */
   #recoveredSessionDir: string | undefined;
+  /** design §9.3: the inbox command ids already appended to the log, seeded
+   * from the log at `start()` and updated on every apply. A file whose id is
+   * in this set is only moved to applied/, never applied a second time. */
+  #appliedCommandIds = new Set<string>();
+  /** The inbox poll timer; cleared by `#doStop`. */
+  #inboxTimer: NodeJS.Timeout | undefined;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -527,6 +547,15 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head);
     }
     this.#state = foldEvents(this.#state, records);
+    // design §9.3: "If the command ID is already in the log, the command is
+    // only moved to applied/." Every applied conductor-state command's event
+    // carries its inbox id, so the applied set is rebuilt from the log alone
+    // after a restart — the log append is the effect, the file move is not.
+    for (const record of records) {
+      if (record.kind !== "event") continue;
+      const id = (record.event as { commandId?: unknown } | null | undefined)?.commandId;
+      if (typeof id === "string") this.#appliedCommandIds.add(id);
+    }
 
     // design §9.3's "create worktree" reconciliation — physical-effect
     // bookkeeping only, never a core Event (the worktree exists before the
@@ -556,6 +585,20 @@ export class Conductor {
     await this.#reconcileInFlight();
 
     this.#syncBudgetTimer();
+
+    // design §9.3's conductor-state commands: read the inbox once on start
+    // (a crash may have left a command un-moved), then poll while running; a
+    // command is applied by appending its event to the log, so the poll must
+    // run even when the phase is parked and `next()` dispatches nothing.
+    this.#ensureInboxDirs();
+    this.#scanInbox();
+    // Reconcile above can itself reach a terminal state and fire the
+    // auto-stop, so only arm the poll timer if `stop()` has not already run
+    // (`#doStop` would have cleared an unset timer, and arming one here
+    // afterwards would keep the process alive forever).
+    if (!this.#closed) {
+      this.#inboxTimer = setInterval(() => this.#scanInbox(), this.#deadlines.inboxPollMs);
+    }
 
     this.drive();
   }
@@ -776,6 +819,7 @@ export class Conductor {
 
   async #doStop(): Promise<void> {
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
+    if (this.#inboxTimer) clearInterval(this.#inboxTimer);
     for (const handle of this.#agents.values()) {
       await handle.agent.terminate().catch(() => undefined);
       // design §2.2's "conductor-owned shell": an `sh` command's process
@@ -799,22 +843,177 @@ export class Conductor {
    * full state snapshot), reduce(), and re-drive. Throws if reduce rejects
    * it (a conductor bug, since every event this file emits should always be
    * exactly what next() asked for). */
-  #applyEvent(event: Event): void {
+  #applyEvent(event: Event, commandId?: string): void {
     // Once `stop()` has started tearing down (or a prior auto-stop already
     // ran), a straggling background dispatch (e.g. `#runWorkerAttempt` for
     // an agent `stop()` just terminated) must not append to an already-
     // closed log or resume driving — see round-of-review item 1.
     if (this.#closed) return;
-    const result = reduce(this.#state, event);
-    this.#log.append("event", event);
+    // design §9.3: an applied inbox command's event carries its inbox
+    // command id, so recovery can tell "already applied" from the log
+    // without a second record. reduce() ignores the extra field.
+    const logged: Event = commandId === undefined ? event : ({ ...event, commandId } as Event);
+    const result = reduce(this.#state, logged);
+    this.#log.append("event", logged);
     if (!result.ok) {
-      this.#log.append("rejected", { event, reason: result.reason });
+      this.#log.append("rejected", { event: logged, reason: result.reason });
       throw new Error(`conductor emitted an event reduce() rejected: ${result.reason}`);
     }
     this.#state = result.state;
     this.#syncBudgetTimer();
     this.drive();
     this.#maybeAutoStop();
+  }
+
+  // -- inbox: owner commands (design §7.4, §9.3) --------------------------
+
+  /** Creates `<run>/inbox/`, `applied/` and `rejected/` if missing — a run
+   * created before this packet, or a run directory assembled by hand, still
+   * gets them on its next start. */
+  #ensureInboxDirs(): void {
+    for (const dir of [this.#paths.inbox, this.#paths.inboxApplied, this.#paths.inboxRejected]) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  /** design §9.3: read every pending `<id>.json` owner command, name-sorted
+   * first (so two commands written in one poll window apply in a stable
+   * order), and apply or reject each exactly once. Synchronous by design: a
+   * scan never interleaves with another, and `#applyEvent`'s own `drive()`
+   * runs inside the same tick. */
+  #scanInbox(): void {
+    if (this.#closed) return;
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.#paths.inbox);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      this.#logUnexpected("scan_inbox", err);
+      return;
+    }
+    for (const name of names.sort()) {
+      if (this.#closed) return;
+      if (!name.endsWith(".json")) continue;
+      try {
+        this.#processInboxFile(path.join(this.#paths.inbox, name));
+      } catch (err) {
+        this.#logUnexpected("process_inbox", err);
+      }
+    }
+  }
+
+  /** One inbox file. The command id is the filename's basename (design §9.1
+   * — schemas/owner-command.schema.json's bodies carry no `id`), never part
+   * of the JSON body. Ordering is deliberate: (1) an id already in the log
+   * is only moved; (2) a command that fails to parse/validate, names an
+   * unsupported kind, or whose binding no longer matches is rejected
+   * visibly — a `command_rejected` log record plus the file moved to
+   * rejected/ with the reason beside it; (3) otherwise the event is appended
+   * (the effect), the id is remembered, and only then is the file moved. */
+  #processInboxFile(file: string): void {
+    if (this.#closed) return;
+    const name = path.basename(file);
+    const commandId = name.endsWith(".json") ? name.slice(0, -".json".length) : name;
+
+    if (this.#appliedCommandIds.has(commandId)) {
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+      return;
+    }
+
+    const reject = (reason: string): void => {
+      const trimmed = reason.length > 500 ? `${reason.slice(0, 500)}…` : reason;
+      this.#log.append("command_rejected", { commandId, reason: trimmed });
+      try {
+        fs.writeFileSync(path.join(this.#paths.inboxRejected, `${commandId}.reason.txt`), `${trimmed}\n`);
+      } catch (err) {
+        this.#log.append("error", { where: "inbox_rejection_note", error: String((err as Error)?.message ?? err) });
+      }
+      this.#moveInboxFile(file, this.#paths.inboxRejected);
+    };
+
+    let text: string;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch (err) {
+      reject(`could not read owner command file: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    // A writer may still be mid-write (an empty or whitespace-only document
+    // is indistinguishable from the truncate window of an in-place write).
+    // That is transient, not malformed: leave the file for the next poll
+    // rather than rejecting it permanently. A genuinely malformed
+    // (non-empty) document is still rejected below.
+    if (text.trim().length === 0) return;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      reject(`could not parse owner command JSON: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
+    // `kind` form (a `tt cmd`/test front end), and the decision view's
+    // `type` + `binding` form (design §10.4 — what Emacs actually writes).
+    // Either reduces to the same core event.
+    // Detect the encoding by shape, not by schema validity: the schema now
+    // accepts BOTH forms, so validity alone cannot say which mapping to use.
+    let event: Event | undefined;
+    let boundRunId: string | undefined;
+    let boundPhaseId: string | undefined;
+    const looksFlat = raw !== null && typeof raw === "object" && typeof (raw as { kind?: unknown }).kind === "string";
+    if (looksFlat) {
+      const flat = validate(OWNER_COMMAND_SCHEMA, raw);
+      if (!flat.valid) {
+        reject(`owner command fails schemas/owner-command.schema.json: ${flat.errors.join("; ")}`);
+        return;
+      }
+      const command = raw as OwnerCommand;
+      event = ownerCommandToEvent(command, commandId);
+      if (!event) {
+        reject(`owner command kind '${command.kind}' is not a conductor-state command this phase applies`);
+        return;
+      }
+    } else {
+      const normalized = normalizeDecisionViewCommand(raw, commandId);
+      if (!normalized.ok) {
+        reject(normalized.reason);
+        return;
+      }
+      event = normalized.event;
+      boundRunId = normalized.runId;
+      boundPhaseId = normalized.phaseId;
+    }
+    // The decision view's binding carries run/phase ids too (design §7.1); a
+    // command for another run or phase is stale by the same rule.
+    if (boundRunId && boundRunId !== this.#state.phase.runId) {
+      reject(`command is bound to run ${boundRunId}, but this run is ${this.#state.phase.runId}`);
+      return;
+    }
+    if (boundPhaseId && boundPhaseId !== this.#state.phase.phaseId) {
+      reject(`command is bound to phase ${boundPhaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
+      return;
+    }
+    const result = reduce(this.#state, event);
+    if (!result.ok) {
+      reject(result.reason);
+      return;
+    }
+    this.#appliedCommandIds.add(commandId);
+    this.#applyEvent(event, commandId);
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Moves an inbox file into `destDir`. A missing source is a no-op (it was
+   * already moved); any other error is logged, never thrown, so one bad file
+   * cannot stop the poll. */
+  #moveInboxFile(file: string, destDir: string): void {
+    const dest = path.join(destDir, path.basename(file));
+    try {
+      fs.renameSync(file, dest);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      this.#logUnexpected("inbox_move", err);
+    }
   }
 
   /** design §8.1/§8.2: "the execution budget counts only time spent
@@ -1597,7 +1796,25 @@ export class Conductor {
       const interruptionNote = resumedSessionDir
         ? "Note: your previous attempt was interrupted by a conductor restart, before it could observe your outcome. Continue from where you left off."
         : undefined;
-      await agent.prompt(buildWorkerPrompt(contract, this.#plan.ownerNotes, interruptionNote));
+      // design §7.4 `note` (conductor state): a note is queued for the NEXT
+      // worker attempt. Deliver only the notes not yet delivered — tracked
+      // by `deliveredNoteCount` and recorded as NOTES_DELIVERED once the
+      // prompt has been sent — so a note does not keep steering every later
+      // attempt (the advisory finding on this candidate). Plan-level notes
+      // are static and are always included.
+      const allNotes = this.#state.phase.ownerNotes ?? [];
+      const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
+      const undelivered = allNotes.slice(deliveredCount);
+      const queuedNotes = undelivered.join("\n");
+      const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
+      await agent.prompt(buildWorkerPrompt(contract, ownerNotes.length > 0 ? ownerNotes : undefined, interruptionNote));
+      // Record delivery only after the prompt was sent; a crash between the
+      // prompt and this append re-delivers on the next attempt (at-least-
+      // once for the first delivery), which is safer than silently losing
+      // the note.
+      if (undelivered.length > 0) {
+        this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: undelivered.length });
+      }
 
       const workerTimeout = cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const);
       const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap">> = [

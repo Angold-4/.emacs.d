@@ -34,7 +34,7 @@
 // `prompt` arrives, so one script can cover both turns.
 
 import { createConnection, type Socket } from "node:net";
-import { readFileSync, statSync } from "node:fs";
+import { appendFileSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -288,6 +288,12 @@ async function main(): Promise<void> {
         case "steer":
         case "follow_up":
           writeStdout({ type: "response", id, command: cmd.type, success: true });
+          // Test-only prompt capture (opt-in via FAKE_PI_PROMPT_LOG): lets a
+          // conductor test assert what the conductor actually sent — e.g.
+          // that a queued `note` reached the next worker attempt's prompt.
+          if (cmd.type === "prompt" && readEnv("FAKE_PI_PROMPT_LOG")) {
+            appendFileSync(readEnv("FAKE_PI_PROMPT_LOG")!, `${String(cmd.message)}\n=====\n`);
+          }
           if (cmd.type === "prompt") {
             if (!ranOnce) {
               ranOnce = true;

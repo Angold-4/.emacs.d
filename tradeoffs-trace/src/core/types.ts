@@ -298,6 +298,11 @@ export interface ResolveCommand {
   requestId: string;
   requestVersion: number;
   option: string;
+  /** Optional scope note for an option that needs one (the open_finding
+   * `accept_risk` option, design §4.2). `EvOwnerRequestResolved` already
+   * carries `note?`; this is the command-side plumbing so the decision
+   * view's `1` key can supply it and the option actually applies. */
+  note?: string;
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
 }
@@ -342,6 +347,17 @@ export interface UnneededCommand {
   requestId: string;
 }
 
+/** design §3.5/§10.4 (`s`): "on a sampled item: 'should have been surfaced'
+ * (records a miss)". The sampled item is either a record the conductor
+ * sampled (a `detail` decision, an unreferenced hunk, ...) or an
+ * unreferenced change; `recordId` names it, `sample` optionally names the
+ * sample kind so the pilot can break the miss rate down. */
+export interface MissCommand {
+  kind: "miss";
+  recordId: string;
+  sample?: string;
+}
+
 export interface PauseResumeModeCommand {
   kind: "pause" | "resume" | "mode";
   mode?: "delegate" | "co-work";
@@ -356,6 +372,7 @@ export type OwnerCommand =
   | ReviseCommand
   | AmendCommand
   | UnneededCommand
+  | MissCommand
   | PauseResumeModeCommand;
 
 // ---------------------------------------------------------------------------
@@ -460,6 +477,24 @@ export interface PhaseState {
   repairRoundsUsed: number;
   repairRoundsGranted: number; // 3 base, +3 per correction (§7.5, §8.1)
   publishedI?: string;
+  /** §7.4 `note`: owner notes queued from the inbox, delivered verbatim in
+   * the next worker attempt's prompt (see `deliveredNoteCount` for the
+   * prefix already sent). Optional/absent on the many test fixtures that
+   * predate the inbox. */
+  ownerNotes?: string[];
+  /** §7.4 `note`: how many of `ownerNotes` have already been delivered in a
+   * worker attempt's prompt. The conductor sends `ownerNotes.slice(count)`
+   * and then logs NOTES_DELIVERED, so a note reaches the *next* attempt
+   * (§7.4) instead of every later one. Optional/absent = none delivered. */
+  deliveredNoteCount?: number;
+  /** §3.5/§10.4 `s`: record ids the owner marked "should have been
+   * surfaced" — the observed miss sample, recorded as a pilot metric. */
+  misses?: string[];
+  /** §7.4 `unneeded` / §11.4's "unnecessary escalations" metric: owner
+   * request ids the owner marked "did not need me". The request itself
+   * stays `open` (so it can still be resolved and is never duplicated or
+   * stranded); this list is the metric, not a resolution. */
+  unneededRequestIds?: string[];
 }
 
 export type RunStatus = RunStateName;
@@ -667,6 +702,40 @@ export interface EvLaunchFailed {
   extra: string[];
 }
 
+/** §7.4 `note`: an owner note delivered to the next worker attempt's
+ * prompt. Record-only (handled by reduce.ts's applyRecordEvent): it moves
+ * no phase state, it only appends to `phase.ownerNotes`. */
+export interface EvNoteAdded {
+  type: "NOTE_ADDED";
+  phaseId: string;
+  text: string;
+}
+
+/** §7.4 `unneeded` / §11.4's "unnecessary escalations" metric: marks an
+ * OPEN owner request as `unneeded` ("did not need me"). Record-only. */
+export interface EvOwnerRequestMarkedUnneeded {
+  type: "OWNER_REQUEST_MARKED_UNNEEDED";
+  requestId: string;
+}
+
+/** §3.5/§10.4 `s`: records that a sampled item should have been surfaced.
+ * Record-only; the miss rate within the sample is the observed rate. */
+export interface EvMissRecorded {
+  type: "MISS_RECORDED";
+  recordId: string;
+  sample?: string;
+}
+
+/** §7.4 `note`: records that the first `count` entries of `phase.ownerNotes`
+ * were delivered in a worker attempt's prompt, so the next attempt sends
+ * only the rest (a note is queued for the NEXT attempt, not every later
+ * one). Record-only: it moves no phase state. */
+export interface EvNotesDelivered {
+  type: "NOTES_DELIVERED";
+  phaseId: string;
+  count: number;
+}
+
 /** Phase 1b work-packet addition (pure, additive — item 3): design §2.2's
  * "a mismatch invalidates that gate's result and marks the run
  * integrity-violated for the owner." A record-only event (no phase-state-
@@ -741,7 +810,11 @@ export type Event =
   | EvRunResumed
   | EvLaunchFailed
   | EvIntegrityViolated
-  | EvDecisionAdded;
+  | EvDecisionAdded
+  | EvNoteAdded
+  | EvOwnerRequestMarkedUnneeded
+  | EvMissRecorded
+  | EvNotesDelivered;
 
 export type EventType = Event["type"];
 

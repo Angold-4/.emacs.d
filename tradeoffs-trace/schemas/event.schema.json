@@ -17,7 +17,8 @@
         "DECISION_CLASS_LOWERED", "OWNER_REQUEST_OPENED", "OWNER_REQUEST_RESOLVED", "ACCEPTED",
         "PUBLISH_INTENT", "PUBLISH_COMPLETED", "PUBLISH_STALE", "REPAIR_ATTEMPT_STARTED",
         "REPAIR_BUDGET_EXHAUSTED", "RESOLVING_INCOMPLETE", "REVISE", "AMEND",
-        "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED"
+        "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED",
+        "NOTE_ADDED", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED"
       ]
     }
   },
@@ -61,6 +62,10 @@
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_BUDGET_EXCEEDED" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_RESUMED" } } },
     { "type": "object", "required": ["type", "role", "expected", "missing", "extra"], "properties": { "type": { "const": "LAUNCH_FAILED" }, "role": { "enum": ["worker", "reviewer"] }, "reviewer": { "enum": ["M", "A", "B"] }, "expected": { "type": "array" }, "missing": { "type": "array" }, "extra": { "type": "array" } } },
-    { "type": "object", "required": ["type", "stage"], "properties": { "type": { "const": "INTEGRITY_VIOLATED" }, "stage": { "type": "string", "minLength": 1 }, "evidence": { "type": "string" } } }
+    { "type": "object", "required": ["type", "stage"], "properties": { "type": { "const": "INTEGRITY_VIOLATED" }, "stage": { "type": "string", "minLength": 1 }, "evidence": { "type": "string" } } },
+    { "type": "object", "required": ["type", "phaseId", "text"], "properties": { "type": { "const": "NOTE_ADDED" }, "phaseId": { "type": "string", "minLength": 1 }, "text": { "type": "string", "minLength": 1 } } },
+    { "type": "object", "required": ["type", "requestId"], "properties": { "type": { "const": "OWNER_REQUEST_MARKED_UNNEEDED" }, "requestId": { "type": "string", "minLength": 1 } } },
+    { "type": "object", "required": ["type", "recordId"], "properties": { "type": { "const": "MISS_RECORDED" }, "recordId": { "type": "string", "minLength": 1 }, "sample": { "type": "string" } } },
+    { "type": "object", "required": ["type", "phaseId", "count"], "properties": { "type": { "const": "NOTES_DELIVERED" }, "phaseId": { "type": "string", "minLength": 1 }, "count": { "type": "integer" } } }
   ]
 }

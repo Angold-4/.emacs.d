@@ -70,6 +70,10 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "LAUNCH_FAILED",
   "INTEGRITY_VIOLATED",
   "DECISION_ADDED",
+  "NOTE_ADDED",
+  "OWNER_REQUEST_MARKED_UNNEEDED",
+  "MISS_RECORDED",
+  "NOTES_DELIVERED",
 ]);
 
 function ok(state: State): ReduceResult {
@@ -320,6 +324,66 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // itself moves IMPLEMENTING -> FREEZING. FREEZE_COMPLETED is what
       // assembles these into bound Decision records (design §6.2, §7.1).
       return undefined;
+    }
+
+    case "NOTE_ADDED": {
+      // §7.4 `note` (conductor state): queued for the next worker attempt's
+      // prompt. Record-only — it moves no phase.
+      if (event.phaseId !== p.phaseId) {
+        return rejected(state, `note is for phase ${event.phaseId}, but this run is on phase ${p.phaseId}`);
+      }
+      if (!event.text || event.text.trim().length === 0) {
+        return rejected(state, "a note must carry non-empty text");
+      }
+      return ok({ ...state, phase: { ...p, ownerNotes: [...(p.ownerNotes ?? []), event.text] } });
+    }
+
+    case "OWNER_REQUEST_MARKED_UNNEEDED": {
+      // §7.4 `unneeded` / §11.4's "unnecessary escalations" pilot metric:
+      // recorded, not resolved (nothing was answered). Record-only, and the
+      // request deliberately STAYS `open`: closing it would (a) reject a
+      // follow-up OWNER_REQUEST_RESOLVED as "already unneeded" and (b) for
+      // the record-less fallback request (no candidate/decision/finding)
+      // leave AWAITING_OWNER with no open request and no command that can
+      // unstick it — the blocking finding on this candidate. The metric
+      // lives in `unneededRequestIds`, so the owner can still grant/stop/
+      // repair the request afterwards.
+      const request = p.ownerRequests.find((r) => r.id === event.requestId);
+      if (!request) return rejected(state, `unknown owner request ${event.requestId}`);
+      if (request.status !== "open") {
+        return rejected(state, `owner request ${event.requestId} is already ${request.status}, not open`);
+      }
+      const already = p.unneededRequestIds ?? [];
+      if (already.includes(event.requestId)) {
+        return rejected(state, `owner request ${event.requestId} is already marked unneeded`);
+      }
+      return ok({ ...state, phase: { ...p, unneededRequestIds: [...already, event.requestId] } });
+    }
+
+    case "NOTES_DELIVERED": {
+      // §7.4 `note`: the conductor delivered the first `count` queued notes
+      // in a worker attempt's prompt; later attempts send only the rest, so
+      // a note reaches the NEXT attempt and does not keep steering every
+      // one (finding F-p2b-...-B-2). Record-only.
+      if (event.phaseId !== p.phaseId) {
+        return rejected(state, `notes are for phase ${event.phaseId}, but this run is on phase ${p.phaseId}`);
+      }
+      if (!Number.isInteger(event.count) || event.count <= 0) {
+        return rejected(state, "a notes-delivered event must carry a positive integer count");
+      }
+      return ok({ ...state, phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count } });
+    }
+
+    case "MISS_RECORDED": {
+      // §3.5/§10.4 `s`: the observed miss sample. Record-only.
+      if (!event.recordId || event.recordId.trim().length === 0) {
+        return rejected(state, "a miss must name the sampled record it refers to");
+      }
+      const misses = p.misses ?? [];
+      if (misses.includes(event.recordId)) {
+        return rejected(state, `record ${event.recordId} is already marked as a miss`);
+      }
+      return ok({ ...state, phase: { ...p, misses: [...misses, event.recordId] } });
     }
 
     default:
