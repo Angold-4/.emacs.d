@@ -133,19 +133,34 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       // not running
     }
     const { state } = foldProgram(dir);
-    for (const n of Object.values(state.nodes)) {
-      if (n.runId && ["running", "needs-you"].includes(n.status)) await cmdStop(n.runId, root);
+    for (const [node, n] of Object.entries(state.nodes)) {
+      if (!n.runId || !["running", "needs-you"].includes(n.status)) continue;
+      await cmdStop(n.runId, root);
+      // The scheduler is gone, so record the stop here: the program status
+      // must not keep showing the node as running.
+      appendProgramEvent(dir, { type: "NODE_STATUS", node, status: "stopped" });
     }
     process.stdout.write(`stopped program ${path.basename(dir)}\n`);
   } else if (sub === "resume") {
     if (args.length !== 1) usage();
     const dir = resolveProgramDir(args[0], root);
-    if (programPidAlive(dir)) {
-      process.stdout.write(`program ${path.basename(dir)} is already running\n`);
-      return;
+    // Undo a stop, restart every node run that is not running (stopped by
+    // the owner or crashed), then the scheduler if it is not running.
+    const { state } = foldProgram(dir);
+    if (state.stopped) appendProgramEvent(dir, { type: "PROGRAM_RESUMED" });
+    const restarted: string[] = [];
+    for (const [node, s] of Object.entries(state.nodes)) {
+      if (!s.runId || ["done", "blocked", "waiting"].includes(s.status)) continue;
+      const runDir = path.join(root, s.runId);
+      if (conductorAlive(runDir)) continue;
+      appendProgramEvent(dir, { type: "NODE_RESUMED", node, reason: "owner" });
+      launchDetached(runDir);
+      restarted.push(node);
     }
-    launchProgramScheduler(dir);
-    process.stdout.write(`resumed program ${path.basename(dir)}\n`);
+    if (!programPidAlive(dir)) launchProgramScheduler(dir);
+    process.stdout.write(
+      `resumed program ${path.basename(dir)}${restarted.length > 0 ? ` (restarted ${restarted.join(", ")})` : ""}\n`,
+    );
   } else if (sub === "prs") {
     // Skill fix 3: one PR per DONE node, stacked on its dependency's branch.
     // Prints the commands; pushing and opening PRs stay the owner's call.
@@ -289,9 +304,18 @@ async function runConductorProcess(runDir: string): Promise<void> {
   const deadlines = t || Object.keys(planDeadlines).length > 0 ? { ...planDeadlines, ...(t ?? {}) } : undefined;
   const stubReviews = testStubReviews();
   writeFileSync(path.join(runDir, "conductor.pid"), String(process.pid));
+  // A clean stop leaves this marker; a conductor that dies without it
+  // crashed, and a program scheduler restarts it (src/program.ts).
+  const stoppedMarker = path.join(runDir, "stopped");
+  rmSync(stoppedMarker, { force: true });
   const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, deadlines, stubReviews });
-  process.on("SIGTERM", () => void conductor.stop().then(() => process.exit(0)));
-  process.on("SIGINT", () => void conductor.stop().then(() => process.exit(0)));
+  const cleanStop = () =>
+    void conductor.stop().then(() => {
+      writeFileSync(stoppedMarker, new Date().toISOString());
+      process.exit(0);
+    });
+  process.on("SIGTERM", cleanStop);
+  process.on("SIGINT", cleanStop);
   await conductor.start();
 }
 

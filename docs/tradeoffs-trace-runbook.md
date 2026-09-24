@@ -142,6 +142,12 @@ rebuilds from scratch:
 (setenv "CARGO_TARGET_DIR" (expand-file-name "~/.cache/dragon-target"))  ; before C-c m r
 ```
 
+**Stop, resume and crashes.**
+- `k` in the program buffer or `tt program stop <id>` stops the scheduler and every running phase cleanly. Published branches and each run's state stay on disk.
+- `R` in the program buffer or `tt program resume <id>` undoes the stop, restarts every node run that isn't running (each recovers from its own control log), and relaunches the scheduler. It never recreates an existing node branch.
+- **Crashes recover on their own.** When a node's conductor dies without a clean stop (Ctrl-C, crash, sleep), the scheduler restarts it, up to 3 times per node (`NODE_RESUMED` in the program log). If the scheduler itself died, for example after a reboot, `tt program resume <id>` brings everything back.
+- One phase alone: `k` / `R` in the runs list, or `tt stop <run>` / `tt resume <run>`.
+
 **Before an unattended program:**
 1. `TT_BRANCH` exists in the repository, and nothing has it or a node branch checked out.
 2. Every plan's check command finishes in a few minutes (the checks limit is 5).

@@ -93,6 +93,10 @@ export class PiAgent {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.#child = child;
+    // A write racing terminate()'s stdin.end() (or a dead pipe) is reported
+    // to that write's callback and fails its request; without a listener the
+    // stream's 'error' event would crash the conductor instead.
+    child.stdin.on("error", () => undefined);
     if (!child.pid) throw new Error("failed to spawn pi agent: no pid");
     this.pgid = child.pid;
 
@@ -181,9 +185,20 @@ export class PiAgent {
         reject(new Error(`cannot send '${command.type}': agent ${this.agentId} has already exited`));
         return;
       }
+      // terminate() ends stdin; a prompt or steer racing a stop must fail its
+      // own promise, not crash the conductor with ERR_STREAM_WRITE_AFTER_END.
+      const stdin = this.#child.stdin;
+      if (stdin.writableEnded || stdin.destroyed) {
+        reject(new Error(`cannot send '${command.type}': agent ${this.agentId} is terminating`));
+        return;
+      }
       this.#pending.set(id, { resolve, reject });
       try {
-        this.#child.stdin.write(encodeLine(withId));
+        stdin.write(encodeLine(withId), (err) => {
+          if (!err) return;
+          this.#pending.delete(id);
+          reject(err);
+        });
       } catch (err) {
         this.#pending.delete(id);
         reject(err as Error);
@@ -229,8 +244,13 @@ export class PiAgent {
     if (this.#exited) return { signalsSent: ["already-exited"] };
 
     try {
-      await this.abort();
-      signalsSent.push("abort");
+      // Bounded: a hung agent never acknowledges the abort, and waiting for it
+      // would hang terminate() — and with it stop() and the stall watchdog.
+      const acked = await Promise.race([
+        this.abort().then(() => true),
+        new Promise<false>((r) => setTimeout(() => r(false), abortGraceMs).unref()),
+      ]);
+      if (acked) signalsSent.push("abort");
     } catch {
       // Agent may already be unreachable (e.g. killed out from under us) —
       // proceed straight to signals.
