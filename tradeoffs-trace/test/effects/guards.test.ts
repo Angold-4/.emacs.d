@@ -226,3 +226,21 @@ test("R3.protection: run metadata, escapes, protected files and symlink escapes 
     cleanup();
   }
 });
+
+test("guards: a whole-disk or home-directory search in sh is refused (program 59163ee2's 13a worker ran find /)", async () => {
+  const { guardedShCommand, searchesWholeDisk } = await import("../../extension/guards.ts");
+  for (const cmd of [
+    'find / -name "13_ref_shared_contract.md" 2>/dev/null',
+    "cd x && find ~ -name a.md",
+    "find $HOME -type f",
+    "find /Users -name x",
+    "locate 13_ref",
+    "mdfind -name ref.md",
+  ]) {
+    assert.ok(searchesWholeDisk(cmd), cmd);
+    assert.match(guardedShCommand(cmd, {}) ?? "", /reference documents are listed in your prompt/);
+  }
+  for (const cmd of ["find . -name '*.rs'", "find crates -name lib.rs", "cargo test -p x", "git grep find"]) {
+    assert.equal(searchesWholeDisk(cmd), false, cmd);
+  }
+});
