@@ -68,8 +68,7 @@ import {
   discardProbe,
   publishCAS,
   removeWorktree,
-  verifyIntegrity,
-} from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { crashAt, CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
@@ -178,6 +177,13 @@ export interface RunPlanFile {
    * TT_ATTEMPT_MINUTES), for repositories whose builds and suites take
    * longer than the defaults (e.g. a Rust workspace). */
   deadlines?: Partial<Deadlines>;
+  /** Documents the plan cites that live outside the repository (absolute
+   * paths; Emacs collects them from #+TT_REFS and from the plan text). They
+   * are copied into <run>/refs at creation, so a run keeps the version it
+   * started with, and every agent is told where they are instead of
+   * searching for them (run aea875c4: reviewers spent 6 minutes running
+   * recursive `find` searches over the home directory). */
+  references?: string[];
 }
 
 export interface ConductorOptions {
@@ -245,7 +251,29 @@ export function runPaths(runDir: string) {
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
     worktree: path.join(runDir, "worktree"),
+    refs: path.join(runDir, "refs"),
   };
+}
+
+/** True iff `repo` is a shallow clone. A candidate checkout clones the
+ * repository, and cloning a shallow repository fails at freeze — run
+ * 9ab9188b lost three attempts that way — so a run refuses to start on one. */
+export function isShallowRepository(repo: string): boolean {
+  try {
+    return execFileSync("git", ["-C", repo, "rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+/** The reference documents copied into a run, as absolute paths. */
+export function runReferences(runDir: string): string[] {
+  const dir = runPaths(runDir).refs;
+  try {
+    return fs.readdirSync(dir).sort().map((f) => path.join(dir, f));
+  } catch {
+    return [];
+  }
 }
 
 /** The conductor's own source revision — `git rev-parse HEAD` of this
@@ -322,6 +350,9 @@ export function initialState(runId: string, phase: RunPlanPhase, integrationHead
  * layout design §9.1 describes, writes `meta.json` and the plan snapshot,
  * and returns the run id (the directory's basename). */
 export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().slice(0, 8)): string {
+  if (plan.repo && isShallowRepository(plan.repo)) {
+    throw new Error(`${plan.repo} is a shallow clone; candidate checkouts cannot be made from it. Run \`git -C ${plan.repo} fetch --unshallow\` first.`);
+  }
   const runDir = path.join(root, runId);
   fs.mkdirSync(runDir, { recursive: false });
   const p = runPaths(runDir);
@@ -329,6 +360,25 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(plan, null, 2));
+  // Snapshot the plan's reference documents (same-named files get a numeric
+  // prefix); a missing one is skipped and noted rather than failing the run.
+  const refs = plan.references ?? [];
+  if (refs.length > 0) {
+    fs.mkdirSync(p.refs, { recursive: true });
+    const used = new Set<string>();
+    const missing: string[] = [];
+    refs.forEach((src, i) => {
+      if (!fs.existsSync(src)) {
+        missing.push(src);
+        return;
+      }
+      let name = path.basename(src);
+      if (used.has(name)) name = `${i}-${name}`;
+      used.add(name);
+      fs.copyFileSync(src, path.join(p.refs, name));
+    });
+    if (missing.length > 0) fs.writeFileSync(path.join(p.refs, "MISSING.txt"), `${missing.join("\n")}\n`);
+  }
   fs.writeFileSync(
     p.meta,
     JSON.stringify(
@@ -2184,6 +2234,8 @@ export class Conductor {
       TT_WORKTREE: this.#paths.worktree,
       TT_RUN_DIR: this.#runDir,
       TT_PROTECTED: protectedPaths,
+      // Where find/grep/ls may search: the worktree and the plan's references.
+      TT_SEARCH_ROOTS: [this.#paths.worktree, this.#paths.refs].join(path.delimiter),
     };
 
     let helloResolve!: (r: HelloResult) => void;
@@ -2289,7 +2341,13 @@ export class Conductor {
       const queuedNotes = undelivered.join("\n");
       const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
       await agent.prompt(
-        buildWorkerPrompt(contract, ownerNotes.length > 0 ? ownerNotes : undefined, interruptionNote, this.#repairContext()),
+        buildWorkerPrompt(
+          contract,
+          ownerNotes.length > 0 ? ownerNotes : undefined,
+          interruptionNote,
+          this.#repairContext(),
+          runReferences(this.#runDir),
+        ),
       );
       // Record delivery only after the prompt was sent; a crash between the
       // prompt and this append re-delivers on the next attempt (at-least-
@@ -2702,6 +2760,7 @@ export class Conductor {
       ...this.#extraEnv,
       ...this.#piEnvFor?.("reviewer", agentId),
       TT_SOCKET: this.#paths.sock,
+      TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
       // The extension waits this long for a command's result: the conductor's
       // per-command limit plus room for the kill and its report.
       TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
@@ -2985,6 +3044,7 @@ export class Conductor {
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       `Candidate checkout (read-only): ${this.#candidateDir()}`,
+      ...referenceLines(runReferences(this.#runDir)),
       `Diff vs. phase base (${phase.integrationHead.slice(0, 7)}):`,
       "```diff",
       diff,
@@ -3001,9 +3061,12 @@ export class Conductor {
     const C = phase.candidate?.sha ?? "";
     const K = phase.contract.contractVersion;
     const live = phase.decisions.filter((d) => isLiveDecision(d) && d.boundCandidateSha === C);
+    // Skill fix 5: a kept decision that passed last round carries its ballots.
+    const carriedIds = new Set(phase.ballots.filter((b) => b.boundCandidateSha === C && b.carriedFrom).map((b) => b.decisionId));
     const record = (d: Decision) => {
       const who = d.source === "worker" ? "worker" : d.source === "trigger" ? "trigger" : `discovered by ${d.id.includes(`-disc-${reviewer}-`) ? "YOU" : "a reviewer"}`;
-      return `- ${d.id} [${d.class}, ${who}]: ${d.choice}\n    why: ${d.whyItMatters}\n    alternatives: ${d.alternatives.map((a) => `${a.option} → ${a.consequence}`).join(" | ")}`;
+      const carried = carriedIds.has(d.id) ? " [carried: kept unchanged and approved last round; vote again only if this candidate's changes affect it]" : "";
+      return `- ${d.id} [${d.class}, ${who}]${carried}: ${d.choice}\n    why: ${d.whyItMatters}\n    alternatives: ${d.alternatives.map((a) => `${a.option} → ${a.consequence}`).join(" | ")}`;
     };
     const own = live.filter((d) => d.id.includes(`-disc-${reviewer}-`));
     const openFindings = phase.findings.filter((f) => f.status === "open");
@@ -3022,10 +3085,25 @@ export class Conductor {
     if (openCorrections.length > 0) {
       lines.push("Open owner corrections (state honored / not_honored for each):", ...openCorrections.map((c) => `- ${c.id}: ${c.correctionText}`));
     }
+    // Skill fix 4: a test deleted from a file that still exists may drop
+    // coverage of live behaviour; make every one visible to the reviewers.
+    let removed: string[] = [];
+    try {
+      removed = removedTestsBetween(this.#plan.repo, phase.integrationHead, C);
+    } catch {
+      removed = [];
+    }
+    if (removed.length > 0) {
+      lines.push(
+        `Tests removed from files that still exist (${removed.length}). For each, check that it was replaced or that the behaviour it tested was removed on purpose; a removed test of behaviour that is still live is a blocking finding:`,
+        ...removed.slice(0, 60).map((t) => `- ${t}`),
+        ...(removed.length > 60 ? [`- … and ${removed.length - 60} more`] : []),
+      );
+    }
     lines.push(
       "",
       "Call submit_review with:",
-      "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation). A ballot with contractObjection=true opens a contract finding and suspends that vote.",
+      "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation), except records marked carried: your previous ballot stands for those, and a new ballot replaces it. A ballot with contractObjection=true opens a contract finding and suspends that vote.",
       "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it.",
       own.length > 0
         ? `- \`discoveryMatches\`: for each of YOUR discoveries (${own.map((d) => d.id).join(", ")}) that is the same choice as another record above, give {discoveryId, sameAs}.`
@@ -3128,17 +3206,29 @@ export interface RepairContext {
   priorDecisions: Array<{ id: string; choice: string }>;
 }
 
+/** The prompt lines naming a run's reference documents, or none. */
+export function referenceLines(references: string[]): string[] {
+  if (references.length === 0) return [];
+  return [
+    "",
+    "Reference documents for this plan (outside the repository; read them with the read tool, do not search for them):",
+    ...references.map((r) => `- ${r}`),
+  ];
+}
+
 function buildWorkerPrompt(
   contract: PhaseContract,
   ownerNotes?: string,
   interruptionNote?: string,
   repair?: RepairContext,
+  references: string[] = [],
 ): string {
   const lines: string[] = [
     `Goal: ${contract.goal}`,
     "",
     "Acceptance criteria:",
     ...contract.acceptance.map((a) => `- ${a}`),
+    ...referenceLines(references),
   ];
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);

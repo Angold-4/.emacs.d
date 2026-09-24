@@ -171,6 +171,30 @@ The goal ends at a blank line, a list item or the \"Acceptance:\" line."
             (provisional . ,(if provisional t :false)))
           (nreverse errors))))
 
+(defun +tt--plan-references (dir)
+  "Absolute paths of the documents this plan cites that exist on disk.
+From #+TT_REFS (space separated) and from every *.md name in the plan
+text that resolves relative to DIR (the plan's directory) or to ~.  The
+conductor copies them into the run and tells every agent where they are,
+so no agent searches the file system for them."
+  (let ((found nil)
+        (self (and buffer-file-name (expand-file-name buffer-file-name))))
+    (dolist (name (split-string (or (+tt--keyword "TT_REFS") "") "[ ,]+" t))
+      (push name found))
+    (save-excursion
+      (goto-char (point-min))
+      ;; Markdown only: plans name sibling .org plans for ordering, not as references.
+      (while (re-search-forward "\\(?:~/\\|/\\)?[[:alnum:]_./-]*[[:alnum:]_-]\\.md\\_>" nil t)
+        (push (match-string-no-properties 0) found)))
+    (let ((out nil))
+      (dolist (name (nreverse found))
+        (let ((abs (expand-file-name name (if (string-prefix-p "~" name) "~" dir))))
+          (when (and (file-regular-p abs)
+                     (not (equal abs self))
+                     (not (member abs out)))
+            (push abs out))))
+      (nreverse out))))
+
 (defun +tt--plan-deadlines ()
   "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES and
 #+TT_ATTEMPT_MINUTES, as the conductor's deadline fields in ms (or nil).
@@ -216,7 +240,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   (checks . ,(vconcat (and global-checks (list global-checks))))
                   (phases . ,(vconcat (nreverse phases)))
                   ,@(let ((d (+tt--plan-deadlines)))
-                      (and d `((deadlines . ,d)))))
+                      (and d `((deadlines . ,d))))
+                  ,@(let ((r (+tt--plan-references dir)))
+                      (and r `((references . ,(vconcat r))))))
           :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
 
 (defun +tt--show-plan-errors (file errors)

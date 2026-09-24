@@ -92,8 +92,9 @@ function pidAlive(file: string): boolean {
   }
 }
 
-/** A launched node's status, observed from its run directory. */
-export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> {
+/** A launched node's status, observed from its run directory. "crashed":
+ * the conductor died without a clean stop (no `stopped` marker). */
+export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "crashed" {
   let phase: string | undefined;
   try {
     const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8"));
@@ -106,9 +107,14 @@ export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> {
   const alive = pidAlive(path.join(runDir, "conductor.pid"));
   if (phase === "AWAITING_OWNER") return "needs-you";
   // A run just launched may not have written its pid yet.
-  if (!alive && fs.existsSync(path.join(runDir, "conductor.pid"))) return "stopped";
+  if (!alive && fs.existsSync(path.join(runDir, "conductor.pid"))) {
+    return fs.existsSync(path.join(runDir, "stopped")) ? "stopped" : "crashed";
+  }
   return "running";
 }
+
+/** How often the scheduler restarts a node whose conductor crashed. */
+export const MAX_CRASH_RESUMES = 3;
 
 export interface SchedulerOptions {
   /** Where node runs are created (the usual run root). */
@@ -131,7 +137,19 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
   for (const n of nodes) {
     const s = state.nodes[n.id];
     if (!s.runId || s.status === "done" || s.status === "blocked") continue;
-    const seen = observeRun(path.join(opts.runRoot, s.runId));
+    const runDir = path.join(opts.runRoot, s.runId);
+    const seen = observeRun(runDir);
+    if (seen === "crashed") {
+      // The run recovers from its own control log (tt resume); an owner
+      // stop leaves a marker and is not restarted here.
+      if (!state.stopped && (s.resumes ?? 0) < MAX_CRASH_RESUMES) {
+        record({ type: "NODE_RESUMED", node: n.id, reason: "crashed" });
+        opts.launch(runDir);
+      } else if (s.status !== "stopped") {
+        record({ type: "NODE_STATUS", node: n.id, status: "stopped" });
+      }
+      continue;
+    }
     if (seen !== s.status) record({ type: "NODE_STATUS", node: n.id, status: seen });
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
@@ -142,7 +160,14 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       record({ type: "NODE_BLOCKED", node: id, reason: prepared.reason });
       continue;
     }
-    const runDir = createRun(opts.runRoot, plan);
+    let runDir: string;
+    try {
+      runDir = createRun(opts.runRoot, plan);
+    } catch (err) {
+      // e.g. a shallow clone: the node cannot start, and says why.
+      record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });
+      continue;
+    }
     fs.writeFileSync(
       path.join(runDir, "program.json"),
       JSON.stringify({ programId: path.basename(dir), node: id }),

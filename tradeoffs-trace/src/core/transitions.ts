@@ -12,7 +12,7 @@
 // distinguishes rows that share a trigger, and `apply` computes the new
 // state. `actions` is what `next()` of the resulting state must equal.
 
-import { carryDecisionsForward } from "./rounds.ts";
+import { carryBallotsForward, carryDecisionsForward } from "./rounds.ts";
 import {
   applyFindingAcceptedByOwner,
   applyOverrideCast,
@@ -237,6 +237,7 @@ addRow({
   actions: [{ type: "run_checks", candidateSha: "C1" }],
   apply: (s, ev) => {
     const e = ev as Extract<Event, { type: "FREEZE_COMPLETED" }>;
+    const carried = carryDecisionsForward(s.phase.decisions, s.phase.pendingPrior, e.candidateSha);
     return withPhase(s, {
       phase: "CHECKING",
       candidate: { sha: e.candidateSha, contractVersion: s.phase.contract.contractVersion },
@@ -247,14 +248,24 @@ addRow({
       // Plan 2c: records from an earlier candidate carry forward only if the
       // worker kept or changed them (core/rounds.ts); the rest are superseded
       // and can no longer block acceptance.
-      decisions: [...carryDecisionsForward(s.phase.decisions, s.phase.pendingPrior, e.candidateSha), ...e.decisions],
+      decisions: [...carried, ...e.decisions],
       pendingDisclosures: undefined,
       pendingPrior: undefined,
       round: (s.phase.round ?? 0) + 1,
       checks: undefined,
       probe: undefined,
       reviews: {},
-      ballots: [],
+      // Skill fix 5: kept decisions that passed keep their ballots.
+      ballots: carryBallotsForward(
+        s.phase.decisions,
+        s.phase.ballots,
+        s.phase.findings,
+        s.phase.pendingPrior,
+        s.phase.candidate?.sha,
+        s.phase.contract.contractVersion,
+        carried,
+        e.candidateSha,
+      ),
       overrides: [],
       // design §2.2: a clean freeze (no survivors this time) clears any
       // earlier taint; one that found survivors sets it, so the next

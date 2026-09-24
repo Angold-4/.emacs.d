@@ -245,6 +245,9 @@ export interface Ballot {
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   boundRecordVersion: number; // design §7.1: bound to the decision's version, not just the candidate
+  /** Skill fix 5: carried over from this earlier candidate because the
+   * worker kept the decision unchanged and it had passed (core/rounds.ts). */
+  carriedFrom?: string;
 }
 
 /** The owner's `override` command (design §7.4): "approve or reject a

@@ -47,13 +47,15 @@ export interface ProgramNode {
 export type NodeStatus = "waiting" | "running" | "needs-you" | "stopped" | "done" | "blocked";
 
 export interface ProgramState {
-  nodes: Record<string, { status: NodeStatus; runId?: string; branch?: string; base?: string; reason?: string }>;
+  nodes: Record<string, { status: NodeStatus; runId?: string; branch?: string; base?: string; reason?: string; resumes?: number }>;
   stopped: boolean;
 }
 
 export type ProgramEvent =
   | { type: "NODE_STARTED"; node: string; runId: string; branch?: string; base?: string }
   | { type: "NODE_BLOCKED"; node: string; reason: string }
+  | { type: "NODE_RESUMED"; node: string; reason: "crashed" | "owner" }
+  | { type: "PROGRAM_RESUMED" }
   | { type: "NODE_STATUS"; node: string; status: Exclude<NodeStatus, "waiting"> }
   | { type: "PROGRAM_STOPPED" };
 
@@ -128,6 +130,13 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
     }
     case "PROGRAM_STOPPED":
       return { ...state, stopped: true };
+    case "PROGRAM_RESUMED":
+      return { ...state, stopped: false };
+    case "NODE_RESUMED": {
+      const prev = state.nodes[event.node];
+      if (!prev) return state;
+      return { ...state, nodes: { ...state.nodes, [event.node]: { ...prev, status: "running", resumes: (prev.resumes ?? 0) + 1 } } };
+    }
   }
 }
 

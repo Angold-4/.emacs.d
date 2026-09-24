@@ -374,5 +374,25 @@
     (should (= (alist-get 'workerAttemptMs d) 5400000))
     (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
 
+(ert-deftest tradeoffs-trace-plan-references ()
+  "A plan's cited documents that exist on disk become its references."
+  (let* ((dir (make-temp-file "tt-ert-refs" t))
+         (ref (expand-file-name "12_ref_contract.md" dir))
+         (plan-file (expand-file-name "12a.org" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file ref (insert "# contract\n"))
+          (with-temp-buffer
+            (insert (replace-regexp-in-string
+                     "Goal: make sum() reject non-numbers"
+                     "Goal: see `12_ref_contract.md` §1 and missing_ref.md; make sum() reject non-numbers"
+                     +tt-test--valid-plan))
+            (setq buffer-file-name plan-file default-directory dir)
+            (org-mode)
+            (let ((refs (alist-get 'references (plist-get (+tt-parse-plan) :plan))))
+              (set-buffer-modified-p nil) (setq buffer-file-name nil)
+              (should (equal refs (vector ref))))))
+      (delete-directory dir t))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

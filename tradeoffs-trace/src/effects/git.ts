@@ -30,6 +30,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { removedTests } from "../core/test-names.ts";
 
 const IDENTITY_ARGS = ["-c", "user.name=tradeoffs-trace", "-c", "user.email=tradeoffs-trace@localhost"];
 const NO_HOOKS_ARGS = ["-c", "core.hooksPath=/dev/null"];
@@ -517,4 +518,22 @@ export function diffHunks(repo: string, base: string, candidateSha: string): Dif
     }
   }
   return hunks;
+}
+
+/** Skill fix 4: tests removed between `base` and `candidateSha` from files
+ * that still exist (see core/test-names.ts). Reads only the changed files. */
+export function removedTestsBetween(repo: string, base: string, candidateSha: string): string[] {
+  const show = (rev: string, file: string): string | undefined => {
+    try {
+      return execFileSync("git", ["-C", repo, "show", `${rev}:${file}`], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      return undefined;
+    }
+  };
+  const files = diffNameOnly(repo, base, candidateSha).map((path) => ({
+    path,
+    base: show(base, path),
+    candidate: show(candidateSha, path),
+  }));
+  return removedTests(files);
 }
