@@ -142,7 +142,23 @@ export function longestSleepSeconds(command: string): number {
  * worker's own worktree. This is a string-level check only — see the module
  * comment above. Returns a human-readable reason, or `undefined` if the
  * command is allowed. */
+/** A `find` (or `fd`, `locate`, `mdfind`) over the whole disk or the home
+ * directory: the 13a worker of program 59163ee2 ran `find / -name …` for its
+ * plan's reference documents, which are listed in its prompt. */
+export function searchesWholeDisk(command: string): boolean {
+  return (
+    /(?:^|[;&|(]\s*)(?:sudo\s+)?find\s+(?:-[A-Za-z]+\s+)*(?:\/|~\/?|\$HOME\/?|\/Users\/?|\/home\/?)(?=\s|$)/.test(command) ||
+    /(?:^|[;&|(]\s*)(?:locate|mdfind)\b/.test(command)
+  );
+}
+
 export function guardedShCommand(command: string, config: GuardConfig): string | undefined {
+  if (searchesWholeDisk(command)) {
+    return (
+      "searching the whole disk or home directory is refused: the plan's reference documents are listed in your " +
+      `prompt (read them directly), and the code is in your checkout. Search there instead: ${command}`
+    );
+  }
   for (const pattern of BLOCKED_SH_PATTERNS) {
     if (pattern.test(command)) {
       return `sh command containing '${pattern.source}' is blocked (workflow guard, not a security boundary): ${command}`;
