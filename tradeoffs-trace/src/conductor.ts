@@ -28,10 +28,11 @@ import { effectiveChecks } from "./core/checks.ts";
 import {
   GATE_TAIL_LINES,
   gateCommandOf,
+  gateDecision,
   gateFailureEvidence,
+  gateLogHashMatches,
   gateLogTail,
   parseGateRecord,
-  reusableGate,
   type GateRecord,
 } from "./core/gate.ts";
 // Plan 01e: the pure half of the base baseline — parsing recorded check
@@ -3986,13 +3987,40 @@ export class Conductor {
     return records.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
   }
 
+  /** The `gate.log` a record names, or undefined when the file is missing or
+   * its bytes no longer hash to the record's own sha256. Only a log that
+   * matches is evidence: a pruned, truncated or hand-edited record must make
+   * the gate rerun, never carry acceptance (runtime doc §6's substitute). */
+  #verifiedGateLog(record: GateRecord): Buffer | undefined {
+    try {
+      const log = fs.readFileSync(path.join(this.#paths.checks, record.candidateSha, "gate.log"));
+      return gateLogHashMatches(record, log) ? log : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Every **verified** passing gate record of this run, keyed by candidate:
+   * the only records `gateDecision` may accept or reuse. */
+  #verifiedPassingGateRecords(): Map<string, { record: GateRecord; log: Buffer }> {
+    const out = new Map<string, { record: GateRecord; log: Buffer }>();
+    for (const record of this.#gateRecords()) {
+      if (!record.passed || record.reused) continue;
+      const log = this.#verifiedGateLog(record);
+      if (log) out.set(record.candidateSha, { record, log });
+    }
+    return out;
+  }
+
   /** Plan 01f: the gate record to show a reviewer for candidate `C` — the
-   * record for `C` itself when one exists (a reused pass, or a stale-publish
+   * record for `C` itself when one exists (an earlier pass, or a stale-publish
    * retry), otherwise the newest record of the run, which is the failed gate
-   * that sent the phase into this repair round. */
+   * that sent the phase into this repair round. Only records whose log still
+   * matches the hash they carry are shown: an unverifiable record is not
+   * evidence, and a prompt must not describe it as one. */
   #gateRecordForPrompt(candidateSha: string): GateRecord | undefined {
-    const records = this.#gateRecords();
-    return records.find((r) => r.candidateSha === candidateSha) ?? records[records.length - 1];
+    const verified = this.#gateRecords().filter((r) => this.#verifiedGateLog(r) !== undefined);
+    return verified.find((r) => r.candidateSha === candidateSha) ?? verified[verified.length - 1];
   }
 
   /** The last lines of the gate log that goes with `#gateRecordForPrompt`,
@@ -4022,8 +4050,15 @@ export class Conductor {
    * plan's secrets in the environment. Writes `checks/<sha>/gate.json` and
    * `checks/<sha>/gate.log`, runs `:GATE_CLEANUP:` whatever the outcome, and
    * applies either the ACCEPTED event (a pass) or GATE_FAILED with the log's
-   * last lines (a failure, or a kill at the limit). An identical tree with a
-   * recorded pass is reused: the command does not run again.
+   * last lines (a failure, or a kill at the limit).
+   *
+   * A candidate whose tree already passed the same command does not run it
+   * again — but only a record whose own `gate.log` still hashes to what the
+   * record claims is used: an unverifiable record makes the gate rerun
+   * (`core/gate.ts`'s `gateDecision`/`gateLogHashMatches`). A candidate's own
+   * record is accepted in place and never rewritten; another candidate's
+   * pass is copied into a new record that names the head it is accepted
+   * against and the head the evidence came from.
    *
    * The agent never produces this evidence (runtime doc §6): a passing gate is
    * what lets acceptance proceed, a failing one is a blocking `integration`
@@ -4051,36 +4086,62 @@ export class Conductor {
     const tree = treeOf(this.#plan.repo, candidateSha);
     this.#log.intent(actionId, { candidateSha, head, tree, command: maskedCommand });
 
-    // The reuse rule (core/gate.ts): a passing record for this exact tree,
-    // gated with this exact command, is this candidate's evidence too — the
-    // command does not run again (a repair round that changes nothing freezes
-    // a new commit with the same tree; a stale-publish retry re-gates the same
-    // candidate).
-    const reuse = reusableGate(this.#gateRecords(), { tree, command: maskedCommand });
-    if (reuse) {
-      const startedAt = new Date().toISOString();
-      let logText = `reused the gate record of candidate ${reuse.candidateSha}: ${maskedCommand}\n`;
-      try {
-        logText = fs.readFileSync(path.join(this.#paths.checks, reuse.candidateSha, "gate.log"), "utf8");
-      } catch {
-        // The source log is gone (a hand-cleaned run dir): keep the note.
-      }
-      const logBytes = Buffer.byteLength(logText, "utf8");
-      const logSha256 = createHash("sha256").update(logText).digest("hex");
-      fs.writeFileSync(logPath, logText);
-      const record: GateRecord = {
-        ...reuse,
+    // The reuse rule (core/gate.ts): a candidate whose tree has already passed
+    // this exact command does not run it again — but only a record whose own
+    // `gate.log` still hashes to what it claims is evidence. A candidate's own
+    // record is handled separately (`gateDecision`): a stale-publish retry
+    // re-gates the same candidate, and its record is accepted in place, never
+    // rewritten with a claim of reusing itself.
+    const passing = this.#verifiedPassingGateRecords();
+    const decision = gateDecision(
+      passing.get(candidateSha)?.record,
+      [...passing.values()].map((v) => v.record),
+      { candidateSha, tree, command: maskedCommand },
+    );
+    if (decision.kind === "own") {
+      // Already this candidate's own evidence: write nothing, and record the
+      // head being accepted now next to the head it was produced at.
+      this.#log.completion(actionId, {
         candidateSha,
-        mergedI: reuse.mergedI,
-        startedAt,
+        head,
+        passed: true,
+        reusedInPlace: true,
+        gateBaseSha: decision.record.baseSha,
+        logSha256: decision.record.logSha256,
+      });
+      this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(this.#state.phase, candidateSha, contract.contractVersion) });
+      return;
+    }
+    if (decision.kind === "reuse") {
+      const source = passing.get(decision.record.candidateSha)!;
+      // The source log is copied byte for byte, so this record's hash is the
+      // same verified hash — the evidence behind it is the run it names.
+      fs.writeFileSync(logPath, source.log);
+      const record: GateRecord = {
+        ...decision.record,
+        candidateSha,
+        // The head this candidate is being accepted against; where the
+        // evidence actually came from is named separately.
+        baseSha: head,
         reused: true,
-        reusedFrom: reuse.candidateSha,
-        ...(reuse.baseSha !== head ? { reusedFromBaseSha: reuse.baseSha } : {}),
-        logBytes,
-        logSha256,
+        reusedFrom: decision.record.candidateSha,
+        reusedFromBaseSha: decision.record.baseSha,
+        // The source's merge result belongs to the source's base, not this
+        // head; a reused record names its bases instead of claiming an I.
+        mergedI: undefined,
+        logBytes: source.log.length,
+        logSha256: createHash("sha256").update(source.log).digest("hex"),
       };
       fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
-      this.#log.completion(actionId, { candidateSha, passed: true, reused: true, reusedFrom: reuse.candidateSha, logSha256 });
+      this.#log.completion(actionId, {
+        candidateSha,
+        head,
+        passed: true,
+        reused: true,
+        reusedFrom: record.reusedFrom,
+        reusedFromBaseSha: record.reusedFromBaseSha,
+        logSha256: record.logSha256,
+      });
       this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(this.#state.phase, candidateSha, contract.contractVersion) });
       return;
     }
@@ -4125,9 +4186,11 @@ export class Conductor {
     let cleanupResult: RunCommandResult | undefined;
     let cleanupStartedAt: string | undefined;
     let cleanupMs = 0;
-    // Measured before the lock is released, so the recorded window is exactly
-    // the time the gate held the machine-wide lock — never the teardown after
-    // it (which would make two honest, sequential gates look overlapped).
+    // The gate command's own duration — the cleanup runs under its own limit
+    // afterwards and is recorded separately (the record must not present
+    // teardown time as build time). Measured before the lock is released, so
+    // the recorded window is exactly the time the gate held the machine-wide
+    // lock and two honest sequential gates never look overlapped.
     let durationMs = 0;
     try {
       const running = runCommand({
@@ -4141,7 +4204,9 @@ export class Conductor {
         onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
       });
       gateResult = await running.result;
-      // Whatever the outcome: release what the gate took.
+      durationMs = Date.now() - startedMs;
+      // Whatever the outcome: release what the gate took. The cleanup holds
+      // its own (gate-length) limit; it is not part of the gate's duration.
       if (cleanupCommand) {
         cleanupStartedAt = new Date().toISOString();
         const cleanupStartedMs = Date.now();
@@ -4156,7 +4221,6 @@ export class Conductor {
         cleanupResult = await cleanup.result;
         cleanupMs = Date.now() - cleanupStartedMs;
       }
-      durationMs = Date.now() - startedMs;
     } finally {
       await lock.release();
       discardProbe(this.#plan.repo, { probeBranch: probed.probeBranch, checkoutDir: probed.checkoutDir });
@@ -4537,6 +4601,12 @@ export class Conductor {
       `Candidate checkout (read-only): ${this.#candidateDir()}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
+      // Plan 01f: turn 1 is told the conductor owns the gate evidence too (a
+      // reviewer that only learns it in turn 2 could demand or accept a
+      // substitute first). The failed record from an earlier candidate is
+      // named here; its log tail is shown in turn 2, with the records under
+      // review.
+      ...gatePromptLines(phase.contract.gate, this.#gateRecordForPrompt(phase.candidate?.sha ?? "")),
       `Diff vs. phase base (${phase.integrationHead.slice(0, 7)}):`,
       "```diff",
       // Plan 01a: the diff is the candidate's own content, and a candidate can
@@ -5000,6 +5070,10 @@ export function buildReviewerPrompt(
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
     ...secretPromptLines(secrets),
     ...directiveLines(directives),
+    // Plan 01f: the same rule every reviewer prompt carries — the conductor
+    // owns the gate evidence, and no agent may run the command or substitute
+    // for its record.
+    ...gatePromptLines(phase.contract.gate),
     ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),
     "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
   ].join("\n");

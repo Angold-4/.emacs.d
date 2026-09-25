@@ -50,6 +50,21 @@ const STAGE_DEADLINE_MS: Record<string, number> = {
   review: DEFAULT_DEADLINES.reviewMs,
 };
 
+/** The stage limits the pipeline line counts down, with the plan's own
+ * `#+TT_*_MINUTES` overrides applied (a plan that sets a 45-minute gate must
+ * not be shown as "over by" while the conductor is running within it). */
+export function stageLimits(plan: Pick<RunPlanFile, "deadlines">): Record<string, number> {
+  const d = { ...DEFAULT_DEADLINES, ...(plan.deadlines ?? {}) };
+  return {
+    implement: d.workerAttemptMs,
+    freeze: d.freezeMs,
+    checks: d.checkMs,
+    probe: d.probeMs,
+    gate: d.gateMs,
+    review: d.reviewMs,
+  };
+}
+
 export interface StageSpan {
   stage: string;
   startedAt: string;
@@ -95,7 +110,7 @@ export function formatDuration(ms: number): string {
 
 /** "implement 30s → freeze 1s → checks ✗ 10m00s → implement 26m → … →
  * review 12s… (14m48s left)". Attempts after the first are numbered. */
-export function pipelineLine(spans: StageSpan[]): string {
+export function pipelineLine(spans: StageSpan[], limits: Record<string, number> = STAGE_DEADLINE_MS): string {
   let attempt = 0;
   const parts = spans.map((s) => {
     let name = s.stage;
@@ -106,7 +121,7 @@ export function pipelineLine(spans: StageSpan[]): string {
     if (s.stage === "DONE" || s.stage === "BLOCKED") return s.stage;
     const d = formatDuration(s.ms);
     if (s.current) {
-      const limit = STAGE_DEADLINE_MS[s.stage];
+      const limit = limits[s.stage];
       const left =
         limit === undefined ? "" : limit >= s.ms ? ` (${formatDuration(limit - s.ms)} left)` : ` (over by ${formatDuration(s.ms - limit)})`;
       return `${name} ${d}…${left}`;
@@ -414,7 +429,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
-    pipeline: pipelineLine(spans),
+    pipeline: pipelineLine(spans, stageLimits(plan)),
     gates,
     gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord) : undefined,
     baseline: baselineStatusLine(baseline),

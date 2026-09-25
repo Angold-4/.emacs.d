@@ -9,12 +9,15 @@
 //
 // This module is the pure half: the on-disk record's shape (`gate.json`),
 // its parser, the log tail a failure quotes, and the reuse rule that keeps
-// an identical tree from paying for the same gate twice. The conductor
-// writes the record; the view and `tt summary` read it.
+// an identical tree from paying for the same gate twice (including the
+// re-hash that refuses a record whose log no longer matches it). The
+// conductor writes the record; the view and `tt summary` read it.
 //
 // Nothing here decides *whether* a phase gates: `contract.gate` (the plan's
 // `:GATE:` command, frozen into the contract) does, and next.ts/
 // transitions.ts read it.
+
+import { createHash } from "node:crypto";
 
 /** The gate command a contract declares, or undefined when the phase has no
  * gate (every run that predates plan 01f, and any phase whose plan does not
@@ -40,22 +43,24 @@ export interface GateRecord {
    * on (a repair attempt that changes nothing produces a new commit with the
    * same tree, and the gate's answer cannot differ for it). */
   tree?: string;
-  /** The integration head H the candidate was probed onto and the gate ran
-   * against. */
+  /** The integration head this record's evidence stands for: the head the
+   * gate ran against, and — for a record written as a reuse — the head the
+   * candidate is being accepted against (`reusedFromBaseSha` then names the
+   * head the command actually ran on). See `gateDecision`/`reusableGate`. */
   baseSha: string;
   /** The merge result I the gate's checkout held (equals the candidate on
-   * the normal fast-forward probe). */
+   * the normal fast-forward probe). Absent on a reused record: its evidence
+   * was produced for `reusedFromBaseSha`, not for this head. */
   mergedI?: string;
   /** The command as the conductor ran it (masked, like every other run
    * file). */
   command: string;
   /** The `:GATE_CLEANUP:` command, when the plan declares one. */
   cleanup?: string;
-  /** When the command started — or, for a reused record, when the reuse was
-   * recorded (the gate itself did not run for this candidate). */
+  /** When the command that produced this evidence started, and how long it
+   * took: a reused record keeps the source run's own facts (the evidence was
+   * produced then, not when it was reused). */
   startedAt: string;
-  /** How long the command took — the source run's duration for a reused
-   * record. */
   durationMs: number;
   exitCode: number | null;
   signal?: string | null;
@@ -66,12 +71,12 @@ export interface GateRecord {
   logSha256: string;
   logBytes: number;
   /** True when the command was not run at all: an identical tree had already
-   * passed the same gate, and that record is the evidence. */
+   * passed the same gate, and that record's verified log is the evidence. */
   reused?: boolean;
   /** The candidate whose gate is being reused (set only with `reused`). */
   reusedFrom?: string;
-  /** The base SHA that reused record's evidence came from, when it differs
-   * from this candidate's (the honest form: the evidence is the older run's). */
+  /** The head the reused command actually ran against (set with `reused`;
+   * `baseSha` is the head this candidate is being accepted against). */
   reusedFromBaseSha?: string;
   cleanupStartedAt?: string;
   cleanupDurationMs?: number;
@@ -173,13 +178,47 @@ export function gateFailureEvidence(opts: {
   return lines.join("\n");
 }
 
+/** True iff `log`'s bytes are exactly the log this record names: its sha256
+ * matches `logSha256` (and its length matches `logBytes` when the record
+ * carries one). The conductor re-hashes before it reuses anything — a
+ * record whose log was pruned, truncated or edited is **not** evidence, and
+ * the gate reruns rather than accepting on it (runtime doc §6's substitute
+ * problem is exactly this shape: a record with no output behind it). */
+export function gateLogHashMatches(record: GateRecord, log: Buffer): boolean {
+  if (!isString(record.logSha256)) return false;
+  if (record.logBytes > 0 && record.logBytes !== log.length) return false;
+  return createHash("sha256").update(log).digest("hex") === record.logSha256;
+}
+
+/** What the conductor must do for a candidate's gate: accept the candidate's
+ * **own** verified passing record (written for this candidate earlier — a
+ * stale-publish retry re-gates the same candidate — and never rewritten),
+ * reuse **another** candidate's verified passing record that answers the same
+ * question, or run the command.
+ *
+ * The candidate's own record is never "reused": a self-reuse record would
+ * overwrite the run's own evidence with a claim of reusing it. Callers pass
+ * only records whose logs they have verified (`gateLogHashMatches`); an
+ * unverified record must be passed as `undefined`/absent so the gate reruns. */
+export function gateDecision(
+  ownVerifiedPass: GateRecord | undefined,
+  records: readonly GateRecord[],
+  want: { candidateSha: string; tree?: string; command: string },
+): { kind: "own"; record: GateRecord } | { kind: "reuse"; record: GateRecord } | { kind: "run" } {
+  if (ownVerifiedPass && ownVerifiedPass.passed) return { kind: "own", record: ownVerifiedPass };
+  const reused = reusableGate(
+    records.filter((r) => r.candidateSha !== want.candidateSha),
+    want,
+  );
+  return reused ? { kind: "reuse", record: reused } : { kind: "run" };
+}
 /** True iff `record` is a passing gate that answers the same question this
  * candidate asks: the same tree, gated with the same command. The base SHA
  * deliberately does not have to match — the gate is dispatched once per
- * candidate (a stale-publish retry re-probes the same candidate, and a
- * repair attempt that changes nothing freezes a new commit with the same
- * tree), and the record names the base the evidence came from
- * (`reusedFromBaseSha`) when it differs. */
+ * candidate (a repair attempt that changes nothing freezes a new commit with
+ * the same tree), and the record names the head the evidence came from
+ * (`reusedFromBaseSha`). A record for the candidate itself is not a reuse:
+ * `gateDecision` handles that case separately. */
 export function gateRecordAnswers(record: GateRecord | undefined, want: { tree?: string; command: string }): boolean {
   // A reused record is not a source: the original pass is the evidence, and
   // reusing a reuse would just add indirection.
@@ -192,7 +231,9 @@ export function gateRecordAnswers(record: GateRecord | undefined, want: { tree?:
  * undefined when the gate must run: the newest passing record among the
  * run's gate records that answers the same question (a repair round that
  * changes nothing reuses the previous round's pass instead of paying for the
- * same build again — the disk-filling repeats of runtime doc §6). */
+ * same build again — the disk-filling repeats of runtime doc §6). Callers
+ * exclude the candidate's own record (`gateDecision` does) and verify the
+ * chosen record's log before writing anything from it. */
 export function reusableGate(
   records: readonly GateRecord[],
   want: { tree?: string; command: string },

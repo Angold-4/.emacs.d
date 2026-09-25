@@ -43,7 +43,9 @@ import type { Reviewer, State } from "../../src/core/types.ts";
 import { buildView, gateSummaryLine, prSummary } from "../../src/view.ts";
 import {
   GATE_TAIL_LINES,
+  gateDecision,
   gateFailureEvidence,
+  gateLogHashMatches,
   gateLogTail,
   parseGateRecord,
   reusableGate,
@@ -160,6 +162,40 @@ test("gate: reusableGate reuses only a passing record for the same tree and comm
   assert.equal(reusableGate(records, { tree: undefined, command: "deploy --clean --build" }), undefined);
 });
 
+test("gate: gateLogHashMatches refuses a log whose bytes are not the record's own", () => {
+  const log = Buffer.from("the gate's real output\n", "utf8");
+  const record = recordFixture({ logSha256: createHash("sha256").update(log).digest("hex"), logBytes: log.length });
+  assert.equal(gateLogHashMatches(record, log), true);
+  assert.equal(gateLogHashMatches(record, Buffer.from("a pruned or edited log\n", "utf8")), false);
+  assert.equal(gateLogHashMatches({ ...record, logBytes: log.length + 1 }, log), false);
+  assert.equal(gateLogHashMatches({ ...record, logSha256: "b".repeat(64) }, log), false);
+});
+
+test("gate: gateDecision accepts the candidate's own verified pass, never reuses it as a source, and reruns otherwise", () => {
+  const own = recordFixture({ candidateSha: "c1", tree: "tree-a" });
+  const other = recordFixture({ candidateSha: "c2", tree: "tree-a", startedAt: "2026-09-25T01:00:00.000Z" });
+  // The candidate's own record wins and is never rewritten (A-9: a
+  // stale-publish retry re-gates the same candidate; a reuse record claiming
+  // to reuse itself would overwrite the evidence).
+  assert.deepEqual(gateDecision(own, [own, other], { candidateSha: "c1", tree: "tree-a", command: own.command }), {
+    kind: "own",
+    record: own,
+  });
+  // Without a verified own record, another candidate's verified pass for the
+  // same tree is reused — and the candidate's own record is never returned as
+  // the reuse source.
+  assert.deepEqual(gateDecision(undefined, [own], { candidateSha: "c1", tree: "tree-a", command: own.command }), {
+    kind: "run",
+  });
+  assert.deepEqual(gateDecision(undefined, [own, other], { candidateSha: "c3", tree: "tree-a", command: own.command }), {
+    kind: "reuse",
+    record: other,
+  });
+  // An unverifiable or mismatching record is not evidence: the gate reruns.
+  assert.deepEqual(gateDecision(undefined, [], { candidateSha: "c1", tree: "tree-a", command: own.command }), { kind: "run" });
+  assert.deepEqual(gateDecision(undefined, [other], { candidateSha: "c2", tree: "other-tree", command: own.command }), { kind: "run" });
+});
+
 test("gate: gateFailureEvidence quotes the log's tail, the exit status and the log hash", () => {
   const record = recordFixture({ passed: false, exitCode: 3, candidateSha: "candidate-sha-1234" });
   const evidence = gateFailureEvidence({
@@ -228,8 +264,11 @@ test("gate: a passing gate runs exactly once, records the candidate, the exit st
     checks: ["true"],
     workerScript,
     reviewerScriptFor,
-    gate: `echo gate-ran >> ${counter}; echo gate-ok`,
-    gateCleanup: `echo cleanup-ran >> ${counter}`,
+    // The cleanup takes far longer than the gate, so the record must show the
+    // gate's own duration and the cleanup's separately (folding them would be
+    // an honest-looking build time it did not spend).
+    gate: `echo gate-ran >> ${counter}; sleep 0.3; echo gate-ok`,
+    gateCleanup: `echo cleanup-ran >> ${counter}; sleep 1.2`,
     gateLockPath: lock,
     deadlines: FAST_DEADLINES,
   });
@@ -248,6 +287,14 @@ test("gate: a passing gate runs exactly once, records the candidate, the exit st
     assert.equal(record.logSha256, sha256File(logFile));
     assert.equal(record.logBytes, fs.statSync(logFile).size);
     assert.match(fs.readFileSync(logFile, "utf8"), /gate-ok/);
+    assert.match(fs.readFileSync(logFile, "utf8"), /cleanup-ran|\$ /);
+    assert.equal(record.cleanupExitCode, 0);
+    assert.ok(record.cleanupDurationMs !== undefined && record.cleanupDurationMs >= 1200, `cleanup duration: ${record.cleanupDurationMs}`);
+    assert.ok(record.durationMs >= 300, `gate duration: ${record.durationMs}`);
+    assert.ok(
+      record.durationMs < record.cleanupDurationMs!,
+      `the gate's duration must not include the cleanup (gate ${record.durationMs}ms, cleanup ${record.cleanupDurationMs}ms)`,
+    );
 
     // The command ran exactly once, and the cleanup ran after it.
     const runs = fs.readFileSync(counter, "utf8").trim().split("\n");
@@ -343,7 +390,7 @@ test("gate: a failing gate becomes a blocking integration finding with the log t
   }
 });
 
-test("gate: a real reviewer's turn-2 prompt is told about the gate and shown the failed record", async () => {
+test("gate: a real reviewer's turn 1 and turn 2 prompts are told about the gate, turn 2 shown the failed record", async () => {
   const dir = shortTmp("tt-gate-reviewer");
   const reviewerPrompts = path.join(dir, "reviewer-prompts.log");
   const lock = path.join(dir, "gate.lock");
@@ -395,6 +442,13 @@ test("gate: a real reviewer's turn-2 prompt is told about the gate and shown the
     // It is the conductor's record (its own sha256 and log path), not an
     // agent's prose about one.
     assert.match(logged, /log sha256 [a-f0-9]{64}/);
+    // Turn 1 learns the rule too (findings B-8/M-3): a reviewer that only
+    // learns it in turn 2 could demand or accept a substitute first.
+    const turn1Messages = logged.split("\n=====\n").filter((m) => m.includes("Turn 1 of 2"));
+    assert.ok(turn1Messages.length > 0, "expected at least one turn-1 prompt in the log");
+    for (const m of turn1Messages) {
+      assert.match(m, /Never run the gate command yourself/, "every turn-1 prompt must carry the gate rule");
+    }
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -434,7 +488,10 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
         {
           candidateSha: sourceSha,
           tree,
-          baseSha: setup.repo.head,
+          // Deliberately a different base from the candidate's: the reused
+          // record must name the head it is accepted against and the head its
+          // evidence came from (finding B-5).
+          baseSha: "0".repeat(40),
           command,
           startedAt: "2026-09-25T00:00:00.000Z",
           durationMs: 900_000,
@@ -459,10 +516,82 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
     assert.equal(reused.reused, true);
     assert.equal(reused.reusedFrom, sourceSha);
     assert.equal(reused.tree, tree);
+    // The head this candidate is accepted against, and where the evidence
+    // came from, are both recorded.
+    assert.equal(reused.baseSha, setup.repo.head);
+    assert.equal(reused.reusedFromBaseSha, "0".repeat(40));
+    // The evidence's own facts are the source run's, not "now".
+    assert.equal(reused.startedAt, "2026-09-25T00:00:00.000Z");
+    // No merge result is claimed for a head the command never ran at.
+    assert.equal(reused.mergedI, undefined);
     assert.equal(reused.logSha256, sha256File(path.join(runPaths(setup.runDir).checks, C, "gate.log")));
     assert.ok(!fs.existsSync(marker), "the gate command must not run when an identical tree has a passing record");
     const plan = JSON.parse(fs.readFileSync(path.join(runPaths(setup.runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
     assert.match(buildView(setup.runDir, plan, false).gates, /gate ✓ \(reused\)/);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    cleanupDir(setup.repo.dir);
+    cleanupDir(dir);
+  }
+});
+
+test("gate: a passing record whose log no longer hashes to it is not evidence, so the gate reruns", async () => {
+  const dir = shortTmp("tt-gate-unverified");
+  const marker = path.join(dir, "ran.marker");
+  const lock = path.join(dir, "gate.lock");
+  const command = `touch ${marker}; exit 9`;
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript,
+    reviewerScriptFor,
+    gate: command,
+    gateLockPath: lock,
+    deadlines: FAST_DEADLINES,
+  });
+  try {
+    // A record that *claims* a pass for the candidate's tree, with no log
+    // behind it and a hash matching nothing (a pruned or hand-edited run
+    // dir): the conductor must not accept it — the gate runs instead.
+    const tree = execFileSync("git", ["-C", setup.repo.dir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    const sourceSha = "fadedfadedfaded1";
+    const sourceDir = path.join(runPaths(setup.runDir).checks, sourceSha);
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sourceDir, "gate.json"),
+      `${JSON.stringify(
+        {
+          candidateSha: sourceSha,
+          tree,
+          baseSha: "0".repeat(40),
+          command,
+          startedAt: "2026-09-25T00:00:00.000Z",
+          durationMs: 900_000,
+          exitCode: 0,
+          timedOut: false,
+          passed: true,
+          logSha256: "c".repeat(64),
+          logBytes: 10,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    await setup.conductor.start();
+    await waitFor(
+      () => setup.conductor.state.phase.findings.some((f) => f.kind === "integration" && f.status === "open"),
+      90_000,
+      50,
+      setup.runDir,
+    );
+    assert.ok(fs.existsSync(marker), "an unverifiable record must not stop the gate command from running");
+    const finding = setup.conductor.state.phase.findings.find((f) => f.kind === "integration" && f.status === "open")!;
+    const record = gateRecordAt(setup.runDir, finding.boundCandidateSha);
+    assert.equal(record.exitCode, 9);
+    assert.equal(record.passed, false);
+    assert.notEqual(record.reused, true);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

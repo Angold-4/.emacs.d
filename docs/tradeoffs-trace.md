@@ -636,23 +636,43 @@ conductor runs the gate itself, and only the conductor produces its evidence.
   once. A second gate waits for the first; a crashed holder releases the lock
   through the OS.
 - **The record.** The conductor writes `checks/<sha>/gate.json` (candidate and
-  base SHA, the merged tree, the command, the exit status, duration, start
-  time, the log's sha256, and the cleanup's own outcome) and
-  `checks/<sha>/gate.log` (stdout and stderr, redacted). The `ACCEPTED` event
-  a passing gate releases is the only thing that lets acceptance proceed. The
-  cleanup command runs whatever the outcome.
+  base SHA, the merged tree, the command, the exit status, the gate command's
+  own duration, start time, the log's sha256, and the cleanup's own exit and
+  duration) and `checks/<sha>/gate.log` (stdout and stderr, redacted). The
+  `ACCEPTED` event a passing gate releases is the only thing that lets
+  acceptance proceed. The cleanup command runs whatever the outcome, under
+  its own limit, and its time is never folded into the gate's duration — the
+  lock is held for both.
 - **A failure is a blocking `integration` finding** whose evidence is the
   log's last 60 lines. The phase returns to `REPAIRING` (or `AWAITING_OWNER`
   when the budget is exhausted), and the repair prompt shows the worker the
   conductor's record and log tail verbatim.
 - **Reuse, not repeat.** A candidate whose tree already has a passing record
-  for the same command reuses that record: the command does not run again.
-  (A repair attempt that changes nothing freezes a new commit with the same
-  tree.) Only a *passing* record is reused; a failed gate is rerun.
+  for the same command reuses it: the command does not run again. (A repair
+  attempt that changes nothing freezes a new commit with the same tree.) Only
+  a *passing* record is reused, and only after its `gate.log` is re-hashed:
+  a record whose log is missing, truncated or edited is not evidence, and
+  the gate reruns rather than accepting on it. A failed gate is always rerun.
+- **A record is never rewritten.** When the *same* candidate is gated again
+  (a stale publish sends the phase back through `PROBING` with its reviews
+  still valid), its own passing record is accepted in place; the control
+  log's completion record names the head being accepted now next to the head
+  the evidence was produced at. For a reused *other* candidate's record, the
+  new record's `baseSha` is the head being accepted and `reusedFromBaseSha`
+  names the head the command actually ran on.
 - **No agent may produce this evidence.** The worker's prompt and every
-  reviewer's prompt say the conductor runs the gate and that running it,
-  reporting its result, or substituting evidence for it is forbidden.
-  Reviewers are shown the gate record when one exists.
+  reviewer's prompt — turn 1 and turn 2 — say the conductor runs the gate
+  and that running it, reporting its result, or substituting evidence for it
+  is forbidden. Reviewers are shown the gate record when one exists and its
+  log still matches.
+- **The JSON schemas trail the change.** `schemas/**` is outside this phase's
+  boundary, so `event.schema.json` does not list `GATE_REQUIRED`,
+  `GATE_FAILED` or `GATE_INTERRUPTED`, and `plan.schema.json` /
+  `phase-contract.schema.json` do not list `gate`/`gateCleanup` (they already
+  lag the emitted plan's `repo`, `deadlines`, `secrets` and directive
+  fields). Nothing in the conductor validates a produced record against them:
+  the core's `Event` type and `buildContract` are the enforced vocabulary, and
+  the schema tests exercise their own fixtures.
 
 ## 7. Versions and authority
 
