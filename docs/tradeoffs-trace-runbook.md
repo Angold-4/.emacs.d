@@ -18,8 +18,55 @@ implement ─▶ freeze ─▶ checks ─▶ probe ─▶ review (M, A, B) ─�
 
 - **Worker:** implements in its own git worktree, `~/.tradeoffs-trace/<run>/worktree`. It never touches your checkout.
 - **Freeze:** commits the worktree as the candidate.
-- **Checks:** run the plan's check command on a fresh checkout of the candidate.
+- **Checks:** run the plan's check command on a fresh checkout of the candidate. Failures the base already had do not count against it (see *Pre-existing check failures* below).
 - **Probe:** merges the candidate onto the current integration branch and runs the checks again. It reuses the check results when the tree is identical.
+
+## Pre-existing check failures (the base baseline)
+
+A phase's base can already fail the phase's own checks before the worker touches
+anything — a red `cargo test --workspace` with 14 deterministic
+`exchange-state-machine` failures, say. Left alone, every attempt pays for the
+same red output and an acceptance item like "`cargo test --workspace` passes"
+can never be met by any worker.
+
+So **before the run's first attempt** the conductor runs the phase's checks once
+on the base (`integrationHead`), in its own disposable checkout, and records a
+`baseline` in `events.jsonl` and `<run>/checks/base/baseline.json`: per command
+its exit status, duration, and the failing test names it can parse. Names are
+parsed from the three runners plans actually use — cargo
+(`test <name> ... FAILED`), node:test (`not ok N - <name>` under
+`--test-reporter=tap`, and the default spec reporter's `✖ <name>`) and ERT
+(`FAILED <name>`). Output that names no test parses to nothing.
+
+- **D2 default — no new failures:** a candidate's failing check still counts as
+  passing when every failing test it names also failed on the base, and at
+  least one name was parsed. The status says
+  `checks ✓ (base has 1 failures)`. Any test the base did not fail fails the
+  gate, and the new names are recorded with the check's completion and in a
+  `check_failure_new` record.
+- **Strict fallback:** a check whose failing output yields no parsable test name
+  (a compile error, a timeout, an integrity violation) always fails. A baseline
+  can therefore only ever *reduce* the failures blamed on a candidate — a new
+  failure is never hidden.
+- **The integration probe still judges strictly** (it is the last gate before
+  publish). In the normal fast-forward case it reuses the candidate's passed
+  checks instead of running them again, so a pre-existing failure does not
+  block acceptance; if the integration moved and the probe runs, a failing
+  check there fails the probe.
+- **The worker and the reviewers are told.** The worker's prompt and each
+  reviewer's turn-2 prompt list the base's failing tests as "Pre-existing check
+  failures on the phase base (NOT this phase's to fix)", so neither tries to
+  fix them nor raises them as a defect.
+- **It is paid for once per base tree.** The record is keyed by the base tree
+  plus the effective check list; a program node with the same base and the same
+  checks reuses a sibling node's record (under
+  `programs/<id>/baselines/<key>/`) instead of running the checks again, and a
+  run restarted after a crash reuses its own. The base itself is never edited,
+  and the gate still runs on the candidate.
+
+When the base fails, the status shows `base fails: N tests: <names>` — or
+`base fails: 0 tests (no test names parsed; checks stay strict)` when its
+failing output names none.
 - **Review:** three independent reviewers. In turn 1 each finds decisions in the diff. At a barrier they see each other's discoveries. In turn 2 they vote on every decision and raise findings. M holds a veto; otherwise 2 of 3 decide.
 - **Publish:** fast-forwards the plan's integration branch in the **local** repository. Nothing is pushed.
 
@@ -341,7 +388,7 @@ on disk after a stop.
 | one agent `sh` command | 3 min | the command's process group is killed; the agent is told not to rerun it as is |
 | stall watchdog | 3 min + 3 min | a mid-turn agent silent with no command running is nudged once, then its attempt or review ends |
 | freeze | 2 min | |
-| checks | 5 min | counts as failed checks |
+| checks | 5 min | counts as failed checks (each baseline command too) |
 | probe | 10 min | |
 | review (both turns) | 15 min | the reviewer is re-dispatched once, then the phase is BLOCKED |
 | repair rounds | 3 | then AWAITING_OWNER |
@@ -368,6 +415,7 @@ stops for you only when its repair rounds are exhausted.
   <run>/worktree/                   the worker's worktree
   <run>/stream/<agent>.jsonl        each agent's raw Pi event stream (the trace renders it)
   <run>/sessions/                   Pi sessions (repairs continue the worker's session)
+  <run>/checks/base/                the base baseline: baseline.json + per-command logs
   <run>/checks/<sha>/               per-command check logs
   <run>/inbox/{,applied/,rejected/} owner input and commands, with rejection reasons
 ```

@@ -297,7 +297,9 @@ test("probe-reuse: a fast-forward probe reuses the candidate's passed checks", a
   try {
     assert.equal(await runToTerminal(setup), "DONE");
     const runs = fs.readFileSync(counter, "utf8").trim().split("\n").length;
-    assert.equal(runs, 1, "the checks ran once, not again on the identical probed tree");
+    // Plan 01e's base baseline is one execution, the candidate's gate another;
+    // the identical probed tree may not add a third.
+    assert.equal(runs, 2, "the checks ran on the base and the candidate, not again on the identical probed tree");
     assert.ok(readEvents(setup.runDir).some((r) => r.kind === "probe_checks_reused"));
   } finally {
     await teardown(setup, dir);

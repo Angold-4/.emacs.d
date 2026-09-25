@@ -148,8 +148,13 @@ test("R2.global-fails: a failing global check fails the gate, and the effective 
   await setup.conductor.start();
   try {
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 30_000);
-    assert.equal(fs.readFileSync(marker, "utf8"), "xx", "the duplicate command must run exactly once per gate (checks + probe)");
-    assert.equal(fs.readFileSync(phaseMarker, "utf8"), "yy", "the phase-only command must run exactly once per gate");
+    // Plan 01e: the base baseline is a third execution of the effective list
+    // (once on the base, before the first attempt), so each command now runs
+    // once for the baseline, once for the C gate and once for the probe.
+    // Without dedup the duplicate would appear six times; if the phase list
+    // were ignored, the phase-only marker would be absent.
+    assert.equal(fs.readFileSync(marker, "utf8"), "xxx", "the duplicate command must run exactly once per execution (baseline + checks + probe)");
+    assert.equal(fs.readFileSync(phaseMarker, "utf8"), "yyy", "the phase-only command must run exactly once per execution (baseline + checks + probe)");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -162,8 +167,11 @@ test("R2.global-fails: a failing global check fails the gate, and the effective 
 test("R2.probe: a phase check passing on C but failing on the merged I yields PROBE_FAILED and blocks publication", async () => {
   const mark = `/tmp/tt-probe-${randomUUID().slice(0, 8)}`;
   fs.rmSync(mark, { force: true });
-  // Passes on C (marker absent -> touch it), fails on I (marker already there).
-  const command = `test -f ${mark} && exit 1 || touch ${mark}`;
+  // Plan 01e adds an execution before CHECKING: the base baseline runs the
+  // same commands once on the base. So this counts runs: the first two — the
+  // baseline and the C gate — pass, and the third (on the merged I, during
+  // PROBING) fails.
+  const command = `n=$(cat ${mark} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${mark}; test $n -lt 3`;
   const setup = await setupConductor({
     globalChecks: ["true"],
     phaseChecks: [command],
