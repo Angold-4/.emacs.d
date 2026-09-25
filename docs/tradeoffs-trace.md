@@ -165,11 +165,13 @@ One tab per run:
 - **Status** (right): rendered from the control log. `RET` on a phase opens its
   diff; `c` its check output; `d` its decisions; `m` switches mode; `p`
   pauses.
-- **Input** (bottom): the text is sent as a **steer** to the worker currently
-  running, bound to that worker's attempt (§7.4). If no worker is running,
-  the text becomes an **owner note**, shown in status and delivered at the
-  start of the next worker attempt. Reviewers cannot be steered. Their
-  independence is the point of having them.
+- **Input** (bottom): every text is an **owner directive** (plan 01i): a
+  numbered record (`OD-1`, …) steered at once to every live agent of the run
+  (the worker and any reviewer mid-turn, bound to its attempt, §7.4) and quoted
+  verbatim under "Owner directives (binding)" in every later prompt. A
+  directive applies to its phase, or to the whole program with `C-u C-c C-c` or
+  from a program buffer; `withdraw OD-n` withdraws one. See the runbook's
+  "Steer it".
 
 `C-c m s` focuses the run's tab. If the tab or any of its windows has been
 closed, it rebuilds the layout. After an Emacs restart, the same command
@@ -645,6 +647,7 @@ promise (§9.3):
 | --- | --- | --- | --- |
 | steer | message delivered to the running worker through Pi's RPC `steer` | **external delivery** | worker attempt id |
 | note | queued for the next worker attempt | conductor state | phase |
+| directive | every input-box text, recorded as `OD-n`: steered at once to every live agent, quoted in every later prompt, binding until withdrawn (§7.6) | conductor state (plus external delivery) | phase (or the whole program) |
 | resolve | answer an owner request (choose an option or write one) | conductor state | request id and version, candidate, contract |
 | override | approve or reject a delegated decision; recorded **beside** the ballots | conductor state | decision version, candidate, contract |
 | accept-finding | the owner's disposition of a finding (§4.2) | conductor state | finding version, candidate, contract |
@@ -657,6 +660,32 @@ Steering, overriding, revising and amending are deliberately separate. Asking
 "would a queue help here?" is conversation. Rejecting the queue is a decision.
 "This trade-off doesn't make sense; do it this way" is a correction. Changing
 what "cancelled" means is a contract revision. The log keeps them apart.
+
+### 7.6 Owner directives
+
+Every text the owner sends through an input box is an **owner directive**: a
+numbered, logged record (`OD-1`, `OD-2`, …) that is part of its phase until
+withdrawn. It is (1) steered at once to **every live agent of the run** — the
+worker and any reviewer mid-turn — with each delivery recorded; (2) included
+verbatim, newest last, under **Owner directives (binding)** in every later
+prompt: every worker attempt and repair, both reviewer turns, and any
+re-dispatched or fresh agent; and (3) **binding on reviewers as part of the
+contract** — a candidate that violates one is a blocking `contract` finding
+citing the directive id, and a candidate that follows one cannot be faulted for
+doing so, even where the plan's text says otherwise.
+
+At `AWAITING_OWNER` the text still does what §7.5's correction does (resolves
+the open requests and grants 3 rounds) *and* becomes a directive. A
+withdrawal — `withdraw OD-n` in the input box — steers the live agents that it
+no longer applies and drops it from every later prompt; an unknown id is refused
+with the reason.
+
+A directive applies to its own phase. Sent from a program buffer, or with
+`C-u` in a run's input box, it applies **program-wide**: every running node is
+steered now, every node started later is started with it, and the program's own
+event log carries it (so it survives a restart). The input header states the
+scope before sending; the status view shows each directive with its scope,
+whether it is in force, and its delivery state per agent.
 
 ### 7.5 Correcting a decision mid-run: revise
 

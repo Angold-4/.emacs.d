@@ -323,6 +323,89 @@
       (should (string-match-p "too late — refused: the phase is DONE (note)" text))
       (should (string-match-p "waiting — not picked up (note)" text)))))
 
+(defconst +tt-test--directive-state
+  '((meta (title . "sum validation"))
+    (conductorAlive . t)
+    (ownerInputs)
+    (pendingOwnerInputs)
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "REVIEWING")
+                  (attempt (n . 2)) (repairRoundsUsed . 0) (repairRoundsGranted . 3)
+                  (ownerRequests)
+                  (ownerDirectives
+                   ((id . "OD-1") (seq . 1)
+                    (text . "the 14 exchange-state-machine failures are pre-existing, not yours")
+                    (scope . "phase") (status . "in-force")
+                    (targets "worker" "M" "A" "B")
+                    ;; A has not acknowledged yet, so it renders ⧗ (the plan's
+                    ;; own example): the delivery state is never inferred.
+                    (deliveries (worker . "delivered") (M . "delivered")
+                                (B . "delivered")))
+                   ((id . "OD-2") (seq . 2)
+                    (text . "no node may touch the vendor adapters after this ruling")
+                    (scope . "program") (status . "withdrawn")
+                    (targets) (deliveries))))))
+  "A fixture `tt state' with one directive in force and one withdrawn.")
+
+(ert-deftest tradeoffs-trace-owner-directives-section ()
+  "Plan 01i: the status shows each directive, its scope, whether it is in
+force, and the delivery state per live agent."
+  (with-temp-buffer
+    (+tt--render-owner-inputs +tt-test--directive-state)
+    (let ((text (buffer-string)))
+      (should (string-match-p "Owner directives (2)" text))
+      (should (string-match-p
+               (regexp-quote
+                "OD-1 [this phase, in force] the 14 exchange-state-machine failures are pre-existing, not yours — worker ✓ M ✓ A ⧗ B ✓")
+               text))
+      (should (string-match-p
+               (regexp-quote
+                "OD-2 [whole program, withdrawn] no node may touch the vendor adapters after this ruling — (no live agent; carried in every later prompt)")
+               text)))))
+
+(ert-deftest tradeoffs-trace-input-header-scope ()
+  "Plan 01i (D5): the input header states the directive's scope, for a run's
+box and for a program buffer's box."
+  (should (string-match-p "owner directive applying to this phase"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t))))
+  (should (string-match-p "C-u C-c C-c: whole program"
+                          (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
+  (should (string-match-p "program-wide owner directive for the whole program"
+                          (+tt--input-header nil t))))
+
+(ert-deftest tradeoffs-trace-input-program-wide ()
+  "Plan 01i (D5): C-u C-c C-c sends the run's text as a program-wide
+directive; without the prefix it applies to this phase."
+  (let ((written nil))
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t)))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
+      (with-temp-buffer
+        (insert "fix the Stork link")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'scope written) "phase"))
+        (insert "fix the Stork link")
+        (+tt-input-send '(4))
+        (should (equal (alist-get 'scope written) "program"))))))
+
+(ert-deftest tradeoffs-trace-program-input-writes-a-program-directive ()
+  "Plan 01i: the program buffer's input box writes a program-wide directive
+to the program's own inbox."
+  (let ((written nil)
+        (dir (make-temp-file "tt-ert-prog" t)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function '+tt--write-command)
+                     (lambda (d cmd) (setq written (cons d cmd)) "id-2")))
+            (with-temp-buffer
+              (insert "no node may touch the vendor adapters")
+              (setq +tt--input-program-dir dir)
+              (+tt-input-send)
+              (should (equal (car written) dir))
+              (should (equal (alist-get 'type (cdr written)) "directive"))
+              (should (equal (alist-get 'scope (cdr written)) "program")))))
+      (delete-directory dir t))))
+
 (ert-deftest tradeoffs-trace-program-parse ()
   "Phase 4: a program file lists plan files with their dependencies."
   (let* ((dir (make-temp-file "tt-ert-prog" t))

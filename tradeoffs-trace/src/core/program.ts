@@ -41,6 +41,22 @@ export interface ProgramNode {
   deps: string[];
 }
 
+/** Plan 01i (D5): a program-wide owner directive. It is a logged program
+ * event, rebuilt by folding, delivered to every running node through its
+ * inbox and included in the plan of every node started later. */
+export interface ProgramDirective {
+  id: string; // "OD-<n>" in the program's own numbering
+  text: string;
+  at: string;
+  withdrawn?: boolean;
+  /** The node run that issued it (`C-u` in a run's input box), if any; the
+   * scheduler does not send it back to that node (it already applies it). */
+  origin?: string;
+  /** The issuing node's inbox command id, when a node forwarded it: the same
+   * file may be re-written after a crash, and the key makes that a no-op. */
+  key?: string;
+}
+
 /** What the scheduler knows about a node. `needs-you` and `stopped` are not
  * terminal: the owner can correct or resume the run, and it may still reach
  * DONE. Only `done` releases dependents; only `blocked` is final. */
@@ -49,6 +65,9 @@ export type NodeStatus = "waiting" | "running" | "needs-you" | "stopped" | "done
 export interface ProgramState {
   nodes: Record<string, { status: NodeStatus; runId?: string; branch?: string; base?: string; reason?: string; resumes?: number }>;
   stopped: boolean;
+  /** Plan 01i: program-wide owner directives in force, in the order the owner
+   * sent them. Rebuilt by folding the program's own event log. */
+  directives?: ProgramDirective[];
 }
 
 export type ProgramEvent =
@@ -57,6 +76,8 @@ export type ProgramEvent =
   | { type: "NODE_RESUMED"; node: string; reason: "crashed" | "owner" }
   | { type: "PROGRAM_RESUMED" }
   | { type: "NODE_STATUS"; node: string; status: Exclude<NodeStatus, "waiting"> }
+  | { type: "DIRECTIVE_ADDED"; directive: ProgramDirective }
+  | { type: "DIRECTIVE_WITHDRAWN"; directiveId: string }
   | { type: "PROGRAM_STOPPED" };
 
 /** Expands entries into phase nodes and validates the graph: unique ids,
@@ -111,7 +132,21 @@ function assertAcyclic(nodes: ProgramNode[]): void {
 }
 
 export function initialProgramState(nodes: ProgramNode[]): ProgramState {
-  return { nodes: Object.fromEntries(nodes.map((n) => [n.id, { status: "waiting" as NodeStatus }])), stopped: false };
+  return { nodes: Object.fromEntries(nodes.map((n) => [n.id, { status: "waiting" as NodeStatus }])), stopped: false, directives: [] };
+}
+
+/** Plan 01i: the program-wide directives still in force, in order. */
+export function programDirectivesInForce(state: ProgramState): ProgramDirective[] {
+  return (state.directives ?? []).filter((d) => !d.withdrawn);
+}
+
+/** Plan 01i: the program's next free directive id (`OD-<n>`). */
+export function nextProgramDirectiveId(state: ProgramState): string {
+  const max = (state.directives ?? []).reduce((m, d) => {
+    const n = Number(d.id.match(/^OD-(\d+)$/)?.[1] ?? 0);
+    return Math.max(m, n);
+  }, 0);
+  return `OD-${max + 1}`;
 }
 
 export function reduceProgram(state: ProgramState, event: ProgramEvent): ProgramState {
@@ -136,6 +171,18 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
       const prev = state.nodes[event.node];
       if (!prev) return state;
       return { ...state, nodes: { ...state.nodes, [event.node]: { ...prev, status: "running", resumes: (prev.resumes ?? 0) + 1 } } };
+    }
+    case "DIRECTIVE_ADDED": {
+      // Plan 01i: record-only, keyed by id — a replay must not duplicate it.
+      const existing = state.directives ?? [];
+      if (existing.some((d) => d.id === event.directive.id)) return state;
+      return { ...state, directives: [...existing, event.directive] };
+    }
+    case "DIRECTIVE_WITHDRAWN": {
+      return {
+        ...state,
+        directives: (state.directives ?? []).map((d) => (d.id === event.directiveId ? { ...d, withdrawn: true } : d)),
+      };
     }
   }
 }
@@ -187,8 +234,10 @@ export function nodeBases(program: ProgramFile, nodes: ProgramNode[], node: Prog
 }
 
 /** The plan a node's run receives: the entry's plan narrowed to its phase,
- * publishing to the node's branch. */
-export function nodePlan(program: ProgramFile, node: ProgramNode): RunPlanFile {
+ * publishing to the node's branch. Plan 01i: the in-force program-wide
+ * directives are seeded into it, so a node started after the owner ruled
+ * still carries the ruling in every prompt. */
+export function nodePlan(program: ProgramFile, node: ProgramNode, directives: ProgramDirective[] = []): RunPlanFile {
   const entry = program.entries.find((e) => e.id === node.entry)!;
   const phase = entry.plan.phases[node.phaseIndex];
   return {
@@ -196,5 +245,8 @@ export function nodePlan(program: ProgramFile, node: ProgramNode): RunPlanFile {
     title: `${entry.plan.title} [${node.id}]`,
     integrationBranch: nodeBranch(program, node),
     phases: [phase],
+    ...(directives.length > 0
+      ? { ownerDirectives: directives.map((d) => ({ id: d.id, text: d.text, at: d.at })) }
+      : {}),
   };
 }

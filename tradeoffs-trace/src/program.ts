@@ -22,11 +22,14 @@ import {
   nodeBases,
   nodeBranch,
   initialProgramState,
+  nextProgramDirectiveId,
   nextStarts,
   nodePlan,
+  programDirectivesInForce,
   programOutcome,
   reduceProgram,
   type NodeStatus,
+  type ProgramDirective,
   type ProgramEvent,
   type ProgramFile,
   type ProgramNode,
@@ -44,6 +47,10 @@ export function programPaths(dir: string) {
     events: path.join(dir, "events.jsonl"),
     pid: path.join(dir, "scheduler.pid"),
     log: path.join(dir, "scheduler.log"),
+    /** Plan 01i: the program's own owner-input inbox (a `C-u` directive from
+     * a node run is forwarded here; the Emacs program buffer writes here). */
+    inbox: path.join(dir, "inbox"),
+    inboxApplied: path.join(dir, "inbox", "applied"),
   };
 }
 
@@ -52,6 +59,8 @@ export function createProgram(root: string, program: ProgramFile, id = randomUUI
   expandProgram(program);
   const dir = path.join(programsRoot(root), id);
   fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(programPaths(dir).inbox, { recursive: true });
+  fs.mkdirSync(programPaths(dir).inboxApplied, { recursive: true });
   fs.writeFileSync(programPaths(dir).program, JSON.stringify(program, null, 2));
   fs.writeFileSync(programPaths(dir).events, "");
   return dir;
@@ -79,6 +88,159 @@ export function foldProgram(dir: string): { program: ProgramFile; nodes: Program
 
 export function appendProgramEvent(dir: string, event: ProgramEvent): void {
   fs.appendFileSync(programPaths(dir).events, `${JSON.stringify({ ts: new Date().toISOString(), event })}\n`);
+}
+
+// -- plan 01i: program-wide owner directives (D5) --------------------------
+
+/** Plan 01i: reads the program's own inbox and records each directive (or
+ * withdrawal) as a program event, then moves the file to applied/. A node's
+ * `C-u` directive is forwarded here by its conductor; the Emacs program
+ * buffer writes here directly. */
+export function scanProgramInbox(dir: string): void {
+  const p = programPaths(dir);
+  fs.mkdirSync(p.inbox, { recursive: true });
+  fs.mkdirSync(p.inboxApplied, { recursive: true });
+  let names: string[];
+  try {
+    names = fs.readdirSync(p.inbox);
+  } catch {
+    return;
+  }
+  for (const name of names.sort()) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(p.inbox, name);
+    let raw: unknown;
+    try {
+      raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      // A file still being written, or malformed: leave it for the next scan.
+      continue;
+    }
+    const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+    const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
+    const text = typeof r.text === "string" ? r.text : "";
+    const { state } = foldProgram(dir);
+    // A node that forwarded the same command twice (a crash between the
+    // forward and its own file move) must not create a second directive.
+    const key = typeof r.key === "string" ? r.key : undefined;
+    if (key && (state.directives ?? []).some((d) => d.key === key)) {
+      // already recorded
+    } else if (kind === "withdraw") {
+      const id = typeof r.directiveId === "string" ? r.directiveId : undefined;
+      if (id) appendProgramEvent(dir, { type: "DIRECTIVE_WITHDRAWN", directiveId: id });
+    } else if (text.trim().length > 0) {
+      const directive: ProgramDirective = {
+        id: nextProgramDirectiveId(state),
+        text: text.trim(),
+        at: new Date().toISOString(),
+        ...(typeof r.origin === "string" ? { origin: r.origin } : {}),
+        ...(key ? { key } : {}),
+      };
+      appendProgramEvent(dir, { type: "DIRECTIVE_ADDED", directive });
+    }
+    try {
+      fs.renameSync(file, path.join(p.inboxApplied, name));
+    } catch {
+      // already moved
+    }
+  }
+}
+
+/** Plan 01i: the directive ids a node run was started with (its plan
+ * snapshot's `ownerDirectives`), so the scheduler does not push the same
+ * directive into a run that already carries it. */
+function seededDirectiveIds(runDir: string): Set<string> {
+  try {
+    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as {
+      ownerDirectives?: Array<{ id?: string }>;
+    };
+    return new Set((plan.ownerDirectives ?? []).map((d) => d.id ?? "").filter((id) => id.length > 0));
+  } catch {
+    return new Set();
+  }
+}
+
+function writeNodeInbox(runDir: string, name: string, command: unknown): void {
+  const inbox = runPaths(runDir).inbox;
+  try {
+    fs.mkdirSync(inbox, { recursive: true });
+  } catch {
+    return;
+  }
+  const file = path.join(inbox, name);
+  const tmp = `${file}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(command));
+    fs.renameSync(tmp, file);
+  } catch {
+    // best effort: the node may be gone; the next tick retries.
+  }
+}
+
+/** Plan 01i: pushes every in-force program-wide directive into each active
+ * node's inbox (deterministic file name, so a re-push is applied at most
+ * once by the node's own command-id dedup), and the withdrawal notice for
+ * each withdrawn one. Future nodes get the directives through `nodePlan`. */
+export function deliverProgramDirectives(runRoot: string, state: ProgramState): void {
+  const inForce = programDirectivesInForce(state);
+  const withdrawn = (state.directives ?? []).filter((d) => d.withdrawn);
+  if (inForce.length === 0 && withdrawn.length === 0) return;
+  for (const [, s] of Object.entries(state.nodes)) {
+    if (!s.runId) continue;
+    if (!["running", "needs-you", "stopped"].includes(s.status)) continue;
+    const runDir = path.join(runRoot, s.runId);
+    const seeded = seededDirectiveIds(runDir);
+    for (const d of inForce) {
+      if (seeded.has(d.id) || d.origin === s.runId) continue;
+      // `programId` lets the node keep the program's own numbering when it can
+      // (so a later `withdraw OD-n` names the same directive on both sides),
+      // falling back to its next free id when that number is taken locally.
+      writeNodeInbox(runDir, `cmd-prog-${d.id}.json`, {
+        type: "directive",
+        text: d.text,
+        scope: "program",
+        pushed: true,
+        programId: d.id,
+      });
+    }
+    for (const d of withdrawn) {
+      if (d.origin === s.runId) continue;
+      const applied = path.join(runPaths(runDir).inboxApplied, `cmd-prog-${d.id}.json`);
+      if (!seeded.has(d.id) && !fs.existsSync(applied)) continue;
+      writeNodeInbox(runDir, `cmd-prog-withdraw-${d.id}.json`, {
+        type: "withdraw-directive",
+        directiveId: d.id,
+        text: `withdraw ${d.id}`,
+      });
+    }
+  }
+}
+
+/** Plan 01i: record one program-wide directive (a `C-u` input or the program
+ * buffer), deliver it to every running node now and seed every later node. */
+export function addProgramDirective(root: string, dir: string, text: string, origin?: string): ProgramDirective {
+  const { state } = foldProgram(dir);
+  const directive: ProgramDirective = {
+    id: nextProgramDirectiveId(state),
+    text,
+    at: new Date().toISOString(),
+    ...(origin ? { origin } : {}),
+  };
+  appendProgramEvent(dir, { type: "DIRECTIVE_ADDED", directive });
+  deliverProgramDirectives(root, foldProgram(dir).state);
+  return directive;
+}
+
+/** Plan 01i: withdraw one program-wide directive: every running node's inbox
+ * is told it no longer applies, and every node started later is started
+ * without it. */
+export function withdrawProgramDirective(root: string, dir: string, directiveId: string): boolean {
+  const { state } = foldProgram(dir);
+  const directive = (state.directives ?? []).find((d) => d.id === directiveId);
+  if (!directive || directive.withdrawn) return false;
+  appendProgramEvent(dir, { type: "DIRECTIVE_WITHDRAWN", directiveId });
+  deliverProgramDirectives(root, foldProgram(dir).state);
+  return true;
 }
 
 function pidAlive(file: string): boolean {
@@ -129,7 +291,12 @@ export interface SchedulerOptions {
 /** One scheduler step: observe active nodes, start ready ones. Returns the
  * program outcome after the step. */
 export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutcome {
+  // Plan 01i: owner directives the program buffer (or a node's `C-u` input)
+  // left in the program's inbox become logged program events first, so they
+  // are part of the program state this tick observes and delivers.
+  scanProgramInbox(dir);
   let { program, nodes, state } = foldProgram(dir);
+  deliverProgramDirectives(opts.runRoot, state);
   const record = (event: ProgramEvent) => {
     appendProgramEvent(dir, event);
     state = reduceProgram(state, event);
@@ -154,7 +321,7 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
     const node = nodes.find((n) => n.id === id)!;
-    const plan = nodePlan(program, node);
+    const plan = nodePlan(program, node, programDirectivesInForce(state));
     const prepared = prepareBranch(plan.repo, plan.integrationBranch, nodeBases(program, nodes, node), id);
     if (!prepared.ok) {
       record({ type: "NODE_BLOCKED", node: id, reason: prepared.reason });
@@ -277,6 +444,13 @@ export function programStatusLines(dir: string): string[] {
     lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${s.status.padEnd(9)} ${s.runId ?? ""}${deps}`);
     if (s.branch) lines.push(`    branch ${s.branch}  (PR base: ${s.base ?? "?"})`);
     if (s.reason) lines.push(`    ${s.reason}`);
+  }
+  const directives = state.directives ?? [];
+  if (directives.length > 0) {
+    lines.push("", "Owner directives (whole program):");
+    for (const d of directives) {
+      lines.push(`  - ${d.id}${d.withdrawn ? " [withdrawn]" : " [in force]"}: ${d.text}`);
+    }
   }
   return lines;
 }

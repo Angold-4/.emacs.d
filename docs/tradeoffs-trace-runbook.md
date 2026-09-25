@@ -120,15 +120,16 @@ and runs independent phases in parallel.
 
 | Where | What |
 |---|---|
-| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. `RET` opens a node's run workspace (status, trace, decisions, input box), `k` stops the program, `R` resumes it. |
-| CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program stop <id>`, `tt program resume <id>` |
+| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive), `k` stops the program, `R` resumes it. It also lists the program's owner directives in force. |
+| CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program directive <id> <text>`, `tt program withdraw <id> <OD-n>`, `tt program stop <id>`, `tt program resume <id>` |
 
 **Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
 
 **Rules the scheduler follows:**
 - A node starts only when all its dependencies are **DONE**. A node that needs you, or whose run was stopped, keeps its slot and holds back its dependents until it finishes. Correct it or resume it as for any run.
 - A **blocked** node never finishes. Its dependents wait, independent branches of the graph continue, and the program ends `stuck` when nothing else can run.
-- The scheduler's state is folded from `~/.tradeoffs-trace/programs/<id>/events.jsonl`. `tt program resume` continues after a restart and never recreates an existing node branch.
+- The scheduler's state is folded from `~/.tradeoffs-trace/programs/<id>/events.jsonl` — including the program's owner directives, so a program-wide ruling survives a restart. `tt program resume` continues after a restart and never recreates an existing node branch.
+- A program-wide directive (`i` in the program buffer, `C-u C-c C-c` in a run's input box, or `tt program directive`) is steered to every running node at once and seeded into the plan of every node started later, so it binds the whole program (see "Steer it").
 
 **Time limits per plan.** A repository whose builds and suites take longer than
 the defaults sets its own limits: `#+TT_SH_MINUTES` (one agent command),
@@ -266,18 +267,47 @@ past run cannot display one either.
 ## Steer it
 
 The input box (bottom window) is the **only** way to intervene. Its header line
-says what sending does right now.
+says what sending does right now, **including the scope** (this phase, or the
+whole program).
+
+**Every text you send is an owner directive** — a numbered record (`OD-1`,
+`OD-2`, …) that is part of its phase until you withdraw it:
+
+1. **delivered at once** to every live agent of the run — the worker and any
+   reviewer mid-turn — as a Pi steer, with each delivery recorded;
+2. **quoted verbatim, newest last, under "Owner directives (binding)" in every
+   later prompt**: every worker attempt and repair, both reviewer turns, and any
+   re-dispatched or fresh agent;
+3. **binding on reviewers as part of the contract**: a candidate that violates a
+   directive is a blocking contract finding that cites the directive id, and a
+   candidate that follows one cannot be faulted for doing so, even where the
+   plan's text says otherwise.
 
 | Phase | Sending your text |
 |---|---|
-| IMPLEMENTING / FREEZING | **steer**: delivered to the running worker immediately (at most once) |
-| CHECKING / PROBING / REVIEWING | **note**: delivered at the start of the next worker attempt |
-| AWAITING_OWNER ("needs you") | **correction**: resolves the open requests, grants 3 repair rounds, repairs with your text verbatim |
+| IMPLEMENTING / FREEZING | **steer**: delivered to the running worker immediately (at most once), and recorded as an owner directive |
+| CHECKING / PROBING / REVIEWING | steers every live agent now (the reviewers, mid-turn) as an owner directive; the note is also delivered at the start of the next worker attempt |
+| AWAITING_OWNER ("needs you") | **correction**: resolves the open requests, grants 3 repair rounds, repairs with your text verbatim — and is an owner directive in every later prompt |
 | DONE / BLOCKED | refused, with the reason |
+
+**Scope.** A directive applies to its own phase by default. It applies to the
+**whole program** — every running node is steered now, and every node started
+later is started with it in its prompts — when it is sent with `C-u C-c C-c`
+from a run's input box, or from a program buffer's input box (`i` in the
+program buffer). The header line states the scope before you send.
+
+**Withdraw one.** Type `withdraw OD-n` (for example `withdraw OD-1`) into the
+input box. Every live agent is steered that it no longer applies, and every
+later prompt omits it. A `withdraw` naming an id that does not exist — or one
+that is already withdrawn — is refused with the reason, and nothing changes.
 
 The status buffer's **Owner input** section shows each text's recorded effect:
 delivered, noted, correction started, refused, delivery uncertain, or not
-picked up after 30 s.
+picked up after 30 s. Under **Owner directives** it shows each directive with
+its scope, whether it is in force or withdrawn, and its delivery state per
+agent (`worker ✓ M ✓ A ⧗ B ✓` — `⧗` is not acknowledged yet, `?` could not be
+sent). `tt summary <run>` lists the directives in force in the PR body, and
+`tt program status <id>` lists the program's own.
 
 `RET` sends in Evil normal state; `C-c C-c` sends from any state.
 
