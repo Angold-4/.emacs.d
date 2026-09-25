@@ -423,15 +423,20 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   // `⚑ AMENDED id: old → new`, so the reworded contract is visible in the
   // status, the decision view and `tt summary` alike.
   const amendments = phase.decisions.filter((d) => d.amendment);
+  // The arrow always names what the contract moved FROM → TO: an applied
+  // amendment replaced the old criterion, a reverted one restored it, so the
+  // rendering never claims replacement wording is in force after a revert
+  // (finding A-14).
   const amendmentLine =
     amendments.length === 0
       ? undefined
       : amendments
-          .map((d) =>
-            d.amendment!.status === "applied"
-              ? `⚑ AMENDED ${d.amendment!.id}: ${d.amendment!.criterion} → ${d.amendment!.proposedWording}`
-              : `⚑ ${d.amendment!.status.toUpperCase()} ${d.amendment!.id}: ${d.amendment!.criterion} → ${d.amendment!.proposedWording}`,
-          )
+          .map((d) => {
+            const a = d.amendment!;
+            const arrow = a.status === "reverted" ? `${a.proposedWording} → ${a.criterion}` : `${a.criterion} → ${a.proposedWording}`;
+            const label = a.status === "applied" ? "AMENDED" : a.status.toUpperCase();
+            return `⚑ ${label} ${a.id}: ${arrow}`;
+          })
           .join("; ");
   const amendedCount = amendments.filter((d) => d.amendment!.status === "applied").length;
 
@@ -617,8 +622,11 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     lines.push("", "### Amended acceptance criteria", "");
     for (const d of amendments) {
       const a = d.amendment!;
+      // A reverted amendment's arrow points back to the restored wording, so
+      // the PR body never reads as if the replacement were in force (A-14).
+      const arrow = a.status === "reverted" ? `${a.proposedWording} → ${a.criterion}` : `${a.criterion} → ${a.proposedWording}`;
       lines.push(
-        `- ${a.status === "applied" ? "**⚑ AMENDED**" : `**${a.status.toUpperCase()}**`} **${a.id}** (raised by ${a.raisedBy}): ${a.criterion} → ${a.proposedWording}`,
+        `- ${a.status === "applied" ? "**⚑ AMENDED**" : `**${a.status.toUpperCase()}**`} **${a.id}** (raised by ${a.raisedBy}): ${arrow}`,
       );
     }
   }

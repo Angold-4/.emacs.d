@@ -1243,14 +1243,24 @@ export class Conductor {
     // passing tally rewrites the accepted item (next()'s `apply_amendment`);
     // a failing one leaves it unchanged and never blocks acceptance.
     const dispute = this.#state.phase.pendingDispute;
-    // Dedup by criterion: an amendment for the same wording is already live
-    // (a carried worker dispute, or a reviewer's). Two identical amendment
-    // records would only create a second, moot vote (finding A-1).
+    // Dedup only an IDENTICAL proposal: a different wording for the same
+    // criterion is a genuinely different choice, and a second dispute with
+    // the same wording is logged rather than silently dropped (A-13).
     const alreadyProposed =
       dispute !== undefined &&
       this.#state.phase.decisions.some(
-        (d) => d.amendment?.status === "proposed" && d.amendment.criterion === dispute.criterion,
+        (d) =>
+          d.amendment?.status === "proposed" &&
+          d.amendment.criterion === dispute.criterion &&
+          d.amendment.proposedWording === dispute.proposedWording,
       );
+    if (dispute && alreadyProposed) {
+      this.#log.append("dispute_ignored", {
+        raisedBy: "worker",
+        criterion: dispute.criterion,
+        reason: "an identical amendment for this criterion is already proposed",
+      });
+    }
     if (dispute && !alreadyProposed) {
       const short = candidateSha.slice(0, 8);
       decisions.push({
@@ -1429,16 +1439,18 @@ export class Conductor {
     this.#moveInboxFile(file, this.#paths.inboxRejected);
   }
 
-  /** Plan 2d: the three input-box kinds (design §7.4), detected by shape in
-   * either the flat `kind` form or the decision view's `type` form. */
-  /** Plan 01g: the applied amendment whose id the owner's correction names,
-   * or undefined. The id is matched as a whole token (`AM-p1-abcd1234`), so
-   * prose around it is fine but a near-miss is not a revert. */
+  /** Plan 01g: the applied amendment an explicit `revert AM-p1-…` command
+   * names, or undefined. Only the command form counts: text that merely
+   * mentions the id must stay a steer/note so it still reaches an agent
+   * (finding B-16), and a near-miss id is not a revert. Trailing prose after
+   * the id is allowed, exactly like `withdraw OD-n`. */
   #revertAmendmentForText(text: string): { decisionId: string; amendmentId: string } | undefined {
+    const match = text.trim().match(/^revert\s+(\S+)/i);
+    if (!match) return undefined;
+    const id = match[1];
     for (const d of this.#state.phase.decisions) {
       if (!d.amendment || d.amendment.status !== "applied") continue;
-      const escaped = d.amendment.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      if (new RegExp(`\\b${escaped}\\b`).test(text)) return { decisionId: d.id, amendmentId: d.amendment.id };
+      if (d.amendment.id === id) return { decisionId: d.id, amendmentId: d.amendment.id };
     }
     return undefined;
   }
@@ -1482,6 +1494,8 @@ export class Conductor {
     this.#moveInboxFile(file, this.#paths.inboxApplied);
   }
 
+  /** Plan 2d: the three input-box kinds (design §7.4), detected by shape in
+   * either the flat `kind` form or the decision view's `type` form. */
   #ownerInputKindOf(raw: unknown): OwnerInputKind | undefined {
     if (!raw || typeof raw !== "object") return undefined;
     const r = raw as Record<string, unknown>;
@@ -2002,18 +2016,6 @@ export class Conductor {
         this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
         return;
       }
-      // Plan 01g: a CORRECTION naming an applied amendment id restores that
-      // criterion's original wording. Only a correction may do this — a note
-      // that merely mentions the id stays advisory and must not silently
-      // rewrite the contract (findings A-2/B-23/B-4/M-8). It never waits for
-      // the phase to be parked on the owner.
-      if (inputKind === "correction") {
-        const revert = this.#revertAmendmentForText(inputText);
-        if (revert) {
-          this.#applyRevertAmendment(file, commandId, inputText, revert.decisionId, revert.amendmentId);
-          return;
-        }
-      }
       // A program-wide input (D5) in a run the scheduler started: the
       // program mints the one `ODP-n` record, so this run only forwards the
       // text — it must not mint a local id that could not match the
@@ -2022,6 +2024,18 @@ export class Conductor {
       // (never a `program`-scoped record in a run that has no program).
       const programWide = scope === "program" && this.#programDir() !== undefined;
       const effectiveScope: DirectiveScope = programWide ? "program" : "phase";
+      // Plan 01g: an explicit CORRECTION command `revert AM-p1-…` restores an
+      // applied amendment's original wording. It is deliberately not any text
+      // that happens to mention the id (a steer or note quoting it must reach
+      // its agents, findings B-16/A-2/B-4/M-8), and it never applies to a
+      // program-wide input, which is forwarded as D5 requires (finding A-15).
+      if (inputKind === "correction" && !programWide) {
+        const revert = this.#revertAmendmentForText(inputText);
+        if (revert) {
+          this.#applyRevertAmendment(file, commandId, inputText, revert.decisionId, revert.amendmentId);
+          return;
+        }
+      }
       if (inputKind === "steer") {
         if (programWide) {
           this.#processProgramWideInput(file, commandId, "steer", inputText);
@@ -2858,13 +2872,22 @@ export class Conductor {
         previousContractVersion: K,
       },
     };
-    // Dedup by criterion: a live amendment for the same wording already
-    // exists, so a second record would only create a moot vote (A-1).
-    if (this.#state.phase.decisions.some((d) => d.amendment?.status === "proposed" && d.amendment.criterion === dispute.criterion)) {
+    // Dedup only an IDENTICAL proposal: a different wording for the same
+    // criterion is a genuinely different choice, and the conductor's own
+    // amendment applies/supersedes siblings. A duplicate is logged rather
+    // than silently dropped (A-1, A-13).
+    if (
+      this.#state.phase.decisions.some(
+        (d) =>
+          d.amendment?.status === "proposed" &&
+          d.amendment.criterion === dispute.criterion &&
+          d.amendment.proposedWording === dispute.proposedWording,
+      )
+    ) {
       this.#log.append("dispute_ignored", {
         reviewer: raisedBy,
         criterion: dispute.criterion,
-        reason: "an amendment for this criterion is already proposed",
+        reason: "an identical amendment for this criterion is already proposed",
       });
       return;
     }

@@ -1046,7 +1046,7 @@ program-wide by construction (S is nil then)."
         (format "Sending steers worker attempt %s now (at most once; C-c C-c or RET), and becomes an owner directive %s."
                 attempt (+tt--input-scope-note nil (not in-program))))
        (t
-        (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s). If the text names an applied amendment id, it is sent as a correction that reverts it."
+        (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s). A text that is exactly `revert <amendment-id> is sent as a correction that reverts that amendment."
                 (+tt--input-scope-note nil (not in-program)) (or name "?")))))))
 
 (defun +tt-input-send (&optional program-wide)
@@ -1098,20 +1098,20 @@ never told a ruling was retracted when it was not."
         (message "tradeoffs-trace: program-wide directive %s recorded; every running node is steered at once" id)))))
 
 (defun +tt--revert-amendment-id (s text)
-  "The applied amendment id TEXT names as a word, or nil.
-Plan 01g: a correction naming an applied amendment restores its criterion's
-original wording, so the input box must send such text as a correction even
-when the phase is not AWAITING_OWNER."
-  (let* ((phase (and s (+tt--get s 'state 'phase)))
-         (decisions (and phase (alist-get 'decisions phase))))
-    (seq-some (lambda (d)
-                (let ((a (alist-get 'amendment d)))
-                  (when (and a (equal (alist-get 'status a) "applied"))
-                    (let ((id (alist-get 'id a)))
-                      (when (and (stringp id)
-                                 (string-match-p (concat "\\b" (regexp-quote id) "\\b") text))
-                        id)))))
-              decisions)))
+  "The applied amendment id an explicit `revert AM-…' command names, or nil.
+Plan 01g: only the command form counts — text that merely mentions the id
+must stay a steer/note so it still reaches an agent (B-16) — and the input
+box sends it as a correction even when the phase is not AWAITING_OWNER."
+  (when (string-match "\\`[ \t]*revert[ \t]+\\([^ \t]+\\)" text)
+    (let* ((id (match-string 1 text))
+           (phase (and s (+tt--get s 'state 'phase)))
+           (decisions (and phase (alist-get 'decisions phase))))
+      (seq-some (lambda (d)
+                  (let ((a (alist-get 'amendment d)))
+                    (when (and a (equal (alist-get 'status a) "applied")
+                               (equal (alist-get 'id a) id))
+                      id)))
+                decisions))))
 
 (defun +tt--send-run-input (run-dir text program-wide)
   "Queue TEXT as the owner input RUN-DIR's phase calls for.
@@ -1228,11 +1228,16 @@ outcome."
                  (_ "pending vote"))))))
 
 (defun +tt--amendment-line (decision)
-  "The `old → new' line for DECISION's amendment record, or nil."
-  (let ((a (alist-get 'amendment decision)))
+  "The `old → new' line for DECISION's amendment record, or nil.
+Plan 01g: a reverted amendment restored the original wording, so its arrow
+points back and the view never claims the replacement is in force (A-14)."
+  (let* ((a (alist-get 'amendment decision))
+         (criterion (or (alist-get 'criterion a) ""))
+         (proposed (or (alist-get 'proposedWording a) "")))
     (when a
-      (format "  %s → %s\n" (or (alist-get 'criterion a) "")
-              (or (alist-get 'proposedWording a) "")))))
+      (if (equal (alist-get 'status a) "reverted")
+          (format "  %s → %s\n" proposed criterion)
+        (format "  %s → %s\n" criterion proposed)))))
 
 (defun +tt--decision-label (status d phase)
   "Heading label for decision D with tally STATUS in PHASE."

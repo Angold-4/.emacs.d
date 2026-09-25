@@ -697,8 +697,11 @@ wording → the new one, read from the tally status the conductor emits."
   "Plan 01g: text naming an applied amendment id is sent as a correction, and
 a near-miss is not."
   (should (equal (+tt--revert-amendment-id +tt-test--amendment-input-state "revert AM-p1-C1") "AM-p1-C1"))
+  ;; Only the command form counts: a mention in a steer/note must not revert.
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "AM-p1-C1 still looks wrong"))
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "please revert AM-p1-C1 later"))
   ;; A longer id that merely begins with the same text is not a revert.
-  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "AM-p1-C10 still looks wrong"))
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "revert AM-p1-C10"))
   (let ((written nil))
     (cl-letf (((symbol-function '+tt--state) (lambda (_) +tt-test--amendment-input-state))
               ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
@@ -706,7 +709,28 @@ a near-miss is not."
         (insert "revert AM-p1-C1 because the owner disagrees")
         (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
         (+tt-input-send)
-        (should (equal (alist-get 'type written) "correction"))))))
+        (should (equal (alist-get 'type written) "correction")))))
+  ;; A mention inside a steer reaches the worker as its natural kind.
+  (let ((written nil))
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) +tt-test--amendment-input-state))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-2")))
+      (with-temp-buffer
+        (insert "AM-p1-C1 still looks wrong, also fix the retry loop")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'type written) "note"))))))
+
+(ert-deftest tradeoffs-trace-amendment-reverted-render ()
+  "Plan 01g: a reverted amendment's line points back to the restored wording,
+so the view never claims the replacement is still in force (A-14)."
+  (let* ((a '((id . "AM-p1-C1") (criterion . "it works")
+              (proposedWording . "the tests pass") (status . "reverted")))
+         (d `((amendment . ,a))))
+    (should (equal (+tt--amendment-line d) "  the tests pass → it works\n")))
+  (let* ((a '((id . "AM-p1-C1") (criterion . "it works")
+              (proposedWording . "the tests pass") (status . "applied")))
+         (d `((amendment . ,a))))
+    (should (equal (+tt--amendment-line d) "  it works → the tests pass\n"))))
 
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

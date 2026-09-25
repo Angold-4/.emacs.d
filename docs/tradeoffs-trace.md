@@ -748,10 +748,13 @@ names **one acceptance item of the phase contract verbatim**. The conductor
 turns it into an **amendment record**: a `reserved` decision (flagged for the
 owner, §3.4) that the reviewers vote on like any other reserved decision. A
 worker's dispute is part of the candidate's own disclosure set, so it is
-balloted in that candidate's turn 2; a reviewer's dispute arrives *during*
+balloted in that candidate's turn 2. A reviewer's dispute arrives *during*
 turn 2, after that round's demanded-ballot set was snapshotted, so it is
-carried to the next dispatch and balloted there. It is not a finding and does
-not open a contract finding of its own.
+carried to the phase's next dispatch and balloted there; if nothing else
+blocks, the candidate may be accepted first, in which case the amendment
+stays recorded as `proposed` (visible in the decision view and `tt summary`)
+and never blocks the run. It is not a finding and does not open a contract
+finding of its own.
 
 Under D1's default, an amendment that passes the normal tally (M, plus one of
 A/B) replaces the criterion's wording in the phase contract **for this phase
