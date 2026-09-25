@@ -185,13 +185,20 @@ A plan declares the credentials it needs **by name** and nothing else:
   searched must not be handed to every agent. A UTF-16 document that quotes
   nothing *is* copied: its bytes were searched. A plan that declares no secrets
   copies its references exactly as before.
+- **A declared secret that could not be resolved withholds the references.** Any
+  document may quote any declared value, so with one name unset (or set too short
+  to mask) no copy can be verified: each document is left out and named in
+  `refs/MISSING.txt` with the reason, and the status says which name was unset.
+  Export every key the plan declares and the documents come back, masked.
 - A declared secret whose value is **shorter than 4 characters** is not used
   for masking or for refusing commands (masking `1` would rewrite every id and
   timestamp in the log); it is reported by name and the run still runs. Give a
   secret a real value, or it is only an environment variable.
 - A declared secret that is unset at start is reported by name (`secret FAKE_KEY
   not set` in `tt status` and the status buffer) and **the run still starts** — a
-  missing credential fails whatever check needs it, not the run.
+  missing credential fails whatever check needs it, not the run. Its reference
+  documents are withheld as above, since a value nobody can supply cannot be
+  masked.
 - Text that merely *quotes* a value (a finding's evidence, a ballot's rationale)
   is masked, not refused, so the evidence stays readable; a **command** carrying
   a value (the `sh` tool, or a finding's reproduction command) is refused with a

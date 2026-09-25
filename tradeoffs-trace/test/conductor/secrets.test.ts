@@ -234,6 +234,46 @@ test("secrets: a reference document that quotes a key is copied into refs/ redac
   }
 });
 
+test("secrets: a declared but unset secret withholds the reference documents instead of copying them raw", () => {
+  const repo = makeRepo();
+  const root = makeRunRoot();
+  const docs = fs.mkdtempSync("/tmp/tt-secret-refs-unset-");
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  const previous = process.env.FAKE_KEY;
+  delete process.env.FAKE_KEY; // the plan declares it; this shell does not export it
+  try {
+    const src = path.join(docs, "01_ref_vendor.md");
+    fs.writeFileSync(src, `# vendor\nPYTH_ACCESS_TOKEN='${value}' is the key\n`);
+    const plan: RunPlanFile = {
+      title: "refs",
+      repo: repo.dir,
+      integrationBranch: "main",
+      checks: ["true"],
+      secrets: ["FAKE_KEY"],
+      references: [src],
+      phases: [{ id: "p1", goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [] }],
+    };
+    const runDir = createRun(root, plan);
+    // Nothing under the run directory may hold the value: with the declared
+    // value unknown there is nothing to mask, so the document is not copied at
+    // all and is named, with the reason, in MISSING.txt (finding M-13).
+    assert.ok(!runReferences(runDir).some((r) => r.endsWith("01_ref_vendor.md")), "no raw copy is written");
+    const note = fs.readFileSync(path.join(runDir, "refs", "MISSING.txt"), "utf8");
+    assert.match(note, /01_ref_vendor\.md \(not copied: FAKE_KEY could not be masked/);
+    for (const file of filesUnder(runDir)) {
+      assert.ok(!fs.readFileSync(file).includes(value), `${path.relative(runDir, file)} holds the value`);
+    }
+    // A plan that declares nothing keeps its references exactly as before.
+    const plain = createRun(root, { ...plan, secrets: undefined, title: "plain" });
+    assert.ok(runReferences(plain).some((r) => r.endsWith("01_ref_vendor.md")), "no declaration, no withholding");
+  } finally {
+    if (previous !== undefined) process.env.FAKE_KEY = previous;
+    cleanupDir(root);
+    cleanupDir(repo.dir);
+    fs.rmSync(docs, { recursive: true, force: true });
+  }
+});
+
 test("secrets: a value the worker discloses reaches neither the conductor's state nor the next prompt", async () => {
   const value = `tt-${randomBytes(12).toString("hex")}`;
   process.env.FAKE_KEY = value;

@@ -382,7 +382,15 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   // all, because a leak that cannot be searched is worse than a missing
   // reference. It is named in refs/MISSING.txt either way, so the agent's
   // prompt says the copy is not there rather than silently lacking it.
-  const { maskable } = resolveSecrets(secretNames(plan.secrets));
+  //
+  // And a copy is only safe when EVERY declared value is known: any document
+  // may quote any of them, so with one declared secret unset (or set too short
+  // to mask) nothing can be verified and no document is copied — the plan that
+  // declares a credential and does not export it gets its names in the status
+  // and no unredactable vendor docs in every agent's reach (finding M-13).
+  const declared = secretNames(plan.secrets);
+  const { maskable } = resolveSecrets(declared);
+  const unmaskable = declared.filter((name) => !maskable.some((s) => s.name === name));
   const refs = plan.references ?? [];
   if (refs.length > 0) {
     fs.mkdirSync(p.refs, { recursive: true });
@@ -391,6 +399,10 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
     refs.forEach((src, i) => {
       if (!fs.existsSync(src)) {
         missing.push(src);
+        return;
+      }
+      if (unmaskable.length > 0) {
+        missing.push(`${src} (not copied: ${unmaskable.join(", ")} could not be masked — the plan declares it, so a copy cannot be verified)`);
         return;
       }
       let name = path.basename(src);
