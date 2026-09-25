@@ -980,7 +980,7 @@ function applyCriterionReverted(s: State, ev: Event): State {
   });
 }
 
-for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
+for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "PUBLISHING", "AWAITING_OWNER"] as PhaseStateName[]) {
   addRow({
     id: `criterion-reverted-from-${from.toLowerCase()}`,
     axis: "phase",

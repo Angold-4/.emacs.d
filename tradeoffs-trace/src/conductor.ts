@@ -3449,6 +3449,9 @@ export class Conductor {
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
+      // Plan 01g: an amendment is never a "change this decision" repair item
+      // — the worker cannot edit it and it never blocks acceptance (B-10).
+      if (d.amendment) continue;
       const st = decisionStatus(d, phase);
       if (st.status !== "failed" && st.status !== "suspended" && st.status !== "owner") continue;
       const rejections = phase.ballots
@@ -3463,8 +3466,11 @@ export class Conductor {
       failedDecisions,
       advisory: open.filter((f) => f.severity === "advisory").map(findingLine),
       corrections: phase.corrections.filter((c) => c.status === "open").map((c) => c.correctionText),
+      // Plan 01g: amendment records are phase-level, not the worker's to
+      // keep/change/withdraw; exclude them so the worker never sees a record
+      // whose stated change would be ignored (B-10).
       priorDecisions: phase.decisions
-        .filter((d) => d.source === "worker" && isLiveDecision(d))
+        .filter((d) => d.source === "worker" && isLiveDecision(d) && !d.amendment)
         .map((d) => ({ id: d.id, choice: d.choice })),
     };
   }
@@ -5002,6 +5008,18 @@ export class Conductor {
     const result = publishCAS(this.#plan.repo, this.#integrationBranch, candidateI, expectedHead);
     crashAt("after_publish_cas");
     this.#log.completion(actionId, result);
+    // Plan 01g: if the phase left PUBLISHING while the CAS ran (an owner
+    // correction reverted an amendment, or any other command moved it), the
+    // completion has no row to land on; applying it would be rejected and
+    // throw. Record it and stop — the log is still the truth of what the
+    // CAS did.
+    if (this.#state.phase.phase !== "PUBLISHING") {
+      this.#log.append("publish_completion_ignored", {
+        reason: `the phase moved to ${this.#state.phase.phase} while the publish CAS ran`,
+        result,
+      });
+      return;
+    }
     if (result.ok) {
       this.#applyEvent({ type: "PUBLISH_COMPLETED", newHead: candidateI });
     } else {

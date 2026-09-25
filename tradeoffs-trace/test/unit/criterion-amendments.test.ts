@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { next } from "../../src/core/next.ts";
 import { reduce } from "../../src/core/reduce.ts";
+import { openItemOwnerRequestsFor } from "../../src/core/owner-requests.ts";
 import { amendmentToApply, decisionStatus, isLiveDecision } from "../../src/core/predicate.ts";
 import type { Ballot, ContractVersion, Decision, Event, Finding, State } from "../../src/core/types.ts";
 import { baseState, CV } from "./helpers.ts";
@@ -205,6 +206,44 @@ test("criterion-amendments: the owner's correction naming the amendment id resto
     newContractVersion: K3,
   });
   assert.equal(again.ok, false);
+});
+
+test("criterion-amendments: an amendment never becomes an owner request (A-11)", () => {
+  const state = resolvingState({ ballots: [ballot("M", "reject"), ballot("A", "reject")] });
+  const requests = openItemOwnerRequestsFor(state.phase, "the repair budget ran out");
+  assert.equal(
+    requests.some((r) => r.linkedDecisionId === "D-p1-C1-amendment"),
+    false,
+    "a proposed/passed amendment must not raise a failed_vote request",
+  );
+});
+
+test("criterion-amendments: a revert from PUBLISHING invalidates the evidence and returns to CHECKING (B-9)", () => {
+  const applied = amendmentDecision({
+    boundContractVersion: K,
+    amendment: { ...amendmentDecision().amendment!, status: "applied", appliedContractVersion: K },
+  });
+  const state = baseState({
+    ...resolvingState().phase,
+    phase: "PUBLISHING",
+    contract: { ...baseState().phase.contract, acceptance: [NEW_WORDING] },
+    candidate: { sha: "C1", contractVersion: K },
+    decisions: [applied],
+    ballots: [ballot("M", "approve")],
+    inFlight: { publish_cas: { actionId: "a1" } },
+  });
+  const reverted = step(state, {
+    type: "CRITERION_REVERTED",
+    amendmentId: "AM-p1-C1",
+    newAcceptance: ["the original wording"],
+    newContractVersion: K3,
+  });
+  assert.equal(reverted.phase.phase, "CHECKING");
+  assert.equal(reverted.phase.checks, undefined);
+  assert.equal(reverted.phase.probe, undefined);
+  assert.deepEqual(reverted.phase.reviews, {});
+  assert.deepEqual(reverted.phase.ballots, []);
+  assert.deepEqual(reverted.phase.inFlight, {});
 });
 
 test("criterion-amendments: a contract finding that merely mentions the criterion is not superseded (B-5)", () => {

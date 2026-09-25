@@ -915,8 +915,11 @@ export interface EvCriterionAmended {
 }
 
 /** Plan 01g: the owner's correction naming an amendment id restores the
- * criterion's original wording. Record-only: it moves no phase state, so it
- * works from any non-terminal state and never waits for the owner. */
+ * criterion's original wording. A phase that already has a candidate takes
+ * the AMEND-like transition to CHECKING and clears the evidence bound to the
+ * replaced contract version; a phase with no candidate yet (IMPLEMENTING,
+ * FREEZING, REPAIRING) is updated record-only. Either way the run never
+ * waits for the owner and the input is recorded as state `reverted`. */
 export interface EvCriterionReverted {
   type: "CRITERION_REVERTED";
   amendmentId: string;

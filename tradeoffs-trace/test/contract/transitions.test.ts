@@ -369,7 +369,7 @@ for (const from of AMEND_FROM) {
 // criterion-reverted-from-* (plan 01g): the owner's correction naming an
 // applied amendment restores the original wording, invalidates the evidence
 // bound to the replaced version and returns to CHECKING.
-const REVERT_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"];
+const REVERT_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "PUBLISHING", "AWAITING_OWNER"];
 for (const from of REVERT_FROM) {
   BUILD[`criterion-reverted-from-${from.toLowerCase()}`] = {
     state: baseState({

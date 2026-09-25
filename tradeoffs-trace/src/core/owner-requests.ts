@@ -117,6 +117,12 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
     const voted = reviewsComplete(phase, C, K);
     for (const d of phase.decisions) {
       if (!voted) break;
+      // Plan 01g: an amendment is never settled by a ballot tally the way a
+      // delegated decision is — accept() ignores it and it is applied by
+      // next()'s apply_amendment. Asking the owner to settle one would raise
+      // a bogus "failed its vote" request for a proposed/passed/reverted
+      // amendment (finding A-11).
+      if (d.amendment) continue;
       if (!isLiveDecision(d) || (d.class !== "delegated" && d.class !== "reserved")) continue;
       if (decisionSettled(d, phase, C, K)) continue;
       if (hasOpenRequestLinkedTo(phase, (r) => r.linkedDecisionId === d.id)) continue;
