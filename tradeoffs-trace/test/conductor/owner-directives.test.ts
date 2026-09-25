@@ -379,16 +379,27 @@ test("owner-directives: a directive survives a restart, and a correction at AWAI
   }
 });
 
-test("owner-directives: withdraw steers the live agents that it no longer applies, later prompts omit it, and an unknown id is refused", async () => {
+/** Waits for a `command_rejected` record whose reason matches RE. */
+async function waitForRejection(runDir: string, re: RegExp): Promise<{ reason: string }> {
+  await waitFor(
+    () => readEvents(runDir).some((r) => r.kind === "command_rejected" && re.test((r.event as { reason?: string }).reason ?? "")),
+    30_000,
+  );
+  return readEvents(runDir).find((r) => r.kind === "command_rejected" && re.test((r.event as { reason?: string }).reason ?? ""))!
+    .event as { reason: string };
+}
+
+test("owner-directives: withdraw retracts exactly the named directive; a malformed or unknown one is refused, never inverted", async () => {
   const dir = shortTmp("tt-dir-withdraw");
   const steerLog = path.join(dir, "worker-steers.log");
   const promptLog = path.join(dir, "worker-prompts.log");
   const text = "fix the Stork live link in this phase; owner-directed exception";
+  const second = "treat the Stork 501ms as inside the contract";
   const setup = await setupConductor({
     checks: ["false"],
     workerScriptForAttempt: (attempt) => ({
       hello: defaultWorkerHello(),
-      steps: attempt === 1 ? [{ kind: "sleep", ms: 6_000 }, submitPhaseStep()] : [submitPhaseStep()],
+      steps: attempt === 1 ? [{ kind: "sleep", ms: 8_000 }, submitPhaseStep()] : [submitPhaseStep()],
     }),
     reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
@@ -405,32 +416,47 @@ test("owner-directives: withdraw steers the live agents that it no longer applie
 
     // An unknown id is refused with the reason, recorded for the status.
     writeCommand(setup.runDir, "cmd-bad", inputCommand(setup, "steer", "withdraw OD-99"));
-    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "command_rejected"), 20_000);
-    const rejected = readEvents(setup.runDir).find((r) => r.kind === "command_rejected")!.event as { reason: string };
-    assert.match(rejected.reason, /no owner directive OD-99/);
-    const refused = (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-bad");
-    assert.equal(refused?.state, "refused");
+    const unknown = await waitForRejection(setup.runDir, /no owner directive OD-99/);
+    assert.equal(
+      (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-bad")?.state,
+      "refused",
+      `the refusal is recorded (${unknown.reason})`,
+    );
     assert.equal(directives(setup).length, 1, "a refused withdraw adds no directive");
 
-    // Withdraw OD-1 while the worker is still live: it is steered that it no
-    // longer applies.
+    // A withdrawal that names no id is refused too: it must never be recorded
+    // as a *new* binding directive that leaves the intended one in force.
+    writeCommand(setup.runDir, "cmd-mal", inputCommand(setup, "steer", "withdraw nonsense"));
+    await waitForRejection(setup.runDir, /must name a directive id/);
+    assert.equal(directives(setup).length, 1, "a malformed withdraw adds no directive");
+
+    // A second ruling, retracted with the owner's natural phrasing.
+    writeCommand(setup.runDir, "cmd-d2", inputCommand(setup, "steer", second));
+    await waitFor(() => directives(setup).some((d) => d.commandId === "cmd-d2"), 20_000);
+    writeCommand(setup.runDir, "cmd-w2", inputCommand(setup, "steer", "withdraw OD-2 because it is stale"));
+    await waitFor(() => directives(setup).find((d) => d.id === "OD-2")?.status === "withdrawn", 20_000);
+    assert.equal(directives(setup).length, 2, "trailing prose retracts OD-2 instead of adding OD-3");
+    assert.equal(directives(setup).find((d) => d.id === "OD-1")?.status, "in-force", "OD-1 is untouched");
+
+    // Withdraw OD-1 too, while the worker is still live: it is steered that it
+    // no longer applies.
     writeCommand(setup.runDir, "cmd-w1", inputCommand(setup, "steer", "withdraw OD-1"));
     await waitFor(
       () => fs.existsSync(steerLog) && fs.readFileSync(steerLog, "utf8").includes("OD-1 is withdrawn; it no longer applies."),
       20_000,
     );
-    const withdrawn = directives(setup)[0];
+    const withdrawn = directives(setup).find((d) => d.id === "OD-1")!;
     assert.equal(withdrawn.status, "withdrawn", "the withdrawal is recorded before anything else is promised");
     assert.ok(withdrawn.withdrawnAt, "the withdrawal time is recorded");
-    // Everything the phase sends from here on must omit it. (The attempt-1
+    // Everything the phase sends from here on must omit them. (The attempt-1
     // prompt may have been built before the owner ruled at all — that one
-    // legitimately quotes it.)
+    // legitimately quotes them.)
     const sizeAtWithdraw = fs.existsSync(promptLog) ? fs.statSync(promptLog).size : 0;
 
     await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("REPAIR"), 90_000);
     const later = fs.readFileSync(promptLog, "utf8").slice(sizeAtWithdraw);
     assert.match(later, /REPAIR/, "a later attempt's prompt is in the sampled window");
-    assert.ok(!later.includes("Owner directives (binding)"), "a withdrawn directive is omitted from later prompts");
+    assert.ok(!later.includes("Owner directives (binding)"), "withdrawn directives are omitted from later prompts");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -443,37 +469,51 @@ test("owner-directives: withdraw steers the live agents that it no longer applie
 // Plan 01i (D5): program-wide directives
 // ---------------------------------------------------------------------------
 
-test("owner-directives: a program-wide directive reaches a running node (steered) and the node started afterwards", async () => {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+interface ProgramHarness {
+  runRoot: string;
+  scriptsDir: string;
+  programDir: string;
+  tick: () => void;
+  tickUntil: (check: () => boolean, ms: number, label: string) => Promise<void>;
+  node: (id: string) => { status: string; runId?: string };
+  waitForWorker: (runId: string) => Promise<void>;
+  stateOf: (runId: string) => State;
+  promptsOf: (runId: string) => string;
+  steersOf: (runId: string) => string;
+  programDirectives: () => Array<{ id: string; text: string; withdrawn?: boolean; origin?: string }>;
+  nodeInbox: (runId: string) => string;
+  cleanup: () => Promise<void>;
+}
+
+/** One program, its node runs launched as detached conductors (exactly what
+ * the scheduler does), and the helpers to tick it and read its state. */
+function startProgramHarness(opts: {
+  entries: Array<{ id: string; after: string[] }>;
+  maxParallel?: number;
+  workerSleepMs?: number;
+  checks?: string[];
+}): ProgramHarness {
   const repo = makeRepo();
   const runRoot = shortTmp("tt-dir-prog-root");
   const scriptsDir = shortTmp("tt-dir-prog-scripts");
-  const text = "PROGRAM-WIDE: no node may touch the vendor adapters after this ruling";
-  const cuText = "C-U-WIDE: every node stops polling the vendor API";
-  const phase = { id: "p1", goal: "add one file", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] };
-  const plan = (title: string): RunPlanFile => ({
-    title,
-    repo: repo.dir,
-    integrationBranch: "main",
-    checks: ["true"],
-    phases: [phase],
-  });
+  const checks = opts.checks ?? ["true"];
+  const phase = { id: "p1", goal: "add one file", acceptance: ["it works"], checks, boundaries: [], reserved: [] };
+  const plan = (title: string): RunPlanFile => ({ title, repo: repo.dir, integrationBranch: "main", checks, phases: [phase] });
   const program: ProgramFile = {
     title: "owner-directive-program",
-    maxParallel: 1,
-    entries: [
-      { id: "n1", after: [], plan: plan("n1") },
-      { id: "n2", after: ["n1"], plan: plan("n2") },
-    ],
+    maxParallel: opts.maxParallel ?? 1,
+    entries: opts.entries.map((e) => ({ ...e, plan: plan(e.id) })),
   };
-  // One script directory, one file per role, shared by every node's agents.
   fs.writeFileSync(
     path.join(scriptsDir, "worker.json"),
     JSON.stringify({
       hello: { role: "worker", tools: ROLE_TOOLS.worker },
-      // Long enough for the owner's directive to reach the first node while
-      // it is still running; every node then submits and finishes.
+      // Long enough for the owner's rulings to reach the node while it is
+      // still running; every node then submits.
       steps: [
-        { kind: "sleep", ms: 15_000 },
+        { kind: "sleep", ms: opts.workerSleepMs ?? 15_000 },
         { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
       ],
     }),
@@ -521,108 +561,218 @@ test("owner-directives: a program-wide directive reaches a running node (steered
     });
     child.unref();
   };
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  /** Ticks the scheduler (which is what observes nodes, starts them and
-   * delivers program-wide directives) until `check` holds. */
+  const tick = (): void => {
+    schedulerTick(programDir, { runRoot, launch });
+  };
   const tickUntil = async (check: () => boolean, ms: number, label: string): Promise<void> => {
     const start = Date.now();
     while (!check()) {
       if (Date.now() - start > ms) throw new Error(`tickUntil: timed out after ${ms}ms (${label})`);
-      schedulerTick(programDir, { runRoot, launch });
+      tick();
       await sleep(250);
     }
   };
   const node = (id: string) => foldProgram(programDir).state.nodes[id];
+  const runDirOf = (runId: string) => path.join(runRoot, runId);
+  return {
+    runRoot,
+    scriptsDir,
+    programDir,
+    tick,
+    tickUntil,
+    node,
+    waitForWorker: async (runId: string) => {
+      const stream = path.join(runDirOf(runId), "stream");
+      await tickUntil(
+        () => fs.existsSync(stream) && fs.readdirSync(stream).some((f) => f.startsWith("worker-")),
+        30_000,
+        `${runId}'s worker is up`,
+      );
+    },
+    stateOf: (runId: string) => stateJson(runDirOf(runId), runRoot),
+    promptsOf: (runId: string) => {
+      const f = path.join(scriptsDir, `${runId}.prompts.log`);
+      return fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "";
+    },
+    steersOf: (runId: string) => {
+      const f = path.join(scriptsDir, `${runId}.steers.log`);
+      return fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "";
+    },
+    programDirectives: () => foldProgram(programDir).state.directives ?? [],
+    nodeInbox: (runId: string) => runPaths(runDirOf(runId)).inbox,
+    cleanup: async () => {
+      // Every node is a detached conductor; stop them hard before removing
+      // the run root, or a still-writing process makes the cleanup fail first
+      // and hides the test's real error.
+      try {
+        execFileSync("pkill", ["-9", "-f", runRoot]);
+      } catch {
+        // nothing running
+      }
+      try {
+        execFileSync(process.execPath, [CLI_PATH, "program", "stop", programDir, "--root", runRoot], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch {
+        // already finished, or a node refused to stop; pkill above is enough
+      }
+      await sleep(300);
+      try {
+        cleanupDir(runRoot);
+      } catch {
+        // best effort
+      }
+      cleanupDir(scriptsDir);
+      cleanupDir(repo.dir);
+    },
+  };
+}
 
+function writeNodeInput(h: ProgramHarness, runId: string, id: string, command: unknown): void {
+  fs.writeFileSync(path.join(h.nodeInbox(runId), `${id}.json`), JSON.stringify(command));
+}
+
+test("owner-directives: a program-wide directive reaches a running node (steered) and the node started afterwards", async () => {
+  const text = "PROGRAM-WIDE: no node may touch the vendor adapters after this ruling";
+  const cuText = "C-U-WIDE: every node stops polling the vendor API";
+  const h = startProgramHarness({ entries: [{ id: "n1", after: [] }, { id: "n2", after: ["n1"] }] });
   try {
-    await tickUntil(() => node("n1").status === "running", 60_000, "n1 running");
-    const n1 = node("n1").runId!;
-    const n1SteerLog = path.join(scriptsDir, `${n1}.steers.log`);
-    const n1Stream = path.join(runRoot, n1, "stream");
-    await tickUntil(
-      () => fs.existsSync(n1Stream) && fs.readdirSync(n1Stream).some((f) => f.startsWith("worker-")),
-      30_000,
-      "n1's worker is up",
-    );
+    await h.tickUntil(() => h.node("n1").status === "running", 60_000, "n1 running");
+    const n1 = h.node("n1").runId!;
+    await h.waitForWorker(n1);
 
     // The owner rules program-wide: the directive is left in the program's
-    // own inbox (what the Emacs program buffer writes; a run's `C-u` input
-    // forwards here too), and the next scheduler tick delivers it.
-    const inbox = path.join(programDir, "inbox");
-    fs.mkdirSync(inbox, { recursive: true });
-    fs.writeFileSync(path.join(inbox, "cmd-prog-1.json"), JSON.stringify({ type: "directive", text, scope: "program" }));
-
-    await tickUntil(
-      () => fs.existsSync(n1SteerLog) && fs.readFileSync(n1SteerLog, "utf8").includes(text),
-      60_000,
-      "the running node's worker was steered",
-    );
-    const n1Directive = stateJson(path.join(runRoot, n1), runRoot).phase.ownerDirectives?.find((d) => d.text === text);
+    // own inbox (what the Emacs program buffer writes), and the next
+    // scheduler tick delivers it.
+    fs.writeFileSync(path.join(h.programDir, "inbox", "cmd-prog-1.json"), JSON.stringify({ type: "directive", text, scope: "program" }));
+    await h.tickUntil(() => h.steersOf(n1).includes(text), 60_000, "the running node's worker was steered");
+    const n1Directive = h.stateOf(n1).phase.ownerDirectives?.find((d) => d.text === text);
     assert.ok(n1Directive, "the running node recorded the program-wide directive");
     assert.equal(n1Directive!.scope, "program");
     assert.equal(n1Directive!.deliveries.worker, "delivered", "the running node's worker was steered");
 
     // A `C-u` input in a *run's* own box: the node applies it and forwards it
     // to the program (D5), so the whole program carries it too.
-    const n1Phase = stateJson(path.join(runRoot, n1), runRoot).phase;
-    fs.writeFileSync(
-      path.join(runPaths(path.join(runRoot, n1)).inbox, "cmd-cu-1.json"),
-      JSON.stringify({
-        type: "steer",
-        text: cuText,
-        scope: "program",
-        binding: { runId: n1Phase.runId, phaseId: n1Phase.phaseId },
-      }),
-    );
-    await tickUntil(
-      () => foldProgram(programDir).state.directives?.some((d) => d.text === cuText) ?? false,
-      60_000,
-      "the run's C-u input was forwarded to the program",
-    );
+    const n1Phase = h.stateOf(n1).phase;
+    writeNodeInput(h, n1, "cmd-cu-1", {
+      type: "steer",
+      text: cuText,
+      scope: "program",
+      binding: { runId: n1Phase.runId, phaseId: n1Phase.phaseId },
+    });
+    await h.tickUntil(() => h.programDirectives().some((d) => d.text === cuText), 60_000, "the run's C-u input was forwarded to the program");
 
-    // Node 1 finishes; node 2 starts WITH the directive (its plan carries it),
-    // so its very first prompt quotes it.
-    await tickUntil(() => node("n2").runId !== undefined, 120_000, "n2 started");
-    const n2 = node("n2").runId!;
-    const n2PromptLog = path.join(scriptsDir, `${n2}.prompts.log`);
-    await tickUntil(
-      () => fs.existsSync(n2PromptLog) && fs.readFileSync(n2PromptLog, "utf8").includes(`: ${text}`),
-      90_000,
-      "n2's first prompt quotes the directive",
-    );
-    const seeded = stateJson(path.join(runRoot, n2), runRoot).phase.ownerDirectives?.find((d) => d.text === text);
+    // Node 1 finishes; node 2 starts WITH the directives (its plan carries
+    // them), so its very first prompt quotes them.
+    await h.tickUntil(() => h.node("n2").runId !== undefined, 120_000, "n2 started");
+    const n2 = h.node("n2").runId!;
+    await h.tickUntil(() => h.promptsOf(n2).includes(text), 90_000, "n2's first prompt quotes the directive");
+    const seeded = h.stateOf(n2).phase.ownerDirectives?.find((d) => d.text === text);
     assert.ok(seeded, "the node started later carries the directive");
     assert.equal(seeded!.seeded, true, "…seeded from its plan, not pushed to its inbox");
+    assert.equal(seeded!.id, "ODP-1", "a program-wide ruling keeps the program's ODP-n id");
 
     const programState = JSON.parse(
-      execFileSync(process.execPath, [CLI_PATH, "program", "state", programDir, "--root", runRoot], { encoding: "utf8" }),
+      execFileSync(process.execPath, [CLI_PATH, "program", "state", h.programDir, "--root", h.runRoot], { encoding: "utf8" }),
     ) as { state: { directives?: Array<{ id: string; text: string }> }; lines: string[] };
     assert.equal(programState.state.directives?.[0].text, text, "the program records the directive as a logged event");
     assert.ok(programState.lines.some((l) => l.includes(text)), "program status lists it");
   } finally {
-    // Every node is a detached conductor; stop them hard before removing the
-    // run root, or a still-writing process makes the cleanup fail first and
-    // hides the test's real error.
-    try {
-      execFileSync("pkill", ["-9", "-f", runRoot]);
-    } catch {
-      // nothing running
-    }
-    try {
-      execFileSync(process.execPath, [CLI_PATH, "program", "stop", programDir, "--root", runRoot], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-    } catch {
-      // already finished, or a node refused to stop; pkill above is enough
-    }
-    await sleep(300);
-    try {
-      cleanupDir(runRoot);
-    } catch {
-      // best effort
-    }
-    cleanupDir(scriptsDir);
-    cleanupDir(repo.dir);
+    await h.cleanup();
+  }
+});
+
+test("owner-directives: a program ruling keeps its ODP-n beside a node's own OD-n, and withdrawing it program-wide retires it on the node that issued it", async () => {
+  const localText = "LOCAL-RULING: this phase keeps its own exception about the lock";
+  const progText = "PROGRAM-RULING: no node may touch the vendor adapters";
+  // Checks fail so a repair attempt follows, whose prompt must have dropped
+  // the withdrawn program ruling but kept the phase's own.
+  const h = startProgramHarness({ entries: [{ id: "n1", after: [] }], workerSleepMs: 14_000, checks: ["false"] });
+  try {
+    await h.tickUntil(() => h.node("n1").status === "running", 60_000, "n1 running");
+    const n1 = h.node("n1").runId!;
+    await h.waitForWorker(n1);
+    const phase = h.stateOf(n1).phase;
+    const binding = { runId: phase.runId, phaseId: phase.phaseId };
+
+    // The phase's own ruling first, so the program ruling has to coexist with
+    // a local OD-1 (the collision that used to force a renumber).
+    writeNodeInput(h, n1, "cmd-local", { type: "note", text: localText, binding });
+    await waitFor(() => h.stateOf(n1).phase.ownerDirectives?.some((d) => d.text === localText) ?? false, 60_000);
+    // Then a `C-u` program ruling issued FROM this node (origin = n1).
+    writeNodeInput(h, n1, "cmd-cu", { type: "steer", text: progText, scope: "program", binding });
+    await h.tickUntil(() => h.programDirectives().some((d) => d.text === progText), 60_000, "the program recorded the C-u ruling");
+
+    const beforeWithdraw = h.stateOf(n1).phase.ownerDirectives ?? [];
+    assert.equal(beforeWithdraw.find((d) => d.text === localText)?.id, "OD-1", "the phase's own ruling is OD-1");
+    assert.equal(beforeWithdraw.find((d) => d.text === progText)?.id, "ODP-1", "the program ruling keeps ODP-1, never renumbered");
+    assert.equal(beforeWithdraw.find((d) => d.text === progText)?.scope, "program");
+
+    // The program retracts it. The node that ISSUED it is still told (the
+    // scheduler used to skip the origin), so its own copy is withdrawn too,
+    // while its unrelated local OD-1 stays in force.
+    const out = execFileSync(process.execPath, [CLI_PATH, "program", "withdraw", h.programDir, "ODP-1", "--root", h.runRoot], {
+      encoding: "utf8",
+    });
+    assert.match(out, /withdrew ODP-1/);
+    await waitFor(() => h.stateOf(n1).phase.ownerDirectives?.find((d) => d.text === progText)?.status === "withdrawn", 60_000);
+    const after = h.stateOf(n1).phase.ownerDirectives ?? [];
+    assert.equal(after.find((d) => d.text === localText)?.status, "in-force", "the unrelated local OD-1 is untouched");
+    assert.equal(h.programDirectives().find((d) => d.text === progText)?.withdrawn, true, "the program record is withdrawn");
+
+    // A later prompt quotes OD-1 and no longer quotes ODP-1.
+    const atWithdraw = h.promptsOf(n1).length;
+    await h.tickUntil(() => h.promptsOf(n1).slice(atWithdraw).includes("REPAIR"), 90_000, "a repair attempt followed");
+    const later = h.promptsOf(n1).slice(atWithdraw);
+    assert.ok(later.includes(`OD-1: ${localText}`), "the phase's own ruling is still quoted");
+    assert.ok(!later.includes("ODP-1"), "the withdrawn program ruling is omitted");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("owner-directives: withdrawing a program ruling from a run's own box retires it on every node", async () => {
+  const text = "C-U-WIDE: every node stops polling the vendor API";
+  const h = startProgramHarness({
+    entries: [{ id: "n1", after: [] }, { id: "n2", after: [] }],
+    maxParallel: 2,
+    workerSleepMs: 18_000,
+  });
+  try {
+    await h.tickUntil(() => h.node("n1").status === "running" && h.node("n2").status === "running", 60_000, "both nodes running");
+    const n1 = h.node("n1").runId!;
+    const n2 = h.node("n2").runId!;
+    await h.waitForWorker(n1);
+    await h.waitForWorker(n2);
+
+    const n1Phase = h.stateOf(n1).phase;
+    writeNodeInput(h, n1, "cmd-cu", {
+      type: "steer",
+      text,
+      scope: "program",
+      binding: { runId: n1Phase.runId, phaseId: n1Phase.phaseId },
+    });
+    await h.tickUntil(() => h.programDirectives().some((d) => d.text === text), 60_000, "the C-u ruling reached the program");
+    await waitFor(() => h.stateOf(n2).phase.ownerDirectives?.some((d) => d.text === text && d.status === "in-force") ?? false, 60_000);
+    assert.equal(h.stateOf(n2).phase.ownerDirectives?.find((d) => d.text === text)?.id, "ODP-1");
+
+    // The owner retracts it from n1's own input box, without `C-u`: a
+    // program-wide ruling must be retracted program-wide from wherever it is
+    // withdrawn.
+    writeNodeInput(h, n1, "cmd-w", {
+      type: "steer",
+      text: "withdraw ODP-1",
+      binding: { runId: n1Phase.runId, phaseId: n1Phase.phaseId },
+    });
+    await h.tickUntil(() => h.programDirectives().find((d) => d.text === text)?.withdrawn === true, 60_000, "the program recorded the withdrawal");
+    await waitFor(() => h.stateOf(n2).phase.ownerDirectives?.find((d) => d.text === text)?.status === "withdrawn", 60_000);
+    assert.equal(
+      h.stateOf(n1).phase.ownerDirectives?.find((d) => d.text === text)?.status,
+      "withdrawn",
+      "the issuing node withdrew its own copy",
+    );
+  } finally {
+    await h.cleanup();
   }
 });

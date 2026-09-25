@@ -647,7 +647,7 @@ promise (§9.3):
 | --- | --- | --- | --- |
 | steer | message delivered to the running worker through Pi's RPC `steer` | **external delivery** | worker attempt id |
 | note | queued for the next worker attempt | conductor state | phase |
-| directive | every input-box text, recorded as `OD-n`: steered at once to every live agent, quoted in every later prompt, binding until withdrawn (§7.6) | conductor state (plus external delivery) | phase (or the whole program) |
+| directive | every input-box text, recorded as `OD-n` (a program-wide one as `ODP-n`): steered at once to every live agent, quoted in every later prompt, binding until withdrawn (§7.6) | conductor state (plus external delivery) | phase (or the whole program) |
 | resolve | answer an owner request (choose an option or write one) | conductor state | request id and version, candidate, contract |
 | override | approve or reject a delegated decision; recorded **beside** the ballots | conductor state | decision version, candidate, contract |
 | accept-finding | the owner's disposition of a finding (§4.2) | conductor state | finding version, candidate, contract |
@@ -677,15 +677,20 @@ doing so, even where the plan's text says otherwise.
 At `AWAITING_OWNER` the text still does what §7.5's correction does (resolves
 the open requests and grants 3 rounds) *and* becomes a directive. A
 withdrawal — `withdraw OD-n` in the input box — steers the live agents that it
-no longer applies and drops it from every later prompt; an unknown id is refused
-with the reason.
+no longer applies and drops it from every later prompt; an unknown or malformed
+id is refused with the reason (a near-miss is never inverted into a new
+ruling). Trailing prose after the id is accepted.
 
-A directive applies to its own phase. Sent from a program buffer, or with
-`C-u` in a run's input box, it applies **program-wide**: every running node is
-steered now, every node started later is started with it, and the program's own
-event log carries it (so it survives a restart). The input header states the
-scope before sending; the status view shows each directive with its scope,
-whether it is in force, and its delivery state per agent.
+A directive applies to its own phase and is numbered `OD-n`. Sent from a
+program buffer, or with `C-u` in a run's input box, it applies
+**program-wide**: the program records it under its own `ODP-n` id, every
+running node is steered now, every node started later is started with it, and
+the program's event log carries it (so it survives a restart). A node never
+mints or renumbers a program id — it forwards the text and adopts the record
+the program pushes, so one id names one ruling at both levels and
+a `withdraw ODP-n` from any node retires it on every node. The input header
+states the scope before sending; the status view shows each directive with its
+scope, whether it is in force, and its delivery state per agent.
 
 ### 7.5 Correcting a decision mid-run: revise
 

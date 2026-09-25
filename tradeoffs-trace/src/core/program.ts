@@ -45,7 +45,7 @@ export interface ProgramNode {
  * event, rebuilt by folding, delivered to every running node through its
  * inbox and included in the plan of every node started later. */
 export interface ProgramDirective {
-  id: string; // "OD-<n>" in the program's own numbering
+  id: string; // "ODP-<n>" — the program-wide namespace (see `nextProgramDirectiveId`)
   text: string;
   at: string;
   withdrawn?: boolean;
@@ -140,13 +140,19 @@ export function programDirectivesInForce(state: ProgramState): ProgramDirective[
   return (state.directives ?? []).filter((d) => !d.withdrawn);
 }
 
-/** Plan 01i: the program's next free directive id (`OD-<n>`). */
+/** Plan 01i: the program's next free directive id.
+ *
+ * Program-wide rulings live in their own namespace (`ODP-<n>`) so that one id
+ * always names one ruling: a node's own phase directives are `OD-<n>`, and a
+ * node can never have to renumber a program ruling into one of its own
+ * numbers. `withdraw OD-n` / `withdraw ODP-n` then retires exactly the record
+ * it names, at either level. */
 export function nextProgramDirectiveId(state: ProgramState): string {
   const max = (state.directives ?? []).reduce((m, d) => {
-    const n = Number(d.id.match(/^OD-(\d+)$/)?.[1] ?? 0);
+    const n = Number(d.id.match(/^(?:ODP|OD)-(\d+)$/)?.[1] ?? 0);
     return Math.max(m, n);
   }, 0);
-  return `OD-${max + 1}`;
+  return `ODP-${max + 1}`;
 }
 
 export function reduceProgram(state: ProgramState, event: ProgramEvent): ProgramState {

@@ -1035,11 +1035,24 @@ directive — for this phase, or for the whole program with PROGRAM-WIDE
         (+tt--send-program-directive in-program text)
       (+tt--send-run-input +tt--run-dir text program-wide))))
 
+(defun +tt--withdraw-id (text)
+  "The directive id the program input TEXT withdraws, or nil.
+Plan 01i: program-wide rulings are ODP-n, a phase's own are OD-n; a text that
+opens with `withdraw' but names no id is malformed and the conductor refuses
+it, never records it as a new ruling."
+  (when (string-match "\\`withdraw\\b[ \t]+\\(ODP-[0-9]+\\|OD-[0-9]+\\)" text)
+    (upcase (match-string 1 text))))
+
 (defun +tt--send-program-directive (dir text)
-  "Queue TEXT as a program-wide owner directive in program DIR's inbox."
-  (let ((id (+tt--write-command dir `((type . "directive") (text . ,text) (scope . "program")))))
+  "Queue TEXT as a program-wide owner directive in program DIR's inbox.
+TEXT that withdraws one (`withdraw ODP-n`) is queued as a withdrawal."
+  (let* ((withdraw-id (+tt--withdraw-id text))
+         (id (+tt--write-command dir (if withdraw-id
+                                        `((type . "withdraw") (directiveId . ,withdraw-id) (text . ,text))
+                                      `((type . "directive") (text . ,text) (scope . "program"))))))
     (erase-buffer)
-    (message "tradeoffs-trace: program-wide directive queued in %s (%s); every running node is steered at once"
+    (message "tradeoffs-trace: program-wide %s queued in %s (%s); every running node is steered at once"
+             (if withdraw-id (format "withdrawal of %s" withdraw-id) "directive")
              (file-name-nondirectory (directory-file-name dir)) id)))
 
 (defun +tt--send-run-input (run-dir text program-wide)

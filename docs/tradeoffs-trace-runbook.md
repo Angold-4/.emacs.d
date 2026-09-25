@@ -290,16 +290,25 @@ whole program).
 | AWAITING_OWNER ("needs you") | **correction**: resolves the open requests, grants 3 repair rounds, repairs with your text verbatim — and is an owner directive in every later prompt |
 | DONE / BLOCKED | refused, with the reason |
 
-**Scope.** A directive applies to its own phase by default. It applies to the
-**whole program** — every running node is steered now, and every node started
-later is started with it in its prompts — when it is sent with `C-u C-c C-c`
-from a run's input box, or from a program buffer's input box (`i` in the
-program buffer). The header line states the scope before you send.
+**Scope.** A directive applies to its own phase by default, and is numbered
+`OD-1`, `OD-2`, …. It applies to the **whole program** — every running node is
+steered now, and every node started later is started with it in its prompts —
+when it is sent with `C-u C-c C-c` from a run's input box, or from a program
+buffer's input box (`i` in the program buffer). A program-wide ruling is
+numbered `ODP-1`, `ODP-2`, … : the `ODP` namespace is the program's own, so a
+node never renumbers a program ruling and one id always names one ruling. The
+header line states the scope before you send.
 
-**Withdraw one.** Type `withdraw OD-n` (for example `withdraw OD-1`) into the
-input box. Every live agent is steered that it no longer applies, and every
-later prompt omits it. A `withdraw` naming an id that does not exist — or one
-that is already withdrawn — is refused with the reason, and nothing changes.
+**Withdraw one.** Type `withdraw OD-n` (or `withdraw ODP-n` for a program-wide
+one), for example `withdraw OD-1`, into any input box — a run's or the
+program's. Every live agent is steered that it no longer applies, and every
+later prompt omits it. Withdrawing a program-wide ruling from *any* node
+retracts it **everywhere**: the program records the withdrawal, every running
+node is told, and every node started later is no longer given it. Trailing
+prose is fine (`withdraw OD-1 because it is stale` retracts OD-1). A withdrawal
+that names no id, an id that does not exist, or one already withdrawn is
+refused with the reason, and nothing changes — it is never turned into a new
+ruling.
 
 The status buffer's **Owner input** section shows each text's recorded effect:
 delivered, noted, correction started, refused, delivery uncertain, or not

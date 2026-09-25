@@ -8,12 +8,14 @@ import { test } from "node:test";
 
 import {
   DIRECTIVE_BINDING_STATEMENT,
+  allocateDirectiveId,
   buildReviewerPrompt,
   buildWorkerPrompt,
   directiveLines,
-  parseWithdrawText,
+  parseWithdrawInput,
 } from "../../src/conductor.ts";
 import { reduce } from "../../src/core/reduce.ts";
+import { initialProgramState, nextProgramDirectiveId, reduceProgram } from "../../src/core/program.ts";
 import type { OwnerDirective, State } from "../../src/core/types.ts";
 import { baseState } from "./helpers.ts";
 
@@ -84,12 +86,54 @@ test("owner-directives: withdrawing keeps the record and refuses an unknown or a
   assert.equal(unknown.ok, false);
 });
 
-test("owner-directives: withdraw text is `withdraw OD-n`, case-insensitively, and nothing else", () => {
-  assert.equal(parseWithdrawText("withdraw OD-1"), "OD-1");
-  assert.equal(parseWithdrawText("  Withdraw od-12  "), "OD-12");
-  assert.equal(parseWithdrawText("withdraw OD-1 because it is stale"), undefined);
-  assert.equal(parseWithdrawText("please withdraw OD-1"), undefined);
-  assert.equal(parseWithdrawText("OD-1"), undefined);
+test("owner-directives: `withdraw OD-n`/`ODP-n` is recognised even with trailing prose; a malformed one is refused, never inverted", () => {
+  assert.deepEqual(parseWithdrawInput("withdraw OD-1"), { kind: "withdraw", id: "OD-1" });
+  assert.deepEqual(parseWithdrawInput("  Withdraw od-12  "), { kind: "withdraw", id: "OD-12" });
+  assert.deepEqual(parseWithdrawInput("withdraw ODP-3"), { kind: "withdraw", id: "ODP-3" });
+  // The owner's natural phrasing retracts OD-1; it must not become a new
+  // binding directive that leaves OD-1 in force.
+  assert.deepEqual(parseWithdrawInput("withdraw OD-1 because it is stale"), { kind: "withdraw", id: "OD-1" });
+  // A withdrawal that names no id is refused, never recorded as a ruling.
+  assert.equal(parseWithdrawInput("withdraw")?.kind, "malformed");
+  assert.equal(parseWithdrawInput("withdraw the Stork exception")?.kind, "malformed");
+  // Not a withdrawal at all: an ordinary directive.
+  assert.equal(parseWithdrawInput("please withdraw OD-1"), undefined);
+  assert.equal(parseWithdrawInput("OD-1"), undefined);
+});
+
+test("owner-directives: ids never collide across levels — a program ruling keeps its ODP-n even when OD-n exists locally", () => {
+  const local = [directive({ id: "OD-1", seq: 1 })];
+  // The phase's own next id skips nothing and renumbers nothing.
+  assert.deepEqual(allocateDirectiveId([]), { id: "OD-1", seq: 1 });
+  assert.deepEqual(allocateDirectiveId(local), { id: "OD-2", seq: 2 });
+  // A program-wide ruling is stored under the program's own id, so `withdraw
+  // ODP-1` names it and `withdraw OD-1` names the node's own ruling.
+  assert.deepEqual(allocateDirectiveId(local, "ODP-1"), { id: "ODP-1", seq: 1 });
+  // …and a program id never advances the phase's own counter.
+  assert.deepEqual(allocateDirectiveId([directive({ id: "ODP-1", seq: 1 })]), { id: "OD-1", seq: 1 });
+  assert.deepEqual(allocateDirectiveId([directive({ id: "ODP-1", seq: 1 }), directive({ id: "OD-1", seq: 1 })]), {
+    id: "OD-2",
+    seq: 2,
+  });
+});
+
+test("owner-directives: program directives are numbered in their own ODP namespace", () => {
+  let state = initialProgramState([]);
+  assert.equal(nextProgramDirectiveId(state), "ODP-1");
+  state = reduceProgram(state, {
+    type: "DIRECTIVE_ADDED",
+    directive: { id: "ODP-1", text: "no vendor adapters", at: "2026-09-25T00:00:00.000Z" },
+  });
+  assert.equal(nextProgramDirectiveId(state), "ODP-2");
+  // A replay of the same id is a no-op, and a withdrawal keeps the record.
+  state = reduceProgram(state, {
+    type: "DIRECTIVE_ADDED",
+    directive: { id: "ODP-1", text: "a duplicate", at: "2026-09-25T00:00:00.000Z" },
+  });
+  assert.equal(state.directives?.length, 1);
+  state = reduceProgram(state, { type: "DIRECTIVE_WITHDRAWN", directiveId: "ODP-1" });
+  assert.equal(state.directives?.[0].withdrawn, true);
+  assert.equal(state.directives?.[0].text, "no vendor adapters");
 });
 
 test("owner-directives: the prompt section lists every directive in force, verbatim, newest last, and omits withdrawn ones", () => {

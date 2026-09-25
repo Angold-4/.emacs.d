@@ -191,10 +191,10 @@ export function deliverProgramDirectives(runRoot: string, state: ProgramState): 
     const runDir = path.join(runRoot, s.runId);
     const seeded = seededDirectiveIds(runDir);
     for (const d of inForce) {
-      if (seeded.has(d.id) || d.origin === s.runId) continue;
-      // `programId` lets the node keep the program's own numbering when it can
-      // (so a later `withdraw OD-n` names the same directive on both sides),
-      // falling back to its next free id when that number is taken locally.
+      if (seeded.has(d.id)) continue;
+      // Pushed to every active node, the origin run included: the origin only
+      // *forwarded* the ruling, so this push is what gives it the program's
+      // own `ODP-n` record (no node ever mints or renumbers a program id).
       writeNodeInbox(runDir, `cmd-prog-${d.id}.json`, {
         type: "directive",
         text: d.text,
@@ -204,13 +204,15 @@ export function deliverProgramDirectives(runRoot: string, state: ProgramState): 
       });
     }
     for (const d of withdrawn) {
-      if (d.origin === s.runId) continue;
-      const applied = path.join(runPaths(runDir).inboxApplied, `cmd-prog-${d.id}.json`);
-      if (!seeded.has(d.id) && !fs.existsSync(applied)) continue;
+      // Every active node is told, the origin node included. A node that
+      // never had the directive treats an unknown-id withdrawal as a no-op —
+      // never a refusal, or the same file would be rejected again on every
+      // tick.
       writeNodeInbox(runDir, `cmd-prog-withdraw-${d.id}.json`, {
         type: "withdraw-directive",
         directiveId: d.id,
         text: `withdraw ${d.id}`,
+        pushed: true,
       });
     }
   }

@@ -386,19 +386,17 @@ export function initialState(
 }
 
 /** Plan 01i: one seeded program-wide directive as a phase record. It keeps
- * the program's own id when that is a plain `OD-<n>` (a fresh node has no
- * directives of its own yet, so there is nothing to collide with), else it
- * takes its position in the seed list. */
+ * the program's own `ODP-<n>` id verbatim, so one id names the same ruling at
+ * both levels and `withdraw ODP-n` retires the right record everywhere. */
 function seededDirective(seed: RunPlanDirectiveSeed, index: number): OwnerDirective {
-  const m = typeof seed.id === "string" ? seed.id.match(/^OD-(\d+)$/) : null;
-  const seq = m ? Number(m[1]) : index + 1;
+  const { id, seq } = allocateDirectiveId([], typeof seed.id === "string" ? seed.id : `ODP-${index + 1}`);
   return {
-    id: `OD-${seq}`,
+    id,
     seq,
     text: seed.text,
     scope: "program",
     status: "in-force",
-    commandId: `seed-${seed.id ?? seq}`,
+    commandId: `seed-${id}`,
     at: seed.at ?? "",
     targets: [],
     deliveries: {},
@@ -1311,69 +1309,70 @@ export class Conductor {
 
   // -- plan 01i: owner directives (01_ref_design.md D5, runtime §8) --------
 
-  /** Plan 01i: the live agents of this run, with the target label the status
-   * shows (`worker`, or the reviewer's letter) and the Pi agent to steer. One
-   * entry per target — the newest live agent wins. */
-  #liveAgentTargets(): Array<{ target: string; agentId: string; agent: PiAgent }> {
+  /** Plan 01i: every live agent of this run, each with the target label the
+   * status shows (`worker`, or the reviewer's letter). One entry per live
+   * agent, deliberately: during a re-dispatch overlap two agents can share a
+   * label, and every one of them must be steered (deliveries are then
+   * recorded per label, newest ack wins). */
+  #liveAgents(): Array<{ target: string; agentId: string; agent: PiAgent }> {
     const out: Array<{ target: string; agentId: string; agent: PiAgent }> = [];
     for (const h of this.#agents.values()) {
       if (h.agent.exited) continue;
       const target = h.role === "worker" ? "worker" : (h.agentId.match(/^reviewer-([MAB])-/)?.[1] ?? h.agentId);
-      if (out.some((a) => a.target === target)) continue;
       out.push({ target, agentId: h.agentId, agent: h.agent });
     }
     return out;
   }
 
-  /** Plan 01i: records one directive (`OD-<seq>`), then steers it at once to
-   * every live agent except `exempt` (a target whose delivery is already
-   * being handled — the worker in `#processSteerCommand`), recording each
-   * delivery as it is acknowledged. The directive itself is a logged event,
-   * so it survives a restart and every later prompt quotes it verbatim. */
+  /** Plan 01i: records one directive, then steers it at once to every live
+   * agent except `exemptAgentIds` (an agent whose steer is already being
+   * handled — the worker in `#processSteerCommand`), recording each delivery
+   * as it is acknowledged. The directive itself is a logged event, so it
+   * survives a restart and every later prompt quotes it verbatim.
+   *
+   * Ids are namespaced so one id always names one ruling: a phase's own
+   * directives are `OD-<n>`, a program-wide one arrives with the program's
+   * `ODP-<n>` and keeps it verbatim (the two spaces never collide, so a node
+   * can never renumber a program ruling into a number of its own). */
   #addDirective(
     text: string,
     scope: DirectiveScope,
     commandId: string,
-    exempt: string[] = [],
+    exemptAgentIds: string[] = [],
     preferredId?: string,
   ): OwnerDirective {
     const existing = this.#state.phase.ownerDirectives ?? [];
     // Idempotent by inbox command id: a replay (the log already holds the
-    // directive but the file was never moved) must not mint a second OD-n.
+    // directive but the file was never moved) must not mint a second id.
     const already = existing.find((d) => d.commandId === commandId);
     if (already) return already;
-    // A program-wide directive keeps the program's own number when that is a
-    // plain OD-n still free here, so `withdraw OD-n` names the same directive
-    // at both levels; otherwise it takes the next free local number.
-    const preferred = preferredId?.match(/^OD-(\d+)$/);
-    const preferredSeq = preferred ? Number(preferred[1]) : undefined;
-    const free = preferredSeq !== undefined && !existing.some((d) => d.seq === preferredSeq);
-    const seq = free ? preferredSeq! : existing.reduce((m, d) => Math.max(m, d.seq), 0) + 1;
-    const live = this.#liveAgentTargets();
+    const { id, seq } = allocateDirectiveId(existing, preferredId);
+    const live = this.#liveAgents();
     const directive: OwnerDirective = {
-      id: `OD-${seq}`,
+      id,
       seq,
       text,
       scope,
       status: "in-force",
       commandId,
       at: new Date().toISOString(),
-      targets: live.map((l) => l.target),
+      targets: [...new Set(live.map((l) => l.target))],
       deliveries: {},
     };
     this.#applyEvent({ type: "DIRECTIVE_ADDED", directive });
-    this.#steerDirectiveTo(directive, exempt);
+    this.#steerDirectiveTo(directive, exemptAgentIds);
     return directive;
   }
 
-  /** Plan 01i: steers one directive's text to the live agents of this run
-   * (except `exempt`), logging an intent before each send and a completion on
-   * acknowledgement — the same intent/completion discipline as a steer, so a
-   * crash mid-send leaves a recoverable record and never a silent loss. */
-  #steerDirectiveTo(directive: OwnerDirective, exempt: string[]): void {
-    for (const { target, agentId, agent } of this.#liveAgentTargets()) {
-      if (exempt.includes(target)) continue;
-      const actionId = `deliver-${directive.commandId}-${target}`;
+  /** Plan 01i: steers one directive's text to every live agent of this run
+   * (except `exemptAgentIds`), logging an intent before each send and a
+   * completion on acknowledgement — the same intent/completion discipline as
+   * a steer, so a crash mid-send leaves a recoverable record and never a
+   * silent loss. */
+  #steerDirectiveTo(directive: OwnerDirective, exemptAgentIds: string[]): void {
+    for (const { target, agentId, agent } of this.#liveAgents()) {
+      if (exemptAgentIds.includes(agentId)) continue;
+      const actionId = `deliver-${directive.commandId}-${target}-${agentId}`;
       const message = `Owner directive ${directive.id} (binding): ${directive.text}`;
       this.#log.intent(actionId, { directiveId: directive.id, target, agentId, text: directive.text });
       void agent.steer(message).then(
@@ -1428,15 +1427,32 @@ export class Conductor {
    * agent is steered that it is withdrawn and every later prompt omits it.
    * An id that is unknown (or already withdrawn) is refused with the reason,
    * never silently applied. */
-  #processWithdraw(file: string, commandId: string, text: string, directiveId: string): void {
+  #processWithdraw(
+    file: string,
+    commandId: string,
+    text: string,
+    directiveId: string,
+    opts: { forwardProgram: boolean; pushed: boolean },
+  ): void {
+    // `pushed` is a withdrawal the program scheduler delivered (or re-
+    // delivered on its next tick): for a directive that is already gone it is
+    // a no-op success, never a refusal — otherwise the same file would be
+    // rejected again on every tick.
+    const noop = (): void => {
+      this.#appliedCommandIds.add(commandId);
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+    };
     const directive = (this.#state.phase.ownerDirectives ?? []).find((d) => d.id === directiveId);
     if (!directive) {
+      if (opts.pushed) return noop();
       const reason = `no owner directive ${directiveId} exists in phase ${this.#state.phase.phaseId}`;
       this.#recordOwnerInput(commandId, "withdraw", text, "refused", undefined, reason);
       this.#rejectInboxFile(file, commandId, reason);
       return;
     }
     if (directive.status === "withdrawn") {
+      if (opts.pushed) return noop();
       const reason = `owner directive ${directiveId} is already withdrawn`;
       this.#recordOwnerInput(commandId, "withdraw", text, "refused", undefined, reason);
       this.#rejectInboxFile(file, commandId, reason);
@@ -1449,8 +1465,8 @@ export class Conductor {
     this.#applyEvent({ type: "DIRECTIVE_WITHDRAWN", directiveId }, commandId);
     this.#appliedCommandIds.add(commandId);
     const message = `Owner directive ${directiveId} is withdrawn; it no longer applies.`;
-    for (const { target, agentId, agent } of this.#liveAgentTargets()) {
-      const actionId = `deliver-${commandId}-${target}`;
+    for (const { target, agentId, agent } of this.#liveAgents()) {
+      const actionId = `deliver-${commandId}-${target}-${agentId}`;
       this.#log.intent(actionId, { directiveId, target, agentId, withdrawn: true });
       void agent.steer(message).then(
         () => {
@@ -1468,16 +1484,79 @@ export class Conductor {
         },
       );
     }
-    this.#recordOwnerInput(commandId, "withdraw", text, "delivered");
+    if (!opts.pushed) this.#recordOwnerInput(commandId, "withdraw", text, "delivered");
+    // A program-wide ruling is retracted program-wide from wherever it is
+    // withdrawn: the program records it and pushes the notice to every node
+    // (this one included — the pushed copy is the no-op above).
+    if (opts.forwardProgram && directive.scope === "program") this.#forwardProgramWithdraw(commandId, directiveId);
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
   }
 
+  /** Plan 01i: this run's program directory, when the scheduler started it
+   * (its `program.json` names the program). `undefined` for a hand-started
+   * run, which has nothing program-wide to reach. */
+  #programDir(): string | undefined {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      return info.programId ? path.join(path.dirname(this.#runDir), "programs", info.programId) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 01i: a `C-u` input in a run's own box, applied program-wide (D5).
+   * The run does NOT record a directive of its own: it forwards the text to
+   * the program, which mints the single program-wide id (`ODP-n`) and pushes
+   * that record to every running node — this one included. The owner's ruling
+   * is still heard at once (every live agent is steered now); the record that
+   * prompts and the status quote is the program's, so one id names one ruling
+   * everywhere. */
+  #processProgramWideInput(file: string, commandId: string, kind: OwnerInputKind, text: string): void {
+    this.#forwardProgramDirective(commandId, text);
+    this.#steerProgramWide(commandId, text);
+    this.#recordOwnerInput(
+      commandId,
+      kind,
+      text,
+      "noted",
+      undefined,
+      "forwarded to the program as a program-wide directive; the program records it and steers every node",
+    );
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 01i: steers a program-wide text (before its `ODP-n` record exists
+   * here) to every live agent, so the ruling is heard now rather than at the
+   * next scheduler tick. */
+  #steerProgramWide(commandId: string, text: string): void {
+    const message = `Owner (program-wide) directive: ${text}`;
+    for (const { target, agentId, agent } of this.#liveAgents()) {
+      const actionId = `deliver-${commandId}-pw-${target}-${agentId}`;
+      this.#log.intent(actionId, { target, agentId, text });
+      void agent.steer(message).then(
+        () => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, { outcome: "program-wide-steer-acknowledged", target, agentId });
+        },
+        (err) => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, {
+            outcome: "program-wide-steer-failed",
+            target,
+            agentId,
+            error: String((err as Error)?.message ?? err),
+          });
+        },
+      );
+    }
+  }
+
   /** Plan 01i: a run started by a program scheduler (D5) forwards a
    * program-wide directive to the program's own inbox, so the scheduler
-   * pushes it to the other running nodes and starts later nodes with it. A
-   * run not started by a program (no `program.json`) just keeps it to its own
-   * phase. */
+   * records it once and pushes it to every running node (this one included)
+   * and starts later nodes with it. */
   #forwardProgramDirective(commandId: string, text: string): void {
     try {
       const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
@@ -1495,6 +1574,26 @@ export class Conductor {
       // Not a program node (no program.json), or its inbox is unwritable: the
       // directive still applies to this phase, never dropped from this run.
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") this.#logUnexpected("forward_program_directive", err);
+    }
+  }
+
+  /** Plan 01i: `withdraw ODP-n` names a program-wide ruling, so retracting it
+   * here must retract it everywhere: the program records the withdrawal and
+   * pushes the notice to every running node (including this one, whose own
+   * record is already withdrawn — the pushed copy is a no-op) and drops it
+   * from every node started later. */
+  #forwardProgramWithdraw(commandId: string, directiveId: string): void {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      if (!info.programId) return;
+      const inbox = path.join(path.dirname(this.#runDir), "programs", info.programId, "inbox");
+      fs.mkdirSync(inbox, { recursive: true });
+      const file = path.join(inbox, `${commandId}.json`);
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ type: "withdraw", directiveId, key: commandId }));
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") this.#logUnexpected("forward_program_withdraw", err);
     }
   }
 
@@ -1685,7 +1784,10 @@ export class Conductor {
         this.#rejectInboxFile(file, commandId, reason);
         return;
       }
-      this.#processWithdraw(file, commandId, programWithdraw.text, programWithdraw.directiveId);
+      this.#processWithdraw(file, commandId, programWithdraw.text, programWithdraw.directiveId, {
+        forwardProgram: false,
+        pushed: true,
+      });
       return;
     }
 
@@ -1697,7 +1799,7 @@ export class Conductor {
     // is also an owner directive, phase-scoped unless the sender asked for
     // `scope: "program"` (`C-u` in a run's input box, D5).
     const inputKind = this.#ownerInputKindOf(raw);
-    let noteKindText: { text: string; scope: DirectiveScope } | undefined;
+    let noteKindText: { text: string; scope: DirectiveScope; programWide: boolean } | undefined;
     if (inputKind) {
       const inputText = (raw as { text?: unknown }).text;
       if (typeof inputText !== "string" || inputText.trim().length === 0) {
@@ -1711,18 +1813,35 @@ export class Conductor {
         return;
       }
       const scope: DirectiveScope = (raw as { scope?: unknown }).scope === "program" ? "program" : "phase";
-      // Plan 01i: `withdraw OD-n` in the input box withdraws one directive —
-      // whatever kind the phase would otherwise have made of the text.
-      const withdrawId = parseWithdrawText(inputText);
-      if (withdrawId) {
-        this.#processWithdraw(file, commandId, inputText, withdrawId);
+      // Plan 01i: `withdraw OD-n` (or `withdraw ODP-n`) in the input box
+      // withdraws one directive — whatever kind the phase would otherwise
+      // have made of the text. A withdrawal that names no valid id is
+      // refused visibly: it must never be recorded as a *new* binding ruling,
+      // which would leave the intended one in force.
+      const parsedWithdraw = parseWithdrawInput(inputText);
+      if (parsedWithdraw?.kind === "malformed") {
+        this.#recordOwnerInput(commandId, "withdraw", inputText, "refused", undefined, parsedWithdraw.reason);
+        this.#rejectInboxFile(file, commandId, parsedWithdraw.reason);
         return;
       }
+      if (parsedWithdraw?.kind === "withdraw") {
+        this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
+        return;
+      }
+      // A program-wide input (D5) in a run the scheduler started: the
+      // program mints the one `ODP-n` record, so this run only forwards the
+      // text and steers its own agents now — it must not mint a local id that
+      // could not match the program's.
+      const programWide = scope === "program" && this.#programDir() !== undefined;
       if (inputKind === "steer") {
+        if (programWide) {
+          this.#processProgramWideInput(file, commandId, "steer", inputText);
+          return;
+        }
         this.#processSteerCommand(file, commandId, raw, inputText, scope);
         return;
       }
-      noteKindText = { text: inputText, scope };
+      noteKindText = { text: inputText, scope, programWide };
     }
 
     // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
@@ -1779,8 +1898,12 @@ export class Conductor {
     // and quoted in every later prompt (a correction still resolves the open
     // requests and grants its 3 rounds first: today's behaviour, unchanged).
     if (noteKindText) {
-      this.#addDirective(noteKindText.text, noteKindText.scope, commandId);
-      if (noteKindText.scope === "program") this.#forwardProgramDirective(commandId, noteKindText.text);
+      if (noteKindText.programWide) {
+        this.#forwardProgramDirective(commandId, noteKindText.text);
+        this.#steerProgramWide(commandId, noteKindText.text);
+      } else {
+        this.#addDirective(noteKindText.text, noteKindText.scope, commandId);
+      }
     }
     // The recorded effect for the input box's status view: a note is queued
     // for the next attempt the moment it is applied; a correction has just
@@ -3725,11 +3848,48 @@ function sanitize(command: string): string {
 
 // -- plan 01i: owner directives (D5) ---------------------------------------
 
-/** Plan 01i: `withdraw OD-n` in the input box withdraws one directive.
- * Returns the id, or undefined when the text is anything else. */
-export function parseWithdrawText(text: string): string | undefined {
-  const m = text.trim().match(/^withdraw\s+(OD-\d+)\s*$/i);
-  return m ? m[1].toUpperCase() : undefined;
+/** Plan 01i: the id a new directive gets.
+ *
+ * A program-wide directive (`preferredId`, `ODP-<n>`) keeps the program's own
+ * id verbatim — the `ODP` space never collides with a phase's `OD` space, so
+ * a node never renumbers a program ruling and `withdraw ODP-n` retires the
+ * same record everywhere. Otherwise the phase's next free `OD-<n>` is used;
+ * program-wide ids never advance that counter. */
+export function allocateDirectiveId(
+  existing: readonly OwnerDirective[],
+  preferredId?: string,
+): { id: string; seq: number } {
+  const preferred = preferredId?.match(/^((?:ODP|OD)-(\d+))$/);
+  if (preferred) return { id: preferred[1], seq: Number(preferred[2]) };
+  const localMax = existing.reduce((m, d) => {
+    const num = d.id.match(/^OD-(\d+)$/);
+    return num ? Math.max(m, Number(num[1])) : m;
+  }, 0);
+  return { id: `OD-${localMax + 1}`, seq: localMax + 1 };
+}
+
+/** Plan 01i: what an input-box text means for withdrawal.
+ * `undefined`: not a withdrawal at all (an ordinary directive).
+ * `withdraw`: retract the named directive; `text` may carry trailing prose
+ * ("withdraw OD-1 because it is stale") without becoming a new ruling.
+ * `malformed`: it opens with `withdraw` but names no valid id — refused with
+ * the reason, never inverted into a fresh binding directive. */
+export type WithdrawInput =
+  | { kind: "withdraw"; id: string }
+  | { kind: "malformed"; reason: string };
+
+export function parseWithdrawInput(text: string): WithdrawInput | undefined {
+  const t = text.trim();
+  if (!/^withdraw\b/i.test(t)) return undefined;
+  const rest = t.replace(/^withdraw\b/i, "").trim();
+  const id = rest.match(/^((?:ODP|OD)-\d+)\b/i);
+  if (!id) {
+    return {
+      kind: "malformed",
+      reason: `a withdrawal must name a directive id, e.g. \`withdraw OD-1\` (got: ${JSON.stringify(t.slice(0, 80))})`,
+    };
+  }
+  return { kind: "withdraw", id: id[1].toUpperCase() };
 }
 
 /** Plan 01i: a directive the program scheduler pushed into this node's inbox

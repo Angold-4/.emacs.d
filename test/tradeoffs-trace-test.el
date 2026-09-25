@@ -341,7 +341,9 @@
                     ;; own example): the delivery state is never inferred.
                     (deliveries (worker . "delivered") (M . "delivered")
                                 (B . "delivered")))
-                   ((id . "OD-2") (seq . 2)
+                   ;; A program-wide ruling lives in its own ODP namespace,
+                   ;; so one id names one ruling at both levels.
+                   ((id . "ODP-2") (seq . 2)
                     (text . "no node may touch the vendor adapters after this ruling")
                     (scope . "program") (status . "withdrawn")
                     (targets) (deliveries))))))
@@ -360,7 +362,7 @@ force, and the delivery state per live agent."
                text))
       (should (string-match-p
                (regexp-quote
-                "OD-2 [whole program, withdrawn] no node may touch the vendor adapters after this ruling — (no live agent; carried in every later prompt)")
+                "ODP-2 [whole program, withdrawn] no node may touch the vendor adapters after this ruling — (no live agent; carried in every later prompt)")
                text)))))
 
 (ert-deftest tradeoffs-trace-input-header-scope ()
@@ -404,6 +406,24 @@ to the program's own inbox."
               (should (equal (car written) dir))
               (should (equal (alist-get 'type (cdr written)) "directive"))
               (should (equal (alist-get 'scope (cdr written)) "program")))))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-program-input-withdraws-a-directive ()
+  "Plan 01i: the program input box's `withdraw ODP-n' queues a withdrawal,
+and trailing prose does not turn it into a new ruling."
+  (let ((written nil)
+        (dir (make-temp-file "tt-ert-prog" t)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function '+tt--write-command)
+                     (lambda (d cmd) (setq written (cons d cmd)) "id-3")))
+            (with-temp-buffer
+              (insert "withdraw ODP-1 because it is stale")
+              (setq +tt--input-program-dir dir)
+              (+tt-input-send)
+              (should (equal (car written) dir))
+              (should (equal (alist-get 'type (cdr written)) "withdraw"))
+              (should (equal (alist-get 'directiveId (cdr written)) "ODP-1")))))
       (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-program-parse ()
