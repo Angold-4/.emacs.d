@@ -735,6 +735,15 @@ async function main(): Promise<void> {
     const round = state.phase.round ?? 0;
     const ownerInputs = state.phase.ownerInputs ?? [];
     const { timeline: _timeline, ...view } = buildView(runDir, plan, alive);
+    // Plan 01i: the program this run is a node of, when a scheduler started
+    // it — the front end needs it to tell the truth about `C-u`'s scope (a
+    // hand-started run has nothing program-wide to reach).
+    let program: { programId?: string; node?: string } | null = null;
+    try {
+      program = JSON.parse(readFileSync(path.join(runDir, "program.json"), "utf8"));
+    } catch {
+      program = null;
+    }
     const payload = {
       runDir,
       meta,
@@ -743,6 +752,7 @@ async function main(): Promise<void> {
       round,
       decisionStatuses,
       conductorAlive: alive,
+      program,
       ownerInputs,
       pendingOwnerInputs: pendingOwnerInputs(runDir),
       // Plan 01a: the plan's declared secret names, and which were unset or

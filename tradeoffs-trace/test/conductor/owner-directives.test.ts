@@ -156,8 +156,12 @@ test("owner-directives: an input while the worker runs is steered to the worker,
     assert.deepEqual(directive.targets, ["worker"]);
     assert.equal(directive.text, text, "the text is recorded verbatim");
 
-    // The steer actually reached the running worker.
+    // The steer actually reached the running worker — exactly once: the
+    // directive records it, but the worker's own steer is that same delivery,
+    // not a second one (plan §7.4's at-most-once).
     await waitFor(() => fs.existsSync(steerLog) && fs.readFileSync(steerLog, "utf8").includes(text), 20_000);
+    const workerSteers = fs.readFileSync(steerLog, "utf8").split("\n=====\n").filter((s) => s.trim().length > 0);
+    assert.equal(workerSteers.filter((s) => s.includes(text)).length, 1, "the worker is steered exactly once");
 
     // The NEXT worker attempt's prompt (the repair round) carries it verbatim.
     await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(`OD-1: ${text}`), 90_000);
@@ -254,9 +258,10 @@ test("owner-directives: an input while the reviewers are mid-turn is steered to 
     assert.equal(shown?.deliveries.B, "delivered");
     for (const r of ["M", "A", "B"] as Reviewer[]) {
       assert.equal(directive.deliveries[r], "delivered", `${r} was steered`);
-      const steered = fs.readFileSync(steerLogs.get(r)!, "utf8");
-      assert.ok(steered.includes(`OD-${directive.seq}`), `${r}'s steer names the directive id`);
-      assert.ok(steered.includes(text), `${r}'s steer carries the text verbatim`);
+      const records = fs.readFileSync(steerLogs.get(r)!, "utf8").split("\n=====\n").filter((s) => s.trim().length > 0);
+      const withText = records.filter((s) => s.includes(text));
+      assert.equal(withText.length, 1, `${r} is steered exactly once`);
+      assert.ok(withText[0].includes(`OD-${directive.seq}`), `${r}'s steer names the directive id`);
     }
 
     // Every later prompt quotes it: wait for each reviewer's turn 2 (which
@@ -388,6 +393,45 @@ async function waitForRejection(runDir: string, re: RegExp): Promise<{ reason: s
   return readEvents(runDir).find((r) => r.kind === "command_rejected" && re.test((r.event as { reason?: string }).reason ?? ""))!
     .event as { reason: string };
 }
+
+test("owner-directives: a C-u on a run that is not part of a program stays this phase's own directive", async () => {
+  const dir = shortTmp("tt-dir-noprogram");
+  const promptLog = path.join(dir, "worker-prompts.log");
+  const text = "C-U-WITHOUT-A-PROGRAM: keep the lock hold under 50us";
+  const setup = await setupConductor({
+    checks: ["false"],
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: attempt === 1 ? [{ kind: "sleep", ms: 3_000 }, submitPhaseStep()] : [submitPhaseStep()],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [submitReviewStep(reviewer, state)],
+    }),
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.agentPgids.some((a) => a.role === "worker"), 30_000);
+    // No program.json here: there is nothing program-wide to reach, so the
+    // input must stay this phase's own directive — never a `program`-scoped
+    // record in a run that has no program (and the header says so).
+    writeCommand(setup.runDir, "cmd-cu", inputCommand(setup, "steer", text, "program"));
+    await waitFor(() => directives(setup).some((d) => d.text === text), 20_000);
+    const directive = directives(setup).find((d) => d.text === text)!;
+    assert.equal(directive.id, "OD-1");
+    assert.equal(directive.scope, "phase", "a hand-started run has no program to reach");
+    assert.equal(directive.status, "in-force");
+    // It is in every later prompt like any phase directive.
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes(`OD-1: ${text}`), 90_000);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("owner-directives: withdraw retracts exactly the named directive; a malformed or unknown one is refused, never inverted", async () => {
   const dir = shortTmp("tt-dir-withdraw");
@@ -703,6 +747,9 @@ test("owner-directives: a program ruling keeps its ODP-n beside a node's own OD-
     // Then a `C-u` program ruling issued FROM this node (origin = n1).
     writeNodeInput(h, n1, "cmd-cu", { type: "steer", text: progText, scope: "program", binding });
     await h.tickUntil(() => h.programDirectives().some((d) => d.text === progText), 60_000, "the program recorded the C-u ruling");
+    // The program pushes its ODP-n record back to the issuing node, which is
+    // where that node's authoritative copy (and its single steer) come from.
+    await waitFor(() => h.stateOf(n1).phase.ownerDirectives?.some((d) => d.text === progText) ?? false, 60_000);
 
     const beforeWithdraw = h.stateOf(n1).phase.ownerDirectives ?? [];
     assert.equal(beforeWithdraw.find((d) => d.text === localText)?.id, "OD-1", "the phase's own ruling is OD-1");
@@ -720,6 +767,19 @@ test("owner-directives: a program ruling keeps its ODP-n beside a node's own OD-
     const after = h.stateOf(n1).phase.ownerDirectives ?? [];
     assert.equal(after.find((d) => d.text === localText)?.status, "in-force", "the unrelated local OD-1 is untouched");
     assert.equal(h.programDirectives().find((d) => d.text === progText)?.withdrawn, true, "the program record is withdrawn");
+
+    // An unknown program id is refused with the reason, not silently accepted.
+    let refusedReason = "";
+    try {
+      execFileSync(process.execPath, [CLI_PATH, "program", "withdraw", h.programDir, "ODP-99", "--root", h.runRoot], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.fail("an unknown program directive id must be refused");
+    } catch (err) {
+      refusedReason = String((err as { stderr?: string }).stderr ?? "");
+    }
+    assert.match(refusedReason, /no program directive ODP-99 is in force/);
 
     // A later prompt quotes OD-1 and no longer quotes ODP-1.
     const atWithdraw = h.promptsOf(n1).length;
@@ -754,7 +814,9 @@ test("owner-directives: withdrawing a program ruling from a run's own box retire
       binding: { runId: n1Phase.runId, phaseId: n1Phase.phaseId },
     });
     await h.tickUntil(() => h.programDirectives().some((d) => d.text === text), 60_000, "the C-u ruling reached the program");
+    await waitFor(() => h.stateOf(n1).phase.ownerDirectives?.some((d) => d.text === text) ?? false, 60_000);
     await waitFor(() => h.stateOf(n2).phase.ownerDirectives?.some((d) => d.text === text && d.status === "in-force") ?? false, 60_000);
+    assert.equal(h.stateOf(n1).phase.ownerDirectives?.find((d) => d.text === text)?.id, "ODP-1");
     assert.equal(h.stateOf(n2).phase.ownerDirectives?.find((d) => d.text === text)?.id, "ODP-1");
 
     // The owner retracts it from n1's own input box, without `C-u`: a

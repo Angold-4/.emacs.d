@@ -264,9 +264,10 @@
       (should-not (string-match-p "Owner input" text))
       (should-not (string-match-p "verdict" text)))))
 
-(defun +tt-test--input-state (phase &optional alive blocked requests)
+(defun +tt-test--input-state (phase &optional alive blocked requests program)
   "A minimal `tt state' for the input-header tests."
   `((conductorAlive . ,(if alive t :false))
+    (program . ,(if program '((programId . "prog1") (node . "13a")) nil))
     (ownerInputs)
     (pendingOwnerInputs)
     (state (run . "RUN_ACTIVE")
@@ -367,11 +368,17 @@ force, and the delivery state per live agent."
 
 (ert-deftest tradeoffs-trace-input-header-scope ()
   "Plan 01i (D5): the input header states the directive's scope, for a run's
-box and for a program buffer's box."
+box, a program node's box, and a program buffer's box."
+  ;; A node of a program: `C-u' really can reach the whole program.
   (should (string-match-p "owner directive applying to this phase"
-                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t))))
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t nil nil t))))
   (should (string-match-p "C-u C-c C-c: whole program"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t nil nil t))))
+  ;; A hand-started run has nothing program-wide to reach, and says so.
+  (should (string-match-p "this run is not part of a program"
                           (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
+  (should-not (string-match-p "whole program"
+                              (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
   (should (string-match-p "program-wide owner directive for the whole program"
                           (+tt--input-header nil t))))
 
@@ -391,39 +398,55 @@ directive; without the prefix it applies to this phase."
         (should (equal (alist-get 'scope written) "program"))))))
 
 (ert-deftest tradeoffs-trace-program-input-writes-a-program-directive ()
-  "Plan 01i: the program buffer's input box writes a program-wide directive
-to the program's own inbox."
-  (let ((written nil)
+  "Plan 01i: the program buffer's input box records a program-wide directive
+through the CLI, which appends the event and steers every running node now."
+  (let ((called nil)
         (dir (make-temp-file "tt-ert-prog" t)))
     (unwind-protect
         (progn
-          (cl-letf (((symbol-function '+tt--write-command)
-                     (lambda (d cmd) (setq written (cons d cmd)) "id-2")))
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "ODP-1")))
             (with-temp-buffer
               (insert "no node may touch the vendor adapters")
               (setq +tt--input-program-dir dir)
               (+tt-input-send)
-              (should (equal (car written) dir))
-              (should (equal (alist-get 'type (cdr written)) "directive"))
-              (should (equal (alist-get 'scope (cdr written)) "program")))))
+              (should (equal called (list "program" "directive" dir "no node may touch the vendor adapters"))))))
       (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-program-input-withdraws-a-directive ()
-  "Plan 01i: the program input box's `withdraw ODP-n' queues a withdrawal,
-and trailing prose does not turn it into a new ruling."
-  (let ((written nil)
+  "Plan 01i: the program input box's `withdraw ODP-n' goes through `tt
+program withdraw' at once; trailing prose does not turn it into a new ruling,
+and an unknown id is refused by that command."
+  (let ((called nil)
         (dir (make-temp-file "tt-ert-prog" t)))
     (unwind-protect
         (progn
-          (cl-letf (((symbol-function '+tt--write-command)
-                     (lambda (d cmd) (setq written (cons d cmd)) "id-3")))
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
             (with-temp-buffer
               (insert "withdraw ODP-1 because it is stale")
               (setq +tt--input-program-dir dir)
               (+tt-input-send)
-              (should (equal (car written) dir))
-              (should (equal (alist-get 'type (cdr written)) "withdraw"))
-              (should (equal (alist-get 'directiveId (cdr written)) "ODP-1")))))
+              (should (equal called (list "program" "withdraw" dir "ODP-1")))))
+          ;; A withdrawal that names no id is refused here, never queued as a
+          ;; brand-new program-wide ruling.
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (setq called nil)
+            (with-temp-buffer
+              (insert "withdraw the Stork exception")
+              (setq +tt--input-program-dir dir)
+              (should-error (+tt-input-send) :type 'user-error)
+              (should-not called)))
+          ;; …and so is a phase id, which is not a program-wide ruling.
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (setq called nil)
+            (with-temp-buffer
+              (insert "withdraw OD-2")
+              (setq +tt--input-program-dir dir)
+              (should-error (+tt-input-send) :type 'user-error)
+              (should-not called))))
       (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-program-parse ()

@@ -51,6 +51,7 @@ export function programPaths(dir: string) {
      * a node run is forwarded here; the Emacs program buffer writes here). */
     inbox: path.join(dir, "inbox"),
     inboxApplied: path.join(dir, "inbox", "applied"),
+    inboxRejected: path.join(dir, "inbox", "rejected"),
   };
 }
 
@@ -61,6 +62,7 @@ export function createProgram(root: string, program: ProgramFile, id = randomUUI
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(programPaths(dir).inbox, { recursive: true });
   fs.mkdirSync(programPaths(dir).inboxApplied, { recursive: true });
+  fs.mkdirSync(programPaths(dir).inboxRejected, { recursive: true });
   fs.writeFileSync(programPaths(dir).program, JSON.stringify(program, null, 2));
   fs.writeFileSync(programPaths(dir).events, "");
   return dir;
@@ -100,12 +102,23 @@ export function scanProgramInbox(dir: string): void {
   const p = programPaths(dir);
   fs.mkdirSync(p.inbox, { recursive: true });
   fs.mkdirSync(p.inboxApplied, { recursive: true });
+  fs.mkdirSync(p.inboxRejected, { recursive: true });
   let names: string[];
   try {
     names = fs.readdirSync(p.inbox);
   } catch {
     return;
   }
+  /** Moves a refused command out of the inbox and says why, beside it — the
+   * same visible refusal a run's inbox gives, never a silent no-op. */
+  const reject = (name: string, reason: string): void => {
+    try {
+      fs.writeFileSync(path.join(p.inboxRejected, `${name}.reason.txt`), `${reason}\n`);
+      fs.renameSync(path.join(p.inbox, name), path.join(p.inboxRejected, name));
+    } catch {
+      // already moved
+    }
+  };
   for (const name of names.sort()) {
     if (!name.endsWith(".json")) continue;
     const file = path.join(p.inbox, name);
@@ -127,7 +140,16 @@ export function scanProgramInbox(dir: string): void {
       // already recorded
     } else if (kind === "withdraw") {
       const id = typeof r.directiveId === "string" ? r.directiveId : undefined;
-      if (id) appendProgramEvent(dir, { type: "DIRECTIVE_WITHDRAWN", directiveId: id });
+      const target = id ? (state.directives ?? []).find((d) => d.id === id) : undefined;
+      if (!target) {
+        reject(name, `no program directive ${id ?? "(none named)"} exists`);
+        continue;
+      }
+      if (target.withdrawn) {
+        reject(name, `program directive ${id} is already withdrawn`);
+        continue;
+      }
+      appendProgramEvent(dir, { type: "DIRECTIVE_WITHDRAWN", directiveId: id! });
     } else if (text.trim().length > 0) {
       const directive: ProgramDirective = {
         id: nextProgramDirectiveId(state),

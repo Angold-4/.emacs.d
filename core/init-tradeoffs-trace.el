@@ -977,13 +977,16 @@ would otherwise reject permanently as malformed)."
     (rename-file tmp final t)
     id))
 
-(defun +tt--input-scope-note (&optional program-wide)
+(defun +tt--input-scope-note (&optional program-wide not-in-program)
   "The scope sentence the input header shows before sending.
 Plan 01i (D5): a directive applies to its phase unless the sender asks for
-the whole program — with PROGRAM-WIDE, or always in a program buffer."
-  (if program-wide
-      "applying to the whole program (every running node now, every node started later)"
-    "applying to this phase (C-u C-c C-c: whole program)"))
+the whole program — with PROGRAM-WIDE, or always in a program buffer.  A run
+that is not part of a program has nothing program-wide to reach, and says so
+rather than promising one."
+  (cond
+   (program-wide "applying to the whole program (every running node now, every node started later)")
+   (not-in-program "applying to this phase (this run is not part of a program, so C-u reaches no other node)")
+   (t "applying to this phase (C-u C-c C-c: whole program)")))
 
 (defun +tt--input-header (s &optional program)
   "One line stating what sending the input will do now, from state S.
@@ -998,6 +1001,7 @@ program-wide by construction (S is nil then)."
            (name (alist-get 'phase phase))
            (attempt (+tt--get phase 'attempt 'n))
            (alive (eq (alist-get 'conductorAlive s) t))
+           (in-program (and (alist-get 'program s) t))
            (requests (seq-filter (lambda (r) (equal (alist-get 'status r) "open"))
                                  (alist-get 'ownerRequests phase))))
       (cond
@@ -1011,13 +1015,13 @@ program-wide by construction (S is nil then)."
         "Cannot deliver input: no conductor is running for this run (resume it to deliver).")
        ((equal name "AWAITING_OWNER")
         (format "Sending corrects the phase: resolves %d open owner request(s), grants 3 repair rounds, starts a repair attempt with your text verbatim, and becomes an owner directive %s."
-                (length requests) (+tt--input-scope-note)))
+                (length requests) (+tt--input-scope-note nil (not in-program))))
        ((member name '("IMPLEMENTING" "FREEZING"))
         (format "Sending steers worker attempt %s now (at most once; C-c C-c or RET), and becomes an owner directive %s."
-                attempt (+tt--input-scope-note)))
+                attempt (+tt--input-scope-note nil (not in-program))))
        (t
         (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s)."
-                (+tt--input-scope-note) (or name "?")))))))
+                (+tt--input-scope-note nil (not in-program)) (or name "?")))))))
 
 (defun +tt-input-send (&optional program-wide)
   "Queue the input buffer's text as the owner input its phase calls for.
@@ -1035,25 +1039,37 @@ directive — for this phase, or for the whole program with PROGRAM-WIDE
         (+tt--send-program-directive in-program text)
       (+tt--send-run-input +tt--run-dir text program-wide))))
 
-(defun +tt--withdraw-id (text)
-  "The directive id the program input TEXT withdraws, or nil.
-Plan 01i: program-wide rulings are ODP-n, a phase's own are OD-n; a text that
-opens with `withdraw' but names no id is malformed and the conductor refuses
-it, never records it as a new ruling."
-  (when (string-match "\\`withdraw\\b[ \t]+\\(ODP-[0-9]+\\|OD-[0-9]+\\)" text)
-    (upcase (match-string 1 text))))
+(defun +tt--program-withdraw-id (text)
+  "The program-wide directive id TEXT withdraws, or nil when not a withdrawal.
+Signals a user-error — never a silent no-op, never a new ruling — for a
+withdrawal that names no id or names a phase directive (`OD-n'): the program
+has only `ODP-n' rulings, and plan 01i forbids inverting a near-miss into a
+fresh binding directive."
+  (when (string-match "\\`withdraw\\b" text)
+    (let* ((rest (string-trim (substring text (match-end 0))))
+           (id (and (string-match "\\`\\(ODP-[0-9]+\\|OD-[0-9]+\\)\\b" rest)
+                    (upcase (match-string 1 rest)))))
+      (cond
+       ((null id)
+        (user-error "Refused: a withdrawal must name a directive id, e.g. `withdraw ODP-1`"))
+       ((not (string-prefix-p "ODP-" id))
+        (user-error "Refused: %s is a phase directive; a program buffer withdraws program-wide ones (ODP-n)" id))
+       (t id)))))
 
 (defun +tt--send-program-directive (dir text)
-  "Queue TEXT as a program-wide owner directive in program DIR's inbox.
-TEXT that withdraws one (`withdraw ODP-n`) is queued as a withdrawal."
-  (let* ((withdraw-id (+tt--withdraw-id text))
-         (id (+tt--write-command dir (if withdraw-id
-                                        `((type . "withdraw") (directiveId . ,withdraw-id) (text . ,text))
-                                      `((type . "directive") (text . ,text) (scope . "program"))))))
+  "Send TEXT as a program-wide ruling through the CLI, at once.
+A withdrawal (`withdraw ODP-n') is recorded and pushed by `tt program
+withdraw', which refuses an unknown or already-withdrawn id — so the owner is
+never told a ruling was retracted when it was not."
+  (let ((withdraw-id (+tt--program-withdraw-id text)))
     (erase-buffer)
-    (message "tradeoffs-trace: program-wide %s queued in %s (%s); every running node is steered at once"
-             (if withdraw-id (format "withdrawal of %s" withdraw-id) "directive")
-             (file-name-nondirectory (directory-file-name dir)) id)))
+    (if withdraw-id
+        (progn
+          (+tt--cli "program" "withdraw" dir withdraw-id)
+          (message "tradeoffs-trace: program-wide withdrawal of %s recorded; every running node is steered that it no longer applies"
+                   withdraw-id))
+      (let ((id (+tt--cli "program" "directive" dir text)))
+        (message "tradeoffs-trace: program-wide directive %s recorded; every running node is steered at once" id)))))
 
 (defun +tt--send-run-input (run-dir text program-wide)
   "Queue TEXT as the owner input RUN-DIR's phase calls for.

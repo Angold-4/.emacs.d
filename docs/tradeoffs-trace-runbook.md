@@ -297,7 +297,9 @@ when it is sent with `C-u C-c C-c` from a run's input box, or from a program
 buffer's input box (`i` in the program buffer). A program-wide ruling is
 numbered `ODP-1`, `ODP-2`, … : the `ODP` namespace is the program's own, so a
 node never renumbers a program ruling and one id always names one ruling. The
-header line states the scope before you send.
+header line states the scope before you send. A run that is **not part of a
+program** has nothing program-wide to reach: its header says so, and a `C-u`
+there stays this phase's own directive.
 
 **Withdraw one.** Type `withdraw OD-n` (or `withdraw ODP-n` for a program-wide
 one), for example `withdraw OD-1`, into any input box — a run's or the
@@ -308,7 +310,8 @@ node is told, and every node started later is no longer given it. Trailing
 prose is fine (`withdraw OD-1 because it is stale` retracts OD-1). A withdrawal
 that names no id, an id that does not exist, or one already withdrawn is
 refused with the reason, and nothing changes — it is never turned into a new
-ruling.
+ruling. (The program buffer's box goes through `tt program withdraw`, which
+refuses an unknown id or a phase id (`OD-n`) the same way.)
 
 The status buffer's **Owner input** section shows each text's recorded effect:
 delivered, noted, correction started, refused, delivery uncertain, or not

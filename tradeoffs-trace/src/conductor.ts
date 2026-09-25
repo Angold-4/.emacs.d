@@ -1506,15 +1506,14 @@ export class Conductor {
   }
 
   /** Plan 01i: a `C-u` input in a run's own box, applied program-wide (D5).
-   * The run does NOT record a directive of its own: it forwards the text to
-   * the program, which mints the single program-wide id (`ODP-n`) and pushes
-   * that record to every running node — this one included. The owner's ruling
-   * is still heard at once (every live agent is steered now); the record that
-   * prompts and the status quote is the program's, so one id names one ruling
-   * everywhere. */
+   * The run does NOT record a directive of its own and does NOT steer: it
+   * forwards the text to the program, which mints the single program-wide id
+   * (`ODP-n`) and pushes that record to every running node — this one
+   * included. That record is what steers each live agent, exactly once, with
+   * the id the owner will withdraw against. So one id names one ruling
+   * everywhere, and no input is ever steered twice. */
   #processProgramWideInput(file: string, commandId: string, kind: OwnerInputKind, text: string): void {
     this.#forwardProgramDirective(commandId, text);
-    this.#steerProgramWide(commandId, text);
     this.#recordOwnerInput(
       commandId,
       kind,
@@ -1525,32 +1524,6 @@ export class Conductor {
     );
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
-  }
-
-  /** Plan 01i: steers a program-wide text (before its `ODP-n` record exists
-   * here) to every live agent, so the ruling is heard now rather than at the
-   * next scheduler tick. */
-  #steerProgramWide(commandId: string, text: string): void {
-    const message = `Owner (program-wide) directive: ${text}`;
-    for (const { target, agentId, agent } of this.#liveAgents()) {
-      const actionId = `deliver-${commandId}-pw-${target}-${agentId}`;
-      this.#log.intent(actionId, { target, agentId, text });
-      void agent.steer(message).then(
-        () => {
-          if (this.#closed) return;
-          this.#log.completion(actionId, { outcome: "program-wide-steer-acknowledged", target, agentId });
-        },
-        (err) => {
-          if (this.#closed) return;
-          this.#log.completion(actionId, {
-            outcome: "program-wide-steer-failed",
-            target,
-            agentId,
-            error: String((err as Error)?.message ?? err),
-          });
-        },
-      );
-    }
   }
 
   /** Plan 01i: a run started by a program scheduler (D5) forwards a
@@ -1603,14 +1576,7 @@ export class Conductor {
    * outcome unknown: on restart an intent with no completion is recorded
    * `delivery-uncertain` and never resent — steering is at most once, or
    * explicitly uncertain. */
-  #processSteerCommand(
-    file: string,
-    commandId: string,
-    raw: unknown,
-    text: string,
-    scope: DirectiveScope = "phase",
-    forward = true,
-  ): void {
+  #processSteerCommand(file: string, commandId: string, raw: unknown, text: string, scope: DirectiveScope = "phase"): void {
     const r = raw as Record<string, unknown>;
     const binding = r.binding && typeof r.binding === "object" ? (r.binding as Record<string, unknown>) : undefined;
     const boundAttemptId =
@@ -1636,8 +1602,7 @@ export class Conductor {
       // restart folds it back; if the crash landed between the directive's
       // own event and the intent, add it now (idempotent by command id) so
       // the recovered input is still a directive in every later prompt.
-      const directive = this.#addDirective(text, scope, commandId, ["worker"]);
-      if (forward && scope === "program") this.#forwardProgramDirective(commandId, text);
+      const directive = this.#addDirective(text, scope, commandId, []);
       const recovered: "delivered" | "delivery-uncertain" = completion ? "delivered" : "delivery-uncertain";
       if (!recorded) {
         if (completion) {
@@ -1672,13 +1637,9 @@ export class Conductor {
     // Plan 01i: every input is also an owner directive. It is recorded before
     // the steer is sent (so a crash between the two still leaves the ruling in
     // every later prompt), and the worker's own steer below is that
-    // directive's delivery — never a second, duplicate steer.
-    const directive = this.#addDirective(text, scope, commandId, ["worker"]);
-    // A `C-u` directive from this run's own box applies program-wide (D5):
-    // its scope is forwarded to the program, which pushes it to the other
-    // running nodes and starts every later node with it. Keyed by the inbox
-    // command id, so a re-forward after a crash adds nothing.
-    if (forward && scope === "program") this.#forwardProgramDirective(commandId, text);
+    // directive's delivery — never a second, duplicate steer. The exemption
+    // is that worker's *agent id* (`worker-<n>-<actionId>`), not its label.
+    const directive = this.#addDirective(text, scope, commandId, [worker.agentId]);
     // Mark in flight (NOT applied): the file must stay in the inbox until the
     // acknowledgement decides its fate, so a crash here can still recover it.
     this.#steerInFlight.add(commandId);
@@ -1830,18 +1791,21 @@ export class Conductor {
       }
       // A program-wide input (D5) in a run the scheduler started: the
       // program mints the one `ODP-n` record, so this run only forwards the
-      // text and steers its own agents now — it must not mint a local id that
-      // could not match the program's.
+      // text — it must not mint a local id that could not match the
+      // program's. A run that is NOT part of a program has nothing
+      // program-wide to reach, so the input stays this phase's own directive
+      // (never a `program`-scoped record in a run that has no program).
       const programWide = scope === "program" && this.#programDir() !== undefined;
+      const effectiveScope: DirectiveScope = programWide ? "program" : "phase";
       if (inputKind === "steer") {
         if (programWide) {
           this.#processProgramWideInput(file, commandId, "steer", inputText);
           return;
         }
-        this.#processSteerCommand(file, commandId, raw, inputText, scope);
+        this.#processSteerCommand(file, commandId, raw, inputText, effectiveScope);
         return;
       }
-      noteKindText = { text: inputText, scope, programWide };
+      noteKindText = { text: inputText, scope: effectiveScope, programWide };
     }
 
     // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
@@ -1900,7 +1864,6 @@ export class Conductor {
     if (noteKindText) {
       if (noteKindText.programWide) {
         this.#forwardProgramDirective(commandId, noteKindText.text);
-        this.#steerProgramWide(commandId, noteKindText.text);
       } else {
         this.#addDirective(noteKindText.text, noteKindText.scope, commandId);
       }
