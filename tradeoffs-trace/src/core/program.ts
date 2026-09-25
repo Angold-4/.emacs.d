@@ -75,6 +75,9 @@ export type ProgramEvent =
   | { type: "NODE_BLOCKED"; node: string; reason: string }
   | { type: "NODE_RESUMED"; node: string; reason: "crashed" | "owner" }
   | { type: "PROGRAM_RESUMED" }
+  /** `tt program retry`: a blocked (or stopped) node goes back to waiting and
+   * runs again as a fresh run; its branch is kept. */
+  | { type: "NODE_RETRY"; node: string }
   | { type: "NODE_STATUS"; node: string; status: Exclude<NodeStatus, "waiting">; reason?: string }
   | { type: "DIRECTIVE_ADDED"; directive: ProgramDirective }
   | { type: "DIRECTIVE_WITHDRAWN"; directiveId: string }
@@ -188,6 +191,11 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
       return { ...state, stopped: true };
     case "PROGRAM_RESUMED":
       return { ...state, stopped: false };
+    case "NODE_RETRY": {
+      const prev = state.nodes[event.node];
+      if (!prev || prev.status === "done" || prev.status === "running") return state;
+      return { ...state, nodes: { ...state.nodes, [event.node]: { status: "waiting", branch: prev.branch, base: prev.base } } };
+    }
     case "NODE_RESUMED": {
       const prev = state.nodes[event.node];
       if (!prev) return state;

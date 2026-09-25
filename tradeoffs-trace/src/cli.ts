@@ -57,7 +57,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -231,6 +231,28 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     process.stdout.write(
       `resumed program ${path.basename(dir)}${restarted.length > 0 ? ` (restarted ${restarted.join(", ")})` : ""}\n`,
     );
+  } else if (sub === "retry") {
+    // A blocked or stopped node runs again as a fresh run on its existing
+    // branch; the scheduler is (re)started to pick it up.
+    if (args.length !== 2) usage();
+    const dir = resolveProgramDir(args[0], root);
+    const { state } = foldProgram(dir);
+    const node = state.nodes[args[1]];
+    if (!node) {
+      process.stderr.write(`no node ${args[1]} in program ${path.basename(dir)}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (node.status === "done" || node.status === "running") {
+      process.stderr.write(`node ${args[1]} is ${node.status}; only a blocked, stopped or needs-you node can be retried\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (node.runId && conductorAlive(path.join(root, node.runId))) await cmdStop(node.runId, root);
+    if (state.stopped) appendProgramEvent(dir, { type: "PROGRAM_RESUMED" });
+    appendProgramEvent(dir, { type: "NODE_RETRY", node: args[1] });
+    if (!programPidAlive(dir)) launchProgramScheduler(dir);
+    process.stdout.write(`retrying ${args[1]} in program ${path.basename(dir)}\n`);
   } else if (sub === "prs") {
     // Skill fix 3: one PR per DONE node, stacked on its dependency's branch.
     // Prints the commands; pushing and opening PRs stay the owner's call.
