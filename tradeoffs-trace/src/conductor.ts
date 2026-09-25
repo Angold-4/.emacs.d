@@ -602,8 +602,13 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
  * to paper over. */
 function foldEvents(base: State, records: readonly LogRecord[], lenient = false): State {
   let state = base;
-  for (const record of records) {
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
     if (record.kind !== "event") continue;
+    // A runner before the stale-review fix logged an event and THEN its
+    // rejection; the live conductor never applied it, so neither does
+    // recovery (otherwise such a run could never be resumed).
+    if (records[i + 1]?.kind === "rejected") continue;
     const result = reduce(state, record.event);
     if (!result.ok && lenient) {
       // Read-only views of a run written by an older runner revision: skip
@@ -1233,11 +1238,15 @@ export class Conductor {
     // callers: intents, completions, sweeps).
     const logged = redactRecord(raw, this.#secretMaskable) as Event;
     const result = reduce(this.#state, logged);
-    this.#log.append("event", logged);
     if (!result.ok) {
+      // Only an applied event is ever written as an "event": recovery folds
+      // every one of them, so a rejected one would make every restart fail
+      // (runs cc1992e2 and ff398f35: a late REVIEW_SUBMITTED, logged and
+      // then rejected, crashed each resume).
       this.#log.append("rejected", { event: logged, reason: result.reason });
       throw new Error(`conductor emitted an event reduce() rejected: ${result.reason}`);
     }
+    this.#log.append("event", logged);
     this.#state = result.state;
     this.#syncBudgetTimer();
     this.drive();
@@ -2289,6 +2298,18 @@ export class Conductor {
       for (const fd of review.findings ?? []) {
         const leak = fd.reproduction ? secretUseInCommand(fd.reproduction.command, this.#secretNames) : undefined;
         if (leak !== undefined) return { ok: false, reason: leak };
+      }
+      if (this.#state.phase.phase !== "REVIEWING" || review.candidateSha !== this.#state.phase.candidate?.sha) {
+        // The round this review belongs to has ended (run cc1992e2: B's
+        // review arrived after the phase moved to a repair). Acknowledge it
+        // so the late agent stops, and change nothing.
+        this.#log.append("stale_review_ignored", {
+          reviewer: review.reviewer,
+          kind: "submission",
+          candidateSha: review.candidateSha,
+          phase: this.#state.phase.phase,
+        });
+        return { ok: true };
       }
       if (!this.#stubReviews && !this.#discoverySubmitted.has(agentId)) {
         // Work packet 2a, design §6.1: turn 2 must not be accepted before
@@ -3872,7 +3893,27 @@ export class Conductor {
 
   // -- review -----------------------------------------------------------
 
+  /** A reviewer dispatch's outcome applies only while the phase is still
+   * reviewing the candidate it was started for. A late one (a stray
+   * dispatch, or a reviewer finishing after the round moved on) is logged
+   * and dropped: run 807d3e84 marked B timed out from a previous round's
+   * stray dispatch, so B was never dispatched again and M and A waited at
+   * the discovery barrier until the phase was BLOCKED. */
+  #reviewStillCurrent(dispatchCandidate: string | undefined): boolean {
+    const phase = this.#state.phase;
+    return phase.phase === "REVIEWING" && phase.candidate?.sha === dispatchCandidate;
+  }
+
+  #reviewTimedOut(reviewer: Reviewer, dispatchCandidate: string | undefined): void {
+    if (!this.#reviewStillCurrent(dispatchCandidate)) {
+      this.#log.append("stale_review_ignored", { reviewer, kind: "timeout", dispatchCandidate, phase: this.#state.phase.phase });
+      return;
+    }
+    this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+  }
+
   async #runReview(actionId: string, reviewer: Reviewer): Promise<void> {
+    const dispatchCandidate = this.#state.phase.candidate?.sha;
     const agentId = `reviewer-${reviewer}-${actionId}`;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
     const candidateDir = this.#candidateDir();
@@ -3993,7 +4034,7 @@ export class Conductor {
       if (hello === "timeout") {
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "hello timed out" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
       if (!hello.ok) {
@@ -4005,7 +4046,7 @@ export class Conductor {
           this.#applyEvent({ type: "LAUNCH_FAILED", role: "reviewer", reviewer, ...hello.mismatch });
         } else {
           this.#log.completion(actionId, { reviewer, ok: false, reason: "hello failed" });
-          this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+          this.#reviewTimedOut(reviewer, dispatchCandidate);
         }
         return;
       }
@@ -4030,7 +4071,7 @@ export class Conductor {
         }
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
 
@@ -4050,7 +4091,7 @@ export class Conductor {
         await agent.terminate();
         const why = turn1 === "settled" ? "settled without submit_discovery (turn 1)" : "timeout (turn 1: submit_discovery)";
         this.#log.completion(actionId, { reviewer, ok: false, reason: why });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
 
@@ -4063,7 +4104,7 @@ export class Conductor {
         reviewTimeout.cancel();
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (turn 1 did not settle)" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
       // Plan 2c discovery barrier (design §3.3): no reviewer gets turn 2
@@ -4084,7 +4125,7 @@ export class Conductor {
         reviewTimeout.cancel();
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (waiting for the other reviewers' discovery)" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
       const settled2 = nextSettle();
@@ -4099,7 +4140,7 @@ export class Conductor {
       await agent.terminate();
       const why2 = turn2 === "settled" ? "settled without submit_review (turn 2)" : "timeout (turn 2: submit_review)";
       this.#log.completion(actionId, { reviewer, ok: false, reason: why2 });
-      this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+      this.#reviewTimedOut(reviewer, dispatchCandidate);
     } finally {
       this.#agents.delete(agentId);
     }
