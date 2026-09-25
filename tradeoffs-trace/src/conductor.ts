@@ -774,7 +774,13 @@ interface AgentHandle {
   /** Plan 01d: how many incomplete `submit_review` submissions this dispatch
    * has already had rejected (at most MAX_INCOMPLETE_REVIEW_REJECTIONS). */
   incompleteReviewRejections?: number;
+  /** A `submit_review` from this agent is being recorded. A second call
+   * while it is (run cc1992e2: B called the tool twice) is refused. */
+  reviewInFlight?: boolean;
 }
+
+/** `#applyReviewFindingsAndBallots` found the round over after an await. */
+const STALE_REVIEW = "stale review";
 
 export class Conductor {
   #runDir: string;
@@ -2743,11 +2749,29 @@ export class Conductor {
         // .review` to already exist (reduce.ts's own
         // FINDING_CONFIRMED_REPAIRED guard, design §4.2) — so that step
         // runs LAST, after REVIEW_SUBMITTED.
+        if (handle.reviewInFlight) return { ok: false, reason: "this review is already being recorded" };
+        handle.reviewInFlight = true;
         let error: string | undefined;
         try {
           error = await this.#applyReviewFindingsAndBallots(review);
         } catch (err) {
           error = `threw: ${String((err as Error)?.message ?? err)}`;
+        } finally {
+          handle.reviewInFlight = false;
+        }
+        if (error === STALE_REVIEW || !this.#reviewStillCurrent(review.candidateSha)) {
+          // Run cc1992e2: recording findings awaits reproductions, and the
+          // round ended meanwhile (the same reviewer's earlier submission
+          // closed it). What was not yet applied is dropped, and the agent is
+          // acknowledged so it stops.
+          this.#log.append("stale_review_ignored", {
+            reviewer: review.reviewer,
+            kind: "submission_after_wait",
+            candidateSha: review.candidateSha,
+            phase: this.#state.phase.phase,
+          });
+          handle.doneResolve();
+          return { ok: true };
         }
         if (error) {
           this.#log.append("review_outcome_error", { reviewer: review.reviewer, error });
@@ -3093,6 +3117,7 @@ export class Conductor {
       const { sameAs: _sameAs, ...disclosure } = fd;
       const error = await this.#raiseFinding(disclosure, review.reviewer, candidate.sha);
       if (error) return error;
+      if (!this.#reviewStillCurrent(candidate.sha)) return STALE_REVIEW;
     }
 
     for (const bd of review.ballots ?? []) {
