@@ -9,7 +9,6 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
 
 import { Conductor, createRun, runPaths, type ConductorOptions, type RunPlanFile } from "../../src/conductor.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
@@ -19,9 +18,15 @@ import { readLog, type LogRecord } from "../../src/effects/log.ts";
 export const FAKE_PI_PATH = fileURLToPath(new URL("../fake-pi/fake-pi.ts", import.meta.url));
 
 function shortTmp(prefix: string): string {
-  const dir = path.join("/tmp", `${prefix}-${randomBytes(4).toString("hex")}`);
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
+  // `mkdtemp` guarantees the name is NEW (it retries on collision). A plain
+  // random name written into with `mkdirSync(..., {recursive: true})` silently
+  // reuses an existing directory when the name collides — and thousands of
+  // `tt-*` directories accumulate in /tmp from earlier runs, so that is a real
+  // draw. A reused repo directory is a confusing failure: the fresh
+  // `git init` sees the old `base` commit, the identical README changes
+  // nothing, and `git commit` fails with "nothing to commit, working tree
+  // clean" (observed failing the phase's own `make check`).
+  return fs.mkdtempSync(path.join("/tmp", `${prefix}-`));
 }
 
 function git(args: string[], cwd: string): string {
@@ -40,6 +45,9 @@ export function makeRepo(): TestRepo {
   fs.writeFileSync(path.join(dir, "README.md"), "base\n");
   git(["add", "-A"], dir);
   git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"], dir);
+  // Names the real cause if the commit above did not happen: `rev-parse HEAD`
+  // fails with "Needed a single revision" instead of leaving a test to fail
+  // later for reasons that look unrelated.
   const head = git(["rev-parse", "HEAD"], dir);
   return { dir, head };
 }
