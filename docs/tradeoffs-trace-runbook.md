@@ -59,17 +59,22 @@ for example a full `deploy/atlas.sh … --clean --build` of a 40-service stack
   the merged tree, the command, exit status, the gate's own duration, start,
   the log's sha256, and the cleanup's own exit and duration) plus
   `<run>/checks/<sha>/gate.log` (redacted stdout/stderr). `tt status` and `tt
-  summary` cite it. `:GATE_CLEANUP:` runs after the gate whatever the outcome,
-  under its own limit; its time is not counted as the gate's.
+  summary` cite it. The cleanup runs whenever the gate command ran (pass, fail
+  or timeout), under its own limit; its time is not counted as the gate's. If
+  the candidate no longer merges, the gate never starts and nothing is
+  cleaned — the record says `not started` rather than claiming a run.
 - **A failure** (non-zero exit, or killed at its limit) is a blocking
   `integration` finding whose evidence is the log's last 60 lines. The phase
   repairs (the worker is shown the log) or parks on you when the rounds run
   out.
 - **An identical tree with the same command reuses a passing record**: the
   command does not run again (a repair attempt that changes nothing freezes a
-  new commit with the same tree). The record is re-hashed first: if its
-  `gate.log` is missing or no longer matches the sha256 it carries — or the
-  plan's `:GATE:` text has changed — the gate reruns instead of passing on it.
+  new commit with the same tree). The run-or-reuse decision happens under the
+  gate lock, so a candidate whose tree another candidate just gated reuses
+  that pass. The record is re-hashed first: if its `gate.log` is missing or no
+  longer matches the sha256 it carries — or the plan's `:GATE:` text has
+  changed — the gate reruns instead of passing on it. A record that is itself
+  a reuse counts as passing, so a chain of reuses still saves the build.
   A failed gate is always rerun, and a record is never overwritten: a
   candidate re-gated after a stale publish accepts on its own record in place,
   and the status/`tt summary` line names both the head the evidence came from

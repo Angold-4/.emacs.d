@@ -642,9 +642,16 @@ conductor runs the gate itself, and only the conductor produces its evidence.
   own duration, start time, the log's sha256, and the cleanup's own exit and
   duration) and `checks/<sha>/gate.log` (stdout and stderr, redacted). The
   `ACCEPTED` event a passing gate releases is the only thing that lets
-  acceptance proceed. The cleanup command runs whatever the outcome, under
-  its own limit, and its time is never folded into the gate's duration — the
-  lock is held for both.
+  acceptance proceed. The cleanup runs under its own limit and its time is
+  never folded into the gate's duration — the lock is held for both. The rule
+  is exactly: **the cleanup runs whenever the gate command ran (pass, fail or
+  timeout); if the candidate no longer merges, the gate never starts and
+  nothing is cleaned.** Such a candidate is recorded as `not started` (with no
+  exit status and no duration), never as an exit-less run.
+- **The run-or-reuse decision is taken under the lock.** The gate takes the
+  lock, then asks whether this tree and command already have a verified pass;
+  only if not does it merge the candidate and run the command. Two candidates
+  with the same tree never both run the gate.
 - **A failure is a blocking `integration` finding** whose evidence is the
   log's last 60 lines. The phase returns to `REPAIRING` (or `AWAITING_OWNER`
   when the budget is exhausted), and the repair prompt shows the worker the
@@ -656,7 +663,9 @@ conductor runs the gate itself, and only the conductor produces its evidence.
   with the same tree, so its gate is reused rather than paid for again; a
   record whose log is missing or edited, whose command differs (the plan was
   re-read or the contract amended), or whose tree is another candidate's makes
-  the gate rerun. A failed gate is always rerun.
+  the gate rerun. A record that was itself written as a reuse counts as
+  passing — its log is the verified copy of the run behind it, so a chain of
+  reuses still saves the build. A failed gate is always rerun.
 - **A record is never rewritten.** When the *same* candidate is gated again
   (a stale publish sends the phase back through `PROBING` with its reviews
   still valid), its own passing record — verified against the same tree and

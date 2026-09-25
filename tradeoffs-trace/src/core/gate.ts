@@ -59,12 +59,13 @@ export interface GateRecord {
   cleanup?: string;
   /** When the command that produced this evidence started, and how long it
    * took: a reused record keeps the source run's own facts (the evidence was
-   * produced then, not when it was reused). */
+   * produced then, not when it was reused). Absent `durationMs` and
+   * `exitCode` mean the command never started — `notStarted` says why. */
   startedAt: string;
-  durationMs: number;
-  exitCode: number | null;
+  durationMs?: number;
+  exitCode?: number | null;
   signal?: string | null;
-  timedOut: boolean;
+  timedOut?: boolean;
   /** exitCode 0 and not killed at the limit. */
   passed: boolean;
   /** sha256 of the (redacted) `gate.log` written beside this record. */
@@ -82,9 +83,13 @@ export interface GateRecord {
   cleanupDurationMs?: number;
   cleanupExitCode?: number | null;
   cleanupTimedOut?: boolean;
-  /** Set instead of the cleanup fields when there was no checkout to clean
-   * (a candidate that no longer merges): recorded rather than guessed. */
+  /** Set instead of the cleanup fields when there was no checkout to clean. */
   cleanupSkipped?: string;
+  /** Set (with no `exitCode`/`durationMs`/`timedOut`) when the gate command
+   * never started at all: today the only case is a candidate that no longer
+   * merges onto the integration head, so there was nothing to run and nothing
+   * to clean up. The record says so rather than claiming an exit-less run. */
+  notStarted?: string;
 }
 
 function isString(v: unknown): v is string {
@@ -103,31 +108,39 @@ function isExitCode(v: unknown): v is number | null {
  * hand-edited or half-written record is treated as "no record", never as a
  * passing gate. The required fields are the ones the design names: the
  * candidate and base SHA, the command, the exit status, the duration, the
- * start time and the log hash. */
+ * start time and the log hash — except on a record that says the command
+ * never started (`notStarted`), which carries no exit status or duration. */
 export function parseGateRecord(value: unknown): GateRecord | undefined {
   if (!value || typeof value !== "object") return undefined;
   const r = value as Record<string, unknown>;
   if (!isString(r.candidateSha)) return undefined;
   if (!isString(r.baseSha)) return undefined;
   if (typeof r.command !== "string") return undefined;
-  if (!isExitCode(r.exitCode)) return undefined;
-  if (!isNumber(r.durationMs) || r.durationMs < 0) return undefined;
   if (!isString(r.startedAt)) return undefined;
   if (!isString(r.logSha256)) return undefined;
-  if (typeof r.timedOut !== "boolean") return undefined;
   if (typeof r.passed !== "boolean") return undefined;
+  const notStarted = isString(r.notStarted);
+  if (!notStarted) {
+    if (!isExitCode(r.exitCode)) return undefined;
+    if (!isNumber(r.durationMs) || r.durationMs < 0) return undefined;
+    if (typeof r.timedOut !== "boolean") return undefined;
+  }
   const record: GateRecord = {
     candidateSha: r.candidateSha,
     baseSha: r.baseSha,
     command: r.command,
     startedAt: r.startedAt,
-    durationMs: r.durationMs,
-    exitCode: r.exitCode,
-    timedOut: r.timedOut,
     passed: r.passed,
     logSha256: r.logSha256,
     logBytes: isNumber(r.logBytes) ? r.logBytes : 0,
   };
+  if (!notStarted) {
+    record.durationMs = r.durationMs as number;
+    record.exitCode = r.exitCode as number | null;
+    record.timedOut = r.timedOut as boolean;
+  } else {
+    record.notStarted = r.notStarted as string;
+  }
   for (const key of ["tree", "mergedI", "cleanup", "reusedFrom", "reusedFromBaseSha", "cleanupSkipped"] as const) {
     if (isString(r[key])) record[key] = r[key] as string;
   }
@@ -156,15 +169,19 @@ export function gateLogTail(text: string, lines = GATE_TAIL_LINES): string {
  * `integration` finding's evidence, so it carries the log tail verbatim —
  * the worker must be able to see the failure, not a summary of it. */
 export function gateFailureEvidence(opts: {
-  record: Pick<GateRecord, "candidateSha" | "command" | "exitCode" | "timedOut" | "durationMs" | "startedAt" | "logSha256">;
+  record: Pick<GateRecord, "candidateSha" | "command" | "exitCode" | "timedOut" | "durationMs" | "startedAt" | "logSha256" | "notStarted">;
   logPath: string;
   tail: string;
   reason?: string;
 }): string {
   const { record } = opts;
-  const how = record.timedOut
-    ? `was killed at its limit after ${Math.round(record.durationMs / 1000)}s`
-    : `exited ${record.exitCode === null ? "on a signal" : record.exitCode}`;
+  // A gate that never started did not exit, and did not get killed: say what
+  // actually happened instead of dressing it up as an exit-less run.
+  const how = record.notStarted
+    ? `did not start: ${record.notStarted}`
+    : record.timedOut
+      ? `was killed at its limit after ${Math.round((record.durationMs ?? 0) / 1000)}s`
+      : `exited ${record.exitCode === null || record.exitCode === undefined ? "on a signal" : record.exitCode}`;
   const lines = [
     `gate command ${how} on candidate ${record.candidateSha.slice(0, 9)}: ${record.command}`,
     `log: ${opts.logPath} (sha256 ${record.logSha256})`,
@@ -208,9 +225,7 @@ export function gateDecision(
   records: readonly GateRecord[],
   want: { candidateSha: string; tree?: string; command: string },
 ): { kind: "own"; record: GateRecord } | { kind: "reuse"; record: GateRecord } | { kind: "run" } {
-  if (gateRecordAnswers(ownVerifiedPass, want, { allowReused: true })) {
-    return { kind: "own", record: ownVerifiedPass! };
-  }
+  if (gateRecordAnswers(ownVerifiedPass, want)) return { kind: "own", record: ownVerifiedPass! };
   const reused = reusableGate(
     records.filter((r) => r.candidateSha !== want.candidateSha),
     want,
@@ -231,9 +246,11 @@ export function gateDecision(
  * the same tree), and the record names the head the evidence came from
  * (`reusedFromBaseSha`).
  *
- * `allowReused` keeps a record that was itself written as a reuse (the
- * candidate's own record after an earlier identical tree): it is still this
- * candidate's evidence, it just came from further back.
+ * A record that was **itself written as a reuse** still answers the question:
+ * its log is the verified copy of the run that produced the evidence, so a
+ * candidate's own reuse record, and a chain of them, count as passing (the
+ * alternative — dropping them — made an identical tree pay for the gate
+ * again, and made a stale-publish re-gate rewrite a candidate's own record).
  *
  * A record whose command differs is not evidence for this gate: the plan
  * snapshot is re-read at every restart and an amended contract can name a
@@ -241,15 +258,8 @@ export function gateDecision(
  * answered a different question. A record whose tree differs is another
  * candidate's pass. Callers verify the log's hash separately
  * (`gateLogHashMatches`). */
-export function gateRecordAnswers(
-  record: GateRecord | undefined,
-  want: { tree?: string; command: string },
-  opts: { allowReused?: boolean } = {},
-): boolean {
-  // A reused record is not a source: the original pass is the evidence, and
-  // reusing a reuse would just add indirection.
+export function gateRecordAnswers(record: GateRecord | undefined, want: { tree?: string; command: string }): boolean {
   if (!record || !record.passed) return false;
-  if (record.reused && !opts.allowReused) return false;
   if (!want.tree || !record.tree) return false;
   return record.tree === want.tree && record.command === want.command;
 }
@@ -260,7 +270,9 @@ export function gateRecordAnswers(
  * changes nothing reuses the previous round's pass instead of paying for the
  * same build again — the disk-filling repeats of runtime doc §6). Callers
  * exclude the candidate's own record (`gateDecision` does) and verify the
- * chosen record's log before writing anything from it. */
+ * chosen record's log before writing anything from it. A record that is
+ * itself a reuse is a valid source: the conductor flattens its provenance to
+ * the run that actually produced the evidence. */
 export function reusableGate(
   records: readonly GateRecord[],
   want: { tree?: string; command: string },

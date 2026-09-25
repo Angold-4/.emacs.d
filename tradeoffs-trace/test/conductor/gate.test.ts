@@ -145,6 +145,35 @@ test("gate: parseGateRecord accepts a full record and refuses one missing a desi
   assert.equal(parseGateRecord(null), undefined);
 });
 
+test("gate: a record that never started carries no exit status or duration", () => {
+  // A-16: the no-merge record says "not started" instead of claiming an
+  // exit-less, zero-duration run.
+  const notStarted = {
+    candidateSha: "c1",
+    tree: "tree-a",
+    baseSha: "h1",
+    command: "deploy --build",
+    startedAt: "2026-09-25T00:00:00.000Z",
+    notStarted: "the candidate does not merge onto h1",
+    passed: false,
+    logSha256: "a".repeat(64),
+    logBytes: 3,
+    cleanupSkipped:
+      "the cleanup runs whenever the gate command ran (pass, fail or timeout); the candidate does not merge, so the gate never started and nothing was cleaned",
+  };
+  const parsed = parseGateRecord(notStarted);
+  assert.ok(parsed);
+  assert.equal(parsed.exitCode, undefined);
+  assert.equal(parsed.durationMs, undefined);
+  assert.equal(parsed.notStarted, "the candidate does not merge onto h1");
+  // The exit status and duration stay required when the command did run.
+  assert.equal(parseGateRecord({ ...notStarted, notStarted: undefined }), undefined);
+  // The failure text says what happened, not "exited on a signal".
+  const evidence = gateFailureEvidence({ record: parsed, logPath: "/run/checks/c1/gate.log", tail: "merge refused" });
+  assert.match(evidence, /did not start: the candidate does not merge onto h1/);
+  assert.ok(!evidence.includes("on a signal"), "a run that never started must not be reported as a signal death");
+});
+
 test("gate: gateLogTail returns the last N lines (the tail a failure quotes)", () => {
   const text = `${Array.from({ length: 70 }, (_, i) => `line-${i + 1}`).join("\n")}\n`;
   const tail = gateLogTail(text, 60).split("\n");
@@ -169,6 +198,11 @@ test("gate: reusableGate reuses only a passing record for the same tree and comm
   assert.equal(reusableGate(records, { tree: "tree-a", command: "different" }), undefined);
   // Without a known tree we cannot prove the same question, so the gate runs.
   assert.equal(reusableGate(records, { tree: undefined, command: "deploy --clean --build" }), undefined);
+  // A record that is itself a reuse still answers the same question (owner
+  // directive 2): dropping reused records made an identical tree pay again.
+  const reused = recordFixture({ candidateSha: "c-reused", reused: true, reusedFrom: "c-old", reusedFromBaseSha: "h0" });
+  assert.equal(reusableGate([reused], { tree: "tree-a", command: "deploy --clean --build" })?.candidateSha, "c-reused");
+  assert.equal(gateDecision(reused, [], { candidateSha: "c-reused", tree: "tree-a", command: reused.command }).kind, "own");
 });
 
 test("gate: gateLogHashMatches refuses a log whose bytes are not the record's own", () => {
@@ -565,10 +599,13 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
         {
           candidateSha: sourceSha,
           tree,
-          // Deliberately a different base from the candidate's: the reused
-          // record must name the head it is accepted against and the head its
-          // evidence came from (finding B-5).
-          baseSha: "0".repeat(40),
+          // A record that is itself a reuse (owner directive 2): its source
+          // passed, so it counts as passing. Its own provenance names the run
+          // that produced the evidence ("orig1" at base 0…).
+          baseSha: "b".repeat(40),
+          reused: true,
+          reusedFrom: "orig1",
+          reusedFromBaseSha: "0".repeat(40),
           command,
           startedAt: "2026-09-25T00:00:00.000Z",
           durationMs: 900_000,
@@ -591,7 +628,9 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
     const reused = gateRecordAt(setup.runDir, C);
     assert.equal(reused.passed, true);
     assert.equal(reused.reused, true);
-    assert.equal(reused.reusedFrom, sourceSha);
+    // Provenance is flattened to the run that produced the evidence, not left
+    // pointing at the intermediate reuse record.
+    assert.equal(reused.reusedFrom, "orig1");
     assert.equal(reused.tree, tree);
     // The head this candidate is accepted against, and where the evidence
     // came from, are both recorded.
@@ -608,7 +647,7 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
     assert.match(view.gates, /gate ✓ \(reused\)/);
     // The citation names both heads: the one the evidence was produced for and
     // the one the candidate is accepted against.
-    assert.match(view.gate ?? "", /reused candidate beefbeefb's record, gated against base 0000000/);
+    assert.match(view.gate ?? "", /reused candidate orig1's record, gated against base 0000000/);
     assert.match(view.gate ?? "", new RegExp(`against base ${setup.repo.head.slice(0, 7)}`));
   } finally {
     await setup.conductor.stop();
@@ -619,14 +658,16 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
   }
 });
 
-test("gate: two conductors sharing the machine-wide lock never gate at once (the second waits)", async () => {
+test("gate: two conductors sharing the machine-wide lock never gate at once, and a third with the same tree reuses", async () => {
   const dir = shortTmp("tt-gate-lock");
   const lock = path.join(dir, "gate.lock");
   const marker = path.join(dir, "in-gate.marker");
+  const counter = path.join(dir, "runs.log");
   // A gate command that proves exclusivity twice: an O_EXCL-style marker (a
   // concurrent gate would find it and fail with exit 7), and its own wall
-  // clock window (recorded in gate.json).
-  const command = `if [ -e ${marker} ]; then echo OVERLAP; exit 7; fi; touch ${marker}; sleep 1.5; rm -f ${marker}; echo gate-ok`;
+  // clock window (recorded in gate.json). It also counts its runs, so a run
+  // that reuses instead of executing is visible.
+  const command = `if [ -e ${marker} ]; then echo OVERLAP; exit 7; fi; touch ${marker}; echo run >> ${counter}; sleep 1.5; rm -f ${marker}; echo gate-ok`;
   const mk = () =>
     setupConductor({
       checks: ["true"],
@@ -638,26 +679,76 @@ test("gate: two conductors sharing the machine-wide lock never gate at once (the
     });
   const a = await mk();
   const b = await mk();
+  const c = await mk();
   try {
-    await Promise.all([a.conductor.start(), b.conductor.start()]);
-    await waitFor(() => a.conductor.state.phase.phase === "DONE" && b.conductor.state.phase.phase === "DONE", WAIT_MS, 50, a.runDir);
+    // Records are per run (D3), so the third run's own reuse record is
+    // prepared here: a verified pass for its candidate's tree (the worker
+    // changes nothing, so that is the base tree). It must take the lock,
+    // decide reuse under it, and never execute the command (owner directive
+    // 3).
+    const tree = execFileSync("git", ["-C", c.repo.dir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    const seededSha = "c0ffee";
+    const seededDir = path.join(runPaths(c.runDir).checks, seededSha);
+    fs.mkdirSync(seededDir, { recursive: true });
+    const seededLog = "a verified earlier gate log\n";
+    fs.writeFileSync(path.join(seededDir, "gate.log"), seededLog);
+    fs.writeFileSync(
+      path.join(seededDir, "gate.json"),
+      `${JSON.stringify(
+        {
+          candidateSha: seededSha,
+          tree,
+          baseSha: "0".repeat(40),
+          command,
+          startedAt: "2026-09-25T00:00:00.000Z",
+          durationMs: 600_000,
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          passed: true,
+          logSha256: createHash("sha256").update(seededLog).digest("hex"),
+          logBytes: Buffer.byteLength(seededLog, "utf8"),
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    await Promise.all([a.conductor.start(), b.conductor.start(), c.conductor.start()]);
+    await waitFor(
+      () =>
+        a.conductor.state.phase.phase === "DONE" &&
+        b.conductor.state.phase.phase === "DONE" &&
+        c.conductor.state.phase.phase === "DONE",
+      WAIT_MS,
+      50,
+      a.runDir,
+    );
     const recA = gateRecordAt(a.runDir, a.conductor.state.phase.candidate!.sha);
     const recB = gateRecordAt(b.runDir, b.conductor.state.phase.candidate!.sha);
+    const recC = gateRecordAt(c.runDir, c.conductor.state.phase.candidate!.sha);
     assert.equal(recA.exitCode, 0, "the first gate must not have seen another gate's marker");
     assert.equal(recB.exitCode, 0, "the second gate must not have seen another gate's marker");
     assert.equal(recA.passed, true);
     assert.equal(recB.passed, true);
+    // The third reused its own verified record for the same tree: it never ran
+    // the command (the counter has exactly the two executions above).
+    assert.equal(recC.reused, true, "a run whose tree already passed must reuse instead of executing");
+    assert.equal(recC.reusedFrom, seededSha);
+    assert.equal(recC.passed, true);
+    assert.deepEqual(fs.readFileSync(counter, "utf8").trim().split("\n"), ["run", "run"], "only the two running gates may execute the command");
     // Sequential, never overlapping: one window ends before the other starts.
     const startA = Date.parse(recA.startedAt);
-    const endA = startA + recA.durationMs;
+    const endA = startA + (recA.durationMs ?? 0);
     const startB = Date.parse(recB.startedAt);
-    const endB = startB + recB.durationMs;
+    const endB = startB + (recB.durationMs ?? 0);
     assert.ok(endA <= startB || endB <= startA, `gate windows overlap: A ${recA.startedAt}+${recA.durationMs}ms, B ${recB.startedAt}+${recB.durationMs}ms`);
     assert.ok(!fs.existsSync(marker), "no gate may leave its marker behind");
   } finally {
     await a.conductor.stop();
     await b.conductor.stop();
-    for (const s of [a, b]) {
+    await c.conductor.stop();
+    for (const s of [a, b, c]) {
       cleanupDir(s.runRoot);
       cleanupDir(s.scriptsDir);
       cleanupDir(s.repo.dir);

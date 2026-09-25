@@ -484,13 +484,16 @@ function readGateRecord(runDir: string, candidateSha: string | undefined): GateR
  * against the older head. */
 export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): string {
   const short = (sha: string) => sha.slice(0, 7);
-  const how = record.reused
-    ? `passed (reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s record${record.reusedFromBaseSha ? `, gated against base ${short(record.reusedFromBaseSha)}` : ""})`
-    : record.passed
-      ? "passed (exit 0)"
-      : record.timedOut
-        ? "killed at its limit"
-        : `failed (exit ${record.exitCode})`;
+  const how = record.notStarted
+    ? `did not start (${record.notStarted})`
+    : record.reused
+      ? `passed (reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s record${record.reusedFromBaseSha ? `, gated against base ${short(record.reusedFromBaseSha)}` : ""})`
+      : record.passed
+        ? "passed (exit 0)"
+        : record.timedOut
+          ? "killed at its limit"
+          : `failed (exit ${record.exitCode ?? "?"})`;
+  const elapsed = record.notStarted ? "" : ` in ${formatDuration(record.durationMs ?? 0)}`;
   const accepted =
     acceptedAtBase !== undefined && acceptedAtBase !== record.baseSha
       ? ` (accepted against base ${short(acceptedAtBase)})`
@@ -498,7 +501,7 @@ export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): st
   const cleanup = record.cleanup
     ? `; cleanup ${record.cleanupExitCode === 0 ? "ok" : `exit ${record.cleanupExitCode ?? "?"}`}`
     : "";
-  return `gate ${how} in ${formatDuration(record.durationMs)} on candidate ${record.candidateSha.slice(0, 9)} against base ${short(record.baseSha)}${accepted}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
+  return `gate ${how}${elapsed} on candidate ${record.candidateSha.slice(0, 9)} against base ${short(record.baseSha)}${accepted}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
 }
 
 function readBaseline(runDir: string): Baseline | undefined {
