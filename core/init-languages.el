@@ -36,7 +36,14 @@
           (html       . ("https://github.com/tree-sitter/tree-sitter-html"))
           (javascript . ("https://github.com/tree-sitter/tree-sitter-javascript"))
           (json       . ("https://github.com/tree-sitter/tree-sitter-json"))
-          (markdown   . ("https://github.com/ikatyang/tree-sitter-markdown"))
+          ;; The tree-sitter-grammars fork at the version pilish pins
+          ;; (pilish-grammars.el). ikatyang's 2021 grammar has a C++ scanner
+          ;; whose deserialize asserts under libtree-sitter 0.25 and aborts
+          ;; all of Emacs when a Pi session is rendered.
+          (markdown   . ("https://github.com/tree-sitter-grammars/tree-sitter-markdown"
+                         "v0.4.1" "tree-sitter-markdown/src"))
+          (markdown-inline . ("https://github.com/tree-sitter-grammars/tree-sitter-markdown"
+                              "v0.4.1" "tree-sitter-markdown-inline/src"))
           (python     . ("https://github.com/tree-sitter/tree-sitter-python"))
           (rust       . ("https://github.com/tree-sitter/tree-sitter-rust"))
           (toml       . ("https://github.com/ikatyang/tree-sitter-toml"))
