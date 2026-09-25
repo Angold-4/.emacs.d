@@ -271,7 +271,10 @@ test("complete-ballots: a discovery that arrives after the reviewer's turn-2 pro
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    deadlines: { ...FAST, reviewMs: 5_000 },
+    // 15s, not 5s: B's first dispatch hangs by design, so the re-dispatch must
+    // spawn and finish both turns inside this budget — 5s misses it on a loaded
+    // machine (a timing flake, not a defect).
+    deadlines: { ...FAST, reviewMs: 15_000 },
     workerScript: () => ({
       hello: defaultWorkerHello(),
       steps: [
