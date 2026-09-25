@@ -19,6 +19,7 @@ import {
   resolveSecrets,
   secretNames,
   secretPromptLines,
+  utf16Kind,
 } from "../../src/effects/secrets.ts";
 
 const VALUE = "sk-live-4f8a2b1c9d3e";
@@ -168,12 +169,23 @@ test("secrets: a UTF-16 document is masked, and a file that could not be searche
   const be = Buffer.from(`k ${VALUE}`, "utf16le").swap16();
   assert.equal(redactBytes(be, secrets).swap16().toString("utf16le"), "k ***FAKE_KEY***");
 
+  // A JSON-escaped form is matched as well (finding M-9): a document (or a
+  // plan snapshot) storing the value inside JSON text holds it escaped.
+  const odd = { name: "FAKE_KEY", value: 'sk-"odd"' };
+  const escapedJson = Buffer.from(`{"k":"sk-\\"odd\\""}`, "utf8");
+  assert.equal(redactBytes(escapedJson, [odd]).toString("utf8"), '{"k":"***FAKE_KEY***"}');
+  const escapedUtf16 = Buffer.from('{"k":"sk-\\"odd\\""}', "utf16le");
+  assert.equal(redactBytes(escapedUtf16, [odd]).toString("utf16le"), '{"k":"***FAKE_KEY***"}');
+  assert.equal(redactText('{"k":"sk-\\"odd\\""}', [odd]), '{"k":"***FAKE_KEY***"}');
+
   const root = fs.mkdtempSync("/tmp/tt-redact-binary-");
   try {
     const runDir = path.join(root, "abcd1234");
     fs.mkdirSync(path.join(runDir, "refs"), { recursive: true });
     fs.mkdirSync(path.join(runDir, "checks"), { recursive: true });
     fs.writeFileSync(path.join(runDir, "refs", "vendor-utf16.md"), utf16);
+    // A clean UTF-16 document was still searched, so it is not "opaque".
+    fs.writeFileSync(path.join(runDir, "refs", "clean-utf16.md"), Buffer.from("nothing secret here", "utf16le"));
     // A genuinely binary artefact (no value in any encoding we search): the
     // value is not found, so it is NAMED rather than silently declared clean.
     fs.writeFileSync(path.join(runDir, "checks", "artifact.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]));
@@ -184,6 +196,15 @@ test("secrets: a UTF-16 document is masked, and a file that could not be searche
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("secrets: utf16Kind tells a UTF-16 document from a file that cannot be searched", () => {
+  assert.equal(utf16Kind(Buffer.from("plain utf8 text", "utf8")), undefined);
+  assert.equal(utf16Kind(Buffer.from("\ufeffutf16 with a BOM", "utf16le")), "utf16le");
+  assert.equal(utf16Kind(Buffer.from("utf16le ascii", "utf16le")), "utf16le");
+  assert.equal(utf16Kind(Buffer.from("utf16be ascii", "utf16le").swap16()), "utf16be");
+  assert.equal(utf16Kind(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03])), undefined, "a PNG is not text");
+  assert.equal(utf16Kind(Buffer.alloc(0)), undefined);
 });
 
 test("secrets: the recorded missing names come from the run's own log", () => {

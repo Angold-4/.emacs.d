@@ -111,21 +111,29 @@ test("tt redact: a run whose conductor is alive is refused, and --force override
 test("tt redact: a UTF-16 document is cleaned, and a file it could not search is named", async () => {
   const root = fs.mkdtempSync("/tmp/tt-redact-utf16-");
   const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  // A value holding a quote is stored JSON-escaped wherever it was written into
+  // JSON text (finding M-9), and it appears that way in UTF-16 too.
+  const quoted = 'sk-"q"';
   try {
     const runDir = plantedRun(root, "ffff6666", value, true);
     // The vendor reference doc case: UTF-16, so its bytes contain NULs.
     fs.mkdirSync(path.join(runDir, "refs"), { recursive: true });
     fs.writeFileSync(path.join(runDir, "refs", "vendor.md"), Buffer.from(`key ${value} end`, "utf16le"));
+    fs.writeFileSync(path.join(runDir, "refs", "vendor.json"), `{"k":${JSON.stringify(quoted)}}\n`);
+    fs.writeFileSync(path.join(runDir, "refs", "vendor-utf16.json"), Buffer.from(`{"k":${JSON.stringify(quoted)}}`, "utf16le"));
     // A genuinely binary artefact, holding nothing this tool can search.
     fs.mkdirSync(path.join(runDir, "checks", "c0ffee"), { recursive: true });
     fs.writeFileSync(path.join(runDir, "checks", "c0ffee", "artifact.png"), Buffer.from([0x89, 0x50, 0x00, 0x00, 0x01]));
-    const result = await runCli(["redact", runDir, "--secrets", "FAKE_KEY"], { FAKE_KEY: value });
+    const result = await runCli(["redact", runDir, "--secrets", "FAKE_KEY QUOTED_KEY"], { FAKE_KEY: value, QUOTED_KEY: quoted });
     assert.equal(result.code, 0, result.stderr);
     assert.equal(
       fs.readFileSync(path.join(runDir, "refs", "vendor.md"), "utf16le"),
       "key ***FAKE_KEY*** end",
       "a UTF-16 document is masked, not skipped",
     );
+    assert.equal(fs.readFileSync(path.join(runDir, "refs", "vendor.json"), "utf8"), '{"k":"***QUOTED_KEY***"}\n');
+    assert.doesNotThrow(() => JSON.parse(fs.readFileSync(path.join(runDir, "refs", "vendor.json"), "utf8")));
+    assert.equal(fs.readFileSync(path.join(runDir, "refs", "vendor-utf16.json"), "utf16le"), '{"k":"***QUOTED_KEY***"}');
     assert.match(result.stdout, /not UTF-8 text, searched UTF-8\/UTF-16 only[^\n]*artifact\.png/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

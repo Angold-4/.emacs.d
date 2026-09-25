@@ -71,7 +71,7 @@ import {
   verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
-import { redactBytes, redactJson, redactText, resolveSecrets, secretNames, secretPromptLines, type Secret } from "./effects/secrets.ts";
+import { redactBytes, redactJson, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
 // Plan 01a: the secret guard itself lives with the other `sh` guards (they
 // are wired into the agent's `tool_call` hook, and the conductor reuses the
 // same refusal at the socket, where a scripted agent's commands arrive).
@@ -376,10 +376,12 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   // Plan 01a: a document that quotes a declared secret is copied redacted —
   // the vendor reference docs of atlas plan 13 held the keys themselves
   // (runtime doc §7), and every agent can read these copies. A value is
-  // replaced in UTF-8, UTF-16LE and UTF-16BE, so a doc saved as UTF-16 (which
-  // is not text by the NUL test) cannot slip through; a document in any other
-  // binary shape is NOT copied at all — a leak that cannot be verified is
-  // worse than a missing reference, and it is named in refs/MISSING.txt.
+  // replaced in UTF-8, UTF-16LE and UTF-16BE (raw and JSON-escaped), so a doc
+  // saved as UTF-16 — which is not text by the NUL test — cannot slip through;
+  // a document that is neither text nor a UTF-16 document is NOT copied at
+  // all, because a leak that cannot be searched is worse than a missing
+  // reference. It is named in refs/MISSING.txt either way, so the agent's
+  // prompt says the copy is not there rather than silently lacking it.
   const { maskable } = resolveSecrets(secretNames(plan.secrets));
   const refs = plan.references ?? [];
   if (refs.length > 0) {
@@ -396,15 +398,15 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
       used.add(name);
       const dest = path.join(p.refs, name);
       const buf = fs.readFileSync(src);
-      const redacted = maskable.length > 0 ? redactBytes(buf, maskable) : buf;
-      // Only when this run declares secrets is an unverifiable copy a risk: a
-      // plan that declares none has nothing to mask, and its binary references
-      // are copied exactly as before.
-      if (maskable.length > 0 && buf.includes(0) && redacted.equals(buf)) {
+      // A UTF-16 document's bytes ARE searched (both flavours), so it is copied
+      // even when it quotes nothing; only a file that is neither text nor a
+      // UTF-16 document cannot be searched exhaustively.
+      const unsearchable = maskable.length > 0 && buf.includes(0) && utf16Kind(buf) === undefined;
+      if (unsearchable) {
         missing.push(`${src} (binary, not copied: its bytes cannot be searched for a secret value)`);
         return;
       }
-      fs.writeFileSync(dest, redacted);
+      fs.writeFileSync(dest, maskable.length > 0 ? redactBytes(buf, maskable) : buf);
     });
     if (missing.length > 0) fs.writeFileSync(path.join(p.refs, "MISSING.txt"), `${missing.join("\n")}\n`);
   }

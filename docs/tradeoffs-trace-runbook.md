@@ -180,11 +180,11 @@ A plan declares the credentials it needs **by name** and nothing else:
   it displays can show one.
 - A `refs/` copy is written masked: a document saved as UTF-16 (its bytes hold
   NULs) is searched in UTF-8/UTF-16 and masked too, and — when the plan declares
-  secrets — a document in any other binary shape is **not copied at all**: it is
-  named in `refs/MISSING.txt`, because a leak that cannot be verified must not
-  be handed to every agent. The same rule applies at cleanup (`tt redact` names
-  a non-UTF-8 file it found nothing in). A plan that declares no secrets copies
-  its references exactly as before.
+  secrets — a document that is neither text nor a UTF-16 document is **not copied
+  at all**: it is named in `refs/MISSING.txt`, because a leak that cannot be
+  searched must not be handed to every agent. A UTF-16 document that quotes
+  nothing *is* copied: its bytes were searched. A plan that declares no secrets
+  copies its references exactly as before.
 - A declared secret whose value is **shorter than 4 characters** is not used
   for masking or for refusing commands (masking `1` would rewrite every id and
   timestamp in the log); it is reported by name and the run still runs. Give a
@@ -219,9 +219,10 @@ agent echoed), `checks/**`, `refs/**`, `views/**`, `plan/`, `inbox/`,
 from the command's own environment; the names come from `--secrets` or, when it
 is omitted, from each run's own plan snapshot. JSONL files are rewritten line by
 line, so every line still parses (a torn final line stays torn and unnewlined).
-A UTF-16 document is searched in UTF-8 and UTF-16 and masked; a file it could
-not search (not UTF-8 text, and nothing found) is **named** in the output rather
-than counted as clean.
+A UTF-16 document is searched in UTF-8 and UTF-16 and masked, in both the raw
+and the JSON-escaped form of a value; a file whose bytes could not be searched
+(neither text nor a UTF-16 document) is **named** in the output rather than
+counted as clean.
 
 It **refuses a run whose conductor is still alive** (that run keeps writing its
 stream, its sessions and its log, so a run reported as redacted could regain the

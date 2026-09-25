@@ -117,12 +117,20 @@ export function byLengthDesc(secrets: readonly Secret[]): readonly Secret[] {
   return secrets;
 }
 
-/** TEXT with every secret value replaced by `***NAME***`. */
+/** TEXT with every secret value replaced by `***NAME***` — in both the raw
+ * form and the JSON-escaped form (`a"b` inside JSON text), because a value
+ * holding a quote or a backslash appears escaped wherever it was written into
+ * JSON, and a plain-text file (a check log, `plan/v1.json`, `conductor.log`)
+ * never goes through the structural walk that would see the raw form. A
+ * longer value is replaced before a shorter one it contains. */
 export function redactText(text: string, secrets: readonly Secret[]): string {
   let out = text;
   for (const s of byLengthDesc(secrets)) {
-    if (s.value.length === 0 || !out.includes(s.value)) continue;
-    out = out.split(s.value).join(placeholder(s.name));
+    if (s.value.length === 0) continue;
+    for (const form of [s.value, jsonEscaped(s.value)]) {
+      if (!out.includes(form)) continue;
+      out = out.split(form).join(placeholder(s.name));
+    }
   }
   return out;
 }
@@ -141,17 +149,6 @@ export function redactJson(value: unknown, secrets: readonly Secret[]): unknown 
   return value;
 }
 
-/** Textual replacement for HITS (the raw and the JSON-escaped form of each
- * value): SAFE on JSON text, because `***NAME***` holds no quote, backslash
- * or newline. Used for a line that does not parse, and for the rare value
- * that survives the structural pass (one sitting in a JSON *key*, which the
- * structural walk leaves alone because keys are structure). */
-function redactTextual(text: string, hits: readonly Secret[]): string {
-  let out = redactText(text, hits);
-  for (const s of byLengthDesc(hits)) out = out.split(jsonEscaped(s.value)).join(placeholder(s.name));
-  return out;
-}
-
 /** One JSONL line, redacted. A line that parses is redacted structurally and
  * re-serialized (so it stays valid JSON); one that does not — a torn final
  * line, or a file that was never JSONL — falls back to textual replacement,
@@ -162,10 +159,11 @@ export function redactJsonLine(line: string, secrets: readonly Secret[]): string
   if (hits.length === 0) return line;
   try {
     const text = JSON.stringify(redactJson(JSON.parse(line), secrets));
-    const survives = hits.some((s) => text.includes(s.value) || text.includes(jsonEscaped(s.value)));
-    return survives ? redactTextual(text, hits) : text;
+    // A value sitting in a JSON *key* survives the structural walk (keys are
+    // structure), so the re-serialized line is checked once more.
+    return redactText(text, hits);
   } catch {
-    return redactTextual(line, hits);
+    return redactText(line, hits);
   }
 }
 
@@ -209,18 +207,44 @@ function replaceBytes(buf: Buffer, needle: Buffer, replacement: Buffer): Buffer 
   return Buffer.concat(parts);
 }
 
+/** Which UTF-16 flavour BUF clearly is, or `undefined` when it is not text:
+ * a BOM, or a document whose every other byte is NUL — which is exactly what
+ * UTF-16 text made of ASCII characters (a vendor reference doc saved by a
+ * Windows editor) looks like. A caller must treat `undefined` as "its contents
+ * cannot be searched exhaustively": such a file is never copied into a run
+ * that declares secrets, and `tt redact` names it instead of reporting it
+ * clean. */
+export function utf16Kind(buf: Buffer): "utf16le" | "utf16be" | undefined {
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return "utf16le";
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) return "utf16be";
+  if (buf.length < 4 || buf.length % 2 !== 0) return undefined;
+  let oddZero = true;
+  let evenZero = true;
+  for (let i = 0; i < buf.length; i++) {
+    if (i % 2 === 0) {
+      if (buf[i] !== 0) evenZero = false;
+    } else if (buf[i] !== 0) oddZero = false;
+  }
+  if (oddZero) return "utf16le";
+  if (evenZero) return "utf16be";
+  return undefined;
+}
+
 /** BUF with every secret value replaced by `***NAME***` in UTF-8, UTF-16LE and
- * UTF-16BE. This is how a non-text file (a NUL byte: a UTF-16 document, or a
- * genuinely binary one) is handled — the value is *replaced*, not skipped, so
- * the leak the evidence describes (a vendor doc copied into refs/) cannot
- * survive a cleanup that reports success. Returns BUF itself when nothing
- * matched. */
+ * UTF-16BE, in both the raw and the JSON-escaped form of the value (a JSON
+ * document stores a value holding a quote escaped). This is how a non-text file
+ * (a NUL byte: a UTF-16 document, or a genuinely binary one) is handled — the
+ * value is *replaced*, not skipped, so the leak the evidence describes (a
+ * vendor doc copied into refs/) cannot survive a cleanup that reports success.
+ * Returns BUF itself when nothing matched. */
 export function redactBytes(buf: Buffer, secrets: readonly Secret[]): Buffer {
   let out = buf;
   for (const s of byLengthDesc(secrets)) {
     if (s.value.length === 0) continue;
-    for (const encode of BYTE_ENCODINGS) {
-      out = replaceBytes(out, encode(s.value), encode(placeholder(s.name))) ?? out;
+    for (const form of [s.value, jsonEscaped(s.value)]) {
+      for (const encode of BYTE_ENCODINGS) {
+        out = replaceBytes(out, encode(form), encode(placeholder(s.name))) ?? out;
+      }
     }
   }
   return out;
@@ -229,9 +253,11 @@ export function redactBytes(buf: Buffer, secrets: readonly Secret[]): Buffer {
 /** Rewrites FILE in place if it held a secret value, and reports whether it
  * changed. A JSONL file is rewritten line by line (`jsonl`); a non-text file
  * (a NUL byte) is searched in UTF-8/UTF-16 by `redactBytes`; anything else is
- * text. `opaque` is true for a non-text file in which nothing was found — the
- * caller names it, because such a file can still hold the value in an encoding
- * this module does not search. */
+ * text. `opaque` is true for a file that is neither text nor a UTF-16 document
+ * AND in which nothing was found — the caller names it, because such a file can
+ * still hold the value in an encoding this module does not search. A UTF-16
+ * document is not opaque: its bytes *were* searched, so a clean one is simply
+ * left alone. */
 export function redactFileInPlace(
   file: string,
   secrets: readonly Secret[],
@@ -246,7 +272,7 @@ export function redactFileInPlace(
   const binary = buf.includes(0);
   if (binary) {
     const next = redactBytes(buf, secrets);
-    if (next.equals(buf)) return { changed: false, opaque: true };
+    if (next.equals(buf)) return { changed: false, opaque: utf16Kind(buf) === undefined };
     fs.writeFileSync(file, next);
     return { changed: true, opaque: false };
   }
@@ -286,7 +312,8 @@ export interface RedactRunResult {
  * value can sit in — `events.jsonl`, `stream/*.jsonl`, `sessions/`, `checks/**`,
  * `refs/**`, `views/**`, `plan/`, `inbox/`, `conductor.log`, `meta.json`. The
  * worker's own `worktree/` and the reviewers' `candidates/` checkouts are git
- * trees, not conductor output, and are left alone. */
+ * trees, not conductor output, and are left alone. `opaque` names every file
+ * whose contents could not be searched exhaustively. */
 export function redactRunDir(runDir: string, secrets: readonly Secret[]): RedactRunResult {
   if (secrets.length === 0) return { changed: 0, opaque: [] };
   const targets: Array<{ file: string; jsonl: boolean }> = [
