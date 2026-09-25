@@ -485,5 +485,69 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (setenv "TT" nil)
       (delete-directory root t))))
 
+(ert-deftest tradeoffs-trace-mode-line-wait ()
+  "Plan 01b: the mode-line segment names the oldest waiting program node."
+  (let ((fixture
+         (concat "[{\"id\":\"p1\",\"title\":\"plan 13\",\"waiting\":["
+                 "{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\","
+                 "\"duration\":\"1h12m\",\"reason\":\"the repair budget ran out\"}]}]")))
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) fixture)))
+      (let ((+tt--notify-flash nil))
+        (should (equal (+tt--mode-line-wait) " [⚑ 13f waiting 1h12m]"))))
+    ;; No program waiting: no segment.
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) "[]")))
+      (should (null (+tt--mode-line-wait))))))
+
+(ert-deftest tradeoffs-trace-notification-echo ()
+  "Plan 01b: each new notifications.jsonl line is shown in the echo area once."
+  (let* ((file (make-temp-file "tt-ert-notify" nil ".jsonl"))
+         (messages nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "{\"id\":\"r1\",\"kind\":\"run\",\"title\":\"13f vendor\","
+                    "\"node\":\"13f\",\"reason\":\"the repair budget ran out\","
+                    "\"at\":\"2026-09-24T04:59:00.000Z\"}\n"))
+          (let ((+tt--notifications-file file)
+                (+tt--notifications-offset 0)
+                (+tt--notify-flash nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+              (+tt--notifications-poll)
+              (should (= 1 (length messages)))
+              (should (string-match-p "the repair budget ran out" (car messages)))
+              (should (string-match-p "13f" (car messages)))
+              ;; The line was consumed: a second poll shows nothing again.
+              (+tt--notifications-poll)
+              (should (= 1 (length messages)))
+              ;; A later append is shown too.
+              (with-temp-file file
+                (insert "{\"id\":\"r1\",\"kind\":\"run\",\"title\":\"13f vendor\","
+                        "\"node\":\"13f\",\"reason\":\"still waiting\","
+                        "\"at\":\"2026-09-24T05:59:00.000Z\"}\n"))
+              (setq +tt--notifications-offset 0)
+              (+tt--notifications-poll)
+              (should (= 2 (length messages)))
+              (should (string-match-p "still waiting" (car messages))))))
+      (delete-file file))))
+
+(ert-deftest tradeoffs-trace-notification-no-replay ()
+  "Plan 01b: a line already in the file when Emacs starts is not shown."
+  (let* ((file (make-temp-file "tt-ert-notify-old" nil ".jsonl"))
+         (messages nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "{\"id\":\"old\",\"kind\":\"run\",\"title\":\"old\","
+                    "\"reason\":\"before Emacs started\"}\n"))
+          (let ((+tt--notifications-file file)
+                (+tt--notifications-offset nil)
+                (+tt--notify-flash nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+              (+tt--notifications-poll)
+              (should (null messages)))))
+      (delete-file file))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

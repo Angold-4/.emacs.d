@@ -56,7 +56,7 @@ export type ProgramEvent =
   | { type: "NODE_BLOCKED"; node: string; reason: string }
   | { type: "NODE_RESUMED"; node: string; reason: "crashed" | "owner" }
   | { type: "PROGRAM_RESUMED" }
-  | { type: "NODE_STATUS"; node: string; status: Exclude<NodeStatus, "waiting"> }
+  | { type: "NODE_STATUS"; node: string; status: Exclude<NodeStatus, "waiting">; reason?: string }
   | { type: "PROGRAM_STOPPED" };
 
 /** Expands entries into phase nodes and validates the graph: unique ids,
@@ -126,7 +126,14 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
     case "NODE_STATUS": {
       const prev = state.nodes[event.node];
       if (!prev) return state;
-      return { ...state, nodes: { ...state.nodes, [event.node]: { ...prev, status: event.status } } };
+      // Plan 01b: the scheduler keeps the one-line reason a node is waiting
+      // (read from its run) so `tt program status` needs no second rebuild;
+      // a status change without a reason clears it, so a node that stopped
+      // waiting is not shown with a stale reason.
+      const next: ProgramState["nodes"][string] = { ...prev, status: event.status };
+      if (event.reason) next.reason = event.reason;
+      else delete next.reason;
+      return { ...state, nodes: { ...state.nodes, [event.node]: next } };
     }
     case "PROGRAM_STOPPED":
       return { ...state, stopped: true };

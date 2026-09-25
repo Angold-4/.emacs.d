@@ -14,8 +14,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { createRun, rebuildState, runPaths } from "./conductor.ts";
+import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor.ts";
 import { execFileSync } from "node:child_process";
+
+import { formatDuration } from "./view.ts";
+import { notify, oneLine, waitReason } from "./notify.ts";
 
 import {
   expandProgram,
@@ -61,20 +64,31 @@ export function readProgram(dir: string): ProgramFile {
   return JSON.parse(fs.readFileSync(programPaths(dir).program, "utf8")) as ProgramFile;
 }
 
-export function foldProgram(dir: string): { program: ProgramFile; nodes: ProgramNode[]; state: ProgramState } {
+export function foldProgram(dir: string): {
+  program: ProgramFile;
+  nodes: ProgramNode[];
+  state: ProgramState;
+  /** Plan 01b: the time each node last changed status (from its own event's
+   * `ts`), for the wait duration `tt program status` and the mode-line show. */
+  at: Record<string, string>;
+} {
   const program = readProgram(dir);
   const nodes = expandProgram(program);
   let state = initialProgramState(nodes);
+  const at: Record<string, string> = {};
   const text = fs.existsSync(programPaths(dir).events) ? fs.readFileSync(programPaths(dir).events, "utf8") : "";
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     try {
-      state = reduceProgram(state, (JSON.parse(line) as { event: ProgramEvent }).event);
+      const parsed = JSON.parse(line) as { ts?: string; event: ProgramEvent };
+      state = reduceProgram(state, parsed.event);
+      const node = (parsed.event as { node?: unknown }).node;
+      if (typeof node === "string" && typeof parsed.ts === "string") at[node] = parsed.ts;
     } catch {
       // a torn last line from a crash; the next append rewrites nothing
     }
   }
-  return { program, nodes, state };
+  return { program, nodes, state, at };
 }
 
 export function appendProgramEvent(dir: string, event: ProgramEvent): void {
@@ -111,6 +125,21 @@ export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "cr
     return fs.existsSync(path.join(runDir, "stopped")) ? "stopped" : "crashed";
   }
   return "running";
+}
+
+/** Plan 01b: the one-line reason a node's run is waiting, read from the run
+ * itself (its plan snapshot is redacted, and its owner-request reasons were
+ * redacted when the conductor logged them). `undefined` when the run is not
+ * (yet) parked or cannot be read. */
+export function runWaitReason(runDir: string): string | undefined {
+  try {
+    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
+    const state = rebuildState(runDir, plan, { lenient: true });
+    if (state.phase.phase === "AWAITING_OWNER" || state.phase.phase === "BLOCKED") return waitReason(state.phase);
+  } catch {
+    // a run whose plan or log cannot be read yet
+  }
+  return undefined;
 }
 
 /** How often the scheduler restarts a node whose conductor crashed. */
@@ -150,7 +179,9 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       }
       continue;
     }
-    if (seen !== s.status) record({ type: "NODE_STATUS", node: n.id, status: seen });
+    if (seen !== s.status) {
+      record({ type: "NODE_STATUS", node: n.id, status: seen, ...(seen === "needs-you" ? reasonField(runWaitReason(runDir)) : {}) });
+    }
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
     const node = nodes.find((n) => n.id === id)!;
@@ -182,6 +213,12 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     opts.launch(runDir);
   }
   return programOutcome(nodes, state);
+}
+
+/** `{ reason }` only when there is one, so an event payload stays exactly
+ * what it was for a node with no known reason. */
+function reasonField(reason: string | undefined): { reason?: string } {
+  return reason ? { reason } : {};
 }
 
 function git(repo: string, args: string[]): string {
@@ -246,6 +283,9 @@ export async function runScheduler(dir: string, opts: SchedulerOptions): Promise
     ticks += 1;
     if (outcome !== "running") {
       fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} program ${outcome}\n`);
+      // Plan 01b: a program that ends done or stuck is the owner's business.
+      // The scheduler is the component that observes this, so it notifies.
+      if (outcome === "done" || outcome === "stuck") notifyProgramOutcome(dir, outcome);
       return outcome;
     }
     if (opts.maxTicks !== undefined && ticks >= opts.maxTicks) return outcome;
@@ -253,9 +293,42 @@ export async function runScheduler(dir: string, opts: SchedulerOptions): Promise
   }
 }
 
-/** Human-readable program status (the CLI and Emacs render this). */
-export function programStatusLines(dir: string): string[] {
-  const { program, nodes, state } = foldProgram(dir);
+/** Plan 01b: one notification when a program ends done or stuck (never when
+ * the owner stopped it on purpose). `notify` dedups by `waitKey`, so a
+ * scheduler restarted against an already-finished program does not re-notify,
+ * and a failure of the notifier is logged into `scheduler.log` and ignored. */
+export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck"): void {
+  const id = path.basename(dir);
+  const log = (message: string) => {
+    try {
+      fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} ${message}\n`);
+    } catch {
+      // the log directory may be gone; a failed log is not a reason to stop
+    }
+  };
+  try {
+    const program = readProgram(dir);
+    const { nodes, state } = foldProgram(dir);
+    const blocked = nodes.find((n) => state.nodes[n.id].status === "blocked");
+    const reason =
+      outcome === "done"
+        ? "program done"
+        : `program stuck${blocked ? `: ${oneLine(state.nodes[blocked.id].reason ?? `${blocked.id} blocked`)}` : ""}`;
+    notify(
+      { id, kind: "program", title: program.title, reason, waitKey: `program:${id}:${outcome}` },
+      { root: path.dirname(path.dirname(dir)), onError: (message) => log(`notify: ${message}`) },
+    );
+  } catch (err) {
+    // Announcing a finished program must never be what stops the scheduler.
+    log(`notify: ${String((err as Error)?.message ?? err)}`);
+  }
+}
+
+/** Human-readable program status (the CLI and Emacs render this). Waiting
+ * (needs-you) nodes come first, oldest wait first, each with how long it has
+ * been waiting and the one-line reason. `now` is injectable for tests. */
+export function programStatusLines(dir: string, now: Date = new Date()): string[] {
+  const { program, nodes, state, at } = foldProgram(dir);
   const outcome = programOutcome(nodes, state);
   const alive = pidAlive(programPaths(dir).pid);
   const lines = [
@@ -271,14 +344,61 @@ export function programStatusLines(dir: string): string[] {
     done: "✓",
     blocked: "✗",
   };
-  for (const n of nodes) {
+  const order = (id: string) => {
+    const t = at[id];
+    return t ? Date.parse(t) : Number.MAX_SAFE_INTEGER;
+  };
+  const waiting = nodes
+    .filter((n) => state.nodes[n.id].status === "needs-you")
+    .sort((a, b) => order(a.id) - order(b.id));
+  const rest = nodes.filter((n) => state.nodes[n.id].status !== "needs-you");
+  for (const n of [...waiting, ...rest]) {
     const s = state.nodes[n.id];
     const deps = n.deps.length > 0 ? `  after ${n.deps.join(", ")}` : "";
-    lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${s.status.padEnd(9)} ${s.runId ?? ""}${deps}`);
+    if (s.status === "needs-you") {
+      const since = at[n.id];
+      const duration = since ? formatDuration(now.getTime() - Date.parse(since)) : "?";
+      lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${`waiting ${duration}`.padEnd(9)} ${s.runId ?? ""}${deps}`.trimEnd());
+      lines.push(`    ${s.reason ?? "needs you"}`);
+    } else {
+      lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${s.status.padEnd(9)} ${s.runId ?? ""}${deps}`.trimEnd());
+    }
     if (s.branch) lines.push(`    branch ${s.branch}  (PR base: ${s.base ?? "?"})`);
-    if (s.reason) lines.push(`    ${s.reason}`);
+    if (s.status !== "needs-you" && s.reason) lines.push(`    ${s.reason}`);
   }
   return lines;
+}
+
+/** Plan 01b: every node currently waiting for the owner, oldest wait first —
+ * what `tt program list --json` gives Emacs for the mode-line indicator. */
+export interface WaitingNode {
+  node: string;
+  runId?: string;
+  since?: string;
+  duration: string;
+  reason: string;
+}
+
+export function programWaitingNodes(dir: string, now: Date = new Date()): WaitingNode[] {
+  const { nodes, state, at } = foldProgram(dir);
+  const order = (id: string) => {
+    const t = at[id];
+    return t ? Date.parse(t) : Number.MAX_SAFE_INTEGER;
+  };
+  return nodes
+    .filter((n) => state.nodes[n.id].status === "needs-you")
+    .sort((a, b) => order(a.id) - order(b.id))
+    .map((n) => {
+      const s = state.nodes[n.id];
+      const since = at[n.id];
+      return {
+        node: n.id,
+        runId: s.runId,
+        since,
+        duration: since ? formatDuration(now.getTime() - Date.parse(since)) : "?",
+        reason: s.reason ?? "needs you",
+      };
+    });
 }
 
 export function programPidAlive(dir: string): boolean {

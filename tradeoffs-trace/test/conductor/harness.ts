@@ -161,6 +161,9 @@ export async function setupConductor(opts: {
   goal?: string;
   /** The plan's title (default "test plan") — plan prose like any other. */
   title?: string;
+  /** Plan 01b: the conductor's notification clock (injectable), so a test
+   * can advance past the 30-minute reminder without waiting. */
+  now?: () => number;
 }): Promise<TestConductorSetup> {
   const repo = makeRepo();
   const runRoot = makeRunRoot();
@@ -202,6 +205,7 @@ export async function setupConductor(opts: {
     deadlines: opts.deadlines,
     stubReviews: opts.stubReviews ?? true,
     probeReuse: opts.probeReuse,
+    ...(opts.now ? { now: opts.now } : {}),
     piEnvFor: (role, agentId) => {
       if (role === "worker") {
         if (opts.workerScriptForAttempt) {

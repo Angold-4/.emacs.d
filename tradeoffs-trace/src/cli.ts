@@ -37,6 +37,7 @@ import {
   programPidAlive,
   programsRoot,
   programStatusLines,
+  programWaitingNodes,
   runScheduler,
 } from "./program.ts";
 
@@ -213,8 +214,24 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     } catch {
       ids = [];
     }
-    const rows = ids.map((id) => programStatusLines(path.join(programsRoot(root), id)).slice(0, 2).join(" · "));
-    process.stdout.write(json ? `${JSON.stringify(ids)}\n` : rows.map((r) => `${r}\n`).join(""));
+    const dirs = ids.map((id) => path.join(programsRoot(root), id));
+    if (json) {
+      // Plan 01b: Emacs's mode-line reads the oldest wait from here, so a
+      // node that needs the owner shows as `⚑ <node> waiting <duration>`.
+      const rows = dirs.map((dir) => {
+        const { program } = foldProgram(dir);
+        return {
+          id: path.basename(dir),
+          title: program.title,
+          alive: programPidAlive(dir),
+          waiting: programWaitingNodes(dir),
+        };
+      });
+      process.stdout.write(`${JSON.stringify(rows)}\n`);
+    } else {
+      const rows = dirs.map((dir) => programStatusLines(dir).slice(0, 2).join(" · "));
+      process.stdout.write(rows.map((r) => `${r}\n`).join(""));
+    }
   } else {
     usage();
   }

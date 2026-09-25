@@ -1277,6 +1277,86 @@ To intervene, type into the run's input box."
 
 (defvar +tt--mode-line-timer nil)
 
+;;;; Owner-wait notifications (plan 01b)
+
+;; The conductor and the program scheduler append one line per owner wait to
+;; `<+tt-root>/notifications.jsonl'; Emacs reads only the bytes it has not
+;; seen, shows each new line in the echo area, and flashes a warning face on
+;; the mode-line indicator.  The watcher never runs Node.
+
+(defvar +tt--notifications-file nil
+  "Override for the notifications file; defaults to `<+tt-root>/notifications.jsonl'.")
+(defvar +tt--notifications-offset nil
+  "How many bytes of the notifications file have already been shown.
+Nil before the first poll, so lines written before Emacs started are not
+replayed as new.")
+(defvar +tt--notify-flash nil
+  "When the last notification arrived, for the mode-line warning flash.")
+(defvar +tt--notify-timer nil)
+
+(defun +tt--notifications-path ()
+  "The notifications file `+tt--notifications-poll' watches."
+  (or +tt--notifications-file (expand-file-name "notifications.jsonl" +tt-root)))
+
+(defun +tt--notification-line (rec)
+  "One echo-area line for notification record REC."
+  (let ((node (alist-get 'node rec)))
+    (format "tradeoffs-trace: ⚑ %s%s — %s"
+            (or (alist-get 'title rec) (alist-get 'id rec) "?")
+            (if node (format " [%s]" node) "")
+            (or (alist-get 'reason rec) ""))))
+
+(defun +tt--notifications-poll ()
+  "Show each new line of the notifications file in the echo area.
+Only the bytes past `+tt--notifications-offset' are read, and a trailing
+partial line is left for the next poll.  Lines already in the file when
+Emacs started are not replayed."
+  (let ((file (+tt--notifications-path)))
+    (when (file-exists-p file)
+      (let ((size (file-attribute-size (file-attributes file))))
+        (cond
+         ((null +tt--notifications-offset)
+          (setq +tt--notifications-offset size))
+         ((> size +tt--notifications-offset)
+          (let* ((start +tt--notifications-offset)
+                 (raw (with-temp-buffer
+                        (insert-file-contents file nil start size)
+                        (buffer-string)))
+                 (cut (if (string-suffix-p "\n" raw)
+                          (length raw)
+                        (max 0 (1+ (or (string-match-p "\n[^\n]*\\'" raw) -1)))))
+                 (complete (substring raw 0 cut)))
+            (dolist (line (split-string complete "\n" t))
+              (let ((rec (ignore-errors
+                           (json-parse-string line :object-type 'alist
+                                              :null-object nil :false-object :false))))
+                (when rec
+                  (setq +tt--notify-flash (current-time))
+                  (message "%s" (+tt--notification-line rec)))))
+            (setq +tt--notifications-offset (+ start cut))))
+         ((< size +tt--notifications-offset)
+          ;; Truncated or replaced: start over from its current end.
+          (setq +tt--notifications-offset size)))))))
+
+(defun +tt--waiting-nodes ()
+  "Waiting nodes across every program, oldest wait first.
+Reads `tt program list --json'; nil when there is no program or no wait."
+  (let (rows)
+    (dolist (p (ignore-errors (json-parse-string (+tt--cli "program" "list" "--json")
+                                                :object-type 'alist :array-type 'list
+                                                :null-object nil :false-object :false)))
+      (dolist (w (alist-get 'waiting p))
+        (push (cons (or (alist-get 'since w) "") w) rows)))
+    (mapcar #'cdr (sort rows (lambda (a b) (string< (car a) (car b)))))))
+
+(defun +tt--mode-line-wait ()
+  "The `⚑ <node> waiting <duration>' mode-line segment, or nil."
+  (when-let* ((w (car (+tt--waiting-nodes))))
+    (propertize (format " [⚑ %s waiting %s]" (alist-get 'node w) (alist-get 'duration w))
+                'face (if (and +tt--notify-flash
+                               (< (float-time (time-since +tt--notify-flash)) 10))
+                          'warning 'error))))
+
 (defun +tt--live-run-p (run-dir)
   "Non-nil when RUN-DIR's conductor process is alive (no Node call)."
   (let* ((f (expand-file-name "conductor.pid" run-dir))
@@ -1286,29 +1366,38 @@ To intervene, type into the run's input box."
 
 (defun +tt--mode-line-update ()
   "Refresh the mode-line indicator from `tt list' when any run is live."
-  (setq +tt--mode-line-string
-        (if (not (seq-some #'+tt--live-run-p (ignore-errors (+tt--runs))))
-            ""
-          (let ((rows (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t) (equal (alist-get 'attention r) "needs you")))
-                                  (ignore-errors (+tt--list)))))
-            (if (null rows) ""
-              (concat " ["
-                      (mapconcat
-                       (lambda (r)
-                         (propertize (format "tt:%s %s %s %s" (substring (alist-get 'id r) 0 4)
-                                             (alist-get 'stage r) (alist-get 'stageElapsed r)
-                                             (replace-regexp-in-string " +" "" (alist-get 'reviews r)))
-                                     'face (+tt--attention-face r)))
-                       rows " | ")
-                      "]")))))
+  (let ((flash (and +tt--notify-flash
+                    (< (float-time (time-since +tt--notify-flash)) 10))))
+    (setq +tt--mode-line-string
+          (if (not (seq-some #'+tt--live-run-p (ignore-errors (+tt--runs))))
+              (if flash (propertize " [⚑]" 'face 'warning) "")
+            (let* ((wait (+tt--mode-line-wait))
+                   (rows (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t) (equal (alist-get 'attention r) "needs you")))
+                                     (ignore-errors (+tt--list)))))
+              (concat
+               (cond (wait wait)
+                     (flash (propertize " [⚑]" 'face 'warning))
+                     (t ""))
+               (if (null rows) ""
+                 (concat " ["
+                         (mapconcat
+                          (lambda (r)
+                            (propertize (format "tt:%s %s %s %s" (substring (alist-get 'id r) 0 4)
+                                                (alist-get 'stage r) (alist-get 'stageElapsed r)
+                                                (replace-regexp-in-string " +" "" (alist-get 'reviews r)))
+                                        'face (+tt--attention-face r)))
+                          rows " | ")
+                         "]")))))))
   (force-mode-line-update t))
 
 (defun +tt--ensure-mode-line ()
-  "Install the display-only mode-line indicator and its timer."
+  "Install the display-only mode-line indicator and its timers."
   (unless (memq '+tt--mode-line-string global-mode-string)
     (setq global-mode-string (append global-mode-string '(+tt--mode-line-string))))
   (unless (timerp +tt--mode-line-timer)
-    (setq +tt--mode-line-timer (run-with-timer 1 10 #'+tt--mode-line-update))))
+    (setq +tt--mode-line-timer (run-with-timer 1 10 #'+tt--mode-line-update)))
+  (unless (timerp +tt--notify-timer)
+    (setq +tt--notify-timer (run-with-timer 1 3 #'+tt--notifications-poll))))
 
 ;;;; Keys
 

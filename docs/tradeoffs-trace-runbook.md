@@ -120,7 +120,7 @@ and runs independent phases in parallel.
 
 | Where | What |
 |---|---|
-| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. `RET` opens a node's run workspace (status, trace, decisions, input box), `k` stops the program, `R` resumes it. |
+| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `k` stops the program, `R` resumes it. |
 | CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program stop <id>`, `tt program resume <id>` |
 
 **Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
@@ -260,8 +260,38 @@ past run cannot display one either.
 | trace buffer | one line per tool call (time, command, ✓/✗ exit, duration, last output line), plus `path +a −r` for each file the call changed; the running call in the header. `a` pins another agent. |
 | decision view (`C-c m d`) | the current round's decisions, each labelled by the tally, with the options, recommendation and each reviewer's ballot; findings grouped by file; earlier rounds one line each. Read-only. |
 | runs list (`C-c m l`) | every run: `RET` opens, `k` stops, `R` resumes |
-| mode line | live runs with stage, time and reviews; a warning face when something needs attention |
+| mode line | live runs with stage, time and reviews; the oldest owner wait (`⚑ 13f waiting 1h12m`) with a warning-face flash when a new notification arrives |
 | CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
+
+## Notifications when something needs you
+
+Nothing waits for the owner by default, so the system tells you when a run has
+stopped making progress on its own:
+
+- A run entering **AWAITING_OWNER** ("needs you") or **BLOCKED**, and a program
+  ending **done** or **stuck**, append one record to
+  `~/.tradeoffs-trace/notifications.jsonl` — the run or program id, its title,
+  the program node (for a node run), a one-line reason, and the time.
+- The same moment, the notifier runs: on macOS an `osascript` banner, and
+  nothing on other platforms. If the run or program is still waiting 30
+  minutes later it notifies once more, and never again for that wait. A
+  notification that fails is written to the run's log (or `scheduler.log`) and
+  ignored; it never stops a run or the scheduler.
+- Emacs watches the file (`core/init-tradeoffs-trace.el`): each new line is
+  shown in the echo area, the mode-line indicator flashes a warning face, and
+  it shows how long the **oldest** wait has lasted (`⚑ 13f waiting 1h12m`).
+- `tt program status` and the program buffer list waiting nodes first, each with
+  `waiting <duration>` and its reason, so one glance says who needs you.
+
+Override the notifier with `TT_NOTIFY_COMMAND` — the shell command the
+conductor and the scheduler run instead of the default. Tests point it at a
+script that appends to a file; on a headless host it can be anything that
+reaches you (a webhook, a mail command, or `:` to disable it). It is a plain
+`sh -c` command with no arguments; read `notifications.jsonl` for the detail.
+
+```sh
+TT_NOTIFY_COMMAND='curl -s -d "tradeoffs-trace needs you" https://ntfy.sh/my-topic' tt program start program.json
+```
 
 ## Steer it
 
@@ -328,6 +358,7 @@ stops for you only when its repair rounds are exhausted.
   <run>/sessions/                   Pi sessions (repairs continue the worker's session)
   <run>/checks/<sha>/               per-command check logs
   <run>/inbox/{,applied/,rejected/} owner input and commands, with rejection reasons
+  notifications.jsonl               one line per owner wait or finished program (see Notifications)
 ```
 
 ## Troubleshooting

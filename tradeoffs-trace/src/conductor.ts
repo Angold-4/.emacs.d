@@ -76,6 +76,8 @@ import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, sec
 // are wired into the agent's `tool_call` hook, and the conductor reuses the
 // same refusal at the socket, where a scripted agent's commands arrive).
 import { secretUseInCommand } from "../extension/guards.ts";
+// Plan 01b: owner-wait notifications (see notify.ts's own header for the rule).
+import { notify, oneLine, waitReason } from "./notify.ts";
 import { crashAt, CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
 
 export { CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
@@ -120,8 +122,14 @@ export interface Deadlines {
   /** design §9.3: how often the conductor re-reads `<run>/inbox/*.json`
    * while running. Owner commands are conductor state, so the conductor
    * must pick one up even when parked in AWAITING_OWNER (when `next()`
-   * dispatches nothing at all). */
+   * dispatches nothing at all). Plan 01b: the same poll re-checks whether a
+   * wait has earned its one 30-minute reminder, so a parked run needs no
+   * second timer. */
   inboxPollMs: number;
+  /** Plan 01b: how long a run may sit in AWAITING_OWNER before the one
+   * reminder notification (design D4: "a re-notify after 30 minutes if
+   * still waiting"). */
+  notifyReminderMs: number;
   /** Wall-clock run execution budget (design §8.1's "run execution budget").
    * Unset (default) = unbounded. The clock counts only time spent
    * *executing* (design §8.2's own text): it pauses whenever the phase is
@@ -153,6 +161,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   stopAbortGraceMs: 2_000,
   stallMs: 3 * 60_000,
   inboxPollMs: 1_000,
+  notifyReminderMs: 30 * 60_000,
 };
 
 export interface RunPlanPhase {
@@ -238,6 +247,10 @@ export interface ConductorOptions {
    * when the probed integration has exactly the candidate's tree (default
    * true). Tests that exercise the probe's own command handling turn it off. */
   probeReuse?: boolean;
+  /** Plan 01b: the clock the notification reminder reads (ms since epoch).
+   * Defaults to `Date.now`; a test advances an injected clock to reach the
+   * 30-minute reminder without waiting. */
+  now?: () => number;
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +627,8 @@ export class Conductor {
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #probeReuse: boolean;
+  /** Plan 01b: the clock `#checkNotifications` reads (injectable). */
+  #now: () => number;
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -709,6 +724,7 @@ export class Conductor {
     this.#piEnvFor = opts.piEnvFor;
     this.#stubReviews = opts.stubReviews ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
+    this.#now = opts.now ?? Date.now;
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -842,12 +858,17 @@ export class Conductor {
     // run even when the phase is parked and `next()` dispatches nothing.
     this.#ensureInboxDirs();
     this.#scanInbox();
+    this.#checkNotifications();
     // Reconcile above can itself reach a terminal state and fire the
     // auto-stop, so only arm the poll timer if `stop()` has not already run
     // (`#doStop` would have cleared an unset timer, and arming one here
     // afterwards would keep the process alive forever).
     if (!this.#closed) {
-      this.#inboxTimer = setInterval(() => this.#scanInbox(), this.#deadlines.inboxPollMs);
+      this.#inboxTimer = setInterval(() => {
+        this.#scanInbox();
+        // The wait's one 30-minute reminder is noticed on the same beat.
+        this.#checkNotifications();
+      }, this.#deadlines.inboxPollMs);
     }
 
     this.drive();
@@ -1161,6 +1182,8 @@ export class Conductor {
     this.#state = result.state;
     this.#syncBudgetTimer();
     this.drive();
+    // Plan 01b: before `#maybeAutoStop` can tear the log down for BLOCKED.
+    this.#checkNotifications();
     this.#maybeAutoStop();
   }
 
@@ -1502,6 +1525,52 @@ export class Conductor {
     if (this.#budgetRemainingMs === undefined || this.#budgetRemainingMs <= 0) return;
     this.#budgetTimerStartedAt = Date.now();
     this.#budgetTimer = setTimeout(() => this.#onRunBudgetExceeded(), this.#budgetRemainingMs);
+  }
+
+  /** Plan 01b: announce (or remind about) an owner wait. Called after every
+   * state change and from the inbox poll, so a run parked in AWAITING_OWNER
+   * stays covered even though `next()` dispatches nothing then. `notify`
+   * itself owns the once-per-wait dedup and the 30-minute reminder, so this
+   * is safe to call on every tick. A no-op unless the phase is AWAITING_OWNER
+   * or BLOCKED; the reminder is deliberately not sent for BLOCKED, which the
+   * conductor stops at once and no owner action can revive. */
+  #checkNotifications(): void {
+    if (this.#closed) return;
+    const phase = this.#state.phase;
+    if (phase.phase !== "AWAITING_OWNER" && phase.phase !== "BLOCKED") return;
+    const open = phase.ownerRequests.filter((r) => r.status === "open");
+    const wait = phase.phase === "BLOCKED" ? `blocked:${oneLine(phase.blockedReason ?? "")}` : `awaiting:${open[open.length - 1]?.id ?? phase.phaseId}`;
+    const node = this.#programNode();
+    // The user-visible run id is the directory's name (`tt list`), not the
+    // conductor's own `phase.runId` (a separate uuid in the init record).
+    const runId = path.basename(this.#runDir);
+    notify(
+      {
+        id: runId,
+        kind: "run",
+        title: redactText(this.#plan.title, this.#secretMaskable),
+        ...(node ? { node } : {}),
+        reason: redactText(waitReason(phase), this.#secretMaskable),
+        waitKey: `${runId}:${wait}`,
+      },
+      {
+        root: path.dirname(this.#runDir),
+        now: this.#now,
+        reminderMs: this.#deadlines.notifyReminderMs,
+        onError: (message) => this.#logUnexpected("notify", new Error(message)),
+      },
+    );
+  }
+
+  /** The program node this run is, if the scheduler started it (`program.json`
+   * is written by `schedulerTick` before the run is launched). */
+  #programNode(): string | undefined {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { node?: unknown };
+      return typeof raw.node === "string" ? raw.node : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** design §8.1's "run execution budget ... tokens" and "per-attempt token
