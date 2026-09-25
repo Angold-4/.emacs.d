@@ -135,9 +135,17 @@ export function initialProgramState(nodes: ProgramNode[]): ProgramState {
   return { nodes: Object.fromEntries(nodes.map((n) => [n.id, { status: "waiting" as NodeStatus }])), stopped: false, directives: [] };
 }
 
-/** Plan 01i: the program-wide directives still in force, in order. */
+/** Plan 01i: the program-wide directives still in force, oldest first by
+ * their `ODP-<n>` number — never in the order the inbox happened to hand the
+ * files over. */
 export function programDirectivesInForce(state: ProgramState): ProgramDirective[] {
-  return (state.directives ?? []).filter((d) => !d.withdrawn);
+  return (state.directives ?? [])
+    .filter((d) => !d.withdrawn)
+    .sort((a, b) => directiveNumber(a.id) - directiveNumber(b.id));
+}
+
+function directiveNumber(id: string): number {
+  return Number(id.match(/^(?:ODP|OD)-(\d+)$/)?.[1] ?? 0);
 }
 
 /** Plan 01i: the program's next free directive id.

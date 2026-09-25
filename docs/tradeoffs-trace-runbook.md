@@ -121,7 +121,7 @@ and runs independent phases in parallel.
 | Where | What |
 |---|---|
 | program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive), `k` stops the program, `R` resumes it. It also lists the program's owner directives in force. |
-| CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program directive <id> <text>`, `tt program withdraw <id> <OD-n>`, `tt program stop <id>`, `tt program resume <id>` |
+| CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program directive <id> <text>`, `tt program withdraw <id> <ODP-n>`, `tt program stop <id>`, `tt program resume <id>` |
 
 **Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
 

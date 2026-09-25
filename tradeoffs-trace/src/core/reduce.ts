@@ -369,20 +369,13 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (existing.some((d) => d.id === directive.id)) {
         return rejected(state, `owner directive ${directive.id} already exists`);
       }
-      return ok({
-        ...state,
-        phase: {
-          ...p,
-          ownerDirectives: [
-            ...existing,
-            {
-              ...directive,
-              targets: directive.targets ?? [],
-              deliveries: directive.deliveries ?? {},
-            },
-          ],
-        },
-      });
+      const added = { ...directive, targets: directive.targets ?? [], deliveries: directive.deliveries ?? {} };
+      // Kept in ascending id order, never in the order the inbox happened to
+      // hand the files over: a lexicographic scan applies `cmd-prog-ODP-10`
+      // before `cmd-prog-ODP-2`, and prompts and the status must still read
+      // oldest → newest. `seq` is the number in the id (`OD-n` or `ODP-n`).
+      const ownerDirectives = [...existing, added].sort((a, b) => a.seq - b.seq);
+      return ok({ ...state, phase: { ...p, ownerDirectives } });
     }
 
     case "DIRECTIVE_WITHDRAWN": {

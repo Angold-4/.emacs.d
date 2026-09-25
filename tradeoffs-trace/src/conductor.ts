@@ -3684,11 +3684,9 @@ export class Conductor {
     const lines = [
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
       ...secretPromptLines(this.#secretNames),
-      ...directiveLines(phase.ownerDirectives),
-      // Plan 01i: a directive binds as part of the contract, always stated so
-      // a reviewer knows the rule whether or not one is in force right now.
-      "",
-      DIRECTIVE_BINDING_STATEMENT,
+      // Plan 01i: the directives in force, and the contract rule that binds
+      // them — always stated, whether or not one is in force right now.
+      ...reviewerTurn2DirectiveSection(phase.ownerDirectives),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -3905,6 +3903,14 @@ export function directiveLines(directives: readonly OwnerDirective[] | undefined
  * says otherwise, and violating one is a blocking contract finding. */
 export const DIRECTIVE_BINDING_STATEMENT =
   "The owner's directives are binding on you as part of the contract: a candidate that follows one cannot be faulted for doing so, even where the plan's text says otherwise; a candidate that violates one is a blocking contract finding that cites the directive id.";
+
+/** Plan 01i: the reviewer turn-2 directive section — every directive in force,
+ * verbatim, newest last, then the contract rule that binds them. Exported (and
+ * used by `#buildReviewerTurn2Prompt`) so a unit test exercises exactly what
+ * turn 2 sends, rather than a look-alike built from state somewhere else. */
+export function reviewerTurn2DirectiveSection(directives?: readonly OwnerDirective[]): string[] {
+  return [...directiveLines(directives), "", DIRECTIVE_BINDING_STATEMENT];
+}
 
 /** Plan 2c: what a repair attempt must know about the candidate that was
  * not accepted (design §5.2 "the rejecting ballots go to the worker's

@@ -4,6 +4,7 @@
 // turn-2 prompt carries.
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import { test } from "node:test";
 
 import {
@@ -13,6 +14,7 @@ import {
   buildWorkerPrompt,
   directiveLines,
   parseWithdrawInput,
+  reviewerTurn2DirectiveSection,
 } from "../../src/conductor.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { initialProgramState, nextProgramDirectiveId, reduceProgram } from "../../src/core/program.ts";
@@ -136,6 +138,21 @@ test("owner-directives: program directives are numbered in their own ODP namespa
   assert.equal(state.directives?.[0].text, "no vendor adapters");
 });
 
+test("owner-directives: the list stays in id order however the inbox scan ordered the files", () => {
+  // The inbox scan is lexicographic, so `cmd-prog-ODP-10.json` is applied
+  // before `cmd-prog-ODP-2.json`; the record (and therefore every prompt and
+  // the status) must still read oldest → newest.
+  let state = baseState();
+  state = step(state, { type: "DIRECTIVE_ADDED", directive: directive({ id: "ODP-10", seq: 10, text: "tenth" }) });
+  state = step(state, { type: "DIRECTIVE_ADDED", directive: directive({ id: "ODP-2", seq: 2, text: "second" }) });
+  state = step(state, { type: "DIRECTIVE_ADDED", directive: directive({ id: "OD-1", seq: 1, text: "first" }) });
+  assert.deepEqual(
+    state.phase.ownerDirectives?.map((d) => d.id),
+    ["OD-1", "ODP-2", "ODP-10"],
+    "ascending id order, not application order",
+  );
+});
+
 test("owner-directives: the prompt section lists every directive in force, verbatim, newest last, and omits withdrawn ones", () => {
   const directives: OwnerDirective[] = [
     directive({ id: "OD-1", text: "first ruling" }),
@@ -166,13 +183,29 @@ test("owner-directives: the worker prompt carries every in-force directive verba
   assert.ok(prompt.includes("OD-1: fix the Stork live link in this phase"));
 });
 
-test("owner-directives: the reviewer turn-2 prompt states that directives are binding and following one is not a defect", () => {
-  // The turn-2 prompt is built from live state, so this exercises the same
-  // statement through the exported reviewer prompt, which shares it.
-  const phase = baseState().phase;
-  const prompt = buildReviewerPrompt(phase, "A", [], [directive()]);
-  assert.ok(prompt.includes("OD-1: the 14 exchange-state-machine failures are pre-existing, not yours"));
-  assert.ok(prompt.includes(DIRECTIVE_BINDING_STATEMENT), "the binding statement must be in the prompt");
-  assert.match(prompt, /blocking contract finding that cites the directive id/);
-  assert.match(prompt, /cannot be faulted for doing so/);
+test("owner-directives: the reviewer turn-2 section states that directives are binding and following one is not a defect", () => {
+  // This is the exact section #buildReviewerTurn2Prompt spreads into the real
+  // turn-2 prompt (the test below checks that wiring), so dropping the
+  // statement from turn 2 fails here.
+  const section = reviewerTurn2DirectiveSection([directive()]).join("\n");
+  assert.ok(section.includes("OD-1: the 14 exchange-state-machine failures are pre-existing, not yours"));
+  assert.ok(section.includes("Owner directives (binding):"));
+  assert.ok(section.includes(DIRECTIVE_BINDING_STATEMENT), "the binding statement must be in the section");
+  assert.match(section, /blocking contract finding that cites the directive id/);
+  assert.match(section, /cannot be faulted for doing so/);
+  // With no directive in force the rule is still stated: it is part of the
+  // contract, not a consequence of one directive existing.
+  assert.ok(reviewerTurn2DirectiveSection([]).join("\n").includes(DIRECTIVE_BINDING_STATEMENT));
+  assert.ok(reviewerTurn2DirectiveSection(undefined).join("\n").includes(DIRECTIVE_BINDING_STATEMENT));
+});
+
+test("owner-directives: the real turn-2 prompt builder uses that section (a static wiring check)", () => {
+  // #buildReviewerTurn2Prompt is private and needs a live candidate, so the
+  // end-to-end assertion lives in test/conductor/owner-directives.test.ts
+  // (turn 2's captured prompt). This check makes it impossible to drop the
+  // section from turn 2 while the unit test above stays green — the same
+  // precedent as test/crash/crash-suite.test.ts's boundary wiring check.
+  const src = fs.readFileSync(new URL("../../src/conductor.ts", import.meta.url), "utf8");
+  const turn2 = src.slice(src.indexOf("#buildReviewerTurn2Prompt"), src.indexOf("// -- publish", src.indexOf("#buildReviewerTurn2Prompt")));
+  assert.ok(turn2.includes("reviewerTurn2DirectiveSection(phase.ownerDirectives)"), "turn 2 must spread the section");
 });

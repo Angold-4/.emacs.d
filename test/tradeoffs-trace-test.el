@@ -383,10 +383,12 @@ box, a program node's box, and a program buffer's box."
                           (+tt--input-header nil t))))
 
 (ert-deftest tradeoffs-trace-input-program-wide ()
-  "Plan 01i (D5): C-u C-c C-c sends the run's text as a program-wide
-directive; without the prefix it applies to this phase."
+  "Plan 01i (D5): C-u C-c C-c on a program node's run sends its text as a
+program-wide directive; without the prefix it applies to this phase, and a
+run that is not part of a program can only apply it to its phase."
   (let ((written nil))
-    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t)))
+    ;; A node of a program: C-u really is program-wide.
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t nil nil t)))
               ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
       (with-temp-buffer
         (insert "fix the Stork link")
@@ -395,7 +397,17 @@ directive; without the prefix it applies to this phase."
         (should (equal (alist-get 'scope written) "phase"))
         (insert "fix the Stork link")
         (+tt-input-send '(4))
-        (should (equal (alist-get 'scope written) "program"))))))
+        (should (equal (alist-get 'scope written) "program"))))
+    ;; A hand-started run has nothing program-wide to reach: the input is
+    ;; recorded for this phase, and the confirmation says so (never "whole
+    ;; program", which the conductor would demote anyway).
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t)))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-2")))
+      (with-temp-buffer
+        (insert "fix the Stork link")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send '(4))
+        (should (equal (alist-get 'scope written) "phase"))))))
 
 (ert-deftest tradeoffs-trace-program-input-writes-a-program-directive ()
   "Plan 01i: the program buffer's input box records a program-wide directive

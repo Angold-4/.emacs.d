@@ -837,6 +837,11 @@ whether it is in force or withdrawn, its verbatim text and the delivery
 state per live agent (`worker ✓ M ⧗ A ✓')."
   (let ((directives (alist-get 'ownerDirectives (+tt--get s 'state 'phase))))
     (when directives
+      ;; Oldest first, by the number in the id — never the order the inbox
+      ;; happened to hand the files over (a lexicographic scan puts ODP-10
+      ;; before ODP-2).
+      (setq directives (sort (copy-sequence directives)
+                             (lambda (a b) (< (or (alist-get 'seq a) 0) (or (alist-get 'seq b) 0)))))
       (insert (format "\nOwner directives (%d)\n" (length directives)))
       (dolist (d directives)
         (insert (format "  - %s [%s, %s] %s — %s\n"
@@ -1089,14 +1094,19 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
              (kind (cond ((equal name "AWAITING_OWNER") "correction")
                          ((member name '("IMPLEMENTING" "FREEZING")) "steer")
                          (t "note")))
+             ;; A run that is not part of a program has nothing program-wide
+             ;; to reach: the conductor demotes such an input to this phase's
+             ;; own directive, and the confirmation must say what the header
+             ;; and the recorded record say.
+             (effective (if (and program-wide (alist-get 'program s)) "program" "phase"))
              (id (+tt--write-command
                   run-dir
                   `((type . ,kind) (text . ,text)
-                    (scope . ,(if program-wide "program" "phase"))
+                    (scope . ,effective)
                     (binding . ,binding)))))
         (erase-buffer)
         (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
-                 kind id (if program-wide "the whole program" "this phase")))))))
+                 kind id (if (equal effective "program") "the whole program" "this phase")))))))
 
 (defun +tt-program-input ()
   "Open this program's input box: text sent there is a program-wide directive."
