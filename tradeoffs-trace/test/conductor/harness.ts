@@ -159,13 +159,15 @@ export async function setupConductor(opts: {
   /** The phase's own goal text (default "do the thing"). A plan's prose is a
    * secret-value carrier too, so a test can quote one in it. */
   goal?: string;
+  /** The plan's title (default "test plan") — plan prose like any other. */
+  title?: string;
 }): Promise<TestConductorSetup> {
   const repo = makeRepo();
   const runRoot = makeRunRoot();
   const scriptsDir = shortTmp("tt-scripts");
 
   const plan: RunPlanFile = {
-    title: "test plan",
+    title: opts.title ?? "test plan",
     repo: repo.dir,
     integrationBranch: "main",
     checks: opts.globalChecks ?? opts.checks ?? ["true"],

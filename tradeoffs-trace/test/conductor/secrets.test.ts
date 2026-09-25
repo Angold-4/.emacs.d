@@ -457,8 +457,10 @@ test("secrets: plan text and outgoing prompts are redacted at the choke points, 
   let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
   try {
     setup = await setupConductor({
-      // The plan's own prose carries the value: its goal, and a check line that
-      // pastes it inline the way the measured runs did (runtime doc §7).
+      // The plan's own prose carries the value: its title, its goal, and a
+      // check line that pastes it inline the way the measured runs did
+      // (runtime doc §7).
+      title: `Phase 01a — vendor key ${value}`,
       goal: `Read the vendor key ${value} from the environment, never paste it`,
       globalChecks: [`test "$FAKE_KEY" = '${value}'`],
       phaseChecks: ["true"],
@@ -498,6 +500,12 @@ test("secrets: plan text and outgoing prompts are redacted at the choke points, 
     assert.ok(!snapshot.includes(value), "plan/v1.json must not hold the value");
     assert.match(snapshot, /\*\*\*FAKE_KEY\*\*\*/);
     assert.doesNotThrow(() => JSON.parse(snapshot));
+    // …and so is meta.json: the title is plan prose too, and every display of
+    // it (tt list, the Emacs run label) redacts it (finding M-20).
+    const meta = fs.readFileSync(runPaths(setup.runDir).meta, "utf8");
+    assert.ok(!meta.includes(value), "meta.json must not hold the value");
+    assert.match(meta, /\*\*\*FAKE_KEY\*\*\*/);
+    assert.doesNotThrow(() => JSON.parse(meta));
 
     // Choke point 2: every outgoing prompt is redacted before it reaches an
     // agent, for the worker and for the reviewers.
@@ -524,6 +532,73 @@ test("secrets: plan text and outgoing prompts are redacted at the choke points, 
       cleanupDir(setup.repo.dir);
     }
     fs.rmSync(scriptsDir, { recursive: true, force: true });
+    delete process.env.FAKE_KEY;
+  }
+});
+
+test("secrets: a masked plan (what a detached conductor reads) still runs its commands with the real value", async () => {
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  process.env.FAKE_KEY = value;
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    // This is the situation the production path creates (finding B-19):
+    // `tt start`'s detached conductor is built from `plan/v1.json`, which
+    // createRun wrote redacted, so the plan it holds says ***FAKE_KEY*** where
+    // its author wrote the value. The command must still run as written — with
+    // the value from the environment — or a legitimate plan's checks would fail
+    // for a reason it cannot see.
+    setup = await setupConductor({
+      title: "masked snapshot",
+      goal: "a plan whose goal quotes ***FAKE_KEY***",
+      globalChecks: ["test \"$FAKE_KEY\" = '***FAKE_KEY***'"],
+      phaseChecks: ["true"],
+      secrets: ["FAKE_KEY"],
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+      }),
+      reviewerScriptFor: (reviewer, state) => ({
+        hello: defaultReviewerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+            },
+          },
+        ],
+      }),
+      deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+    });
+    await setup.conductor.start();
+    const conductor = setup.conductor;
+    await waitFor(() => conductor.state.phase.phase === "DONE", 120_000);
+    assert.equal(conductor.state.phase.checks?.passed, true, "the masked command must run with the real value");
+    // The value is used for execution only: nothing under the run directory has it.
+    for (const file of filesUnder(setup.runDir)) {
+      assert.ok(!fs.readFileSync(file).includes(value), `${path.relative(setup.runDir, file)} holds the value`);
+    }
+    // …and the check log shows the mask, not the value.
+    const checkLogs = fs
+      .readdirSync(path.join(runPaths(setup.runDir).checks), { recursive: true } as never)
+      .filter((f) => String(f).endsWith(".log"))
+      .map((f) => fs.readFileSync(path.join(runPaths(setup.runDir).checks, String(f)), "utf8"))
+      .join("\n");
+    assert.match(checkLogs, /\*\*\*FAKE_KEY\*\*\*/, "the check log records the masked command");
+    assert.ok(!checkLogs.includes(value));
+  } finally {
+    await setup?.conductor.stop();
+    if (setup) {
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+      cleanupDir(setup.repo.dir);
+    }
     delete process.env.FAKE_KEY;
   }
 });

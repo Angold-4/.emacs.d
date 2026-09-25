@@ -377,8 +377,10 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   // ("the plan's own check line"). Redacting here rather than in each reader
   // means the value cannot be in the file at all, for any consumer: agents
   // read it, `tt status`/`tt state` print it, `tt redact` would only clean it
-  // later. The conductor's own in-memory plan stays as written, so the checks
-  // it runs still see the real command line and the real environment.
+  // later. A conductor started from this snapshot (`tt start`'s detached
+  // process re-reads it, cli.ts) therefore holds the mask in the plan's own
+  // text — see `#withValues`, which puts the real value back for the commands
+  // the plan asks for, and only for them.
   const declared = secretNames(plan.secrets);
   const { maskable } = resolveSecrets(declared);
   fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(redactRecord(plan, maskable), null, 2));
@@ -433,14 +435,20 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   }
   fs.writeFileSync(
     p.meta,
+    // Plan 01a: the title is plan prose like any other, and the same value is
+    // redacted wherever a title is displayed (`tt list`, the Emacs run label),
+    // so the file itself must not keep it either (finding M-20).
     JSON.stringify(
-      {
-        title: plan.title,
-        repo: plan.repo,
-        createdAt: new Date().toISOString(),
-        status: "created",
-        runnerRevision: runnerRevision(),
-      },
+      redactRecord(
+        {
+          title: plan.title,
+          repo: plan.repo,
+          createdAt: new Date().toISOString(),
+          status: "created",
+          runnerRevision: runnerRevision(),
+        },
+        maskable,
+      ),
       null,
       2,
     ),
@@ -2769,6 +2777,28 @@ export class Conductor {
     );
   }
 
+  /** Plan 01a: the run's plan snapshot on disk is written redacted, and
+   * `tt start`'s detached conductor is built by re-reading that snapshot
+   * (cli.ts's `runConductorProcess`), so the plan's own text can hold the mask.
+   * A command the PLAN asks for must still run as its author wrote it — the
+   * values are in this process's environment, which is the only place they may
+   * be read from — so the mask is exchanged for the real value here, in memory,
+   * at the moment the command is handed to the shell.
+   *
+   * Nothing is written back: the check log records the masked command
+   * (`#recordCheck`), the snapshot keeps the mask, and prompts are redacted at
+   * their own choke point. This is not a general "unmask": it is applied to
+   * plan-authored commands only, never to agent-supplied text, which must use
+   * `$NAME` and is refused when it carries a value. */
+  #withValues(text: string): string {
+    let out = text;
+    for (const s of this.#secretMaskable) {
+      if (!out.includes(`***${s.name}***`)) continue;
+      out = out.split(`***${s.name}***`).join(s.value);
+    }
+    return out;
+  }
+
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
@@ -2784,7 +2814,10 @@ export class Conductor {
         // F04: the effective list is the global plan checks followed by the
         // phase contract's own checks, deduped by exact command string — the
         // same list `#runProbe` executes against the merged integration I.
-        for (const command of effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+        for (const rawCommand of effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+          // Plan 01a: a plan that pasted a value into its check line gets it
+          // back here (the snapshot it may have been read from is masked).
+          const command = this.#withValues(rawCommand);
           // design §8.1: "each check command | 10 min | kill its group |
           // check failed: timeout" — runCommand's own deadlineMs already
           // kills the command's process group on expiry (shell.ts); this
@@ -2859,7 +2892,8 @@ export class Conductor {
     const sameTree = treeOf(this.#plan.repo, result.I) === treeOf(this.#plan.repo, candidateSha);
     const reuse = this.#probeReuse && sameTree && checks?.candidateSha === candidateSha && checks.passed === true;
     if (reuse) this.#log.append("probe_checks_reused", { candidateSha, I: result.I, reason: "I has the candidate's tree; checks passed on the candidate" });
-    for (const command of reuse ? [] : effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+    for (const rawCommand of reuse ? [] : effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+      const command = this.#withValues(rawCommand);
       // design §8.1: "integration probe (merge plus its checks) | as for
       // checks, per command | kill its group; discard the probe branch |
       // 'integration' finding: timeout" — runCommand's deadlineMs already
