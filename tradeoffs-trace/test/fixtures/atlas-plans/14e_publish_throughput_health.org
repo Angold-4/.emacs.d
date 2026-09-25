@@ -1,0 +1,24 @@
+#+TITLE: index-price-service 14.5: publish without per-tick ack waits, and expose replica health
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p index-subscriber-service -p index-calculator-service && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase. Findings F3 and F5 of 14_ref_split_findings.md.
+
+* Phase 14.5: the publish path has headroom, and a silent replica is visible
+  :PROPERTIES:
+  :ID:          ips14-publish-headroom
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-subscriber-service -p index-calculator-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/services/index/index-subscriber-service/** crates/services/index/index-calculator-service/src/lib.rs docker/docker-compose.yml deploy/lib/readiness.sh
+  :RESERVED:    the envelope bytes stay identical (v1); a publish must still be acknowledged in aggregate, only not one-at-a-time; the health surface reports link state per replica and never invents a healthy signal
+  :END:
+  Goal: Reference — `14_ref_split_findings.md` F3, F5 and MDS §6.2.
+  Give the split headroom and a visible pulse. Each subscriber replica currently sends one tick and waits for `acks=all` plus librdkafka's 5 ms batching delay before sending the next, which measures out at roughly 150–200 messages/s per replica; replica 0 (Pyth+Stork+Kaiko) is already near that ceiling at 17 markets, so at 29 markets it would fall behind and age ticks to stale. Pipeline the sends — bounded in-flight requests with the acknowledgement awaited in aggregate — so throughput is no longer one round trip per tick, and record the measured ceiling and the headroom for 29 markets.
+  Then expose a health surface on each subscriber replica (it has none today), reporting per-vendor link state from the adapters that already track it (MDS §6.2), partition assignment, publish rate and last-publish age. The readiness script must consult it, so a replica that is up but silently disconnected is reported down rather than invisible.
+  Priorities: measured headroom over a hoped-for one; a visible failure over a silent one; no change to the envelope.
+  Acceptance:
+  - `publish_throughput_has_headroom_for_the_target` measures per-replica messages/s under a burst and asserts comfortable headroom (recorded, with the measured number) for the planned market count
+  - `envelope_bytes_are_unchanged_by_pipelining` asserts the emitted envelope for a fixed SourceTick is byte-identical to today's
+  - `subscriber_health_reports_link_state` asserts the endpoint reports per-vendor link state, partition assignment and last-publish age, and that a disconnected link is reported not-healthy
+  - `readiness_fails_a_silently_disconnected_replica` asserts the readiness path surfaces the not-healthy replica
+  - all existing tests still pass

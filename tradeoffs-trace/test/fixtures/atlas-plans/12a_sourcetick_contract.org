@@ -1,0 +1,29 @@
+#+TITLE: index-price-service 12.1: define the doc-exact SourceTick contract
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-fix
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 12, phase 12.1 (one phase per file, PLAN_TEMPLATE.md v1 limit). Serial.
+# Runs after: P0, which rebases the 7-PR stack, fixes F1/F2 and merges it into feat/atlas; feat/atlas-ips-fix is then cut from the merged feat/atlas (12_ref_stack_and_findings.md §6). Next: 12b_calculator_sourcetick.org. Run order and settled decisions: 12_index.md.
+# References (self-contained with this plan):
+#   ~/orgw/work/atlas/indexps/12_ref_source_tick_contract.md — normative SourceTick, edge rules, settled decisions D1-D6, transitional mapping
+#   ~/orgw/work/atlas/indexps/12_ref_stack_and_findings.md   — pinned SHAs, findings F1-F4, merge-gate commands, P0 merge procedure
+
+* Phase 12.1: define the doc-exact SourceTick contract
+  :PROPERTIES:
+  :ID:          ips12-sourcetick-contract
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p oracle-protocol && cargo check --workspace --all-targets && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/protocol/src/** crates/modules/oracle/protocol/Cargo.toml
+  :RESERVED:    the SourceTick serialized field set and its field/session vocabularies (settled, 12_ref_source_tick_contract §1); the crate that owns SourceTick (settled D4: oracle-protocol); the D3 value mapping
+  :END:
+  Goal: Reference — `12_ref_source_tick_contract.md` §1, §3, §5. Add one `SourceTick` value type that is exactly the Market Data Subscriber output contract of `docs/atlas/risk/ATLAS - Market Data Subscriber.md` §2 and the input contract of `docs/atlas/risk/ATLAS - Index Calculator.md` §4, so the design documents and the code name the same thing and the required fields are enforced by the type. Define it in `crates/modules/oracle/protocol/src/source_tick.rs`, re-exported from the `oracle-protocol` crate root (settled decision D4). Fields: required `instrument_id: AssetPair`, `vendor: Vendor`, `price: Price`, `ts_vendor: u64` ns, `ts_recv: u64` ns, `field`, `session`, `ccy: String`, `carried_forward: bool`; optional `halt_flag: Option<bool>`, `sale_cond: Option<SaleCondition>`. There is no `confidence`, `publisher_count`, `contract_month`, identity, `ts_vendor_kind`, `native_product`, `verification` or assumptions field (MDS §2 "Not on SourceTick"; settled decisions D2 and D5). The field enum is exactly mid|last|official_close|settlement|nav|index_official|fut_front_mid, and the session enum is exactly rth|pre|ah|overnight|fut_open|otc_open|closed|halt|auction|unknown. Serde uses snake_case names; `Vendor` has exactly `pyth`, `coinbase` and `hyperliquid` in this plan (plan 13 adds the others). Give the new enums their own names in `source_tick.rs` (for example `TickField`, `TickSession`) so they do not collide with the old `PriceField`/`Session`, which stay until 12.3. `SourceTick::new(..) -> Result<SourceTick, SourceTickError>` rejects a non-positive price and an empty `ccy`; deserializing a tick without price, ts_vendor, field or session fails. Also add the transitional bridge `SourceTick::from_observation(obs: &PriceObservation, demo_row: bool) -> Result<SourceTick, SourceTickError>` from `12_ref_source_tick_contract.md` §5. It is total over admissible rows and returns a typed error otherwise. It is explicitly not lossless. When `demo_row` is true and the vendor time is absent, it uses `ts_recv` as `ts_vendor` (settled decision D1). It maps `CryptoOpen→rth`, `FxOpen→otc_open` and `OracleIndex→mid` (settled D3), and it sets `carried_forward: false`. `PriceObservation` stays in place, and nothing else changes in this phase. Priorities: the documented vocabulary exactly, over preserving today's extra enum values; a workspace that compiles unchanged.
+  Acceptance:
+  - `SourceTick` exists only in `crates/modules/oracle/protocol/src/source_tick.rs`, is re-exported from the crate root, and `source_tick_field_set_is_the_documented_set` pins its exact serde field set as instrument_id, vendor, price, ts_vendor, ts_recv, field, session, ccy, carried_forward, halt_flag, sale_cond
+  - `source_tick_field_vocabulary_matches_index_calculator_doc` and `source_tick_session_vocabulary_matches_mds_doc` assert the two enums serialize to exactly the documented 7 and 10 snake_case values
+  - `source_tick_excludes_confidence_publisher_count_and_contract_month` asserts that deserializing JSON with those keys added either ignores or rejects them and that none appears on serialization
+  - `source_tick_rejects_a_missing_required_field` asserts that deserialization fails for JSON missing each of price, ts_vendor, field and session, and that `SourceTick::new` returns a typed error for price <= 0 and for an empty ccy
+  - `Vendor` serializes to exactly `pyth`, `coinbase` and `hyperliquid`, and an unknown vendor string fails to deserialize, covered by `vendor_is_a_closed_enumeration`
+  - `observation_bridge_is_total_over_admissible_rows` covers a Coinbase row (event time kept), a Pyth row, a Hyperliquid demo row without vendor time (ts_vendor == ts_recv), CryptoOpen→rth, FxOpen→otc_open and OracleIndex→mid
+  - `observation_bridge_rejects_an_inadmissible_row` covers a missing vendor time on a non-demo row, the PerpMark and Unknown fields, and an unknown source_id, each with its own `SourceTickError` variant
+  - `cargo check --workspace --all-targets` passes and `cargo xtask check dep-rules` passes with no new dependency on `oracle-protocol`
+  - all existing tests still pass

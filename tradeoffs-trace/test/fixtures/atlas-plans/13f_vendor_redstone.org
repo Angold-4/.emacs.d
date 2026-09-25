@@ -1,0 +1,34 @@
+#+TITLE: index-price-service 13.6: Redstone adapter for all 17 markets
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p oracle-source-redstone -p index-subscriber && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase: starts after 13a_shared_markets.org (13.1) and 13b_adapter_contract.org (13.2) are
+# merged, alongside the other three vendor files (13c-13f). The calculator 13g_calculator_blend.org
+# (13.7) starts only after all four vendor phases merge. This phase touches only the files in its
+# reference §2, so it cannot conflict with them.
+#
+# Self-contained reference (mapping, rules, tests, and the temporary credential in §0):
+#   ~/orgw/work/atlas/indexps/13_ref_vendor_redstone.md
+# Shared contract it builds on: ~/orgw/work/atlas/indexps/13_ref_shared_contract.md §5.
+# Before the live check: export REDSTONE_API_KEY (values in the reference §0). Never commit a credential.
+
+* Phase 13.6: Redstone adapter for all 17 markets
+  :PROPERTIES:
+  :ID:          ips13-redstone-adapter
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p oracle-source-redstone -p index-subscriber && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/adapters/source-redstone/Cargo.toml crates/modules/index/subscriber/src/adapters/redstone.rs config/index/vendors/redstone.yaml
+  :RESERVED:    credentials only from REDSTONE_API_KEY; base feeds only (no ---EXTENDED/---PRE_AFTER/---24_7, *_FUNDAMENTAL, *_MARK, *_INDEX); gateway/service overrides only through the fragment's overrides map; files outside 13_ref_vendor_redstone §2
+  :END:
+  Goal: Reference — `13_ref_vendor_redstone.md` (self-contained) and `13_ref_shared_contract.md` §5. Implement `oracle-source-redstone` behind the 13.2 seam so Redstone, a full blend vendor, covers as many of the 17 markets as its services allow, trying every Redstone service before recording a gap (owner coverage rule). Implement exactly `13_ref_vendor_redstone.md` §3–§4: poll `GET {gateway}/data-packages/latest/{data_service_id}` every 500 ms (contracted interval 500 ms, 13_ref_shared_contract §3.1; the public gateway only updates every 10 s, so locating the key-gated 500 ms service is required) (default `https://oracle-gateway-1.a.redstone.finance`, `redstone-primary-prod`) as one request for all feeds; take the newest package per feed, with the exact median of values on a timestamp tie; price = `dataPoints[0].value` parsed from its raw JSON text, never f64; `ts_vendor` = timestampMilliseconds × 1e6; `carried_forward` = the timestamp did not advance; field mid; ccy USD; session rth for crypto and index-calendar for equities and metals; `VerificationStatus::Unverifiable`; a missing feed fails stop for that row only; link Down on HTTP failure. Twelve feeds are present publicly (crypto, XAU, XAG, NVDA). Locate INTC, MU, MRVL, SNDK and DRAM: work out from Redstone's docs how `REDSTONE_API_KEY` is used (the public gateway ignores it as x-api-key, Bearer or api-key) and which service or host carries them. Record the working gateway/service in the fragment's `overrides:` (never in the service config), and document every remaining gap as a comment in `config/index/vendors/redstone.yaml`. The temporary key is in §0; export it and never write it into the repository. Touch only the files in `13_ref_vendor_redstone.md` §2. Every test uses recorded payloads served by a local fixture, so CI needs no key. Priorities: covering all 17 markets or documenting each gap, over speed; exact prices and honest vendor time over convenience; the generic adapter contract of `13_ref_shared_contract.md` §5.
+  Acceptance:
+  - `redstone_native_fixture_emits_source_tick` asserts every SourceTick field from a recorded gateway response served by a local HTTP fixture
+  - `redstone_value_is_parsed_from_raw_text_not_f64` asserts that 0.00430522 and a 16-significant-digit value keep every digit
+  - `redstone_picks_the_newest_package_and_medians_ties` and `redstone_carried_forward_when_timestamp_does_not_advance` pass
+  - `redstone_missing_feed_is_dropped_at_startup`, `redstone_equity_session_follows_the_us_equity_calendar` and `redstone_fragment_override_selects_gateway_and_service` pass
+  - `redstone_works_without_key_on_the_public_gateway` and `redstone_link_down_is_reported_distinct_from_quiet` pass
+  - `redstone_fragment_covers_or_documents_all_17_markets` passes and the crate docs state the key mechanism found, the endpoints and every located or missing feed
+  - the owner live check is recorded in the phase decisions: with REDSTONE_API_KEY exported, which of the 17 markets streamed ticks, and each market's measured `ts_vendor`-advancement p50/p99 over ≥ 60 s (not message arrival) against the contracted 500 ms (13_ref_shared_contract §3.1)
+  - every `config/index/vendors/redstone.yaml` row declares `price_kind: spot`, covered by `redstone_fragment_declares_price_kind`
+  - `config/index/vendors/redstone.yaml` has a `cadence:` block with measured `p50_ms`, `p99_ms` and `measured_at` filled in from the live check
+  - all existing tests still pass

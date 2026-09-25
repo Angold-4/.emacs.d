@@ -109,6 +109,19 @@ be tagged `:provisional:` and are revised as implementation teaches us things.
   "Secrets (credentials)" and `tt redact` for a run that already leaked one.
 - The goal and acceptance list are given to the worker and to every reviewer
   word for word.
+- `Owner checklist:` (phase level, optional) lists what the owner will do after
+  the phase — a live run with credentials, a ruling, a push. Its items are
+  **never** given to the worker or the reviewers as acceptance; they are shown
+  once the phase is `DONE` and in `tt summary`'s PR body as `- [ ]` items. An
+  acceptance item the linter flags as the owner's job belongs here.
+- Every start lints the plan first (`tt lint`, `tt start`, `tt program start`;
+  Emacs `C-c m r` mirrors it by calling `tt lint`, so the rules live once, in
+  `tradeoffs-trace/src/core/plan-lint.ts`). An acceptance item whose actor is
+  the owner or a human is an **error** and refuses the start; an item that
+  depends on a future the gate cannot see ("after merge", "the current rebased
+  tip", "once deployed"), or a comparison against a contracted limit with no
+  stated tolerance ("p99 ≤ its contracted interval"), is a **warning** and the
+  run starts.
 
 ### 1.2 Starting a run: `C-c m r`
 
@@ -116,7 +129,8 @@ be tagged `:provisional:` and are revised as implementation teaches us things.
 visit the plan file (find-file, a link, wherever it came from)
     │
     ▼  C-c m r   (in the plan buffer)
-validate      – next phase has ID, CHECKS, goal, acceptance; globs parse
+validate      – next phase has ID, CHECKS, goal, acceptance; globs parse;
+    │           lint: owner-actor items are errors, future/tolerance warn
     │           errors → *tt-plan-errors* with jump-to-line, and no run starts
     ▼
 snapshot      – copy to <run>/plan/v1.org; record its sha256

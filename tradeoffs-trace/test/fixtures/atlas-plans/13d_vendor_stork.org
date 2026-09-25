@@ -1,0 +1,34 @@
+#+TITLE: index-price-service 13.4: Stork adapter emits SourceTick for all 17 markets
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p oracle-source-stork -p index-subscriber && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase: starts after 13a_shared_markets.org (13.1) and 13b_adapter_contract.org (13.2) are
+# merged, alongside the other three vendor files (13c-13f). The calculator 13g_calculator_blend.org
+# (13.7) starts only after all four vendor phases merge. This phase touches only the files in its
+# reference §2, so it cannot conflict with them.
+#
+# Self-contained reference (mapping, rules, tests, and the temporary credential in §0):
+#   ~/orgw/work/atlas/indexps/13_ref_vendor_stork.md
+# Shared contract it builds on: ~/orgw/work/atlas/indexps/13_ref_shared_contract.md §5.
+# Before the live check: export STORK_API_KEY (values in the reference §0). Never commit a credential.
+
+* Phase 13.4: Stork adapter emits SourceTick for all 17 markets
+  :PROPERTIES:
+  :ID:          ips13-stork-adapter
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p oracle-source-stork -p index-subscriber && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/adapters/source-stork/Cargo.toml crates/modules/index/subscriber/src/adapters/stork.rs config/index/vendors/stork.yaml
+  :RESERVED:    credentials only from STORK_API_KEY; base asset ids only (no *_USDC or *MARK variants); session from index-calendar for equities and metals; files outside 13_ref_vendor_stork §2
+  :END:
+  Goal: Reference — `13_ref_vendor_stork.md` (self-contained) and `13_ref_shared_contract.md` §5. Upgrade the existing `oracle-source-stork` REST client to emit `SourceTick` behind the 13.2 seam, so Stork is a blend vendor for all 17 markets (`docs/atlas/risk/ATLAS - Index Calculator.md` §4 peer). Implement exactly `13_ref_vendor_stork.md` §4: subscribe to Stork's WebSocket push stream for all pinned asset ids with `Authorization: Basic ${STORK_API_KEY}`, so the contracted 10–500 ms interval is met (the 1 s REST poll is only a recorded fallback), with the URL used recorded in the module docs and the fragment `overrides:` (`ws_endpoint`); a symbology check against `/v1/prices/assets` at startup with per-id fail-stop; price = the integer string with 18 implied decimals as an exact i128 `Price`, never f64; `ts_vendor` = the top-level `timestamp` (ns); `carried_forward` = the timestamp did not advance; field mid; ccy USD; session rth for crypto and `index_calendar::session_at` for equities (`*_24_5` composite) and metals; `VerificationStatus::Unverifiable`; link Down on socket or HTTP failure, distinct from quiet; disabled with a log line when the key is unset. Record the vendor rules in the crate's `//!` docs; MDS has no Stork binding, and no MDS amendment is made. All 17 asset ids are verified live and are already in `config/index/vendors/stork.yaml` from 13.1. The temporary key is in §0; export it for the live check and never write it into the repository. Touch only the files in `13_ref_vendor_stork.md` §2. Every test uses recorded payloads served by a local fixture, so CI needs no key. Priorities: covering all 17 markets or documenting each gap, over speed; exact prices and honest vendor time over convenience; the generic adapter contract of `13_ref_shared_contract.md` §5.
+  Acceptance:
+  - `stork_native_fixture_emits_source_tick` asserts every SourceTick field for a crypto, a metal and an equity asset from recorded frames served by a local WebSocket fixture, and `stork_stream_reconnects_to_the_same_endpoint` passes
+  - `stork_price_is_parsed_exactly` asserts that "228969999999999000000" decodes to mantissa 228969999999999000000 with 18 decimals and no f64
+  - `stork_carried_forward_when_timestamp_does_not_advance` and `stork_missing_timestamp_is_dropped_and_counted` pass
+  - `stork_equity_session_follows_the_us_equity_calendar` asserts rth at 09:31 New York, ah at 17:00 and closed on Saturday
+  - `stork_symbology_drops_an_unknown_asset_id`, `stork_disabled_without_key` and `stork_link_down_is_reported_distinct_from_quiet` pass
+  - `stork_fragment_pins_all_17_markets` passes and the crate docs state endpoint, auth, precision, field, session and carry-forward rules
+  - the owner live check is recorded in the phase decisions: with STORK_API_KEY exported, which of the 17 markets streamed ticks, and each market's measured `ts_vendor`-advancement p50/p99 over ≥ 60 s (not message arrival) against the contracted 10–500 ms (13_ref_shared_contract §3.1)
+  - every `config/index/vendors/stork.yaml` row declares `price_kind: spot`, covered by `stork_fragment_declares_price_kind`
+  - `config/index/vendors/stork.yaml` has a `cadence:` block with measured `p50_ms`, `p99_ms` and `measured_at` filled in from the live check
+  - all existing tests still pass

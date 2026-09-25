@@ -14,6 +14,16 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { decisionStatus } from "./core/predicate.ts";
+import {
+  formatFindings,
+  hasLintErrors,
+  isProgramInput,
+  lintPlan,
+  lintProgram,
+  type LintFinding,
+  type LintPlanInput,
+  type LintProgramInput,
+} from "./core/plan-lint.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
@@ -44,9 +54,33 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
+}
+
+/** Plan 01c: lint a parsed JSON file (a plan or a program). Every entry of a
+ * program is linted. Pure wrapper so `tt lint` and the start commands share
+ * one call. */
+function lintJson(json: unknown): LintFinding[] {
+  return isProgramInput(json) ? lintProgram(json as LintProgramInput) : lintPlan(json as LintPlanInput);
+}
+
+/** Plan 01c: print findings to OUT (stderr for a start that is about to be
+ * refused, stdout for `tt lint`). Nothing is printed when there are none. */
+function reportFindings(findings: readonly LintFinding[], file: string, out: NodeJS.WriteStream): void {
+  if (findings.length === 0) return;
+  out.write(`${formatFindings(findings, file)}\n`);
+}
+
+/** Plan 01c: `tt lint <plan.json|program.json>`. Prints every finding and
+ * exits non-zero when any is an error, so a script (and Emacs) can branch on
+ * the exit status. Warnings alone exit 0. */
+function cmdLint(file: string): void {
+  const json = JSON.parse(readFileSync(file, "utf8")) as unknown;
+  const findings = lintJson(json);
+  reportFindings(findings, file, process.stdout);
+  if (hasLintErrors(findings)) process.exitCode = 1;
 }
 
 function parseArgs(argv: string[]): { positional: string[]; root?: string; json: boolean } {
@@ -135,6 +169,14 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
   if (sub === "start") {
     if (args.length !== 1) usage();
     const program = JSON.parse(readFileSync(args[0], "utf8")) as ProgramFile;
+    // Plan 01c: every entry's plan is linted before the scheduler starts. An
+    // error refuses the whole program; warnings are printed and it starts.
+    const findings = lintProgram(program);
+    reportFindings(findings, args[0], process.stderr);
+    if (hasLintErrors(findings)) {
+      process.exitCode = 1;
+      return;
+    }
     const dir = createProgram(root, program);
     launchProgramScheduler(dir);
     process.stdout.write(`${path.basename(dir)}\n`);
@@ -223,6 +265,14 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
 async function cmdStart(planPath: string, root: string): Promise<void> {
   const plan = JSON.parse(readFileSync(planPath, "utf8")) as RunPlanFile;
   if (!plan.repo) usage();
+  // Plan 01c: lint before any run exists. An error refuses to start (message
+  // on stderr, non-zero exit); warnings are printed and the run starts.
+  const findings = lintPlan(plan);
+  reportFindings(findings, planPath, process.stderr);
+  if (hasLintErrors(findings)) {
+    process.exitCode = 1;
+    return;
+  }
   launchDetached(createRun(root, plan));
 }
 
@@ -661,6 +711,9 @@ async function main(): Promise<void> {
   if (cmd === "start") {
     if (positional.length !== 1) usage();
     await cmdStart(positional[0], runRoot);
+  } else if (cmd === "lint") {
+    if (positional.length !== 1) usage();
+    cmdLint(positional[0]);
   } else if (cmd === "status") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);

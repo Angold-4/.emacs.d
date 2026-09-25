@@ -1,0 +1,39 @@
+#+TITLE: index-price-service 13.9: 17-market three-vendor end-to-end gate (Pyth/Kaiko/Stork; Redstone deferred)
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 13, phase 13.9 (one phase per file). Serial: runs only after 13a–13h are ALL merged into
+# feat/atlas-ips-next. It is the first live run of the whole chain over the ENABLED adapters
+# (Pyth, Kaiko, Stork; Redstone is deferred/disabled pending its endpoint), and the gate before the
+# process split (13j_process_split.org).
+# The live part needs the enabled vendors' keys. Export them from the references before running:
+#   PYTH_ACCESS_TOKEN (13_ref_vendor_pyth.md §0), STORK_API_KEY (13_ref_vendor_stork.md §0),
+#   KAIKO_API_KEY and KAIKO_EQUITIES_API_KEY (13_ref_vendor_kaiko.md §0).
+#   REDSTONE_API_KEY is not needed for this cut (Redstone disabled).
+# References: 13_ref_shared_contract.md §1-§3 (target state, markets, coverage rule); 12_ref_stack_and_findings.md §4-§5 (gate commands, environment gotchas).
+
+* Phase 13.9: the whole stack runs the 17 markets on the enabled vendors (Pyth, Kaiko, Stork)
+  :PROPERTIES:
+  :ID:          ips13-e2e-17
+  :CHECKS:      cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules && cargo test -p index-subscriber -p index-calculator -p index-price-service -p index-calendar -p oracle-source-pyth -p oracle-source-stork -p oracle-source-kaiko -p oracle-source-redstone && PATH="$HOME/.cargo/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo -Zscript --quiet scripts/build-manifest-gen.rs --check
+  :BOUNDARIES:  Cargo.toml Cargo.lock config/index/** crates/services/index/index-price-service/config*.yaml docker/docker-compose.yml
+  :RESERVED:    the 17 markets and ids; the coverage rule (gaps are recorded, not papered over with another vendor's price); no credential value committed; any change to a vendor's settled rules in its 13_ref_vendor_*.md §4
+  :END:
+  Goal: Reference — `13_ref_shared_contract.md` §1–§3 and §6, and `12_ref_stack_and_findings.md` §4–§5.
+  Prove the integrated stack meets the plan-13 target before the process split: exactly the 17 markets, priced by the enabled vendors — Pyth, Kaiko and Stork (Redstone is deferred: disabled, no rows) — through the blend, regime and anchor, with INDEX applied on stream 215.
+  Merge-level work only. Resolve any `Cargo.lock` conflict from the parallel phases by regenerating it (never hand-editing). Make the full workspace compile and test green. Fix integration faults, each justified by a failing check and kept minimal; a fault whose fix belongs to one vendor's rules is recorded for that vendor instead of being patched around here.
+  Coverage report: produce `config/index/COVERAGE.md` from the vendor fragment files (Redstone recorded as deferred), listing, per market, which vendors have rows and each recorded gap with its reason (the owner coverage rule: cover all, record gaps).
+  Then run the owner live gate with the enabled vendors' keys exported and record it in the phase decisions: `deploy/atlas.sh apply --target local --profile demo --clean --build`, then `deploy/atlas.sh verify --plan active` (authoritative readiness), and `bash scripts/index-fixture-smoke.sh` (BTC and NVDA baselines). Record the code SHA, the image IDs, and per market over two samples a minute apart: n, quality, regime, and whether the applied INDEX on stream 215 advanced.
+  This gate is a **demo/observability milestone**: B4 (the quality vector never reaches Core) and B3 (the degraded threshold) are recorded deviations; the vendor set is now P/K/S (the docs' set), with Redstone deferred, so the gate must not claim IC §8–§9 completion or IC §10 test 10. Re-run it whenever the base moves: the recorded code SHA must be the final rebased tip, not an earlier one.
+  Priorities: a truthful gate over a green one; no cross-vendor substitution to hide a gap; no credential in the repository.
+  Acceptance:
+  - `cargo check --workspace --all-targets` and `cargo test --workspace` pass on the merged branch; files touched outside this phase's BOUNDARIES are reviewed (BOUNDARIES is a review-trigger, not an edit allowlist), and every integration fix is justified by a failing check and recorded
+  - `coverage_meets_the_settled_minimum` asserts, from `config/index/COVERAGE.md` and the vendor fragments, that every instrument has ≥ 2 qualifying vendor rows (or a recorded owner exception), every crypto instrument has ≥ 2, and every non-crypto instrument has ≥ 1 delivering in its open session
+  - `fragment_cadence_qualifies_on_ts_vendor_advancement` asserts each fragment's measured `p99_ms` reflects `ts_vendor` advancement (not message arrival) and is ≤ its contracted interval, or the market is a recorded gap
+  - `gate_is_rerun_when_the_base_moves` asserts the recorded live-run SHA is the current rebased tip
+  - `config/index/COVERAGE.md` lists all 17 markets with each vendor's row or recorded gap, and it matches the vendor fragment files (Redstone recorded as deferred), covered by `coverage_report_matches_fragments`
+  - `catalog_17_markets_resolve_to_one_instrument_each` still passes
+  - `grep -rnE "EytzDzmH|bGF5ZXJ6ZXJv|79fe0514|ec508556|793121af" .` over the repository finds nothing (no temporary key committed)
+  - the owner live gate is recorded in the phase decisions: verify reports READY; exactly one index-price-service publisher; for each of the 17 markets n ≥ 1 and applied INDEX advancing across two samples a minute apart, or a named gap from COVERAGE.md explaining n = 0; the smoke script exits 0
+  - all existing tests still pass

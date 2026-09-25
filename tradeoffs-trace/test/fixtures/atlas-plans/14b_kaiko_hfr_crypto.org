@@ -1,0 +1,27 @@
+#+TITLE: index-price-service 14.2: Kaiko's sub-second crypto family, and the S&P 500 licence gap
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p oracle-source-kaiko -p index-subscriber && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase. Reference (self-contained): 14_ref_vendor_kaiko_hfr.md.
+# Crypto goes from a recorded cadence gap to a qualifying row, so the blend reaches n=3 there.
+
+* Phase 14.2: the nine crypto markets carry KK_HFR_*_200MS
+  :PROPERTIES:
+  :ID:          ips14-kaiko-hfr
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p oracle-source-kaiko -p index-subscriber && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/adapters/source-kaiko/** crates/modules/index/subscriber/src/adapters/kaiko.rs config/index/vendors/kaiko.yaml
+  :RESERVED:    the `KK_HFR_<ASSET>USD_200MS` tickers of 14_ref_vendor_kaiko_hfr.md §0; LIT is USD-quoted via LIGHTERUSD (not USDT); the S&P 500 licence refusal is a permanent vendor gap; crypto rows are rows only while their measured p99 is inside 500 ms–1 s
+  :END:
+  Goal: Reference — `14_ref_vendor_kaiko_hfr.md` (self-contained) and `13_ref_shared_contract.md` §3.1.
+  Replace the nine crypto cadence gaps in `config/index/vendors/kaiko.yaml` with rows on the newly permissioned sub-second family, so crypto blends three vendors instead of two. Measured 2026-09-25 (14_ref §0): all nine entitled, p50 **200 ms**, p99 **207–224 ms**, 1 s interval window — inside the contract, on the same `index_v1` transport already implemented.
+  `KK_HFR_LIGHTERUSD_200MS` settles the LIT unit question (USD, not USDT) recorded in plan 13. Verify the family's exact value scaling and timestamp field against the existing crypto decode path before switching rows; a market whose measured p99 leaves the band becomes a recorded gap again rather than a silent pass.
+  Also record, in the fragment comments and the coverage report: the vendor's outstanding commitments (1 s for the remaining crypto; sub-second crypto **and equities**; QQQM/QQQE rates), and that **S&P 500 is not licensable** — so SPY, VOO, IVV and SPLG are a permanent Kaiko gap with the licence as the reason, and the S&P 500 leg must come from Stork (`SPY_24_5`).
+  Priorities: the measured contract over the announced headline; a recorded licence gap over a hoped-for feed.
+  Acceptance:
+  - `kaiko_crypto_rows_use_the_subsecond_family` asserts every crypto row's `native_product` is a `KK_HFR_*_200MS` code and every capital-markets row is unchanged
+  - `kaiko_fragment_cadence_is_measured_not_assumed` asserts the `cadence:` block carries the crypto p50/p99 and `measured_at`, and that no row exceeds the contracted band
+  - `kaiko_lit_row_is_usd_quoted` asserts the LIT row is `KK_HFR_LIGHTERUSD_200MS` with a USD quote, and that the USDT variant is not used
+  - `kaiko_sp500_gap_is_recorded_with_the_licence_reason` asserts SPY/VOO/IVV/SPLG appear as named gaps carrying the licence reason
+  - the owner live check is recorded: the nine crypto markets' measured `ts_vendor`-advancement p50/p99 over ≥ 60 s
+  - all existing tests still pass

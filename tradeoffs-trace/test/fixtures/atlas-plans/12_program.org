@@ -1,0 +1,78 @@
+#+TITLE: index-price-service 12: P0 merge + SourceTick refactor (12.0-12.4), stacked
+#+TT_PROGRAM: 1
+#+TT_BRANCHES: stack
+#+TT_SH_MINUTES: 8
+#+TT_CHECK_MINUTES: 20
+#+TT_ATTEMPT_MINUTES: 60
+
+# STATUS: COMPLETE. Plan 12 was merged into `feat/atlas` as the squash commits
+# babaf2844 (#1213), ac4b19aeb (#1214), 9f9d17ca8 (#1215), 7f7f9ccda (#1216) and
+# 2404ded55 (#1217); `feat/atlas` is now 2404ded55. Plan 13
+# (~/orgw/work/atlas/indexps/13_program.org) builds on that feat/atlas.
+
+# Runs 12.0 (P0) then the four refactor phases serially, each phase as its own
+# tradeoffs-trace run, stacked so every phase becomes its own PR. Settled
+# decisions and run order: 12_index.md.
+#
+#   12p0  merge the 7-PR stack into the base branch, with F1 + F2
+#         (12p0_merge_stack.org; 12_ref_stack_and_findings.md §6)
+#   12a   define the doc-exact SourceTick contract    (12a_sourcetick_contract.org)
+#   12b   calculator/service consume SourceTick       (12b_calculator_sourcetick.org)
+#   12c   subscriber/adapters emit SourceTick; delete PriceObservation + F4
+#   12d   executable 33-market check + final gate     (12d_merge_gate.org)
+#
+# ── ONE manual precondition: the branches are cut from it ──
+# feat/atlas-ips-fix must exist and point at the current feat/atlas head
+# (the 12p0 node is cut from it, then 12a from 12p0's branch, and so on):
+#   cd /Users/angold.wang/Work/dragon
+#   git fetch origin
+#   git branch -f feat/atlas-ips-fix origin/feat/atlas
+#   git push -u origin feat/atlas-ips-fix
+#
+# ── Start and watch ──
+#   C-c m r   in this buffer      start the program (validates first)
+#   C-c m p                        the program buffer (status per node)
+#   RET on a node                  its run workspace (status, trace, time)
+#   C-c m d  decisions            C-c m l  runs list
+# Stack-mode branches (PR bases are shown per node in the program buffer):
+#   feat/atlas-ips-fix--12p0  (cut from feat/atlas-ips-fix)   <- the stack-merge PR
+#   feat/atlas-ips-fix--12a   (cut from --12p0)
+#   feat/atlas-ips-fix--12b   (cut from --12a)
+#   feat/atlas-ips-fix--12c   (cut from --12b)
+#   feat/atlas-ips-fix--12d   (cut from --12c)
+# TT_BRANCH itself is never moved; the conductor publishes locally. Push the
+# five branches and open the PRs yourself (each stacked, base = the previous
+# one). 12p0 does the LOCAL merge only: its push, CI, reviews, the owner E2E
+# gate and the final merge into feat/atlas stay with you.
+#
+# Before starting:
+#   - no checkout has feat/atlas-ips-fix or any --12x branch checked out;
+#   - share one cargo target dir across worktrees, set BEFORE C-c m r:
+#       (setenv "CARGO_TARGET_DIR" (expand-file-name "~/.cache/dragon-target"))
+#   - no vendor keys are needed: plan 12 uses recorded fixtures;
+#   - the runner is installed: readlink ~/.tradeoffs-trace/runner/current.
+
+* 12p0
+  :PROPERTIES:
+  :PLAN: 12p0_merge_stack.org
+  :END:
+* 12a
+  :PROPERTIES:
+  :PLAN: 12a_sourcetick_contract.org
+  :AFTER: 12p0
+  :END:
+* 12b
+  :PROPERTIES:
+  :PLAN: 12b_calculator_sourcetick.org
+  :AFTER: 12a
+  :END:
+* 12c
+  :PROPERTIES:
+  :PLAN: 12c_subscriber_sourcetick.org
+  :AFTER: 12b
+  :END:
+* 12d
+  :PROPERTIES:
+  :PLAN: 12d_merge_gate.org
+  :AFTER: 12c
+  :END:

@@ -1,0 +1,40 @@
+#+TITLE: index-price-service 13.10: split the subscriber and calculator over Kafka
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 13, phase 13.10 (one phase per file). Serial, last: runs after 13i_e2e_gate.org (13.9) is
+# accepted, so the split moves a working 17-market, four-vendor calculator.
+# Self-contained reference: ~/orgw/work/atlas/indexps/13_ref_process_split.md (settled K1-K7).
+# The live run needs the five vendor keys exported (13_ref_vendor_*.md §0). Tests need no key.
+
+* Phase 13.10: split the components and connect them with Kafka and replicas
+  :PROPERTIES:
+  :ID:          ips13-process-split
+  :CHECKS:      cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules && cargo test -p index-subscriber -p index-calculator -p index-price-service -p index-subscriber-service -p index-calculator-service && PATH="$HOME/.cargo/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo -Zscript --quiet scripts/build-manifest-gen.rs --check
+  :BOUNDARIES:  Cargo.toml matrix.yaml build-manifest.toml scripts/generated/** docker/docker-compose.yml crates/services/index/*/Cargo.toml crates/services/index/*/config*.yaml
+  :RESERVED:    the Kafka settings K1-K3 (topic ips.source-tick.v1, key instrument_id, 8 partitions, 1h retention, start latest, JSON envelope v1); the replica layout K4 (3 subscribers pinned to Pyth links 0/1/2, non-Pyth vendors on replica 0); the fencing rule K5 (one publisher; the split and in-process publishers are mutually exclusive, rollout is stop-before-start, and debug calculators use a distinct consumer group); index-price-service stays the default in-process mode
+  :END:
+  Goal: Reference — `13_ref_process_split.md` §0–§4. The in-process stack already passed the 17-market four-vendor gate (13.9); this phase changes only the transport. Add a split deployment in which a Market Data Subscriber process and an Index Calculator process are joined by Kafka, with three subscriber replicas and a single INDEX publisher, as `~/orgw/work/atlas/indexps/02_index_price_service_implementation_plan.md` §0.3 and §0.4 and MDS §1.1/§6.1 describe. The in-process `index-price-service` stays as the default demo mode and the equivalence baseline.
+  Binaries: new `crates/services/index/index-subscriber-service` (bin `index-subscriber-service`) and `crates/services/index/index-calculator-service` (bin `index-calculator-service`), registered in the root Cargo.toml, `matrix.yaml` and `build-manifest.toml`, with `scripts/generated/**` regenerated. Both are thin: composition over the existing `index-subscriber` and `index-calculator` crates, with no new business logic.
+  Wire (settled K1–K3): topic `ips.source-tick.v1`, 8 partitions, retention.ms 3600000, record key = instrument_id, consumer starting at latest. The subscriber creates the topic at startup if it is missing, and different existing settings are a startup error. Each record is the JSON envelope {version: 1, replica, tick: SourceTick}, produced and consumed with the workspace `rdkafka`.
+  Replicas (settled K4): three subscribers, each pinned to one Pyth link (0, 1, 2) and subscribing the same Pyth instruments. Stork, Kaiko and Redstone run on replica 0 only.
+  Fencing (settled K5): one calculator; an `index.publisher` flag, where false computes and serves debug/health but never submits.
+  Replay and buffering: no identity on the wire. A redelivered record is ignored unless its ts_vendor is greater, and it is stale by τ on ts_vendor. Consumer receipt time and broker append time are never used. The consumer pauses its partition when the bounded channel is full, so lag ages ticks into n = 0/held rather than producing a burst. Offsets are committed after apply; exactly-once is not claimed.
+  Compose: a new `ips-split` profile runs the three subscribers, the calculator and the existing Kafka service.
+  Priorities: replay determinism and a single writer over throughput; a visible held feed over a speculative price; identical calculator output in-process and over Kafka.
+  Acceptance:
+  - both binaries exist, are listed in build-manifest.toml, and the build-manifest freshness check passes
+  - `transport_envelope_round_trips_source_tick` asserts that the JSON envelope round-trips every SourceTick field unchanged, including ts_vendor, ts_recv and carried_forward, and that its version field is 1
+  - `in_process_and_kafka_agree_for_identical_observations` asserts that the same SourceTick sequence yields identical per-second offers through the in-process channel and through the Kafka transport (a broker-less transport fake preserving envelope bytes is allowed when no broker is reachable)
+  - `replayed_record_does_not_become_fresh` asserts that re-delivering an old record neither replaces a newer tick nor counts as fresh
+  - `three_replicas_publish_without_coordination` asserts that three subscribers publishing the same Pyth instrument through Kafka leave one per-vendor state holding the greatest ts_vendor, with no de-duplication error (MDS §8 test 14)
+  - `second_calculator_replica_does_not_publish` asserts that a calculator with index.publisher false computes the quality vector but never calls the submitter
+  - `bounded_consumer_lag_pauses_the_feed` asserts that a stalled producer drives the affected instruments to held after τ, with at most one offer per instrument per second on resume
+  - `topic_is_created_with_the_settled_settings` asserts the partition count, retention and cleanup settings, and that a mismatched existing topic fails startup
+  - `ips_split_compose_forwards_vendor_keys` asserts that the `ips-split` services receive PYTH_ACCESS_TOKEN, STORK_API_KEY, KAIKO_API_KEY, KAIKO_EQUITIES_API_KEY and REDSTONE_API_KEY only as ${NAME} pass-through, with no literal value
+  - `in_process_and_split_publishers_are_exclusive` starts the in-process publisher and the split publisher together and asserts exactly one submits (the other is not started, or fails closed)
+  - `calculator_rollout_does_not_overlap_publishers` asserts the deployment is stop-before-start (replicas 1, no surge / `strategy: Recreate`), so no two publishers are ever live during a rollout
+  - `debug_calculator_uses_a_distinct_consumer_group` asserts a `publisher: false` calculator has a distinct consumer group id and is never assigned a partition the publisher needs
+  - the owner records a live `ips-split` run with the five keys exported (values in 13_ref_vendor_*.md §0), showing subscriber → Kafka → calculator → applied INDEX on stream 215 for the 17 markets, with the code SHA, the image IDs and per-market n and quality matching the 13.9 in-process record
+  - all existing tests still pass

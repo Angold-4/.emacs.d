@@ -1,0 +1,39 @@
+#+TITLE: index-price-service 13.2: shared adapter contract (seam, crates, calendars, config, health)
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules && cargo test -p index-subscriber -p index-calculator -p index-price-service -p index-calendar
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 13, phase 13.2 (one phase per file). Serial after 13a_shared_markets.org (13.1). After it merges,
+# the four vendor phases run in parallel on disjoint files: 13c (Pyth), 13d (Stork), 13e (Kaiko),
+# 13f (Redstone). The calculator 13g_calculator_blend.org (13.7) runs after all four merge. Run order: 13_index.md.
+#
+# References (self-contained with this plan):
+#   ~/orgw/work/atlas/indexps/13_ref_shared_contract.md — §5 adapter seam, calendars, crates, config, health, generic rules; §6 ownership
+
+* Phase 13.2: shared adapter contract so the four vendor phases can run in parallel
+  :PROPERTIES:
+  :ID:          ips13-adapter-contract
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-subscriber -p index-calculator -p index-price-service -p index-calendar -p oracle-source-kaiko -p oracle-source-redstone -p oracle-source-stork && cargo xtask check workspace && cargo xtask check dep-rules
+  :BOUNDARIES:  Cargo.toml matrix.yaml docker/docker-compose.yml crates/modules/index/subscriber/src/source.rs crates/modules/index/subscriber/src/run.rs crates/modules/index/calendar/** crates/modules/oracle/adapters/source-kaiko/** crates/modules/oracle/adapters/source-redstone/** crates/services/index/index-price-service/config*.yaml config/index/calendars.yaml
+  :RESERVED:    the adapter seam signature build(rows, cfg) -> Result<Option<Box<dyn MarketDataSource>>, SourceError>; the file-ownership split of 13_ref_shared_contract §6; credentials only as ${NAME} references (PYTH_ACCESS_TOKEN, STORK_API_KEY, KAIKO_API_KEY, KAIKO_EQUITIES_API_KEY, REDSTONE_API_KEY); index-calendar as a pure catalog-layer crate
+  :END:
+  Goal: Reference — `13_ref_shared_contract.md` §5 and §6. Put in place everything the four vendor adapters share, so each vendor phase then edits only its own adapter crate, its own `index-subscriber/src/adapters/<vendor>.rs` and its own `config/index/vendors/<vendor>.yaml`, and the phases cannot conflict.
+  Seam: each of `index-subscriber/src/adapters/{pyth,stork,kaiko,redstone}.rs` exposes `pub fn build(rows: &[ListingRow], cfg: &VendorConfig) -> Result<Option<Box<dyn MarketDataSource>>, SourceError>`, where `Ok(None)` means disabled. `run.rs` calls the four in fixed order and names no vendor anywhere else. `pyth.rs` wraps the existing Pyth source unchanged; stork, kaiko and redstone are stubs returning `Ok(None)`. `VendorConfig` carries that vendor's service-config section plus the fragment's `overrides:` map. `MarketDataSource` gains `fn link_state(&self) -> LinkState { Connected, Down }`, and the health report shows, per vendor, connected/down/disabled plus `invalid_ticks_dropped`, separate from per-instrument quiet (MDS §6.2).
+  Crates: create empty compiling crates `crates/modules/oracle/adapters/source-kaiko` (`oracle-source-kaiko`) and `source-redstone` (`oracle-source-redstone`), each with only a `//!` doc. Add `index-subscriber` dependencies on them and on `oracle-source-stork`. Register them in the root `Cargo.toml` and `matrix.yaml`.
+  Workspace dependencies: add `pyth-lazer-client` and `pyth-lazer-protocol` (MDS §6.3 "Decided"; if they fail to build on Rust 1.91.1, omit them and record the error); `tonic` 0.12 and `prost` 0.13 (already in Cargo.lock transitively; Kaiko's capital-markets service is gRPC-only); `chrono` and `chrono-tz` (DST-correct New York hours; the workspace has no timezone database).
+  Calendars: new pure crate `crates/modules/index/calendar` (`index-calendar`), registered as the catalog layer in the dep-rules configuration, with no I/O or async. It loads `config/index/calendars.yaml` and exposes its **own** `session_at(calendar, t_ns) -> CalendarSession`. It must **not** depend on `oracle-protocol`; the `CalendarSession -> oracle_protocol::Session` boundary mapping lives in `index-subscriber`. Calendars: `crypto_24_7` (always rth); `us_equity` (America/New_York; pre 04:00–09:30, rth 09:30–16:00, ah 16:00–20:00, overnight 20:00–04:00 on Sun–Thu nights, closed on weekends and NYSE holidays 2026–2027); `metal_otc` (America/New_York; otc_open from Sun 18:00 to Fri 17:00 excluding the daily 17:00–18:00 break, closed otherwise).
+  Config: both index service configs get final `sources:` sections for all four vendors, with the endpoints and poll intervals of `13_ref_vendor_{pyth,stork,kaiko,redstone}.md` §1 and credentials only as `${PYTH_ACCESS_TOKEN}`, `${STORK_API_KEY}`, `${KAIKO_API_KEY}`, `${KAIKO_EQUITIES_API_KEY}` and `${REDSTONE_API_KEY}`. An unset or empty variable disables that vendor with one log line, and is never a crash (Redstone's public gateway works without a key). Vendor phases never edit these configs. `docker/docker-compose.yml` forwards all five variables into the index-price-service container as `${NAME:-}` pass-through; today only PYTH_ACCESS_TOKEN is forwarded.
+  Priorities: a seam that makes the parallel phases file-disjoint; no business logic in this phase; no credential value anywhere in the repository.
+  Acceptance:
+  - each of the four `adapters/<vendor>.rs` exposes `build` with the settled signature, `run.rs` calls all four, and `seam_calls_every_vendor_builder_once` asserts it with the stubs returning None
+  - `oracle-source-kaiko` and `oracle-source-redstone` exist as compiling crates, are in the root Cargo.toml members and matrix.yaml, and `cargo xtask check workspace` passes
+  - the root `[workspace.dependencies]` contains tonic, prost, chrono and chrono-tz, and either pyth-lazer-client and pyth-lazer-protocol or a phase decision recording why not
+  - `us_equity_session_at_boundaries` asserts pre at 04:00, rth at 09:30, ah at 16:00, overnight at 20:00 on a Monday, closed on a Saturday and on 2026-11-26 (Thanksgiving), across both DST transitions of 2026
+  - `metal_otc_session_at_boundaries` asserts otc_open on Sunday 18:00, closed on Friday 17:00 and in the daily 17:00–18:00 break
+  - `cargo xtask check dep-rules` passes with index-calendar in the catalog layer, depended on by index-subscriber and index-calculator only, and index-calendar depends on no protocol crate
+  - `calendar_session_maps_to_source_tick_session_at_the_boundary` asserts every `CalendarSession` variant maps to the documented `oracle_protocol::Session` in `index-subscriber`, and that `index-calendar` does not depend on `oracle-protocol`
+  - `health_reports_vendor_link_state_and_disabled` asserts that the health report lists all four vendors with connected, down or disabled, and invalid_ticks_dropped
+  - `vendor_credentials_are_absent_from_repo` asserts that every credential field in both index service configs matches the pattern of a single ${NAME} reference and that no file under config/ contains a credential-looking literal
+  - `docker/docker-compose.yml` forwards PYTH_ACCESS_TOKEN, STORK_API_KEY, KAIKO_API_KEY, KAIKO_EQUITIES_API_KEY and REDSTONE_API_KEY to index-price-service as ${NAME:-} pass-through only, checked by `compose_forwards_all_vendor_keys`
+  - `unset_vendor_key_disables_only_that_vendor` asserts that an empty STORK_API_KEY disables Stork with a log line and the service still starts
+  - all existing tests still pass

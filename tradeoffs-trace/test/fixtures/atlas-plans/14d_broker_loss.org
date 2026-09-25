@@ -1,0 +1,24 @@
+#+TITLE: index-price-service 14.4: a Kafka outage keeps offering held, never exits
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p index-calculator-service -p index-subscriber-service && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase. Finding F2 of 14_ref_split_findings.md.
+
+* Phase 14.4: a broker outage holds the index instead of killing the publisher
+  :PROPERTIES:
+  :ID:          ips14-broker-loss
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-calculator-service -p index-subscriber-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/services/index/index-calculator-service/** crates/services/index/index-subscriber-service/src/kafka.rs
+  :RESERVED:    a Kafka outage means held on the 1 s clock (process-split ref §3), never "Core receives no INDEX"; malformed or wrong-version records still fail closed
+  :END:
+  Goal: Reference — `14_ref_split_findings.md` F2 and `13_ref_process_split.md` §3.
+  Today the calculator treats consumer failure as fatal: `consumer.recv().await?` propagates an "all brokers down" error and the process exits. Docker restarts it, in-memory state is lost, and a long outage becomes a crash loop in which the design's promised behaviour — *held on the 1 s clock* — never happens; Core instead receives nothing.
+  Separate the two error classes the current `?` conflates: a **malformed or wrong-version record** stays fail-closed (that is deliberate and must remain), while a **broker/transport failure** becomes a retryable condition. On broker loss, keep the 1 s boundary loop running, publish the last index as held (exactly as a stale-source window does), keep `n` and quality honest, and reconnect with backoff. The subscriber side may keep exiting on publish failure — it restarts and recovers in about a second; the publisher must not.
+  Priorities: the documented behaviour over the emergent one; a visible held state over silence; no crash loop.
+  Acceptance:
+  - `broker_loss_keeps_publishing_held` drives a broker outage (a transport fake that fails `recv`) and asserts an offer for every market on every 1 s boundary, marked held, with the process alive
+  - `broker_recovery_resumes_without_a_restart` asserts fresh offers resume once the broker returns, with no process exit
+  - `malformed_record_still_fails_closed` asserts a wrong-version record still ends the consumer rather than being skipped
+  - the owner live check is recorded: stop Kafka for ≥ 60 s, show held offers throughout, and show recovery without a calculator restart
+  - all existing tests still pass

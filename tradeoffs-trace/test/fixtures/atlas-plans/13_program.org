@@ -1,0 +1,108 @@
+#+TITLE: index-price-service 13: 17 markets, four vendors, blend, regime/anchor, split
+#+TT_PROGRAM: 4
+#+TT_BRANCHES: stack
+#+TT_REPO: /Users/angold.wang/Work/dragon
+#+TT_SH_MINUTES: 8
+#+TT_CHECK_MINUTES: 20
+#+TT_ATTEMPT_MINUTES: 60
+
+# Plan 13 as one dependency graph. Run order and ownership: 13_index.md,
+# 13_ref_shared_contract.md §6. Every phase is an ordinary tradeoffs-trace run
+# (worker + M/A/B reviewers, 3 repair rounds); the scheduler starts a node when
+# every node it waits for is DONE.
+#
+#   13a ─► 13b ─┬─► 13c Pyth ────┐
+#               ├─► 13d Stork ───┤
+#               ├─► 13e Kaiko ───┼─► 13g blend ─► 13h regime/anchor ─► 13i E2E gate ─► 13j split
+#               └─► 13f Redstone ┘
+#
+# `#+TT_PROGRAM: 4` is what lets the four vendor phases (13c-13f) run at once.
+# `#+TT_BRANCHES: stack` gives one branch (and PR) per phase, cut from its
+# dependencies:
+#   feat/atlas-ips-next--13a        <- feat/atlas-ips-next
+#   feat/atlas-ips-next--13b        <- --13a
+#   feat/atlas-ips-next--13c/-13d/-13e/-13f   <- each from --13b (four siblings)
+#   feat/atlas-ips-next--13g        <- a merge commit of --13c + --13d + --13e + --13f
+#   feat/atlas-ips-next--13h/-13i/-13j        <- each from the previous
+# The four vendor phases touch disjoint files (one adapter crate + one
+# adapters/<vendor>.rs + one vendor fragment each), so their sibling branches
+# merge cleanly at the 13g join. Open the PRs stack-style; the join's base is
+# the merged vendor set (the program status names each node's branches).
+#
+# ── ONE manual precondition ──
+# Create the integration branch from the merged feat/atlas (2404ded55 already
+# contains the plan-12 stack, SourceTick, and the Bugbot health fix):
+#   cd /Users/angold.wang/Work/dragon
+#   git fetch origin
+#   git branch -f feat/atlas-ips-next origin/feat/atlas
+#   git push -u origin feat/atlas-ips-next
+#
+# ── Credentials (needed by 13c-13f live checks and by the 13i gate) ──
+# Export these in the shell that starts Emacs/the program. Values are in the
+# per-vendor references' §0 (outside the repo); never commit them.
+#   PYTH_ACCESS_TOKEN                 (13c)
+#   STORK_API_KEY                     (13d)
+#   KAIKO_API_KEY, KAIKO_EQUITIES_API_KEY  (13e)
+#   REDSTONE_API_KEY                  (13f)
+# CI tests use recorded fixtures and need no key; only the recorded live checks do.
+#
+# ── Before starting ──
+#   - no checkout has feat/atlas-ips-next or any --13x branch checked out;
+#   - share one cargo target dir across worktrees, set BEFORE C-c m r:
+#       (setenv "CARGO_TARGET_DIR" (expand-file-name "~/.cache/dragon-target"))
+#   - the runner is installed: readlink ~/.tradeoffs-trace/runner/current.
+#
+# ── Watch ──
+#   C-c m p  program buffer (RET opens a node, k stop, R resume)
+#   C-c m d  decision view      C-c m l  runs list
+#   bash ~/orgw/work/atlas/indexps/12_watch.sh --watch 20   (auto-finds the newest program)
+
+* 13a
+  :PROPERTIES:
+  :PLAN: 13a_shared_markets.org
+  :END:
+* 13b
+  :PROPERTIES:
+  :PLAN: 13b_adapter_contract.org
+  :AFTER: 13a
+  :END:
+* 13c
+  :PROPERTIES:
+  :PLAN: 13c_vendor_pyth.org
+  :AFTER: 13b
+  :END:
+* 13d
+  :PROPERTIES:
+  :PLAN: 13d_vendor_stork.org
+  :AFTER: 13b
+  :END:
+* 13e
+  :PROPERTIES:
+  :PLAN: 13e_vendor_kaiko.org
+  :AFTER: 13b
+  :END:
+* 13f
+  :PROPERTIES:
+  :PLAN: 13f_vendor_redstone.org
+  :AFTER: 13b
+  :END:
+* 13g
+  :PROPERTIES:
+  :PLAN: 13g_calculator_blend.org
+  :AFTER: 13c 13d 13e 13f
+  :END:
+* 13h
+  :PROPERTIES:
+  :PLAN: 13h_regime_anchor.org
+  :AFTER: 13g
+  :END:
+* 13i
+  :PROPERTIES:
+  :PLAN: 13i_e2e_gate.org
+  :AFTER: 13h
+  :END:
+* 13j
+  :PROPERTIES:
+  :PLAN: 13j_process_split.org
+  :AFTER: 13i
+  :END:

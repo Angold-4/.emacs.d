@@ -1,0 +1,25 @@
+#+TITLE: index-price-service 14.3: a calculator restart costs seconds, not 75
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p index-calculator-service -p index-subscriber-service && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase. Finding F1 of 14_ref_split_findings.md.
+
+* Phase 14.3: restart from the newest record, close the consumer on SIGTERM, offer held not unknown
+  :PROPERTIES:
+  :ID:          ips14-consumer-restart
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-calculator-service -p index-subscriber-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/services/index/index-calculator-service/** crates/services/index/index-subscriber-service/src/kafka.rs docker/docker-compose.yml
+  :RESERVED:    a consumer that discards anything older than τ must start from the newest record and need no offset commits (process-split ref §3); a restarted publisher must offer **held**, never `unknown`; SIGTERM is a clean stop, never a timeout
+  :END:
+  Goal: Reference — `14_ref_split_findings.md` F1 and `13_ref_process_split.md` §3.
+  A plain `docker restart` of the calculator must not stop INDEX for ~75 s. Today it does, for three compounding reasons, all verified: no SIGTERM handler, so the process never leaves the Kafka consumer group and Kafka waits its 45 s `session.timeout` before reassigning partitions; the consumer resumes from committed offsets and replays ticks that are already stale; and no published index is persisted, so a restarted calculator reports `unknown` (`n=0`) and sends **no** offer at all during the window — worse than held.
+  Fix all three: (1) install a SIGTERM handler that closes the consumer so the group rebalances immediately; (2) start consumption at the newest record and stop relying on offset commits for correctness — a consumer that drops everything older than τ gains nothing from them; (3) persist the last published index per market (next to the anchor state) and republish it as `held` on startup until the blend produces a fresh value. Log partition assignment, lag and replay progress so the window is visible while it happens.
+  Priorities: an honest held price over silence; measured recovery over assumed recovery; the smallest change that removes the 45 s wait.
+  Acceptance:
+  - `restart_recovers_within_the_bound` starts the calculator, restarts it, and asserts a fresh offer for all 17 markets within a small bound (seconds, not the ~45 s group timeout)
+  - `sigterm_closes_the_consumer_cleanly` asserts the handler leaves the group rather than being reaped
+  - `restart_publishes_held_not_unknown` asserts that, between restart and the first fresh boundary, each market's offer carries the persisted index and is marked held, and never `n=0`/unknown
+  - `replayed_old_records_do_not_become_fresh` still passes (nothing in the newest-start path may resurrect a stale tick)
+  - the owner live check is recorded: measured wall-clock from `docker restart` to the first fresh offer for all 17 markets
+  - all existing tests still pass
