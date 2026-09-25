@@ -549,5 +549,38 @@ first, and a value shorter than the conductor's own minimum is never masked."
               (should (null messages)))))
       (delete-file file))))
 
+(ert-deftest tradeoffs-trace-notification-multibyte-offset ()
+  "Plan 01b: a multi-byte reason leaves the offset at the file's byte end."
+  (let* ((file (make-temp-file "tt-ert-notify-mb" nil ".jsonl"))
+         (messages nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "{\"id\":\"r1\",\"kind\":\"run\",\"title\":\"café — 13f\","
+                    "\"node\":\"13f\",\"reason\":\"waiting…\"}\n"))
+          (let ((+tt--notifications-file file)
+                (+tt--notifications-offset 0)
+                (+tt--notify-flash nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+              (+tt--notifications-poll)
+              (should (= 1 (length messages)))
+              ;; The offset must be a BYTE position at the file's end, or the
+              ;; next poll re-reads text inside a line it already showed.
+              (should (= +tt--notifications-offset (file-attribute-size (file-attributes file))))
+              (+tt--notifications-poll)
+              (should (= 1 (length messages))))))
+      (delete-file file))))
+
+(ert-deftest tradeoffs-trace-mode-line-wait-without-live-run ()
+  "Plan 01b: a waiting node whose run conductor is gone still shows its wait."
+  (let ((fixture "[{\"id\":\"p1\",\"waiting\":[{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\",\"duration\":\"1h12m\"}]}]"))
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) fixture))
+              ((symbol-function '+tt--runs) (lambda () (list "/nonexistent-tt-run")))
+              ((symbol-function '+tt--live-run-p) (lambda (_) nil)))
+      (let ((+tt--notify-flash nil))
+        (+tt--mode-line-update)
+        (should (string-match-p "⚑ 13f waiting 1h12m" +tt--mode-line-string))))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

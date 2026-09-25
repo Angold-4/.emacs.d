@@ -18,7 +18,7 @@ import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor
 import { execFileSync } from "node:child_process";
 
 import { formatDuration } from "./view.ts";
-import { notify, oneLine, waitReason } from "./notify.ts";
+import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 
 import {
   expandProgram,
@@ -153,6 +153,8 @@ export interface SchedulerOptions {
   pollMs?: number;
   /** Test hook: stop the loop after this many ticks. */
   maxTicks?: number;
+  /** Plan 01b: how long a stuck program is watched before its one reminder. */
+  notifyReminderMs?: number;
 }
 
 /** One scheduler step: observe active nodes, start ready ones. Returns the
@@ -277,15 +279,33 @@ export function prepareBranch(
 /** The scheduler process: tick until the program is done, stuck or stopped. */
 export async function runScheduler(dir: string, opts: SchedulerOptions): Promise<ProgramOutcome> {
   fs.writeFileSync(programPaths(dir).pid, String(process.pid));
+  const reminderMs = opts.notifyReminderMs ?? NOTIFY_REMINDER_MS;
   let ticks = 0;
+  let stuckNotifiedAt: number | undefined;
   for (;;) {
     const outcome = schedulerTick(dir, opts);
     ticks += 1;
-    if (outcome !== "running") {
+    if (outcome === "running") {
+      stuckNotifiedAt = undefined;
+    } else if (outcome === "stuck") {
+      // Plan 01b: a stuck program is exactly a wait for the owner, so the
+      // scheduler stays alive to send the one 30-minute reminder (design
+      // D4's "still waiting") before it exits — nothing else observes the
+      // program once it is stuck. `notify` does the dedup, so the re-notify
+      // is a reminder only after the window has passed; if a `tt program
+      // resume` makes the program runnable again, the next tick sees
+      // "running" and clears the wait.
+      if (stuckNotifiedAt === undefined) {
+        fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} program stuck\n`);
+        notifyProgramOutcome(dir, "stuck", { reminderMs });
+        stuckNotifiedAt = Date.now();
+      } else if (Date.now() - stuckNotifiedAt >= reminderMs) {
+        notifyProgramOutcome(dir, "stuck", { reminderMs });
+        return outcome;
+      }
+    } else {
       fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} program ${outcome}\n`);
-      // Plan 01b: a program that ends done or stuck is the owner's business.
-      // The scheduler is the component that observes this, so it notifies.
-      if (outcome === "done" || outcome === "stuck") notifyProgramOutcome(dir, outcome);
+      if (outcome === "done") notifyProgramOutcome(dir, "done", { reminderMs });
       return outcome;
     }
     if (opts.maxTicks !== undefined && ticks >= opts.maxTicks) return outcome;
@@ -296,8 +316,10 @@ export async function runScheduler(dir: string, opts: SchedulerOptions): Promise
 /** Plan 01b: one notification when a program ends done or stuck (never when
  * the owner stopped it on purpose). `notify` dedups by `waitKey`, so a
  * scheduler restarted against an already-finished program does not re-notify,
- * and a failure of the notifier is logged into `scheduler.log` and ignored. */
-export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck"): void {
+ * and a failure of the notifier is logged into `scheduler.log` and ignored.
+ * `reminderMs` matches the window `runScheduler` waits before re-notifying a
+ * stuck program and the conductor's own default. */
+export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opts: { reminderMs?: number } = {}): void {
   const id = path.basename(dir);
   const log = (message: string) => {
     try {
@@ -316,7 +338,7 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck"): vo
         : `program stuck${blocked ? `: ${oneLine(state.nodes[blocked.id].reason ?? `${blocked.id} blocked`)}` : ""}`;
     notify(
       { id, kind: "program", title: program.title, reason, waitKey: `program:${id}:${outcome}` },
-      { root: path.dirname(path.dirname(dir)), onError: (message) => log(`notify: ${message}`) },
+      { root: path.dirname(path.dirname(dir)), ...(opts.reminderMs !== undefined ? { reminderMs: opts.reminderMs } : {}), onError: (message) => log(`notify: ${message}`) },
     );
   } catch (err) {
     // Announcing a finished program must never be what stops the scheduler.

@@ -629,6 +629,12 @@ export class Conductor {
   #probeReuse: boolean;
   /** Plan 01b: the clock `#checkNotifications` reads (injectable). */
   #now: () => number;
+  /** Plan 01b: how many times the phase has entered AWAITING_OWNER so far.
+   * Seeded from the log at `start()` and incremented on each new park, so the
+   * notification key names the PARK, not the newest open owner request: an
+   * owner resolving one request of several stays in the same episode and is
+   * not re-banner-stormed, while a genuinely new park is announced again. */
+  #awaitingEpisode = 0;
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -807,6 +813,9 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head);
     }
     this.#state = foldEvents(this.#state, records);
+    // Plan 01b: seed the park-episode counter from the log, so a restarted
+    // conductor keeps the same notification key for the wait it is resuming.
+    this.#awaitingEpisode = rebuildTimeline(this.#runDir, this.#plan).phases.filter((p) => p.phase === "AWAITING_OWNER").length;
     if (this.#secretNames.length > 0) this.#recordSecrets();
     // design §9.3: "If the command ID is already in the log, the command is
     // only moved to applied/." Every applied conductor-state command's event
@@ -1173,6 +1182,7 @@ export class Conductor {
     // event (`EventLog` keeps its own pass as a backstop for its other
     // callers: intents, completions, sweeps).
     const logged = redactRecord(raw, this.#secretMaskable) as Event;
+    const before = this.#state.phase.phase;
     const result = reduce(this.#state, logged);
     this.#log.append("event", logged);
     if (!result.ok) {
@@ -1180,6 +1190,10 @@ export class Conductor {
       throw new Error(`conductor emitted an event reduce() rejected: ${result.reason}`);
     }
     this.#state = result.state;
+    // Plan 01b: a fresh park is a new notification episode; resolving some of
+    // a park's requests (which bounces through AWAITING_OWNER back to itself)
+    // is not.
+    if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") this.#awaitingEpisode += 1;
     this.#syncBudgetTimer();
     this.drive();
     // Plan 01b: before `#maybeAutoStop` can tear the log down for BLOCKED.
@@ -1531,15 +1545,21 @@ export class Conductor {
    * state change and from the inbox poll, so a run parked in AWAITING_OWNER
    * stays covered even though `next()` dispatches nothing then. `notify`
    * itself owns the once-per-wait dedup and the 30-minute reminder, so this
-   * is safe to call on every tick. A no-op unless the phase is AWAITING_OWNER
-   * or BLOCKED; the reminder is deliberately not sent for BLOCKED, which the
-   * conductor stops at once and no owner action can revive. */
+   * is safe to call on every tick. The key names the PARK EPISODE
+   * (`#awaitingEpisode`), so an owner resolving one of several open requests
+   * — which routes AWAITING_OWNER back to itself — keeps the same key and is
+   * not announced again, while a later, genuinely new park is. A no-op unless
+   * the phase is AWAITING_OWNER or BLOCKED; the reminder is deliberately not
+   * sent for BLOCKED, which the conductor stops at once and no owner action
+   * can revive. */
   #checkNotifications(): void {
     if (this.#closed) return;
     const phase = this.#state.phase;
     if (phase.phase !== "AWAITING_OWNER" && phase.phase !== "BLOCKED") return;
-    const open = phase.ownerRequests.filter((r) => r.status === "open");
-    const wait = phase.phase === "BLOCKED" ? `blocked:${oneLine(phase.blockedReason ?? "")}` : `awaiting:${open[open.length - 1]?.id ?? phase.phaseId}`;
+    const wait =
+      phase.phase === "BLOCKED"
+        ? `blocked:${oneLine(phase.blockedReason ?? "")}`
+        : `awaiting:${phase.phaseId}:${this.#awaitingEpisode}`;
     const node = this.#programNode();
     // The user-visible run id is the directory's name (`tt list`), not the
     // conductor's own `phase.runId` (a separate uuid in the init record).

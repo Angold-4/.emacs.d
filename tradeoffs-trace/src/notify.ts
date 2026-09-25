@@ -133,21 +133,42 @@ export function notify(entry: NotifyEntry, opts: NotifyOptions): "initial" | "re
   try {
     fs.appendFileSync(notificationsPath(opts.root), `${JSON.stringify(record)}\n`);
   } catch (err) {
+    // No record on disk means the next poll would see an unseen waitKey and
+    // re-enter here, so failing to append must NOT fall through to the
+    // notifier: that would run TT_NOTIFY_COMMAND on every inbox poll. Log it
+    // and report nothing done; the wait is already unannounceable.
     fail(opts, `notifications.jsonl: ${String((err as Error)?.message ?? err)}`);
+    return "none";
   }
   runNotifier(record, opts);
   return last ? "reminder" : "initial";
 }
 
-/** The command the notifier runs, or undefined when there is none to run.
- * `TT_NOTIFY_COMMAND` wins (tests point it at a script); on macOS the
- * default is an `osascript` banner; everywhere else there is no default. */
-export function notifierCommand(record: NotificationRecord, env: NodeJS.ProcessEnv): string | undefined {
+/** How the notifier is launched: an argv (no shell, so the record's own text
+ * is never re-parsed) or a shell command (the `TT_NOTIFY_COMMAND` override,
+ * which the operator controls verbatim). */
+export interface NotifierCommand {
+  command: string;
+  args: string[];
+}
+
+/** The notifier to run, or undefined when there is none.
+ *
+ * `TT_NOTIFY_COMMAND` wins (tests point it at a script) and runs through
+ * `sh -c` — it is the operator's command, never built from the record. The
+ * macOS default runs `osascript` DIRECTLY with `-e <script>` as argv: a wait
+ * reason is model-written prose (an owner-request evidence line can hold any
+ * character, including `'`), and passing it inside a shell single-quoted
+ * `-e '...'` argument let the reason close that quote — the blocking defect.
+ * With argv there is no shell to break; only the AppleScript string literal
+ * still needs `"` and `\` escaped. */
+export function notifierCommand(record: NotificationRecord, env: NodeJS.ProcessEnv): NotifierCommand | undefined {
   const override = env.TT_NOTIFY_COMMAND;
-  if (typeof override === "string" && override.trim() !== "") return override;
+  if (typeof override === "string" && override.trim() !== "") return { command: "/bin/sh", args: ["-c", override] };
   if (process.platform === "darwin") {
     const body = record.node ? `${record.title} [${record.node}]: ${record.reason}` : `${record.title}: ${record.reason}`;
-    return `osascript -e 'display notification "${escapeAppleScript(body)}" with title "tradeoffs-trace"'`;
+    const script = `display notification "${escapeAppleScript(body)}" with title "tradeoffs-trace"`;
+    return { command: "osascript", args: ["-e", script] };
   }
   return undefined;
 }
@@ -158,17 +179,17 @@ function escapeAppleScript(text: string): string {
 
 function runNotifier(record: NotificationRecord, opts: NotifyOptions): void {
   const env = opts.env ?? process.env;
-  let command: string | undefined;
+  let spec: NotifierCommand | undefined;
   try {
-    command = notifierCommand(record, env);
+    spec = notifierCommand(record, env);
   } catch (err) {
     fail(opts, String((err as Error)?.message ?? err));
     return;
   }
-  if (!command) return;
+  if (!spec) return;
   let result;
   try {
-    result = spawnSync("/bin/sh", ["-c", command], { env: { ...env }, timeout: opts.timeoutMs ?? 5_000, stdio: "ignore" });
+    result = spawnSync(spec.command, spec.args, { env: { ...env }, timeout: opts.timeoutMs ?? 5_000, stdio: "ignore" });
   } catch (err) {
     fail(opts, String((err as Error)?.message ?? err));
     return;

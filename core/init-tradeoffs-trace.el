@@ -1333,7 +1333,12 @@ Emacs started are not replayed."
                 (when rec
                   (setq +tt--notify-flash (current-time))
                   (message "%s" (+tt--notification-line rec)))))
-            (setq +tt--notifications-offset (+ start cut))))
+            ;; `start`/`size` are BYTE positions, so advance by the byte
+            ;; length of what was shown, not its character count: a reason or
+            ;; title can hold a multi-byte character (`oneLine` even appends
+            ;; an ellipsis), and a short offset would re-read and re-echo an
+            ;; already-shown line.
+            (setq +tt--notifications-offset (+ start (string-bytes complete)))))
          ((< size +tt--notifications-offset)
           ;; Truncated or replaced: start over from its current end.
           (setq +tt--notifications-offset size)))))))
@@ -1366,14 +1371,19 @@ Reads `tt program list --json'; nil when there is no program or no wait."
 
 (defun +tt--mode-line-update ()
   "Refresh the mode-line indicator from `tt list' when any run is live."
-  (let ((flash (and +tt--notify-flash
-                    (< (float-time (time-since +tt--notify-flash)) 10))))
+  (let* ((wait (+tt--mode-line-wait))
+         (flash (and +tt--notify-flash
+                     (< (float-time (time-since +tt--notify-flash)) 10)))
+         (live (seq-some #'+tt--live-run-p (ignore-errors (+tt--runs)))))
     (setq +tt--mode-line-string
-          (if (not (seq-some #'+tt--live-run-p (ignore-errors (+tt--runs))))
-              (if flash (propertize " [⚑]" 'face 'warning) "")
-            (let* ((wait (+tt--mode-line-wait))
-                   (rows (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t) (equal (alist-get 'attention r) "needs you")))
-                                     (ignore-errors (+tt--list)))))
+          (if (not live)
+              ;; A waiting program whose run conductor is stopped or dead
+              ;; (BLOCKED, crashed) still shows its wait, not just a flash.
+              (cond (wait wait)
+                    (flash (propertize " [⚑]" 'face 'warning))
+                    (t ""))
+            (let ((rows (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t) (equal (alist-get 'attention r) "needs you")))
+                                    (ignore-errors (+tt--list)))))
               (concat
                (cond (wait wait)
                      (flash (propertize " [⚑]" 'face 'warning))

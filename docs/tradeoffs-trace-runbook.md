@@ -273,10 +273,14 @@ stopped making progress on its own:
   `~/.tradeoffs-trace/notifications.jsonl` — the run or program id, its title,
   the program node (for a node run), a one-line reason, and the time.
 - The same moment, the notifier runs: on macOS an `osascript` banner, and
-  nothing on other platforms. If the run or program is still waiting 30
-  minutes later it notifies once more, and never again for that wait. A
-  notification that fails is written to the run's log (or `scheduler.log`) and
-  ignored; it never stops a run or the scheduler.
+  nothing on other platforms. A run parked in AWAITING_OWNER keeps its
+  conductor alive and notifies once more 30 minutes later if the owner has
+  still not acted; a program that ends **stuck** keeps its scheduler watching
+  and does the same, then exits. A program that ends **done** is announced
+  once — it is not waiting on anyone. One wait is never announced twice before
+  that reminder, and each new park (or new stuck program) is a new wait. A
+  notification that fails, or cannot be written, is logged (to the run's log
+  or `scheduler.log`) and ignored; it never stops a run or the scheduler.
 - Emacs watches the file (`core/init-tradeoffs-trace.el`): each new line is
   shown in the echo area, the mode-line indicator flashes a warning face, and
   it shows how long the **oldest** wait has lasted (`⚑ 13f waiting 1h12m`).
