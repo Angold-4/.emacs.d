@@ -62,6 +62,15 @@ export interface PhaseContract {
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 01f: the phase's own expensive, live command (the plan's `:GATE:`
+   * property). Declaring one inserts a GATING stage between RESOLVING and
+   * ACCEPTED: the conductor runs this command itself, once per candidate the
+   * reviewers already accepted, and only a passing gate lets the ACCEPTED
+   * event through (core/gate.ts, conductor.ts's `#runGate`). */
+  gate?: string;
+  /** Plan 01f: the plan's `:GATE_CLEANUP:` command, run after the gate
+   * whatever its outcome (release the resources the gate took). */
+  gateCleanup?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +443,7 @@ export type PhaseStateName =
   | "PROBING"
   | "REVIEWING"
   | "RESOLVING"
+  | "GATING"
   | "ACCEPTED"
   | "PUBLISHING"
   | "DONE"
@@ -559,6 +569,7 @@ export type InFlightKey =
   | "review_M"
   | "review_A"
   | "review_B"
+  | "run_gate"
   | "publish_cas";
 
 /** The full state of one phase, as reduce()/next() see it. */
@@ -777,6 +788,31 @@ export interface EvOwnerRequestResolved extends RecordBinding {
 export interface EvAccepted {
   type: "ACCEPTED";
   resolvedCorrectionIds: string[]; // must equal what predicate.ts computes; reduce verifies
+}
+
+/** Plan 01f: the phase has nothing left open (`accept(C, K)` holds) and its
+ * contract declares a gate, so the phase gates the candidate before
+ * accepting it: RESOLVING -> GATING. Emitted by the conductor exactly when
+ * next() asks for it, never for a gate-less phase (which keeps the old
+ * RESOLVING --ACCEPTED--> ACCEPTED edge). */
+export interface EvGateRequired {
+  type: "GATE_REQUIRED";
+}
+
+/** Plan 01f: the gate command failed — a non-zero exit, or a kill at the
+ * limit. The phase returns to REPAIRING (or AWAITING_OWNER when the repair
+ * budget is exhausted) with a blocking `integration` finding carrying
+ * `evidence`: the log's last lines, so the worker is shown the failure. */
+export interface EvGateFailed {
+  type: "GATE_FAILED";
+  evidence: string;
+}
+
+/** Plan 01f / design §9.3: the conductor died while gating. An interrupted
+ * gate is never a passing one, and never a failing one either: the gate is
+ * rerun ("interrupted gates: interrupted, never passed — rerun"). */
+export interface EvGateInterrupted {
+  type: "GATE_INTERRUPTED";
 }
 export interface EvPublishIntent {
   type: "PUBLISH_INTENT";
@@ -999,6 +1035,9 @@ export type Event =
   | EvOwnerRequestOpened
   | EvOwnerRequestResolved
   | EvAccepted
+  | EvGateRequired
+  | EvGateFailed
+  | EvGateInterrupted
   | EvPublishIntent
   | EvPublishCompleted
   | EvPublishStale

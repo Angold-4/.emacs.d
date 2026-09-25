@@ -102,6 +102,13 @@ be tagged `:provisional:` and are revised as implementation teaches us things.
 - `RESERVED` names choices the owner wants flagged, in addition to the
   standing reserved classes in §3.4. They are voted like any other decision;
   the owner is never waited for (owner-optional).
+- `GATE` is the phase's expensive, live proof (a `--clean --build` of a
+  whole stack, say). The conductor runs it itself, once per candidate whose
+  checks, probe and three reviews have passed, and records the evidence;
+  §6.5 is the normative account. `GATE_CLEANUP` is the command that releases
+  what the gate took, run after it whatever the outcome. `#+TT_GATE_MINUTES`
+  sets the gate's limit (default 30 minutes). No agent may run the gate or
+  report its result.
 - `#+TT_SECRETS` (plan level) names the credentials the plan needs, by name
   only. The conductor reads each value from its own environment, passes it to
   every agent as an environment variable, refuses a command containing one, and
@@ -497,7 +504,14 @@ REVIEWING     M, A, B review C under contract K (two turns each)
 RESOLVING     decisions voted; findings, owner requests, corrections open?
   │ open items remain and budget remains ────────────────────▶ REPAIRING
   │ open items remain, budget exhausted ─────────────────────▶ AWAITING_OWNER
-  │ accept(C, K) holds (§6.3)
+  │ accept(C, K) holds (§6.3), and the contract declares no gate
+  ├──────────────────────────────────────────────────────────▶ ACCEPTED(C)
+  │ accept(C, K) holds and the contract declares a `GATE` command
+  ▼
+GATING        the conductor runs the gate itself, once per candidate (§6.5)
+  │ the gate fails → blocking `integration` finding with its log tail
+  │ ────────────────────────────────────────────────────────▶ REPAIRING
+  │ the gate passes (or an identical tree reuses a pass)
   ▼
 ACCEPTED(C)   atomically: corrections addressed by C recorded resolved
   ▼
@@ -596,6 +610,49 @@ it, so that the integration result is part of the evidence acceptance requires.
 3. Record `DONE(I)`. If the branch no longer points at H, which cannot happen
    with serial phases but is checked anyway, the probe result is stale: the
    phase returns to `PROBING` against the new head.
+
+### 6.5 The gate (plan 01f)
+
+Some phases need a proof that is too expensive for the ordinary check loop: the
+atlas plan's `deploy/atlas.sh … --clean --build` of a 40-service stack takes
+about 15 minutes. Run inside an agent's attempt, that command was paid for on
+every repair round (82 minutes of docker across 13i/13j), was sometimes killed
+by the per-command limit before answering, and — because the agent had to
+produce the live proof — invited substitutes: a sentinel `code_sha`, a
+`pending_owner_live_run`, a fingerprint-only record ([runtime evidence](01_ref_runtime_f8ecf5e3.md) §1, §6). So the
+conductor runs the gate itself, and only the conductor produces its evidence.
+
+- **Declaration.** A phase declares `GATE` (and optionally `GATE_CLEANUP`) in
+  its property drawer; `#+TT_GATE_MINUTES` sets the limit (default 30). A
+  phase without a gate accepts on `accept(C, K)` alone, exactly as before.
+- **One run, after everything else.** The gate is dispatched from `GATING`,
+  which is only entered when `accept(C, K)` already holds. It runs in a fresh
+  checkout of the candidate merged onto the current integration head — the
+  integration the probe verified — with the plan's secrets in its environment.
+  A gate that exceeds its limit has its process group killed and counts as a
+  failure.
+- **The machine-wide lock.** The gate holds `~/.tradeoffs-trace/gate.lock`
+  while it runs, so two phases — in one program or in two runs — never gate at
+  once. A second gate waits for the first; a crashed holder releases the lock
+  through the OS.
+- **The record.** The conductor writes `checks/<sha>/gate.json` (candidate and
+  base SHA, the merged tree, the command, the exit status, duration, start
+  time, the log's sha256, and the cleanup's own outcome) and
+  `checks/<sha>/gate.log` (stdout and stderr, redacted). The `ACCEPTED` event
+  a passing gate releases is the only thing that lets acceptance proceed. The
+  cleanup command runs whatever the outcome.
+- **A failure is a blocking `integration` finding** whose evidence is the
+  log's last 60 lines. The phase returns to `REPAIRING` (or `AWAITING_OWNER`
+  when the budget is exhausted), and the repair prompt shows the worker the
+  conductor's record and log tail verbatim.
+- **Reuse, not repeat.** A candidate whose tree already has a passing record
+  for the same command reuses that record: the command does not run again.
+  (A repair attempt that changes nothing freezes a new commit with the same
+  tree.) Only a *passing* record is reused; a failed gate is rerun.
+- **No agent may produce this evidence.** The worker's prompt and every
+  reviewer's prompt say the conductor runs the gate and that running it,
+  reporting its result, or substituting evidence for it is forbidden.
+  Reviewers are shown the gate record when one exists.
 
 ## 7. Versions and authority
 
@@ -788,6 +845,7 @@ Every stage below has a conductor-enforced deadline:
 | each check command | 10 min | kill its group | check `failed: timeout` |
 | integration probe (merge plus its checks) | as for checks, per command | kill its group; discard the probe branch | `integration` finding: timeout |
 | each review | 15 min | cancel, re-dispatch once | then the phase is `BLOCKED: reviewer unavailable` |
+| the phase gate command (`GATE`) | 30 min (`#+TT_GATE_MINUTES`) | kill its process group, run `GATE_CLEANUP` | gate failed: blocking `integration` finding |
 | reproduction command | 5 min | kill its group | reproduction `inconclusive` |
 | repair rounds per phase | 3, plus 3 per owner correction | — | open items become owner requests |
 | run execution budget | from `TT_BUDGET` (wall and tokens) | stop dispatching | run `PAUSED: budget` until the owner resumes it with more budget |
@@ -833,6 +891,8 @@ None of those states advances without a recorded cause.
   sessions/         Pi session files, one per agent
   candidates/       read-only checkouts of frozen candidates
   checks/           check and reproduction output, by candidate
+  checks/<sha>/gate.json  the conductor's own gate record, when the phase
+  checks/<sha>/gate.log   declares a gate (§6.5) — never an agent's evidence
 ```
 
 Workers cannot write here. Their `tool_call` guard blocks it (§9.5), within the
@@ -861,6 +921,7 @@ Each has a reconciliation for "intent recorded, completion missing":
 | freeze commit | worktree HEAD carries trailer `TT-Action: <id>` → record it; otherwise redo the freeze |
 | check run | mark `interrupted` and rerun (checks are required to be rerunnable) |
 | probe | discard the probe branch and its checkout; mark the probe `interrupted`; probe again (the integration branch was never touched) |
+| gate | kill the gate's recorded process group and its cleanup's; discard the gate's checkout; mark the gate `interrupted` and rerun it — an interrupted gate is neither passed nor failed (§6.5) |
 | publish | integration branch points at I → record `DONE(I)`; still at H → retry the compare-and-swap; anywhere else → the probe is stale, return to `PROBING` |
 
 **Owner commands come in two kinds, with different guarantees:**

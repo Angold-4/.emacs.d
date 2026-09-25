@@ -19,7 +19,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { accept, isLiveDecision } from "../../src/core/predicate.ts";
+import { accept, isLiveDecision, resolvedCorrectionIdsFor } from "../../src/core/predicate.ts";
 import { next } from "../../src/core/next.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "../../src/core/owner-requests.ts";
 import { reduce } from "../../src/core/reduce.ts";
@@ -122,7 +122,15 @@ interface RunResult {
 /** Drives a phase using ONLY `next(state)` to decide what happens; a
  * simulated environment answers each emitted action. */
 function driveOnce(rng: () => number): RunResult {
-  let state = baseState({ phase: "READY" });
+  // Plan 01f: half the runs declare a gate, so the GATING stage (and its
+  // pass/fail/interrupt paths) is exercised by the same property as every
+  // other state. A gate-less run keeps the old RESOLVING -> ACCEPTED edge.
+  const gated = rng() < 0.5;
+  const base = baseState({
+    phase: "READY",
+    ...(gated ? { contract: { ...baseState().phase.contract, gate: "deploy --clean --build" } } : {}),
+  });
+  let state = base;
   let candidateCounter = 0;
   let correctionsUsed = 0;
   let grantsUsed = 0;
@@ -297,6 +305,48 @@ function driveOnce(rng: () => number): RunResult {
       }
       throw new Error(`next() returned no actions in a non-terminal state: phase=${state.phase.phase}`);
     }
+
+    /** The whole acceptance flow, shared by the gate-less `accept` action and
+     * a passing gate: it checks design §6.3's "accept is identical with and
+     * without post-ACCEPTED events" on this candidate's own publish flow. */
+    const acceptCandidate = (): void => {
+      const C = state.phase.candidate!.sha;
+      const Kc = state.phase.contract.contractVersion;
+      const resultAtAccept = accept(state.phase, C, Kc);
+      state = step(state, { type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(state.phase, C, Kc) });
+
+      const publishIntentAction = next(state).find((a) => a.type === "publish_intent");
+      let casSucceeded = false;
+      if (publishIntentAction) {
+        state = step(state, {
+          type: "PUBLISH_INTENT",
+          expectedHead: publishIntentAction.expectedHead as string,
+          candidateI: publishIntentAction.candidateI as string,
+        });
+        state = step(state, { type: "ACTION_STARTED", action: "publish_cas", actionId: freshId("a") });
+        if (rng() < 0.06) {
+          state = step(state, { type: "PUBLISH_STALE", actualHead: `H-stale-${freshId("h")}` });
+        } else {
+          state = step(state, { type: "PUBLISH_COMPLETED", newHead: state.phase.probe!.probedI! });
+          casSucceeded = true;
+        }
+      }
+
+      // Only meaningful when the CAS actually succeeded: a stale publish
+      // legitimately invalidates the probe (design §6.4 step 3), so accept()
+      // correctly reporting false afterward is not a circularity violation —
+      // it is new evidence (the head moved), not a fact acceptance itself
+      // produced.
+      if (casSucceeded) {
+        const recomputed = accept(state.phase, C, Kc);
+        acceptRecords.push({ phase: state.phase, candidateSha: C, contractVersion: Kc, resultAtAccept });
+        assert.equal(
+          recomputed,
+          resultAtAccept,
+          `accept(${C}) changed after PUBLISH_INTENT/PUBLISH_COMPLETED (was ${resultAtAccept}, now ${recomputed})`,
+        );
+      }
+    };
 
     for (const action of actions) {
       switch (action.type) {
@@ -489,51 +539,29 @@ function driveOnce(rng: () => number): RunResult {
           break;
         }
 
+        // Plan 01f: the gate stage. GATE_REQUIRED moves RESOLVING -> GATING;
+        // the gate itself is answered by run_gate, which either passes
+        // (acceptance proceeds) or fails (a repair round).
+        case "gate_required": {
+          state = step(state, { type: "GATE_REQUIRED" });
+          break;
+        }
+
+        case "run_gate": {
+          state = step(state, { type: "ACTION_STARTED", action: "run_gate", actionId: freshId("a") });
+          const r = rng();
+          if (r < 0.08) {
+            state = step(state, { type: "GATE_INTERRUPTED" });
+          } else if (r < 0.35) {
+            state = step(state, { type: "GATE_FAILED", evidence: "simulated gate failure: exit 3" });
+          } else {
+            acceptCandidate();
+          }
+          break;
+        }
+
         case "accept": {
-          // Check "accept is identical with and without post-ACCEPTED
-          // events" right here, on THIS candidate's own publish flow —
-          // not deferred to the run's eventual terminal state, which may
-          // include a later, unrelated REVIEWING/RESOLVING episode (e.g.
-          // after a stale-publish retry legitimately gathers further
-          // ballots or findings for a LATER round). That would compare
-          // accept()'s answer against genuinely new evidence, which is not
-          // what design §6.3's "no circularity" claim is about.
-          const C = state.phase.candidate!.sha;
-          const Kc = state.phase.contract.contractVersion;
-          const resultAtAccept = accept(state.phase, C, Kc);
-          state = step(state, { type: "ACCEPTED", resolvedCorrectionIds: action.resolvedCorrectionIds as string[] });
-
-          const publishIntentAction = next(state).find((a) => a.type === "publish_intent");
-          let casSucceeded = false;
-          if (publishIntentAction) {
-            state = step(state, {
-              type: "PUBLISH_INTENT",
-              expectedHead: publishIntentAction.expectedHead as string,
-              candidateI: publishIntentAction.candidateI as string,
-            });
-            state = step(state, { type: "ACTION_STARTED", action: "publish_cas", actionId: freshId("a") });
-            if (rng() < 0.06) {
-              state = step(state, { type: "PUBLISH_STALE", actualHead: `H-stale-${i}` });
-            } else {
-              state = step(state, { type: "PUBLISH_COMPLETED", newHead: state.phase.probe!.probedI! });
-              casSucceeded = true;
-            }
-          }
-
-          // Only meaningful when the CAS actually succeeded: a stale
-          // publish legitimately invalidates the probe (design §6.4 step
-          // 3), so accept() correctly reporting false afterward is not a
-          // circularity violation — it is new evidence (the head moved),
-          // not a fact acceptance itself produced.
-          if (casSucceeded) {
-            const recomputed = accept(state.phase, C, Kc);
-            acceptRecords.push({ phase: state.phase, candidateSha: C, contractVersion: Kc, resultAtAccept });
-            assert.equal(
-              recomputed,
-              resultAtAccept,
-              `accept(${C}) changed after PUBLISH_INTENT/PUBLISH_COMPLETED (was ${resultAtAccept}, now ${recomputed})`,
-            );
-          }
+          acceptCandidate();
           break;
         }
 

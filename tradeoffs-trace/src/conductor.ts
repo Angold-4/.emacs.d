@@ -15,6 +15,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,6 +23,17 @@ import { reduce } from "./core/reduce.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
+// Plan 01f: the pure half of the gate — the record's shape, its parser, the
+// log tail a failure quotes, and the reuse rule (see core/gate.ts's header).
+import {
+  GATE_TAIL_LINES,
+  gateCommandOf,
+  gateFailureEvidence,
+  gateLogTail,
+  parseGateRecord,
+  reusableGate,
+  type GateRecord,
+} from "./core/gate.ts";
 // Plan 01e: the pure half of the base baseline — parsing recorded check
 // output for failing test names, D2's "all failures pre-existing" rule, and
 // the on-disk record's shape. See the module's own header.
@@ -62,12 +74,13 @@ import type {
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
 import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
 import { decisionStatus, isLiveDecision, sameVersion } from "./core/predicate.ts";
+import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
-import { acquireLock, type Lock } from "./effects/lock.ts";
+import { acquireLock, acquireWaitingLock, type Lock } from "./effects/lock.ts";
 import { killGroup, childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
 import { sweep, type SweepResult } from "./effects/sweep.ts";
 import {
@@ -125,6 +138,11 @@ export interface Deadlines {
   freezeMs: number;
   checkMs: number;
   probeMs: number;
+  /** Plan 01f: how long the gate command may run before its process group is
+   * killed and the gate recorded as failed. The plan sets it with
+   * `#+TT_GATE_MINUTES` (default 30): a 15-minute `--clean --build` fits,
+   * the old 8-minute `sh` limit did not (runtime doc §6). */
+  gateMs: number;
   reviewMs: number;
   reproductionMs: number;
   abortGraceMs: number;
@@ -169,6 +187,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   freezeMs: 2 * 60_000,
   checkMs: 5 * 60_000,
   probeMs: 10 * 60_000,
+  gateMs: 30 * 60_000,
   reviewMs: 15 * 60_000,
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
@@ -186,6 +205,13 @@ export interface RunPlanPhase {
   boundaries: string[];
   reserved: string[];
   provisional?: boolean;
+  /** Plan 01f: the phase's `:GATE:` command — the expensive, live proof the
+   * conductor runs itself after checks, probe and reviews pass, and before
+   * acceptance. Undeclared on every phase that predates plan 01f. */
+  gate?: string;
+  /** Plan 01f: the phase's `:GATE_CLEANUP:` command, run after the gate
+   * whatever its outcome. */
+  gateCleanup?: string;
 }
 
 /** The on-disk plan file `tt start` reads. Only phase 0 (index 0) is run by
@@ -273,6 +299,11 @@ export interface ConductorOptions {
    * when the probed integration has exactly the candidate's tree (default
    * true). Tests that exercise the probe's own command handling turn it off. */
   probeReuse?: boolean;
+  /** Plan 01f: the machine-wide gate lock's path. Defaults to
+   * `~/.tradeoffs-trace/gate.lock`, so two phases (in one program or in two
+   * runs) never gate at once; tests point it at a temp path so they neither
+   * contend with a real run nor with each other. */
+  gateLockPath?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +397,11 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     checks: phase.checks,
     boundaries: phase.boundaries,
     reserved: phase.reserved,
+    // Plan 01f: a declared gate is part of the frozen contract — the FSM
+    // (next.ts/transitions.ts) reads it to decide whether the phase gates at
+    // all, and every prompt that mentions the gate quotes the same text.
+    ...(gateCommandOf(phase) ? { gate: phase.gate } : {}),
+    ...(phase.gateCleanup ? { gateCleanup: phase.gateCleanup } : {}),
   };
 }
 
@@ -694,6 +730,10 @@ export class Conductor {
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #probeReuse: boolean;
+  /** Plan 01f: the machine-wide gate lock's path (default
+   * `~/.tradeoffs-trace/gate.lock`). Held only while the gate command runs,
+   * so two phases never gate at once. */
+  #gateLockPath: string;
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -789,6 +829,7 @@ export class Conductor {
     this.#piEnvFor = opts.piEnvFor;
     this.#stubReviews = opts.stubReviews ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
+    this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -1077,6 +1118,29 @@ export class Conductor {
       discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       this.#applyEvent({ type: "PROBE_INTERRUPTED" });
+      return;
+    }
+
+    if (key === "run_gate") {
+      // Plan 01f / design §9.3: an interrupted gate is neither passed nor
+      // failed — kill whatever survived, discard the checkout the gate used,
+      // and rerun. (The process group was recorded in the intent before the
+      // command started, and the checkout branch is the probe's own name, so
+      // both are recoverable from this record alone.)
+      const candidateSha = payload.candidateSha as string;
+      // The command's own process group was recorded at spawn (an
+      // `onIntent`-logged `gate-sh-<actionId>-<pgid>` intent), plus the
+      // cleanup's — a killed conductor leaves both to reap.
+      const prefixes = [`gate-sh-${actionId}-`, `gate-cleanup-sh-${actionId}-`];
+      for (const rec of records) {
+        if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
+        if (!prefixes.some((p) => rec.actionId.startsWith(p))) continue;
+        const pgid = (rec.event as { pgid?: number }).pgid;
+        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
+      discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
+      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#applyEvent({ type: "GATE_INTERRUPTED" });
       return;
     }
 
@@ -2160,6 +2224,17 @@ export class Conductor {
       case "accept":
         this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: action.resolvedCorrectionIds as string[] });
         return;
+      // Plan 01f: the phase is acceptable and its contract declares a gate —
+      // enter GATING, from where next() asks for the gate itself.
+      case "gate_required":
+        this.#applyEvent({ type: "GATE_REQUIRED" });
+        return;
+      case "run_gate": {
+        const actionId = this.#log.actionId(kind);
+        this.#applyEvent({ type: "ACTION_STARTED", action: "run_gate", actionId });
+        void this.#runGate(actionId, action.candidateSha as string).catch((err) => this.#logUnexpected("run_gate", err));
+        return;
+      }
       case "resolving_incomplete":
         this.#applyEvent({ type: "RESOLVING_INCOMPLETE" });
         return;
@@ -3113,6 +3188,22 @@ export class Conductor {
     const blocking = open.filter((f) => f.severity === "blocking").map(findingLine);
     if (checksFailed) blocking.unshift("The phase checks failed on the candidate (see the check output in your worktree by rerunning the failing test).");
     if (probeFailed) blocking.unshift("The integration probe failed: the candidate does not merge cleanly or fails the checks when merged onto the integration branch.");
+    // Plan 01f: a failed gate is a repair round that shows the worker the
+    // log (design 01_ref_design.md): the conductor's own record, not an
+    // agent's summary of it, with the last lines inline.
+    const gateRecord = this.#gateRecords().find((r) => r.candidateSha === C);
+    if (gateRecord && !gateRecord.passed) {
+      const how = gateRecord.timedOut
+        ? `was killed at its limit after ${Math.round(gateRecord.durationMs / 1000)}s`
+        : gateRecord.exitCode === null
+          ? "ended on a signal"
+          : `exited ${gateRecord.exitCode}`;
+      const tail = this.#gateTailForPrompt(C);
+      blocking.unshift(
+        `The conductor ran the phase's gate command and it ${how}: ${gateRecord.command} (checks/${C}/gate.log, sha256 ${gateRecord.logSha256}).` +
+          (tail ? ` Last ${GATE_TAIL_LINES} lines of its log:\n${tail}` : ""),
+      );
+    }
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
@@ -3870,6 +3961,278 @@ export class Conductor {
     }
   }
 
+  // -- plan 01f: the gate ---------------------------------------------------
+
+  /** Every gate record this run has written so far (`checks/<sha>/gate.json`),
+   * newest last — the inputs to the reuse rule in core/gate.ts. A malformed
+   * or half-written record is ignored: it is never a passing gate. */
+  #gateRecords(): GateRecord[] {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.#paths.checks);
+    } catch {
+      return [];
+    }
+    const records: GateRecord[] = [];
+    for (const name of names) {
+      if (name === "base" || name === "probe") continue;
+      try {
+        const record = parseGateRecord(JSON.parse(fs.readFileSync(path.join(this.#paths.checks, name, "gate.json"), "utf8")));
+        if (record) records.push(record);
+      } catch {
+        // no record here, or an unreadable/partial one
+      }
+    }
+    return records.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  }
+
+  /** Plan 01f: the gate record to show a reviewer for candidate `C` — the
+   * record for `C` itself when one exists (a reused pass, or a stale-publish
+   * retry), otherwise the newest record of the run, which is the failed gate
+   * that sent the phase into this repair round. */
+  #gateRecordForPrompt(candidateSha: string): GateRecord | undefined {
+    const records = this.#gateRecords();
+    return records.find((r) => r.candidateSha === candidateSha) ?? records[records.length - 1];
+  }
+
+  /** The last lines of the gate log that goes with `#gateRecordForPrompt`,
+   * for a failed record (a pass needs no tail). */
+  #gateTailForPrompt(candidateSha: string): string | undefined {
+    const record = this.#gateRecordForPrompt(candidateSha);
+    if (!record || record.passed) return undefined;
+    try {
+      return gateLogTail(fs.readFileSync(path.join(this.#paths.checks, record.candidateSha, "gate.log"), "utf8"));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 01f: the environment the gate (and its cleanup) run with — the
+   * same isolation as a check (`childEnv`), plus the plan's declared secret
+   * values, so a gate command that needs a vendor key gets it from the
+   * environment rather than from its own text (plan 01a's rule). */
+  #gateEnv(): NodeJS.ProcessEnv {
+    return { ...childEnv(), ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])) };
+  }
+
+  /** Plan 01f: the conductor's own gate. Runs the contract's `:GATE:` command
+   * in a fresh checkout of the candidate merged onto the current integration
+   * head (the same probed integration the probe verified), under the
+   * machine-wide gate lock so two phases never gate at once, and with the
+   * plan's secrets in the environment. Writes `checks/<sha>/gate.json` and
+   * `checks/<sha>/gate.log`, runs `:GATE_CLEANUP:` whatever the outcome, and
+   * applies either the ACCEPTED event (a pass) or GATE_FAILED with the log's
+   * last lines (a failure, or a kill at the limit). An identical tree with a
+   * recorded pass is reused: the command does not run again.
+   *
+   * The agent never produces this evidence (runtime doc §6): a passing gate is
+   * what lets acceptance proceed, a failing one is a blocking `integration`
+   * finding the worker is shown, and no agent may run the command or report
+   * its result. */
+  async #runGate(actionId: string, candidateSha: string): Promise<void> {
+    const contract = this.#state.phase.contract;
+    const head = this.#state.phase.integrationHead;
+    const declared = gateCommandOf(contract);
+    const outDir = path.join(this.#paths.checks, candidateSha);
+    fs.mkdirSync(outDir, { recursive: true });
+    const logPath = path.join(outDir, "gate.log");
+    const recordPath = path.join(outDir, "gate.json");
+    if (!declared) {
+      // Defensive: GATING is only reachable when the contract declares a
+      // gate, but a hand-built event must not silently accept a candidate.
+      this.#log.completion(actionId, { candidateSha, passed: false, reason: "no gate command declared" });
+      this.#applyEvent({ type: "GATE_FAILED", evidence: "the conductor was asked to gate a phase whose contract declares no :GATE: command" });
+      return;
+    }
+    const command = this.#withValues(declared);
+    const maskedCommand = redactText(command, this.#secretMaskable);
+    const maskedCleanup = contract.gateCleanup ? redactText(this.#withValues(contract.gateCleanup), this.#secretMaskable) : undefined;
+    const cleanupCommand = contract.gateCleanup ? this.#withValues(contract.gateCleanup) : undefined;
+    const tree = treeOf(this.#plan.repo, candidateSha);
+    this.#log.intent(actionId, { candidateSha, head, tree, command: maskedCommand });
+
+    // The reuse rule (core/gate.ts): a passing record for this exact tree,
+    // gated with this exact command, is this candidate's evidence too — the
+    // command does not run again (a repair round that changes nothing freezes
+    // a new commit with the same tree; a stale-publish retry re-gates the same
+    // candidate).
+    const reuse = reusableGate(this.#gateRecords(), { tree, command: maskedCommand });
+    if (reuse) {
+      const startedAt = new Date().toISOString();
+      let logText = `reused the gate record of candidate ${reuse.candidateSha}: ${maskedCommand}\n`;
+      try {
+        logText = fs.readFileSync(path.join(this.#paths.checks, reuse.candidateSha, "gate.log"), "utf8");
+      } catch {
+        // The source log is gone (a hand-cleaned run dir): keep the note.
+      }
+      const logBytes = Buffer.byteLength(logText, "utf8");
+      const logSha256 = createHash("sha256").update(logText).digest("hex");
+      fs.writeFileSync(logPath, logText);
+      const record: GateRecord = {
+        ...reuse,
+        candidateSha,
+        mergedI: reuse.mergedI,
+        startedAt,
+        reused: true,
+        reusedFrom: reuse.candidateSha,
+        ...(reuse.baseSha !== head ? { reusedFromBaseSha: reuse.baseSha } : {}),
+        logBytes,
+        logSha256,
+      };
+      fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+      this.#log.completion(actionId, { candidateSha, passed: true, reused: true, reusedFrom: reuse.candidateSha, logSha256 });
+      this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(this.#state.phase, candidateSha, contract.contractVersion) });
+      return;
+    }
+
+    // The probed checkout: merge the candidate onto the current head, exactly
+    // as the probe does, so the gate's evidence is for the integration the
+    // probe verified. (The probe passed, so a conflict here means the head
+    // moved under the phase: a genuine gate failure.)
+    const probed = gitProbe(this.#plan.repo, { runId: this.#state.phase.runId, candidateSha, headSha: head });
+    if (!probed.ok) {
+      const conflictLog = `$ ${maskedCommand}\n${probed.output}\nthe candidate no longer merges onto ${head}\n`;
+      const redacted = redactText(conflictLog, this.#secretMaskable);
+      fs.writeFileSync(logPath, redacted);
+      const record: GateRecord = {
+        candidateSha,
+        tree,
+        baseSha: head,
+        command: maskedCommand,
+        ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
+        startedAt: new Date().toISOString(),
+        durationMs: 0,
+        exitCode: null,
+        timedOut: false,
+        passed: false,
+        logBytes: Buffer.byteLength(redacted, "utf8"),
+        logSha256: createHash("sha256").update(redacted).digest("hex"),
+        cleanupSkipped: "the candidate no longer merges onto the integration head; there was no checkout to clean",
+      };
+      fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+      this.#log.completion(actionId, { candidateSha, passed: false, reason: "merge conflict" });
+      this.#applyEvent({
+        type: "GATE_FAILED",
+        evidence: gateFailureEvidence({ record, logPath, tail: gateLogTail(redacted), reason: `the candidate no longer merges onto ${head}` }),
+      });
+      return;
+    }
+
+    const lock: Lock = await this.#acquireGateLock();
+    const startedAt = new Date().toISOString();
+    const startedMs = Date.now();
+    let gateResult: RunCommandResult;
+    let cleanupResult: RunCommandResult | undefined;
+    let cleanupStartedAt: string | undefined;
+    let cleanupMs = 0;
+    // Measured before the lock is released, so the recorded window is exactly
+    // the time the gate held the machine-wide lock — never the teardown after
+    // it (which would make two honest, sequential gates look overlapped).
+    let durationMs = 0;
+    try {
+      const running = runCommand({
+        command,
+        cwd: probed.checkoutDir,
+        env: this.#gateEnv(),
+        deadlineMs: this.#deadlines.gateMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+        // Design §2.2: the command's process group is recorded before it runs,
+        // so a crashed gate is recoverable (see `#reconcileOne`).
+        onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
+      });
+      gateResult = await running.result;
+      // Whatever the outcome: release what the gate took.
+      if (cleanupCommand) {
+        cleanupStartedAt = new Date().toISOString();
+        const cleanupStartedMs = Date.now();
+        const cleanup = runCommand({
+          command: cleanupCommand,
+          cwd: probed.checkoutDir,
+          env: this.#gateEnv(),
+          deadlineMs: this.#deadlines.gateMs,
+          termGraceMs: this.#deadlines.termGraceMs,
+          onIntent: ({ pgid }) => this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid }),
+        });
+        cleanupResult = await cleanup.result;
+        cleanupMs = Date.now() - cleanupStartedMs;
+      }
+      durationMs = Date.now() - startedMs;
+    } finally {
+      await lock.release();
+      discardProbe(this.#plan.repo, { probeBranch: probed.probeBranch, checkoutDir: probed.checkoutDir });
+    }
+    const passed = !gateResult.timedOut && gateResult.exitCode === 0;
+    // The log holds both commands' output, redacted, with the exit facts —
+    // the same shape `#recordCheck` writes.
+    const parts = [
+      `$ ${maskedCommand}\n${gateResult.output}\nexit ${gateResult.exitCode} signal ${gateResult.signal}${gateResult.timedOut ? ` (timed out after ${Math.round(durationMs / 1000)}s)` : ""}\n`,
+    ];
+    if (cleanupResult && maskedCleanup) {
+      parts.push(
+        `$ ${maskedCleanup}\n${cleanupResult.output}\nexit ${cleanupResult.exitCode} signal ${cleanupResult.signal}${cleanupResult.timedOut ? " (timed out)" : ""}\n`,
+      );
+    }
+    const logText = redactText(parts.join("\n"), this.#secretMaskable);
+    fs.writeFileSync(logPath, logText);
+    const record: GateRecord = {
+      candidateSha,
+      tree,
+      baseSha: head,
+      mergedI: probed.I,
+      command: maskedCommand,
+      ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
+      startedAt,
+      durationMs,
+      exitCode: gateResult.exitCode,
+      signal: gateResult.signal,
+      timedOut: gateResult.timedOut,
+      passed,
+      logSha256: createHash("sha256").update(logText).digest("hex"),
+      logBytes: Buffer.byteLength(logText, "utf8"),
+      ...(cleanupResult
+        ? {
+            cleanupStartedAt,
+            cleanupDurationMs: cleanupMs,
+            cleanupExitCode: cleanupResult.exitCode,
+            cleanupTimedOut: cleanupResult.timedOut,
+          }
+        : {}),
+    };
+    fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+    this.#log.completion(actionId, {
+      candidateSha,
+      head,
+      passed,
+      exitCode: gateResult.exitCode,
+      timedOut: gateResult.timedOut,
+      durationMs,
+      logSha256: record.logSha256,
+      ...(cleanupResult ? { cleanupExitCode: cleanupResult.exitCode } : {}),
+    });
+    if (passed) {
+      this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(this.#state.phase, candidateSha, contract.contractVersion) });
+    } else {
+      this.#applyEvent({
+        type: "GATE_FAILED",
+        evidence: gateFailureEvidence({ record, logPath, tail: gateLogTail(logText) }),
+      });
+    }
+  }
+
+  /** The machine-wide gate lock (plan 01f). Waits for a holder instead of
+   * failing: a second phase gates after the first is done, never alongside
+   * it. The lock is released in a `finally` around the gate and its cleanup;
+   * a conductor that dies mid-gate releases it through the perl helper's own
+   * exit, so a crashed gate cannot wedge every later one. */
+  async #acquireGateLock(): Promise<Lock> {
+    try {
+      fs.mkdirSync(path.dirname(this.#gateLockPath), { recursive: true });
+    } catch {
+      // Best effort: the run root usually already exists.
+    }
+    return acquireWaitingLock(this.#gateLockPath);
+  }
+
   // -- review -----------------------------------------------------------
 
   async #runReview(actionId: string, reviewer: Reviewer): Promise<void> {
@@ -4227,6 +4590,11 @@ export class Conductor {
     const lines = [
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
       ...secretPromptLines(this.#secretNames),
+      // Plan 01f: reviewers are told the conductor produces the gate's
+      // evidence and shown the record when one exists (the failed gate that
+      // sent the phase into this repair round, or a record reused for this
+      // candidate) — a substitute gate proof has to be refused, not accepted.
+      ...gatePromptLines(phase.contract.gate, this.#gateRecordForPrompt(C), this.#gateTailForPrompt(C)),
       // Plan 01i: the directives in force, and the contract rule that binds
       // them — always stated, whether or not one is in force right now.
       ...reviewerTurn2DirectiveSection(phase.ownerDirectives),
@@ -4488,6 +4856,48 @@ export function baselinePromptLines(commands: readonly BaselineCommand[] | undef
 export const DIRECTIVE_BINDING_STATEMENT =
   "The owner's directives are binding on you as part of the contract: a candidate that follows one cannot be faulted for doing so, even where the plan's text says otherwise; a candidate that violates one is a blocking contract finding that cites the directive id.";
 
+/** Plan 01f: what every agent must know about the gate. Only the conductor
+ * runs it and only its record is accepted evidence (runtime doc §6: agents
+ * ran the expensive command inside their attempts — 82 minutes of docker in
+ * 13i/13j, some killed at the 8-minute command limit — and, because they had
+ * to produce the live proof, wrote substitutes: a sentinel `code_sha`,
+ * `pending_owner_live_run`, a fingerprint-only record). */
+export const GATE_BINDING_STATEMENT =
+  "The conductor runs the phase's gate command itself, once, after the checks, the probe and all three reviews pass, and only its record (checks/<sha>/gate.json) counts as the live proof. Never run the gate command yourself, and never report, substitute or fabricate its evidence.";
+
+/** Plan 01f: the gate section a prompt carries — the binding statement, the
+ * command when the contract declares one, and the record when one exists
+ * (facts only; `tail` adds the log's last lines for a failed record). Empty
+ * only when the phase has no gate and no record. */
+export function gatePromptLines(
+  gate: string | undefined,
+  record?: GateRecord,
+  tail?: string,
+): string[] {
+  if (!gate && !record) return [];
+  const lines = ["", GATE_BINDING_STATEMENT];
+  if (gate) lines.push(`The phase's gate command is: \`${gate}\``);
+  if (record) {
+    const how = record.reused
+      ? `reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s passing record`
+      : record.passed
+        ? `passed (exit 0) in ${formatDurationForPrompt(record.durationMs)}`
+        : record.timedOut
+          ? `was killed at its limit after ${formatDurationForPrompt(record.durationMs)}`
+          : `failed (exit ${record.exitCode})`;
+    lines.push(`Gate record for candidate ${record.candidateSha.slice(0, 9)}: ${record.command} — ${how}; log sha256 ${record.logSha256}`);
+    if (!record.passed && tail && tail.trim().length > 0) {
+      lines.push(`Last lines of that gate's log:`, tail);
+    }
+  }
+  return lines;
+}
+
+function formatDurationForPrompt(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
 /** Plan 01i: the reviewer turn-2 directive section — every directive in force,
  * verbatim, newest last, then the contract rule that binds them. Exported (and
  * used by `#buildReviewerTurn2Prompt`) so a unit test exercises exactly what
@@ -4541,6 +4951,11 @@ export function buildWorkerPrompt(
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
   lines.push(...directiveLines(directives));
+  // Plan 01f: the gate is the conductor's proof to produce, never the
+  // worker's (runtime doc §6's structural incentive to substitute it). The
+  // rule is stated for every phase — a substitute is never welcome, gate or
+  // no gate — and the command is named when the contract declares one.
+  lines.push("", GATE_BINDING_STATEMENT, ...(contract.gate ? [`The phase's gate command is: \`${contract.gate}\``] : []));
   if (interruptionNote) lines.push("", interruptionNote);
   if (repair) {
     lines.push(

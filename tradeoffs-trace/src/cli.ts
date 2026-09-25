@@ -410,6 +410,8 @@ function renderStatus(runDir: string): string {
   const view = buildView(runDir, plan, conductorAlive(runDir));
   lines.push(`pipeline: ${view.pipeline}`);
   lines.push(`gates: ${view.gates}`);
+  // Plan 01f: the conductor's gate record, cited (tt summary cites the same).
+  if (view.gate) lines.push(`gate: ${view.gate}`);
   // Plan 01e: the base's own pre-existing check failures (D2), when it has any.
   if (view.baseline) lines.push(`base: ${view.baseline}`);
   lines.push(`reviews: ${view.reviewLine}`);

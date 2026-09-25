@@ -13,6 +13,7 @@
 // state. `actions` is what `next()` of the resulting state must equal.
 
 import { carryBallotsForward, carryDecisionsForward } from "./rounds.ts";
+import { gateCommandOf } from "./gate.ts";
 import {
   applyFindingAcceptedByOwner,
   applyOverrideCast,
@@ -95,6 +96,7 @@ function activePhaseStates(): PhaseStateName[] {
     "PROBING",
     "REVIEWING",
     "RESOLVING",
+    "GATING",
     "ACCEPTED",
     "AWAITING_OWNER",
     "BLOCKED",
@@ -152,7 +154,7 @@ function failureRows(
   trigger: Event["type"],
   repairActions: { type: string; [key: string]: unknown }[],
   cause: string,
-  extraApply?: (s: State) => State,
+  extraApply?: (s: State, ev: Event) => State,
 ) {
   addRow({
     id: `${idPrefix}-to-repairing`,
@@ -163,9 +165,9 @@ function failureRows(
     guard: (s) => budgetRemains(s),
     to: "REPAIRING",
     actions: repairActions,
-    apply: (s) => {
+    apply: (s, ev) => {
       const base = withPhase(s, { phase: "REPAIRING" });
-      return extraApply ? extraApply(base) : base;
+      return extraApply ? extraApply(base, ev) : base;
     },
   });
   addRow({
@@ -177,8 +179,8 @@ function failureRows(
     guard: (s) => budgetExhausted(s),
     to: "AWAITING_OWNER",
     actions: [],
-    apply: (s) => {
-      const base = extraApply ? extraApply(s) : s;
+    apply: (s, ev) => {
+      const base = extraApply ? extraApply(s, ev) : s;
       return enterAwaitingOwner(base, cause);
     },
   });
@@ -531,31 +533,122 @@ addRow({
 });
 
 // --- RESOLVING --------------------------------------------------------
+/** Plan 01f: a phase whose contract declares a `:GATE:` command gates the
+ * candidate before accepting it — `` accept(C, K) `` is what the *gate stage*
+ * is entered on, and the ACCEPTED event is what a passing gate releases.
+ * Two guards share the two events, so a gate-less phase keeps exactly the
+ * pre-01f edge (RESOLVING --ACCEPTED--> ACCEPTED): */
+function gateDeclared(s: State): boolean {
+  return gateCommandOf(s.phase.contract) !== undefined;
+}
+
+/** The corrections the ACCEPTED event must name, checked against what
+ * predicate.ts computes — the event may not invent or omit one (§6.3/§7.5
+ * step 5: "the ACCEPTED event records it as resolved"). */
+function acceptCorrectionsMatch(s: State, ev: Event): boolean {
+  const e = ev as Extract<Event, { type: "ACCEPTED" }>;
+  const C = s.phase.candidate!.sha;
+  const K = s.phase.contract.contractVersion;
+  const computed = resolvedCorrectionIdsFor(s.phase, C, K);
+  const given = [...(e.resolvedCorrectionIds ?? [])].sort();
+  return JSON.stringify(given) === JSON.stringify(computed);
+}
+
+function applyAccepted(s: State, ev: Event): State {
+  const e = ev as Extract<Event, { type: "ACCEPTED" }>;
+  const corrections = s.phase.corrections.map((c: Correction) =>
+    e.resolvedCorrectionIds.includes(c.id) ? { ...c, status: "resolved" as const } : c,
+  );
+  return withPhase(s, { phase: "ACCEPTED", corrections, inFlight: clearInFlight(s.phase, "run_gate") });
+}
+
+// A gate-less phase: acceptance is immediate, exactly as before plan 01f.
 addRow({
   id: "resolving-accept-holds",
   axis: "phase",
   from: "RESOLVING",
   trigger: "ACCEPTED",
-  guardName: "acceptHoldsAndCorrectionsMatch",
-  guard: (s, ev) => {
-    if (!acceptHolds(s)) return false;
-    const e = ev as Extract<Event, { type: "ACCEPTED" }>;
-    const C = s.phase.candidate!.sha;
-    const K = s.phase.contract.contractVersion;
-    const computed = resolvedCorrectionIdsFor(s.phase, C, K);
-    const given = [...(e.resolvedCorrectionIds ?? [])].sort();
-    return JSON.stringify(given) === JSON.stringify(computed);
-  },
+  guardName: "acceptHoldsNoGateAndCorrectionsMatch",
+  guard: (s, ev) => !gateDeclared(s) && acceptHolds(s) && acceptCorrectionsMatch(s, ev),
   to: "ACCEPTED",
   // Canonical integrationHead "H0", probedI "I1" (see the row's fixture).
   actions: [{ type: "publish_intent", expectedHead: "H0", candidateI: "I1" }],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ACCEPTED" }>;
-    const corrections = s.phase.corrections.map((c: Correction) =>
-      e.resolvedCorrectionIds.includes(c.id) ? { ...c, status: "resolved" as const } : c,
-    );
-    return withPhase(s, { phase: "ACCEPTED", corrections });
+  apply: applyAccepted,
+});
+
+/** Plan 01f: the candidate is acceptable, but the phase's contract declares a
+ * gate — so the phase gates it first. The gate itself is dispatched from
+ * GATING (the new stage), never from here. */
+addRow({
+  id: "resolving-gate-required",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "GATE_REQUIRED",
+  guardName: "acceptHoldsAndGateDeclared",
+  guard: (s) => acceptHolds(s) && gateDeclared(s),
+  to: "GATING",
+  actions: [{ type: "run_gate", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { phase: "GATING" }),
+});
+
+// --- GATING (plan 01f): the conductor's own expensive, live gate ----------
+// The gate command runs once for this candidate (a recorded pass for the same
+// tree is reused instead of rerun: core/gate.ts's `reusableGate`, and the
+// conductor's `#runGate`). Its outcome is one of these three events; nothing
+// else leaves GATING except AMEND/REVISE (see their own rows).
+addRow({
+  id: "gate-accepted",
+  axis: "phase",
+  from: "GATING",
+  trigger: "ACCEPTED",
+  guardName: "acceptHoldsAndCorrectionsMatch",
+  guard: (s, ev) => acceptHolds(s) && acceptCorrectionsMatch(s, ev),
+  to: "ACCEPTED",
+  actions: [{ type: "publish_intent", expectedHead: "H0", candidateI: "I1" }],
+  apply: applyAccepted,
+});
+
+failureRows(
+  "gate-failed",
+  "GATING",
+  "GATE_FAILED",
+  REPAIR_ATTEMPT_ACTIONS,
+  "the gate kept failing",
+  (s, ev) => {
+    // The gate's own evidence enters the record as a blocking `integration`
+    // finding (runtime §4's fourth blocking-integration case), exactly like a
+    // failed integration probe: the repair round carries the log's last lines
+    // to the worker, and the owner sees the same finding if the budget runs
+    // out.
+    const e = ev as Extract<Event, { type: "GATE_FAILED" }>;
+    const finding: Finding = {
+      id: `F-${s.phase.phaseId}-gate-${s.phase.findings.length + 1}`,
+      version: 1,
+      phaseId: s.phase.phaseId,
+      kind: "integration",
+      severity: "blocking",
+      evidence: e.evidence,
+      raisedBy: "conductor",
+      status: "open",
+      boundCandidateSha: s.phase.candidate!.sha,
+    };
+    return withPhase(s, {
+      findings: [...s.phase.findings, finding],
+      inFlight: clearInFlight(s.phase, "run_gate"),
+    });
   },
+);
+
+addRow({
+  id: "gate-interrupted",
+  axis: "phase",
+  from: "GATING",
+  trigger: "GATE_INTERRUPTED",
+  guardName: "always",
+  guard: () => true,
+  to: "GATING",
+  actions: [{ type: "run_gate", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "run_gate") }),
 });
 
 addRow({
@@ -707,7 +800,7 @@ function hasCandidateAndCurrentContract(s: State, ev: Event): boolean {
   return sameVersion(e.replacingContractVersion, s.phase.contract.contractVersion);
 }
 
-for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
+for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
   addRow({
     id: `amend-from-${from.toLowerCase()}`,
     axis: "phase",
@@ -956,6 +1049,10 @@ function addAwaitingOwnerRecordCommandRows(
     guard: (s, ev) =>
       extraGuard(s, ev) && checker.guardValid(s, ev) && awaitingOwnerTarget(checker.applyPhase(s, ev)) === "RESOLVING",
     to: "RESOLVING",
+    // The gate-less form. A phase whose contract declares a gate never takes
+    // the `accept` action from RESOLVING: next() asks for `gate_required`
+    // first and the gate stage decides (plan 01f). The row's `actions` column
+    // documents the fixture (a gate-less contract), exactly as before.
     actions: [{ type: "accept", resolvedCorrectionIds: [] }],
     apply: (s, ev) => withPhase(s, { ...checker.applyPhase(s, ev), phase: "RESOLVING" }),
   });
