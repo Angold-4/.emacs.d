@@ -20,7 +20,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { test } from "node:test";
+import { describe, test } from "node:test";
 
 import {
   cleanupDir,
@@ -32,6 +32,7 @@ import {
 } from "./harness.ts";
 import {
   buildContract,
+  buildReviewerPrompt,
   buildWorkerPrompt,
   GATE_BINDING_STATEMENT,
   gatePromptLines,
@@ -39,6 +40,7 @@ import {
   type ConductorOptions,
   type RunPlanFile,
 } from "../../src/conductor.ts";
+import { baseState } from "../unit/helpers.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { buildView, gateSummaryLine, prSummary } from "../../src/view.ts";
 import {
@@ -51,6 +53,13 @@ import {
   reusableGate,
   type GateRecord,
 } from "../../src/core/gate.ts";
+
+// The wait budget for these end-to-end tests. The harness floors every
+// `waitFor` at 90 s, but under `make check` the whole suite runs four files at
+// once: a full conductor cycle that takes 5 s alone can take over a minute.
+// 150 s keeps a healthy-but-slow run green and still fails a stuck one (the
+// runner's per-test timeout is 180 s).
+const WAIT_MS = 150_000;
 
 const FAST_DEADLINES: ConductorOptions["deadlines"] = {
   abortGraceMs: 500,
@@ -249,12 +258,41 @@ test("gate: the record section names the command, the outcome and the log hash, 
   const ok = gatePromptLines("deploy --build", recordFixture()).join("\n");
   assert.match(ok, /passed \(exit 0\)/);
   assert.ok(!ok.includes("boom"));
-  assert.equal(gatePromptLines(undefined, undefined).length, 0);
+  // A gate-less phase still gets the binding rule (a substitute is never
+  // evidence), just no command.
+  const plain = gatePromptLines(undefined, undefined).join("\n");
+  assert.match(plain, /Never run the gate command yourself/);
+  assert.ok(!plain.includes("The phase's gate command is:"));
+});
+
+test("gate: the stub reviewer prompt carries the gate rule too", () => {
+  // buildReviewerPrompt is the one-turn reviewer prompt (stub reviewers), and
+  // is the function finding B-8 named: it must state that the conductor owns
+  // the gate evidence, with or without a gate.
+  const gate = "deploy --clean --build";
+  const contract = buildContract({ id: "p1", goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [], gate });
+  const gated = baseState({ phase: "REVIEWING", contract, candidate: { sha: "c1", contractVersion: contract.contractVersion } });
+  const prompt = buildReviewerPrompt(gated.phase, "M");
+  assert.match(prompt, /Never run the gate command yourself/);
+  assert.ok(prompt.includes(gate), "the reviewer prompt must name the gate command");
+  const plain = buildReviewerPrompt(baseState({ phase: "REVIEWING" }).phase, "M");
+  assert.match(plain, /Never run the gate command yourself/);
+  assert.ok(!plain.includes("The phase's gate command is:"));
 });
 
 // ---------------------------------------------------------------------------
 // End to end
+//
+// Wrapped in one `describe` with `concurrency: 4`: each of these drives a real
+// conductor (a couple of seconds of process spawning and git checkouts), and
+// this phase's own `:CHECKS:` is the whole `make -C tradeoffs-trace check`
+// suite under the plan's check deadline, so the file must not add serial
+// minutes to it. Every test builds its own temp repo, run root and gate lock,
+// so they are independent. Three is the ceiling: at six concurrent conductors
+// the host serializes them and a wait budget can be exhausted.
 // ---------------------------------------------------------------------------
+
+describe("gate: end to end", { concurrency: 3 }, () => {
 
 test("gate: a passing gate runs exactly once, records the candidate, the exit status and the log hash, and reaches DONE", async () => {
   const dir = shortTmp("tt-gate-pass");
@@ -264,17 +302,18 @@ test("gate: a passing gate runs exactly once, records the candidate, the exit st
     checks: ["true"],
     workerScript,
     reviewerScriptFor,
-    // The cleanup takes far longer than the gate, so the record must show the
-    // gate's own duration and the cleanup's separately (folding them would be
-    // an honest-looking build time it did not spend).
-    gate: `echo gate-ran >> ${counter}; sleep 0.3; echo gate-ok`,
-    gateCleanup: `echo cleanup-ran >> ${counter}; sleep 1.2`,
+    // The cleanup takes 3 s and fails with its own exit status while the gate
+    // is instant: the record must show the gate's own duration and status and
+    // the cleanup's separately (folding them would cite a build time the gate
+    // did not spend, and a cleanup failure it did not have).
+    gate: `echo gate-ran >> ${counter}; echo gate-ok`,
+    gateCleanup: `echo cleanup-ran >> ${counter}; sleep 3; exit 7`,
     gateLockPath: lock,
     deadlines: FAST_DEADLINES,
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", WAIT_MS, 50, setup.runDir);
 
     const C = setup.conductor.state.phase.candidate!.sha;
     const record = gateRecordAt(setup.runDir, C);
@@ -286,15 +325,18 @@ test("gate: a passing gate runs exactly once, records the candidate, the exit st
     const logFile = path.join(runPaths(setup.runDir).checks, C, "gate.log");
     assert.equal(record.logSha256, sha256File(logFile));
     assert.equal(record.logBytes, fs.statSync(logFile).size);
-    assert.match(fs.readFileSync(logFile, "utf8"), /gate-ok/);
-    assert.match(fs.readFileSync(logFile, "utf8"), /cleanup-ran|\$ /);
-    assert.equal(record.cleanupExitCode, 0);
-    assert.ok(record.cleanupDurationMs !== undefined && record.cleanupDurationMs >= 1200, `cleanup duration: ${record.cleanupDurationMs}`);
-    assert.ok(record.durationMs >= 300, `gate duration: ${record.durationMs}`);
-    assert.ok(
-      record.durationMs < record.cleanupDurationMs!,
-      `the gate's duration must not include the cleanup (gate ${record.durationMs}ms, cleanup ${record.cleanupDurationMs}ms)`,
-    );
+    const logText = fs.readFileSync(logFile, "utf8");
+    assert.match(logText, /gate-ok/);
+    assert.match(logText, /cleanup-ran/);
+    // The cleanup's own outcome, kept separate from the gate's: a non-zero
+    // cleanup does not turn a passing gate into a failing one.
+    assert.equal(record.cleanupExitCode, 7);
+    assert.equal(record.cleanupTimedOut, false);
+    assert.ok(record.cleanupDurationMs !== undefined && record.cleanupDurationMs >= 3000, `cleanup duration: ${record.cleanupDurationMs}`);
+    // The gate's own duration cannot have included a 3 s cleanup. A fixed
+    // ceiling, not a ratio: the gate command itself is instant here, so a
+    // loaded host cannot push its window near the cleanup's sleep.
+    assert.ok(record.durationMs < 3000, `the gate's duration must not include the cleanup (got ${record.durationMs}ms)`);
 
     // The command ran exactly once, and the cleanup ran after it.
     const runs = fs.readFileSync(counter, "utf8").trim().split("\n");
@@ -343,10 +385,10 @@ test("gate: a failing gate becomes a blocking integration finding with the log t
     await setup.conductor.start();
     // The first candidate's gate fails; the phase repairs, and the repair
     // attempt's prompt is what must carry the log.
-    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("tail-line-70"), 90_000, 50, setup.runDir);
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("tail-line-70"), WAIT_MS, 50, setup.runDir);
     await waitFor(
       () => setup.conductor.state.phase.findings.some((f) => f.kind === "integration" && f.status === "open"),
-      30_000,
+      WAIT_MS,
       50,
       setup.runDir,
     );
@@ -390,7 +432,13 @@ test("gate: a failing gate becomes a blocking integration finding with the log t
   }
 });
 
-test("gate: a real reviewer's turn 1 and turn 2 prompts are told about the gate, turn 2 shown the failed record", async () => {
+// The reviewers' side of the rule (findings B-8/M-3): every reviewer prompt
+// says the conductor owns the gate evidence, and a reviewer is shown the
+// conductor's record when one exists. Two candidate cycles are needed for a
+// record to exist while reviews run, so this test waits for the *first*
+// prompt that carries it (turn 1 of candidate 2), not for turn 2's tail —
+// `gatePromptLines` covers the tail itself.
+test("gate: a reviewer is told the conductor owns the gate and shown the failed record", async () => {
   const dir = shortTmp("tt-gate-reviewer");
   const reviewerPrompts = path.join(dir, "reviewer-prompts.log");
   const lock = path.join(dir, "gate.lock");
@@ -426,11 +474,9 @@ test("gate: a real reviewer's turn 1 and turn 2 prompts are told about the gate,
   });
   try {
     await setup.conductor.start();
-    // Candidate 2's turn 2 is prompted after candidate 1's gate failed, so it
-    // must carry the conductor's record of that failure.
     await waitFor(
       () => fs.existsSync(reviewerPrompts) && fs.readFileSync(reviewerPrompts, "utf8").includes("Gate record for candidate"),
-      90_000,
+      WAIT_MS,
       50,
       setup.runDir,
     );
@@ -438,12 +484,10 @@ test("gate: a real reviewer's turn 1 and turn 2 prompts are told about the gate,
     assert.match(logged, /Never run the gate command yourself/);
     assert.match(logged, /Gate record for candidate/);
     assert.match(logged, /failed \(exit 4\)/);
-    assert.match(logged, /reviewer-visible-tail/);
-    // It is the conductor's record (its own sha256 and log path), not an
-    // agent's prose about one.
+    // It is the conductor's record (its own sha256), not an agent's prose.
     assert.match(logged, /log sha256 [a-f0-9]{64}/);
-    // Turn 1 learns the rule too (findings B-8/M-3): a reviewer that only
-    // learns it in turn 2 could demand or accept a substitute first.
+    // Every turn-1 prompt carries the rule: a reviewer that only learns it
+    // later could demand or accept a substitute first.
     const turn1Messages = logged.split("\n=====\n").filter((m) => m.includes("Turn 1 of 2"));
     assert.ok(turn1Messages.length > 0, "expected at least one turn-1 prompt in the log");
     for (const m of turn1Messages) {
@@ -508,7 +552,7 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
     );
 
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", WAIT_MS, 50, setup.runDir);
 
     const C = setup.conductor.state.phase.candidate!.sha;
     const reused = gateRecordAt(setup.runDir, C);
@@ -537,70 +581,6 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
   }
 });
 
-test("gate: a passing record whose log no longer hashes to it is not evidence, so the gate reruns", async () => {
-  const dir = shortTmp("tt-gate-unverified");
-  const marker = path.join(dir, "ran.marker");
-  const lock = path.join(dir, "gate.lock");
-  const command = `touch ${marker}; exit 9`;
-  const setup = await setupConductor({
-    checks: ["true"],
-    workerScript,
-    reviewerScriptFor,
-    gate: command,
-    gateLockPath: lock,
-    deadlines: FAST_DEADLINES,
-  });
-  try {
-    // A record that *claims* a pass for the candidate's tree, with no log
-    // behind it and a hash matching nothing (a pruned or hand-edited run
-    // dir): the conductor must not accept it — the gate runs instead.
-    const tree = execFileSync("git", ["-C", setup.repo.dir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
-    const sourceSha = "fadedfadedfaded1";
-    const sourceDir = path.join(runPaths(setup.runDir).checks, sourceSha);
-    fs.mkdirSync(sourceDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(sourceDir, "gate.json"),
-      `${JSON.stringify(
-        {
-          candidateSha: sourceSha,
-          tree,
-          baseSha: "0".repeat(40),
-          command,
-          startedAt: "2026-09-25T00:00:00.000Z",
-          durationMs: 900_000,
-          exitCode: 0,
-          timedOut: false,
-          passed: true,
-          logSha256: "c".repeat(64),
-          logBytes: 10,
-        },
-        null,
-        2,
-      )}\n`,
-    );
-
-    await setup.conductor.start();
-    await waitFor(
-      () => setup.conductor.state.phase.findings.some((f) => f.kind === "integration" && f.status === "open"),
-      90_000,
-      50,
-      setup.runDir,
-    );
-    assert.ok(fs.existsSync(marker), "an unverifiable record must not stop the gate command from running");
-    const finding = setup.conductor.state.phase.findings.find((f) => f.kind === "integration" && f.status === "open")!;
-    const record = gateRecordAt(setup.runDir, finding.boundCandidateSha);
-    assert.equal(record.exitCode, 9);
-    assert.equal(record.passed, false);
-    assert.notEqual(record.reused, true);
-  } finally {
-    await setup.conductor.stop();
-    cleanupDir(setup.runRoot);
-    cleanupDir(setup.scriptsDir);
-    cleanupDir(setup.repo.dir);
-    cleanupDir(dir);
-  }
-});
-
 test("gate: two conductors sharing the machine-wide lock never gate at once (the second waits)", async () => {
   const dir = shortTmp("tt-gate-lock");
   const lock = path.join(dir, "gate.lock");
@@ -608,7 +588,7 @@ test("gate: two conductors sharing the machine-wide lock never gate at once (the
   // A gate command that proves exclusivity twice: an O_EXCL-style marker (a
   // concurrent gate would find it and fail with exit 7), and its own wall
   // clock window (recorded in gate.json).
-  const command = `if [ -e ${marker} ]; then echo OVERLAP; exit 7; fi; touch ${marker}; sleep 2.5; rm -f ${marker}; echo gate-ok`;
+  const command = `if [ -e ${marker} ]; then echo OVERLAP; exit 7; fi; touch ${marker}; sleep 1.5; rm -f ${marker}; echo gate-ok`;
   const mk = () =>
     setupConductor({
       checks: ["true"],
@@ -622,7 +602,7 @@ test("gate: two conductors sharing the machine-wide lock never gate at once (the
   const b = await mk();
   try {
     await Promise.all([a.conductor.start(), b.conductor.start()]);
-    await waitFor(() => a.conductor.state.phase.phase === "DONE" && b.conductor.state.phase.phase === "DONE", 90_000, 50, a.runDir);
+    await waitFor(() => a.conductor.state.phase.phase === "DONE" && b.conductor.state.phase.phase === "DONE", WAIT_MS, 50, a.runDir);
     const recA = gateRecordAt(a.runDir, a.conductor.state.phase.candidate!.sha);
     const recB = gateRecordAt(b.runDir, b.conductor.state.phase.candidate!.sha);
     assert.equal(recA.exitCode, 0, "the first gate must not have seen another gate's marker");
@@ -648,6 +628,11 @@ test("gate: two conductors sharing the machine-wide lock never gate at once (the
   }
 });
 
+// One run covers two things: a gate killed at its limit is a failed gate, and
+// a passing record whose log no longer hashes to it is not evidence — the
+// conductor must run the command rather than accept the record. The fabricated
+// record claims a pass for the candidate's tree with no log behind it; the
+// hanging command is what proves the gate ran (and was killed), not reused.
 test("gate: a gate exceeding its limit is killed and reported as a failed gate", async () => {
   const dir = shortTmp("tt-gate-kill");
   const lock = path.join(dir, "gate.lock");
@@ -660,21 +645,56 @@ test("gate: a gate exceeding its limit is killed and reported as a failed gate",
     deadlines: { ...FAST_DEADLINES, gateMs: 800, termGraceMs: 300 },
   });
   try {
+    // A record that *claims* a pass for the candidate's tree, with a hash that
+    // matches nothing and no log file (a pruned or hand-edited run dir).
+    const tree = execFileSync("git", ["-C", setup.repo.dir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    const sourceSha = "fadedfadedfaded1";
+    const sourceDir = path.join(runPaths(setup.runDir).checks, sourceSha);
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sourceDir, "gate.json"),
+      `${JSON.stringify(
+        {
+          candidateSha: sourceSha,
+          tree,
+          baseSha: "0".repeat(40),
+          command: "echo starting-gate; sleep 30",
+          startedAt: "2026-09-25T00:00:00.000Z",
+          durationMs: 900_000,
+          exitCode: 0,
+          timedOut: false,
+          passed: true,
+          logSha256: "c".repeat(64),
+          logBytes: 10,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
     await setup.conductor.start();
+    // The killed gate's finding is open only until the next candidate's probe
+    // passes, so capture it (and its candidate) the moment it appears.
     await waitFor(
       () => setup.conductor.state.phase.findings.some((f) => f.kind === "integration" && f.status === "open"),
-      90_000,
+      WAIT_MS,
       50,
       setup.runDir,
     );
-    const C = setup.conductor.state.phase.candidate!.sha;
+    const finding = setup.conductor.state.phase.findings.find((f) => f.kind === "integration" && f.status === "open")!;
+    assert.equal(finding.severity, "blocking");
+    assert.equal(finding.raisedBy, "conductor");
+    assert.match(finding.evidence, /killed at its limit/);
+    // The gate ran for the finding's candidate (the unverifiable record was
+    // not reused), and its own fresh record says it was killed.
+    const C = finding.boundCandidateSha;
     const record = gateRecordAt(setup.runDir, C);
+    assert.equal(record.candidateSha, C);
+    assert.equal(record.reused, undefined, "an unverifiable record must not be reused");
     assert.equal(record.timedOut, true, "the gate must be killed at its limit");
     assert.equal(record.passed, false);
     assert.ok(record.durationMs < 10_000, `expected a prompt kill, took ${record.durationMs}ms`);
-    const finding = setup.conductor.state.phase.findings.find((f) => f.kind === "integration" && f.status === "open");
-    assert.ok(finding, "a killed gate must be a failed gate with a blocking finding");
-    assert.match(finding.evidence, /killed at its limit/);
+    assert.match(fs.readFileSync(path.join(runPaths(setup.runDir).checks, C, "gate.log"), "utf8"), /starting-gate/);
     assert.notEqual(setup.conductor.state.phase.phase, "DONE");
   } finally {
     await setup.conductor.stop();
@@ -683,4 +703,5 @@ test("gate: a gate exceeding its limit is killed and reported as a failed gate",
     cleanupDir(setup.repo.dir);
     cleanupDir(dir);
   }
+});
 });

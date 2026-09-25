@@ -4935,16 +4935,16 @@ export const DIRECTIVE_BINDING_STATEMENT =
 export const GATE_BINDING_STATEMENT =
   "The conductor runs the phase's gate command itself, once, after the checks, the probe and all three reviews pass, and only its record (checks/<sha>/gate.json) counts as the live proof. Never run the gate command yourself, and never report, substitute or fabricate its evidence.";
 
-/** Plan 01f: the gate section a prompt carries — the binding statement, the
- * command when the contract declares one, and the record when one exists
- * (facts only; `tail` adds the log's last lines for a failed record). Empty
- * only when the phase has no gate and no record. */
+/** Plan 01f: the gate section a prompt carries — the binding statement
+ * (always: no agent may run the gate or substitute its evidence, gate or no
+ * gate), the command when the contract declares one, and the record when one
+ * exists (facts only; `tail` adds the log's last lines for a failed
+ * record). */
 export function gatePromptLines(
   gate: string | undefined,
   record?: GateRecord,
   tail?: string,
 ): string[] {
-  if (!gate && !record) return [];
   const lines = ["", GATE_BINDING_STATEMENT];
   if (gate) lines.push(`The phase's gate command is: \`${gate}\``);
   if (record) {
@@ -5022,10 +5022,8 @@ export function buildWorkerPrompt(
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
   lines.push(...directiveLines(directives));
   // Plan 01f: the gate is the conductor's proof to produce, never the
-  // worker's (runtime doc §6's structural incentive to substitute it). The
-  // rule is stated for every phase — a substitute is never welcome, gate or
-  // no gate — and the command is named when the contract declares one.
-  lines.push("", GATE_BINDING_STATEMENT, ...(contract.gate ? [`The phase's gate command is: \`${contract.gate}\``] : []));
+  // worker's (runtime doc §6's structural incentive to substitute it).
+  lines.push(...gatePromptLines(contract.gate));
   if (interruptionNote) lines.push("", interruptionNote);
   if (repair) {
     lines.push(
