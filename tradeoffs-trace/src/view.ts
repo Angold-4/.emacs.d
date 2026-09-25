@@ -8,8 +8,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimeline, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
+import { effectiveChecks } from "./core/checks.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
-import { baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
+import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 import { notAcceptedReasons, reviewerOutcomes, type ReviewerOutcome } from "./core/verdict.ts";
 import type { PhaseState } from "./core/types.ts";
 
@@ -331,8 +332,12 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
 
   // Plan 01e: the base's own baseline, read from `<run>/checks/base/`; a
   // candidate's passing checks that leaned on it are shown as such, and the
-  // base's failures get their own status line (D2).
-  const baseline = readBaseline(runDir);
+  // base's failures get their own status line (D2). It is only trusted when it
+  // covers the phase's *current* effective check list: after a contract
+  // amendment changes a check, the gate (and the prompts) no longer use this
+  // record, so the status must not claim a baseline-tolerated pass either.
+  const record = readBaseline(runDir);
+  const baseline = baselineCoversCommands(record, effectiveChecks(plan.checks, phase.contract.checks)) ? record : undefined;
   const gate = (r: { candidateSha: string; passed?: boolean } | undefined, reused = false) =>
     !r || r.candidateSha !== C ? "⧗" : r.passed === true ? `✓${reused ? " (reused)" : ""}` : r.passed === false ? "✗" : "⧗";
   /** ` (base has N failures)` only on the current candidate's passed checks,

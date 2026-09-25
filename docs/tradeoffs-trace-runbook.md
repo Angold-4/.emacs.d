@@ -20,6 +20,8 @@ implement ─▶ freeze ─▶ checks ─▶ probe ─▶ review (M, A, B) ─�
 - **Freeze:** commits the worktree as the candidate.
 - **Checks:** run the plan's check command on a fresh checkout of the candidate. Failures the base already had do not count against it (see *Pre-existing check failures* below).
 - **Probe:** merges the candidate onto the current integration branch and runs the checks again. It reuses the check results when the tree is identical.
+- **Review:** three independent reviewers. In turn 1 each finds decisions in the diff. At a barrier they see each other's discoveries. In turn 2 they vote on every decision and raise findings. M holds a veto; otherwise 2 of 3 decide.
+- **Publish:** fast-forwards the plan's integration branch in the **local** repository. Nothing is pushed.
 
 ## Pre-existing check failures (the base baseline)
 
@@ -36,18 +38,23 @@ its exit status, duration, and the failing test names it can parse. Names are
 parsed from the three runners plans actually use — cargo
 (`test <name> ... FAILED`), node:test (`not ok N - <name>` under
 `--test-reporter=tap`, and the default spec reporter's `✖ <name>`) and ERT
-(`FAILED <name>`). Output that names no test parses to nothing.
+(`FAILED <name>`). Output that names no test parses to nothing, and **only a
+command that ran to completion and exited non-zero may contribute names**: a
+timeout's output is truncated, a signal death (the OOM killer's `SIGKILL`, a
+`SIGSEGV`) never printed its last failure, and a command that exited 0 did not
+fail at all — none of those three can put a name into the set that excuses a
+candidate's check.
 
 - **D2 default — no new failures:** a candidate's failing check still counts as
-  passing when every failing test it names also failed on the base, and at
-  least one name was parsed. The status says
+  passing when every failing test it names also failed on the base *for that
+  same command*, and at least one name was parsed. The status says
   `checks ✓ (base has 1 failures)`. Any test the base did not fail fails the
   gate, and the new names are recorded with the check's completion and in a
   `check_failure_new` record.
 - **Strict fallback:** a check whose failing output yields no parsable test name
-  (a compile error, a timeout, an integrity violation) always fails. A baseline
-  can therefore only ever *reduce* the failures blamed on a candidate — a new
-  failure is never hidden.
+  (a compile error, a timeout, a signal death, an integrity violation) always
+  fails. A baseline can therefore only ever *reduce* the failures blamed on a
+  candidate — a new failure is never hidden.
 - **The integration probe still judges strictly** (it is the last gate before
   publish). In the normal fast-forward case it reuses the candidate's passed
   checks instead of running them again, so a pre-existing failure does not
@@ -55,20 +62,26 @@ parsed from the three runners plans actually use — cargo
   check there fails the probe.
 - **The worker and the reviewers are told.** The worker's prompt and each
   reviewer's turn-2 prompt list the base's failing tests as "Pre-existing check
-  failures on the phase base (NOT this phase's to fix)", so neither tries to
-  fix them nor raises them as a defect.
-- **It is paid for once per base tree.** The record is keyed by the base tree
-  plus the effective check list; a program node with the same base and the same
-  checks reuses a sibling node's record (under
-  `programs/<id>/baselines/<key>/`) instead of running the checks again, and a
-  run restarted after a crash reuses its own. The base itself is never edited,
-  and the gate still runs on the candidate.
+  failures on the phase base (NOT this phase's to fix)", each under the command
+  it failed in, so neither tries to fix them nor raises them as a defect — and
+  a name from one command is never mistaken for a licence to fail it in
+  another.
+- **It is paid for once per base tree.** The record carries the base's full
+  tree id, and the key is that tree plus the effective check list; a program
+  node with the same base and the same checks reuses a sibling node's record
+  (under `programs/<id>/baselines/<key>/`) instead of running the checks again,
+  and a run restarted after a crash reuses its own. Two nodes that start in the
+  same parallel wave cannot both pay: the first to take a lock under that
+  directory runs it, the others wait for the record it publishes (a holder that
+  died is detected by its pid and age, so a stale lock never wedges a run). The
+  base itself is never edited, and the gate still runs on the candidate. A
+  record that no longer covers the phase's current check list — after a
+  contract amendment changes one — is not trusted by the gate, the prompts or
+  the status.
 
 When the base fails, the status shows `base fails: N tests: <names>` — or
 `base fails: 0 tests (no test names parsed; checks stay strict)` when its
 failing output names none.
-- **Review:** three independent reviewers. In turn 1 each finds decisions in the diff. At a barrier they see each other's discoveries. In turn 2 they vote on every decision and raise findings. M holds a veto; otherwise 2 of 3 decide.
-- **Publish:** fast-forwards the plan's integration branch in the **local** repository. Nothing is pushed.
 
 ## Prerequisites
 

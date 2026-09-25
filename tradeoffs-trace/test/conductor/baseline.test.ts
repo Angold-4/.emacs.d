@@ -292,13 +292,16 @@ test("baseline: the worker prompt and the reviewers' turn-2 prompt carry the bas
     );
     const worker = fs.readFileSync(workerPromptLog, "utf8");
     assert.match(worker, /Pre-existing check failures on the phase base \(NOT this phase's to fix\)/);
-    assert.match(worker, /- base X fails/);
+    // The names are shown under the command they failed in, so the prompt's
+    // promise matches the gate's per-command rule (finding A-5).
+    assert.match(worker, /- `node --test`: base X fails/);
+    assert.match(worker, /for that same command/);
     for (const r of ["M", "A", "B"] as Reviewer[]) {
       const prompts = fs.readFileSync(path.join(dir, `${r}.prompts.log`), "utf8").split("\n=====\n");
       const turn2 = prompts.find((p) => p.includes("Turn 2 of 2"));
       assert.ok(turn2, `${r}'s turn 2 was captured`);
       assert.match(turn2!, /Pre-existing check failures on the phase base/);
-      assert.match(turn2!, /- base X fails/);
+      assert.match(turn2!, /- `node --test`: base X fails/);
     }
   } finally {
     await setup.conductor.stop();
@@ -311,10 +314,18 @@ test("baseline: the worker prompt and the reviewers' turn-2 prompt carry the bas
 test("baseline: the pre-existing prompt section is pure, and absent when the base has no parsed failures", () => {
   assert.deepEqual(baselinePromptLines([]), []);
   assert.deepEqual(baselinePromptLines(undefined), []);
-  const section = baselinePromptLines(["x", "y"]).join("\n");
+  const command = (c: string, failures: string[]) => ({ command: c, exitCode: 1, signal: null, timedOut: false, durationMs: 1, failures });
+  const section = baselinePromptLines([command("make check", ["x", "y"]), command("cargo test", ["z"])]).join("\n");
   assert.match(section, /Pre-existing check failures on the phase base \(NOT this phase's to fix\)/);
-  assert.match(section, /- x/);
-  assert.match(section, /- y/);
+  assert.match(section, /- `make check`: x, y/);
+  assert.match(section, /- `cargo test`: z/);
+  // A command that exited 0, timed out or died by signal is not a baseline
+  // failure, so it never reaches the prompt (findings M-2, B-1).
+  const notAFailure = baselinePromptLines([
+    { command: "wrapped", exitCode: 0, signal: null, timedOut: false, durationMs: 1, failures: ["q"] },
+    { command: "killed", exitCode: null, signal: "SIGKILL", timedOut: false, durationMs: 1, failures: ["r"] },
+  ]);
+  assert.deepEqual(notAFailure, []);
 
   const contract = buildContract({
     id: "p1",
@@ -324,8 +335,126 @@ test("baseline: the pre-existing prompt section is pure, and absent when the bas
     boundaries: [],
     reserved: [],
   });
-  assert.match(buildWorkerPrompt(contract, undefined, undefined, undefined, [], [], undefined, ["x"]), /- x/);
+  const worker = buildWorkerPrompt(contract, undefined, undefined, undefined, [], [], undefined, [command("node --test", ["x"])]);
+  assert.match(worker, /- `node --test`: x/);
   assert.ok(!buildWorkerPrompt(contract).includes("Pre-existing check failures"));
+});
+
+test("baseline: a base command that exits 0 contributes no names, even if it printed a FAILED line", async () => {
+  const counter = `/tmp/tt-baseline-exit0-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  // Run 1 (the baseline) prints the FAILED line but exits 0; run 2 (the
+  // candidate) prints it and exits 1. A wrapper like `cargo test || echo done`
+  // must not smuggle the name into the excuse set (finding M-2).
+  const command =
+    `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${counter};` +
+    ` echo 'test pre_existing_x ... FAILED'; if [ $n -ge 2 ]; then exit 1; fi`;
+  const setup = await setupConductor({
+    checks: [command],
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);
+    const record = baselineRecord(setup.runDir);
+    assert.equal(record.commands[0].exitCode, 0, "the base command exited 0");
+    assert.deepEqual(record.failures, [], "a command that exited 0 names no pre-existing failure");
+    assert.ok(!eventTypes(setup.runDir).includes("CHECKS_PASSED"), "the candidate's own failure must fail the gate");
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "check_failures_pre_existing").length, 0);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
+});
+
+test("baseline: a check killed by a signal is never excused, even when its output names only base failures", async () => {
+  const counter = `/tmp/tt-baseline-signal-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  // Run 1 (the baseline) fails normally with baseX. Run 2 (the candidate)
+  // prints the very same line and is then SIGKILLed — `exitCode: null` with a
+  // non-null signal, `timedOut` false. Its truncated output names only a
+  // pre-existing failure, so only the strict rule may be applied.
+  const command =
+    `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${counter};` +
+    ` echo 'test baseX ... FAILED'; if [ $n -eq 1 ]; then exit 1; fi; kill -KILL $$`;
+  const setup = await setupConductor({
+    checks: [command],
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);
+    const record = baselineRecord(setup.runDir);
+    assert.deepEqual(record.commands[0].failures, ["baseX"], "the base failed normally, so its name is recorded");
+    assert.ok(!eventTypes(setup.runDir).includes("CHECKS_PASSED"), "a signal death must never pass the gate");
+    assert.equal(
+      readEvents(setup.runDir).filter((r) => r.kind === "check_failures_pre_existing").length,
+      0,
+      "a signal-killed check is never recorded as pre-existing",
+    );
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
+});
+
+test("baseline: a node waits for the lock holder's record instead of running the checks again", async () => {
+  const counter = `/tmp/tt-baseline-lock-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  const command = `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${counter}; echo 'test pre_existing_x ... FAILED'; exit 1`;
+  const count = () => (fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8").trim()) : 0);
+  const setup = await setupConductor({
+    checks: [command],
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  const programId = "prog-baseline-lock";
+  fs.writeFileSync(path.join(setup.runDir, "program.json"), JSON.stringify({ programId, node: "n1" }));
+  const tree = git(setup.repo.dir, ["rev-parse", "HEAD^{tree}"]);
+  const baseSha = git(setup.repo.dir, ["rev-parse", "HEAD"]);
+  const key = baselineKey(tree, [command]);
+  const shared = path.join(path.dirname(setup.runDir), "programs", programId, "baselines", key);
+  fs.mkdirSync(shared, { recursive: true });
+  // A live holder (this test process) has already taken the lock. The node
+  // must wait for its record rather than pay for the base check run again.
+  fs.writeFileSync(path.join(shared, "lock.json"), JSON.stringify({ pid: process.pid, at: Date.now() }));
+  await setup.conductor.start();
+  try {
+    setTimeout(() => {
+      fs.writeFileSync(
+        path.join(shared, "baseline.json"),
+        JSON.stringify({
+          baseSha,
+          tree,
+          key,
+          at: new Date().toISOString(),
+          commands: [{ command, exitCode: 1, signal: null, timedOut: false, durationMs: 1, failures: ["pre_existing_x"] }],
+          failures: ["pre_existing_x"],
+        }),
+      );
+    }, 500);
+    await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_PASSED"), 90_000, undefined, setup.runDir);
+    assert.equal(count(), 1, "the node waited for the shared record instead of running the baseline itself");
+    const record = baselineRecord(setup.runDir);
+    assert.deepEqual(record.failures, ["pre_existing_x"]);
+    const reused = baselineEvents(setup.runDir).find((e) => e.reused === true);
+    assert.ok(reused, "the adopted record is logged as reused");
+    assert.equal(reused!.source, "program");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
 });
 
 test("baseline: runs once per base tree — a second program node with the same base reuses the shared record", async () => {

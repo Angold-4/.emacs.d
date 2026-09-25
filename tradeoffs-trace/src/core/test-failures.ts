@@ -35,12 +35,27 @@ export interface BaselineCommand {
 export interface Baseline {
   /** The base commit the checks ran on. */
   baseSha: string;
+  /** The base commit's **full** tree object id — what "the same base" really
+   * means. A program node whose branch is another commit with this same tree
+   * reuses the record; `key`'s shortened tree prefix is only a file name, never
+   * the identity a reuse decision is based on. */
+  tree: string;
   /** `baselineKey` of that base: its tree plus the effective command list. */
   key: string;
   at: string;
   commands: BaselineCommand[];
   /** Every failing test name across `commands`, deduped, in order. */
   failures: string[];
+}
+
+/** True iff the command ran to completion and exited non-zero. Only this shape
+ * may contribute an excuse: a timeout's output is truncated, a signal death
+ * (SIGKILL from the OOM killer, SIGSEGV) never printed its last failure, and a
+ * command that exited 0 did not fail at all — in all three cases its
+ * `FAILED`-looking lines could not be trusted to name the base's whole failure
+ * set. */
+export function failedNormally(command: { exitCode: number | null; signal?: string | null; timedOut: boolean }): boolean {
+  return command.exitCode !== null && command.exitCode !== 0 && command.signal == null && !command.timedOut;
 }
 
 /** A stable, filesystem-safe key for "the same base": the base tree's object
@@ -138,6 +153,24 @@ export function classifyCheckFailure(output: string, baseFailures: readonly stri
   return { parsed, newFailures, excused: parsed.length > 0 && newFailures.length === 0 };
 }
 
+/** The baseline commands whose failures the prompts may name as pre-existing:
+ * the ones that failed normally (see `failedNormally`) and yielded parsable
+ * names — exactly the set the gate would excuse, so the prompt's promise and
+ * the gate's rule are the same rule. */
+export function baselineFailedCommands(commands: readonly BaselineCommand[]): BaselineCommand[] {
+  return commands.filter((c) => c.failures.length > 0 && failedNormally(c));
+}
+
+/** True iff `baseline` was taken over exactly this ordered command list — the
+ * status view's guard, so a record from before a contract amendment (a check
+ * changed) is not shown as the current pass's baseline. The conductor's own
+ * reuse check is stricter still (same full base tree, masked forms); this one
+ * is what a read-only view, which has no repo access, can honestly verify. */
+export function baselineCoversCommands(baseline: Baseline | undefined, commands: readonly string[]): boolean {
+  if (!baseline || baseline.commands.length !== commands.length) return false;
+  return baseline.commands.every((c, i) => c.command === commands[i]);
+}
+
 /** Every failing test name across a baseline's commands, deduped, in order. */
 export function baselineFailureNames(commands: readonly BaselineCommand[]): string[] {
   const seen = new Set<string>();
@@ -176,6 +209,9 @@ export function parseBaseline(value: unknown): Baseline | undefined {
   const stored = Array.isArray(raw.failures) ? raw.failures.filter((f): f is string => typeof f === "string") : undefined;
   return {
     baseSha: raw.baseSha,
+    // A record written before the tree field existed has no identity to trust,
+    // so it can never be reused (a caller comparing it sees "" ≠ any tree).
+    tree: typeof raw.tree === "string" ? raw.tree : "",
     key: raw.key,
     at: typeof raw.at === "string" ? raw.at : "",
     commands,
@@ -189,7 +225,7 @@ export function parseBaseline(value: unknown): Baseline | undefined {
  * failing output yields none says so, because the checks then stay strict. */
 export function baselineStatusLine(baseline: Baseline | undefined): string | undefined {
   if (!baseline) return undefined;
-  const failed = baseline.commands.some((c) => c.timedOut || c.exitCode !== 0);
+  const failed = baseline.commands.some((c) => c.timedOut || c.exitCode !== 0 || c.signal != null);
   if (!failed) return undefined;
   const names = baseline.failures;
   if (names.length === 0) return "base fails: 0 tests (no test names parsed; checks stay strict)";

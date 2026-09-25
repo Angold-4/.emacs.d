@@ -7,10 +7,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  baselineCoversCommands,
+  baselineFailedCommands,
   baselineFailureNames,
   baselineKey,
   baselineStatusLine,
   classifyCheckFailure,
+  failedNormally,
   parseBaseline,
   parseTestFailures,
   type Baseline,
@@ -143,6 +146,27 @@ test("test-failures: the baseline key depends on the base tree and the command l
   assert.notEqual(baselineKey(tree, ["make check"]), baselineKey("f".repeat(40), ["make check"]));
 });
 
+test("test-failures: a record no longer covering the effective check list is not trusted by the status", () => {
+  const record: Baseline = {
+    baseSha: "a".repeat(40),
+    tree: "t".repeat(40),
+    key: "k",
+    at: "",
+    commands: [
+      { command: "make check", exitCode: 1, timedOut: false, durationMs: 5, failures: ["x"] },
+      { command: "cargo test --workspace", exitCode: 101, timedOut: false, durationMs: 5, failures: ["y"] },
+    ],
+    failures: ["x", "y"],
+  };
+  assert.equal(baselineCoversCommands(record, ["make check", "cargo test --workspace"]), true);
+  // An amended contract changed the list: the record no longer describes what
+  // the gate runs, so the status must not show it (finding A-6).
+  assert.equal(baselineCoversCommands(record, ["make check", "make test"]), false);
+  assert.equal(baselineCoversCommands(record, ["make check"]), false);
+  assert.equal(baselineCoversCommands(record, ["make check", "cargo test --workspace", "extra"]), false);
+  assert.equal(baselineCoversCommands(undefined, ["make check"]), false);
+});
+
 test("test-failures: baselineFailureNames dedupes across commands, in order", () => {
   const commands: BaselineCommand[] = [
     { command: "cargo test", exitCode: 101, timedOut: false, durationMs: 5, failures: ["x", "y"] },
@@ -151,9 +175,26 @@ test("test-failures: baselineFailureNames dedupes across commands, in order", ()
   assert.deepEqual(baselineFailureNames(commands), ["x", "y", "z"]);
 });
 
+test("test-failures: only a completed non-zero exit may put names in the excuse set", () => {
+  assert.equal(failedNormally({ exitCode: 1, signal: null, timedOut: false }), true);
+  assert.equal(failedNormally({ exitCode: 0, signal: null, timedOut: false }), false, "exit 0 did not fail");
+  assert.equal(failedNormally({ exitCode: null, signal: "SIGKILL", timedOut: false }), false, "a signal death printed no ending");
+  assert.equal(failedNormally({ exitCode: 1, signal: null, timedOut: true }), false, "a timeout's output is truncated");
+  // A command that exits 0 while printing FAILED lines (a `|| echo done`
+  // wrapper) must not contribute names, and a signal death must not either.
+  const commands: BaselineCommand[] = [
+    { command: "wrapped", exitCode: 0, signal: null, timedOut: false, durationMs: 5, failures: ["x"] },
+    { command: "oom", exitCode: null, signal: "SIGKILL", timedOut: false, durationMs: 5, failures: ["y"] },
+    { command: "real", exitCode: 1, signal: null, timedOut: false, durationMs: 5, failures: ["z"] },
+  ];
+  const shown = baselineFailedCommands(commands);
+  assert.deepEqual(shown.map((c) => c.command), ["real"], "only the normally-failed command is named as pre-existing");
+});
+
 test("test-failures: the status line reports a failing base, and nothing for a passing one", () => {
   const failing: Baseline = {
     baseSha: "a".repeat(40),
+    tree: "t".repeat(40),
     key: "k",
     at: "",
     commands: [{ command: "cargo test", exitCode: 101, timedOut: false, durationMs: 5, failures: ["x", "y"] }],
@@ -184,10 +225,16 @@ test("test-failures: parseBaseline rejects junk and recomputes a missing aggrega
   assert.equal(parseBaseline({ key: "k" }), undefined);
   const parsed = parseBaseline({
     baseSha: "a".repeat(40),
+    tree: "b".repeat(40),
     key: "k",
     at: "t",
     commands: [{ command: "cargo test", exitCode: 1, failures: ["x"] }],
   });
   assert.ok(parsed);
   assert.deepEqual(parsed!.failures, ["x"]);
+  assert.equal(parsed!.tree, "b".repeat(40));
+  // A record written before the tree field existed has no identity to trust:
+  // it parses, but as the empty tree — never equal to a real base's tree.
+  const legacy = parseBaseline({ baseSha: "a", key: "k", commands: [] });
+  assert.equal(legacy!.tree, "");
 });
