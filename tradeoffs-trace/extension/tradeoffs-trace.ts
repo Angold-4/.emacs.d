@@ -341,7 +341,7 @@ export default function (pi: ExtensionAPI) {
     submit_discovery:
       "You have not called submit_discovery yet. List the behavioural choices you see in the diff and call submit_discovery before finishing. Do not call any other submission tool in this turn.",
     submit_review:
-      "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every decision listed in the prompt (ones marked carried are optional), your findings, and your statements. submit_review is the only submission tool you may use now.",
+      "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every record the prompt lists as delegated or reserved and does not mark carried — the conductor rejects a review that omits one, names the missing ids and their choices, and expects you to resubmit — plus your findings and your statements. submit_review is the only submission tool you may use now.",
   };
 
   pi.on("session_start", async () => {
