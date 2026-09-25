@@ -71,7 +71,7 @@ import {
   verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
-import { redactText, resolveSecrets, secretNames, secretPromptLines, type Secret } from "./effects/secrets.ts";
+import { redactBytes, redactJson, redactText, resolveSecrets, secretNames, secretPromptLines, type Secret } from "./effects/secrets.ts";
 // Plan 01a: the secret guard itself lives with the other `sh` guards (they
 // are wired into the agent's `tool_call` hook, and the conductor reuses the
 // same refusal at the socket, where a scripted agent's commands arrive).
@@ -375,8 +375,12 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   // prefix); a missing one is skipped and noted rather than failing the run.
   // Plan 01a: a document that quotes a declared secret is copied redacted —
   // the vendor reference docs of atlas plan 13 held the keys themselves
-  // (runtime doc §7), and every agent can read these copies.
-  const { secrets } = resolveSecrets(secretNames(plan.secrets));
+  // (runtime doc §7), and every agent can read these copies. A value is
+  // replaced in UTF-8, UTF-16LE and UTF-16BE, so a doc saved as UTF-16 (which
+  // is not text by the NUL test) cannot slip through; a document in any other
+  // binary shape is NOT copied at all — a leak that cannot be verified is
+  // worse than a missing reference, and it is named in refs/MISSING.txt.
+  const { maskable } = resolveSecrets(secretNames(plan.secrets));
   const refs = plan.references ?? [];
   if (refs.length > 0) {
     fs.mkdirSync(p.refs, { recursive: true });
@@ -392,8 +396,15 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
       used.add(name);
       const dest = path.join(p.refs, name);
       const buf = fs.readFileSync(src);
-      if (secrets.length === 0 || buf.includes(0)) fs.writeFileSync(dest, buf);
-      else fs.writeFileSync(dest, redactText(buf.toString("utf8"), secrets));
+      const redacted = maskable.length > 0 ? redactBytes(buf, maskable) : buf;
+      // Only when this run declares secrets is an unverifiable copy a risk: a
+      // plan that declares none has nothing to mask, and its binary references
+      // are copied exactly as before.
+      if (maskable.length > 0 && buf.includes(0) && redacted.equals(buf)) {
+        missing.push(`${src} (binary, not copied: its bytes cannot be searched for a secret value)`);
+        return;
+      }
+      fs.writeFileSync(dest, redacted);
     });
     if (missing.length > 0) fs.writeFileSync(path.join(p.refs, "MISSING.txt"), `${missing.join("\n")}\n`);
   }
@@ -572,12 +583,16 @@ export class Conductor {
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #probeReuse: boolean;
-  /** Plan 01a: the plan's declared secret names, the values resolved from
-   * the conductor's own environment at start, and the declared names that
-   * were unset then (reported by `tt status`, never a reason not to run). */
+  /** Plan 01a: the plan's declared secret names; the values resolved from
+   * the conductor's own environment at start (`#secretValues` is every set
+   * value, for the agents' environment; `#secretMaskable` is the subset long
+   * enough to mask and to match in a command); and the names that were unset
+   * or unusable then (reported by `tt status`, never a reason not to run). */
   #secretNames: string[] = [];
-  #secrets: Secret[] = [];
+  #secretValues: Secret[] = [];
+  #secretMaskable: Secret[] = [];
   #missingSecrets: string[] = [];
+  #tooShortSecrets: string[] = [];
   #log!: EventLog;
   #lock: Lock | undefined;
   #socket!: RunSocketServer;
@@ -712,9 +727,11 @@ export class Conductor {
     // unset is recorded and reported — the run still starts.
     this.#secretNames = secretNames(this.#plan.secrets);
     const resolved = resolveSecrets(this.#secretNames);
-    this.#secrets = resolved.secrets;
+    this.#secretValues = resolved.values;
+    this.#secretMaskable = resolved.maskable;
     this.#missingSecrets = resolved.missing;
-    this.#log = new EventLog(this.#paths.events, this.#secrets);
+    this.#tooShortSecrets = resolved.tooShort;
+    this.#log = new EventLog(this.#paths.events, this.#secretMaskable);
 
     // design §2.1: assert the Pi version before ever launching it — but
     // only when the real `pi` binary is actually going to be used for at
@@ -813,12 +830,13 @@ export class Conductor {
    * changes (a restart with the variable now exported), so `tt status` shows
    * the current truth without the log growing a record per start. */
   #recordSecrets(): void {
-    const record = { declared: this.#secretNames, missing: this.#missingSecrets };
+    const record = { declared: this.#secretNames, missing: this.#missingSecrets, tooShort: this.#tooShortSecrets };
     const { records } = readLog(this.#paths.events);
     for (let i = records.length - 1; i >= 0; i--) {
       if (records[i].kind !== "secrets") continue;
-      const last = records[i].event as { declared?: unknown; missing?: unknown };
-      if (JSON.stringify(last.declared) === JSON.stringify(record.declared) && JSON.stringify(last.missing) === JSON.stringify(record.missing)) {
+      const last = records[i].event as { declared?: unknown; missing?: unknown; tooShort?: unknown };
+      const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+      if (same(last.declared, record.declared) && same(last.missing, record.missing) && same(last.tooShort, record.tooShort)) {
         return;
       }
       break;
@@ -1090,7 +1108,19 @@ export class Conductor {
     // design §9.3: an applied inbox command's event carries its inbox
     // command id, so recovery can tell "already applied" from the log
     // without a second record. reduce() ignores the extra field.
-    const logged: Event = commandId === undefined ? event : ({ ...event, commandId } as Event);
+    const raw: Event = commandId === undefined ? event : ({ ...event, commandId } as Event);
+    // Plan 01a: THIS is where agent-supplied text (a decision's choice, a
+    // finding's evidence, an owner's correction, a ballot's rationale) enters
+    // the conductor's in-memory state, and every prompt the conductor later
+    // sends is built from that state — the turn-2 reviewer prompt, the repair
+    // request, the views. Redacting only the copy written to `events.jsonl`
+    // would leave the raw value in memory and put it back in front of a model,
+    // and it would also make a restarted conductor's state (folded from the
+    // redacted log) differ from the live one. So the event is redacted once,
+    // here, before reduce(), and the log's own copy is redacted from the same
+    // event (`EventLog` keeps its own pass as a backstop for its other
+    // callers: intents, completions, sweeps).
+    const logged = redactJson(raw, this.#secretMaskable) as Event;
     const result = reduce(this.#state, logged);
     this.#log.append("event", logged);
     if (!result.ok) {
@@ -1146,7 +1176,9 @@ export class Conductor {
     const trimmed = reason.length > 500 ? `${reason.slice(0, 500)}…` : reason;
     this.#log.append("command_rejected", { commandId, reason: trimmed });
     try {
-      fs.writeFileSync(path.join(this.#paths.inboxRejected, `${commandId}.reason.txt`), `${trimmed}\n`);
+      // Plan 01a: a rejection reason can quote the offending field (a schema
+      // error names the value it refused), so the note on disk is redacted too.
+      fs.writeFileSync(path.join(this.#paths.inboxRejected, `${commandId}.reason.txt`), `${redactText(trimmed, this.#secretMaskable)}\n`);
     } catch (err) {
       this.#log.append("error", { where: "inbox_rejection_note", error: String((err as Error)?.message ?? err) });
     }
@@ -1488,7 +1520,7 @@ export class Conductor {
         // Plan 01a: a file path could hold a secret value; this writes to the
         // same stream file `pi-rpc.ts` redacts when it appends. `***NAME***`
         // holds no quote or backslash, so the line stays valid JSON.
-        fs.appendFileSync(streamFile, `${redactText(JSON.stringify(record), this.#secrets)}\n`);
+        fs.appendFileSync(streamFile, `${redactText(JSON.stringify(record), this.#secretMaskable)}\n`);
       } catch {
         // display only
       }
@@ -1719,6 +1751,17 @@ export class Conductor {
   }
 
   async #onSubmit(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
+    const result = await this.#onSubmitChecked(agentId, msg);
+    // Plan 01a: a rejection reason is delivered back to the model (the
+    // extension shows it as the tool's error), and a validation error quotes
+    // the field it refused — so the reason is redacted like every other text
+    // on its way to a prompt.
+    return result.reason === undefined || this.#secretMaskable.length === 0
+      ? result
+      : { ...result, reason: redactText(result.reason, this.#secretMaskable) };
+  }
+
+  async #onSubmitChecked(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
     const handle = this.#agents.get(agentId);
     if (!handle) return { ok: false, reason: "unknown agent" };
     if (msg.tool === "submit_phase") {
@@ -1762,6 +1805,16 @@ export class Conductor {
       const review = msg.args as Review;
       if (review.candidateSha !== this.#state.phase.candidate?.sha) {
         return { ok: false, reason: "submit_review candidateSha does not match the current candidate" };
+      }
+      // Plan 01a: a reproduction command is a command the conductor runs
+      // (design §8.1), so it is refused for the same reason an `sh` command
+      // is, in the same words, before anything is recorded. A reviewer has to
+      // write `$NAME`. (The value inside a *text* field — evidence, a ballot's
+      // rationale — is redacted rather than refused: quoting the output a value
+      // leaked into is legitimate evidence, and `***NAME***` keeps it useful.)
+      for (const fd of review.findings ?? []) {
+        const leak = fd.reproduction ? secretUseInCommand(fd.reproduction.command, this.#secretNames) : undefined;
+        if (leak !== undefined) return { ok: false, reason: leak };
       }
       if (!this.#stubReviews && !this.#discoverySubmitted.has(agentId)) {
         // Work packet 2a, design §6.1: turn 2 must not be accepted before
@@ -2300,7 +2353,7 @@ export class Conductor {
       // the agent's own environment. Set last: these win over any
       // test-injected env, so a guard always sees the run's real value.
       TT_SECRETS: this.#secretNames.join(" "),
-      ...Object.fromEntries(this.#secrets.map((s) => [s.name, s.value])),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
     };
 
     let helloResolve!: (r: HelloResult) => void;
@@ -2335,7 +2388,7 @@ export class Conductor {
       role: "worker",
       agentId,
       streamFile,
-      secrets: this.#secrets,
+      secrets: this.#secretMaskable,
       abortGraceMs: this.#deadlines.abortGraceMs,
       termGraceMs: this.#deadlines.termGraceMs,
       onEvent: (event) => {
@@ -2685,10 +2738,10 @@ export class Conductor {
     // Plan 01a: a check or probe command (and its output) may carry a secret
     // value — a vendor key a command echoes, or the plan's own check line.
     fs.writeFileSync(
-      path.join(outDir, `${sanitize(redactText(command, this.#secrets))}.log`),
+      path.join(outDir, `${sanitize(redactText(command, this.#secretMaskable))}.log`),
       redactText(
         `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
-        this.#secrets,
+        this.#secretMaskable,
       ),
     );
   }
@@ -2840,7 +2893,7 @@ export class Conductor {
       // Plan 01a: same secrets as the worker (a reviewer's reproduction
       // command or check run may need one) — names plus values, set last.
       TT_SECRETS: this.#secretNames.join(" "),
-      ...Object.fromEntries(this.#secrets.map((s) => [s.name, s.value])),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
       // Phase 1b work-packet item 6: a `tt start`-launched, CLI-driven
       // conductor has no in-process JS hook (unlike setupConductor's
       // `piEnvFor` callback in the test harness) that a static, on-disk
@@ -2906,7 +2959,7 @@ export class Conductor {
       role: "reviewer",
       agentId,
       streamFile,
-      secrets: this.#secrets,
+      secrets: this.#secretMaskable,
       abortGraceMs: this.#deadlines.abortGraceMs,
       termGraceMs: this.#deadlines.termGraceMs,
       onEvent: (event) => {
@@ -3125,7 +3178,11 @@ export class Conductor {
       ...referenceLines(runReferences(this.#runDir)),
       `Diff vs. phase base (${phase.integrationHead.slice(0, 7)}):`,
       "```diff",
-      diff,
+      // Plan 01a: the diff is the candidate's own content, and a candidate can
+      // carry a value a guard never saw (a file the worker wrote through
+      // `edit`, not `sh`). It is a prompt, so the value is masked — and the
+      // mask still tells the reviewer that this file holds a secret.
+      redactText(diff, this.#secretMaskable),
       "```",
       "Call submit_discovery with at most 5 choices that change behaviour, interfaces, guarantees or cost where the plan left room. Each choice is one plain sentence of at most 20 words. Do not list implementation details (helper structure, naming, file layout) and do not give review advice here — correctness problems are findings, which you raise in turn 2. An empty list is fine.",
     ].join("\n");
@@ -3175,7 +3232,7 @@ export class Conductor {
     if (removed.length > 0) {
       lines.push(
         `Tests removed from files that still exist (${removed.length}). For each, check that it was replaced or that the behaviour it tested was removed on purpose; a removed test of behaviour that is still live is a blocking finding:`,
-        ...removed.slice(0, 60).map((t) => `- ${t}`),
+        ...removed.slice(0, 60).map((t) => `- ${redactText(t, this.#secretMaskable)}`),
         ...(removed.length > 60 ? [`- … and ${removed.length - 60} more`] : []),
       );
     }

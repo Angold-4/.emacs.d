@@ -10,6 +10,8 @@
 import * as fs from "node:fs";
 import { resolve as resolvePath, dirname, basename, join as joinPath, sep as pathSep } from "node:path";
 
+import { maskableSecrets } from "../src/effects/secrets.ts";
+
 export interface GuardConfig {
   /** The worker's live worktree (`TT_WORKTREE`). Writes outside it are
    * blocked. */
@@ -141,9 +143,11 @@ export function longestSleepSeconds(command: string): number {
 }
 
 /** Plan 01a: the secret whose value `command` contains, or `undefined`.
- * The value is read from THIS process's environment (`env`, the agent's own
+ * The values are read from THIS process's environment (`env`, the agent's own
  * environment — the conductor hands each secret over as a variable, so a
- * guard never needs a value to be passed to it any other way). The reason
+ * guard never needs a value to be passed to it any other way), and only the
+ * maskable ones count: a value too short to mask safely (a declared secret
+ * exported as "1") would otherwise refuse nearly every command. The reason
  * names the variable to use instead and never repeats the value or the
  * command (which holds it). */
 export function secretUseInCommand(
@@ -151,9 +155,8 @@ export function secretUseInCommand(
   names: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
-  for (const name of names) {
-    const value = env[name];
-    if (!value || !command.includes(value)) continue;
+  for (const { name, value } of maskableSecrets(names, env)) {
+    if (!command.includes(value)) continue;
     return (
       `sh command contains the value of the secret ${name}. Use the environment variable instead — write "$${name}". ` +
       "Nothing was run. A secret value must never be pasted into a command, an edit or a submission."

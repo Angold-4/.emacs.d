@@ -8,8 +8,10 @@ import * as path from "node:path";
 import { test } from "node:test";
 
 import {
-  loggedMissingSecrets,
+  loggedSecretStatus,
+  maskableSecrets,
   planSecretNames,
+  redactBytes,
   redactJson,
   redactJsonl,
   redactRunDir,
@@ -27,9 +29,36 @@ test("secrets: names are parsed, deduped and validated; values come from the env
   assert.deepEqual(secretNames(undefined), []);
   assert.deepEqual(secretNames(["1BAD", "BAD-NAME", "OK_KEY"]), ["OK_KEY"], "only shell-assignable names");
 
-  const { secrets, missing } = resolveSecrets(["FAKE_KEY", "GONE_KEY"], { FAKE_KEY: VALUE, GONE_KEY: "" });
-  assert.deepEqual(secrets, [{ name: "FAKE_KEY", value: VALUE }]);
-  assert.deepEqual(missing, ["GONE_KEY"], "an empty variable counts as unset");
+  const resolved = resolveSecrets(["FAKE_KEY", "GONE_KEY"], { FAKE_KEY: VALUE, GONE_KEY: "" });
+  assert.deepEqual(resolved.values, [{ name: "FAKE_KEY", value: VALUE }]);
+  assert.deepEqual(resolved.maskable, [{ name: "FAKE_KEY", value: VALUE }]);
+  assert.deepEqual(resolved.missing, ["GONE_KEY"], "an empty variable counts as unset");
+  assert.deepEqual(resolved.tooShort, []);
+});
+
+test("secrets: a value too short to mask is reported, never applied", () => {
+  // A plan declaring TT with TT=1: masking it would rewrite every id, count
+  // and timestamp in the log, so it is used for the environment but never for
+  // masking or for refusing a command.
+  const resolved = resolveSecrets(["TT", "OK_KEY"], { TT: "1", OK_KEY: VALUE });
+  assert.deepEqual(resolved.missing, []);
+  assert.deepEqual(resolved.tooShort, ["TT"]);
+  assert.deepEqual(resolved.values.map((s) => s.name), ["TT", "OK_KEY"], "the agent still gets it");
+  assert.deepEqual(resolved.maskable, [{ name: "OK_KEY", value: VALUE }]);
+  assert.equal(redactText("x 1 y", resolved.maskable), "x 1 y", "unrelated text is untouched");
+  assert.deepEqual(maskableSecrets(["TT"], { TT: "1" }), []);
+});
+
+test("secrets: an overlapping value cannot leave a suffix of another behind", () => {
+  const short = { name: "A_KEY", value: "sk-live" };
+  const long = { name: "AB_KEY", value: "sk-live-abcd1234" };
+  for (const order of [[short, long], [long, short]]) {
+    const out = redactText(`x ${long.value} y`, order);
+    assert.equal(out, "x ***AB_KEY*** y", `no suffix may survive (order ${JSON.stringify(order.map((s) => s.name))})`);
+    assert.ok(!out.includes("abcd1234"));
+  }
+  const both = redactText("a=sk-live b=sk-live-abcd1234", [short, long]);
+  assert.equal(both, "a=***A_KEY*** b=***AB_KEY***");
 });
 
 test("secrets: redaction keeps JSON and JSONL valid, and does not touch a torn line", () => {
@@ -102,10 +131,11 @@ test("secrets: redactRunDir rewrites the planted value out and leaves JSONL pars
   try {
     const { runDir } = plantedRunDir(root);
     assert.deepEqual(planSecretNames(runDir), ["FAKE_KEY"], "the plan snapshot supplies the names");
-    const { secrets, missing } = resolveSecrets(planSecretNames(runDir), { FAKE_KEY: VALUE });
+    const { maskable, missing } = resolveSecrets(planSecretNames(runDir), { FAKE_KEY: VALUE });
     assert.deepEqual(missing, []);
-    const changed = redactRunDir(runDir, secrets);
-    assert.equal(changed, 4, "every planted file changed");
+    const first = redactRunDir(runDir, maskable);
+    assert.equal(first.changed, 4, "every planted file changed");
+    assert.deepEqual(first.opaque, []);
 
     for (const file of ["events.jsonl", "stream/worker-1.jsonl", "checks/c0ffee/true.log", "views/pr.md"]) {
       const text = fs.readFileSync(path.join(runDir, file), "utf8");
@@ -119,7 +149,38 @@ test("secrets: redactRunDir rewrites the planted value out and leaves JSONL pars
       assert.doesNotThrow(() => JSON.parse(line), "every stream line still parses");
     }
     // Nothing changes on a second pass.
-    assert.equal(redactRunDir(runDir, secrets), 0);
+    assert.equal(redactRunDir(runDir, maskable).changed, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("secrets: a UTF-16 document is masked, and a file that could not be searched is named", () => {
+  const secrets = [{ name: "FAKE_KEY", value: VALUE }];
+  // UTF-16LE, as a vendor doc saved from a Windows editor: the value's bytes
+  // are interleaved with NULs, so no UTF-8 pass can see it.
+  const utf16 = Buffer.from(`key ${VALUE} end`, "utf16le");
+  assert.ok(utf16.includes(0), "a UTF-16 document contains NUL bytes");
+  const masked = redactBytes(utf16, secrets);
+  assert.ok(!masked.includes(Buffer.from(VALUE, "utf16le")), "the value is replaced, not skipped");
+  assert.equal(masked.toString("utf16le"), "key ***FAKE_KEY*** end");
+  // …and UTF-16BE too.
+  const be = Buffer.from(`k ${VALUE}`, "utf16le").swap16();
+  assert.equal(redactBytes(be, secrets).swap16().toString("utf16le"), "k ***FAKE_KEY***");
+
+  const root = fs.mkdtempSync("/tmp/tt-redact-binary-");
+  try {
+    const runDir = path.join(root, "abcd1234");
+    fs.mkdirSync(path.join(runDir, "refs"), { recursive: true });
+    fs.mkdirSync(path.join(runDir, "checks"), { recursive: true });
+    fs.writeFileSync(path.join(runDir, "refs", "vendor-utf16.md"), utf16);
+    // A genuinely binary artefact (no value in any encoding we search): the
+    // value is not found, so it is NAMED rather than silently declared clean.
+    fs.writeFileSync(path.join(runDir, "checks", "artifact.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]));
+    const result = redactRunDir(runDir, secrets);
+    assert.equal(result.changed, 1, "the UTF-16 document changed");
+    assert.equal(fs.readFileSync(path.join(runDir, "refs", "vendor-utf16.md"), "utf16le"), "key ***FAKE_KEY*** end");
+    assert.deepEqual(result.opaque, [path.join(runDir, "checks", "artifact.png")]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -129,12 +190,12 @@ test("secrets: the recorded missing names come from the run's own log", () => {
   const root = fs.mkdtempSync("/tmp/tt-redact-log-");
   try {
     const { runDir } = plantedRunDir(root);
-    assert.deepEqual(loggedMissingSecrets(runDir), [], "no record yet");
+    assert.deepEqual(loggedSecretStatus(runDir), { missing: [], tooShort: [] }, "no record yet");
     fs.appendFileSync(
       path.join(runDir, "events.jsonl"),
-      `${JSON.stringify({ seq: 2, ts: "2026-01-01T00:00:01.000Z", kind: "secrets", event: { declared: ["FAKE_KEY"], missing: ["FAKE_KEY"] } })}\n`,
+      `${JSON.stringify({ seq: 2, ts: "2026-01-01T00:00:01.000Z", kind: "secrets", event: { declared: ["FAKE_KEY", "TT"], missing: ["FAKE_KEY"], tooShort: ["TT"] } })}\n`,
     );
-    assert.deepEqual(loggedMissingSecrets(runDir), ["FAKE_KEY"]);
+    assert.deepEqual(loggedSecretStatus(runDir), { missing: ["FAKE_KEY"], tooShort: ["TT"] });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

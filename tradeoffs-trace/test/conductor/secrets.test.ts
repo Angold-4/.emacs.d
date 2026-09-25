@@ -181,28 +181,213 @@ test("secrets: a reference document that quotes a key is copied into refs/ redac
   try {
     const src = path.join(docs, "01_ref_vendor.md");
     fs.writeFileSync(src, `# vendor\nPYTH_ACCESS_TOKEN='${value}' is the key\n`);
+    // A doc saved as UTF-16 (NUL bytes: not text by the usual test) and a
+    // genuinely binary artefact: the first is masked in place, the second is
+    // not copied at all — a leak that cannot be verified must not be silently
+    // copied into every agent's reach (blocking finding M-4).
+    const utf16 = path.join(docs, "02_ref_utf16.md");
+    fs.writeFileSync(utf16, Buffer.from(`key ${value} end`, "utf16le"));
+    const binary = path.join(docs, "03_ref_binary.bin");
+    fs.writeFileSync(binary, Buffer.from([0x00, 0x01, 0x02, 0x00, 0xfe, 0xff]));
     const plan: RunPlanFile = {
       title: "refs",
       repo: repo.dir,
       integrationBranch: "main",
       checks: ["true"],
       secrets: ["FAKE_KEY"],
-      references: [src],
+      references: [src, utf16, binary],
       phases: [{ id: "p1", goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [] }],
     };
     const runDir = createRun(root, plan);
-    const copy = runReferences(runDir).find((r) => r.endsWith("01_ref_vendor.md"))!;
+    const refs = runReferences(runDir);
+    const copy = refs.find((r) => r.endsWith("01_ref_vendor.md"))!;
     const text = fs.readFileSync(copy, "utf8");
     assert.match(text, /is the key/);
     assert.match(text, /\*\*\*FAKE_KEY\*\*\*/);
     assert.ok(!text.includes(value), "the copy in refs/ must not hold the value");
-    // The source document itself is the owner's, and untouched.
+    const utf16Copy = refs.find((r) => r.endsWith("02_ref_utf16.md"))!;
+    assert.equal(fs.readFileSync(utf16Copy, "utf16le"), "key ***FAKE_KEY*** end", "a UTF-16 doc is masked, not skipped");
+    assert.ok(!refs.some((r) => r.endsWith("03_ref_binary.bin")), "an unverifiable binary doc is not copied");
+    assert.match(fs.readFileSync(path.join(runDir, "refs", "MISSING.txt"), "utf8"), /03_ref_binary\.bin \(binary, not copied/);
+    // The source documents themselves are the owner's, and untouched.
     assert.ok(fs.readFileSync(src, "utf8").includes(value));
   } finally {
     delete process.env.FAKE_KEY;
     cleanupDir(root);
     cleanupDir(repo.dir);
     fs.rmSync(docs, { recursive: true, force: true });
+  }
+});
+
+test("secrets: a value the worker discloses reaches neither the conductor's state nor the next prompt", async () => {
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  process.env.FAKE_KEY = value;
+  const scriptsDir = fs.mkdtempSync("/tmp/tt-secret-state-");
+  const promptLog = path.join(scriptsDir, "worker.prompts");
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      // Every candidate fails its checks, so the phase repairs: attempt 2's
+      // prompt is built from the conductor's in-memory state (the repair
+      // request lists attempt 1's disclosed decisions verbatim).
+      checks: ["false"],
+      secrets: ["FAKE_KEY"],
+      workerScriptForAttempt: (attempt) => ({
+        hello: defaultWorkerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_phase",
+            args: {
+              decisions:
+                attempt === 1
+                  ? [
+                      {
+                        choice: `Read the vendor key ${value} from the environment`,
+                        whyItMatters: `the key ${value} must not be pasted into code`,
+                        alternatives: [{ option: `hard-code ${value}`, consequence: "the key is in the repository" }],
+                        recommendation: { choice: "read it from the environment", reason: "the value never enters the tree" },
+                        classProposal: "delegated",
+                      },
+                    ]
+                  : [],
+              assumptions: [],
+              deviations: [],
+            },
+          },
+        ],
+      }),
+      reviewerScriptFor: (reviewer, state) => ({
+        hello: defaultReviewerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+            },
+          },
+        ],
+      }),
+      extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+      deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000, checkMs: 20_000 },
+    });
+    const conductor = setup.conductor;
+
+    await conductor.start();
+    // Attempt 2 exists once the first repair round started.
+    await waitFor(() => (conductor.state.phase.attempt.n ?? 1) >= 2, 120_000);
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("REPAIR"), 120_000);
+
+    // 1. The in-memory state itself holds no value (blocking findings M-3/B-5:
+    // the state is what every prompt and view is built from).
+    const state = JSON.stringify(conductor.state);
+    assert.ok(!state.includes(value), "the conductor's own state must hold the mask, not the value");
+    assert.match(state, /\*\*\*FAKE_KEY\*\*\*/, "the disclosed text is still useful, masked");
+
+    // 2. …and the repair prompt built from it carries no value, while the
+    // worker is still told which records to keep, change or withdraw.
+    const prompts = fs.readFileSync(promptLog, "utf8");
+    assert.match(prompts, /REPAIR \(round/);
+    assert.match(prompts, /\*\*\*FAKE_KEY\*\*\*/);
+    assert.ok(!prompts.includes(value), "a value must never reach a prompt");
+  } finally {
+    await setup?.conductor.stop();
+    if (setup) {
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+      cleanupDir(setup.repo.dir);
+    }
+    fs.rmSync(scriptsDir, { recursive: true, force: true });
+    delete process.env.FAKE_KEY;
+  }
+});
+
+test("secrets: a reproduction command carrying the value is refused, not run", async () => {
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  process.env.FAKE_KEY = value;
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      checks: ["true"],
+      secrets: ["FAKE_KEY"],
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+      }),
+      reviewerScriptFor: (reviewer, state) => ({
+        hello: defaultReviewerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+              findings: [
+                {
+                  kind: "defect",
+                  severity: "advisory",
+                  evidence: "a reproduction is offered",
+                  // A command the conductor would run — the same literal value
+                  // the `sh` guard refuses, submitted through a different door
+                  // (blocking finding B-6).
+                  reproduction: { command: `echo ${value} >> repro-ran.txt` },
+                },
+              ],
+            },
+          },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+            },
+          },
+        ],
+      }),
+      deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+    });
+
+    await setup.conductor.start();
+    const conductor = setup.conductor;
+    await waitFor(() => conductor.state.phase.phase === "DONE", 120_000);
+
+    // The refusal names the variable to use, and the command never ran.
+    const streams = fs
+      .readdirSync(runPaths(setup.runDir).stream)
+      .map((f) => fs.readFileSync(path.join(runPaths(setup.runDir).stream, f), "utf8"))
+      .join("\n");
+    assert.match(streams, /contains the value of the secret FAKE_KEY[\s\S]{0,200}\$FAKE_KEY/);
+    assert.ok(!fs.existsSync(path.join(runPaths(setup.runDir).worktree, "repro-ran.txt")), "the refused reproduction never ran");
+    // No finding carries it either: the submission was rejected as a whole.
+    assert.deepEqual(conductor.state.phase.findings, []);
+    // …and no file under the run directory holds the value.
+    for (const file of filesUnder(setup.runDir)) {
+      assert.ok(!fs.readFileSync(file).includes(value), `${path.relative(setup.runDir, file)} holds the value`);
+    }
+  } finally {
+    await setup?.conductor.stop();
+    if (setup) {
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+      cleanupDir(setup.repo.dir);
+    }
+    delete process.env.FAKE_KEY;
   }
 });
 

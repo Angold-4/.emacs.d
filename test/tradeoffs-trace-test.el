@@ -237,7 +237,7 @@
      `((meta (title . "sum validation"))
        (conductorAlive . t)
        (ownerInputs) (pendingOwnerInputs)
-       (secrets (declared "FAKE_KEY" "OTHER_KEY") (missing "FAKE_KEY"))
+       (secrets (declared "FAKE_KEY" "OTHER_KEY" "TT") (missing "FAKE_KEY") (tooShort "TT"))
        (state (run . "RUN_ACTIVE")
               (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 1))
                      (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
@@ -255,8 +255,10 @@
       (should (string-match-p "reviews   M ✗ 2 reject · 1 blocking   A ✓   B ⧗" text))
       (should (string-match-p "4 decisions · 2 flagged for you · 1 open findings" text))
       (should (string-match-p "boundary files changed: 2 (reviewers classify)" text))
-      ;; Plan 01a: an unset declared secret is reported by name; a set one is not.
+      ;; Plan 01a: an unset declared secret is reported by name; a set one is
+      ;; not, and a value too short to mask is reported too.
       (should (string-match-p "secret    FAKE_KEY not set" text))
+      (should (string-match-p "secret    TT too short to mask" text))
       (should-not (string-match-p "OTHER_KEY" text))
       ;; empty sections are not shown
       (should-not (string-match-p "Owner input" text))

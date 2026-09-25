@@ -228,11 +228,15 @@ async function main(): Promise<void> {
           writeStdout({ type: "tool_execution_start", toolCallId, toolName: step.tool, args });
           const reply = await runSocket.submit(step.tool, args);
           const ok = reply.type === "submit_reply" && reply.ok;
+          // The conductor's own reason is echoed into the tool result (the real
+          // extension shows it to the model too), so a test can assert *why* a
+          // submission was refused, not just that it was.
+          const reason = reply.type === "submit_reply" ? reply.reason : undefined;
           writeStdout({
             type: "tool_execution_end",
             toolCallId,
             toolName: step.tool,
-            result: { content: [{ type: "text", text: ok ? "submission accepted" : "submission rejected" }] },
+            result: { content: [{ type: "text", text: ok ? "submission accepted" : `submission rejected: ${reason ?? "no reason given"}` }] },
             isError: !ok,
           });
           break;

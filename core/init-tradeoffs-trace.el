@@ -871,10 +871,12 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
                                (if (> b 0) (format " · boundary files changed: %d (reviewers classify)" b) ""))))
     (when-let* ((why (alist-get 'blockedReason phase)))
       (+tt--status-row "blocked" why 'error))
-    ;; Plan 01a: a declared secret that was unset when the run started (names
-    ;; only; the value is never shown, and the run still runs without it).
+    ;; Plan 01a: a declared secret that was unset or unusable when the run
+    ;; started (names only; the value is never shown, and the run still runs).
     (dolist (name (alist-get 'missing (alist-get 'secrets s)))
       (+tt--status-row "secret" (format "%s not set" name) 'warning))
+    (dolist (name (alist-get 'tooShort (alist-get 'secrets s)))
+      (+tt--status-row "secret" (format "%s too short to mask" name) 'warning))
     (+tt--render-owner-inputs s)
     (when attention
       (insert "\n" (propertize (format "⚑ %s%s" attention

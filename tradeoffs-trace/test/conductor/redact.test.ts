@@ -80,7 +80,53 @@ test("tt redact --all: a planted value disappears and every JSONL line still par
       jsonlLinesParse(path.join(runDir, "events.jsonl"));
       jsonlLinesParse(path.join(runDir, "stream", "worker-1.jsonl"));
     }
-    assert.match(result.stdout, /redacted 2 run\(s\), \d+ file\(s\)/);
+    assert.match(result.stdout, /redacted 2 of 2 run\(s\), \d+ file\(s\)/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tt redact: a run whose conductor is alive is refused, and --force overrides it", async () => {
+  const root = fs.mkdtempSync("/tmp/tt-redact-live-");
+  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  try {
+    const runDir = plantedRun(root, "eeee5555", value, true);
+    // A pid that is alive: this very test process.
+    fs.writeFileSync(path.join(runDir, "conductor.pid"), String(process.pid));
+    const refused = await runCli(["redact", "--all", "--root", root], { FAKE_KEY: value });
+    assert.equal(refused.code, 0, refused.stderr);
+    assert.match(refused.stdout, /redacted 0 of 1 run\(s\)/);
+    assert.match(refused.stdout, /conductor still running: eeee5555/);
+    assert.ok(fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").includes(value), "a live run is left alone");
+
+    const forced = await runCli(["redact", "--all", "--force", "--root", root], { FAKE_KEY: value });
+    assert.equal(forced.code, 0, forced.stderr);
+    assert.match(forced.stdout, /redacted 1 of 1 run\(s\)/);
+    assert.ok(!fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").includes(value));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tt redact: a UTF-16 document is cleaned, and a file it could not search is named", async () => {
+  const root = fs.mkdtempSync("/tmp/tt-redact-utf16-");
+  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  try {
+    const runDir = plantedRun(root, "ffff6666", value, true);
+    // The vendor reference doc case: UTF-16, so its bytes contain NULs.
+    fs.mkdirSync(path.join(runDir, "refs"), { recursive: true });
+    fs.writeFileSync(path.join(runDir, "refs", "vendor.md"), Buffer.from(`key ${value} end`, "utf16le"));
+    // A genuinely binary artefact, holding nothing this tool can search.
+    fs.mkdirSync(path.join(runDir, "checks", "c0ffee"), { recursive: true });
+    fs.writeFileSync(path.join(runDir, "checks", "c0ffee", "artifact.png"), Buffer.from([0x89, 0x50, 0x00, 0x00, 0x01]));
+    const result = await runCli(["redact", runDir, "--secrets", "FAKE_KEY"], { FAKE_KEY: value });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(
+      fs.readFileSync(path.join(runDir, "refs", "vendor.md"), "utf16le"),
+      "key ***FAKE_KEY*** end",
+      "a UTF-16 document is masked, not skipped",
+    );
+    assert.match(result.stdout, /not UTF-8 text, searched UTF-8\/UTF-16 only[^\n]*artifact\.png/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -159,7 +205,7 @@ test("tt redact: an unset secret is reported, and a single run directory can be 
 
     const redacted = await runCli(["redact", runDir, "--secrets", "FAKE_KEY"], { FAKE_KEY: value });
     assert.equal(redacted.code, 0, redacted.stderr);
-    assert.match(redacted.stdout, /redacted 1 run\(s\)/);
+    assert.match(redacted.stdout, /redacted 1 of 1 run\(s\)/);
     assert.ok(!fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").includes(value));
     jsonlLinesParse(path.join(runDir, "events.jsonl"));
   } finally {

@@ -5,13 +5,23 @@
 // A plan declares its secrets by NAME (`#+TT_SECRETS: NAME1 NAME2`, parsed by
 // Emacs into the JSON plan's `secrets`). The conductor resolves each value
 // from *its own* environment, passes it to every agent's environment, and
-// replaces every value with `***NAME***` in everything it writes. Nothing in
-// this module ever prints, logs or returns a value to a caller that is not
-// about to substitute it back into an environment.
+// replaces every value with `***NAME***` in everything it writes — and, more
+// importantly, at the one boundary where agent text enters the conductor's
+// in-memory state (see `conductor.ts`'s `#applyEvent`), because prompts are
+// built from that state and a value must never reach a prompt either.
+//
+// Two shapes of "the value is still there" this module refuses to report as
+// success:
+//  - a value that OVERLAPS another (`A_KEY=sk-live`, `AB_KEY=sk-live-abcd`):
+//    the longer value is masked first, so masking one cannot leave a suffix
+//    of the other;
+//  - a value that is too SHORT to mask safely (see MIN_SECRET_LENGTH): masking
+//    it would rewrite unrelated text (`1` inside every id and timestamp), so
+//    it is reported instead of used.
 //
 // The replacement text (`***NAME***`) contains no quote, backslash or
-// newline, so it can never break a JSON line (or a JSONL file) that a
-// value was redacted out of.
+// newline, so it can never break a JSON line (or a JSONL file) that a value
+// was redacted out of.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -23,6 +33,13 @@ export interface Secret {
   /** The value, read once from the conductor's own environment. */
   value: string;
 }
+
+/** A value shorter than this cannot be masked safely: replacing every
+ * occurrence of `1` (a declared secret named TT exported as "1") would rewrite
+ * every id, timestamp and count in the log, so such a value is reported in the
+ * status instead of being used (plan: an unusable declaration must be visible,
+ * and the run still runs). */
+export const MIN_SECRET_LENGTH = 4;
 
 /** Only shell-assignable names (`NAME=value` must work in the agent's env). */
 const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -50,26 +67,60 @@ export function secretNames(raw: readonly string[] | undefined): string[] {
 }
 
 /** Which of NAMES are set in ENV (the conductor's own environment — a secret
- * is never carried anywhere but the environment). An unset or empty variable
- * is `missing`: the run starts anyway and the status says so. */
+ * is never carried anywhere but the environment), and which are declared but
+ * unusable. `values` is every set secret, for the agents' environment;
+ * `maskable` is the subset long enough to mask and to match in a command (see
+ * MIN_SECRET_LENGTH); `missing` (unset) and `tooShort` are what a status line
+ * reports. The run starts in every case. */
 export function resolveSecrets(
   names: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
-): { secrets: Secret[]; missing: string[] } {
-  const secrets: Secret[] = [];
+): { values: Secret[]; maskable: Secret[]; missing: string[]; tooShort: string[] } {
+  const values: Secret[] = [];
+  const maskable: Secret[] = [];
   const missing: string[] = [];
+  const tooShort: string[] = [];
   for (const name of names) {
     const value = env[name];
-    if (value !== undefined && value.length > 0) secrets.push({ name, value });
-    else missing.push(name);
+    if (value === undefined || value.length === 0) {
+      missing.push(name);
+      continue;
+    }
+    values.push({ name, value });
+    if (value.length < MIN_SECRET_LENGTH) tooShort.push(name);
+    else maskable.push({ name, value });
   }
-  return { secrets, missing };
+  // Longest value first: a value that contains another (A_KEY=sk-live,
+  // AB_KEY=sk-live-abcd) must be replaced before the shorter one can leave a
+  // suffix of it behind.
+  maskable.sort((a, b) => b.value.length - a.value.length);
+  return { values, maskable, missing, tooShort };
+}
+
+/** The maskable secrets among NAMES, for a caller holding only the names (the
+ * extension's guard): it resolves them from its OWN process environment, which
+ * the conductor handed the values to. */
+export function maskableSecrets(names: readonly string[], env: NodeJS.ProcessEnv = process.env): Secret[] {
+  return resolveSecrets(names, env).maskable;
+}
+
+/** SECRETS ordered so a longer value is replaced before a shorter one it
+ * contains. `resolveSecrets` already returns them in that order; this keeps a
+ * hand-built list honest (and returns the array unchanged when it is already
+ * ordered, so the common path allocates nothing). */
+export function byLengthDesc(secrets: readonly Secret[]): readonly Secret[] {
+  for (let i = 1; i < secrets.length; i++) {
+    if (secrets[i - 1].value.length < secrets[i].value.length) {
+      return [...secrets].sort((a, b) => b.value.length - a.value.length);
+    }
+  }
+  return secrets;
 }
 
 /** TEXT with every secret value replaced by `***NAME***`. */
 export function redactText(text: string, secrets: readonly Secret[]): string {
   let out = text;
-  for (const s of secrets) {
+  for (const s of byLengthDesc(secrets)) {
     if (s.value.length === 0 || !out.includes(s.value)) continue;
     out = out.split(s.value).join(placeholder(s.name));
   }
@@ -97,7 +148,7 @@ export function redactJson(value: unknown, secrets: readonly Secret[]): unknown 
  * structural walk leaves alone because keys are structure). */
 function redactTextual(text: string, hits: readonly Secret[]): string {
   let out = redactText(text, hits);
-  for (const s of hits) out = out.split(jsonEscaped(s.value)).join(placeholder(s.name));
+  for (const s of byLengthDesc(hits)) out = out.split(jsonEscaped(s.value)).join(placeholder(s.name));
   return out;
 }
 
@@ -130,20 +181,80 @@ export function redactJsonl(text: string, secrets: readonly Secret[]): string {
   return endedWithNewline ? `${out}\n` : out;
 }
 
-/** True (and rewrites the file) when FILE contained a secret value. */
-export function redactFileInPlace(file: string, secrets: readonly Secret[], jsonl: boolean): boolean {
+/** The byte encodings a file may hold a value in: UTF-8, UTF-16LE and
+ * UTF-16BE. A document saved as UTF-16 contains NUL bytes, so it is not text
+ * by the usual test — and it is exactly the "vendor doc in refs/" shape the
+ * evidence describes, whose value would otherwise survive every text-level
+ * pass. */
+const BYTE_ENCODINGS: Array<(text: string) => Buffer> = [
+  (text) => Buffer.from(text, "utf8"),
+  (text) => Buffer.from(text, "utf16le"),
+  // Node has no "utf16be": encode little-endian and swap the pairs.
+  (text) => Buffer.from(text, "utf16le").swap16(),
+];
+
+/** BUF with every occurrence of NEEDLE replaced by REPLACEMENT, or undefined
+ * when NEEDLE does not occur (so a caller keeps the original buffer). */
+function replaceBytes(buf: Buffer, needle: Buffer, replacement: Buffer): Buffer | undefined {
+  if (needle.length === 0 || buf.indexOf(needle) === -1) return undefined;
+  const parts: Buffer[] = [];
+  let from = 0;
+  for (;;) {
+    const at = buf.indexOf(needle, from);
+    if (at === -1) break;
+    parts.push(buf.subarray(from, at), replacement);
+    from = at + needle.length;
+  }
+  parts.push(buf.subarray(from));
+  return Buffer.concat(parts);
+}
+
+/** BUF with every secret value replaced by `***NAME***` in UTF-8, UTF-16LE and
+ * UTF-16BE. This is how a non-text file (a NUL byte: a UTF-16 document, or a
+ * genuinely binary one) is handled — the value is *replaced*, not skipped, so
+ * the leak the evidence describes (a vendor doc copied into refs/) cannot
+ * survive a cleanup that reports success. Returns BUF itself when nothing
+ * matched. */
+export function redactBytes(buf: Buffer, secrets: readonly Secret[]): Buffer {
+  let out = buf;
+  for (const s of byLengthDesc(secrets)) {
+    if (s.value.length === 0) continue;
+    for (const encode of BYTE_ENCODINGS) {
+      out = replaceBytes(out, encode(s.value), encode(placeholder(s.name))) ?? out;
+    }
+  }
+  return out;
+}
+
+/** Rewrites FILE in place if it held a secret value, and reports whether it
+ * changed. A JSONL file is rewritten line by line (`jsonl`); a non-text file
+ * (a NUL byte) is searched in UTF-8/UTF-16 by `redactBytes`; anything else is
+ * text. `opaque` is true for a non-text file in which nothing was found — the
+ * caller names it, because such a file can still hold the value in an encoding
+ * this module does not search. */
+export function redactFileInPlace(
+  file: string,
+  secrets: readonly Secret[],
+  jsonl: boolean,
+): { changed: boolean; opaque: boolean } {
   let buf: Buffer;
   try {
     buf = fs.readFileSync(file);
   } catch {
-    return false;
+    return { changed: false, opaque: false };
   }
-  if (buf.includes(0)) return false; // binary: never text-rewrite it
+  const binary = buf.includes(0);
+  if (binary) {
+    const next = redactBytes(buf, secrets);
+    if (next.equals(buf)) return { changed: false, opaque: true };
+    fs.writeFileSync(file, next);
+    return { changed: true, opaque: false };
+  }
   const text = buf.toString("utf8");
-  const next = jsonl ? redactJsonl(text, secrets) : redactText(text, secrets);
-  if (next === text) return false;
-  fs.writeFileSync(file, next);
-  return true;
+  const rewritten = jsonl ? redactJsonl(text, secrets) : redactText(text, secrets);
+  if (rewritten === text) return { changed: false, opaque: false };
+  fs.writeFileSync(file, rewritten);
+  return { changed: true, opaque: false };
 }
 
 function filesUnder(dir: string): string[] {
@@ -162,25 +273,38 @@ function filesUnder(dir: string): string[] {
   return out;
 }
 
+export interface RedactRunResult {
+  /** Files whose bytes changed. */
+  changed: number;
+  /** Non-text files (a NUL byte) in which the value was NOT found: they can
+   * still hold it in an encoding `redactBytes` does not search, so a caller
+   * must name them rather than report an unqualified success. */
+  opaque: string[];
+}
+
 /** Rewrites a run directory in place (`tt redact`): every file a secret
  * value can sit in — `events.jsonl`, `stream/*.jsonl`, `sessions/`, `checks/**`,
- * `refs/**`, `views/**`, `plan/`, `conductor.log`, `meta.json`. The worker's
- * own `worktree/` and the reviewers' `candidates/` checkouts are git trees,
- * not conductor output, and are left alone. Returns how many files changed. */
-export function redactRunDir(runDir: string, secrets: readonly Secret[]): number {
-  if (secrets.length === 0) return 0;
+ * `refs/**`, `views/**`, `plan/`, `inbox/`, `conductor.log`, `meta.json`. The
+ * worker's own `worktree/` and the reviewers' `candidates/` checkouts are git
+ * trees, not conductor output, and are left alone. */
+export function redactRunDir(runDir: string, secrets: readonly Secret[]): RedactRunResult {
+  if (secrets.length === 0) return { changed: 0, opaque: [] };
   const targets: Array<{ file: string; jsonl: boolean }> = [
     { file: path.join(runDir, "events.jsonl"), jsonl: true },
     { file: path.join(runDir, "conductor.log"), jsonl: false },
     { file: path.join(runDir, "meta.json"), jsonl: false },
   ];
   const JSONL_DIRS = new Set(["stream", "sessions"]);
-  for (const dir of ["plan", "stream", "sessions", "checks", "refs", "views"]) {
+  for (const dir of ["plan", "stream", "sessions", "checks", "refs", "views", "inbox"]) {
     for (const file of filesUnder(path.join(runDir, dir))) targets.push({ file, jsonl: JSONL_DIRS.has(dir) });
   }
-  let changed = 0;
-  for (const t of targets) if (redactFileInPlace(t.file, secrets, t.jsonl)) changed += 1;
-  return changed;
+  const result: RedactRunResult = { changed: 0, opaque: [] };
+  for (const t of targets) {
+    const outcome = redactFileInPlace(t.file, secrets, t.jsonl);
+    if (outcome.changed) result.changed += 1;
+    else if (outcome.opaque) result.opaque.push(t.file);
+  }
+  return result;
 }
 
 /** The prompt lines naming a run's declared secrets, for every agent (the
@@ -207,19 +331,21 @@ export function planSecretNames(runDir: string): string[] {
   }
 }
 
-/** The declared secrets the conductor found unset when it started this run
- * (the `secrets` record it logs then), for `tt status`. Read from the log so
+/** What the conductor recorded about the run's declared secrets when it
+ * started (`tt status`, `tt state`): which were unset, and which are set but
+ * too short to mask safely. Names only — never a value. Read from the log so
  * a later `tt status` reports what the *run* saw, not what this shell has. */
-export function loggedMissingSecrets(runDir: string): string[] {
+export function loggedSecretStatus(runDir: string): { missing: string[]; tooShort: string[] } {
+  const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((n): n is string => typeof n === "string") : []);
   try {
     const { records } = readLog(path.join(runDir, "events.jsonl"));
     for (let i = records.length - 1; i >= 0; i--) {
       if (records[i].kind !== "secrets") continue;
-      const missing = (records[i].event as { missing?: unknown }).missing;
-      return Array.isArray(missing) ? missing.filter((n): n is string => typeof n === "string") : [];
+      const event = records[i].event as { missing?: unknown; tooShort?: unknown };
+      return { missing: strings(event.missing), tooShort: strings(event.tooShort) };
     }
   } catch {
     // An unreadable log is not this view's problem.
   }
-  return [];
+  return { missing: [], tooShort: [] };
 }

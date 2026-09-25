@@ -138,6 +138,9 @@ test("secretUseInCommand: the value is matched from this process's environment, 
   // No declared names, or an unset variable: nothing to match.
   assert.equal(secretUseInCommand("echo sk-live-4f8a2b1c9d3e", [], env), undefined);
   assert.equal(secretUseInCommand("echo sk-live-4f8a2b1c9d3e", ["GONE"], env), undefined);
+  // A value too short to mask (a declared secret exported as "1") must not
+  // refuse ordinary commands — it is reported in the status instead.
+  assert.equal(secretUseInCommand("echo 1 of 2", ["TT"], { TT: "1" }), undefined);
 });
 
 test("guardedShCommand refuses a command containing a declared secret's value", () => {

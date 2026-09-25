@@ -170,14 +170,34 @@ A plan declares the credentials it needs **by name** and nothing else:
   `$NAME`, never to paste a value.
 - An `sh` command containing a secret's literal value is refused (before it
   runs), with a message naming the variable to use instead.
-- The conductor replaces every value with `***NAME***` in everything it writes:
-  the agent stream files, `events.jsonl`, the check logs, the `refs/` copies of
-  the plan's reference documents, `views/pr.md`, and what `tt status`, `tt state`
-  and `tt timing` print. Emacs masks a declared secret's value as well, using its
-  own environment, so nothing it displays can show one.
+- The conductor replaces every value with `***NAME***` in everything it
+  writes — the agent stream files, `events.jsonl`, the check logs, the `refs/`
+  copies of the plan's reference documents, `views/pr.md`, and what `tt status`,
+  `tt state` and `tt timing` print — **and** at the one boundary where agent
+  text enters its in-memory state, so the prompts it builds from that state
+  (the turn-2 reviewer prompt, the repair request) carry the mask too. Emacs
+  masks a declared secret's value as well, using its own environment, so nothing
+  it displays can show one.
+- A `refs/` copy is written masked: a document saved as UTF-16 (its bytes hold
+  NULs) is searched in UTF-8/UTF-16 and masked too, and — when the plan declares
+  secrets — a document in any other binary shape is **not copied at all**: it is
+  named in `refs/MISSING.txt`, because a leak that cannot be verified must not
+  be handed to every agent. The same rule applies at cleanup (`tt redact` names
+  a non-UTF-8 file it found nothing in). A plan that declares no secrets copies
+  its references exactly as before.
+- A declared secret whose value is **shorter than 4 characters** is not used
+  for masking or for refusing commands (masking `1` would rewrite every id and
+  timestamp in the log); it is reported by name and the run still runs. Give a
+  secret a real value, or it is only an environment variable.
 - A declared secret that is unset at start is reported by name (`secret FAKE_KEY
   not set` in `tt status` and the status buffer) and **the run still starts** — a
   missing credential fails whatever check needs it, not the run.
+- Text that merely *quotes* a value (a finding's evidence, a ballot's rationale)
+  is masked, not refused, so the evidence stays readable; a **command** carrying
+  a value (the `sh` tool, or a finding's reproduction command) is refused with a
+  message naming `$NAME` and never runs.
+- The input box is the owner's own channel: what you type is delivered to the
+  worker as written. Everything the conductor *records* about it is masked.
 - Two files a run can still hold a value in are not the conductor's to write at
   the moment it is written: Pi's own session file under `<run>/sessions/`, and a
   file the worker itself edited in `<run>/worktree/`. `tt redact` cleans the
@@ -194,11 +214,20 @@ PYTH_ACCESS_TOKEN=…  tt redact --all --secrets PYTH_ACCESS_TOKEN
 
 `tt redact` rewrites run directories **in place** — `events.jsonl`,
 `stream/*.jsonl`, `sessions/` (Pi's own session files, which hold whatever an
-agent echoed), `checks/**`, `refs/**`, `views/**`, `plan/`, `conductor.log` —
-replacing the value with `***NAME***`. The values are read from the
-command's own environment; the names come from `--secrets` or, when it is
-omitted, from each run's own plan snapshot. JSONL files are rewritten line by
+agent echoed), `checks/**`, `refs/**`, `views/**`, `plan/`, `inbox/`,
+`conductor.log` — replacing the value with `***NAME***`. The values are read
+from the command's own environment; the names come from `--secrets` or, when it
+is omitted, from each run's own plan snapshot. JSONL files are rewritten line by
 line, so every line still parses (a torn final line stays torn and unnewlined).
+A UTF-16 document is searched in UTF-8 and UTF-16 and masked; a file it could
+not search (not UTF-8 text, and nothing found) is **named** in the output rather
+than counted as clean.
+
+It **refuses a run whose conductor is still alive** (that run keeps writing its
+stream, its sessions and its log, so a run reported as redacted could regain the
+value a second later) — stop the run first, or pass `--force` if you accept
+that. `--root` chooses the run root.
+
 A worker's `worktree/` and the reviewers' `candidates/` checkouts are git trees,
 not conductor output, and are left alone — check them yourself if a worker ever
 pasted a value into the code. The trace buffer masks a declared secret's value
