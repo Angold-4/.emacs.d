@@ -631,10 +631,12 @@ conductor runs the gate itself, and only the conductor produces its evidence.
   integration the probe verified — with the plan's secrets in its environment.
   A gate that exceeds its limit has its process group killed and counts as a
   failure.
-- **The machine-wide lock.** The gate holds `~/.tradeoffs-trace/gate.lock`
-  while it runs, so two phases — in one program or in two runs — never gate at
-  once. A second gate waits for the first; a crashed holder releases the lock
-  through the OS.
+- **The machine-wide lock.** The gate takes `~/.tradeoffs-trace/gate.lock`
+  before it merges the candidate into its checkout and holds it through the
+  command, the cleanup and the record, so two phases — in one program or in
+  two runs — never have gate checkouts or build commands live at once. A
+  second gate waits for the first; a crashed holder releases the lock through
+  the OS.
 - **The record.** The conductor writes `checks/<sha>/gate.json` (candidate and
   base SHA, the merged tree, the command, the exit status, the gate command's
   own duration, start time, the log's sha256, and the cleanup's own exit and
@@ -647,19 +649,23 @@ conductor runs the gate itself, and only the conductor produces its evidence.
   log's last 60 lines. The phase returns to `REPAIRING` (or `AWAITING_OWNER`
   when the budget is exhausted), and the repair prompt shows the worker the
   conductor's record and log tail verbatim.
-- **Reuse, not repeat.** A candidate whose tree already has a passing record
-  for the same command reuses it: the command does not run again. (A repair
-  attempt that changes nothing freezes a new commit with the same tree.) Only
-  a *passing* record is reused, and only after its `gate.log` is re-hashed:
-  a record whose log is missing, truncated or edited is not evidence, and
-  the gate reruns rather than accepting on it. A failed gate is always rerun.
+- **Reuse, not repeat, and only for the same question.** A record is
+  evidence only when it answers *this* gate: the same candidate tree, the same
+  `:GATE:` command, and a `gate.log` that still hashes to the sha256 the
+  record carries. A repair attempt that changes nothing freezes a new commit
+  with the same tree, so its gate is reused rather than paid for again; a
+  record whose log is missing or edited, whose command differs (the plan was
+  re-read or the contract amended), or whose tree is another candidate's makes
+  the gate rerun. A failed gate is always rerun.
 - **A record is never rewritten.** When the *same* candidate is gated again
   (a stale publish sends the phase back through `PROBING` with its reviews
-  still valid), its own passing record is accepted in place; the control
-  log's completion record names the head being accepted now next to the head
-  the evidence was produced at. For a reused *other* candidate's record, the
-  new record's `baseSha` is the head being accepted and `reusedFromBaseSha`
-  names the head the command actually ran on.
+  still valid), its own passing record — verified against the same tree and
+  command — is accepted in place. The record keeps the head its evidence was
+  produced at, and both the control log's completion record and the status/
+  `tt summary` citation name the head being accepted now next to it, so a pass
+  is never read as evidence for a head it was not produced against. For a
+  reused *other* candidate's record, the new record's `baseSha` is the head
+  being accepted and `reusedFromBaseSha` names the head the command ran on.
 - **No agent may produce this evidence.** The worker's prompt and every
   reviewer's prompt — turn 1 and turn 2 — say the conductor runs the gate
   and that running it, reporting its result, or substituting evidence for it

@@ -4146,146 +4146,153 @@ export class Conductor {
       return;
     }
 
-    // The probed checkout: merge the candidate onto the current head, exactly
-    // as the probe does, so the gate's evidence is for the integration the
-    // probe verified. (The probe passed, so a conflict here means the head
-    // moved under the phase: a genuine gate failure.)
-    const probed = gitProbe(this.#plan.repo, { runId: this.#state.phase.runId, candidateSha, headSha: head });
-    if (!probed.ok) {
-      const conflictLog = `$ ${maskedCommand}\n${probed.output}\nthe candidate no longer merges onto ${head}\n`;
-      const redacted = redactText(conflictLog, this.#secretMaskable);
-      fs.writeFileSync(logPath, redacted);
-      const record: GateRecord = {
-        candidateSha,
-        tree,
-        baseSha: head,
-        command: maskedCommand,
-        ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
-        startedAt: new Date().toISOString(),
-        durationMs: 0,
-        exitCode: null,
-        timedOut: false,
-        passed: false,
-        logBytes: Buffer.byteLength(redacted, "utf8"),
-        logSha256: createHash("sha256").update(redacted).digest("hex"),
-        cleanupSkipped: "the candidate no longer merges onto the integration head; there was no checkout to clean",
-      };
-      fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
-      this.#log.completion(actionId, { candidateSha, passed: false, reason: "merge conflict" });
-      this.#applyEvent({
-        type: "GATE_FAILED",
-        evidence: gateFailureEvidence({ record, logPath, tail: gateLogTail(redacted), reason: `the candidate no longer merges onto ${head}` }),
-      });
-      return;
-    }
-
+    // Everything the gate does in a checkout is inside the machine-wide lock
+    // (plan 01f's approved decision: "acquired before the merge"), so two
+    // phases never have their build checkouts or commands live at once.
     const lock: Lock = await this.#acquireGateLock();
-    const startedAt = new Date().toISOString();
-    const startedMs = Date.now();
-    let gateResult: RunCommandResult;
-    let cleanupResult: RunCommandResult | undefined;
-    let cleanupStartedAt: string | undefined;
-    let cleanupMs = 0;
-    // The gate command's own duration — the cleanup runs under its own limit
-    // afterwards and is recorded separately (the record must not present
-    // teardown time as build time). Measured before the lock is released, so
-    // the recorded window is exactly the time the gate held the machine-wide
-    // lock and two honest sequential gates never look overlapped.
-    let durationMs = 0;
+    let probed: ReturnType<typeof gitProbe> | undefined;
+    let record: GateRecord | undefined;
+    let logText = "";
     try {
-      const running = runCommand({
-        command,
-        cwd: probed.checkoutDir,
-        env: this.#gateEnv(),
-        deadlineMs: this.#deadlines.gateMs,
-        termGraceMs: this.#deadlines.termGraceMs,
-        // Design §2.2: the command's process group is recorded before it runs,
-        // so a crashed gate is recoverable (see `#reconcileOne`).
-        onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
-      });
-      gateResult = await running.result;
-      durationMs = Date.now() - startedMs;
-      // Whatever the outcome: release what the gate took. The cleanup holds
-      // its own (gate-length) limit; it is not part of the gate's duration.
-      if (cleanupCommand) {
-        cleanupStartedAt = new Date().toISOString();
-        const cleanupStartedMs = Date.now();
-        const cleanup = runCommand({
-          command: cleanupCommand,
+      // The probed checkout: merge the candidate onto the current head, exactly
+      // as the probe does, so the gate's evidence is for the integration the
+      // probe verified. (The probe passed, so a conflict here means the head
+      // moved under the phase: a genuine gate failure.)
+      probed = gitProbe(this.#plan.repo, { runId: this.#state.phase.runId, candidateSha, headSha: head });
+      if (!probed.ok) {
+        logText = redactText(
+          `$ ${maskedCommand}\n${probed.output}\nthe candidate no longer merges onto ${head}\n`,
+          this.#secretMaskable,
+        );
+        fs.writeFileSync(logPath, logText);
+        record = {
+          candidateSha,
+          tree,
+          baseSha: head,
+          command: maskedCommand,
+          ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
+          startedAt: new Date().toISOString(),
+          durationMs: 0,
+          exitCode: null,
+          timedOut: false,
+          passed: false,
+          logBytes: Buffer.byteLength(logText, "utf8"),
+          logSha256: createHash("sha256").update(logText).digest("hex"),
+          cleanupSkipped: "the candidate no longer merges onto the integration head; there was no checkout to clean",
+        };
+        fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+        this.#log.completion(actionId, { candidateSha, passed: false, reason: "merge conflict" });
+      } else {
+        const startedAt = new Date().toISOString();
+        const startedMs = Date.now();
+        const running = runCommand({
+          command,
           cwd: probed.checkoutDir,
           env: this.#gateEnv(),
           deadlineMs: this.#deadlines.gateMs,
           termGraceMs: this.#deadlines.termGraceMs,
-          onIntent: ({ pgid }) => this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid }),
+          // Design §2.2: the command's process group is recorded before it
+          // runs, so a crashed gate is recoverable (see `#reconcileOne`).
+          onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
         });
-        cleanupResult = await cleanup.result;
-        cleanupMs = Date.now() - cleanupStartedMs;
+        const gateResult = await running.result;
+        // The gate command's own duration: the cleanup runs under its own
+        // limit afterwards and is recorded separately (the record must not
+        // present teardown time as build time).
+        const durationMs = Date.now() - startedMs;
+        // Whatever the outcome: release what the gate took. The cleanup holds
+        // its own (gate-length) limit; it is not part of the gate's duration.
+        let cleanupResult: RunCommandResult | undefined;
+        let cleanupStartedAt: string | undefined;
+        let cleanupMs = 0;
+        if (cleanupCommand) {
+          cleanupStartedAt = new Date().toISOString();
+          const cleanupStartedMs = Date.now();
+          const cleanup = runCommand({
+            command: cleanupCommand,
+            cwd: probed.checkoutDir,
+            env: this.#gateEnv(),
+            deadlineMs: this.#deadlines.gateMs,
+            termGraceMs: this.#deadlines.termGraceMs,
+            onIntent: ({ pgid }) => this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid }),
+          });
+          cleanupResult = await cleanup.result;
+          cleanupMs = Date.now() - cleanupStartedMs;
+        }
+        const passed = !gateResult.timedOut && gateResult.exitCode === 0;
+        // The log holds both commands' output, redacted, with the exit facts —
+        // the same shape `#recordCheck` writes.
+        const parts = [
+          `$ ${maskedCommand}\n${gateResult.output}\nexit ${gateResult.exitCode} signal ${gateResult.signal}${gateResult.timedOut ? ` (timed out after ${Math.round(durationMs / 1000)}s)` : ""}\n`,
+        ];
+        if (cleanupResult && maskedCleanup) {
+          parts.push(
+            `$ ${maskedCleanup}\n${cleanupResult.output}\nexit ${cleanupResult.exitCode} signal ${cleanupResult.signal}${cleanupResult.timedOut ? " (timed out)" : ""}\n`,
+          );
+        }
+        logText = redactText(parts.join("\n"), this.#secretMaskable);
+        fs.writeFileSync(logPath, logText);
+        record = {
+          candidateSha,
+          tree,
+          baseSha: head,
+          mergedI: probed.I,
+          command: maskedCommand,
+          ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
+          startedAt,
+          durationMs,
+          exitCode: gateResult.exitCode,
+          signal: gateResult.signal,
+          timedOut: gateResult.timedOut,
+          passed,
+          logSha256: createHash("sha256").update(logText).digest("hex"),
+          logBytes: Buffer.byteLength(logText, "utf8"),
+          ...(cleanupResult
+            ? {
+                cleanupStartedAt,
+                cleanupDurationMs: cleanupMs,
+                cleanupExitCode: cleanupResult.exitCode,
+                cleanupTimedOut: cleanupResult.timedOut,
+              }
+            : {}),
+        };
+        fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+        this.#log.completion(actionId, {
+          candidateSha,
+          head,
+          passed,
+          exitCode: gateResult.exitCode,
+          timedOut: gateResult.timedOut,
+          durationMs,
+          logSha256: record.logSha256,
+          ...(cleanupResult ? { cleanupExitCode: cleanupResult.exitCode } : {}),
+        });
       }
     } finally {
+      // The record and the completion are written inside the lock, so the
+      // window in the record is the window the lock covered (two honest
+      // sequential gates can never look overlapped). Dispatching the phase's
+      // next action is deliberately *outside* the lock: publishing is not the
+      // gate, and other phases' gates must not wait for it.
       await lock.release();
-      discardProbe(this.#plan.repo, { probeBranch: probed.probeBranch, checkoutDir: probed.checkoutDir });
+      if (probed?.ok) discardProbe(this.#plan.repo, { probeBranch: probed.probeBranch, checkoutDir: probed.checkoutDir });
     }
-    const passed = !gateResult.timedOut && gateResult.exitCode === 0;
-    // The log holds both commands' output, redacted, with the exit facts —
-    // the same shape `#recordCheck` writes.
-    const parts = [
-      `$ ${maskedCommand}\n${gateResult.output}\nexit ${gateResult.exitCode} signal ${gateResult.signal}${gateResult.timedOut ? ` (timed out after ${Math.round(durationMs / 1000)}s)` : ""}\n`,
-    ];
-    if (cleanupResult && maskedCleanup) {
-      parts.push(
-        `$ ${maskedCleanup}\n${cleanupResult.output}\nexit ${cleanupResult.exitCode} signal ${cleanupResult.signal}${cleanupResult.timedOut ? " (timed out)" : ""}\n`,
-      );
-    }
-    const logText = redactText(parts.join("\n"), this.#secretMaskable);
-    fs.writeFileSync(logPath, logText);
-    const record: GateRecord = {
-      candidateSha,
-      tree,
-      baseSha: head,
-      mergedI: probed.I,
-      command: maskedCommand,
-      ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
-      startedAt,
-      durationMs,
-      exitCode: gateResult.exitCode,
-      signal: gateResult.signal,
-      timedOut: gateResult.timedOut,
-      passed,
-      logSha256: createHash("sha256").update(logText).digest("hex"),
-      logBytes: Buffer.byteLength(logText, "utf8"),
-      ...(cleanupResult
-        ? {
-            cleanupStartedAt,
-            cleanupDurationMs: cleanupMs,
-            cleanupExitCode: cleanupResult.exitCode,
-            cleanupTimedOut: cleanupResult.timedOut,
-          }
-        : {}),
-    };
-    fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
-    this.#log.completion(actionId, {
-      candidateSha,
-      head,
-      passed,
-      exitCode: gateResult.exitCode,
-      timedOut: gateResult.timedOut,
-      durationMs,
-      logSha256: record.logSha256,
-      ...(cleanupResult ? { cleanupExitCode: cleanupResult.exitCode } : {}),
-    });
-    if (passed) {
+    if (!record) return;
+    if (record.passed) {
       this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(this.#state.phase, candidateSha, contract.contractVersion) });
     } else {
+      const reason = probed && !probed.ok ? `the candidate no longer merges onto ${head}` : undefined;
       this.#applyEvent({
         type: "GATE_FAILED",
-        evidence: gateFailureEvidence({ record, logPath, tail: gateLogTail(logText) }),
+        evidence: gateFailureEvidence({ record, logPath, tail: gateLogTail(logText), reason }),
       });
     }
   }
 
   /** The machine-wide gate lock (plan 01f). Waits for a holder instead of
    * failing: a second phase gates after the first is done, never alongside
-   * it. The lock is released in a `finally` around the gate and its cleanup;
+   * it. It is acquired before the merge that builds the gate's checkout and
+   * released after the gate command, its cleanup and the record are written;
    * a conductor that dies mid-gate releases it through the perl helper's own
    * exit, so a crashed gate cannot wedge every later one. */
   async #acquireGateLock(): Promise<Lock> {

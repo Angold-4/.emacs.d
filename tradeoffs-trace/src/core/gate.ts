@@ -196,7 +196,10 @@ export function gateLogHashMatches(record: GateRecord, log: Buffer): boolean {
  * reuse **another** candidate's verified passing record that answers the same
  * question, or run the command.
  *
- * The candidate's own record is never "reused": a self-reuse record would
+ * Both branches go through `gateRecordAnswers`, so a record that answered a
+ * different question is never evidence — a different `:GATE:` command (the
+ * plan was re-read or amended) or a different tree reruns the gate. The
+ * candidate's own record is never "reused": a self-reuse record would
  * overwrite the run's own evidence with a claim of reusing it. Callers pass
  * only records whose logs they have verified (`gateLogHashMatches`); an
  * unverified record must be passed as `undefined`/absent so the gate reruns. */
@@ -205,7 +208,9 @@ export function gateDecision(
   records: readonly GateRecord[],
   want: { candidateSha: string; tree?: string; command: string },
 ): { kind: "own"; record: GateRecord } | { kind: "reuse"; record: GateRecord } | { kind: "run" } {
-  if (ownVerifiedPass && ownVerifiedPass.passed) return { kind: "own", record: ownVerifiedPass };
+  if (gateRecordAnswers(ownVerifiedPass, want, { allowReused: true })) {
+    return { kind: "own", record: ownVerifiedPass! };
+  }
   const reused = reusableGate(
     records.filter((r) => r.candidateSha !== want.candidateSha),
     want,
@@ -219,10 +224,32 @@ export function gateDecision(
  * the same tree), and the record names the head the evidence came from
  * (`reusedFromBaseSha`). A record for the candidate itself is not a reuse:
  * `gateDecision` handles that case separately. */
-export function gateRecordAnswers(record: GateRecord | undefined, want: { tree?: string; command: string }): boolean {
+/** True iff `record` is a passing gate that answers the same question this
+ * candidate asks: the same tree, gated with the same command. The base SHA
+ * deliberately does not have to match — the gate is dispatched once per
+ * candidate (a repair attempt that changes nothing freezes a new commit with
+ * the same tree), and the record names the head the evidence came from
+ * (`reusedFromBaseSha`).
+ *
+ * `allowReused` keeps a record that was itself written as a reuse (the
+ * candidate's own record after an earlier identical tree): it is still this
+ * candidate's evidence, it just came from further back.
+ *
+ * A record whose command differs is not evidence for this gate: the plan
+ * snapshot is re-read at every restart and an amended contract can name a
+ * different `:GATE:` command, so a changed command means the old record
+ * answered a different question. A record whose tree differs is another
+ * candidate's pass. Callers verify the log's hash separately
+ * (`gateLogHashMatches`). */
+export function gateRecordAnswers(
+  record: GateRecord | undefined,
+  want: { tree?: string; command: string },
+  opts: { allowReused?: boolean } = {},
+): boolean {
   // A reused record is not a source: the original pass is the evidence, and
   // reusing a reuse would just add indirection.
-  if (!record || !record.passed || record.reused) return false;
+  if (!record || !record.passed) return false;
+  if (record.reused && !opts.allowReused) return false;
   if (!want.tree || !record.tree) return false;
   return record.tree === want.tree && record.command === want.command;
 }

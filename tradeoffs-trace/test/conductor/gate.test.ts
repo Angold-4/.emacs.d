@@ -190,6 +190,19 @@ test("gate: gateDecision accepts the candidate's own verified pass, never reuses
     kind: "own",
     record: own,
   });
+  // A record that was itself written as a reuse is still this candidate's own
+  // evidence, as long as it answers the same question.
+  const ownReused = recordFixture({ candidateSha: "c1", tree: "tree-a", reused: true, reusedFrom: "c0" });
+  assert.equal(gateDecision(ownReused, [ownReused], { candidateSha: "c1", tree: "tree-a", command: own.command }).kind, "own");
+  // The own branch checks the question too (A-14/M-13): a record for a
+  // different command — the plan's `:GATE:` was re-read or amended — or for a
+  // different tree is not evidence, and the gate must run.
+  assert.deepEqual(
+    gateDecision(own, [own], { candidateSha: "c1", tree: "tree-a", command: "deploy --build --new" }),
+    { kind: "run" },
+  );
+  assert.deepEqual(gateDecision(own, [own], { candidateSha: "c1", tree: "tree-b", command: own.command }), { kind: "run" });
+  assert.deepEqual(gateDecision(own, [own], { candidateSha: "c1", tree: undefined, command: own.command }), { kind: "run" });
   // Without a verified own record, another candidate's verified pass for the
   // same tree is reused — and the candidate's own record is never returned as
   // the reuse source.
@@ -203,6 +216,23 @@ test("gate: gateDecision accepts the candidate's own verified pass, never reuses
   // An unverifiable or mismatching record is not evidence: the gate reruns.
   assert.deepEqual(gateDecision(undefined, [], { candidateSha: "c1", tree: "tree-a", command: own.command }), { kind: "run" });
   assert.deepEqual(gateDecision(undefined, [other], { candidateSha: "c2", tree: "other-tree", command: own.command }), { kind: "run" });
+});
+
+test("gate: the citation names the head the evidence was produced for, and the head being accepted when they differ", () => {
+  const headA = "a".repeat(40);
+  const headB = "b".repeat(40);
+  const fresh = recordFixture({ baseSha: headA });
+  assert.match(gateSummaryLine(fresh, headA), /passed \(exit 0\).*against base aaaaaaa/);
+  assert.ok(!gateSummaryLine(fresh, headA).includes("accepted against"), "no second base when they agree");
+  // B-11: a candidate re-gated at a moved head keeps its own record, so the
+  // citation must show both heads rather than implying the evidence was for
+  // the new one.
+  const reAccepted = gateSummaryLine(fresh, headB);
+  assert.match(reAccepted, /against base aaaaaaa \(accepted against base bbbbbbb\)/);
+  const reused = recordFixture({ baseSha: headB, reused: true, reusedFrom: "c0", reusedFromBaseSha: headA });
+  const cited = gateSummaryLine(reused, headB);
+  assert.match(cited, /reused candidate c0's record, gated against base aaaaaaa/);
+  assert.match(cited, /candidate c1 against base bbbbbbb/);
 });
 
 test("gate: gateFailureEvidence quotes the log's tail, the exit status and the log hash", () => {
@@ -354,6 +384,9 @@ test("gate: a passing gate runs exactly once, records the candidate, the exit st
     assert.match(view.pipeline, /gate/);
     assert.match(view.gates, /gate ✓/);
     assert.match(view.gate ?? "", /gate passed \(exit 0\)/);
+    // The citation names the head the evidence was produced against.
+    assert.match(view.gate ?? "", /against base [0-9a-f]{7}/);
+    assert.ok(!(view.gate ?? "").includes("accepted against"), "no second base for a fresh pass");
     assert.match(gateSummaryLine(record), new RegExp(C.slice(0, 9)));
     // `tt summary <run>` is prSummary's Markdown verbatim (cli.ts's
     // runSummary), so this is the citation the PR body carries.
@@ -571,7 +604,12 @@ test("gate: a candidate whose tree already has a passing record reuses it withou
     assert.equal(reused.logSha256, sha256File(path.join(runPaths(setup.runDir).checks, C, "gate.log")));
     assert.ok(!fs.existsSync(marker), "the gate command must not run when an identical tree has a passing record");
     const plan = JSON.parse(fs.readFileSync(path.join(runPaths(setup.runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-    assert.match(buildView(setup.runDir, plan, false).gates, /gate ✓ \(reused\)/);
+    const view = buildView(setup.runDir, plan, false);
+    assert.match(view.gates, /gate ✓ \(reused\)/);
+    // The citation names both heads: the one the evidence was produced for and
+    // the one the candidate is accepted against.
+    assert.match(view.gate ?? "", /reused candidate beefbeefb's record, gated against base 0000000/);
+    assert.match(view.gate ?? "", new RegExp(`against base ${setup.repo.head.slice(0, 7)}`));
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

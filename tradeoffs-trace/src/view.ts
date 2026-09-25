@@ -431,7 +431,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
     pipeline: pipelineLine(spans, stageLimits(plan)),
     gates,
-    gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord) : undefined,
+    gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord, phase.integrationHead) : undefined,
     baseline: baselineStatusLine(baseline),
     previousRound,
     reviewers,
@@ -473,18 +473,32 @@ function readGateRecord(runDir: string, candidateSha: string | undefined): GateR
   }
 }
 
-/** Plan 01f: one line citing a gate record — what a passing gate proved, how
- * long it took and where its log is. */
-export function gateSummaryLine(record: GateRecord): string {
+/** Plan 01f: one line citing a gate record — what a passing gate proved, the
+ * head its evidence was produced for, how long it took and where its log is.
+ *
+ * `acceptedAtBase` is the integration head the phase is accepting the
+ * candidate against now. When it differs from the record's own head (a
+ * re-acceptance after a stale publish reuses the candidate's own record
+ * rather than rewriting it), both are named: the record is never rewritten,
+ * so the citation is where a reader learns that the evidence was produced
+ * against the older head. */
+export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): string {
+  const short = (sha: string) => sha.slice(0, 7);
   const how = record.reused
-    ? `passed (reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s record${record.reusedFromBaseSha ? `, gated at base ${record.reusedFromBaseSha.slice(0, 7)}` : ""})`
+    ? `passed (reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s record${record.reusedFromBaseSha ? `, gated against base ${short(record.reusedFromBaseSha)}` : ""})`
     : record.passed
       ? "passed (exit 0)"
       : record.timedOut
         ? "killed at its limit"
         : `failed (exit ${record.exitCode})`;
-  const cleanup = record.cleanup ? `; cleanup ${record.cleanupExitCode === 0 ? "ok" : `exit ${record.cleanupExitCode ?? "?"}`}` : "";
-  return `gate ${how} in ${formatDuration(record.durationMs)} on candidate ${record.candidateSha.slice(0, 9)}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
+  const accepted =
+    acceptedAtBase !== undefined && acceptedAtBase !== record.baseSha
+      ? ` (accepted against base ${short(acceptedAtBase)})`
+      : "";
+  const cleanup = record.cleanup
+    ? `; cleanup ${record.cleanupExitCode === 0 ? "ok" : `exit ${record.cleanupExitCode ?? "?"}`}`
+    : "";
+  return `gate ${how} in ${formatDuration(record.durationMs)} on candidate ${record.candidateSha.slice(0, 9)} against base ${short(record.baseSha)}${accepted}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
 }
 
 function readBaseline(runDir: string): Baseline | undefined {

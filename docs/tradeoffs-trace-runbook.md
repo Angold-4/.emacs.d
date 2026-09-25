@@ -51,9 +51,10 @@ for example a full `deploy/atlas.sh … --clean --build` of a 40-service stack
   "pending owner live run", a fingerprint) is a blocking finding, not evidence.
 - It runs in a fresh checkout of the candidate merged onto the current
   integration head, with the plan's secrets (`#+TT_SECRETS`) in its
-  environment. It holds `~/.tradeoffs-trace/gate.lock` while the command and
-  its cleanup run, so two phases — in one program or in two runs — never gate
-  at once; the second waits.
+  environment. It takes `~/.tradeoffs-trace/gate.lock` before that merge and
+  holds it through the command, the cleanup and the record, so two phases —
+  in one program or in two runs — never have gate checkouts or builds live at
+  once; the second waits.
 - **The evidence** is `<run>/checks/<sha>/gate.json` (candidate and base SHA,
   the merged tree, the command, exit status, the gate's own duration, start,
   the log's sha256, and the cleanup's own exit and duration) plus
@@ -64,12 +65,15 @@ for example a full `deploy/atlas.sh … --clean --build` of a 40-service stack
   `integration` finding whose evidence is the log's last 60 lines. The phase
   repairs (the worker is shown the log) or parks on you when the rounds run
   out.
-- **An identical tree reuses a passing record**: the command does not run
-  again (a repair attempt that changes nothing freezes a new commit with the
-  same tree). The record is re-hashed first: if its `gate.log` is missing or no
-  longer matches the sha256 it carries, the gate reruns instead of passing on
-  it. A failed gate is always rerun, and a record is never overwritten — a
-  candidate re-gated after a stale publish accepts on its own record in place.
+- **An identical tree with the same command reuses a passing record**: the
+  command does not run again (a repair attempt that changes nothing freezes a
+  new commit with the same tree). The record is re-hashed first: if its
+  `gate.log` is missing or no longer matches the sha256 it carries — or the
+  plan's `:GATE:` text has changed — the gate reruns instead of passing on it.
+  A failed gate is always rerun, and a record is never overwritten: a
+  candidate re-gated after a stale publish accepts on its own record in place,
+  and the status/`tt summary` line names both the head the evidence came from
+  and the head being accepted.
 - **The limit** is 30 min by default; `#+TT_GATE_MINUTES: 45` raises it. A gate
   over the limit has its process group killed and counts as failed.
 - A phase without `:GATE:` is unaffected: it accepts as soon as the reviews
