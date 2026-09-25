@@ -49,6 +49,7 @@ import {
   gateFailureEvidence,
   gateLogHashMatches,
   gateLogTail,
+  gateOutcomeText,
   parseGateRecord,
   reusableGate,
   type GateRecord,
@@ -170,8 +171,9 @@ test("gate: a record that never started carries no exit status or duration", () 
   assert.equal(parseGateRecord({ ...notStarted, notStarted: undefined }), undefined);
   // The failure text says what happened, not "exited on a signal".
   const evidence = gateFailureEvidence({ record: parsed, logPath: "/run/checks/c1/gate.log", tail: "merge refused" });
-  assert.match(evidence, /did not start: the candidate does not merge onto h1/);
+  assert.match(evidence, /did not start \(the candidate does not merge onto h1\)/);
   assert.ok(!evidence.includes("on a signal"), "a run that never started must not be reported as a signal death");
+  assert.ok(!evidence.includes("undefined"), "no field may be rendered as undefined");
 });
 
 test("gate: gateLogTail returns the last N lines (the tail a failure quotes)", () => {
@@ -276,7 +278,7 @@ test("gate: gateFailureEvidence quotes the log's tail, the exit status and the l
     logPath: "/run/checks/candidate-sha-1234/gate.log",
     tail: gateLogTail("a\nb\nboom\n", GATE_TAIL_LINES),
   });
-  assert.match(evidence, /exited 3/);
+  assert.match(evidence, /failed \(exit 3\)/);
   assert.match(evidence, /candidate/);
   assert.match(evidence, /boom/);
   assert.match(evidence, new RegExp(record.logSha256));
@@ -307,6 +309,39 @@ test("gate: the worker prompt says the conductor runs the gate and forbids runni
   const plain = buildWorkerPrompt(buildContract({ id: "p1", goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [] }));
   assert.match(plain, /Never run the gate command yourself/);
   assert.ok(!plain.includes("The phase's gate command is:"));
+});
+
+test("gate: every place that names a gate's outcome says some specific thing, never 'undefined'", () => {
+  // B-22/A-23: two prompt sites rendered exitCode/timedOut directly, so a
+  // notStarted record came out as "exited undefined"/"failed (exit
+  // undefined)". One helper now decides the phrase for the evidence, the
+  // prompts and the citation.
+  const started = recordFixture({ passed: false, exitCode: 3 });
+  assert.match(gateOutcomeText(started, { withElapsed: true }), /^failed \(exit 3\)$/);
+  assert.match(gateOutcomeText(recordFixture({ passed: false, timedOut: true }), { withElapsed: true }), /^was killed at its limit after 15m00s$/);
+  assert.match(gateOutcomeText(recordFixture({ exitCode: null, passed: false })), /^ended on a signal$/);
+  assert.match(gateOutcomeText(recordFixture(), { withElapsed: true }), /^passed \(exit 0\) in 15m00s$/);
+  const neverStarted = parseGateRecord({
+    candidateSha: "c1",
+    tree: "tree-a",
+    baseSha: "h1",
+    command: "deploy --build",
+    startedAt: "2026-09-25T00:00:00.000Z",
+    notStarted: "the candidate does not merge onto h1",
+    passed: false,
+    logSha256: "a".repeat(64),
+  })!;
+  const outcome = gateOutcomeText(neverStarted, { withElapsed: true });
+  assert.match(outcome, /^did not start \(the candidate does not merge onto h1\)$/);
+  assert.ok(!outcome.includes("undefined"));
+  assert.ok(!outcome.includes("signal"));
+  // The prompt line and the citation use the same phrase.
+  const line = gatePromptLines("deploy --build", neverStarted).join("\n");
+  assert.match(line, /did not start \(the candidate does not merge onto h1\)/);
+  assert.ok(!line.includes("undefined"));
+  const cited = gateSummaryLine(neverStarted);
+  assert.match(cited, /did not start \(the candidate does not merge onto h1\)/);
+  assert.ok(!cited.includes("undefined"), cited);
 });
 
 test("gate: the record section names the command, the outcome and the log hash, with the tail when it failed", () => {
@@ -347,16 +382,17 @@ test("gate: the stub reviewer prompt carries the gate rule too", () => {
 // ---------------------------------------------------------------------------
 // End to end
 //
-// Wrapped in one `describe` with `concurrency: 4`: each of these drives a real
-// conductor (a couple of seconds of process spawning and git checkouts), and
-// this phase's own `:CHECKS:` is the whole `make -C tradeoffs-trace check`
-// suite under the plan's check deadline, so the file must not add serial
-// minutes to it. Every test builds its own temp repo, run root and gate lock,
-// so they are independent. Three is the ceiling: at six concurrent conductors
-// the host serializes them and a wait budget can be exhausted.
+// Grouped in one `describe` and run SEQUENTIALLY. Each of these drives a real
+// conductor (seconds of process spawning and git checkouts), and
+// `make -C tradeoffs-trace check` runs four test files at once under the
+// plan's check deadline. Running them concurrently shortened this file but
+// raised the peak load enough to destabilize a pre-existing timing-sensitive
+// test elsewhere in the suite (a 4-second review deadline), so this file
+// trades about 15s of its own wall time for a quieter machine; the 150s wait
+// budgets below still absorb the load that four files at once create.
 // ---------------------------------------------------------------------------
 
-describe("gate: end to end", { concurrency: 3 }, () => {
+describe("gate: end to end", () => {
 
 test("gate: a passing gate runs exactly once, records the candidate, the exit status and the log hash, and reaches DONE", async () => {
   const dir = shortTmp("tt-gate-pass");
@@ -478,7 +514,7 @@ test("gate: a failing gate becomes a blocking integration finding with the log t
 
     // The repair round shows the worker the conductor's own record and log.
     const prompts = fs.readFileSync(promptLog, "utf8");
-    assert.match(prompts, /The conductor ran the phase's gate command and it exited 3/);
+    assert.match(prompts, /The conductor ran the phase's gate command and it failed \(exit 3\)/);
     assert.match(prompts, /tail-line-70/);
 
     // The record itself is a failing one, and no agent produced it: it is in

@@ -164,6 +164,34 @@ export function gateLogTail(text: string, lines = GATE_TAIL_LINES): string {
   return all.slice(Math.max(0, all.length - lines)).join("\n");
 }
 
+function formatGateDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
+/** How a gate record's run ended, in words — the ONE place that decides, so a
+ * gate that never started is never described as an exit-less or signal-killed
+ * run (findings B-22 and A-23: two prompt sites rendered `exitCode`/`timedOut`
+ * directly and said "exited undefined"). Used by the failure evidence, the
+ * worker's repair prompt, every agent prompt's record line and the status
+ * citation. `withElapsed` appends how long the command took, which a record
+ * that never started has nothing to say about. */
+export function gateOutcomeText(
+  record: Pick<GateRecord, "passed" | "timedOut" | "exitCode" | "durationMs" | "notStarted">,
+  opts: { withElapsed?: boolean } = {},
+): string {
+  if (record.notStarted) return `did not start (${record.notStarted})`;
+  if (record.timedOut) {
+    return `was killed at its limit${opts.withElapsed && record.durationMs !== undefined ? ` after ${formatGateDuration(record.durationMs)}` : ""}`;
+  }
+  if (record.passed) {
+    return `passed (exit 0)${opts.withElapsed && record.durationMs !== undefined ? ` in ${formatGateDuration(record.durationMs)}` : ""}`;
+  }
+  if (record.exitCode === null || record.exitCode === undefined) return "ended on a signal";
+  return `failed (exit ${record.exitCode})`;
+}
+
 /** The evidence a failed gate becomes: what ran, how it ended, where the
  * whole log is, and its last lines. This string is the blocking
  * `integration` finding's evidence, so it carries the log tail verbatim —
@@ -175,13 +203,9 @@ export function gateFailureEvidence(opts: {
   reason?: string;
 }): string {
   const { record } = opts;
-  // A gate that never started did not exit, and did not get killed: say what
-  // actually happened instead of dressing it up as an exit-less run.
-  const how = record.notStarted
-    ? `did not start: ${record.notStarted}`
-    : record.timedOut
-      ? `was killed at its limit after ${Math.round((record.durationMs ?? 0) / 1000)}s`
-      : `exited ${record.exitCode === null || record.exitCode === undefined ? "on a signal" : record.exitCode}`;
+  // One outcome phrase for every path: a gate that never started did not
+  // exit, and was not killed, so it is never dressed up as either.
+  const how = gateOutcomeText(record, { withElapsed: true });
   const lines = [
     `gate command ${how} on candidate ${record.candidateSha.slice(0, 9)}: ${record.command}`,
     `log: ${opts.logPath} (sha256 ${record.logSha256})`,

@@ -32,6 +32,7 @@ import {
   gateFailureEvidence,
   gateLogHashMatches,
   gateLogTail,
+  gateOutcomeText,
   parseGateRecord,
   type GateRecord,
 } from "./core/gate.ts";
@@ -3194,11 +3195,9 @@ export class Conductor {
     // agent's summary of it, with the last lines inline.
     const gateRecord = this.#gateRecords().find((r) => r.candidateSha === C);
     if (gateRecord && !gateRecord.passed) {
-      const how = gateRecord.timedOut
-        ? `was killed at its limit after ${Math.round(gateRecord.durationMs / 1000)}s`
-        : gateRecord.exitCode === null
-          ? "ended on a signal"
-          : `exited ${gateRecord.exitCode}`;
+      // One outcome phrase (core/gate.ts): a gate that never started says so
+      // instead of "exited undefined" (findings B-22/A-23).
+      const how = gateOutcomeText(gateRecord, { withElapsed: true });
       const tail = this.#gateTailForPrompt(C);
       blocking.unshift(
         `The conductor ran the phase's gate command and it ${how}: ${gateRecord.command} (checks/${C}/gate.log, sha256 ${gateRecord.logSha256}).` +
@@ -4977,13 +4976,11 @@ export function gatePromptLines(
   const lines = ["", GATE_BINDING_STATEMENT];
   if (gate) lines.push(`The phase's gate command is: \`${gate}\``);
   if (record) {
+    // One outcome phrase (core/gate.ts), so a gate that never started is
+    // never rendered as "failed (exit undefined)" (findings B-22/A-23).
     const how = record.reused
       ? `reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s passing record`
-      : record.passed
-        ? `passed (exit 0) in ${formatDurationForPrompt(record.durationMs)}`
-        : record.timedOut
-          ? `was killed at its limit after ${formatDurationForPrompt(record.durationMs)}`
-          : `failed (exit ${record.exitCode})`;
+      : gateOutcomeText(record, { withElapsed: true });
     lines.push(`Gate record for candidate ${record.candidateSha.slice(0, 9)}: ${record.command} — ${how}; log sha256 ${record.logSha256}`);
     if (!record.passed && tail && tail.trim().length > 0) {
       lines.push(`Last lines of that gate's log:`, tail);
@@ -4992,10 +4989,6 @@ export function gatePromptLines(
   return lines;
 }
 
-function formatDurationForPrompt(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000));
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
-}
 
 /** Plan 01i: the reviewer turn-2 directive section — every directive in force,
  * verbatim, newest last, then the contract rule that binds them. Exported (and

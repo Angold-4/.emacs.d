@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { DEFAULT_DEADLINES, rebuildTimeline, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { effectiveChecks } from "./core/checks.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
-import { parseGateRecord, type GateRecord } from "./core/gate.ts";
+import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 import { notAcceptedReasons, reviewerOutcomes, type ReviewerOutcome } from "./core/verdict.ts";
@@ -484,16 +484,12 @@ function readGateRecord(runDir: string, candidateSha: string | undefined): GateR
  * against the older head. */
 export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): string {
   const short = (sha: string) => sha.slice(0, 7);
-  const how = record.notStarted
-    ? `did not start (${record.notStarted})`
-    : record.reused
-      ? `passed (reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s record${record.reusedFromBaseSha ? `, gated against base ${short(record.reusedFromBaseSha)}` : ""})`
-      : record.passed
-        ? "passed (exit 0)"
-        : record.timedOut
-          ? "killed at its limit"
-          : `failed (exit ${record.exitCode ?? "?"})`;
-  const elapsed = record.notStarted ? "" : ` in ${formatDuration(record.durationMs ?? 0)}`;
+  // One outcome phrase (core/gate.ts), shared with the prompts and the
+  // failure evidence: a gate that never started is never rendered as an
+  // exit-less failure.
+  const how = record.reused
+    ? `passed (reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s record${record.reusedFromBaseSha ? `, gated against base ${short(record.reusedFromBaseSha)}` : ""})`
+    : gateOutcomeText(record, { withElapsed: true });
   const accepted =
     acceptedAtBase !== undefined && acceptedAtBase !== record.baseSha
       ? ` (accepted against base ${short(acceptedAtBase)})`
@@ -501,7 +497,7 @@ export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): st
   const cleanup = record.cleanup
     ? `; cleanup ${record.cleanupExitCode === 0 ? "ok" : `exit ${record.cleanupExitCode ?? "?"}`}`
     : "";
-  return `gate ${how}${elapsed} on candidate ${record.candidateSha.slice(0, 9)} against base ${short(record.baseSha)}${accepted}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
+  return `gate ${how} on candidate ${record.candidateSha.slice(0, 9)} against base ${short(record.baseSha)}${accepted}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
 }
 
 function readBaseline(runDir: string): Baseline | undefined {
