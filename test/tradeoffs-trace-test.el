@@ -641,5 +641,44 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (setenv "TT" nil)
       (delete-directory root t))))
 
+(defconst +tt-test--amended-state
+  '((meta (title . "sum validation"))
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "IMPLEMENTING")
+                  (attempt (n . 2))
+                  (candidate (sha . "7c1e0a4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+                  (contract (contractVersion (snapshot . 2) (sectionSha256 . "9e2c")))
+                  (decisions ((id . "D-p1-C1-amendment") (version . 2) (class . "reserved")
+                              (source . "worker")
+                              (choice . "the tests pass")
+                              (whyItMatters . "the literal wording cannot be met")
+                              (alternatives ((option . "it works") (consequence . "no candidate can satisfy it")))
+                              (recommendation (choice . "the tests pass") (reason . "satisfiable and still meaningful"))
+                              (amendment (id . "AM-p1-C1")
+                                         (criterion . "it works")
+                                         (proposedWording . "the tests pass")
+                                         (why . "the literal wording cannot be met")
+                                         (raisedBy . "worker") (status . "applied"))))
+                  (ballots)
+                  (findings)
+                  (ownerRequests)
+                  (corrections)))
+    (decisionStatuses (D-p1-C1-amendment (status . "passed") (reason . "vote passed")
+                                         (amendment (id . "AM-p1-C1")
+                                                    (criterion . "it works")
+                                                    (proposedWording . "the tests pass")
+                                                    (status . "applied"))))
+    (view (round . 2) (reviewLine . "M ✓   A ✓   B ✓") (needsYou . 0)))
+  "Plan 01g: a `tt state' whose only record is an applied amendment.")
+
+(ert-deftest tradeoffs-trace-amendment-decision-render ()
+  "Plan 01g: the decision view shows an amendment as `⚑ AMENDED' with the old
+wording → the new one, read from the tally status the conductor emits."
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--amended-state)
+    (let ((text (buffer-string)))
+      (should (string-match-p "\\* ⚑ AMENDED" text))
+      (should (string-match-p (regexp-quote "it works → the tests pass") text)))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

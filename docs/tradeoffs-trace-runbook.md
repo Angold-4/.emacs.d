@@ -378,9 +378,9 @@ past run cannot display one either.
 
 | Where | What you see |
 |---|---|
-| status buffer | pipeline with stage times and time left; `time`: where the active agent's time goes (model, polling, full tests) and its running tool; gates for the current candidate; each reviewer's **outcome** (`M ✗ 2 reject · 1 blocking`); `verdict`: why the phase did or did not accept, and what happens next |
+| status buffer | pipeline with stage times and time left; `time`: where the active agent's time goes (model, polling, full tests) and its running tool; gates for the current candidate; `amended`: every passed or reverted criterion amendment with old → new; each reviewer's **outcome** (`M ✗ 2 reject · 1 blocking`); `verdict`: why the phase did or did not accept, and what happens next |
 | trace buffer | one line per tool call (time, command, ✓/✗ exit, duration, last output line), plus `path +a −r` for each file the call changed; the running call in the header. `a` pins another agent. |
-| decision view (`C-c m d`) | the current round's decisions, each labelled by the tally, with the options, recommendation and each reviewer's ballot; findings grouped by file; earlier rounds one line each. Read-only. |
+| decision view (`C-c m d`) | the current round's decisions, each labelled by the tally, with the options, recommendation and each reviewer's ballot; a passed amendment reads `⚑ AMENDED` and shows the old → new wording; findings grouped by file; earlier rounds one line each. Read-only. |
 | runs list (`C-c m l`) | every run: `RET` opens, `k` stops, `R` resumes |
 | mode line | live runs with stage, time and reviews; a warning face when something needs attention |
 | CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
@@ -410,6 +410,13 @@ whole program).
 | CHECKING / PROBING / REVIEWING | steers every live agent now (the reviewers, mid-turn) as an owner directive; the note is also delivered at the start of the next worker attempt |
 | AWAITING_OWNER ("needs you") | **correction**: resolves the open requests, grants 3 repair rounds, repairs with your text verbatim — and is an owner directive in every later prompt |
 | DONE / BLOCKED | refused, with the reason |
+
+**Taking back an amendment.** A dispute (§ below) that passed becomes an
+amendment. To restore the criterion's original wording, type a correction
+naming the amendment's id — `revert AM-p1-7c1e0a4a` — into the input box. It
+works from any running phase (it does not wait for AWAITING_OWNER and grants no
+repair rounds); the status shows the input as `reverted an amendment`, and a
+later `revert` of the same amendment is refused.
 
 **Scope.** A directive applies to its own phase by default, and is numbered
 `OD-1`, `OD-2`, …. It applies to the **whole program** — every running node is
@@ -474,6 +481,21 @@ a dependency) are voted on by M, A and B like any other and marked
 `⚑ FLAGGED` in the decision view; the status counts them ("N flagged for
 you"). Read them if you care and override one through the input box. A run
 stops for you only when its repair rounds are exhausted.
+
+**Unmeetable criteria do not stop the run either.** A worker (or a reviewer)
+that finds a criterion cannot be met **as written** — not merely unmet —
+records a *criterion dispute* (`criterionDispute: {criterion, why,
+proposedWording}` in `submit_phase`, or the same field on a turn-2 finding).
+The conductor turns it into an **amendment** record, voted on like any other
+reserved decision. If the normal tally passes (M, plus one of A/B) the
+criterion's wording is replaced **for this phase only, from the next candidate
+on**: the contract version bumps, contract findings citing the old wording are
+closed as **superseded**, and the status, the decision view and `tt summary`
+show `⚑ AMENDED` with the old and the new text. The amendment starts a fresh
+attempt, not a repair round, and a failed one leaves the wording unchanged and
+blocks nothing. A criterion that is merely unmet is still an ordinary blocking
+finding and a normal repair. You can undo an amendment at any time with a
+correction naming its id (`revert AM-p1-7c1e0a4a`).
 
 ## Outcomes
 

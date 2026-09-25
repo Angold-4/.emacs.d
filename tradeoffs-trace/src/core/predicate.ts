@@ -30,7 +30,7 @@
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
-import type { ContractVersion, Correction, Decision, PhaseState, Review } from "./types.ts";
+import type { ContractVersion, Correction, CriterionAmendment, Decision, PhaseState, Review } from "./types.ts";
 
 export function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
   return a.snapshot === b.snapshot && a.sectionSha256 === b.sectionSha256;
@@ -141,6 +141,29 @@ export function isLiveDecision(decision: Decision): boolean {
   return !decision.supersededByCorrection && !decision.supersededBy;
 }
 
+/** Plan 01g: a proposed amendment that has passed the normal tally and is
+ * ready to be applied — a live `reserved` decision bound to the current
+ * (candidate, contract) whose `amendment.status` is `proposed` and whose
+ * ballot tally is `pass`. This is the only amendment that may rewrite the
+ * contract; an amendment that failed (or is still short of a ballot) leaves
+ * the criterion unchanged and never blocks acceptance by itself. */
+export function amendmentToApply(
+  phase: PhaseState,
+  C: string,
+  K: ContractVersion,
+): Decision | undefined {
+  return phase.decisions.find(
+    (d) =>
+      d.amendment !== undefined &&
+      isLiveDecision(d) &&
+      d.class === "reserved" &&
+      d.amendment.status === "proposed" &&
+      d.boundCandidateSha === C &&
+      sameVersion(d.boundContractVersion, K) &&
+      tally(d, phase.ballots, phase.findings, C, K) === "pass",
+  );
+}
+
 export function decisionSettled(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): boolean {
   if (decision.class === "detail") return true;
 
@@ -197,6 +220,12 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     // owner resolution, is what acceptance now depends on (via the
     // corrections/addressed check below).
     if (!isLiveDecision(decision)) continue;
+    // Plan 01g: an amendment record is never an acceptance blocker by
+    // itself. A passing one is applied (next.ts's `apply_amendment`); a
+    // failed one leaves the criterion unchanged, and the round is handled
+    // exactly as today — a dispute must not, by itself, consume a repair
+    // round or park the run on the owner.
+    if (decision.amendment) continue;
     if (!decisionSettled(decision, phase, C, K)) return false;
   }
 
@@ -227,17 +256,34 @@ export interface DecisionStatus {
   reason?: string;
   /** A reserved decision: voted like any other, shown to the owner. */
   flagged?: boolean;
+  /** Plan 01g: set on an amendment record so the status and the decision
+   * view can show `⚑ AMENDED` with the old and new wording, without
+   * inferring it from the decision's own choice. */
+  amendment?: CriterionAmendment;
 }
 
 export function decisionStatus(decision: Decision, phase: PhaseState): DecisionStatus {
   if (decision.supersededByCorrection) return { status: "superseded", reason: `by correction ${decision.supersededByCorrection}` };
   if (decision.supersededBy) return { status: "superseded", reason: decision.supersededBy };
   if (decision.class === "detail") return { status: "detail" };
+  const amendment = decision.amendment;
+  // Plan 01g: an applied or reverted amendment is history — it is never
+  // re-tallied against a later candidate (its ballots belonged to the
+  // candidate it passed on) and never reads as a failed decision, which
+  // would wrongly appear in the verdict.
+  if (amendment && (amendment.status === "applied" || amendment.status === "reverted")) {
+    return {
+      status: "passed",
+      reason: amendment.status === "applied" ? "amendment applied" : "reverted by the owner",
+      flagged: true,
+      amendment,
+    };
+  }
   const C = phase.candidate?.sha;
   const K = phase.contract.contractVersion;
-  if (!C || decision.boundCandidateSha !== C) return { status: "pending", reason: "not bound to the current candidate" };
+  if (!C || decision.boundCandidateSha !== C) return { status: "pending", reason: "not bound to the current candidate", ...(amendment ? { amendment } : {}) };
   const flag = decision.class === "reserved" ? { flagged: true } : {};
-  return { ...votedStatus(decision, phase, C, K), ...flag };
+  return { ...votedStatus(decision, phase, C, K), ...flag, ...(amendment ? { amendment } : {}) };
 }
 
 function votedStatus(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): DecisionStatus {

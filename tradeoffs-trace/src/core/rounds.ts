@@ -23,16 +23,30 @@
 import { isLiveDecision } from "./predicate.ts";
 import { currentBallot, tally } from "./tally.ts";
 import type { Ballot, ContractVersion, Decision, Finding, PriorDecisionStatement } from "./types.ts";
+// (ContractVersion is used by carryDecisionsForward's optional 4th argument.)
 
 export function carryDecisionsForward(
   decisions: Decision[],
   prior: PriorDecisionStatement[] | undefined,
   newCandidateSha: string,
+  newContractVersion?: ContractVersion,
 ): Decision[] {
   const statements = new Map((prior ?? []).map((p) => [p.id, p]));
   const short = newCandidateSha.slice(0, 7);
   return decisions.map((d) => {
     if (!isLiveDecision(d) || d.boundCandidateSha === newCandidateSha) return d;
+    // Plan 01g: an amendment record belongs to the phase's contract, not to
+    // one candidate. A still-proposed one is carried forward (rebound to the
+    // new candidate and contract) so it can be voted on in a later round; an
+    // applied or reverted one stays as history. It never blocks acceptance.
+    if (d.amendment) {
+      return {
+        ...d,
+        boundCandidateSha: newCandidateSha,
+        ...(newContractVersion ? { boundContractVersion: newContractVersion } : {}),
+        version: d.version + 1,
+      };
+    }
     const statement = d.source === "worker" ? statements.get(d.id) : undefined;
     if (statement?.status === "kept") {
       return { ...d, boundCandidateSha: newCandidateSha, version: d.version + 1 };

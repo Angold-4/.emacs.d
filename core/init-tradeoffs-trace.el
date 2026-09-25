@@ -816,6 +816,7 @@ the longer one behind — the same order secrets.ts's byLengthDesc uses."
     ("delivered" "delivered")
     ("noted" "noted")
     ("correction-started" "correction started")
+    ("reverted" "reverted an amendment")
     ("delivery-uncertain" (format "delivery uncertain%s" (if reason (format " (%s)" reason) "")))
     ("refused" (format "refused: %s" (or reason "not accepted")))
     (_ (or state "sent"))))
@@ -937,6 +938,8 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
     (+tt--status-row "gate" (alist-get 'gate v))
     ;; Plan 01e: the base's own pre-existing check failures (D2), when any.
     (+tt--status-row "base" (alist-get 'baseline v) 'warning)
+    ;; Plan 01g: every amendment record, applied or reverted, old → new.
+    (+tt--status-row "amended" (alist-get 'amendments v) 'warning)
     (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)
     (+tt--status-row "reviews" (alist-get 'reviewLine v))
     (+tt--status-row "verdict" (alist-get 'verdict v)
@@ -1188,21 +1191,47 @@ program-wide owner directive."
 ;; intervenes only through the input box.  Every state label comes from the
 ;; tally (`decisionStatuses' in `tt state'), never from individual ballots.
 
+(defun +tt--amendment-label (amendment status)
+  "The heading an amendment record's AMENDMENT and tally STATUS deserve.
+Plan 01g: an applied amendment reads `⚑ AMENDED', a reverted one
+`⚑ REVERTED', and one still proposed or rejected reads as the vote's
+outcome."
+  (pcase (alist-get 'status amendment)
+    ("applied" "⚑ AMENDED")
+    ("reverted" "⚑ REVERTED")
+    (_ (format "AMENDMENT (%s)"
+               (pcase (alist-get 'status status)
+                 ("passed" "approved, applying")
+                 ("failed" (format "rejected: %s" (or (alist-get 'reason status) "vote failed")))
+                 ("superseded" "superseded")
+                 (_ "pending vote"))))))
+
+(defun +tt--amendment-line (decision)
+  "The `old → new' line for DECISION's amendment record, or nil."
+  (let ((a (alist-get 'amendment decision)))
+    (when a
+      (format "  %s → %s\n" (or (alist-get 'criterion a) "")
+              (or (alist-get 'proposedWording a) "")))))
+
 (defun +tt--decision-label (status d phase)
   "Heading label for decision D with tally STATUS in PHASE."
   (let ((dissent (seq-some (lambda (b) (and (equal (alist-get 'decisionId b) (alist-get 'id d))
                                             (equal (alist-get 'vote b) "reject")))
-                           (alist-get 'ballots phase))))
+                           (alist-get 'ballots phase)))
+        (amendment (alist-get 'amendment status)))
     (concat
-     (pcase (alist-get 'status status)
-       ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
-       ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
-       ("suspended" "SUSPENDED")
-       ("owner" "NEEDS YOU")
-       ("detail" "DETAIL")
-       (_ "PENDING"))
-     ;; A reserved decision: voted like any other, flagged for the owner.
-     (if (eq (alist-get 'flagged status) t) " ⚑ FLAGGED" ""))))
+     (if amendment
+         (+tt--amendment-label amendment status)
+       (pcase (alist-get 'status status)
+         ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
+         ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
+         ("suspended" "SUSPENDED")
+         ("owner" "NEEDS YOU")
+         ("detail" "DETAIL")
+         (_ "PENDING")))
+     ;; A reserved decision: voted like any other, flagged for the owner (an
+     ;; amendment is already marked, so the flag would only repeat it).
+     (if (and (not amendment) (eq (alist-get 'flagged status) t)) " ⚑ FLAGGED" ""))))
 
 (defun +tt--decision-block (d status phase)
   "Insert decision D (tally STATUS) as one self-contained Org entry."
@@ -1215,6 +1244,8 @@ program-wide owner directive."
          (ballots (seq-filter (lambda (b) (equal (alist-get 'decisionId b) (alist-get 'id d)))
                               (alist-get 'ballots phase))))
     (insert (format "* %s  %s\n" (+tt--decision-label status d phase) short))
+    ;; Plan 01g: the reworded acceptance item, verbatim old → new.
+    (when-let* ((line (+tt--amendment-line d))) (insert line))
     (unless (equal short (+tt--one-line choice 200)) (insert (format "  %s\n" choice)))
     (insert (format "  raised by %s%s\n"
                     (if (equal source "reviewer-discovered")

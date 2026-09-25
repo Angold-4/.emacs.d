@@ -106,6 +106,39 @@ export interface DecisionDisclosure {
   classProposal: DecisionClass;
 }
 
+/** Plan 01g: a worker or reviewer may say a criterion cannot be met *as
+ * written* rather than merely unmet. `criterion` must name one acceptance
+ * item of the current phase contract verbatim; `proposedWording` replaces it
+ * if the reviewers' normal tally passes (D1). It is a different claim from a
+ * blocking finding: an unmet-but-clear criterion is repaired, an unmeetable
+ * one is reworded, and the run never waits for the owner for either. */
+export interface CriterionDispute {
+  criterion: string;
+  why: string;
+  proposedWording: string;
+}
+
+export type AmendmentStatus = "proposed" | "applied" | "reverted";
+
+/** Plan 01g: the amendment record a `criterionDispute` becomes — a
+ * `reserved` decision the reviewers vote on like any other. While
+ * `status` is `proposed` a passing tally applies it: the wording is replaced
+ * for this phase only, the contract version bumps, and contract findings
+ * citing the old wording are superseded. `appliedContractVersion` records
+ * the version the amendment produced; the owner can revert it through the
+ * input box (a correction naming `id`). */
+export interface CriterionAmendment {
+  id: string;
+  criterion: string; // the replaced acceptance item, verbatim
+  proposedWording: string; // the replacement
+  why: string;
+  raisedBy: "worker" | Reviewer;
+  status: AmendmentStatus;
+  previousContractVersion?: ContractVersion;
+  appliedContractVersion?: ContractVersion;
+  revertedAt?: string;
+}
+
 export interface Decision {
   id: string;
   version: number;
@@ -120,6 +153,11 @@ export interface Decision {
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   supersededByCorrection?: string; // correction id, once superseded (§7.5)
+  /** Plan 01g: set on an amendment record — a `reserved` decision the
+   * reviewers vote on, whose passing tally rewrites one acceptance item for
+   * this phase. An amendment decision never blocks acceptance by itself: a
+   * failed amendment simply leaves the criterion unchanged. */
+  amendment?: CriterionAmendment;
   /** Plan 2c: the record no longer describes the current candidate and is
    * never votable again. Set when a new candidate is frozen and the worker
    * did not carry the record forward ("candidate <sha>: not carried
@@ -152,7 +190,7 @@ export interface PriorDecisionStatement {
 
 export type FindingKind = "defect" | "contract" | "integration";
 export type FindingSeverity = "blocking" | "advisory";
-export type FindingStatus = "open" | "repaired" | "disproved" | "accepted";
+export type FindingStatus = "open" | "repaired" | "disproved" | "accepted" | "superseded";
 export type Reviewer = "M" | "A" | "B";
 
 export interface Finding {
@@ -170,6 +208,13 @@ export interface Finding {
   repairedByCandidateSha?: string;
   disprovedEvidence?: string;
   acceptedScope?: string; // required scope note (§4.2, §10.4 `x`)
+  /** Plan 01g: the acceptance item this `contract` finding disputes verbatim
+   * (set when it was raised with a `criterionDispute`). A later amendment of
+   * that item supersedes the finding. */
+  criterionDisputed?: string;
+  /** Plan 01g: why this finding was closed without repair — set when an
+   * amendment replaced the wording it cited. */
+  supersededBy?: string;
   /** Plan 2c: other reviewers who raised the same finding ("same as F-…")
    * instead of filing a duplicate. */
   alsoRaisedBy?: Reviewer[];
@@ -298,6 +343,10 @@ export interface FindingDisclosure {
   severity: FindingSeverity;
   evidence: string;
   linkedDecisionId?: string;
+  /** Plan 01g: a reviewer may say the finding is that a criterion cannot be
+   * met as written, naming it verbatim; the conductor records it as an
+   * amendment record and the finding cites it. */
+  criterionDispute?: CriterionDispute;
   reproduction?: { command: string };
   /** Plan 2c: the id of an already-open finding this one repeats; the
    * conductor records the reviewer on that finding instead of a duplicate. */
@@ -469,6 +518,7 @@ export type OwnerInputState =
   | "noted" // note queued for the next worker attempt
   | "correction-started" // AWAITING_OWNER correction: requests resolved, repair started
   | "delivery-uncertain" // steer intent recorded, no acknowledgement (never resent)
+  | "reverted" // plan 01g: a correction naming an amendment id restored its criterion
   | "refused"; // conductor refused: terminal phase, or no running worker for a steer
 
 export interface OwnerInputRecord {
@@ -636,6 +686,10 @@ export interface PhaseState {
    * buffer's "Owner input" section renders this — never an inferred or
    * optimistic state. Ordered by id (stable across a restart). */
   ownerInputs?: OwnerInputRecord[];
+  /** Plan 01g: the raw `criterionDispute` a SUBMIT_PHASE carried, held here
+   * until FREEZE_COMPLETED assembles it into an amendment record bound to
+   * the new candidate (exactly like `pendingDisclosures`). */
+  pendingDispute?: CriterionDispute;
   /** Plan 01i: the owner directives in force (or withdrawn) in this phase,
    * in the order the owner sent them. Rebuilt by folding the log, so a
    * directive survives a conductor restart; included, newest last, in every
@@ -670,6 +724,10 @@ export interface EvSubmitPhase {
   disclosures: DecisionDisclosure[];
   /** Plan 2c: statements about prior decisions (repair attempts only). */
   prior?: PriorDecisionStatement[];
+  /** Plan 01g: a criterion the worker says cannot be met as written; freeze
+   * turns it into an amendment record (a `reserved` decision) bound to the
+   * new candidate. */
+  dispute?: CriterionDispute;
 }
 export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
@@ -843,6 +901,29 @@ export interface EvRevise extends RecordBinding {
   correctionText: string;
   contractChange: boolean;
 }
+/** Plan 01g: an amendment decision passed the normal tally (M, plus one of
+ * A/B), so the conductor replaces one acceptance item for this phase. The
+ * phase returns to a fresh attempt under the new contract version so the
+ * *next* candidate is judged against the new wording; no repair round is
+ * consumed by the amendment itself. Emitted by the conductor when next()
+ * asks for `apply_amendment`. */
+export interface EvCriterionAmended {
+  type: "CRITERION_AMENDED";
+  decisionId: string; // the amendment decision that passed
+  newAcceptance: string[]; // the full replacement acceptance list
+  newContractVersion: ContractVersion;
+}
+
+/** Plan 01g: the owner's correction naming an amendment id restores the
+ * criterion's original wording. Record-only: it moves no phase state, so it
+ * works from any non-terminal state and never waits for the owner. */
+export interface EvCriterionReverted {
+  type: "CRITERION_REVERTED";
+  amendmentId: string;
+  newAcceptance: string[]; // the restored acceptance list
+  newContractVersion: ContractVersion;
+}
+
 export interface EvAmend {
   type: "AMEND";
   replacingContractVersion: ContractVersion; // what the sender saw — staleness check
@@ -1046,6 +1127,8 @@ export type Event =
   | EvResolvingIncomplete
   | EvRevise
   | EvAmend
+  | EvCriterionAmended
+  | EvCriterionReverted
   | EvRunBudgetExceeded
   | EvRunResumed
   | EvLaunchFailed

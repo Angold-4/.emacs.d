@@ -55,6 +55,7 @@ import type {
   Ballot,
   BallotDisclosure,
   ContractVersion,
+  CriterionDispute,
   Decision,
   DecisionDisclosure,
   DirectiveScope,
@@ -388,6 +389,29 @@ export class RunnerMismatchError extends Error {}
 export function contractVersionFor(phase: RunPlanPhase, snapshot = 1): ContractVersion {
   const sectionSha256 = createHash("sha256").update(JSON.stringify(phase)).digest("hex");
   return { snapshot, sectionSha256 };
+}
+
+/** Plan 01g: the contract version produced when an amendment (or the owner's
+ * revert of one) replaces the phase's acceptance list. `snapshot` bumps by
+ * one so every existing binding says "it changed since you viewed it", and
+ * the section hash is recomputed from the amendable contract fields so two
+ * different acceptance lists never share a version. */
+export function amendContractVersion(contract: PhaseContract, acceptance: string[]): ContractVersion {
+  const sectionSha256 = createHash("sha256")
+    .update(
+      JSON.stringify({
+        phaseId: contract.phaseId,
+        goal: contract.goal,
+        acceptance,
+        checks: contract.checks,
+        boundaries: contract.boundaries,
+        reserved: contract.reserved,
+        gate: contract.gate,
+        gateCleanup: contract.gateCleanup,
+      }),
+    )
+    .digest("hex");
+  return { snapshot: contract.contractVersion.snapshot + 1, sectionSha256 };
 }
 
 export function buildContract(phase: RunPlanPhase): PhaseContract {
@@ -1214,6 +1238,41 @@ export class Conductor {
       boundCandidateSha: candidateSha,
       boundContractVersion: this.#state.phase.contract.contractVersion,
     }));
+    // Plan 01g: a `criterionDispute` becomes an amendment record — a
+    // `reserved` decision the reviewers vote on in turn 2 like any other. A
+    // passing tally rewrites the accepted item (next()'s `apply_amendment`);
+    // a failing one leaves it unchanged and never blocks acceptance.
+    const dispute = this.#state.phase.pendingDispute;
+    if (dispute) {
+      const short = candidateSha.slice(0, 8);
+      decisions.push({
+        id: `D-${this.#state.phase.phaseId}-${short}-amendment`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        source: "worker",
+        class: "reserved",
+        choice: dispute.proposedWording,
+        whyItMatters: dispute.why,
+        alternatives: [
+          {
+            option: dispute.criterion,
+            consequence: "the letter of this criterion stays in force and no candidate can satisfy it",
+          },
+        ],
+        recommendation: { choice: dispute.proposedWording, reason: dispute.why },
+        boundCandidateSha: candidateSha,
+        boundContractVersion: this.#state.phase.contract.contractVersion,
+        amendment: {
+          id: `AM-${this.#state.phase.phaseId}-${short}`,
+          criterion: dispute.criterion,
+          proposedWording: dispute.proposedWording,
+          why: dispute.why,
+          raisedBy: "worker",
+          status: "proposed",
+          previousContractVersion: this.#state.phase.contract.contractVersion,
+        },
+      });
+    }
     for (const decision of decisions) {
       const result = validate(DECISION_SCHEMA, decision);
       if (!result.valid) {
@@ -1364,6 +1423,57 @@ export class Conductor {
 
   /** Plan 2d: the three input-box kinds (design §7.4), detected by shape in
    * either the flat `kind` form or the decision view's `type` form. */
+  /** Plan 01g: the applied amendment whose id the owner's correction names,
+   * or undefined. The id is matched as a whole token (`AM-p1-abcd1234`), so
+   * prose around it is fine but a near-miss is not a revert. */
+  #revertAmendmentForText(text: string): { decisionId: string; amendmentId: string } | undefined {
+    for (const d of this.#state.phase.decisions) {
+      if (!d.amendment || d.amendment.status !== "applied") continue;
+      const escaped = d.amendment.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`\\b${escaped}\\b`).test(text)) return { decisionId: d.id, amendmentId: d.amendment.id };
+    }
+    return undefined;
+  }
+
+  /** Plan 01g: apply the owner's revert of one amendment — restore the
+   * criterion's original wording, record the input as `reverted`, and move
+   * the inbox file on. A failure is rejected visibly, never silently. */
+  #applyRevertAmendment(
+    file: string,
+    commandId: string,
+    text: string,
+    decisionId: string,
+    amendmentId: string,
+  ): void {
+    const decision = this.#state.phase.decisions.find((d) => d.id === decisionId);
+    const amendment = decision?.amendment;
+    if (!decision || !amendment || amendment.status !== "applied") {
+      this.#rejectInboxFile(file, commandId, `amendment ${amendmentId} is not an applied amendment of this phase`);
+      return;
+    }
+    const restored = this.#state.phase.contract.acceptance.map((a) =>
+      a === amendment.proposedWording ? amendment.criterion : a,
+    );
+    try {
+      this.#applyEvent(
+        {
+          type: "CRITERION_REVERTED",
+          amendmentId,
+          newAcceptance: restored,
+          newContractVersion: amendContractVersion(this.#state.phase.contract, restored),
+        },
+        commandId,
+      );
+    } catch (err) {
+      this.#rejectInboxFile(file, commandId, `could not revert ${amendmentId}: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    this.#appliedCommandIds.add(commandId);
+    this.#recordOwnerInput(commandId, "correction", text, "reverted");
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
   #ownerInputKindOf(raw: unknown): OwnerInputKind | undefined {
     if (!raw || typeof raw !== "object") return undefined;
     const r = raw as Record<string, unknown>;
@@ -1884,6 +1994,17 @@ export class Conductor {
         this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
         return;
       }
+      // Plan 01g: a correction (or note) naming an applied amendment id
+      // restores that criterion's original wording. It is a targeted owner
+      // action, not a directive, and it never waits for the phase to be
+      // parked on the owner.
+      if (inputKind === "note" || inputKind === "correction") {
+        const revert = this.#revertAmendmentForText(inputText);
+        if (revert) {
+          this.#applyRevertAmendment(file, commandId, inputText, revert.decisionId, revert.amendmentId);
+          return;
+        }
+      }
       // A program-wide input (D5) in a run the scheduler started: the
       // program mints the one `ODP-n` record, so this run only forwards the
       // text — it must not mint a local id that could not match the
@@ -2240,6 +2361,29 @@ export class Conductor {
       case "resolving_incomplete":
         this.#applyEvent({ type: "RESOLVING_INCOMPLETE" });
         return;
+      // Plan 01g: a passing amendment rewrites one acceptance item for this
+      // phase. The conductor computes the replacement acceptance list and the
+      // new contract version; the core row applies them and starts a fresh
+      // attempt so the next candidate is judged against the new wording.
+      case "apply_amendment": {
+        const decisionId = action.decisionId as string;
+        const decision = this.#state.phase.decisions.find((d) => d.id === decisionId);
+        const amendment = decision?.amendment;
+        if (!decision || !amendment) {
+          this.#logUnexpected("apply_amendment", new Error(`unknown amendment decision ${decisionId}`));
+          return;
+        }
+        const acceptance = this.#state.phase.contract.acceptance.map((a) =>
+          a === amendment.criterion ? amendment.proposedWording : a,
+        );
+        this.#applyEvent({
+          type: "CRITERION_AMENDED",
+          decisionId,
+          newAcceptance: acceptance,
+          newContractVersion: amendContractVersion(this.#state.phase.contract, acceptance),
+        });
+        return;
+      }
       case "publish_intent":
         this.#applyEvent({
           type: "PUBLISH_INTENT",
@@ -2332,6 +2476,20 @@ export class Conductor {
       // Plan 2c: prior-decision statements must name live worker records;
       // anything else is a model mistake the worker can fix and resubmit.
       const prior = args.priorDecisions ?? [];
+      // Plan 01g: a dispute must name one of this phase's acceptance items
+      // verbatim — an amendment of anything else could never apply, so it is
+      // refused back to the worker rather than becoming a record the
+      // reviewers waste a turn on.
+      const dispute = args.criterionDispute;
+      if (dispute && (!dispute.why || dispute.why.trim().length === 0 || !dispute.proposedWording || dispute.proposedWording.trim().length === 0)) {
+        return { ok: false, reason: "criterionDispute needs a non-empty why and proposedWording" };
+      }
+      if (dispute && !this.#state.phase.contract.acceptance.includes(dispute.criterion)) {
+        return {
+          ok: false,
+          reason: `criterionDispute names a criterion that is not one of this phase's acceptance items verbatim: ${JSON.stringify(dispute.criterion)}`,
+        };
+      }
       for (const st of prior) {
         const d = this.#state.phase.decisions.find((x) => x.id === st.id);
         if (!d || d.source !== "worker" || !isLiveDecision(d)) {
@@ -2342,7 +2500,12 @@ export class Conductor {
         }
       }
       this.#activeWorkerHandle = handle;
-      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures: args.decisions ?? [], ...(prior.length > 0 ? { prior } : {}) });
+      this.#applyEvent({
+        type: "SUBMIT_PHASE",
+        disclosures: args.decisions ?? [],
+        ...(prior.length > 0 ? { prior } : {}),
+        ...(dispute ? { dispute } : {}),
+      });
       // Unblocks #runWorkerAttempt's race with outcome "submitted" (rather
       // than falling through to "settled" once the freeze's own abort makes
       // the agent settle, which would misreport this as no_submission).
@@ -2626,12 +2789,72 @@ export class Conductor {
       // bug this test caught: M's finding with no linkedDecisionId failed
       // validation with "expected type string, got undefined").
       ...(fd.linkedDecisionId !== undefined ? { linkedDecisionId: fd.linkedDecisionId } : {}),
+      ...(fd.criterionDispute?.criterion && fd.criterionDispute.criterion.trim().length > 0
+        ? { criterionDisputed: fd.criterionDispute.criterion }
+        : {}),
       ...(reproduction !== undefined ? { reproduction } : {}),
     };
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
     this.#applyEvent({ type: "FINDING_RAISED", finding });
+    // Plan 01g: a reviewer's finding may say the criterion cannot be met as
+    // written. That is recorded as an amendment the reviewers vote on later;
+    // a criterion the contract does not carry is ignored (the finding itself
+    // still stands).
+    if (fd.criterionDispute?.criterion && fd.criterionDispute.why && fd.criterionDispute.proposedWording) {
+      if (this.#state.phase.contract.acceptance.includes(fd.criterionDispute.criterion)) {
+        this.#addAmendmentDecision(fd.criterionDispute, reviewer, candidateSha);
+      } else {
+        this.#log.append("dispute_ignored", {
+          reviewer,
+          criterion: fd.criterionDispute.criterion,
+          reason: "not one of this phase's acceptance items verbatim",
+        });
+      }
+    }
     return undefined;
+  }
+
+  /** Plan 01g: assembles a reviewer-raised `criterionDispute` into an
+   * amendment record (a `reserved` decision) bound to the candidate/contract
+   * being reviewed, exactly like a worker disclosure. It is votable like any
+   * other reserved decision; if it passes, next() applies it. A reviewer
+   * raises one in turn 2, after this round's ballot demand was captured, so
+   * it is voted in a later round (carryDecisionsForward keeps amendments). */
+  #addAmendmentDecision(dispute: CriterionDispute, raisedBy: Reviewer, candidateSha: string): void {
+    const K = this.#state.phase.contract.contractVersion;
+    const short = candidateSha.slice(0, 8);
+    const n = this.#state.phase.decisions.length + 1;
+    const decision: Decision = {
+      id: `D-${this.#state.phase.phaseId}-${short}-amendment-${raisedBy}-${n}`,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      source: "reviewer-discovered",
+      class: "reserved",
+      choice: dispute.proposedWording,
+      whyItMatters: dispute.why,
+      alternatives: [
+        { option: dispute.criterion, consequence: "the letter of this criterion stays in force and no candidate can satisfy it" },
+      ],
+      recommendation: { choice: dispute.proposedWording, reason: dispute.why },
+      boundCandidateSha: candidateSha,
+      boundContractVersion: K,
+      amendment: {
+        id: `AM-${this.#state.phase.phaseId}-${short}-${raisedBy}-${n}`,
+        criterion: dispute.criterion,
+        proposedWording: dispute.proposedWording,
+        why: dispute.why,
+        raisedBy,
+        status: "proposed",
+        previousContractVersion: K,
+      },
+    };
+    const valid = validate(DECISION_SCHEMA, decision);
+    if (!valid.valid) {
+      this.#log.append("error", { where: "reviewer_amendment", error: valid.errors.join("; ") });
+      return;
+    }
+    this.#applyEvent({ type: "DECISION_ADDED", decision });
   }
 
   /** design §8.1's reproduction-command deadline: runs `command` in a fresh
@@ -4656,8 +4879,18 @@ export class Conductor {
     // prompt listed and a record added afterwards (a late discovery) can
     // never be demanded.
     if (handle) {
+      // Plan 01g: an applied (or reverted) amendment record is shown but no
+      // longer needs a ballot — its vote is history. Only a still-proposed
+      // amendment is demanded.
       handle.demandedBallots = new Map(
-        live.filter((d) => (d.class === "delegated" || d.class === "reserved") && !carriedIds.has(d.id)).map((d) => [d.id, d.choice]),
+        live
+          .filter(
+            (d) =>
+              (d.class === "delegated" || d.class === "reserved") &&
+              !carriedIds.has(d.id) &&
+              (!d.amendment || d.amendment.status === "proposed"),
+          )
+          .map((d) => [d.id, d.choice]),
       );
       handle.incompleteReviewRejections = 0;
       // Durable trace of the exact demand, for observability and to make the
@@ -4724,7 +4957,14 @@ export class Conductor {
       "",
       "Call submit_review with:",
       "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation), except records marked carried: your previous ballot stands for those, and a new ballot replaces it. A ballot with contractObjection=true opens a contract finding and suspends that vote.",
-      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it.",
+      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it. If the problem is that a criterion cannot be met AS WRITTEN, add `criterionDispute` = { criterion: <the acceptance item verbatim>, why, proposedWording }: the conductor records an amendment voted on like any reserved record (a passing one replaces the wording; a failed one leaves it unchanged). An unmet-but-clear criterion is an ordinary defect finding.",
+      // Plan 01g: an amendment record is a reserved decision like any other;
+      // it must get a ballot, and it never blocks acceptance on its own.
+      ...(phase.decisions.some((d) => d.amendment && d.boundCandidateSha === C && isLiveDecision(d))
+        ? [
+            "- An amendment record (class reserved, shown with `proposedWording`) is the worker's or a reviewer's claim that a criterion cannot be met as written. Vote on it like any other reserved decision; a passing normal tally replaces that acceptance item for this phase.",
+          ]
+        : []),
       own.length > 0
         ? `- \`discoveryMatches\`: for each of YOUR discoveries (${own.map((d) => d.id).join(", ")}) that is the same choice as another record above, give {discoveryId, sameAs}.`
         : "- `discoveryMatches`: none needed (you have no discoveries on this list).",
@@ -4758,6 +4998,7 @@ export class Conductor {
 interface SubmitPhaseArgs {
   decisions?: DecisionDisclosure[];
   priorDecisions?: PriorDecisionStatement[];
+  criterionDispute?: CriterionDispute;
   assumptions?: string[];
   deviations?: string[];
 }
@@ -5067,6 +5308,7 @@ export function buildWorkerPrompt(
   }
   lines.push(
     "",
+    "If a criterion cannot be met AS WRITTEN (not merely unmet yet), say so instead of faking it: call submit_phase with `criterionDispute` = { criterion: <one acceptance item above, verbatim>, why, proposedWording }. The conductor records it as an amendment the reviewers vote on; if the normal tally passes, the wording is replaced for this phase and the next candidate is judged against it. A criterion that is merely unmet is a normal repair, not a dispute.",
     "How to work:",
     `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target). With node --test, pass --test-force-exit so a test that leaks a process cannot hold the command open. Do not pipe test output through tail or head: a command killed at the per-command time limit then returns nothing. If a test file is slow, run one test at a time with --test-name-pattern.`,
     "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",

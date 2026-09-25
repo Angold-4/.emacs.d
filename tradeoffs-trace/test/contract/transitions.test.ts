@@ -240,6 +240,54 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "GATE_INTERRUPTED" },
   },
+  // Plan 01g: a passing amendment (M and A approve it) replaces one
+  // acceptance item, bumps the contract version and starts a fresh attempt
+  // so the next candidate is judged against the new wording. The resulting
+  // IMPLEMENTING state has no worker in flight, so next() dispatches one.
+  "resolving-criterion-amended": {
+    state: baseState({
+      phase: "RESOLVING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      decisions: [
+        {
+          id: "D-am",
+          version: 1,
+          phaseId: "p1",
+          source: "worker",
+          class: "reserved",
+          choice: "no fill after cancel is acknowledged",
+          whyItMatters: "the letter of the wording cannot be met",
+          alternatives: [{ option: "no fill after cancel is acknowledged", consequence: "no candidate can satisfy it" }],
+          recommendation: { choice: "the guarantee holds within the tick", reason: "satisfiable" },
+          boundCandidateSha: "C1",
+          boundContractVersion: K,
+          amendment: {
+            id: "AM-p1",
+            criterion: "no fill after cancel is acknowledged",
+            proposedWording: "the guarantee holds within the tick",
+            why: "the letter of the wording cannot be met",
+            raisedBy: "worker",
+            status: "proposed",
+            previousContractVersion: K,
+          },
+        },
+      ],
+      ballots: [
+        { reviewer: "M", decisionId: "D-am", vote: "approve", rationale: "satisfiable wording", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+        { reviewer: "A", decisionId: "D-am", vote: "approve", rationale: "satisfiable wording", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+      ],
+    }),
+    event: {
+      type: "CRITERION_AMENDED",
+      decisionId: "D-am",
+      newAcceptance: ["the guarantee holds within the tick"],
+      newContractVersion: CV(2),
+    },
+  },
   "resolving-incomplete-repair": {
     state: baseState({
       phase: "RESOLVING",

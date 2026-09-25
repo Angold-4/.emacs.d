@@ -68,6 +68,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "GATE_INTERRUPTED",
   "REVISE",
   "AMEND",
+  "CRITERION_AMENDED",
+  "CRITERION_REVERTED",
   "RUN_BUDGET_EXCEEDED",
   "RUN_RESUMED",
   "LAUNCH_FAILED",
@@ -340,6 +342,46 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return undefined;
     }
 
+    case "CRITERION_REVERTED": {
+      // Plan 01g: the owner's correction naming an amendment id restores the
+      // criterion's original wording. Record-only (it never moves the phase
+      // state name) so it works from any non-terminal state and the run
+      // never waits for the owner. Prior evidence bound to the amended
+      // contract version no longer matches, so the phase re-evaluates under
+      // the restored wording the same way an AMEND makes it re-evaluate.
+      const decision = p.decisions.find((d) => d.amendment?.id === event.amendmentId);
+      if (!decision || !decision.amendment) {
+        return rejected(state, `unknown amendment ${event.amendmentId}`);
+      }
+      if (decision.amendment.status === "reverted") {
+        return rejected(state, `amendment ${event.amendmentId} is already reverted`);
+      }
+      if (decision.amendment.status !== "applied") {
+        return rejected(state, `amendment ${event.amendmentId} has not been applied, so there is no wording to restore`);
+      }
+      if (!Array.isArray(event.newAcceptance) || event.newAcceptance.length === 0 || event.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
+        return rejected(state, `reverting amendment ${event.amendmentId} needs the restored acceptance list`);
+      }
+      const decisions = p.decisions.map((d) =>
+        d.id === decision.id
+          ? {
+              ...d,
+              version: d.version + 1,
+              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+            }
+          : d,
+      );
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          contract: { ...p.contract, acceptance: event.newAcceptance, contractVersion: event.newContractVersion },
+          candidate: p.candidate && { sha: p.candidate.sha, contractVersion: event.newContractVersion },
+          decisions,
+        },
+      });
+    }
+
     case "NOTE_ADDED": {
       // §7.4 `note` (conductor state): queued for the next worker attempt's
       // prompt. Record-only — it moves no phase.
@@ -581,7 +623,10 @@ export function reduce(state: State, event: unknown): ReduceResult {
     // pending until FREEZE_COMPLETED assembles and binds them.
     let working = state;
     if (ev.type === "SUBMIT_PHASE") {
-      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior } };
+      working = {
+        ...state,
+        phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior, pendingDispute: ev.dispute },
+      };
     }
 
     const rows = rowsFor(working, ev.type);

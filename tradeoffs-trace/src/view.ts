@@ -332,6 +332,11 @@ export interface RunView {
   boundaryFilesChanged: number;
   liveDecisions: number;
   failedDecisions: number;
+  /** Plan 01g: every amendment record of this phase, applied or reverted,
+   * with its old → new wording. Undefined when there are none. */
+  amendments?: string;
+  /** Plan 01g: how many amendments are applied right now. */
+  amendedCount: number;
   /** Reserved decisions on the current candidate: voted like any other,
    * flagged so the owner can look (and override through the input box). */
   flaggedDecisions: number;
@@ -414,6 +419,21 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   const failed = live.filter((d) => decisionStatus(d, phase).status === "failed").length;
   const flagged = live.filter((d) => d.class === "reserved" && d.boundCandidateSha === C).length;
   const openFindings = phase.findings.filter((f) => f.status === "open").length;
+  // Plan 01g: every amendment (applied or reverted) is shown as
+  // `⚑ AMENDED id: old → new`, so the reworded contract is visible in the
+  // status, the decision view and `tt summary` alike.
+  const amendments = phase.decisions.filter((d) => d.amendment);
+  const amendmentLine =
+    amendments.length === 0
+      ? undefined
+      : amendments
+          .map((d) =>
+            d.amendment!.status === "applied"
+              ? `⚑ AMENDED ${d.amendment!.id}: ${d.amendment!.criterion} → ${d.amendment!.proposedWording}`
+              : `⚑ ${d.amendment!.status.toUpperCase()} ${d.amendment!.id}: ${d.amendment!.criterion} → ${d.amendment!.proposedWording}`,
+          )
+          .join("; ");
+  const amendedCount = amendments.filter((d) => d.amendment!.status === "applied").length;
 
   let attention: string | undefined;
   if (phase.phase === "BLOCKED") attention = "BLOCKED";
@@ -446,6 +466,8 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     liveDecisions: live.length,
     failedDecisions: failed,
     flaggedDecisions: flagged,
+    amendments: amendmentLine,
+    amendedCount,
     openFindings,
     needsYou,
     idleMinutes,
@@ -563,6 +585,9 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   const flagged = live.filter((d) => d.class === "reserved");
   const advisories = phase.findings.filter((f) => f.status === "open" && f.severity === "advisory");
   const fixed = phase.findings.filter((f) => f.severity === "blocking" && f.status === "repaired");
+  // Plan 01g: every amendment the reviewers passed for this phase, with the
+  // wording it replaced — the PR body must not hide a reworded criterion.
+  const amendments = phase.decisions.filter((d) => d.amendment);
   // Plan 01i: the owner's rulings in force are part of the PR body — binding
   // on reviewers, and the reason a `⚑` decision reads the way it does.
   const directives = (phase.ownerDirectives ?? []).filter((d) => d.status === "in-force");
@@ -588,6 +613,15 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
   ];
+  if (amendments.length > 0) {
+    lines.push("", "### Amended acceptance criteria", "");
+    for (const d of amendments) {
+      const a = d.amendment!;
+      lines.push(
+        `- ${a.status === "applied" ? "**⚑ AMENDED**" : `**${a.status.toUpperCase()}**`} **${a.id}** (raised by ${a.raisedBy}): ${a.criterion} → ${a.proposedWording}`,
+      );
+    }
+  }
   if (fixed.length > 0) {
     lines.push("", "### Blocking findings fixed during review", "");
     for (const f of fixed) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 300)}`);

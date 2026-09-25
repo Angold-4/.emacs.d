@@ -32,7 +32,7 @@ export const DECISION_DISCLOSURE_PARAMS: ParamShape = {
 
 /** Matches schemas/submission.schema.json's `$defs.submitPhase`. */
 export const SUBMIT_PHASE_PARAMS: ParamShape = {
-  properties: ["decisions", "assumptions", "deviations", "priorDecisions"],
+  properties: ["decisions", "assumptions", "deviations", "priorDecisions", "criterionDispute"],
   required: ["decisions", "assumptions", "deviations"],
 };
 

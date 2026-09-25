@@ -239,7 +239,12 @@ addRow({
   actions: [{ type: "run_checks", candidateSha: "C1" }],
   apply: (s, ev) => {
     const e = ev as Extract<Event, { type: "FREEZE_COMPLETED" }>;
-    const carried = carryDecisionsForward(s.phase.decisions, s.phase.pendingPrior, e.candidateSha);
+    const carried = carryDecisionsForward(
+      s.phase.decisions,
+      s.phase.pendingPrior,
+      e.candidateSha,
+      s.phase.contract.contractVersion,
+    );
     return withPhase(s, {
       phase: "CHECKING",
       candidate: { sha: e.candidateSha, contractVersion: s.phase.contract.contractVersion },
@@ -251,10 +256,11 @@ addRow({
       // worker kept or changed them (core/rounds.ts); the rest are superseded
       // and can no longer block acceptance.
       decisions: [...carried, ...e.decisions],
-      pendingDisclosures: undefined,
-      pendingPrior: undefined,
       round: (s.phase.round ?? 0) + 1,
       checks: undefined,
+      pendingDisclosures: undefined,
+      pendingPrior: undefined,
+      pendingDispute: undefined,
       probe: undefined,
       reviews: {},
       // Skill fix 5: kept decisions that passed keep their ballots.
@@ -561,6 +567,85 @@ function applyAccepted(s: State, ev: Event): State {
   );
   return withPhase(s, { phase: "ACCEPTED", corrections, inFlight: clearInFlight(s.phase, "run_gate") });
 }
+
+// --- plan 01g: a passing amendment rewrites one acceptance item -------
+// A `criterionDispute` becomes a `reserved` amendment decision the reviewers
+// vote on like any other. A passing normal tally (M plus one of A/B) applies
+// it: the wording is replaced for this phase only, the contract version
+// bumps, contract findings citing the old wording are superseded, and the
+// phase starts a fresh attempt so the NEXT candidate is judged against the
+// new wording. The amendment itself consumes no repair round (the attempt is
+// a fresh one, not a repair), and a failed amendment leaves the criterion
+// unchanged and never blocks acceptance on its own.
+function amendmentCitesCriterion(f: Finding, criterion: string): boolean {
+  return f.criterionDisputed === criterion || (f.evidence ?? "").includes(criterion);
+}
+
+function criterionAmendmentReady(s: State, ev: Event): boolean {
+  const e = ev as Extract<Event, { type: "CRITERION_AMENDED" }>;
+  if (!s.phase.candidate) return false;
+  const decision = s.phase.decisions.find((d) => d.id === e.decisionId);
+  if (!decision || !decision.amendment || decision.amendment.status !== "proposed") return false;
+  if (decision.boundCandidateSha !== s.phase.candidate.sha) return false;
+  if (!sameVersion(decision.boundContractVersion, s.phase.contract.contractVersion)) return false;
+  if (!Array.isArray(e.newAcceptance) || e.newAcceptance.length === 0 || e.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
+    return false;
+  }
+  return s.phase.contract.acceptance.includes(decision.amendment.criterion);
+}
+
+function applyCriterionAmended(s: State, ev: Event): State {
+  const e = ev as Extract<Event, { type: "CRITERION_AMENDED" }>;
+  const decision = s.phase.decisions.find((d) => d.id === e.decisionId)!;
+  const amendment = decision.amendment!;
+  const decisions = s.phase.decisions.map((d) =>
+    d.id === e.decisionId
+      ? {
+          ...d,
+          version: d.version + 1,
+          amendment: { ...amendment, status: "applied" as const, appliedContractVersion: e.newContractVersion },
+        }
+      : d,
+  );
+  // Contract findings that cited the replaced wording are closed as
+  // superseded — never left open to fail every later round.
+  const findings = s.phase.findings.map((f) =>
+    f.status === "open" && f.kind === "contract" && amendmentCitesCriterion(f, amendment.criterion)
+      ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
+      : f,
+  );
+  return withPhase(s, {
+    phase: "IMPLEMENTING",
+    contract: { ...s.phase.contract, acceptance: e.newAcceptance, contractVersion: e.newContractVersion },
+    candidate: s.phase.candidate && { sha: s.phase.candidate.sha, contractVersion: e.newContractVersion },
+    decisions,
+    findings,
+    attempt: { n: s.phase.attempt.n + 1 },
+    checks: undefined,
+    probe: undefined,
+    reviews: {},
+    ballots: [],
+    overrides: [],
+    inFlight: {},
+    pendingDispute: undefined,
+    pendingDisclosures: undefined,
+    pendingPrior: undefined,
+  });
+}
+
+addRow({
+  id: "resolving-criterion-amended",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "CRITERION_AMENDED",
+  guardName: "criterionAmendmentReady",
+  guard: criterionAmendmentReady,
+  to: "IMPLEMENTING",
+  // The resulting IMPLEMENTING state has no worker in flight, so next()
+  // dispatches a fresh attempt under the new contract version.
+  actions: [{ type: "dispatch_worker" }],
+  apply: applyCriterionAmended,
+});
 
 // A gate-less phase: acceptance is immediate, exactly as before plan 01f.
 addRow({
