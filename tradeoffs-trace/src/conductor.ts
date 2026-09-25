@@ -71,6 +71,11 @@ import {
   verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
+import { redactText, resolveSecrets, secretNames, secretPromptLines, type Secret } from "./effects/secrets.ts";
+// Plan 01a: the secret guard itself lives with the other `sh` guards (they
+// are wired into the agent's `tool_call` hook, and the conductor reuses the
+// same refusal at the socket, where a scripted agent's commands arrive).
+import { secretUseInCommand } from "../extension/guards.ts";
 import { crashAt, CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
 
 export { CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
@@ -184,6 +189,12 @@ export interface RunPlanFile {
    * searching for them (run aea875c4: reviewers spent 6 minutes running
    * recursive `find` searches over the home directory). */
   references?: string[];
+  /** Plan 01a: the secrets the plan declares by name (#+TT_SECRETS). Each is
+   * resolved from the conductor's own environment — never from the plan —
+   * passed to every agent, and replaced by `***NAME***` in everything the
+   * conductor writes. A name that is unset at start is reported in the
+   * status; the run starts anyway. */
+  secrets?: string[];
 }
 
 export interface ConductorOptions {
@@ -362,6 +373,10 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(plan, null, 2));
   // Snapshot the plan's reference documents (same-named files get a numeric
   // prefix); a missing one is skipped and noted rather than failing the run.
+  // Plan 01a: a document that quotes a declared secret is copied redacted —
+  // the vendor reference docs of atlas plan 13 held the keys themselves
+  // (runtime doc §7), and every agent can read these copies.
+  const { secrets } = resolveSecrets(secretNames(plan.secrets));
   const refs = plan.references ?? [];
   if (refs.length > 0) {
     fs.mkdirSync(p.refs, { recursive: true });
@@ -375,7 +390,10 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
       let name = path.basename(src);
       if (used.has(name)) name = `${i}-${name}`;
       used.add(name);
-      fs.copyFileSync(src, path.join(p.refs, name));
+      const dest = path.join(p.refs, name);
+      const buf = fs.readFileSync(src);
+      if (secrets.length === 0 || buf.includes(0)) fs.writeFileSync(dest, buf);
+      else fs.writeFileSync(dest, redactText(buf.toString("utf8"), secrets));
     });
     if (missing.length > 0) fs.writeFileSync(path.join(p.refs, "MISSING.txt"), `${missing.join("\n")}\n`);
   }
@@ -554,6 +572,12 @@ export class Conductor {
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #probeReuse: boolean;
+  /** Plan 01a: the plan's declared secret names, the values resolved from
+   * the conductor's own environment at start, and the declared names that
+   * were unset then (reported by `tt status`, never a reason not to run). */
+  #secretNames: string[] = [];
+  #secrets: Secret[] = [];
+  #missingSecrets: string[] = [];
   #log!: EventLog;
   #lock: Lock | undefined;
   #socket!: RunSocketServer;
@@ -682,7 +706,15 @@ export class Conductor {
    * off `drive()`. */
   async start(): Promise<void> {
     this.#lock = await acquireLock(this.#paths.lock);
-    this.#log = new EventLog(this.#paths.events);
+    // Plan 01a: the plan only ever names its secrets; the values come from
+    // this process's own environment (never from the plan, a prompt or a
+    // file), and every writer below redacts them. A declared name that is
+    // unset is recorded and reported — the run still starts.
+    this.#secretNames = secretNames(this.#plan.secrets);
+    const resolved = resolveSecrets(this.#secretNames);
+    this.#secrets = resolved.secrets;
+    this.#missingSecrets = resolved.missing;
+    this.#log = new EventLog(this.#paths.events, this.#secrets);
 
     // design §2.1: assert the Pi version before ever launching it — but
     // only when the real `pi` binary is actually going to be used for at
@@ -711,6 +743,7 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head);
     }
     this.#state = foldEvents(this.#state, records);
+    if (this.#secretNames.length > 0) this.#recordSecrets();
     // design §9.3: "If the command ID is already in the log, the command is
     // only moved to applied/." Every applied conductor-state command's event
     // carries its inbox id, so the applied set is rebuilt from the log alone
@@ -734,6 +767,10 @@ export class Conductor {
       cwdFor: (agentId) => this.#cwdFor(agentId),
       onShIntent: (agentId, commandId, pgid) => this.#onShIntent(agentId, commandId, pgid),
       onShExit: (_agentId, _commandId, pgid) => void this.#liveShGroups.delete(pgid),
+      // Plan 01a: a command carrying a secret's literal value is refused
+      // here as well as in the agent's extension guard — a scripted agent
+      // (fake-pi) sends its `sh` messages straight to this socket.
+      refuseSh: (_agentId, command) => secretUseInCommand(command, this.#secretNames),
       shDeadline: { deadlineMs: this.#deadlines.shCommandMs, termGraceMs: this.#deadlines.termGraceMs },
       onNoSubmission: (agentId) => this.#onNoSubmission(agentId),
     });
@@ -769,6 +806,25 @@ export class Conductor {
   }
 
   // -- crash recovery (design §9.3) ----------------------------------------
+
+  /** Plan 01a: the names the plan declared and which of them were unset when
+   * this start resolved them. Names only — a value is never recorded anywhere
+   * but the environment. Appended once, and again only when the answer
+   * changes (a restart with the variable now exported), so `tt status` shows
+   * the current truth without the log growing a record per start. */
+  #recordSecrets(): void {
+    const record = { declared: this.#secretNames, missing: this.#missingSecrets };
+    const { records } = readLog(this.#paths.events);
+    for (let i = records.length - 1; i >= 0; i--) {
+      if (records[i].kind !== "secrets") continue;
+      const last = records[i].event as { declared?: unknown; missing?: unknown };
+      if (JSON.stringify(last.declared) === JSON.stringify(record.declared) && JSON.stringify(last.missing) === JSON.stringify(record.missing)) {
+        return;
+      }
+      break;
+    }
+    this.#log.append("secrets", record);
+  }
 
   /** design §9.3's "create worktree" row: "path exists at the recorded base
    * → record done; otherwise remove the partial worktree and recreate it."
@@ -1429,7 +1485,10 @@ export class Conductor {
       if (event.type === "agent_start" || files.length === 0) return;
       const record = { agentId, ts: new Date().toISOString(), event: { type: "tt_file_changes", toolCallId, files } };
       try {
-        fs.appendFileSync(streamFile, `${JSON.stringify(record)}\n`);
+        // Plan 01a: a file path could hold a secret value; this writes to the
+        // same stream file `pi-rpc.ts` redacts when it appends. `***NAME***`
+        // holds no quote or backslash, so the line stays valid JSON.
+        fs.appendFileSync(streamFile, `${redactText(JSON.stringify(record), this.#secrets)}\n`);
       } catch {
         // display only
       }
@@ -2236,6 +2295,12 @@ export class Conductor {
       TT_PROTECTED: protectedPaths,
       // Where find/grep/ls may search: the worktree and the plan's references.
       TT_SEARCH_ROOTS: [this.#paths.worktree, this.#paths.refs].join(path.delimiter),
+      // Plan 01a: the plan's secrets — the names (so the extension guard
+      // knows what to look for) and each value, which lives only here and in
+      // the agent's own environment. Set last: these win over any
+      // test-injected env, so a guard always sees the run's real value.
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secrets.map((s) => [s.name, s.value])),
     };
 
     let helloResolve!: (r: HelloResult) => void;
@@ -2270,6 +2335,7 @@ export class Conductor {
       role: "worker",
       agentId,
       streamFile,
+      secrets: this.#secrets,
       abortGraceMs: this.#deadlines.abortGraceMs,
       termGraceMs: this.#deadlines.termGraceMs,
       onEvent: (event) => {
@@ -2347,6 +2413,7 @@ export class Conductor {
           interruptionNote,
           this.#repairContext(),
           runReferences(this.#runDir),
+          this.#secretNames,
         ),
       );
       // Record delivery only after the prompt was sent; a crash between the
@@ -2615,9 +2682,14 @@ export class Conductor {
    * command. */
   #recordCheck(outDir: string, command: string, result: RunCommandResult): void {
     fs.mkdirSync(outDir, { recursive: true });
+    // Plan 01a: a check or probe command (and its output) may carry a secret
+    // value — a vendor key a command echoes, or the plan's own check line.
     fs.writeFileSync(
-      path.join(outDir, `${sanitize(command)}.log`),
-      `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
+      path.join(outDir, `${sanitize(redactText(command, this.#secrets))}.log`),
+      redactText(
+        `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
+        this.#secrets,
+      ),
     );
   }
 
@@ -2765,6 +2837,10 @@ export class Conductor {
       // per-command limit plus room for the kill and its report.
       TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
       TT_RUN_DIR: this.#runDir,
+      // Plan 01a: same secrets as the worker (a reviewer's reproduction
+      // command or check run may need one) — names plus values, set last.
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secrets.map((s) => [s.name, s.value])),
       // Phase 1b work-packet item 6: a `tt start`-launched, CLI-driven
       // conductor has no in-process JS hook (unlike setupConductor's
       // `piEnvFor` callback in the test harness) that a static, on-disk
@@ -2830,6 +2906,7 @@ export class Conductor {
       role: "reviewer",
       agentId,
       streamFile,
+      secrets: this.#secrets,
       abortGraceMs: this.#deadlines.abortGraceMs,
       termGraceMs: this.#deadlines.termGraceMs,
       onEvent: (event) => {
@@ -2893,7 +2970,7 @@ export class Conductor {
       );
 
       if (this.#stubReviews) {
-        await agent.prompt(buildReviewerPrompt(this.#state.phase, reviewer));
+        await agent.prompt(buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames));
         const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
         reviewTimeout.cancel();
         if (outcome === "submitted") {
@@ -3043,6 +3120,7 @@ export class Conductor {
       `Goal: ${phase.contract.goal}`,
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
+      ...secretPromptLines(this.#secretNames),
       `Candidate checkout (read-only): ${this.#candidateDir()}`,
       ...referenceLines(runReferences(this.#runDir)),
       `Diff vs. phase base (${phase.integrationHead.slice(0, 7)}):`,
@@ -3073,6 +3151,7 @@ export class Conductor {
     const openCorrections = phase.corrections.filter((c) => c.status === "open");
     const lines = [
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
+      ...secretPromptLines(this.#secretNames),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -3216,18 +3295,20 @@ export function referenceLines(references: string[]): string[] {
   ];
 }
 
-function buildWorkerPrompt(
+export function buildWorkerPrompt(
   contract: PhaseContract,
   ownerNotes?: string,
   interruptionNote?: string,
   repair?: RepairContext,
   references: string[] = [],
+  secrets: readonly string[] = [],
 ): string {
   const lines: string[] = [
     `Goal: ${contract.goal}`,
     "",
     "Acceptance criteria:",
     ...contract.acceptance.map((a) => `- ${a}`),
+    ...secretPromptLines(secrets),
     ...referenceLines(references),
   ];
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
@@ -3264,11 +3345,12 @@ function buildWorkerPrompt(
   return lines.join("\n");
 }
 
-function buildReviewerPrompt(phase: PhaseState, reviewer: Reviewer): string {
+export function buildReviewerPrompt(phase: PhaseState, reviewer: Reviewer, secrets: readonly string[] = []): string {
   return [
     `You are reviewer ${reviewer}. Review candidate ${phase.candidate?.sha} for phase ${phase.phaseId}.`,
     `Goal: ${phase.contract.goal}`,
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
+    ...secretPromptLines(secrets),
     "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
   ].join("\n");
 }

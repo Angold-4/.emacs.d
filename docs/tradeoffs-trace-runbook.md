@@ -152,7 +152,58 @@ rebuilds from scratch:
 1. `TT_BRANCH` exists in the repository, and nothing has it or a node branch checked out.
 2. Every plan's check command finishes in a few minutes (the checks limit is 5).
 3. The runner is installed at the revision you want (`readlink ~/.tradeoffs-trace/runner/current`).
-4. Credentials the checks need (for example vendor keys) are exported in the shell that starts Emacs or `tt`.
+4. The plan declares every credential it needs with `#+TT_SECRETS` (see below), and each one is exported in the shell that starts Emacs or `tt`.
+
+## Secrets (credentials)
+
+A plan declares the credentials it needs **by name** and nothing else:
+
+```org
+#+TT_SECRETS: PYTH_ACCESS_TOKEN KAIKO_KEY
+```
+
+- The name goes into the JSON plan (`secrets`); the plan never holds a value.
+- The conductor resolves each value from **its own environment** (the shell that
+  starts Emacs or `tt`) when the run starts, and passes it to the worker and
+  every reviewer as an environment variable. In a command, write `$PYTH_ACCESS_TOKEN`.
+- Every agent's prompt names the declared secrets and says to reference them as
+  `$NAME`, never to paste a value.
+- An `sh` command containing a secret's literal value is refused (before it
+  runs), with a message naming the variable to use instead.
+- The conductor replaces every value with `***NAME***` in everything it writes:
+  the agent stream files, `events.jsonl`, the check logs, the `refs/` copies of
+  the plan's reference documents, `views/pr.md`, and what `tt status`, `tt state`
+  and `tt timing` print. Emacs masks a declared secret's value as well, using its
+  own environment, so nothing it displays can show one.
+- A declared secret that is unset at start is reported by name (`secret FAKE_KEY
+  not set` in `tt status` and the status buffer) and **the run still starts** — a
+  missing credential fails whatever check needs it, not the run.
+- Two files a run can still hold a value in are not the conductor's to write at
+  the moment it is written: Pi's own session file under `<run>/sessions/`, and a
+  file the worker itself edited in `<run>/worktree/`. `tt redact` cleans the
+  sessions; the worktree and the reviewers' `candidates/` checkouts are git
+  trees and are left to you.
+
+Cleaning a run that already leaked a value (for example a run started before its
+plan declared its secrets):
+
+```sh
+PYTH_ACCESS_TOKEN=…  tt redact <run-dir-or-id> --secrets PYTH_ACCESS_TOKEN
+PYTH_ACCESS_TOKEN=…  tt redact --all --secrets PYTH_ACCESS_TOKEN
+```
+
+`tt redact` rewrites run directories **in place** — `events.jsonl`,
+`stream/*.jsonl`, `sessions/` (Pi's own session files, which hold whatever an
+agent echoed), `checks/**`, `refs/**`, `views/**`, `plan/`, `conductor.log` —
+replacing the value with `***NAME***`. The values are read from the
+command's own environment; the names come from `--secrets` or, when it is
+omitted, from each run's own plan snapshot. JSONL files are rewritten line by
+line, so every line still parses (a torn final line stays torn and unnewlined).
+A worker's `worktree/` and the reviewers' `candidates/` checkouts are git trees,
+not conductor output, and are left alone — check them yourself if a worker ever
+pasted a value into the code. The trace buffer masks a declared secret's value
+that a stream file still holds, using Emacs's own environment, so an unredacted
+past run cannot display one either.
 
 ## Watch it
 
@@ -163,7 +214,7 @@ rebuilds from scratch:
 | decision view (`C-c m d`) | the current round's decisions, each labelled by the tally, with the options, recommendation and each reviewer's ballot; findings grouped by file; earlier rounds one line each. Read-only. |
 | runs list (`C-c m l`) | every run: `RET` opens, `k` stops, `R` resumes |
 | mode line | live runs with stage, time and reviews; a warning face when something needs attention |
-| CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown) |
+| CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
 
 ## Steer it
 
@@ -244,6 +295,7 @@ Each row was observed in a real run.
 | freeze fails with "failed to copy file … objects" | a concurrent `git gc` in the source repository | nothing: the clone retries once |
 | review shows many decisions for a small change | every reviewer discovers up to 5 more | expected; read only REJECTED and flagged ones |
 | `tt stop` reports the lock still held | conductor killed hard | wait a moment and rerun `tt stop`; `tt list` shows the real state |
+| a key was pasted into a command or a file by an agent | the plan did not declare it (`#+TT_SECRETS`) | clean the run with `tt redact` (see Secrets), add the name to the plan, and export the value in the shell that starts the run |
 
 ## Known limitations
 

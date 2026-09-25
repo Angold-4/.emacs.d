@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 
 import { JSONLDecoder, encodeLine, type PiRpcCommand, type PiRpcEvent, type PiRpcResponse } from "../core/protocol.ts";
 import type { Role } from "../core/roles.ts";
+import { redactJson, type Secret } from "./secrets.ts";
 
 export interface PiAgentOptions {
   /** The `pi` binary, or an injected stand-in (fake-pi) for tests. Defaults
@@ -31,6 +32,10 @@ export interface PiAgentOptions {
   /** Absolute path of the file every RPC event is appended to (no fsync —
    * design §9.2's "high-volume" stream). Parent directory must exist. */
   streamFile?: string;
+  /** The plan's secrets (plan 01a): every event is redacted before it is
+   * written to `streamFile`. This is the file the workers' pasted keys
+   * landed in (721 occurrences in one program, runtime doc §7). */
+  secrets?: readonly Secret[];
   /** design §8.2 defaults; overridable for tests. */
   abortGraceMs?: number;
   termGraceMs?: number;
@@ -69,6 +74,7 @@ export class PiAgent {
   #exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   #abortGraceMs: number;
   #termGraceMs: number;
+  #secrets: readonly Secret[];
   #terminating: Promise<TerminateResult> | undefined;
   readonly pgid: number;
   readonly agentId: string;
@@ -80,6 +86,7 @@ export class PiAgent {
     this.#abortGraceMs = opts.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS;
     this.#termGraceMs = opts.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
     this.#onEvent = opts.onEvent;
+    this.#secrets = opts.secrets ?? [];
 
     if (opts.streamFile) {
       fs.mkdirSync(path.dirname(opts.streamFile), { recursive: true });
@@ -149,7 +156,7 @@ export class PiAgent {
     const event = msg as PiRpcEvent;
     if (this.#streamFd !== undefined) {
       try {
-        fs.writeSync(this.#streamFd, encodeLine({ agentId: this.agentId, ts: new Date().toISOString(), event }));
+        fs.writeSync(this.#streamFd, encodeLine({ agentId: this.agentId, ts: new Date().toISOString(), event: redactJson(event, this.#secrets) }));
       } catch {
         // best effort: losing the stream loses display detail, never state.
       }

@@ -102,6 +102,11 @@ be tagged `:provisional:` and are revised as implementation teaches us things.
 - `RESERVED` names choices the owner wants flagged, in addition to the
   standing reserved classes in §3.4. They are voted like any other decision;
   the owner is never waited for (owner-optional).
+- `#+TT_SECRETS` (plan level) names the credentials the plan needs, by name
+  only. The conductor reads each value from its own environment, passes it to
+  every agent as an environment variable, refuses a command containing one, and
+  writes `***NAME***` wherever a value would otherwise land. See the runbook's
+  "Secrets (credentials)" and `tt redact` for a run that already leaked one.
 - The goal and acceptance list are given to the worker and to every reviewer
   word for word.
 

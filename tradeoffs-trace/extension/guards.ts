@@ -24,6 +24,10 @@ export interface GuardConfig {
    * touch — the phase's own acceptance files (`TT_PROTECTED`, comma
    * separated). */
   protectedPaths?: string[];
+  /** The plan's declared secret names (`TT_SECRETS`, space separated). Their
+   * values are in this process's own environment; a command containing one
+   * is refused (see `secretUseInCommand`). */
+  secretNames?: string[];
 }
 
 /** Canonicalizes `pathname` the way the filesystem sees it, tolerating a
@@ -136,12 +140,28 @@ export function longestSleepSeconds(command: string): number {
   return max;
 }
 
-/** True iff `command` (the `sh` tool's `command` argument) must be blocked:
- * `git commit`/`git push`, backgrounded work, a sleep longer than
- * MAX_SLEEP_SECONDS, or any mention of the run directory outside the
- * worker's own worktree. This is a string-level check only — see the module
- * comment above. Returns a human-readable reason, or `undefined` if the
- * command is allowed. */
+/** Plan 01a: the secret whose value `command` contains, or `undefined`.
+ * The value is read from THIS process's environment (`env`, the agent's own
+ * environment — the conductor hands each secret over as a variable, so a
+ * guard never needs a value to be passed to it any other way). The reason
+ * names the variable to use instead and never repeats the value or the
+ * command (which holds it). */
+export function secretUseInCommand(
+  command: string,
+  names: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  for (const name of names) {
+    const value = env[name];
+    if (!value || !command.includes(value)) continue;
+    return (
+      `sh command contains the value of the secret ${name}. Use the environment variable instead — write "$${name}". ` +
+      "Nothing was run. A secret value must never be pasted into a command, an edit or a submission."
+    );
+  }
+  return undefined;
+}
+
 /** A `find` (or `fd`, `locate`, `mdfind`) over the whole disk or the home
  * directory: the 13a worker of program 59163ee2 ran `find / -name …` for its
  * plan's reference documents, which are listed in its prompt. */
@@ -152,7 +172,16 @@ export function searchesWholeDisk(command: string): boolean {
   );
 }
 
+/** True iff `command` (the `sh` tool's `command` argument) must be blocked:
+ * a secret's literal value, `git commit`/`git push`, backgrounded work, a
+ * sleep longer than MAX_SLEEP_SECONDS, or any mention of the run directory
+ * outside the worker's own worktree. This is a string-level check only — see
+ * the module comment above. Returns a human-readable reason, or `undefined`
+ * if the command is allowed. */
 export function guardedShCommand(command: string, config: GuardConfig): string | undefined {
+  // First: the one check whose reason must not repeat the command.
+  const leak = secretUseInCommand(command, config.secretNames ?? []);
+  if (leak !== undefined) return leak;
   if (searchesWholeDisk(command)) {
     return (
       "searching the whole disk or home directory is refused: the plan's reference documents are listed in your " +
@@ -219,6 +248,10 @@ export function readGuardConfigFromEnv(): GuardConfig {
     runDir: readEnv("TT_RUN_DIR"),
     protectedPaths: (readEnv("TT_PROTECTED") ?? "")
       .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+    secretNames: (readEnv("TT_SECRETS") ?? "")
+      .split(/[\s,]+/)
       .map((s) => s.trim())
       .filter((s) => s.length > 0),
   };

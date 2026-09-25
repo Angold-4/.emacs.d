@@ -144,6 +144,10 @@ export async function setupConductor(opts: {
    * "acceptance files" boundary-trigger input. Appended after the fixed
    * `"it works"` acceptance criterion. */
   acceptanceFiles?: string[];
+  /** Plan 01a: the plan's `#+TT_SECRETS` names, as Emacs would put them in
+   * the JSON plan. The values are read from the harness process's own
+   * environment (set them with `process.env.NAME = …` before calling). */
+  secrets?: string[];
 }): Promise<TestConductorSetup> {
   const repo = makeRepo();
   const runRoot = makeRunRoot();
@@ -154,6 +158,7 @@ export async function setupConductor(opts: {
     repo: repo.dir,
     integrationBranch: "main",
     checks: opts.globalChecks ?? opts.checks ?? ["true"],
+    ...(opts.secrets ? { secrets: opts.secrets } : {}),
     phases: [
       {
         id: "p1",

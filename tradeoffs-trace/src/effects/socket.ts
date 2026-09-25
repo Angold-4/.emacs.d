@@ -76,6 +76,13 @@ export interface RunSocketHandlers {
   /** Per-command deadline (design §8.1's "each `sh` command the worker
    * runs"). Defaults live here so tests can override with ms-scale values. */
   shDeadline?: ShDeadlineOptions;
+  /** Plan 01a: refuse a command before it runs. The extension's own guard
+   * (`guards.ts`) already refuses one containing a secret value, but a
+   * scripted agent (fake-pi in tests) speaks this socket directly, so the
+   * conductor refuses at the same place it runs every command. Returns the
+   * reason to hand the agent, or `undefined` to run the command. Never echo
+   * the command back in the reason — it holds the value. */
+  refuseSh?: (agentId: string, command: string) => string | undefined;
   /** design §3.3 item 1 / §9.5: the worker's extension reports this once its
    * two settle reminders are exhausted with no accepted `submit_phase`. See
    * `NoSubmissionMessage` in core/protocol.ts for why this is a pure
@@ -182,6 +189,14 @@ export class RunSocketServer {
 
   async #runSh(conn: Connection, msg: ShMessage): Promise<void> {
     const agentId = conn.agentId ?? "unknown";
+    const refusal = this.#handlers.refuseSh?.(agentId, msg.command);
+    if (refusal !== undefined) {
+      // The agent gets a normal tool failure: no process group is created,
+      // so there is nothing for the deadline or the sweep to clean up.
+      this.#write(conn.socket, { type: "sh_output", commandId: msg.commandId, chunk: `${refusal}\n`, stream: "stderr" });
+      this.#write(conn.socket, { type: "sh_exit", commandId: msg.commandId, code: 2, signal: null });
+      return;
+    }
     const cwd = this.#handlers.cwdFor(agentId);
     const deadline = this.#handlers.shDeadline ?? {};
     let groupId: number | undefined;

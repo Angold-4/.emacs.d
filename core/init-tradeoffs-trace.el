@@ -207,6 +207,13 @@ For repositories whose builds and suites outlast the defaults (3, 5, 45)."
     (when-let* ((v (funcall ms "TT_ATTEMPT_MINUTES"))) (push (cons 'workerAttemptMs v) out))
     (nreverse out)))
 
+(defun +tt--plan-secrets ()
+  "Secret names the plan declares with #+TT_SECRETS (space or comma separated).
+Only names ever appear in a plan, in this buffer or in the JSON the conductor
+reads: the values live in the environment (design §7)."
+  (seq-remove #'string-empty-p
+              (split-string (or (+tt--keyword "TT_SECRETS") "") "[ \t,]+" t)))
+
 (defun +tt-parse-plan ()
   "Parse the current Org plan buffer.
 Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
@@ -242,7 +249,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))
-                      (and r `((references . ,(vconcat r))))))
+                      (and r `((references . ,(vconcat r)))))
+                  ,@(let ((s (+tt--plan-secrets)))
+                      (and s `((secrets . ,(vconcat s))))))
           :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
 
 (defun +tt--show-plan-errors (file errors)
@@ -281,7 +290,8 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
   "Completion label for RUN-DIR."
   (let* ((meta (ignore-errors (json-read-file (expand-file-name "meta.json" run-dir)))))
     (format "%s  %s" (file-name-nondirectory (directory-file-name run-dir))
-            (or (alist-get 'title meta) ""))))
+            ;; Plan 01a: a title could quote a value; names are all that show.
+            (+tt--redact (or (alist-get 'title meta) "") (+tt--secret-values run-dir)))))
 
 (defun +tt--resolve-run ()
   "Resolve the run a `C-c m' command means (design §1.4)."
@@ -602,9 +612,20 @@ several phases runs them in order."
   (truncate-string-to-width
    (string-trim (replace-regexp-in-string "[\n\t ]+" " " (or text ""))) width nil nil "…"))
 
+(defvar +tt--trace-secrets nil
+  "Alist of (NAME . VALUE) the trace masks while rendering (see
+`+tt--secret-values').  A value is only ever used to strip itself back out.")
+
+(defun +tt--clean (text)
+  "TEXT with every secret value masked (via `+tt--trace-secrets').
+Applied to the raw argument or output BEFORE it is truncated to one line, so
+a value cut off mid-line cannot survive the mask."
+  (+tt--redact text +tt--trace-secrets))
+
 (defun +tt--tool-verb (name arg)
   "Short rendering of tool NAME with ARG: `$ cmd' for sh, else `name arg'."
-  (let ((polling (and (member name '("sh" "bash"))
+  (let* ((arg (+tt--clean arg))
+         (polling (and (member name '("sh" "bash"))
                       (string-match-p "\\bsleep\\b\\|\\btail -f\\b" (or arg "")))))
     (concat (if (member name '("sh" "bash")) "$ " (concat name " "))
             (+tt--one-line arg 300)
@@ -613,14 +634,14 @@ several phases runs them in order."
 (defun +tt--tool-arg (args)
   "The one argument that identifies a tool call in ARGS."
   (let ((v (or (alist-get 'command args) (alist-get 'path args) (alist-get 'pattern args) "")))
-    (if (stringp v) v (format "%s" v))))
+    (+tt--clean (if (stringp v) v (format "%s" v)))))
 
 (defun +tt--result-tail (ev)
   "Last non-empty output line of a tool_execution_end event EV."
   (let* ((content (alist-get 'content (alist-get 'result ev)))
          (text (and (listp content) (alist-get 'text (car content)))))
     (when (stringp text)
-      (let ((lines (seq-remove #'string-blank-p (split-string text "\n"))))
+      (let ((lines (seq-remove #'string-blank-p (split-string (+tt--clean text) "\n"))))
         (when lines (+tt--one-line (car (last lines)) 60))))))
 
 (defun +tt--trace-line (rec)
@@ -636,7 +657,7 @@ several phases runs them in order."
                           (seq-keep (lambda (c) (and (equal (alist-get 'type c) "text") (alist-get 'text c)))
                                     (alist-get 'content msg)))))
          (when (and texts (not (string-blank-p (string-join texts " "))))
-           (format "%s » %s\n" (+tt--hms ts) (+tt--one-line (string-join texts " ") 400)))))
+           (format "%s » %s\n" (+tt--hms ts) (+tt--one-line (+tt--clean (string-join texts " ")) 400)))))
       ("tool_execution_start"
        (puthash (alist-get 'toolCallId ev)
                 (list ts (alist-get 'toolName ev) (+tt--tool-arg (alist-get 'args ev)))
@@ -657,7 +678,7 @@ several phases runs them in order."
                      (if (and tail (member (nth 1 start) '("sh" "bash"))) (concat " · " tail) ""))))))
       ("tt_file_changes"
        (mapconcat (lambda (f)
-                    (format "           %s %s\n" (alist-get 'path f)
+                    (format "           %s %s\n" (+tt--clean (alist-get 'path f))
                             (propertize (format "+%d −%d" (alist-get 'added f) (alist-get 'removed f))
                                         'face 'shadow)))
                   (alist-get 'files ev) ""))
@@ -675,9 +696,30 @@ several phases runs them in order."
                                  (+tt--dur (+tt--secs-between (nth 0 v) nil))))
                        running ""))))
 
+(defun +tt--secret-values (run-dir)
+  "Alist of (NAME . VALUE) for RUN-DIR's declared secrets set in this Emacs.
+The names come from the run's own plan snapshot; the values only from this
+process's environment.  Emacs never displays a value: they are read here for
+one purpose — stripping them out of what the trace renders if a value ever
+reaches a stream file."
+  (let* ((file (expand-file-name "plan/v1.json" run-dir))
+         (names (and (file-exists-p file)
+                     (ignore-errors (alist-get 'secrets (json-read-file file))))))
+    (seq-keep (lambda (name)
+                (let ((value (getenv name)))
+                  (and value (not (string-empty-p value)) (cons name value))))
+              names)))
+
+(defun +tt--redact (text secrets)
+  "TEXT with every value in SECRETS (an alist of NAME . VALUE) masked."
+  (dolist (s secrets text)
+    (setq text (replace-regexp-in-string (regexp-quote (cdr s))
+                                         (format "***%s***" (car s)) text t t))))
+
 (defun +tt--render-trace (&optional win)
   "Append whatever the followed agent's stream gained since the last refresh."
-  (let* ((files (+tt--stream-files +tt--run-dir))
+  (let* ((+tt--trace-secrets (+tt--secret-values +tt--run-dir))
+         (files (+tt--stream-files +tt--run-dir))
          (file (if +tt--trace-agent
                    (seq-find (lambda (f) (string-prefix-p +tt--trace-agent (file-name-nondirectory f))) files)
                  (car files)))
@@ -706,12 +748,15 @@ several phases runs them in order."
                                    (json-parse-string line :object-type 'alist :array-type 'list
                                                       :null-object nil :false-object :false)))
                             (text (+tt--trace-line rec)))
-                  (push text out))))
+                  ;; Belt and braces: the raw strings above were already
+                  ;; cleaned before truncation; this catches anything else
+                  ;; (a file path, an agent id).
+                  (push (+tt--clean text) out))))
             (when out
               (save-excursion
                 (goto-char (point-max))
                 (insert (apply #'concat (nreverse out)))))))
-        (setq header-line-format (+tt--trace-header))
+        (setq header-line-format (+tt--clean (+tt--trace-header)))
         (when (and win at-end) (set-window-point win (point-max)))))))
 
 (defun +tt-trace-pick-agent ()
@@ -826,6 +871,10 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
                                (if (> b 0) (format " · boundary files changed: %d (reviewers classify)" b) ""))))
     (when-let* ((why (alist-get 'blockedReason phase)))
       (+tt--status-row "blocked" why 'error))
+    ;; Plan 01a: a declared secret that was unset when the run started (names
+    ;; only; the value is never shown, and the run still runs without it).
+    (dolist (name (alist-get 'missing (alist-get 'secrets s)))
+      (+tt--status-row "secret" (format "%s not set" name) 'warning))
     (+tt--render-owner-inputs s)
     (when attention
       (insert "\n" (propertize (format "⚑ %s%s" attention

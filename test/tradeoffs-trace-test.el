@@ -237,6 +237,7 @@
      `((meta (title . "sum validation"))
        (conductorAlive . t)
        (ownerInputs) (pendingOwnerInputs)
+       (secrets (declared "FAKE_KEY" "OTHER_KEY") (missing "FAKE_KEY"))
        (state (run . "RUN_ACTIVE")
               (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 1))
                      (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
@@ -254,6 +255,9 @@
       (should (string-match-p "reviews   M ✗ 2 reject · 1 blocking   A ✓   B ⧗" text))
       (should (string-match-p "4 decisions · 2 flagged for you · 1 open findings" text))
       (should (string-match-p "boundary files changed: 2 (reviewers classify)" text))
+      ;; Plan 01a: an unset declared secret is reported by name; a set one is not.
+      (should (string-match-p "secret    FAKE_KEY not set" text))
+      (should-not (string-match-p "OTHER_KEY" text))
       ;; empty sections are not shown
       (should-not (string-match-p "Owner input" text))
       (should-not (string-match-p "verdict" text)))))
@@ -393,6 +397,51 @@
               (set-buffer-modified-p nil) (setq buffer-file-name nil)
               (should (equal refs (vector ref))))))
       (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-plan-secrets ()
+  "Plan 01a: #+TT_SECRETS becomes the plan's secrets list — names only."
+  (let ((plan (plist-get (+tt-test--parse (concat "#+TT_SECRETS: FAKE_KEY  OTHER_KEY,THIRD_KEY\n"
+                                                    +tt-test--valid-plan))
+                          :plan)))
+    (should (equal (alist-get 'secrets plan) ["FAKE_KEY" "OTHER_KEY" "THIRD_KEY"])))
+  (should-not (assq 'secrets (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+  ;; An empty #+TT_SECRETS declares nothing.
+  (should-not (assq 'secrets (plist-get (+tt-test--parse (concat "#+TT_SECRETS:\n" +tt-test--valid-plan)) :plan))))
+
+(ert-deftest tradeoffs-trace-trace-never-shows-a-secret-value ()
+  "Plan 01a: the trace masks a declared secret's value (read from Emacs's own
+environment) wherever a stream file happens to hold one; the name shows."
+  (let* ((root (make-temp-file "tt-ert-secret" t))
+         (dir (expand-file-name "stream" root)))
+    (unwind-protect
+        (progn
+          (make-directory dir)
+          (make-directory (expand-file-name "plan" root))
+          (with-temp-file (expand-file-name "plan/v1.json" root)
+            (insert (json-encode '((title . "t") (secrets . ["FAKE_KEY"])))))
+          (setenv "FAKE_KEY" "sk-live-4f8a2b1c9d3e")
+          (with-temp-file (expand-file-name "worker-1.jsonl" dir)
+            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I used sk-live-4f8a2b1c9d3e now.\"}]}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:04.000Z\",\"event\":{\"type\":\"tool_execution_start\",\"toolCallId\":\"t1\",\"toolName\":\"sh\",\"args\":{\"command\":\"curl -H 'Bearer sk-live-4f8a2b1c9d3e' x\"}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:05.000Z\",\"event\":{\"type\":\"tool_execution_end\",\"toolCallId\":\"t1\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Bearer sk-live-4f8a2b1c9d3e\"}]}}}\n"))
+          (with-temp-buffer
+            (+tt-trace-mode)
+            (setq +tt--run-dir root)
+            (+tt--render-trace)
+            (let ((text (buffer-string)))
+              (should (string-search "» I used ***FAKE_KEY*** now." text))
+              (should (string-search "$ curl -H 'Bearer ***FAKE_KEY***' x ✓" text))
+              (should (string-search "· Bearer ***FAKE_KEY***" text))
+              (should-not (string-search "sk-live-4f8a2b1c9d3e" text))))
+          ;; Without the declared name (or without the variable set) nothing
+          ;; is masked: this is a display guard, not the conductor's redaction.
+          (setenv "FAKE_KEY" nil)
+          (with-temp-buffer
+            (+tt-trace-mode)
+            (setq +tt--run-dir root)
+            (should (null (+tt--secret-values root)))))
+      (setenv "FAKE_KEY" nil)
+      (delete-directory root t))))
 
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
