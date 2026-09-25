@@ -181,15 +181,18 @@ test("secrets: a reference document that quotes a key is copied into refs/ redac
   try {
     const src = path.join(docs, "01_ref_vendor.md");
     fs.writeFileSync(src, `# vendor\nPYTH_ACCESS_TOKEN='${value}' is the key\n`);
-    // A doc saved as UTF-16 (NUL bytes: not text by the usual test) and a
-    // genuinely binary artefact: the first is searched and copied — masked
-    // where it quotes the key, and copied as-is when it does not — while the
-    // second is not copied at all, because a file whose bytes cannot be
-    // searched must not be handed to every agent (finding M-4).
+    // A doc saved as UTF-16 — and mostly non-Latin-1 (an English heading plus
+    // CJK), which has NUL bytes but no every-other-byte pattern, so only the
+    // BOM identifies it (finding B-10) — plus a genuinely binary artefact: the
+    // first two are searched and copied (masked where they quote the key,
+    // copied as-is where they do not), while a file whose bytes cannot be
+    // searched is never handed to every agent (finding M-4).
+    const utf16Text = `\ufeffVendor notes / 日本語の参考文書: key ${value} end`;
     const utf16 = path.join(docs, "02_ref_utf16.md");
-    fs.writeFileSync(utf16, Buffer.from(`key ${value} end`, "utf16le"));
+    fs.writeFileSync(utf16, Buffer.from(utf16Text, "utf16le"));
+    const cleanText = "\ufeffVendor notes / 日本語の参考文書（鍵は引用しない）";
     const cleanUtf16 = path.join(docs, "04_ref_clean_utf16.md");
-    fs.writeFileSync(cleanUtf16, Buffer.from("a UTF-16 doc that quotes nothing", "utf16le"));
+    fs.writeFileSync(cleanUtf16, Buffer.from(cleanText, "utf16le"));
     const binary = path.join(docs, "03_ref_binary.bin");
     fs.writeFileSync(binary, Buffer.from([0x00, 0x01, 0x02, 0x00, 0xfe, 0xff]));
     const plan: RunPlanFile = {
@@ -209,10 +212,14 @@ test("secrets: a reference document that quotes a key is copied into refs/ redac
     assert.match(text, /\*\*\*FAKE_KEY\*\*\*/);
     assert.ok(!text.includes(value), "the copy in refs/ must not hold the value");
     const utf16Copy = refs.find((r) => r.endsWith("02_ref_utf16.md"))!;
-    assert.equal(fs.readFileSync(utf16Copy, "utf16le"), "key ***FAKE_KEY*** end", "a UTF-16 doc is masked, not skipped");
+    assert.equal(
+      fs.readFileSync(utf16Copy, "utf16le"),
+      utf16Text.split(value).join("***FAKE_KEY***"),
+      "a non-Latin-1 UTF-16 document is masked in place, not skipped",
+    );
     const cleanCopy = refs.find((r) => r.endsWith("04_ref_clean_utf16.md"));
     assert.ok(cleanCopy, "a UTF-16 document that quotes nothing is still searched, so it is copied");
-    assert.equal(fs.readFileSync(cleanCopy!, "utf16le"), "a UTF-16 doc that quotes nothing");
+    assert.equal(fs.readFileSync(cleanCopy!, "utf16le"), cleanText);
     assert.ok(!refs.some((r) => r.endsWith("03_ref_binary.bin")), "an unsearchable binary doc is not copied");
     const missingNote = fs.readFileSync(path.join(runDir, "refs", "MISSING.txt"), "utf8");
     assert.match(missingNote, /03_ref_binary\.bin \(binary, not copied/);

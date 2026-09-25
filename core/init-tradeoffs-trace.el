@@ -696,25 +696,38 @@ a value cut off mid-line cannot survive the mask."
                                  (+tt--dur (+tt--secs-between (nth 0 v) nil))))
                        running ""))))
 
+(defconst +tt--secret-min-length 4
+  "Shortest value Emacs will mask, matching MIN_SECRET_LENGTH in
+src/effects/secrets.ts.  A value shorter than this (a declared secret exported
+as `1') would rewrite every id, count and timestamp the trace renders, so it is
+never used for masking — the conductor reports such a name in the status
+instead, and the two sides must agree on the rule.")
+
 (defun +tt--secret-values (run-dir)
   "Alist of (NAME . VALUE) for RUN-DIR's declared secrets set in this Emacs.
 The names come from the run's own plan snapshot; the values only from this
 process's environment.  Emacs never displays a value: they are read here for
 one purpose — stripping them out of what the trace renders if a value ever
-reaches a stream file."
+reaches a stream file.  A value shorter than `+tt--secret-min-length' is
+skipped, exactly as the conductor skips it."
   (let* ((file (expand-file-name "plan/v1.json" run-dir))
          (names (and (file-exists-p file)
                      (ignore-errors (alist-get 'secrets (json-read-file file))))))
     (seq-keep (lambda (name)
                 (let ((value (getenv name)))
-                  (and value (not (string-empty-p value)) (cons name value))))
+                  (and value
+                       (>= (length value) +tt--secret-min-length)
+                       (cons name value))))
               names)))
 
 (defun +tt--redact (text secrets)
-  "TEXT with every value in SECRETS (an alist of NAME . VALUE) masked."
-  (dolist (s secrets text)
+  "TEXT with every value in SECRETS (an alist of NAME . VALUE) masked.
+Longest value first, so a value that contains another cannot leave a suffix of
+the longer one behind — the same order secrets.ts's byLengthDesc uses."
+  (dolist (s (sort (copy-sequence secrets) (lambda (a b) (> (length (cdr a)) (length (cdr b))))))
     (setq text (replace-regexp-in-string (regexp-quote (cdr s))
-                                         (format "***%s***" (car s)) text t t))))
+                                         (format "***%s***" (car s)) text t t)))
+  text)
 
 (defun +tt--render-trace (&optional win)
   "Append whatever the followed agent's stream gained since the last refresh."

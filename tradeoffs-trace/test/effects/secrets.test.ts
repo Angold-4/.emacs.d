@@ -203,6 +203,16 @@ test("secrets: utf16Kind tells a UTF-16 document from a file that cannot be sear
   assert.equal(utf16Kind(Buffer.from("\ufeffutf16 with a BOM", "utf16le")), "utf16le");
   assert.equal(utf16Kind(Buffer.from("utf16le ascii", "utf16le")), "utf16le");
   assert.equal(utf16Kind(Buffer.from("utf16be ascii", "utf16le").swap16()), "utf16be");
+  // A document whose characters are mostly non-Latin-1 — an English heading and
+  // a CJK body, as a vendor doc has — has NUL bytes but no every-other-byte
+  // pattern, so the BOM is what identifies it (finding B-10).
+  const cjk = "\ufeffVendor notes / 日本語の参考文書です。";
+  assert.ok(Buffer.from(cjk, "utf16le").includes(0), "it does contain NULs");
+  assert.equal(utf16Kind(Buffer.from(cjk, "utf16le")), "utf16le");
+  const cjkBe = Buffer.from(cjk, "utf16le");
+  cjkBe.swap16();
+  cjkBe.writeUInt16BE(0xfeff, 0);
+  assert.equal(utf16Kind(cjkBe), "utf16be");
   assert.equal(utf16Kind(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03])), undefined, "a PNG is not text");
   assert.equal(utf16Kind(Buffer.alloc(0)), undefined);
 });

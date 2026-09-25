@@ -445,5 +445,45 @@ environment) wherever a stream file happens to hold one; the name shows."
       (setenv "FAKE_KEY" nil)
       (delete-directory root t))))
 
+(ert-deftest tradeoffs-trace-redact-masks-longest-first-and-skips-short-values ()
+  "Plan 01a, matching secrets.ts: a value that contains another must be masked
+first, and a value shorter than the conductor's own minimum is never masked."
+  (let* ((root (make-temp-file "tt-ert-redact" t))
+         (plan (expand-file-name "plan" root)))
+    (unwind-protect
+        (progn
+          (make-directory plan)
+          (with-temp-file (expand-file-name "v1.json" plan)
+            (insert (json-encode '((title . "t") (secrets . ["A_KEY" "AB_KEY" "TT"])))))
+          (setenv "A_KEY" "sk-live")
+          (setenv "AB_KEY" "sk-live-abcd1234")
+          (setenv "TT" "1")
+          ;; The short value is skipped entirely: masking "1" would rewrite
+          ;; every id, count and timestamp the trace renders.
+          (let ((secrets (+tt--secret-values root)))
+            (should (equal (mapcar #'car secrets) '("A_KEY" "AB_KEY")))
+            (should (equal (+tt--redact "1 of 2" secrets) "1 of 2"))
+            ;; Longest first: no suffix of AB_KEY's value may survive, and one
+            ;; pass masks both.
+            (should (equal (+tt--redact "a=sk-live b=sk-live-abcd1234" secrets)
+                           "a=***A_KEY*** b=***AB_KEY***"))
+            (should-not (string-match-p "abcd1234" (+tt--redact "x sk-live-abcd1234 y" secrets))))
+          ;; …and the same holds through the trace renderer, which is what a
+          ;; stream file left unredacted by an older runner goes through.
+          (make-directory (expand-file-name "stream" root))
+          (with-temp-file (expand-file-name "worker-1.jsonl" (expand-file-name "stream" root))
+            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"keep 1 and sk-live-abcd1234\"}]}}}\n"))
+          (with-temp-buffer
+            (+tt-trace-mode)
+            (setq +tt--run-dir root)
+            (+tt--render-trace)
+            (let ((text (buffer-string)))
+              (should (string-search "keep 1 and ***AB_KEY***" text))
+              (should-not (string-search "sk-live" text)))))
+      (setenv "A_KEY" nil)
+      (setenv "AB_KEY" nil)
+      (setenv "TT" nil)
+      (delete-directory root t))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

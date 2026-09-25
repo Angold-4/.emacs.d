@@ -207,13 +207,19 @@ function replaceBytes(buf: Buffer, needle: Buffer, replacement: Buffer): Buffer 
   return Buffer.concat(parts);
 }
 
-/** Which UTF-16 flavour BUF clearly is, or `undefined` when it is not text:
- * a BOM, or a document whose every other byte is NUL — which is exactly what
- * UTF-16 text made of ASCII characters (a vendor reference doc saved by a
- * Windows editor) looks like. A caller must treat `undefined` as "its contents
- * cannot be searched exhaustively": such a file is never copied into a run
- * that declares secrets, and `tt redact` names it instead of reporting it
- * clean. */
+/** Which UTF-16 flavour BUF clearly is, or `undefined` when it is not text.
+ *
+ * A BOM is authoritative — it is what an editor writes when it saves a document
+ * as UTF-16, and it is the only way a document whose characters are mostly
+ * non-Latin-1 (an English heading next to CJK, say) can be told from binary
+ * bytes: those documents have NUL bytes, but nowhere near every other byte.
+ * Without a BOM the tell is the position of the NULs: UTF-16 text made of
+ * Latin-1 characters has NUL in every high byte (UTF-16LE: odd indices,
+ * UTF-16BE: even indices).
+ *
+ * A caller must treat `undefined` as "its contents cannot be searched
+ * exhaustively": such a file is never copied into a run that declares secrets,
+ * and `tt redact` names it instead of reporting it clean. */
 export function utf16Kind(buf: Buffer): "utf16le" | "utf16be" | undefined {
   if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return "utf16le";
   if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) return "utf16be";
