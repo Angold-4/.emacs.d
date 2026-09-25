@@ -344,11 +344,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
 
     case "CRITERION_REVERTED": {
       // Plan 01g: the owner's correction naming an amendment id restores the
-      // criterion's original wording. Record-only (it never moves the phase
-      // state name) so it works from any non-terminal state and the run
-      // never waits for the owner. Prior evidence bound to the amended
-      // contract version no longer matches, so the phase re-evaluates under
-      // the restored wording the same way an AMEND makes it re-evaluate.
+      // criterion's original wording. A phase with a candidate has its own
+      // transition rows (transitions.ts) that also invalidate the evidence
+      // bound to the replaced contract version and return to CHECKING. This
+      // handler is the fallback for a phase with no candidate yet
+      // (IMPLEMENTING/FREEZING/REPAIRING), where there is no evidence to
+      // invalidate: it only restores the wording so the next freeze binds to
+      // it. Both paths reject an unknown, not-yet-applied or already-reverted
+      // amendment, and the row guard and this handler agree on validity so
+      // next() can never emit an event the reducer refuses.
       const decision = p.decisions.find((d) => d.amendment?.id === event.amendmentId);
       if (!decision || !decision.amendment) {
         return rejected(state, `unknown amendment ${event.amendmentId}`);
@@ -362,11 +366,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!Array.isArray(event.newAcceptance) || event.newAcceptance.length === 0 || event.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
         return rejected(state, `reverting amendment ${event.amendmentId} needs the restored acceptance list`);
       }
+      if (!p.contract.acceptance.includes(decision.amendment.proposedWording)) {
+        return rejected(state, `amendment ${event.amendmentId}'s wording is not in the current contract, so there is nothing to restore`);
+      }
       const decisions = p.decisions.map((d) =>
         d.id === decision.id
           ? {
               ...d,
               version: d.version + 1,
+              boundContractVersion: event.newContractVersion,
               amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
             }
           : d,

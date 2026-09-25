@@ -208,10 +208,33 @@ test("criterion-disputes: a correction naming the amendment id restores the orig
       setup.runDir,
     );
     const applied = setup.conductor.state.phase.decisions.find((d) => d.amendment?.status === "applied")!;
+    const amendmentId = applied.amendment!.id;
     const inbox = runPaths(setup.runDir).inbox;
+    // A NOTE that merely mentions the id must stay advisory: it is queued for
+    // the worker and must not rewrite the contract (findings A-2/B-4/B-23).
+    fs.writeFileSync(
+      path.join(inbox, "cmd-note-revert.json"),
+      JSON.stringify({
+        type: "note",
+        text: `${amendmentId} still looks wrong; revisit after the vendor call`,
+        binding: { runId: setup.conductor.state.phase.runId, phaseId: setup.conductor.state.phase.phaseId },
+      }),
+    );
+    await waitFor(
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.kind === "note"),
+      30_000,
+      20,
+      setup.runDir,
+    );
+    assert.equal(
+      setup.conductor.state.phase.decisions.find((d) => d.amendment?.id === amendmentId)?.amendment?.status,
+      "applied",
+      "a note mentioning the amendment id must not revert it",
+    );
+    // Only an explicit correction naming the id restores the wording.
     fs.writeFileSync(
       path.join(inbox, "cmd-revert-1.json"),
-      JSON.stringify({ type: "correction", text: `revert ${applied.amendment!.id} because the owner disagrees` }),
+      JSON.stringify({ type: "correction", text: `revert ${amendmentId} because the owner disagrees` }),
     );
     await waitFor(() => setup.conductor.state.phase.decisions.some((d) => d.amendment?.status === "reverted"), 30_000, 20, setup.runDir);
 

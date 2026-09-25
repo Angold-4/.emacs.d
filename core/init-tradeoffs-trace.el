@@ -1046,7 +1046,7 @@ program-wide by construction (S is nil then)."
         (format "Sending steers worker attempt %s now (at most once; C-c C-c or RET), and becomes an owner directive %s."
                 attempt (+tt--input-scope-note nil (not in-program))))
        (t
-        (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s)."
+        (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s). If the text names an applied amendment id, it is sent as a correction that reverts it."
                 (+tt--input-scope-note nil (not in-program)) (or name "?")))))))
 
 (defun +tt-input-send (&optional program-wide)
@@ -1097,6 +1097,22 @@ never told a ruling was retracted when it was not."
       (let ((id (+tt--cli "program" "directive" dir text)))
         (message "tradeoffs-trace: program-wide directive %s recorded; every running node is steered at once" id)))))
 
+(defun +tt--revert-amendment-id (s text)
+  "The applied amendment id TEXT names as a word, or nil.
+Plan 01g: a correction naming an applied amendment restores its criterion's
+original wording, so the input box must send such text as a correction even
+when the phase is not AWAITING_OWNER."
+  (let* ((phase (and s (+tt--get s 'state 'phase)))
+         (decisions (and phase (alist-get 'decisions phase))))
+    (seq-some (lambda (d)
+                (let ((a (alist-get 'amendment d)))
+                  (when (and a (equal (alist-get 'status a) "applied"))
+                    (let ((id (alist-get 'id a)))
+                      (when (and (stringp id)
+                                 (string-match-p (concat "\\b" (regexp-quote id) "\\b") text))
+                        id)))))
+              decisions)))
+
 (defun +tt--send-run-input (run-dir text program-wide)
   "Queue TEXT as the owner input RUN-DIR's phase calls for.
 PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
@@ -1112,7 +1128,9 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
         (user-error "Refused: the phase is BLOCKED%s" (if why (format " (%s)" why) ""))))
      (t
       (let* ((binding `((runId . ,(+tt--get phase 'runId)) (phaseId . ,(+tt--get phase 'phaseId))))
+             (revert-id (and (not program-wide) (+tt--revert-amendment-id s text)))
              (kind (cond ((equal name "AWAITING_OWNER") "correction")
+                         (revert-id "correction")
                          ((member name '("IMPLEMENTING" "FREEZING")) "steer")
                          (t "note")))
              ;; A run that is not part of a program has nothing program-wide
@@ -1126,8 +1144,11 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
                     (scope . ,effective)
                     (binding . ,binding)))))
         (erase-buffer)
-        (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
-                 kind id (if (equal effective "program") "the whole program" "this phase")))))))
+        (if revert-id
+            (message "tradeoffs-trace: correction %s queued in the inbox (%s) — it reverts %s; see Owner input in the status buffer"
+                     kind id revert-id)
+          (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
+                   kind id (if (equal effective "program") "the whole program" "this phase"))))))))
 
 (defun +tt-program-input ()
   "Open this program's input box: text sent there is a program-wide directive."

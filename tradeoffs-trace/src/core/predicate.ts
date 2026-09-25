@@ -160,6 +160,11 @@ export function amendmentToApply(
       d.amendment.status === "proposed" &&
       d.boundCandidateSha === C &&
       sameVersion(d.boundContractVersion, K) &&
+      // The disputed criterion must still be in the contract: after another
+      // amendment (or an owner AMEND) replaced it, applying this one is
+      // meaningless — next() must agree with the row's own guard, or the
+      // conductor emits an event the reducer refuses and throws.
+      phase.contract.acceptance.includes(d.amendment.criterion) &&
       tally(d, phase.ballots, phase.findings, C, K) === "pass",
   );
 }

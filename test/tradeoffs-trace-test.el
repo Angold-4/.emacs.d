@@ -680,5 +680,33 @@ wording → the new one, read from the tally status the conductor emits."
       (should (string-match-p "\\* ⚑ AMENDED" text))
       (should (string-match-p (regexp-quote "it works → the tests pass") text)))))
 
+(defconst +tt-test--amendment-input-state
+  '((conductorAlive . t)
+    (program . nil)
+    (ownerInputs) (pendingOwnerInputs)
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "REVIEWING")
+                  (attempt (n . 2))
+                  (decisions ((id . "D-am") (class . "reserved")
+                              (amendment (id . "AM-p1-C1") (status . "applied")
+                                         (criterion . "it works")
+                                         (proposedWording . "the tests pass")))))))
+  "Plan 01g: a state with one applied amendment, for the input-box tests.")
+
+(ert-deftest tradeoffs-trace-amendment-revert-input ()
+  "Plan 01g: text naming an applied amendment id is sent as a correction, and
+a near-miss is not."
+  (should (equal (+tt--revert-amendment-id +tt-test--amendment-input-state "revert AM-p1-C1") "AM-p1-C1"))
+  ;; A longer id that merely begins with the same text is not a revert.
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "AM-p1-C10 still looks wrong"))
+  (let ((written nil))
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) +tt-test--amendment-input-state))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
+      (with-temp-buffer
+        (insert "revert AM-p1-C1 because the owner disagrees")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'type written) "correction"))))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

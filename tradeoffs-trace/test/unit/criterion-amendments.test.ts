@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { next } from "../../src/core/next.ts";
 import { reduce } from "../../src/core/reduce.ts";
-import { amendmentToApply, decisionStatus } from "../../src/core/predicate.ts";
+import { amendmentToApply, decisionStatus, isLiveDecision } from "../../src/core/predicate.ts";
 import type { Ballot, ContractVersion, Decision, Event, Finding, State } from "../../src/core/types.ts";
 import { baseState, CV } from "./helpers.ts";
 
@@ -205,6 +205,76 @@ test("criterion-amendments: the owner's correction naming the amendment id resto
     newContractVersion: K3,
   });
   assert.equal(again.ok, false);
+});
+
+test("criterion-amendments: a contract finding that merely mentions the criterion is not superseded (B-5)", () => {
+  const { criterionDisputed: _drop, ...rest } = contractFinding();
+  const unrelated: Finding = {
+    ...rest,
+    id: "F-p1-contract-2",
+    evidence: `unlike the ${CRITERION} rule, this other clause is ambiguous`,
+  };
+  let state = resolvingState({
+    ballots: [ballot("M", "approve"), ballot("A", "approve")],
+    findings: [unrelated],
+  });
+  state = step(state, {
+    type: "CRITERION_AMENDED",
+    decisionId: "D-p1-C1-amendment",
+    newAcceptance: [NEW_WORDING],
+    newContractVersion: K2,
+  });
+  const finding = state.phase.findings.find((f) => f.id === "F-p1-contract-2")!;
+  assert.equal(finding.status, "open", "a mere mention must not retire a live contract finding");
+});
+
+test("criterion-amendments: a contract finding quoting the criterion verbatim is superseded without a dispute marker", () => {
+  const { criterionDisputed: _drop, ...rest } = contractFinding();
+  const quoted: Finding = {
+    ...rest,
+    id: "F-p1-contract-3",
+    evidence: `the acceptance item "${CRITERION}" cannot be met on any candidate`,
+  };
+  let state = resolvingState({
+    ballots: [ballot("M", "approve"), ballot("A", "approve")],
+    findings: [quoted],
+  });
+  state = step(state, {
+    type: "CRITERION_AMENDED",
+    decisionId: "D-p1-C1-amendment",
+    newAcceptance: [NEW_WORDING],
+    newContractVersion: K2,
+  });
+  assert.equal(state.phase.findings.find((f) => f.id === "F-p1-contract-3")!.status, "superseded");
+});
+
+test("criterion-amendments: a proposed amendment whose criterion left the contract is not applied (A-1/M-7)", () => {
+  // An owner AMEND (or another amendment) replaced the disputed item, so the
+  // criterion is no longer in the contract. next() must not emit
+  // apply_amendment, or the row's guard would reject the conductor's event.
+  const offContract = baseState({
+    ...resolvingState({ ballots: [ballot("M", "approve"), ballot("A", "approve")] }).phase,
+    contract: { ...baseState().phase.contract, acceptance: ["a different item"] },
+  });
+  assert.equal(amendmentToApply(offContract.phase, "C1", K), undefined);
+  assert.equal(next(offContract).some((a) => a.type === "apply_amendment"), false);
+});
+
+test("criterion-amendments: applying one of two amendments for the same criterion supersedes the other (A-1)", () => {
+  const twin = amendmentDecision({ id: "D-p1-C1-amendment-B", amendment: { ...amendmentDecision().amendment!, id: "AM-p1-C1-B", raisedBy: "B" } });
+  let state = baseState({
+    ...resolvingState({ ballots: [ballot("M", "approve"), ballot("A", "approve")] }).phase,
+    decisions: [amendmentDecision(), twin],
+  });
+  state = step(state, {
+    type: "CRITERION_AMENDED",
+    decisionId: "D-p1-C1-amendment",
+    newAcceptance: [NEW_WORDING],
+    newContractVersion: K2,
+  });
+  const sibling = state.phase.decisions.find((d) => d.id === "D-p1-C1-amendment-B")!;
+  assert.match(sibling.supersededBy ?? "", /AM-p1-C1/);
+  assert.equal(isLiveDecision(sibling), false);
 });
 
 test("criterion-amendments: applying an unknown amendment, or one whose criterion the contract does not carry, is rejected", () => {

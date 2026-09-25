@@ -25,7 +25,7 @@ import {
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
-import { accept, resolvedCorrectionIdsFor, reviewsComplete, sameVersion } from "./predicate.ts";
+import { accept, isLiveDecision, resolvedCorrectionIdsFor, reviewsComplete, sameVersion } from "./predicate.ts";
 import type {
   Correction,
   Decision,
@@ -577,8 +577,20 @@ function applyAccepted(s: State, ev: Event): State {
 // new wording. The amendment itself consumes no repair round (the attempt is
 // a fresh one, not a repair), and a failed amendment leaves the criterion
 // unchanged and never blocks acceptance on its own.
-function amendmentCitesCriterion(f: Finding, criterion: string): boolean {
-  return f.criterionDisputed === criterion || (f.evidence ?? "").includes(criterion);
+function amendmentCitesCriterion(f: Finding, criterion: string, amendmentDecisionId: string): boolean {
+  if (f.criterionDisputed === criterion) return true;
+  if (f.linkedDecisionId === amendmentDecisionId) return true;
+  // A `contract` finding may quote the criterion without carrying the
+  // dispute marker; only a delimited verbatim quote counts, so a finding
+  // that merely mentions the phrase while raising a different problem is
+  // not silently retired (finding B-5).
+  if (f.kind !== "contract") return false;
+  const i = (f.evidence ?? "").indexOf(criterion);
+  if (i === -1) return false;
+  const before = i === 0 ? "" : f.evidence[i - 1];
+  const after = i + criterion.length >= f.evidence.length ? "" : f.evidence[i + criterion.length];
+  const delim = (c: string) => c === "" || /["'`“”‘’(\[<]/.test(c);
+  return delim(before) && delim(after);
 }
 
 function criterionAmendmentReady(s: State, ev: Event): boolean {
@@ -598,19 +610,34 @@ function applyCriterionAmended(s: State, ev: Event): State {
   const e = ev as Extract<Event, { type: "CRITERION_AMENDED" }>;
   const decision = s.phase.decisions.find((d) => d.id === e.decisionId)!;
   const amendment = decision.amendment!;
-  const decisions = s.phase.decisions.map((d) =>
-    d.id === e.decisionId
-      ? {
-          ...d,
-          version: d.version + 1,
-          amendment: { ...amendment, status: "applied" as const, appliedContractVersion: e.newContractVersion },
-        }
-      : d,
-  );
+  const decisions = s.phase.decisions.map((d) => {
+    if (d.id === e.decisionId) {
+      return {
+        ...d,
+        version: d.version + 1,
+        // The applied amendment now describes the new contract version; a
+        // later revert is bound to it.
+        boundContractVersion: e.newContractVersion,
+        amendment: { ...amendment, status: "applied" as const, appliedContractVersion: e.newContractVersion },
+      };
+    }
+    // Another reviewer's still-proposed amendment for the SAME criterion is
+    // moot once this one applies: supersede it so it is never voted or
+    // applied again (finding A-1).
+    if (
+      d !== decision &&
+      isLiveDecision(d) &&
+      d.amendment?.status === "proposed" &&
+      d.amendment.criterion === amendment.criterion
+    ) {
+      return { ...d, version: d.version + 1, supersededBy: `amendment ${amendment.id} replaced the wording` };
+    }
+    return d;
+  });
   // Contract findings that cited the replaced wording are closed as
   // superseded — never left open to fail every later round.
   const findings = s.phase.findings.map((f) =>
-    f.status === "open" && f.kind === "contract" && amendmentCitesCriterion(f, amendment.criterion)
+    f.status === "open" && f.kind === "contract" && amendmentCitesCriterion(f, amendment.criterion, e.decisionId)
       ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
       : f,
   );
@@ -896,6 +923,74 @@ for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "
     to: "CHECKING",
     actions: [{ type: "run_checks", candidateSha: "C1" }],
     apply: applyAmend,
+  });
+}
+
+// --- plan 01g: the owner reverts an amendment (`revert AM-...`) ----------
+// Like AMEND, a revert changes the contract version, so the evidence bound
+// to the replaced version is invalidated and the phase re-evaluates from
+// CHECKING. Without that reset the phase could not re-derive acceptance
+// (finding M-6). It applies only from a correction naming an applied
+// amendment (conductor/emacs enforce that); the core only cares that the
+// target is a real, applied amendment of this phase.
+function revertTarget(s: State, ev: Event): Decision | undefined {
+  const e = ev as Extract<Event, { type: "CRITERION_REVERTED" }>;
+  if (!s.phase.candidate) return undefined;
+  const decision = s.phase.decisions.find((d) => d.amendment?.id === e.amendmentId);
+  if (!decision || !decision.amendment || decision.amendment.status !== "applied") return undefined;
+  if (!sameVersion(decision.boundContractVersion, s.phase.contract.contractVersion)) return undefined;
+  if (!Array.isArray(e.newAcceptance) || e.newAcceptance.length === 0 || e.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
+    return undefined;
+  }
+  if (!s.phase.contract.acceptance.includes(decision.amendment.proposedWording)) return undefined;
+  return decision;
+}
+
+function applyCriterionReverted(s: State, ev: Event): State {
+  const e = ev as Extract<Event, { type: "CRITERION_REVERTED" }>;
+  const decisions = s.phase.decisions.map((d) =>
+    d.amendment?.id === e.amendmentId
+      ? {
+          ...d,
+          version: d.version + 1,
+          boundContractVersion: e.newContractVersion,
+          amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+        }
+      : d,
+  );
+  // An open request bound to the wording just replaced is superseded; it is
+  // re-evaluated under the restored contract version.
+  const ownerRequests = s.phase.ownerRequests.map((r) =>
+    r.status === "open" && r.boundContractVersion && sameVersion(r.boundContractVersion, s.phase.contract.contractVersion)
+      ? { ...r, status: "resolved" as const, resolution: { option: "superseded_by_amendment_revert" } }
+      : r,
+  );
+  return withPhase(s, {
+    phase: "CHECKING",
+    contract: { ...s.phase.contract, acceptance: e.newAcceptance, contractVersion: e.newContractVersion },
+    candidate: s.phase.candidate && { sha: s.phase.candidate.sha, contractVersion: e.newContractVersion },
+    decisions,
+    ownerRequests,
+    checks: undefined,
+    probe: undefined,
+    reviews: {},
+    ballots: [],
+    overrides: [],
+    inFlight: {},
+  });
+}
+
+for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
+  addRow({
+    id: `criterion-reverted-from-${from.toLowerCase()}`,
+    axis: "phase",
+    from,
+    trigger: "CRITERION_REVERTED",
+    guardName: "revertTargetReady",
+    guard: (s, ev) => revertTarget(s, ev) !== undefined,
+    to: "CHECKING",
+    actions: [{ type: "run_checks", candidateSha: "C1" }],
+    apply: applyCriterionReverted,
   });
 }
 

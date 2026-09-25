@@ -366,6 +366,50 @@ for (const from of AMEND_FROM) {
   };
 }
 
+// criterion-reverted-from-* (plan 01g): the owner's correction naming an
+// applied amendment restores the original wording, invalidates the evidence
+// bound to the replaced version and returns to CHECKING.
+const REVERT_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"];
+for (const from of REVERT_FROM) {
+  BUILD[`criterion-reverted-from-${from.toLowerCase()}`] = {
+    state: baseState({
+      phase: from,
+      candidate: C1,
+      decisions: [
+        {
+          id: "D-am",
+          version: 1,
+          phaseId: "p1",
+          source: "worker",
+          class: "reserved",
+          choice: "no fill after cancel is acknowledged",
+          whyItMatters: "x",
+          alternatives: [{ option: "the guarantee holds within the tick", consequence: "y" }],
+          recommendation: { choice: "no fill after cancel is acknowledged", reason: "z" },
+          boundCandidateSha: "C1",
+          boundContractVersion: K,
+          amendment: {
+            id: "AM-p1",
+            criterion: "the guarantee holds within the tick",
+            proposedWording: "no fill after cancel is acknowledged",
+            why: "x",
+            raisedBy: "worker",
+            status: "applied",
+            previousContractVersion: K,
+            appliedContractVersion: K,
+          },
+        },
+      ],
+    }),
+    event: {
+      type: "CRITERION_REVERTED",
+      amendmentId: "AM-p1",
+      newAcceptance: ["the guarantee holds within the tick"],
+      newContractVersion: CV(2),
+    },
+  };
+}
+
 const REVISE_FROM: PhaseStateName[] = [
   "IMPLEMENTING",
   "FREEZING",

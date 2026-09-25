@@ -1243,7 +1243,15 @@ export class Conductor {
     // passing tally rewrites the accepted item (next()'s `apply_amendment`);
     // a failing one leaves it unchanged and never blocks acceptance.
     const dispute = this.#state.phase.pendingDispute;
-    if (dispute) {
+    // Dedup by criterion: an amendment for the same wording is already live
+    // (a carried worker dispute, or a reviewer's). Two identical amendment
+    // records would only create a second, moot vote (finding A-1).
+    const alreadyProposed =
+      dispute !== undefined &&
+      this.#state.phase.decisions.some(
+        (d) => d.amendment?.status === "proposed" && d.amendment.criterion === dispute.criterion,
+      );
+    if (dispute && !alreadyProposed) {
       const short = candidateSha.slice(0, 8);
       decisions.push({
         id: `D-${this.#state.phase.phaseId}-${short}-amendment`,
@@ -1994,11 +2002,12 @@ export class Conductor {
         this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
         return;
       }
-      // Plan 01g: a correction (or note) naming an applied amendment id
-      // restores that criterion's original wording. It is a targeted owner
-      // action, not a directive, and it never waits for the phase to be
-      // parked on the owner.
-      if (inputKind === "note" || inputKind === "correction") {
+      // Plan 01g: a CORRECTION naming an applied amendment id restores that
+      // criterion's original wording. Only a correction may do this — a note
+      // that merely mentions the id stays advisory and must not silently
+      // rewrite the contract (findings A-2/B-23/B-4/M-8). It never waits for
+      // the phase to be parked on the owner.
+      if (inputKind === "correction") {
         const revert = this.#revertAmendmentForText(inputText);
         if (revert) {
           this.#applyRevertAmendment(file, commandId, inputText, revert.decisionId, revert.amendmentId);
@@ -2849,6 +2858,16 @@ export class Conductor {
         previousContractVersion: K,
       },
     };
+    // Dedup by criterion: a live amendment for the same wording already
+    // exists, so a second record would only create a moot vote (A-1).
+    if (this.#state.phase.decisions.some((d) => d.amendment?.status === "proposed" && d.amendment.criterion === dispute.criterion)) {
+      this.#log.append("dispute_ignored", {
+        reviewer: raisedBy,
+        criterion: dispute.criterion,
+        reason: "an amendment for this criterion is already proposed",
+      });
+      return;
+    }
     const valid = validate(DECISION_SCHEMA, decision);
     if (!valid.valid) {
       this.#log.append("error", { where: "reviewer_amendment", error: valid.errors.join("; ") });

@@ -412,11 +412,14 @@ whole program).
 | DONE / BLOCKED | refused, with the reason |
 
 **Taking back an amendment.** A dispute (§ below) that passed becomes an
-amendment. To restore the criterion's original wording, type a correction
+amendment. To restore the criterion's original wording, type a **correction**
 naming the amendment's id — `revert AM-p1-7c1e0a4a` — into the input box. It
 works from any running phase (it does not wait for AWAITING_OWNER and grants no
-repair rounds); the status shows the input as `reverted an amendment`, and a
-later `revert` of the same amendment is refused.
+repair rounds): it restores the wording, invalidates the evidence bound to the
+replaced version and returns the phase to checks under the restored contract.
+The status shows the input as `reverted an amendment`, and a later `revert` of
+the same amendment is refused. A note that merely mentions an amendment id
+stays advisory and never rewrites the contract.
 
 **Scope.** A directive applies to its own phase by default, and is numbered
 `OD-1`, `OD-2`, …. It applies to the **whole program** — every running node is
@@ -495,7 +498,8 @@ show `⚑ AMENDED` with the old and the new text. The amendment starts a fresh
 attempt, not a repair round, and a failed one leaves the wording unchanged and
 blocks nothing. A criterion that is merely unmet is still an ordinary blocking
 finding and a normal repair. You can undo an amendment at any time with a
-correction naming its id (`revert AM-p1-7c1e0a4a`).
+correction naming its id (`revert AM-p1-7c1e0a4a`); a plain note mentioning
+the id does not revert anything.
 
 ## Outcomes
 

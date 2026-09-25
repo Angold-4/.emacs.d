@@ -746,8 +746,12 @@ So a worker (in `submit_phase`) or a reviewer (in a turn-2 finding) may carry
 `criterionDispute: { criterion, why, proposedWording }`, where `criterion`
 names **one acceptance item of the phase contract verbatim**. The conductor
 turns it into an **amendment record**: a `reserved` decision (flagged for the
-owner, §3.4) that the reviewers vote on in turn 2 exactly like any other
-record. It is not a finding and does not open a contract finding of its own.
+owner, §3.4) that the reviewers vote on like any other reserved decision. A
+worker's dispute is part of the candidate's own disclosure set, so it is
+balloted in that candidate's turn 2; a reviewer's dispute arrives *during*
+turn 2, after that round's demanded-ballot set was snapshotted, so it is
+carried to the next dispatch and balloted there. It is not a finding and does
+not open a contract finding of its own.
 
 Under D1's default, an amendment that passes the normal tally (M, plus one of
 A/B) replaces the criterion's wording in the phase contract **for this phase
@@ -766,8 +770,11 @@ An amendment that fails (for example M vetoes it) leaves the criterion
 unchanged; the round is handled exactly as today, and the amendment is never
 an acceptance blocker on its own. **A dispute never consumes a repair round by
 itself, and the run never waits for the owner because of one.** The owner can
-still rule later: a correction naming the amendment id (`revert AM-p1-…`)
-restores the original wording, recorded as an owner input in state `reverted`.
+still rule later: a **correction** naming the amendment id (`revert AM-p1-…`)
+restores the original wording and returns the phase to checks under the
+restored contract version, recorded as an owner input in state `reverted`. A
+note that merely mentions an amendment id stays advisory and never rewrites
+the contract.
 `tt summary` lists every amendment, applied or reverted.
 
 Clear wording and plain disagreements still go through normal repair: if the
