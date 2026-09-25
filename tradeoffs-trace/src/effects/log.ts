@@ -24,7 +24,7 @@ import { randomBytes } from "node:crypto";
 // every append fsyncs.
 import fs from "node:fs";
 
-import { redactJson, type Secret } from "./secrets.ts";
+import { redactRecord, type Secret } from "./secrets.ts";
 
 /** One line of `events.jsonl`. `kind` is `"intent"` or `"completion"` for
  * effect records, and free-form (e.g. `"state"`, `"applied"`) for anything
@@ -129,7 +129,9 @@ export class EventLog {
 
   /** `secrets` (plan 01a): every appended record's payload is redacted before
    * it is serialized, so no value ever lands in `events.jsonl` — the file a
-   * crash-recovered conductor, `tt state` and every view read back. */
+   * crash-recovered conductor, `tt state` and every view read back. The same
+   * redaction the offline `tt redact` path uses, so a value used as a JSON key
+   * is masked here too and a number is never touched. */
   constructor(path: string, secrets: readonly Secret[] = []) {
     this.#path = path;
     this.#secrets = secrets;
@@ -149,7 +151,7 @@ export class EventLog {
    * object. */
   append(kind: string, event: unknown, actionId?: string): LogRecord {
     this.#seq += 1;
-    const redacted = redactJson(event, this.#secrets);
+    const redacted = redactRecord(event, this.#secrets);
     const record: LogRecord =
       actionId === undefined
         ? { seq: this.#seq, ts: new Date().toISOString(), kind, event: redacted }

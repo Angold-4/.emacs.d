@@ -23,6 +23,8 @@ import {
   runReferences,
   type RunPlanFile,
 } from "../../src/conductor.ts";
+import { EventLog } from "../../src/effects/log.ts";
+import { resolveSecrets } from "../../src/effects/secrets.ts";
 import type { PhaseState } from "../../src/core/types.ts";
 
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
@@ -442,6 +444,159 @@ test("secrets: a reproduction command carrying the value is refused, not run", a
       cleanupDir(setup.scriptsDir);
       cleanupDir(setup.repo.dir);
     }
+    delete process.env.FAKE_KEY;
+  }
+});
+
+test("secrets: plan text and outgoing prompts are redacted at the choke points, and the check still runs", async () => {
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  process.env.FAKE_KEY = value;
+  const scriptsDir = fs.mkdtempSync("/tmp/tt-secret-plan-");
+  const workerPromptLog = path.join(scriptsDir, "worker.prompts");
+  const reviewerPromptLog = path.join(scriptsDir, "reviewer.prompts");
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      // The plan's own prose carries the value: its goal, and a check line that
+      // pastes it inline the way the measured runs did (runtime doc §7).
+      goal: `Read the vendor key ${value} from the environment, never paste it`,
+      globalChecks: [`test "$FAKE_KEY" = '${value}'`],
+      phaseChecks: ["true"],
+      secrets: ["FAKE_KEY"],
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+      }),
+      reviewerScriptFor: (reviewer, state) => ({
+        hello: defaultReviewerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+            },
+          },
+        ],
+      }),
+      extraWorkerEnv: { FAKE_PI_PROMPT_LOG: workerPromptLog },
+      extraReviewerEnv: () => ({ FAKE_PI_PROMPT_LOG: reviewerPromptLog }),
+      deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+    });
+
+    await setup.conductor.start();
+    const conductor = setup.conductor;
+    await waitFor(() => conductor.state.phase.phase === "DONE", 120_000);
+
+    // Choke point 1: the run's plan snapshot is written redacted.
+    const snapshot = fs.readFileSync(path.join(runPaths(setup.runDir).plan, "v1.json"), "utf8");
+    assert.ok(!snapshot.includes(value), "plan/v1.json must not hold the value");
+    assert.match(snapshot, /\*\*\*FAKE_KEY\*\*\*/);
+    assert.doesNotThrow(() => JSON.parse(snapshot));
+
+    // Choke point 2: every outgoing prompt is redacted before it reaches an
+    // agent, for the worker and for the reviewers.
+    for (const log of [workerPromptLog, reviewerPromptLog]) {
+      const prompts = fs.readFileSync(log, "utf8");
+      assert.ok(!prompts.includes(value), "a value must never reach a prompt");
+      assert.match(prompts, /\*\*\*FAKE_KEY\*\*\*/, "the plan's prose is still readable, masked");
+    }
+
+    // Nothing under the run directory holds it either.
+    for (const file of filesUnder(setup.runDir)) {
+      assert.ok(!fs.readFileSync(file).includes(value), `${path.relative(setup.runDir, file)} holds the value`);
+    }
+
+    // …and the check still ran with the real value from the environment: its
+    // command is `test "$FAKE_KEY" = '<value>'`, so it passes only if the
+    // conductor's environment carried the key and the command ran unmasked.
+    assert.equal(conductor.state.phase.checks?.passed, true, "the inline-value check must still pass");
+  } finally {
+    await setup?.conductor.stop();
+    if (setup) {
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+      cleanupDir(setup.repo.dir);
+    }
+    fs.rmSync(scriptsDir, { recursive: true, force: true });
+    delete process.env.FAKE_KEY;
+  }
+});
+
+test("secrets: the live writers mask a value used as a JSON key, and never a number", async () => {
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  process.env.FAKE_KEY = value;
+  const root = fs.mkdtempSync("/tmp/tt-secret-live-");
+  const { maskable } = resolveSecrets(["FAKE_KEY"]);
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    // EventLog.append (events.jsonl) — a value used as a JSON key.
+    const logPath = path.join(root, "events.jsonl");
+    const log = new EventLog(logPath, maskable);
+    log.append("event", { type: "X", args: { [value]: "1" }, n: 42 });
+    log.close();
+    const logged = fs.readFileSync(logPath, "utf8");
+    assert.ok(!logged.includes(value), "EventLog must mask a value used as a key");
+    const loggedRecord = JSON.parse(logged.trim()) as { event: { args: Record<string, string>; n: number } };
+    assert.deepEqual(loggedRecord.event.args, { "***FAKE_KEY***": "1" });
+    assert.equal(loggedRecord.event.n, 42, "a number is never touched");
+
+    // The stream writer: a fake-pi event whose args are keyed BY the value.
+    setup = await setupConductor({
+      checks: ["true"],
+      secrets: ["FAKE_KEY"],
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [
+          { kind: "emit", event: { type: "custom", args: { [value]: "1" }, n: 42 } },
+          { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        ],
+      }),
+      reviewerScriptFor: (reviewer, state) => ({
+        hello: defaultReviewerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+            },
+          },
+        ],
+      }),
+      deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+    });
+    await setup.conductor.start();
+    const conductor = setup.conductor;
+    await waitFor(() => conductor.state.phase.phase === "DONE", 120_000);
+    const streams = fs
+      .readdirSync(runPaths(setup.runDir).stream)
+      .map((f) => fs.readFileSync(path.join(runPaths(setup.runDir).stream, f), "utf8"))
+      .join("\n");
+    assert.ok(!streams.includes(value), "the stream writer must mask a value used as a key");
+    assert.match(streams, /\*\*\*FAKE_KEY\*\*\*/);
+    for (const line of streams.split("\n")) {
+      if (line.length === 0) continue;
+      assert.doesNotThrow(() => JSON.parse(line), "every stream line still parses");
+    }
+  } finally {
+    await setup?.conductor.stop();
+    if (setup) {
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+      cleanupDir(setup.repo.dir);
+    }
+    fs.rmSync(root, { recursive: true, force: true });
     delete process.env.FAKE_KEY;
   }
 });

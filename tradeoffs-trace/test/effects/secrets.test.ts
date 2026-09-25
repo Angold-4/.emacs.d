@@ -13,7 +13,9 @@ import {
   planSecretNames,
   redactBytes,
   redactJson,
+  redactJsonLine,
   redactJsonl,
+  redactRecord,
   redactRunDir,
   redactText,
   resolveSecrets,
@@ -96,6 +98,33 @@ test("secrets: redaction keeps JSON and JSONL valid, and does not touch a torn l
   const redactedOdd = redactJsonl(`${oddLine}\n`, [odd]);
   assert.ok(!redactedOdd.includes("odd"), `value survived: ${redactedOdd}`);
   assert.doesNotThrow(() => JSON.parse(redactedOdd.trim()));
+});
+
+test("secrets: a value that is also a JSON number token is left alone (finding A-16)", () => {
+  // `1234` is long enough to be a declared value (MIN_SECRET_LENGTH is 4), so
+  // this is reachable: a whole-line textual pass would turn {"seq":1234} into
+  // {"seq":***FAKE_KEY***}, which no longer parses.
+  const secrets = [{ name: "FAKE_KEY", value: "1234" }];
+  assert.equal(redactJsonl('{"seq":1234}\n', secrets), '{"seq":1234}\n', "a number token is never rewritten");
+  assert.equal(redactJsonLine('{"seq":1234,"ok":true,"none":null}', secrets), '{"seq":1234,"ok":true,"none":null}');
+
+  const line = '{"seq":1234,"event":{"type":"X","text":"id 1234 here"}}';
+  const out = redactJsonl(`${line}\n`, secrets).trim();
+  const parsed = JSON.parse(out) as { seq: number; event: { text: string } };
+  assert.equal(parsed.seq, 1234, "the number stays a number");
+  assert.equal(parsed.event.text, "id ***FAKE_KEY*** here", "a string is masked");
+  // A value used as an object KEY is a string token, so it is masked — and the
+  // line stays valid JSON (finding M-14's case).
+  const keyed = redactJsonl(`{"args":{"1234":"x"},"n":1234}\n`, secrets).trim();
+  assert.deepEqual(JSON.parse(keyed), { args: { "***FAKE_KEY***": "x" }, n: 1234 });
+
+  // redactRecord (the live writers) uses the same rule.
+  const record = { seq: 1234, args: { "1234": "x" }, text: "a 1234 b" };
+  const redacted = redactRecord(record, secrets) as typeof record;
+  assert.equal(redacted.seq, 1234);
+  assert.deepEqual(redacted.args, { "***FAKE_KEY***": "x" });
+  assert.equal(redacted.text, "a ***FAKE_KEY*** b");
+  assert.equal(redactRecord(record, []), record, "no secrets: the caller's own object, unchanged");
 });
 
 test("secrets: the prompt lines name the secrets and say to use $NAME", () => {

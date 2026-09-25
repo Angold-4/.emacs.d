@@ -156,6 +156,9 @@ export async function setupConductor(opts: {
    * the JSON plan. The values are read from the harness process's own
    * environment (set them with `process.env.NAME = …` before calling). */
   secrets?: string[];
+  /** The phase's own goal text (default "do the thing"). A plan's prose is a
+   * secret-value carrier too, so a test can quote one in it. */
+  goal?: string;
 }): Promise<TestConductorSetup> {
   const repo = makeRepo();
   const runRoot = makeRunRoot();
@@ -170,7 +173,7 @@ export async function setupConductor(opts: {
     phases: [
       {
         id: "p1",
-        goal: "do the thing",
+        goal: opts.goal ?? "do the thing",
         acceptance: ["it works", ...(opts.acceptanceFiles ?? [])],
         checks: opts.phaseChecks ?? opts.checks ?? ["true"],
         boundaries: opts.boundaries ?? [],

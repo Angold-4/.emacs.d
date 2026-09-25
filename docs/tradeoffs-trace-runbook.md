@@ -170,14 +170,23 @@ A plan declares the credentials it needs **by name** and nothing else:
   `$NAME`, never to paste a value.
 - An `sh` command containing a secret's literal value is refused (before it
   runs), with a message naming the variable to use instead.
-- The conductor replaces every value with `***NAME***` in everything it
-  writes — the agent stream files, `events.jsonl`, the check logs, the `refs/`
-  copies of the plan's reference documents, `views/pr.md`, and what `tt status`,
-  `tt state` and `tt timing` print — **and** at the one boundary where agent
-  text enters its in-memory state, so the prompts it builds from that state
-  (the turn-2 reviewer prompt, the repair request) carry the mask too. Emacs
-  masks a declared secret's value as well, using its own environment, so nothing
-  it displays can show one.
+- Redaction happens at choke points, not at each caller:
+  - the run's **plan snapshot** (`<run>/plan/v1.json`) is written with every
+    declared value replaced, so a plan whose goal or check line quotes one
+    cannot put it on disk;
+  - **everything sent to an agent** — the worker prompt, every reviewer
+    prompt, a steer, the stall nudge — is redacted before it is written to the
+    agent's stdin, so no prompt can carry a value;
+  - agent text entering the conductor's **in-memory state**, the agent stream
+    files, `events.jsonl`, the check logs, the `refs/` copies, `views/pr.md`,
+    and what `tt status`/`tt state`/`tt timing` print are all redacted too, with
+    one line-safe rule: a value is replaced inside JSON strings (keys included)
+    and never inside a number, so every JSONL line stays parseable.
+  The conductor's own copy of the plan is *not* changed, so a check the plan
+  wrote runs exactly as written; but anything re-read from the snapshot (a
+  detached conductor's checks) sees the mask, which is why a plan should write
+  `$NAME` rather than the value. Emacs masks a declared secret's value as well,
+  using its own environment, so nothing it displays can show one.
 - A `refs/` copy is written masked: a document saved as UTF-16 (its bytes hold
   NULs) is searched in UTF-8/UTF-16 and masked too, and — when the plan declares
   secrets — a document that is neither text nor a UTF-16 document is **not copied

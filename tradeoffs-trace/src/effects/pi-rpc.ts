@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 
 import { JSONLDecoder, encodeLine, type PiRpcCommand, type PiRpcEvent, type PiRpcResponse } from "../core/protocol.ts";
 import type { Role } from "../core/roles.ts";
-import { redactJson, type Secret } from "./secrets.ts";
+import { redactRecord, type Secret } from "./secrets.ts";
 
 export interface PiAgentOptions {
   /** The `pi` binary, or an injected stand-in (fake-pi) for tests. Defaults
@@ -33,8 +33,9 @@ export interface PiAgentOptions {
    * design §9.2's "high-volume" stream). Parent directory must exist. */
   streamFile?: string;
   /** The plan's secrets (plan 01a): every event is redacted before it is
-   * written to `streamFile`. This is the file the workers' pasted keys
-   * landed in (721 occurrences in one program, runtime doc §7). */
+   * written to `streamFile`, and every outgoing command before it reaches the
+   * agent. This is the file the workers' pasted keys landed in (721
+   * occurrences in one program, runtime doc §7). */
   secrets?: readonly Secret[];
   /** design §8.2 defaults; overridable for tests. */
   abortGraceMs?: number;
@@ -156,7 +157,7 @@ export class PiAgent {
     const event = msg as PiRpcEvent;
     if (this.#streamFd !== undefined) {
       try {
-        fs.writeSync(this.#streamFd, encodeLine({ agentId: this.agentId, ts: new Date().toISOString(), event: redactJson(event, this.#secrets) }));
+        fs.writeSync(this.#streamFd, encodeLine({ agentId: this.agentId, ts: new Date().toISOString(), event: redactRecord(event, this.#secrets) }));
       } catch {
         // best effort: losing the stream loses display detail, never state.
       }
@@ -187,6 +188,11 @@ export class PiAgent {
   #send(command: PiRpcCommand): Promise<PiRpcResponse> {
     const id = command.id ?? randomUUID();
     const withId = { ...command, id };
+    // Plan 01a's second choke point (the first is the run's plan snapshot in
+    // `createRun`): EVERYTHING sent to an agent — a prompt, a steer, the stall
+    // nudge, a turn-2 review prompt — is redacted here, so no caller can leak a
+    // declared value into a model's context, however it built the text.
+    const outgoing = redactRecord(withId, this.#secrets) as PiRpcCommand;
     return new Promise((resolve, reject) => {
       if (this.#exited) {
         reject(new Error(`cannot send '${command.type}': agent ${this.agentId} has already exited`));
@@ -201,7 +207,7 @@ export class PiAgent {
       }
       this.#pending.set(id, { resolve, reject });
       try {
-        stdin.write(encodeLine(withId), (err) => {
+        stdin.write(encodeLine(outgoing), (err) => {
           if (!err) return;
           this.#pending.delete(id);
           reject(err);

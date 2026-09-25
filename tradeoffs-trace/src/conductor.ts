@@ -71,7 +71,7 @@ import {
   verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
-import { redactBytes, redactJson, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
+import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
 // Plan 01a: the secret guard itself lives with the other `sh` guards (they
 // are wired into the agent's `tool_call` hook, and the conductor reuses the
 // same refusal at the socket, where a scripted agent's commands arrive).
@@ -370,7 +370,18 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   for (const dir of [p.plan, p.stream, p.views, p.sessions, p.candidates, p.checks, p.inbox, p.inboxApplied, p.inboxRejected]) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(plan, null, 2));
+  // Plan 01a's first choke point: the run's plan snapshot is written redacted.
+  // A plan's own prose is a value carrier — its goal, its reference list, above
+  // all its `checks` lines, which the measured runs used to paste a vendor key
+  // inline (runtime doc §7), and which `#recordCheck` already treats as one
+  // ("the plan's own check line"). Redacting here rather than in each reader
+  // means the value cannot be in the file at all, for any consumer: agents
+  // read it, `tt status`/`tt state` print it, `tt redact` would only clean it
+  // later. The conductor's own in-memory plan stays as written, so the checks
+  // it runs still see the real command line and the real environment.
+  const declared = secretNames(plan.secrets);
+  const { maskable } = resolveSecrets(declared);
+  fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(redactRecord(plan, maskable), null, 2));
   // Snapshot the plan's reference documents (same-named files get a numeric
   // prefix); a missing one is skipped and noted rather than failing the run.
   // Plan 01a: a document that quotes a declared secret is copied redacted —
@@ -388,8 +399,6 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   // to mask) nothing can be verified and no document is copied — the plan that
   // declares a credential and does not export it gets its names in the status
   // and no unredactable vendor docs in every agent's reach (finding M-13).
-  const declared = secretNames(plan.secrets);
-  const { maskable } = resolveSecrets(declared);
   const unmaskable = declared.filter((name) => !maskable.some((s) => s.name === name));
   const refs = plan.references ?? [];
   if (refs.length > 0) {
@@ -1134,7 +1143,7 @@ export class Conductor {
     // here, before reduce(), and the log's own copy is redacted from the same
     // event (`EventLog` keeps its own pass as a backstop for its other
     // callers: intents, completions, sweeps).
-    const logged = redactJson(raw, this.#secretMaskable) as Event;
+    const logged = redactRecord(raw, this.#secretMaskable) as Event;
     const result = reduce(this.#state, logged);
     this.#log.append("event", logged);
     if (!result.ok) {
@@ -1532,9 +1541,9 @@ export class Conductor {
       const record = { agentId, ts: new Date().toISOString(), event: { type: "tt_file_changes", toolCallId, files } };
       try {
         // Plan 01a: a file path could hold a secret value; this writes to the
-        // same stream file `pi-rpc.ts` redacts when it appends. `***NAME***`
-        // holds no quote or backslash, so the line stays valid JSON.
-        fs.appendFileSync(streamFile, `${redactText(JSON.stringify(record), this.#secretMaskable)}\n`);
+        // same stream file `pi-rpc.ts` redacts when it appends, with the same
+        // line-safe rule (keys included, numbers never touched).
+        fs.appendFileSync(streamFile, `${JSON.stringify(redactRecord(record, this.#secretMaskable))}\n`);
       } catch {
         // display only
       }

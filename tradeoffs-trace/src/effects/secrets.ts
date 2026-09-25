@@ -149,21 +149,71 @@ export function redactJson(value: unknown, secrets: readonly Secret[]): unknown 
   return value;
 }
 
-/** One JSONL line, redacted. A line that parses is redacted structurally and
- * re-serialized (so it stays valid JSON); one that does not — a torn final
- * line, or a file that was never JSONL — falls back to textual replacement,
- * which cannot corrupt JSON either. */
+/** TEXT (JSON) with each hit replaced inside its string literals only — object
+ * keys included — never inside a number, boolean or `null` token. A declared
+ * value can be a number (`1234` is the minimum length), so a whole-line textual
+ * pass would rewrite `{"seq":1234}` into `{"seq":***FAKE_KEY***}`, which is not
+ * JSON any more (finding A-16). The scan follows escapes rather than
+ * regex-matching quotes, so a string holding a quote is copied exactly. */
+function redactJsonStrings(text: string, hits: readonly Secret[]): string {
+  if (hits.length === 0) return text;
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== '"') {
+      out += text[i];
+      i += 1;
+      continue;
+    }
+    let end = i + 1;
+    while (end < text.length) {
+      const c = text[end];
+      if (c === "\\") {
+        end += 2;
+        continue;
+      }
+      end += 1;
+      if (c === '"') break;
+    }
+    out += redactText(text.slice(i, end), hits);
+    i = end;
+  }
+  return out;
+}
+
+/** One JSONL line, redacted. A line that parses is redacted structurally (every
+ * string value) and then, for a value used as a JSON *key*, inside its string
+ * literals only; numbers, booleans and nulls are never touched, so the line
+ * stays valid JSON. A line that does not parse — a torn final line, or a file
+ * that was never JSONL — falls back to whole-line textual replacement, which
+ * cannot corrupt JSON either. */
 export function redactJsonLine(line: string, secrets: readonly Secret[]): string {
   if (line.length === 0 || secrets.length === 0) return line;
   const hits = secrets.filter((s) => s.value.length > 0 && (line.includes(s.value) || line.includes(jsonEscaped(s.value))));
   if (hits.length === 0) return line;
   try {
-    const text = JSON.stringify(redactJson(JSON.parse(line), secrets));
-    // A value sitting in a JSON *key* survives the structural walk (keys are
-    // structure), so the re-serialized line is checked once more.
-    return redactText(text, hits);
+    return redactJsonStrings(JSON.stringify(redactJson(JSON.parse(line), secrets)), hits);
   } catch {
     return redactText(line, hits);
+  }
+}
+
+/** A JSON-shaped VALUE for a live writer (a log payload, a stream event, an
+ * outgoing prompt): redacted exactly like one JSONL line, so the same rule
+ * holds whether a record is cleaned as it is written or later by `tt redact` —
+ * including a value sitting in a JSON *key*, and never a number. Returns the
+ * caller's own object when nothing matched, so the common path allocates
+ * nothing. */
+export function redactRecord(value: unknown, secrets: readonly Secret[]): unknown {
+  if (secrets.length === 0 || value === null || value === undefined) return value;
+  const text = JSON.stringify(value);
+  if (text === undefined) return value; // not JSON-serializable
+  const redacted = redactJsonLine(text, secrets);
+  if (redacted === text) return value;
+  try {
+    return JSON.parse(redacted);
+  } catch {
+    return redactJson(value, secrets);
   }
 }
 
