@@ -65,6 +65,17 @@
           "evidence": { "type": "string", "minLength": 1 },
           "linkedDecisionId": { "type": "string", "minLength": 1 },
           "sameAs": { "type": "string", "minLength": 1 },
+          "criterionDispute": {
+            "type": "object",
+            "description": "Plan 01g: this finding is that a criterion cannot be met as written; the conductor records an amendment decision and the finding cites it.",
+            "required": ["criterion", "why", "proposedWording"],
+            "additionalProperties": false,
+            "properties": {
+              "criterion": { "type": "string", "minLength": 1 },
+              "why": { "type": "string", "minLength": 1 },
+              "proposedWording": { "type": "string", "minLength": 1 }
+            }
+          },
           "reproduction": {
             "type": "object",
             "required": ["command"],

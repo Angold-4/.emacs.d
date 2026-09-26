@@ -15,6 +15,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,19 +23,49 @@ import { reduce } from "./core/reduce.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
+// Plan 01f: the pure half of the gate — the record's shape, its parser, the
+// log tail a failure quotes, and the reuse rule (see core/gate.ts's header).
+import {
+  GATE_TAIL_LINES,
+  gateCommandOf,
+  gateDecision,
+  gateFailureEvidence,
+  gateLogHashMatches,
+  gateLogTail,
+  gateOutcomeText,
+  parseGateRecord,
+  type GateRecord,
+} from "./core/gate.ts";
+// Plan 01e: the pure half of the base baseline — parsing recorded check
+// output for failing test names, D2's "all failures pre-existing" rule, and
+// the on-disk record's shape. See the module's own header.
+import {
+  baselineFailureNames,
+  baselineFailedCommands,
+  baselineKey,
+  classifyCheckFailure,
+  failedNormally,
+  parseBaseline,
+  parseTestFailures,
+  type Baseline,
+  type BaselineCommand,
+} from "./core/test-failures.ts";
 import type {
   Action,
   Ballot,
   BallotDisclosure,
   ContractVersion,
+  CriterionDispute,
   Decision,
   DecisionDisclosure,
+  DirectiveScope,
   Event,
   Finding,
   PriorDecisionStatement,
   FindingDisclosure,
   InFlightKey,
   OwnerCommand,
+  OwnerDirective,
   OwnerInputKind,
   OwnerInputState,
   PhaseContract,
@@ -46,12 +77,13 @@ import type {
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
 import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
 import { decisionStatus, isLiveDecision, sameVersion } from "./core/predicate.ts";
+import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
-import { acquireLock, type Lock } from "./effects/lock.ts";
+import { acquireLock, acquireWaitingLock, type Lock } from "./effects/lock.ts";
 import { killGroup, childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
 import { sweep, type SweepResult } from "./effects/sweep.ts";
 import {
@@ -93,6 +125,13 @@ const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
   fs.readFileSync(new URL("../schemas/owner-command.schema.json", import.meta.url), "utf8"),
 );
 
+/** Plan 01d: how many times a reviewer dispatch's incomplete `submit_review`
+ * is rejected back to it before the review is accepted as-is (and logged as
+ * `incomplete_review`). Two: a model that fixes its own omission gets a
+ * second and third chance within the same turn, and one that never does
+ * cannot wedge the turn. */
+export const MAX_INCOMPLETE_REVIEW_REJECTIONS = 2;
+
 // ---------------------------------------------------------------------------
 // Config — design §8.1 defaults, overridable per run.
 // ---------------------------------------------------------------------------
@@ -104,6 +143,11 @@ export interface Deadlines {
   freezeMs: number;
   checkMs: number;
   probeMs: number;
+  /** Plan 01f: how long the gate command may run before its process group is
+   * killed and the gate recorded as failed. The plan sets it with
+   * `#+TT_GATE_MINUTES` (default 30): a 15-minute `--clean --build` fits,
+   * the old 8-minute `sh` limit did not (runtime doc §6). */
+  gateMs: number;
   reviewMs: number;
   reproductionMs: number;
   abortGraceMs: number;
@@ -154,6 +198,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   freezeMs: 2 * 60_000,
   checkMs: 5 * 60_000,
   probeMs: 10 * 60_000,
+  gateMs: 30 * 60_000,
   reviewMs: 15 * 60_000,
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
@@ -184,6 +229,13 @@ export interface RunPlanPhase {
   /** Plan 01c: 1-based lines of `ownerChecklist` in the source Org file. */
   ownerChecklistLines?: number[];
   provisional?: boolean;
+  /** Plan 01f: the phase's `:GATE:` command — the expensive, live proof the
+   * conductor runs itself after checks, probe and reviews pass, and before
+   * acceptance. Undeclared on every phase that predates plan 01f. */
+  gate?: string;
+  /** Plan 01f: the phase's `:GATE_CLEANUP:` command, run after the gate
+   * whatever its outcome. */
+  gateCleanup?: string;
 }
 
 /** The on-disk plan file `tt start` reads. Only phase 0 (index 0) is run by
@@ -220,6 +272,18 @@ export interface RunPlanFile {
    * conductor writes. A name that is unset at start is reported in the
    * status; the run starts anyway. */
   secrets?: string[];
+  /** Plan 01i: program-wide owner directives already in force when this
+   * run's node was started (D5). They seed the phase's directive list, so a
+   * node started after the owner's ruling still carries it in every prompt.
+   * Written by the program scheduler (`nodePlan`), never by hand. */
+  ownerDirectives?: RunPlanDirectiveSeed[];
+}
+
+/** Plan 01i: a program-wide owner directive a node's plan was started with. */
+export interface RunPlanDirectiveSeed {
+  id?: string;
+  text: string;
+  at?: string;
 }
 
 export interface ConductorOptions {
@@ -267,6 +331,11 @@ export interface ConductorOptions {
    * Defaults to `Date.now`; a test advances an injected clock to reach the
    * 30-minute reminder without waiting. */
   now?: () => number;
+  /** Plan 01f: the machine-wide gate lock's path. Defaults to
+   * `~/.tradeoffs-trace/gate.lock`, so two phases (in one program or in two
+   * runs) never gate at once; tests point it at a temp path so they neither
+   * contend with a real run nor with each other. */
+  gateLockPath?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +420,29 @@ export function contractVersionFor(phase: RunPlanPhase, snapshot = 1): ContractV
   return { snapshot, sectionSha256 };
 }
 
+/** Plan 01g: the contract version produced when an amendment (or the owner's
+ * revert of one) replaces the phase's acceptance list. `snapshot` bumps by
+ * one so every existing binding says "it changed since you viewed it", and
+ * the section hash is recomputed from the amendable contract fields so two
+ * different acceptance lists never share a version. */
+export function amendContractVersion(contract: PhaseContract, acceptance: string[]): ContractVersion {
+  const sectionSha256 = createHash("sha256")
+    .update(
+      JSON.stringify({
+        phaseId: contract.phaseId,
+        goal: contract.goal,
+        acceptance,
+        checks: contract.checks,
+        boundaries: contract.boundaries,
+        reserved: contract.reserved,
+        gate: contract.gate,
+        gateCleanup: contract.gateCleanup,
+      }),
+    )
+    .digest("hex");
+  return { snapshot: contract.contractVersion.snapshot + 1, sectionSha256 };
+}
+
 export function buildContract(phase: RunPlanPhase): PhaseContract {
   return {
     phaseId: phase.id,
@@ -360,10 +452,20 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     checks: phase.checks,
     boundaries: phase.boundaries,
     reserved: phase.reserved,
+    // Plan 01f: a declared gate is part of the frozen contract — the FSM
+    // (next.ts/transitions.ts) reads it to decide whether the phase gates at
+    // all, and every prompt that mentions the gate quotes the same text.
+    ...(gateCommandOf(phase) ? { gate: phase.gate } : {}),
+    ...(phase.gateCleanup ? { gateCleanup: phase.gateCleanup } : {}),
   };
 }
 
-export function initialState(runId: string, phase: RunPlanPhase, integrationHead: string): State {
+export function initialState(
+  runId: string,
+  phase: RunPlanPhase,
+  integrationHead: string,
+  programDirectives: RunPlanDirectiveSeed[] = [],
+): State {
   const contract = buildContract(phase);
   const phaseState: PhaseState = {
     runId,
@@ -382,8 +484,36 @@ export function initialState(runId: string, phase: RunPlanPhase, integrationHead
     inFlight: {},
     repairRoundsUsed: 0,
     repairRoundsGranted: 3,
+    // Plan 01i: a program-wide directive in force when this node was started
+    // seeds the phase's own list (scope `program`, seeded), so it is quoted
+    // in every prompt from the first attempt. The plan snapshot is on disk,
+    // so a restart folds the identical seeds.
+    ...(programDirectives.length > 0
+      ? {
+          ownerDirectives: programDirectives.map((d, i) => seededDirective(d, i)),
+        }
+      : {}),
   };
   return { run: "RUN_ACTIVE", phase: phaseState };
+}
+
+/** Plan 01i: one seeded program-wide directive as a phase record. It keeps
+ * the program's own `ODP-<n>` id verbatim, so one id names the same ruling at
+ * both levels and `withdraw ODP-n` retires the right record everywhere. */
+function seededDirective(seed: RunPlanDirectiveSeed, index: number): OwnerDirective {
+  const { id, seq } = allocateDirectiveId([], typeof seed.id === "string" ? seed.id : `ODP-${index + 1}`);
+  return {
+    id,
+    seq,
+    text: seed.text,
+    scope: "program",
+    status: "in-force",
+    commandId: `seed-${id}`,
+    at: seed.at ?? "",
+    targets: [],
+    deliveries: {},
+    seeded: true,
+  };
 }
 
 /** Creates a fresh run directory (fails if it already exists) with the
@@ -512,7 +642,11 @@ export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?
     runId = randomUUID().slice(0, 8);
     integrationHead = currentHead(plan.repo, plan.integrationBranch);
   }
-  return foldEvents(initialState(runId, plan.phases[0], integrationHead), records, opts.lenient === true);
+  return foldEvents(
+    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? []),
+    records,
+    opts.lenient === true,
+  );
 }
 
 /** Plan 3b: one entry per phase-state change, and one per finished review
@@ -527,7 +661,7 @@ export interface Timeline {
 export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
   const { records } = readLog(runPaths(runDir).events);
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string } | undefined;
-  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "");
+  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
   for (const record of records) {
@@ -627,6 +761,14 @@ interface AgentHandle {
    * mode or for a worker handle. */
   discoveryResolve: () => void;
   discoveryPromise: Promise<void>;
+  /** Plan 01d: the records this dispatch's turn-2 prompt demanded a ballot
+   * for (id → its one-line choice), captured when that prompt was built and
+   * never recomputed, so a record added after it (a late discovery) is never
+   * demanded. Absent for a worker, a stub review, or before turn 2. */
+  demandedBallots?: Map<string, string>;
+  /** Plan 01d: how many incomplete `submit_review` submissions this dispatch
+   * has already had rejected (at most MAX_INCOMPLETE_REVIEW_REJECTIONS). */
+  incompleteReviewRejections?: number;
 }
 
 export class Conductor {
@@ -651,6 +793,10 @@ export class Conductor {
    * owner resolving one request of several stays in the same episode and is
    * not re-banner-stormed, while a genuinely new park is announced again. */
   #awaitingEpisode = 0;
+  /** Plan 01f: the machine-wide gate lock's path (default
+   * `~/.tradeoffs-trace/gate.lock`). Held only while the gate command runs,
+   * so two phases never gate at once. */
+  #gateLockPath: string;
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -747,6 +893,7 @@ export class Conductor {
     this.#stubReviews = opts.stubReviews ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
+    this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -821,12 +968,12 @@ export class Conductor {
           `run was started under runner ${init.runnerRevision}; this conductor is ${mine} — refusing to resume (reinstall that runner, or start a new run)`,
         );
       }
-      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead);
+      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? []);
     } else {
       const head = currentHead(this.#plan.repo, this.#integrationBranch);
       const runId = randomUUID().slice(0, 8);
       this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision() });
-      this.#state = initialState(runId, this.#plan.phases[0], head);
+      this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
     }
     this.#state = foldEvents(this.#state, records);
     // Plan 01b: seed the park-episode counter from the log, so a restarted
@@ -1046,6 +1193,29 @@ export class Conductor {
       return;
     }
 
+    if (key === "run_gate") {
+      // Plan 01f / design §9.3: an interrupted gate is neither passed nor
+      // failed — kill whatever survived, discard the checkout the gate used,
+      // and rerun. (The process group was recorded in the intent before the
+      // command started, and the checkout branch is the probe's own name, so
+      // both are recoverable from this record alone.)
+      const candidateSha = payload.candidateSha as string;
+      // The command's own process group was recorded at spawn (an
+      // `onIntent`-logged `gate-sh-<actionId>-<pgid>` intent), plus the
+      // cleanup's — a killed conductor leaves both to reap.
+      const prefixes = [`gate-sh-${actionId}-`, `gate-cleanup-sh-${actionId}-`];
+      for (const rec of records) {
+        if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
+        if (!prefixes.some((p) => rec.actionId.startsWith(p))) continue;
+        const pgid = (rec.event as { pgid?: number }).pgid;
+        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
+      discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
+      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#applyEvent({ type: "GATE_INTERRUPTED" });
+      return;
+    }
+
     if (key === "review_M" || key === "review_A" || key === "review_B") {
       const reviewer = key.slice("review_".length) as Reviewer;
       const pgid = payload.pgid as number | undefined;
@@ -1114,6 +1284,59 @@ export class Conductor {
       boundCandidateSha: candidateSha,
       boundContractVersion: this.#state.phase.contract.contractVersion,
     }));
+    // Plan 01g: a `criterionDispute` becomes an amendment record — a
+    // `reserved` decision the reviewers vote on in turn 2 like any other. A
+    // passing tally rewrites the accepted item (next()'s `apply_amendment`);
+    // a failing one leaves it unchanged and never blocks acceptance.
+    const dispute = this.#state.phase.pendingDispute;
+    // Dedup only an IDENTICAL proposal: a different wording for the same
+    // criterion is a genuinely different choice, and a second dispute with
+    // the same wording is logged rather than silently dropped (A-13).
+    const alreadyProposed =
+      dispute !== undefined &&
+      this.#state.phase.decisions.some(
+        (d) =>
+          d.amendment?.status === "proposed" &&
+          d.amendment.criterion === dispute.criterion &&
+          d.amendment.proposedWording === dispute.proposedWording,
+      );
+    if (dispute && alreadyProposed) {
+      this.#log.append("dispute_ignored", {
+        raisedBy: "worker",
+        criterion: dispute.criterion,
+        reason: "an identical amendment for this criterion is already proposed",
+      });
+    }
+    if (dispute && !alreadyProposed) {
+      const short = candidateSha.slice(0, 8);
+      decisions.push({
+        id: `D-${this.#state.phase.phaseId}-${short}-amendment`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        source: "worker",
+        class: "reserved",
+        choice: dispute.proposedWording,
+        whyItMatters: dispute.why,
+        alternatives: [
+          {
+            option: dispute.criterion,
+            consequence: "the letter of this criterion stays in force and no candidate can satisfy it",
+          },
+        ],
+        recommendation: { choice: dispute.proposedWording, reason: dispute.why },
+        boundCandidateSha: candidateSha,
+        boundContractVersion: this.#state.phase.contract.contractVersion,
+        amendment: {
+          id: `AM-${this.#state.phase.phaseId}-${short}`,
+          criterion: dispute.criterion,
+          proposedWording: dispute.proposedWording,
+          why: dispute.why,
+          raisedBy: "worker",
+          status: "proposed",
+          previousContractVersion: this.#state.phase.contract.contractVersion,
+        },
+      });
+    }
     for (const decision of decisions) {
       const result = validate(DECISION_SCHEMA, decision);
       if (!result.valid) {
@@ -1269,6 +1492,61 @@ export class Conductor {
     this.#moveInboxFile(file, this.#paths.inboxRejected);
   }
 
+  /** Plan 01g: the applied amendment an explicit `revert AM-p1-…` command
+   * names, or undefined. Only the command form counts: text that merely
+   * mentions the id must stay a steer/note so it still reaches an agent
+   * (finding B-16), and a near-miss id is not a revert. Trailing prose after
+   * the id is allowed, exactly like `withdraw OD-n`. */
+  #revertAmendmentForText(text: string): { decisionId: string; amendmentId: string } | undefined {
+    const match = text.trim().match(/^revert\s+(\S+)/i);
+    if (!match) return undefined;
+    const id = match[1];
+    for (const d of this.#state.phase.decisions) {
+      if (!d.amendment || d.amendment.status !== "applied") continue;
+      if (d.amendment.id === id) return { decisionId: d.id, amendmentId: d.amendment.id };
+    }
+    return undefined;
+  }
+
+  /** Plan 01g: apply the owner's revert of one amendment — restore the
+   * criterion's original wording, record the input as `reverted`, and move
+   * the inbox file on. A failure is rejected visibly, never silently. */
+  #applyRevertAmendment(
+    file: string,
+    commandId: string,
+    text: string,
+    decisionId: string,
+    amendmentId: string,
+  ): void {
+    const decision = this.#state.phase.decisions.find((d) => d.id === decisionId);
+    const amendment = decision?.amendment;
+    if (!decision || !amendment || amendment.status !== "applied") {
+      this.#rejectInboxFile(file, commandId, `amendment ${amendmentId} is not an applied amendment of this phase`);
+      return;
+    }
+    const restored = this.#state.phase.contract.acceptance.map((a) =>
+      a === amendment.proposedWording ? amendment.criterion : a,
+    );
+    try {
+      this.#applyEvent(
+        {
+          type: "CRITERION_REVERTED",
+          amendmentId,
+          newAcceptance: restored,
+          newContractVersion: amendContractVersion(this.#state.phase.contract, restored),
+        },
+        commandId,
+      );
+    } catch (err) {
+      this.#rejectInboxFile(file, commandId, `could not revert ${amendmentId}: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    this.#appliedCommandIds.add(commandId);
+    this.#recordOwnerInput(commandId, "correction", text, "reverted");
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
   /** Plan 2d: the three input-box kinds (design §7.4), detected by shape in
    * either the flat `kind` form or the decision view's `type` form. */
   #ownerInputKindOf(raw: unknown): OwnerInputKind | undefined {
@@ -1289,18 +1567,287 @@ export class Conductor {
     attemptId?: string,
     reason?: string,
   ): void {
-    this.#applyEvent({
-      type: "OWNER_INPUT_RECORDED",
-      input: {
-        id,
-        kind,
-        text,
-        state,
-        ...(attemptId ? { attemptId } : {}),
-        ...(reason ? { reason } : {}),
-        at: new Date().toISOString(),
+    // `id` is the inbox command id, so the logged event carries it: recovery
+    // then knows a replayed file was already applied (design §9.3) instead of
+    // processing it a second time.
+    this.#applyEvent(
+      {
+        type: "OWNER_INPUT_RECORDED",
+        input: {
+          id,
+          kind,
+          text,
+          state,
+          ...(attemptId ? { attemptId } : {}),
+          ...(reason ? { reason } : {}),
+          at: new Date().toISOString(),
+        },
       },
-    });
+      id,
+    );
+  }
+
+  // -- plan 01i: owner directives (01_ref_design.md D5, runtime §8) --------
+
+  /** Plan 01i: every live agent of this run, each with the target label the
+   * status shows (`worker`, or the reviewer's letter). One entry per live
+   * agent, deliberately: during a re-dispatch overlap two agents can share a
+   * label, and every one of them must be steered (deliveries are then
+   * recorded per label, newest ack wins). */
+  #liveAgents(): Array<{ target: string; agentId: string; agent: PiAgent }> {
+    const out: Array<{ target: string; agentId: string; agent: PiAgent }> = [];
+    for (const h of this.#agents.values()) {
+      if (h.agent.exited) continue;
+      const target = h.role === "worker" ? "worker" : (h.agentId.match(/^reviewer-([MAB])-/)?.[1] ?? h.agentId);
+      out.push({ target, agentId: h.agentId, agent: h.agent });
+    }
+    return out;
+  }
+
+  /** Plan 01i: records one directive, then steers it at once to every live
+   * agent except `exemptAgentIds` (an agent whose steer is already being
+   * handled — the worker in `#processSteerCommand`), recording each delivery
+   * as it is acknowledged. The directive itself is a logged event, so it
+   * survives a restart and every later prompt quotes it verbatim.
+   *
+   * Ids are namespaced so one id always names one ruling: a phase's own
+   * directives are `OD-<n>`, a program-wide one arrives with the program's
+   * `ODP-<n>` and keeps it verbatim (the two spaces never collide, so a node
+   * can never renumber a program ruling into a number of its own). */
+  #addDirective(
+    text: string,
+    scope: DirectiveScope,
+    commandId: string,
+    exemptAgentIds: string[] = [],
+    preferredId?: string,
+  ): OwnerDirective {
+    const existing = this.#state.phase.ownerDirectives ?? [];
+    // Idempotent by inbox command id: a replay (the log already holds the
+    // directive but the file was never moved) must not mint a second id.
+    const already = existing.find((d) => d.commandId === commandId);
+    if (already) return already;
+    const { id, seq } = allocateDirectiveId(existing, preferredId);
+    const live = this.#liveAgents();
+    const directive: OwnerDirective = {
+      id,
+      seq,
+      text,
+      scope,
+      status: "in-force",
+      commandId,
+      at: new Date().toISOString(),
+      targets: [...new Set(live.map((l) => l.target))],
+      deliveries: {},
+    };
+    this.#applyEvent({ type: "DIRECTIVE_ADDED", directive });
+    this.#steerDirectiveTo(directive, exemptAgentIds);
+    return directive;
+  }
+
+  /** Plan 01i: steers one directive's text to every live agent of this run
+   * (except `exemptAgentIds`), logging an intent before each send and a
+   * completion on acknowledgement — the same intent/completion discipline as
+   * a steer, so a crash mid-send leaves a recoverable record and never a
+   * silent loss. */
+  #steerDirectiveTo(directive: OwnerDirective, exemptAgentIds: string[]): void {
+    for (const { target, agentId, agent } of this.#liveAgents()) {
+      if (exemptAgentIds.includes(agentId)) continue;
+      const actionId = `deliver-${directive.commandId}-${target}-${agentId}`;
+      const message = `Owner directive ${directive.id} (binding): ${directive.text}`;
+      this.#log.intent(actionId, { directiveId: directive.id, target, agentId, text: directive.text });
+      void agent.steer(message).then(
+        () => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, { outcome: "directive-steer-acknowledged", target, agentId });
+          this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state: "delivered" });
+        },
+        (err) => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, {
+            outcome: "directive-steer-failed",
+            target,
+            agentId,
+            error: String((err as Error)?.message ?? err),
+          });
+          this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state: "delivery-uncertain" });
+        },
+      );
+    }
+  }
+
+  /** Plan 01i: an owner directive pushed by a program (a node that was
+   * already running when the director sent it, D5). It is a directive like
+   * any other — steered to every live agent now, quoted in every later
+   * prompt — and, when scope is `program`, forwarded to the program's own
+   * inbox so every other running node gets it and every node started later
+   * is started with it. */
+  #processDirective(
+    file: string,
+    commandId: string,
+    text: string,
+    scope: DirectiveScope,
+    forward: boolean,
+    programId?: string,
+  ): void {
+    this.#addDirective(text, scope, commandId, [], programId);
+    // Recorded `noted` (it is part of the phase and in every later prompt);
+    // each steer's real outcome is on the directive itself, so this record
+    // never claims a delivery that has not been acknowledged.
+    this.#recordOwnerInput(commandId, "directive", text, "noted");
+    // Only a directive the *owner* sent from this run's own input box with
+    // `C-u` is forwarded to the program: the scheduler already pushed a
+    // program-wide one here, and forwarding it back would loop.
+    if (forward && scope === "program") this.#forwardProgramDirective(commandId, text);
+    this.#appliedCommandIds.add(commandId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 01i: `withdraw OD-n`. The directive no longer applies: every live
+   * agent is steered that it is withdrawn and every later prompt omits it.
+   * An id that is unknown (or already withdrawn) is refused with the reason,
+   * never silently applied. */
+  #processWithdraw(
+    file: string,
+    commandId: string,
+    text: string,
+    directiveId: string,
+    opts: { forwardProgram: boolean; pushed: boolean },
+  ): void {
+    // `pushed` is a withdrawal the program scheduler delivered (or re-
+    // delivered on its next tick): for a directive that is already gone it is
+    // a no-op success, never a refusal — otherwise the same file would be
+    // rejected again on every tick.
+    const noop = (): void => {
+      this.#appliedCommandIds.add(commandId);
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+    };
+    const directive = (this.#state.phase.ownerDirectives ?? []).find((d) => d.id === directiveId);
+    if (!directive) {
+      if (opts.pushed) return noop();
+      const reason = `no owner directive ${directiveId} exists in phase ${this.#state.phase.phaseId}`;
+      this.#recordOwnerInput(commandId, "withdraw", text, "refused", undefined, reason);
+      this.#rejectInboxFile(file, commandId, reason);
+      return;
+    }
+    if (directive.status === "withdrawn") {
+      if (opts.pushed) return noop();
+      const reason = `owner directive ${directiveId} is already withdrawn`;
+      this.#recordOwnerInput(commandId, "withdraw", text, "refused", undefined, reason);
+      this.#rejectInboxFile(file, commandId, reason);
+      return;
+    }
+    // The command id rides the logged event, so a re-push of the same
+    // withdrawal file (the program scheduler writes it on every tick) is
+    // moved without being re-processed — hence without a second, spurious
+    // "already withdrawn" refusal.
+    this.#applyEvent({ type: "DIRECTIVE_WITHDRAWN", directiveId }, commandId);
+    this.#appliedCommandIds.add(commandId);
+    const message = `Owner directive ${directiveId} is withdrawn; it no longer applies.`;
+    for (const { target, agentId, agent } of this.#liveAgents()) {
+      const actionId = `deliver-${commandId}-${target}-${agentId}`;
+      this.#log.intent(actionId, { directiveId, target, agentId, withdrawn: true });
+      void agent.steer(message).then(
+        () => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, { outcome: "directive-withdraw-acknowledged", target, agentId });
+        },
+        (err) => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, {
+            outcome: "directive-withdraw-failed",
+            target,
+            agentId,
+            error: String((err as Error)?.message ?? err),
+          });
+        },
+      );
+    }
+    if (!opts.pushed) this.#recordOwnerInput(commandId, "withdraw", text, "delivered");
+    // A program-wide ruling is retracted program-wide from wherever it is
+    // withdrawn: the program records it and pushes the notice to every node
+    // (this one included — the pushed copy is the no-op above).
+    if (opts.forwardProgram && directive.scope === "program") this.#forwardProgramWithdraw(commandId, directiveId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 01i: this run's program directory, when the scheduler started it
+   * (its `program.json` names the program). `undefined` for a hand-started
+   * run, which has nothing program-wide to reach. */
+  #programDir(): string | undefined {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      return info.programId ? path.join(path.dirname(this.#runDir), "programs", info.programId) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 01i: a `C-u` input in a run's own box, applied program-wide (D5).
+   * The run does NOT record a directive of its own and does NOT steer: it
+   * forwards the text to the program, which mints the single program-wide id
+   * (`ODP-n`) and pushes that record to every running node — this one
+   * included. That record is what steers each live agent, exactly once, with
+   * the id the owner will withdraw against. So one id names one ruling
+   * everywhere, and no input is ever steered twice. */
+  #processProgramWideInput(file: string, commandId: string, kind: OwnerInputKind, text: string): void {
+    this.#forwardProgramDirective(commandId, text);
+    this.#recordOwnerInput(
+      commandId,
+      kind,
+      text,
+      "noted",
+      undefined,
+      "forwarded to the program as a program-wide directive; the program records it and steers every node",
+    );
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 01i: a run started by a program scheduler (D5) forwards a
+   * program-wide directive to the program's own inbox, so the scheduler
+   * records it once and pushes it to every running node (this one included)
+   * and starts later nodes with it. */
+  #forwardProgramDirective(commandId: string, text: string): void {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      if (!info.programId) return;
+      const inbox = path.join(path.dirname(this.#runDir), "programs", info.programId, "inbox");
+      fs.mkdirSync(inbox, { recursive: true });
+      const file = path.join(inbox, `${commandId}.json`);
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({ type: "directive", text, scope: "program", origin: this.#state.phase.runId, key: commandId }),
+      );
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      // Not a program node (no program.json), or its inbox is unwritable: the
+      // directive still applies to this phase, never dropped from this run.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") this.#logUnexpected("forward_program_directive", err);
+    }
+  }
+
+  /** Plan 01i: `withdraw ODP-n` names a program-wide ruling, so retracting it
+   * here must retract it everywhere: the program records the withdrawal and
+   * pushes the notice to every running node (including this one, whose own
+   * record is already withdrawn — the pushed copy is a no-op) and drops it
+   * from every node started later. */
+  #forwardProgramWithdraw(commandId: string, directiveId: string): void {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      if (!info.programId) return;
+      const inbox = path.join(path.dirname(this.#runDir), "programs", info.programId, "inbox");
+      fs.mkdirSync(inbox, { recursive: true });
+      const file = path.join(inbox, `${commandId}.json`);
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ type: "withdraw", directiveId, key: commandId }));
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") this.#logUnexpected("forward_program_withdraw", err);
+    }
   }
 
   /** Plan 2d (design §7.4/§9.3): external delivery of one steer. The intent
@@ -1309,7 +1856,7 @@ export class Conductor {
    * outcome unknown: on restart an intent with no completion is recorded
    * `delivery-uncertain` and never resent — steering is at most once, or
    * explicitly uncertain. */
-  #processSteerCommand(file: string, commandId: string, raw: unknown, text: string): void {
+  #processSteerCommand(file: string, commandId: string, raw: unknown, text: string, scope: DirectiveScope = "phase"): void {
     const r = raw as Record<string, unknown>;
     const binding = r.binding && typeof r.binding === "object" ? (r.binding as Record<string, unknown>) : undefined;
     const boundAttemptId =
@@ -1331,6 +1878,12 @@ export class Conductor {
     const recorded = (this.#state.phase.ownerInputs ?? []).find((i) => i.id === commandId);
 
     if (intent) {
+      // Plan 01i: the directive was recorded just before this intent, so a
+      // restart folds it back; if the crash landed between the directive's
+      // own event and the intent, add it now (idempotent by command id) so
+      // the recovered input is still a directive in every later prompt.
+      const directive = this.#addDirective(text, scope, commandId, []);
+      const recovered: "delivered" | "delivery-uncertain" = completion ? "delivered" : "delivery-uncertain";
       if (!recorded) {
         if (completion) {
           const outcome = completion.event as { agentId?: string; attemptId?: string };
@@ -1345,6 +1898,7 @@ export class Conductor {
             "the conductor restarted between sending the steer and Pi acknowledging it; it is never resent automatically",
           );
         }
+        this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state: recovered });
       }
       this.#appliedCommandIds.add(commandId);
       crashAt("before_inbox_move");
@@ -1360,6 +1914,12 @@ export class Conductor {
       return;
     }
     const attemptId = boundAttemptId ?? worker.agentId;
+    // Plan 01i: every input is also an owner directive. It is recorded before
+    // the steer is sent (so a crash between the two still leaves the ruling in
+    // every later prompt), and the worker's own steer below is that
+    // directive's delivery — never a second, duplicate steer. The exemption
+    // is that worker's *agent id* (`worker-<n>-<actionId>`), not its label.
+    const directive = this.#addDirective(text, scope, commandId, [worker.agentId]);
     // Mark in flight (NOT applied): the file must stay in the inbox until the
     // acknowledgement decides its fate, so a crash here can still recover it.
     this.#steerInFlight.add(commandId);
@@ -1372,6 +1932,7 @@ export class Conductor {
       this.#steerInFlight.delete(commandId);
       this.#appliedCommandIds.add(commandId);
       this.#recordOwnerInput(commandId, "steer", text, state, attemptId, reason);
+      this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state });
       crashAt("before_inbox_move");
       this.#moveInboxFile(file, this.#paths.inboxApplied);
     };
@@ -1434,12 +1995,52 @@ export class Conductor {
       return;
     }
 
+    // Plan 01i (D5): a program-wide directive the scheduler pushed into this
+    // node's inbox — `{type: "directive", text, scope}` — or a program-level
+    // withdraw of one. Neither is an owner-input kind, so both are handled
+    // before the input-kind detection below.
+    const programDirective = directiveCommandOf(raw);
+    if (programDirective) {
+      if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+        const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
+        this.#recordOwnerInput(commandId, "directive", programDirective.text, "refused", undefined, reason);
+        this.#rejectInboxFile(file, commandId, reason);
+        return;
+      }
+      this.#processDirective(
+        file,
+        commandId,
+        programDirective.text,
+        programDirective.scope,
+        programDirective.forward,
+        programDirective.programId,
+      );
+      return;
+    }
+    const programWithdraw = withdrawCommandOf(raw);
+    if (programWithdraw) {
+      if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+        const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
+        this.#recordOwnerInput(commandId, "withdraw", programWithdraw.text, "refused", undefined, reason);
+        this.#rejectInboxFile(file, commandId, reason);
+        return;
+      }
+      this.#processWithdraw(file, commandId, programWithdraw.text, programWithdraw.directiveId, {
+        forwardProgram: false,
+        pushed: true,
+      });
+      return;
+    }
+
     // Plan 2d: the input box's kinds are handled before the conductor-state
     // mapping. A steer is external delivery, not a core event. A note or
     // correction is a core event but also carries the owner-input record
     // the status view shows. Input after the phase is terminal is refused
-    // with the reason — never silently dropped.
+    // with the reason — never silently dropped. Plan 01i: every one of them
+    // is also an owner directive, phase-scoped unless the sender asked for
+    // `scope: "program"` (`C-u` in a run's input box, D5).
     const inputKind = this.#ownerInputKindOf(raw);
+    let noteKindText: { text: string; scope: DirectiveScope; programWide: boolean } | undefined;
     if (inputKind) {
       const inputText = (raw as { text?: unknown }).text;
       if (typeof inputText !== "string" || inputText.trim().length === 0) {
@@ -1452,10 +2053,51 @@ export class Conductor {
         this.#rejectInboxFile(file, commandId, reason);
         return;
       }
-      if (inputKind === "steer") {
-        this.#processSteerCommand(file, commandId, raw, inputText);
+      const scope: DirectiveScope = (raw as { scope?: unknown }).scope === "program" ? "program" : "phase";
+      // Plan 01i: `withdraw OD-n` (or `withdraw ODP-n`) in the input box
+      // withdraws one directive — whatever kind the phase would otherwise
+      // have made of the text. A withdrawal that names no valid id is
+      // refused visibly: it must never be recorded as a *new* binding ruling,
+      // which would leave the intended one in force.
+      const parsedWithdraw = parseWithdrawInput(inputText);
+      if (parsedWithdraw?.kind === "malformed") {
+        this.#recordOwnerInput(commandId, "withdraw", inputText, "refused", undefined, parsedWithdraw.reason);
+        this.#rejectInboxFile(file, commandId, parsedWithdraw.reason);
         return;
       }
+      if (parsedWithdraw?.kind === "withdraw") {
+        this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
+        return;
+      }
+      // A program-wide input (D5) in a run the scheduler started: the
+      // program mints the one `ODP-n` record, so this run only forwards the
+      // text — it must not mint a local id that could not match the
+      // program's. A run that is NOT part of a program has nothing
+      // program-wide to reach, so the input stays this phase's own directive
+      // (never a `program`-scoped record in a run that has no program).
+      const programWide = scope === "program" && this.#programDir() !== undefined;
+      const effectiveScope: DirectiveScope = programWide ? "program" : "phase";
+      // Plan 01g: an explicit CORRECTION command `revert AM-p1-…` restores an
+      // applied amendment's original wording. It is deliberately not any text
+      // that happens to mention the id (a steer or note quoting it must reach
+      // its agents, findings B-16/A-2/B-4/M-8), and it never applies to a
+      // program-wide input, which is forwarded as D5 requires (finding A-15).
+      if (inputKind === "correction" && !programWide) {
+        const revert = this.#revertAmendmentForText(inputText);
+        if (revert) {
+          this.#applyRevertAmendment(file, commandId, inputText, revert.decisionId, revert.amendmentId);
+          return;
+        }
+      }
+      if (inputKind === "steer") {
+        if (programWide) {
+          this.#processProgramWideInput(file, commandId, "steer", inputText);
+          return;
+        }
+        this.#processSteerCommand(file, commandId, raw, inputText, effectiveScope);
+        return;
+      }
+      noteKindText = { text: inputText, scope: effectiveScope, programWide };
     }
 
     // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
@@ -1507,6 +2149,17 @@ export class Conductor {
     }
     this.#appliedCommandIds.add(commandId);
     this.#applyEvent(event, commandId);
+    // Plan 01i: a note or a correction is a directive too — recorded here,
+    // on top of the event above, so it is steered to every live agent now
+    // and quoted in every later prompt (a correction still resolves the open
+    // requests and grants its 3 rounds first: today's behaviour, unchanged).
+    if (noteKindText) {
+      if (noteKindText.programWide) {
+        this.#forwardProgramDirective(commandId, noteKindText.text);
+      } else {
+        this.#addDirective(noteKindText.text, noteKindText.scope, commandId);
+      }
+    }
     // The recorded effect for the input box's status view: a note is queued
     // for the next attempt the moment it is applied; a correction has just
     // resolved the open requests and started a repair.
@@ -1822,9 +2475,43 @@ export class Conductor {
       case "accept":
         this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: action.resolvedCorrectionIds as string[] });
         return;
+      // Plan 01f: the phase is acceptable and its contract declares a gate —
+      // enter GATING, from where next() asks for the gate itself.
+      case "gate_required":
+        this.#applyEvent({ type: "GATE_REQUIRED" });
+        return;
+      case "run_gate": {
+        const actionId = this.#log.actionId(kind);
+        this.#applyEvent({ type: "ACTION_STARTED", action: "run_gate", actionId });
+        void this.#runGate(actionId, action.candidateSha as string).catch((err) => this.#logUnexpected("run_gate", err));
+        return;
+      }
       case "resolving_incomplete":
         this.#applyEvent({ type: "RESOLVING_INCOMPLETE" });
         return;
+      // Plan 01g: a passing amendment rewrites one acceptance item for this
+      // phase. The conductor computes the replacement acceptance list and the
+      // new contract version; the core row applies them and starts a fresh
+      // attempt so the next candidate is judged against the new wording.
+      case "apply_amendment": {
+        const decisionId = action.decisionId as string;
+        const decision = this.#state.phase.decisions.find((d) => d.id === decisionId);
+        const amendment = decision?.amendment;
+        if (!decision || !amendment) {
+          this.#logUnexpected("apply_amendment", new Error(`unknown amendment decision ${decisionId}`));
+          return;
+        }
+        const acceptance = this.#state.phase.contract.acceptance.map((a) =>
+          a === amendment.criterion ? amendment.proposedWording : a,
+        );
+        this.#applyEvent({
+          type: "CRITERION_AMENDED",
+          decisionId,
+          newAcceptance: acceptance,
+          newContractVersion: amendContractVersion(this.#state.phase.contract, acceptance),
+        });
+        return;
+      }
       case "publish_intent":
         this.#applyEvent({
           type: "PUBLISH_INTENT",
@@ -1917,6 +2604,20 @@ export class Conductor {
       // Plan 2c: prior-decision statements must name live worker records;
       // anything else is a model mistake the worker can fix and resubmit.
       const prior = args.priorDecisions ?? [];
+      // Plan 01g: a dispute must name one of this phase's acceptance items
+      // verbatim — an amendment of anything else could never apply, so it is
+      // refused back to the worker rather than becoming a record the
+      // reviewers waste a turn on.
+      const dispute = args.criterionDispute;
+      if (dispute && (!dispute.why || dispute.why.trim().length === 0 || !dispute.proposedWording || dispute.proposedWording.trim().length === 0)) {
+        return { ok: false, reason: "criterionDispute needs a non-empty why and proposedWording" };
+      }
+      if (dispute && !this.#state.phase.contract.acceptance.includes(dispute.criterion)) {
+        return {
+          ok: false,
+          reason: `criterionDispute names a criterion that is not one of this phase's acceptance items verbatim: ${JSON.stringify(dispute.criterion)}`,
+        };
+      }
       for (const st of prior) {
         const d = this.#state.phase.decisions.find((x) => x.id === st.id);
         if (!d || d.source !== "worker" || !isLiveDecision(d)) {
@@ -1927,7 +2628,12 @@ export class Conductor {
         }
       }
       this.#activeWorkerHandle = handle;
-      this.#applyEvent({ type: "SUBMIT_PHASE", disclosures: args.decisions ?? [], ...(prior.length > 0 ? { prior } : {}) });
+      this.#applyEvent({
+        type: "SUBMIT_PHASE",
+        disclosures: args.decisions ?? [],
+        ...(prior.length > 0 ? { prior } : {}),
+        ...(dispute ? { dispute } : {}),
+      });
       // Unblocks #runWorkerAttempt's race with outcome "submitted" (rather
       // than falling through to "settled" once the freeze's own abort makes
       // the agent settle, which would misreport this as no_submission).
@@ -1965,6 +2671,40 @@ export class Conductor {
         this.#applyEvent({ type: "REVIEW_SUBMITTED", review });
         this.#castStubBallots(review.reviewer);
       } else {
+        // Plan 01d: enforce a complete ballot. Every record this dispatch's
+        // turn-2 prompt listed as votable (delegated/reserved, not carried)
+        // needs a ballot (or a valid discoveryMatch retiring it). An
+        // incomplete review is rejected back to the model — naming every
+        // missing id and its one-line choice — so it resubmits within the
+        // same turn, and after MAX_INCOMPLETE_REVIEW_REJECTIONS the review is
+        // accepted as-is with an `incomplete_review` log record, so a
+        // stubborn model cannot wedge the turn. The demanded set is the
+        // prompt-time snapshot, so a late discovery is never demanded.
+        const missing = this.#missingDemandedBallots(review, handle);
+        if (missing.length > 0) {
+          const rejections = handle.incompleteReviewRejections ?? 0;
+          if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
+            handle.incompleteReviewRejections = rejections + 1;
+            this.#log.append("incomplete_review_rejected", {
+              reviewer: review.reviewer,
+              agentId,
+              missing: missing.map((m) => m.id),
+              rejection: rejections + 1,
+            });
+            return {
+              ok: false,
+              reason: `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
+                .map((m) => `${m.id} (${m.choice})`)
+                .join("; ")}`,
+            };
+          }
+          this.#log.append("incomplete_review", {
+            reviewer: review.reviewer,
+            agentId,
+            missing: missing.map((m) => m.id),
+            rejections,
+          });
+        }
         // Ordering matters, and in TWO conflicting directions at once — a
         // real bug this packet's own contract-objection test caught: if
         // REVIEW_SUBMITTED is applied first and this happens to be the
@@ -2030,6 +2770,36 @@ export class Conductor {
       return { ok: true };
     }
     return { ok: false, reason: `unknown submission tool ${msg.tool}` };
+  }
+
+  /** Plan 01d: the records this dispatch's turn-2 prompt demanded a ballot
+   * for that `review` gives no ballot. The demanded set is the prompt-time
+   * snapshot on the handle, never a live recomputation, so a record that
+   * appeared after the prompt (a late discovery) is never demanded. A
+   * `discoveryMatches` entry that retires the reviewer's own discovery —
+   * exactly the condition `#applyReviewFindingsAndBallots` uses to apply a
+   * match — also covers its discovery, so a reviewer never has to ballot a
+   * record it is matching away. */
+  #missingDemandedBallots(review: Review, handle: AgentHandle): Array<{ id: string; choice: string }> {
+    const demanded = handle.demandedBallots;
+    if (!demanded || demanded.size === 0) return [];
+    const covered = new Set<string>();
+    for (const b of review.ballots ?? []) covered.add(b.decisionId);
+    for (const m of review.discoveryMatches ?? []) {
+      const discovery = this.#state.phase.decisions.find((d) => d.id === m.discoveryId);
+      const target = this.#state.phase.decisions.find((d) => d.id === m.sameAs);
+      if (
+        discovery &&
+        target &&
+        discovery.id.includes(`-disc-${review.reviewer}-`) &&
+        isLiveDecision(discovery) &&
+        isLiveDecision(target) &&
+        discovery.id !== target.id
+      ) {
+        covered.add(m.discoveryId);
+      }
+    }
+    return [...demanded.entries()].filter(([id]) => !covered.has(id)).map(([id, choice]) => ({ id, choice }));
   }
 
   /** Phase-1 stub (design §5/§7.1's real ballot casting is phase 2 —
@@ -2147,12 +2917,91 @@ export class Conductor {
       // bug this test caught: M's finding with no linkedDecisionId failed
       // validation with "expected type string, got undefined").
       ...(fd.linkedDecisionId !== undefined ? { linkedDecisionId: fd.linkedDecisionId } : {}),
+      ...(fd.criterionDispute?.criterion && fd.criterionDispute.criterion.trim().length > 0
+        ? { criterionDisputed: fd.criterionDispute.criterion }
+        : {}),
       ...(reproduction !== undefined ? { reproduction } : {}),
     };
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
     this.#applyEvent({ type: "FINDING_RAISED", finding });
+    // Plan 01g: a reviewer's finding may say the criterion cannot be met as
+    // written. That is recorded as an amendment the reviewers vote on later;
+    // a criterion the contract does not carry is ignored (the finding itself
+    // still stands).
+    if (fd.criterionDispute?.criterion && fd.criterionDispute.why && fd.criterionDispute.proposedWording) {
+      if (this.#state.phase.contract.acceptance.includes(fd.criterionDispute.criterion)) {
+        this.#addAmendmentDecision(fd.criterionDispute, reviewer, candidateSha);
+      } else {
+        this.#log.append("dispute_ignored", {
+          reviewer,
+          criterion: fd.criterionDispute.criterion,
+          reason: "not one of this phase's acceptance items verbatim",
+        });
+      }
+    }
     return undefined;
+  }
+
+  /** Plan 01g: assembles a reviewer-raised `criterionDispute` into an
+   * amendment record (a `reserved` decision) bound to the candidate/contract
+   * being reviewed, exactly like a worker disclosure. It is votable like any
+   * other reserved decision; if it passes, next() applies it. A reviewer
+   * raises one in turn 2, after this round's ballot demand was captured, so
+   * it is voted in a later round (carryDecisionsForward keeps amendments). */
+  #addAmendmentDecision(dispute: CriterionDispute, raisedBy: Reviewer, candidateSha: string): void {
+    const K = this.#state.phase.contract.contractVersion;
+    const short = candidateSha.slice(0, 8);
+    const n = this.#state.phase.decisions.length + 1;
+    const decision: Decision = {
+      id: `D-${this.#state.phase.phaseId}-${short}-amendment-${raisedBy}-${n}`,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      source: "reviewer-discovered",
+      class: "reserved",
+      choice: dispute.proposedWording,
+      whyItMatters: dispute.why,
+      alternatives: [
+        { option: dispute.criterion, consequence: "the letter of this criterion stays in force and no candidate can satisfy it" },
+      ],
+      recommendation: { choice: dispute.proposedWording, reason: dispute.why },
+      boundCandidateSha: candidateSha,
+      boundContractVersion: K,
+      amendment: {
+        id: `AM-${this.#state.phase.phaseId}-${short}-${raisedBy}-${n}`,
+        criterion: dispute.criterion,
+        proposedWording: dispute.proposedWording,
+        why: dispute.why,
+        raisedBy,
+        status: "proposed",
+        previousContractVersion: K,
+      },
+    };
+    // Dedup only an IDENTICAL proposal: a different wording for the same
+    // criterion is a genuinely different choice, and the conductor's own
+    // amendment applies/supersedes siblings. A duplicate is logged rather
+    // than silently dropped (A-1, A-13).
+    if (
+      this.#state.phase.decisions.some(
+        (d) =>
+          d.amendment?.status === "proposed" &&
+          d.amendment.criterion === dispute.criterion &&
+          d.amendment.proposedWording === dispute.proposedWording,
+      )
+    ) {
+      this.#log.append("dispute_ignored", {
+        reviewer: raisedBy,
+        criterion: dispute.criterion,
+        reason: "an identical amendment for this criterion is already proposed",
+      });
+      return;
+    }
+    const valid = validate(DECISION_SCHEMA, decision);
+    if (!valid.valid) {
+      this.#log.append("error", { where: "reviewer_amendment", error: valid.errors.join("; ") });
+      return;
+    }
+    this.#applyEvent({ type: "DECISION_ADDED", decision });
   }
 
   /** design §8.1's reproduction-command deadline: runs `command` in a fresh
@@ -2452,6 +3301,15 @@ export class Conductor {
       createWorktree(this.#plan.repo, this.#paths.worktree, sha);
     }
 
+    // Plan 01e: before the run's first attempt, run the phase's checks once on
+    // the base and remember which test names already fail there, so (D2) the
+    // candidate's gate can tell a pre-existing failure from a new one and the
+    // worker is told which ones are not its to fix. A repair attempt never
+    // re-runs it — the base tree has not moved — and `#ensureBaseline`
+    // reuses an existing record for the same base tree and check list
+    // (including one a sibling program node already paid for).
+    if (this.#state.phase.attempt.n === 1) await this.#ensureBaseline();
+
     const agentId = `worker-${this.#state.phase.attempt.n}-${actionId}`;
     const contract = this.#state.phase.contract;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
@@ -2603,6 +3461,8 @@ export class Conductor {
           this.#repairContext(),
           runReferences(this.#runDir),
           this.#secretNames,
+          this.#state.phase.ownerDirectives,
+          this.#baselineFailedCommands(),
         ),
       );
       // Record delivery only after the prompt was sent; a crash between the
@@ -2700,9 +3560,26 @@ export class Conductor {
     const blocking = open.filter((f) => f.severity === "blocking").map(findingLine);
     if (checksFailed) blocking.unshift("The phase checks failed on the candidate (see the check output in your worktree by rerunning the failing test).");
     if (probeFailed) blocking.unshift("The integration probe failed: the candidate does not merge cleanly or fails the checks when merged onto the integration branch.");
+    // Plan 01f: a failed gate is a repair round that shows the worker the
+    // log (design 01_ref_design.md): the conductor's own record, not an
+    // agent's summary of it, with the last lines inline.
+    const gateRecord = this.#gateRecords().find((r) => r.candidateSha === C);
+    if (gateRecord && !gateRecord.passed) {
+      // One outcome phrase (core/gate.ts): a gate that never started says so
+      // instead of "exited undefined" (findings B-22/A-23).
+      const how = gateOutcomeText(gateRecord, { withElapsed: true });
+      const tail = this.#gateTailForPrompt(C);
+      blocking.unshift(
+        `The conductor ran the phase's gate command and it ${how}: ${gateRecord.command} (checks/${C}/gate.log, sha256 ${gateRecord.logSha256}).` +
+          (tail ? ` Last ${GATE_TAIL_LINES} lines of its log:\n${tail}` : ""),
+      );
+    }
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
+      // Plan 01g: an amendment is never a "change this decision" repair item
+      // — the worker cannot edit it and it never blocks acceptance (B-10).
+      if (d.amendment) continue;
       const st = decisionStatus(d, phase);
       if (st.status !== "failed" && st.status !== "suspended" && st.status !== "owner") continue;
       const rejections = phase.ballots
@@ -2717,8 +3594,11 @@ export class Conductor {
       failedDecisions,
       advisory: open.filter((f) => f.severity === "advisory").map(findingLine),
       corrections: phase.corrections.filter((c) => c.status === "open").map((c) => c.correctionText),
+      // Plan 01g: amendment records are phase-level, not the worker's to
+      // keep/change/withdraw; exclude them so the worker never sees a record
+      // whose stated change would be ignored (B-10).
       priorDecisions: phase.decisions
-        .filter((d) => d.source === "worker" && isLiveDecision(d))
+        .filter((d) => d.source === "worker" && isLiveDecision(d) && !d.amendment)
         .map((d) => ({ id: d.id, choice: d.choice })),
     };
   }
@@ -2874,12 +3754,19 @@ export class Conductor {
     // Plan 01a: a check or probe command (and its output) may carry a secret
     // value — a vendor key a command echoes, or the plan's own check line.
     fs.writeFileSync(
-      path.join(outDir, `${sanitize(redactText(command, this.#secretMaskable))}.log`),
+      path.join(outDir, this.#checkLogName(command)),
       redactText(
         `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
         this.#secretMaskable,
       ),
     );
+  }
+
+  /** The log file name a check command's evidence gets under its gate's
+   * directory — shared by `#recordCheck` and the baseline record, which names
+   * the same file. */
+  #checkLogName(command: string): string {
+    return `${sanitize(redactText(command, this.#secretMaskable))}.log`;
   }
 
   /** Plan 01a: the run's plan snapshot on disk is written redacted, and
@@ -2904,6 +3791,378 @@ export class Conductor {
     return out;
   }
 
+  // -- plan 01e: the base baseline -----------------------------------------
+
+  /** Plan 01e: the base baseline's own directory (`<run>/checks/base/`), the
+   * sibling of the per-candidate `<run>/checks/<sha>/` dirs. */
+  #baselineDir(): string {
+    return path.join(this.#paths.checks, "base");
+  }
+
+  #baselinePath(): string {
+    return path.join(this.#baselineDir(), "baseline.json");
+  }
+
+  /** Plan 01e: the phase's current base commit — what a check's failures are
+   * compared against under D2. */
+  #baselineBaseSha(): string {
+    return this.#state.phase.integrationHead;
+  }
+
+  /** The effective check list as it will actually be run (plan secrets
+   * resolved), which is both what the baseline records and what the C gate
+   * and the probe execute. */
+  #resolvedEffectiveChecks(): string[] {
+    return effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks).map((c) => this.#withValues(c));
+  }
+
+  #baselineKey(commands: readonly string[]): string {
+    return baselineKey(this.#baselineTree(), commands);
+  }
+
+  /** The base commit's full tree object id (or the commit id when git cannot
+   * read it) — the identity two nodes must share to reuse one baseline. */
+  #baselineTree(): string {
+    const baseSha = this.#baselineBaseSha();
+    return treeOf(this.#plan.repo, baseSha) ?? baseSha;
+  }
+
+  /** The run-local baseline record, if one exists (and only then). */
+  #readBaseline(): Baseline | undefined {
+    try {
+      return parseBaseline(JSON.parse(fs.readFileSync(this.#baselinePath(), "utf8")));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 01e: the base commands whose pre-existing failures the worker and
+   * the reviewers are told about — the ones whose failures the gate would
+   * actually excuse, so the promise in the prompt and the rule at the gate are
+   * the same rule. Empty when the base passed, when no baseline was taken, when
+   * the record no longer covers this base, or when its failing output held no
+   * parsable names (the strict rule then applies, and there is nothing honest
+   * to call pre-existing). */
+  #baselineFailedCommands(): BaselineCommand[] {
+    const commands = this.#resolvedEffectiveChecks();
+    const baseline = this.#readBaseline();
+    if (!baseline || !this.#baselineCovers(baseline, this.#baselineKey(commands), commands)) return [];
+    return baselineFailedCommands(baseline.commands);
+  }
+
+  /** Plan 01e: the base's failing names for one check command, or none when
+   * no baseline covers this command (D2 then falls back to the strict rule). */
+  #baseFailuresFor(command: string): string[] {
+    const commands = this.#resolvedEffectiveChecks();
+    const baseline = this.#readBaseline();
+    if (!baseline || !this.#baselineCovers(baseline, this.#baselineKey(commands), commands)) return [];
+    const name = this.#baselineCommandName(command);
+    const entry = baseline.commands.find((c) => c.command === name);
+    // The record should never carry names for a command that did not fail
+    // normally (`#runBaseline` does not write them), but a hand-written or
+    // older record is still checked here: only a completed non-zero exit may
+    // excuse a candidate failure (finding M-2).
+    return entry && failedNormally(entry) ? entry.failures : [];
+  }
+
+  /** Plan 01e: the baseline the phase shares with the rest of its program
+   * (`<program>/baselines/<key>/`), or undefined for a hand-started run.
+   * Keyed by base tree plus check list, so two nodes that start from the same
+   * tree run one baseline between them, and a node with different checks
+   * never reuses another's. */
+  #baselineSharedDir(key: string): string | undefined {
+    const programDir = this.#programDir();
+    return programDir ? path.join(programDir, "baselines", key) : undefined;
+  }
+
+  /** The masked form a baseline record is written with: its commands are
+   * resolved (plan secrets put back) when they run, and on disk they keep the
+   * mask every other run file keeps. */
+  #baselineForDisk(record: Baseline): Baseline {
+    return redactRecord(record, this.#secretMaskable) as Baseline;
+  }
+
+  /** The command as a baseline record names it — masked the same way the
+   * record was written, so a lookup and a reuse check compare like forms. */
+  #baselineCommandName(command: string): string {
+    return redactText(command, this.#secretMaskable);
+  }
+
+  /** True iff `record` was taken over this exact base — the same **full** tree
+   * (never the key's shortened prefix, which is only a file name) and exactly
+   * these commands, compared in the masked form the record is stored in. This
+   * is the guard that keeps a stale record, another base's record, or a
+   * whole-program key collision from ever hiding a new failure. */
+  #baselineCovers(record: Baseline, key: string, commands: readonly string[]): boolean {
+    if (record.key !== key || record.tree !== this.#baselineTree()) return false;
+    if (record.commands.length !== commands.length) return false;
+    return record.commands.every((c, i) => c.command === this.#baselineCommandName(commands[i]));
+  }
+
+  /** Plan 01e: run the phase's checks once on the base, at the start of the
+   * first attempt, unless a baseline for this exact base tree and check list
+   * already exists — in this run (a restart) or in this node's program (a
+   * sibling node). Best-effort: any failure leaves no baseline and the checks
+   * stay strict, which is the safe direction. */
+  async #ensureBaseline(): Promise<void> {
+    const commands = this.#resolvedEffectiveChecks();
+    if (commands.length === 0) return;
+    const key = this.#baselineKey(commands);
+    const local = this.#readBaseline();
+    if (local && this.#baselineCovers(local, key, commands)) return;
+
+    // A program node reuses a sibling's identical-base baseline before paying
+    // for its own run (runtime doc §4: every node of atlas plan 13's base paid
+    // for the same 14 failures).
+    const shared = this.#baselineSharedDir(key);
+    if (!shared) {
+      await this.#runBaselineOnce(commands, key);
+      return;
+    }
+
+    const file = path.join(shared, "baseline.json");
+    const sibling = this.#readBaselineFrom(file);
+    if (sibling && this.#baselineCovers(sibling, key, commands)) {
+      this.#adoptBaseline(sibling, shared, "program");
+      return;
+    }
+
+    // "One check run per base tree at most" must hold for the parallel wave
+    // too (two nodes whose branches differ but whose trees are identical): the
+    // first node to take the lock runs it and the others wait for the record
+    // it publishes. A holder that died or stalled is detected by its own pid
+    // and age, so a stale lock can never wedge a run.
+    const waitMs = Math.max(30_000, commands.length * this.#deadlines.checkMs + this.#deadlines.termGraceMs);
+    if (!this.#acquireBaselineLock(shared)) {
+      const waited = await this.#waitForSharedBaseline(file, shared, key, commands, waitMs);
+      if (waited) {
+        this.#adoptBaseline(waited, shared, "program");
+        return;
+      }
+      // The holder never published: compute our own rather than wait further.
+      // Publishing is safe without the lock (a per-writer temp file plus a
+      // rename), and both records hold the same answer for the same tree.
+      await this.#runBaselineOnce(commands, key, shared);
+      return;
+    }
+    try {
+      // Double-check under the lock: another node may have published between
+      // our read above and taking it.
+      const published = this.#readBaselineFrom(file);
+      if (published && this.#baselineCovers(published, key, commands)) {
+        this.#adoptBaseline(published, shared, "program");
+        return;
+      }
+      await this.#runBaselineOnce(commands, key, shared);
+    } finally {
+      this.#releaseBaselineLock(shared);
+    }
+  }
+
+  /** Runs the baseline, records it in this run and (in a program) publishes it,
+   * logging the record. Never throws: a baseline that cannot be taken leaves
+   * every check judged strictly. */
+  async #runBaselineOnce(commands: readonly string[], key: string, shared?: string): Promise<Baseline | undefined> {
+    let record: Baseline;
+    try {
+      record = await this.#runBaseline(commands, key);
+      this.#recordBaselineLocal(record);
+    } catch (err) {
+      this.#log.append("baseline_error", { error: String((err as Error)?.message ?? err) });
+      return undefined;
+    }
+    if (shared) this.#publishBaselineShared(record, shared);
+    this.#log.append("baseline", { ...record, reused: false });
+    return record;
+  }
+
+  /** Reuses a record another run took: the record and its logs are copied into
+   * this run's own `checks/base/`, so the run directory stays self-contained,
+   * and the reuse is logged with where it came from. */
+  #adoptBaseline(record: Baseline, sourceDir: string, source: string): void {
+    this.#writeBaselineLocal(record, sourceDir);
+    this.#log.append("baseline", { ...record, reused: true, source });
+  }
+
+  /** Waits (bounded) for the node that holds the shared baseline lock to
+   * publish its record. The lock names its holder's pid and age, so a dead or
+   * stalled holder is given up on instead of waited out. */
+  async #waitForSharedBaseline(
+    file: string,
+    shared: string,
+    key: string,
+    commands: readonly string[],
+    waitMs: number,
+  ): Promise<Baseline | undefined> {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      if (this.#closed) return undefined;
+      const record = this.#readBaselineFrom(file);
+      if (record && this.#baselineCovers(record, key, commands)) return record;
+      // A lock whose holder is gone (or that outlived any possible run) is
+      // released here, so the next node — or this one — can compute its own.
+      if (this.#baselineLockIsStale(shared, waitMs)) {
+        this.#releaseBaselineLock(shared);
+        return undefined;
+      }
+      if (Date.now() >= deadline) return undefined;
+      await sleepMs(250);
+    }
+  }
+
+  /** Exclusively creates the shared baseline lock, carrying this process's pid
+   * and the time, so a waiter can tell a live holder from a dead one. */
+  #acquireBaselineLock(shared: string): boolean {
+    try {
+      fs.mkdirSync(shared, { recursive: true });
+      fs.writeFileSync(
+        path.join(shared, "lock.json"),
+        JSON.stringify({ pid: process.pid, at: Date.now() }),
+        { flag: "wx" },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #releaseBaselineLock(shared: string): void {
+    try {
+      fs.rmSync(path.join(shared, "lock.json"), { force: true });
+    } catch {
+      // best effort
+    }
+  }
+
+  /** True when the lock's holder is gone or the lock is older than any baseline
+   * could possibly take. An unreadable lock file is treated as live — the
+   * bounded wait handles that case. */
+  #baselineLockIsStale(shared: string, waitMs: number): boolean {
+    let info: { pid?: unknown; at?: unknown };
+    try {
+      info = JSON.parse(fs.readFileSync(path.join(shared, "lock.json"), "utf8")) as { pid?: unknown; at?: unknown };
+    } catch {
+      return false;
+    }
+    if (typeof info.at === "number" && Date.now() - info.at > waitMs) return true;
+    if (typeof info.pid === "number" && !pidRunning(info.pid)) return true;
+    return false;
+  }
+
+  /** Plan 01e: run every effective check command once on a disposable checkout
+   * of the base, recording each one's exit, duration, parsed failing test
+   * names and log. Unlike the C gate the loop does not stop at the first
+   * failure — the whole base picture is the point. */
+  async #runBaseline(commands: readonly string[], key: string): Promise<Baseline> {
+    const outDir = this.#baselineDir();
+    fs.mkdirSync(outDir, { recursive: true });
+    const checkout = disposableCheckout(this.#plan.repo, this.#baselineBaseSha());
+    const results: BaselineCommand[] = [];
+    try {
+      for (const command of commands) {
+        const startedAt = Date.now();
+        // Same isolation and per-command deadline as the C gate (F13).
+        const running = runCommand({
+          command,
+          cwd: checkout.dir,
+          env: childEnv(),
+          deadlineMs: this.#deadlines.checkMs,
+          termGraceMs: this.#deadlines.termGraceMs,
+        });
+        const result = await running.result;
+        this.#recordCheck(outDir, command, result);
+        results.push({
+          command,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          durationMs: Date.now() - startedAt,
+          // Only a command that ran to completion and exited non-zero names a
+          // failure the base is known to have: a timeout's output is truncated,
+          // a signal death never printed its last failure, and a command that
+          // exited 0 did not fail at all — so none of those three may put a
+          // name into the set that excuses a candidate's check.
+          failures: failedNormally(result) ? parseTestFailures(result.output) : [],
+          log: this.#checkLogName(command),
+        });
+      }
+    } finally {
+      checkout.dispose();
+    }
+    return {
+      baseSha: this.#baselineBaseSha(),
+      tree: this.#baselineTree(),
+      key,
+      at: new Date().toISOString(),
+      commands: results,
+      failures: baselineFailureNames(results),
+    };
+  }
+
+  #readBaselineFrom(file: string): Baseline | undefined {
+    try {
+      return parseBaseline(JSON.parse(fs.readFileSync(file, "utf8")));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Writes the run-local record and, when `sourceDir` holds a reused
+   * baseline, copies its logs in too, so `checks/base/` of this run is
+   * self-contained. */
+  #writeBaselineLocal(record: Baseline, sourceDir: string): void {
+    try {
+      const outDir = this.#baselineDir();
+      fs.mkdirSync(outDir, { recursive: true });
+      for (const command of record.commands) {
+        if (!command.log) continue;
+        try {
+          fs.copyFileSync(path.join(sourceDir, command.log), path.join(outDir, command.log));
+        } catch {
+          // best effort: the record still names the command and its failures.
+        }
+      }
+    } catch {
+      // best effort; `#writeBaselineRecord` reports its own failure
+    }
+    this.#writeBaselineRecord(record);
+  }
+
+  #recordBaselineLocal(record: Baseline): void {
+    this.#writeBaselineRecord(record);
+  }
+
+  /** The run-local `baseline.json`, best-effort: an unwritable checks dir must
+   * leave the gate strict, never wedge the attempt. */
+  #writeBaselineRecord(record: Baseline): void {
+    try {
+      fs.mkdirSync(this.#baselineDir(), { recursive: true });
+      fs.writeFileSync(this.#baselinePath(), JSON.stringify(this.#baselineForDisk(record), null, 2));
+    } catch (err) {
+      this.#log.append("baseline_error", { error: String((err as Error)?.message ?? err) });
+    }
+  }
+
+  /** Publishes a freshly-run baseline to the program's shared store, so a
+   * later node with the same base and checks reuses it. Best-effort: a
+   * hand-started run has none, and an unwritable program dir must not fail the
+   * run. Temporary file plus rename, so a concurrent node never reads a
+   * half-written record. */
+  #publishBaselineShared(record: Baseline, shared: string): void {
+    try {
+      fs.mkdirSync(shared, { recursive: true });
+      for (const command of record.commands) {
+        if (!command.log) continue;
+        fs.copyFileSync(path.join(this.#baselineDir(), command.log), path.join(shared, command.log));
+      }
+      const tmp = path.join(shared, `baseline.json.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
+      fs.writeFileSync(tmp, JSON.stringify(this.#baselineForDisk(record), null, 2));
+      fs.renameSync(tmp, path.join(shared, "baseline.json"));
+    } catch (err) {
+      this.#log.append("baseline_shared_error", { error: String((err as Error)?.message ?? err) });
+    }
+  }
+
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
@@ -2915,6 +4174,10 @@ export class Conductor {
       let passed = before;
       let integrityViolated = !before;
       let timedOut = false;
+      /** Plan 01e: the names this candidate's checks failed on that the base
+       * did not — recorded with the check's completion so a repair round (and
+       * the owner) can see exactly what is new. */
+      let newFailures: string[] = [];
       if (before) {
         // F04: the effective list is the global plan checks followed by the
         // phase contract's own checks, deduped by exact command string — the
@@ -2942,7 +4205,43 @@ export class Conductor {
           this.#recordCheck(outDir, command, result);
           const after = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
           if (!after) integrityViolated = true;
-          if (result.exitCode !== 0 || result.timedOut || !after) {
+          const failed = result.exitCode !== 0 || result.timedOut || !after;
+          if (failed) {
+            // Plan 01e / D2's default: a failing check whose every parsed
+            // failing test also failed on the base is not this candidate's
+            // failure — the base already had it before the phase started. The
+            // rule is deliberately narrow: only a check that ran to completion
+            // and exited non-zero can be excused. A timeout's output is
+            // truncated; a signal death (the OOM killer's SIGKILL, a SIGSEGV)
+            // reports `exitCode: null` with a non-null signal and never got to
+            // print its last failure; and an integrity violation is not this
+            // candidate's tree at all. In all three the output could name only
+            // the base's tests while a new failure went unnamed. A check whose
+            // output yields no test name at all keeps the strict rule, and any
+            // parsed name the base did not fail on that same command fails the
+            // gate.
+            if (after && failedNormally(result)) {
+              const baseFailures = this.#baseFailuresFor(command);
+              const verdict = classifyCheckFailure(result.output, baseFailures);
+              if (verdict.excused) {
+                this.#log.append("check_failures_pre_existing", {
+                  candidateSha,
+                  command,
+                  failures: verdict.parsed,
+                  baseFailures,
+                });
+                continue;
+              }
+              if (verdict.newFailures.length > 0) {
+                newFailures = verdict.newFailures;
+                this.#log.append("check_failure_new", {
+                  candidateSha,
+                  command,
+                  newFailures: verdict.newFailures,
+                  failures: verdict.parsed,
+                });
+              }
+            }
             passed = false;
             break;
           }
@@ -2962,6 +4261,7 @@ export class Conductor {
         candidateSha,
         passed,
         integrityViolated,
+        ...(newFailures.length > 0 ? { newFailures } : {}),
         reason: !passed && timedOut ? "timeout" : undefined,
       });
       this.#applyEvent(passed ? { type: "CHECKS_PASSED" } : { type: "CHECKS_FAILED" });
@@ -3035,6 +4335,363 @@ export class Conductor {
     } else {
       this.#applyEvent({ type: "PROBE_FAILED", evidence: `checks failed on probed integration ${result.I}` });
     }
+  }
+
+  // -- plan 01f: the gate ---------------------------------------------------
+
+  /** Every gate record this run has written so far (`checks/<sha>/gate.json`),
+   * newest last — the inputs to the reuse rule in core/gate.ts. A malformed
+   * or half-written record is ignored: it is never a passing gate. */
+  #gateRecords(): GateRecord[] {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.#paths.checks);
+    } catch {
+      return [];
+    }
+    const records: GateRecord[] = [];
+    for (const name of names) {
+      if (name === "base" || name === "probe") continue;
+      try {
+        const record = parseGateRecord(JSON.parse(fs.readFileSync(path.join(this.#paths.checks, name, "gate.json"), "utf8")));
+        if (record) records.push(record);
+      } catch {
+        // no record here, or an unreadable/partial one
+      }
+    }
+    return records.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  }
+
+  /** The `gate.log` a record names, or undefined when the file is missing or
+   * its bytes no longer hash to the record's own sha256. Only a log that
+   * matches is evidence: a pruned, truncated or hand-edited record must make
+   * the gate rerun, never carry acceptance (runtime doc §6's substitute). */
+  #verifiedGateLog(record: GateRecord): Buffer | undefined {
+    try {
+      const log = fs.readFileSync(path.join(this.#paths.checks, record.candidateSha, "gate.log"));
+      return gateLogHashMatches(record, log) ? log : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Every **verified** passing gate record of this run, keyed by candidate:
+   * the only records `gateDecision` may accept or reuse. A record written as a
+   * reuse counts: its log is the verified copy of the run that produced the
+   * evidence, so a candidate's own reuse record (and a chain of them) is
+   * still this gate's evidence, and an identical tree never pays twice. */
+  #verifiedPassingGateRecords(): Map<string, { record: GateRecord; log: Buffer }> {
+    const out = new Map<string, { record: GateRecord; log: Buffer }>();
+    for (const record of this.#gateRecords()) {
+      if (!record.passed) continue;
+      const log = this.#verifiedGateLog(record);
+      if (log) out.set(record.candidateSha, { record, log });
+    }
+    return out;
+  }
+
+  /** Plan 01f: the gate record to show a reviewer for candidate `C` — the
+   * record for `C` itself when one exists (an earlier pass, or a stale-publish
+   * retry), otherwise the newest record of the run, which is the failed gate
+   * that sent the phase into this repair round. Only records whose log still
+   * matches the hash they carry are shown: an unverifiable record is not
+   * evidence, and a prompt must not describe it as one. */
+  #gateRecordForPrompt(candidateSha: string): GateRecord | undefined {
+    const verified = this.#gateRecords().filter((r) => this.#verifiedGateLog(r) !== undefined);
+    return verified.find((r) => r.candidateSha === candidateSha) ?? verified[verified.length - 1];
+  }
+
+  /** The last lines of the gate log that goes with `#gateRecordForPrompt`,
+   * for a failed record (a pass needs no tail). */
+  #gateTailForPrompt(candidateSha: string): string | undefined {
+    const record = this.#gateRecordForPrompt(candidateSha);
+    if (!record || record.passed) return undefined;
+    try {
+      return gateLogTail(fs.readFileSync(path.join(this.#paths.checks, record.candidateSha, "gate.log"), "utf8"));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 01f: the environment the gate (and its cleanup) run with — the
+   * same isolation as a check (`childEnv`), plus the plan's declared secret
+   * values, so a gate command that needs a vendor key gets it from the
+   * environment rather than from its own text (plan 01a's rule). */
+  #gateEnv(): NodeJS.ProcessEnv {
+    return { ...childEnv(), ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])) };
+  }
+
+  /** Plan 01f: the conductor's own gate. Takes the machine-wide gate lock
+   * first, then decides run-or-reuse under it, then (only if it must run)
+   * merges the candidate onto the current integration head, runs the
+   * contract's `:GATE:` command in that checkout with the plan's secrets in
+   * the environment, and records everything. Writes `checks/<sha>/gate.json`
+   * and `checks/<sha>/gate.log`, runs `:GATE_CLEANUP:` whenever the command
+   * ran (pass, fail or timeout; a candidate that no longer merges never
+   * starts it and is recorded as `not started`), and applies either the
+   * ACCEPTED event (a pass) or GATE_FAILED with the log's last lines.
+   *
+   * A candidate whose tree already passed the same command does not run it
+   * again — but only a record whose own `gate.log` still hashes to what the
+   * record claims is used: an unverifiable record makes the gate rerun
+   * (`core/gate.ts`'s `gateDecision`/`gateLogHashMatches`). A candidate's own
+   * record is accepted in place and never rewritten; another candidate's
+   * pass is copied into a new record that names the head it is accepted
+   * against and the head the evidence came from.
+   *
+   * The agent never produces this evidence (runtime doc §6): a passing gate is
+   * what lets acceptance proceed, a failing one is a blocking `integration`
+   * finding the worker is shown, and no agent may run the command or report
+   * its result. */
+  async #runGate(actionId: string, candidateSha: string): Promise<void> {
+    const contract = this.#state.phase.contract;
+    const head = this.#state.phase.integrationHead;
+    const declared = gateCommandOf(contract);
+    const outDir = path.join(this.#paths.checks, candidateSha);
+    fs.mkdirSync(outDir, { recursive: true });
+    const logPath = path.join(outDir, "gate.log");
+    const recordPath = path.join(outDir, "gate.json");
+    if (!declared) {
+      // Defensive: GATING is only reachable when the contract declares a
+      // gate, but a hand-built event must not silently accept a candidate.
+      this.#log.completion(actionId, { candidateSha, passed: false, reason: "no gate command declared" });
+      this.#applyEvent({ type: "GATE_FAILED", evidence: "the conductor was asked to gate a phase whose contract declares no :GATE: command" });
+      return;
+    }
+    const command = this.#withValues(declared);
+    const maskedCommand = redactText(command, this.#secretMaskable);
+    const maskedCleanup = contract.gateCleanup ? redactText(this.#withValues(contract.gateCleanup), this.#secretMaskable) : undefined;
+    const cleanupCommand = contract.gateCleanup ? this.#withValues(contract.gateCleanup) : undefined;
+    const tree = treeOf(this.#plan.repo, candidateSha);
+    this.#log.intent(actionId, { candidateSha, head, tree, command: maskedCommand });
+
+    // Everything the gate does for this candidate is inside the machine-wide
+    // lock: the merge that builds its checkout, the run-or-reuse decision
+    // (taken here, under the lock, so a candidate whose tree another candidate
+    // has just gated reuses that run's record instead of running the command
+    // again), the command, the cleanup and the record. Two phases — and two
+    // candidates that share a tree — never have their gate work live at once.
+    const lock: Lock = await this.#acquireGateLock();
+    let probed: ReturnType<typeof gitProbe> | undefined;
+    let record: GateRecord | undefined;
+    let logText = "";
+    try {
+      // The reuse rule (core/gate.ts): a candidate whose tree has already
+      // passed this exact command does not run it again — but only a record
+      // whose own `gate.log` still hashes to what it claims is evidence. A
+      // candidate's own record is handled separately (`gateDecision`): a
+      // stale-publish retry re-gates the same candidate, and its record is
+      // accepted in place, never rewritten with a claim of reusing itself.
+      const passing = this.#verifiedPassingGateRecords();
+      const decision = gateDecision(
+        passing.get(candidateSha)?.record,
+        [...passing.values()].map((v) => v.record),
+        { candidateSha, tree, command: maskedCommand },
+      );
+      if (decision.kind === "own") {
+        // Already this candidate's own evidence: write nothing, and record the
+        // head being accepted now next to the head it was produced at.
+        record = decision.record;
+        this.#log.completion(actionId, {
+          candidateSha,
+          head,
+          passed: true,
+          reusedInPlace: true,
+          gateBaseSha: decision.record.baseSha,
+          logSha256: decision.record.logSha256,
+        });
+      } else if (decision.kind === "reuse") {
+        const source = passing.get(decision.record.candidateSha)!;
+        // The source log is copied byte for byte, so this record's hash is the
+        // same verified hash — the evidence behind it is the run it names. A
+        // source that is itself a reuse has its provenance flattened to the
+        // run that actually produced the evidence.
+        fs.writeFileSync(logPath, source.log);
+        record = {
+          ...source.record,
+          candidateSha,
+          // The head this candidate is being accepted against; where the
+          // evidence actually came from is named separately.
+          baseSha: head,
+          reused: true,
+          reusedFrom: source.record.reused
+            ? (source.record.reusedFrom ?? source.record.candidateSha)
+            : source.record.candidateSha,
+          reusedFromBaseSha: source.record.reused
+            ? (source.record.reusedFromBaseSha ?? source.record.baseSha)
+            : source.record.baseSha,
+          // The source's merge result belongs to the source's base, not this
+          // head; a reused record names its bases instead of claiming an I.
+          mergedI: undefined,
+          logBytes: source.log.length,
+          logSha256: createHash("sha256").update(source.log).digest("hex"),
+        };
+        fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+        this.#log.completion(actionId, {
+          candidateSha,
+          head,
+          passed: true,
+          reused: true,
+          reusedFrom: record.reusedFrom,
+          reusedFromBaseSha: record.reusedFromBaseSha,
+          logSha256: record.logSha256,
+        });
+      } else {
+        // The probed checkout: merge the candidate onto the current head,
+        // exactly as the probe does, so the gate's evidence is for the
+        // integration the probe verified. (The probe passed, so a conflict
+        // here means the head moved under the phase.)
+        probed = gitProbe(this.#plan.repo, { runId: this.#state.phase.runId, candidateSha, headSha: head });
+        if (!probed.ok) {
+          // The candidate does not merge, so the gate command never starts and
+          // the cleanup has nothing to release (the owner's ruling, D-B-62):
+          // the record says "not started" rather than claiming an exit-less,
+          // zero-duration run.
+          logText = redactText(
+            `$ ${maskedCommand}\nnot started: the candidate does not merge onto ${head}\n${probed.output}\n`,
+            this.#secretMaskable,
+          );
+          fs.writeFileSync(logPath, logText);
+          record = {
+            candidateSha,
+            tree,
+            baseSha: head,
+            command: maskedCommand,
+            ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
+            startedAt: new Date().toISOString(),
+            notStarted: `the candidate does not merge onto ${head}`,
+            passed: false,
+            logBytes: Buffer.byteLength(logText, "utf8"),
+            logSha256: createHash("sha256").update(logText).digest("hex"),
+            cleanupSkipped: CLEANUP_NOT_RUN,
+          };
+          fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+          this.#log.completion(actionId, {
+            candidateSha,
+            passed: false,
+            reason: `not started: the candidate does not merge onto ${head}`,
+          });
+        } else {
+          const startedAt = new Date().toISOString();
+          const startedMs = Date.now();
+          const running = runCommand({
+            command,
+            cwd: probed.checkoutDir,
+            env: this.#gateEnv(),
+            deadlineMs: this.#deadlines.gateMs,
+            termGraceMs: this.#deadlines.termGraceMs,
+            // Design §2.2: the command's process group is recorded before it
+            // runs, so a crashed gate is recoverable (see `#reconcileOne`).
+            onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
+          });
+          const gateResult = await running.result;
+          // The gate command's own duration: the cleanup runs under its own
+          // limit afterwards and is recorded separately (the record must not
+          // present teardown time as build time).
+          const durationMs = Date.now() - startedMs;
+          // Whatever the outcome of the command: release what it took. The
+          // cleanup holds its own (gate-length) limit; it is not part of the
+          // gate's duration.
+          let cleanupResult: RunCommandResult | undefined;
+          let cleanupStartedAt: string | undefined;
+          let cleanupMs = 0;
+          if (cleanupCommand) {
+            cleanupStartedAt = new Date().toISOString();
+            const cleanupStartedMs = Date.now();
+            const cleanup = runCommand({
+              command: cleanupCommand,
+              cwd: probed.checkoutDir,
+              env: this.#gateEnv(),
+              deadlineMs: this.#deadlines.gateMs,
+              termGraceMs: this.#deadlines.termGraceMs,
+              onIntent: ({ pgid }) => this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid }),
+            });
+            cleanupResult = await cleanup.result;
+            cleanupMs = Date.now() - cleanupStartedMs;
+          }
+          const passed = !gateResult.timedOut && gateResult.exitCode === 0;
+          // The log holds both commands' output, redacted, with the exit
+          // facts — the same shape `#recordCheck` writes.
+          const parts = [
+            `$ ${maskedCommand}\n${gateResult.output}\nexit ${gateResult.exitCode} signal ${gateResult.signal}${gateResult.timedOut ? ` (timed out after ${Math.round(durationMs / 1000)}s)` : ""}\n`,
+          ];
+          if (cleanupResult && maskedCleanup) {
+            parts.push(
+              `$ ${maskedCleanup}\n${cleanupResult.output}\nexit ${cleanupResult.exitCode} signal ${cleanupResult.signal}${cleanupResult.timedOut ? " (timed out)" : ""}\n`,
+            );
+          }
+          logText = redactText(parts.join("\n"), this.#secretMaskable);
+          fs.writeFileSync(logPath, logText);
+          record = {
+            candidateSha,
+            tree,
+            baseSha: head,
+            mergedI: probed.I,
+            command: maskedCommand,
+            ...(maskedCleanup ? { cleanup: maskedCleanup } : {}),
+            startedAt,
+            durationMs,
+            exitCode: gateResult.exitCode,
+            signal: gateResult.signal,
+            timedOut: gateResult.timedOut,
+            passed,
+            logSha256: createHash("sha256").update(logText).digest("hex"),
+            logBytes: Buffer.byteLength(logText, "utf8"),
+            ...(cleanupResult
+              ? {
+                  cleanupStartedAt,
+                  cleanupDurationMs: cleanupMs,
+                  cleanupExitCode: cleanupResult.exitCode,
+                  cleanupTimedOut: cleanupResult.timedOut,
+                }
+              : {}),
+          };
+          fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+          this.#log.completion(actionId, {
+            candidateSha,
+            head,
+            passed,
+            exitCode: gateResult.exitCode,
+            timedOut: gateResult.timedOut,
+            durationMs,
+            logSha256: record.logSha256,
+            ...(cleanupResult ? { cleanupExitCode: cleanupResult.exitCode } : {}),
+          });
+        }
+      }
+    } finally {
+      // The record and the completion are written inside the lock, so the
+      // window in the record is the window the lock covered (two honest
+      // sequential gates can never look overlapped). Dispatching the phase's
+      // next action is deliberately *outside* the lock: publishing is not the
+      // gate, and other phases' gates must not wait for it.
+      await lock.release();
+      if (probed?.ok) discardProbe(this.#plan.repo, { probeBranch: probed.probeBranch, checkoutDir: probed.checkoutDir });
+    }
+    if (!record) return;
+    if (record.passed) {
+      this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(this.#state.phase, candidateSha, contract.contractVersion) });
+    } else {
+      this.#applyEvent({
+        type: "GATE_FAILED",
+        evidence: gateFailureEvidence({ record, logPath, tail: gateLogTail(logText) }),
+      });
+    }
+  }
+
+  /** The machine-wide gate lock (plan 01f). Waits for a holder instead of
+   * failing: a second phase gates after the first is done, never alongside
+   * it. It is acquired before the merge that builds the gate's checkout and
+   * released after the gate command, its cleanup and the record are written;
+   * a conductor that dies mid-gate releases it through the perl helper's own
+   * exit, so a crashed gate cannot wedge every later one. */
+  async #acquireGateLock(): Promise<Lock> {
+    try {
+      fs.mkdirSync(path.dirname(this.#gateLockPath), { recursive: true });
+    } catch {
+      // Best effort: the run root usually already exists.
+    }
+    return acquireWaitingLock(this.#gateLockPath);
   }
 
   // -- review -----------------------------------------------------------
@@ -3185,7 +4842,9 @@ export class Conductor {
       );
 
       if (this.#stubReviews) {
-        await agent.prompt(buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames));
+        await agent.prompt(
+          buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives),
+        );
         const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
         reviewTimeout.cancel();
         if (outcome === "submitted") {
@@ -3253,7 +4912,7 @@ export class Conductor {
         return;
       }
       const settled2 = nextSettle();
-      await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer));
+      await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer, handle));
       const turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled2]);
       reviewTimeout.cancel();
       if (turn2 === "submitted") {
@@ -3338,6 +4997,13 @@ export class Conductor {
       ...secretPromptLines(this.#secretNames),
       `Candidate checkout (read-only): ${this.#candidateDir()}`,
       ...referenceLines(runReferences(this.#runDir)),
+      ...directiveLines(phase.ownerDirectives),
+      // Plan 01f: turn 1 is told the conductor owns the gate evidence too (a
+      // reviewer that only learns it in turn 2 could demand or accept a
+      // substitute first). The failed record from an earlier candidate is
+      // named here; its log tail is shown in turn 2, with the records under
+      // review.
+      ...gatePromptLines(phase.contract.gate, this.#gateRecordForPrompt(phase.candidate?.sha ?? "")),
       `Diff vs. phase base (${phase.integrationHead.slice(0, 7)}):`,
       "```diff",
       // Plan 01a: the diff is the candidate's own content, and a candidate can
@@ -3353,13 +5019,43 @@ export class Conductor {
   /** Turn 2 (design §6.1): every live record on this candidate (the worker's
    * disclosures, all reviewers' discoveries after the discovery barrier, and
    * triggers), open findings and open corrections. */
-  #buildReviewerTurn2Prompt(reviewer: Reviewer): string {
+  #buildReviewerTurn2Prompt(reviewer: Reviewer, handle?: AgentHandle): string {
     const phase = this.#state.phase;
     const C = phase.candidate?.sha ?? "";
     const K = phase.contract.contractVersion;
     const live = phase.decisions.filter((d) => isLiveDecision(d) && d.boundCandidateSha === C);
     // Skill fix 5: a kept decision that passed last round carries its ballots.
     const carriedIds = new Set(phase.ballots.filter((b) => b.boundCandidateSha === C && b.carriedFrom).map((b) => b.decisionId));
+    // Plan 01d: the votable records (delegated or reserved) this prompt
+    // demands a ballot for, minus the carried ones — recorded HERE, on this
+    // dispatch's own handle, so the submit-time check reads exactly what this
+    // prompt listed and a record added afterwards (a late discovery) can
+    // never be demanded.
+    if (handle) {
+      // Plan 01g: an applied (or reverted) amendment record is shown but no
+      // longer needs a ballot — its vote is history. Only a still-proposed
+      // amendment is demanded.
+      handle.demandedBallots = new Map(
+        live
+          .filter(
+            (d) =>
+              (d.class === "delegated" || d.class === "reserved") &&
+              !carriedIds.has(d.id) &&
+              (!d.amendment || d.amendment.status === "proposed"),
+          )
+          .map((d) => [d.id, d.choice]),
+      );
+      handle.incompleteReviewRejections = 0;
+      // Durable trace of the exact demand, for observability and to make the
+      // "a late discovery is never demanded" guarantee checkable: it is a
+      // prompt-time snapshot, so a record added later is not in this list.
+      this.#log.append("ballot_demanded", {
+        reviewer,
+        agentId: handle.agentId,
+        candidateSha: C,
+        records: [...handle.demandedBallots.entries()].map(([id, choice]) => ({ id, choice })),
+      });
+    }
     const record = (d: Decision) => {
       const who = d.source === "worker" ? "worker" : d.source === "trigger" ? "trigger" : `discovered by ${d.id.includes(`-disc-${reviewer}-`) ? "YOU" : "a reviewer"}`;
       const carried = carriedIds.has(d.id) ? " [carried: kept unchanged and approved last round; vote again only if this candidate's changes affect it]" : "";
@@ -3371,6 +5067,18 @@ export class Conductor {
     const lines = [
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
       ...secretPromptLines(this.#secretNames),
+      // Plan 01f: reviewers are told the conductor produces the gate's
+      // evidence and shown the record when one exists (the failed gate that
+      // sent the phase into this repair round, or a record reused for this
+      // candidate) — a substitute gate proof has to be refused, not accepted.
+      ...gatePromptLines(phase.contract.gate, this.#gateRecordForPrompt(C), this.#gateTailForPrompt(C)),
+      // Plan 01i: the directives in force, and the contract rule that binds
+      // them — always stated, whether or not one is in force right now.
+      ...reviewerTurn2DirectiveSection(phase.ownerDirectives),
+      // Plan 01e: the base's own failing tests, so a reviewer does not raise
+      // them as this candidate's defect (runtime doc §8: reviewers kept
+      // flagging the 14 pre-existing exchange-state-machine failures).
+      ...baselinePromptLines(this.#baselineFailedCommands()),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -3402,7 +5110,14 @@ export class Conductor {
       "",
       "Call submit_review with:",
       "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation), except records marked carried: your previous ballot stands for those, and a new ballot replaces it. A ballot with contractObjection=true opens a contract finding and suspends that vote.",
-      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it.",
+      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it. If the problem is that a criterion cannot be met AS WRITTEN, add `criterionDispute` = { criterion: <the acceptance item verbatim>, why, proposedWording }: the conductor records an amendment voted on like any reserved record (a passing one replaces the wording; a failed one leaves it unchanged). An unmet-but-clear criterion is an ordinary defect finding.",
+      // Plan 01g: an amendment record is a reserved decision like any other;
+      // it must get a ballot, and it never blocks acceptance on its own.
+      ...(phase.decisions.some((d) => d.amendment && d.boundCandidateSha === C && isLiveDecision(d))
+        ? [
+            "- An amendment record (class reserved, shown with `proposedWording`) is the worker's or a reviewer's claim that a criterion cannot be met as written. Vote on it like any other reserved decision; a passing normal tally replaces that acceptance item for this phase.",
+          ]
+        : []),
       own.length > 0
         ? `- \`discoveryMatches\`: for each of YOUR discoveries (${own.map((d) => d.id).join(", ")}) that is the same choice as another record above, give {discoveryId, sameAs}.`
         : "- `discoveryMatches`: none needed (you have no discoveries on this list).",
@@ -3421,6 +5136,18 @@ export class Conductor {
     const result = publishCAS(this.#plan.repo, this.#integrationBranch, candidateI, expectedHead);
     crashAt("after_publish_cas");
     this.#log.completion(actionId, result);
+    // Plan 01g: if the phase left PUBLISHING while the CAS ran (an owner
+    // correction reverted an amendment, or any other command moved it), the
+    // completion has no row to land on; applying it would be rejected and
+    // throw. Record it and stop — the log is still the truth of what the
+    // CAS did.
+    if (this.#state.phase.phase !== "PUBLISHING") {
+      this.#log.append("publish_completion_ignored", {
+        reason: `the phase moved to ${this.#state.phase.phase} while the publish CAS ran`,
+        result,
+      });
+      return;
+    }
     if (result.ok) {
       this.#applyEvent({ type: "PUBLISH_COMPLETED", newHead: candidateI });
     } else {
@@ -3436,6 +5163,7 @@ export class Conductor {
 interface SubmitPhaseArgs {
   decisions?: DecisionDisclosure[];
   priorDecisions?: PriorDecisionStatement[];
+  criterionDispute?: CriterionDispute;
   assumptions?: string[];
   deviations?: string[];
 }
@@ -3457,6 +5185,25 @@ async function raceTimeout<T>(promise: Promise<T>, ms: number, _label: string): 
  * won, which is exactly what made every conductor test process hang (round
  * of review item 1). Every `Promise.race([..., timer.promise])` in this
  * file cancels its timer in a `finally` immediately after the race. */
+/** A plain `setTimeout` promise, for the baseline lock's bounded wait (plan
+ * 01e) — unlike `cancelableTimeout` it has no deadline value to return. */
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True iff `pid` still exists (owned by any user, which on this machine means
+ * this account) — how a waiter tells a live baseline-lock holder from a dead
+ * one. A recycled pid can only make a stale lock look live for one bounded
+ * wait, never wedge a run. */
+function pidRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function cancelableTimeout<T>(ms: number, value: T): { promise: Promise<T>; cancel: () => void } {
   let timer: NodeJS.Timeout;
   const promise = new Promise<T>((resolve) => {
@@ -3491,6 +5238,172 @@ function sanitize(command: string): string {
   return command.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 60) || "check";
 }
 
+// -- plan 01i: owner directives (D5) ---------------------------------------
+
+/** Plan 01i: the id a new directive gets.
+ *
+ * A program-wide directive (`preferredId`, `ODP-<n>`) keeps the program's own
+ * id verbatim — the `ODP` space never collides with a phase's `OD` space, so
+ * a node never renumbers a program ruling and `withdraw ODP-n` retires the
+ * same record everywhere. Otherwise the phase's next free `OD-<n>` is used;
+ * program-wide ids never advance that counter. */
+export function allocateDirectiveId(
+  existing: readonly OwnerDirective[],
+  preferredId?: string,
+): { id: string; seq: number } {
+  const preferred = preferredId?.match(/^((?:ODP|OD)-(\d+))$/);
+  if (preferred) return { id: preferred[1], seq: Number(preferred[2]) };
+  const localMax = existing.reduce((m, d) => {
+    const num = d.id.match(/^OD-(\d+)$/);
+    return num ? Math.max(m, Number(num[1])) : m;
+  }, 0);
+  return { id: `OD-${localMax + 1}`, seq: localMax + 1 };
+}
+
+/** Plan 01i: what an input-box text means for withdrawal.
+ * `undefined`: not a withdrawal at all (an ordinary directive).
+ * `withdraw`: retract the named directive; `text` may carry trailing prose
+ * ("withdraw OD-1 because it is stale") without becoming a new ruling.
+ * `malformed`: it opens with `withdraw` but names no valid id — refused with
+ * the reason, never inverted into a fresh binding directive. */
+export type WithdrawInput =
+  | { kind: "withdraw"; id: string }
+  | { kind: "malformed"; reason: string };
+
+export function parseWithdrawInput(text: string): WithdrawInput | undefined {
+  const t = text.trim();
+  if (!/^withdraw\b/i.test(t)) return undefined;
+  const rest = t.replace(/^withdraw\b/i, "").trim();
+  const id = rest.match(/^((?:ODP|OD)-\d+)\b/i);
+  if (!id) {
+    return {
+      kind: "malformed",
+      reason: `a withdrawal must name a directive id, e.g. \`withdraw OD-1\` (got: ${JSON.stringify(t.slice(0, 80))})`,
+    };
+  }
+  return { kind: "withdraw", id: id[1].toUpperCase() };
+}
+
+/** Plan 01i: a directive the program scheduler pushed into this node's inbox
+ * (a node that was already running when the owner ruled program-wide). */
+export function directiveCommandOf(
+  raw: unknown,
+): { text: string; scope: DirectiveScope; forward: boolean; programId?: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
+  if (kind !== "directive") return undefined;
+  if (typeof r.text !== "string" || r.text.trim().length === 0) return undefined;
+  // `pushed` marks a directive the program scheduler delivered here; it must
+  // not be forwarded back to the program (that would loop). `programId` is the
+  // program's own numbering, kept when the local number is free.
+  return {
+    text: r.text,
+    scope: r.scope === "phase" ? "phase" : "program",
+    forward: r.pushed !== true,
+    ...(typeof r.programId === "string" ? { programId: r.programId } : {}),
+  };
+}
+
+/** Plan 01i: a program-level withdrawal the scheduler pushed into this node. */
+export function withdrawCommandOf(raw: unknown): { directiveId: string; text: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
+  if (kind !== "withdraw-directive") return undefined;
+  if (typeof r.directiveId !== "string" || r.directiveId.length === 0) return undefined;
+  const text = typeof r.text === "string" && r.text.trim().length > 0 ? r.text : `withdraw ${r.directiveId}`;
+  return { directiveId: r.directiveId, text };
+}
+
+/** Plan 01i: the prompt section that makes the owner's directives binding —
+ * every directive still in force, verbatim, newest last. Empty when none is
+ * in force, so a prompt with no directive gains no section. */
+export function directiveLines(directives: readonly OwnerDirective[] | undefined): string[] {
+  const inForce = (directives ?? []).filter((d) => d.status === "in-force");
+  if (inForce.length === 0) return [];
+  return [
+    "",
+    "Owner directives (binding):",
+    ...inForce.map((d) => `- ${d.id}${d.scope === "program" ? " (whole program)" : ""}: ${d.text}`),
+  ];
+}
+
+/** Plan 01e: the prompt section that tells an agent which check failures were
+ * already on the phase base before this phase began, so it neither tries to
+ * fix them nor treats them as a defect. Empty when the base passed (or no
+ * baseline was taken), so a prompt with no pre-existing failure gains no
+ * section. Exported (and used by `buildWorkerPrompt` and
+ * `#buildReviewerTurn2Prompt`) so a unit test exercises exactly the words the
+ * two prompts send, rather than a look-alike built somewhere else. */
+export function baselinePromptLines(commands: readonly BaselineCommand[] | undefined): string[] {
+  const failed = baselineFailedCommands(commands ?? []);
+  if (failed.length === 0) return [];
+  return [
+    "",
+    "Pre-existing check failures on the phase base (NOT this phase's to fix):",
+    "These already failed on the base commit before any change here, each under the command shown. The conductor does not count a check as failed when every failing test it names is one of these for that same command; any other failing test fails the gate.",
+    ...failed.map((c) => `- \`${c.command}\`: ${c.failures.join(", ")}`),
+  ];
+}
+
+/** Plan 01i: what a reviewer must know about a directive it is shown: it binds
+ * as part of the contract, following one is never a defect even where the plan
+ * says otherwise, and violating one is a blocking contract finding. */
+export const DIRECTIVE_BINDING_STATEMENT =
+  "The owner's directives are binding on you as part of the contract: a candidate that follows one cannot be faulted for doing so, even where the plan's text says otherwise; a candidate that violates one is a blocking contract finding that cites the directive id.";
+
+/** Plan 01f: what every agent must know about the gate. Only the conductor
+ * runs it and only its record is accepted evidence (runtime doc §6: agents
+ * ran the expensive command inside their attempts — 82 minutes of docker in
+ * 13i/13j, some killed at the 8-minute command limit — and, because they had
+ * to produce the live proof, wrote substitutes: a sentinel `code_sha`,
+ * `pending_owner_live_run`, a fingerprint-only record). */
+/** Plan 01f: the note a gate record carries when the command never started.
+ * The owner's ruling (D-B-62): the cleanup runs whenever the gate command ran
+ * (pass, fail or timeout); a candidate that no longer merges never starts the
+ * command, so there is nothing to clean up. */
+export const CLEANUP_NOT_RUN =
+  "the cleanup runs whenever the gate command ran (pass, fail or timeout); the candidate does not merge, so the gate never started and nothing was cleaned";
+
+export const GATE_BINDING_STATEMENT =
+  "The conductor runs the phase's gate command itself, once, after the checks, the probe and all three reviews pass, and only its record (checks/<sha>/gate.json) counts as the live proof. Never run the gate command yourself, and never report, substitute or fabricate its evidence.";
+
+/** Plan 01f: the gate section a prompt carries — the binding statement
+ * (always: no agent may run the gate or substitute its evidence, gate or no
+ * gate), the command when the contract declares one, and the record when one
+ * exists (facts only; `tail` adds the log's last lines for a failed
+ * record). */
+export function gatePromptLines(
+  gate: string | undefined,
+  record?: GateRecord,
+  tail?: string,
+): string[] {
+  const lines = ["", GATE_BINDING_STATEMENT];
+  if (gate) lines.push(`The phase's gate command is: \`${gate}\``);
+  if (record) {
+    // One outcome phrase (core/gate.ts), so a gate that never started is
+    // never rendered as "failed (exit undefined)" (findings B-22/A-23).
+    const how = record.reused
+      ? `reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s passing record`
+      : gateOutcomeText(record, { withElapsed: true });
+    lines.push(`Gate record for candidate ${record.candidateSha.slice(0, 9)}: ${record.command} — ${how}; log sha256 ${record.logSha256}`);
+    if (!record.passed && tail && tail.trim().length > 0) {
+      lines.push(`Last lines of that gate's log:`, tail);
+    }
+  }
+  return lines;
+}
+
+
+/** Plan 01i: the reviewer turn-2 directive section — every directive in force,
+ * verbatim, newest last, then the contract rule that binds them. Exported (and
+ * used by `#buildReviewerTurn2Prompt`) so a unit test exercises exactly what
+ * turn 2 sends, rather than a look-alike built from state somewhere else. */
+export function reviewerTurn2DirectiveSection(directives?: readonly OwnerDirective[]): string[] {
+  return [...directiveLines(directives), "", DIRECTIVE_BINDING_STATEMENT];
+}
+
 /** Plan 2c: what a repair attempt must know about the candidate that was
  * not accepted (design §5.2 "the rejecting ballots go to the worker's
  * session as a repair request", §4.2, §7.5). */
@@ -3521,6 +5434,8 @@ export function buildWorkerPrompt(
   repair?: RepairContext,
   references: string[] = [],
   secrets: readonly string[] = [],
+  directives?: readonly OwnerDirective[],
+  baselineCommands?: readonly BaselineCommand[],
 ): string {
   const lines: string[] = [
     `Goal: ${contract.goal}`,
@@ -3529,9 +5444,14 @@ export function buildWorkerPrompt(
     ...contract.acceptance.map((a) => `- ${a}`),
     ...secretPromptLines(secrets),
     ...referenceLines(references),
+    ...baselinePromptLines(baselineCommands),
   ];
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
+  lines.push(...directiveLines(directives));
+  // Plan 01f: the gate is the conductor's proof to produce, never the
+  // worker's (runtime doc §6's structural incentive to substitute it).
+  lines.push(...gatePromptLines(contract.gate));
   if (interruptionNote) lines.push("", interruptionNote);
   if (repair) {
     lines.push(
@@ -3553,6 +5473,7 @@ export function buildWorkerPrompt(
   }
   lines.push(
     "",
+    "If a criterion cannot be met AS WRITTEN (not merely unmet yet), say so instead of faking it: call submit_phase with `criterionDispute` = { criterion: <one acceptance item above, verbatim>, why, proposedWording }. The conductor records it as an amendment the reviewers vote on; if the normal tally passes, the wording is replaced for this phase and the next candidate is judged against it. A criterion that is merely unmet is a normal repair, not a dispute.",
     "How to work:",
     `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target). With node --test, pass --test-force-exit so a test that leaks a process cannot hold the command open. Do not pipe test output through tail or head: a command killed at the per-command time limit then returns nothing. If a test file is slow, run one test at a time with --test-name-pattern.`,
     "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",
@@ -3564,12 +5485,23 @@ export function buildWorkerPrompt(
   return lines.join("\n");
 }
 
-export function buildReviewerPrompt(phase: PhaseState, reviewer: Reviewer, secrets: readonly string[] = []): string {
+export function buildReviewerPrompt(
+  phase: PhaseState,
+  reviewer: Reviewer,
+  secrets: readonly string[] = [],
+  directives?: readonly OwnerDirective[],
+): string {
   return [
     `You are reviewer ${reviewer}. Review candidate ${phase.candidate?.sha} for phase ${phase.phaseId}.`,
     `Goal: ${phase.contract.goal}`,
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
     ...secretPromptLines(secrets),
+    ...directiveLines(directives),
+    // Plan 01f: the same rule every reviewer prompt carries — the conductor
+    // owns the gate evidence, and no agent may run the command or substitute
+    // for its record.
+    ...gatePromptLines(phase.contract.gate),
+    ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),
     "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
   ].join("\n");
 }

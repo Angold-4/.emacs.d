@@ -56,6 +56,13 @@ while (my $line = <STDIN>) { }
 exit 0;
 `;
 
+/** Plan 01f: the same helper, but with a BLOCKING `flock(LOCK_EX)`: the
+ * machine-wide gate lock (`~/.tradeoffs-trace/gate.lock`) must make a second
+ * gate wait for the first, never fail it. A holder that dies releases the
+ * lock the same way (its stdin hits EOF), so a crashed gate cannot wedge
+ * every later one. */
+const WAITING_HELPER_SCRIPT = HELPER_SCRIPT.replace("flock($fh, LOCK_EX | LOCK_NB)", "flock($fh, LOCK_EX)");
+
 export class LockError extends Error {
   lockPath: string;
   holderPid: string | undefined;
@@ -114,8 +121,23 @@ export class Lock {
  * fails to start. Fails fast: it never waits for a timeout, because the
  * perl side uses `LOCK_EX | LOCK_NB`. */
 export function acquireLock(lockPath: string): Promise<Lock> {
+  return spawnLockHelper(HELPER_SCRIPT, lockPath);
+}
+
+/** Plan 01f: a machine-wide lock that WAITS for the holder instead of
+ * failing (the perl side takes a blocking `LOCK_EX`). Used for the gate, so
+ * two phases — in the same program or in different runs — never run their
+ * expensive gate command at once; the second waits for the first (design
+ * 01_ref_design.md's `~/.tradeoffs-trace/gate.lock`). A holder that died
+ * releases the lock when its helper exits, so the wait is bounded by the
+ * holder's own gate limit, never by this call. */
+export function acquireWaitingLock(lockPath: string): Promise<Lock> {
+  return spawnLockHelper(WAITING_HELPER_SCRIPT, lockPath);
+}
+
+function spawnLockHelper(helperScript: string, lockPath: string): Promise<Lock> {
   return new Promise((resolve, reject) => {
-    const child = spawn(PERL_BIN, ["-e", HELPER_SCRIPT, lockPath], {
+    const child = spawn(PERL_BIN, ["-e", helperScript, lockPath], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 

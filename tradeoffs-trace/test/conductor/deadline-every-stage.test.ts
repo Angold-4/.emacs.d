@@ -231,10 +231,14 @@ test("deadline-every-stage", { timeout: 300_000 }, async (t) => {
     const mark = marker("probe");
     const probeMarkerFile = `/tmp/${mark}-seen`;
     const setup = await setupConductor({
-      // Passes quickly the first time (during CHECKING); the second time
-      // the very same command runs (during PROBING, against the probed
-      // integration checkout) it sleeps long enough to hit probeMs.
-      checks: [`test -f ${probeMarkerFile} && { echo START-${mark}; sleep 300; } || touch ${probeMarkerFile}`],
+      // Passes quickly on the first two executions (plan 01e's base
+      // baseline, then CHECKING); the third — the very same command, during
+      // PROBING, against the probed integration checkout — sleeps long
+      // enough to hit probeMs.
+      checks: [
+        `n=$(cat ${probeMarkerFile} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${probeMarkerFile};` +
+          ` if [ $n -ge 3 ]; then echo START-${mark}; sleep 300; fi`,
+      ],
       // The probe must actually rerun the checks for this case (plan 2c
       // otherwise reuses the candidate's passed checks on a fast-forward).
       probeReuse: false,

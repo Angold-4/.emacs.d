@@ -174,6 +174,13 @@ Org line the owner will edit rather than at a temporary JSON copy."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
          (id (org-element-property :ID hl))
          (checks (org-element-property :CHECKS hl))
+         ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
+         ;; the command it runs once per candidate the reviewers accepted,
+         ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
+         ;; whatever its outcome. Both optional — a phase without them never
+         ;; enters the GATING stage.
+         (gate (org-element-property :GATE hl))
+         (gate-cleanup (org-element-property :GATE_CLEANUP hl))
          (boundaries (org-element-property :BOUNDARIES hl))
          (reserved (org-element-property :RESERVED hl))
          (provisional (member "provisional" (org-element-property :tags hl)))
@@ -199,10 +206,12 @@ Org line the owner will edit rather than at a temporary JSON copy."
             (checks . ,(vconcat (and checks (list checks))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat (and reserved (split-string reserved ";" t "[ \t]+"))))
+            (provisional . ,(if provisional t :false))
             ,@(when owner-checklist
                 `((ownerChecklist . ,(vconcat owner-checklist))
                   (ownerChecklistLines . ,(vconcat owner-checklist-lines))))
-            (provisional . ,(if provisional t :false)))
+            ,@(when gate `((gate . ,gate)))
+            ,@(when gate-cleanup `((gateCleanup . ,gate-cleanup))))
           (nreverse errors))))
 
 (defun +tt--plan-references (dir)
@@ -230,15 +239,19 @@ so no agent searches the file system for them."
       (nreverse out))))
 
 (defun +tt--plan-deadlines ()
-  "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES and
-#+TT_ATTEMPT_MINUTES, as the conductor's deadline fields in ms (or nil).
-For repositories whose builds and suites outlast the defaults (3, 5, 45)."
+  "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES,
+#+TT_ATTEMPT_MINUTES and #+TT_GATE_MINUTES, as the conductor's deadline
+fields in ms (or nil).  For repositories whose builds and suites outlast the
+defaults (3, 5, 45, 30)."
   (let ((ms (lambda (kw) (let ((v (+tt--keyword kw)))
                            (and v (string-match-p "\\`[0-9]+\\'" v) (* 60000 (string-to-number v))))))
         (out nil))
     (when-let* ((v (funcall ms "TT_SH_MINUTES"))) (push (cons 'shCommandMs v) out))
     (when-let* ((v (funcall ms "TT_CHECK_MINUTES"))) (push (cons 'checkMs v) out) (push (cons 'probeMs v) out))
     (when-let* ((v (funcall ms "TT_ATTEMPT_MINUTES"))) (push (cons 'workerAttemptMs v) out))
+    ;; Plan 01f: a gate defaults to 30 minutes — a 15-minute --clean --build
+    ;; fits, the old 8-minute sh limit did not (runtime doc §6).
+    (when-let* ((v (funcall ms "TT_GATE_MINUTES"))) (push (cons 'gateMs v) out))
     (nreverse out)))
 
 (defun +tt--plan-secrets ()
@@ -494,6 +507,10 @@ several phases runs them in order."
 
 (defvar-local +tt--program-dir nil "Program directory shown by this buffer.")
 
+;; Plan 01i: an input buffer whose text becomes a program-wide directive.
+(defvar-local +tt--input-program-dir nil
+  "Program directory whose input box this buffer is, or nil for a run's box.")
+
 (defun +tt-program-start ()
   "Validate the program (or multi-phase plan) in this buffer and start it.
 Every entry's plan is linted first, so a lint error in any phase blocks the
@@ -558,14 +575,16 @@ whole program; warnings are shown and it starts."
   "RET" #'+tt-program-open-node
   "k" #'+tt-program-stop
   "R" #'+tt-program-resume
+  "i" #'+tt-program-input
   "g" #'+tt--refresh-all)
 
 (define-derived-mode +tt-program-mode special-mode "tt-program"
-  "A tradeoffs-trace program.  \\<+tt-program-mode-map>\\[+tt-program-open-node] opens a phase's run, \\[+tt-program-stop] stops, \\[+tt-program-resume] resumes."
+  "A tradeoffs-trace program.  \\<+tt-program-mode-map>\\[+tt-program-open-node] opens a phase's run, \\[+tt-program-input] sends a program-wide directive, \\[+tt-program-stop] stops, \\[+tt-program-resume] resumes."
   (visual-line-mode 1)
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +tt-program-mode-map
-      (kbd "RET") #'+tt-program-open-node "k" #'+tt-program-stop "R" #'+tt-program-resume "g" #'+tt--refresh-all)))
+      (kbd "RET") #'+tt-program-open-node "k" #'+tt-program-stop "R" #'+tt-program-resume
+      "i" #'+tt-program-input "g" #'+tt--refresh-all)))
 
 ;;;###autoload
 (defun +tt-program (&optional dir)
@@ -869,6 +888,7 @@ the longer one behind — the same order secrets.ts's byLengthDesc uses."
     ("delivered" "delivered")
     ("noted" "noted")
     ("correction-started" "correction started")
+    ("reverted" "reverted an amendment")
     ("delivery-uncertain" (format "delivery uncertain%s" (if reason (format " (%s)" reason) "")))
     ("refused" (format "refused: %s" (or reason "not accepted")))
     (_ (or state "sent"))))
@@ -878,11 +898,51 @@ the longer one behind — the same order secrets.ts's byLengthDesc uses."
   (ignore-errors
     (> (- (float-time) (float-time (date-to-time at))) 30)))
 
+(defun +tt--directive-delivery (d)
+  "Per-agent delivery text for directive D: `worker ✓ M ⧗ A ✓'.
+A target the conductor recorded `delivered' shows ✓, one it could not send
+shows ?, and one still in flight (or never live) shows ⧗.  A directive sent
+with no agent live says so instead."
+  (let ((targets (alist-get 'targets d))
+        (deliveries (alist-get 'deliveries d)))
+    (if (null targets)
+        "(no live agent; carried in every later prompt)"
+      (mapconcat
+       (lambda (t)
+         (let ((state (alist-get (intern t) deliveries)))
+           (format "%s %s" t
+                   (cond ((equal state "delivered") "✓")
+                         ((equal state "delivery-uncertain") "?")
+                         (t "⧗")))))
+       targets " "))))
+
+(defun +tt--render-directives (s)
+  "Insert the Owner directives section (plan 01i) from state S, if any.
+Each directive shows its id, its scope (this phase / whole program),
+whether it is in force or withdrawn, its verbatim text and the delivery
+state per live agent (`worker ✓ M ⧗ A ✓')."
+  (let ((directives (alist-get 'ownerDirectives (+tt--get s 'state 'phase))))
+    (when directives
+      ;; Oldest first, by the number in the id — never the order the inbox
+      ;; happened to hand the files over (a lexicographic scan puts ODP-10
+      ;; before ODP-2).
+      (setq directives (sort (copy-sequence directives)
+                             (lambda (a b) (< (or (alist-get 'seq a) 0) (or (alist-get 'seq b) 0)))))
+      (insert (format "\nOwner directives (%d)\n" (length directives)))
+      (dolist (d directives)
+        (insert (format "  - %s [%s, %s] %s — %s\n"
+                        (alist-get 'id d)
+                        (if (equal (alist-get 'scope d) "program") "whole program" "this phase")
+                        (if (equal (alist-get 'status d) "withdrawn") "withdrawn" "in force")
+                        (truncate-string-to-width (or (alist-get 'text d) "") 70 nil nil "…")
+                        (+tt--directive-delivery d)))))))
+
 (defun +tt--render-owner-inputs (s)
   "Insert the Owner input section (design §7.4/§9.3) from state S, if any.
 Recorded effects come from the conductor (`ownerInputs'); anything still
 sitting in the inbox (`pendingOwnerInputs') is shown as sent, or `not
-picked up' once 30 s have passed.  Nothing is inferred beyond that."
+picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
+01i: the owner directives are shown here too, with their per-agent delivery."
   (let* ((recorded (or (alist-get 'ownerInputs s) nil))
          (pending (or (alist-get 'pendingOwnerInputs s) nil))
          (entries (append
@@ -902,13 +962,16 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
           (insert (format "  - %s — %s%s\n"
                           (truncate-string-to-width text 70 nil nil "…")
                           (car e)
-                          (if kind (format " (%s)" kind) ""))))))))
+                          (if kind (format " (%s)" kind) ""))))))
+    (+tt--render-directives s)))
 
 (defun +tt--render-input-header ()
   "Recompute the *tt-input* header line from the current run state."
   (setq header-line-format
         (condition-case err
-            (+tt--input-header (+tt--state +tt--run-dir))
+            (if +tt--input-program-dir
+                (+tt--input-header nil t)
+              (+tt--input-header (+tt--state +tt--run-dir)))
           (error (format "Cannot deliver input: %s" (error-message-string err))))))
 
 (defun +tt--status-row (label value &optional face)
@@ -942,6 +1005,13 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
     (+tt--status-row "pipeline" (alist-get 'pipeline v))
     (+tt--status-row "time" (alist-get 'time v))
     (+tt--status-row "gates" (alist-get 'gates v))
+    ;; Plan 01f: the conductor's own gate record, cited (nil when this phase
+    ;; declares no :GATE:).
+    (+tt--status-row "gate" (alist-get 'gate v))
+    ;; Plan 01e: the base's own pre-existing check failures (D2), when any.
+    (+tt--status-row "base" (alist-get 'baseline v) 'warning)
+    ;; Plan 01g: every amendment record, applied or reverted, old → new.
+    (+tt--status-row "amended" (alist-get 'amendments v) 'warning)
     (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)
     (+tt--status-row "reviews" (alist-get 'reviewLine v))
     (+tt--status-row "verdict" (alist-get 'verdict v)
@@ -1015,45 +1085,122 @@ would otherwise reject permanently as malformed)."
     (rename-file tmp final t)
     id))
 
-(defun +tt--input-header (s)
+(defun +tt--input-scope-note (&optional program-wide not-in-program)
+  "The scope sentence the input header shows before sending.
+Plan 01i (D5): a directive applies to its phase unless the sender asks for
+the whole program — with PROGRAM-WIDE, or always in a program buffer.  A run
+that is not part of a program has nothing program-wide to reach, and says so
+rather than promising one."
+  (cond
+   (program-wide "applying to the whole program (every running node now, every node started later)")
+   (not-in-program "applying to this phase (this run is not part of a program, so C-u reaches no other node)")
+   (t "applying to this phase (C-u C-c C-c: whole program)")))
+
+(defun +tt--input-header (s &optional program)
   "One line stating what sending the input will do now, from state S.
 Design §7.4/§7.5: a steer while a worker runs, a note otherwise, a
-correction while the phase is AWAITING_OWNER, a refusal after DONE/BLOCKED
-— or that the conductor cannot deliver input at all."
-  (let* ((phase (+tt--get s 'state 'phase))
-         (name (alist-get 'phase phase))
-         (attempt (+tt--get phase 'attempt 'n))
-         (alive (eq (alist-get 'conductorAlive s) t))
-         (requests (seq-filter (lambda (r) (equal (alist-get 'status r) "open"))
-                               (alist-get 'ownerRequests phase))))
-    (cond
-     ((equal name "DONE")
-      "Sending is refused: the run is DONE.")
-     ((equal name "BLOCKED")
-      (let ((why (alist-get 'blockedReason phase)))
-        (format "Sending is refused: the phase is BLOCKED%s."
-                (if why (format " (%s)" why) ""))))
-     ((not alive)
-      "Cannot deliver input: no conductor is running for this run (resume it to deliver).")
-     ((equal name "AWAITING_OWNER")
-      (format "Sending corrects the phase: resolves %d open owner request(s), grants 3 repair rounds, starts a repair attempt with your text verbatim."
-              (length requests)))
-     ((member name '("IMPLEMENTING" "FREEZING"))
-      (format "Sending steers worker attempt %s now (at most once; C-c C-c or RET)." attempt))
-     (t
-      (format "Sending notes the next worker attempt (phase %s)." (or name "?"))))))
+correction while the phase is AWAITING_OWNER and a refusal after DONE or
+BLOCKED — plus plan 01i's scope, since every text becomes an owner
+directive.  PROGRAM t means this is a program buffer's input, which is
+program-wide by construction (S is nil then)."
+  (if program
+      "Sending makes a program-wide owner directive for the whole program: steered to every running node now, and carried in every later prompt of every node."
+    (let* ((phase (+tt--get s 'state 'phase))
+           (name (alist-get 'phase phase))
+           (attempt (+tt--get phase 'attempt 'n))
+           (alive (eq (alist-get 'conductorAlive s) t))
+           (in-program (and (alist-get 'program s) t))
+           (requests (seq-filter (lambda (r) (equal (alist-get 'status r) "open"))
+                                 (alist-get 'ownerRequests phase))))
+      (cond
+       ((equal name "DONE")
+        "Sending is refused: the run is DONE.")
+       ((equal name "BLOCKED")
+        (let ((why (alist-get 'blockedReason phase)))
+          (format "Sending is refused: the phase is BLOCKED%s."
+                  (if why (format " (%s)" why) ""))))
+       ((not alive)
+        "Cannot deliver input: no conductor is running for this run (resume it to deliver).")
+       ((equal name "AWAITING_OWNER")
+        (format "Sending corrects the phase: resolves %d open owner request(s), grants 3 repair rounds, starts a repair attempt with your text verbatim, and becomes an owner directive %s."
+                (length requests) (+tt--input-scope-note nil (not in-program))))
+       ((member name '("IMPLEMENTING" "FREEZING"))
+        (format "Sending steers worker attempt %s now (at most once; C-c C-c or RET), and becomes an owner directive %s."
+                attempt (+tt--input-scope-note nil (not in-program))))
+       (t
+        (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s). A text that is exactly `revert <amendment-id> is sent as a correction that reverts that amendment."
+                (+tt--input-scope-note nil (not in-program)) (or name "?")))))))
 
-(defun +tt-input-send ()
+(defun +tt-input-send (&optional program-wide)
   "Queue the input buffer's text as the owner input its phase calls for.
 Design §7.4/§7.5: a steer to a running worker, a correction while the
 phase is AWAITING_OWNER, a note otherwise; refused after DONE or BLOCKED,
-with the reason shown here."
-  (interactive)
+with the reason shown here.  Plan 01i: every text is also an owner
+directive — for this phase, or for the whole program with PROGRAM-WIDE
+(C-u C-c C-c) or in a program buffer."
+  (interactive "P")
   (let* ((text (string-trim (buffer-string)))
-         (s (ignore-errors (+tt--state +tt--run-dir)))
+         (in-program +tt--input-program-dir)
+         (program-wide (or in-program program-wide)))
+    (when (string-empty-p text) (user-error "Nothing to send"))
+    (if in-program
+        (+tt--send-program-directive in-program text)
+      (+tt--send-run-input +tt--run-dir text program-wide))))
+
+(defun +tt--program-withdraw-id (text)
+  "The program-wide directive id TEXT withdraws, or nil when not a withdrawal.
+Signals a user-error — never a silent no-op, never a new ruling — for a
+withdrawal that names no id or names a phase directive (`OD-n'): the program
+has only `ODP-n' rulings, and plan 01i forbids inverting a near-miss into a
+fresh binding directive."
+  (when (string-match "\\`withdraw\\b" text)
+    (let* ((rest (string-trim (substring text (match-end 0))))
+           (id (and (string-match "\\`\\(ODP-[0-9]+\\|OD-[0-9]+\\)\\b" rest)
+                    (upcase (match-string 1 rest)))))
+      (cond
+       ((null id)
+        (user-error "Refused: a withdrawal must name a directive id, e.g. `withdraw ODP-1`"))
+       ((not (string-prefix-p "ODP-" id))
+        (user-error "Refused: %s is a phase directive; a program buffer withdraws program-wide ones (ODP-n)" id))
+       (t id)))))
+
+(defun +tt--send-program-directive (dir text)
+  "Send TEXT as a program-wide ruling through the CLI, at once.
+A withdrawal (`withdraw ODP-n') is recorded and pushed by `tt program
+withdraw', which refuses an unknown or already-withdrawn id — so the owner is
+never told a ruling was retracted when it was not."
+  (let ((withdraw-id (+tt--program-withdraw-id text)))
+    (erase-buffer)
+    (if withdraw-id
+        (progn
+          (+tt--cli "program" "withdraw" dir withdraw-id)
+          (message "tradeoffs-trace: program-wide withdrawal of %s recorded; every running node is steered that it no longer applies"
+                   withdraw-id))
+      (let ((id (+tt--cli "program" "directive" dir text)))
+        (message "tradeoffs-trace: program-wide directive %s recorded; every running node is steered at once" id)))))
+
+(defun +tt--revert-amendment-id (s text)
+  "The applied amendment id an explicit `revert AM-…' command names, or nil.
+Plan 01g: only the command form counts — text that merely mentions the id
+must stay a steer/note so it still reaches an agent (B-16) — and the input
+box sends it as a correction even when the phase is not AWAITING_OWNER."
+  (when (string-match "\\`[ \t]*revert[ \t]+\\([^ \t]+\\)" text)
+    (let* ((id (match-string 1 text))
+           (phase (and s (+tt--get s 'state 'phase)))
+           (decisions (and phase (alist-get 'decisions phase))))
+      (seq-some (lambda (d)
+                  (let ((a (alist-get 'amendment d)))
+                    (when (and a (equal (alist-get 'status a) "applied")
+                               (equal (alist-get 'id a) id))
+                      id)))
+                decisions))))
+
+(defun +tt--send-run-input (run-dir text program-wide)
+  "Queue TEXT as the owner input RUN-DIR's phase calls for.
+PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
+  (let* ((s (ignore-errors (+tt--state run-dir)))
          (phase (and s (+tt--get s 'state 'phase)))
          (name (and phase (alist-get 'phase phase))))
-    (when (string-empty-p text) (user-error "Nothing to send"))
     (unless s (user-error "Cannot read this run's state"))
     (cond
      ((equal name "DONE")
@@ -1063,14 +1210,39 @@ with the reason shown here."
         (user-error "Refused: the phase is BLOCKED%s" (if why (format " (%s)" why) ""))))
      (t
       (let* ((binding `((runId . ,(+tt--get phase 'runId)) (phaseId . ,(+tt--get phase 'phaseId))))
+             (revert-id (and (not program-wide) (+tt--revert-amendment-id s text)))
              (kind (cond ((equal name "AWAITING_OWNER") "correction")
+                         (revert-id "correction")
                          ((member name '("IMPLEMENTING" "FREEZING")) "steer")
                          (t "note")))
+             ;; A run that is not part of a program has nothing program-wide
+             ;; to reach: the conductor demotes such an input to this phase's
+             ;; own directive, and the confirmation must say what the header
+             ;; and the recorded record say.
+             (effective (if (and program-wide (alist-get 'program s)) "program" "phase"))
              (id (+tt--write-command
-                  +tt--run-dir
-                  `((type . ,kind) (text . ,text) (binding . ,binding)))))
+                  run-dir
+                  `((type . ,kind) (text . ,text)
+                    (scope . ,effective)
+                    (binding . ,binding)))))
         (erase-buffer)
-        (message "tradeoffs-trace: %s queued in the inbox (%s); see Owner input in the status buffer" kind id))))))
+        (if revert-id
+            (message "tradeoffs-trace: correction %s queued in the inbox (%s) — it reverts %s; see Owner input in the status buffer"
+                     kind id revert-id)
+          (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
+                   kind id (if (equal effective "program") "the whole program" "this phase"))))))))
+
+(defun +tt-program-input ()
+  "Open this program's input box: text sent there is a program-wide directive."
+  (interactive)
+  (let* ((dir (or +tt--program-dir (user-error "Not a program buffer")))
+         (buf (get-buffer-create (format "*tt-input: program %s*" (file-name-nondirectory (directory-file-name dir))))))
+    (with-current-buffer buf
+      (unless (derived-mode-p '+tt-input-mode) (+tt-input-mode))
+      (setq +tt--run-dir dir
+            +tt--input-program-dir dir))
+    (pop-to-buffer buf)
+    (+tt--ensure-timer)))
 
 (defun +tt-input-ret ()
   "RET in the input buffer: send in Evil normal state, else insert a newline."
@@ -1084,7 +1256,9 @@ with the reason shown here."
   "RET" #'+tt-input-ret)
 
 (define-derived-mode +tt-input-mode text-mode "tt-input"
-  "Owner input for a tradeoffs-trace run.  \\<+tt-input-mode-map>\\[+tt-input-send] sends."
+  "Owner input for a tradeoffs-trace run, or for a program (whole program).
+\\<+tt-input-mode-map>\\[+tt-input-send] sends; a prefix argument sends as a
+program-wide owner directive."
   (visual-line-mode 1)
   ;; In Evil normal state RET must send; in insert state it must insert a
   ;; newline (the mode-map RET binding covers emacs/insert, this covers
@@ -1120,21 +1294,52 @@ with the reason shown here."
 ;; intervenes only through the input box.  Every state label comes from the
 ;; tally (`decisionStatuses' in `tt state'), never from individual ballots.
 
+(defun +tt--amendment-label (amendment status)
+  "The heading an amendment record's AMENDMENT and tally STATUS deserve.
+Plan 01g: an applied amendment reads `⚑ AMENDED', a reverted one
+`⚑ REVERTED', and one still proposed or rejected reads as the vote's
+outcome."
+  (pcase (alist-get 'status amendment)
+    ("applied" "⚑ AMENDED")
+    ("reverted" "⚑ REVERTED")
+    (_ (format "AMENDMENT (%s)"
+               (pcase (alist-get 'status status)
+                 ("passed" "approved, applying")
+                 ("failed" (format "rejected: %s" (or (alist-get 'reason status) "vote failed")))
+                 ("superseded" "superseded")
+                 (_ "pending vote"))))))
+
+(defun +tt--amendment-line (decision)
+  "The `old → new' line for DECISION's amendment record, or nil.
+Plan 01g: a reverted amendment restored the original wording, so its arrow
+points back and the view never claims the replacement is in force (A-14)."
+  (let* ((a (alist-get 'amendment decision))
+         (criterion (or (alist-get 'criterion a) ""))
+         (proposed (or (alist-get 'proposedWording a) "")))
+    (when a
+      (if (equal (alist-get 'status a) "reverted")
+          (format "  %s → %s\n" proposed criterion)
+        (format "  %s → %s\n" criterion proposed)))))
+
 (defun +tt--decision-label (status d phase)
   "Heading label for decision D with tally STATUS in PHASE."
   (let ((dissent (seq-some (lambda (b) (and (equal (alist-get 'decisionId b) (alist-get 'id d))
                                             (equal (alist-get 'vote b) "reject")))
-                           (alist-get 'ballots phase))))
+                           (alist-get 'ballots phase)))
+        (amendment (alist-get 'amendment status)))
     (concat
-     (pcase (alist-get 'status status)
-       ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
-       ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
-       ("suspended" "SUSPENDED")
-       ("owner" "NEEDS YOU")
-       ("detail" "DETAIL")
-       (_ "PENDING"))
-     ;; A reserved decision: voted like any other, flagged for the owner.
-     (if (eq (alist-get 'flagged status) t) " ⚑ FLAGGED" ""))))
+     (if amendment
+         (+tt--amendment-label amendment status)
+       (pcase (alist-get 'status status)
+         ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
+         ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
+         ("suspended" "SUSPENDED")
+         ("owner" "NEEDS YOU")
+         ("detail" "DETAIL")
+         (_ "PENDING")))
+     ;; A reserved decision: voted like any other, flagged for the owner (an
+     ;; amendment is already marked, so the flag would only repeat it).
+     (if (and (not amendment) (eq (alist-get 'flagged status) t)) " ⚑ FLAGGED" ""))))
 
 (defun +tt--decision-block (d status phase)
   "Insert decision D (tally STATUS) as one self-contained Org entry."
@@ -1147,6 +1352,8 @@ with the reason shown here."
          (ballots (seq-filter (lambda (b) (equal (alist-get 'decisionId b) (alist-get 'id d)))
                               (alist-get 'ballots phase))))
     (insert (format "* %s  %s\n" (+tt--decision-label status d phase) short))
+    ;; Plan 01g: the reworded acceptance item, verbatim old → new.
+    (when-let* ((line (+tt--amendment-line d))) (insert line))
     (unless (equal short (+tt--one-line choice 200)) (insert (format "  %s\n" choice)))
     (insert (format "  raised by %s%s\n"
                     (if (equal source "reviewer-discovered")

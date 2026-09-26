@@ -317,7 +317,7 @@ test("owner-inbox: an 'unneeded' command leaves the request open, so AWAITING_OW
   }
 });
 
-test("owner-inbox: a queued note is delivered in the next worker attempt only, not every later one", async () => {
+test("owner-inbox: a queued note is delivered in the next worker attempt (and, as an owner directive, in every later one)", async () => {
   const markerDir = fs.mkdtempSync("/tmp/tt-inbox-note-once-");
   const promptLog = path.join(markerDir, "worker-prompts.log");
   const noteText = "ONCE-ONLY-NOTE: keep the lock hold under 50us";
@@ -363,10 +363,17 @@ test("owner-inbox: a queued note is delivered in the next worker attempt only, n
       90_000,
     );
     assert.ok(fs.existsSync(promptLog), "expected worker prompts to be captured");
-    const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n");
-    const withNote = prompts.filter((p) => p.includes(noteText));
-    assert.equal(withNote.length, 1, "the note must appear in exactly one worker attempt's prompt");
+    const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n").filter((p) => p.trim().length > 0);
+    // The note's own queue entry is delivered to exactly the next attempt…
+    const withNote = prompts.filter((p) => p.includes(`Owner notes: ${noteText}`));
+    assert.equal(withNote.length, 1, "the note's own queue entry reaches exactly one worker attempt's prompt");
     assert.equal(setup.conductor.state.phase.deliveredNoteCount, 1, "exactly one note must be recorded as delivered");
+    // …and, plan 01i, every input is an owner directive in force: every
+    // later prompt quotes it verbatim, newest last.
+    const firstWithNote = prompts.findIndex((p) => p.includes(`Owner notes: ${noteText}`));
+    const later = prompts.slice(firstWithNote);
+    assert.ok(later.length >= 2, "several later attempts ran");
+    for (const p of later) assert.ok(p.includes(`OD-1: ${noteText}`), "every later prompt carries the directive");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

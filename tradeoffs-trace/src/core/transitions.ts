@@ -13,6 +13,7 @@
 // state. `actions` is what `next()` of the resulting state must equal.
 
 import { carryBallotsForward, carryDecisionsForward } from "./rounds.ts";
+import { gateCommandOf } from "./gate.ts";
 import {
   applyFindingAcceptedByOwner,
   applyOverrideCast,
@@ -24,7 +25,7 @@ import {
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
-import { accept, resolvedCorrectionIdsFor, reviewsComplete, sameVersion } from "./predicate.ts";
+import { accept, isLiveDecision, resolvedCorrectionIdsFor, reviewsComplete, sameVersion } from "./predicate.ts";
 import type {
   Correction,
   Decision,
@@ -95,6 +96,7 @@ function activePhaseStates(): PhaseStateName[] {
     "PROBING",
     "REVIEWING",
     "RESOLVING",
+    "GATING",
     "ACCEPTED",
     "AWAITING_OWNER",
     "BLOCKED",
@@ -152,7 +154,7 @@ function failureRows(
   trigger: Event["type"],
   repairActions: { type: string; [key: string]: unknown }[],
   cause: string,
-  extraApply?: (s: State) => State,
+  extraApply?: (s: State, ev: Event) => State,
 ) {
   addRow({
     id: `${idPrefix}-to-repairing`,
@@ -163,9 +165,9 @@ function failureRows(
     guard: (s) => budgetRemains(s),
     to: "REPAIRING",
     actions: repairActions,
-    apply: (s) => {
+    apply: (s, ev) => {
       const base = withPhase(s, { phase: "REPAIRING" });
-      return extraApply ? extraApply(base) : base;
+      return extraApply ? extraApply(base, ev) : base;
     },
   });
   addRow({
@@ -177,8 +179,8 @@ function failureRows(
     guard: (s) => budgetExhausted(s),
     to: "AWAITING_OWNER",
     actions: [],
-    apply: (s) => {
-      const base = extraApply ? extraApply(s) : s;
+    apply: (s, ev) => {
+      const base = extraApply ? extraApply(s, ev) : s;
       return enterAwaitingOwner(base, cause);
     },
   });
@@ -237,7 +239,12 @@ addRow({
   actions: [{ type: "run_checks", candidateSha: "C1" }],
   apply: (s, ev) => {
     const e = ev as Extract<Event, { type: "FREEZE_COMPLETED" }>;
-    const carried = carryDecisionsForward(s.phase.decisions, s.phase.pendingPrior, e.candidateSha);
+    const carried = carryDecisionsForward(
+      s.phase.decisions,
+      s.phase.pendingPrior,
+      e.candidateSha,
+      s.phase.contract.contractVersion,
+    );
     return withPhase(s, {
       phase: "CHECKING",
       candidate: { sha: e.candidateSha, contractVersion: s.phase.contract.contractVersion },
@@ -249,10 +256,11 @@ addRow({
       // worker kept or changed them (core/rounds.ts); the rest are superseded
       // and can no longer block acceptance.
       decisions: [...carried, ...e.decisions],
-      pendingDisclosures: undefined,
-      pendingPrior: undefined,
       round: (s.phase.round ?? 0) + 1,
       checks: undefined,
+      pendingDisclosures: undefined,
+      pendingPrior: undefined,
+      pendingDispute: undefined,
       probe: undefined,
       reviews: {},
       // Skill fix 5: kept decisions that passed keep their ballots.
@@ -531,31 +539,228 @@ addRow({
 });
 
 // --- RESOLVING --------------------------------------------------------
+/** Plan 01f: a phase whose contract declares a `:GATE:` command gates the
+ * candidate before accepting it — `` accept(C, K) `` is what the *gate stage*
+ * is entered on, and the ACCEPTED event is what a passing gate releases.
+ * Two guards share the two events, so a gate-less phase keeps exactly the
+ * pre-01f edge (RESOLVING --ACCEPTED--> ACCEPTED): */
+function gateDeclared(s: State): boolean {
+  return gateCommandOf(s.phase.contract) !== undefined;
+}
+
+/** The corrections the ACCEPTED event must name, checked against what
+ * predicate.ts computes — the event may not invent or omit one (§6.3/§7.5
+ * step 5: "the ACCEPTED event records it as resolved"). */
+function acceptCorrectionsMatch(s: State, ev: Event): boolean {
+  const e = ev as Extract<Event, { type: "ACCEPTED" }>;
+  const C = s.phase.candidate!.sha;
+  const K = s.phase.contract.contractVersion;
+  const computed = resolvedCorrectionIdsFor(s.phase, C, K);
+  const given = [...(e.resolvedCorrectionIds ?? [])].sort();
+  return JSON.stringify(given) === JSON.stringify(computed);
+}
+
+function applyAccepted(s: State, ev: Event): State {
+  const e = ev as Extract<Event, { type: "ACCEPTED" }>;
+  const corrections = s.phase.corrections.map((c: Correction) =>
+    e.resolvedCorrectionIds.includes(c.id) ? { ...c, status: "resolved" as const } : c,
+  );
+  return withPhase(s, { phase: "ACCEPTED", corrections, inFlight: clearInFlight(s.phase, "run_gate") });
+}
+
+// --- plan 01g: a passing amendment rewrites one acceptance item -------
+// A `criterionDispute` becomes a `reserved` amendment decision the reviewers
+// vote on like any other. A passing normal tally (M plus one of A/B) applies
+// it: the wording is replaced for this phase only, the contract version
+// bumps, contract findings citing the old wording are superseded, and the
+// phase starts a fresh attempt so the NEXT candidate is judged against the
+// new wording. The amendment itself consumes no repair round (the attempt is
+// a fresh one, not a repair), and a failed amendment leaves the criterion
+// unchanged and never blocks acceptance on its own.
+function amendmentCitesCriterion(f: Finding, criterion: string, amendmentDecisionId: string): boolean {
+  if (f.criterionDisputed === criterion) return true;
+  if (f.linkedDecisionId === amendmentDecisionId) return true;
+  // A `contract` finding may quote the criterion without carrying the
+  // dispute marker; only a delimited verbatim quote counts, so a finding
+  // that merely mentions the phrase while raising a different problem is
+  // not silently retired (finding B-5).
+  if (f.kind !== "contract") return false;
+  const i = (f.evidence ?? "").indexOf(criterion);
+  if (i === -1) return false;
+  const before = i === 0 ? "" : f.evidence[i - 1];
+  const after = i + criterion.length >= f.evidence.length ? "" : f.evidence[i + criterion.length];
+  const delim = (c: string) => c === "" || /["'`“”‘’(\[<]/.test(c);
+  return delim(before) && delim(after);
+}
+
+function criterionAmendmentReady(s: State, ev: Event): boolean {
+  const e = ev as Extract<Event, { type: "CRITERION_AMENDED" }>;
+  if (!s.phase.candidate) return false;
+  const decision = s.phase.decisions.find((d) => d.id === e.decisionId);
+  if (!decision || !decision.amendment || decision.amendment.status !== "proposed") return false;
+  if (decision.boundCandidateSha !== s.phase.candidate.sha) return false;
+  if (!sameVersion(decision.boundContractVersion, s.phase.contract.contractVersion)) return false;
+  if (!Array.isArray(e.newAcceptance) || e.newAcceptance.length === 0 || e.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
+    return false;
+  }
+  return s.phase.contract.acceptance.includes(decision.amendment.criterion);
+}
+
+function applyCriterionAmended(s: State, ev: Event): State {
+  const e = ev as Extract<Event, { type: "CRITERION_AMENDED" }>;
+  const decision = s.phase.decisions.find((d) => d.id === e.decisionId)!;
+  const amendment = decision.amendment!;
+  const decisions = s.phase.decisions.map((d) => {
+    if (d.id === e.decisionId) {
+      return {
+        ...d,
+        version: d.version + 1,
+        // The applied amendment now describes the new contract version; a
+        // later revert is bound to it.
+        boundContractVersion: e.newContractVersion,
+        amendment: { ...amendment, status: "applied" as const, appliedContractVersion: e.newContractVersion },
+      };
+    }
+    // Another reviewer's still-proposed amendment for the SAME criterion is
+    // moot once this one applies: supersede it so it is never voted or
+    // applied again (finding A-1).
+    if (
+      d !== decision &&
+      isLiveDecision(d) &&
+      d.amendment?.status === "proposed" &&
+      d.amendment.criterion === amendment.criterion
+    ) {
+      return { ...d, version: d.version + 1, supersededBy: `amendment ${amendment.id} replaced the wording` };
+    }
+    return d;
+  });
+  // Contract findings that cited the replaced wording are closed as
+  // superseded — never left open to fail every later round.
+  const findings = s.phase.findings.map((f) =>
+    f.status === "open" && f.kind === "contract" && amendmentCitesCriterion(f, amendment.criterion, e.decisionId)
+      ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
+      : f,
+  );
+  return withPhase(s, {
+    phase: "IMPLEMENTING",
+    contract: { ...s.phase.contract, acceptance: e.newAcceptance, contractVersion: e.newContractVersion },
+    candidate: s.phase.candidate && { sha: s.phase.candidate.sha, contractVersion: e.newContractVersion },
+    decisions,
+    findings,
+    attempt: { n: s.phase.attempt.n + 1 },
+    checks: undefined,
+    probe: undefined,
+    reviews: {},
+    ballots: [],
+    overrides: [],
+    inFlight: {},
+    pendingDispute: undefined,
+    pendingDisclosures: undefined,
+    pendingPrior: undefined,
+  });
+}
+
+addRow({
+  id: "resolving-criterion-amended",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "CRITERION_AMENDED",
+  guardName: "criterionAmendmentReady",
+  guard: criterionAmendmentReady,
+  to: "IMPLEMENTING",
+  // The resulting IMPLEMENTING state has no worker in flight, so next()
+  // dispatches a fresh attempt under the new contract version.
+  actions: [{ type: "dispatch_worker" }],
+  apply: applyCriterionAmended,
+});
+
+// A gate-less phase: acceptance is immediate, exactly as before plan 01f.
 addRow({
   id: "resolving-accept-holds",
   axis: "phase",
   from: "RESOLVING",
   trigger: "ACCEPTED",
-  guardName: "acceptHoldsAndCorrectionsMatch",
-  guard: (s, ev) => {
-    if (!acceptHolds(s)) return false;
-    const e = ev as Extract<Event, { type: "ACCEPTED" }>;
-    const C = s.phase.candidate!.sha;
-    const K = s.phase.contract.contractVersion;
-    const computed = resolvedCorrectionIdsFor(s.phase, C, K);
-    const given = [...(e.resolvedCorrectionIds ?? [])].sort();
-    return JSON.stringify(given) === JSON.stringify(computed);
-  },
+  guardName: "acceptHoldsNoGateAndCorrectionsMatch",
+  guard: (s, ev) => !gateDeclared(s) && acceptHolds(s) && acceptCorrectionsMatch(s, ev),
   to: "ACCEPTED",
   // Canonical integrationHead "H0", probedI "I1" (see the row's fixture).
   actions: [{ type: "publish_intent", expectedHead: "H0", candidateI: "I1" }],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ACCEPTED" }>;
-    const corrections = s.phase.corrections.map((c: Correction) =>
-      e.resolvedCorrectionIds.includes(c.id) ? { ...c, status: "resolved" as const } : c,
-    );
-    return withPhase(s, { phase: "ACCEPTED", corrections });
+  apply: applyAccepted,
+});
+
+/** Plan 01f: the candidate is acceptable, but the phase's contract declares a
+ * gate — so the phase gates it first. The gate itself is dispatched from
+ * GATING (the new stage), never from here. */
+addRow({
+  id: "resolving-gate-required",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "GATE_REQUIRED",
+  guardName: "acceptHoldsAndGateDeclared",
+  guard: (s) => acceptHolds(s) && gateDeclared(s),
+  to: "GATING",
+  actions: [{ type: "run_gate", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { phase: "GATING" }),
+});
+
+// --- GATING (plan 01f): the conductor's own expensive, live gate ----------
+// The gate command runs once for this candidate (a recorded pass for the same
+// tree is reused instead of rerun: core/gate.ts's `reusableGate`, and the
+// conductor's `#runGate`). Its outcome is one of these three events; nothing
+// else leaves GATING except AMEND/REVISE (see their own rows).
+addRow({
+  id: "gate-accepted",
+  axis: "phase",
+  from: "GATING",
+  trigger: "ACCEPTED",
+  guardName: "acceptHoldsAndCorrectionsMatch",
+  guard: (s, ev) => acceptHolds(s) && acceptCorrectionsMatch(s, ev),
+  to: "ACCEPTED",
+  actions: [{ type: "publish_intent", expectedHead: "H0", candidateI: "I1" }],
+  apply: applyAccepted,
+});
+
+failureRows(
+  "gate-failed",
+  "GATING",
+  "GATE_FAILED",
+  REPAIR_ATTEMPT_ACTIONS,
+  "the gate kept failing",
+  (s, ev) => {
+    // The gate's own evidence enters the record as a blocking `integration`
+    // finding (runtime §4's fourth blocking-integration case), exactly like a
+    // failed integration probe: the repair round carries the log's last lines
+    // to the worker, and the owner sees the same finding if the budget runs
+    // out.
+    const e = ev as Extract<Event, { type: "GATE_FAILED" }>;
+    const finding: Finding = {
+      id: `F-${s.phase.phaseId}-gate-${s.phase.findings.length + 1}`,
+      version: 1,
+      phaseId: s.phase.phaseId,
+      kind: "integration",
+      severity: "blocking",
+      evidence: e.evidence,
+      raisedBy: "conductor",
+      status: "open",
+      boundCandidateSha: s.phase.candidate!.sha,
+    };
+    return withPhase(s, {
+      findings: [...s.phase.findings, finding],
+      inFlight: clearInFlight(s.phase, "run_gate"),
+    });
   },
+);
+
+addRow({
+  id: "gate-interrupted",
+  axis: "phase",
+  from: "GATING",
+  trigger: "GATE_INTERRUPTED",
+  guardName: "always",
+  guard: () => true,
+  to: "GATING",
+  actions: [{ type: "run_gate", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "run_gate") }),
 });
 
 addRow({
@@ -707,7 +912,7 @@ function hasCandidateAndCurrentContract(s: State, ev: Event): boolean {
   return sameVersion(e.replacingContractVersion, s.phase.contract.contractVersion);
 }
 
-for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
+for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
   addRow({
     id: `amend-from-${from.toLowerCase()}`,
     axis: "phase",
@@ -718,6 +923,74 @@ for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "ACCEPTED",
     to: "CHECKING",
     actions: [{ type: "run_checks", candidateSha: "C1" }],
     apply: applyAmend,
+  });
+}
+
+// --- plan 01g: the owner reverts an amendment (`revert AM-...`) ----------
+// Like AMEND, a revert changes the contract version, so the evidence bound
+// to the replaced version is invalidated and the phase re-evaluates from
+// CHECKING. Without that reset the phase could not re-derive acceptance
+// (finding M-6). It applies only from a correction naming an applied
+// amendment (conductor/emacs enforce that); the core only cares that the
+// target is a real, applied amendment of this phase.
+function revertTarget(s: State, ev: Event): Decision | undefined {
+  const e = ev as Extract<Event, { type: "CRITERION_REVERTED" }>;
+  if (!s.phase.candidate) return undefined;
+  const decision = s.phase.decisions.find((d) => d.amendment?.id === e.amendmentId);
+  if (!decision || !decision.amendment || decision.amendment.status !== "applied") return undefined;
+  if (!sameVersion(decision.boundContractVersion, s.phase.contract.contractVersion)) return undefined;
+  if (!Array.isArray(e.newAcceptance) || e.newAcceptance.length === 0 || e.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
+    return undefined;
+  }
+  if (!s.phase.contract.acceptance.includes(decision.amendment.proposedWording)) return undefined;
+  return decision;
+}
+
+function applyCriterionReverted(s: State, ev: Event): State {
+  const e = ev as Extract<Event, { type: "CRITERION_REVERTED" }>;
+  const decisions = s.phase.decisions.map((d) =>
+    d.amendment?.id === e.amendmentId
+      ? {
+          ...d,
+          version: d.version + 1,
+          boundContractVersion: e.newContractVersion,
+          amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+        }
+      : d,
+  );
+  // An open request bound to the wording just replaced is superseded; it is
+  // re-evaluated under the restored contract version.
+  const ownerRequests = s.phase.ownerRequests.map((r) =>
+    r.status === "open" && r.boundContractVersion && sameVersion(r.boundContractVersion, s.phase.contract.contractVersion)
+      ? { ...r, status: "resolved" as const, resolution: { option: "superseded_by_amendment_revert" } }
+      : r,
+  );
+  return withPhase(s, {
+    phase: "CHECKING",
+    contract: { ...s.phase.contract, acceptance: e.newAcceptance, contractVersion: e.newContractVersion },
+    candidate: s.phase.candidate && { sha: s.phase.candidate.sha, contractVersion: e.newContractVersion },
+    decisions,
+    ownerRequests,
+    checks: undefined,
+    probe: undefined,
+    reviews: {},
+    ballots: [],
+    overrides: [],
+    inFlight: {},
+  });
+}
+
+for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "PUBLISHING", "AWAITING_OWNER"] as PhaseStateName[]) {
+  addRow({
+    id: `criterion-reverted-from-${from.toLowerCase()}`,
+    axis: "phase",
+    from,
+    trigger: "CRITERION_REVERTED",
+    guardName: "revertTargetReady",
+    guard: (s, ev) => revertTarget(s, ev) !== undefined,
+    to: "CHECKING",
+    actions: [{ type: "run_checks", candidateSha: "C1" }],
+    apply: applyCriterionReverted,
   });
 }
 
@@ -956,6 +1229,10 @@ function addAwaitingOwnerRecordCommandRows(
     guard: (s, ev) =>
       extraGuard(s, ev) && checker.guardValid(s, ev) && awaitingOwnerTarget(checker.applyPhase(s, ev)) === "RESOLVING",
     to: "RESOLVING",
+    // The gate-less form. A phase whose contract declares a gate never takes
+    // the `accept` action from RESOLVING: next() asks for `gate_required`
+    // first and the gate stage decides (plan 01f). The row's `actions` column
+    // documents the fixture (a gate-less contract), exactly as before.
     actions: [{ type: "accept", resolvedCorrectionIds: [] }],
     apply: (s, ev) => withPhase(s, { ...checker.applyPhase(s, ev), phase: "RESOLVING" }),
   });

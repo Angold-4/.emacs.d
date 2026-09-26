@@ -69,6 +69,9 @@ export function notAcceptedReasons(phase: PhaseState): string[] {
   const failedBy = new Map<string, string[]>();
   for (const d of phase.decisions) {
     if (!isLiveDecision(d) || d.boundCandidateSha !== C) continue;
+    // Plan 01g: a failed amendment is not a reason the candidate was not
+    // accepted — it leaves the criterion unchanged and blocks nothing.
+    if (d.amendment) continue;
     const s = decisionStatus(d, phase);
     if (s.status !== "failed") continue;
     const why = s.reason ?? "failed";

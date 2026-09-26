@@ -63,8 +63,13 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "REPAIR_ATTEMPT_STARTED",
   "REPAIR_BUDGET_EXHAUSTED",
   "RESOLVING_INCOMPLETE",
+  "GATE_REQUIRED",
+  "GATE_FAILED",
+  "GATE_INTERRUPTED",
   "REVISE",
   "AMEND",
+  "CRITERION_AMENDED",
+  "CRITERION_REVERTED",
   "RUN_BUDGET_EXCEEDED",
   "RUN_RESUMED",
   "LAUNCH_FAILED",
@@ -72,6 +77,9 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "DECISION_ADDED",
   "NOTE_ADDED",
   "OWNER_INPUT_RECORDED",
+  "DIRECTIVE_ADDED",
+  "DIRECTIVE_WITHDRAWN",
+  "DIRECTIVE_DELIVERED",
   "OWNER_CORRECTION",
   "OWNER_REQUEST_MARKED_UNNEEDED",
   "MISS_RECORDED",
@@ -334,6 +342,54 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return undefined;
     }
 
+    case "CRITERION_REVERTED": {
+      // Plan 01g: the owner's correction naming an amendment id restores the
+      // criterion's original wording. A phase with a candidate has its own
+      // transition rows (transitions.ts) that also invalidate the evidence
+      // bound to the replaced contract version and return to CHECKING. This
+      // handler is the fallback for a phase with no candidate yet
+      // (IMPLEMENTING/FREEZING/REPAIRING), where there is no evidence to
+      // invalidate: it only restores the wording so the next freeze binds to
+      // it. Both paths reject an unknown, not-yet-applied or already-reverted
+      // amendment, and the row guard and this handler agree on validity so
+      // next() can never emit an event the reducer refuses.
+      const decision = p.decisions.find((d) => d.amendment?.id === event.amendmentId);
+      if (!decision || !decision.amendment) {
+        return rejected(state, `unknown amendment ${event.amendmentId}`);
+      }
+      if (decision.amendment.status === "reverted") {
+        return rejected(state, `amendment ${event.amendmentId} is already reverted`);
+      }
+      if (decision.amendment.status !== "applied") {
+        return rejected(state, `amendment ${event.amendmentId} has not been applied, so there is no wording to restore`);
+      }
+      if (!Array.isArray(event.newAcceptance) || event.newAcceptance.length === 0 || event.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
+        return rejected(state, `reverting amendment ${event.amendmentId} needs the restored acceptance list`);
+      }
+      if (!p.contract.acceptance.includes(decision.amendment.proposedWording)) {
+        return rejected(state, `amendment ${event.amendmentId}'s wording is not in the current contract, so there is nothing to restore`);
+      }
+      const decisions = p.decisions.map((d) =>
+        d.id === decision.id
+          ? {
+              ...d,
+              version: d.version + 1,
+              boundContractVersion: event.newContractVersion,
+              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+            }
+          : d,
+      );
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          contract: { ...p.contract, acceptance: event.newAcceptance, contractVersion: event.newContractVersion },
+          candidate: p.candidate && { sha: p.candidate.sha, contractVersion: event.newContractVersion },
+          decisions,
+        },
+      });
+    }
+
     case "NOTE_ADDED": {
       // §7.4 `note` (conductor state): queued for the next worker attempt's
       // prompt. Record-only — it moves no phase.
@@ -344,6 +400,64 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, "a note must carry non-empty text");
       }
       return ok({ ...state, phase: { ...p, ownerNotes: [...(p.ownerNotes ?? []), event.text] } });
+    }
+
+    case "DIRECTIVE_ADDED": {
+      // Plan 01i: a numbered owner directive. Record-only (moves no phase
+      // state name) but binding: every later prompt quotes it verbatim
+      // until it is withdrawn. The conductor assigns the id/seq and the
+      // delivery targets; reduce() only stores the record, exactly like
+      // NOTE_ADDED's queue.
+      const directive = event.directive;
+      if (!directive || typeof directive.id !== "string" || directive.id.length === 0) {
+        return rejected(state, "an owner directive must carry its id (OD-n)");
+      }
+      if (typeof directive.text !== "string" || directive.text.trim().length === 0) {
+        return rejected(state, "an owner directive must carry the text the owner sent");
+      }
+      if (directive.scope !== "phase" && directive.scope !== "program") {
+        return rejected(state, `owner directive ${directive.id} must have scope phase or program`);
+      }
+      const existing = p.ownerDirectives ?? [];
+      if (existing.some((d) => d.id === directive.id)) {
+        return rejected(state, `owner directive ${directive.id} already exists`);
+      }
+      const added = { ...directive, targets: directive.targets ?? [], deliveries: directive.deliveries ?? {} };
+      // Kept in ascending id order, never in the order the inbox happened to
+      // hand the files over: a lexicographic scan applies `cmd-prog-ODP-10`
+      // before `cmd-prog-ODP-2`, and prompts and the status must still read
+      // oldest → newest. `seq` is the number in the id (`OD-n` or `ODP-n`).
+      const ownerDirectives = [...existing, added].sort((a, b) => a.seq - b.seq);
+      return ok({ ...state, phase: { ...p, ownerDirectives } });
+    }
+
+    case "DIRECTIVE_WITHDRAWN": {
+      // Plan 01i: `withdraw OD-n`. Record-only: the record stays and the
+      // status shows it withdrawn; every later prompt omits it.
+      const directive = (p.ownerDirectives ?? []).find((d) => d.id === event.directiveId);
+      if (!directive) return rejected(state, `unknown owner directive ${event.directiveId}`);
+      if (directive.status === "withdrawn") {
+        return rejected(state, `owner directive ${event.directiveId} is already withdrawn`);
+      }
+      const ownerDirectives = (p.ownerDirectives ?? []).map((d) =>
+        d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at ?? new Date().toISOString() } : d,
+      );
+      return ok({ ...state, phase: { ...p, ownerDirectives } });
+    }
+
+    case "DIRECTIVE_DELIVERED": {
+      // Plan 01i: the observed outcome of the immediate steer to one live
+      // agent, keyed by target. Record-only; a later record for the same
+      // target (a re-dispatched agent) is the truer one.
+      const directive = (p.ownerDirectives ?? []).find((d) => d.id === event.directiveId);
+      if (!directive) return rejected(state, `unknown owner directive ${event.directiveId}`);
+      if (event.state !== "delivered" && event.state !== "delivery-uncertain") {
+        return rejected(state, `owner directive ${event.directiveId} delivery must be delivered or delivery-uncertain`);
+      }
+      const ownerDirectives = (p.ownerDirectives ?? []).map((d) =>
+        d.id === event.directiveId ? { ...d, deliveries: { ...d.deliveries, [event.target]: event.state } } : d,
+      );
+      return ok({ ...state, phase: { ...p, ownerDirectives } });
     }
 
     case "OWNER_INPUT_RECORDED": {
@@ -517,7 +631,10 @@ export function reduce(state: State, event: unknown): ReduceResult {
     // pending until FREEZE_COMPLETED assembles and binds them.
     let working = state;
     if (ev.type === "SUBMIT_PHASE") {
-      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior } };
+      working = {
+        ...state,
+        phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior, pendingDispute: ev.dispute },
+      };
     }
 
     const rows = rowsFor(working, ev.type);

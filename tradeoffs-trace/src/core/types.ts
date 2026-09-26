@@ -62,6 +62,15 @@ export interface PhaseContract {
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 01f: the phase's own expensive, live command (the plan's `:GATE:`
+   * property). Declaring one inserts a GATING stage between RESOLVING and
+   * ACCEPTED: the conductor runs this command itself, once per candidate the
+   * reviewers already accepted, and only a passing gate lets the ACCEPTED
+   * event through (core/gate.ts, conductor.ts's `#runGate`). */
+  gate?: string;
+  /** Plan 01f: the plan's `:GATE_CLEANUP:` command, run after the gate
+   * whatever its outcome (release the resources the gate took). */
+  gateCleanup?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +106,39 @@ export interface DecisionDisclosure {
   classProposal: DecisionClass;
 }
 
+/** Plan 01g: a worker or reviewer may say a criterion cannot be met *as
+ * written* rather than merely unmet. `criterion` must name one acceptance
+ * item of the current phase contract verbatim; `proposedWording` replaces it
+ * if the reviewers' normal tally passes (D1). It is a different claim from a
+ * blocking finding: an unmet-but-clear criterion is repaired, an unmeetable
+ * one is reworded, and the run never waits for the owner for either. */
+export interface CriterionDispute {
+  criterion: string;
+  why: string;
+  proposedWording: string;
+}
+
+export type AmendmentStatus = "proposed" | "applied" | "reverted";
+
+/** Plan 01g: the amendment record a `criterionDispute` becomes — a
+ * `reserved` decision the reviewers vote on like any other. While
+ * `status` is `proposed` a passing tally applies it: the wording is replaced
+ * for this phase only, the contract version bumps, and contract findings
+ * citing the old wording are superseded. `appliedContractVersion` records
+ * the version the amendment produced; the owner can revert it through the
+ * input box (a correction naming `id`). */
+export interface CriterionAmendment {
+  id: string;
+  criterion: string; // the replaced acceptance item, verbatim
+  proposedWording: string; // the replacement
+  why: string;
+  raisedBy: "worker" | Reviewer;
+  status: AmendmentStatus;
+  previousContractVersion?: ContractVersion;
+  appliedContractVersion?: ContractVersion;
+  revertedAt?: string;
+}
+
 export interface Decision {
   id: string;
   version: number;
@@ -111,6 +153,11 @@ export interface Decision {
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   supersededByCorrection?: string; // correction id, once superseded (§7.5)
+  /** Plan 01g: set on an amendment record — a `reserved` decision the
+   * reviewers vote on, whose passing tally rewrites one acceptance item for
+   * this phase. An amendment decision never blocks acceptance by itself: a
+   * failed amendment simply leaves the criterion unchanged. */
+  amendment?: CriterionAmendment;
   /** Plan 2c: the record no longer describes the current candidate and is
    * never votable again. Set when a new candidate is frozen and the worker
    * did not carry the record forward ("candidate <sha>: not carried
@@ -143,7 +190,7 @@ export interface PriorDecisionStatement {
 
 export type FindingKind = "defect" | "contract" | "integration";
 export type FindingSeverity = "blocking" | "advisory";
-export type FindingStatus = "open" | "repaired" | "disproved" | "accepted";
+export type FindingStatus = "open" | "repaired" | "disproved" | "accepted" | "superseded";
 export type Reviewer = "M" | "A" | "B";
 
 export interface Finding {
@@ -161,6 +208,13 @@ export interface Finding {
   repairedByCandidateSha?: string;
   disprovedEvidence?: string;
   acceptedScope?: string; // required scope note (§4.2, §10.4 `x`)
+  /** Plan 01g: the acceptance item this `contract` finding disputes verbatim
+   * (set when it was raised with a `criterionDispute`). A later amendment of
+   * that item supersedes the finding. */
+  criterionDisputed?: string;
+  /** Plan 01g: why this finding was closed without repair — set when an
+   * amendment replaced the wording it cited. */
+  supersededBy?: string;
   /** Plan 2c: other reviewers who raised the same finding ("same as F-…")
    * instead of filing a duplicate. */
   alsoRaisedBy?: Reviewer[];
@@ -289,6 +343,10 @@ export interface FindingDisclosure {
   severity: FindingSeverity;
   evidence: string;
   linkedDecisionId?: string;
+  /** Plan 01g: a reviewer may say the finding is that a criterion cannot be
+   * met as written, naming it verbatim; the conductor records it as an
+   * amendment record and the finding cites it. */
+  criterionDispute?: CriterionDispute;
   reproduction?: { command: string };
   /** Plan 2c: the id of an already-open finding this one repeats; the
    * conductor records the reviewer on that finding instead of a duplicate. */
@@ -434,6 +492,7 @@ export type PhaseStateName =
   | "PROBING"
   | "REVIEWING"
   | "RESOLVING"
+  | "GATING"
   | "ACCEPTED"
   | "PUBLISHING"
   | "DONE"
@@ -447,7 +506,7 @@ export type RunStateName = "RUN_ACTIVE" | "RUN_PAUSED_BUDGET";
 // §7.4/§9.3 (plan 2d): owner input, recorded
 // ---------------------------------------------------------------------------
 
-export type OwnerInputKind = "steer" | "note" | "correction";
+export type OwnerInputKind = "steer" | "note" | "correction" | "directive" | "withdraw";
 
 /** The state the conductor actually recorded for one owner input. `sent` is
  * never logged: it is derived by the read-only views from a pending inbox
@@ -459,6 +518,7 @@ export type OwnerInputState =
   | "noted" // note queued for the next worker attempt
   | "correction-started" // AWAITING_OWNER correction: requests resolved, repair started
   | "delivery-uncertain" // steer intent recorded, no acknowledgement (never resent)
+  | "reverted" // plan 01g: a correction naming an amendment id restored its criterion
   | "refused"; // conductor refused: terminal phase, or no running worker for a steer
 
 export interface OwnerInputRecord {
@@ -469,6 +529,50 @@ export interface OwnerInputRecord {
   attemptId?: string; // steer: the worker attempt id it was bound to
   reason?: string; // refused / delivery-uncertain detail
   at: string; // ISO timestamp the conductor recorded
+}
+
+// ---------------------------------------------------------------------------
+// Plan 01i: owner directives (design 01_ref_design.md D5, runtime §8)
+// ---------------------------------------------------------------------------
+
+/** How far a directive reaches: its own phase (every agent now, and in every
+ * later prompt) or the whole program (every running node now, every node
+ * started later). */
+export type DirectiveScope = "phase" | "program";
+
+/** The outcome of one directive's immediate Pi steer to one live agent of
+ * this run, keyed by the agent's target label ("worker", "M", "A", "B"). A
+ * target with no entry yet is still in flight. */
+export type DirectiveDeliveryState = "delivered" | "delivery-uncertain";
+
+/** Plan 01i: every text the owner sent through the input box, recorded as a
+ * numbered directive (`OD-1`, `OD-2`, …) that is part of the phase until
+ * withdrawn. It is steered at once to every live agent of the run (`targets`,
+ * `deliveries`) and included verbatim, newest last, under "Owner directives
+ * (binding)" in every later prompt — worker attempts and repairs, reviewer
+ * turns 1 and 2, and re-dispatched or fresh agents. It binds reviewers as
+ * part of the contract: a candidate that follows a directive cannot be
+ * faulted for doing so, even where the plan's text says otherwise, and a
+ * candidate that violates one is a blocking contract finding citing the id. */
+export interface OwnerDirective {
+  id: string; // "OD-1"
+  seq: number; // 1
+  text: string; // what the owner typed, verbatim
+  scope: DirectiveScope;
+  status: "in-force" | "withdrawn";
+  commandId: string; // the inbox command id it arrived as
+  at: string; // ISO timestamp the conductor recorded it
+  /** The live agents it was steered to when sent ("worker", "M", "A", "B";
+   * a reviewer letter per live reviewer). Empty when no agent was live — it
+   * still reaches every later prompt. */
+  targets: string[];
+  /** Per-target outcome of that steer; a target in `targets` with no entry
+   * has not acknowledged yet (shown `⧗`). */
+  deliveries: Record<string, DirectiveDeliveryState>;
+  withdrawnAt?: string;
+  /** A program-wide directive that reached this phase through its plan (a
+   * node started after the directive was issued), not through its inbox. */
+  seeded?: boolean;
 }
 
 export interface Attempt {
@@ -515,6 +619,7 @@ export type InFlightKey =
   | "review_M"
   | "review_A"
   | "review_B"
+  | "run_gate"
   | "publish_cas";
 
 /** The full state of one phase, as reduce()/next() see it. */
@@ -581,6 +686,15 @@ export interface PhaseState {
    * buffer's "Owner input" section renders this — never an inferred or
    * optimistic state. Ordered by id (stable across a restart). */
   ownerInputs?: OwnerInputRecord[];
+  /** Plan 01g: the raw `criterionDispute` a SUBMIT_PHASE carried, held here
+   * until FREEZE_COMPLETED assembles it into an amendment record bound to
+   * the new candidate (exactly like `pendingDisclosures`). */
+  pendingDispute?: CriterionDispute;
+  /** Plan 01i: the owner directives in force (or withdrawn) in this phase,
+   * in the order the owner sent them. Rebuilt by folding the log, so a
+   * directive survives a conductor restart; included, newest last, in every
+   * later prompt. */
+  ownerDirectives?: OwnerDirective[];
 }
 
 export type RunStatus = RunStateName;
@@ -610,6 +724,10 @@ export interface EvSubmitPhase {
   disclosures: DecisionDisclosure[];
   /** Plan 2c: statements about prior decisions (repair attempts only). */
   prior?: PriorDecisionStatement[];
+  /** Plan 01g: a criterion the worker says cannot be met as written; freeze
+   * turns it into an amendment record (a `reserved` decision) bound to the
+   * new candidate. */
+  dispute?: CriterionDispute;
 }
 export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
@@ -729,6 +847,31 @@ export interface EvAccepted {
   type: "ACCEPTED";
   resolvedCorrectionIds: string[]; // must equal what predicate.ts computes; reduce verifies
 }
+
+/** Plan 01f: the phase has nothing left open (`accept(C, K)` holds) and its
+ * contract declares a gate, so the phase gates the candidate before
+ * accepting it: RESOLVING -> GATING. Emitted by the conductor exactly when
+ * next() asks for it, never for a gate-less phase (which keeps the old
+ * RESOLVING --ACCEPTED--> ACCEPTED edge). */
+export interface EvGateRequired {
+  type: "GATE_REQUIRED";
+}
+
+/** Plan 01f: the gate command failed — a non-zero exit, or a kill at the
+ * limit. The phase returns to REPAIRING (or AWAITING_OWNER when the repair
+ * budget is exhausted) with a blocking `integration` finding carrying
+ * `evidence`: the log's last lines, so the worker is shown the failure. */
+export interface EvGateFailed {
+  type: "GATE_FAILED";
+  evidence: string;
+}
+
+/** Plan 01f / design §9.3: the conductor died while gating. An interrupted
+ * gate is never a passing one, and never a failing one either: the gate is
+ * rerun ("interrupted gates: interrupted, never passed — rerun"). */
+export interface EvGateInterrupted {
+  type: "GATE_INTERRUPTED";
+}
 export interface EvPublishIntent {
   type: "PUBLISH_INTENT";
   expectedHead: string;
@@ -758,6 +901,32 @@ export interface EvRevise extends RecordBinding {
   correctionText: string;
   contractChange: boolean;
 }
+/** Plan 01g: an amendment decision passed the normal tally (M, plus one of
+ * A/B), so the conductor replaces one acceptance item for this phase. The
+ * phase returns to a fresh attempt under the new contract version so the
+ * *next* candidate is judged against the new wording; no repair round is
+ * consumed by the amendment itself. Emitted by the conductor when next()
+ * asks for `apply_amendment`. */
+export interface EvCriterionAmended {
+  type: "CRITERION_AMENDED";
+  decisionId: string; // the amendment decision that passed
+  newAcceptance: string[]; // the full replacement acceptance list
+  newContractVersion: ContractVersion;
+}
+
+/** Plan 01g: the owner's correction naming an amendment id restores the
+ * criterion's original wording. A phase that already has a candidate takes
+ * the AMEND-like transition to CHECKING and clears the evidence bound to the
+ * replaced contract version; a phase with no candidate yet (IMPLEMENTING,
+ * FREEZING, REPAIRING) is updated record-only. Either way the run never
+ * waits for the owner and the input is recorded as state `reverted`. */
+export interface EvCriterionReverted {
+  type: "CRITERION_REVERTED";
+  amendmentId: string;
+  newAcceptance: string[]; // the restored acceptance list
+  newContractVersion: ContractVersion;
+}
+
 export interface EvAmend {
   type: "AMEND";
   replacingContractVersion: ContractVersion; // what the sender saw — staleness check
@@ -806,6 +975,32 @@ export interface EvNoteAdded {
 export interface EvOwnerInputRecorded {
   type: "OWNER_INPUT_RECORDED";
   input: OwnerInputRecord;
+}
+
+/** Plan 01i: records one owner directive (`OD-<seq>`) the moment it is
+ * accepted. Record-only: it moves no phase-state name, it appends a binding
+ * record the phase carries until withdrawn and every later prompt quotes. */
+export interface EvDirectiveAdded {
+  type: "DIRECTIVE_ADDED";
+  directive: OwnerDirective;
+}
+
+/** Plan 01i: `withdraw OD-n` — the directive no longer applies. Record-only:
+ * the record stays (the status shows it withdrawn) and later prompts omit
+ * it. */
+export interface EvDirectiveWithdrawn {
+  type: "DIRECTIVE_WITHDRAWN";
+  directiveId: string;
+  at?: string;
+}
+
+/** Plan 01i: the observed outcome of one directive's immediate steer to one
+ * live agent, keyed by its target label. Record-only. */
+export interface EvDirectiveDelivered {
+  type: "DIRECTIVE_DELIVERED";
+  directiveId: string;
+  target: string;
+  state: DirectiveDeliveryState;
 }
 
 /** Plan 2d (§7.5/§7.4): the owner's correction typed while the phase is
@@ -924,6 +1119,9 @@ export type Event =
   | EvOwnerRequestOpened
   | EvOwnerRequestResolved
   | EvAccepted
+  | EvGateRequired
+  | EvGateFailed
+  | EvGateInterrupted
   | EvPublishIntent
   | EvPublishCompleted
   | EvPublishStale
@@ -932,6 +1130,8 @@ export type Event =
   | EvResolvingIncomplete
   | EvRevise
   | EvAmend
+  | EvCriterionAmended
+  | EvCriterionReverted
   | EvRunBudgetExceeded
   | EvRunResumed
   | EvLaunchFailed
@@ -939,6 +1139,9 @@ export type Event =
   | EvDecisionAdded
   | EvNoteAdded
   | EvOwnerInputRecorded
+  | EvDirectiveAdded
+  | EvDirectiveWithdrawn
+  | EvDirectiveDelivered
   | EvOwnerCorrection
   | EvOwnerRequestMarkedUnneeded
   | EvMissRecorded

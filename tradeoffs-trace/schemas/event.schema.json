@@ -18,6 +18,7 @@
         "PUBLISH_INTENT", "PUBLISH_COMPLETED", "PUBLISH_STALE", "REPAIR_ATTEMPT_STARTED",
         "REPAIR_BUDGET_EXHAUSTED", "RESOLVING_INCOMPLETE", "REVISE", "AMEND",
         "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED",
+        "CRITERION_AMENDED", "CRITERION_REVERTED",
         "NOTE_ADDED", "OWNER_INPUT_RECORDED", "OWNER_CORRECTION", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED"
       ]
     }
@@ -59,6 +60,8 @@
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "RESOLVING_INCOMPLETE" } } },
     { "type": "object", "required": ["type", "correctionId", "targetRecordId", "correctionText", "contractChange", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "REVISE" }, "correctionId": { "type": "string", "minLength": 1 }, "targetRecordId": { "type": "string", "minLength": 1 }, "correctionText": { "type": "string", "minLength": 1 }, "contractChange": { "type": "boolean" } } },
     { "type": "object", "required": ["type", "replacingContractVersion", "newContractVersion"], "properties": { "type": { "const": "AMEND" }, "replacingContractVersion": { "type": "object" }, "newContractVersion": { "type": "object" } } },
+    { "type": "object", "required": ["type", "decisionId", "newAcceptance", "newContractVersion"], "properties": { "type": { "const": "CRITERION_AMENDED" }, "decisionId": { "type": "string", "minLength": 1 }, "newAcceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } }, "newContractVersion": { "type": "object" } } },
+    { "type": "object", "required": ["type", "amendmentId", "newAcceptance", "newContractVersion"], "properties": { "type": { "const": "CRITERION_REVERTED" }, "amendmentId": { "type": "string", "minLength": 1 }, "newAcceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } }, "newContractVersion": { "type": "object" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_BUDGET_EXCEEDED" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_RESUMED" } } },
     { "type": "object", "required": ["type", "role", "expected", "missing", "extra"], "properties": { "type": { "const": "LAUNCH_FAILED" }, "role": { "enum": ["worker", "reviewer"] }, "reviewer": { "enum": ["M", "A", "B"] }, "expected": { "type": "array" }, "missing": { "type": "array" }, "extra": { "type": "array" } } },

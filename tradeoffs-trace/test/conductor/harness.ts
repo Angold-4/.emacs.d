@@ -159,6 +159,13 @@ export async function setupConductor(opts: {
   /** The phase's own goal text (default "do the thing"). A plan's prose is a
    * secret-value carrier too, so a test can quote one in it. */
   goal?: string;
+  /** Plan 01f: the phase's `:GATE:` command (omitted = no gate, the
+   * pre-01f pipeline) and its `:GATE_CLEANUP:` companion. */
+  gate?: string;
+  gateCleanup?: string;
+  /** Plan 01f: the machine-wide gate lock's path. Two conductors in one test
+   * share it to prove their gates never overlap. */
+  gateLockPath?: string;
   /** The plan's title (default "test plan") — plan prose like any other. */
   title?: string;
   /** Plan 01b: the conductor's notification clock (injectable), so a test
@@ -183,6 +190,8 @@ export async function setupConductor(opts: {
         checks: opts.phaseChecks ?? opts.checks ?? ["true"],
         boundaries: opts.boundaries ?? [],
         reserved: [],
+        ...(opts.gate ? { gate: opts.gate } : {}),
+        ...(opts.gateCleanup ? { gateCleanup: opts.gateCleanup } : {}),
       },
     ],
   };
@@ -206,6 +215,7 @@ export async function setupConductor(opts: {
     stubReviews: opts.stubReviews ?? true,
     probeReuse: opts.probeReuse,
     ...(opts.now ? { now: opts.now } : {}),
+    gateLockPath: opts.gateLockPath,
     piEnvFor: (role, agentId) => {
       if (role === "worker") {
         if (opts.workerScriptForAttempt) {

@@ -102,6 +102,13 @@ be tagged `:provisional:` and are revised as implementation teaches us things.
 - `RESERVED` names choices the owner wants flagged, in addition to the
   standing reserved classes in §3.4. They are voted like any other decision;
   the owner is never waited for (owner-optional).
+- `GATE` is the phase's expensive, live proof (a `--clean --build` of a
+  whole stack, say). The conductor runs it itself, once per candidate whose
+  checks, probe and three reviews have passed, and records the evidence;
+  §6.5 is the normative account. `GATE_CLEANUP` is the command that releases
+  what the gate took, run after it whatever the outcome. `#+TT_GATE_MINUTES`
+  sets the gate's limit (default 30 minutes). No agent may run the gate or
+  report its result.
 - `#+TT_SECRETS` (plan level) names the credentials the plan needs, by name
   only. The conductor reads each value from its own environment, passes it to
   every agent as an environment variable, refuses a command containing one, and
@@ -179,11 +186,13 @@ One tab per run:
 - **Status** (right): rendered from the control log. `RET` on a phase opens its
   diff; `c` its check output; `d` its decisions; `m` switches mode; `p`
   pauses.
-- **Input** (bottom): the text is sent as a **steer** to the worker currently
-  running, bound to that worker's attempt (§7.4). If no worker is running,
-  the text becomes an **owner note**, shown in status and delivered at the
-  start of the next worker attempt. Reviewers cannot be steered. Their
-  independence is the point of having them.
+- **Input** (bottom): every text is an **owner directive** (plan 01i): a
+  numbered record (`OD-1`, …) steered at once to every live agent of the run
+  (the worker and any reviewer mid-turn, bound to its attempt, §7.4) and quoted
+  verbatim under "Owner directives (binding)" in every later prompt. A
+  directive applies to its phase, or to the whole program with `C-u C-c C-c` or
+  from a program buffer; `withdraw OD-n` withdraws one. See the runbook's
+  "Steer it".
 
 `C-c m s` focuses the run's tab. If the tab or any of its windows has been
 closed, it rebuilds the layout. After an Emacs restart, the same command
@@ -509,7 +518,14 @@ REVIEWING     M, A, B review C under contract K (two turns each)
 RESOLVING     decisions voted; findings, owner requests, corrections open?
   │ open items remain and budget remains ────────────────────▶ REPAIRING
   │ open items remain, budget exhausted ─────────────────────▶ AWAITING_OWNER
-  │ accept(C, K) holds (§6.3)
+  │ accept(C, K) holds (§6.3), and the contract declares no gate
+  ├──────────────────────────────────────────────────────────▶ ACCEPTED(C)
+  │ accept(C, K) holds and the contract declares a `GATE` command
+  ▼
+GATING        the conductor runs the gate itself, once per candidate (§6.5)
+  │ the gate fails → blocking `integration` finding with its log tail
+  │ ────────────────────────────────────────────────────────▶ REPAIRING
+  │ the gate passes (or an identical tree reuses a pass)
   ▼
 ACCEPTED(C)   atomically: corrections addressed by C recorded resolved
   ▼
@@ -609,6 +625,84 @@ it, so that the integration result is part of the evidence acceptance requires.
    with serial phases but is checked anyway, the probe result is stale: the
    phase returns to `PROBING` against the new head.
 
+### 6.5 The gate (plan 01f)
+
+Some phases need a proof that is too expensive for the ordinary check loop: the
+atlas plan's `deploy/atlas.sh … --clean --build` of a 40-service stack takes
+about 15 minutes. Run inside an agent's attempt, that command was paid for on
+every repair round (82 minutes of docker across 13i/13j), was sometimes killed
+by the per-command limit before answering, and — because the agent had to
+produce the live proof — invited substitutes: a sentinel `code_sha`, a
+`pending_owner_live_run`, a fingerprint-only record ([runtime evidence](01_ref_runtime_f8ecf5e3.md) §1, §6). So the
+conductor runs the gate itself, and only the conductor produces its evidence.
+
+- **Declaration.** A phase declares `GATE` (and optionally `GATE_CLEANUP`) in
+  its property drawer; `#+TT_GATE_MINUTES` sets the limit (default 30). A
+  phase without a gate accepts on `accept(C, K)` alone, exactly as before.
+- **One run, after everything else.** The gate is dispatched from `GATING`,
+  which is only entered when `accept(C, K)` already holds. It runs in a fresh
+  checkout of the candidate merged onto the current integration head — the
+  integration the probe verified — with the plan's secrets in its environment.
+  A gate that exceeds its limit has its process group killed and counts as a
+  failure.
+- **The machine-wide lock.** The gate takes `~/.tradeoffs-trace/gate.lock`
+  before it merges the candidate into its checkout and holds it through the
+  command, the cleanup and the record, so two phases — in one program or in
+  two runs — never have gate checkouts or build commands live at once. A
+  second gate waits for the first; a crashed holder releases the lock through
+  the OS.
+- **The record.** The conductor writes `checks/<sha>/gate.json` (candidate and
+  base SHA, the merged tree, the command, the exit status, the gate command's
+  own duration, start time, the log's sha256, and the cleanup's own exit and
+  duration) and `checks/<sha>/gate.log` (stdout and stderr, redacted). The
+  `ACCEPTED` event a passing gate releases is the only thing that lets
+  acceptance proceed. The cleanup runs under its own limit and its time is
+  never folded into the gate's duration — the lock is held for both. The rule
+  is exactly: **the cleanup runs whenever the gate command ran (pass, fail or
+  timeout); if the candidate no longer merges, the gate never starts and
+  nothing is cleaned.** Such a candidate is recorded as `not started` (with no
+  exit status and no duration), never as an exit-less run.
+- **The run-or-reuse decision is taken under the lock.** The gate takes the
+  lock, then asks whether this tree and command already have a verified pass;
+  only if not does it merge the candidate and run the command. Two candidates
+  with the same tree never both run the gate.
+- **A failure is a blocking `integration` finding** whose evidence is the
+  log's last 60 lines. The phase returns to `REPAIRING` (or `AWAITING_OWNER`
+  when the budget is exhausted), and the repair prompt shows the worker the
+  conductor's record and log tail verbatim.
+- **Reuse, not repeat, and only for the same question.** A record is
+  evidence only when it answers *this* gate: the same candidate tree, the same
+  `:GATE:` command, and a `gate.log` that still hashes to the sha256 the
+  record carries. A repair attempt that changes nothing freezes a new commit
+  with the same tree, so its gate is reused rather than paid for again; a
+  record whose log is missing or edited, whose command differs (the plan was
+  re-read or the contract amended), or whose tree is another candidate's makes
+  the gate rerun. A record that was itself written as a reuse counts as
+  passing — its log is the verified copy of the run behind it, so a chain of
+  reuses still saves the build. A failed gate is always rerun.
+- **A record is never rewritten.** When the *same* candidate is gated again
+  (a stale publish sends the phase back through `PROBING` with its reviews
+  still valid), its own passing record — verified against the same tree and
+  command — is accepted in place. The record keeps the head its evidence was
+  produced at, and both the control log's completion record and the status/
+  `tt summary` citation name the head being accepted now next to it, so a pass
+  is never read as evidence for a head it was not produced against. For a
+  reused *other* candidate's record, the new record's `baseSha` is the head
+  being accepted and `reusedFromBaseSha` names the head the command ran on.
+- **No agent may produce this evidence.** The worker's prompt and every
+  reviewer's prompt — turn 1 and turn 2 — say the conductor runs the gate
+  and that running it, reporting its result, or substituting evidence for it
+  is forbidden. Reviewers are shown the gate record when one exists and its
+  log still matches.
+- **The JSON schemas trail the change.** `schemas/**` is outside this phase's
+  boundary, so `event.schema.json` does not list `GATE_REQUIRED`,
+  `GATE_FAILED` or `GATE_INTERRUPTED`, and `plan.schema.json` /
+  `phase-contract.schema.json` do not list `gate`/`gateCleanup` (they already
+  lag the emitted plan's `repo`, `deadlines`, `secrets` and directive
+  fields). Nothing in the conductor validates a produced record against them:
+  the core's `Event` type and `buildContract` are the enforced vocabulary, and
+  the schema tests exercise their own fixtures.
+
 ## 7. Versions and authority
 
 ### 7.1 Everything is bound to what it evaluated
@@ -650,6 +744,60 @@ changes code, and that cost is intended.
   as correcting one (§7.5): supported only while no later phase has been
   integrated; otherwise a new run is required.
 
+### 7.3a Criterion disputes and the amendments they become
+
+The runtime evidence (§4) shows contract findings come in two kinds the
+pipeline used to conflate. "**Unmet but clear**" is a defect: the worker can
+fix it, and a repair round is the right answer. "**Unmeetable as written**" is
+a contract problem: `gate_is_rerun_when_the_base_moves` needs the tip the
+conductor only creates when it commits; `cargo test --workspace` passes on a
+base that already fails; `p99 ≤ 500 ms` is missed by every vendor by a little;
+"the owner records a live run" is the owner's duty, not a worker's. Left
+unspoken, these return every round until the 3-round budget runs out and the
+run parks — all eight owner waits in the evidence began that way.
+
+So a worker (in `submit_phase`) or a reviewer (in a turn-2 finding) may carry
+`criterionDispute: { criterion, why, proposedWording }`, where `criterion`
+names **one acceptance item of the phase contract verbatim**. The conductor
+turns it into an **amendment record**: a `reserved` decision (flagged for the
+owner, §3.4) that the reviewers vote on like any other reserved decision. A
+worker's dispute is part of the candidate's own disclosure set, so it is
+balloted in that candidate's turn 2. A reviewer's dispute arrives *during*
+turn 2, after that round's demanded-ballot set was snapshotted, so it is
+carried to the phase's next dispatch and balloted there; if nothing else
+blocks, the candidate may be accepted first, in which case the amendment
+stays recorded as `proposed` (visible in the decision view and `tt summary`)
+and never blocks the run. It is not a finding and does not open a contract
+finding of its own.
+
+Under D1's default, an amendment that passes the normal tally (M, plus one of
+A/B) replaces the criterion's wording in the phase contract **for this phase
+only, from the next candidate on**:
+
+- the change is logged as a `CRITERION_AMENDED` event;
+- `contract` findings that cited the old wording are closed as **superseded**,
+  never left open to fail every later round;
+- the contract version bumps, so the next candidate's checks, probe and
+  reviews are bound to the new wording;
+- the phase starts a **fresh attempt** under the new contract version — the
+  amendment itself consumes no repair round — and the status, the decision
+  view and `tt summary` show `⚑ AMENDED` with the old and the new text.
+
+An amendment that fails (for example M vetoes it) leaves the criterion
+unchanged; the round is handled exactly as today, and the amendment is never
+an acceptance blocker on its own. **A dispute never consumes a repair round by
+itself, and the run never waits for the owner because of one.** The owner can
+still rule later: a **correction** naming the amendment id (`revert AM-p1-…`)
+restores the original wording and returns the phase to checks under the
+restored contract version, recorded as an owner input in state `reverted`. A
+note that merely mentions an amendment id stays advisory and never rewrites
+the contract.
+`tt summary` lists every amendment, applied or reverted.
+
+Clear wording and plain disagreements still go through normal repair: if the
+criterion is satisfiable and the candidate simply misses it, the right artefact
+is a blocking finding, not a dispute.
+
 ### 7.4 Owner commands
 
 Commands differ in where their effect lands, and that decides what recovery can
@@ -659,11 +807,14 @@ promise (§9.3):
 | --- | --- | --- | --- |
 | steer | message delivered to the running worker through Pi's RPC `steer` | **external delivery** | worker attempt id |
 | note | queued for the next worker attempt | conductor state | phase |
+| directive | every input-box text, recorded as `OD-n` (a program-wide one as `ODP-n`): steered at once to every live agent, quoted in every later prompt, binding until withdrawn (§7.6) | conductor state (plus external delivery) | phase (or the whole program) |
 | resolve | answer an owner request (choose an option or write one) | conductor state | request id and version, candidate, contract |
 | override | approve or reject a delegated decision; recorded **beside** the ballots | conductor state | decision version, candidate, contract |
 | accept-finding | the owner's disposition of a finding (§4.2) | conductor state | finding version, candidate, contract |
 | revise | correct a decision or finding and repair the phase (§7.5) | conductor state (then its own attempt) | record version, candidate, contract |
 | amend | new contract version (§7.3) | conductor state | contract version being replaced |
+| criterionDispute | a `reserved` amendment decision the reviewers vote on; a passing tally rewrites one acceptance item for this phase (§7.3a) | conductor state | acceptance item verbatim |
+| revert an amendment | a correction naming an amendment id (`revert AM-p1-…`) restores the original wording (§7.3a) | conductor state (record-only) | amendment id |
 | unneeded | mark an owner request as "did not need me" (a pilot metric) | conductor state | request id |
 | pause / resume / mode | control only | conductor state | run |
 
@@ -671,6 +822,37 @@ Steering, overriding, revising and amending are deliberately separate. Asking
 "would a queue help here?" is conversation. Rejecting the queue is a decision.
 "This trade-off doesn't make sense; do it this way" is a correction. Changing
 what "cancelled" means is a contract revision. The log keeps them apart.
+
+### 7.6 Owner directives
+
+Every text the owner sends through an input box is an **owner directive**: a
+numbered, logged record (`OD-1`, `OD-2`, …) that is part of its phase until
+withdrawn. It is (1) steered at once to **every live agent of the run** — the
+worker and any reviewer mid-turn — with each delivery recorded; (2) included
+verbatim, newest last, under **Owner directives (binding)** in every later
+prompt: every worker attempt and repair, both reviewer turns, and any
+re-dispatched or fresh agent; and (3) **binding on reviewers as part of the
+contract** — a candidate that violates one is a blocking `contract` finding
+citing the directive id, and a candidate that follows one cannot be faulted for
+doing so, even where the plan's text says otherwise.
+
+At `AWAITING_OWNER` the text still does what §7.5's correction does (resolves
+the open requests and grants 3 rounds) *and* becomes a directive. A
+withdrawal — `withdraw OD-n` in the input box — steers the live agents that it
+no longer applies and drops it from every later prompt; an unknown or malformed
+id is refused with the reason (a near-miss is never inverted into a new
+ruling). Trailing prose after the id is accepted.
+
+A directive applies to its own phase and is numbered `OD-n`. Sent from a
+program buffer, or with `C-u` in a run's input box, it applies
+**program-wide**: the program records it under its own `ODP-n` id, every
+running node is steered now, every node started later is started with it, and
+the program's event log carries it (so it survives a restart). A node never
+mints or renumbers a program id — it forwards the text and adopts the record
+the program pushes, so one id names one ruling at both levels and
+a `withdraw ODP-n` from any node retires it on every node. The input header
+states the scope before sending; the status view shows each directive with its
+scope, whether it is in force, and its delivery state per agent.
 
 ### 7.5 Correcting a decision mid-run: revise
 
@@ -768,6 +950,7 @@ Every stage below has a conductor-enforced deadline:
 | each check command | 10 min | kill its group | check `failed: timeout` |
 | integration probe (merge plus its checks) | as for checks, per command | kill its group; discard the probe branch | `integration` finding: timeout |
 | each review | 15 min | cancel, re-dispatch once | then the phase is `BLOCKED: reviewer unavailable` |
+| the phase gate command (`GATE`) | 30 min (`#+TT_GATE_MINUTES`) | kill its process group, run `GATE_CLEANUP` | gate failed: blocking `integration` finding |
 | reproduction command | 5 min | kill its group | reproduction `inconclusive` |
 | repair rounds per phase | 3, plus 3 per owner correction | — | open items become owner requests |
 | run execution budget | from `TT_BUDGET` (wall and tokens) | stop dispatching | run `PAUSED: budget` until the owner resumes it with more budget |
@@ -813,6 +996,8 @@ None of those states advances without a recorded cause.
   sessions/         Pi session files, one per agent
   candidates/       read-only checkouts of frozen candidates
   checks/           check and reproduction output, by candidate
+  checks/<sha>/gate.json  the conductor's own gate record, when the phase
+  checks/<sha>/gate.log   declares a gate (§6.5) — never an agent's evidence
 ```
 
 Workers cannot write here. Their `tool_call` guard blocks it (§9.5), within the
@@ -841,6 +1026,7 @@ Each has a reconciliation for "intent recorded, completion missing":
 | freeze commit | worktree HEAD carries trailer `TT-Action: <id>` → record it; otherwise redo the freeze |
 | check run | mark `interrupted` and rerun (checks are required to be rerunnable) |
 | probe | discard the probe branch and its checkout; mark the probe `interrupted`; probe again (the integration branch was never touched) |
+| gate | kill the gate's recorded process group and its cleanup's; discard the gate's checkout; mark the gate `interrupted` and rerun it — an interrupted gate is neither passed nor failed (§6.5) |
 | publish | integration branch points at I → record `DONE(I)`; still at H → retry the compare-and-swap; anywhere else → the probe is stale, return to `PROBING` |
 
 **Owner commands come in two kinds, with different guarantees:**

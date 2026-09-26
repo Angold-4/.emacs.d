@@ -340,9 +340,10 @@ then.  It is never part of the worker's or a reviewer's acceptance."
       (should-not (string-match-p "Owner input" text))
       (should-not (string-match-p "verdict" text)))))
 
-(defun +tt-test--input-state (phase &optional alive blocked requests)
+(defun +tt-test--input-state (phase &optional alive blocked requests program)
   "A minimal `tt state' for the input-header tests."
   `((conductorAlive . ,(if alive t :false))
+    (program . ,(if program '((programId . "prog1") (node . "13a")) nil))
     (ownerInputs)
     (pendingOwnerInputs)
     (state (run . "RUN_ACTIVE")
@@ -399,6 +400,143 @@ then.  It is never part of the worker's or a reviewer's acceptance."
       (should (string-match-p "too late — refused: the phase is DONE (note)" text))
       (should (string-match-p "waiting — not picked up (note)" text)))))
 
+(defconst +tt-test--directive-state
+  '((meta (title . "sum validation"))
+    (conductorAlive . t)
+    (ownerInputs)
+    (pendingOwnerInputs)
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "REVIEWING")
+                  (attempt (n . 2)) (repairRoundsUsed . 0) (repairRoundsGranted . 3)
+                  (ownerRequests)
+                  (ownerDirectives
+                   ((id . "OD-1") (seq . 1)
+                    (text . "the 14 exchange-state-machine failures are pre-existing, not yours")
+                    (scope . "phase") (status . "in-force")
+                    (targets "worker" "M" "A" "B")
+                    ;; A has not acknowledged yet, so it renders ⧗ (the plan's
+                    ;; own example): the delivery state is never inferred.
+                    (deliveries (worker . "delivered") (M . "delivered")
+                                (B . "delivered")))
+                   ;; A program-wide ruling lives in its own ODP namespace,
+                   ;; so one id names one ruling at both levels.
+                   ((id . "ODP-2") (seq . 2)
+                    (text . "no node may touch the vendor adapters after this ruling")
+                    (scope . "program") (status . "withdrawn")
+                    (targets) (deliveries))))))
+  "A fixture `tt state' with one directive in force and one withdrawn.")
+
+(ert-deftest tradeoffs-trace-owner-directives-section ()
+  "Plan 01i: the status shows each directive, its scope, whether it is in
+force, and the delivery state per live agent."
+  (with-temp-buffer
+    (+tt--render-owner-inputs +tt-test--directive-state)
+    (let ((text (buffer-string)))
+      (should (string-match-p "Owner directives (2)" text))
+      (should (string-match-p
+               (regexp-quote
+                "OD-1 [this phase, in force] the 14 exchange-state-machine failures are pre-existing, not yours — worker ✓ M ✓ A ⧗ B ✓")
+               text))
+      (should (string-match-p
+               (regexp-quote
+                "ODP-2 [whole program, withdrawn] no node may touch the vendor adapters after this ruling — (no live agent; carried in every later prompt)")
+               text)))))
+
+(ert-deftest tradeoffs-trace-input-header-scope ()
+  "Plan 01i (D5): the input header states the directive's scope, for a run's
+box, a program node's box, and a program buffer's box."
+  ;; A node of a program: `C-u' really can reach the whole program.
+  (should (string-match-p "owner directive applying to this phase"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t nil nil t))))
+  (should (string-match-p "C-u C-c C-c: whole program"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t nil nil t))))
+  ;; A hand-started run has nothing program-wide to reach, and says so.
+  (should (string-match-p "this run is not part of a program"
+                          (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
+  (should-not (string-match-p "whole program"
+                              (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
+  (should (string-match-p "program-wide owner directive for the whole program"
+                          (+tt--input-header nil t))))
+
+(ert-deftest tradeoffs-trace-input-program-wide ()
+  "Plan 01i (D5): C-u C-c C-c on a program node's run sends its text as a
+program-wide directive; without the prefix it applies to this phase, and a
+run that is not part of a program can only apply it to its phase."
+  (let ((written nil))
+    ;; A node of a program: C-u really is program-wide.
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t nil nil t)))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
+      (with-temp-buffer
+        (insert "fix the Stork link")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'scope written) "phase"))
+        (insert "fix the Stork link")
+        (+tt-input-send '(4))
+        (should (equal (alist-get 'scope written) "program"))))
+    ;; A hand-started run has nothing program-wide to reach: the input is
+    ;; recorded for this phase, and the confirmation says so (never "whole
+    ;; program", which the conductor would demote anyway).
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t)))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-2")))
+      (with-temp-buffer
+        (insert "fix the Stork link")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send '(4))
+        (should (equal (alist-get 'scope written) "phase"))))))
+
+(ert-deftest tradeoffs-trace-program-input-writes-a-program-directive ()
+  "Plan 01i: the program buffer's input box records a program-wide directive
+through the CLI, which appends the event and steers every running node now."
+  (let ((called nil)
+        (dir (make-temp-file "tt-ert-prog" t)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "ODP-1")))
+            (with-temp-buffer
+              (insert "no node may touch the vendor adapters")
+              (setq +tt--input-program-dir dir)
+              (+tt-input-send)
+              (should (equal called (list "program" "directive" dir "no node may touch the vendor adapters"))))))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-program-input-withdraws-a-directive ()
+  "Plan 01i: the program input box's `withdraw ODP-n' goes through `tt
+program withdraw' at once; trailing prose does not turn it into a new ruling,
+and an unknown id is refused by that command."
+  (let ((called nil)
+        (dir (make-temp-file "tt-ert-prog" t)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (with-temp-buffer
+              (insert "withdraw ODP-1 because it is stale")
+              (setq +tt--input-program-dir dir)
+              (+tt-input-send)
+              (should (equal called (list "program" "withdraw" dir "ODP-1")))))
+          ;; A withdrawal that names no id is refused here, never queued as a
+          ;; brand-new program-wide ruling.
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (setq called nil)
+            (with-temp-buffer
+              (insert "withdraw the Stork exception")
+              (setq +tt--input-program-dir dir)
+              (should-error (+tt-input-send) :type 'user-error)
+              (should-not called)))
+          ;; …and so is a phase id, which is not a program-wide ruling.
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (setq called nil)
+            (with-temp-buffer
+              (insert "withdraw OD-2")
+              (setq +tt--input-program-dir dir)
+              (should-error (+tt-input-send) :type 'user-error)
+              (should-not called))))
+      (delete-directory dir t))))
+
 (ert-deftest tradeoffs-trace-program-parse ()
   "Phase 4: a program file lists plan files with their dependencies."
   (let* ((dir (make-temp-file "tt-ert-prog" t))
@@ -446,7 +584,7 @@ then.  It is never part of the worker's or a reviewer's acceptance."
 
 (ert-deftest tradeoffs-trace-plan-deadlines ()
   "Per-plan time limits reach the JSON plan in ms; none means no field."
-  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n"
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n#+TT_GATE_MINUTES: 45\n"
                                                    +tt-test--valid-plan))
                           :plan))
          (d (alist-get 'deadlines plan)))
@@ -454,7 +592,25 @@ then.  It is never part of the worker's or a reviewer's acceptance."
     (should (= (alist-get 'checkMs d) 1800000))
     (should (= (alist-get 'probeMs d) 1800000))
     (should (= (alist-get 'workerAttemptMs d) 5400000))
+    ;; Plan 01f: the gate's own limit, defaulting to 30 minutes when unwritten.
+    (should (= (alist-get 'gateMs d) 2700000))
     (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
+
+(ert-deftest tradeoffs-trace-plan-gate ()
+  "Plan 01f: :GATE: and :GATE_CLEANUP: parse into the phase."
+  (let* ((text (replace-regexp-in-string
+                ":RESERVED:    public API types; persistence format\n"
+                ":RESERVED:    public API types; persistence format\n  :GATE:        deploy/atlas.sh --clean --build\n  :GATE_CLEANUP: docker compose down -v\n"
+                +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan))
+         (p1 (aref (alist-get 'phases plan) 0))
+         (p2 (aref (alist-get 'phases plan) 1)))
+    (should (equal (alist-get 'gate p1) "deploy/atlas.sh --clean --build"))
+    (should (equal (alist-get 'gateCleanup p1) "docker compose down -v"))
+    ;; A phase without the properties carries no gate at all: it never
+    ;; enters the GATING stage and accepts exactly as before plan 01f.
+    (should-not (assq 'gate p2))
+    (should-not (assq 'gateCleanup p2))))
 
 (ert-deftest tradeoffs-trace-plan-references ()
   "A plan's cited documents that exist on disk become its references."
@@ -657,6 +813,97 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (let ((+tt--notify-flash nil))
         (+tt--mode-line-update)
         (should (string-match-p "⚑ 13f waiting 1h12m" +tt--mode-line-string))))))
+
+(defconst +tt-test--amended-state
+  '((meta (title . "sum validation"))
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "IMPLEMENTING")
+                  (attempt (n . 2))
+                  (candidate (sha . "7c1e0a4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+                  (contract (contractVersion (snapshot . 2) (sectionSha256 . "9e2c")))
+                  (decisions ((id . "D-p1-C1-amendment") (version . 2) (class . "reserved")
+                              (source . "worker")
+                              (choice . "the tests pass")
+                              (whyItMatters . "the literal wording cannot be met")
+                              (alternatives ((option . "it works") (consequence . "no candidate can satisfy it")))
+                              (recommendation (choice . "the tests pass") (reason . "satisfiable and still meaningful"))
+                              (amendment (id . "AM-p1-C1")
+                                         (criterion . "it works")
+                                         (proposedWording . "the tests pass")
+                                         (why . "the literal wording cannot be met")
+                                         (raisedBy . "worker") (status . "applied"))))
+                  (ballots)
+                  (findings)
+                  (ownerRequests)
+                  (corrections)))
+    (decisionStatuses (D-p1-C1-amendment (status . "passed") (reason . "vote passed")
+                                         (amendment (id . "AM-p1-C1")
+                                                    (criterion . "it works")
+                                                    (proposedWording . "the tests pass")
+                                                    (status . "applied"))))
+    (view (round . 2) (reviewLine . "M ✓   A ✓   B ✓") (needsYou . 0)))
+  "Plan 01g: a `tt state' whose only record is an applied amendment.")
+
+(ert-deftest tradeoffs-trace-amendment-decision-render ()
+  "Plan 01g: the decision view shows an amendment as `⚑ AMENDED' with the old
+wording → the new one, read from the tally status the conductor emits."
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--amended-state)
+    (let ((text (buffer-string)))
+      (should (string-match-p "\\* ⚑ AMENDED" text))
+      (should (string-match-p (regexp-quote "it works → the tests pass") text)))))
+
+(defconst +tt-test--amendment-input-state
+  '((conductorAlive . t)
+    (program . nil)
+    (ownerInputs) (pendingOwnerInputs)
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "REVIEWING")
+                  (attempt (n . 2))
+                  (decisions ((id . "D-am") (class . "reserved")
+                              (amendment (id . "AM-p1-C1") (status . "applied")
+                                         (criterion . "it works")
+                                         (proposedWording . "the tests pass")))))))
+  "Plan 01g: a state with one applied amendment, for the input-box tests.")
+
+(ert-deftest tradeoffs-trace-amendment-revert-input ()
+  "Plan 01g: text naming an applied amendment id is sent as a correction, and
+a near-miss is not."
+  (should (equal (+tt--revert-amendment-id +tt-test--amendment-input-state "revert AM-p1-C1") "AM-p1-C1"))
+  ;; Only the command form counts: a mention in a steer/note must not revert.
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "AM-p1-C1 still looks wrong"))
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "please revert AM-p1-C1 later"))
+  ;; A longer id that merely begins with the same text is not a revert.
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "revert AM-p1-C10"))
+  (let ((written nil))
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) +tt-test--amendment-input-state))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
+      (with-temp-buffer
+        (insert "revert AM-p1-C1 because the owner disagrees")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'type written) "correction")))))
+  ;; A mention inside a steer reaches the worker as its natural kind.
+  (let ((written nil))
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) +tt-test--amendment-input-state))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-2")))
+      (with-temp-buffer
+        (insert "AM-p1-C1 still looks wrong, also fix the retry loop")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'type written) "note"))))))
+
+(ert-deftest tradeoffs-trace-amendment-reverted-render ()
+  "Plan 01g: a reverted amendment's line points back to the restored wording,
+so the view never claims the replacement is still in force (A-14)."
+  (let* ((a '((id . "AM-p1-C1") (criterion . "it works")
+              (proposedWording . "the tests pass") (status . "reverted")))
+         (d `((amendment . ,a))))
+    (should (equal (+tt--amendment-line d) "  the tests pass → it works\n")))
+  (let* ((a '((id . "AM-p1-C1") (criterion . "it works")
+              (proposedWording . "the tests pass") (status . "applied")))
+         (d `((amendment . ,a))))
+    (should (equal (+tt--amendment-line d) "  it works → the tests pass\n"))))
 
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

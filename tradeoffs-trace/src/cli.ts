@@ -40,6 +40,7 @@ import {
 } from "./effects/secrets.ts";
 import type { ProgramFile } from "./core/program.ts";
 import {
+  addProgramDirective,
   appendProgramEvent,
   createProgram,
   foldProgram,
@@ -49,13 +50,14 @@ import {
   programStatusLines,
   programWaitingNodes,
   runScheduler,
+  withdrawProgramDirective,
 } from "./program.ts";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -249,6 +251,21 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       out.push(`(cd ${entry.plan.repo} && gh pr create --base ${base} --head ${s.branch} --title "${title}" --body-file ${path.join(runDir, "views", "pr.md")})`);
     }
     process.stdout.write(out.length > 0 ? `${out.join("\n")}\n` : "no DONE nodes yet\n");
+  } else if (sub === "directive") {
+    // Plan 01i: a program-wide owner directive — every running node is
+    // steered at once, every node started later is started with it.
+    if (args.length !== 2) usage();
+    const dir = resolveProgramDir(args[0], root);
+    process.stdout.write(`${addProgramDirective(root, dir, args[1]).id}\n`);
+  } else if (sub === "withdraw") {
+    if (args.length !== 2) usage();
+    const dir = resolveProgramDir(args[0], root);
+    if (!withdrawProgramDirective(root, dir, args[1])) {
+      process.stderr.write(`no program directive ${args[1]} is in force\n`);
+      process.exitCode = 1;
+      return;
+    }
+    process.stdout.write(`withdrew ${args[1]}\n`);
   } else if (sub === "list") {
     let ids: string[] = [];
     try {
@@ -448,12 +465,25 @@ function renderStatus(runDir: string): string {
   const ownerRequests = (phase.ownerRequests as Array<{ status: string }>) ?? [];
   const openRequests = ownerRequests.filter((r) => r.status === "open");
   lines.push(`open owner requests: ${openRequests.length}`);
+  // Plan 01i: every directive in force, with its scope, so `tt status` names
+  // the rulings the phase is bound to.
+  const directives = (phase.ownerDirectives as Array<{ id: string; text: string; scope: string; status: string }>) ?? [];
+  for (const d of directives.filter((d) => d.status === "in-force")) {
+    lines.push(`directive ${d.id} (${d.scope === "program" ? "whole program" : "this phase"}): ${d.text}`);
+  }
   if (phase.blockedReason) lines.push(`blocked: ${phase.blockedReason}`);
   if (phase.publishedI) lines.push(`published: ${phase.publishedI}`);
   // Plan 3b: the same readable view the status buffer shows.
   const view = buildView(runDir, plan, conductorAlive(runDir));
   lines.push(`pipeline: ${view.pipeline}`);
+  lines.push(`gates: ${view.gates}`);
+  // Plan 01f: the conductor's gate record, cited (tt summary cites the same).
+  if (view.gate) lines.push(`gate: ${view.gate}`);
+  // Plan 01e: the base's own pre-existing check failures (D2), when it has any.
+  if (view.baseline) lines.push(`base: ${view.baseline}`);
   lines.push(`reviews: ${view.reviewLine}`);
+  // Plan 01g: every amendment record, applied or reverted, with old → new.
+  if (view.amendments) lines.push(`amendments: ${view.amendments}`);
   if (view.verdict) lines.push(`verdict: ${view.verdict}`);
   if (view.time) lines.push(`time: ${view.time}`);
   return `${lines.join("\n")}\n`;
@@ -782,6 +812,15 @@ async function main(): Promise<void> {
     const round = state.phase.round ?? 0;
     const ownerInputs = state.phase.ownerInputs ?? [];
     const { timeline: _timeline, ...view } = buildView(runDir, plan, alive);
+    // Plan 01i: the program this run is a node of, when a scheduler started
+    // it — the front end needs it to tell the truth about `C-u`'s scope (a
+    // hand-started run has nothing program-wide to reach).
+    let program: { programId?: string; node?: string } | null = null;
+    try {
+      program = JSON.parse(readFileSync(path.join(runDir, "program.json"), "utf8"));
+    } catch {
+      program = null;
+    }
     const payload = {
       runDir,
       meta,
@@ -790,6 +829,7 @@ async function main(): Promise<void> {
       round,
       decisionStatuses,
       conductorAlive: alive,
+      program,
       ownerInputs,
       pendingOwnerInputs: pendingOwnerInputs(runDir),
       // Plan 01a: the plan's declared secret names, and which were unset or

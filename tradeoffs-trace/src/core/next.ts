@@ -18,7 +18,8 @@
 // exactly, and calling next() again after the matching ACTION_STARTED
 // returns [] (no double dispatch) for the dispatch-shaped ones.
 
-import { accept, resolvedCorrectionIdsFor, sameVersion } from "./predicate.ts";
+import { gateCommandOf } from "./gate.ts";
+import { accept, amendmentToApply, resolvedCorrectionIdsFor, sameVersion } from "./predicate.ts";
 import type { Action, PhaseState, Reviewer, State } from "./types.ts";
 
 function hasValidReview(phase: PhaseState, who: Reviewer): boolean {
@@ -77,11 +78,30 @@ export function next(state: State): Action[] {
       if (!p.candidate) return [];
       const C = p.candidate.sha;
       const K = p.contract.contractVersion;
+      // Plan 01g: a passing amendment is applied before anything else — it
+      // rewrites one acceptance item and returns the phase to a fresh
+      // attempt under the new contract version, so the next candidate is
+      // judged against the new wording. It never waits for the owner and
+      // never consumes a repair round by itself.
+      const amendment = amendmentToApply(p, C, K);
+      if (amendment) return [{ type: "apply_amendment", decisionId: amendment.id }];
       if (accept(p, C, K)) {
+        // Plan 01f: an acceptable candidate with a declared gate is gated
+        // first; the gate stage then asks for the gate command itself. A
+        // gate-less phase accepts exactly as it did before plan 01f.
+        if (gateCommandOf(p.contract)) return [{ type: "gate_required" }];
         return [{ type: "accept", resolvedCorrectionIds: resolvedCorrectionIdsFor(p, C, K) }];
       }
       return [{ type: "resolving_incomplete" }];
     }
+
+    // Plan 01f: the conductor's own gate command, run once for this
+    // candidate (a recorded pass for an identical tree is reused instead,
+    // and the action is still reported as dispatched — the reuse decision is
+    // the effect layer's, not the FSM's).
+    case "GATING":
+      if (!p.candidate) return [];
+      return p.inFlight.run_gate ? [] : [{ type: "run_gate", candidateSha: p.candidate.sha }];
 
     case "ACCEPTED":
       if (!p.candidate || !p.probe?.probedI) return [];
