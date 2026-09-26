@@ -1358,6 +1358,38 @@ binding, so a trade-off line still opens the decision view."
             (should (seq-find (lambda (m) (string-match-p (regexp-quote reason) m)) echoed)))
         (delete-directory dir t)))))
 
+(ert-deftest tradeoffs-trace-status-file-restores-faces ()
+  "A-15: the rendered status file keeps the row faces +tt--render-status-from
+used: shadow `previous'/`cost' values, and a DONE `verdict' as success."
+  (let ((dir (make-temp-file "tt-ert-status" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/status.txt" dir)
+            (insert "sum validation\n"
+                    "run r1 · conductor stopped · 8s\n\n"
+                    "phase     p1 · DONE · round 1 · attempt 1 · repairs 0/3\n"
+                    "previous  round 1 · c1 · not accepted\n"
+                    "verdict   accepted and published\n"
+                    "cost      1 round · 0m total\n"
+                    "base      base fails: 1 test\n"
+                    "blocked   no candidate\n"))
+          (with-temp-buffer
+            (+tt-status-mode)
+            (setq +tt--run-dir dir)
+            (+tt--render-status)
+            (let ((face-at (lambda (needle)
+                             (goto-char (point-min))
+                             (search-forward needle)
+                             (get-text-property (match-beginning 0) 'face))))
+              (should (eq (funcall face-at "accepted and published") 'success))
+              (should (eq (funcall face-at "round 1 · c1") 'shadow))
+              (should (eq (funcall face-at "1 round · 0m total") 'shadow))
+              (should (eq (funcall face-at "base fails") 'warning))
+              (should (eq (funcall face-at "no candidate") 'error))
+              (should (eq (funcall face-at "sum validation") 'bold))))) 
+      (delete-directory dir t))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
 

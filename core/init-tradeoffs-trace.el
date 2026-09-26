@@ -1130,10 +1130,12 @@ removed and the whole line carries the id."
 
 (defun +tt--status-restore-faces ()
   "Re-apply the faces the runtime's plain status text implies.
-`views/status.txt' is text, so the bold title, the shadow run line and row
-labels, the warning `base'/`amended'/`secret' rows, the error `blocked' row
-and the attention line are restored here."
-  (let ((inhibit-read-only t))
+`views/status.txt' is text, so the bold title, the shadow run line, row
+labels and `previous'/`cost' values, the warning `base'/`amended'/`secret'
+rows, the `verdict' success/warning, the error `blocked' row and the
+attention line are restored here, matching `+tt--render-status-from'."
+  (let ((inhibit-read-only t)
+        (name nil))
     (save-excursion
       (goto-char (point-min))
       ;; The bold title, then the shadow `run <id> · conductor … · …' line.
@@ -1141,15 +1143,24 @@ and the attention line are restored here."
       (forward-line 1)
       (when (looking-at "run ")
         (put-text-property (line-beginning-position) (line-end-position) 'face 'shadow))
-      ;; Each status row's label is shadow; its value's face depends on the row.
+      ;; Each status row's label is shadow; its value's face depends on the row
+      ;; (and the phase row tells us whether the verdict is a success).
       (while (re-search-forward "^\\([a-z]+\\) +\\(.*\\)$" nil t)
         (let ((label (match-string 1))
+              (value (match-string 2))
               (beg (line-beginning-position))
-              (end (line-end-position)))
+              (end (line-end-position))
+              (vbeg nil))
           (put-text-property beg (min end (+ beg 10)) 'face 'shadow)
+          (setq vbeg (min end (+ beg 10)))
+          (when (equal label "phase")
+            (when (string-match " · \\([A-Z_]+\\) · " value)
+              (setq name (match-string 1 value))))
           (pcase label
-            ((or "base" "amended" "secret") (put-text-property (min end (+ beg 10)) end 'face 'warning))
-            ("blocked" (put-text-property (min end (+ beg 10)) end 'face 'error)))))
+            ((or "base" "amended" "secret") (put-text-property vbeg end 'face 'warning))
+            ((or "previous" "cost") (put-text-property vbeg end 'face 'shadow))
+            ("verdict" (put-text-property vbeg end 'face (if (equal name "DONE") 'success 'warning)))
+            ("blocked" (put-text-property vbeg end 'face 'error)))))
       ;; The attention line.
       (goto-char (point-min))
       (when (re-search-forward "^⚑ " nil t)
