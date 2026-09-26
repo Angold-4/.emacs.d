@@ -11,17 +11,78 @@ it through a fixed pipeline. Each attempt and each reviewer is a separate Pi
 agent with its own session:
 
 ```text
-implement ─▶ freeze ─▶ checks ─▶ probe ─▶ review (M, A, B) ─▶ resolve ─▶ publish ─▶ DONE
-    ▲                    │          │             │                │
+implement ─▶ freeze ─▶ checks ─▶ probe ─▶ review (M, A, B) ─▶ resolve ─▶ gate ─▶ publish ─▶ DONE
+    ▲                    │          │             │                │       │
     └──── repair (up to 3 rounds, with the findings and rejected decisions) ◀┘
 ```
+
+`gate` is the phase's own expensive, live proof, run by the conductor itself
+and only for a phase that declares `:GATE:` (see *The gate* below). A phase
+without one goes straight from `resolve` to `publish`.
 
 - **Worker:** implements in its own git worktree, `~/.tradeoffs-trace/<run>/worktree`. It never touches your checkout.
 - **Freeze:** commits the worktree as the candidate.
 - **Checks:** run the plan's check command on a fresh checkout of the candidate. Failures the base already had do not count against it (see *Pre-existing check failures* below).
 - **Probe:** merges the candidate onto the current integration branch and runs the checks again. It reuses the check results when the tree is identical.
 - **Review:** three independent reviewers. In turn 1 each finds decisions in the diff. At a barrier they see each other's discoveries. In turn 2 they vote on every decision and raise findings. M holds a veto; otherwise 2 of 3 decide.
+- **Gate:** runs the phase's `:GATE:` command itself, once per candidate the reviewers accepted, under a machine-wide lock, and records the evidence (see *The gate* below).
 - **Publish:** fast-forwards the plan's integration branch in the **local** repository. Nothing is pushed.
+
+## The gate (`:GATE:`)
+
+Some phases need a live proof that is far more expensive than the check loop —
+for example a full `deploy/atlas.sh … --clean --build` of a 40-service stack
+(~15 min). Declare it on the phase:
+
+```org
+* 13i: the live atlas gate
+  :PROPERTIES:
+  :ID:          13i
+  :CHECKS:      make check
+  :GATE:        deploy/atlas.sh --clean --build
+  :GATE_CLEANUP: docker compose -f deploy/atlas.yml down -v
+  :END:
+```
+
+- The **conductor runs it**, never an agent, after the checks, the probe and
+  all three reviews have passed and before acceptance. It is the only accepted
+  live proof; the worker and the reviewers are told so and never to run the
+  command or report its result themselves. A substitute (a sentinel sha, a
+  "pending owner live run", a fingerprint) is a blocking finding, not evidence.
+- It runs in a fresh checkout of the candidate merged onto the current
+  integration head, with the plan's secrets (`#+TT_SECRETS`) in its
+  environment. It takes `~/.tradeoffs-trace/gate.lock` before that merge and
+  holds it through the command, the cleanup and the record, so two phases —
+  in one program or in two runs — never have gate checkouts or builds live at
+  once; the second waits.
+- **The evidence** is `<run>/checks/<sha>/gate.json` (candidate and base SHA,
+  the merged tree, the command, exit status, the gate's own duration, start,
+  the log's sha256, and the cleanup's own exit and duration) plus
+  `<run>/checks/<sha>/gate.log` (redacted stdout/stderr). `tt status` and `tt
+  summary` cite it. The cleanup runs whenever the gate command ran (pass, fail
+  or timeout), under its own limit; its time is not counted as the gate's. If
+  the candidate no longer merges, the gate never starts and nothing is
+  cleaned — the record says `not started` rather than claiming a run.
+- **A failure** (non-zero exit, or killed at its limit) is a blocking
+  `integration` finding whose evidence is the log's last 60 lines. The phase
+  repairs (the worker is shown the log) or parks on you when the rounds run
+  out.
+- **An identical tree with the same command reuses a passing record**: the
+  command does not run again (a repair attempt that changes nothing freezes a
+  new commit with the same tree). The run-or-reuse decision happens under the
+  gate lock, so a candidate whose tree another candidate just gated reuses
+  that pass. The record is re-hashed first: if its `gate.log` is missing or no
+  longer matches the sha256 it carries — or the plan's `:GATE:` text has
+  changed — the gate reruns instead of passing on it. A record that is itself
+  a reuse counts as passing, so a chain of reuses still saves the build.
+  A failed gate is always rerun, and a record is never overwritten: a
+  candidate re-gated after a stale publish accepts on its own record in place,
+  and the status/`tt summary` line names both the head the evidence came from
+  and the head being accepted.
+- **The limit** is 30 min by default; `#+TT_GATE_MINUTES: 45` raises it. A gate
+  over the limit has its process group killed and counts as failed.
+- A phase without `:GATE:` is unaffected: it accepts as soon as the reviews
+  pass, exactly as before.
 
 ## Pre-existing check failures (the base baseline)
 
@@ -403,6 +464,7 @@ on disk after a stop.
 | freeze | 2 min | |
 | checks | 5 min | counts as failed checks (each baseline command too) |
 | probe | 10 min | |
+| the phase gate (`:GATE:`) | 30 min (`#+TT_GATE_MINUTES`) | the command's group is killed and the gate counts as failed |
 | review (both turns) | 15 min | the reviewer is re-dispatched once, then the phase is BLOCKED |
 | repair rounds | 3 | then AWAITING_OWNER |
 
@@ -429,7 +491,10 @@ stops for you only when its repair rounds are exhausted.
   <run>/stream/<agent>.jsonl        each agent's raw Pi event stream (the trace renders it)
   <run>/sessions/                   Pi sessions (repairs continue the worker's session)
   <run>/checks/base/                the base baseline: baseline.json + per-command logs
-  <run>/checks/<sha>/               per-command check logs
+  <run>/checks/<sha>/               per-command check logs; when the phase
+                                    declares :GATE:, gate.json + gate.log too
+  ~/.tradeoffs-trace/gate.lock      the machine-wide gate lock (two phases
+                                    never run their gate command at once)
   <run>/inbox/{,applied/,rejected/} owner input and commands, with rejection reasons
 ```
 

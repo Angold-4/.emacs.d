@@ -9,6 +9,8 @@ import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimeline, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { effectiveChecks } from "./core/checks.ts";
+// Plan 01f: the gate stage's own record (the conductor's live proof).
+import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 import { notAcceptedReasons, reviewerOutcomes, type ReviewerOutcome } from "./core/verdict.ts";
@@ -27,6 +29,7 @@ const STAGE_OF: Record<string, string> = {
   PROBING: "probe",
   REVIEWING: "review",
   RESOLVING: "resolve",
+  GATING: "gate",
   ACCEPTED: "publish",
   PUBLISHING: "publish",
   AWAITING_OWNER: "needs you",
@@ -36,15 +39,31 @@ const STAGE_OF: Record<string, string> = {
 
 /** The stages the conductor runs itself: no agent is expected to be active,
  * so "no agent activity" there is not idleness. */
-export const CONDUCTOR_STAGES = new Set(["freeze", "checks", "probe", "resolve", "publish"]);
+export const CONDUCTOR_STAGES = new Set(["freeze", "checks", "probe", "resolve", "gate", "publish"]);
 
 const STAGE_DEADLINE_MS: Record<string, number> = {
   implement: DEFAULT_DEADLINES.workerAttemptMs,
   freeze: DEFAULT_DEADLINES.freezeMs,
   checks: DEFAULT_DEADLINES.checkMs,
   probe: DEFAULT_DEADLINES.probeMs,
+  gate: DEFAULT_DEADLINES.gateMs,
   review: DEFAULT_DEADLINES.reviewMs,
 };
+
+/** The stage limits the pipeline line counts down, with the plan's own
+ * `#+TT_*_MINUTES` overrides applied (a plan that sets a 45-minute gate must
+ * not be shown as "over by" while the conductor is running within it). */
+export function stageLimits(plan: Pick<RunPlanFile, "deadlines">): Record<string, number> {
+  const d = { ...DEFAULT_DEADLINES, ...(plan.deadlines ?? {}) };
+  return {
+    implement: d.workerAttemptMs,
+    freeze: d.freezeMs,
+    checks: d.checkMs,
+    probe: d.probeMs,
+    gate: d.gateMs,
+    review: d.reviewMs,
+  };
+}
 
 export interface StageSpan {
   stage: string;
@@ -91,7 +110,7 @@ export function formatDuration(ms: number): string {
 
 /** "implement 30s → freeze 1s → checks ✗ 10m00s → implement 26m → … →
  * review 12s… (14m48s left)". Attempts after the first are numbered. */
-export function pipelineLine(spans: StageSpan[]): string {
+export function pipelineLine(spans: StageSpan[], limits: Record<string, number> = STAGE_DEADLINE_MS): string {
   let attempt = 0;
   const parts = spans.map((s) => {
     let name = s.stage;
@@ -102,7 +121,7 @@ export function pipelineLine(spans: StageSpan[]): string {
     if (s.stage === "DONE" || s.stage === "BLOCKED") return s.stage;
     const d = formatDuration(s.ms);
     if (s.current) {
-      const limit = STAGE_DEADLINE_MS[s.stage];
+      const limit = limits[s.stage];
       const left =
         limit === undefined ? "" : limit >= s.ms ? ` (${formatDuration(limit - s.ms)} left)` : ` (over by ${formatDuration(s.ms - limit)})`;
       return `${name} ${d}…${left}`;
@@ -286,11 +305,16 @@ export interface RunView {
   stageElapsed: string;
   elapsed: string;
   pipeline: string;
-  /** Checks/probe/reviews for the current candidate only; while a repair
+  /** Checks/probe/reviews/gate for the current candidate only; while a repair
    * attempt implements they are "pending (round N)". A candidate whose checks
    * passed only because every failure was already on the base says so:
-   * `checks ✓ (base has N failures)`. */
+   * `checks ✓ (base has N failures)`. The gate is shown only for a phase
+   * whose contract declares one (`gate ✓`, `gate ✓ (reused)`, `gate ✗`). */
   gates: string;
+  /** Plan 01f: one line citing the conductor's gate record for the current
+   * candidate (`tt status`/`tt summary`/the status buffer). Undefined when
+   * the phase declares no gate or none has run yet. */
+  gate?: string;
   /** Plan 01e: the base's own pre-existing check failures, when it has any
    * (`base fails: N tests: …`). Undefined when the base passes or no baseline
    * was taken. */
@@ -346,6 +370,16 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     C && r?.candidateSha === C && r.passed === true && baseline && baseline.failures.length > 0
       ? ` (base has ${baseline.failures.length} failures)`
       : "";
+  // Plan 01f: the gate's own record for the current candidate, read from
+  // disk like the baseline (the conductor writes it; nothing here moves run
+  // state).
+  const gateRecord = readGateRecord(runDir, C);
+  const gateDeclared = Boolean(phase.contract.gate);
+  const gateTag = !gateDeclared
+    ? ""
+    : !C || gateRecord?.candidateSha !== C
+      ? " · gate ⧗"
+      : ` · gate ${gateRecord.passed ? `✓${gateRecord.reused ? " (reused)" : ""}` : "✗"}`;
   let gates: string;
   let previousRound: string | undefined;
   if (repairing && stage === "implement") {
@@ -353,7 +387,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     previousRound = C ? `round ${round} · ${C.slice(0, 7)} · ${reasons.length > 0 ? `not accepted: ${reasons.join("; ")}` : "not accepted"}` : undefined;
   } else {
     gates = C
-      ? `checks ${gate(phase.checks)}${baseNote(phase.checks)} · probe ${gate(phase.probe, probeReused(runDir, C))}`
+      ? `checks ${gate(phase.checks)}${baseNote(phase.checks)} · probe ${gate(phase.probe, probeReused(runDir, C))}${gateTag}`
       : "no candidate yet";
   }
 
@@ -395,8 +429,9 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
-    pipeline: pipelineLine(spans),
+    pipeline: pipelineLine(spans, stageLimits(plan)),
     gates,
+    gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord, phase.integrationHead) : undefined,
     baseline: baselineStatusLine(baseline),
     previousRound,
     reviewers,
@@ -425,6 +460,44 @@ function lastEventAt(runDir: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Plan 01f: the gate record for `candidateSha`, or undefined when none has
+ * been written (yet). A malformed record is no record. */
+function readGateRecord(runDir: string, candidateSha: string | undefined): GateRecord | undefined {
+  if (!candidateSha) return undefined;
+  try {
+    return parseGateRecord(JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, candidateSha, "gate.json"), "utf8")));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Plan 01f: one line citing a gate record — what a passing gate proved, the
+ * head its evidence was produced for, how long it took and where its log is.
+ *
+ * `acceptedAtBase` is the integration head the phase is accepting the
+ * candidate against now. When it differs from the record's own head (a
+ * re-acceptance after a stale publish reuses the candidate's own record
+ * rather than rewriting it), both are named: the record is never rewritten,
+ * so the citation is where a reader learns that the evidence was produced
+ * against the older head. */
+export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): string {
+  const short = (sha: string) => sha.slice(0, 7);
+  // One outcome phrase (core/gate.ts), shared with the prompts and the
+  // failure evidence: a gate that never started is never rendered as an
+  // exit-less failure.
+  const how = record.reused
+    ? `passed (reused candidate ${record.reusedFrom?.slice(0, 9) ?? "?"}'s record${record.reusedFromBaseSha ? `, gated against base ${short(record.reusedFromBaseSha)}` : ""})`
+    : gateOutcomeText(record, { withElapsed: true });
+  const accepted =
+    acceptedAtBase !== undefined && acceptedAtBase !== record.baseSha
+      ? ` (accepted against base ${short(acceptedAtBase)})`
+      : "";
+  const cleanup = record.cleanup
+    ? `; cleanup ${record.cleanupExitCode === 0 ? "ok" : `exit ${record.cleanupExitCode ?? "?"}`}`
+    : "";
+  return `gate ${how} on candidate ${record.candidateSha.slice(0, 9)} against base ${short(record.baseSha)}${accepted}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
 }
 
 function readBaseline(runDir: string): Baseline | undefined {
@@ -509,6 +582,8 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     "### Review (tradeoffs-trace)",
     "",
     `- Pipeline: ${v.pipeline}`,
+    // Plan 01f: the conductor's own live proof, cited from its record.
+    ...(phase.contract.gate ? [`- Gate: ${v.gate ?? "no record for the accepted candidate"}`] : []),
     `- Reviews on the accepted candidate ${C ? C.slice(0, 9) : "?"}: ${v.reviewLine}`,
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,

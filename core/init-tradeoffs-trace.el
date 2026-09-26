@@ -147,6 +147,13 @@ The goal ends at a blank line, a list item or the \"Acceptance:\" line."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
          (id (org-element-property :ID hl))
          (checks (org-element-property :CHECKS hl))
+         ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
+         ;; the command it runs once per candidate the reviewers accepted,
+         ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
+         ;; whatever its outcome. Both optional — a phase without them never
+         ;; enters the GATING stage.
+         (gate (org-element-property :GATE hl))
+         (gate-cleanup (org-element-property :GATE_CLEANUP hl))
          (boundaries (org-element-property :BOUNDARIES hl))
          (reserved (org-element-property :RESERVED hl))
          (provisional (member "provisional" (org-element-property :tags hl)))
@@ -168,7 +175,9 @@ The goal ends at a blank line, a list item or the \"Acceptance:\" line."
             (checks . ,(vconcat (and checks (list checks))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat (and reserved (split-string reserved ";" t "[ \t]+"))))
-            (provisional . ,(if provisional t :false)))
+            (provisional . ,(if provisional t :false))
+            ,@(when gate `((gate . ,gate)))
+            ,@(when gate-cleanup `((gateCleanup . ,gate-cleanup))))
           (nreverse errors))))
 
 (defun +tt--plan-references (dir)
@@ -196,15 +205,19 @@ so no agent searches the file system for them."
       (nreverse out))))
 
 (defun +tt--plan-deadlines ()
-  "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES and
-#+TT_ATTEMPT_MINUTES, as the conductor's deadline fields in ms (or nil).
-For repositories whose builds and suites outlast the defaults (3, 5, 45)."
+  "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES,
+#+TT_ATTEMPT_MINUTES and #+TT_GATE_MINUTES, as the conductor's deadline
+fields in ms (or nil).  For repositories whose builds and suites outlast the
+defaults (3, 5, 45, 30)."
   (let ((ms (lambda (kw) (let ((v (+tt--keyword kw)))
                            (and v (string-match-p "\\`[0-9]+\\'" v) (* 60000 (string-to-number v))))))
         (out nil))
     (when-let* ((v (funcall ms "TT_SH_MINUTES"))) (push (cons 'shCommandMs v) out))
     (when-let* ((v (funcall ms "TT_CHECK_MINUTES"))) (push (cons 'checkMs v) out) (push (cons 'probeMs v) out))
     (when-let* ((v (funcall ms "TT_ATTEMPT_MINUTES"))) (push (cons 'workerAttemptMs v) out))
+    ;; Plan 01f: a gate defaults to 30 minutes — a 15-minute --clean --build
+    ;; fits, the old 8-minute sh limit did not (runtime doc §6).
+    (when-let* ((v (funcall ms "TT_GATE_MINUTES"))) (push (cons 'gateMs v) out))
     (nreverse out)))
 
 (defun +tt--plan-secrets ()
@@ -919,6 +932,9 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
     (+tt--status-row "pipeline" (alist-get 'pipeline v))
     (+tt--status-row "time" (alist-get 'time v))
     (+tt--status-row "gates" (alist-get 'gates v))
+    ;; Plan 01f: the conductor's own gate record, cited (nil when this phase
+    ;; declares no :GATE:).
+    (+tt--status-row "gate" (alist-get 'gate v))
     ;; Plan 01e: the base's own pre-existing check failures (D2), when any.
     (+tt--status-row "base" (alist-get 'baseline v) 'warning)
     (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)

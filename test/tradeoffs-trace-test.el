@@ -508,7 +508,7 @@ and an unknown id is refused by that command."
 
 (ert-deftest tradeoffs-trace-plan-deadlines ()
   "Per-plan time limits reach the JSON plan in ms; none means no field."
-  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n"
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n#+TT_GATE_MINUTES: 45\n"
                                                    +tt-test--valid-plan))
                           :plan))
          (d (alist-get 'deadlines plan)))
@@ -516,7 +516,25 @@ and an unknown id is refused by that command."
     (should (= (alist-get 'checkMs d) 1800000))
     (should (= (alist-get 'probeMs d) 1800000))
     (should (= (alist-get 'workerAttemptMs d) 5400000))
+    ;; Plan 01f: the gate's own limit, defaulting to 30 minutes when unwritten.
+    (should (= (alist-get 'gateMs d) 2700000))
     (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
+
+(ert-deftest tradeoffs-trace-plan-gate ()
+  "Plan 01f: :GATE: and :GATE_CLEANUP: parse into the phase."
+  (let* ((text (replace-regexp-in-string
+                ":RESERVED:    public API types; persistence format\n"
+                ":RESERVED:    public API types; persistence format\n  :GATE:        deploy/atlas.sh --clean --build\n  :GATE_CLEANUP: docker compose down -v\n"
+                +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan))
+         (p1 (aref (alist-get 'phases plan) 0))
+         (p2 (aref (alist-get 'phases plan) 1)))
+    (should (equal (alist-get 'gate p1) "deploy/atlas.sh --clean --build"))
+    (should (equal (alist-get 'gateCleanup p1) "docker compose down -v"))
+    ;; A phase without the properties carries no gate at all: it never
+    ;; enters the GATING stage and accepts exactly as before plan 01f.
+    (should-not (assq 'gate p2))
+    (should-not (assq 'gateCleanup p2))))
 
 (ert-deftest tradeoffs-trace-plan-references ()
   "A plan's cited documents that exist on disk become its references."

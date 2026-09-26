@@ -47,6 +47,12 @@ const acceptableReviews = {
   B: { review: approvingReview("B", "C1", K) },
 };
 
+/** Plan 01f: the same contract with a `:GATE:` command declared, which is
+ * what inserts the GATING stage between RESOLVING and ACCEPTED. */
+function gatedContract(gate = "deploy/atlas.sh --clean --build", gateCleanup?: string) {
+  return { ...baseState().phase.contract, gate, ...(gateCleanup ? { gateCleanup } : {}) };
+}
+
 interface Fixture {
   state: State;
   event: Event;
@@ -169,6 +175,71 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "ACCEPTED", resolvedCorrectionIds: [] },
   },
+  // Plan 01f: an acceptable candidate whose contract declares a gate enters
+  // GATING instead; the gate is the next action from there.
+  "resolving-gate-required": {
+    state: baseState({
+      phase: "RESOLVING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      contract: gatedContract(),
+    }),
+    event: { type: "GATE_REQUIRED" },
+  },
+  "gate-accepted": {
+    state: baseState({
+      phase: "GATING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_gate: { actionId: "a1" } },
+      contract: gatedContract(),
+    }),
+    event: { type: "ACCEPTED", resolvedCorrectionIds: [] },
+  },
+  "gate-failed-to-repairing": {
+    state: baseState({
+      phase: "GATING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_gate: { actionId: "a1" } },
+      contract: gatedContract(),
+    }),
+    event: { type: "GATE_FAILED", evidence: "gate command exited 3: boom" },
+  },
+  "gate-failed-budget-exhausted": {
+    state: baseState({
+      phase: "GATING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_gate: { actionId: "a1" } },
+      repairRoundsUsed: 3,
+      repairRoundsGranted: 3,
+      contract: gatedContract(),
+    }),
+    event: { type: "GATE_FAILED", evidence: "gate command exited 3: boom" },
+  },
+  "gate-interrupted": {
+    state: baseState({
+      phase: "GATING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_gate: { actionId: "a1" } },
+      contract: gatedContract(),
+    }),
+    event: { type: "GATE_INTERRUPTED" },
+  },
   "resolving-incomplete-repair": {
     state: baseState({
       phase: "RESOLVING",
@@ -239,7 +310,7 @@ const BUILD: Record<string, Fixture> = {
 
 // amend-from-* and revise-from-* rows are generated over a list of states in
 // transitions.ts; build fixtures for each the same way here.
-const AMEND_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "ACCEPTED"];
+const AMEND_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED"];
 for (const from of AMEND_FROM) {
   BUILD[`amend-from-${from.toLowerCase()}`] = {
     state: baseState({ phase: from, candidate: C1 }),
@@ -254,6 +325,7 @@ const REVISE_FROM: PhaseStateName[] = [
   "PROBING",
   "REVIEWING",
   "RESOLVING",
+  "GATING",
   "ACCEPTED",
   "BLOCKED",
 ];
@@ -1004,6 +1076,10 @@ const DESIGN_EDGES: { from: PhaseStateName; to: PhaseStateName; cite: string }[]
   { from: "RESOLVING", to: "REPAIRING", cite: "§6.1: RESOLVING │ open items remain and budget remains ─...─▶ REPAIRING" },
   { from: "RESOLVING", to: "AWAITING_OWNER", cite: "§6.1: RESOLVING │ open items remain, budget exhausted ─...─▶ AWAITING_OWNER" },
   { from: "RESOLVING", to: "ACCEPTED", cite: "§6.1: RESOLVING │ accept(C, K) holds (§6.3) ▼ ACCEPTED(C)" },
+  // Plan 01f: a declared `:GATE:` inserts the gate stage between them.
+  { from: "RESOLVING", to: "GATING", cite: "plan 01f: accept(C, K) holds and the contract declares a gate ▼ GATING" },
+  { from: "GATING", to: "ACCEPTED", cite: "plan 01f: a passing gate lets acceptance proceed ▼ ACCEPTED(C)" },
+  { from: "GATING", to: "REPAIRING", cite: "plan 01f: a failing gate is a blocking integration finding ─▶ REPAIRING" },
   { from: "ACCEPTED", to: "PUBLISHING", cite: "§6.1: ACCEPTED(C) ... ▼ PUBLISHING" },
   { from: "PUBLISHING", to: "DONE", cite: "§6.1: PUBLISHING ... ▼ DONE(I)" },
   { from: "REPAIRING", to: "IMPLEMENTING", cite: "§6.1: REPAIRING the same worker session, a new attempt ... ──▶ IMPLEMENTING (consumes one repair round)" },

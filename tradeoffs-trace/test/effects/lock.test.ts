@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { acquireLock, Lock, LockError } from "../../src/effects/lock.ts";
+import { acquireLock, acquireWaitingLock, Lock, LockError } from "../../src/effects/lock.ts";
 
 let dir: string;
 const spawned: ChildProcess[] = [];
@@ -48,6 +48,25 @@ test("a second acquire fails fast, naming the lock path", async () => {
   } finally {
     await first.release();
   }
+});
+
+// Plan 01f: the machine-wide gate lock WAITS for the holder instead of
+// failing, so two phases never gate at once: the second acquirer resolves
+// only after the first releases.
+test("acquireWaitingLock waits for the holder, then succeeds", async () => {
+  const lockPath = path.join(dir, "gate.lock");
+  const first = await acquireWaitingLock(lockPath);
+  let secondSettled = false;
+  const second = acquireWaitingLock(lockPath).then((lock) => {
+    secondSettled = true;
+    return lock;
+  });
+  await delay(300);
+  assert.equal(secondSettled, false, "the second acquirer must wait while the first holds the lock");
+  await first.release();
+  const lock2 = await second;
+  assert.equal(secondSettled, true);
+  await lock2.release();
 });
 
 test("release lets a subsequent acquire succeed", async () => {
