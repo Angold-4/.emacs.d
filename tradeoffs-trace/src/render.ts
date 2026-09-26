@@ -10,6 +10,9 @@
 // review. Rebuilt from state, never authoritative: `tt contract rebuild'
 // regenerates them and `tt contract check' compares them.
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 import type { Ballot, Decision, Finding, Message } from "./core/types.ts";
 import { ledgerEntries } from "./core/messages.ts";
 import type { Timeline } from "./conductor.ts";
@@ -295,5 +298,218 @@ export function renderStatusText(
   for (const t of view.tradeoffs ?? []) lines.push(`trade-off: ${t.text}`);
   if (view.cost) lines.push(`cost: ${view.cost.text}`);
   if (view.time) lines.push(`time: ${view.time}`);
+  return `${lines.join("\n")}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// views/status.txt: the Emacs status buffer's own text
+// ---------------------------------------------------------------------------
+
+/** The marker a rendered trade-off line carries after its text, so the status
+ * buffer can still open the decision view (plan 01h's RET binding) from the
+ * plain file. `+tt-open-tradeoff' reads the `+tt-record' property the Emacs
+ * side restores by parsing this. */
+export const STATUS_RECORD_MARKER = "\t:RECORD:";
+
+/** Plan 2d: pending owner-input files the conductor has not yet picked up.
+ * `tt state' carries them so the status view can show a command the owner
+ * sent while no conductor was running as `not picked up' after 30 s. */
+export function pendingOwnerInputs(runDir: string): Array<{ id: string; kind: string; text: string; at: string }> {
+  let names: string[];
+  try {
+    names = fs.readdirSync(path.join(runDir, "inbox"));
+  } catch {
+    return [];
+  }
+  const out: Array<{ id: string; kind: string; text: string; at: string }> = [];
+  for (const name of names.sort()) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(runDir, "inbox", name), "utf8")) as Record<string, unknown>;
+      const kind = typeof raw.type === "string" ? raw.type : typeof raw.kind === "string" ? raw.kind : undefined;
+      if (kind !== "steer" && kind !== "note" && kind !== "correction") continue;
+      if (typeof raw.text !== "string") continue;
+      const at = fs.statSync(path.join(runDir, "inbox", name)).mtime.toISOString();
+      out.push({ id: name.slice(0, -".json".length), kind, text: raw.text, at });
+    } catch {
+      // A file still being written, or malformed: the conductor will reject
+      // it; not this view's job to guess.
+    }
+  }
+  return out;
+}
+
+export interface OwnerInputLike {
+  id?: string;
+  kind?: string;
+  text?: string;
+  state?: string;
+  reason?: string;
+  at?: string;
+}
+
+export interface OwnerDirectiveLike {
+  id?: string;
+  seq?: number;
+  text?: string;
+  scope?: string;
+  status?: string;
+  targets?: string[];
+  deliveries?: Record<string, string>;
+}
+
+export interface StatusViewInput {
+  runDir: string;
+  title: string;
+  /** `state.phase` — the same shape `tt state` carries. */
+  phase: Record<string, unknown>;
+  alive: boolean;
+  view: RunView & { timeline: Timeline };
+  secrets?: { missing: string[]; tooShort: string[] };
+  ownerInputs?: OwnerInputLike[];
+  pendingOwnerInputs?: OwnerInputLike[];
+  ownerDirectives?: OwnerDirectiveLike[];
+  ownerChecklist?: string[];
+}
+
+/** Assemble a `StatusViewInput` from the pieces a caller already has, so the
+ * conductor and the CLI's late-verdict path render the same view. */
+export function statusViewInput(opts: {
+  runDir: string;
+  plan: { title?: string; phases?: Array<{ ownerChecklist?: string[] }> };
+  state: { phase: unknown };
+  view: RunView & { timeline: Timeline };
+  alive: boolean;
+  secrets?: { missing: string[]; tooShort: string[] };
+}): StatusViewInput {
+  const phase = opts.state.phase as Record<string, unknown>;
+  return {
+    runDir: opts.runDir,
+    title: opts.plan.title ?? "",
+    phase,
+    alive: opts.alive,
+    view: opts.view,
+    secrets: opts.secrets,
+    ownerInputs: (phase.ownerInputs as OwnerInputLike[] | undefined) ?? [],
+    pendingOwnerInputs: pendingOwnerInputs(opts.runDir),
+    ownerDirectives: (phase.ownerDirectives as OwnerDirectiveLike[] | undefined) ?? [],
+    ownerChecklist: opts.plan.phases?.[0]?.ownerChecklist,
+  };
+}
+
+function truncate(text: string | undefined, width: number): string {
+  const s = oneLine(text);
+  return s.length > width ? `${s.slice(0, width - 1)}…` : s;
+}
+
+function row(label: string, value: string | number | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const s = String(value);
+  if (s.length === 0) return undefined;
+  return `${label.padEnd(10)}${s}`;
+}
+
+function ownerInputStateLabel(state: string | undefined, reason: string | undefined): string {
+  switch (state) {
+    case "delivered": return "delivered";
+    case "noted": return "noted";
+    case "correction-started": return "correction started";
+    case "reverted": return "reverted an amendment";
+    case "delivery-uncertain": return `delivery uncertain${reason ? ` (${reason})` : ""}`;
+    case "refused": return `refused: ${reason ?? "not accepted"}`;
+    default: return state ?? "sent";
+  }
+}
+
+function directiveDelivery(d: OwnerDirectiveLike): string {
+  const targets = d.targets ?? [];
+  if (targets.length === 0) return "(no live agent; carried in every later prompt)";
+  return targets
+    .map((t) => {
+      const state = d.deliveries?.[t];
+      return `${t} ${state === "delivered" ? "✓" : state === "delivery-uncertain" ? "?" : "⧗"}`;
+    })
+    .join(" ");
+}
+
+function renderOwnerInputs(lines: string[], input: StatusViewInput): void {
+  const recorded = input.ownerInputs ?? [];
+  const pending = input.pendingOwnerInputs ?? [];
+  const now = Date.now();
+  const entries: Array<{ label: string; r: OwnerInputLike }> = [
+    ...recorded.map((r) => ({ label: ownerInputStateLabel(r.state, r.reason), r })),
+    ...pending.map((r) => ({ label: r.at && now - Date.parse(r.at) > 30_000 ? "not picked up" : "sent", r })),
+  ];
+  if (entries.length > 0) {
+    lines.push("", `Owner input (${entries.length})`);
+    for (const e of entries) {
+      lines.push(`  - ${truncate(e.r.text, 70)} — ${e.label}${e.r.kind ? ` (${e.r.kind})` : ""}`);
+    }
+  }
+  const directives = [...(input.ownerDirectives ?? [])].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  if (directives.length > 0) {
+    lines.push("", `Owner directives (${directives.length})`);
+    for (const d of directives) {
+      const scope = d.scope === "program" ? "whole program" : "this phase";
+      const status = d.status === "withdrawn" ? "withdrawn" : "in force";
+      lines.push(`  - ${d.id} [${scope}, ${status}] ${truncate(d.text, 70)} — ${directiveDelivery(d)}`);
+    }
+  }
+}
+
+/** `views/status.txt`: the text the Emacs status buffer shows — the title, the
+ * `run <id> · conductor … · <elapsed>' line, every status row from the view,
+ * the trade-offs (each tagged with its record id so RET still opens the
+ * decision view), the cost, the record counts, the DONE owner checklist, the
+ * owner input and directives, and the attention line. `tt status' keeps its
+ * own plain-text rendering; this is the front end's view as a file. */
+export function renderStatusView(input: StatusViewInput): string {
+  const { phase, view } = input;
+  const name = phase.phase as string | undefined;
+  const lines: string[] = [];
+  const push = (r: string | undefined) => { if (r !== undefined) lines.push(r); };
+  lines.push(input.title);
+  lines.push(`run ${path.basename(input.runDir)} · ${input.alive ? "conductor running" : "conductor stopped"} · ${view.elapsed}`);
+  lines.push("");
+  const attempt = phase.attempt as { n?: number } | undefined;
+  push(row("phase", `${phase.phaseId} · ${name} · round ${view.round} · attempt ${attempt?.n ?? "?"} · repairs ${phase.repairRoundsUsed ?? 0}/${phase.repairRoundsGranted ?? 0}`));
+  push(row("pipeline", view.pipeline));
+  push(row("time", view.time));
+  push(row("gates", view.gates));
+  push(row("gate", view.gate));
+  push(row("base", view.baseline));
+  push(row("amended", view.amendments));
+  push(row("previous", view.previousRound));
+  push(row("reviews", view.reviewLine));
+  push(row("verdict", view.verdict));
+  const tradeoffs = view.tradeoffs ?? [];
+  if (tradeoffs.length > 0) {
+    lines.push("", `Trade-offs (${tradeoffs.length})`);
+    for (const t of tradeoffs) {
+      lines.push(`  - ${t.text ?? ""}${t.recordId ? `${STATUS_RECORD_MARKER}${t.recordId}` : ""}`);
+    }
+  }
+  push(row("cost", view.cost?.text));
+  push(
+    row(
+      "records",
+      `${view.liveDecisions} decisions${view.failedDecisions > 0 ? ` (${view.failedDecisions} failed)` : ""}${(view.flaggedDecisions ?? 0) > 0 ? ` · ${view.flaggedDecisions} flagged for you` : ""} · ${view.openFindings} open findings${view.boundaryFilesChanged > 0 ? ` · boundary files changed: ${view.boundaryFilesChanged} (reviewers classify)` : ""}`,
+    ),
+  );
+  push(row("blocked", phase.blockedReason as string | undefined));
+  for (const nm of input.secrets?.missing ?? []) push(row("secret", `${nm} not set`));
+  for (const nm of input.secrets?.tooShort ?? []) push(row("secret", `${nm} too short to mask`));
+  if (name === "DONE" && (input.ownerChecklist?.length ?? 0) > 0) {
+    lines.push("", `Owner checklist (${input.ownerChecklist!.length}) — yours, not the worker's`);
+    for (const item of input.ownerChecklist!) lines.push(`  - ${truncate(item, 200)}`);
+  }
+  renderOwnerInputs(lines, input);
+  if (view.attention) {
+    const suffix =
+      view.attention === "needs you"
+        ? " — type a correction in the input box (C-c m d to read the review)"
+        : view.attention === "conductor stopped" ? " — M-x +tt-resume" : "";
+    lines.push("", `⚑ ${view.attention}${suffix}`);
+  }
   return `${lines.join("\n")}\n`;
 }

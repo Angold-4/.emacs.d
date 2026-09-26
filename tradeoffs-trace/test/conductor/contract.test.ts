@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -567,12 +567,14 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
       steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
     }),
     // The reviewers raise one advisory finding while the phase is REVIEWING,
-    // so a second message is added after the first projections are written.
+    // after a pause, so the views are written once for the trade-offs and
+    // again when the finding is added (a message is added).
     reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
       steps: [
         { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
         { kind: "wait-for-prompt" },
+        ...(reviewer === "M" ? [{ kind: "sleep" as const, ms: 1500 }] : []),
         {
           kind: "call-submit",
           tool: "submit_review",
@@ -605,12 +607,11 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(reviewBefore, /T-1/);
     assert.match(reviewBefore, /^\* Trade-offs$/m);
     const statusBefore = readFileSync(p.status, "utf8");
-    assert.match(statusBefore, /^run: /m);
-    assert.match(statusBefore, /^phase: /m);
-    const statusMtime = statSync(p.status).mtimeMs;
+    assert.match(statusBefore, /^run /m);
+    assert.match(statusBefore, /^phase /m);
 
     // A finding message is added; both views are rewritten from the new state
-    // (the status view at most once a second, so it is waited for).
+    // (the status view is coalesced, so it is waited for).
     await waitFor(() => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "finding"), 90_000, 20, setup.runDir);
     await waitFor(() => readFileSync(p.review, "utf8") !== reviewBefore, 30_000, 20, setup.runDir);
     const reviewAfter = readFileSync(p.review, "utf8");
@@ -618,8 +619,12 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(reviewAfter, /^\* Findings$/m);
     assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
     assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
-    await waitFor(() => statSync(p.status).mtimeMs !== statusMtime, 30_000, 20, setup.runDir);
-    assert.notEqual(readFileSync(p.status, "utf8"), "");
+    await waitFor(() => readFileSync(p.status, "utf8") !== statusBefore, 30_000, 20, setup.runDir);
+    // The status view is the buffer's own text: it carries the trade-offs and,
+    // on each trade-off line, the record marker that keeps plan 01h's RET.
+    const statusAfter = readFileSync(p.status, "utf8");
+    assert.match(statusAfter, /^Trade-offs \(\d+\)$/m);
+    assert.match(statusAfter, /\t:RECORD:[A-Za-z][-A-Za-z0-9]*/);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

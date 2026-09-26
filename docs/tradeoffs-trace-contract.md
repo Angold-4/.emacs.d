@@ -26,7 +26,7 @@ Everything else under a run directory is a **projection** rebuilt from state:
 | `ledger.jsonl` | one settled entry per line, id order (`projectLedger`) |
 | `views/review.org` | the runtime-rendered review view (`projectReview`, `src/render.ts`) |
 | `views/messages/<id>.org` | one message's evidence, plan excerpt, history, ledger and votes (`renderMessageFile`) |
-| `views/status.txt` | the plain-text status `tt status` prints (`renderStatusText`) |
+| `views/status.txt` | the status buffer's own text (`renderStatusView`), with trade-off record markers |
 
 Projections are written when an event can have changed them (any `MESSAGE_*`
 or `OWNER_VERDICT` event) and again on every conductor start. Because
@@ -210,8 +210,7 @@ binding check rejects it.
   message's own file, `views/messages/<id>.org`, carries its evidence (path
   and lines), the plan excerpt it concerns, every version's history, its
   ledger entry and its votes.
-- `views/status.txt` is the plain-text status the Emacs status buffer reads
-  instead of calling `tt state` every poll.
+- `views/status.txt` is the text the Emacs status buffer shows: the title, the run line, every status row, the trade-offs (each tagged `\t:RECORD:<id>` so RET still opens the decision view), the cost and record counts, the DONE owner checklist, the owner input and directives, and the attention line. `tt status` keeps its own plain-text rendering.
 - `tt summary` (the PR body) lists refused-after-`DONE` follow-ups under
   `### Follow-ups`.
 

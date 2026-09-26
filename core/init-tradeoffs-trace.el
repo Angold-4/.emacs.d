@@ -1101,11 +1101,51 @@ open the decision view at that record."
     (when attention
       (insert "\n" (propertize (format "⚑ %s%s" attention
                                        (cond ((equal attention "needs you")
-                                              " — type a correction in the input box (C-c m d to read the decisions)")
+                                              " — type a correction in the input box (C-c m d to read the review)")
                                              ((equal attention "conductor stopped") " — M-x +tt-resume")
                                              (t "")))
                                'face 'error)
               "\n"))))
+
+(defun +tt--status-restore-records ()
+  "Restore the `+tt-record' property a rendered trade-off line carries.
+`views/status.txt' appends `\t:RECORD:<id>' to each trade-off line, so the
+plain file still lets RET open the decision view (plan 01h).  The marker is
+removed and the whole line carries the id."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "\t:RECORD:\\([^ \t\n]+\\)" nil t)
+        (let ((id (match-string 1)))
+          (delete-region (match-beginning 0) (match-end 0))
+          (put-text-property (line-beginning-position) (line-end-position) '+tt-record id))))))
+
+(defun +tt--status-restore-faces ()
+  "Re-apply the faces the runtime's plain status text implies.
+`views/status.txt' is text, so the bold title, the shadow run line and row
+labels, the warning `base'/`amended'/`secret' rows, the error `blocked' row
+and the attention line are restored here."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      ;; The bold title, then the shadow `run <id> · conductor … · …' line.
+      (put-text-property (line-beginning-position) (line-end-position) 'face 'bold)
+      (forward-line 1)
+      (when (looking-at "run ")
+        (put-text-property (line-beginning-position) (line-end-position) 'face 'shadow))
+      ;; Each status row's label is shadow; its value's face depends on the row.
+      (while (re-search-forward "^\\([a-z]+\\) +\\(.*\\)$" nil t)
+        (let ((label (match-string 1))
+              (beg (line-beginning-position))
+              (end (line-end-position)))
+          (put-text-property beg (min end (+ beg 10)) 'face 'shadow)
+          (pcase label
+            ((or "base" "amended" "secret") (put-text-property (min end (+ beg 10)) end 'face 'warning))
+            ("blocked" (put-text-property (min end (+ beg 10)) end 'face 'error)))))
+      ;; The attention line.
+      (goto-char (point-min))
+      (when (re-search-forward "^⚑ " nil t)
+        (put-text-property (line-beginning-position) (line-end-position) 'face 'error)))))
 
 (defun +tt--render-status ()
   "Render the status buffer.
@@ -1116,7 +1156,9 @@ read, so it costs nothing over TRAMP and calls neither `tt' nor
         (file (and +tt--run-dir (expand-file-name "views/status.txt" +tt--run-dir))))
     (erase-buffer)
     (if (and file (file-exists-p file))
-        (insert-file-contents file)
+        (progn (insert-file-contents file)
+               (+tt--status-restore-records)
+               (+tt--status-restore-faces))
       (+tt--render-status-from (+tt--state +tt--run-dir) +tt--run-dir))))
 
 (defun +tt-open-tradeoff ()

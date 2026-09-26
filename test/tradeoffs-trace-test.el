@@ -1289,6 +1289,33 @@ calls neither `+tt--cli' nor `process-file' — only file reads."
           (should (= pf 0)))
       (delete-directory dir t))))
 
+(ert-deftest tradeoffs-trace-status-file-restores-records ()
+  "Plan 03b (A-1/B-6): the rendered status file keeps plan 01h's RET
+binding, so a trade-off line still opens the decision view."
+  (let ((dir (make-temp-file "tt-ert-status" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/status.txt" dir)
+            (insert "sum validation\n"
+                    "run r1 · conductor running · 1m\n\n"
+                    "Trade-offs (1)\n"
+                    "  - vetoed by M: D-1 Batch cancels per tick\t:RECORD:D-1\n"))
+          (let (record)
+            (cl-letf (((symbol-function '+tt-decisions) (lambda (&optional r) (setq record r))))
+              (with-temp-buffer
+                (+tt-status-mode)
+                (setq +tt--run-dir dir)
+                (+tt--render-status)
+                (should-not (string-search ":RECORD:" (buffer-string)))
+                (should (string-search "Trade-offs (1)" (buffer-string)))
+                (goto-char (point-min))
+                (search-forward "vetoed by M: D-1")
+                (goto-char (match-beginning 0))
+                (+tt-open-tradeoff)
+                (should (equal record "D-1"))))))
+      (delete-directory dir t))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
 

@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { projectReview, renderStatusText, reviewMessageFiles } from "./render.ts";
+import { pendingOwnerInputs, projectReview, renderStatusText, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
 import { reduce } from "./core/reduce.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
@@ -768,35 +768,6 @@ async function cmdStop(runIdOrDir: string, root: string): Promise<void> {
   }
 }
 
-/** Plan 2d: pending owner-input files the conductor has not yet picked up
- * (design §7.4/§9.3). `tt state` carries them so the status buffer can show
- * a command the owner sent while no conductor was running as "not picked
- * up" after 30 s, rather than silently losing it. */
-function pendingOwnerInputs(runDir: string): Array<{ id: string; kind: string; text: string; at: string }> {
-  let names: string[];
-  try {
-    names = readdirSync(path.join(runDir, "inbox"));
-  } catch {
-    return [];
-  }
-  const out: Array<{ id: string; kind: string; text: string; at: string }> = [];
-  for (const name of names.sort()) {
-    if (!name.endsWith(".json")) continue;
-    try {
-      const raw = JSON.parse(readFileSync(path.join(runDir, "inbox", name), "utf8")) as Record<string, unknown>;
-      const kind = typeof raw.type === "string" ? raw.type : typeof raw.kind === "string" ? raw.kind : undefined;
-      if (kind !== "steer" && kind !== "note" && kind !== "correction") continue;
-      if (typeof raw.text !== "string") continue;
-      const at = statSync(path.join(runDir, "inbox", name)).mtime.toISOString();
-      out.push({ id: name.slice(0, -".json".length), kind, text: raw.text, at });
-    } catch {
-      // A file still being written, or malformed: the conductor will reject
-      // it; not this view's job to guess.
-    }
-  }
-  return out;
-}
-
 /** Contract v1: `tt contract rebuild|check <run>`. The projections are
  * rebuilt from `events.jsonl` (state), never the other way round. */
 function cmdContract(sub: string | undefined, runDir: string): void {
@@ -881,10 +852,35 @@ function cmdVerdict(
   };
   const boundRunId = overrides.runId ?? state.phase.runId;
   const boundPhaseId = overrides.phaseId ?? state.phase.phaseId;
+  // The heading carries the full binding. A run/phase id that names another
+  // run is refused here, never silently dropped when the daemon has exited.
+  if (overrides.runId !== undefined && overrides.runId !== "" && overrides.runId !== state.phase.runId) {
+    process.stderr.write(`verdict rejected: run id ${overrides.runId} is not this run (${state.phase.runId})\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (overrides.phaseId !== undefined && overrides.phaseId !== "" && overrides.phaseId !== state.phase.phaseId) {
+    process.stderr.write(`verdict rejected: phase id ${overrides.phaseId} is not this phase (${state.phase.phaseId})\n`);
+    process.exitCode = 1;
+    return;
+  }
   const withReason = reason !== undefined && reason.trim().length > 0 ? { reason } : {};
+  const event = {
+    type: "OWNER_VERDICT" as const,
+    messageId,
+    verdict,
+    ...withReason,
+    boundCandidateSha,
+    boundContractVersion,
+    boundRecordVersion,
+  };
   if (conductorAlive(runDir)) {
     // Live run: through the inbox, so the conductor checks the binding and a
-    // stale verdict lands in inbox/rejected with its reason.
+    // stale verdict lands in inbox/rejected with its reason. Dry-run it too:
+    // a stale verdict then shows its reason to the front end at once, while
+    // the conductor still owns the rejection record and the queueing path.
+    const precheck = reduce(state, event);
+    if (!precheck.ok) process.stderr.write(`verdict likely rejected: ${precheck.reason}\n`);
     const inbox = path.join(runDir, "inbox");
     mkdirSync(inbox, { recursive: true });
     const commandId = `verdict-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
@@ -908,15 +904,6 @@ function cmdVerdict(
   // No live conductor: this is a late verdict. Validate it against a dry-run
   // reduce first, then append it to the authoritative log and refresh the
   // projections.
-  const event = {
-    type: "OWNER_VERDICT" as const,
-    messageId,
-    verdict,
-    ...withReason,
-    boundCandidateSha,
-    boundContractVersion,
-    boundRecordVersion,
-  };
   const result = reduce(state, event);
   if (!result.ok) {
     process.stderr.write(`verdict rejected: ${result.reason}\n`);
@@ -934,10 +921,30 @@ function cmdVerdict(
   writeFileSync(p.messages, projectMessages(after.phase));
   writeFileSync(p.ledger, projectLedger(after.phase));
   writeFileSync(p.review, projectReview(after.phase));
-  for (const f of reviewMessageFiles(after.phase)) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
+  // A run from before this view has no views/messages/: create it, and prune
+  // ids the state no longer has (same as the conductor and the rebuild path).
+  const files = reviewMessageFiles(after.phase);
+  const ids = new Set(files.map((f) => f.id));
+  mkdirSync(p.messagesView, { recursive: true });
+  for (const f of files) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
+  for (const name of readdirSync(p.messagesView)) {
+    if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
+  }
   // Plan 03b: the status view is refreshed too, so the Emacs status buffer
   // never shows a message the review buffer already has.
-  writeFileSync(p.status, renderStatusText(runDir, after, buildView(runDir, plan, false), loggedSecretStatus(runDir)));
+  writeFileSync(
+    p.status,
+    renderStatusView(
+      statusViewInput({
+        runDir,
+        plan,
+        state: after,
+        view: buildView(runDir, plan, false),
+        alive: false,
+        secrets: loggedSecretStatus(runDir),
+      }),
+    ),
+  );
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
 }
 

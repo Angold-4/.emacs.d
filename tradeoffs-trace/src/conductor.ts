@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { projectReview, renderStatusText, reviewMessageFiles } from "./render.ts";
+import { projectReview, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
@@ -922,9 +922,10 @@ export class Conductor {
   #steerInFlight = new Set<string>();
   /** The inbox poll timer; cleared by `#doStop`. */
   #inboxTimer: NodeJS.Timeout | undefined;
-  /** Plan 03b: a coalesced `views/status.txt` write, at most once a second.
-   * `buildView` rebuilds the timeline, so it must stay off the message-event
-   * path (the discovery-barrier tests are timing-sensitive). */
+  /** Plan 03b: a coalesced `views/status.txt` write, at most once a second,
+   * scheduled by any applied event (message or stage). `buildView` rebuilds
+   * the timeline, so it stays off the event path and never runs when nothing
+   * changed. */
   #statusTimer: NodeJS.Timeout | undefined;
 
   constructor(opts: ConductorOptions) {
@@ -1500,6 +1501,10 @@ export class Conductor {
     // event (of which there are thousands per run) slowed long runs enough to
     // matter against their test timeouts.
     if (MESSAGE_EVENT_TYPES.has(logged.type)) this.#writeContractProjections();
+    // Plan 03b: any applied event can change the rendered status (a stage
+    // transition, a pending review, a gate record). Coalesced to one write a
+    // second, so a burst never rebuilds the view per event.
+    this.#scheduleStatusView();
     // Plan 01b: a fresh park is a new notification episode; resolving some of
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
@@ -3867,15 +3872,14 @@ export class Conductor {
       fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
       fs.writeFileSync(this.#paths.review, projectReview(phase));
       this.#writeMessageViews();
-      this.#scheduleStatusView();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
     }
   }
 
   /** Plan 03b: write `views/status.txt` at most once a second. Several
-   * message events in a burst produce one write; a pending write is left for
-   * the next tick and never blocks event application. */
+   * events in a burst produce one write; a pending write never blocks event
+   * application. */
   #scheduleStatusView(): void {
     if (this.#statusTimer) return;
     this.#statusTimer = setTimeout(() => {
@@ -3907,14 +3911,21 @@ export class Conductor {
     }
   }
 
-  /** Plan 03b: `views/status.txt`, the same text `tt status` prints, so the
-   * Emacs status buffer reads a file instead of calling `tt state`. */
+  /** Plan 03b: `views/status.txt`, the status buffer's own text (title, run
+   * line, rows, trade-offs with their record ids, owner input, checklist),
+   * so Emacs reads a file instead of calling `tt state`. */
   #writeStatusView(): void {
     const view = buildView(this.#runDir, this.#plan, !this.#closed);
-    const text = renderStatusText(this.#runDir, this.#state, view, {
-      missing: this.#missingSecrets,
-      tooShort: this.#tooShortSecrets,
-    });
+    const text = renderStatusView(
+      statusViewInput({
+        runDir: this.#runDir,
+        plan: this.#plan,
+        state: this.#state,
+        view,
+        alive: !this.#closed,
+        secrets: { missing: this.#missingSecrets, tooShort: this.#tooShortSecrets },
+      }),
+    );
     fs.writeFileSync(this.#paths.status, text);
   }
 
