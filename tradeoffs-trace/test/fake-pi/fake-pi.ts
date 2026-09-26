@@ -226,7 +226,14 @@ async function main(): Promise<void> {
           const toolCallId = randomUUID();
           const args = substituteEnvTokens(step.args);
           writeStdout({ type: "tool_execution_start", toolCallId, toolName: step.tool, args });
-          const reply = await runSocket.submit(step.tool, args);
+          const pending = runSocket.submit(step.tool, args);
+          // `noWait`: fire the call and go on (run cc1992e2: a reviewer called
+          // submit_review twice, the second while the first was recorded).
+          if (step.noWait) {
+            void pending;
+            break;
+          }
+          const reply = await pending;
           const ok = reply.type === "submit_reply" && reply.ok;
           // The conductor's own reason is echoed into the tool result (the real
           // extension shows it to the model too), so a test can assert *why* a

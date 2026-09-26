@@ -42,6 +42,7 @@ import {
 import {
   baselineFailureNames,
   baselineFailedCommands,
+  testIsNamedIn,
   baselineKey,
   classifyCheckFailure,
   failedNormally,
@@ -656,6 +657,12 @@ export interface Timeline {
   state: State;
   phases: Array<{ phase: string; at: string }>;
   rounds: Array<{ round: number; candidateSha: string; outcome: string }>;
+  /** When an attempt was interrupted and restarted in the same phase (a
+   * conductor stop/resume or a crash recovery). The worker's deadline starts
+   * again at each, so the pipeline counts the current stage from the last one
+   * (program 14: 14g showed "over by 22m" right after a resume, counting the
+   * whole time it was stopped). */
+  restarts?: string[];
 }
 
 export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
@@ -664,6 +671,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
+  const restarts: string[] = [];
   for (const record of records) {
     if (record.kind !== "event") continue;
     const before = state;
@@ -671,6 +679,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
     if (!result.ok) continue;
     state = result.state;
     const type = (record.event as { type?: string }).type;
+    if (type === "ATTEMPT_INTERRUPTED") restarts.push(record.ts);
     const prevC = before.phase.candidate?.sha;
     if (type === "FREEZE_COMPLETED" && prevC) {
       const reasons = notAcceptedReasons(before.phase);
@@ -684,7 +693,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
       phases.push({ phase: state.phase.phase, at: record.ts });
     }
   }
-  return { state, phases, rounds };
+  return { state, phases, rounds, restarts };
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
@@ -693,8 +702,13 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
  * to paper over. */
 function foldEvents(base: State, records: readonly LogRecord[], lenient = false): State {
   let state = base;
-  for (const record of records) {
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
     if (record.kind !== "event") continue;
+    // A runner before the stale-review fix logged an event and THEN its
+    // rejection; the live conductor never applied it, so neither does
+    // recovery (otherwise such a run could never be resumed).
+    if (records[i + 1]?.kind === "rejected") continue;
     const result = reduce(state, record.event);
     if (!result.ok && lenient) {
       // Read-only views of a run written by an older runner revision: skip
@@ -769,7 +783,13 @@ interface AgentHandle {
   /** Plan 01d: how many incomplete `submit_review` submissions this dispatch
    * has already had rejected (at most MAX_INCOMPLETE_REVIEW_REJECTIONS). */
   incompleteReviewRejections?: number;
+  /** A `submit_review` from this agent is being recorded. A second call
+   * while it is (run cc1992e2: B called the tool twice) is refused. */
+  reviewInFlight?: boolean;
 }
+
+/** `#applyReviewFindingsAndBallots` found the round over after an await. */
+const STALE_REVIEW = "stale review";
 
 export class Conductor {
   #runDir: string;
@@ -1423,11 +1443,15 @@ export class Conductor {
     const logged = redactRecord(raw, this.#secretMaskable) as Event;
     const before = this.#state.phase.phase;
     const result = reduce(this.#state, logged);
-    this.#log.append("event", logged);
     if (!result.ok) {
+      // Only an applied event is ever written as an "event": recovery folds
+      // every one of them, so a rejected one would make every restart fail
+      // (runs cc1992e2 and ff398f35: a late REVIEW_SUBMITTED, logged and
+      // then rejected, crashed each resume).
       this.#log.append("rejected", { event: logged, reason: result.reason });
       throw new Error(`conductor emitted an event reduce() rejected: ${result.reason}`);
     }
+    this.#log.append("event", logged);
     this.#state = result.state;
     // Plan 01b: a fresh park is a new notification episode; resolving some of
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
@@ -2658,6 +2682,18 @@ export class Conductor {
         const leak = fd.reproduction ? secretUseInCommand(fd.reproduction.command, this.#secretNames) : undefined;
         if (leak !== undefined) return { ok: false, reason: leak };
       }
+      if (this.#state.phase.phase !== "REVIEWING" || review.candidateSha !== this.#state.phase.candidate?.sha) {
+        // The round this review belongs to has ended (run cc1992e2: B's
+        // review arrived after the phase moved to a repair). Acknowledge it
+        // so the late agent stops, and change nothing.
+        this.#log.append("stale_review_ignored", {
+          reviewer: review.reviewer,
+          kind: "submission",
+          candidateSha: review.candidateSha,
+          phase: this.#state.phase.phase,
+        });
+        return { ok: true };
+      }
       if (!this.#stubReviews && !this.#discoverySubmitted.has(agentId)) {
         // Work packet 2a, design §6.1: turn 2 must not be accepted before
         // turn 1 (submit_discovery) was — this is the two-turn ordering
@@ -2722,11 +2758,29 @@ export class Conductor {
         // .review` to already exist (reduce.ts's own
         // FINDING_CONFIRMED_REPAIRED guard, design §4.2) — so that step
         // runs LAST, after REVIEW_SUBMITTED.
+        if (handle.reviewInFlight) return { ok: false, reason: "this review is already being recorded" };
+        handle.reviewInFlight = true;
         let error: string | undefined;
         try {
           error = await this.#applyReviewFindingsAndBallots(review);
         } catch (err) {
           error = `threw: ${String((err as Error)?.message ?? err)}`;
+        } finally {
+          handle.reviewInFlight = false;
+        }
+        if (error === STALE_REVIEW || !this.#reviewStillCurrent(review.candidateSha)) {
+          // Run cc1992e2: recording findings awaits reproductions, and the
+          // round ended meanwhile (the same reviewer's earlier submission
+          // closed it). What was not yet applied is dropped, and the agent is
+          // acknowledged so it stops.
+          this.#log.append("stale_review_ignored", {
+            reviewer: review.reviewer,
+            kind: "submission_after_wait",
+            candidateSha: review.candidateSha,
+            phase: this.#state.phase.phase,
+          });
+          handle.doneResolve();
+          return { ok: true };
         }
         if (error) {
           this.#log.append("review_outcome_error", { reviewer: review.reviewer, error });
@@ -3072,6 +3126,7 @@ export class Conductor {
       const { sameAs: _sameAs, ...disclosure } = fd;
       const error = await this.#raiseFinding(disclosure, review.reviewer, candidate.sha);
       if (error) return error;
+      if (!this.#reviewStillCurrent(candidate.sha)) return STALE_REVIEW;
     }
 
     for (const bd of review.ballots ?? []) {
@@ -3836,6 +3891,18 @@ export class Conductor {
     }
   }
 
+  /** The texts that make a test this phase's job: its goal, its acceptance
+   * items and the owner's directives in force. A failing test named in any of
+   * them is never excused as pre-existing (`classifyCheckFailure`). */
+  #requiredTestTexts(): string[] {
+    const phase = this.#state.phase;
+    return [
+      phase.contract.goal,
+      ...phase.contract.acceptance,
+      ...(phase.ownerDirectives ?? []).filter((d) => d.status === "in-force").map((d) => d.text),
+    ];
+  }
+
   /** Plan 01e: the base commands whose pre-existing failures the worker and
    * the reviewers are told about — the ones whose failures the gate would
    * actually excuse, so the promise in the prompt and the rule at the gate are
@@ -3847,7 +3914,13 @@ export class Conductor {
     const commands = this.#resolvedEffectiveChecks();
     const baseline = this.#readBaseline();
     if (!baseline || !this.#baselineCovers(baseline, this.#baselineKey(commands), commands)) return [];
-    return baselineFailedCommands(baseline.commands);
+    // A test this phase is required to fix is never called pre-existing,
+    // here or at the gate (`classifyCheckFailure`): the prompt must not tell
+    // the worker to leave it failing.
+    const required = this.#requiredTestTexts();
+    return baselineFailedCommands(
+      baseline.commands.map((c) => ({ ...c, failures: (c.failures ?? []).filter((name) => !testIsNamedIn(name, required)) })),
+    );
   }
 
   /** Plan 01e: the base's failing names for one check command, or none when
@@ -4222,7 +4295,7 @@ export class Conductor {
             // gate.
             if (after && failedNormally(result)) {
               const baseFailures = this.#baseFailuresFor(command);
-              const verdict = classifyCheckFailure(result.output, baseFailures);
+              const verdict = classifyCheckFailure(result.output, baseFailures, this.#requiredTestTexts());
               if (verdict.excused) {
                 this.#log.append("check_failures_pre_existing", {
                   candidateSha,
@@ -4696,7 +4769,27 @@ export class Conductor {
 
   // -- review -----------------------------------------------------------
 
+  /** A reviewer dispatch's outcome applies only while the phase is still
+   * reviewing the candidate it was started for. A late one (a stray
+   * dispatch, or a reviewer finishing after the round moved on) is logged
+   * and dropped: run 807d3e84 marked B timed out from a previous round's
+   * stray dispatch, so B was never dispatched again and M and A waited at
+   * the discovery barrier until the phase was BLOCKED. */
+  #reviewStillCurrent(dispatchCandidate: string | undefined): boolean {
+    const phase = this.#state.phase;
+    return phase.phase === "REVIEWING" && phase.candidate?.sha === dispatchCandidate;
+  }
+
+  #reviewTimedOut(reviewer: Reviewer, dispatchCandidate: string | undefined): void {
+    if (!this.#reviewStillCurrent(dispatchCandidate)) {
+      this.#log.append("stale_review_ignored", { reviewer, kind: "timeout", dispatchCandidate, phase: this.#state.phase.phase });
+      return;
+    }
+    this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+  }
+
   async #runReview(actionId: string, reviewer: Reviewer): Promise<void> {
+    const dispatchCandidate = this.#state.phase.candidate?.sha;
     const agentId = `reviewer-${reviewer}-${actionId}`;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
     const candidateDir = this.#candidateDir();
@@ -4817,7 +4910,7 @@ export class Conductor {
       if (hello === "timeout") {
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "hello timed out" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
       if (!hello.ok) {
@@ -4829,7 +4922,7 @@ export class Conductor {
           this.#applyEvent({ type: "LAUNCH_FAILED", role: "reviewer", reviewer, ...hello.mismatch });
         } else {
           this.#log.completion(actionId, { reviewer, ok: false, reason: "hello failed" });
-          this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+          this.#reviewTimedOut(reviewer, dispatchCandidate);
         }
         return;
       }
@@ -4854,7 +4947,7 @@ export class Conductor {
         }
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
 
@@ -4874,7 +4967,7 @@ export class Conductor {
         await agent.terminate();
         const why = turn1 === "settled" ? "settled without submit_discovery (turn 1)" : "timeout (turn 1: submit_discovery)";
         this.#log.completion(actionId, { reviewer, ok: false, reason: why });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
 
@@ -4887,7 +4980,7 @@ export class Conductor {
         reviewTimeout.cancel();
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (turn 1 did not settle)" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
       // Plan 2c discovery barrier (design §3.3): no reviewer gets turn 2
@@ -4908,7 +5001,7 @@ export class Conductor {
         reviewTimeout.cancel();
         await agent.terminate();
         this.#log.completion(actionId, { reviewer, ok: false, reason: "timeout (waiting for the other reviewers' discovery)" });
-        this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+        this.#reviewTimedOut(reviewer, dispatchCandidate);
         return;
       }
       const settled2 = nextSettle();
@@ -4923,7 +5016,7 @@ export class Conductor {
       await agent.terminate();
       const why2 = turn2 === "settled" ? "settled without submit_review (turn 2)" : "timeout (turn 2: submit_review)";
       this.#log.completion(actionId, { reviewer, ok: false, reason: why2 });
-      this.#applyEvent({ type: "REVIEW_TIMED_OUT", reviewer });
+      this.#reviewTimedOut(reviewer, dispatchCandidate);
     } finally {
       this.#agents.delete(agentId);
     }

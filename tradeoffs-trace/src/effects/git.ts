@@ -141,14 +141,27 @@ function cloneCheckout(repo: string, sha: string, dir: string): void {
   // file ... No such file or directory", run 0c99b1ff's first freeze). One
   // retry after the repack settles. (`--no-local` would avoid the race but
   // only transfers objects reachable from refs, and candidates are not.)
-  const clone = () => git(["clone", "-q", "--no-hardlinks", "--no-checkout", repo, dir]);
-  try {
-    clone();
-  } catch {
-    fs.rmSync(dir, { recursive: true, force: true });
-    clone();
+  //
+  // The same race can also let the clone SUCCEED with an object missing, so
+  // the failure only shows at checkout: "fatal: unable to read tree" (runs
+  // 823db925 and 9ab9188b, where the freeze then counted as a timeout and
+  // cost a repair round). So the retry covers clone AND checkout, with a short
+  // pause for the repack to settle.
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500 * attempt);
+    }
+    try {
+      git(["clone", "-q", "--no-hardlinks", "--no-checkout", repo, dir]);
+      git(["-C", dir, "checkout", "-q", "--detach", sha]);
+      return;
+    } catch (err) {
+      lastError = err;
+    }
   }
-  git(["-C", dir, "checkout", "-q", "--detach", sha]);
+  throw lastError;
 }
 
 /** Collects regular files and directories under `root`, **never following

@@ -547,7 +547,7 @@ and an unknown id is refused by that command."
           (with-temp-file plan-a (insert +tt-test--valid-plan))
           (with-temp-file plan-b (insert (replace-regexp-in-string "p1" "q1" +tt-test--valid-plan)))
           (with-temp-buffer
-            (insert "#+TITLE: plan 13\n#+TT_PROGRAM: 4\n#+TT_CHECK_MINUTES: 40\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
+            (insert "#+TITLE: plan 13\n#+TT_PROGRAM: 4\n#+TT_CHECK_MINUTES: 40\n#+TT_SECRETS: VENDOR_KEY OTHER_KEY\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
             (setq buffer-file-name (expand-file-name "program.org" dir) default-directory dir)
             (org-mode)
             (let* ((parsed (+tt-parse-program))
@@ -561,7 +561,11 @@ and an unknown id is refused by that command."
               (should (equal (alist-get 'after (aref entries 1)) ["13a"]))
               (should (equal (alist-get 'title (alist-get 'plan (aref entries 0))) "sum validation"))
               ;; the program's time limits reach every entry's plan
-              (should (= (alist-get 'checkMs (alist-get 'deadlines (alist-get 'plan (aref entries 1)))) 2400000))))
+              (should (= (alist-get 'checkMs (alist-get 'deadlines (alist-get 'plan (aref entries 1)))) 2400000))
+              ;; ... and so do its declared secrets (names only; plan 14's
+              ;; program-level declaration used to reach no entry)
+              (should (equal (alist-get 'secrets (alist-get 'plan (aref entries 0))) ["VENDOR_KEY" "OTHER_KEY"]))
+              (should (equal (alist-get 'secrets (alist-get 'plan (aref entries 1))) ["VENDOR_KEY" "OTHER_KEY"]))))
           ;; A missing plan file is an error at the entry's line.
           (with-temp-buffer
             (insert "#+TITLE: bad\n#+TT_PROGRAM: 2\n* x\n  :PROPERTIES:\n  :PLAN: missing.org\n  :END:\n")
@@ -653,11 +657,11 @@ environment) wherever a stream file happens to hold one; the name shows."
           (make-directory (expand-file-name "plan" root))
           (with-temp-file (expand-file-name "plan/v1.json" root)
             (insert (json-encode '((title . "t") (secrets . ["FAKE_KEY"])))))
-          (setenv "FAKE_KEY" "sk-live-4f8a2b1c9d3e")
+          (setenv "FAKE_KEY" "tt-fake-4f8a2b1c9d3e")
           (with-temp-file (expand-file-name "worker-1.jsonl" dir)
-            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I used sk-live-4f8a2b1c9d3e now.\"}]}}}\n"
-                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:04.000Z\",\"event\":{\"type\":\"tool_execution_start\",\"toolCallId\":\"t1\",\"toolName\":\"sh\",\"args\":{\"command\":\"curl -H 'Bearer sk-live-4f8a2b1c9d3e' x\"}}}\n"
-                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:05.000Z\",\"event\":{\"type\":\"tool_execution_end\",\"toolCallId\":\"t1\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Bearer sk-live-4f8a2b1c9d3e\"}]}}}\n"))
+            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I used tt-fake-4f8a2b1c9d3e now.\"}]}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:04.000Z\",\"event\":{\"type\":\"tool_execution_start\",\"toolCallId\":\"t1\",\"toolName\":\"sh\",\"args\":{\"command\":\"curl -H 'Bearer tt-fake-4f8a2b1c9d3e' x\"}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:05.000Z\",\"event\":{\"type\":\"tool_execution_end\",\"toolCallId\":\"t1\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Bearer tt-fake-4f8a2b1c9d3e\"}]}}}\n"))
           (with-temp-buffer
             (+tt-trace-mode)
             (setq +tt--run-dir root)
@@ -666,7 +670,7 @@ environment) wherever a stream file happens to hold one; the name shows."
               (should (string-search "» I used ***FAKE_KEY*** now." text))
               (should (string-search "$ curl -H 'Bearer ***FAKE_KEY***' x ✓" text))
               (should (string-search "· Bearer ***FAKE_KEY***" text))
-              (should-not (string-search "sk-live-4f8a2b1c9d3e" text))))
+              (should-not (string-search "tt-fake-4f8a2b1c9d3e" text))))
           ;; Without the declared name (or without the variable set) nothing
           ;; is masked: this is a display guard, not the conductor's redaction.
           (setenv "FAKE_KEY" nil)
@@ -687,8 +691,8 @@ first, and a value shorter than the conductor's own minimum is never masked."
           (make-directory plan)
           (with-temp-file (expand-file-name "v1.json" plan)
             (insert (json-encode '((title . "t") (secrets . ["A_KEY" "AB_KEY" "TT"])))))
-          (setenv "A_KEY" "sk-live")
-          (setenv "AB_KEY" "sk-live-abcd1234")
+          (setenv "A_KEY" "tt-fake")
+          (setenv "AB_KEY" "tt-fake-abcd1234")
           (setenv "TT" "1")
           ;; The short value is skipped entirely: masking "1" would rewrite
           ;; every id, count and timestamp the trace renders.
@@ -697,21 +701,21 @@ first, and a value shorter than the conductor's own minimum is never masked."
             (should (equal (+tt--redact "1 of 2" secrets) "1 of 2"))
             ;; Longest first: no suffix of AB_KEY's value may survive, and one
             ;; pass masks both.
-            (should (equal (+tt--redact "a=sk-live b=sk-live-abcd1234" secrets)
+            (should (equal (+tt--redact "a=tt-fake b=tt-fake-abcd1234" secrets)
                            "a=***A_KEY*** b=***AB_KEY***"))
-            (should-not (string-match-p "abcd1234" (+tt--redact "x sk-live-abcd1234 y" secrets))))
+            (should-not (string-match-p "abcd1234" (+tt--redact "x tt-fake-abcd1234 y" secrets))))
           ;; …and the same holds through the trace renderer, which is what a
           ;; stream file left unredacted by an older runner goes through.
           (make-directory (expand-file-name "stream" root))
           (with-temp-file (expand-file-name "worker-1.jsonl" (expand-file-name "stream" root))
-            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"keep 1 and sk-live-abcd1234\"}]}}}\n"))
+            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"keep 1 and tt-fake-abcd1234\"}]}}}\n"))
           (with-temp-buffer
             (+tt-trace-mode)
             (setq +tt--run-dir root)
             (+tt--render-trace)
             (let ((text (buffer-string)))
               (should (string-search "keep 1 and ***AB_KEY***" text))
-              (should-not (string-search "sk-live" text)))))
+              (should-not (string-search "tt-fake" text)))))
       (setenv "A_KEY" nil)
       (setenv "AB_KEY" nil)
       (setenv "TT" nil)
@@ -1106,3 +1110,27 @@ inert as it was before the key existed — no error, and nothing opened."
 
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
+
+(ert-deftest tradeoffs-trace-remote-root ()
+  "A remote `+tt-root' runs `tt' on that host with host-local paths."
+  (let ((calls nil)
+        (+tt-root "/ssh:mac:/Users/me/.tradeoffs-trace/")
+        (+tt-runner "/ssh:mac:/Users/me/.tradeoffs-trace/runner/current/tradeoffs-trace"))
+    (cl-letf (((symbol-function 'file-exists-p) (lambda (_) t))
+              ((symbol-function 'process-file)
+               (lambda (program _in _out _disp &rest args)
+                 (push (list default-directory program args) calls)
+                 (insert "ok")
+                 0)))
+      (should (equal (+tt--cli "state" "/ssh:mac:/Users/me/.tradeoffs-trace/abcd1234") "ok"))
+      (pcase-let ((`(,dir ,program ,args) (car calls)))
+        ;; It runs on the server: TRAMP's default-directory, the server's paths.
+        (should (equal dir "/ssh:mac:/Users/me/.tradeoffs-trace/"))
+        (should (equal program +tt-node))
+        (should (equal args '("/Users/me/.tradeoffs-trace/runner/current/tradeoffs-trace/src/cli.ts"
+                              "state" "/Users/me/.tradeoffs-trace/abcd1234"
+                              "--root" "/Users/me/.tradeoffs-trace"))))
+      ;; git asks the plan's own host too.
+      (setq calls nil)
+      (+tt--git "/ssh:mac:/Users/me/work/repo" "rev-parse" "HEAD")
+      (should (equal (nth 2 (car calls)) '("-C" "/Users/me/work/repo" "rev-parse" "HEAD"))))))

@@ -285,7 +285,7 @@ and runs independent phases in parallel.
 `<TT_BRANCH>--<node>`:
 - A node with no dependencies is cut from `TT_BRANCH`.
 - A node with one dependency is cut from that dependency's branch, so a chain like 12a → 12b → 12c → 12d becomes **four stacked PRs**.
-- A **join** (13g after 13c–13f) is cut from a merge commit of all its parents. If that merge conflicts, the node stops as blocked, with the files named.
+- A **join** (13g after 13c–13f) is cut from a merge commit of all its parents. If that merge conflicts, the node stops as blocked, with the files named. To unblock it, merge the parents by hand into a new branch with the node's branch name (the blocked reason names it), check it, then run `tt program retry <program> <node>`. The scheduler keeps a branch that already exists, so your merge is used as-is.
 - `TT_BRANCH` itself is never moved. Push the branches and open the PRs yourself: each node's PR base is shown in the program status.
 - Parallel phases work in separate worktrees and publish to separate branches, so they never touch each other's files on disk.
 
@@ -337,6 +337,13 @@ A plan declares the credentials it needs **by name** and nothing else:
 ```
 
 - The name goes into the JSON plan (`secrets`); the plan never holds a value.
+- In a program file, `#+TT_SECRETS` declares the names for **every** entry, in
+  addition to any entry plan's own declaration.
+- `tt start`, `tt resume` and `tt program start|resume|retry` refuse to launch
+  a conductor when a declared secret is not set in the environment they run in,
+  and name what is missing (never a value). Export it and run the command again,
+  or set `TT_ALLOW_MISSING_SECRETS=1` to run without it on purpose. A conductor
+  resumed from a shell without the keys otherwise runs every node keyless.
 - The conductor resolves each value from **its own environment** (the shell that
   starts Emacs or `tt`) when the run starts, and passes it to the worker and
   every reviewer as an environment variable. In a command, write `$PYTH_ACCESS_TOKEN`.

@@ -128,16 +128,16 @@ test("guardedShCommand allows commands that mention the worktree inside the run 
 // --- Plan 01a: secrets ------------------------------------------------------
 
 test("secretUseInCommand: the value is matched from this process's environment, and the reason never repeats it", () => {
-  const env = { FAKE_KEY: "sk-live-4f8a2b1c9d3e" };
-  const hit = secretUseInCommand("curl -H 'Authorization: Bearer sk-live-4f8a2b1c9d3e' https://x", ["FAKE_KEY"], env);
+  const env = { FAKE_KEY: "tt-fake-4f8a2b1c9d3e" };
+  const hit = secretUseInCommand("curl -H 'Authorization: Bearer tt-fake-4f8a2b1c9d3e' https://x", ["FAKE_KEY"], env);
   assert.match(hit ?? "", /contains the value of the secret FAKE_KEY/);
   assert.match(hit ?? "", /\$FAKE_KEY/, "names the variable to use instead");
-  assert.ok(!(hit ?? "").includes("sk-live-4f8a2b1c9d3e"), "the reason never repeats the value");
+  assert.ok(!(hit ?? "").includes("tt-fake-4f8a2b1c9d3e"), "the reason never repeats the value");
   // A by-name reference is exactly what is wanted.
   assert.equal(secretUseInCommand("curl -H \"Authorization: Bearer $FAKE_KEY\" https://x", ["FAKE_KEY"], env), undefined);
   // No declared names, or an unset variable: nothing to match.
-  assert.equal(secretUseInCommand("echo sk-live-4f8a2b1c9d3e", [], env), undefined);
-  assert.equal(secretUseInCommand("echo sk-live-4f8a2b1c9d3e", ["GONE"], env), undefined);
+  assert.equal(secretUseInCommand("echo tt-fake-4f8a2b1c9d3e", [], env), undefined);
+  assert.equal(secretUseInCommand("echo tt-fake-4f8a2b1c9d3e", ["GONE"], env), undefined);
   // A value too short to mask (a declared secret exported as "1") must not
   // refuse ordinary commands — it is reported in the status instead.
   assert.equal(secretUseInCommand("echo 1 of 2", ["TT"], { TT: "1" }), undefined);
@@ -145,10 +145,10 @@ test("secretUseInCommand: the value is matched from this process's environment, 
 
 test("guardedShCommand refuses a command containing a declared secret's value", () => {
   const env = process.env;
-  env.TT_TEST_SECRET = "sk-live-4f8a2b1c9d3e";
+  env.TT_TEST_SECRET = "tt-fake-4f8a2b1c9d3e";
   try {
     const cfg = { secretNames: ["TT_TEST_SECRET"], worktree: "/r/run1/worktree", runDir: "/r/run1" };
-    const reason = guardedShCommand("psql 'postgres://u:sk-live-4f8a2b1c9d3e@h/db'", cfg);
+    const reason = guardedShCommand("psql 'postgres://u:tt-fake-4f8a2b1c9d3e@h/db'", cfg);
     assert.match(reason ?? "", /secret TT_TEST_SECRET/);
     assert.match(reason ?? "", /\$TT_TEST_SECRET/);
     assert.equal(guardedShCommand("psql \"postgres://u:$TT_TEST_SECRET@h/db\"", cfg), undefined);

@@ -146,11 +146,31 @@ export interface CheckFailureVerdict {
 
 /** Classify one failing check command's output against the base's own failing
  * test names (D2's default rule). No parsable name means no excuse. */
-export function classifyCheckFailure(output: string, baseFailures: readonly string[]): CheckFailureVerdict {
+export function classifyCheckFailure(
+  output: string,
+  baseFailures: readonly string[],
+  requiredTexts: readonly string[] = [],
+): CheckFailureVerdict {
   const parsed = parseTestFailures(output);
   const base = new Set(baseFailures);
-  const newFailures = parsed.filter((name) => !base.has(name));
+  // A test the phase is required to fix is never "pre-existing", even when
+  // the base fails it too. Plan 14h: the base failed
+  // `gate_is_rerun_when_the_base_moves`, the phase's own directive named it
+  // as its job, and the gate excused the candidate's failure of it, so the
+  // checks read green while the live gate record was stale.
+  const newFailures = parsed.filter((name) => !base.has(name) || testIsNamedIn(name, requiredTexts));
   return { parsed, newFailures, excused: parsed.length > 0 && newFailures.length === 0 };
+}
+
+/** True when the test's own name (its last `::`, ` > ` or `/` segment, the
+ * identifier a person writes) appears as a whole word in any of `texts`: the
+ * phase's goal and acceptance items, and the owner's directives. */
+export function testIsNamedIn(name: string, texts: readonly string[]): boolean {
+  const leaf = name.split(/::| > |\//).pop()?.trim() ?? "";
+  if (leaf.length < 4) return false;
+  const escaped = leaf.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(^|[^A-Za-z0-9_])${escaped}([^A-Za-z0-9_]|$)`);
+  return texts.some((t) => re.test(t));
 }
 
 /** The baseline commands whose failures the prompts may name as pre-existing:
