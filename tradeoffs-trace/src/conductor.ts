@@ -93,6 +93,13 @@ const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
   fs.readFileSync(new URL("../schemas/owner-command.schema.json", import.meta.url), "utf8"),
 );
 
+/** Plan 01d: how many times a reviewer dispatch's incomplete `submit_review`
+ * is rejected back to it before the review is accepted as-is (and logged as
+ * `incomplete_review`). Two: a model that fixes its own omission gets a
+ * second and third chance within the same turn, and one that never does
+ * cannot wedge the turn. */
+export const MAX_INCOMPLETE_REVIEW_REJECTIONS = 2;
+
 // ---------------------------------------------------------------------------
 // Config — design §8.1 defaults, overridable per run.
 // ---------------------------------------------------------------------------
@@ -649,6 +656,14 @@ interface AgentHandle {
    * mode or for a worker handle. */
   discoveryResolve: () => void;
   discoveryPromise: Promise<void>;
+  /** Plan 01d: the records this dispatch's turn-2 prompt demanded a ballot
+   * for (id → its one-line choice), captured when that prompt was built and
+   * never recomputed, so a record added after it (a late discovery) is never
+   * demanded. Absent for a worker, a stub review, or before turn 2. */
+  demandedBallots?: Map<string, string>;
+  /** Plan 01d: how many incomplete `submit_review` submissions this dispatch
+   * has already had rejected (at most MAX_INCOMPLETE_REVIEW_REJECTIONS). */
+  incompleteReviewRejections?: number;
 }
 
 export class Conductor {
@@ -2274,6 +2289,40 @@ export class Conductor {
         this.#applyEvent({ type: "REVIEW_SUBMITTED", review });
         this.#castStubBallots(review.reviewer);
       } else {
+        // Plan 01d: enforce a complete ballot. Every record this dispatch's
+        // turn-2 prompt listed as votable (delegated/reserved, not carried)
+        // needs a ballot (or a valid discoveryMatch retiring it). An
+        // incomplete review is rejected back to the model — naming every
+        // missing id and its one-line choice — so it resubmits within the
+        // same turn, and after MAX_INCOMPLETE_REVIEW_REJECTIONS the review is
+        // accepted as-is with an `incomplete_review` log record, so a
+        // stubborn model cannot wedge the turn. The demanded set is the
+        // prompt-time snapshot, so a late discovery is never demanded.
+        const missing = this.#missingDemandedBallots(review, handle);
+        if (missing.length > 0) {
+          const rejections = handle.incompleteReviewRejections ?? 0;
+          if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
+            handle.incompleteReviewRejections = rejections + 1;
+            this.#log.append("incomplete_review_rejected", {
+              reviewer: review.reviewer,
+              agentId,
+              missing: missing.map((m) => m.id),
+              rejection: rejections + 1,
+            });
+            return {
+              ok: false,
+              reason: `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
+                .map((m) => `${m.id} (${m.choice})`)
+                .join("; ")}`,
+            };
+          }
+          this.#log.append("incomplete_review", {
+            reviewer: review.reviewer,
+            agentId,
+            missing: missing.map((m) => m.id),
+            rejections,
+          });
+        }
         // Ordering matters, and in TWO conflicting directions at once — a
         // real bug this packet's own contract-objection test caught: if
         // REVIEW_SUBMITTED is applied first and this happens to be the
@@ -2339,6 +2388,36 @@ export class Conductor {
       return { ok: true };
     }
     return { ok: false, reason: `unknown submission tool ${msg.tool}` };
+  }
+
+  /** Plan 01d: the records this dispatch's turn-2 prompt demanded a ballot
+   * for that `review` gives no ballot. The demanded set is the prompt-time
+   * snapshot on the handle, never a live recomputation, so a record that
+   * appeared after the prompt (a late discovery) is never demanded. A
+   * `discoveryMatches` entry that retires the reviewer's own discovery —
+   * exactly the condition `#applyReviewFindingsAndBallots` uses to apply a
+   * match — also covers its discovery, so a reviewer never has to ballot a
+   * record it is matching away. */
+  #missingDemandedBallots(review: Review, handle: AgentHandle): Array<{ id: string; choice: string }> {
+    const demanded = handle.demandedBallots;
+    if (!demanded || demanded.size === 0) return [];
+    const covered = new Set<string>();
+    for (const b of review.ballots ?? []) covered.add(b.decisionId);
+    for (const m of review.discoveryMatches ?? []) {
+      const discovery = this.#state.phase.decisions.find((d) => d.id === m.discoveryId);
+      const target = this.#state.phase.decisions.find((d) => d.id === m.sameAs);
+      if (
+        discovery &&
+        target &&
+        discovery.id.includes(`-disc-${review.reviewer}-`) &&
+        isLiveDecision(discovery) &&
+        isLiveDecision(target) &&
+        discovery.id !== target.id
+      ) {
+        covered.add(m.discoveryId);
+      }
+    }
+    return [...demanded.entries()].filter(([id]) => !covered.has(id)).map(([id, choice]) => ({ id, choice }));
   }
 
   /** Phase-1 stub (design §5/§7.1's real ballot casting is phase 2 —
@@ -3565,7 +3644,7 @@ export class Conductor {
         return;
       }
       const settled2 = nextSettle();
-      await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer));
+      await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer, handle));
       const turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled2]);
       reviewTimeout.cancel();
       if (turn2 === "submitted") {
@@ -3666,13 +3745,33 @@ export class Conductor {
   /** Turn 2 (design §6.1): every live record on this candidate (the worker's
    * disclosures, all reviewers' discoveries after the discovery barrier, and
    * triggers), open findings and open corrections. */
-  #buildReviewerTurn2Prompt(reviewer: Reviewer): string {
+  #buildReviewerTurn2Prompt(reviewer: Reviewer, handle?: AgentHandle): string {
     const phase = this.#state.phase;
     const C = phase.candidate?.sha ?? "";
     const K = phase.contract.contractVersion;
     const live = phase.decisions.filter((d) => isLiveDecision(d) && d.boundCandidateSha === C);
     // Skill fix 5: a kept decision that passed last round carries its ballots.
     const carriedIds = new Set(phase.ballots.filter((b) => b.boundCandidateSha === C && b.carriedFrom).map((b) => b.decisionId));
+    // Plan 01d: the votable records (delegated or reserved) this prompt
+    // demands a ballot for, minus the carried ones — recorded HERE, on this
+    // dispatch's own handle, so the submit-time check reads exactly what this
+    // prompt listed and a record added afterwards (a late discovery) can
+    // never be demanded.
+    if (handle) {
+      handle.demandedBallots = new Map(
+        live.filter((d) => (d.class === "delegated" || d.class === "reserved") && !carriedIds.has(d.id)).map((d) => [d.id, d.choice]),
+      );
+      handle.incompleteReviewRejections = 0;
+      // Durable trace of the exact demand, for observability and to make the
+      // "a late discovery is never demanded" guarantee checkable: it is a
+      // prompt-time snapshot, so a record added later is not in this list.
+      this.#log.append("ballot_demanded", {
+        reviewer,
+        agentId: handle.agentId,
+        candidateSha: C,
+        records: [...handle.demandedBallots.entries()].map(([id, choice]) => ({ id, choice })),
+      });
+    }
     const record = (d: Decision) => {
       const who = d.source === "worker" ? "worker" : d.source === "trigger" ? "trigger" : `discovered by ${d.id.includes(`-disc-${reviewer}-`) ? "YOU" : "a reviewer"}`;
       const carried = carriedIds.has(d.id) ? " [carried: kept unchanged and approved last round; vote again only if this candidate's changes affect it]" : "";
