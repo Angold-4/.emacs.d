@@ -12,7 +12,7 @@
 //
 // Two shapes of "the value is still there" this module refuses to report as
 // success:
-//  - a value that OVERLAPS another (`A_KEY=sk-live`, `AB_KEY=sk-live-abcd`):
+//  - a value that OVERLAPS another (`A_KEY=tt-fake`, `AB_KEY=tt-fake-abcd`):
 //    the longer value is masked first, so masking one cannot leave a suffix
 //    of the other;
 //  - a value that is too SHORT to mask safely (see MIN_SECRET_LENGTH): masking
@@ -90,8 +90,8 @@ export function resolveSecrets(
     if (value.length < MIN_SECRET_LENGTH) tooShort.push(name);
     else maskable.push({ name, value });
   }
-  // Longest value first: a value that contains another (A_KEY=sk-live,
-  // AB_KEY=sk-live-abcd) must be replaced before the shorter one can leave a
+  // Longest value first: a value that contains another (A_KEY=tt-fake,
+  // AB_KEY=tt-fake-abcd) must be replaced before the shorter one can leave a
   // suffix of it behind.
   maskable.sort((a, b) => b.value.length - a.value.length);
   return { values, maskable, missing, tooShort };

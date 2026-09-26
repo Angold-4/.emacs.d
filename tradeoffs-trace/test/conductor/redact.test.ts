@@ -62,7 +62,7 @@ function jsonlLinesParse(file: string): void {
 
 test("tt redact --all: a planted value disappears and every JSONL line still parses", async () => {
   const root = fs.mkdtempSync("/tmp/tt-redact-root-");
-  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  const value = `tt-fake-${randomBytes(12).toString("hex")}`;
   try {
     const declared = plantedRun(root, "aaaa1111", value, true);
     const undeclared = plantedRun(root, "bbbb2222", value, false);
@@ -88,7 +88,7 @@ test("tt redact --all: a planted value disappears and every JSONL line still par
 
 test("tt redact: a run whose conductor is alive is refused, and --force overrides it", async () => {
   const root = fs.mkdtempSync("/tmp/tt-redact-live-");
-  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  const value = `tt-fake-${randomBytes(12).toString("hex")}`;
   try {
     const runDir = plantedRun(root, "eeee5555", value, true);
     // A pid that is alive: this very test process.
@@ -110,7 +110,7 @@ test("tt redact: a run whose conductor is alive is refused, and --force override
 
 test("tt redact: a UTF-16 document is cleaned, and a file it could not search is named", async () => {
   const root = fs.mkdtempSync("/tmp/tt-redact-utf16-");
-  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  const value = `tt-fake-${randomBytes(12).toString("hex")}`;
   // A value holding a quote is stored JSON-escaped wherever it was written into
   // JSON text (finding M-9), and it appears that way in UTF-16 too.
   const quoted = 'sk-"q"';
@@ -142,7 +142,7 @@ test("tt redact: a UTF-16 document is cleaned, and a file it could not search is
 
 test("tt redact --all: a run's own plan snapshot supplies the names", async () => {
   const root = fs.mkdtempSync("/tmp/tt-redact-plan-");
-  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  const value = `tt-fake-${randomBytes(12).toString("hex")}`;
   try {
     const runDir = plantedRun(root, "dddd4444", value, true);
     const result = await runCli(["redact", "--all", "--root", root], { FAKE_KEY: value });
@@ -157,7 +157,7 @@ test("tt redact --all: a run's own plan snapshot supplies the names", async () =
 test("tt status/state/timing: a value a run already leaked is not printed", async () => {
   const repo = makeRepo();
   const root = makeRunRoot();
-  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  const value = `tt-fake-${randomBytes(12).toString("hex")}`;
   try {
     const plan: RunPlanFile = {
       title: "leaky",
@@ -203,7 +203,7 @@ test("tt status/state/timing: a value a run already leaked is not printed", asyn
 
 test("tt redact: an unset secret is reported, and a single run directory can be named", async () => {
   const root = fs.mkdtempSync("/tmp/tt-redact-one-");
-  const value = `sk-live-${randomBytes(12).toString("hex")}`;
+  const value = `tt-fake-${randomBytes(12).toString("hex")}`;
   try {
     const runDir = plantedRun(root, "cccc3333", value, false);
     const unset = await runCli(["redact", runDir, "--secrets", "FAKE_KEY"]);

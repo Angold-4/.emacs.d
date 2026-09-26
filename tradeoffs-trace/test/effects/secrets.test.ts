@@ -24,7 +24,7 @@ import {
   utf16Kind,
 } from "../../src/effects/secrets.ts";
 
-const VALUE = "sk-live-4f8a2b1c9d3e";
+const VALUE = "tt-fake-4f8a2b1c9d3e";
 
 test("secrets: names are parsed, deduped and validated; values come from the environment", () => {
   assert.deepEqual(secretNames(["FAKE_KEY"]), ["FAKE_KEY"]);
@@ -53,14 +53,14 @@ test("secrets: a value too short to mask is reported, never applied", () => {
 });
 
 test("secrets: an overlapping value cannot leave a suffix of another behind", () => {
-  const short = { name: "A_KEY", value: "sk-live" };
-  const long = { name: "AB_KEY", value: "sk-live-abcd1234" };
+  const short = { name: "A_KEY", value: "tt-fake" };
+  const long = { name: "AB_KEY", value: "tt-fake-abcd1234" };
   for (const order of [[short, long], [long, short]]) {
     const out = redactText(`x ${long.value} y`, order);
     assert.equal(out, "x ***AB_KEY*** y", `no suffix may survive (order ${JSON.stringify(order.map((s) => s.name))})`);
     assert.ok(!out.includes("abcd1234"));
   }
-  const both = redactText("a=sk-live b=sk-live-abcd1234", [short, long]);
+  const both = redactText("a=tt-fake b=tt-fake-abcd1234", [short, long]);
   assert.equal(both, "a=***A_KEY*** b=***AB_KEY***");
 });
 
