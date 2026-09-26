@@ -1,0 +1,128 @@
+#+TITLE: tradeoffs-trace review — p1
+#+RUN_ID: r-03b
+#+CONTRACT_VERSION: v1
+
+* Blockers
+** B-1 the loop does not terminate on empty input
+  :PROPERTIES:
+  :ID: B-1
+  :TYPE: blocker
+  :STATE: published
+  :RAISED_BY: M
+  :IMPORTANCE: high
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  raised by M against C1
+
+  an empty input leaves the cursor where it started
+
+* Trade-offs
+** T-1 Batch cancels per tick
+  :PROPERTIES:
+  :ID: T-1
+  :TYPE: tradeoff
+  :STATE: accepted
+  :RAISED_BY: worker
+  :IMPORTANCE: high
+  :VERDICT: accepted
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  fewer lock acquisitions under load
+
+  the cancel path took one lock per request
+
+  Verdict: accepted by owner — the goal needs the smaller lock window
+
+** T-3 Keep the existing file layout
+  :PROPERTIES:
+  :ID: T-3
+  :TYPE: tradeoff
+  :STATE: refused
+  :RAISED_BY: worker
+  :IMPORTANCE: normal
+  :VERDICT: refused
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :FOLLOW_UP: true
+  :END:
+  a layout change would make the diff harder to review
+
+  the reviewer asked for the smallest reviewable diff
+
+  Verdict: refused by owner — worth revisiting after the run
+  Follow-up: yes (refused after DONE; not a blocker)
+
+** Minor (1)
+*** T-2 Rename the helper
+  :PROPERTIES:
+  :ID: T-2
+  :TYPE: tradeoff
+  :STATE: published
+  :RAISED_BY: worker
+  :IMPORTANCE: low
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  the name hid the retry behaviour
+
+  callers had to read the body to know it retried
+
+* Findings
+** Minor (2)
+*** F-1 a slow path returns NaN to callers
+  :PROPERTIES:
+  :ID: F-1
+  :TYPE: finding
+  :STATE: published
+  :RAISED_BY: M
+  :IMPORTANCE: low
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  raised by M against C1
+
+  accepted, not fixed
+
+*** F-2 an unreachable branch
+  :PROPERTIES:
+  :ID: F-2
+  :TYPE: finding
+  :STATE: raw
+  :RAISED_BY: A
+  :IMPORTANCE: low
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  raised by A
+
+  not frozen yet

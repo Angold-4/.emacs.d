@@ -41,14 +41,16 @@ const STAGE_OF: Record<string, string> = {
  * so "no agent activity" there is not idleness. */
 export const CONDUCTOR_STAGES = new Set(["freeze", "checks", "probe", "resolve", "gate", "publish"]);
 
-const STAGE_DEADLINE_MS: Record<string, number> = {
-  implement: DEFAULT_DEADLINES.workerAttemptMs,
-  freeze: DEFAULT_DEADLINES.freezeMs,
-  checks: DEFAULT_DEADLINES.checkMs,
-  probe: DEFAULT_DEADLINES.probeMs,
-  gate: DEFAULT_DEADLINES.gateMs,
-  review: DEFAULT_DEADLINES.reviewMs,
-};
+function stageDeadlineMs(): Record<string, number> {
+  return {
+    implement: DEFAULT_DEADLINES.workerAttemptMs,
+    freeze: DEFAULT_DEADLINES.freezeMs,
+    checks: DEFAULT_DEADLINES.checkMs,
+    probe: DEFAULT_DEADLINES.probeMs,
+    gate: DEFAULT_DEADLINES.gateMs,
+    review: DEFAULT_DEADLINES.reviewMs,
+  };
+}
 
 /** The stage limits the pipeline line counts down, with the plan's own
  * `#+TT_*_MINUTES` overrides applied (a plan that sets a 45-minute gate must
@@ -114,7 +116,7 @@ export function formatDuration(ms: number): string {
 
 /** "implement 30s → freeze 1s → checks ✗ 10m00s → implement 26m → … →
  * review 12s… (14m48s left)". Attempts after the first are numbered. */
-export function pipelineLine(spans: StageSpan[], limits: Record<string, number> = STAGE_DEADLINE_MS): string {
+export function pipelineLine(spans: StageSpan[], limits: Record<string, number> = stageDeadlineMs()): string {
   let attempt = 0;
   const parts = spans.map((s) => {
     let name = s.stage;

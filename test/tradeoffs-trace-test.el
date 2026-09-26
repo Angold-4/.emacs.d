@@ -1108,6 +1108,187 @@ inert as it was before the key existed — no error, and nothing opened."
         (+tt-open-tradeoff)
         (should-not called)))))
 
+;;; Plan 03b: the runtime-rendered review buffer
+
+(defconst +tt-test--review-org
+  (concat "#+TITLE: tradeoffs-trace review — p1\n"
+          "#+RUN_ID: r1\n"
+          "#+CONTRACT_VERSION: v1\n"
+          "\n"
+          "* Blockers\n"
+          "** B-1 the loop does not terminate\n"
+          "  :PROPERTIES:\n"
+          "  :ID: B-1\n"
+          "  :TYPE: blocker\n"
+          "  :STATE: published\n"
+          "  :RAISED_BY: M\n"
+          "  :IMPORTANCE: high\n"
+          "  :VERDICT: none\n"
+          "  :MESSAGE_VERSION: 1\n"
+          "  :CANDIDATE_SHA: C1\n"
+          "  :CONTRACT_VERSION: 1\n"
+          "  :CONTRACT_SHA256: aaaa\n"
+          "  :RUN_ID: r1\n"
+          "  :PHASE_ID: p1\n"
+          "  :END:\n"
+          "  an empty input leaves the cursor where it started\n"
+          "\n"
+          "* Trade-offs\n"
+          "** T-1 Batch cancels per tick\n"
+          "  :PROPERTIES:\n"
+          "  :ID: T-1\n"
+          "  :TYPE: tradeoff\n"
+          "  :STATE: published\n"
+          "  :RAISED_BY: worker\n"
+          "  :IMPORTANCE: high\n"
+          "  :VERDICT: none\n"
+          "  :MESSAGE_VERSION: 2\n"
+          "  :CANDIDATE_SHA: C2\n"
+          "  :CONTRACT_VERSION: 1\n"
+          "  :CONTRACT_SHA256: aaaa\n"
+          "  :RUN_ID: r1\n"
+          "  :PHASE_ID: p1\n"
+          "  :END:\n"
+          "  fewer lock acquisitions under load\n"
+          "\n"
+          "* Findings\n"
+          "** Minor (1)\n"
+          "*** F-1 a slow path\n"
+          "  :PROPERTIES:\n"
+          "  :ID: F-1\n"
+          "  :TYPE: finding\n"
+          "  :STATE: raw\n"
+          "  :RAISED_BY: A\n"
+          "  :IMPORTANCE: low\n"
+          "  :VERDICT: none\n"
+          "  :MESSAGE_VERSION: 1\n"
+          "  :CANDIDATE_SHA: C2\n"
+          "  :CONTRACT_VERSION: 1\n"
+          "  :CONTRACT_SHA256: aaaa\n"
+          "  :RUN_ID: r1\n"
+          "  :PHASE_ID: p1\n"
+          "  :END:\n"
+          "  not frozen yet\n")
+  "A fixture `views/review.org' with a blocker, a trade-off and a raw finding.")
+
+(defun +tt-test--review-buffer (dir)
+  "A `+tt-review-mode' buffer displaying the fixture review under DIR."
+  (let ((buf (generate-new-buffer "*tt-ert-review*")))
+    (with-current-buffer buf
+      (insert +tt-test--review-org)
+      (+tt-review-mode)
+      (setq +tt--run-dir dir
+            +tt-review--file (expand-file-name "views/review.org" dir)
+            +tt-review--mtime nil))
+    buf))
+
+(ert-deftest tradeoffs-trace-review-buffer-faces-and-ret ()
+  "Plan 03b: each type gets its face; RET opens the message's own file."
+  (let ((dir (make-temp-file "tt-ert-review" t)))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir)))
+          (with-current-buffer buf
+            (make-directory (expand-file-name "views/messages" dir) t)
+            (with-temp-file (expand-file-name "views/messages/T-1.org" dir) (insert "* T-1\n"))
+            (goto-char (point-min))
+            (search-forward "B-1")
+            (should (eq (get-text-property (match-beginning 0) 'face) '+tt-review-blocker-face))
+            (goto-char (point-min))
+            (search-forward "T-1")
+            (should (eq (get-text-property (match-beginning 0) 'face) '+tt-review-tradeoff-face))
+            (goto-char (point-min))
+            (search-forward "F-1")
+            (should (eq (get-text-property (match-beginning 0) 'face) '+tt-review-finding-face))
+            ;; RET opens views/messages/<id>.org, not a move within the buffer.
+            (let (opened)
+              (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
+                (goto-char (point-min))
+                (search-forward "T-1")
+                (goto-char (match-beginning 0))
+                (+tt-review-open-message))
+              (should (equal opened (expand-file-name "views/messages/T-1.org" dir)))))
+          (kill-buffer buf))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-review-verdicts-call-tt-with-the-binding ()
+  "Plan 03b: A and D call `tt verdict' with the heading's full binding; D
+asks for a one-line reason; a raw message is not yet frozen."
+  (let ((dir (make-temp-file "tt-ert-review" t)))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir))
+              (calls nil))
+          (with-current-buffer buf
+            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "queued verdict x"))
+                      ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
+              ;; A on the blocker: the full binding from the heading.
+              (goto-char (point-min))
+              (search-forward "B-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-accept)
+              (should (equal (nth 0 calls) "verdict"))
+              (should (equal (nth 1 calls) dir))
+              (should (equal (nth 2 calls) "B-1"))
+              (should (equal (nth 3 calls) "accept"))
+              (should (equal (member "--candidate-sha" calls)
+                             '("--candidate-sha" "C1" "--message-version" "1"
+                               "--contract-version" "1" "--contract-sha256" "aaaa"
+                               "--run-id" "r1" "--phase-id" "p1")))
+              ;; D on the trade-off asks for the reason and passes it.
+              (setq calls nil)
+              (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "not the trade-off the goal needed")))
+                (goto-char (point-min))
+                (search-forward "T-1")
+                (goto-char (match-beginning 0))
+                (+tt-review-refuse))
+              (should (equal (nth 3 calls) "refuse"))
+              (should (equal (member "--reason" calls)
+                             '("--reason" "not the trade-off the goal needed"
+                               "--candidate-sha" "C2" "--message-version" "2"
+                               "--contract-version" "1" "--contract-sha256" "aaaa"
+                               "--run-id" "r1" "--phase-id" "p1")))
+              ;; A raw message cannot be settled: no CLI call, a clear reason.
+              (setq calls nil)
+              (goto-char (point-min))
+              (search-forward "F-1")
+              (goto-char (match-beginning 0))
+              (let ((err (condition-case e (progn (+tt-review-accept) nil) (user-error e))))
+                (should err)
+                (should (string-match-p "not yet frozen" (error-message-string err))))
+              (should (null calls))))
+          (kill-buffer buf))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-review-refresh-costs-only-reads ()
+  "Plan 03b: with views present, refreshing the review and status buffers
+calls neither `+tt--cli' nor `process-file' — only file reads."
+  (let* ((dir (make-temp-file "tt-ert-review" t))
+         (cli 0) (pf 0))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--review-org))
+          (with-temp-file (expand-file-name "views/status.txt" dir) (insert "run: r1\nphase: p1 — REVIEWING\npipeline: review 12s…\n"))
+          (let ((buf (+tt-test--review-buffer dir)))
+            (with-current-buffer buf
+              (setq +tt-review--mtime (file-attribute-modification-time
+                                       (file-attributes (expand-file-name "views/review.org" dir))))
+              (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) (cl-incf cli) ""))
+                        ((symbol-function 'process-file) (lambda (&rest _) (cl-incf pf) 0)))
+                (+tt-review-refresh)
+                (+tt-review-refresh t)))
+            (kill-buffer buf))
+          ;; The status buffer reads views/status.txt instead of `tt state'.
+          (with-temp-buffer
+            (+tt-status-mode)
+            (setq +tt--run-dir dir)
+            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) (cl-incf cli) ""))
+                      ((symbol-function 'process-file) (lambda (&rest _) (cl-incf pf) 0)))
+              (+tt--render-status))
+            (should (string-match-p "pipeline: review 12s" (buffer-string))))
+          (should (= cli 0))
+          (should (= pf 0)))
+      (delete-directory dir t))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
 

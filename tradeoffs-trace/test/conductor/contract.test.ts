@@ -557,3 +557,69 @@ test("contract v1 projections pass check, rebuild identically, and record a late
     cleanupDir(setup.scriptsDir);
   }
 });
+
+test("a run writes views/review.org and views/status.txt, and a new message updates both", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
+    }),
+    // The reviewers raise one advisory finding while the phase is REVIEWING,
+    // so a second message is added after the first projections are written.
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings:
+              reviewer === "M"
+                ? [{ kind: "defect", severity: "advisory", evidence: "src/sum.ts:9 a slow path" }]
+                : [],
+          },
+        },
+      ],
+    }),
+    deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+  });
+
+  try {
+    await setup.conductor.start();
+    const p = runPaths(setup.runDir);
+    // The trade-offs are raised at freeze; the views exist before any finding.
+    await waitFor(() => (setup.conductor.state.phase.messages ?? []).filter((m) => m.type === "tradeoff").length >= 2, 90_000, 20, setup.runDir);
+    await waitFor(() => existsSync(p.review) && existsSync(p.status), 30_000, 20, setup.runDir);
+    const reviewBefore = readFileSync(p.review, "utf8");
+    assert.match(reviewBefore, /T-1/);
+    assert.match(reviewBefore, /^\* Trade-offs$/m);
+    const statusBefore = readFileSync(p.status, "utf8");
+    assert.match(statusBefore, /^run: /m);
+    assert.match(statusBefore, /^phase: /m);
+
+    // A finding message is added; both views are rewritten from the new state.
+    await waitFor(() => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "finding"), 90_000, 20, setup.runDir);
+    await waitFor(() => readFileSync(p.review, "utf8") !== reviewBefore, 30_000, 20, setup.runDir);
+    const reviewAfter = readFileSync(p.review, "utf8");
+    assert.match(reviewAfter, /F-1/);
+    assert.match(reviewAfter, /^\* Findings$/m);
+    assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
+    assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
+    assert.notEqual(readFileSync(p.status, "utf8"), "");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});

@@ -20,7 +20,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
-import { projectLedger, projectMessages, projectReview } from "./core/messages.ts";
+import { projectLedger, projectMessages } from "./core/messages.ts";
+import { projectReview, renderStatusText, reviewMessageFiles } from "./render.ts";
+import { buildView } from "./view.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -377,6 +379,8 @@ export function runPaths(runDir: string) {
     messages: path.join(runDir, "messages.jsonl"),
     ledger: path.join(runDir, "ledger.jsonl"),
     review: path.join(runDir, "views", "review.org"),
+    messagesView: path.join(runDir, "views", "messages"),
+    status: path.join(runDir, "views", "status.txt"),
     inbox: path.join(runDir, "inbox"),
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
@@ -3839,15 +3843,45 @@ export class Conductor {
     this.#recordBoundaryDataAndSample(outcome.candidateSha);
   }
 
-  /** Contract v1: writes `messages.jsonl` and `ledger.jsonl` from state. */
+  /** Contract v1: writes `messages.jsonl`, `ledger.jsonl` and the rendered
+   * views (`views/review.org`, `views/messages/<id>.org`, `views/status.txt`)
+   * from state. */
   #writeContractProjections(): void {
     try {
-      fs.writeFileSync(this.#paths.messages, projectMessages(this.#state.phase));
-      fs.writeFileSync(this.#paths.ledger, projectLedger(this.#state.phase));
-      fs.writeFileSync(this.#paths.review, projectReview(this.#state.phase));
+      const phase = this.#state.phase;
+      fs.writeFileSync(this.#paths.messages, projectMessages(phase));
+      fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
+      fs.writeFileSync(this.#paths.review, projectReview(phase));
+      this.#writeMessageViews();
+      this.#writeStatusView();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
     }
+  }
+
+  /** Plan 03b: `views/messages/<id>.org`, one per message, pruned of files
+   * whose message no longer exists (a superseded id is never resurrected). */
+  #writeMessageViews(): void {
+    const files = reviewMessageFiles(this.#state.phase);
+    const ids = new Set(files.map((f) => f.id));
+    fs.mkdirSync(this.#paths.messagesView, { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(this.#paths.messagesView, `${f.id}.org`), f.contents);
+    for (const name of fs.readdirSync(this.#paths.messagesView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) {
+        fs.rmSync(path.join(this.#paths.messagesView, name), { force: true });
+      }
+    }
+  }
+
+  /** Plan 03b: `views/status.txt`, the same text `tt status` prints, so the
+   * Emacs status buffer reads a file instead of calling `tt state`. */
+  #writeStatusView(): void {
+    const view = buildView(this.#runDir, this.#plan, true);
+    const text = renderStatusText(this.#runDir, this.#state, view, {
+      missing: this.#missingSecrets,
+      tooShort: this.#tooShortSecrets,
+    });
+    fs.writeFileSync(this.#paths.status, text);
   }
 
   /** Contract v1: the reviewable content of the message a worker decision
@@ -3874,6 +3908,21 @@ export class Conductor {
       evidence: [finding.evidence],
       planRef: this.#state.phase.phaseId,
     };
+  }
+
+  /** Plan 03b: who raised a message and how much it matters, so the runtime
+   * renderer can colour and group it without a second lookup. Derived from
+   * the record the message was raised from. */
+  #messageProvenance(type: MessageType, sourceRecordId: string): { raisedBy: string; importance: "high" | "normal" | "low" } {
+    if (type === "tradeoff") {
+      const d = this.#state.phase.decisions.find((x) => x.id === sourceRecordId);
+      if (d?.source === "reviewer-discovered") {
+        return { raisedBy: d.alsoSeenBy?.[0] ? `reviewer ${d.alsoSeenBy[0]}` : "reviewer", importance: d.class === "reserved" ? "high" : d.class === "detail" ? "low" : "normal" };
+      }
+      return { raisedBy: "worker", importance: d?.class === "reserved" ? "high" : d?.class === "detail" ? "low" : "normal" };
+    }
+    const f = this.#state.phase.findings.find((x) => x.id === sourceRecordId);
+    return { raisedBy: f?.raisedBy ?? "reviewer", importance: type === "blocker" ? "high" : "low" };
   }
 
   /** The current content of the record a message was raised from, or
@@ -3921,6 +3970,7 @@ export class Conductor {
       boundContractVersion: this.#state.phase.contract.contractVersion,
       contentHash: contentHashOf({ type, ...content }),
       sourceRecordId,
+      ...this.#messageProvenance(type, sourceRecordId),
     };
     this.#applyEvent({ type: "MESSAGE_RAISED", message });
     this.#applyEvent({

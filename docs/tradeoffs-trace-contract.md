@@ -24,7 +24,9 @@ Everything else under a run directory is a **projection** rebuilt from state:
 | `events.jsonl` | the authoritative history (events, intents, completions, applied commands) |
 | `messages.jsonl` | one current message per line, id order (`projectMessages`) |
 | `ledger.jsonl` | one settled entry per line, id order (`projectLedger`) |
-| `views/review.org` | the runtime-rendered review view (`projectReview`) |
+| `views/review.org` | the runtime-rendered review view (`projectReview`, `src/render.ts`) |
+| `views/messages/<id>.org` | one message's evidence, plan excerpt, history, ledger and votes (`renderMessageFile`) |
+| `views/status.txt` | the plain-text status `tt status` prints (`renderStatusText`) |
 
 Projections are written when an event can have changed them (any `MESSAGE_*`
 or `OWNER_VERDICT` event) and again on every conductor start. Because
@@ -33,9 +35,10 @@ current projections; and a conductor killed between an event and its
 projection write rebuilds them on the next start — the log is the only
 authority.
 
-`tt contract rebuild <run>` rewrites all three projections from
-`events.jsonl`. `tt contract check <run>` compares them to state and exits
-non-zero with the mismatching file names when they differ.
+`tt contract rebuild <run>` rewrites the projections (including one file per
+message) from `events.jsonl`. `tt contract check <run>` compares them to
+state and exits non-zero with the mismatching file names when they differ.
+`views/status.txt` is time-dependent and is regenerated, not compared.
 
 ## 1. Messages and the message state machine
 
@@ -197,9 +200,18 @@ binding check rejects it.
 ## 5. Rendering
 
 - `messages.jsonl` and `ledger.jsonl` are the machine view.
-- `views/review.org` is the human view: one subtree per message with its
-  state, version, candidate, contract, `contentHash`, settlement and
-  `FOLLOW_UP: true` where relevant.
+- `views/review.org` is the human view: three top-level sections (Blockers,
+  Trade-offs, Findings), blockers first. Each message is one heading (`<id>
+  <title>`) carrying its summary and context and a property drawer with its
+  id, type, state, `raisedBy`, `importance`, the owner's verdict (if any) and
+  the binding a verdict needs (`messageVersion`, `candidateSha`,
+  `contractVersion`, `runId`, `phaseId`). Within a section, high and normal
+  messages come first; low-importance ones are folded under `Minor (N)`. A
+  message's own file, `views/messages/<id>.org`, carries its evidence (path
+  and lines), the plan excerpt it concerns, every version's history, its
+  ledger entry and its votes.
+- `views/status.txt` is the plain-text status the Emacs status buffer reads
+  instead of calling `tt state` every poll.
 - `tt summary` (the PR body) lists refused-after-`DONE` follow-ups under
   `### Follow-ups`.
 

@@ -1,0 +1,34 @@
+#+TITLE: B-1 — the loop does not terminate on empty input
+#+TYPE: blocker
+
+* B-1 the loop does not terminate on empty input
+  :PROPERTIES:
+  :ID: B-1
+  :TYPE: blocker
+  :STATE: published
+  :RAISED_BY: M
+  :IMPORTANCE: high
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  raised by M against C1
+
+* Evidence
+  - src/loop.ts:12 does not break on empty input
+
+* Plan
+  plan/03b.org
+
+* History
+  - v1 · C1 · a23cc118bb88b15a417bbf607157d6b6a3ef441255efd31662eedbb8e9474f05
+
+* Ledger
+  (not settled)
+
+* Votes
+  (none)
