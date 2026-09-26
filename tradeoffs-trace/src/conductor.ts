@@ -5675,7 +5675,14 @@ export class Conductor {
       if (!hello.ok) {
         await agent.terminate();
         this.#log.completion(actionId, { messageType, ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
-        this.#evaluationTimedOut(messageType, dispatchCandidate);
+        // B-31 / design §2.1: a tool-set mismatch is a launch failure — the
+        // whole run stops (BLOCKED) with evidence, exactly as for the worker
+        // and the reviewer. Anything else takes the type's timeout path.
+        if (hello.mismatch) {
+          this.#applyEvent({ type: "LAUNCH_FAILED", role: "evaluator", ...hello.mismatch });
+        } else {
+          this.#evaluationTimedOut(messageType, dispatchCandidate);
+        }
         return;
       }
 

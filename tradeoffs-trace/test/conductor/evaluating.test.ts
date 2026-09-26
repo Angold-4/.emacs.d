@@ -17,6 +17,12 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const CLI = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
+function tt(args: string[]): string {
+  return execFileSync(process.execPath, [CLI, ...args], { encoding: "utf8" });
+}
 
 import {
   buildContract,
@@ -33,6 +39,7 @@ import { next } from "../../src/core/next.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { evaluationSettled, typesNeedingEvaluation } from "../../src/core/predicate.ts";
 import { baseState, makeMessage } from "../unit/helpers.ts";
+import { contentHashOf, projectLedger, projectMessages, projectReview } from "../../src/core/messages.ts";
 import { baselineKey } from "../../src/core/test-failures.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { buildView } from "../../src/view.ts";
@@ -532,6 +539,37 @@ test("plan 04a: an addressed:false report is recorded, not silently dropped", ()
   // rebuild from events.jsonl is identical.
   assert.equal(result.state.phase.messages?.[0].addressedReport?.at, "2026-01-01T00:00:00.000Z");
   assert.equal(result.state.phase.messages?.[0].state, "refused", "the refusal still stands");
+});
+
+test("plan 04a: an owner refusal plus an addressed:false report rebuilds byte-identically (OD-2)", () => {
+  // The exact proof OD-2 asks for, at the layer `tt contract check` uses:
+  // fold the events live, project, fold the SAME events again from scratch and
+  // project again. Byte-identical projections mean the check passes; a clock
+  // (or randomness) inside reduce() would make them differ.
+  const K = { snapshot: 1, sectionSha256: "a".repeat(64) };
+  const content = { type: "tradeoff" as const, title: "A polished trade-off title", summary: "one sentence.", context: "src/cancel.ts:1", evidence: ["src/cancel.ts:1"] };
+  const events = [
+    { type: "MESSAGE_RAISED", message: makeMessage({ state: "raw", boundCandidateSha: "C1", boundContractVersion: K, ...content, contentHash: contentHashOf(content) }) },
+    { type: "MESSAGE_PUBLISHED", messageId: "T-1", boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1, content },
+    { type: "OWNER_VERDICT", messageId: "T-1", verdict: "refuse", reason: "not the trade-off the goal needed", boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+    { type: "MESSAGE_ADDRESS_REPORTED", messageId: "T-1", addressed: false, reason: "the candidate never touched the cancel path", at: "2026-01-02T00:00:00.000Z", boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+  ];
+  const fold = () => {
+    let state = baseState({ phase: "EVALUATING", candidate: { sha: "C1", contractVersion: K } });
+    for (const ev of events) {
+      const r = reduce(state, ev);
+      assert.equal(r.ok, true, !r.ok ? r.reason : "");
+      state = r.state;
+    }
+    return state;
+  };
+  const live = fold();
+  const rebuilt = fold();
+  assert.equal(live.phase.messages?.[0].addressedReport?.at, "2026-01-02T00:00:00.000Z");
+  assert.equal(projectMessages(live.phase), projectMessages(rebuilt.phase));
+  assert.equal(projectLedger(live.phase), projectLedger(rebuilt.phase));
+  assert.equal(projectReview(live.phase), projectReview(rebuilt.phase));
+  assert.match(projectLedger(live.phase), /"addressed":false/);
 });
 
 test("plan 04a: a submit_evaluation naming one message twice is refused, never partly applied", async () => {

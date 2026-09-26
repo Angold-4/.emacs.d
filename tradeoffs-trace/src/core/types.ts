@@ -1145,7 +1145,7 @@ export interface EvRunResumed {
  * missing, extra) for whoever looks at BLOCKED next. */
 export interface EvLaunchFailed {
   type: "LAUNCH_FAILED";
-  role: "worker" | "reviewer";
+  role: "worker" | "reviewer" | "evaluator";
   reviewer?: Reviewer; // set when role === "reviewer"
   expected: string[];
   missing: string[];

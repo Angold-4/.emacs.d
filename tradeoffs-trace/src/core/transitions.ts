@@ -1058,7 +1058,9 @@ function applyCriterionReverted(s: State, ev: Event): State {
           ...d,
           version: d.version + 1,
           boundContractVersion: e.newContractVersion,
-          amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+          // OD-2 / B-30: the timestamp rides on the event; the transition
+          // never reads a clock, so a rebuild is byte-identical.
+          amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: e.at },
         }
       : d,
   );
@@ -1447,6 +1449,32 @@ addRow({
       phase: "BLOCKED",
       blockedReason: launchFailedReason(e),
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
+    });
+  },
+});
+
+// Plan 04a / B-31: an evaluator whose tool set does not match is a launch
+// failure too — straight to BLOCKED with evidence, never a silent timeout.
+addRow({
+  id: "launch-failed-from-evaluating",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "LAUNCH_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "LAUNCH_FAILED" }>;
+    return withPhase(s, {
+      phase: "BLOCKED",
+      blockedReason: launchFailedReason(e),
+      inFlight: clearInFlight(
+        s.phase,
+        "dispatch_evaluation_tradeoff",
+        "dispatch_evaluation_finding",
+        "dispatch_evaluation_blocker",
+      ),
     });
   },
 });

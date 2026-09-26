@@ -1077,6 +1077,15 @@ BUILD["owner-correction-from-awaiting-owner"] = {
 // Plan 04a: the BASELINE and EVALUATING states, each with its own fixture.
 const rawMessage = () => makeMessage({ state: "raw", boundCandidateSha: "C1", boundContractVersion: K });
 
+BUILD["launch-failed-from-evaluating"] = {
+  state: baseState({
+    phase: "EVALUATING",
+    candidate: C1,
+    inFlight: { dispatch_evaluation_tradeoff: { actionId: "a1" } },
+  }),
+  event: { type: "LAUNCH_FAILED", role: "evaluator", expected: ["read"], missing: [], extra: ["write"] },
+};
+
 BUILD["start-baseline"] = {
   state: baseState({ phase: "READY" }),
   event: { type: "ATTEMPT_STARTED", baselineNeeded: true },
