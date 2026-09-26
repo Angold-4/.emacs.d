@@ -49,6 +49,8 @@ with no matching row.
 raw       → published | merged | dropped
 published → accepted | refused | superseded | resolved
 refused   → resolved | superseded
+accepted | merged | dropped → superseded   (a settled message whose backing
+                                            record went away)
 ```
 
 Every row:
@@ -65,6 +67,15 @@ Every row:
 | `message-resolved-published` | `published` | `MESSAGE_RESOLVED` | always | `resolved` |
 | `message-superseded-refused` | `refused` | `MESSAGE_SUPERSEDED` | always | `superseded` |
 | `message-resolved-refused` | `refused` | `MESSAGE_RESOLVED` | always | `resolved` |
+| `message-superseded-accepted` | `accepted` | `MESSAGE_SUPERSEDED` | always | `superseded` |
+| `message-superseded-merged` | `merged` | `MESSAGE_SUPERSEDED` | always | `superseded` |
+| `message-superseded-dropped` | `dropped` | `MESSAGE_SUPERSEDED` | always | `superseded` |
+
+A supersede never clears a settlement: a settled message that is superseded
+keeps its settlement in the ledger, marked `supersededBy`. A message whose
+backing decision was withdrawn or not carried forward is superseded at the
+next freeze, so a withdrawn record's settlement can never survive as active
+(`MESSAGE_CARRIED` only ever goes to a live message).
 
 An event with no row is rejected with a visible reason. `OWNER_VERDICT` on a
 `dropped` message is rejected (`no rule from message …'s state 'dropped'`);
@@ -140,7 +151,10 @@ At every `FREEZE_COMPLETED` the conductor emits **one explicit
 The conductor re-derives each message's content from the decision or finding
 it came from at every freeze, so a decision the worker changed this round is
 carried as `unchanged: false` with its new content — the content-changed
-branch is reachable from a real run, not only from fixtures.
+branch is reachable from a real run, not only from fixtures. An
+already-invalidated settlement is never rebound by a later carry: the ledger
+reports it under the candidate, version and contentHash it was actually
+settled under.
 
 Carrying bumps `messageVersion` and rebinds `boundCandidateSha`. The message
 records every past `(candidate, version)` and each version's contentHash, so a

@@ -3887,6 +3887,19 @@ export class Conductor {
     return undefined;
   }
 
+  /** Whether the record a message came from is still live. A decision the
+   * worker withdrew or did not carry forward is superseded (predicate.ts's
+   * isLiveDecision), so its message must be superseded too — never carried
+   * with its old settlement intact. */
+  #backingStatus(message: Message): "live" | "superseded" | "gone" {
+    if (!message.sourceRecordId) return "gone";
+    const decision = this.#state.phase.decisions.find((d) => d.id === message.sourceRecordId);
+    if (decision && message.type === "tradeoff") return isLiveDecision(decision) ? "live" : "superseded";
+    const finding = this.#state.phase.findings.find((f) => f.id === message.sourceRecordId);
+    if (finding && (message.type === "finding" || message.type === "blocker")) return "live";
+    return "gone";
+  }
+
   /** Contract v1: raises a raw message from a decision or finding and
    * publishes it immediately (there is no evaluator in this profile yet).
    * Deduped by the source record id, so a re-freeze or a re-review never
@@ -3928,6 +3941,20 @@ export class Conductor {
     for (const message of this.#state.phase.messages ?? []) {
       if (message.state === "superseded" || message.state === "resolved") continue;
       if (message.boundCandidateSha === toCandidate) continue;
+      // A message whose backing decision was withdrawn or not carried forward
+      // is superseded: its settlement (if any) stays in the ledger, marked,
+      // but it can never survive as an active settlement.
+      if (this.#backingStatus(message) === "superseded") {
+        this.#applyEvent({
+          type: "MESSAGE_SUPERSEDED",
+          messageId: message.id,
+          reason: `its record ${message.sourceRecordId} was superseded`,
+          boundCandidateSha: message.boundCandidateSha,
+          boundContractVersion: message.boundContractVersion,
+          boundRecordVersion: message.messageVersion,
+        });
+        continue;
+      }
       const current = this.#currentContentFor(message);
       const contentHash = current ? contentHashOf(current) : message.contentHash;
       const unchanged = contentHash === message.contentHash;

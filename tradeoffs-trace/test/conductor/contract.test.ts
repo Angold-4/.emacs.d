@@ -382,6 +382,97 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
   }
 });
 
+test("a withdrawn decision supersedes its message and keeps the settlement marked", async () => {
+  let priorId = "";
+  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 };
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf 'attempt ${attempt}\\n' > attempt.txt` },
+        attempt === 1
+          ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
+          : { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [], priorDecisions: [{ id: priorId, status: "withdrawn" }] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const open = state.phase.findings.find((f) => f.raisedBy === "M" && f.status === "open");
+      const repaired = open && open.boundCandidateSha !== state.phase.candidate?.sha;
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: reviewer === "M" && repaired ? [{ findingId: open!.id, status: "confirm" }] : [],
+              ballots: [],
+              findings:
+                reviewer === "M" && !open
+                  ? [{ kind: "defect", severity: "blocking", evidence: "the loop does not terminate on empty input" }]
+                  : [],
+            },
+          },
+        ],
+      };
+    },
+    deadlines,
+  });
+
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      90_000,
+      20,
+      setup.runDir,
+    );
+    const published = setup.conductor.state.phase.messages!.find((m) => m.type === "tradeoff" && m.state === "published")!;
+    priorId = setup.conductor.state.phase.decisions.find((d) => d.source === "worker")!.id;
+    writeFileSync(`${setup.runDir}/conductor.pid`, String(process.pid));
+    assert.match(tt(["verdict", setup.runDir, published.id, "accept"]), /queued verdict/);
+    await waitFor(
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.id === published.id && m.state === "accepted"),
+      30_000,
+      20,
+      setup.runDir,
+    );
+
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 120_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.phase, "DONE");
+    const types = readEvents(setup.runDir)
+      .filter((r) => r.kind === "event")
+      .map((r) => (r.event as { type: string }).type);
+    assert.ok(types.includes("MESSAGE_SUPERSEDED"), "a withdrawn decision must supersede its message");
+    const message = setup.conductor.state.phase.messages!.find((m) => m.id === published.id)!;
+    assert.equal(message.state, "superseded");
+    assert.equal(message.settlement?.settledBy, "owner");
+    assert.match(message.supersededBy ?? "", /superseded/);
+    const entry = readFileSync(runPaths(setup.runDir).ledger, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .find((e: { messageId: string }) => e.messageId === published.id)!;
+    assert.equal(entry.state, "accepted");
+    assert.equal(entry.settledBy, "owner");
+    assert.match(entry.supersededBy ?? "", /superseded/);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
 test("contract v1 projections pass check, rebuild identically, and record a late verdict", async () => {
   const setup = await setupConductor({
     checks: ["true"],

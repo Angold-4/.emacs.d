@@ -176,10 +176,10 @@ addRow({
   guardName: "always",
   guard: () => true,
   to: "superseded",
-  apply: (m, event) => {
-    const next = settle(m!, "resolved", "evaluator", event);
-    return { ...next, state: "superseded", settlement: undefined, supersededBy: event.reason ?? "superseded" };
-  },
+  // A supersede is a state change, not an erasure: any prior settlement stays
+  // in the ledger, marked superseded (so a refused or merged entry is never
+  // silently dropped).
+  apply: (m, event) => ({ ...m!, state: "superseded", supersededBy: event.reason ?? "superseded" }),
 });
 
 addRow({
@@ -199,8 +199,23 @@ addRow({
   guardName: "always",
   guard: () => true,
   to: "superseded",
-  apply: (m, event) => ({ ...m!, state: "superseded", settlement: undefined, supersededBy: event.reason ?? "superseded" }),
+  apply: (m, event) => ({ ...m!, state: "superseded", supersededBy: event.reason ?? "superseded" }),
 });
+
+// A message whose backing record was withdrawn or superseded is superseded
+// too, whatever it had settled to — its settlement stays in the ledger,
+// marked `supersededBy`, never cleared.
+for (const from of ["accepted", "merged", "dropped"] as const) {
+  addRow({
+    id: `message-superseded-${from}`,
+    from,
+    trigger: "MESSAGE_SUPERSEDED",
+    guardName: "always",
+    guard: () => true,
+    to: "superseded",
+    apply: (m, event) => ({ ...m!, state: "superseded", supersededBy: event.reason ?? "superseded" }),
+  });
+}
 
 addRow({
   id: "message-resolved-refused",
@@ -409,6 +424,12 @@ export function applyCarryWithContract(
   const next: Message = { ...carried, boundContractVersion: currentContractVersion };
   if (!next.settlement) return { ok: true, messages: base.messages.map((m) => (m.id === message.id ? next : m)) };
 
+  // An already-invalidated settlement is never rebound to a later candidate:
+  // the ledger reports it under the bindings it was actually settled under.
+  if (message.invalidated) {
+    return { ok: true, messages: base.messages.map((m) => (m.id === message.id ? next : m)) };
+  }
+
   const contentChanged = !(event.unchanged && event.contentHash === message.contentHash);
   if (!contentChanged && contractSame) {
     // The settlement stays: rebind it to the new version/candidate.
@@ -462,6 +483,9 @@ export interface LedgerEntry {
   messageVersion: number;
   contentHash: string;
   invalidated?: { reason: "content changed" | "contract amended"; atCandidate: string };
+  /** Set when the message was later superseded: its settlement is kept, but
+   * the ledger marks that it no longer stands. */
+  supersededBy?: string;
   /** A refusal recorded after the phase reached DONE: a follow-up, not a
    * blocker. */
   followUp?: boolean;
@@ -490,6 +514,7 @@ export function ledgerEntries(messages: Message[]): LedgerEntry[] {
         messageVersion: s.messageVersion,
         contentHash: s.contentHash,
         ...(m.invalidated ? { invalidated: m.invalidated } : {}),
+        ...(m.supersededBy ? { supersededBy: m.supersededBy } : {}),
         ...(m.followUp ? { followUp: true } : {}),
       };
     });

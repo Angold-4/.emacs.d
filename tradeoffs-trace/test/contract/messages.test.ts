@@ -81,6 +81,18 @@ const FIXTURES: Record<string, RowFixture> = {
     state: withMessage(makeMessage({ state: "refused" })),
     event: { type: "MESSAGE_SUPERSEDED", messageId: "T-1", reason: "replaced by T-2", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },
   },
+  "message-superseded-accepted": {
+    state: withMessage(makeMessage({ state: "accepted" })),
+    event: { type: "MESSAGE_SUPERSEDED", messageId: "T-1", reason: "its record was superseded", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },
+  },
+  "message-superseded-merged": {
+    state: withMessage(makeMessage({ state: "merged" })),
+    event: { type: "MESSAGE_SUPERSEDED", messageId: "T-1", reason: "its record was superseded", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },
+  },
+  "message-superseded-dropped": {
+    state: withMessage(makeMessage({ state: "dropped" })),
+    event: { type: "MESSAGE_SUPERSEDED", messageId: "T-1", reason: "its record was superseded", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },
+  },
   "message-resolved-refused": {
     state: withMessage(makeMessage({ state: "refused" })),
     event: { type: "MESSAGE_RESOLVED", messageId: "T-1", by: "owner", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },
@@ -282,6 +294,80 @@ test("ledger: an invalidated entry keeps who settled it, its state and its bindi
   assert.equal(entry.state, "merged");
   assert.equal(entry.candidateSha, C1);
   assert.equal(entry.invalidated?.reason, "contract amended");
+});
+
+test("supersede keeps a prior settlement in the ledger, marked superseded", () => {
+  const raw = makeMessage({ state: "raw" });
+  const pub = reduce(withMessage(raw), {
+    type: "MESSAGE_PUBLISHED",
+    messageId: "T-1",
+    boundCandidateSha: C1,
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(pub.ok, true, pub.ok ? "" : pub.reason);
+  const refused = reduce(pub.state, {
+    type: "OWNER_VERDICT",
+    messageId: "T-1",
+    verdict: "refuse",
+    reason: "wrong choice",
+    boundCandidateSha: C1,
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(refused.ok, true, refused.ok ? "" : refused.reason);
+  const superseded = reduce(refused.state, {
+    type: "MESSAGE_SUPERSEDED",
+    messageId: "T-1",
+    reason: "its record was withdrawn",
+    boundCandidateSha: C1,
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(superseded.ok, true, superseded.ok ? "" : superseded.reason);
+  const message = superseded.state.phase.messages![0];
+  assert.equal(message.state, "superseded");
+  assert.equal(message.settlement?.settledBy, "owner");
+  const entry = ledgerEntries(superseded.state.phase.messages!).find((e) => e.messageId === "T-1")!;
+  assert.equal(entry.state, "refused");
+  assert.equal(entry.supersededBy, "its record was withdrawn");
+});
+
+test("carry: a later unchanged carry never rebinds an invalidated settlement", () => {
+  const { state, before } = acceptedOnce();
+  const changed = { type: "tradeoff" as const, title: "a rewritten choice", summary: "new summary", context: "new context", evidence: ["new evidence"], planRef: "p" };
+  const invalidated = reduce(state, {
+    type: "MESSAGE_CARRIED",
+    messageId: "T-1",
+    fromCandidate: C1,
+    toCandidate: "C2",
+    fromVersion: 1,
+    toVersion: 2,
+    contentHash: contentHashOf(changed),
+    unchanged: false,
+    content: changed,
+  });
+  assert.equal(invalidated.ok, true);
+  // A second, unchanged carry must NOT rebase the invalidated settlement.
+  const again = reduce(invalidated.state, {
+    type: "MESSAGE_CARRIED",
+    messageId: "T-1",
+    fromCandidate: "C2",
+    toCandidate: "C3",
+    fromVersion: 2,
+    toVersion: 3,
+    contentHash: contentHashOf(changed),
+    unchanged: true,
+  });
+  assert.equal(again.ok, true, again.ok ? "" : again.reason);
+  const message = again.state.phase.messages![0];
+  assert.equal(message.settlement?.candidateSha, C1);
+  assert.equal(message.settlement?.messageVersion, 1);
+  assert.equal(message.settlement?.contentHash, before.contentHash);
+  assert.equal(message.invalidated?.reason, "content changed");
+  const entry = ledgerEntries(again.state.phase.messages!).find((e) => e.messageId === "T-1")!;
+  assert.equal(entry.candidateSha, C1);
+  assert.equal(entry.messageVersion, 1);
 });
 
 test("carry: an unchanged settlement stays settled on the new candidate", () => {
