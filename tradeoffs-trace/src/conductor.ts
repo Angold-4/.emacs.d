@@ -347,6 +347,18 @@ export interface ConductorOptions {
 // Run directory layout (design §9.1)
 // ---------------------------------------------------------------------------
 
+/** Contract v1: the events that can change a message projection. */
+const MESSAGE_EVENT_TYPES = new Set<string>([
+  "MESSAGE_RAISED",
+  "MESSAGE_PUBLISHED",
+  "MESSAGE_MERGED",
+  "MESSAGE_DROPPED",
+  "OWNER_VERDICT",
+  "MESSAGE_RESOLVED",
+  "MESSAGE_SUPERSEDED",
+  "MESSAGE_CARRIED",
+]);
+
 export function runPaths(runDir: string) {
   return {
     root: runDir,
@@ -1465,7 +1477,12 @@ export class Conductor {
     }
     this.#log.append("event", logged);
     this.#state = result.state;
-    this.#writeContractProjections();
+    // Contract v1: write the message projections only when an event can have
+    // changed them. `start()` rebuilds them from the log regardless, so a
+    // conductor killed before this write loses nothing; writing on every
+    // event (of which there are thousands per run) slowed long runs enough to
+    // matter against their test timeouts.
+    if (MESSAGE_EVENT_TYPES.has(logged.type)) this.#writeContractProjections();
     // Plan 01b: a fresh park is a new notification episode; resolving some of
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
