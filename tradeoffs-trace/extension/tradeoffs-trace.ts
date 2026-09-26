@@ -249,6 +249,9 @@ const EvaluationParam = Type.Object({
   importance: Type.Optional(StringEnum(["high", "medium", "low"] as const)),
   into: Type.Optional(Type.String({ description: "merge only: the message id it folds into" })),
   reason: Type.Optional(Type.String({ description: "drop only: why it is not reviewable" })),
+  addressed: Type.Optional(
+    Type.Boolean({ description: "owner-refused messages only: whether this candidate addressed the owner's reason" }),
+  ),
 });
 const submitEvaluationFields: Record<string, TSchema> = {
   evaluations: Type.Array(EvaluationParam, { description: "One entry per raw message you were shown" }),

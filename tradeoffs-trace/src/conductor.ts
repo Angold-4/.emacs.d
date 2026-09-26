@@ -2988,14 +2988,26 @@ export class Conductor {
     for (const entry of entries) {
       const id = typeof entry?.messageId === "string" ? entry.messageId : "";
       const message = byId.get(id);
-      if (!message || message.state !== "raw") continue;
-      handled.add(id);
+      if (!message) continue;
       const binding = {
         messageId: id,
         boundCandidateSha: message.boundCandidateSha,
         boundContractVersion: message.boundContractVersion,
         boundRecordVersion: message.messageVersion,
       };
+      // Plan 04a item 4: an owner-refused message is not re-evaluated; the
+      // evaluator reports whether this candidate addressed it. `addressed:
+      // true` resolves the refusal; `false` (or omitted) leaves it standing.
+      if (message.state === "refused") {
+        handled.add(id);
+        if (entry.addressed === true) {
+          const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : "addressed by the candidate";
+          events.push({ type: "MESSAGE_RESOLVED", ...binding, by: "evaluator", reason });
+        }
+        continue;
+      }
+      if (message.state !== "raw") continue;
+      handled.add(id);
       if (entry.action === "merge") {
         const into = typeof entry.into === "string" && entry.into.trim().length > 0 ? entry.into.trim() : undefined;
         events.push({ type: "MESSAGE_MERGED", ...binding, by: "evaluator", reason: into ? `merged into ${into}` : "merged" });
@@ -3004,6 +3016,10 @@ export class Conductor {
         events.push({ type: "MESSAGE_DROPPED", ...binding, by: "evaluator", reason });
       } else {
         const text = (v: unknown, fallback: string) => (typeof v === "string" && v.trim().length > 0 ? v.trim() : fallback);
+        const importance =
+          entry.importance === "high" || entry.importance === "medium" || entry.importance === "low"
+            ? entry.importance
+            : message.importance;
         events.push({
           type: "MESSAGE_PUBLISHED",
           ...binding,
@@ -3014,6 +3030,7 @@ export class Conductor {
             context: text(entry.context, message.context),
             evidence: Array.isArray(entry.evidence) && entry.evidence.length > 0 ? entry.evidence.map(String) : message.evidence,
             planRef: message.planRef,
+            ...(importance ? { importance } : {}),
           },
         });
       }
@@ -3144,6 +3161,10 @@ export class Conductor {
         return `discovered decision fails schemas/decision.schema.json: ${result.errors.join("; ")}`;
       }
       this.#applyEvent({ type: "DECISION_ADDED", decision });
+      // Plan 04a item 2: a reviewer's discovered trade-off is raised as a raw
+      // message too, so the evaluator checks it in EVALUATING like any other
+      // (finding M-9). Deduped by the decision id.
+      this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), candidate.sha);
     }
     return undefined;
   }
@@ -4104,6 +4125,9 @@ export class Conductor {
       boundCandidateSha: candidateSha,
       boundContractVersion: this.#state.phase.contract.contractVersion,
       contentHash: contentHashOf({ type, ...content }),
+      // The record-derived hash a later carry compares against, so an
+      // evaluator-rewritten title is not mistaken for a changed decision.
+      sourceContentHash: contentHashOf({ type, ...content }),
       ...(sourceRecordId !== undefined ? { sourceRecordId } : {}),
     };
     this.#applyEvent({ type: "MESSAGE_RAISED", message });
@@ -4134,8 +4158,14 @@ export class Conductor {
         continue;
       }
       const current = this.#currentContentFor(message);
-      const contentHash = current ? contentHashOf(current) : message.contentHash;
-      const unchanged = contentHash === message.contentHash;
+      // Compare the RECORD's content against the hash it had when the message
+      // was raised (sourceContentHash), not against the message's visible
+      // contentHash: the evaluator may have rewritten the title, and that must
+      // not read as "the record changed" (finding F-A-5).
+      const sourceHash = message.sourceContentHash ?? message.contentHash;
+      const currentHash = current ? contentHashOf(current) : sourceHash;
+      const unchanged = !current || currentHash === sourceHash;
+      const contentHash = unchanged ? message.contentHash : currentHash;
       this.#applyEvent({
         type: "MESSAGE_CARRIED",
         messageId: message.id,
@@ -4145,7 +4175,8 @@ export class Conductor {
         toVersion: message.messageVersion + 1,
         contentHash,
         unchanged,
-        ...(unchanged || !current ? {} : { content: current }),
+        ...(current ? { sourceContentHash: currentHash } : {}),
+        ...(unchanged ? {} : { content: current! }),
       });
     }
   }
@@ -4342,7 +4373,20 @@ export class Conductor {
     if (commands.length === 0) return false;
     const key = this.#baselineKey(commands);
     const local = this.#readBaseline();
-    return !(local && this.#baselineCovers(local, key, commands));
+    if (local && this.#baselineCovers(local, key, commands)) return false;
+    // Plan 01e's reuse rule names a sibling program node's identical-base
+    // record too: adopt it here (copying it into this run's own checks/base/)
+    // so READY skips the state entirely, while the candidate's checks still
+    // have a local record to lean on (finding M-7).
+    const shared = this.#baselineSharedDir(key);
+    if (shared) {
+      const sibling = this.#readBaselineFrom(path.join(shared, "baseline.json"));
+      if (sibling && this.#baselineCovers(sibling, key, commands)) {
+        this.#adoptBaseline(sibling, shared, "program");
+        return false;
+      }
+    }
+    return true;
   }
 
   /** Plan 04a: the BASELINE stage's own logged action. It runs the base
@@ -5580,6 +5624,7 @@ export class Conductor {
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
+      ...refusedPromptLines(phase.messages),
       ...ledgerPromptLines(phase.messages),
       "",
       "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
@@ -5596,6 +5641,7 @@ export class Conductor {
       "- publish: title (one clean line, at most 80 characters), summary (at most 3 sentences), context, evidence (the code facts you checked), importance (high|medium|low).",
       "- merge: the message says the same thing as another — name `into` that message id.",
       "- drop: it is trivial, already settled, or not reviewable — give a reason.",
+      "For each owner-refused message above, name it with `addressed: true` only if this candidate really addressed the owner's reason (which resolves the refusal), or `addressed: false` if it did not. Do not re-raise a refusal.",
     ];
     return lines.join("\n");
   }
@@ -5848,6 +5894,8 @@ interface EvaluationEntry {
   importance?: unknown;
   into?: unknown;
   reason?: unknown;
+  /** Owner-refused messages only: whether this candidate addressed it. */
+  addressed?: unknown;
 }
 
 /** Plan 04a: an anchor is `{path, lines: [start, end]}`. Anything else is

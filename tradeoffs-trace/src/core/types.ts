@@ -300,6 +300,15 @@ export interface Message {
   /** Plan 04a: an evaluator timed out (or did not evaluate this message), so
    * the raw message was published unchanged, marked unevaluated. */
   unevaluated?: boolean;
+  /** Plan 04a: how important the evaluator judged this message
+   * (high|medium|low). Metadata, not part of the reviewable contentHash. */
+  importance?: "high" | "medium" | "low";
+  /** Plan 04a: the contentHash of the content RE-DERIVED from the backing
+   * record when the message was last raised/carried. The evaluator may
+   * rewrite the visible content, so a carry must compare the record against
+   * this, not against `contentHash`, or an unchanged record would look
+   * changed and lose the evaluator's wording. */
+  sourceContentHash?: string;
   supersededBy?: string;
   /** Every past version's contentHash, so a verdict bound to a pre-carry
    * version of an unchanged message is still recognised as current. */
@@ -1277,6 +1286,7 @@ export interface EvMessagePublished {
     context: string;
     evidence: string[];
     planRef?: string;
+    importance?: "high" | "medium" | "low";
   };
   /** Set when the evaluator did not evaluate this message (it missed it, or
    * the evaluation timed out): it is published unchanged, marked so. */
@@ -1342,6 +1352,10 @@ export interface EvMessageCarried {
   toVersion: number;
   contentHash: string;
   unchanged: boolean;
+  /** Plan 04a: the record-derived content hash this carry compares against,
+   * so a later carry can tell an unchanged record from a changed one even
+   * when the evaluator rewrote the visible content. */
+  sourceContentHash?: string;
 }
 
 export type Event =

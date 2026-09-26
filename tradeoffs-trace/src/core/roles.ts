@@ -22,9 +22,10 @@ export const ROLE_TOOLS: Record<Role, string[]> = {
   worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "raise_tradeoff"],
   reviewer: ["read", "grep", "find", "ls", "submit_discovery", "submit_review"],
   // Plan 04a: the evaluator checks a round's raw messages against the code
-  // it can read, and returns through `submit_evaluation`. No write tools: it
-  // reports, it does not change the candidate.
-  evaluator: ["read", "grep", "find", "ls", "raise_tradeoff", "submit_evaluation"],
+  // it can read, and returns through `submit_evaluation`. No write tools, and
+  // no `raise_tradeoff`: the plan gives that tool to the worker, and a tool
+  // the evaluator could never use would be a dead interface.
+  evaluator: ["read", "grep", "find", "ls", "submit_evaluation"],
 };
 
 /** The skeleton extension's own file, resolved relative to this module so

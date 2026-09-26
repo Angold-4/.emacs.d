@@ -41,6 +41,9 @@ export interface MessageContent {
   context: string;
   evidence: string[];
   planRef?: string;
+  /** Plan 04a: evaluator metadata. Deliberately NOT part of `contentHashOf`:
+   * it is the evaluator's judgement, not the reviewable claim. */
+  importance?: "high" | "medium" | "low";
 }
 
 export function contentHashOf(content: MessageContent): string {
@@ -413,6 +416,7 @@ export function applyCarry(messages: Message[], message: Message, event: Message
     messageVersion: event.toVersion,
     boundCandidateSha: event.toCandidate,
     contentHash: event.contentHash,
+    sourceContentHash: event.sourceContentHash ?? message.sourceContentHash,
     versionContentHashes,
     carriedFrom,
   };

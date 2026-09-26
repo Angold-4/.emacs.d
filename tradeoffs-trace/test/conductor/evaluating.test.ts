@@ -458,6 +458,67 @@ test("plan 04a: the next reviewer turn-2 prompt carries the settled ledger", asy
   }
 });
 
+test("plan 04a: a later round's new raw messages are evaluated afresh (no stale settled flag)", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "raise_tradeoff",
+          args: { choice: `Round ${attempt} choice`, alternative: "the other way", why: "matters", anchor: { path: "src/a.ts", lines: [1, 2] } },
+        },
+        submitPhaseStep(),
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const open = state.phase.findings.find((f) => f.raisedBy === "M" && f.status === "open");
+      const repaired = open && open.boundCandidateSha !== state.phase.candidate?.sha;
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: reviewer === "M" && repaired ? [{ findingId: open!.id, status: "confirm" }] : [],
+              ballots: [],
+              findings: reviewer === "M" && !open ? [{ kind: "defect", severity: "blocking", evidence: "the loop can spin" }] : [],
+            },
+          },
+        ],
+      };
+    },
+    deadlines: { ...FAST, reviewMs: 30_000, probeMs: 5_000 },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 90_000, 20, setup.runDir);
+    assert.equal(setup.conductor.state.phase.phase, "DONE");
+    assert.ok(
+      !(setup.conductor.state.phase.messages ?? []).some((m) => m.state === "raw"),
+      "a later round's new raw message must not skip evaluation via a stale settled flag",
+    );
+    assert.ok(
+      eventTypes(setup.runDir).filter((t) => t === "EVALUATION_COMPLETED").length >= 2,
+      "each round must complete its own evaluation",
+    );
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
 test("plan 04a: a conductor killed during EVALUATING re-dispatches the evaluation once on restart", async () => {
   const repo = fs.mkdtempSync("/tmp/tt-eval-repo-");
   const root = fs.mkdtempSync("/tmp/tt-eval-run-");

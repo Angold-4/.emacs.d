@@ -435,6 +435,10 @@ function applyProbePassed(s: State, ev: Event, targetPhase: PhaseStateName): Sta
     phase: targetPhase,
     probe: { candidateSha: s.phase.candidate!.sha, head: s.phase.integrationHead, probedI: e.probedI, passed: true },
     findings,
+    // Entering EVALUATING starts a FRESH round: an earlier round's
+    // `evaluation.settled` must never let the new round's raw messages skip
+    // evaluation.
+    ...(targetPhase === "EVALUATING" ? { evaluation: undefined } : {}),
     inFlight: clearInFlight(s.phase, "dispatch_probe"),
   });
 }
@@ -553,6 +557,8 @@ addRow({
     return withPhase(s, {
       phase: "EVALUATING",
       reviews: { ...s.phase.reviews, [e.review.reviewer]: { review: e.review } },
+      // A fresh round: never inherit a previous round's settled flag.
+      evaluation: undefined,
       inFlight: clearInFlight(s.phase, key),
     });
   },
