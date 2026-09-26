@@ -58,7 +58,11 @@ test("stale reviews: a reviewer calling submit_review twice at once never crashe
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    deadlines: { abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 10_000, workerAttemptMs: 30_000, checkMs: 20_000, probeMs: 20_000, freezeMs: 20_000 },
+    // helloTimeoutMs: generous, because the full suite runs four files at
+    // once and a reviewer's process start can be slow under that load; a
+    // hello that merely races a busy host must not read as a review timeout
+    // (plan 04a adds an evaluator process per round, which adds to the load).
+    deadlines: { abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 30_000, workerAttemptMs: 60_000, checkMs: 20_000, probeMs: 20_000, freezeMs: 20_000 },
     workerScript: () => ({
       hello: defaultWorkerHello(),
       steps: [
