@@ -1090,11 +1090,12 @@ open the decision view at that record."
 (defun +tt-open-tradeoff ()
   "Open the decision view at the trade-off record on this line (RET).
 Plan 01h: a Trade-offs line carries the record it is about as a text
-property; RET on it opens the decision view with point at that record."
+property; RET on it opens the decision view with point at that record.
+Every other status row is left exactly as inert as it was before this key
+existed (finding B-5: a row with no record must not raise)."
   (interactive)
   (let ((record (get-text-property (point) '+tt-record)))
-    (unless record (user-error "No trade-off record on this line"))
-    (+tt-decisions record)))
+    (when record (+tt-decisions record))))
 
 (defvar-keymap +tt-status-mode-map
   :parent special-mode-map
@@ -1455,6 +1456,27 @@ not named by a trade-off line keeps its place after those that are."
       (setq i (1+ i)))
     ranks))
 
+(defun +tt--render-directive-records (s)
+  "Insert the owner directives (plan 01i) as Org blocks carrying their id.
+Plan 01h: a Trade-offs line about a directive names its `OD-n'/`ODP-n', so
+the decision view must carry a block RET can land on (finding M-3).
+Oldest first, by the number in the id — never the inbox's file order."
+  (let ((directives (alist-get 'ownerDirectives (+tt--get s 'state 'phase))))
+    (when directives
+      (setq directives (sort (copy-sequence directives)
+                             (lambda (a b) (< (or (alist-get 'seq a) 0) (or (alist-get 'seq b) 0)))))
+      (insert (format "* Owner directives (%d)\n" (length directives)))
+      (dolist (d directives)
+        (let ((start (point)))
+          (insert (format "** %s [%s, %s] %s — %s\n"
+                          (alist-get 'id d)
+                          (if (equal (alist-get 'scope d) "program") "whole program" "this phase")
+                          (if (equal (alist-get 'status d) "withdrawn") "withdrawn" "in force")
+                          (truncate-string-to-width (or (alist-get 'text d) "") 70 nil nil "…")
+                          (+tt--directive-delivery d)))
+          (put-text-property start (point) '+tt-record (alist-get 'id d))))
+      (insert "\n"))))
+
 (defun +tt--render-advisories (advisories)
   "Insert ADVISORIES (open advisory findings) folded under one heading.
 Plan 01h: the decision view does not list each advisory in the findings
@@ -1496,6 +1518,8 @@ carries its record so RET can reach it."
     (when (and needs (> needs 0))
       (insert (format "⚑ %d owner request(s) open — type a correction in the input box\n" needs)))
     (insert "\n")
+    ;; Plan 01h: the owner directives come first, as in the Trade-offs panel.
+    (+tt--render-directive-records s)
     ;; Plan 01h: the same ordering as the Trade-offs panel (amendments,
     ;; flagged, M vetoes, dissent, the rest).  Sorting by the rank the view
     ;; computed keeps this a renderer, not a second opinion.
@@ -1522,7 +1546,7 @@ carries its record so RET can reach it."
                           (substring (alist-get 'candidateSha r) 0 7) (alist-get 'outcome r))))))))
 
 (defun +tt--goto-record (record)
-  "Move point to the block whose `+tt-record' property is RECORD.
+  "Move point to the block whose `+tt-record' property is RECORD, and show it.
 Return the position, or nil when the view does not carry it."
   (let ((pos (point-min))
         (found nil))
@@ -1530,7 +1554,17 @@ Return the position, or nil when the view does not carry it."
       (if (equal (get-text-property pos '+tt-record) record)
           (setq found pos)
         (setq pos (next-single-property-change pos '+tt-record))))
-    (when found (goto-char found) found)))
+    (when found
+      (goto-char found)
+      ;; Plan 01h: `+tt-decisions' folds to level 1 before this runs, so a
+      ;; level-2 block (an advisory, a directive) starts hidden.  Reveal the
+      ;; context, or the view would open with the record invisible, which is
+      ;; not "at that record" (finding M-4).
+      (ignore-errors
+        (cond ((fboundp 'org-reveal) (org-reveal))
+              ((fboundp 'org-fold-show-context) (org-fold-show-context 'org-goto))
+              ((fboundp 'org-show-context) (org-show-context 'org-goto))))
+      found)))
 
 ;;;###autoload
 (defun +tt-decisions (&optional record)

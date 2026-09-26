@@ -1018,5 +1018,91 @@ count; each block carries its record so RET can land on it."
     (goto-char (point-min))
     (should-not (+tt--goto-record "D-missing"))))
 
+(ert-deftest tradeoffs-trace-decision-view-reveals-the-record ()
+  "Plan 01h (M-4): `+tt-decisions' folds to level 1 before RET's jump runs,
+ so a level-2 advisory must be revealed by the jump instead of staying
+hidden under the Advisories heading."
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--tradeoff-state)
+    (org-mode)
+    (org-content 1)
+    (goto-char (point-min))
+    (should (+tt--goto-record "F-p1-M-2"))
+    (should (looking-at "\\*\\* ADVISORY"))
+    (should-not (get-char-property (point) 'invisible))))
+
+(defconst +tt-test--directive-tradeoff-state
+  '((meta (title . "sum validation"))
+    (conductorAlive . :false)
+    (ownerInputs) (pendingOwnerInputs)
+    (secrets (declared) (missing) (tooShort))
+    (state (run . "RUN_ACTIVE")
+           (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 2))
+                  (candidate (sha . "7c1e0a4aaaaaaaa"))
+                  (decisions) (ballots) (findings) (ownerRequests)
+                  (ownerDirectives ((id . "OD-1") (seq . 1)
+                                    (text . "the 14 exchange-state-machine failures are pre-existing, not yours")
+                                    (scope . "phase") (status . "in-force")
+                                    (targets "worker" "M")
+                                    (deliveries (worker . "delivered"))))))
+    (decisionStatuses)
+    (view (elapsed . "1m02s") (round . 2) (pipeline . "review 12s")
+          (reviewLine . "M ✓   A ✓   B ✓")
+          (verdict . "not accepted: the checks kept failing → repair attempt 2")
+          (liveDecisions . 0) (failedDecisions . 0) (flaggedDecisions . 0)
+          (openFindings . 0) (boundaryFilesChanged . 0) (needsYou . 0)
+          (tradeoffs ((kind . "directive") (recordId . "OD-1")
+                      (text . "directive OD-1 not yet delivered to M: the 14 exchange-state-machine failures are pre-existing, not yours")))
+          (cost (text . "2 rounds · 20m total"))
+          (rounds)))
+  "Plan 01h: a directive Trade-offs line and the directive record it names.")
+
+(ert-deftest tradeoffs-trace-tradeoff-directive-ret ()
+  "Plan 01h (M-3): RET on a directive's Trade-offs line opens the decision
+view on that directive's own record, which the view now carries."
+  (with-temp-buffer
+    (+tt--render-status-from +tt-test--directive-tradeoff-state "/tmp/tt-ert/abcd1234")
+    (should (string-match-p "Trade-offs (1)" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "not yet delivered")
+    (should (equal (get-text-property (match-beginning 0) '+tt-record) "OD-1")))
+  (let (record)
+    (cl-letf (((symbol-function '+tt-decisions) (lambda (&optional r) (setq record r))))
+      (with-temp-buffer
+        (+tt--render-status-from +tt-test--directive-tradeoff-state "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (search-forward "not yet delivered")
+        (goto-char (match-beginning 0))
+        (+tt-open-tradeoff)
+        (should (equal record "OD-1")))))
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--directive-tradeoff-state)
+    (org-mode)
+    (org-content 1)
+    (should (string-match-p "\\* Owner directives (1)" (buffer-string)))
+    (goto-char (point-min))
+    (should (+tt--goto-record "OD-1"))
+    (should (looking-at "\\*\\* OD-1"))
+    (should-not (get-char-property (point) 'invisible))))
+
+(ert-deftest tradeoffs-trace-status-ret-without-a-record-is-inert ()
+  "Plan 01h (B-5): RET on a status row that is not a Trade-offs line stays as
+inert as it was before the key existed — no error, and nothing opened."
+  (let ((called nil))
+    (cl-letf (((symbol-function '+tt-decisions) (lambda (&optional _) (setq called t))))
+      (with-temp-buffer
+        (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (search-forward "pipeline")
+        (goto-char (match-beginning 0))
+        (+tt-open-tradeoff)
+        (should-not called)
+        ;; …and on a plain row of a run from before this stage.
+        (erase-buffer)
+        (+tt--render-status-from (+tt-test--without-tradeoffs) "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (+tt-open-tradeoff)
+        (should-not called)))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

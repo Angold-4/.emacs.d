@@ -327,24 +327,61 @@ test("view-tradeoffs: a directive in force that an agent has not received ranks 
   assert.match(entries[0].text, /directive OD-1 not yet delivered to M:/);
 });
 
-test("view-tradeoffs: a delivered directive and an empty phase show nothing", () => {
+test("view-tradeoffs: a delivered directive, a program-seeded one and an empty phase show nothing", () => {
+  const base = {
+    seq: 1,
+    scope: "phase" as const,
+    status: "in-force" as const,
+    commandId: "c1",
+    at: at(0),
+    targets: ["worker"],
+    deliveries: { worker: "delivered" as const },
+  };
   const delivered = basePhase({
-    ownerDirectives: [
-      {
-        id: "OD-1",
-        seq: 1,
-        text: "already landed",
-        scope: "phase",
-        status: "in-force",
-        commandId: "c1",
-        at: at(0),
-        targets: ["worker"],
-        deliveries: { worker: "delivered" },
-      },
-    ],
+    ownerDirectives: [{ id: "OD-1", text: "already landed", ...base }],
   });
   assert.deepEqual(tradeoffEntries(delivered), []);
+  // A1: a program-wide directive seeded into this node's plan carries no
+  // targets at all — nothing recorded says an agent has not received it, so
+  // it is never announced as "not yet delivered".
+  const seeded = basePhase({
+    ownerDirectives: [
+      { id: "ODP-1", text: "no node may touch the vendor adapters", scope: "program", status: "in-force", commandId: "seed-ODP-1", at: at(0), targets: [], deliveries: {}, seeded: true, ...{ seq: 1 } },
+    ],
+  });
+  assert.deepEqual(tradeoffEntries(seeded), []);
+  // No live agent at send time is the same record: nothing to announce.
+  const noLiveAgent = basePhase({
+    ownerDirectives: [{ id: "OD-2", text: "sent while nothing was live", ...base, targets: [], deliveries: {}, seq: 2 }],
+  });
+  assert.deepEqual(tradeoffEntries(noLiveAgent), []);
   assert.deepEqual(tradeoffEntries(basePhase()), []);
+});
+
+test("view-tradeoffs: a superseded amendment is history and is not offered", () => {
+  const superseded: Decision = {
+    id: "D-p1-9",
+    version: 3,
+    phaseId: "p1",
+    source: "worker",
+    class: "reserved",
+    choice: "the tests pass",
+    whyItMatters: "x",
+    alternatives: [{ option: "a", consequence: "b" }],
+    recommendation: { choice: "a", reason: "b" },
+    boundCandidateSha: "C1",
+    boundContractVersion: CV(),
+    supersededBy: "candidate c1: not carried forward by the worker",
+    amendment: {
+      id: "AM-p1-C9",
+      criterion: "it works",
+      proposedWording: "the tests pass",
+      why: "cannot be met as written",
+      raisedBy: "worker",
+      status: "applied",
+    },
+  };
+  assert.deepEqual(tradeoffEntries(basePhase({ decisions: [superseded] })), []);
 });
 
 test("program status: each node gets its rounds, minutes, owner wait and top trade-off", () => {

@@ -125,14 +125,18 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
   const dissents: TradeoffEntry[] = [];
   const advisories: TradeoffEntry[] = [];
 
-  // (0) owner directives in force (plan 01i) that some agent has not received
-  // yet — a ruling that has not landed is what the owner must know first.
+  // (0) owner directives in force (plan 01i) whose immediate steer to a
+  // recorded live agent has not been acknowledged — a ruling still in the
+  // air is what the owner must know first. A directive with NO recorded
+  // targets is not shown: "no agent was live at the time", and for a
+  // program-wide directive seeded into a node's plan (conductor.ts's
+  // `seededDirective`) the empty list means it reached this run through its
+  // prompts all along. Nothing recorded says an agent has not received it,
+  // so nothing here claims one has not (finding A-1).
   for (const d of phase.ownerDirectives ?? []) {
     if (d.status !== "in-force") continue;
-    const pending =
-      d.targets.length === 0
-        ? ["(no live agent)"]
-        : d.targets.filter((t) => (d.deliveries ?? {})[t] !== "delivered");
+    if (d.targets.length === 0) continue;
+    const pending = d.targets.filter((t) => (d.deliveries ?? {})[t] !== "delivered");
     if (pending.length === 0) continue;
     directives.push({
       kind: "directive",
@@ -141,10 +145,12 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
     });
   }
 
-  // (1) disputed or amended criteria (plan 01g), old → new.
+  // (1) disputed or amended criteria (plan 01g), old → new. A superseded
+  // record is history — the decision view does not render it, so a line
+  // pointing at it could not be followed (finding A-2).
   for (const d of phase.decisions) {
     const a = d.amendment;
-    if (!a) continue;
+    if (!a || !isLiveDecision(d)) continue;
     const arrow = a.status === "reverted" ? `${a.proposedWording} → ${a.criterion}` : `${a.criterion} → ${a.proposedWording}`;
     const status = decisionStatus(d, phase).status;
     const label =
