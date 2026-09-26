@@ -26,9 +26,12 @@ Everything else under a run directory is a **projection** rebuilt from state:
 | `ledger.jsonl` | one settled entry per line, id order (`projectLedger`) |
 | `views/review.org` | the runtime-rendered review view (`projectReview`) |
 
-Projections are written after every state change and again on every
-conductor start. A conductor killed between an event and its projection write
-rebuilds the projections on the next start — the log is the only authority.
+Projections are written when an event can have changed them (any `MESSAGE_*`
+or `OWNER_VERDICT` event) and again on every conductor start. Because
+messages only change through those events, a mid-run `tt contract check` sees
+current projections; and a conductor killed between an event and its
+projection write rebuilds them on the next start — the log is the only
+authority.
 
 `tt contract rebuild <run>` rewrites all three projections from
 `events.jsonl`. `tt contract check <run>` compares them to state and exits
@@ -77,16 +80,19 @@ The events, all reduced by `reduce()`:
 - `OWNER_VERDICT { messageId, verdict: "accept" | "refuse", reason?, …binding }`
 - `MESSAGE_RESOLVED { messageId, by, reason?, …binding }`
 - `MESSAGE_SUPERSEDED { messageId, reason?, …binding }`
-- `MESSAGE_CARRIED { messageId, fromCandidate, toCandidate, fromVersion, toVersion, contentHash, unchanged }`
+- `MESSAGE_CARRIED { messageId, fromCandidate, toCandidate, fromVersion, toVersion, contentHash, unchanged, content? }`
+  — `content` is present exactly when the reviewable content changed, so the
+  stored fields and `contentHash` can never disagree.
 
 `by` is one of `owner`, `evaluator`, `panel`, `vote`.
 
 ### Owner verdict side effects
 
-- **`refuse` during `REVIEWING`** appends an owner-authored **blocking**
-  finding bound to the current candidate. Because `accept(C, K)` fails on any
-  open blocking finding, the candidate cannot reach `ACCEPTED`; the run
-  returns to repair or, when the budget is exhausted, parks on the owner.
+- **`refuse` before `DONE`** (in any phase: `CHECKING`, `PROBING`,
+  `REVIEWING`, `ACCEPTED`, …) appends an owner-authored **blocking** finding
+  bound to the current candidate. Because `accept(C, K)` fails on any open
+  blocking finding, the candidate cannot reach `ACCEPTED`; the run returns to
+  repair or, when the budget is exhausted, parks on the owner.
 - **`refuse` after `DONE`** is a **follow-up**: the message is marked
   `followUp` and no phase state changes.
 - **`accept`** settles exactly the message version the command named.
@@ -126,9 +132,15 @@ At every `FREEZE_COMPLETED` the conductor emits **one explicit
 
 > A settlement carries to the new version exactly when `unchanged` is true
 > (the same `contentHash`) **and** the contract version is the same.
-> Otherwise the ledger entry is marked `invalidated` with the reason
-> (`content changed` or `contract amended`), and the message needs a new
+> Otherwise the ledger entry is **kept** (who settled it and its bindings)
+> and marked `invalidated` with the reason (`content changed` or `contract
+> amended`); the message itself returns to `published` and needs a new
 > verdict.
+
+The conductor re-derives each message's content from the decision or finding
+it came from at every freeze, so a decision the worker changed this round is
+carried as `unchanged: false` with its new content — the content-changed
+branch is reachable from a real run, not only from fixtures.
 
 Carrying bumps `messageVersion` and rebinds `boundCandidateSha`. The message
 records every past `(candidate, version)` and each version's contentHash, so a
@@ -153,8 +165,12 @@ a full `RecordBinding` whose `recordId` is the message id and whose
 The CLI is:
 
 ```
-tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--root <dir>]
+tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--root <dir>]
 ```
+
+`--candidate-sha` and `--message-version` send a binding other than the
+message's current one (what the owner saw before a carry); the same stale-
+binding check rejects it.
 
 - On a **live** run (a conductor is running) the command is written to
   `<run>/inbox/<id>.json`; the conductor validates the binding and a stale one

@@ -61,7 +61,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -90,25 +90,43 @@ function cmdLint(file: string): void {
   if (hasLintErrors(findings)) process.exitCode = 1;
 }
 
-function parseArgs(argv: string[]): { positional: string[]; root?: string; json: boolean; reason?: string } {
+function parseArgs(argv: string[]): {
+  positional: string[];
+  root?: string;
+  json: boolean;
+  reason?: string;
+  candidateSha?: string;
+  messageVersion?: number;
+} {
   const positional: string[] = [];
   let root: string | undefined;
   let json = false;
   let reason: string | undefined;
+  let candidateSha: string | undefined;
+  let messageVersion: number | undefined;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--root") {
+    const arg = argv[i];
+    if (arg === "--root") {
       root = argv[++i];
-    } else if (argv[i] === "--json") {
+    } else if (arg === "--json") {
       json = true;
-    } else if (argv[i] === "--reason") {
+    } else if (arg === "--reason") {
       reason = argv[++i];
-    } else if (argv[i].startsWith("--reason=")) {
-      reason = argv[i].slice("--reason=".length);
+    } else if (arg.startsWith("--reason=")) {
+      reason = arg.slice("--reason=".length);
+    } else if (arg === "--candidate-sha") {
+      candidateSha = argv[++i];
+    } else if (arg.startsWith("--candidate-sha=")) {
+      candidateSha = arg.slice("--candidate-sha=".length);
+    } else if (arg === "--message-version") {
+      messageVersion = Number(argv[++i]);
+    } else if (arg.startsWith("--message-version=")) {
+      messageVersion = Number(arg.slice("--message-version=".length));
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json, reason };
+  return { positional, root, json, reason, candidateSha, messageVersion };
 }
 
 function resolveRunDir(rootOrId: string, root: string): string {
@@ -843,7 +861,12 @@ function cmdContract(sub: string | undefined, runDir: string): void {
  * run gets an inbox command (the conductor checks the binding); a run whose
  * daemon has exited gets the event appended to `events.jsonl` after a
  * dry-run reduce, so a stale verdict never poisons the log. */
-function cmdVerdict(positional: string[], root: string, reason: string | undefined): void {
+function cmdVerdict(
+  positional: string[],
+  root: string,
+  reason: string | undefined,
+  overrides: { candidateSha?: string; messageVersion?: number } = {},
+): void {
   const runDir = resolveRunDir(positional[0], root);
   const messageId = positional[1];
   const verdict = positional[2] as "accept" | "refuse" | undefined;
@@ -856,6 +879,11 @@ function cmdVerdict(positional: string[], root: string, reason: string | undefin
     process.exitCode = 1;
     return;
   }
+  // `--candidate-sha`/`--message-version` let the caller send the binding it
+  // actually saw (e.g. after a carry), so a stale verdict is expressible and
+  // is rejected by the same path as any other stale command.
+  const boundCandidateSha = overrides.candidateSha ?? message.boundCandidateSha;
+  const boundRecordVersion = overrides.messageVersion ?? message.messageVersion;
   const withReason = reason !== undefined && reason.trim().length > 0 ? { reason } : {};
   if (conductorAlive(runDir)) {
     // Live run: through the inbox, so the conductor checks the binding and a
@@ -870,10 +898,10 @@ function cmdVerdict(positional: string[], root: string, reason: string | undefin
       binding: {
         runId: state.phase.runId,
         phaseId: state.phase.phaseId,
-        candidateSha: message.boundCandidateSha,
+        candidateSha: boundCandidateSha,
         contractVersion: message.boundContractVersion,
         recordId: messageId,
-        recordVersion: message.messageVersion,
+        recordVersion: boundRecordVersion,
       },
     };
     writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
@@ -888,9 +916,9 @@ function cmdVerdict(positional: string[], root: string, reason: string | undefin
     messageId,
     verdict,
     ...withReason,
-    boundCandidateSha: message.boundCandidateSha,
+    boundCandidateSha,
     boundContractVersion: message.boundContractVersion,
-    boundRecordVersion: message.messageVersion,
+    boundRecordVersion,
   };
   const result = reduce(state, event);
   if (!result.ok) {
@@ -925,7 +953,7 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json, reason } = parseArgs(rest);
+  const { positional, root, json, reason, candidateSha, messageVersion } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
@@ -951,7 +979,7 @@ async function main(): Promise<void> {
     cmdContract(positional[0], resolveRunDir(positional[1], runRoot));
   } else if (cmd === "verdict") {
     if (positional.length !== 3) usage();
-    cmdVerdict(positional, runRoot, reason);
+    cmdVerdict(positional, runRoot, reason, { candidateSha, messageVersion });
   } else if (cmd === "summary") {
     if (positional.length !== 1) usage();
     process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));

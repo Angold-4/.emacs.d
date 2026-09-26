@@ -13,7 +13,7 @@
     "kind": { "enum": ["defect", "contract", "integration"] },
     "severity": { "enum": ["blocking", "advisory"] },
     "evidence": { "type": "string", "minLength": 1 },
-    "raisedBy": { "enum": ["M", "A", "B", "conductor"] },
+    "raisedBy": { "enum": ["M", "A", "B", "conductor", "owner"] },
     "linkedDecisionId": { "type": "string", "minLength": 1 },
     "status": { "enum": ["open", "repaired", "disproved", "accepted", "superseded"] },
     "boundCandidateSha": { "type": "string", "minLength": 1 },

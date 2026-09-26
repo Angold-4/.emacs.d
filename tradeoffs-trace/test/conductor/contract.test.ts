@@ -88,28 +88,109 @@ test("a verdict on a live run goes through the inbox", async () => {
       "a refusal during REVIEWING must raise an owner blocking finding",
     );
 
-    // A stale verdict is rejected into inbox/rejected with its reason.
+    // A stale verdict, sent through `tt verdict`'s own binding override, is
+    // rejected into inbox/rejected with its reason (not hand-written JSON).
+    assert.match(
+      tt(["verdict", setup.runDir, message.id, "accept", "--candidate-sha", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]),
+      /queued verdict/,
+    );
+    await waitFor(
+      () => readdirSync(runPaths(setup.runDir).inboxRejected).some((n) => n.endsWith(".reason.txt")),
+      30_000,
+      20,
+      setup.runDir,
+    );
+    const reason = readdirSync(runPaths(setup.runDir).inboxRejected)
+      .filter((n) => n.endsWith(".reason.txt"))
+      .map((n) => readFileSync(`${runPaths(setup.runDir).inboxRejected}/${n}`, "utf8"))
+      .join("\n");
+    assert.match(reason, /candidate/);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("a verdict file left in the inbox before exit is applied on the next start", async () => {
+  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 };
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    }),
+    deadlines,
+  });
+
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    await setup.conductor.stop();
+    const message = setup.conductor.state.phase.messages!.find((m) => m.state === "published")!;
+    // The owner left the verdict file in the inbox; the daemon then exited.
+    const inbox = `${setup.runDir}/inbox`;
+    mkdirSync(inbox, { recursive: true });
     writeFileSync(
-      `${inbox}/verdict-stale.json`,
+      `${inbox}/verdict-left.json`,
       JSON.stringify({
         type: "verdict",
-        verdict: "accept",
+        verdict: "refuse",
+        reason: "worth revisiting after the run",
         binding: {
           runId: setup.conductor.state.phase.runId,
           phaseId: setup.conductor.state.phase.phaseId,
-          candidateSha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+          candidateSha: message.boundCandidateSha,
           contractVersion: message.boundContractVersion,
           recordId: message.id,
           recordVersion: message.messageVersion,
         },
       }),
     );
-    await waitFor(() => existsSync(`${runPaths(setup.runDir).inboxRejected}/verdict-stale.json`), 30_000, 20, setup.runDir);
-    const reason = readdirSync(runPaths(setup.runDir).inboxRejected)
-      .filter((n) => n.startsWith("verdict-stale") && n.endsWith(".reason.txt"))
-      .map((n) => readFileSync(`${runPaths(setup.runDir).inboxRejected}/${n}`, "utf8"))
-      .join("\n");
-    assert.match(reason, /candidate/);
+    // The next start scans the inbox and applies it — the conductor's own
+    // inbox path, not a reducer shortcut.
+    const restarted = new Conductor({
+      runDir: setup.runDir,
+      plan: setup.plan,
+      piCommand: process.execPath,
+      piArgsPrefix: [FAKE_PI_PATH],
+      stubReviews: true,
+      deadlines,
+    });
+    await restarted.start();
+    try {
+      await waitFor(
+        () => (restarted.state.phase.messages ?? []).some((m) => m.id === message.id && m.state === "refused"),
+        30_000,
+        20,
+        setup.runDir,
+      );
+      const refused = restarted.state.phase.messages!.find((m) => m.id === message.id)!;
+      assert.equal(refused.followUp, true);
+      const p = runPaths(setup.runDir);
+      assert.match(readFileSync(p.ledger, "utf8"), /"followUp":true/);
+      assert.match(readFileSync(p.review, "utf8"), /FOLLOW_UP: true/);
+      assert.match(tt(["summary", setup.runDir]), /Follow-ups/);
+    } finally {
+      await restarted.stop();
+    }
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -180,15 +261,37 @@ test("a conductor killed before its projection write rebuilds them on start", as
   }
 });
 
-test("MESSAGE_CARRIED is emitted per live message at every freeze", async () => {
+test("MESSAGE_CARRIED is emitted per live message, and a changed decision invalidates its settlement", async () => {
+  let priorId = "";
+  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 };
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    workerScriptForAttempt: () => ({
+    workerScriptForAttempt: (attempt) => ({
       hello: defaultWorkerHello(),
       steps: [
-        { kind: "call-sh", command: `printf 'attempt %s\n' "$RANDOM" > attempt.txt` },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } },
+        { kind: "call-sh", command: `printf 'attempt ${attempt}\n' > attempt.txt` },
+        attempt === 1
+          ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
+          : {
+              kind: "call-submit",
+              tool: "submit_phase",
+              args: {
+                decisions: [],
+                assumptions: [],
+                deviations: [],
+                priorDecisions: [
+                  {
+                    id: priorId,
+                    status: "changed",
+                    choice: "A rewritten choice that names the cost",
+                    whyItMatters: "the earlier wording hid the cost from the owner",
+                    alternatives: [{ option: "keep the old wording", consequence: "the trade-off stays misreported" }],
+                    recommendation: { choice: "use the new wording", reason: "it names the cost" },
+                  },
+                ],
+              },
+            },
       ],
     }),
     // M raises a blocking finding on the first candidate; after the repair,
@@ -221,20 +324,57 @@ test("MESSAGE_CARRIED is emitted per live message at every freeze", async () => 
         ],
       };
     },
-    deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+    deadlines,
   });
 
   try {
     await setup.conductor.start();
+    // Publish attempt 1's trade-off, settle it with an owner accept through
+    // the inbox, then let the repair change the decision it came from.
+    await waitFor(
+      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      90_000,
+      20,
+      setup.runDir,
+    );
+    const published = setup.conductor.state.phase.messages!.find((m) => m.type === "tradeoff" && m.state === "published")!;
+    priorId = setup.conductor.state.phase.decisions.find((d) => d.source === "worker")!.id;
+    writeFileSync(`${setup.runDir}/conductor.pid`, String(process.pid));
+    assert.match(tt(["verdict", setup.runDir, published.id, "accept"]), /queued verdict/);
+    await waitFor(
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.id === published.id && m.state === "accepted"),
+      30_000,
+      20,
+      setup.runDir,
+    );
+
     await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 120_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.phase, "DONE");
     assert.equal(setup.conductor.state.phase.round, 2, "the run must have frozen two candidates");
-    const types = readEvents(setup.runDir)
-      .filter((r) => r.kind === "event")
-      .map((r) => (r.event as { type: string }).type);
-    assert.ok(types.includes("MESSAGE_CARRIED"), `a second freeze must emit MESSAGE_CARRIED; events=${JSON.stringify(types)}`);
-    const message = setup.conductor.state.phase.messages!.find((m) => m.type === "tradeoff")!;
+    const carries = readEvents(setup.runDir).filter(
+      (r) => r.kind === "event" && (r.event as { type: string }).type === "MESSAGE_CARRIED",
+    );
+    assert.ok(carries.length >= 1, "a second freeze must emit MESSAGE_CARRIED");
+    const changedCarry = carries.find(
+      (r) =>
+        (r.event as { messageId: string }).messageId === published.id && (r.event as { unchanged: boolean }).unchanged === false,
+    );
+    assert.ok(changedCarry, "the changed decision must be carried as unchanged:false");
+    assert.ok((changedCarry!.event as { content?: unknown }).content, "a changed carry must carry the new content");
+
+    const message = setup.conductor.state.phase.messages!.find((m) => m.id === published.id)!;
     assert.ok(message.messageVersion >= 2, `the carried trade-off must have bumped its version, got ${message.messageVersion}`);
+    assert.equal(message.invalidated?.reason, "content changed");
+    assert.equal(message.title, "A rewritten choice that names the cost");
+    // The ledger keeps who settled it and the bindings it was settled under.
+    const ledger = readFileSync(runPaths(setup.runDir).ledger, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    const entry = ledger.find((e: { messageId: string }) => e.messageId === published.id)!;
+    assert.equal(entry.settledBy, "owner");
+    assert.equal(entry.invalidated?.reason, "content changed");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

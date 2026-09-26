@@ -342,6 +342,10 @@ export interface MessageCarryEvent {
   toVersion: number;
   contentHash: string;
   unchanged: boolean;
+  /** The message's reviewable content as of the new version. Present only
+   * when it changed; the conductor re-derives it from the underlying record
+   * so `contentHash` is not asserted blindly. */
+  content?: MessageContent;
 }
 
 /** Applies one MESSAGE_CARRIED: bumps the version to the new candidate, and
@@ -358,17 +362,35 @@ export function applyCarry(messages: Message[], message: Message, event: Message
   if (event.toVersion !== event.fromVersion + 1) {
     return { ok: false, reason: `carry of message ${message.id} must bump the version by one` };
   }
+  // A changed content is carried as data, not just a different hash, or the
+  // stored fields and the hash would disagree.
+  let content: Partial<MessageContent> = {};
+  if (event.content) {
+    const hash = contentHashOf(event.content);
+    if (hash !== event.contentHash) {
+      return {
+        ok: false,
+        reason: `carry of message ${message.id} declares contentHash ${event.contentHash}, but its content hashes to ${hash}`,
+      };
+    }
+    content = { ...event.content };
+  } else if (event.contentHash !== message.contentHash) {
+    return {
+      ok: false,
+      reason: `carry of message ${message.id} changes contentHash without carrying the new content`,
+    };
+  }
   const versionContentHashes = { ...(message.versionContentHashes ?? {}), [event.fromVersion]: message.contentHash };
   const carriedFrom = [...(message.carriedFrom ?? []), { candidateSha: event.fromCandidate, version: event.fromVersion }];
   const carried: Message = {
     ...message,
+    ...content,
     messageVersion: event.toVersion,
     boundCandidateSha: event.toCandidate,
     contentHash: event.contentHash,
     versionContentHashes,
     carriedFrom,
   };
-  const contentUnchanged = event.unchanged && event.contentHash === message.contentHash;
   return { ok: true, messages: messages.map((m) => (m.id === message.id ? carried : m)) };
 }
 
@@ -387,7 +409,8 @@ export function applyCarryWithContract(
   const next: Message = { ...carried, boundContractVersion: currentContractVersion };
   if (!next.settlement) return { ok: true, messages: base.messages.map((m) => (m.id === message.id ? next : m)) };
 
-  if (event.unchanged && event.contentHash === message.contentHash && contractSame) {
+  const contentChanged = !(event.unchanged && event.contentHash === message.contentHash);
+  if (!contentChanged && contractSame) {
     // The settlement stays: rebind it to the new version/candidate.
     return {
       ok: true,
@@ -406,6 +429,9 @@ export function applyCarryWithContract(
       ),
     };
   }
+  // The settlement is kept in the ledger (who settled it, and under which
+  // bindings) but marked invalidated; the message itself returns to
+  // `published` and needs a new verdict.
   const reason = !contractSame ? "contract amended" : "content changed";
   return {
     ok: true,
@@ -414,7 +440,6 @@ export function applyCarryWithContract(
         ? {
             ...next,
             state: "published",
-            settlement: undefined,
             invalidated: { reason: reason as "content changed" | "contract amended", atCandidate: event.toCandidate },
           }
         : m,
@@ -447,21 +472,27 @@ export interface LedgerEntry {
  * its `invalidated` reason, never silently dropping it. */
 export function ledgerEntries(messages: Message[]): LedgerEntry[] {
   return [...messages]
-    .filter((m) => m.settlement !== undefined || m.invalidated !== undefined)
+    .filter((m) => m.settlement !== undefined)
     .sort((a, b) => a.id.localeCompare(b.id))
-    .map((m) => ({
-      messageId: m.id,
-      type: m.type,
-      state: m.state,
-      settledBy: m.settlement?.settledBy ?? "owner",
-      ...(m.settlement?.reason ?? m.invalidated ? { reason: m.settlement?.reason } : {}),
-      candidateSha: m.settlement?.candidateSha ?? m.boundCandidateSha,
-      contractVersion: m.settlement?.contractVersion ?? m.boundContractVersion,
-      messageVersion: m.settlement?.messageVersion ?? m.messageVersion,
-      contentHash: m.settlement?.contentHash ?? m.contentHash,
-      ...(m.invalidated ? { invalidated: m.invalidated } : {}),
-      ...(m.followUp ? { followUp: true } : {}),
-    }));
+    .map((m) => {
+      const s = m.settlement!;
+      return {
+        messageId: m.id,
+        type: m.type,
+        // The settled state, not the message's current one: an invalidated
+        // entry still says how it was settled (the `invalidated` field says
+        // that settlement no longer stands).
+        state: s.state,
+        settledBy: s.settledBy,
+        ...(s.reason !== undefined ? { reason: s.reason } : {}),
+        candidateSha: s.candidateSha,
+        contractVersion: s.contractVersion,
+        messageVersion: s.messageVersion,
+        contentHash: s.contentHash,
+        ...(m.invalidated ? { invalidated: m.invalidated } : {}),
+        ...(m.followUp ? { followUp: true } : {}),
+      };
+    });
 }
 
 function stableStringify(value: unknown): string {

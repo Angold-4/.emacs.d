@@ -52,7 +52,7 @@ import {
   type Baseline,
   type BaselineCommand,
 } from "./core/test-failures.ts";
-import { contentHashOf } from "./core/messages.ts";
+import { contentHashOf, type MessageContent } from "./core/messages.ts";
 import type {
   Action,
   Ballot,
@@ -3011,18 +3011,7 @@ export class Conductor {
     this.#applyEvent({ type: "FINDING_RAISED", finding });
     // Contract v1 §1: a finding (or, at blocking severity, a blocker) is a
     // published message too.
-    this.#raiseMessage(
-      fd.severity === "blocking" ? "blocker" : "finding",
-      finding.id,
-      {
-        title: `${fd.kind} ${fd.severity}: ${fd.evidence}`,
-        summary: `raised by ${reviewer} against ${candidateSha}`,
-        context: fd.evidence,
-        evidence: [fd.evidence],
-        planRef: this.#state.phase.phaseId,
-      },
-      candidateSha,
-    );
+    this.#raiseMessage(finding.severity === "blocking" ? "blocker" : "finding", finding.id, this.#findingContent(finding), candidateSha);
     // Plan 01g: a reviewer's finding may say the criterion cannot be met as
     // written. That is recorded as an amendment the reviewers vote on later;
     // a criterion the contract does not carry is ignored (the finding itself
@@ -3841,18 +3830,7 @@ export class Conductor {
     // Contract v1 §1: every worker decision is a trade-off message, published
     // for the owner immediately (this profile has no evaluator yet).
     for (const decision of outcome.decisions) {
-      this.#raiseMessage(
-        "tradeoff",
-        decision.id,
-        {
-          title: decision.choice,
-          summary: decision.recommendation.reason,
-          context: decision.whyItMatters,
-          evidence: decision.alternatives.map((a) => `${a.option}: ${a.consequence}`),
-          planRef: this.#state.phase.phaseId,
-        },
-        outcome.candidateSha,
-      );
+      this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), outcome.candidateSha);
     }
     // Work packet 2a: boundary triggers (design §3.3) and §3.5's sampling
     // data need a real candidate (for the diff, and for DECISION_ADDED's
@@ -3872,11 +3850,48 @@ export class Conductor {
     }
   }
 
+  /** Contract v1: the reviewable content of the message a worker decision
+   * raises. Re-derived at every freeze, so a decision the worker changed
+   * produces a new contentHash (and a changed carry). */
+  #decisionContent(decision: Decision): MessageContent {
+    return {
+      type: "tradeoff",
+      title: decision.choice,
+      summary: decision.recommendation.reason,
+      context: decision.whyItMatters,
+      evidence: decision.alternatives.map((a) => `${a.option}: ${a.consequence}`),
+      planRef: this.#state.phase.phaseId,
+    };
+  }
+
+  /** Contract v1: the reviewable content of the message a finding raises. */
+  #findingContent(finding: Finding): MessageContent {
+    return {
+      type: finding.severity === "blocking" ? "blocker" : "finding",
+      title: `${finding.kind} ${finding.severity}: ${finding.evidence}`,
+      summary: `raised by ${finding.raisedBy} against ${finding.boundCandidateSha}`,
+      context: finding.evidence,
+      evidence: [finding.evidence],
+      planRef: this.#state.phase.phaseId,
+    };
+  }
+
+  /** The current content of the record a message was raised from, or
+   * undefined when that record is gone. */
+  #currentContentFor(message: Message): MessageContent | undefined {
+    if (!message.sourceRecordId) return undefined;
+    const decision = this.#state.phase.decisions.find((d) => d.id === message.sourceRecordId);
+    if (decision && message.type === "tradeoff") return this.#decisionContent(decision);
+    const finding = this.#state.phase.findings.find((f) => f.id === message.sourceRecordId);
+    if (finding && (message.type === "finding" || message.type === "blocker")) return this.#findingContent(finding);
+    return undefined;
+  }
+
   /** Contract v1: raises a raw message from a decision or finding and
    * publishes it immediately (there is no evaluator in this profile yet).
    * Deduped by the source record id, so a re-freeze or a re-review never
    * raises the same message twice. */
-  #raiseMessage(type: MessageType, sourceRecordId: string, content: { title: string; summary: string; context: string; evidence: string[]; planRef?: string }, candidateSha: string): void {
+  #raiseMessage(type: MessageType, sourceRecordId: string, content: MessageContent, candidateSha: string): void {
     const existing = this.#state.phase.messages ?? [];
     if (existing.some((m) => m.sourceRecordId === sourceRecordId)) return;
     const letter = type === "tradeoff" ? "T" : type === "finding" ? "F" : "B";
@@ -3904,11 +3919,18 @@ export class Conductor {
     });
   }
 
-  /** Contract v1 §2: one MESSAGE_CARRIED per live message at a freeze. */
+  /** Contract v1 §2: one MESSAGE_CARRIED per live message at a freeze. The
+   * content is re-derived from the underlying record, so a decision the
+   * worker changed this round is carried as CHANGED (with its new content)
+   * and the previous settlement is invalidated, rather than asserted
+   * unchanged. */
   #carryMessages(toCandidate: string): void {
     for (const message of this.#state.phase.messages ?? []) {
       if (message.state === "superseded" || message.state === "resolved") continue;
       if (message.boundCandidateSha === toCandidate) continue;
+      const current = this.#currentContentFor(message);
+      const contentHash = current ? contentHashOf(current) : message.contentHash;
+      const unchanged = contentHash === message.contentHash;
       this.#applyEvent({
         type: "MESSAGE_CARRIED",
         messageId: message.id,
@@ -3916,8 +3938,9 @@ export class Conductor {
         toCandidate,
         fromVersion: message.messageVersion,
         toVersion: message.messageVersion + 1,
-        contentHash: message.contentHash,
-        unchanged: true,
+        contentHash,
+        unchanged,
+        ...(unchanged || !current ? {} : { content: current }),
       });
     }
   }

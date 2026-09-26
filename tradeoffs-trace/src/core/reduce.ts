@@ -598,10 +598,14 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           // After DONE a refusal is a recorded follow-up: it changes no phase
           // state and does not reopen the run (contract §1.3).
           messages = messages.map((m) => (m.id === event.messageId ? { ...m, followUp: true } : m));
-        } else if (p.phase === "REVIEWING" && p.candidate) {
-          // Refusing during review raises an owner-authored blocking finding,
-          // so accept(C, K) cannot hold on this candidate (predicate.ts's
-          // open-blocking-finding clause).
+        } else if (p.candidate) {
+          // A refusal before DONE always raises an owner-authored blocking
+          // finding, in every pre-DONE phase — REVIEWING included, but also
+          // CHECKING/PROBING/ACCEPTED/... — so the refusal can never settle
+          // silently and accept(C, K) cannot hold on this candidate
+          // (predicate.ts's open-blocking-finding clause). A message only
+          // exists once a candidate does, so a pre-DONE refusal always has
+          // one to bind the finding to.
           const finding: Finding = {
             id: `F-${p.phaseId}-owner-${p.findings.length + 1}`,
             version: 1,

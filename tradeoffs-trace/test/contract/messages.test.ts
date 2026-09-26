@@ -16,7 +16,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { contentHashOf, MESSAGE_TRANSITIONS } from "../../src/core/messages.ts";
+import { contentHashOf, ledgerEntries, MESSAGE_TRANSITIONS } from "../../src/core/messages.ts";
 import { accept } from "../../src/core/predicate.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import type { Event, Message, State } from "../../src/core/types.ts";
@@ -230,6 +230,60 @@ function acceptedOnce(overrides: Partial<Message> = {}): { state: State; before:
   return { state: result.state, before };
 }
 
+test("refuse before DONE (CHECKING) raises an owner blocking finding", () => {
+  const published = makeMessage({ state: "published" });
+  const checking = baseState({ phase: "CHECKING", candidate: { sha: C1, contractVersion: K }, messages: [published] });
+  const result = reduce(checking, {
+    type: "OWNER_VERDICT",
+    messageId: "T-1",
+    verdict: "refuse",
+    reason: "not the trade-off the goal needed",
+    boundCandidateSha: C1,
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.state.phase.phase, "CHECKING");
+  assert.ok(
+    result.state.phase.findings.some((f) => f.raisedBy === "owner" && f.severity === "blocking" && f.status === "open"),
+    "a pre-DONE refusal must raise an owner blocking finding",
+  );
+});
+
+test("ledger: an invalidated entry keeps who settled it, its state and its bindings", () => {
+  const raw = makeMessage({ state: "raw" });
+  const merged = reduce(withMessage(raw), {
+    type: "MESSAGE_MERGED",
+    messageId: "T-1",
+    by: "evaluator",
+    reason: "duplicate of T-9",
+    boundCandidateSha: C1,
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(merged.ok, true, merged.ok ? "" : merged.reason);
+  const amended: State = {
+    ...merged.state,
+    phase: { ...merged.state.phase, contract: { ...merged.state.phase.contract, contractVersion: CV(2, "b".repeat(64)) } },
+  };
+  const carried = reduce(amended, {
+    type: "MESSAGE_CARRIED",
+    messageId: "T-1",
+    fromCandidate: C1,
+    toCandidate: "C2",
+    fromVersion: 1,
+    toVersion: 2,
+    contentHash: raw.contentHash,
+    unchanged: true,
+  });
+  assert.equal(carried.ok, true, carried.ok ? "" : carried.reason);
+  const entry = ledgerEntries(carried.state.phase.messages!).find((e) => e.messageId === "T-1")!;
+  assert.equal(entry.settledBy, "evaluator");
+  assert.equal(entry.state, "merged");
+  assert.equal(entry.candidateSha, C1);
+  assert.equal(entry.invalidated?.reason, "contract amended");
+});
+
 test("carry: an unchanged settlement stays settled on the new candidate", () => {
   const { state } = acceptedOnce();
   const result = reduce(state, {
@@ -252,8 +306,34 @@ test("carry: an unchanged settlement stays settled on the new candidate", () => 
   assert.equal(message.invalidated, undefined);
 });
 
-test("carry: a changed settlement is invalidated and needs a new verdict", () => {
+test("carry: a changed settlement is invalidated, keeps who settled it, and needs a new verdict", () => {
   const { state, before } = acceptedOnce();
+  const changed = { type: "tradeoff" as const, title: "a rewritten choice", summary: "new summary", context: "new context", evidence: ["new evidence"], planRef: "p" };
+  const result = reduce(state, {
+    type: "MESSAGE_CARRIED",
+    messageId: "T-1",
+    fromCandidate: C1,
+    toCandidate: "C2",
+    fromVersion: 1,
+    toVersion: 2,
+    contentHash: contentHashOf(changed),
+    unchanged: false,
+    content: changed,
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.reason);
+  const message = result.state.phase.messages![0];
+  assert.equal(message.state, "published");
+  // The old settlement is kept for the ledger, but marked invalidated.
+  assert.equal(message.settlement?.settledBy, "owner");
+  assert.equal(message.settlement?.candidateSha, C1);
+  assert.equal(message.invalidated?.reason, "content changed");
+  assert.notEqual(message.contentHash, before.contentHash);
+  assert.equal(message.title, "a rewritten choice");
+  assert.equal(message.contentHash, contentHashOf(changed));
+});
+
+test("carry: a changed contentHash without the new content is rejected", () => {
+  const { state } = acceptedOnce();
   const result = reduce(state, {
     type: "MESSAGE_CARRIED",
     messageId: "T-1",
@@ -264,12 +344,8 @@ test("carry: a changed settlement is invalidated and needs a new verdict", () =>
     contentHash: "f".repeat(64),
     unchanged: false,
   });
-  assert.equal(result.ok, true);
-  const message = result.state.phase.messages![0];
-  assert.equal(message.state, "published");
-  assert.equal(message.settlement, undefined);
-  assert.equal(message.invalidated?.reason, "content changed");
-  assert.notEqual(message.contentHash, before.contentHash);
+  assert.equal(result.ok, false);
+  assert.match(result.ok ? "" : result.reason, /without carrying the new content/);
 });
 
 test("carry: a settlement after a contract amendment is invalidated", () => {
@@ -317,6 +393,7 @@ test("carry: a verdict naming the pre-carry version of an UNCHANGED message is a
 
 test("carry: a verdict naming the pre-carry version of a CHANGED message is rejected", () => {
   const published = makeMessage({ state: "published" });
+  const changed = { type: "tradeoff" as const, title: "a rewritten choice", summary: "new summary", context: "new context", evidence: ["new evidence"], planRef: "p" };
   const afterCarry = reduce(withMessage(published), {
     type: "MESSAGE_CARRIED",
     messageId: "T-1",
@@ -324,8 +401,9 @@ test("carry: a verdict naming the pre-carry version of a CHANGED message is reje
     toCandidate: "C2",
     fromVersion: 1,
     toVersion: 2,
-    contentHash: "f".repeat(64),
+    contentHash: contentHashOf(changed),
     unchanged: false,
+    content: changed,
   });
   assert.equal(afterCarry.ok, true);
   const result = reduce(afterCarry.state, {
@@ -337,11 +415,12 @@ test("carry: a verdict naming the pre-carry version of a CHANGED message is reje
     boundRecordVersion: 1,
   });
   assert.equal(result.ok, false);
-  assert.match(result.ok ? "" : result.reason, /changed v1 → v2/);
+  assert.match(result.ok ? "" : result.reason, /invalidated|changed v1 → v2/);
 });
 
 test("carry: a new verdict on the current version clears the invalidation", () => {
   const { state } = acceptedOnce();
+  const changed = { type: "tradeoff" as const, title: "a rewritten choice", summary: "new summary", context: "new context", evidence: ["new evidence"], planRef: "p" };
   const carried = reduce(state, {
     type: "MESSAGE_CARRIED",
     messageId: "T-1",
@@ -349,8 +428,9 @@ test("carry: a new verdict on the current version clears the invalidation", () =
     toCandidate: "C2",
     fromVersion: 1,
     toVersion: 2,
-    contentHash: "f".repeat(64),
+    contentHash: contentHashOf(changed),
     unchanged: false,
+    content: changed,
   });
   assert.equal(carried.ok, true);
   assert.equal(carried.state.phase.messages![0].invalidated?.reason, "content changed");
