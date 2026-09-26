@@ -174,6 +174,10 @@ test("gate: a record that never started carries no exit status or duration", () 
   assert.match(evidence, /did not start \(the candidate does not merge onto h1\)/);
   assert.ok(!evidence.includes("on a signal"), "a run that never started must not be reported as a signal death");
   assert.ok(!evidence.includes("undefined"), "no field may be rendered as undefined");
+  // The citation says the cleanup was skipped, not `cleanup exit ?`.
+  const line = gateSummaryLine({ ...parsed, cleanup: "docker compose down -v" });
+  assert.match(line, /cleanup skipped \(the gate did not start\)/);
+  assert.ok(!line.includes("exit ?"), line);
 });
 
 test("gate: gateLogTail returns the last N lines (the tail a failure quotes)", () => {
@@ -474,12 +478,16 @@ test("gate: a passing gate runs exactly once, records the candidate, the exit st
 test("gate: a failing gate becomes a blocking integration finding with the log tail and a repair round that shows the worker the log", async () => {
   const dir = shortTmp("tt-gate-fail");
   const promptLog = path.join(dir, "prompts.log");
+  const cleanupLog = path.join(dir, "cleanup.log");
   const lock = path.join(dir, "gate.lock");
   const setup = await setupConductor({
     checks: ["true"],
     workerScript,
     reviewerScriptFor,
     gate: `echo gate-header; i=1; while [ $i -le 70 ]; do echo tail-line-$i; i=$((i+1)); done; exit 3`,
+    // The plan's contract: the cleanup runs after a failing gate too (01f
+    // advisory M: only the passing path was covered).
+    gateCleanup: `echo cleanup-ran >> ${cleanupLog}`,
     gateLockPath: lock,
     deadlines: FAST_DEADLINES,
     extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
@@ -522,6 +530,8 @@ test("gate: a failing gate becomes a blocking integration finding with the log t
     const failedRecord = gateRecordAt(setup.runDir, gateFinding.boundCandidateSha);
     assert.equal(failedRecord.passed, false);
     assert.equal(failedRecord.exitCode, 3);
+    assert.equal(failedRecord.cleanupExitCode, 0, "the cleanup ran after the failing gate");
+    assert.match(fs.readFileSync(cleanupLog, "utf8"), /cleanup-ran/);
     assert.match(fs.readFileSync(path.join(runPaths(setup.runDir).checks, gateFinding.boundCandidateSha, "gate.log"), "utf8"), /tail-line-70/);
 
     // The gate's own evidence names the log hash, not an agent's summary.

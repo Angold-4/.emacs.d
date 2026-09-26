@@ -508,7 +508,9 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   // Plan 01g: every amendment (applied or reverted) is shown as
   // `⚑ AMENDED id: old → new`, so the reworded contract is visible in the
   // status, the decision view and `tt summary` alike.
-  const amendments = phase.decisions.filter((d) => d.amendment);
+  // Only live records: a sibling proposal superseded by another is not a
+  // pending amendment and must not read PROPOSED (01g advisory B).
+  const amendments = phase.decisions.filter((d) => d.amendment && isLiveDecision(d));
   // The arrow always names what the contract moved FROM → TO: an applied
   // amendment replaced the old criterion, a reverted one restored it, so the
   // rendering never claims replacement wording is in force after a revert
@@ -613,9 +615,13 @@ export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): st
     acceptedAtBase !== undefined && acceptedAtBase !== record.baseSha
       ? ` (accepted against base ${short(acceptedAtBase)})`
       : "";
-  const cleanup = record.cleanup
-    ? `; cleanup ${record.cleanupExitCode === 0 ? "ok" : `exit ${record.cleanupExitCode ?? "?"}`}`
-    : "";
+  // A gate that never started (the candidate no longer merges) has nothing to
+  // clean up, and says so, not `exit ?` (01f advisories A, B and M).
+  const cleanup = !record.cleanup
+    ? ""
+    : record.notStarted || record.cleanupSkipped
+      ? "; cleanup skipped (the gate did not start)"
+      : `; cleanup ${record.cleanupExitCode === 0 ? "ok" : record.cleanupTimedOut ? "timed out" : `exit ${record.cleanupExitCode ?? "?"}`}`;
   return `gate ${how} on candidate ${record.candidateSha.slice(0, 9)} against base ${short(record.baseSha)}${accepted}: ${record.command} (log sha256 ${record.logSha256.slice(0, 12)}…${cleanup})`;
 }
 
@@ -684,7 +690,9 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   const fixed = phase.findings.filter((f) => f.severity === "blocking" && f.status === "repaired");
   // Plan 01g: every amendment the reviewers passed for this phase, with the
   // wording it replaced — the PR body must not hide a reworded criterion.
-  const amendments = phase.decisions.filter((d) => d.amendment);
+  // Only live records: a sibling proposal superseded by another is not a
+  // pending amendment and must not read PROPOSED (01g advisory B).
+  const amendments = phase.decisions.filter((d) => d.amendment && isLiveDecision(d));
   // Plan 01i: the owner's rulings in force are part of the PR body — binding
   // on reviewers, and the reason a `⚑` decision reads the way it does.
   const directives = (phase.ownerDirectives ?? []).filter((d) => d.status === "in-force");

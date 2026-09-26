@@ -547,7 +547,7 @@ and an unknown id is refused by that command."
           (with-temp-file plan-a (insert +tt-test--valid-plan))
           (with-temp-file plan-b (insert (replace-regexp-in-string "p1" "q1" +tt-test--valid-plan)))
           (with-temp-buffer
-            (insert "#+TITLE: plan 13\n#+TT_PROGRAM: 4\n#+TT_CHECK_MINUTES: 40\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
+            (insert "#+TITLE: plan 13\n#+TT_PROGRAM: 4\n#+TT_CHECK_MINUTES: 40\n#+TT_SECRETS: VENDOR_KEY OTHER_KEY\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
             (setq buffer-file-name (expand-file-name "program.org" dir) default-directory dir)
             (org-mode)
             (let* ((parsed (+tt-parse-program))
@@ -561,7 +561,11 @@ and an unknown id is refused by that command."
               (should (equal (alist-get 'after (aref entries 1)) ["13a"]))
               (should (equal (alist-get 'title (alist-get 'plan (aref entries 0))) "sum validation"))
               ;; the program's time limits reach every entry's plan
-              (should (= (alist-get 'checkMs (alist-get 'deadlines (alist-get 'plan (aref entries 1)))) 2400000))))
+              (should (= (alist-get 'checkMs (alist-get 'deadlines (alist-get 'plan (aref entries 1)))) 2400000))
+              ;; ... and so do its declared secrets (names only; plan 14's
+              ;; program-level declaration used to reach no entry)
+              (should (equal (alist-get 'secrets (alist-get 'plan (aref entries 0))) ["VENDOR_KEY" "OTHER_KEY"]))
+              (should (equal (alist-get 'secrets (alist-get 'plan (aref entries 1))) ["VENDOR_KEY" "OTHER_KEY"]))))
           ;; A missing plan file is an error at the entry's line.
           (with-temp-buffer
             (insert "#+TITLE: bad\n#+TT_PROGRAM: 2\n* x\n  :PROPERTIES:\n  :PLAN: missing.org\n  :END:\n")

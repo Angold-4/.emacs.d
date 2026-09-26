@@ -478,6 +478,10 @@ several phases runs them in order."
          ;; TT_*_MINUTES in the program file: the default for every entry
          ;; whose plan does not set its own.
          (defaults (+tt--plan-deadlines))
+         ;; #+TT_SECRETS in the program file: added to every entry's own
+         ;; declaration (plan 14 declared its vendor keys once, here, and no
+         ;; entry received them).
+         (program-secrets (+tt--plan-secrets))
          (entries nil) (errors nil))
     (if (not (+tt--keyword "TT_PROGRAM"))
         (let ((parsed (+tt-parse-plan)))
@@ -499,6 +503,10 @@ several phases runs them in order."
                   (dolist (e errs) (push (cons line (cdr e)) errors))
                   (when (and defaults (not (assq 'deadlines plan)))
                     (setq plan (append plan `((deadlines . ,defaults)))))
+                  (when program-secrets
+                    (let ((own (append (alist-get 'secrets plan) nil)))
+                      (setq plan (cons `(secrets . ,(vconcat (seq-uniq (append own program-secrets))))
+                                       (assq-delete-all 'secrets (copy-alist plan))))))
                   (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
     (unless entries (push (cons 1 "program has no entries") errors))
     (list :program `((title . ,title) (maxParallel . ,max) (branches . ,branches)

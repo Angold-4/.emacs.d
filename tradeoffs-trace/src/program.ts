@@ -453,7 +453,13 @@ export function prepareBranch(
       } catch (err) {
         const out = String((err as { stdout?: string }).stdout ?? "");
         const files = out.split("\n").slice(1).filter((l) => l.trim()).join(", ");
-        return { ok: false, reason: `merging ${bases[0]} with ${bases[i]} for ${node} conflicts${files ? `: ${files}` : ""}` };
+        // Say how to unblock it: the scheduler keeps an existing branch, so a
+        // hand-made merge commit at `branch` is used as-is on retry (plans
+        // 14h and 01h were both unblocked this way).
+        return {
+          ok: false,
+          reason: `merging ${bases[0]} with ${bases[i]} for ${node} conflicts${files ? `: ${files}` : ""}. To unblock: merge ${bases.join(" + ")} by hand into a new branch ${branch}, then \`tt program retry <program> ${node}\``,
+        };
       }
       head = git(repo, [
         "-c", "user.name=tradeoffs-trace", "-c", "user.email=tradeoffs-trace@local",

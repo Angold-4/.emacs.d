@@ -168,6 +168,30 @@ function secretsForRun(runDir: string): Secret[] {
   }
 }
 
+/** A conductor resolves its declared secrets from its OWN environment, once,
+ * at start. Starting one from a shell that lacks them used to run every node
+ * keyless for hours (plan 14: `tt program resume` from a shell without the
+ * vendor keys; the worker could not run the live gate and deferred it). So a
+ * start or resume that would launch a conductor refuses, naming what is
+ * missing, unless TT_ALLOW_MISSING_SECRETS=1. Names only; never a value. */
+function refuseMissingSecrets(declared: readonly (string | undefined)[] | undefined, what: string): boolean {
+  const names = [...new Set(secretNames((declared ?? []).filter((n): n is string => typeof n === "string")))];
+  const { missing } = resolveSecrets(names);
+  if (missing.length === 0 || process.env.TT_ALLOW_MISSING_SECRETS === "1") return false;
+  process.stderr.write(
+    `refusing to ${what}: declared secret(s) not set in this environment: ${missing.join(", ")}\n` +
+      `export them in the shell (or Emacs) that runs this command, or set TT_ALLOW_MISSING_SECRETS=1 to run without them\n`,
+  );
+  process.exitCode = 1;
+  return true;
+}
+
+/** The secrets every not-yet-done entry of a program declares. */
+function programSecrets(dir: string): string[] {
+  const { program, state } = foldProgram(dir);
+  return program.entries.filter((e) => state.nodes[e.id]?.status !== "done").flatMap((e) => e.plan.secrets ?? []);
+}
+
 async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean): Promise<void> {
   if (sub === "start") {
     if (args.length !== 1) usage();
@@ -180,6 +204,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       process.exitCode = 1;
       return;
     }
+    if (refuseMissingSecrets(program.entries.flatMap((e) => e.plan.secrets ?? []), "start the program")) return;
     const dir = createProgram(root, program);
     launchProgramScheduler(dir);
     process.stdout.write(`${path.basename(dir)}\n`);
@@ -214,6 +239,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
   } else if (sub === "resume") {
     if (args.length !== 1) usage();
     const dir = resolveProgramDir(args[0], root);
+    if (refuseMissingSecrets(programSecrets(dir), `resume program ${path.basename(dir)}`)) return;
     // Undo a stop, restart every node run that is not running (stopped by
     // the owner or crashed), then the scheduler if it is not running.
     const { state } = foldProgram(dir);
@@ -248,6 +274,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       process.exitCode = 1;
       return;
     }
+    if (refuseMissingSecrets(programSecrets(dir), `retry ${args[1]}`)) return;
     if (node.runId && conductorAlive(path.join(root, node.runId))) await cmdStop(node.runId, root);
     if (state.stopped) appendProgramEvent(dir, { type: "PROGRAM_RESUMED" });
     appendProgramEvent(dir, { type: "NODE_RETRY", node: args[1] });
@@ -331,6 +358,7 @@ async function cmdStart(planPath: string, root: string): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  if (refuseMissingSecrets(plan.secrets, "start the run")) return;
   launchDetached(createRun(root, plan));
 }
 
@@ -795,7 +823,9 @@ async function main(): Promise<void> {
     process.stdout.write(redactText(renderStatus(runDir), secretsForRun(runDir)));
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
-    launchDetached(resolveRunDir(positional[0], runRoot));
+    const runDir = resolveRunDir(positional[0], runRoot);
+    if (refuseMissingSecrets(readPlan(runDir).secrets, "resume the run")) return;
+    launchDetached(runDir);
   } else if (cmd === "program") {
     await cmdProgram(positional[0], positional.slice(1), runRoot, json);
   } else if (cmd === "list") {
