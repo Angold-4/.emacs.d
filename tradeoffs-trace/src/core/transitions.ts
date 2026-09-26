@@ -615,26 +615,11 @@ addRow({
 });
 
 // --- EVALUATING (plan 04a) ----------------------------------------------
-/** The evaluator's own outcome record event (EVALUATOR_FINISHED) settles the
- * round without moving the phase: next() then asks for
- * `evaluation_complete`, which is the EVALUATION_COMPLETED row below. On a
- * timeout the raw messages are published unchanged, marked `unevaluated`, so
- * the owner still sees them and the run moves on. */
-function publishRawUnevaluated(messages: Message[] | undefined): Message[] {
-  return (messages ?? []).map((m) =>
-    m.state === "raw" ? { ...m, state: "published" as const, unevaluated: true } : m,
-  );
-}
-
-function applyEvaluationTimedOut(s: State): State {
-  return withPhase(s, {
-    phase: "RESOLVING",
-    messages: publishRawUnevaluated(s.phase.messages),
-    evaluation: { ...(s.phase.evaluation ?? {}), settled: true, timedOut: true },
-    inFlight: clearInFlight(s.phase, "dispatch_evaluation"),
-  });
-}
-
+// One fresh evaluator per message type is dispatched from next(); each one's
+// outcome is a RECORD event in reduce.ts (EVALUATOR_FINISHED, or
+// EVALUATION_TIMED_OUT which publishes that type's raw messages unevaluated).
+// The only transition out of EVALUATING is EVALUATION_COMPLETED, and only
+// once every dispatched type has settled.
 addRow({
   id: "evaluation-completed",
   axis: "phase",
@@ -648,36 +633,12 @@ addRow({
   apply: (s) =>
     withPhase(s, {
       phase: "RESOLVING",
-      evaluation: { ...(s.phase.evaluation ?? {}), settled: true },
-      inFlight: clearInFlight(s.phase, "dispatch_evaluation"),
-    }),
-});
-
-addRow({
-  id: "evaluation-timed-out",
-  axis: "phase",
-  from: "EVALUATING",
-  trigger: "EVALUATION_TIMED_OUT",
-  guardName: "always",
-  guard: () => true,
-  to: "RESOLVING",
-  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
-  apply: (s) => applyEvaluationTimedOut(s),
-});
-
-addRow({
-  id: "evaluation-interrupted",
-  axis: "phase",
-  from: "EVALUATING",
-  trigger: "EVALUATION_INTERRUPTED",
-  guardName: "firstInterruption",
-  guard: () => true,
-  to: "EVALUATING",
-  actions: [{ type: "dispatch_evaluation" }],
-  apply: (s) =>
-    withPhase(s, {
-      inFlight: clearInFlight(s.phase, "dispatch_evaluation"),
-      evaluation: { ...(s.phase.evaluation ?? {}), interruptedOnce: true },
+      inFlight: clearInFlight(
+        s.phase,
+        "dispatch_evaluation_tradeoff",
+        "dispatch_evaluation_finding",
+        "dispatch_evaluation_blocker",
+      ),
     }),
 });
 

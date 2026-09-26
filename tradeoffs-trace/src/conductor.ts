@@ -352,8 +352,11 @@ export interface ConductorOptions {
 // Run directory layout (design §9.1)
 // ---------------------------------------------------------------------------
 
-/** Contract v1: the events that can change a message projection. */
+/** Contract v1: the events that can change a message projection. An
+ * EVALUATION_TIMED_OUT publishes a type's raw messages `unevaluated`, so it
+ * changes `messages.jsonl`/`ledger.jsonl` too. */
 const MESSAGE_EVENT_TYPES = new Set<string>([
+  "EVALUATION_TIMED_OUT",
   "MESSAGE_RAISED",
   "MESSAGE_PUBLISHED",
   "MESSAGE_MERGED",
@@ -800,6 +803,8 @@ interface AgentHandle {
    * mode or for a worker handle. */
   discoveryResolve: () => void;
   discoveryPromise: Promise<void>;
+  /** Plan 04a: the message type this evaluator handles. */
+  messageType?: MessageType;
   /** Plan 01d: the records this dispatch's turn-2 prompt demanded a ballot
    * for (id → its one-line choice), captured when that prompt was built and
    * never recomputed, so a record added after it (a late discovery) is never
@@ -1213,20 +1218,21 @@ export class Conductor {
       return;
     }
 
-    if (key === "dispatch_evaluation") {
-      // Plan 04a: a conductor died during EVALUATING. Kill whatever survived
-      // and re-dispatch once; a second loss publishes the raw messages
-      // `unevaluated` and moves on (EVALUATION_TIMED_OUT).
+    if (key.startsWith("dispatch_evaluation_")) {
+      // Plan 04a: a conductor died while ONE message type's evaluator ran.
+      // Kill whatever survived and re-dispatch that type once; a second loss
+      // publishes that type's raw messages `unevaluated` and settles it.
+      const messageType = key.slice("dispatch_evaluation_".length) as MessageType;
       const pgid = payload.pgid as number | undefined;
       if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
       for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
         await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
       }
-      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#log.completion(actionId, { messageType, interrupted: true, reason: "crash-recovery" });
       this.#applyEvent(
-        this.#state.phase.evaluation?.interruptedOnce
-          ? { type: "EVALUATION_TIMED_OUT" }
-          : { type: "EVALUATION_INTERRUPTED" },
+        this.#state.phase.evaluation?.types?.[messageType]?.interruptedOnce
+          ? { type: "EVALUATION_TIMED_OUT", messageType }
+          : { type: "EVALUATION_INTERRUPTED", messageType },
       );
       return;
     }
@@ -2531,7 +2537,12 @@ export class Conductor {
   }
 
   #dispatch(action: Action): void {
-    const kind = action.type === "dispatch_review" ? `dispatch_review_${action.reviewer}` : action.type;
+    const kind =
+      action.type === "dispatch_review"
+        ? `dispatch_review_${action.reviewer}`
+        : action.type === "dispatch_evaluation"
+          ? `dispatch_evaluation_${action.messageType}`
+          : action.type;
     switch (action.type) {
       case "start_attempt":
         // Plan 04a: the base baseline is its own state. It is needed exactly
@@ -2548,8 +2559,9 @@ export class Conductor {
       }
       case "dispatch_evaluation": {
         const actionId = this.#log.actionId(kind);
-        this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_evaluation", actionId });
-        void this.#runEvaluation(actionId).catch((err) => this.#logUnexpected("dispatch_evaluation", err));
+        const messageType = action.messageType as MessageType;
+        this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_evaluation", actionId, messageType });
+        void this.#runEvaluation(actionId, messageType).catch((err) => this.#logUnexpected("dispatch_evaluation", err));
         return;
       }
       case "evaluation_complete":
@@ -2923,10 +2935,10 @@ export class Conductor {
     }
     if (msg.tool === "raise_tradeoff") {
       // Plan 04a: the worker raises a choice the plan did not fix the moment
-      // it makes it; an evaluator may also raise one it spots. Callable any
-      // time during implementation. It is a raw message; the evaluator
-      // publishes it later.
-      if (handle.role !== "worker" && handle.role !== "evaluator") {
+      // it makes it. Callable any time during implementation. It is a raw
+      // message; the type's evaluator publishes it later. The evaluator role
+      // does NOT have this tool (roles.ts), so this is worker-only.
+      if (handle.role !== "worker") {
         return { ok: false, reason: `raise_tradeoff is not accepted from role ${handle.role}` };
       }
       if (this.#state.phase.phase !== "IMPLEMENTING") {
@@ -2956,58 +2968,86 @@ export class Conductor {
       return { ok: true };
     }
     if (msg.tool === "submit_evaluation") {
-      // Plan 04a: the evaluator's per-message outcome. It is the only way a
-      // raw message becomes published/merged/dropped in this profile.
+      // Plan 04a: one type's evaluator outcome. It is the only way that
+      // type's raw messages become published/merged/dropped in this profile.
       if (handle.role !== "evaluator" || this.#state.phase.phase !== "EVALUATING") {
         return { ok: false, reason: `submit_evaluation is not accepted in phase ${this.#state.phase.phase}` };
       }
+      const messageType = handle.messageType;
+      if (!messageType) return { ok: false, reason: "this evaluator is not bound to a message type" };
       const entries = (msg.args as { evaluations?: unknown }).evaluations;
       if (!Array.isArray(entries)) {
         return { ok: false, reason: "submit_evaluation needs an evaluations array" };
       }
-      // Build every message event AND the evaluator's own outcome record in
-      // one batch, then apply it as one visible step: next() must never act
-      // on a half-resolved round (a premature EVALUATION_COMPLETED).
-      const events = this.#evaluationEvents(entries as EvaluationEntry[]);
-      this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", evaluated: entries.length }]);
+      // B-16 / owner directive 1: validate the WHOLE submission before
+      // applying anything. An invalid one is refused back to the evaluator
+      // (like an incomplete review), never partly applied.
+      const issue = this.#evaluationIssue(messageType, entries as EvaluationEntry[]);
+      if (issue) return { ok: false, reason: `invalid evaluation: ${issue}` };
+      const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
+      this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
       handle.doneResolve();
       return { ok: true };
     }
     return { ok: false, reason: `unknown submission tool ${msg.tool}` };
   }
 
-  /** Plan 04a: the message events one evaluator submission produces. Each
-   * raw message the evaluator named is published (with its clean wording),
-   * merged or dropped; any raw message it did not name is published
-   * unchanged, marked `unevaluated`, so nothing is lost. */
-  #evaluationEvents(entries: EvaluationEntry[]): Event[] {
+  /** B-16 (owner directive 1): why one `submit_evaluation` is refused before
+   * anything is applied, or undefined when it is well-formed. */
+  #evaluationIssue(messageType: MessageType, entries: EvaluationEntry[]): string | undefined {
+    const messages = this.#state.phase.messages ?? [];
+    const ids = new Set(messages.map((m) => m.id));
+    const rawIds = messages.filter((m) => m.type === messageType && m.state === "raw").map((m) => m.id);
+    const rawSet = new Set(rawIds);
+    const refusedSet = new Set(messages.filter((m) => m.type === messageType && m.state === "refused").map((m) => m.id));
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      const id = typeof entry?.messageId === "string" ? entry.messageId : "";
+      if (!id) return "every evaluation entry must name a messageId";
+      if (seen.has(id)) return `message ${id} is named more than once in one submit_evaluation`;
+      seen.add(id);
+      if (!rawSet.has(id) && !refusedSet.has(id)) {
+        return `message ${id} is not a raw or owner-refused ${messageType} message of this round`;
+      }
+      if (entry.action !== "publish" && entry.action !== "merge" && entry.action !== "drop") {
+        return `entry for ${id} must be publish, merge or drop`;
+      }
+      if (entry.action === "merge") {
+        const into = typeof entry.into === "string" ? entry.into : "";
+        if (!into || !ids.has(into)) return `merge of ${id} names an unknown target ${JSON.stringify(into)}`;
+      }
+    }
+    for (const id of rawIds) {
+      if (!seen.has(id)) return `every raw ${messageType} message must appear exactly once; ${id} is missing`;
+    }
+    return undefined;
+  }
+
+  /** Plan 04a: the message events one TYPE's evaluator submission produces.
+   * Each raw message of the type is published (with its clean wording),
+   * merged or dropped; an owner-refused message is resolved only when the
+   * evaluator reports it addressed. The submission was already validated. */
+  #evaluationEvents(messageType: MessageType, entries: EvaluationEntry[]): Event[] {
     const messages = this.#state.phase.messages ?? [];
     const byId = new Map(messages.map((m) => [m.id, m]));
     const events: Event[] = [];
-    const handled = new Set<string>();
     for (const entry of entries) {
       const id = typeof entry?.messageId === "string" ? entry.messageId : "";
       const message = byId.get(id);
-      if (!message) continue;
+      if (!message || message.type !== messageType) continue;
       const binding = {
         messageId: id,
         boundCandidateSha: message.boundCandidateSha,
         boundContractVersion: message.boundContractVersion,
         boundRecordVersion: message.messageVersion,
       };
-      // Plan 04a item 4: an owner-refused message is not re-evaluated; the
-      // evaluator reports whether this candidate addressed it. `addressed:
-      // true` resolves the refusal; `false` (or omitted) leaves it standing.
       if (message.state === "refused") {
-        handled.add(id);
         if (entry.addressed === true) {
           const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : "addressed by the candidate";
           events.push({ type: "MESSAGE_RESOLVED", ...binding, by: "evaluator", reason });
         }
         continue;
       }
-      if (message.state !== "raw") continue;
-      handled.add(id);
       if (entry.action === "merge") {
         const into = typeof entry.into === "string" && entry.into.trim().length > 0 ? entry.into.trim() : undefined;
         events.push({ type: "MESSAGE_MERGED", ...binding, by: "evaluator", reason: into ? `merged into ${into}` : "merged" });
@@ -3024,7 +3064,7 @@ export class Conductor {
           type: "MESSAGE_PUBLISHED",
           ...binding,
           content: {
-            type: message.type,
+            type: messageType,
             title: clampMessageTitle(text(entry.title, message.title)),
             summary: text(entry.summary, message.summary),
             context: text(entry.context, message.context),
@@ -3034,17 +3074,6 @@ export class Conductor {
           },
         });
       }
-    }
-    for (const message of messages) {
-      if (message.state !== "raw" || handled.has(message.id)) continue;
-      events.push({
-        type: "MESSAGE_PUBLISHED",
-        messageId: message.id,
-        boundCandidateSha: message.boundCandidateSha,
-        boundContractVersion: message.boundContractVersion,
-        boundRecordVersion: message.messageVersion,
-        unevaluated: true,
-      });
     }
     return events;
   }
@@ -4360,14 +4389,15 @@ export class Conductor {
   /** Plan 04a: whether the BASELINE state must run. True when the phase has
    * effective checks and its own run-local baseline does not yet cover this
    * base tree and check list. A false answer sends READY straight to
-   * IMPLEMENTING (the 01e reuse rule for a restart); reduce() itself cannot
-   * see the disk, so the conductor decides.
+   * IMPLEMENTING; reduce() itself cannot see the disk, so the conductor
+   * decides.
    *
-   * A run-local record that is missing but whose identical base tree already
-   * has a record elsewhere (a sibling program node) still enters BASELINE:
-   * `#ensureBaseline` adopts that record — copying it locally, running
-   * nothing — so the candidate's checks can lean on it. Only a record
-   * already in THIS run's `checks/base/` lets the state be skipped. */
+   * A missing run-local record whose identical base tree already has a
+   * record elsewhere (a sibling program node) is adopted HERE, synchronously
+   * — copied into this run's `checks/base/`, running nothing — and the state
+   * is skipped for it too (finding M-12: the docstring must match the code).
+   * Only a record this run does not hold and cannot adopt makes the state
+   * run. */
   #baselineNeeded(): boolean {
     const commands = this.#resolvedEffectiveChecks();
     if (commands.length === 0) return false;
@@ -5472,22 +5502,22 @@ export class Conductor {
   /** A timeout or loss applies only while the phase is still evaluating the
    * candidate this dispatch was started for. A late one is logged and
    * dropped, like a stale review. */
-  #evaluationTimedOut(dispatchCandidate: string | undefined): void {
+  #evaluationTimedOut(messageType: MessageType, dispatchCandidate: string | undefined): void {
     const phase = this.#state.phase;
     if (phase.phase !== "EVALUATING" || phase.candidate?.sha !== dispatchCandidate) {
-      this.#log.append("stale_evaluation_ignored", { dispatchCandidate, phase: phase.phase });
+      this.#log.append("stale_evaluation_ignored", { messageType, dispatchCandidate, phase: phase.phase });
       return;
     }
-    this.#applyEvent({ type: "EVALUATION_TIMED_OUT" });
+    this.#applyEvent({ type: "EVALUATION_TIMED_OUT", messageType });
   }
 
-  /** Plan 04a: one fresh evaluator checks this round's raw messages against
-   * the candidate's diff and a read-only checkout, then returns through
-   * `submit_evaluation`. A submit settles the round; a timeout publishes the
-   * raw messages `unevaluated` and moves on. */
-  async #runEvaluation(actionId: string): Promise<void> {
+  /** Plan 04a: one fresh evaluator PER MESSAGE TYPE checks that type's raw
+   * messages against the candidate's diff and a read-only checkout, then
+   * returns through `submit_evaluation`. A submit settles that type; a
+   * timeout publishes only that type's raw messages `unevaluated`. */
+  async #runEvaluation(actionId: string, messageType: MessageType): Promise<void> {
     const dispatchCandidate = this.#state.phase.candidate?.sha;
-    const agentId = `evaluator-${actionId}`;
+    const agentId = `evaluator-${messageType}-${actionId}`;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
     const candidateDir = this.#candidateDir();
     const env: NodeJS.ProcessEnv = {
@@ -5500,6 +5530,7 @@ export class Conductor {
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
       TT_CANDIDATE_SHA: this.#state.phase.candidate?.sha,
+      TT_MESSAGE_TYPE: messageType,
     };
 
     let helloResolve!: (r: HelloResult) => void;
@@ -5513,6 +5544,11 @@ export class Conductor {
 
     const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
     const providerModel = this.#providerModelFor?.("evaluator");
+    // An evaluator that settles without an ACCEPTED submission fails fast
+    // (that type times out and publishes unevaluated); waiting out the whole
+    // evaluateMs would wedge a run whose evaluator's submission was refused.
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
     const agent = spawnPiAgent({
       command: evaluatorPiCommand,
       args: [
@@ -5534,6 +5570,7 @@ export class Conductor {
       onEvent: (event) => {
         this.#noteActivity(agentId, event);
         this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
       },
     });
 
@@ -5548,9 +5585,10 @@ export class Conductor {
       donePromise,
       discoveryResolve: () => undefined,
       discoveryPromise: Promise.resolve(),
+      messageType,
     };
     this.#agents.set(agentId, handle);
-    this.#log.intent(actionId, { agentId, pgid: agent.pgid });
+    this.#log.intent(actionId, { agentId, pgid: agent.pgid, messageType });
 
     try {
       // `waitExit` is raced alongside hello: an evaluator that cannot even
@@ -5562,17 +5600,14 @@ export class Conductor {
       ]);
       if (hello === "timeout" || hello === "exited") {
         await agent.terminate();
-        this.#log.completion(actionId, { ok: false, reason: hello === "exited" ? "evaluator exited before hello" : "hello timed out" });
-        this.#evaluationTimedOut(dispatchCandidate);
+        this.#log.completion(actionId, { messageType, ok: false, reason: hello === "exited" ? "evaluator exited before hello" : "hello timed out" });
+        this.#evaluationTimedOut(messageType, dispatchCandidate);
         return;
       }
       if (!hello.ok) {
         await agent.terminate();
-        this.#log.completion(actionId, { ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
-        // A tool-set mismatch is a launch failure; for an evaluator there is
-        // no repair to spend, so it takes the timeout path (raw published
-        // unevaluated) rather than wedging the phase.
-        this.#evaluationTimedOut(dispatchCandidate);
+        this.#log.completion(actionId, { messageType, ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
+        this.#evaluationTimedOut(messageType, dispatchCandidate);
         return;
       }
 
@@ -5582,34 +5617,39 @@ export class Conductor {
         cancelableTimeout(this.#deadlines.evaluateMs, "timeout" as const),
         "Owner (conductor): no progress for a while. Finish now and call submit_evaluation.",
       );
-      await agent.prompt(this.#buildEvaluatorPrompt());
+      const settled = nextSettle();
+      await agent.prompt(this.#buildEvaluatorPrompt(messageType));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         evaluatorTimeout.promise,
+        settled,
         agent.waitExit().then(() => "exited" as const),
       ]);
       evaluatorTimeout.cancel();
       if (outcome === "submitted") {
         await agent.terminate();
-        this.#log.completion(actionId, { ok: true });
+        this.#log.completion(actionId, { messageType, ok: true });
         return;
       }
       await agent.terminate();
-      this.#log.completion(actionId, { ok: false, reason: outcome });
-      this.#evaluationTimedOut(dispatchCandidate);
+      this.#log.completion(actionId, { messageType, ok: false, reason: outcome });
+      this.#evaluationTimedOut(messageType, dispatchCandidate);
     } finally {
       this.#agents.delete(agentId);
     }
   }
 
-  /** Plan 04a: the evaluator's prompt — the phase contract, the owner
-   * directives in force, the settled ledger, the candidate's diff against
-   * the base (its read-only checkout is the working directory), and this
-   * round's raw messages. */
-  #buildEvaluatorPrompt(): string {
+  /** Plan 04a: one type's evaluator prompt — the phase contract, the owner
+   * directives in force, the settled ledger, the candidate's diff against the
+   * base (its read-only checkout is the working directory), and THIS TYPE's
+   * raw messages. An owner-refused message of the type is shown so the
+   * evaluator can report whether it was addressed. */
+  #buildEvaluatorPrompt(messageType: MessageType): string {
     const phase = this.#state.phase;
     const C = phase.candidate?.sha ?? "";
-    const raw = (phase.messages ?? []).filter((m) => m.state === "raw");
+    const mine = (phase.messages ?? []).filter((m) => m.type === messageType);
+    const raw = mine.filter((m) => m.state === "raw");
+    const refused = mine.filter((m) => m.state === "refused");
     let diff = "";
     try {
       diff = diffText(this.#plan.repo, phase.integrationHead, C);
@@ -5617,14 +5657,13 @@ export class Conductor {
       diff = "(the diff could not be read)";
     }
     const lines = [
-      `You are the evaluator for phase ${phase.phaseId}, candidate ${C.slice(0, 9)} (contract snapshot ${phase.contract.contractVersion.snapshot}).`,
+      `You are the ${messageType} evaluator for phase ${phase.phaseId}, candidate ${C.slice(0, 9)} (contract snapshot ${phase.contract.contractVersion.snapshot}). You evaluate ONLY the ${messageType} messages listed below.`,
       `Goal: ${phase.contract.goal}`,
       "",
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
-      ...refusedPromptLines(phase.messages),
       ...ledgerPromptLines(phase.messages),
       "",
       "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
@@ -5632,17 +5671,30 @@ export class Conductor {
       redactText(diff, this.#secretMaskable),
       "```",
       "",
-      `Raw messages to evaluate (${raw.length}):`,
+      `Raw ${messageType} messages to evaluate (${raw.length}):`,
       ...raw.map(
-        (m) => `- ${m.id} [${m.type}]: ${m.title}${m.anchor ? ` (anchor ${m.anchor.path}:${m.anchor.lines[0]}-${m.anchor.lines[1]})` : ""}\n    why: ${m.summary}\n    context: ${m.context}`,
+        (m) => `- ${m.id}: ${m.title}${m.anchor ? ` (anchor ${m.anchor.path}:${m.anchor.lines[0]}-${m.anchor.lines[1]})` : ""}\n    why: ${m.summary}\n    context: ${m.context}`,
       ),
+    ];
+    if (refused.length > 0) {
+      lines.push(
+        "",
+        `Owner-refused ${messageType} messages (report whether this candidate addressed each):`,
+        ...refused.map((m) => `- ${m.id} "${m.title}" — refused: ${m.settlement?.reason ?? "no reason given"}`),
+      );
+    }
+    lines.push(
       "",
-      "For EACH raw message above, check its claim against the code and call submit_evaluation with one entry:",
+      "For EACH raw message above, check its claim against the code and call submit_evaluation with exactly one entry:",
       "- publish: title (one clean line, at most 80 characters), summary (at most 3 sentences), context, evidence (the code facts you checked), importance (high|medium|low).",
       "- merge: the message says the same thing as another — name `into` that message id.",
       "- drop: it is trivial, already settled, or not reviewable — give a reason.",
-      "For each owner-refused message above, name it with `addressed: true` only if this candidate really addressed the owner's reason (which resolves the refusal), or `addressed: false` if it did not. Do not re-raise a refusal.",
-    ];
+    );
+    if (refused.length > 0) {
+      lines.push(
+        "For each owner-refused message above, name it with `addressed: true` only if this candidate really addressed the owner's reason (which resolves the refusal), or `addressed: false` if it did not. Do not re-raise a refusal.",
+      );
+    }
     return lines.join("\n");
   }
 

@@ -19,7 +19,7 @@
 // returns [] (no double dispatch) for the dispatch-shaped ones.
 
 import { gateCommandOf } from "./gate.ts";
-import { accept, amendmentToApply, evaluationSettled, resolvedCorrectionIdsFor, sameVersion } from "./predicate.ts";
+import { accept, amendmentToApply, evaluationSettled, resolvedCorrectionIdsFor, sameVersion, typesNeedingEvaluation } from "./predicate.ts";
 import type { Action, PhaseState, Reviewer, State } from "./types.ts";
 
 function hasValidReview(phase: PhaseState, who: Reviewer): boolean {
@@ -81,12 +81,19 @@ export function next(state: State): Action[] {
       return actions;
     }
 
-    // Plan 04a: the evaluator settles the round's raw messages; the phase
-    // only asks for `evaluation_complete` once everything it waits for has
-    // settled. Acceptance can never outrun evaluation.
+    // Plan 04a: one fresh evaluator PER MESSAGE TYPE that has work this
+    // round (batched per type, not one agent for all types — plan item 3 and
+    // vision §8). The phase only asks for `evaluation_complete` once every
+    // dispatched type has finished or timed out. Acceptance can never outrun
+    // evaluation.
     case "EVALUATING": {
-      if (evaluationSettled(p)) return [{ type: "evaluation_complete" }];
-      return p.inFlight.dispatch_evaluation ? [] : [{ type: "dispatch_evaluation" }];
+      const pending = typesNeedingEvaluation(p).filter((t) => p.evaluation?.types?.[t]?.settled !== true);
+      const actions: Action[] = [];
+      for (const t of pending) {
+        if (!p.inFlight[`dispatch_evaluation_${t}`]) actions.push({ type: "dispatch_evaluation", messageType: t });
+      }
+      if (actions.length > 0) return actions;
+      return evaluationSettled(p) ? [{ type: "evaluation_complete" }] : [];
     }
 
     case "RESOLVING": {

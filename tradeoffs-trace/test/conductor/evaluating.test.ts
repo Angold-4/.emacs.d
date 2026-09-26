@@ -29,6 +29,10 @@ import {
   runPaths,
   type RunPlanFile,
 } from "../../src/conductor.ts";
+import { next } from "../../src/core/next.ts";
+import { reduce } from "../../src/core/reduce.ts";
+import { evaluationSettled, typesNeedingEvaluation } from "../../src/core/predicate.ts";
+import { baseState, makeMessage } from "../unit/helpers.ts";
 import { baselineKey } from "../../src/core/test-failures.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { buildView } from "../../src/view.ts";
@@ -190,6 +194,9 @@ test("plan 04a: acceptance cannot outrun evaluation — the phase stays EVALUATI
         { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } },
       ],
     }),
+    // The empty submission above is refused (a raw message is uncovered), so
+    // the trade-off type times out and publishes unevaluated; the phase still
+    // may not accept before that.
     deadlines: FAST,
   });
   await setup.conductor.start();
@@ -297,36 +304,43 @@ test("plan 04a: raise_tradeoff anchors, the evaluator merges/drops/publishes, an
         },
       ],
     }),
-    evaluatorScriptFor: () => ({
+    // One evaluator per message type: the trade-off evaluator polishes the
+    // two trade-offs, the finding evaluator merges/drops/publishes the three
+    // findings.
+    evaluatorScriptFor: (messageType) => ({
       hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
       steps: [
         {
           kind: "call-submit",
           tool: "submit_evaluation",
           args: {
-            evaluations: [
-              {
-                messageId: "T-1",
-                action: "publish",
-                title: "Batch cancels per tick to stay inside the latency budget",
-                summary: "The cancel path took one lock per request. Batching per tick keeps it inside budget.",
-                context: "src/cancel.ts:10-24 batches cancels instead of locking each one.",
-                evidence: ["src/cancel.ts:10-24"],
-                importance: "high",
-              },
-              {
-                messageId: "T-2",
-                action: "publish",
-                title: "Keep the existing file layout",
-                summary: "Reorganizing the module would only make the diff noisier.",
-                context: "src/cancel.ts:1-8 keeps the layout.",
-                evidence: ["src/cancel.ts:1-8"],
-                importance: "low",
-              },
-              { messageId: "F-1", action: "publish", title: "The loop can spin on an empty input", summary: "A guard is missing.", context: "src/a.ts:10", evidence: ["src/a.ts:10"], importance: "medium" },
-              { messageId: "F-2", action: "merge", into: "F-1" },
-              { messageId: "F-3", action: "drop", reason: "a naming nit, not reviewable" },
-            ],
+            evaluations:
+              messageType === "tradeoff"
+                ? [
+                    {
+                      messageId: "T-1",
+                      action: "publish",
+                      title: "Batch cancels per tick to stay inside the latency budget",
+                      summary: "The cancel path took one lock per request. Batching per tick keeps it inside budget.",
+                      context: "src/cancel.ts:10-24 batches cancels instead of locking each one.",
+                      evidence: ["src/cancel.ts:10-24"],
+                      importance: "high",
+                    },
+                    {
+                      messageId: "T-2",
+                      action: "publish",
+                      title: "Keep the existing file layout",
+                      summary: "Reorganizing the module would only make the diff noisier.",
+                      context: "src/cancel.ts:1-8 keeps the layout.",
+                      evidence: ["src/cancel.ts:1-8"],
+                      importance: "low",
+                    },
+                  ]
+                : [
+                    { messageId: "F-1", action: "publish", title: "The loop can spin on an empty input", summary: "A guard is missing.", context: "src/a.ts:10", evidence: ["src/a.ts:10"], importance: "medium" },
+                    { messageId: "F-2", action: "merge", into: "F-1" },
+                    { messageId: "F-3", action: "drop", reason: "a naming nit, not reviewable" },
+                  ],
           },
         },
       ],
@@ -455,6 +469,87 @@ test("plan 04a: the next reviewer turn-2 prompt carries the settled ledger", asy
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("plan 04a: a refused-only round still dispatches that message type's evaluator", () => {
+  const C1 = { sha: "C1", contractVersion: { snapshot: 1, sectionSha256: "a".repeat(64) } };
+  const K = C1.contractVersion;
+  const refused = makeMessage({
+    state: "refused",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    settlement: { state: "refused", settledBy: "owner", reason: "not the trade-off the goal needed", candidateSha: "C1", contractVersion: K, messageVersion: 1, contentHash: "a".repeat(64) },
+  });
+  let state = baseState({
+    phase: "EVALUATING",
+    candidate: C1,
+    messages: [refused],
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: {},
+  });
+  assert.deepEqual(typesNeedingEvaluation(state.phase), ["tradeoff"]);
+  assert.equal(evaluationSettled(state.phase), false);
+  assert.deepEqual(next(state), [{ type: "dispatch_evaluation", messageType: "tradeoff" }]);
+  const done = reduce(state, { type: "EVALUATOR_FINISHED", messageType: "tradeoff", evaluated: 0 });
+  assert.equal(done.ok, true, !done.ok ? done.reason : "");
+  state = done.state;
+  assert.deepEqual(next(state), [{ type: "evaluation_complete" }]);
+});
+
+test("plan 04a: a submit_evaluation naming one message twice is refused, never partly applied", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-submit", tool: "raise_tradeoff", args: { choice: "One choice", alternative: "the other", why: "matters", anchor: { path: "src/a.ts", lines: [1, 2] } } },
+        submitPhaseStep(),
+      ],
+    }),
+    reviewerScriptFor: stubReviewer(),
+    evaluatorScriptFor: (messageType) => ({
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps:
+        messageType === "tradeoff"
+          ? [
+              {
+                kind: "call-submit",
+                tool: "submit_evaluation",
+                args: {
+                  evaluations: [
+                    { messageId: "T-1", action: "publish", title: "first" },
+                    { messageId: "T-1", action: "drop", reason: "duplicate" },
+                  ],
+                },
+              },
+            ]
+          : [],
+    }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 60_000, 20, setup.runDir);
+    assert.ok(
+      !readEvents(setup.runDir).some((r) => r.kind === "error"),
+      "a duplicate-id submission must be refused, not crash the conductor",
+    );
+    const streamDir = runPaths(setup.runDir).stream;
+    const text = fs
+      .readdirSync(streamDir)
+      .filter((f) => f.startsWith("evaluator-tradeoff-"))
+      .map((f) => fs.readFileSync(path.join(streamDir, f), "utf8"))
+      .join("\n");
+    assert.match(text, /named more than once/);
+    const message = (setup.conductor.state.phase.messages ?? []).find((m) => m.type === "tradeoff")!;
+    assert.equal(message.state, "published", "the refused round later publishes the message unevaluated");
+    assert.equal(message.unevaluated, true);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
   }
 });
 

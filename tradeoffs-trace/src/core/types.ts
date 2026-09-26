@@ -734,7 +734,9 @@ export type InFlightKey =
   | "review_M"
   | "review_A"
   | "review_B"
-  | "dispatch_evaluation"
+  | "dispatch_evaluation_tradeoff"
+  | "dispatch_evaluation_finding"
+  | "dispatch_evaluation_blocker"
   | "run_gate"
   | "publish_cas";
 
@@ -819,11 +821,12 @@ export interface PhaseState {
    * an interrupted `run_baseline` has been re-dispatched, so a second loss
    * takes the timed-out path instead of re-dispatching again. */
   baseline?: { interruptedOnce?: boolean };
-  /** Plan 04a: the EVALUATING stage's own state. `settled` is set by
-   * `EVALUATOR_FINISHED` (the evaluator's own outcome record event);
-   * `timedOut` records that its raw messages were published unevaluated;
+  /** Plan 04a: the EVALUATING stage's own state, PER MESSAGE TYPE (one
+   * fresh evaluator per type that has raw messages this round): `settled` is
+   * set by that type's `EVALUATOR_FINISHED` (or its timeout); `timedOut`
+   * records that only that type's raw messages were published unevaluated;
    * `interruptedOnce` is the same one-redispatch bookkeeping as `baseline`. */
-  evaluation?: { settled?: boolean; timedOut?: boolean; interruptedOnce?: boolean };
+  evaluation?: { types?: Partial<Record<MessageType, EvaluatorOutcome>> };
 }
 
 export type RunStatus = RunStateName;
@@ -876,31 +879,43 @@ export interface EvBaselineTimedOut {
 export interface EvBaselineInterrupted {
   type: "BASELINE_INTERRUPTED";
 }
-/** Plan 04a: all three reviewers have submitted and the phase enters
- * EVALUATING (the evaluator is about to check the round's raw messages). */
-export interface EvEvaluationCompleted {
-  type: "EVALUATION_COMPLETED";
+export interface EvAttemptTimedOut {
+  type: "ATTEMPT_TIMED_OUT";
 }
-/** Plan 04a: the evaluator did not settle in time; its raw messages are
- * published unchanged, marked `unevaluated`, and the phase moves on. */
-export interface EvEvaluationTimedOut {
-  type: "EVALUATION_TIMED_OUT";
+
+/** Plan 04a: one message type's evaluator state inside EVALUATING. */
+export interface EvaluatorOutcome {
+  settled?: boolean;
+  timedOut?: boolean;
+  interruptedOnce?: boolean;
 }
-/** Plan 04a: a conductor died during EVALUATING; the evaluation is
- * re-dispatched once. */
-export interface EvEvaluationInterrupted {
-  type: "EVALUATION_INTERRUPTED";
-}
-/** Plan 04a: the evaluator's own outcome, a record event inside EVALUATING.
- * It settles the round so next() asks for `evaluation_complete`. */
+
+/** Plan 04a: one type's evaluator finished its round. A record event inside
+ * EVALUATING; the phase completes only once every dispatched type has. */
 export interface EvEvaluatorFinished {
   type: "EVALUATOR_FINISHED";
-  /** How many raw messages the evaluator resolved (observability only). */
+  messageType: MessageType;
   evaluated: number;
 }
 
-export interface EvAttemptTimedOut {
-  type: "ATTEMPT_TIMED_OUT";
+/** Plan 04a: one type's evaluator did not settle in time; only that type's
+ * raw messages are published unchanged, marked `unevaluated`. A record event
+ * inside EVALUATING. */
+export interface EvEvaluationTimedOut {
+  type: "EVALUATION_TIMED_OUT";
+  messageType: MessageType;
+}
+
+/** Plan 04a: a conductor died while one type's evaluator ran; that dispatch
+ * is re-dispatched once. A record event inside EVALUATING. */
+export interface EvEvaluationInterrupted {
+  type: "EVALUATION_INTERRUPTED";
+  messageType: MessageType;
+}
+
+/** Plan 04a: all dispatched evaluators settled; EVALUATING -> RESOLVING. */
+export interface EvEvaluationCompleted {
+  type: "EVALUATION_COMPLETED";
 }
 export interface EvAttemptNoSubmission {
   type: "ATTEMPT_NO_SUBMISSION";
@@ -960,6 +975,7 @@ export interface EvActionStarted {
   action: string; // one of the Action["type"] values next() emits
   actionId: string;
   reviewer?: Reviewer; // required when action === "dispatch_review"
+  messageType?: MessageType; // required when action === "dispatch_evaluation"
 }
 export interface EvBallotCast {
   type: "BALLOT_CAST";

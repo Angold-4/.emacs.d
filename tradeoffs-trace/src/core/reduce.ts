@@ -27,7 +27,17 @@ import {
 } from "./owner-commands.ts";
 import { isLiveDecision, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
-import type { BindingTuple, ContractVersion, Event, Finding, InFlightKey, ReduceResult, State } from "./types.ts";
+import type {
+  BindingTuple,
+  ContractVersion,
+  Event,
+  Finding,
+  InFlightKey,
+  MessageType,
+  PhaseState,
+  ReduceResult,
+  State,
+} from "./types.ts";
 
 const KNOWN_EVENT_TYPES = new Set<string>([
   "ATTEMPT_STARTED",
@@ -127,8 +137,25 @@ function bindingTupleForRecord(
   };
 }
 
-function inFlightKeyFor(action: string, reviewer?: string): string {
-  return action === "dispatch_review" ? `review_${reviewer}` : action;
+function inFlightKeyFor(action: string, reviewer?: string, messageType?: string): string {
+  if (action === "dispatch_review") return `review_${reviewer}`;
+  // Plan 04a: one evaluator per message type, so each dispatch has its own
+  // in-flight key (`dispatch_evaluation_tradeoff`, …).
+  if (action === "dispatch_evaluation") return `dispatch_evaluation_${messageType}`;
+  return action;
+}
+
+/** Plan 04a: merge one message type's evaluator outcome into `evaluation`. */
+function withEvaluatorOutcome(p: PhaseState, type: MessageType, patch: { settled?: boolean; timedOut?: boolean; interruptedOnce?: boolean }): PhaseState["evaluation"] {
+  const types = { ...(p.evaluation?.types ?? {}) };
+  types[type] = { ...(types[type] ?? {}), ...patch };
+  return { types };
+}
+
+function withoutEvaluationInFlight(p: PhaseState, type: MessageType): PhaseState["inFlight"] {
+  const inFlight = { ...p.inFlight };
+  delete inFlight[`dispatch_evaluation_${type}` as InFlightKey];
+  return inFlight;
 }
 
 /** Events handled directly by reduce.ts, not by the transitions table: they
@@ -144,15 +171,18 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // is exactly what makes a second next() call return [] (no double
       // dispatch).
       const outstanding = computeNext(state).some(
-        (a) => a.type === event.action && (event.action !== "dispatch_review" || a.reviewer === event.reviewer),
+        (a) =>
+          a.type === event.action &&
+          (event.action !== "dispatch_review" || a.reviewer === event.reviewer) &&
+          (event.action !== "dispatch_evaluation" || a.messageType === event.messageType),
       );
       if (!outstanding) {
         return rejected(
           state,
-          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""} is not currently outstanding in phase ${p.phase}`,
+          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""}${event.messageType ? ` (${event.messageType})` : ""} is not currently outstanding in phase ${p.phase}`,
         );
       }
-      const key = inFlightKeyFor(event.action, event.reviewer) as InFlightKey;
+      const key = inFlightKeyFor(event.action, event.reviewer, event.messageType) as InFlightKey;
       return ok({ ...state, phase: { ...p, inFlight: { ...p.inFlight, [key]: { actionId: event.actionId } } } });
     }
 
@@ -372,15 +402,60 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     }
 
     case "EVALUATOR_FINISHED": {
-      // Plan 04a: the evaluator's own outcome, a record event inside
-      // EVALUATING. It settles the round without moving the phase; next()
-      // then asks for `evaluation_complete`, which is the
-      // EVALUATION_COMPLETED transition. Rejected outside EVALUATING, so a
-      // late evaluator cannot settle a different stage.
+      // Plan 04a: one type's evaluator outcome, a record event inside
+      // EVALUATING. It settles that type without moving the phase; next()
+      // asks for `evaluation_complete` once every dispatched type has
+      // settled. Rejected outside EVALUATING, so a late evaluator cannot
+      // settle a different stage.
       if (p.phase !== "EVALUATING") {
         return rejected(state, `EVALUATOR_FINISHED is only valid in EVALUATING, not ${p.phase}`);
       }
-      return ok({ ...state, phase: { ...p, evaluation: { ...(p.evaluation ?? {}), settled: true } } });
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { settled: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
+    case "EVALUATION_TIMED_OUT": {
+      // Plan 04a: only THIS type's raw messages are published unchanged,
+      // marked unevaluated; the type is settled so the phase can move on once
+      // every type has. A record event (no phase change) — EVALUATION_COMPLETED
+      // is the transition that leaves EVALUATING.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_TIMED_OUT is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const messages = (p.messages ?? []).map((m) =>
+        m.type === event.messageType && m.state === "raw" ? { ...m, state: "published" as const, unevaluated: true } : m,
+      );
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          messages,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { settled: true, timedOut: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
+    case "EVALUATION_INTERRUPTED": {
+      // Plan 04a: one type's evaluator was interrupted by a conductor crash;
+      // re-dispatched once, tracked per type.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_INTERRUPTED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { interruptedOnce: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
     }
 
     case "CRITERION_REVERTED": {

@@ -30,7 +30,7 @@
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
-import type { ContractVersion, Correction, CriterionAmendment, Decision, PhaseState, Review } from "./types.ts";
+import type { ContractVersion, Correction, CriterionAmendment, Decision, MessageType, PhaseState, Review } from "./types.ts";
 
 export function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
   return a.snapshot === b.snapshot && a.sectionSha256 === b.sectionSha256;
@@ -77,14 +77,24 @@ export function addressed(correction: Correction, phase: PhaseState, C: string, 
   return true;
 }
 
+/** Plan 04a: the message types, one evaluator each per round. */
+export const EVALUATOR_TYPES = ["tradeoff", "finding", "blocker"] as const;
+
+/** Plan 04a: the types this round's EVALUATING stage must evaluate: a type
+ * with a raw message to check, or one with an owner-refused message awaiting
+ * its "was it addressed" report (owner correction, item 3). */
+export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
+  return (EVALUATOR_TYPES as readonly MessageType[]).filter((t) =>
+    (phase.messages ?? []).some((m) => m.type === t && (m.state === "raw" || m.state === "refused")),
+  );
+}
+
 /** Plan 04a: whether everything EVALUATING waits for has settled. In 04a
- * that is the evaluator alone — the phase has no raw messages left for it to
- * check (`EVALUATOR_FINISHED` resolves them; a timeout publishes them
- * `unevaluated`), or the evaluator's own outcome record already settled the
- * round. Plan 04b adds its panels to this same predicate. */
+ * that is one fresh evaluator per message type that has work: the predicate
+ * holds when every such type's evaluator has finished or timed out. Plan 04b
+ * adds its panels to this same predicate. */
 export function evaluationSettled(phase: PhaseState): boolean {
-  if (!(phase.messages ?? []).some((m) => m.state === "raw")) return true;
-  return phase.evaluation?.settled === true;
+  return typesNeedingEvaluation(phase).every((t) => phase.evaluation?.types?.[t]?.settled === true);
 }
 
 /** M, A and B each have a review bound to (C, K) already. Used to decide,
