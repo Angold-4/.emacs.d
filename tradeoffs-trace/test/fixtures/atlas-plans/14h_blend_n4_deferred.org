@@ -1,0 +1,24 @@
+#+TITLE: index-price-service 14.8 (DEFERRED): the blend at n >= 4
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p index-calculator -p index-price-service && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# DEFERRED — do not start. The owner is confirming the logic for a four-source blend ("I'll let you
+# know the logic when n >= 4"). This file exists so the decision has a home and plan 14 does not
+# quietly assume an answer. 13_ref_index_calculator.md §3-§5 defines the blend at n <= 3 today.
+
+* Phase 14.8 (deferred): the aggregation logic once every market has more than three sources
+  :PROPERTIES:
+  :ID:          ips14-blend-n4
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-calculator -p index-price-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/index/calculator/** config/index/instruments.yaml
+  :RESERVED:    the n>=4 aggregation, its quality tiers, and the coverage minimum — all awaiting the owner's ruling
+  :END:
+  Goal: Reference — `ATLAS - Index Calculator.md` §5 and `13_ref_index_calculator.md` §3-§5, which define median (n>=3) / mid (n=2) / singleton / hold. With Redstone live (14a) and Kaiko's sub-second crypto rows (14b), a crypto market can carry **four** sources and the capital markets three — so the aggregation, the quality tiers and the coverage minimum need an explicit answer before the code assumes one.
+  The open questions this phase must be given answers to, not invent:
+  - the aggregation function at n = 4 (median of four is the mean of the middle pair — is that intended, or a trimmed/winsorised statistic?),
+  - how `quality` and the degraded threshold are defined once n can be 4, given the recorded B3 deviation,
+  - whether the coverage minimum becomes ">= 3" where four vendors are available, or stays ">= 2" with the surplus recorded,
+  - whether the fourth source's cadence gaps (Redstone: ~2 s for BTC/ETH, ~20 s for XRP/NEAR) admit it at all under τ, and therefore which markets can actually reach n = 4.
+  Priorities: the owner's stated logic over an inferred one; the existing n<=3 behaviour untouched until the ruling lands.
+  Acceptance: to be written when the owner confirms the logic. Until then this phase stays parked, and 14g records the four-vendor coverage without claiming a four-source blend.

@@ -188,6 +188,58 @@ From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
   shallow clone, because candidate checkouts can't be made from one. Run
   `git fetch --unshallow` first.
 
+## Lint a plan before it runs
+
+Every start lints the plan first — `C-c m r` (a single run, or every entry of a
+program), `tt start` and `tt program start`. The rules live in one place,
+`tradeoffs-trace/src/core/plan-lint.ts`; Emacs mirrors them by calling
+`tt lint <plan.json>`, so there is only one implementation.
+
+```sh
+tt lint plan.json     # the findings; exit 1 if any is an error
+tt lint program.json  # every entry's plan, each finding prefixed with the entry
+```
+
+Two kinds of finding:
+
+- **Error — stops the start.** An acceptance item whose actor is the owner or a
+  human (`the owner records …`, `manually …`, `someone …`). No worker or
+  reviewer can satisfy it. Move it to the plan's `Owner checklist:` list, or
+  rewrite it as an observable result a worker produces. Emacs shows errors in
+  `*tt-plan-errors*` (jump-to-line to the Org file) and starts nothing.
+- **Warning — shown, and the start continues.** An item that depends on a
+  future that does not exist when the checks run and the reviewers judge the
+  candidate (`after merge`, `the current rebased tip`, `once deployed`), or a
+  comparison against a contracted limit with no stated tolerance
+  (`p99 ≤ its contracted interval`). State a fact that is true when the run
+  finishes, or the allowed margin (or the recorded gap a miss becomes).
+
+The measured run is the reason (runtime doc §4): `13j`'s "the owner records a
+live run" parked a phase, and `13i`'s "the recorded live-run SHA is the current
+rebased tip" could never be true, because the rebased tip does not exist until
+the conductor commits the candidate. The existing plans in
+`~/orgw/work/atlas/indexps/` are a lint fixture in the package
+(`tradeoffs-trace/test/fixtures/atlas-plans/`): the linter finds exactly one
+error across them, `13j`'s owner-actor item.
+
+## Owner checklist
+
+A plan may carry the owner's own to-dos next to `Acceptance:`:
+
+```org
+  Acceptance:
+  - the report exists
+  Owner checklist:
+  - record a live run with the five keys exported
+```
+
+`Owner checklist:` items are **not** given to the worker or the reviewers — they
+are never acceptance criteria, so no reviewer blocks a phase for them. Once the
+phase is `DONE`, the status buffer lists them, and `tt summary`'s PR body
+carries them as `- [ ]` items to tick off. Use the list for anything that is the
+owner's to do: a live run with keys, a ruling, a push. That is where the
+linter's error message asks you to move an owner-actor item.
+
 ## Run several phases or plans: programs
 
 A **program** runs several plans, and plans with several phases, as one
@@ -227,7 +279,7 @@ and runs independent phases in parallel.
 
 - Each heading is an **entry**: `:PLAN:` is a plan file (relative to the program file), and `:AFTER:` lists the entries it waits for (all of their phases).
 - A plan file with several phases expands into one node per phase, run in order. Pressing `C-c m r` on such a plan (no program file) runs its phases in order.
-- Start: `C-c m r` in the program buffer, or `tt program start <program.json>`.
+- Start: `C-c m r` in the program buffer, or `tt program start <program.json>`. Every entry's plan is linted first (see above); one error blocks the whole program.
 
 **Branches (stack mode, the default).** Every node publishes to its own branch,
 `<TT_BRANCH>--<node>`:
@@ -241,7 +293,7 @@ and runs independent phases in parallel.
 
 | Where | What |
 |---|---|
-| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive), `k` stops the program, `R` resumes it. It also lists the program's owner directives in force. |
+| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive), `k` stops the program, `R` resumes it. It also lists the program's owner directives in force. |
 | CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program directive <id> <text>`, `tt program withdraw <id> <ODP-n>`, `tt program stop <id>`, `tt program resume <id>` |
 
 **Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
@@ -378,12 +430,48 @@ past run cannot display one either.
 
 | Where | What you see |
 |---|---|
-| status buffer | pipeline with stage times and time left; `time`: where the active agent's time goes (model, polling, full tests) and its running tool; gates for the current candidate; `amended`: every passed or reverted criterion amendment with old → new; each reviewer's **outcome** (`M ✗ 2 reject · 1 blocking`); `verdict`: why the phase did or did not accept, and what happens next |
+| status buffer | pipeline with stage times and time left; `time`: where the active agent's time goes (model, polling, full tests) and its running tool; gates for the current candidate; `amended`: every passed or reverted criterion amendment with old → new; each reviewer's **outcome** (`M ✗ 2 reject · 1 blocking`); `verdict`: why the phase did or did not accept, and what happens next; directly under the verdict, the **Trade-offs** panel and the **cost** row |
+| Trade-offs panel (in the status buffer) | the few trade-offs that matter while the run is live, most important first, at most 6 lines: an owner directive some agent has not received yet; a disputed or amended criterion (old → new); a flagged (reserved) decision and its tally; a decision M vetoed this round, with M's one-line reason; a decision that passed with dissent; and **one** line counting the advisories (`3 advisories (2 new) — C-c m d`) instead of listing them. Each line is self-contained, and `RET` on it opens the decision view at that record. |
+| cost row | what the run has cost so far: rounds, total minutes and per-stage minutes, owner-wait minutes, and a plain estimate for one more round from this phase's own completed rounds (`4 rounds · 106m total · implement 34m · checks 8m · review 30m · owner wait 34m · next round ≈ 14 min`). Per node, `tt program status` and the program buffer show the same in one line: rounds, minutes, owner wait and the node's top trade-off. |
 | trace buffer | one line per tool call (time, command, ✓/✗ exit, duration, last output line), plus `path +a −r` for each file the call changed; the running call in the header. `a` pins another agent. |
-| decision view (`C-c m d`) | the current round's decisions, each labelled by the tally, with the options, recommendation and each reviewer's ballot; a passed amendment reads `⚑ AMENDED` and shows the old → new wording; findings grouped by file; earlier rounds one line each. Read-only. |
+| decision view (`C-c m d`) | the owner directives in force (so `RET` from a directive trade-off line lands on the ruling), then the current round's decisions in the same order as the Trade-offs panel (amendments, flagged, M vetoes, dissent, the rest), each labelled by the tally, with the options, recommendation and each reviewer's ballot; a passed amendment reads `⚑ AMENDED` and shows the old → new wording; the open advisories folded under one `Advisories (N)` heading; other findings grouped by file; earlier rounds one line each. Read-only. |
 | runs list (`C-c m l`) | every run: `RET` opens, `k` stops, `R` resumes |
-| mode line | live runs with stage, time and reviews; a warning face when something needs attention |
+| mode line | live runs with stage, time and reviews; the oldest owner wait (`⚑ 13f waiting 1h12m`) with a warning-face flash when a new notification arrives |
 | CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
+
+## Notifications when something needs you
+
+Nothing waits for the owner by default, so the system tells you when a run has
+stopped making progress on its own:
+
+- A run entering **AWAITING_OWNER** ("needs you") or **BLOCKED**, and a program
+  ending **done** or **stuck**, append one record to
+  `~/.tradeoffs-trace/notifications.jsonl` — the run or program id, its title,
+  the program node (for a node run), a one-line reason, and the time.
+- The same moment, the notifier runs: on macOS an `osascript` banner, and
+  nothing on other platforms. A run parked in AWAITING_OWNER keeps its
+  conductor alive and notifies once more 30 minutes later if the owner has
+  still not acted; a program that ends **stuck** keeps its scheduler watching
+  and does the same, then exits. A program that ends **done** is announced
+  once — it is not waiting on anyone. One wait is never announced twice before
+  that reminder, and each new park (or new stuck program) is a new wait. A
+  notification that fails, or cannot be written, is logged (to the run's log
+  or `scheduler.log`) and ignored; it never stops a run or the scheduler.
+- Emacs watches the file (`core/init-tradeoffs-trace.el`): each new line is
+  shown in the echo area, the mode-line indicator flashes a warning face, and
+  it shows how long the **oldest** wait has lasted (`⚑ 13f waiting 1h12m`).
+- `tt program status` and the program buffer list waiting nodes first, each with
+  `waiting <duration>` and its reason, so one glance says who needs you.
+
+Override the notifier with `TT_NOTIFY_COMMAND` — the shell command the
+conductor and the scheduler run instead of the default. Tests point it at a
+script that appends to a file; on a headless host it can be anything that
+reaches you (a webhook, a mail command, or `:` to disable it). It is a plain
+`sh -c` command with no arguments; read `notifications.jsonl` for the detail.
+
+```sh
+TT_NOTIFY_COMMAND='curl -s -d "tradeoffs-trace needs you" https://ntfy.sh/my-topic' tt program start program.json
+```
 
 ## Steer it
 
@@ -524,6 +612,7 @@ the id does not revert anything.
   ~/.tradeoffs-trace/gate.lock      the machine-wide gate lock (two phases
                                     never run their gate command at once)
   <run>/inbox/{,applied/,rejected/} owner input and commands, with rejection reasons
+  notifications.jsonl               one line per owner wait or finished program (see Notifications)
 ```
 
 ## Troubleshooting

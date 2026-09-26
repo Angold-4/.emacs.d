@@ -1,0 +1,40 @@
+#+TITLE: index-price-service 12.3: the subscriber and adapters emit SourceTick; PriceObservation and the dormant code are deleted
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-fix
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 12, phase 12.3 (one phase per file, PLAN_TEMPLATE.md v1 limit). Serial.
+# Runs after: 12b_calculator_sourcetick.org (12.2). Next: 12d_merge_gate.org. Run order and settled decisions: 12_index.md.
+# References (self-contained with this plan):
+#   ~/orgw/work/atlas/indexps/12_ref_source_tick_contract.md — normative SourceTick, edge rules, settled decisions D1-D6, transitional mapping
+#   ~/orgw/work/atlas/indexps/12_ref_stack_and_findings.md   — pinned SHAs, findings F1-F4, merge-gate commands, P0 merge procedure
+
+* Phase 12.3: the subscriber and adapters emit SourceTick; PriceObservation and the dormant code are deleted
+  :PROPERTIES:
+  :ID:          ips12-subscriber-sourcetick
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-subscriber -p index-calculator -p index-price-service -p oracle-source-pyth -p oracle-source-hyperliquid -p oracle-cex-coinbase -p oracle-source-chainlink && cargo check --workspace --all-targets && cargo xtask check workspace && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/protocol/src/lib.rs crates/modules/index/subscriber/src/listing.rs config/index/listings.yaml Cargo.toml matrix.yaml
+  :RESERVED:    the listing rules (settled D1: `demo: true` only and always on hyperliquid rows; a non-demo row needs genuine vendor event time and cannot be reciprocal); the D3 sheet values (crypto rows rth, FX rows otc_open, oraclePx→mid, the FX rows kept as demo, 29 rows); removal of the School A code and of Chainlink's observation methods (settled D6)
+  :END:
+  Goal: Reference — `12_ref_source_tick_contract.md` §2 and §3. Make the vendor edge emit `SourceTick` natively, so the boundary declared in `docs/atlas/risk/ATLAS - Market Data Subscriber.md` §2 and §2.1 is the actual Rust type. Then delete `PriceObservation` and everything that exists only for it, so exactly one observation shape remains (`~/orgw/work/atlas/indexps/03_inprocess_subscriber_calculator.md`, "one unified observation").
+  Adapters: the Pyth, Coinbase and Hyperliquid driver crates (`crates/modules/oracle/adapters/{source-pyth,cex-coinbase,source-hyperliquid}`) change their observation normalization to return `SourceTick`, and the `index-subscriber` `MarketDataSource` stream carries `SourceTick`. `instrument_id` is the listing key. `price` stays exact. `ts_recv` is the edge receive time. `field`, `session` and `ccy` come from the reviewed listing row. `carried_forward` follows the per-vendor table in `12_ref_source_tick_contract.md` §2: Pyth is true iff `feedUpdateTimestamp < timestampUs`, with `ts_vendor := feedUpdateTimestamp`, and a Pyth update without `feedUpdateTimestamp` is invalid (the fallback to message time is removed); Coinbase is false with the trade time; Hyperliquid is false.
+  Listing (settled D1, D3): rename `demo_session` to `demo`. `demo: true` is required on every Hyperliquid row and forbidden elsewhere. For a demo row the adapter sets `ts_vendor := ts_recv`. A non-demo row with no vendor event time is invalid. `reciprocal: true` is only allowed on a demo row. The loader rejects the session values `crypto_open` and `fx_open` with a named error. In `config/index/listings.yaml`, set the 6 crypto rows to `session: rth` and the 3 FX rows (EUR-USD, JPY-USD, KRW-USD) to `session: otc_open`, keep all 29 rows, and let Hyperliquid `oraclePx` normalize to field `mid`.
+  Edge: the subscriber validates required fields; an invalid tick is dropped and counted per vendor in `invalid_ticks_dropped`, and the health report shows it; there is no de-duplication.
+  Pyth (MDS §5.3, §4.6): stop force-adding `confidence` to the requested properties (`source-pyth/src/source.rs:126`), and report `VerificationStatus::Unverifiable`, not `Pending`.
+  Deletion: delete `subscriber/src/identity.rs`, `ObservationIdentity`, `PriceObservation` and its now-unused companion types in `observation.rs`, the 12.1 bridge, and the `forward_and_cache` bridge call. Also delete the dormant School A code (settled D6): `crates/modules/oracle/calculation/` (crate `oracle-calculation-domain`, removed from the root `Cargo.toml` members and `[workspace.dependencies]` and from `matrix.yaml`), `crates/modules/oracle/application/src/{listing,source}.rs`, `factory::build_observation_sources` and `submitter/offer.rs`. Remove `fetch_observation`, `subscribe_observations` and `observation_descriptor` from `source-chainlink`; Chainlink stays out of the live path, and its legacy report driver and its tests stay.
+  Priorities: honest absence and edge rejection over filling metadata; one observation shape over any compatibility shim; adapters must not depend on each other.
+  Acceptance:
+  - `grep -RE "PriceObservation|ObservationIdentity" crates` is empty and `crates/modules/index/subscriber/src/identity.rs` no longer exists
+  - `oracle-calculation-domain` is absent from the root `Cargo.toml` and from `matrix.yaml`, `crates/modules/oracle/calculation/` no longer exists, and `cargo xtask check workspace` passes
+  - `mds_drops_a_tick_missing_a_required_field` asserts that a native Pyth update without feedUpdateTimestamp is dropped and increments `invalid_ticks_dropped` for vendor pyth
+  - `pyth_carried_forward_does_not_advance_ts_vendor` asserts that feedUpdateTimestamp < timestampUs yields carried_forward true and ts_vendor == feedUpdateTimestamp
+  - `non_demo_row_without_vendor_time_is_invalid` asserts that a Coinbase observation without trade time is dropped, never stamped with receipt time
+  - `demo_row_uses_edge_receipt_time` asserts that a Hyperliquid demo row's SourceTick has ts_vendor == ts_recv and field mid
+  - `listing_rules_for_demo_and_reciprocal` asserts that demo on a non-Hyperliquid row, a Hyperliquid row without demo, and reciprocal on a non-demo row each fail loading with a named error
+  - `legacy_session_values_are_rejected_by_the_loader` asserts that crypto_open and fx_open fail loading with a named error, and the shipped `config/index/listings.yaml` loads with 29 rows, 6 of them session rth with source coinbase and 3 of them session otc_open with demo true
+  - `reciprocal_rows_normalize_exactly` still passes for JPY-USD and KRW-USD as demo rows
+  - `pyth_subscription_requests_no_confidence` asserts that the Pyth subscribe frame's properties contain no confidence
+  - `pyth_verification_is_unverifiable` asserts that the Pyth adapter reports VerificationStatus::Unverifiable
+  - `cargo test -p oracle-source-chainlink` still passes with the legacy driver and no observation methods
+  - `cargo xtask check dep-rules` passes: adapter crates do not depend on each other and the calculator depends on no adapter crate
+  - all existing tests still pass

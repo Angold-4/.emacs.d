@@ -1,0 +1,33 @@
+#+TITLE: index-price-service 13.5: Kaiko adapter: crypto reference rates and capital-markets rates for all 17 markets
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p oracle-source-kaiko -p index-subscriber && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase: starts after 13a_shared_markets.org (13.1) and 13b_adapter_contract.org (13.2) are
+# merged, alongside the other three vendor files (13c-13f). The calculator 13g_calculator_blend.org
+# (13.7) starts only after all four vendor phases merge. This phase touches only the files in its
+# reference §2, so it cannot conflict with them.
+#
+# Self-contained reference (mapping, rules, tests, and the temporary credential in §0):
+#   ~/orgw/work/atlas/indexps/13_ref_vendor_kaiko.md
+# Shared contract it builds on: ~/orgw/work/atlas/indexps/13_ref_shared_contract.md §5.
+# Before the live check: export KAIKO_API_KEY and KAIKO_EQUITIES_API_KEY (values in the reference §0). Never commit a credential.
+
+* Phase 13.5: Kaiko adapter: crypto reference rates and capital-markets rates for all 17 markets
+  :PROPERTIES:
+  :ID:          ips13-kaiko-adapter
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p oracle-source-kaiko -p index-subscriber && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/adapters/source-kaiko/Cargo.toml crates/modules/index/subscriber/src/adapters/kaiko.rs config/index/vendors/kaiko.yaml
+  :RESERVED:    credentials only from KAIKO_API_KEY (crypto) and KAIKO_EQUITIES_API_KEY (capital markets); wrong-instrument codes lit, pump and mu are never used; files outside 13_ref_vendor_kaiko §2
+  :END:
+  Goal: Reference — `13_ref_vendor_kaiko.md` (self-contained) and `13_ref_shared_contract.md` §5. Implement `oracle-source-kaiko` behind the 13.2 seam so Kaiko covers as many of the 17 markets as its products allow, trying every Kaiko product before recording a gap (owner coverage rule). Implement exactly `13_ref_vendor_kaiko.md` §3–§4. Contracted update interval 500 ms–1 s (13_ref_shared_contract §3.1): the `KK_BRR_*` benchmark on `index_v1` publishes only every 5 s, so locate the key's real-time rate product that meets the contract, and keep `KK_BRR_*` only as a recorded fallback. Crypto: the Stream reference-rate endpoint `POST https://gateway-v0-http.kaiko.ovh/api/stream/index_v1` with `X-Api-Key: ${KAIKO_API_KEY}`, read as a long-lived NDJSON stream (the only endpoint this key is entitled to; every REST market-data endpoint returns PermissionDenied). Six codes are verified live (KK_BRR_BTC/ETH/SOL/XRP/NEAR/PUMPFUNUSD); locate HYPE, ZEC and LIT (asset `lighter`, never `lit`, which is Litentry). Metals and equities: the gRPC service `gateway.equ.kaiko.io:443` (`kaiko.equities.EquitiesService`) via tonic with `${KAIKO_EQUITIES_API_KEY}`, with the proto vendored under `source-kaiko/proto/`; if protoc is unavailable, use a pure-Rust path (e.g. protox) or checked-in generated code, recorded in the phase decisions. Locate the codes, which follow the documented pattern `KK_RFR_<SYM>USD`; MU is Micron, never asset `mu`; prefer a spot rate over a futures-implied one where both exist. Decode: price parsed exactly from raw JSON or protobuf, never f64; `ts_vendor` = tsEvent/timestamp; `carried_forward` = timestamp did not advance or `fallbackInfo` is present; field mid; ccy USD; session rth for crypto and from `sessionDetector` for capital markets (REGULAR→rth, or otc_open for metals; EARLY→pre; LATE→ah; OVERNIGHT→overnight; CLOSED→closed), with a fallback to index-calendar. An unknown code fails stop for that row only. Each key disables only its own half. Link state is per transport. Complete `config/index/vendors/kaiko.yaml`: a row for every located code, and a comment naming each remaining gap with the reason. The temporary keys are in §0; export them and never write them into the repository. Touch only the files in `13_ref_vendor_kaiko.md` §2. Every test uses recorded payloads served by a local fixture, so CI needs no key. Priorities: covering all 17 markets or documenting each gap, over speed; exact prices and honest vendor time over convenience; the generic adapter contract of `13_ref_shared_contract.md` §5.
+  Acceptance:
+  - `kaiko_index_v1_fixture_emits_source_tick` drives a recorded NDJSON stream from a local HTTP server and asserts every SourceTick field
+  - `kaiko_capital_markets_fixture_emits_source_tick_with_session` drives a recorded protobuf from a local tonic test server and asserts the sessionDetector mapping
+  - `kaiko_price_is_parsed_exactly` asserts that 4.610970833333333 keeps all 16 significant digits, and `kaiko_carried_forward_on_stale_ts_event_or_fallback` passes
+  - `kaiko_unknown_index_code_is_dropped_at_startup`, `kaiko_each_key_disables_only_its_half` and `kaiko_link_down_is_reported_distinct_from_quiet` pass
+  - `kaiko_fragment_covers_or_documents_all_17_markets` asserts that each of the 17 feed_ids is either a row or a comment naming the gap, that no row uses the codes lit, pump or mu, and that every row declares `price_kind` (`spot` or `futures_implied`) — a futures-implied rate is never tagged `spot`, so the calculator's step-1 product gate can reject it for a spot instrument (13_ref_index_calculator §4 step 1)
+  - the crate docs record endpoints, auth, code families, the session mapping and every located or missing code
+  - the owner live check is recorded in the phase decisions: with both keys exported, which of the 17 markets streamed ticks, which product and rate kind (`spot` or `futures_implied`) each uses, and each market's measured `ts_vendor`-advancement p50/p99 over ≥ 60 s (not message arrival) against the contracted 500 ms–1 s (13_ref_shared_contract §3.1)
+  - `config/index/vendors/kaiko.yaml` has a `cadence:` block with measured `p50_ms`, `p99_ms` and `measured_at` filled in from the live check
+  - all existing tests still pass

@@ -71,6 +71,82 @@
       (with-current-buffer "*tt-plan-errors*"
         (should (string-match-p "tt-plan\\|:5: phase has no :ID:" (buffer-string)))))))
 
+(ert-deftest tradeoffs-trace-plan-owner-checklist ()
+  "Plan 01c: an `Owner checklist:' list parses beside Acceptance, not into it.
+Its items are the owner's, and their lines are recorded for `tt lint'."
+  (let* ((text (concat "#+TITLE: t\n#+TT_REPO: /tmp/x\n#+TT_BRANCH: main\n\n"
+                       "* Phase 1: p\n  :PROPERTIES:\n  :ID: p1\n  :CHECKS: true\n  :END:\n"
+                       "  Goal: g\n  Acceptance:\n  - a worker check\n  - all existing tests still pass\n"
+                       "  Owner checklist:\n  - the owner records a live run\n  - the owner rules on K4\n"))
+         (parsed (+tt-test--parse text))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0)))
+    (should (null (plist-get parsed :errors)))
+    ;; The checklist is not acceptance: the worker and reviewers never see it.
+    (should (equal (alist-get 'acceptance p1) ["a worker check" "all existing tests still pass"]))
+    (should (equal (alist-get 'ownerChecklist p1) ["the owner records a live run" "the owner rules on K4"]))
+    (should (= (length (alist-get 'acceptanceLines p1)) 2))
+    (should (= (length (alist-get 'ownerChecklistLines p1)) 2))
+    ;; The plan records its source file so `tt lint' can name it.
+    (should (equal (alist-get 'sourceFile (plist-get parsed :plan)) "/tmp/tt-ert-plan.org"))
+    ;; A plan without the list has no ownerChecklist key.
+    (should-not (assq 'ownerChecklist
+                      (aref (alist-get 'phases (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)) 0)))))
+
+(ert-deftest tradeoffs-trace-plan-lint-blocks-run ()
+  "Plan 01c: a lint error shown by `tt lint' blocks `+tt-run'.
+Emacs mirrors the one implementation by shelling out: `+tt--cli' is stubbed
+the way a lint failure would behave, and no run may start."
+  (let ((started nil) (linted nil))
+    (cl-letf (((symbol-function '+tt--cli)
+               (lambda (cmd &rest _)
+                 (if (equal cmd "lint")
+                     (progn (setq linted t)
+                            (error "tt lint failed: PLAN.org:39: error: [p1] the owner is the actor"))
+                   (setq started t)
+                   "run-id"))))
+      (with-temp-buffer
+        (insert +tt-test--valid-plan)
+        (setq buffer-file-name "/tmp/tt-ert-lint-plan.org")
+        (org-mode)
+        (+tt-run)
+        (set-buffer-modified-p nil)
+        (setq buffer-file-name nil)))
+    (should linted)
+    (should-not started)
+    (with-current-buffer "*tt-plan-errors*"
+      (should (string-match-p "PLAN\\.org:39: error" (buffer-string))))))
+
+(ert-deftest tradeoffs-trace-status-owner-checklist ()
+  "Plan 01c: the status buffer shows the owner checklist once DONE, and only
+then.  It is never part of the worker's or a reviewer's acceptance."
+  (let* ((plan (list (cons 'title "split")
+                     (cons 'phases
+                           (list (list (cons 'id "13.10") (cons 'goal "g")
+                                       (cons 'acceptance nil)
+                                       (cons 'ownerChecklist (list "the owner records a live run"
+                                                                   "the owner rules on K4")))))))
+         (state-for (lambda (name)
+                      `((meta (title . "split"))
+                        (conductorAlive . :false)
+                        (ownerInputs) (pendingOwnerInputs)
+                        (secrets (declared) (missing) (tooShort))
+                        (plan . ,plan)
+                        (state (run . "RUN_ACTIVE")
+                               (phase (phaseId . "13.10") (phase . ,name) (attempt (n . 1))
+                                      (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
+                        (view (elapsed . "1m") (round . 1) (pipeline . ,name)
+                              (reviewLine . "M ✓   A ✓   B ✓")
+                              (liveDecisions . 0) (failedDecisions . 0)
+                              (flaggedDecisions . 0) (openFindings . 0)
+                              (boundaryFilesChanged . 0))))))
+    (with-temp-buffer
+      (+tt--render-status-from (funcall state-for "DONE") "/tmp/tt-ert/abcd1234")
+      (should (string-match-p "Owner checklist (2)" (buffer-string)))
+      (should (string-match-p "- the owner records a live run" (buffer-string))))
+    (with-temp-buffer
+      (+tt--render-status-from (funcall state-for "REVIEWING") "/tmp/tt-ert/abcd1234")
+      (should-not (string-match-p "Owner checklist" (buffer-string))))))
+
 (defun +tt-test--make-run (root id &optional plan-path)
   "Create a fake run ID under ROOT, optionally recording PLAN-PATH."
   (let ((dir (expand-file-name id root)))
@@ -641,6 +717,103 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (setenv "TT" nil)
       (delete-directory root t))))
 
+(ert-deftest tradeoffs-trace-mode-line-wait ()
+  "Plan 01b: the mode-line segment names the oldest waiting program node."
+  (let ((fixture
+         (concat "[{\"id\":\"p1\",\"title\":\"plan 13\",\"waiting\":["
+                 "{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\","
+                 "\"duration\":\"1h12m\",\"reason\":\"the repair budget ran out\"}]}]")))
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) fixture)))
+      (let ((+tt--notify-flash nil))
+        (should (equal (+tt--mode-line-wait) " [⚑ 13f waiting 1h12m]"))))
+    ;; No program waiting: no segment.
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) "[]")))
+      (should (null (+tt--mode-line-wait))))))
+
+(ert-deftest tradeoffs-trace-notification-echo ()
+  "Plan 01b: each new notifications.jsonl line is shown in the echo area once."
+  (let* ((file (make-temp-file "tt-ert-notify" nil ".jsonl"))
+         (messages nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "{\"id\":\"r1\",\"kind\":\"run\",\"title\":\"13f vendor\","
+                    "\"node\":\"13f\",\"reason\":\"the repair budget ran out\","
+                    "\"at\":\"2026-09-24T04:59:00.000Z\"}\n"))
+          (let ((+tt--notifications-file file)
+                (+tt--notifications-offset 0)
+                (+tt--notify-flash nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+              (+tt--notifications-poll)
+              (should (= 1 (length messages)))
+              (should (string-match-p "the repair budget ran out" (car messages)))
+              (should (string-match-p "13f" (car messages)))
+              ;; The line was consumed: a second poll shows nothing again.
+              (+tt--notifications-poll)
+              (should (= 1 (length messages)))
+              ;; A later append is shown too.
+              (with-temp-file file
+                (insert "{\"id\":\"r1\",\"kind\":\"run\",\"title\":\"13f vendor\","
+                        "\"node\":\"13f\",\"reason\":\"still waiting\","
+                        "\"at\":\"2026-09-24T05:59:00.000Z\"}\n"))
+              (setq +tt--notifications-offset 0)
+              (+tt--notifications-poll)
+              (should (= 2 (length messages)))
+              (should (string-match-p "still waiting" (car messages))))))
+      (delete-file file))))
+
+(ert-deftest tradeoffs-trace-notification-no-replay ()
+  "Plan 01b: a line already in the file when Emacs starts is not shown."
+  (let* ((file (make-temp-file "tt-ert-notify-old" nil ".jsonl"))
+         (messages nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "{\"id\":\"old\",\"kind\":\"run\",\"title\":\"old\","
+                    "\"reason\":\"before Emacs started\"}\n"))
+          (let ((+tt--notifications-file file)
+                (+tt--notifications-offset nil)
+                (+tt--notify-flash nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+              (+tt--notifications-poll)
+              (should (null messages)))))
+      (delete-file file))))
+
+(ert-deftest tradeoffs-trace-notification-multibyte-offset ()
+  "Plan 01b: a multi-byte reason leaves the offset at the file's byte end."
+  (let* ((file (make-temp-file "tt-ert-notify-mb" nil ".jsonl"))
+         (messages nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "{\"id\":\"r1\",\"kind\":\"run\",\"title\":\"café — 13f\","
+                    "\"node\":\"13f\",\"reason\":\"waiting…\"}\n"))
+          (let ((+tt--notifications-file file)
+                (+tt--notifications-offset 0)
+                (+tt--notify-flash nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+              (+tt--notifications-poll)
+              (should (= 1 (length messages)))
+              ;; The offset must be a BYTE position at the file's end, or the
+              ;; next poll re-reads text inside a line it already showed.
+              (should (= +tt--notifications-offset (file-attribute-size (file-attributes file))))
+              (+tt--notifications-poll)
+              (should (= 1 (length messages))))))
+      (delete-file file))))
+
+(ert-deftest tradeoffs-trace-mode-line-wait-without-live-run ()
+  "Plan 01b: a waiting node whose run conductor is gone still shows its wait."
+  (let ((fixture "[{\"id\":\"p1\",\"waiting\":[{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\",\"duration\":\"1h12m\"}]}]"))
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) fixture))
+              ((symbol-function '+tt--runs) (lambda () (list "/nonexistent-tt-run")))
+              ((symbol-function '+tt--live-run-p) (lambda (_) nil)))
+      (let ((+tt--notify-flash nil))
+        (+tt--mode-line-update)
+        (should (string-match-p "⚑ 13f waiting 1h12m" +tt--mode-line-string))))))
+
 (defconst +tt-test--amended-state
   '((meta (title . "sum validation"))
     (state (run . "RUN_ACTIVE")
@@ -731,6 +904,205 @@ so the view never claims the replacement is still in force (A-14)."
               (proposedWording . "the tests pass") (status . "applied")))
          (d `((amendment . ,a))))
     (should (equal (+tt--amendment-line d) "  it works → the tests pass\n"))))
+
+;;; Plan 01h: the live trade-offs panel and the cost meter
+
+(defconst +tt-test--tradeoff-state
+  '((meta (title . "sum validation"))
+    (conductorAlive . :false)
+    (ownerInputs) (pendingOwnerInputs)
+    (secrets (declared) (missing) (tooShort))
+    (plan (title . "sum") (phases . (((id . "p1") (goal . "g") (acceptance) (ownerChecklist)))))
+    (state (run . "RUN_ACTIVE")
+           (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 2))
+                  (repairRoundsUsed . 1) (repairRoundsGranted . 3)
+                  (candidate (sha . "7c1e0a4aaaaaaaa"))
+                  (decisions ((id . "D-p1-1") (class . "delegated")
+                              (choice . "Batch cancels per tick") (whyItMatters . "w")
+                              (alternatives ((option . "a") (consequence . "b")))
+                              (recommendation (choice . "a") (reason . "b")))
+                             ((id . "D-p1-flag") (class . "reserved")
+                              (choice . "Errors are thrown, not returned") (whyItMatters . "w")
+                              (alternatives ((option . "a") (consequence . "b")))
+                              (recommendation (choice . "a") (reason . "b"))))
+                  (ballots)
+                  (findings ((id . "F-p1-M-2") (severity . "advisory") (status . "open")
+                             (raisedBy . "M")
+                             (evidence . "src/sum.js:9 a slow path. It returns NaN to callers.")))
+                  (ownerRequests)))
+    (decisionStatuses (D-p1-1 (status . "failed") (reason . "M veto"))
+                      (D-p1-flag (status . "passed") (flagged . t)))
+    (view (elapsed . "1m02s") (round . 2)
+          (pipeline . "review 12s… (14m48s left)")
+          (reviewLine . "M ✗ 1 reject   A ✓   B ✓")
+          (verdict . "not accepted: D-1 vetoed by M → repair attempt 2")
+          (liveDecisions . 2) (failedDecisions . 1) (flaggedDecisions . 1)
+          (openFindings . 1) (boundaryFilesChanged . 0)
+          (needsYou . 0)
+          (tradeoffs ((kind . "flagged") (recordId . "D-p1-flag")
+                      (text . "⚑ flagged: D-flag Errors are thrown, not returned — passed"))
+                     ((kind . "veto") (recordId . "D-p1-1")
+                      (text . "vetoed by M: D-1 Batch cancels per tick — a lone cancel waits a tick"))
+                     ((kind . "advisories") (recordId . "F-p1-M-2")
+                      (text . "1 advisories (1 new) — C-c m d")))
+          (cost (rounds . 2) (totalMinutes . 106) (ownerWaitMinutes . 34)
+                (nextRoundMinutes . 14)
+                (text . "2 rounds · 106m total · implement 34m · review 30m · owner wait 34m · next round ≈ 14 min"))
+          (rounds)))
+  "A plan 01h `tt state': a Trade-offs panel, a cost row and the records they name.")
+
+(defun +tt-test--without-tradeoffs ()
+  "The plan 01h fixture as a run from before the stage: no tradeoffs/cost."
+  (let ((s (copy-tree +tt-test--tradeoff-state)))
+    (setf (alist-get 'tradeoffs (alist-get 'view s)) nil)
+    (setf (alist-get 'cost (alist-get 'view s)) nil)
+    s))
+
+(ert-deftest tradeoffs-trace-status-tradeoffs-and-cost ()
+  "Plan 01h: the status buffer renders the Trade-offs section directly under
+ the verdict and the cost row; each trade-off line carries its record for RET."
+  (with-temp-buffer
+    (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
+    (let ((text (buffer-string)))
+      (should (string-match-p "Trade-offs (3)" text))
+      (should (string-match-p "⚑ flagged: D-flag Errors are thrown, not returned — passed" text))
+      (should (string-match-p "vetoed by M: D-1 Batch cancels per tick — a lone cancel waits a tick" text))
+      (should (string-match-p "1 advisories (1 new) — C-c m d" text))
+      (should (string-match-p "cost .*2 rounds · 106m total · implement 34m · review 30m · owner wait 34m · next round ≈ 14 min" text))
+      (should (< (string-match-p "verdict" text) (string-match-p "Trade-offs" text)))))
+  ;; RET finds the record on the line, without printing it.
+  (let (record)
+    (cl-letf (((symbol-function '+tt-decisions) (lambda (&optional r) (setq record r))))
+      (with-temp-buffer
+        (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (search-forward "vetoed by M: D-1")
+        (goto-char (match-beginning 0))
+        (+tt-open-tradeoff)
+        (should (equal record "D-p1-1"))))))
+
+(ert-deftest tradeoffs-trace-status-omits-empty-tradeoffs ()
+  "Plan 01h: a run from before the stage (no `tradeoffs'/`cost' in the view)
+renders as before; an empty Trade-offs section is omitted too."
+  (with-temp-buffer
+    (+tt--render-status-from (+tt-test--without-tradeoffs) "/tmp/tt-ert/abcd1234")
+    (should-not (string-match-p "Trade-offs" (buffer-string)))
+    (should-not (string-match-p "^cost" (buffer-string)))
+    (should (string-match-p "verdict" (buffer-string))))
+  (with-temp-buffer
+    (let ((s (copy-tree +tt-test--tradeoff-state)))
+      (setf (alist-get 'tradeoffs (alist-get 'view s)) nil)
+      (+tt--render-status-from s "/tmp/tt-ert/abcd1234")
+      (should-not (string-match-p "Trade-offs" (buffer-string))))))
+
+(ert-deftest tradeoffs-trace-decision-view-follows-tradeoff-order ()
+  "Plan 01h: the decision view keeps the Trade-offs order (flagged before a
+vetoed decision here) and folds the advisories under one heading with the
+count; each block carries its record so RET can land on it."
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--tradeoff-state)
+    (let ((text (buffer-string)))
+      (should (< (string-match-p "ACCEPTED ⚑ FLAGGED" text)
+                 (string-match-p "REJECTED (M veto)" text)))
+      (should (string-match-p "\\* Advisories (1) — accepted, not fixed" text))
+      (should (string-match-p "\\*\\* ADVISORY src/sum.js:9 a slow path — M" text))
+      ;; The advisories are not listed again as blocking findings.
+      (should-not (string-match-p "Findings (" text)))
+    (goto-char (point-min))
+    (should (+tt--goto-record "D-p1-1"))
+    (should (looking-at "\\* REJECTED (M veto)"))
+    (goto-char (point-min))
+    (should (+tt--goto-record "F-p1-M-2"))
+    (should (looking-at "\\*\\* ADVISORY"))
+    ;; A record the view does not carry is not an error, just not found.
+    (goto-char (point-min))
+    (should-not (+tt--goto-record "D-missing"))))
+
+(ert-deftest tradeoffs-trace-decision-view-reveals-the-record ()
+  "Plan 01h (M-4): `+tt-decisions' folds to level 1 before RET's jump runs,
+ so a level-2 advisory must be revealed by the jump instead of staying
+hidden under the Advisories heading."
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--tradeoff-state)
+    (org-mode)
+    (org-content 1)
+    (goto-char (point-min))
+    (should (+tt--goto-record "F-p1-M-2"))
+    (should (looking-at "\\*\\* ADVISORY"))
+    (should-not (get-char-property (point) 'invisible))))
+
+(defconst +tt-test--directive-tradeoff-state
+  '((meta (title . "sum validation"))
+    (conductorAlive . :false)
+    (ownerInputs) (pendingOwnerInputs)
+    (secrets (declared) (missing) (tooShort))
+    (state (run . "RUN_ACTIVE")
+           (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 2))
+                  (candidate (sha . "7c1e0a4aaaaaaaa"))
+                  (decisions) (ballots) (findings) (ownerRequests)
+                  (ownerDirectives ((id . "OD-1") (seq . 1)
+                                    (text . "the 14 exchange-state-machine failures are pre-existing, not yours")
+                                    (scope . "phase") (status . "in-force")
+                                    (targets "worker" "M")
+                                    (deliveries (worker . "delivered"))))))
+    (decisionStatuses)
+    (view (elapsed . "1m02s") (round . 2) (pipeline . "review 12s")
+          (reviewLine . "M ✓   A ✓   B ✓")
+          (verdict . "not accepted: the checks kept failing → repair attempt 2")
+          (liveDecisions . 0) (failedDecisions . 0) (flaggedDecisions . 0)
+          (openFindings . 0) (boundaryFilesChanged . 0) (needsYou . 0)
+          (tradeoffs ((kind . "directive") (recordId . "OD-1")
+                      (text . "directive OD-1 not yet delivered to M: the 14 exchange-state-machine failures are pre-existing, not yours")))
+          (cost (text . "2 rounds · 20m total"))
+          (rounds)))
+  "Plan 01h: a directive Trade-offs line and the directive record it names.")
+
+(ert-deftest tradeoffs-trace-tradeoff-directive-ret ()
+  "Plan 01h (M-3): RET on a directive's Trade-offs line opens the decision
+view on that directive's own record, which the view now carries."
+  (with-temp-buffer
+    (+tt--render-status-from +tt-test--directive-tradeoff-state "/tmp/tt-ert/abcd1234")
+    (should (string-match-p "Trade-offs (1)" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "not yet delivered")
+    (should (equal (get-text-property (match-beginning 0) '+tt-record) "OD-1")))
+  (let (record)
+    (cl-letf (((symbol-function '+tt-decisions) (lambda (&optional r) (setq record r))))
+      (with-temp-buffer
+        (+tt--render-status-from +tt-test--directive-tradeoff-state "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (search-forward "not yet delivered")
+        (goto-char (match-beginning 0))
+        (+tt-open-tradeoff)
+        (should (equal record "OD-1")))))
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--directive-tradeoff-state)
+    (org-mode)
+    (org-content 1)
+    (should (string-match-p "\\* Owner directives (1)" (buffer-string)))
+    (goto-char (point-min))
+    (should (+tt--goto-record "OD-1"))
+    (should (looking-at "\\*\\* OD-1"))
+    (should-not (get-char-property (point) 'invisible))))
+
+(ert-deftest tradeoffs-trace-status-ret-without-a-record-is-inert ()
+  "Plan 01h (B-5): RET on a status row that is not a Trade-offs line stays as
+inert as it was before the key existed — no error, and nothing opened."
+  (let ((called nil))
+    (cl-letf (((symbol-function '+tt-decisions) (lambda (&optional _) (setq called t))))
+      (with-temp-buffer
+        (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (search-forward "pipeline")
+        (goto-char (match-beginning 0))
+        (+tt-open-tradeoff)
+        (should-not called)
+        ;; …and on a plain row of a run from before this stage.
+        (erase-buffer)
+        (+tt--render-status-from (+tt-test--without-tradeoffs) "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (+tt-open-tradeoff)
+        (should-not called)))))
 
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

@@ -1,0 +1,30 @@
+#+TITLE: index-price-service 12.4: executable 33-market check and final gate
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-fix
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 12, phase 12.4 (one phase per file, PLAN_TEMPLATE.md v1 limit). Serial.
+# Runs after: 12c_subscriber_sourcetick.org (12.3). Next: 13a_shared_markets.org (plan 13). Run order and settled decisions: 12_index.md.
+# References (self-contained with this plan):
+#   ~/orgw/work/atlas/indexps/12_ref_source_tick_contract.md — normative SourceTick, edge rules, settled decisions D1-D6, transitional mapping
+#   ~/orgw/work/atlas/indexps/12_ref_stack_and_findings.md   — pinned SHAs, findings F1-F4, merge-gate commands, P0 merge procedure
+
+* Phase 12.4: executable 33-market check and final gate after the SourceTick refactor
+  :PROPERTIES:
+  :ID:          ips12-merge-gate
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-subscriber -p execution-event && cargo xtask check workspace && cargo xtask check dep-rules && PATH="$HOME/.cargo/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo -Zscript --quiet scripts/build-manifest-gen.rs --check
+  :BOUNDARIES:  crates/modules/index/subscriber/tests/** config/index/listings.yaml
+  :RESERVED:    the 33-market sharing and protocol rules of 08_33_market_ledger.md; the Borsh discriminant order fixed in P0 (RequestCompletion 8, AppliedIndexPrice 9); sender_account_id 196608
+  :END:
+  Goal: Reference — `12_ref_stack_and_findings.md` §3 (F3) and §4, and `~/orgw/work/atlas/indexps/08_33_market_ledger.md`.
+  The stack is already merged into `feat/atlas` (P0, `12_ref_stack_and_findings.md` §6), with F1 (Borsh tag order) and F2 (#1202 sender account) fixed before the merge. F4 was closed by 12c. This phase closes the last finding and proves plan 12 is complete, so plan 13 starts from a clean `feat/atlas`.
+  F3: add the executable check `catalog_33_markets_resolve_without_duplicate_index_publishers` in `crates/modules/index/subscriber/tests/catalog_33_markets.rs`. It reads `config/genesis.yaml`, `config/dev-markets.yaml`, `config/services.yaml` (`trade_generator.markets`) and `config/index/listings.yaml`, and applies the 08 ledger's rules: market 0 RESERVED and markets 1–2 share NATIVE asset 1 (a protocol constant); USDT asset 2 is the quote protocol constant; BTC-USDT spot shares BTC-USD asset 3; every other market's base asset has exactly one listing row. The sheet has 29 rows, including the 3 FX demo rows (12_ref_source_tick_contract D3).
+  Final gate: the full §4 gate is green on the branch after 12a–12c, and the P0 fixes are still intact.
+  Priorities: never weaken an existing assertion to pass the gate; the P0 compatibility fixes stay exactly as merged.
+  Acceptance:
+  - `catalog_33_markets_resolve_without_duplicate_index_publishers` passes, names all 33 market ids 0–32, and fails if any market resolves to no row and no rule or to two listing rows
+  - the P0 tests still pass unchanged: `request_completion_keeps_tag_8_and_applied_index_appends_tag_9`, `upstream_request_completion_frame_decodes_across_versions`, `applied_index_fixture_survives_the_tag_swap` and `index_service_sender_account_matches_oracle_account_id`
+  - `git merge-base --is-ancestor <P0_MERGED> HEAD` exits 0 for the P0_MERGED recorded in `12_ref_stack_and_findings.md` §6
+  - `cargo fmt --all -- --check`, `cargo xtask check workspace`, `cargo xtask check dep-rules`, the build-manifest freshness check, `cargo check --workspace --all-targets` and `cargo test --workspace` all pass
+  - the owner end-to-end gate is run and recorded with the code SHA and image IDs: `deploy/atlas.sh apply --target local --profile demo --clean --build`, then `deploy/atlas.sh verify --plan active` reports READY, exactly one `index-price-service` publisher runs, stream 215 shows applied INDEX advancing across two samples a minute apart, and `bash scripts/index-fixture-smoke.sh` exits 0 (or 6 with the quiet-feed reason recorded)
+  - all existing tests still pass

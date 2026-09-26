@@ -1,0 +1,24 @@
+#+TITLE: index-price-service 14.6: enforce one publisher for real, and decide the replica-0 SPOF
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p index-subscriber-service -p index-calculator-service && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase. Findings F4 and F6 of 14_ref_split_findings.md. F4 needs an owner decision.
+
+* Phase 14.6: the single-publisher guarantee is tested, and K4's single point of failure is decided
+  :PROPERTIES:
+  :ID:          ips14-publisher-guarantee
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-subscriber-service -p index-calculator-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/services/index/index-calculator-service/** crates/services/index/index-subscriber-service/tests/** docker/docker-compose.yml deploy/lib/*.sh
+  :RESERVED:    one publisher at a time (K5); the replica layout K4 (3 subscribers; non-Pyth vendors where the owner decides); no two publishers live during a rollout
+  :END:
+  Goal: Reference — `14_ref_split_findings.md` F4, F6 and `13_ref_process_split.md` K4/K5.
+  Two gaps the plan-13 acceptance named and the implementation did not reach. **K5:** "exactly one publisher" is enforced only by `atlas.sh` choosing Compose profiles — the test that was asked for ("start both publishers, assert only one submits") shipped as a static YAML check, the rollout test asserts `deploy.update_config` (a Swarm-only key plain Compose ignores), and no Kubernetes manifest exists. Make the guarantee real at runtime: start the in-process publisher and the split publisher together in a test and assert exactly one submits (the other fails closed), and make the rollout assertion meaningful for the topology actually used, or record explicitly that deployment-level exclusivity is the only mechanism and why that is acceptable.
+  **K4:** replica 0 owns Stork, Kaiko and Redstone, so it is a single point of failure for everything except Pyth — measured: stopping it drops all 17 markets to `n=1 degraded` within 15 s, and it also exits on any single publish error. This is the design working as written, so the phase must **state the decision** rather than silently keep it: either accept the SPOF (recorded, with its blast radius) or spread the non-Pyth vendors across replicas and update the fragments, the replica configs, and the readiness expectations together. Owner input is expected here.
+  Priorities: a runtime guarantee over a config assertion; an explicit decision over an inherited default.
+  Acceptance:
+  - `only_one_publisher_submits_when_both_are_started` starts both publishers and asserts exactly one submits, the other fails closed
+  - `rollout_never_overlaps_publishers` asserts the property for the deployment mechanism actually used, or the phase records the accepted alternative as a decision
+  - `vendor_placement_matches_the_k4_decision` asserts the replica configs match whichever K4 layout the owner rules on, and that every market still reaches `n>=2` with one replica down when the chosen layout promises it
+  - the owner's K4 ruling is recorded in the phase decisions with its blast radius
+  - all existing tests still pass

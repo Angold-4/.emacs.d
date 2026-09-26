@@ -13,7 +13,7 @@ import { effectiveChecks } from "./core/checks.ts";
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
-import { notAcceptedReasons, reviewerOutcomes, type ReviewerOutcome } from "./core/verdict.ts";
+import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
 import type { PhaseState } from "./core/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -342,9 +342,95 @@ export interface RunView {
   flaggedDecisions: number;
   openFindings: number;
   needsYou: number;
+  /** Plan 01h: the few trade-offs that matter while the run is live, most
+   * important first, at most 6. Undefined when there is nothing to show. */
+  tradeoffs?: TradeoffEntry[];
+  /** Plan 01h: what the run costs so far (rounds, minutes, owner wait) and a
+   * plain estimate for one more round from this phase's own history. */
+  cost?: RunCost;
   /** Minutes since the active agent last produced an event (agent stages only). */
   idleMinutes?: number;
   attention?: string;
+}
+
+/** Plan 01h: what the run costs so far. `stageMinutes` excludes `needs you`,
+ * which is reported separately as `ownerWaitMinutes`. */
+export interface RunCost {
+  /** Completed rounds plus the one in progress (the current candidate). */
+  rounds: number;
+  totalMinutes: number;
+  stageMinutes: { stage: string; minutes: number }[];
+  ownerWaitMinutes: number;
+  /** Median minutes of this phase's completed rounds — the plain estimate
+   * `next round ≈ N min`. Undefined when no round has completed yet. */
+  nextRoundMinutes?: number;
+  /** The one-line summary the status buffer and `tt program status` render. */
+  text: string;
+}
+
+/** Round start times: every CHECKING phase entry that a FREEZING entry
+ * immediately precedes is a candidate being reviewed (FREEZE_COMPLETED is
+ * FREEZING → CHECKING). A CHECKING re-entry from AMEND/CRITERION_REVERTED is
+ * preceded by some other stage and is not a new round. */
+function roundStarts(timeline: Timeline): string[] {
+  const starts: string[] = [];
+  for (let i = 1; i < timeline.phases.length; i++) {
+    if (timeline.phases[i].phase === "CHECKING" && timeline.phases[i - 1].phase === "FREEZING") {
+      starts.push(timeline.phases[i].at);
+    }
+  }
+  return starts;
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** Plan 01h: the cost meter. Rounds and per-stage minutes come from the
+ * timeline's own stage spans; a completed round is the gap between one
+ * candidate's freeze and the next (a round's checks, probe, review, resolve,
+ * gate and repair implementation all count), and the phase's last round is
+ * only complete once it ends DONE or BLOCKED. */
+export function runCost(timeline: Timeline, spans: StageSpan[], now: Date): RunCost {
+  const phase = timeline.state.phase;
+  const round = timeline.rounds.length + (phase.candidate ? 1 : 0);
+  const starts = roundStarts(timeline);
+  const durations: number[] = [];
+  for (let i = 0; i + 1 < starts.length; i++) durations.push(Date.parse(starts[i + 1]) - Date.parse(starts[i]));
+  const ended = phase.phase === "DONE" || phase.phase === "BLOCKED";
+  if (ended && starts.length > 0) {
+    const last = timeline.phases[timeline.phases.length - 1]?.at;
+    if (last) durations.push(Date.parse(last) - Date.parse(starts[starts.length - 1]));
+  }
+  const nextRoundMinutes = durations.length > 0 ? Math.round(median(durations) / 60_000) : undefined;
+
+  const byStage = new Map<string, number>();
+  for (const s of spans) byStage.set(s.stage, (byStage.get(s.stage) ?? 0) + s.ms);
+  const ownerWaitMinutes = Math.round((byStage.get("needs you") ?? 0) / 60_000);
+  byStage.delete("needs you");
+  const stageMinutes = [...byStage.entries()]
+    .map(([stage, ms]) => ({ stage, minutes: Math.round(ms / 60_000) }))
+    .filter((s) => s.minutes > 0)
+    .sort((a, b) => b.minutes - a.minutes);
+  const totalMinutes = Math.round([...byStage.values()].reduce((a, b) => a + b, 0) / 60_000) + ownerWaitMinutes;
+
+  const parts = [
+    `${round} round${round === 1 ? "" : "s"}`,
+    `${totalMinutes}m total`,
+    ...stageMinutes.map((s) => `${s.stage} ${s.minutes}m`),
+  ];
+  if (ownerWaitMinutes > 0) parts.push(`owner wait ${ownerWaitMinutes}m`);
+  if (nextRoundMinutes !== undefined) parts.push(`next round ≈ ${nextRoundMinutes} min`);
+  return {
+    rounds: round,
+    totalMinutes,
+    stageMinutes,
+    ownerWaitMinutes,
+    ...(nextRoundMinutes !== undefined ? { nextRoundMinutes } : {}),
+    text: parts.join(" · "),
+  };
 }
 
 export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now = new Date()): RunView & { timeline: Timeline } {
@@ -449,6 +535,10 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
 
   const firstAt = timeline.phases[0]?.at;
   const endAt = phase.phase === "DONE" || phase.phase === "BLOCKED" ? Date.parse(timeline.phases[timeline.phases.length - 1].at) : now.getTime();
+  // Plan 01h: the live trade-offs panel and the cost meter. Both come from
+  // this phase's own records (verdict.ts's tradeoffEntries and runCost).
+  const tradeoffs = tradeoffEntries(phase);
+  const cost = runCost(timeline, spans, now);
   return {
     timeline,
     stage,
@@ -473,6 +563,8 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     flaggedDecisions: flagged,
     amendments: amendmentLine,
     amendedCount,
+    ...(tradeoffs.length > 0 ? { tradeoffs } : {}),
+    cost,
     openFindings,
     needsYou,
     idleMinutes,
@@ -618,6 +710,15 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
   ];
+  // Plan 01c: the owner's own checklist (from the plan's `Owner checklist:`
+  // list). It is not a worker/reviewer acceptance criterion, so it is not
+  // judged in the loop; the PR body carries it as an open checklist for the
+  // owner to tick off.
+  const ownerChecklist = plan.phases[0]?.ownerChecklist ?? [];
+  if (ownerChecklist.length > 0) {
+    lines.push("", "### Owner checklist", "");
+    for (const item of ownerChecklist) lines.push(`- [ ] ${item}`);
+  }
   if (amendments.length > 0) {
     lines.push("", "### Amended acceptance criteria", "");
     for (const d of amendments) {

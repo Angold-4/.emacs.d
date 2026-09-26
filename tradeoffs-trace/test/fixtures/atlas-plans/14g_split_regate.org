@@ -1,0 +1,28 @@
+#+TITLE: index-price-service 14.7: the split re-gate — restart, outage and load, live
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules && cargo test -p index-subscriber -p index-calculator -p index-price-service -p index-subscriber-service -p index-calculator-service -p oracle-source-redstone -p oracle-source-kaiko && PATH="$HOME/.cargo/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo -Zscript --quiet scripts/build-manifest-gen.rs --check
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Serial gate. Runs after 14a-14f are all merged. It is the first live run with the fourth vendor
+# active and the first that exercises restart, outage and load deliberately.
+
+* Phase 14.7: the fourth vendor and the robustness fixes, proved on one live stack
+  :PROPERTIES:
+  :ID:          ips14-split-regate
+  :CHECKS:      cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules && cargo test -p index-subscriber -p index-calculator -p index-price-service -p index-subscriber-service -p index-calculator-service -p oracle-source-redstone -p oracle-source-kaiko && PATH="$HOME/.cargo/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo -Zscript --quiet scripts/build-manifest-gen.rs --check
+  :BOUNDARIES:  config/index/** Cargo.toml Cargo.lock docker/docker-compose.yml deploy/lib/*.sh
+  :RESERVED:    the 17 markets and ids; the coverage rule (gaps are recorded, not papered over); no credential value committed; per-market cadence and coverage as measured, never as announced
+  :END:
+  Goal: Reference — `14_ref_split_findings.md`, `14_ref_vendor_redstone_live.md`, `14_ref_vendor_kaiko_hfr.md` and `13_ref_process_split.md` §3.
+  Prove the whole stack again, now with four vendors and a split that survives being disturbed. Fix integration faults minimally, each justified by a failing check; a fault belonging to one vendor's rules is recorded for that vendor rather than patched around here.
+  Live runs to record, in one phase: (1) the `ips-split` steady state with the keys exported — every market's `n`, `quality`, `regime` and whether the applied INDEX advanced, over two samples a minute apart, against the plan-13 baseline; (2) a **calculator restart** — wall-clock to a fresh offer on all 17 markets, and proof that the window shows held rather than unknown; (3) a **Kafka outage** of ≥ 60 s — held offers throughout, recovery without a restart; (4) the **load** measurement — per-replica publish rate and consumer lag at the shipped market count, with the headroom recorded.
+  Then refresh `config/index/COVERAGE.md` from the fragments as they now stand: each market × vendor cell as row, owner exception, carried or gap, with the reason — and state plainly that **SPY/VOO/IVV/SPLG are a licence gap** and that the four-vendor blend is **not yet** implemented (14h).
+  Priorities: a truthful gate over a green one; recorded gaps over substitution; no credential in the repository.
+  Acceptance:
+  - `coverage_report_matches_fragments` and `catalog_17_markets_resolve_to_one_instrument_each` still pass
+  - `four_vendor_coverage_is_recorded` asserts every market has a row or a named gap for each of the four vendors, and that each market's qualifying-row count is stated
+  - `restart_recovery_is_recorded` asserts the recorded restart evidence is present and within the 14.3 bound
+  - `outage_holds_and_recovers_is_recorded` asserts the recorded outage evidence shows held offers and no restart
+  - the owner live gate is recorded in the phase decisions: `deploy/atlas.sh apply --target local --profile ips-split --clean --build`, `verify` READY, `index_publishers == 1`, and for each of the 17 markets `n >= 2` (or a named gap), with the code SHA and image IDs
+  - `grep -rnE "EytzDzmH|bGF5ZXJ6ZXJv|79fe0514|ec508556|793121af" .` finds nothing
+  - all existing tests still pass
