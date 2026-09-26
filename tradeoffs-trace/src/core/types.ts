@@ -303,6 +303,11 @@ export interface Message {
   /** Plan 04a: how important the evaluator judged this message
    * (high|medium|low). Metadata, not part of the reviewable contentHash. */
   importance?: "high" | "medium" | "low";
+  /** Plan 04a item 4: the evaluator's report on an owner-refused message —
+   * whether this candidate addressed the owner's reason. `addressed: false`
+   * leaves the refusal standing but records the report, so the ledger can
+   * tell "checked and not addressed" from "never checked". */
+  addressedReport?: { addressed: boolean; reason?: string; at?: string };
   /** Plan 04a: the contentHash of the content RE-DERIVED from the backing
    * record when the message was last raised/carried. The evaluator may
    * rewrite the visible content, so a carry must compare the record against
@@ -1348,6 +1353,18 @@ export interface EvMessageResolved {
   boundContractVersion: ContractVersion;
   boundRecordVersion: number;
 }
+/** Plan 04a item 4: the evaluator reports whether an owner-refused message
+ * was addressed. A record event on the message, not a state change. */
+export interface EvMessageAddressReported {
+  type: "MESSAGE_ADDRESS_REPORTED";
+  messageId: string;
+  addressed: boolean;
+  reason?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+
 /** A message is superseded (never votable again). */
 export interface EvMessageSuperseded {
   type: "MESSAGE_SUPERSEDED";
@@ -1445,6 +1462,7 @@ export type Event =
   | EvMessageDropped
   | EvOwnerVerdict
   | EvMessageResolved
+  | EvMessageAddressReported
   | EvMessageSuperseded
   | EvMessageCarried;
 

@@ -357,6 +357,7 @@ export interface ConductorOptions {
  * changes `messages.jsonl`/`ledger.jsonl` too. */
 const MESSAGE_EVENT_TYPES = new Set<string>([
   "EVALUATION_TIMED_OUT",
+  "MESSAGE_ADDRESS_REPORTED",
   "MESSAGE_RAISED",
   "MESSAGE_PUBLISHED",
   "MESSAGE_MERGED",
@@ -873,6 +874,9 @@ export class Conductor {
    * suppress the per-event `drive()` so next() cannot act on a half-applied
    * batch — the batch helper drives once at the end. */
   #driveSuspended = false;
+  /** Plan 04a: the current baseline action's id, so each baseline command's
+   * process group can be recorded for crash recovery (advisory A-15). */
+  #baselineActionId: string | undefined;
   #runStartedAt = Date.now();
   #budgetTimer: NodeJS.Timeout | undefined;
   /** design §8.1/§8.2: "the execution budget counts only time spent
@@ -1209,8 +1213,15 @@ export class Conductor {
     const payload = (intentRecord?.event ?? {}) as Record<string, unknown>;
 
     if (key === "run_baseline") {
-      // Plan 04a: a conductor died during BASELINE. Re-dispatch once; a
-      // second loss takes the timed-out path (the strict rule then applies).
+      // Plan 04a: a conductor died during BASELINE. Kill any orphaned baseline
+      // command (recorded as `baseline-sh-<actionId>-<pgid>`), then re-dispatch
+      // once; a second loss takes the timed-out path (advisory A-15).
+      const prefix = `baseline-sh-${actionId}-`;
+      for (const rec of records) {
+        if (rec.kind !== "intent" || typeof rec.actionId !== "string" || !rec.actionId.startsWith(prefix)) continue;
+        const pgid = (rec.event as { pgid?: number }).pgid;
+        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       this.#applyEvent(
         this.#state.phase.baseline?.interruptedOnce ? { type: "BASELINE_TIMED_OUT" } : { type: "BASELINE_INTERRUPTED" },
@@ -2999,7 +3010,8 @@ export class Conductor {
     const ids = new Set(messages.map((m) => m.id));
     const rawIds = messages.filter((m) => m.type === messageType && m.state === "raw").map((m) => m.id);
     const rawSet = new Set(rawIds);
-    const refusedSet = new Set(messages.filter((m) => m.type === messageType && m.state === "refused").map((m) => m.id));
+    const refusedIds = messages.filter((m) => m.type === messageType && m.state === "refused").map((m) => m.id);
+    const refusedSet = new Set(refusedIds);
     const seen = new Set<string>();
     for (const entry of entries) {
       const id = typeof entry?.messageId === "string" ? entry.messageId : "";
@@ -3008,6 +3020,15 @@ export class Conductor {
       seen.add(id);
       if (!rawSet.has(id) && !refusedSet.has(id)) {
         return `message ${id} is not a raw or owner-refused ${messageType} message of this round`;
+      }
+      // Owner item 4 / discs B-50, M-20, A-21: an owner-refused message is
+      // NOT optional — the evaluator must report `addressed: true|false` for
+      // it, so the report always reaches the ledger.
+      if (refusedSet.has(id)) {
+        if (typeof entry.addressed !== "boolean") {
+          return `entry for owner-refused message ${id} must say addressed: true or false`;
+        }
+        continue;
       }
       if (entry.action !== "publish" && entry.action !== "merge" && entry.action !== "drop") {
         return `entry for ${id} must be publish, merge or drop`;
@@ -3019,6 +3040,9 @@ export class Conductor {
     }
     for (const id of rawIds) {
       if (!seen.has(id)) return `every raw ${messageType} message must appear exactly once; ${id} is missing`;
+    }
+    for (const id of refusedIds) {
+      if (!seen.has(id)) return `every owner-refused ${messageType} message must appear exactly once; ${id} is missing`;
     }
     return undefined;
   }
@@ -3042,9 +3066,13 @@ export class Conductor {
         boundRecordVersion: message.messageVersion,
       };
       if (message.state === "refused") {
+        const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : undefined;
         if (entry.addressed === true) {
-          const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : "addressed by the candidate";
-          events.push({ type: "MESSAGE_RESOLVED", ...binding, by: "evaluator", reason });
+          events.push({ type: "MESSAGE_RESOLVED", ...binding, by: "evaluator", reason: reason ?? "addressed by the candidate" });
+        } else {
+          // addressed: false — record the report so the ledger distinguishes
+          // "checked and not addressed" from "never checked".
+          events.push({ type: "MESSAGE_ADDRESS_REPORTED", ...binding, addressed: false, ...(reason ? { reason } : {}) });
         }
         continue;
       }
@@ -4427,12 +4455,11 @@ export class Conductor {
     const commands = this.#resolvedEffectiveChecks();
     this.#log.intent(actionId, { commands });
     crashAt("before_run_baseline");
-    const deadlineMs = Math.max(
-      this.#deadlines.checkMs,
-      commands.length * this.#deadlines.checkMs + this.#deadlines.termGraceMs,
-    );
-    const timer = cancelableTimeout(deadlineMs, "timeout" as const);
+    // The plan names a flat `checkMs` for this stage (disc-A-59): the
+    // observable limit must match the configured one.
+    const timer = cancelableTimeout(this.#deadlines.checkMs, "timeout" as const);
     let outcome: "done" | "timeout";
+    this.#baselineActionId = actionId;
     try {
       outcome = await Promise.race([this.#ensureBaseline().then(() => "done" as const), timer.promise]);
     } catch (err) {
@@ -4440,6 +4467,8 @@ export class Conductor {
       // must still let the phase move on rather than wedge the run.
       this.#log.append("error", { where: "baseline", error: String((err as Error)?.message ?? err) });
       outcome = "done";
+    } finally {
+      this.#baselineActionId = undefined;
     }
     timer.cancel();
     crashAt("after_run_baseline");
@@ -4616,6 +4645,12 @@ export class Conductor {
           env: childEnv(),
           deadlineMs: this.#deadlines.checkMs,
           termGraceMs: this.#deadlines.termGraceMs,
+          // Plan 04a / advisory A-15: record the command's own process group
+          // so a crash-recovery restart can kill the orphaned baseline run
+          // instead of starting a second copy of the same heavy suite.
+          onIntent: ({ pgid }) => {
+            this.#log.intent(`baseline-sh-${this.#baselineActionId ?? "?"}-${pgid}`, { pgid });
+          },
         });
         const result = await running.result;
         this.#recordCheck(outDir, command, result);

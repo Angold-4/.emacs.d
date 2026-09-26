@@ -498,6 +498,29 @@ test("plan 04a: a refused-only round still dispatches that message type's evalua
   assert.deepEqual(next(state), [{ type: "evaluation_complete" }]);
 });
 
+test("plan 04a: an addressed:false report is recorded, not silently dropped", () => {
+  const K = { snapshot: 1, sectionSha256: "a".repeat(64) };
+  const refused = makeMessage({
+    state: "refused",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    settlement: { state: "refused", settledBy: "owner", reason: "still broken", candidateSha: "C1", contractVersion: K, messageVersion: 1, contentHash: "a".repeat(64) },
+  });
+  const state = baseState({ phase: "EVALUATING", candidate: { sha: "C1", contractVersion: K }, messages: [refused] });
+  const result = reduce(state, {
+    type: "MESSAGE_ADDRESS_REPORTED",
+    messageId: "T-1",
+    addressed: false,
+    reason: "the candidate never touched the cancel path",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(result.ok, true, !result.ok ? result.reason : "");
+  assert.equal(result.state.phase.messages?.[0].addressedReport?.addressed, false);
+  assert.equal(result.state.phase.messages?.[0].state, "refused", "the refusal still stands");
+});
+
 test("plan 04a: a submit_evaluation naming one message twice is refused, never partly applied", async () => {
   const setup = await setupConductor({
     checks: ["true"],

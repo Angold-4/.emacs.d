@@ -15,7 +15,7 @@
 // mismatch, before anything else about the event is considered.
 
 import { checkBallotBinding, checkBinding, checkTupleBinding, currentVersionsFor } from "./binding.ts";
-import { applyCarryWithContract, applyMessageEvent } from "./messages.ts";
+import { applyCarryWithContract, applyMessageEvent, checkMessageBinding } from "./messages.ts";
 import { next as computeNext } from "./next.ts";
 import {
   applyFindingAcceptedByOwner,
@@ -110,6 +110,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "MESSAGE_DROPPED",
   "OWNER_VERDICT",
   "MESSAGE_RESOLVED",
+  "MESSAGE_ADDRESS_REPORTED",
   "MESSAGE_SUPERSEDED",
   "MESSAGE_CARRIED",
 ]);
@@ -680,6 +681,23 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const result = applyMessageEvent(p.messages ?? [], event);
       if (!result.ok) return rejected(state, result.reason);
       return ok({ ...state, phase: { ...p, messages: result.messages } });
+    }
+
+    case "MESSAGE_ADDRESS_REPORTED": {
+      // Plan 04a item 4: the evaluator's report on an owner-refused message.
+      // Record-only (no state change): `addressed: true` is separately a
+      // MESSAGE_RESOLVED; `false` is recorded here so the ledger can tell
+      // "checked and not addressed" from "never checked" (findings M-20/A-21).
+      const message = (p.messages ?? []).find((m) => m.id === event.messageId);
+      if (!message) return rejected(state, `unknown message ${event.messageId}`);
+      const binding = checkMessageBinding(message, event);
+      if (!binding.ok) return rejected(state, binding.reason!);
+      const messages = (p.messages ?? []).map((m) =>
+        m.id === event.messageId
+          ? { ...m, addressedReport: { addressed: event.addressed, ...(event.reason ? { reason: event.reason } : {}), at: new Date().toISOString() } }
+          : m,
+      );
+      return ok({ ...state, phase: { ...p, messages } });
     }
 
     case "MESSAGE_CARRIED": {

@@ -1101,31 +1101,12 @@ BUILD["evaluation-completed"] = {
     checks: { candidateSha: "C1", passed: true },
     probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
     reviews: acceptableReviews,
-    evaluation: { settled: true },
+    // A raw trade-off with its type's evaluator already settled: this is the
+    // per-type `evaluationSettled` guard (finding M-19), not a boolean flag.
+    messages: [rawMessage()],
+    evaluation: { types: { tradeoff: { settled: true } } },
   }),
   event: { type: "EVALUATION_COMPLETED" },
-};
-BUILD["evaluation-timed-out"] = {
-  state: baseState({
-    phase: "EVALUATING",
-    candidate: C1,
-    integrationHead: "H0",
-    checks: { candidateSha: "C1", passed: true },
-    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
-    reviews: acceptableReviews,
-    messages: [rawMessage()],
-    inFlight: { dispatch_evaluation: { actionId: "a1" } },
-  }),
-  event: { type: "EVALUATION_TIMED_OUT" },
-};
-BUILD["evaluation-interrupted"] = {
-  state: baseState({
-    phase: "EVALUATING",
-    candidate: C1,
-    messages: [rawMessage()],
-    inFlight: { dispatch_evaluation: { actionId: "a1" } },
-  }),
-  event: { type: "EVALUATION_INTERRUPTED" },
 };
 
 test("transition table: every row in transitions.ts has a covering fixture", () => {

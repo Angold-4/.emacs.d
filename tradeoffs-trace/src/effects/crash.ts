@@ -29,6 +29,8 @@ export const CRASH_BOUNDARIES = [
   "after_create_worktree",
   "before_dispatch_worker",
   "after_dispatch_worker",
+  "before_run_baseline",
+  "after_run_baseline",
   "before_freeze",
   "after_freeze",
   "before_run_checks",
