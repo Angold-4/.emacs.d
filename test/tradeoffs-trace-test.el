@@ -1110,3 +1110,27 @@ inert as it was before the key existed — no error, and nothing opened."
 
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
+
+(ert-deftest tradeoffs-trace-remote-root ()
+  "A remote `+tt-root' runs `tt' on that host with host-local paths."
+  (let ((calls nil)
+        (+tt-root "/ssh:mac:/Users/me/.tradeoffs-trace/")
+        (+tt-runner "/ssh:mac:/Users/me/.tradeoffs-trace/runner/current/tradeoffs-trace"))
+    (cl-letf (((symbol-function 'file-exists-p) (lambda (_) t))
+              ((symbol-function 'process-file)
+               (lambda (program _in _out _disp &rest args)
+                 (push (list default-directory program args) calls)
+                 (insert "ok")
+                 0)))
+      (should (equal (+tt--cli "state" "/ssh:mac:/Users/me/.tradeoffs-trace/abcd1234") "ok"))
+      (pcase-let ((`(,dir ,program ,args) (car calls)))
+        ;; It runs on the server: TRAMP's default-directory, the server's paths.
+        (should (equal dir "/ssh:mac:/Users/me/.tradeoffs-trace/"))
+        (should (equal program +tt-node))
+        (should (equal args '("/Users/me/.tradeoffs-trace/runner/current/tradeoffs-trace/src/cli.ts"
+                              "state" "/Users/me/.tradeoffs-trace/abcd1234"
+                              "--root" "/Users/me/.tradeoffs-trace"))))
+      ;; git asks the plan's own host too.
+      (setq calls nil)
+      (+tt--git "/ssh:mac:/Users/me/work/repo" "rev-parse" "HEAD")
+      (should (equal (nth 2 (car calls)) '("-C" "/Users/me/work/repo" "rev-parse" "HEAD"))))))

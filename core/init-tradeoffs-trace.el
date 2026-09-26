@@ -47,7 +47,11 @@
   :group 'tools)
 
 (defcustom +tt-root (expand-file-name "~/.tradeoffs-trace/")
-  "Directory holding tradeoffs-trace runs and installed runners."
+  "Directory holding tradeoffs-trace runs and installed runners.
+It may be remote, e.g. \"/ssh:mac:~/.tradeoffs-trace/\": every file is then
+read over TRAMP, and `tt' and git run on that host (`process-file'), so a
+laptop Emacs is only a renderer of the server's runs and they keep running
+while it is closed."
   :type 'directory)
 
 (defcustom +tt-runner nil
@@ -56,7 +60,9 @@ Nil means `<+tt-root>/runner/current/tradeoffs-trace'."
   :type '(choice (const nil) directory))
 
 (defcustom +tt-node "node"
-  "Node executable used to run the tradeoffs-trace CLI."
+  "Node executable used to run the tradeoffs-trace CLI.
+With a remote `+tt-root' it runs on that host: use an absolute path there
+(e.g. \"/opt/homebrew/bin/node\") unless it is on `tramp-remote-path'."
   :type 'string)
 
 (defcustom +tt-refresh-interval 2
@@ -82,12 +88,21 @@ Nil means `<+tt-root>/runner/current/tradeoffs-trace'."
       (user-error "No tradeoffs-trace runner at %s; run `tt runner install <sha>'" dir))
     dir))
 
+(defun +tt--local-arg (arg)
+  "ARG as the host that runs `tt' sees it: a remote file name loses its
+TRAMP prefix, anything else is passed through."
+  (if (and (stringp arg) (file-remote-p arg)) (file-local-name arg) arg))
+
 (defun +tt--cli (&rest args)
-  "Run the tradeoffs-trace CLI with ARGS; return its stdout, trimmed."
-  (let ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir))))
+  "Run the tradeoffs-trace CLI with ARGS; return its stdout, trimmed.
+It runs where `+tt-root' lives (`process-file' with that directory as
+`default-directory'), so a remote root drives the server's runner."
+  (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir)))
+         (default-directory (file-name-as-directory +tt-root)))
     (with-temp-buffer
-      (let ((status (apply #'call-process +tt-node nil t nil cli
-                           (append args (list "--root" (directory-file-name +tt-root))))))
+      (let ((status (apply #'process-file +tt-node nil t nil (+tt--local-arg cli)
+                           (append (mapcar #'+tt--local-arg args)
+                                   (list "--root" (directory-file-name (+tt--local-arg +tt-root)))))))
         (unless (eq status 0)
           (error "tt %s failed: %s" (string-join args " ") (string-trim (buffer-string))))
         (string-trim (buffer-string))))))
@@ -107,10 +122,12 @@ Nil means `<+tt-root>/runner/current/tradeoffs-trace'."
 ;;;; Plan parsing and validation
 
 (defun +tt--git (dir &rest args)
-  "Run git ARGS in DIR; return trimmed stdout or nil."
-  (with-temp-buffer
-    (when (eq 0 (apply #'call-process "git" nil t nil "-C" dir args))
-      (string-trim (buffer-string)))))
+  "Run git ARGS in DIR; return trimmed stdout or nil.
+Runs on DIR's host, so a plan opened over TRAMP asks the server's repo."
+  (let ((default-directory (file-name-as-directory dir)))
+    (with-temp-buffer
+      (when (eq 0 (apply #'process-file "git" nil t nil "-C" (+tt--local-arg dir) args))
+        (string-trim (buffer-string))))))
 
 (defun +tt--keyword (name)
   "Return the value of #+NAME in the current buffer, or nil."

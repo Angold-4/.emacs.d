@@ -90,6 +90,10 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
     spans.push({ stage, startedAt: p.at, ms: 0, failed: false, current: true });
   }
   const last = spans[spans.length - 1];
+  // The current stage counts from the last restart inside it: an interrupted
+  // attempt that was re-dispatched has a fresh deadline.
+  const restart = (timeline.restarts ?? []).filter((t) => last && Date.parse(t) >= Date.parse(last.startedAt)).pop();
+  if (last && restart) last.startedAt = restart;
   if (last) {
     if (last.stage === "DONE" || last.stage === "BLOCKED") last.current = false;
     else {

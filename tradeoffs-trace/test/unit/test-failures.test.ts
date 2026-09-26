@@ -6,19 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import {
-  baselineCoversCommands,
-  baselineFailedCommands,
-  baselineFailureNames,
-  baselineKey,
-  baselineStatusLine,
-  classifyCheckFailure,
-  failedNormally,
-  parseBaseline,
-  parseTestFailures,
-  type Baseline,
-  type BaselineCommand,
-} from "../../src/core/test-failures.ts";
+import { baselineCoversCommands, baselineFailedCommands, baselineFailureNames, baselineKey, baselineStatusLine, classifyCheckFailure, failedNormally, parseBaseline, parseTestFailures, type Baseline, type BaselineCommand, testIsNamedIn } from "../../src/core/test-failures.ts";
 
 // A real `cargo test` tail: the per-test FAILED lines, the summary list, and
 // the result line. Only the `test <name> ... FAILED` lines are names.
@@ -237,4 +225,19 @@ test("test-failures: parseBaseline rejects junk and recomputes a missing aggrega
   // it parses, but as the empty tree — never equal to a real base's tree.
   const legacy = parseBaseline({ baseSha: "a", key: "k", commands: [] });
   assert.equal(legacy!.tree, "");
+});
+
+test("test-failures: a failing test the phase is required to fix is never excused as pre-existing (plan 14h)", () => {
+  const output = "test gate_is_rerun_when_the_base_moves ... FAILED\ntest other_flaky ... FAILED\n";
+  const base = ["gate_is_rerun_when_the_base_moves", "other_flaky"];
+  // Without a requirement both match the base, so the check is excused.
+  assert.equal(classifyCheckFailure(output, base).excused, true);
+  // An owner directive names one of them: that one is the candidate's failure.
+  const directive = "Re-run the live gate. `gate_is_rerun_when_the_base_moves` must PASS, not merely match the base.";
+  const verdict = classifyCheckFailure(output, base, [directive]);
+  assert.equal(verdict.excused, false);
+  assert.deepEqual(verdict.newFailures, ["gate_is_rerun_when_the_base_moves"]);
+  // Whole words only, and module paths match on the test's own name.
+  assert.equal(testIsNamedIn("tests::coverage::gate_is_rerun_when_the_base_moves", [directive]), true);
+  assert.equal(testIsNamedIn("gate_is_rerun", [directive]), false);
 });

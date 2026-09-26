@@ -42,6 +42,7 @@ import {
 import {
   baselineFailureNames,
   baselineFailedCommands,
+  testIsNamedIn,
   baselineKey,
   classifyCheckFailure,
   failedNormally,
@@ -656,6 +657,12 @@ export interface Timeline {
   state: State;
   phases: Array<{ phase: string; at: string }>;
   rounds: Array<{ round: number; candidateSha: string; outcome: string }>;
+  /** When an attempt was interrupted and restarted in the same phase (a
+   * conductor stop/resume or a crash recovery). The worker's deadline starts
+   * again at each, so the pipeline counts the current stage from the last one
+   * (program 14: 14g showed "over by 22m" right after a resume, counting the
+   * whole time it was stopped). */
+  restarts?: string[];
 }
 
 export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
@@ -664,6 +671,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
+  const restarts: string[] = [];
   for (const record of records) {
     if (record.kind !== "event") continue;
     const before = state;
@@ -671,6 +679,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
     if (!result.ok) continue;
     state = result.state;
     const type = (record.event as { type?: string }).type;
+    if (type === "ATTEMPT_INTERRUPTED") restarts.push(record.ts);
     const prevC = before.phase.candidate?.sha;
     if (type === "FREEZE_COMPLETED" && prevC) {
       const reasons = notAcceptedReasons(before.phase);
@@ -684,7 +693,7 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
       phases.push({ phase: state.phase.phase, at: record.ts });
     }
   }
-  return { state, phases, rounds };
+  return { state, phases, rounds, restarts };
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
@@ -3882,6 +3891,18 @@ export class Conductor {
     }
   }
 
+  /** The texts that make a test this phase's job: its goal, its acceptance
+   * items and the owner's directives in force. A failing test named in any of
+   * them is never excused as pre-existing (`classifyCheckFailure`). */
+  #requiredTestTexts(): string[] {
+    const phase = this.#state.phase;
+    return [
+      phase.contract.goal,
+      ...phase.contract.acceptance,
+      ...(phase.ownerDirectives ?? []).filter((d) => d.status === "in-force").map((d) => d.text),
+    ];
+  }
+
   /** Plan 01e: the base commands whose pre-existing failures the worker and
    * the reviewers are told about — the ones whose failures the gate would
    * actually excuse, so the promise in the prompt and the rule at the gate are
@@ -3893,7 +3914,13 @@ export class Conductor {
     const commands = this.#resolvedEffectiveChecks();
     const baseline = this.#readBaseline();
     if (!baseline || !this.#baselineCovers(baseline, this.#baselineKey(commands), commands)) return [];
-    return baselineFailedCommands(baseline.commands);
+    // A test this phase is required to fix is never called pre-existing,
+    // here or at the gate (`classifyCheckFailure`): the prompt must not tell
+    // the worker to leave it failing.
+    const required = this.#requiredTestTexts();
+    return baselineFailedCommands(
+      baseline.commands.map((c) => ({ ...c, failures: (c.failures ?? []).filter((name) => !testIsNamedIn(name, required)) })),
+    );
   }
 
   /** Plan 01e: the base's failing names for one check command, or none when
@@ -4268,7 +4295,7 @@ export class Conductor {
             // gate.
             if (after && failedNormally(result)) {
               const baseFailures = this.#baseFailuresFor(command);
-              const verdict = classifyCheckFailure(result.output, baseFailures);
+              const verdict = classifyCheckFailure(result.output, baseFailures, this.#requiredTestTexts());
               if (verdict.excused) {
                 this.#log.append("check_failures_pre_existing", {
                   candidateSha,
