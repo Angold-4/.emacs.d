@@ -922,10 +922,11 @@ export class Conductor {
   #steerInFlight = new Set<string>();
   /** The inbox poll timer; cleared by `#doStop`. */
   #inboxTimer: NodeJS.Timeout | undefined;
-  /** Plan 03b: a coalesced `views/status.txt` write, at most once a second,
-   * scheduled by any applied event (message or stage). `buildView` rebuilds
-   * the timeline, so it stays off the event path and never runs when nothing
-   * changed. */
+  /** Plan 03b: the periodic `views/status.txt` refresh, once a second while
+   * the conductor runs. `buildView` rebuilds the timeline, so it stays off
+   * the message-event path (the discovery-barrier tests are timing-sensitive)
+   * but must still track a silent execute stage (B-5), not only message
+   * events. */
   #statusTimer: NodeJS.Timeout | undefined;
 
   constructor(opts: ConductorOptions) {
@@ -1097,6 +1098,10 @@ export class Conductor {
         // The wait's one 30-minute reminder is noticed on the same beat.
         this.#checkNotifications();
       }, this.#deadlines.inboxPollMs);
+      // Plan 03b: refresh views/status.txt once a second through every stage,
+      // including a long silent execute, on its own beat (tests shorten the
+      // inbox poll to tens of ms).
+      this.#statusTimer = setInterval(() => this.#writeStatusViewSafe(), 1000);
     }
 
     this.drive();
@@ -1417,7 +1422,7 @@ export class Conductor {
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
     if (this.#inboxTimer) clearInterval(this.#inboxTimer);
     if (this.#statusTimer) {
-      clearTimeout(this.#statusTimer);
+      clearInterval(this.#statusTimer);
       this.#statusTimer = undefined;
     }
     // Plan 03b: flush the status view once before the log closes.
@@ -1501,10 +1506,6 @@ export class Conductor {
     // event (of which there are thousands per run) slowed long runs enough to
     // matter against their test timeouts.
     if (MESSAGE_EVENT_TYPES.has(logged.type)) this.#writeContractProjections();
-    // Plan 03b: any applied event can change the rendered status (a stage
-    // transition, a pending review, a gate record). Coalesced to one write a
-    // second, so a burst never rebuilds the view per event.
-    this.#scheduleStatusView();
     // Plan 01b: a fresh park is a new notification episode; resolving some of
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
@@ -3863,8 +3864,7 @@ export class Conductor {
 
   /** Contract v1: writes `messages.jsonl`, `ledger.jsonl` and the rendered
    * views (`views/review.org`, `views/messages/<id>.org`) from state. The
-   * status view is coalesced (see `#scheduleStatusView`) because `buildView`
-   * is expensive and these writes run on the message-event path. */
+   * status view has its own one-second beat (`#statusTimer`). */
   #writeContractProjections(): void {
     try {
       const phase = this.#state.phase;
@@ -3875,18 +3875,6 @@ export class Conductor {
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
     }
-  }
-
-  /** Plan 03b: write `views/status.txt` at most once a second. Several
-   * events in a burst produce one write; a pending write never blocks event
-   * application. */
-  #scheduleStatusView(): void {
-    if (this.#statusTimer) return;
-    this.#statusTimer = setTimeout(() => {
-      this.#statusTimer = undefined;
-      this.#writeStatusViewSafe();
-    }, 1000);
-    this.#statusTimer.unref?.();
   }
 
   #writeStatusViewSafe(): void {
@@ -3926,7 +3914,7 @@ export class Conductor {
         secrets: { missing: this.#missingSecrets, tooShort: this.#tooShortSecrets },
       }),
     );
-    fs.writeFileSync(this.#paths.status, text);
+    fs.writeFileSync(this.#paths.status, redactText(text, this.#secretMaskable));
   }
 
   /** Contract v1: the reviewable content of the message a worker decision

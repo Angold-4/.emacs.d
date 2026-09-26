@@ -911,7 +911,8 @@ function cmdVerdict(
     return;
   }
   const p = runPaths(runDir);
-  const log = new EventLog(p.events, resolveSecrets(secretNames(plan.secrets)).maskable);
+  const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
+  const log = new EventLog(p.events, maskable);
   try {
     log.append("event", event);
   } finally {
@@ -934,15 +935,18 @@ function cmdVerdict(
   // never shows a message the review buffer already has.
   writeFileSync(
     p.status,
-    renderStatusView(
-      statusViewInput({
-        runDir,
-        plan,
-        state: after,
-        view: buildView(runDir, plan, false),
-        alive: false,
-        secrets: loggedSecretStatus(runDir),
-      }),
+    redactText(
+      renderStatusView(
+        statusViewInput({
+          runDir,
+          plan,
+          state: after,
+          view: buildView(runDir, plan, false),
+          alive: false,
+          secrets: loggedSecretStatus(runDir),
+        }),
+      ),
+      maskable,
     ),
   );
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
