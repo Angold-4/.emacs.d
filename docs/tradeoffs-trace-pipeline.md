@@ -1,7 +1,7 @@
 # tradeoffs-trace as a programmable review pipeline (plan 04)
 
 Status: **Owner's direction, recorded 2026-09-26.** Not implemented. This is the
-intent that plan 04 builds toward; plan 03 (the UI) is parked behind it. It
+intent that plan 04 builds toward; plan 03, the UI, renders it (see [everything is a buffer](tradeoffs-trace-ui.md)). It
 refines [tradeoffs-trace](tradeoffs-trace.md) and follows from
 [Human judgment and programmed agent workflows](agent-evaluation-and-programmed-workflows.md).
 
