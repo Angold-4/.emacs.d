@@ -171,6 +171,18 @@ export interface RunPlanPhase {
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 01c: 1-based lines in the source Org file of the `acceptance`
+   * items, parallel to the array. Emacs records them so `tt lint` can point
+   * at the offending line; a hand-written JSON plan has no lines and the
+   * linter reports the item without one. */
+  acceptanceLines?: number[];
+  /** Plan 01c: the owner's own checklist. These items are the owner's to do —
+   * they are never given to the worker or the reviewers as acceptance. They
+   * are shown in the status buffer once the phase is DONE, and in
+   * `tt summary`'s PR body as `- [ ]` items. */
+  ownerChecklist?: string[];
+  /** Plan 01c: 1-based lines of `ownerChecklist` in the source Org file. */
+  ownerChecklistLines?: number[];
   provisional?: boolean;
 }
 
@@ -178,6 +190,10 @@ export interface RunPlanPhase {
  * this packet's single-phase conductor. */
 export interface RunPlanFile {
   title: string;
+  /** Plan 01c: the Org file this JSON plan was parsed from, recorded by Emacs
+   * so `tt lint` can name the file the owner edited rather than its temporary
+   * JSON copy. Never read by the conductor. */
+  sourceFile?: string;
   /** Absolute path to the git repository this run operates on. */
   repo: string;
   /** The integration branch this phase publishes onto. Defaults to the

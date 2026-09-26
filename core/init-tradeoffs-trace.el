@@ -142,6 +142,33 @@ The goal ends at a blank line, a list item or the \"Acceptance:\" line."
            (in (push tl goal))))))
     (when goal (string-trim (string-join (nreverse goal) " ")))))
 
+(defun +tt--list-items (header body)
+  "Items of the list introduced by HEADER in phase BODY, or nil."
+  (when (string-match
+         (concat "^[ \t]*" (regexp-quote header) "[ \t]*\n\\(\\(?:[ \t]*- .*\n?\\)+\\)")
+         body)
+    (mapcar (lambda (l) (string-trim (replace-regexp-in-string "^[ \t]*- " "" l)))
+            (split-string (match-string 1 body) "\n" t "[ \t]+"))))
+
+(defun +tt--list-lines (hl header)
+  "Line numbers, in the buffer, of headline HL's HEADER list items.
+Searches the headline's own body so the numbers can go into the plan JSON
+(`acceptanceLines' / `ownerChecklistLines'), letting `tt lint' point at the
+Org line the owner will edit rather than at a temporary JSON copy."
+  (let ((beg (org-element-property :contents-begin hl))
+        (end (or (org-element-property :contents-end hl) (point-max)))
+        (re (concat "^[ \t]*" (regexp-quote header) "[ \t]*$"))
+        (lines nil))
+    (when beg
+      (save-excursion
+        (goto-char beg)
+        (when (re-search-forward re end t)
+          (forward-line 1)
+          (while (and (< (point) end) (looking-at "[ \t]*- "))
+            (push (line-number-at-pos) lines)
+            (forward-line 1)))))
+    (nreverse lines)))
+
 (defun +tt--parse-phase (hl)
   "Parse phase headline HL into (PHASE-ALIST . ERRORS)."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
@@ -152,10 +179,13 @@ The goal ends at a blank line, a list item or the \"Acceptance:\" line."
          (provisional (member "provisional" (org-element-property :tags hl)))
          (body (+tt--phase-body hl))
          (goal (+tt--goal body))
-         (acceptance
-          (when (string-match "^[ \t]*Acceptance:[ \t]*\n\\(\\(?:[ \t]*- .*\n?\\)+\\)" body)
-            (mapcar (lambda (l) (string-trim (replace-regexp-in-string "^[ \t]*- " "" l)))
-                    (split-string (match-string 1 body) "\n" t "[ \t]+"))))
+         (acceptance (+tt--list-items "Acceptance:" body))
+         (acceptance-lines (+tt--list-lines hl "Acceptance:"))
+         ;; Plan 01c: the owner's own checklist, next to Acceptance.  Its
+         ;; items are never given to the worker or the reviewers as
+         ;; acceptance; they are shown once the phase is DONE.
+         (owner-checklist (+tt--list-items "Owner checklist:" body))
+         (owner-checklist-lines (+tt--list-lines hl "Owner checklist:"))
          (errors nil))
     (unless provisional
       (unless id (push (cons line "phase has no :ID: property") errors))
@@ -165,9 +195,13 @@ The goal ends at a blank line, a list item or the \"Acceptance:\" line."
     (cons `((id . ,(or id (format "line-%d" line)))
             (goal . ,(or goal ""))
             (acceptance . ,(vconcat acceptance))
+            (acceptanceLines . ,(vconcat acceptance-lines))
             (checks . ,(vconcat (and checks (list checks))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat (and reserved (split-string reserved ";" t "[ \t]+"))))
+            ,@(when owner-checklist
+                `((ownerChecklist . ,(vconcat owner-checklist))
+                  (ownerChecklistLines . ,(vconcat owner-checklist-lines))))
             (provisional . ,(if provisional t :false)))
           (nreverse errors))))
 
@@ -242,6 +276,7 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
             (push phase phases)))))
     (unless phases (push (cons 1 "plan has no phase headlines") errors))
     (list :plan `((title . ,title)
+                  (sourceFile . ,(or buffer-file-name default-directory))
                   (repo . ,(or repo ""))
                   (integrationBranch . ,(or branch ""))
                   (checks . ,(vconcat (and global-checks (list global-checks))))
@@ -254,14 +289,28 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                       (and s `((secrets . ,(vconcat s))))))
           :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
 
+(defun +tt--lint-json (json-file)
+  "Run `tt lint' on JSON-FILE and return its output.
+The rules live in one place (tradeoffs-trace/src/core/plan-lint.ts); Emacs
+only mirrors them by shelling out, so there is a single implementation.  The
+output is the warnings text when the plan has no error; a non-zero exit
+(`+tt--cli' signals) carries the errors, so the caller can show them and
+refuse to start."
+  (+tt--cli "lint" json-file))
+
 (defun +tt--show-plan-errors (file errors)
-  "Show ERRORS for FILE in *tt-plan-errors* with jump-to-line."
+  "Show ERRORS for FILE in *tt-plan-errors* with jump-to-line.
+ERRORS is either an alist of (LINE . MESSAGE) from `+tt-parse-plan', or a
+string already formatted by the linter (`tt lint' output); the string is
+shown verbatim, since it already carries `file:line:' prefixes."
   (with-current-buffer (get-buffer-create "*tt-plan-errors*")
     (let ((inhibit-read-only t))
       (erase-buffer)
-      (insert (format "tradeoffs-trace: %d plan error(s); no run started\n\n" (length errors)))
-      (dolist (e errors)
-        (insert (format "%s:%d: %s\n" file (car e) (cdr e)))))
+      (if (stringp errors)
+          (insert (string-trim errors) "\n")
+        (insert (format "tradeoffs-trace: %d plan error(s); no run started\n\n" (length errors)))
+        (dolist (e errors)
+          (insert (format "%s:%d: %s\n" file (car e) (cdr e))))))
     (compilation-mode)
     (display-buffer (current-buffer))))
 
@@ -321,6 +370,22 @@ program instead: one run per phase, in dependency order (see `+tt-program')."
       (+tt-program-start)
     (+tt--run-single)))
 
+(defun +tt--lint-plan-json (json-file file)
+  "Lint the plan JSON-FILE; return non-nil when it is safe to start.
+The rules live in one place (tradeoffs-trace/src/core/plan-lint.ts): Emacs
+mirrors them by shelling out to `tt lint'.  Errors are shown in
+*tt-plan-errors* and block the start; warnings are shown and the start
+continues.  FILE names the Org file for the errors buffer."
+  (let ((failed nil) (warnings nil))
+    (condition-case err
+        (setq warnings (+tt--lint-json json-file))
+      (error (setq failed (error-message-string err))))
+    (if failed
+        (progn (+tt--show-plan-errors (or file (buffer-name)) failed) nil)
+      (when (and warnings (not (string-empty-p warnings)))
+        (message "tradeoffs-trace: plan warnings:\n%s" warnings))
+      t)))
+
 (defun +tt--run-single ()
   "Start a single-phase run from the plan in this buffer."
   (let* ((parsed (+tt-parse-plan))
@@ -335,16 +400,18 @@ program instead: one run per phase, in dependency order (see `+tt-program')."
                               +tt--terminal-phases))
                  (y-or-n-p "This plan has an active run; focus it instead of starting a new one? "))
             (+tt--workspace existing)
-          (let* ((json-file (make-temp-file "tt-plan-" nil ".json"
-                                            (json-encode (plist-get parsed :plan))))
-                 (run-id (car (last (split-string (+tt--cli "start" json-file) "\n" t))))
-                 (run-dir (expand-file-name run-id +tt-root)))
-            (delete-file json-file)
-            (with-temp-file (expand-file-name "emacs.json" run-dir)
-              (insert (json-encode `((planPath . ,file)))))
-            (write-region nil nil (expand-file-name "plan/v1.org" run-dir) nil 'silent)
-            (message "tradeoffs-trace: started run %s" run-id)
-            (+tt--workspace run-dir)))))))
+          (let ((json-file (make-temp-file "tt-plan-" nil ".json"
+                                           (json-encode (plist-get parsed :plan)))))
+            (unwind-protect
+                (when (+tt--lint-plan-json json-file file)
+                  (let* ((run-id (car (last (split-string (+tt--cli "start" json-file) "\n" t))))
+                         (run-dir (expand-file-name run-id +tt-root)))
+                    (with-temp-file (expand-file-name "emacs.json" run-dir)
+                      (insert (json-encode `((planPath . ,file)))))
+                    (write-region nil nil (expand-file-name "plan/v1.org" run-dir) nil 'silent)
+                    (message "tradeoffs-trace: started run %s" run-id)
+                    (+tt--workspace run-dir)))
+              (delete-file json-file))))))))
 
 (defun +tt--phase-name (state)
   "Return the phase state name in STATE."
@@ -428,17 +495,22 @@ several phases runs them in order."
 (defvar-local +tt--program-dir nil "Program directory shown by this buffer.")
 
 (defun +tt-program-start ()
-  "Validate the program (or multi-phase plan) in this buffer and start it."
+  "Validate the program (or multi-phase plan) in this buffer and start it.
+Every entry's plan is linted first, so a lint error in any phase blocks the
+whole program; warnings are shown and it starts."
   (interactive)
   (let* ((parsed (+tt-parse-program))
-         (errors (plist-get parsed :errors)))
+         (errors (plist-get parsed :errors))
+         (file buffer-file-name))
     (if errors
-        (+tt--show-plan-errors (or buffer-file-name (buffer-name)) errors)
-      (let* ((json-file (make-temp-file "tt-program-" nil ".json" (json-encode (plist-get parsed :program))))
-             (id (car (last (split-string (+tt--cli "program" "start" json-file) "\n" t)))))
-        (delete-file json-file)
-        (message "tradeoffs-trace: started program %s" id)
-        (+tt-program (expand-file-name (concat "programs/" id) +tt-root))))))
+        (+tt--show-plan-errors (or file (buffer-name)) errors)
+      (let ((json-file (make-temp-file "tt-program-" nil ".json" (json-encode (plist-get parsed :program)))))
+        (unwind-protect
+            (when (+tt--lint-plan-json json-file file)
+              (let ((id (car (last (split-string (+tt--cli "program" "start" json-file) "\n" t)))))
+                (message "tradeoffs-trace: started program %s" id)
+                (+tt-program (expand-file-name (concat "programs/" id) +tt-root))))
+          (delete-file json-file))))))
 
 (defun +tt--program-state (dir)
   "Parsed `tt program state' of DIR."
@@ -890,6 +962,16 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that."
       (+tt--status-row "secret" (format "%s not set" name) 'warning))
     (dolist (name (alist-get 'tooShort (alist-get 'secrets s)))
       (+tt--status-row "secret" (format "%s too short to mask" name) 'warning))
+    ;; Plan 01c: once the phase is DONE, show the owner's own checklist (the
+    ;; plan's `Owner checklist:' list).  It was never handed to the worker or
+    ;; the reviewers as acceptance; this is the one place the owner sees it.
+    (let* ((plan (alist-get 'plan s))
+           (planned (car (alist-get 'phases plan)))
+           (checklist (alist-get 'ownerChecklist planned)))
+      (when (and (equal name "DONE") checklist)
+        (insert (format "\nOwner checklist (%d) — yours, not the worker's\n" (length checklist)))
+        (dolist (item checklist)
+          (insert (format "  - %s\n" (+tt--one-line item 200))))))
     (+tt--render-owner-inputs s)
     (when attention
       (insert "\n" (propertize (format "⚑ %s%s" attention

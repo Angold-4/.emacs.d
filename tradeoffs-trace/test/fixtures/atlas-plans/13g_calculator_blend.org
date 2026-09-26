@@ -1,0 +1,58 @@
+#+TITLE: index-price-service 13.7: open-regime Index Calculator blend
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 13, phase 13.7 (one phase per file). SERIAL: starts only after the four vendor phases
+# 13c (Pyth), 13d (Stork), 13e (Kaiko) and 13f (Redstone) are merged. Redstone is disabled for this
+# cut (endpoint pending), so the blend runs over the ENABLED adapters — Pyth, Kaiko, Stork — and their
+# recorded cadence and coverage (13_ref_shared_contract.md §3.1). Next:
+# 13h_regime_anchor.org (13.8).
+# Tests use synthetic SourceTicks, so no vendor key is needed.
+# Self-contained reference: ~/orgw/work/atlas/indexps/13_ref_index_calculator.md
+
+* Phase 13.7: open-regime Index Calculator blend over the enabled vendors (Pyth, Kaiko, Stork)
+  :PROPERTIES:
+  :ID:          ips13-calculator-blend
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-calculator -p index-subscriber -p index-price-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/index/calculator/src/lib.rs crates/services/index/index-price-service/src/health.rs config/index/instruments.yaml
+  :RESERVED:    the parameter values of 13_ref_index_calculator §3; the step order and the blend rules for n>=3, n=2, n=1, n=0 (§4, including the §4.1 torn-pair rule); the offer staying OracleUpdatePrice every 1s (B4); quality degraded when n is below the configured vendor-row count (B3); the supported submission-latency budget and the dispatch-fairness rule
+  :END:
+  Goal: Reference — `13_ref_index_calculator.md` §1–§5, §9–§11 (normative source `docs/atlas/risk/ATLAS - Index Calculator.md` §4, §5, §8, §9).
+  Replace the interim "newest ts_vendor across vendors when advanced" rule (set by 13.1) with the ordered Index Calculator pipeline, run in an open regime for all 17 instruments, so Trading Core receives a stable blended INDEX every second from Pyth, Stork, Kaiko and Redstone.
+  Add the settled `parameters:` block to `config/index/instruments.yaml`, keyed by product type: crypto τ 5 s, δ 100 bps, no β; equity, etf and metal_spot τ 10 s, δ 100 bps, β 300 bps; T_out 5 s, T_walk 1 s, T_in 10 s for all.
+  At each epoch-aligned 1 s boundary t, take the latest tick of each configured vendor, including ticks from earlier seconds, and run:
+  (1) reject halt_flag true, ccy ≠ USD, field ∉ {mid, last}, or a vendor row whose price_kind is not the instrument's canonical price_kind (all 17 are spot) unless the instrument's proxy_policy admits it in the regime (13_ref_index_calculator §4 step 1);
+  (2) reject t − ts_vendor > τ;
+  (3) reject a session outside {rth} for crypto, {otc_open, rth} for metal_spot, or {rth, pre, ah, overnight} for equity/etf (never unknown, closed, halt or auction);
+  (4) with n ≥ 3, m = median of the fresh set; with n ≤ 2 there is no majority, so steps (5)-(6) do not run and the torn-pair rule of `13_ref_index_calculator.md` §4.1 applies;
+  (5) clamp (n ≥ 3 only) each value to m(1±δ);
+  (6) mark a source outside the band for T_out consecutive boundaries, remove it after a further T_walk, re-admit it after T_in inside the band computed without it; never flip within one boundary;
+  (7) n ≥ 3 gives the median (even n: mean of the two middle values); n = 2 gives the mean when the pair agrees within δ, otherwise the §4.1 torn-pair rule (the original value closer to the previous I, the mean if equidistant; a torn source far from both the other source and the previous I is excluded per step 6); n = 1 gives that value; n = 0 holds the previous I, and sends nothing if there has never been one;
+  (9) offer every instrument with an I every second, even when unchanged, through the existing `OracleUpdatePrice`/`FeedPrice` path with `num_sources = n`, `aggregation_method` `Median` for n ≥ 3 / the paired rule for n = 2 / `Direct` for n ≤ 1, and `timestamp_ns` set to the calculator boundary time t for every offer (never the winner's ts_recv).
+  There is no cage and no anchor here (13.8).
+  Quality vector: compute {I, I_anchor: null, n, regime: OPEN, quality} every boundary. held means n = 0; degraded means n below the instrument's configured vendor-row count, or any clamp or exclusion; ok otherwise. Expose it at `GET /debug/index` and in the health summary. A never-computed instrument reads unknown, never ok. It does not reach Trading Core.
+  Arithmetic is exact i128 fixed-point, rescaled to the largest decimals, with δ in bps and never f64. Keep the bounded drain, `PendingOffers` expiry and the serialized submission worker.
+  Inputs from the vendor phases: the enabled vendors' (Pyth, Kaiko, Stork) fragment `cadence:` blocks (contracted and measured p99 intervals) and their recorded coverage gaps. Redstone is disabled with no rows, so it contributes nothing and is skipped by the per-row checks. The settled τ must be at least 5× every covering vendor's measured p99 (13_ref_shared_contract §3.1). If a measured p99 breaks that, the phase stops and reports it; it never raises τ on its own, because τ is reserved.
+  Priorities: the documented step order (freshness before distance, clamp then exclude) over simplicity; a held value with quality held over inventing a price; the existing signed submission path unchanged.
+  Acceptance:
+  - `tau_covers_every_vendor_measured_interval` loads the enabled vendors' `cadence:` blocks and asserts τ(product) ≥ 5 × p99_ms for every vendor with a row for that product (a disabled vendor with no rows, i.e. Redstone, is skipped)
+  - `blend_runs_over_the_real_adapters` builds the service with all four builders from 13.3–13.6 (Redstone returns `Ok(None)`), fed by the enabled adapters' recorded fixtures, and asserts one blended offer per instrument per second
+  - `instruments_parameters_are_the_settled_values` asserts the parameters block holds exactly the 13_ref_index_calculator §3 values for crypto, equity, etf and metal_spot
+  - `ic_no_bounce_three_sources_publish_the_median_path` (IC §10 test 1) asserts that three sources within 8 bp publish their median every second and that the offer carries no vendor id
+  - `ic_fat_finger_is_clamped_then_excluded_after_t_out` (IC §10 test 2) asserts that one source at +8% for 2 s never moves I beyond m(1+δ), and that a source held there is excluded at T_out + T_walk and re-admitted after T_in inside the band
+  - `ic_stale_majority_does_not_veto_a_live_minority` (IC §10 test 3) asserts that two sources older than τ are dropped and I follows the live one
+  - `ic_failover_kill_stork_gives_mid_of_pyth_and_kaiko` (IC §10 test 4) asserts that once Stork's last tick ages past τ, I = mean(Pyth, Kaiko) at the next boundary
+  - `blend_median_even_n_pair_rule_singleton_and_hold` covers n=4 (mean of the two middle values), n=3, n=2 agreeing, n=2 disagreeing (closer to the previous I; mean when equidistant), n=1, n=0 with a previous I (held) and n=0 without one (no offer)
+  - `ic_n0_holds_last_value_every_second_quality_held` (IC §10 test 9) asserts that an instrument with no fresh source is offered its last I every second with quality held
+  - `field_and_session_gate_rejects_a_mismatch` asserts that unknown, closed, halt and auction sessions and a nav field are rejected per product type, and that crypto accepts only rth
+  - `quality_vector_is_emitted_every_second_and_missing_is_unknown` asserts that `/debug/index` returns I, I_anchor null, n, regime OPEN and quality for all 17 instruments every second, and unknown for one never computed
+  - `offer_carries_n_and_aggregation_method` asserts that FeedPrice.num_sources == n and that the aggregation method is Median for n ≥ 2 and Direct for n ≤ 1
+  - `blend_arithmetic_is_exact` asserts that the mean of 4.610970833333333 and 4.610970833333334 is exact at one extra decimal and that no f64 appears in the calculator crate (`grep -n f64 crates/modules/index/calculator/src` is empty)
+  - `ic_torn_pair_good_print_is_not_moved` covers 13_ref_index_calculator §4.1: with previous I 100, x 100 and y 200 at δ 1%, I = 100 (not 148.5); y is excluded after T_out+T_walk and re-admitted after T_in, and x is never excluded (recovery)
+  - `price_kind_mismatch_is_rejected` asserts that a vendor row whose `price_kind` is not the instrument's (e.g. a futures-implied rate tagged mid for a spot instrument) is rejected at step 1, and is admitted only when the instrument's `proxy_policy` allows it in that regime
+  - `offer_timestamp_is_the_boundary_time_for_unchanged_and_held` asserts that FeedPrice.timestamp_ns equals the calculator boundary t for an unchanged and for a held offer, and that the winning tick's ts_recv is not used
+  - `seventeen_markets_offer_within_one_second_at_controlled_latency` drives 17 markets through the real submission worker with a controlled per-request latency, and asserts every market is offered and dispatched once per second, the pending-offer expiry is accounted, and no market starves; it records the measured dispatch latency
+  - `submission_latency_budget_is_recorded` measures the real submitter's p99 latency and asserts 17 × p99 < 1 s, or the phase stops and reports the shortfall (batching or pipelining is a reserved decision, never an unmeasured assumption)
+  - `cargo xtask check dep-rules` passes and the calculator depends on no engine, book or vendor-adapter crate (IC §10 test 11, structural)
+  - all existing tests still pass

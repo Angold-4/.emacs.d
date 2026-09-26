@@ -1,0 +1,38 @@
+#+TITLE: index-price-service 13.3: Pyth Pro adapter to the Market Data Subscriber contract
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p oracle-source-pyth -p index-subscriber && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase: starts after 13a_shared_markets.org (13.1) and 13b_adapter_contract.org (13.2) are
+# merged, alongside the other three vendor files (13c-13f). The calculator 13g_calculator_blend.org
+# (13.7) starts only after all four vendor phases merge. This phase touches only the files in its
+# reference §2, so it cannot conflict with them.
+#
+# Self-contained reference (mapping, rules, tests, and the temporary credential in §0):
+#   ~/orgw/work/atlas/indexps/13_ref_vendor_pyth.md
+# Shared contract it builds on: ~/orgw/work/atlas/indexps/13_ref_shared_contract.md §5.
+# Before the live check: export PYTH_ACCESS_TOKEN (values in the reference §0). Never commit a credential.
+
+* Phase 13.3: Pyth Pro adapter to the Market Data Subscriber contract
+  :PROPERTIES:
+  :ID:          ips13-pyth-adapter
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p oracle-source-pyth -p index-subscriber && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/adapters/source-pyth/Cargo.toml crates/modules/index/subscriber/src/adapters/pyth.rs config/index/vendors/pyth.yaml
+  :RESERVED:    one Pyth link per process (sources.pyth.stream_endpoint); channel rule max(fixed_rate@200ms, min_channel) with fail-stop only for an illegal min_channel; the MDS §4.4 session mapping, where absent is unknown and never rth; files outside 13_ref_vendor_pyth §2
+  :END:
+  Goal: Reference — `13_ref_vendor_pyth.md` (self-contained) and `13_ref_shared_contract.md` §5. Bring the Pyth adapter up to `docs/atlas/risk/ATLAS - Market Data Subscriber.md` §3–§8 so Pyth Pro is a full blend vendor for all 17 markets. MDS was written for Pyth, so conform fully. Implement exactly `13_ref_vendor_pyth.md` §4: a thin layer over `pyth-lazer-client`/`pyth-lazer-protocol` (fall back to `tokio-tungstenite` only if 13.2 recorded that they do not build); one link per process pinned to `sources.pyth.stream_endpoint`, with `try_endpoints`/`merge_report_streams` removed from this path; one socket for all rows, with one subscribe per channel group, distinct subscriptionIds, the five properties, `formats: []` and `ignoreInvalidFeeds: true`; channel = max(fixed_rate@200ms, min_channel); symbology fetched from the public catalog at startup and every 10 minutes, with per-instrument fail-stop on absent symbol, non-stable state, exponent ≠ `native_exponent`, quote ≠ USD or an illegal min_channel, and the hand-typed numeric id map removed; decode with the per-update exponent, `ts_vendor := feedUpdateTimestamp`, `carried_forward := feedUpdateTimestamp < timestampUs`, field mid, and the §4 session table where absent is unknown; link state Connected/Down, with all-invalid reported as Down. The mapping of all 17 markets is in §3 and is already in `config/index/vendors/pyth.yaml` from 13.1; correct a pin there only with evidence. The temporary key is in §0; export it as `PYTH_ACCESS_TOKEN` for the live check and never write it into the repository. Touch only the files in `13_ref_vendor_pyth.md` §2. Every test uses recorded payloads served by a local fixture, so CI needs no key. Priorities: covering all 17 markets or documenting each gap, over speed; exact prices and honest vendor time over convenience; the generic adapter contract of `13_ref_shared_contract.md` §5.
+  Acceptance:
+  - `pyth_exponent_is_per_feed_not_hardcoded` decodes crypto (-8), equity (-5) and gold (-3) feeds arriving on one socket to their correct decimals
+  - `pyth_symbology_fail_stop_on_each_binding_rule` covers absent symbol, non-stable state, exponent mismatch, quote mismatch and illegal min_channel at startup: the failing instrument is not subscribed and the others are
+  - `pyth_per_update_exponent_mismatch_is_rejected` asserts that an update whose own exponent differs from the pinned `native_exponent` is dropped and counted, not decoded, and `pyth_catalog_refresh_reenforces_the_pin` asserts that a 10-minute catalog refresh reporting a changed exponent stops that instrument (startup-only validation is not enough)
+  - `pyth_channel_mismatch_regroups_onto_min_channel` asserts that a fixed_rate@1000ms feed gets its own group with a distinct subscriptionId and is not dropped
+  - `pyth_partial_and_all_invalid_subscriptions` asserts that one invalid id keeps the valid feeds streaming and logs it, and that all-invalid reports the link Down
+  - `pyth_session_mapping_and_unknown_is_not_rth` covers regular (rth; otc_open for metals), preMarket, postMarket, overNight, closed and absent → unknown
+  - `pyth_carried_forward_does_not_advance_ts_vendor` passes and `pyth_flat_price_still_advances_ts_vendor` asserts that 30 s of an identical price with advancing feedUpdateTimestamp publishes every update
+  - `pyth_link_down_is_reported_distinct_from_quiet` and `pyth_eur_quoted_feed_keeps_ccy_eur` pass
+  - `pyth_uses_one_socket_and_one_endpoint` asserts that the fixture server sees exactly one connection for all rows and no other host is dialed
+  - no numeric Pyth feed-id map remains in index-subscriber, and the transitional `pyth_lazer_id` field written by 13.1 is gone from `config/index/vendors/pyth.yaml`, and `pyth_fragment_pins_all_17_markets` passes
+  - the owner live check is recorded in the phase decisions: with PYTH_ACCESS_TOKEN exported, which of the 17 markets streamed ticks, and each market's measured `ts_vendor`-advancement p50/p99 over ≥ 60 s (not message arrival), with p99 ≤ 200 ms plus network jitter (contracted interval, 13_ref_shared_contract §3.1)
+  - every `config/index/vendors/pyth.yaml` row declares `price_kind: spot`, covered by `pyth_fragment_declares_price_kind`
+  - `config/index/vendors/pyth.yaml` has a `cadence:` block with measured `p50_ms`, `p99_ms` and `measured_at` filled in from the live check
+  - all existing tests still pass

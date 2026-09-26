@@ -1,0 +1,43 @@
+#+TITLE: index-price-service 13.8: regime, persisted anchor and dark-regime cage
+#+TT_CHECKS: cargo fmt --all -- --check && cargo xtask check workspace && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Plan 13, phase 13.8 (one phase per file). Serial after 13g_calculator_blend.org (13.7).
+# Next: 13i_e2e_gate.org (13.9).
+# Tests use synthetic SourceTicks and fixed clocks, so no vendor key is needed.
+# Self-contained reference: ~/orgw/work/atlas/indexps/13_ref_index_calculator.md
+
+* Phase 13.8: regime machine, persisted anchor and the dark-regime cage
+  :PROPERTIES:
+  :ID:          ips13-regime-anchor
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p index-calculator -p index-calendar -p index-price-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/index/calculator/src/lib.rs crates/modules/index/calendar/src/lib.rs crates/services/index/index-price-service/config*.yaml
+  :RESERVED:    the calendars and the regime/allowed-session table of 13_ref_index_calculator §6; the anchor update rules of §7; β 300 bps; crypto never caged; n=0 in the dark holds and never snaps to the anchor; the anchor discontinuity trip (3β / 60 s) that mitigates deferred corporate actions
+  :END:
+  Goal: Reference — `13_ref_index_calculator.md` §4 step 8, §6, §7, §8 and §10 (normative source `docs/atlas/risk/ATLAS - Index Calculator.md` §5 anchor cage, §6, §7, §10).
+  Add the Index Calculator regime machine, anchor and dark-regime cage, so the 6 equity/ETF and 2 metal instruments keep moving after the cash close inside a band around I_anchor instead of freezing or gapping. Crypto stays uncaged.
+  Regime: add `regime_at(calendar, t_ns)` to the `index-calendar` crate from 13.2. `crypto_24_7` is always OPEN. `us_equity` (America/New_York, NYSE 2026–2027 holidays): PRE 04:00–09:30, RTH 09:30–16:00, AH 16:00–20:00, OVERNIGHT 20:00–04:00 on Sun–Thu nights, DARK on weekends and holidays. `metal_otc`: OTC_OPEN from Sun 18:00 to Fri 17:00 New York excluding the daily 17:00–18:00 break, WEEKEND_THIN otherwise.
+  Gate: step 3 then uses per-regime allowed sessions: OPEN {rth}, RTH {rth}, PRE {pre}, AH {ah}, OVERNIGHT {overnight}, DARK {overnight}, OTC_OPEN {otc_open, rth}, WEEKEND_THIN {otc_open}. etf (DRAM) never allows nav.
+  Anchor: persisted atomically (write-temp, then rename) as JSON at `index.anchor_state_path` on a **dedicated writable volume** (added to Compose), on every change, and loaded at startup. Crypto: I_anchor = I every boundary. Equity/etf: the last I published in RTH, captured at the RTH→AH or RTH→DARK transition. Metal: the last I in OTC_OPEN, captured at OTC_OPEN→WEEKEND_THIN. The calendar encodes exchange **early-close** days (e.g. 13:00 ET), and a calendar whose configured horizon does not cover `t` is a startup error, never a silent fallback. A stale anchor (deferred corporate actions, B8) is cleared by a **discontinuity trip**: if I_raw stays outside the cage band by more than 3β for 60 s, clear the anchor and publish uncaged/degraded.
+  Cage: in PRE, AH, OVERNIGHT, DARK and WEEKEND_THIN, I = clamp(I_raw, I_anchor(1−β), I_anchor(1+β)) with β 300 bps. An instrument without an anchor is not caged and its quality is at most degraded. With n = 0 in the dark, hold the last published I and never snap to I_anchor. The quality vector now carries the real regime and I_anchor.
+  Corporate-action rebasing and `IndexPriceUpdate` (IC §10 test 10) stay deferred (settled B4, B8).
+  Priorities: the regime comes from the calendar, never from "did a vendor print"; continuity inside the cage over freezing at the close; exact i128 arithmetic.
+  Acceptance:
+  - `regime_follows_the_calendar_not_vendor_prints` asserts the us_equity regimes at 03:59, 04:00, 09:30, 16:00, 20:00 on a Monday, on a Saturday, and on 2026-11-26, plus the metal_otc Sunday-open, Friday-close and daily-break edges, across both 2026 DST transitions, with no tick present
+  - `ic_weekend_equity_proxy_moves_inside_beta` (IC §10 test 5) asserts that with anchor 100 and a DARK-regime overnight print of 101.2, I = 101.2 and I_anchor stays 100
+  - `ic_cage_112_vs_anchor_100_beta_3pct_gives_103` (IC §10 test 6) passes
+  - `ic_crypto_sunday_is_uncaged_and_does_not_snap` (IC §10 test 7) asserts that BTC tracks its median on Sunday with no cage
+  - `ic_etf_ah_follows_share_not_nav` (IC §10 test 8) asserts that a nav-field tick for DRAM in AH is rejected and I follows the share print
+  - `dark_n0_holds_and_does_not_snap_to_anchor` asserts that n = 0 in DARK republishes the last I every second with quality held
+  - `anchor_is_captured_at_the_documented_moment` covers the equity RTH→AH capture and the metal Friday capture
+  - `anchor_survives_restart` asserts that the anchor file is written by rename and reloaded, so a restarted calculator cages against the persisted anchor
+  - `quality_vector_carries_regime_and_anchor` asserts that `/debug/index` shows the calendar regime and I_anchor for all 17 instruments
+  - `anchor_missing_at_first_launch_publishes_uncaged_degraded` asserts that with no persisted anchor an instrument in a caged regime publishes uncaged with I_anchor null and quality at most degraded
+  - `anchor_transition_missed_by_restart_uses_the_persisted_value` asserts that a restart across the RTH→AH transition reloads the persisted anchor and cages, and that a stale prior-day value is not back-filled
+  - `anchor_survives_container_recreation` recreates the Compose container (not merely reloads the file) and asserts the anchor is reloaded from the dedicated volume
+  - `anchor_unavailable_or_corrupt_state_publishes_uncaged_degraded` asserts an absent, read-only or corrupt state file yields an uncaged/degraded publish and one log line, never a crash
+  - `anchor_discontinuity_trip_clears_a_stale_anchor` asserts an anchor of 100 and a sustained real 50 (post-split, B8) trips after 60 s, clears the anchor, and publishes uncaged/degraded
+  - `us_equity_early_close_shifts_the_rth_to_ah_transition` asserts a 13:00 ET early close captures the anchor at 13:00, not 16:00, and `calendar_beyond_its_configured_horizon_is_rejected_at_startup` asserts a time past the calendar's horizon fails startup
+  - `holiday_and_overnight_precedence_is_defined` asserts a holiday that is also a weekday yields DARK and an overnight window that crosses a holiday boundary follows a stated rule
+  - all existing tests still pass

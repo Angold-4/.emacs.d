@@ -1,0 +1,46 @@
+#+TITLE: index-price-service 14: Redstone live, sub-second Kaiko crypto, split robustness
+#+TT_PROGRAM: 6
+#+TT_BRANCHES: stack
+#+TT_REPO: /Users/angold.wang/Work/dragon
+#+TT_SH_MINUTES: 8
+#+TT_CHECK_MINUTES: 20
+#+TT_ATTEMPT_MINUTES: 60
+
+# Plan 14 as one dependency graph. Run order and ownership: 14_index.md. Every phase is an ordinary
+# tradeoffs-trace run (worker + M/A/B reviewers, 3 repair rounds); the scheduler starts a node when
+# every node it waits for is DONE.
+#
+#   14a Redstone live ──┐
+#   14b Kaiko HFR crypto┼──► 14g split re-gate ──► 14h n≥4 blend (DEFERRED, owner confirmation)
+#   14c restart ────────┤
+#   14d broker loss ────┤
+#   14e publish+health ─┤
+#   14f K5/K4 ──────────┘
+#
+# `#+TT_PROGRAM: 6` lets 14a-14f (six independent phases) run at once. `#+TT_BRANCHES: stack` gives
+# one branch (and PR) per phase, cut from its dependencies:
+#   feat/atlas-ips-next--14a … --14f   <- feat/atlas-ips-next (six siblings: two vendor phases,
+#                                          four robustness phases, disjoint file sets)
+#   feat/atlas-ips-next--14g           <- a merge commit of --14a … --14f
+#
+# 14a and 14b are vendor phases (adapter crate + one fragment each). 14c-14f are split-robustness
+# phases, all inside crates/services/index/{index-subscriber-service,index-calculator-service} and
+# docker/docker-compose.yml. They touch disjoint files, so the six siblings merge cleanly at the 14g
+# join. **Nothing in plan 14 touches crates/modules/index/calculator/** — the n≥4 blend is 14h,
+# parked until the owner confirms the logic.
+#
+# ── ONE manual precondition ──
+# Plan 13 must be in the base before 14a starts. Either merge the plan-13 stack into feat/atlas and
+# re-cut this branch, or fast-forward it to the plan-13 tip:
+#   cd /Users/angold.wang/Work/dragon
+#   git fetch origin
+#   git branch -f feat/atlas-ips-next feat/atlas-ips-next--13j   # + the #1247 deploy fix
+#   git push -u origin feat/atlas-ips-next
+#
+# ── Credentials (needed by 14a, 14b and the 14g gate) ──
+# Export in the shell that launches the program, never into the repository:
+#   PYTH_ACCESS_TOKEN, STORK_API_KEY, KAIKO_API_KEY, KAIKO_EQUITIES_API_KEY
+#   REDSTONE_API_KEY   <- now load-bearing: wss://live.a.redstone.finance rejects
+#                         unauthenticated upgrades with HTTP 403 (measured 2026-09-25)
+#   SYSTEM_SECRET_KEY_HEX   <- required by the split calculator (see #1247)
+# Values: 13_ref_vendor_*.md §0 and 14_ref_vendor_redstone_live.md §0.

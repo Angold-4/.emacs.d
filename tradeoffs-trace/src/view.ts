@@ -469,6 +469,15 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
   ];
+  // Plan 01c: the owner's own checklist (from the plan's `Owner checklist:`
+  // list). It is not a worker/reviewer acceptance criterion, so it is not
+  // judged in the loop; the PR body carries it as an open checklist for the
+  // owner to tick off.
+  const ownerChecklist = plan.phases[0]?.ownerChecklist ?? [];
+  if (ownerChecklist.length > 0) {
+    lines.push("", "### Owner checklist", "");
+    for (const item of ownerChecklist) lines.push(`- [ ] ${item}`);
+  }
   if (fixed.length > 0) {
     lines.push("", "### Blocking findings fixed during review", "");
     for (const f of fixed) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 300)}`);

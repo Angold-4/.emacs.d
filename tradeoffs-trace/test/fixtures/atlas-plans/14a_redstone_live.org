@@ -1,0 +1,28 @@
+#+TITLE: index-price-service 14.1: the Redstone adapter over the live endpoint
+#+TT_CHECKS: cargo fmt --all -- --check && cargo test -p oracle-source-redstone -p index-subscriber && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-next
+#+TT_REPO: /Users/angold.wang/Work/dragon
+
+# Parallel phase. Reference (self-contained): 14_ref_vendor_redstone_live.md.
+# Closes plan 13's recorded deviation B1 (four vendors configured, Redstone disabled).
+
+* Phase 14.1: Redstone emits SourceTick over wss://live.a.redstone.finance
+  :PROPERTIES:
+  :ID:          ips14-redstone-live
+  :CHECKS:      cargo fmt --all -- --check && cargo test -p oracle-source-redstone -p index-subscriber && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/modules/oracle/adapters/source-redstone/** crates/modules/index/subscriber/src/adapters/redstone.rs config/index/vendors/redstone.yaml crates/services/index/index-price-service/config*.yaml
+  :RESERVED:    the endpoint, auth header and subscribe/frame shapes of 14_ref_vendor_redstone_live.md §0; `dataServiceId` is redstone-primary-prod for both test and prod; per-market cadence gaps are recorded, never papered over with another vendor's price; `REDSTONE_API_KEY` unset is the only disabled case
+  :END:
+  Goal: Reference — `14_ref_vendor_redstone_live.md` (self-contained) and `13_ref_shared_contract.md` §5.
+  Make Redstone a live blend vendor: dial `wss://live.a.redstone.finance` with `x-api-key: ${REDSTONE_API_KEY}`, subscribe every pinned id in one `{"op":"subscribe","items":[…]}` frame, decode `{"type":"price","dataPackageId","timestamp"(ms),"value"}` into `SourceTick` behind the 13.2 seam, and complete `config/index/vendors/redstone.yaml` with a row per market Redstone actually delivers plus a named gap for each market it does not.
+  Measured 2026-09-25 (14_ref §1): 12/17 deliver — all nine crypto, NVDA, XAU, XAG — with cadence per market (~500 ms for SOL/HYPE/ZEC/PUMP/LIT/NVDA/XAU/XAG; ~2 s for BTC/ETH; ~20 s for XRP/NEAR). INTC, MU, MRVL, SNDK, DRAM, SPY and QQQ did not resolve under the obvious tickers: locate their ids from the vendor's feed registry, and where none exists record a gap with the reason.
+  `value` is a JSON number: parse to an exact `i128` at the instrument's decimals, never through `f64`. `ts_vendor` is the frame `timestamp` in epoch ms. Equities and metals carry no session, so `index-calendar` classifies them (as Kaiko and Stork do). One link serves every id; reconnect with backoff; keep `link_state()` distinguishing Down from quiet (MDS §6.2). Every test uses recorded frames served by a local fixture, so CI needs no key.
+  Priorities: real per-market measurement over optimistic coverage; recorded gaps over substitution; exact prices over convenience.
+  Acceptance:
+  - `redstone_native_fixture_emits_source_tick` asserts every SourceTick field for a crypto, a metal and an equity asset from recorded frames served by a local fixture
+  - `redstone_requires_the_key_and_fails_closed` asserts that an unauthenticated upgrade (the measured HTTP 403) is a Down link, and that an unset `REDSTONE_API_KEY` is the only path to a disabled vendor with one log line
+  - `redstone_missing_timestamp_is_dropped_and_counted` and `redstone_carried_forward_when_timestamp_does_not_advance` pass
+  - `redstone_fragment_records_every_market` asserts a row or a named gap for each of the 17, and that every row declares `price_kind: spot`
+  - `redstone_fragment_cadence_matches_measurement` asserts the `cadence:` block carries the measured p50/p99 and `measured_at`, and that each market whose p99 exceeds 500 ms is a recorded gap
+  - the owner live check is recorded in the phase decisions: with the key exported, which markets streamed, and each market's measured `ts_vendor`-advancement p50/p99 over ≥ 60 s
+  - all existing tests still pass

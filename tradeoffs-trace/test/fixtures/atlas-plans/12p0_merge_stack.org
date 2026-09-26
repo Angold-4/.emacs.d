@@ -1,0 +1,42 @@
+#+TITLE: index-price-service 12.0 (P0): the working 7-PR stack on current feat/atlas, with F1 and F2
+#+TT_CHECKS: cargo fmt --all -- --check && cargo check --workspace --all-targets && cargo xtask check dep-rules
+#+TT_BRANCH: feat/atlas-ips-fix
+#+TT_REPO: /Users/angold.wang/Work/dragon
+#+TT_SH_MINUTES: 8
+#+TT_CHECK_MINUTES: 20
+#+TT_ATTEMPT_MINUTES: 60
+
+# Plan 12, phase 12.0 — P0 of 12_ref_stack_and_findings.md §6 (steps 1–4) as a conductor phase.
+# Instead of rebasing seven PR branches, this phase merges the stack's top branch
+# (origin/fix/atlas-ips-oracle-sender-account, #1202, which contains all six below it)
+# into current feat/atlas once, so the result is ONE branch that merges into feat/atlas as
+# one PR. Checked 2026-09-24: that merge conflicts in exactly one file,
+# crates/contracts/execution-event/src/lib.rs (the F1 enum).
+# §6 steps 5–8 (push, CI, reviews, the owner E2E gate, merging into feat/atlas) stay with the owner.
+# Runs first in 12_program.org; 12a is cut from this phase's branch.
+# References: ~/orgw/work/atlas/indexps/12_ref_stack_and_findings.md (§4 gate, §6 P0, findings F1/F2)
+#
+# PRECONDITION (one manual command): the worktree starts at TT_BRANCH, so
+# feat/atlas-ips-fix must exist and point at the current feat/atlas head:
+#   git fetch origin
+#   git branch -f feat/atlas-ips-fix origin/feat/atlas
+#   git push -u origin feat/atlas-ips-fix
+# A standalone run (C-c m r on this file) publishes the merge result back onto
+# feat/atlas-ips-fix by fast-forward, so that branch becomes the single PR
+# branch; 12a then stacks on top of it.
+
+* Phase 12.0: merge the stack onto current feat/atlas with F1 and F2
+  :PROPERTIES:
+  :ID:          ips12-p0-merge-stack
+  :CHECKS:      cargo fmt --all -- --check && cargo check --workspace --all-targets && cargo test -p execution-event -p index-subscriber -p index-calculator -p index-price-service && cargo xtask check dep-rules
+  :BOUNDARIES:  crates/contracts/execution-event/src/** crates/contracts/execution-event/tests/**
+  :RESERVED:    the Borsh variant order of execution-event (RequestCompletion stays tag 8, AppliedIndexPrice is appended as 9); taking #1207's RequestCompletion shape exactly
+  :END:
+  Goal: Reference — `12_ref_stack_and_findings.md` §6 steps 1–4 and findings F1, F2. The working index-price-service stack (#1066 → #1072–#1076 → #1202) cannot merge into `feat/atlas`: `feat/atlas` moved past the stack base and upstream #1207 changed `RequestCompletion` in `crates/contracts/execution-event/src/lib.rs`. Your worktree starts at current `feat/atlas`. Run `git merge --no-ff origin/fix/atlas-ips-oracle-sender-account` (the stack's top, #1202, containing all seven PRs), resolve the conflict and commit the merge. While resolving `execution-event/src/lib.rs`, apply F1: take #1207's `RequestCompletion` exactly as upstream has it (the `Qty` fields and `ImmediateOutcome`); keep the upstream variant order `… ValuationBatch = 7, RequestCompletion = 8` and APPEND `AppliedIndexPrice` after it as 9 — never insert it before `RequestCompletion` (safe because the applied-index emitter is dark, `EMIT_APPLIED_INDEX_V1 = false`, so no archive holds a tag-8 `AppliedIndexPrice`). Update the guard test and the `applied_index_compatibility` module to 8/9 and regenerate `tests/fixtures/applied-index-{0,1,2,3}.borsh` at tag 9. For F2 (#1202, part of the merge), confirm `sender_account_id: 196608` (`ORACLE_ACCOUNT_ID = 0x030000`) in `crates/services/index/index-price-service/config.docker.yaml` and `scripts/fixture-ws/repointed-config/config.docker.yaml` and add the test `index_service_sender_account_matches_oracle_account_id`. Resolve anything else by keeping upstream behaviour and re-applying the stack's additions on top. Priorities: wire compatibility with the upstream enum first; the stack's behaviour unchanged otherwise; no refactor, no reformatting beyond the resolution. Do not push, rebase or touch any other branch; the conductor publishes your result. One cargo build can take several minutes: run narrow `cargo test -p <crate>` commands, and never the whole workspace test suite yourself.
+  Acceptance:
+  - the candidate's history contains `origin/fix/atlas-ips-oracle-sender-account` through a merge commit whose other parent is the `feat/atlas` head the worktree started from, and no conflict markers remain (`git grep -nE '^(<<<<<<<|>>>>>>>)'` finds nothing)
+  - `RequestCompletion` is exactly #1207's shape at tag 8, `AppliedIndexPrice` is tag 9, and the tests `request_completion_keeps_tag_8_and_applied_index_appends_tag_9`, `upstream_request_completion_frame_decodes_across_versions` and `applied_index_fixture_survives_the_tag_swap` pass (`cargo test -p execution-event`)
+  - the regenerated `applied-index-{0,1,2,3}.borsh` fixtures decode to the same `AppliedIndexPrice` values as before
+  - `index_service_sender_account_matches_oracle_account_id` passes and both config files carry `sender_account_id: 196608`
+  - `cargo test -p index-subscriber -p index-calculator -p index-price-service` passes (baseline 91 tests before the F1/F2 tests)
+  - `cargo check --workspace --all-targets`, `cargo fmt --all -- --check` and `cargo xtask check dep-rules` pass

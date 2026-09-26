@@ -67,6 +67,58 @@ From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
   shallow clone, because candidate checkouts can't be made from one. Run
   `git fetch --unshallow` first.
 
+## Lint a plan before it runs
+
+Every start lints the plan first — `C-c m r` (a single run, or every entry of a
+program), `tt start` and `tt program start`. The rules live in one place,
+`tradeoffs-trace/src/core/plan-lint.ts`; Emacs mirrors them by calling
+`tt lint <plan.json>`, so there is only one implementation.
+
+```sh
+tt lint plan.json     # the findings; exit 1 if any is an error
+tt lint program.json  # every entry's plan, each finding prefixed with the entry
+```
+
+Two kinds of finding:
+
+- **Error — stops the start.** An acceptance item whose actor is the owner or a
+  human (`the owner records …`, `manually …`, `someone …`). No worker or
+  reviewer can satisfy it. Move it to the plan's `Owner checklist:` list, or
+  rewrite it as an observable result a worker produces. Emacs shows errors in
+  `*tt-plan-errors*` (jump-to-line to the Org file) and starts nothing.
+- **Warning — shown, and the start continues.** An item that depends on a
+  future that does not exist when the checks run and the reviewers judge the
+  candidate (`after merge`, `the current rebased tip`, `once deployed`), or a
+  comparison against a contracted limit with no stated tolerance
+  (`p99 ≤ its contracted interval`). State a fact that is true when the run
+  finishes, or the allowed margin (or the recorded gap a miss becomes).
+
+The measured run is the reason (runtime doc §4): `13j`'s "the owner records a
+live run" parked a phase, and `13i`'s "the recorded live-run SHA is the current
+rebased tip" could never be true, because the rebased tip does not exist until
+the conductor commits the candidate. The existing plans in
+`~/orgw/work/atlas/indexps/` are a lint fixture in the package
+(`tradeoffs-trace/test/fixtures/atlas-plans/`): the linter finds exactly one
+error across them, `13j`'s owner-actor item.
+
+## Owner checklist
+
+A plan may carry the owner's own to-dos next to `Acceptance:`:
+
+```org
+  Acceptance:
+  - the report exists
+  Owner checklist:
+  - record a live run with the five keys exported
+```
+
+`Owner checklist:` items are **not** given to the worker or the reviewers — they
+are never acceptance criteria, so no reviewer blocks a phase for them. Once the
+phase is `DONE`, the status buffer lists them, and `tt summary`'s PR body
+carries them as `- [ ]` items to tick off. Use the list for anything that is the
+owner's to do: a live run with keys, a ruling, a push. That is where the
+linter's error message asks you to move an owner-actor item.
+
 ## Run several phases or plans: programs
 
 A **program** runs several plans, and plans with several phases, as one
@@ -106,7 +158,7 @@ and runs independent phases in parallel.
 
 - Each heading is an **entry**: `:PLAN:` is a plan file (relative to the program file), and `:AFTER:` lists the entries it waits for (all of their phases).
 - A plan file with several phases expands into one node per phase, run in order. Pressing `C-c m r` on such a plan (no program file) runs its phases in order.
-- Start: `C-c m r` in the program buffer, or `tt program start <program.json>`.
+- Start: `C-c m r` in the program buffer, or `tt program start <program.json>`. Every entry's plan is linted first (see above); one error blocks the whole program.
 
 **Branches (stack mode, the default).** Every node publishes to its own branch,
 `<TT_BRANCH>--<node>`:

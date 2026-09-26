@@ -71,6 +71,82 @@
       (with-current-buffer "*tt-plan-errors*"
         (should (string-match-p "tt-plan\\|:5: phase has no :ID:" (buffer-string)))))))
 
+(ert-deftest tradeoffs-trace-plan-owner-checklist ()
+  "Plan 01c: an `Owner checklist:' list parses beside Acceptance, not into it.
+Its items are the owner's, and their lines are recorded for `tt lint'."
+  (let* ((text (concat "#+TITLE: t\n#+TT_REPO: /tmp/x\n#+TT_BRANCH: main\n\n"
+                       "* Phase 1: p\n  :PROPERTIES:\n  :ID: p1\n  :CHECKS: true\n  :END:\n"
+                       "  Goal: g\n  Acceptance:\n  - a worker check\n  - all existing tests still pass\n"
+                       "  Owner checklist:\n  - the owner records a live run\n  - the owner rules on K4\n"))
+         (parsed (+tt-test--parse text))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0)))
+    (should (null (plist-get parsed :errors)))
+    ;; The checklist is not acceptance: the worker and reviewers never see it.
+    (should (equal (alist-get 'acceptance p1) ["a worker check" "all existing tests still pass"]))
+    (should (equal (alist-get 'ownerChecklist p1) ["the owner records a live run" "the owner rules on K4"]))
+    (should (= (length (alist-get 'acceptanceLines p1)) 2))
+    (should (= (length (alist-get 'ownerChecklistLines p1)) 2))
+    ;; The plan records its source file so `tt lint' can name it.
+    (should (equal (alist-get 'sourceFile (plist-get parsed :plan)) "/tmp/tt-ert-plan.org"))
+    ;; A plan without the list has no ownerChecklist key.
+    (should-not (assq 'ownerChecklist
+                      (aref (alist-get 'phases (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)) 0)))))
+
+(ert-deftest tradeoffs-trace-plan-lint-blocks-run ()
+  "Plan 01c: a lint error shown by `tt lint' blocks `+tt-run'.
+Emacs mirrors the one implementation by shelling out: `+tt--cli' is stubbed
+the way a lint failure would behave, and no run may start."
+  (let ((started nil) (linted nil))
+    (cl-letf (((symbol-function '+tt--cli)
+               (lambda (cmd &rest _)
+                 (if (equal cmd "lint")
+                     (progn (setq linted t)
+                            (error "tt lint failed: PLAN.org:39: error: [p1] the owner is the actor"))
+                   (setq started t)
+                   "run-id"))))
+      (with-temp-buffer
+        (insert +tt-test--valid-plan)
+        (setq buffer-file-name "/tmp/tt-ert-lint-plan.org")
+        (org-mode)
+        (+tt-run)
+        (set-buffer-modified-p nil)
+        (setq buffer-file-name nil)))
+    (should linted)
+    (should-not started)
+    (with-current-buffer "*tt-plan-errors*"
+      (should (string-match-p "PLAN\\.org:39: error" (buffer-string))))))
+
+(ert-deftest tradeoffs-trace-status-owner-checklist ()
+  "Plan 01c: the status buffer shows the owner checklist once DONE, and only
+then.  It is never part of the worker's or a reviewer's acceptance."
+  (let* ((plan (list (cons 'title "split")
+                     (cons 'phases
+                           (list (list (cons 'id "13.10") (cons 'goal "g")
+                                       (cons 'acceptance nil)
+                                       (cons 'ownerChecklist (list "the owner records a live run"
+                                                                   "the owner rules on K4")))))))
+         (state-for (lambda (name)
+                      `((meta (title . "split"))
+                        (conductorAlive . :false)
+                        (ownerInputs) (pendingOwnerInputs)
+                        (secrets (declared) (missing) (tooShort))
+                        (plan . ,plan)
+                        (state (run . "RUN_ACTIVE")
+                               (phase (phaseId . "13.10") (phase . ,name) (attempt (n . 1))
+                                      (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
+                        (view (elapsed . "1m") (round . 1) (pipeline . ,name)
+                              (reviewLine . "M ✓   A ✓   B ✓")
+                              (liveDecisions . 0) (failedDecisions . 0)
+                              (flaggedDecisions . 0) (openFindings . 0)
+                              (boundaryFilesChanged . 0))))))
+    (with-temp-buffer
+      (+tt--render-status-from (funcall state-for "DONE") "/tmp/tt-ert/abcd1234")
+      (should (string-match-p "Owner checklist (2)" (buffer-string)))
+      (should (string-match-p "- the owner records a live run" (buffer-string))))
+    (with-temp-buffer
+      (+tt--render-status-from (funcall state-for "REVIEWING") "/tmp/tt-ert/abcd1234")
+      (should-not (string-match-p "Owner checklist" (buffer-string))))))
+
 (defun +tt-test--make-run (root id &optional plan-path)
   "Create a fake run ID under ROOT, optionally recording PLAN-PATH."
   (let ((dir (expand-file-name id root)))
