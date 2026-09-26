@@ -19,6 +19,7 @@
 //       { "kind": "call-sh", "command": "echo hi" },
 //       { "kind": "emit-env", "name": "FAKE_KEY" },
 //       { "kind": "sleep", "ms": 10 },
+//       { "kind": "await-pending" },           (waits for every call-submit fired with noWait)
 //       { "kind": "hang-until-abort" },
 //       { "kind": "hang-forever" },
 //       { "kind": "crash", "code": 7 },
@@ -58,6 +59,8 @@ type Step =
   // environment is not the agent's).
   | { kind: "emit-env"; name: string }
   | { kind: "sleep"; ms: number }
+  // Waits for every `call-submit` fired with `noWait: true` to be answered.
+  | { kind: "await-pending" }
   | { kind: "hang-until-abort" }
   | { kind: "hang-forever" }
   | { kind: "crash"; code: number }
@@ -217,6 +220,9 @@ async function main(): Promise<void> {
 
   async function runSteps(): Promise<void> {
     writeStdout({ type: "agent_start" });
+    // Calls fired with `noWait`, awaited by an `await-pending` step: a real
+    // Pi turn does not end while one of its tool calls is still running.
+    const pendingCalls: Promise<unknown>[] = [];
     for (const step of script.steps) {
       switch (step.kind) {
         case "emit":
@@ -230,7 +236,7 @@ async function main(): Promise<void> {
           // `noWait`: fire the call and go on (run cc1992e2: a reviewer called
           // submit_review twice, the second while the first was recorded).
           if (step.noWait) {
-            void pending;
+            pendingCalls.push(pending);
             break;
           }
           const reply = await pending;
@@ -278,6 +284,9 @@ async function main(): Promise<void> {
         }
         case "sleep":
           await new Promise((resolve) => setTimeout(resolve, step.ms));
+          break;
+        case "await-pending":
+          await Promise.allSettled(pendingCalls.splice(0));
           break;
         case "hang-until-abort":
           if (!abortRequested) {
