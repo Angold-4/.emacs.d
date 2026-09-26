@@ -293,6 +293,10 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
       hello: defaultWorkerHello(),
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\n' > attempt.txt` },
+        // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
+        // the published message (queued through the 1s inbox poll) is applied
+        // before the next freeze carries it.
+        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 4000 }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : {
