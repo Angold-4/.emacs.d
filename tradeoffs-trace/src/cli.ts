@@ -62,7 +62,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -783,7 +783,13 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     writeFileSync(p.ledger, ledger);
     writeFileSync(p.review, review);
     mkdirSync(p.messagesView, { recursive: true });
+    const ids = new Set(messageFiles.map((f) => f.id));
     for (const f of messageFiles) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
+    // B-12/A-14: rebuild is a projection of state, so it also removes a
+    // message file whose id state no longer has (a superseded id).
+    for (const name of readdirSync(p.messagesView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
+    }
     process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/messages/\n`);
     return;
   }
@@ -800,6 +806,14 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     const actual = existsSync(file) ? readFileSync(file, "utf8") : "";
     if (actual !== f.contents) mismatches.push(`views/messages/${f.id}.org`);
   }
+  // B-12/A-14: an extra file for an id state no longer has is a mismatch, so
+  // `check` sees the same stale file `rebuild` now prunes.
+  if (existsSync(p.messagesView)) {
+    const expected = new Set(messageFiles.map((f) => f.id));
+    for (const name of readdirSync(p.messagesView)) {
+      if (name.endsWith(".org") && !expected.has(name.slice(0, -4))) mismatches.push(`views/messages/${name}`);
+    }
+  }
   if (mismatches.length > 0) {
     process.stderr.write(
       `contract check failed for ${path.basename(runDir)}: ${mismatches.join(", ")} do not match state; run \`tt contract rebuild ${path.basename(runDir)}\`\n`,
@@ -810,11 +824,26 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   process.stdout.write(`contract check ok for ${path.basename(runDir)}\n`);
 }
 
-/** Contract v1 §3: `tt verdict <run> <messageId> <accept|refuse>`. A live
- * run gets an inbox command (the conductor checks the binding); a run whose
- * daemon has exited gets the event appended to `events.jsonl` after a
- * dry-run reduce, so a stale verdict never poisons the log. */
-function cmdVerdict(
+/** A-13: a live `tt verdict` reports the OUTCOME. The command is written to
+ * the inbox, then this waits briefly for the conductor to move it to
+ * `inbox/applied` or `inbox/rejected` and returns which, with the reason. */
+async function awaitInboxVerdict(
+  runDir: string,
+  commandId: string,
+  timeoutMs: number,
+): Promise<{ kind: "applied" | "rejected" | "pending"; reason?: string }> {
+  const p = runPaths(runDir);
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const reasonFile = path.join(p.inboxRejected, `${commandId}.reason.txt`);
+    if (existsSync(reasonFile)) return { kind: "rejected", reason: readFileSync(reasonFile, "utf8").trim() };
+    if (existsSync(path.join(p.inboxApplied, `${commandId}.json`))) return { kind: "applied" };
+    if (Date.now() >= deadline) return { kind: "pending" };
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function cmdVerdict(
   positional: string[],
   root: string,
   reason: string | undefined,
@@ -835,7 +864,7 @@ function cmdVerdict(
   const state = rebuildState(runDir, plan, { lenient: true });
   const message = (state.phase.messages ?? []).find((m) => m.id === messageId);
   if (!message) {
-    process.stderr.write(`no message ${messageId} in run ${path.basename(runDir)}\n`);
+    process.stdout.write(`verdict rejected: no message ${messageId} in run ${path.basename(runDir)}\n`);
     process.exitCode = 1;
     return;
   }
@@ -855,12 +884,12 @@ function cmdVerdict(
   // The heading carries the full binding. A run/phase id that names another
   // run is refused here, never silently dropped when the daemon has exited.
   if (overrides.runId !== undefined && overrides.runId !== "" && overrides.runId !== state.phase.runId) {
-    process.stderr.write(`verdict rejected: run id ${overrides.runId} is not this run (${state.phase.runId})\n`);
+    process.stdout.write(`verdict rejected: run id ${overrides.runId} is not this run (${state.phase.runId})\n`);
     process.exitCode = 1;
     return;
   }
   if (overrides.phaseId !== undefined && overrides.phaseId !== "" && overrides.phaseId !== state.phase.phaseId) {
-    process.stderr.write(`verdict rejected: phase id ${overrides.phaseId} is not this phase (${state.phase.phaseId})\n`);
+    process.stdout.write(`verdict rejected: phase id ${overrides.phaseId} is not this phase (${state.phase.phaseId})\n`);
     process.exitCode = 1;
     return;
   }
@@ -875,12 +904,9 @@ function cmdVerdict(
     boundRecordVersion,
   };
   if (conductorAlive(runDir)) {
-    // Live run: through the inbox, so the conductor checks the binding and a
-    // stale verdict lands in inbox/rejected with its reason. Dry-run it too:
-    // a stale verdict then shows its reason to the front end at once, while
-    // the conductor still owns the rejection record and the queueing path.
-    const precheck = reduce(state, event);
-    if (!precheck.ok) process.stderr.write(`verdict likely rejected: ${precheck.reason}\n`);
+    // Live run: through the inbox, so the conductor checks the binding. The
+    // CLI then waits for the outcome (A-13), so the front end shows the
+    // rejection reason rather than only `queued'.
     const inbox = path.join(runDir, "inbox");
     mkdirSync(inbox, { recursive: true });
     const commandId = `verdict-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
@@ -898,7 +924,15 @@ function cmdVerdict(
       },
     };
     writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
-    process.stdout.write(`queued verdict ${commandId} on ${messageId} for run ${path.basename(runDir)}\n`);
+    const outcome = await awaitInboxVerdict(runDir, commandId, 5000);
+    if (outcome.kind === "applied") {
+      process.stdout.write(`verdict applied: ${verdict} recorded for ${messageId} in run ${path.basename(runDir)}\n`);
+    } else if (outcome.kind === "rejected") {
+      process.stdout.write(`verdict rejected: ${outcome.reason}\n`);
+      process.exitCode = 1;
+    } else {
+      process.stdout.write(`queued verdict ${commandId} on ${messageId} for run ${path.basename(runDir)} (queued, not yet applied)\n`);
+    }
     return;
   }
   // No live conductor: this is a late verdict. Validate it against a dry-run
@@ -906,7 +940,9 @@ function cmdVerdict(
   // projections.
   const result = reduce(state, event);
   if (!result.ok) {
-    process.stderr.write(`verdict rejected: ${result.reason}\n`);
+    // A-13: the rejection reason is the command's outcome, so print it on
+    // stdout; the non-zero exit is what tells the front end it failed.
+    process.stdout.write(`verdict rejected: ${result.reason}\n`);
     process.exitCode = 1;
     return;
   }
@@ -991,7 +1027,7 @@ async function main(): Promise<void> {
     cmdContract(positional[0], resolveRunDir(positional[1], runRoot));
   } else if (cmd === "verdict") {
     if (positional.length !== 3) usage();
-    cmdVerdict(positional, runRoot, reason, { candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId });
+    await cmdVerdict(positional, runRoot, reason, { candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId });
   } else if (cmd === "summary") {
     if (positional.length !== 1) usage();
     process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));

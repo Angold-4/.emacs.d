@@ -1316,6 +1316,48 @@ binding, so a trade-off line still opens the decision view."
                 (should (equal record "D-1"))))))
       (delete-directory dir t))))
 
+(ert-deftest tradeoffs-trace-cli-error-includes-stderr ()
+  "A-13: a failing `tt' failure message carries stderr as well as stdout."
+  (let ((+tt-root (make-temp-file "tt-ert-root" t))
+        (+tt-runner (make-temp-file "tt-ert-runner" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "src" +tt-runner) t)
+          (with-temp-file (expand-file-name "src/cli.ts" +tt-runner) (insert "//"))
+          (cl-letf (((symbol-function 'process-file)
+                     (lambda (_program _in destination _display &rest _args)
+                       (insert "queued verdict v-1")
+                       (when (consp destination)
+                         (with-current-buffer (cadr destination) (insert "verdict rejected: message T-1 changed v1 → v2")))
+                       1)))
+            (let ((err (condition-case e (+tt--cli "verdict" "/tmp/run" "T-1" "accept") (error e))))
+              (should err)
+              (should (string-match-p "queued verdict v-1" (error-message-string err)))
+              (should (string-match-p "verdict rejected: message T-1 changed" (error-message-string err))))))
+      (delete-directory +tt-root t)
+      (delete-directory +tt-runner t))))
+
+(ert-deftest tradeoffs-trace-review-verdict-stale-echo ()
+  "A-13: a rejected verdict's reason reaches the echo area, live or exited."
+  (dolist (reason '("verdict rejected: message B-1 changed v1 → v2 since you viewed it"
+                    "verdict rejected: message B-1 is bound to candidate C1, but the phase is now at candidate C2"))
+    (let ((dir (make-temp-file "tt-ert-review" t))
+          (echoed nil))
+      (unwind-protect
+          (let ((buf (+tt-test--review-buffer dir)))
+            (with-current-buffer buf
+              (cl-letf (((symbol-function '+tt--cli)
+                         (lambda (&rest _) (error "tt verdict failed: %s" reason)))
+                        ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil))
+                        ((symbol-function 'message)
+                         (lambda (fmt &rest args) (push (apply #'format fmt args) echoed))))
+                (goto-char (point-min))
+                (search-forward "B-1")
+                (goto-char (match-beginning 0))
+                (+tt-review-accept)))
+            (should (seq-find (lambda (m) (string-match-p (regexp-quote reason) m)) echoed)))
+        (delete-directory dir t)))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
 

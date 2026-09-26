@@ -182,7 +182,7 @@ a full `RecordBinding` whose `recordId` is the message id and whose
 The CLI is:
 
 ```
-tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--root <dir>]
+tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]
 ```
 
 `--candidate-sha` and `--message-version` send a binding other than the
@@ -191,11 +191,15 @@ binding check rejects it.
 
 - On a **live** run (a conductor is running) the command is written to
   `<run>/inbox/<id>.json`; the conductor validates the binding and a stale one
-  lands in `inbox/rejected/` with the reason.
+  lands in `inbox/rejected/` with the reason. The CLI then waits briefly for
+  the outcome and prints it on stdout (`verdict applied: …`, or
+  `verdict rejected: <reason>` with a non-zero exit); a command the conductor
+  does not answer in time prints `(queued, not yet applied)`.
 - On a run whose daemon has **exited** the command is a **late verdict**: the
   CLI dry-runs `reduce()` and, if it accepts, appends the `OWNER_VERDICT`
   event to `events.jsonl` and refreshes the projections. A stale or
-  out-of-order verdict is refused, never written.
+  out-of-order verdict is refused, never written, and the reason is printed on
+  stdout with a non-zero exit.
 
 ## 5. Rendering
 
