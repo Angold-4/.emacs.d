@@ -114,3 +114,55 @@ read-only view buffers, and never ones Evil users reach for when moving around
 - **The loop graph** needs the pipeline config (plan 04 §6) as its source. For
   today's fixed loop, a built-in description of the tradeoffs-trace profile
   stands in.
+
+## 8. Notes (2026-09-27)
+
+- **Let the runtime render and Emacs display.** The runtime writes a
+  ready-made `review.org` and the graph text per phase; Emacs reverts files
+  instead of running `tt state` every 2 s. This makes remote use cheap, and
+  any future front end gets the same view.
+- **One file per phase, details on demand.** A single review file with a
+  subtree per message; the message's own detail file is fetched only when the
+  owner presses `RET`, keeping TRAMP round-trips low.
+- **`D` asks for a one-line reason** (minibuffer), which becomes the
+  evaluators' input. The input box stays for anything longer.
+- **Stable ids across retries.** A retried node gets a new run, so `program-NN`
+  must name the phase, with the attempt or run as a suffix.
+
+### Sequencing: the contract first, then 03 and 04 in parallel
+
+Plans 03 and 04 both change the runtime. They can still run in parallel if a
+short **contract phase comes first**:
+
+- **The contract** is a versioned on-disk spec with fixture files:
+  - the run directory layout;
+  - the message schema (trade-off, finding, blocker);
+  - the **settled ledger**;
+  - the verdict files (`A`/`D` plus reason);
+  - the rendered view files (`review.org`, the loop graph, the program graph);
+  - the inbox commands.
+
+  It is the real interface between the runtime and any front end, so moving
+  the runtime out of `~/.emacs.d` later changes nothing for Emacs.
+- **04 owns the producing side:** the loop, the agents, the message flow and
+  the ledger. It writes messages and the ledger in the contract's format.
+- **03 owns the rendering side:** the runtime renderer (contract files in,
+  `review.org` and graph text out) and Emacs, which only displays and writes
+  verdicts and inbox commands.
+- After the contract, 03 builds against the fixtures while 04 builds the
+  runtime that produces them. Neither waits for the other.
+
+Proposed order:
+1. The contract and the runtime-rendered views. This serves 03, 04 and remote
+   use at once, and replaces Emacs calling `tt state` every 2 s, which is
+   costly over TRAMP.
+2. **In parallel:**
+   - 04 step 1: the message format, the evaluator and the ledger, inside
+     today's fixed loop;
+   - 03: the review buffer and `A`/`D`, on the contract fixtures.
+3. 04 steps 2–3: models per unit, then the pipeline language. 03's loop graph
+   is drawn from it.
+
+Test each step with a small practice program like 02. Before starting, agree
+what "better" means in numbers, for example owner minutes per phase, rounds
+per phase, and how often the owner refuses something (`D`).

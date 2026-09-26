@@ -136,7 +136,77 @@ Other workflows are other profiles; the runtime is the same.
 | Model per unit, escalation | One model for every unit (Pi's default). |
 | Loop defined in org | Fixed in the conductor's state machine: one worker, reviewers M/A/B, M veto, 2 of 3, 3 repair rounds. |
 
-## 8. Open questions
+## 8. Notes (from the runs, 2026-09-27)
+
+- **A settled ledger, on disk.** Fresh agents forget what has been settled:
+  in plans 13 and 14 fresh reviewers re-raised settled points again and again
+  (1,923 ballots on records already merged; 14h took 15 rounds). Each phase
+  keeps a ledger file of every settled item (message id, verdict, by whom,
+  evidence, time). It holds the owner's `A`/`D` verdicts and the evaluators'
+  outcomes, and every fresh agent receives it as facts, not as something to
+  re-litigate.
+- **Cost.** Merge duplicates before evaluating, and evaluate in batches (one
+  evaluator per message type per round, not one per message). Keep the blocker
+  panel for blockers only. Show the spend in the loop graph (plan 03).
+- **The pipeline language: org, TypeScript, or both. Settle it with a spike
+  first.**
+  - **Org** expresses units (headings), parameters (property drawers) and
+    routes (lists, links) well. Rules such as "round > 2 → stronger model",
+    escalation, and validating a routing graph are awkward.
+  - **Where the parser runs matters more than syntax.** Today Emacs parses org
+    into JSON. Once the runtime leaves `~/.emacs.d`, the runtime must parse the
+    pipeline itself, so either a TypeScript parser for a restricted org
+    subset, or a different format.
+  - **Working hypothesis:** the mechanism in **TypeScript** (profiles as typed,
+    tested modules, tradeoffs-trace the reference profile), the policy in
+    **org** (`#+TT_PIPELINE: tradeoffs-trace` plus per-plan overrides: models,
+    counts, thresholds). The spike writes the tradeoffs-trace profile both ways
+    and compares readability, validation and testability.
+  - Keep the building blocks few (units, message types, routes, loop control).
+    Today's ~580 tests are the conformance suite that proves the
+    tradeoffs-trace profile still behaves the same.
+- **Structured raising by the worker** is the crux (question 1 below). Try it
+  on a practice program before building the rest.
+
+### Sequencing: the contract first, then 03 and 04 in parallel
+
+Plans 03 and 04 both change the runtime. They can still run in parallel if a
+short **contract phase comes first**:
+
+- **The contract** is a versioned on-disk spec with fixture files:
+  - the run directory layout;
+  - the message schema (trade-off, finding, blocker);
+  - the **settled ledger**;
+  - the verdict files (`A`/`D` plus reason);
+  - the rendered view files (`review.org`, the loop graph, the program graph);
+  - the inbox commands.
+
+  It is the real interface between the runtime and any front end, so moving
+  the runtime out of `~/.emacs.d` later changes nothing for Emacs.
+- **04 owns the producing side:** the loop, the agents, the message flow and
+  the ledger. It writes messages and the ledger in the contract's format.
+- **03 owns the rendering side:** the runtime renderer (contract files in,
+  `review.org` and graph text out) and Emacs, which only displays and writes
+  verdicts and inbox commands.
+- After the contract, 03 builds against the fixtures while 04 builds the
+  runtime that produces them. Neither waits for the other.
+
+Proposed order:
+1. The contract and the runtime-rendered views. This serves 03, 04 and remote
+   use at once, and replaces Emacs calling `tt state` every 2 s, which is
+   costly over TRAMP.
+2. **In parallel:**
+   - 04 step 1: the message format, the evaluator and the ledger, inside
+     today's fixed loop;
+   - 03: the review buffer and `A`/`D`, on the contract fixtures.
+3. 04 steps 2–3: models per unit, then the pipeline language. 03's loop graph
+   is drawn from it.
+
+Test each step with a small practice program like 02. Before starting, agree
+what "better" means in numbers, for example owner minutes per phase, rounds
+per phase, and how often the owner refuses something (`D`).
+
+## 9. Open questions
 
 1. **Structured raising by the worker.** How does the worker raise a trade-off
    the moment it makes one, as data, not as prose at the end? A tool call per
