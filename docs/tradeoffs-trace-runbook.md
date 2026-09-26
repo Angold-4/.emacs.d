@@ -152,7 +152,105 @@ rebuilds from scratch:
 1. `TT_BRANCH` exists in the repository, and nothing has it or a node branch checked out.
 2. Every plan's check command finishes in a few minutes (the checks limit is 5).
 3. The runner is installed at the revision you want (`readlink ~/.tradeoffs-trace/runner/current`).
-4. Credentials the checks need (for example vendor keys) are exported in the shell that starts Emacs or `tt`.
+4. The plan declares every credential it needs with `#+TT_SECRETS` (see below), and each one is exported in the shell that starts Emacs or `tt`.
+
+## Secrets (credentials)
+
+A plan declares the credentials it needs **by name** and nothing else:
+
+```org
+#+TT_SECRETS: PYTH_ACCESS_TOKEN KAIKO_KEY
+```
+
+- The name goes into the JSON plan (`secrets`); the plan never holds a value.
+- The conductor resolves each value from **its own environment** (the shell that
+  starts Emacs or `tt`) when the run starts, and passes it to the worker and
+  every reviewer as an environment variable. In a command, write `$PYTH_ACCESS_TOKEN`.
+- Every agent's prompt names the declared secrets and says to reference them as
+  `$NAME`, never to paste a value.
+- An `sh` command containing a secret's literal value is refused (before it
+  runs), with a message naming the variable to use instead.
+- Redaction happens at choke points, not at each caller:
+  - the run's **plan snapshot** (`<run>/plan/v1.json`) is written with every
+    declared value replaced, so a plan whose goal or check line quotes one
+    cannot put it on disk;
+  - **everything sent to an agent** — the worker prompt, every reviewer
+    prompt, a steer, the stall nudge — is redacted before it is written to the
+    agent's stdin, so no prompt can carry a value;
+  - agent text entering the conductor's **in-memory state**, the agent stream
+    files, `events.jsonl`, the check logs, the `refs/` copies, `views/pr.md`,
+    and what `tt status`/`tt state`/`tt timing` print are all redacted too, with
+    one line-safe rule: a value is replaced inside JSON strings (keys included)
+    and never inside a number, so every JSONL line stays parseable.
+  A check the plan wrote still runs exactly as written, even when the conductor
+  was started from the masked snapshot: the value is put back, in memory, for
+  the commands the plan asks for and only for those (the check log keeps the
+  mask). Write `$NAME` anyway — it is clearer and survives a run started
+  without the value. Emacs masks a declared secret's value as well, using its
+  own environment, so nothing it displays can show one.
+- A `refs/` copy is written masked: a document saved as UTF-16 (its bytes hold
+  NULs) is searched in UTF-8/UTF-16 and masked too, and — when the plan declares
+  secrets — a document that is neither text nor a UTF-16 document is **not copied
+  at all**: it is named in `refs/MISSING.txt`, because a leak that cannot be
+  searched must not be handed to every agent. A UTF-16 document that quotes
+  nothing *is* copied: its bytes were searched. A plan that declares no secrets
+  copies its references exactly as before.
+- **A declared secret that could not be resolved withholds the references.** Any
+  document may quote any declared value, so with one name unset (or set too short
+  to mask) no copy can be verified: each document is left out and named in
+  `refs/MISSING.txt` with the reason, and the status says which name was unset.
+  Export every key the plan declares and the documents come back, masked.
+- A declared secret whose value is **shorter than 4 characters** is not used
+  for masking or for refusing commands (masking `1` would rewrite every id and
+  timestamp in the log); it is reported by name and the run still runs. Give a
+  secret a real value, or it is only an environment variable.
+- A declared secret that is unset at start is reported by name (`secret FAKE_KEY
+  not set` in `tt status` and the status buffer) and **the run still starts** — a
+  missing credential fails whatever check needs it, not the run. Its reference
+  documents are withheld as above, since a value nobody can supply cannot be
+  masked.
+- Text that merely *quotes* a value (a finding's evidence, a ballot's rationale)
+  is masked, not refused, so the evidence stays readable; a **command** carrying
+  a value (the `sh` tool, or a finding's reproduction command) is refused with a
+  message naming `$NAME` and never runs.
+- The input box is the owner's own channel: what you type is delivered to the
+  worker as written. Everything the conductor *records* about it is masked.
+- Two files a run can still hold a value in are not the conductor's to write at
+  the moment it is written: Pi's own session file under `<run>/sessions/`, and a
+  file the worker itself edited in `<run>/worktree/`. `tt redact` cleans the
+  sessions; the worktree and the reviewers' `candidates/` checkouts are git
+  trees and are left to you.
+
+Cleaning a run that already leaked a value (for example a run started before its
+plan declared its secrets):
+
+```sh
+PYTH_ACCESS_TOKEN=…  tt redact <run-dir-or-id> --secrets PYTH_ACCESS_TOKEN
+PYTH_ACCESS_TOKEN=…  tt redact --all --secrets PYTH_ACCESS_TOKEN
+```
+
+`tt redact` rewrites run directories **in place** — `events.jsonl`,
+`stream/*.jsonl`, `sessions/` (Pi's own session files, which hold whatever an
+agent echoed), `checks/**`, `refs/**`, `views/**`, `plan/`, `inbox/`,
+`conductor.log` — replacing the value with `***NAME***`. The values are read
+from the command's own environment; the names come from `--secrets` or, when it
+is omitted, from each run's own plan snapshot. JSONL files are rewritten line by
+line, so every line still parses (a torn final line stays torn and unnewlined).
+A UTF-16 document is searched in UTF-8 and UTF-16 and masked, in both the raw
+and the JSON-escaped form of a value; a file whose bytes could not be searched
+(neither text nor a UTF-16 document) is **named** in the output rather than
+counted as clean.
+
+It **refuses a run whose conductor is still alive** (that run keeps writing its
+stream, its sessions and its log, so a run reported as redacted could regain the
+value a second later) — stop the run first, or pass `--force` if you accept
+that. `--root` chooses the run root.
+
+A worker's `worktree/` and the reviewers' `candidates/` checkouts are git trees,
+not conductor output, and are left alone — check them yourself if a worker ever
+pasted a value into the code. The trace buffer masks a declared secret's value
+that a stream file still holds, using Emacs's own environment, so an unredacted
+past run cannot display one either.
 
 ## Watch it
 
@@ -163,7 +261,7 @@ rebuilds from scratch:
 | decision view (`C-c m d`) | the current round's decisions, each labelled by the tally, with the options, recommendation and each reviewer's ballot; findings grouped by file; earlier rounds one line each. Read-only. |
 | runs list (`C-c m l`) | every run: `RET` opens, `k` stops, `R` resumes |
 | mode line | live runs with stage, time and reviews; a warning face when something needs attention |
-| CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown) |
+| CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
 
 ## Steer it
 
@@ -244,6 +342,7 @@ Each row was observed in a real run.
 | freeze fails with "failed to copy file … objects" | a concurrent `git gc` in the source repository | nothing: the clone retries once |
 | review shows many decisions for a small change | every reviewer discovers up to 5 more | expected; read only REJECTED and flagged ones |
 | `tt stop` reports the lock still held | conductor killed hard | wait a moment and rerun `tt stop`; `tt list` shows the real state |
+| a key was pasted into a command or a file by an agent | the plan did not declare it (`#+TT_SECRETS`) | clean the run with `tt redact` (see Secrets), add the name to the plan, and export the value in the shell that starts the run |
 
 ## Known limitations
 

@@ -6,6 +6,13 @@
 // harness.ts's `extraPiArgsPrefix`) purely so `pgrep -f <marker>` can prove
 // nothing survives, and every `sh`/check/probe command line embeds its own
 // unique marker text for the same reason.
+//
+// The file's own timeout is raised above the Makefile's 180s default: the 11
+// sub-tests are inherently slow (each waits out a real deadline), and under
+// the suite's four-way concurrency they already summed to 164s there — 92% of
+// a limit that then failed the phase's own `make check` when the last
+// sub-test's window was too narrow (see it below). The check as a whole still
+// finishes far inside its own 5-minute budget.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -39,7 +46,7 @@ async function assertNoOrphan(mark: string): Promise<void> {
   assert.equal(out, "", `expected no process matching '${mark}' to survive, found: ${out}`);
 }
 
-test("deadline-every-stage", async (t) => {
+test("deadline-every-stage", { timeout: 300_000 }, async (t) => {
   await t.test("worker attempt: exceeding workerAttemptMs cancels, times out, consumes a repair round", async () => {
     const mark = marker("worker-attempt");
     const setup = await setupConductor({
@@ -361,14 +368,20 @@ test("deadline-every-stage", async (t) => {
 
   await t.test("run execution budget: time spent AWAITING_OWNER is not counted against it", async () => {
     const mark = marker("budget-paused");
-    // checks always fail -> repair rounds exhaust (~10s of real, actively
-    // *executing* fake-pi round trips, per the sibling "repair rounds
-    // exhausted" sub-test above) -> AWAITING_OWNER. `runBudgetMs` is
-    // generous enough to comfortably survive that actual execution time
-    // (with headroom) but well under the total wall-clock this sub-test
-    // spends once the AWAITING_OWNER dwell below is added on top — so if
-    // the budget clock ran during the dwell too, it would have already
-    // fired by the time this sub-test checks.
+    // checks always fail -> repair rounds exhaust (~9s of real, actively
+    // *executing* fake-pi round trips on an idle machine, 13–20s while the
+    // rest of `make test` runs alongside this file) -> AWAITING_OWNER.
+    //
+    // The two numbers below are one window, and it is deliberately not a
+    // guess about how long that flow takes: the dwell is LONGER THAN THE
+    // WHOLE BUDGET, so a budget clock that kept running while the phase was
+    // parked would necessarily have fired by the time this sub-test checks,
+    // whatever the flow cost — and the budget still leaves room for the flow
+    // to take twice as long as measured. A fixed 10s dwell with a 15s budget
+    // did need that guess, and under four-way test concurrency the flow
+    // itself outlasted the 15s budget: the run paused before it ever parked
+    // (`RUN_PAUSED_BUDGET` does not auto-stop) and this sub-test timed out.
+    const budgetMs = 45_000;
     const setup = await setupConductor({
       checks: ["false"],
       workerScript: () => ({
@@ -382,18 +395,18 @@ test("deadline-every-stage", async (t) => {
         workerAttemptMs: 20_000,
         checkMs: 10_000,
         freezeMs: 15_000,
-        runBudgetMs: 15_000,
+        runBudgetMs: budgetMs,
       },
       extraPiArgsPrefix: [`--tt-marker=${mark}`],
     });
     await setup.conductor.start();
     try {
       await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 40_000);
-      // Sit parked in AWAITING_OWNER for longer than what's left of
-      // runBudgetMs. If the budget clock ran during this dwell, RUN_BUDGET_EXCEEDED would have
-      // already fired — design §8.1/§8.2: "a phase parked in AWAITING_OWNER
-      // consumes nothing."
-      await sleep(10_000);
+      // Sit parked for longer than the whole budget. If the budget clock ran
+      // during this dwell, RUN_BUDGET_EXCEEDED would already have fired —
+      // design §8.1/§8.2: "a phase parked in AWAITING_OWNER consumes
+      // nothing."
+      await sleep(budgetMs + 1_000);
       assert.equal(setup.conductor.state.run, "RUN_ACTIVE", "budget must not be consumed while AWAITING_OWNER");
       const events = readEvents(setup.runDir);
       assert.ok(

@@ -18,6 +18,16 @@ import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
+import {
+  loggedSecretStatus,
+  planSecretNames,
+  redactJson,
+  redactRunDir,
+  redactText,
+  resolveSecrets,
+  secretNames,
+  type Secret,
+} from "./effects/secrets.ts";
 import type { ProgramFile } from "./core/program.ts";
 import {
   appendProgramEvent,
@@ -34,7 +44,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | list | prs <id>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -98,12 +108,27 @@ function runSummary(runDir: string): string {
     }
   }
   const md = prSummary(runDir, plan, { removedTests: removed });
+  // Plan 01a: the body quotes findings and decisions, which can carry a
+  // secret value an agent echoed; `views/pr.md` is written redacted.
+  const redacted = redactText(md, secretsForRun(runDir));
   try {
-    writeFileSync(path.join(runPaths(runDir).views, "pr.md"), md);
+    writeFileSync(path.join(runPaths(runDir).views, "pr.md"), redacted);
   } catch {
     // views/ may be missing on a very old run; printing is what matters
   }
-  return md;
+  return redacted;
+}
+
+/** Plan 01a: the values this run's plan declares, resolved from this
+ * process's own environment — `tt state`/`tt timing`/`tt status`/`tt summary`
+ * redact what they print with them, so a value an agent echoed into a
+ * finding, a decision or a command is never shown. */
+function secretsForRun(runDir: string): Secret[] {
+  try {
+    return resolveSecrets(secretNames(readPlan(runDir).secrets)).maskable;
+  } catch {
+    return [];
+  }
 }
 
 async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean): Promise<void> {
@@ -333,6 +358,11 @@ function renderStatus(runDir: string): string {
   const lines: string[] = [];
   lines.push(`run: ${path.basename(runDir)}`);
   lines.push(`run status: ${state.run}`);
+  // Plan 01a: a declared secret that was unset, or set to a value too short
+  // to mask safely, is reported here (names only); the run still runs.
+  const secretStatus = loggedSecretStatus(runDir);
+  for (const name of secretStatus.missing) lines.push(`secret ${name} not set`);
+  for (const name of secretStatus.tooShort) lines.push(`secret ${name} too short to mask (value under 4 characters)`);
   lines.push(`phase: ${phase.phaseId} — ${phase.phase}`);
   const attempt = phase.attempt as { n: number; interrupted?: boolean } | undefined;
   if (attempt) lines.push(`attempt: ${attempt.n}${attempt.interrupted ? " (interrupted)" : ""}`);
@@ -390,16 +420,18 @@ function cmdList(root: string, json: boolean): void {
         const alive = conductorAlive(runDir);
         const meta = JSON.parse(readFileSync(runPaths(runDir).meta, "utf8")) as { title?: string };
         const v = buildView(runDir, readPlan(runDir), alive);
+        // Plan 01a: a title or an attention line can quote a value.
+        const secrets = secretsForRun(runDir);
         return {
           id: n,
           runDir,
-          title: meta.title ?? "",
+          title: redactText(meta.title ?? "", secrets),
           phase: v.timeline.state.phase.phase,
           stage: v.stage,
           stageElapsed: v.stageElapsed,
           elapsed: v.elapsed,
           reviews: v.reviewLine,
-          attention: v.attention ?? null,
+          attention: v.attention ? redactText(v.attention, secrets) : null,
           needsYou: v.needsYou,
           alive,
           activity: statSync(runPaths(runDir).events).mtimeMs,
@@ -421,9 +453,103 @@ function cmdList(root: string, json: boolean): void {
   }
 }
 
-async function cmdStatus(runIdOrDir: string, root: string): Promise<void> {
-  const runDir = resolveRunDir(runIdOrDir, root);
-  process.stdout.write(renderStatus(runDir));
+/** Plan 01a: `tt redact <run-dir-or-id | --all> [--secrets NAME…] [--force]`
+ * rewrites existing run directories in place — the streams, the control log,
+ * the check logs, the refs copies and the views — replacing every declared
+ * secret's value with `***NAME***`. The values come from this process's
+ * environment (there is nowhere else to read them from), so a past run can be
+ * cleaned by exporting the keys it used and naming their variables here.
+ * Without `--secrets`, a run's own plan snapshot supplies the names.
+ *
+ * A run whose conductor is still alive is refused: it keeps writing (Pi's own
+ * session file, the stream, the log), so a "redacted" run could regain the
+ * value a second later. `--force` overrides that, and the warning says what
+ * the live run will keep writing. */
+function cmdRedact(argv: string[], defaultRoot: string): void {
+  const positional: string[] = [];
+  const nameArgs: string[] = [];
+  let all = false;
+  let force = false;
+  let root = defaultRoot;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--all") all = true;
+    else if (arg === "--force") force = true;
+    else if (arg === "--root") root = argv[++i];
+    else if (arg === "--secrets") {
+      while (i + 1 < argv.length && !argv[i + 1].startsWith("--")) nameArgs.push(argv[++i]);
+    } else if (arg.startsWith("--secrets=")) nameArgs.push(arg.slice("--secrets=".length));
+    else positional.push(arg);
+  }
+  if (all === (positional.length > 0) || positional.length > 1) usage();
+
+  let dirs: string[];
+  if (all) {
+    try {
+      dirs = readdirSync(root)
+        .filter((n) => existsSync(path.join(root, n, "meta.json")))
+        .map((n) => path.join(root, n));
+    } catch {
+      dirs = [];
+    }
+  } else {
+    dirs = positional.map((p) => resolveRunDir(p, root));
+  }
+  if (dirs.length === 0) {
+    process.stdout.write(`no runs to redact under ${root}\n`);
+    return;
+  }
+
+  const named = secretNames(nameArgs);
+  let files = 0;
+  let runs = 0;
+  const unset: string[] = [];
+  const tooShort: string[] = [];
+  const unnamed: string[] = [];
+  const notRuns: string[] = [];
+  const live: string[] = [];
+  const opaque: string[] = [];
+  for (const dir of dirs) {
+    if (!existsSync(path.join(dir, "meta.json"))) {
+      notRuns.push(dir);
+      continue;
+    }
+    if (conductorAlive(dir) && !force) {
+      live.push(path.basename(dir));
+      continue;
+    }
+    const declared = named.length > 0 ? named : planSecretNames(dir);
+    if (declared.length === 0) {
+      unnamed.push(path.basename(dir));
+      continue;
+    }
+    const { maskable, missing, tooShort: short } = resolveSecrets(declared);
+    unset.push(...missing);
+    tooShort.push(...short);
+    const result = redactRunDir(dir, maskable);
+    files += result.changed;
+    for (const file of result.opaque) opaque.push(path.relative(dir, file));
+    runs += 1;
+  }
+  process.stdout.write(`redacted ${runs} of ${dirs.length} run(s), ${files} file(s)\n`);
+  if (live.length > 0) {
+    process.stdout.write(
+      `conductor still running: ${live.join(", ")} — refused (it keeps writing stream, sessions and log); stop it first, or pass --force\n`,
+    );
+  }
+  for (const name of [...new Set(unset)]) {
+    process.stdout.write(`secret ${name} not set: its value is not in this environment, nothing was redacted for it\n`);
+  }
+  for (const name of [...new Set(tooShort)]) {
+    process.stdout.write(`secret ${name} too short to mask (value under 4 characters): masking it would rewrite unrelated text\n`);
+  }
+  if (unnamed.length > 0) process.stdout.write(`no declared secrets (pass --secrets NAME…): ${unnamed.join(", ")}\n`);
+  for (const dir of notRuns) process.stdout.write(`not a run directory (no meta.json): ${dir}\n`);
+  if (opaque.length > 0) {
+    process.stdout.write(
+      `not UTF-8 text, searched UTF-8/UTF-16 only — check these yourself: ${opaque.join(", ")}\n`,
+    );
+  }
 }
 
 function pidAlive(pid: number): boolean {
@@ -537,7 +663,8 @@ async function main(): Promise<void> {
     await cmdStart(positional[0], runRoot);
   } else if (cmd === "status") {
     if (positional.length !== 1) usage();
-    await cmdStatus(positional[0], runRoot);
+    const runDir = resolveRunDir(positional[0], runRoot);
+    process.stdout.write(redactText(renderStatus(runDir), secretsForRun(runDir)));
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
     launchDetached(resolveRunDir(positional[0], runRoot));
@@ -550,8 +677,10 @@ async function main(): Promise<void> {
     process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));
   } else if (cmd === "timing") {
     if (positional.length !== 1) usage();
-    const times = timingReport(resolveRunDir(positional[0], runRoot));
-    process.stdout.write(json ? `${JSON.stringify(times)}\n` : `${timingText(times)}\n`);
+    const runDir = resolveRunDir(positional[0], runRoot);
+    const secrets = secretsForRun(runDir);
+    const times = timingReport(runDir);
+    process.stdout.write(json ? `${JSON.stringify(redactJson(times, secrets))}\n` : `${redactText(timingText(times), secrets)}\n`);
   } else if (cmd === "stop") {
     if (positional.length !== 1) usage();
     await cmdStop(positional[0], runRoot);
@@ -583,9 +712,30 @@ async function main(): Promise<void> {
     const round = state.phase.round ?? 0;
     const ownerInputs = state.phase.ownerInputs ?? [];
     const { timeline: _timeline, ...view } = buildView(runDir, plan, alive);
-    process.stdout.write(
-      `${JSON.stringify({ runDir, meta, plan, state, round, decisionStatuses, conductorAlive: alive, ownerInputs, pendingOwnerInputs: pendingOwnerInputs(runDir), view })}\n`,
-    );
+    const payload = {
+      runDir,
+      meta,
+      plan,
+      state,
+      round,
+      decisionStatuses,
+      conductorAlive: alive,
+      ownerInputs,
+      pendingOwnerInputs: pendingOwnerInputs(runDir),
+      // Plan 01a: the plan's declared secret names, and which were unset or
+      // unusable when the conductor started (names only — never a value).
+      secrets: {
+        declared: planSecretNames(runDir),
+        missing: loggedSecretStatus(runDir).missing,
+        tooShort: loggedSecretStatus(runDir).tooShort,
+      },
+      view,
+    };
+    // Plan 01a: "what `tt state` prints" carries no secret value either —
+    // redacted structurally, so the JSON stays JSON.
+    process.stdout.write(`${JSON.stringify(redactJson(payload, secretsForRun(runDir)))}\n`);
+  } else if (cmd === "redact") {
+    cmdRedact(rest, runRoot);
   } else if (cmd === "runner" && positional[0] === "install") {
     // `tt runner install <sha>`: freeze an accepted revision outside every
     // worktree at <root>/runner/<sha>/, so a run that edits tradeoffs-trace

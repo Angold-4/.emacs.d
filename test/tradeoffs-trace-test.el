@@ -237,6 +237,7 @@
      `((meta (title . "sum validation"))
        (conductorAlive . t)
        (ownerInputs) (pendingOwnerInputs)
+       (secrets (declared "FAKE_KEY" "OTHER_KEY" "TT") (missing "FAKE_KEY") (tooShort "TT"))
        (state (run . "RUN_ACTIVE")
               (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 1))
                      (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
@@ -254,6 +255,11 @@
       (should (string-match-p "reviews   M ✗ 2 reject · 1 blocking   A ✓   B ⧗" text))
       (should (string-match-p "4 decisions · 2 flagged for you · 1 open findings" text))
       (should (string-match-p "boundary files changed: 2 (reviewers classify)" text))
+      ;; Plan 01a: an unset declared secret is reported by name; a set one is
+      ;; not, and a value too short to mask is reported too.
+      (should (string-match-p "secret    FAKE_KEY not set" text))
+      (should (string-match-p "secret    TT too short to mask" text))
+      (should-not (string-match-p "OTHER_KEY" text))
       ;; empty sections are not shown
       (should-not (string-match-p "Owner input" text))
       (should-not (string-match-p "verdict" text)))))
@@ -393,6 +399,91 @@
               (set-buffer-modified-p nil) (setq buffer-file-name nil)
               (should (equal refs (vector ref))))))
       (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-plan-secrets ()
+  "Plan 01a: #+TT_SECRETS becomes the plan's secrets list — names only."
+  (let ((plan (plist-get (+tt-test--parse (concat "#+TT_SECRETS: FAKE_KEY  OTHER_KEY,THIRD_KEY\n"
+                                                    +tt-test--valid-plan))
+                          :plan)))
+    (should (equal (alist-get 'secrets plan) ["FAKE_KEY" "OTHER_KEY" "THIRD_KEY"])))
+  (should-not (assq 'secrets (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+  ;; An empty #+TT_SECRETS declares nothing.
+  (should-not (assq 'secrets (plist-get (+tt-test--parse (concat "#+TT_SECRETS:\n" +tt-test--valid-plan)) :plan))))
+
+(ert-deftest tradeoffs-trace-trace-never-shows-a-secret-value ()
+  "Plan 01a: the trace masks a declared secret's value (read from Emacs's own
+environment) wherever a stream file happens to hold one; the name shows."
+  (let* ((root (make-temp-file "tt-ert-secret" t))
+         (dir (expand-file-name "stream" root)))
+    (unwind-protect
+        (progn
+          (make-directory dir)
+          (make-directory (expand-file-name "plan" root))
+          (with-temp-file (expand-file-name "plan/v1.json" root)
+            (insert (json-encode '((title . "t") (secrets . ["FAKE_KEY"])))))
+          (setenv "FAKE_KEY" "sk-live-4f8a2b1c9d3e")
+          (with-temp-file (expand-file-name "worker-1.jsonl" dir)
+            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I used sk-live-4f8a2b1c9d3e now.\"}]}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:04.000Z\",\"event\":{\"type\":\"tool_execution_start\",\"toolCallId\":\"t1\",\"toolName\":\"sh\",\"args\":{\"command\":\"curl -H 'Bearer sk-live-4f8a2b1c9d3e' x\"}}}\n"
+                    "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:05.000Z\",\"event\":{\"type\":\"tool_execution_end\",\"toolCallId\":\"t1\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Bearer sk-live-4f8a2b1c9d3e\"}]}}}\n"))
+          (with-temp-buffer
+            (+tt-trace-mode)
+            (setq +tt--run-dir root)
+            (+tt--render-trace)
+            (let ((text (buffer-string)))
+              (should (string-search "» I used ***FAKE_KEY*** now." text))
+              (should (string-search "$ curl -H 'Bearer ***FAKE_KEY***' x ✓" text))
+              (should (string-search "· Bearer ***FAKE_KEY***" text))
+              (should-not (string-search "sk-live-4f8a2b1c9d3e" text))))
+          ;; Without the declared name (or without the variable set) nothing
+          ;; is masked: this is a display guard, not the conductor's redaction.
+          (setenv "FAKE_KEY" nil)
+          (with-temp-buffer
+            (+tt-trace-mode)
+            (setq +tt--run-dir root)
+            (should (null (+tt--secret-values root)))))
+      (setenv "FAKE_KEY" nil)
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-redact-masks-longest-first-and-skips-short-values ()
+  "Plan 01a, matching secrets.ts: a value that contains another must be masked
+first, and a value shorter than the conductor's own minimum is never masked."
+  (let* ((root (make-temp-file "tt-ert-redact" t))
+         (plan (expand-file-name "plan" root)))
+    (unwind-protect
+        (progn
+          (make-directory plan)
+          (with-temp-file (expand-file-name "v1.json" plan)
+            (insert (json-encode '((title . "t") (secrets . ["A_KEY" "AB_KEY" "TT"])))))
+          (setenv "A_KEY" "sk-live")
+          (setenv "AB_KEY" "sk-live-abcd1234")
+          (setenv "TT" "1")
+          ;; The short value is skipped entirely: masking "1" would rewrite
+          ;; every id, count and timestamp the trace renders.
+          (let ((secrets (+tt--secret-values root)))
+            (should (equal (mapcar #'car secrets) '("A_KEY" "AB_KEY")))
+            (should (equal (+tt--redact "1 of 2" secrets) "1 of 2"))
+            ;; Longest first: no suffix of AB_KEY's value may survive, and one
+            ;; pass masks both.
+            (should (equal (+tt--redact "a=sk-live b=sk-live-abcd1234" secrets)
+                           "a=***A_KEY*** b=***AB_KEY***"))
+            (should-not (string-match-p "abcd1234" (+tt--redact "x sk-live-abcd1234 y" secrets))))
+          ;; …and the same holds through the trace renderer, which is what a
+          ;; stream file left unredacted by an older runner goes through.
+          (make-directory (expand-file-name "stream" root))
+          (with-temp-file (expand-file-name "worker-1.jsonl" (expand-file-name "stream" root))
+            (insert "{\"agentId\":\"worker-1\",\"ts\":\"2026-09-23T06:52:03.000Z\",\"event\":{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"keep 1 and sk-live-abcd1234\"}]}}}\n"))
+          (with-temp-buffer
+            (+tt-trace-mode)
+            (setq +tt--run-dir root)
+            (+tt--render-trace)
+            (let ((text (buffer-string)))
+              (should (string-search "keep 1 and ***AB_KEY***" text))
+              (should-not (string-search "sk-live" text)))))
+      (setenv "A_KEY" nil)
+      (setenv "AB_KEY" nil)
+      (setenv "TT" nil)
+      (delete-directory root t))))
 
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

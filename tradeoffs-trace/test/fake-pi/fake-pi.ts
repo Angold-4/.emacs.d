@@ -17,6 +17,7 @@
 //       { "kind": "emit", "event": { "type": "agent_start" } },
 //       { "kind": "call-submit", "tool": "submit_phase", "args": { ... } },
 //       { "kind": "call-sh", "command": "echo hi" },
+//       { "kind": "emit-env", "name": "FAKE_KEY" },
 //       { "kind": "sleep", "ms": 10 },
 //       { "kind": "hang-until-abort" },
 //       { "kind": "hang-forever" },
@@ -51,6 +52,11 @@ type Step =
   | { kind: "emit"; event: Record<string, unknown> }
   | { kind: "call-submit"; tool: "submit_phase" | "submit_discovery" | "submit_review"; args: unknown }
   | { kind: "call-sh"; command: string; cwd?: string }
+  // Plan 01a: report one environment variable of THIS agent process as a tool
+  // result, so a test can assert what the conductor put in an agent's
+  // environment (a real agent runs commands through the conductor, whose
+  // environment is not the agent's).
+  | { kind: "emit-env"; name: string }
   | { kind: "sleep"; ms: number }
   | { kind: "hang-until-abort" }
   | { kind: "hang-forever" }
@@ -222,11 +228,15 @@ async function main(): Promise<void> {
           writeStdout({ type: "tool_execution_start", toolCallId, toolName: step.tool, args });
           const reply = await runSocket.submit(step.tool, args);
           const ok = reply.type === "submit_reply" && reply.ok;
+          // The conductor's own reason is echoed into the tool result (the real
+          // extension shows it to the model too), so a test can assert *why* a
+          // submission was refused, not just that it was.
+          const reason = reply.type === "submit_reply" ? reply.reason : undefined;
           writeStdout({
             type: "tool_execution_end",
             toolCallId,
             toolName: step.tool,
-            result: { content: [{ type: "text", text: ok ? "submission accepted" : "submission rejected" }] },
+            result: { content: [{ type: "text", text: ok ? "submission accepted" : `submission rejected: ${reason ?? "no reason given"}` }] },
             isError: !ok,
           });
           break;
@@ -241,6 +251,20 @@ async function main(): Promise<void> {
             toolCallId,
             toolName: "sh",
             result: { content: [{ type: "text", text: chunks.join("") }] },
+            isError: false,
+          });
+          break;
+        }
+        case "emit-env": {
+          const toolCallId = randomUUID();
+          writeStdout({ type: "tool_execution_start", toolCallId, toolName: "env", args: { name: step.name } });
+          writeStdout({
+            type: "tool_execution_end",
+            toolCallId,
+            toolName: "env",
+            result: {
+              content: [{ type: "text", text: `${step.name}=${process.env[step.name] ?? "(unset)"}` }],
+            },
             isError: false,
           });
           break;

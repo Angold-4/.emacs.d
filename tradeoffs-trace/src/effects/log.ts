@@ -13,7 +13,9 @@
 //
 // This module has no opinion on *what* a record's `event` payload looks
 // like beyond it being JSON-serializable; that is for the conductor to
-// define per action kind.
+// define per action kind. It does redact one thing on every append: the
+// plan's secret values (see `secrets.ts` and the constructor), so a value an
+// agent echoed into a finding or a disclosure never reaches the log.
 
 import { randomBytes } from "node:crypto";
 // `fs`'s default export is the same mutable CJS `module.exports` object,
@@ -21,6 +23,8 @@ import { randomBytes } from "node:crypto";
 // changing behavior) so tests can `mock.method(fs, "fsyncSync")` to prove
 // every append fsyncs.
 import fs from "node:fs";
+
+import { redactRecord, type Secret } from "./secrets.ts";
 
 /** One line of `events.jsonl`. `kind` is `"intent"` or `"completion"` for
  * effect records, and free-form (e.g. `"state"`, `"applied"`) for anything
@@ -121,9 +125,16 @@ export class EventLog {
   #fd: number;
   #seq: number;
   #path: string;
+  #secrets: readonly Secret[];
 
-  constructor(path: string) {
+  /** `secrets` (plan 01a): every appended record's payload is redacted before
+   * it is serialized, so no value ever lands in `events.jsonl` — the file a
+   * crash-recovered conductor, `tt state` and every view read back. The same
+   * redaction the offline `tt redact` path uses, so a value used as a JSON key
+   * is masked here too and a number is never touched. */
+  constructor(path: string, secrets: readonly Secret[] = []) {
     this.#path = path;
+    this.#secrets = secrets;
     let lastSeq = 0;
     // Reopening: continue the seq counter from whatever is already on
     // disk (including a torn final line's seq if it happened to parse a
@@ -135,13 +146,16 @@ export class EventLog {
     this.#fd = fs.openSync(path, "a");
   }
 
-  /** Appends one record and fsyncs before returning. */
+  /** Appends one record and fsyncs before returning. The record's `event`
+   * payload is redacted (see the constructor), never the caller's own
+   * object. */
   append(kind: string, event: unknown, actionId?: string): LogRecord {
     this.#seq += 1;
+    const redacted = redactRecord(event, this.#secrets);
     const record: LogRecord =
       actionId === undefined
-        ? { seq: this.#seq, ts: new Date().toISOString(), kind, event }
-        : { seq: this.#seq, ts: new Date().toISOString(), kind, actionId, event };
+        ? { seq: this.#seq, ts: new Date().toISOString(), kind, event: redacted }
+        : { seq: this.#seq, ts: new Date().toISOString(), kind, actionId, event: redacted };
     fs.writeSync(this.#fd, `${JSON.stringify(record)}\n`);
     fs.fsyncSync(this.#fd);
     return record;
