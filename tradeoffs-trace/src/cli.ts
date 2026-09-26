@@ -288,7 +288,9 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       });
       process.stdout.write(`${JSON.stringify(rows)}\n`);
     } else {
-      const rows = dirs.map((dir) => programStatusLines(dir).slice(0, 2).join(" · "));
+      // Plan 01h: `tt program list` only shows the first two lines, so it
+      // skips the per-node cost/trade-off detail (no view is built).
+      const rows = dirs.map((dir) => programStatusLines(dir, new Date(), { nodeDetail: false }).slice(0, 2).join(" · "));
       process.stdout.write(rows.map((r) => `${r}\n`).join(""));
     }
   } else {
@@ -485,6 +487,10 @@ function renderStatus(runDir: string): string {
   // Plan 01g: every amendment record, applied or reverted, with old → new.
   if (view.amendments) lines.push(`amendments: ${view.amendments}`);
   if (view.verdict) lines.push(`verdict: ${view.verdict}`);
+  // Plan 01h: the trade-offs panel (most important first) and the cost row,
+  // directly under the verdict like the status buffer.
+  for (const t of view.tradeoffs ?? []) lines.push(`trade-off: ${t.text}`);
+  if (view.cost) lines.push(`cost: ${view.cost.text}`);
   if (view.time) lines.push(`time: ${view.time}`);
   return `${lines.join("\n")}\n`;
 }

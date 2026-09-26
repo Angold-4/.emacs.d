@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor.ts";
 import { execFileSync } from "node:child_process";
 
-import { formatDuration } from "./view.ts";
+import { buildView, formatDuration } from "./view.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 
 import {
@@ -537,10 +537,35 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
   }
 }
 
+/** Plan 01h: one line per node under its own status line — its rounds, its
+ * minutes, its owner wait and its single most important trade-off — built
+ * from the node's run. Undefined when the run cannot be read (a node that
+ * never started, or a hand-made fixture). */
+function nodeCostLine(runDir: string): string | undefined {
+  try {
+    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
+    const view = buildView(runDir, plan, pidAlive(path.join(runDir, "conductor.pid")));
+    const cost = view.cost;
+    if (!cost) return undefined;
+    const parts = [`${cost.rounds} round${cost.rounds === 1 ? "" : "s"}`, `${cost.totalMinutes}m`];
+    if (cost.ownerWaitMinutes > 0) parts.push(`owner wait ${cost.ownerWaitMinutes}m`);
+    const top = view.tradeoffs?.[0];
+    if (top) parts.push(`top: ${top.text}`);
+    return `    ${parts.join(" · ")}`;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Human-readable program status (the CLI and Emacs render this). Waiting
  * (needs-you) nodes come first, oldest wait first, each with how long it has
- * been waiting and the one-line reason. `now` is injectable for tests. */
-export function programStatusLines(dir: string, now: Date = new Date()): string[] {
+ * been waiting and the one-line reason. `now` is injectable for tests.
+ *
+ * Plan 01h: with `nodeDetail` (the default), each node with a readable run
+ * gets one more indented line: its rounds, minutes, owner wait and its most
+ * important trade-off. `tt program list` passes `nodeDetail: false` so it
+ * never builds a view for every node. */
+export function programStatusLines(dir: string, now: Date = new Date(), opts: { nodeDetail?: boolean } = {}): string[] {
   const { program, nodes, state, at } = foldProgram(dir);
   const outcome = programOutcome(nodes, state);
   const alive = pidAlive(programPaths(dir).pid);
@@ -578,6 +603,10 @@ export function programStatusLines(dir: string, now: Date = new Date()): string[
     }
     if (s.branch) lines.push(`    branch ${s.branch}  (PR base: ${s.base ?? "?"})`);
     if (s.status !== "needs-you" && s.reason) lines.push(`    ${s.reason}`);
+    if (opts.nodeDetail !== false && s.runId) {
+      const detail = nodeCostLine(path.join(path.dirname(path.dirname(dir)), s.runId));
+      if (detail) lines.push(detail);
+    }
   }
   const directives = state.directives ?? [];
   if (directives.length > 0) {

@@ -541,13 +541,19 @@ whole program; warnings are shown and it starts."
          (inhibit-read-only t)
          (pt (point)))
     (erase-buffer)
-    (dolist (line (alist-get 'lines s))
-      (let ((start (point)))
-        (insert line "\n")
-        ;; RET on a node's line opens its run.
-        (when (string-match "\\`[^ ]+ \\([^ ]+\\)" line)
-          (let ((run (alist-get 'runId (alist-get (intern (match-string 1 line)) nodes))))
-            (when run (put-text-property start (point) '+tt-run-id run))))))
+    (let ((run-id nil))
+      (dolist (line (alist-get 'lines s))
+        (let ((start (point)))
+          (insert line "\n")
+          (cond
+           ;; RET on a node's line opens its run.
+           ((string-match "\\`[^ ]+ \\([^ ]+\\)" line)
+            (setq run-id (alist-get 'runId (alist-get (intern (match-string 1 line)) nodes)))
+            (when run-id (put-text-property start (point) '+tt-run-id run-id)))
+           ;; Plan 01h: an indented detail line (rounds/minutes/owner wait/top
+           ;; trade-off) belongs to the node above it; RET opens the same run.
+           ((and run-id (string-prefix-p "    " line))
+            (put-text-property start (point) '+tt-run-id run-id))))))
     (goto-char (min pt (point-max)))))
 
 (defun +tt-program-open-node ()
@@ -983,6 +989,23 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
       ;; A row longer than the window wraps under its value, not its label.
       (put-text-property start (point) 'wrap-prefix (make-string 10 ?\s)))))
 
+(defun +tt--render-tradeoffs (v)
+  "Insert the Trade-offs section (plan 01h) from view V, if any.
+At most 6 self-contained lines, most important first, computed in
+`src/view.ts'.  Each line carries the record it is about, so RET on it can
+open the decision view at that record."
+  (let ((entries (alist-get 'tradeoffs v)))
+    (when entries
+      (insert (format "\nTrade-offs (%d)\n" (length entries)))
+      (dolist (e entries)
+        (let ((start (point))
+              (record (alist-get 'recordId e)))
+          (insert (format "  - %s\n" (or (alist-get 'text e) "")))
+          (when record
+            ;; Invisible to the eye, read by RET and by the arrow keys: the
+            ;; full record id this line is about.
+            (put-text-property start (point) '+tt-record record)))))))
+
 (defun +tt--render-status-from (s run-dir)
   "Insert the status of RUN-DIR from `tt state' S (plan 3b layout)."
   (let* ((phase (+tt--get s 'state 'phase))
@@ -1016,6 +1039,11 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
     (+tt--status-row "reviews" (alist-get 'reviewLine v))
     (+tt--status-row "verdict" (alist-get 'verdict v)
                      (if (equal name "DONE") 'success 'warning))
+    ;; Plan 01h: the trade-offs panel directly under the verdict, then what
+    ;; the run is costing.  Both are omitted when absent (a run from before
+    ;; this stage carries neither).
+    (+tt--render-tradeoffs v)
+    (+tt--status-row "cost" (alist-get 'text (alist-get 'cost v)) 'shadow)
     (+tt--status-row "records"
                      (format "%d decisions%s%s · %d open findings%s"
                              (alist-get 'liveDecisions v)
@@ -1059,9 +1087,19 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
     (erase-buffer)
     (+tt--render-status-from s +tt--run-dir)))
 
+(defun +tt-open-tradeoff ()
+  "Open the decision view at the trade-off record on this line (RET).
+Plan 01h: a Trade-offs line carries the record it is about as a text
+property; RET on it opens the decision view with point at that record."
+  (interactive)
+  (let ((record (get-text-property (point) '+tt-record)))
+    (unless record (user-error "No trade-off record on this line"))
+    (+tt-decisions record)))
+
 (defvar-keymap +tt-status-mode-map
   :parent special-mode-map
   "d" #'+tt-decisions
+  "RET" #'+tt-open-tradeoff
   "g" #'+tt--refresh-all)
 
 (define-derived-mode +tt-status-mode special-mode "tt-status"
@@ -1343,7 +1381,8 @@ points back and the view never claims the replacement is in force (A-14)."
 
 (defun +tt--decision-block (d status phase)
   "Insert decision D (tally STATUS) as one self-contained Org entry."
-  (let* ((choice (or (alist-get 'choice d) ""))
+  (let* ((start (point))
+         (choice (or (alist-get 'choice d) ""))
          (short (truncate-string-to-width (+tt--one-line choice 200) 80 nil nil "…"))
          (source (alist-get 'source d))
          (seen (alist-get 'alsoSeenBy d))
@@ -1352,6 +1391,8 @@ points back and the view never claims the replacement is in force (A-14)."
          (ballots (seq-filter (lambda (b) (equal (alist-get 'decisionId b) (alist-get 'id d)))
                               (alist-get 'ballots phase))))
     (insert (format "* %s  %s\n" (+tt--decision-label status d phase) short))
+    ;; Plan 01h: RET from a Trade-offs line finds this record by its id.
+    (put-text-property start (point) '+tt-record (alist-get 'id d))
     ;; Plan 01g: the reworded acceptance item, verbatim old → new.
     (when-let* ((line (+tt--amendment-line d))) (insert line))
     (unless (equal short (+tt--one-line choice 200)) (insert (format "  %s\n" choice)))
@@ -1402,18 +1443,47 @@ points back and the view never claims the replacement is in force (A-14)."
           (insert (format "   %s\n" ev)))))
     (insert "\n")))
 
+(defun +tt--tradeoff-ranks (v)
+  "Hash of record id -> rank, from view V's `tradeoffs' (plan 01h).
+The decision view uses the same order the Trade-offs panel uses; a record
+not named by a trade-off line keeps its place after those that are."
+  (let ((ranks (make-hash-table :test #'equal))
+        (i 0))
+    (dolist (e (alist-get 'tradeoffs v))
+      (let ((r (alist-get 'recordId e)))
+        (when r (puthash r i ranks)))
+      (setq i (1+ i)))
+    ranks))
+
+(defun +tt--render-advisories (advisories)
+  "Insert ADVISORIES (open advisory findings) folded under one heading.
+Plan 01h: the decision view does not list each advisory in the findings
+section; they sit under one foldable heading with their count, and each
+carries its record so RET can reach it."
+  (when advisories
+    (insert (format "* Advisories (%d) — accepted, not fixed\n" (length advisories)))
+    (dolist (f advisories)
+      (let ((start (point))
+            (first (car (split-string (or (alist-get 'evidence f) "") "\\. " t))))
+        (insert (format "** ADVISORY %s — %s\n" (+tt--one-line first 90) (alist-get 'raisedBy f)))
+        (put-text-property start (point) '+tt-record (alist-get 'id f))))
+    (insert "\n")))
+
 (defun +tt--render-decisions (s)
   "Insert the decision view for state S."
   (let* ((phase (+tt--get s 'state 'phase))
          (v (alist-get 'view s))
          (statuses (alist-get 'decisionStatuses s))
          (candidate (+tt--get phase 'candidate 'sha))
+         (ranks (+tt--tradeoff-ranks v))
          (current (seq-filter (lambda (d)
                                 (and (not (equal (alist-get 'source d) "trigger"))
                                      (not (equal (alist-get 'status (alist-get (intern (alist-get 'id d)) statuses))
                                                  "superseded"))))
                               (alist-get 'decisions phase)))
-         (findings (seq-filter (lambda (f) (equal (alist-get 'status f) "open")) (alist-get 'findings phase)))
+         (open-findings (seq-filter (lambda (f) (equal (alist-get 'status f) "open")) (alist-get 'findings phase)))
+         (advisories (seq-filter (lambda (f) (equal (alist-get 'severity f) "advisory")) open-findings))
+         (findings (seq-remove (lambda (f) (equal (alist-get 'severity f) "advisory")) open-findings))
          (addressing (alist-get 'addressing v))
          (needs (alist-get 'needsYou v)))
     (insert (format "#+TITLE: decisions — %s\n" (+tt--get s 'meta 'title)))
@@ -1426,6 +1496,16 @@ points back and the view never claims the replacement is in force (A-14)."
     (when (and needs (> needs 0))
       (insert (format "⚑ %d owner request(s) open — type a correction in the input box\n" needs)))
     (insert "\n")
+    ;; Plan 01h: the same ordering as the Trade-offs panel (amendments,
+    ;; flagged, M vetoes, dissent, the rest).  Sorting by the rank the view
+    ;; computed keeps this a renderer, not a second opinion.
+    (setq current (sort current (lambda (a b)
+                                  (let ((ra (gethash (alist-get 'id a) ranks))
+                                        (rb (gethash (alist-get 'id b) ranks)))
+                                    (cond ((and ra rb) (< ra rb))
+                                          (ra t)
+                                          (rb nil)
+                                          (t nil))))))
     (if current
         (dolist (d current)
           (+tt--decision-block d (alist-get (intern (alist-get 'id d)) statuses) phase))
@@ -1433,6 +1513,7 @@ points back and the view never claims the replacement is in force (A-14)."
     (when findings
       (insert (format "Findings (%d open)\n" (length findings)))
       (+tt--render-findings findings))
+    (+tt--render-advisories advisories)
     (let ((rounds (alist-get 'rounds v)))
       (when rounds
         (insert "Earlier rounds\n")
@@ -1440,9 +1521,22 @@ points back and the view never claims the replacement is in force (A-14)."
           (insert (format "* Round %s · %s · %s\n" (alist-get 'round r)
                           (substring (alist-get 'candidateSha r) 0 7) (alist-get 'outcome r))))))))
 
+(defun +tt--goto-record (record)
+  "Move point to the block whose `+tt-record' property is RECORD.
+Return the position, or nil when the view does not carry it."
+  (let ((pos (point-min))
+        (found nil))
+    (while (and (not found) pos (< pos (point-max)))
+      (if (equal (get-text-property pos '+tt-record) record)
+          (setq found pos)
+        (setq pos (next-single-property-change pos '+tt-record))))
+    (when found (goto-char found) found)))
+
 ;;;###autoload
-(defun +tt-decisions ()
-  "Open the decision view of the run this buffer means."
+(defun +tt-decisions (&optional record)
+  "Open the decision view of the run this buffer means.
+With RECORD (plan 01h), move point to that decision or finding's block —
+the target of RET on a Trade-offs line."
   (interactive)
   (let* ((run (+tt--resolve-run))
          (s (+tt--state run))
@@ -1454,7 +1548,7 @@ points back and the view never claims the replacement is in force (A-14)."
       (+tt-decisions-mode)
       (setq +tt--run-dir run)
       (org-content 1)
-      (goto-char (point-min)))
+      (if record (+tt--goto-record record) (goto-char (point-min))))
     (pop-to-buffer buf)))
 
 (defun +tt-decisions-refresh ()

@@ -905,5 +905,118 @@ so the view never claims the replacement is still in force (A-14)."
          (d `((amendment . ,a))))
     (should (equal (+tt--amendment-line d) "  it works → the tests pass\n"))))
 
+;;; Plan 01h: the live trade-offs panel and the cost meter
+
+(defconst +tt-test--tradeoff-state
+  '((meta (title . "sum validation"))
+    (conductorAlive . :false)
+    (ownerInputs) (pendingOwnerInputs)
+    (secrets (declared) (missing) (tooShort))
+    (plan (title . "sum") (phases . (((id . "p1") (goal . "g") (acceptance) (ownerChecklist)))))
+    (state (run . "RUN_ACTIVE")
+           (phase (phaseId . "p1") (phase . "REVIEWING") (attempt (n . 2))
+                  (repairRoundsUsed . 1) (repairRoundsGranted . 3)
+                  (candidate (sha . "7c1e0a4aaaaaaaa"))
+                  (decisions ((id . "D-p1-1") (class . "delegated")
+                              (choice . "Batch cancels per tick") (whyItMatters . "w")
+                              (alternatives ((option . "a") (consequence . "b")))
+                              (recommendation (choice . "a") (reason . "b")))
+                             ((id . "D-p1-flag") (class . "reserved")
+                              (choice . "Errors are thrown, not returned") (whyItMatters . "w")
+                              (alternatives ((option . "a") (consequence . "b")))
+                              (recommendation (choice . "a") (reason . "b"))))
+                  (ballots)
+                  (findings ((id . "F-p1-M-2") (severity . "advisory") (status . "open")
+                             (raisedBy . "M")
+                             (evidence . "src/sum.js:9 a slow path. It returns NaN to callers.")))
+                  (ownerRequests)))
+    (decisionStatuses (D-p1-1 (status . "failed") (reason . "M veto"))
+                      (D-p1-flag (status . "passed") (flagged . t)))
+    (view (elapsed . "1m02s") (round . 2)
+          (pipeline . "review 12s… (14m48s left)")
+          (reviewLine . "M ✗ 1 reject   A ✓   B ✓")
+          (verdict . "not accepted: D-1 vetoed by M → repair attempt 2")
+          (liveDecisions . 2) (failedDecisions . 1) (flaggedDecisions . 1)
+          (openFindings . 1) (boundaryFilesChanged . 0)
+          (needsYou . 0)
+          (tradeoffs ((kind . "flagged") (recordId . "D-p1-flag")
+                      (text . "⚑ flagged: D-flag Errors are thrown, not returned — passed"))
+                     ((kind . "veto") (recordId . "D-p1-1")
+                      (text . "vetoed by M: D-1 Batch cancels per tick — a lone cancel waits a tick"))
+                     ((kind . "advisories") (recordId . "F-p1-M-2")
+                      (text . "1 advisories (1 new) — C-c m d")))
+          (cost (rounds . 2) (totalMinutes . 106) (ownerWaitMinutes . 34)
+                (nextRoundMinutes . 14)
+                (text . "2 rounds · 106m total · implement 34m · review 30m · owner wait 34m · next round ≈ 14 min"))
+          (rounds)))
+  "A plan 01h `tt state': a Trade-offs panel, a cost row and the records they name.")
+
+(defun +tt-test--without-tradeoffs ()
+  "The plan 01h fixture as a run from before the stage: no tradeoffs/cost."
+  (let ((s (copy-tree +tt-test--tradeoff-state)))
+    (setf (alist-get 'tradeoffs (alist-get 'view s)) nil)
+    (setf (alist-get 'cost (alist-get 'view s)) nil)
+    s))
+
+(ert-deftest tradeoffs-trace-status-tradeoffs-and-cost ()
+  "Plan 01h: the status buffer renders the Trade-offs section directly under
+ the verdict and the cost row; each trade-off line carries its record for RET."
+  (with-temp-buffer
+    (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
+    (let ((text (buffer-string)))
+      (should (string-match-p "Trade-offs (3)" text))
+      (should (string-match-p "⚑ flagged: D-flag Errors are thrown, not returned — passed" text))
+      (should (string-match-p "vetoed by M: D-1 Batch cancels per tick — a lone cancel waits a tick" text))
+      (should (string-match-p "1 advisories (1 new) — C-c m d" text))
+      (should (string-match-p "cost .*2 rounds · 106m total · implement 34m · review 30m · owner wait 34m · next round ≈ 14 min" text))
+      (should (< (string-match-p "verdict" text) (string-match-p "Trade-offs" text)))))
+  ;; RET finds the record on the line, without printing it.
+  (let (record)
+    (cl-letf (((symbol-function '+tt-decisions) (lambda (&optional r) (setq record r))))
+      (with-temp-buffer
+        (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
+        (goto-char (point-min))
+        (search-forward "vetoed by M: D-1")
+        (goto-char (match-beginning 0))
+        (+tt-open-tradeoff)
+        (should (equal record "D-p1-1"))))))
+
+(ert-deftest tradeoffs-trace-status-omits-empty-tradeoffs ()
+  "Plan 01h: a run from before the stage (no `tradeoffs'/`cost' in the view)
+renders as before; an empty Trade-offs section is omitted too."
+  (with-temp-buffer
+    (+tt--render-status-from (+tt-test--without-tradeoffs) "/tmp/tt-ert/abcd1234")
+    (should-not (string-match-p "Trade-offs" (buffer-string)))
+    (should-not (string-match-p "^cost" (buffer-string)))
+    (should (string-match-p "verdict" (buffer-string))))
+  (with-temp-buffer
+    (let ((s (copy-tree +tt-test--tradeoff-state)))
+      (setf (alist-get 'tradeoffs (alist-get 'view s)) nil)
+      (+tt--render-status-from s "/tmp/tt-ert/abcd1234")
+      (should-not (string-match-p "Trade-offs" (buffer-string))))))
+
+(ert-deftest tradeoffs-trace-decision-view-follows-tradeoff-order ()
+  "Plan 01h: the decision view keeps the Trade-offs order (flagged before a
+vetoed decision here) and folds the advisories under one heading with the
+count; each block carries its record so RET can land on it."
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--tradeoff-state)
+    (let ((text (buffer-string)))
+      (should (< (string-match-p "ACCEPTED ⚑ FLAGGED" text)
+                 (string-match-p "REJECTED (M veto)" text)))
+      (should (string-match-p "\\* Advisories (1) — accepted, not fixed" text))
+      (should (string-match-p "\\*\\* ADVISORY src/sum.js:9 a slow path — M" text))
+      ;; The advisories are not listed again as blocking findings.
+      (should-not (string-match-p "Findings (" text)))
+    (goto-char (point-min))
+    (should (+tt--goto-record "D-p1-1"))
+    (should (looking-at "\\* REJECTED (M veto)"))
+    (goto-char (point-min))
+    (should (+tt--goto-record "F-p1-M-2"))
+    (should (looking-at "\\*\\* ADVISORY"))
+    ;; A record the view does not carry is not an error, just not found.
+    (goto-char (point-min))
+    (should-not (+tt--goto-record "D-missing"))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here
