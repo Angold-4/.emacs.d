@@ -1527,12 +1527,10 @@ tuple the owner saw; a missing property is refused before this runs."
            "--run-id" (nth 4 binding)
            "--phase-id" (nth 5 binding)))))
 
-(defun +tt-review--verdict (verdict reason)
-  "Send VERDICT (`accept'/`refuse') for the message at point.
-A raw message cannot be settled yet (contract v1: it is not yet frozen);
-one already published is sent through `tt verdict' with its full binding.
-A missing binding property is refused locally, and a stale verdict's reason
-is shown in the echo area and the buffer refreshes."
+(defun +tt-review--settleable-id ()
+  "The id at point when the message can be settled, else signal an error.
+A raw message is not yet frozen, and a heading without the full binding is
+refused rather than settled against the run's current state."
   (let ((id (+tt-review--message-id))
         (state (org-entry-get nil "STATE")))
     (unless id (user-error "No message on this line"))
@@ -1540,6 +1538,15 @@ is shown in the echo area and the buffer refreshes."
       (user-error "message %s is not yet frozen; it must be published before a verdict" id))
     (unless (+tt-review--binding-at-point)
       (user-error "message %s has no full binding in its heading; refresh the review (g) and try again" id))
+    id))
+
+(defun +tt-review--verdict (verdict reason)
+  "Send VERDICT (`accept'/`refuse') for the message at point.
+A raw message cannot be settled yet (contract v1: it is not yet frozen);
+one already published is sent through `tt verdict' with its full binding.
+A missing binding property is refused locally, and a stale verdict's reason
+is shown in the echo area and the buffer refreshes."
+  (let ((id (+tt-review--settleable-id)))
     (condition-case err
         (message "%s" (apply #'+tt--cli (+tt-review--verdict-args id verdict reason)))
       (error (message "%s" (error-message-string err))))
@@ -1551,8 +1558,11 @@ is shown in the echo area and the buffer refreshes."
   (+tt-review--verdict "accept" nil))
 
 (defun +tt-review-refuse ()
-  "Refuse the message at point (D), asking for an optional one-line reason."
+  "Refuse the message at point (D), asking for an optional one-line reason.
+A message that cannot be settled is reported before the reason is asked for
+(A-18), so D on a raw message just says it is not yet frozen."
   (interactive)
+  (+tt-review--settleable-id)
   (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))
 
 (defun +tt-review-refresh (&optional force)
@@ -1601,8 +1611,11 @@ point, \[org-cycle] folds and \[+tt-review-refresh] refreshes."
       (user-error "No rendered review at %s; the runtime writes it after a message is raised" file))
     (let ((buf (find-file-noselect file)))
       (with-current-buffer buf
-        (setq +tt--run-dir run +tt-review--file file)
+        ;; A-17: the mode first.  `+tt-review-mode' derives from org-mode,
+        ;; whose parent chain runs `kill-all-local-variables', so buffer-locals
+        ;; set before it would be cleared and `+tt--run-dir' would be nil.
         (+tt-review-mode)
+        (setq +tt--run-dir run +tt-review--file file)
         (setq +tt-review--mtime (file-attribute-modification-time (file-attributes file)))
         (+tt-review--setup)
         (goto-char (point-min)))

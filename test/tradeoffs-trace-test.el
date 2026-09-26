@@ -1172,15 +1172,61 @@ inert as it was before the key existed — no error, and nothing opened."
   "A fixture `views/review.org' with a blocker, a trade-off and a raw finding.")
 
 (defun +tt-test--review-buffer (dir)
-  "A `+tt-review-mode' buffer displaying the fixture review under DIR."
-  (let ((buf (generate-new-buffer "*tt-ert-review*")))
-    (with-current-buffer buf
-      (insert +tt-test--review-org)
-      (+tt-review-mode)
-      (setq +tt--run-dir dir
-            +tt-review--file (expand-file-name "views/review.org" dir)
-            +tt-review--mtime nil))
-    buf))
+  "Open DIR's review the real way: +tt-review on a fixture run directory.
+A-17/OD-2: the buffer must be opened through +tt-review (the mode first,
+then the buffer-locals), not by setting the locals after the mode."
+  (make-directory (expand-file-name "views/messages" dir) t)
+  (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--review-org))
+  (dolist (id '("B-1" "T-1" "F-1"))
+    (with-temp-file (expand-file-name (concat "views/messages/" id ".org") dir)
+      (insert (format "* %s\n\n* Evidence\n  - src/x.ts:1\n" id))))
+  (let ((+tt--run-dir dir))
+    (+tt-review))
+  ;; The shared refresh timer is not part of these unit tests.
+  (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+  (get-file-buffer (expand-file-name "views/review.org" dir)))
+
+(ert-deftest tradeoffs-trace-review-real-buffer ()
+  "A-17/OD-2: a buffer opened through +tt-review keeps its run dir, so RET,
+A/D and the mtime refresh all work in a real, file-visiting buffer."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (opened nil) (calls nil) (cli 0) (pf 0))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir)))
+          (with-current-buffer buf
+            (should (equal +tt--run-dir dir))
+            (should (equal +tt-review--file (expand-file-name "views/review.org" dir)))
+            ;; RET opens the message's own file.
+            (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
+              (goto-char (point-min))
+              (search-forward "T-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-open-message))
+            (should (equal opened (expand-file-name "views/messages/T-1.org" dir)))
+            ;; A calls tt verdict with the heading's run dir and full binding.
+            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "verdict applied"))
+                      ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
+              (goto-char (point-min))
+              (search-forward "B-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-accept))
+            (should (equal (nth 1 calls) dir))
+            (should (equal (member "--candidate-sha" calls)
+                           '("--candidate-sha" "C1" "--message-version" "1"
+                             "--contract-version" "1" "--contract-sha256" "aaaa"
+                             "--run-id" "r1" "--phase-id" "p1")))
+            ;; The mtime refresh re-reads the changed file, with no CLI call.
+            (with-temp-file (expand-file-name "views/review.org" dir)
+              (insert (replace-regexp-in-string "Batch cancels per tick" "A changed title" +tt-test--review-org)))
+            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) (cl-incf cli) ""))
+                      ((symbol-function 'process-file) (lambda (&rest _) (cl-incf pf) 0)))
+              (+tt-review-refresh))
+            (should (string-search "A changed title" (buffer-string)))
+            (should (= cli 0))
+            (should (= pf 0))))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
+      (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-review-buffer-faces-and-ret ()
   "Plan 03b: each type gets its face; RET opens the message's own file."
@@ -1415,6 +1461,27 @@ version the owner never saw (the M/B objection to the silent fallback)."
               (let ((err (condition-case e (progn (+tt-review-accept) nil) (user-error e))))
                 (should err)
                 (should (string-match-p "no full binding" (error-message-string err))))
+              (should-not called)))
+          (kill-buffer buf))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-review-refuse-checks-before-asking ()
+  "A-18: D on a raw message says 'not yet frozen' without asking for a reason."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (asked nil) (called nil))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir)))
+          (with-current-buffer buf
+            (cl-letf (((symbol-function 'read-string) (lambda (&rest _) (setq asked t) "reason"))
+                      ((symbol-function '+tt--cli) (lambda (&rest _) (setq called t) ""))
+                      ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
+              (goto-char (point-min))
+              (search-forward "F-1")
+              (goto-char (match-beginning 0))
+              (let ((err (condition-case e (progn (+tt-review-refuse) nil) (user-error e))))
+                (should err)
+                (should (string-match-p "not yet frozen" (error-message-string err))))
+              (should-not asked)
               (should-not called)))
           (kill-buffer buf))
       (delete-directory dir t))))
