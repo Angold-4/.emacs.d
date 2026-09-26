@@ -15,6 +15,7 @@
 // mismatch, before anything else about the event is considered.
 
 import { checkBallotBinding, checkBinding, checkTupleBinding, currentVersionsFor } from "./binding.ts";
+import { applyCarryWithContract, applyMessageEvent } from "./messages.ts";
 import { next as computeNext } from "./next.ts";
 import {
   applyFindingAcceptedByOwner,
@@ -26,7 +27,7 @@ import {
 } from "./owner-commands.ts";
 import { isLiveDecision, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
-import type { BindingTuple, ContractVersion, Event, InFlightKey, ReduceResult, State } from "./types.ts";
+import type { BindingTuple, ContractVersion, Event, Finding, InFlightKey, ReduceResult, State } from "./types.ts";
 
 const KNOWN_EVENT_TYPES = new Set<string>([
   "ATTEMPT_STARTED",
@@ -86,6 +87,14 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "NOTES_DELIVERED",
   "DECISION_MATCHED",
   "FINDING_ALSO_RAISED",
+  "MESSAGE_RAISED",
+  "MESSAGE_PUBLISHED",
+  "MESSAGE_MERGED",
+  "MESSAGE_DROPPED",
+  "OWNER_VERDICT",
+  "MESSAGE_RESOLVED",
+  "MESSAGE_SUPERSEDED",
+  "MESSAGE_CARRIED",
 ]);
 
 function ok(state: State): ReduceResult {
@@ -553,6 +562,61 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (finding.raisedBy === event.reviewer || also.includes(event.reviewer)) return ok(state);
       const findings = p.findings.map((f) => (f.id === finding.id ? { ...f, alsoRaisedBy: [...also, event.reviewer] } : f));
       return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "MESSAGE_RAISED":
+    case "MESSAGE_PUBLISHED":
+    case "MESSAGE_MERGED":
+    case "MESSAGE_DROPPED":
+    case "MESSAGE_RESOLVED":
+    case "MESSAGE_SUPERSEDED": {
+      const result = applyMessageEvent(p.messages ?? [], event);
+      if (!result.ok) return rejected(state, result.reason);
+      return ok({ ...state, phase: { ...p, messages: result.messages } });
+    }
+
+    case "MESSAGE_CARRIED": {
+      const message = (p.messages ?? []).find((m) => m.id === event.messageId);
+      if (!message) return rejected(state, `unknown message ${event.messageId}`);
+      const result = applyCarryWithContract(p.messages ?? [], message, event, p.contract.contractVersion);
+      if (!result.ok) return rejected(state, result.reason);
+      return ok({ ...state, phase: { ...p, messages: result.messages } });
+    }
+
+    case "OWNER_VERDICT": {
+      const message = (p.messages ?? []).find((m) => m.id === event.messageId);
+      if (!message) return rejected(state, `unknown message ${event.messageId}`);
+      if (message.state === "raw") {
+        return rejected(state, `message ${event.messageId} is not yet frozen; it must be published before a verdict`);
+      }
+      const result = applyMessageEvent(p.messages ?? [], event);
+      if (!result.ok) return rejected(state, result.reason);
+      let messages = result.messages;
+      let findings = p.findings;
+      if (event.verdict === "refuse") {
+        if (p.phase === "DONE") {
+          // After DONE a refusal is a recorded follow-up: it changes no phase
+          // state and does not reopen the run (contract §1.3).
+          messages = messages.map((m) => (m.id === event.messageId ? { ...m, followUp: true } : m));
+        } else if (p.phase === "REVIEWING" && p.candidate) {
+          // Refusing during review raises an owner-authored blocking finding,
+          // so accept(C, K) cannot hold on this candidate (predicate.ts's
+          // open-blocking-finding clause).
+          const finding: Finding = {
+            id: `F-${p.phaseId}-owner-${p.findings.length + 1}`,
+            version: 1,
+            phaseId: p.phaseId,
+            kind: "defect",
+            severity: "blocking",
+            evidence: event.reason?.trim().length ? event.reason : `the owner refused message ${event.messageId}: ${message.title}`,
+            raisedBy: "owner",
+            status: "open",
+            boundCandidateSha: p.candidate.sha,
+          };
+          findings = [...p.findings, finding];
+        }
+      }
+      return ok({ ...state, phase: { ...p, messages, findings } });
     }
 
     case "MISS_RECORDED": {

@@ -700,6 +700,9 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   // Plan 01i: the owner's rulings in force are part of the PR body — binding
   // on reviewers, and the reason a `⚑` decision reads the way it does.
   const directives = (phase.ownerDirectives ?? []).filter((d) => d.status === "in-force");
+  // Contract v1: a message the owner refused after DONE is a recorded
+  // follow-up, not a blocker. The PR body must not hide it.
+  const followUps = (phase.messages ?? []).filter((m) => m.followUp);
   const lines = [
     `## ${phase.phaseId}`,
     "",
@@ -754,6 +757,13 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   if (advisories.length > 0) {
     lines.push("", `### Open advisory findings (${advisories.length}) — accepted, not fixed`, "");
     for (const f of advisories) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 400)}`);
+  }
+  if (followUps.length > 0) {
+    lines.push("", `### Follow-ups (refused after DONE — recorded, not blocking)`, "");
+    for (const m of followUps) {
+      const reason = m.settlement?.reason ? ` — ${oneLine(m.settlement.reason, 200)}` : "";
+      lines.push(`- **${m.id}** (${m.type}): ${oneLine(m.title, 200)}${reason}`);
+    }
   }
   if (extra.removedTests && extra.removedTests.length > 0) {
     lines.push("", `### Tests removed from files that still exist (${extra.removedTests.length})`, "");

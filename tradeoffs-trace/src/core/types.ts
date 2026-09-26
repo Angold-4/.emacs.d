@@ -200,7 +200,9 @@ export interface Finding {
   kind: FindingKind;
   severity: FindingSeverity;
   evidence: string; // file:line, scenario, check result or plan clause — required, non-empty
-  raisedBy: Reviewer | "conductor"; // conductor raises `integration` findings itself
+  /** Reviewers and the conductor raise findings; the owner may raise one by
+   * refusing a published message during review (contract §1.3). */
+  raisedBy: Reviewer | "conductor" | "owner"; // conductor raises `integration` findings itself
   linkedDecisionId?: string;
   status: FindingStatus;
   boundCandidateSha: string; // the candidate the finding was raised against
@@ -218,6 +220,86 @@ export interface Finding {
   /** Plan 2c: other reviewers who raised the same finding ("same as F-…")
    * instead of filing a duplicate. */
   alsoRaisedBy?: Reviewer[];
+}
+
+// ---------------------------------------------------------------------------
+// Contract v1: messages, their lifecycle and the settled ledger
+// ---------------------------------------------------------------------------
+
+/** The three structured message kinds (plan 04 §2). */
+export type MessageType = "tradeoff" | "finding" | "blocker";
+
+/**
+ * A message's lifecycle (contract §1). The allowed edges are the rows of
+ * `MESSAGE_TRANSITIONS` (core/messages.ts):
+ *
+ *   raw → published | merged | dropped
+ *   published → accepted | refused | superseded | resolved
+ *   refused → resolved | superseded
+ */
+export type MessageState =
+  | "raw"
+  | "published"
+  | "merged"
+  | "dropped"
+  | "accepted"
+  | "refused"
+  | "superseded"
+  | "resolved";
+
+/** A terminal message state carries a settlement (contract §2's ledger): who
+ * settled it, the reason, and the bindings it was settled under. */
+export interface MessageSettlement {
+  state: "accepted" | "refused" | "merged" | "dropped" | "resolved";
+  settledBy: "owner" | "evaluator" | "panel" | "vote";
+  reason?: string;
+  at?: string;
+  candidateSha: string;
+  contractVersion: ContractVersion;
+  messageVersion: number;
+  contentHash: string;
+}
+
+/**
+ * Contract v1's first-class message. A trade-off, a finding or a blocker is
+ * raised as `raw`, is published (`published`) once it is reviewable, and is
+ * settled by an owner verdict (`accepted`/`refused`), an evaluator (`merged`
+ * or `dropped`) or a later resolution. Every version carries the candidate,
+ * contract version and a `contentHash` of the reviewable content, so a
+ * settlement is bound to the CONTENT, not the version number. Ids are
+ * `T-n`, `F-n`, `B-n`, unique within a run. */
+export interface Message {
+  id: string; // T-n | F-n | B-n
+  phaseId: string;
+  type: MessageType;
+  title: string;
+  summary: string;
+  context: string;
+  evidence: string[];
+  planRef?: string;
+  state: MessageState;
+  messageVersion: number;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  contentHash: string;
+  /** The settlement once this message reaches a terminal state. */
+  settlement?: MessageSettlement;
+  /** Set when a carry to a new candidate invalidated an existing settlement
+   * (content changed, or the contract was amended): the message needs a new
+   * verdict. */
+  invalidated?: { reason: "content changed" | "contract amended"; atCandidate: string };
+  /** The decision or finding id this message was raised from, so a re-freeze
+   * or re-review does not raise a duplicate. */
+  sourceRecordId?: string;
+  /** A refusal after the phase reached DONE is a follow-up, not a blocker. */
+  followUp?: boolean;
+  supersededBy?: string;
+  /** Every past version's contentHash, so a verdict bound to a pre-carry
+   * version of an unchanged message is still recognised as current. */
+  versionContentHashes?: Record<number, string>;
+  /** The (candidate, version) pairs this message was carried from, so a
+   * verdict bound to a pre-carry candidate is still recognised. */
+  carriedFrom?: Array<{ candidateSha: string; version: number }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +523,19 @@ export interface UnneededCommand {
   requestId: string;
 }
 
+/** Contract v1 §3: the owner's verdict on a published message. Bound exactly
+ * like every other record-level command (the message id is the record id and
+ * the message version is the record version). */
+export interface VerdictCommand {
+  kind: "verdict";
+  messageId: string;
+  verdict: "accept" | "refuse";
+  reason?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  messageVersion: number;
+}
+
 /** design §3.5/§10.4 (`s`): "on a sampled item: 'should have been surfaced'
  * (records a miss)". The sampled item is either a record the conductor
  * sampled (a `detail` decision, an unreferenced hunk, ...) or an
@@ -477,6 +572,7 @@ export type OwnerCommand =
   | ReviseCommand
   | AmendCommand
   | UnneededCommand
+  | VerdictCommand
   | MissCommand
   | PauseResumeModeCommand;
 
@@ -695,6 +791,10 @@ export interface PhaseState {
    * directive survives a conductor restart; included, newest last, in every
    * later prompt. */
   ownerDirectives?: OwnerDirective[];
+  /** Contract v1 (core/messages.ts): every trade-off, finding and blocker
+   * raised in this phase, in raise order. Folded from MESSAGE_* events, so a
+   * conductor restart rebuilds it from the log alone. */
+  messages?: Message[];
 }
 
 export type RunStatus = RunStateName;
@@ -1090,6 +1190,86 @@ export interface EvDecisionAdded {
   decision: Decision;
 }
 
+// ---------------------------------------------------------------------------
+// Contract v1: message events (core/messages.ts)
+// ---------------------------------------------------------------------------
+
+/** A trade-off, finding or blocker is raised as a raw message bound to the
+ * phase's current candidate/contract. */
+export interface EvMessageRaised {
+  type: "MESSAGE_RAISED";
+  message: Message;
+}
+/** A raw message is published (reviewable by the owner). */
+export interface EvMessagePublished {
+  type: "MESSAGE_PUBLISHED";
+  messageId: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+/** An evaluator merged a message into another (or into the plan). */
+export interface EvMessageMerged {
+  type: "MESSAGE_MERGED";
+  messageId: string;
+  by: "owner" | "evaluator" | "panel" | "vote";
+  reason?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+/** An evaluator dropped a message as not reviewable. */
+export interface EvMessageDropped {
+  type: "MESSAGE_DROPPED";
+  messageId: string;
+  by: "owner" | "evaluator" | "panel" | "vote";
+  reason?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+/** The owner's verdict on a published message (contract §3). */
+export interface EvOwnerVerdict {
+  type: "OWNER_VERDICT";
+  messageId: string;
+  verdict: "accept" | "refuse";
+  reason?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+/** A message is resolved without an owner verdict. */
+export interface EvMessageResolved {
+  type: "MESSAGE_RESOLVED";
+  messageId: string;
+  by: "owner" | "evaluator" | "panel" | "vote";
+  reason?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+/** A message is superseded (never votable again). */
+export interface EvMessageSuperseded {
+  type: "MESSAGE_SUPERSEDED";
+  messageId: string;
+  reason?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+/** Conductor-emitted at each FREEZE_COMPLETED, one per live message: pins the
+ * version bump and whether the content (and contract) survived unchanged. */
+export interface EvMessageCarried {
+  type: "MESSAGE_CARRIED";
+  messageId: string;
+  fromCandidate: string;
+  toCandidate: string;
+  fromVersion: number;
+  toVersion: number;
+  contentHash: string;
+  unchanged: boolean;
+}
+
 export type Event =
   | EvAttemptStarted
   | EvSubmitPhase
@@ -1147,7 +1327,15 @@ export type Event =
   | EvMissRecorded
   | EvNotesDelivered
   | EvDecisionMatched
-  | EvFindingAlsoRaised;
+  | EvFindingAlsoRaised
+  | EvMessageRaised
+  | EvMessagePublished
+  | EvMessageMerged
+  | EvMessageDropped
+  | EvOwnerVerdict
+  | EvMessageResolved
+  | EvMessageSuperseded
+  | EvMessageCarried;
 
 export type EventType = Event["type"];
 

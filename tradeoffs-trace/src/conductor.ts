@@ -20,6 +20,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { projectLedger, projectMessages, projectReview } from "./core/messages.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -51,6 +52,7 @@ import {
   type Baseline,
   type BaselineCommand,
 } from "./core/test-failures.ts";
+import { contentHashOf } from "./core/messages.ts";
 import type {
   Action,
   Ballot,
@@ -65,6 +67,8 @@ import type {
   PriorDecisionStatement,
   FindingDisclosure,
   InFlightKey,
+  Message,
+  MessageType,
   OwnerCommand,
   OwnerDirective,
   OwnerInputKind,
@@ -357,6 +361,10 @@ export function runPaths(runDir: string) {
     sessions: path.join(runDir, "sessions"),
     candidates: path.join(runDir, "candidates"),
     checks: path.join(runDir, "checks"),
+    // Contract v1: the rebuilt projections from `events.jsonl`.
+    messages: path.join(runDir, "messages.jsonl"),
+    ledger: path.join(runDir, "ledger.jsonl"),
+    review: path.join(runDir, "views", "review.org"),
     inbox: path.join(runDir, "inbox"),
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
@@ -996,6 +1004,10 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
     }
     this.#state = foldEvents(this.#state, records);
+    // Contract v1: rebuild the projections on every start. A conductor
+    // killed between an event and its projection write leaves stale or
+    // missing files; the log is authoritative and this restores them.
+    this.#writeContractProjections();
     // Plan 01b: seed the park-episode counter from the log, so a restarted
     // conductor keeps the same notification key for the wait it is resuming.
     this.#awaitingEpisode = rebuildTimeline(this.#runDir, this.#plan).phases.filter((p) => p.phase === "AWAITING_OWNER").length;
@@ -1453,6 +1465,7 @@ export class Conductor {
     }
     this.#log.append("event", logged);
     this.#state = result.state;
+    this.#writeContractProjections();
     // Plan 01b: a fresh park is a new notification episode; resolving some of
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
@@ -2979,6 +2992,20 @@ export class Conductor {
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
     this.#applyEvent({ type: "FINDING_RAISED", finding });
+    // Contract v1 §1: a finding (or, at blocking severity, a blocker) is a
+    // published message too.
+    this.#raiseMessage(
+      fd.severity === "blocking" ? "blocker" : "finding",
+      finding.id,
+      {
+        title: `${fd.kind} ${fd.severity}: ${fd.evidence}`,
+        summary: `raised by ${reviewer} against ${candidateSha}`,
+        context: fd.evidence,
+        evidence: [fd.evidence],
+        planRef: this.#state.phase.phaseId,
+      },
+      candidateSha,
+    );
     // Plan 01g: a reviewer's finding may say the criterion cannot be met as
     // written. That is recorded as an amendment the reviewers vote on later;
     // a criterion the contract does not carry is ignored (the finding itself
@@ -3789,11 +3816,93 @@ export class Conductor {
       decisions: outcome.decisions,
       tainted: outcome.tainted,
     });
+    // Contract v1 §2: one explicit MESSAGE_CARRIED per live message, at every
+    // freeze. The settlement carries to the new version exactly when the
+    // content is unchanged and the contract version is the same; reduce()
+    // marks it invalidated otherwise.
+    this.#carryMessages(outcome.candidateSha);
+    // Contract v1 §1: every worker decision is a trade-off message, published
+    // for the owner immediately (this profile has no evaluator yet).
+    for (const decision of outcome.decisions) {
+      this.#raiseMessage(
+        "tradeoff",
+        decision.id,
+        {
+          title: decision.choice,
+          summary: decision.recommendation.reason,
+          context: decision.whyItMatters,
+          evidence: decision.alternatives.map((a) => `${a.option}: ${a.consequence}`),
+          planRef: this.#state.phase.phaseId,
+        },
+        outcome.candidateSha,
+      );
+    }
     // Work packet 2a: boundary triggers (design §3.3) and §3.5's sampling
     // data need a real candidate (for the diff, and for DECISION_ADDED's
     // own binding check) — only possible once FREEZE_COMPLETED above has
     // set phase.candidate.
     this.#recordBoundaryDataAndSample(outcome.candidateSha);
+  }
+
+  /** Contract v1: writes `messages.jsonl` and `ledger.jsonl` from state. */
+  #writeContractProjections(): void {
+    try {
+      fs.writeFileSync(this.#paths.messages, projectMessages(this.#state.phase));
+      fs.writeFileSync(this.#paths.ledger, projectLedger(this.#state.phase));
+      fs.writeFileSync(this.#paths.review, projectReview(this.#state.phase));
+    } catch (err) {
+      this.#logUnexpected("write_contract_projections", err);
+    }
+  }
+
+  /** Contract v1: raises a raw message from a decision or finding and
+   * publishes it immediately (there is no evaluator in this profile yet).
+   * Deduped by the source record id, so a re-freeze or a re-review never
+   * raises the same message twice. */
+  #raiseMessage(type: MessageType, sourceRecordId: string, content: { title: string; summary: string; context: string; evidence: string[]; planRef?: string }, candidateSha: string): void {
+    const existing = this.#state.phase.messages ?? [];
+    if (existing.some((m) => m.sourceRecordId === sourceRecordId)) return;
+    const letter = type === "tradeoff" ? "T" : type === "finding" ? "F" : "B";
+    let n = existing.filter((m) => m.type === type).length + 1;
+    while (existing.some((m) => m.id === `${letter}-${n}`)) n += 1;
+    const message: Message = {
+      id: `${letter}-${n}`,
+      phaseId: this.#state.phase.phaseId,
+      type,
+      ...content,
+      state: "raw",
+      messageVersion: 1,
+      boundCandidateSha: candidateSha,
+      boundContractVersion: this.#state.phase.contract.contractVersion,
+      contentHash: contentHashOf({ type, ...content }),
+      sourceRecordId,
+    };
+    this.#applyEvent({ type: "MESSAGE_RAISED", message });
+    this.#applyEvent({
+      type: "MESSAGE_PUBLISHED",
+      messageId: message.id,
+      boundCandidateSha: candidateSha,
+      boundContractVersion: message.boundContractVersion,
+      boundRecordVersion: 1,
+    });
+  }
+
+  /** Contract v1 §2: one MESSAGE_CARRIED per live message at a freeze. */
+  #carryMessages(toCandidate: string): void {
+    for (const message of this.#state.phase.messages ?? []) {
+      if (message.state === "superseded" || message.state === "resolved") continue;
+      if (message.boundCandidateSha === toCandidate) continue;
+      this.#applyEvent({
+        type: "MESSAGE_CARRIED",
+        messageId: message.id,
+        fromCandidate: message.boundCandidateSha,
+        toCandidate,
+        fromVersion: message.messageVersion,
+        toVersion: message.messageVersion + 1,
+        contentHash: message.contentHash,
+        unchanged: true,
+      });
+    }
   }
 
   // -- checks ---------------------------------------------------------------

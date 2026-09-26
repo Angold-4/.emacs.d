@@ -8,11 +8,14 @@
 // run id immediately rather than blocking for the whole run.
 
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readdirSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { projectLedger, projectMessages, projectReview } from "./core/messages.ts";
+import { reduce } from "./core/reduce.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
   formatFindings,
@@ -24,6 +27,7 @@ import {
   type LintPlanInput,
   type LintProgramInput,
 } from "./core/plan-lint.ts";
+import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
@@ -57,7 +61,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -86,20 +90,25 @@ function cmdLint(file: string): void {
   if (hasLintErrors(findings)) process.exitCode = 1;
 }
 
-function parseArgs(argv: string[]): { positional: string[]; root?: string; json: boolean } {
+function parseArgs(argv: string[]): { positional: string[]; root?: string; json: boolean; reason?: string } {
   const positional: string[] = [];
   let root: string | undefined;
   let json = false;
+  let reason: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--root") {
       root = argv[++i];
     } else if (argv[i] === "--json") {
       json = true;
+    } else if (argv[i] === "--reason") {
+      reason = argv[++i];
+    } else if (argv[i].startsWith("--reason=")) {
+      reason = argv[i].slice("--reason=".length);
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json };
+  return { positional, root, json, reason };
 }
 
 function resolveRunDir(rootOrId: string, root: string): string {
@@ -796,6 +805,113 @@ function pendingOwnerInputs(runDir: string): Array<{ id: string; kind: string; t
   return out;
 }
 
+/** Contract v1: `tt contract rebuild|check <run>`. The projections are
+ * rebuilt from `events.jsonl` (state), never the other way round. */
+function cmdContract(sub: string | undefined, runDir: string): void {
+  const p = runPaths(runDir);
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const messages = projectMessages(state.phase);
+  const ledger = projectLedger(state.phase);
+  const review = projectReview(state.phase);
+  if (sub === "rebuild") {
+    writeFileSync(p.messages, messages);
+    writeFileSync(p.ledger, ledger);
+    writeFileSync(p.review, review);
+    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org\n`);
+    return;
+  }
+  if (sub !== "check") usage();
+  const actualMessages = existsSync(p.messages) ? readFileSync(p.messages, "utf8") : "";
+  const actualLedger = existsSync(p.ledger) ? readFileSync(p.ledger, "utf8") : "";
+  const actualReview = existsSync(p.review) ? readFileSync(p.review, "utf8") : "";
+  const mismatches: string[] = [];
+  if (actualMessages !== messages) mismatches.push("messages.jsonl");
+  if (actualLedger !== ledger) mismatches.push("ledger.jsonl");
+  if (actualReview !== review) mismatches.push("views/review.org");
+  if (mismatches.length > 0) {
+    process.stderr.write(
+      `contract check failed for ${path.basename(runDir)}: ${mismatches.join(", ")} do not match state; run \`tt contract rebuild ${path.basename(runDir)}\`\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write(`contract check ok for ${path.basename(runDir)}\n`);
+}
+
+/** Contract v1 §3: `tt verdict <run> <messageId> <accept|refuse>`. A live
+ * run gets an inbox command (the conductor checks the binding); a run whose
+ * daemon has exited gets the event appended to `events.jsonl` after a
+ * dry-run reduce, so a stale verdict never poisons the log. */
+function cmdVerdict(positional: string[], root: string, reason: string | undefined): void {
+  const runDir = resolveRunDir(positional[0], root);
+  const messageId = positional[1];
+  const verdict = positional[2] as "accept" | "refuse" | undefined;
+  if (verdict !== "accept" && verdict !== "refuse") usage();
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const message = (state.phase.messages ?? []).find((m) => m.id === messageId);
+  if (!message) {
+    process.stderr.write(`no message ${messageId} in run ${path.basename(runDir)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const withReason = reason !== undefined && reason.trim().length > 0 ? { reason } : {};
+  if (conductorAlive(runDir)) {
+    // Live run: through the inbox, so the conductor checks the binding and a
+    // stale verdict lands in inbox/rejected with its reason.
+    const inbox = path.join(runDir, "inbox");
+    mkdirSync(inbox, { recursive: true });
+    const commandId = `verdict-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+    const command = {
+      type: "verdict",
+      verdict,
+      ...withReason,
+      binding: {
+        runId: state.phase.runId,
+        phaseId: state.phase.phaseId,
+        candidateSha: message.boundCandidateSha,
+        contractVersion: message.boundContractVersion,
+        recordId: messageId,
+        recordVersion: message.messageVersion,
+      },
+    };
+    writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
+    process.stdout.write(`queued verdict ${commandId} on ${messageId} for run ${path.basename(runDir)}\n`);
+    return;
+  }
+  // No live conductor: this is a late verdict. Validate it against a dry-run
+  // reduce first, then append it to the authoritative log and refresh the
+  // projections.
+  const event = {
+    type: "OWNER_VERDICT" as const,
+    messageId,
+    verdict,
+    ...withReason,
+    boundCandidateSha: message.boundCandidateSha,
+    boundContractVersion: message.boundContractVersion,
+    boundRecordVersion: message.messageVersion,
+  };
+  const result = reduce(state, event);
+  if (!result.ok) {
+    process.stderr.write(`verdict rejected: ${result.reason}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const p = runPaths(runDir);
+  const log = new EventLog(p.events, resolveSecrets(secretNames(plan.secrets)).maskable);
+  try {
+    log.append("event", event);
+  } finally {
+    log.close();
+  }
+  const after = rebuildState(runDir, plan, { lenient: true });
+  writeFileSync(p.messages, projectMessages(after.phase));
+  writeFileSync(p.ledger, projectLedger(after.phase));
+  writeFileSync(p.review, projectReview(after.phase));
+  process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
+}
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === RUN_PROGRAM_FLAG) {
@@ -809,7 +925,7 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json } = parseArgs(rest);
+  const { positional, root, json, reason } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
@@ -830,6 +946,12 @@ async function main(): Promise<void> {
     await cmdProgram(positional[0], positional.slice(1), runRoot, json);
   } else if (cmd === "list") {
     cmdList(runRoot, json);
+  } else if (cmd === "contract") {
+    if (positional.length !== 2) usage();
+    cmdContract(positional[0], resolveRunDir(positional[1], runRoot));
+  } else if (cmd === "verdict") {
+    if (positional.length !== 3) usage();
+    cmdVerdict(positional, runRoot, reason);
   } else if (cmd === "summary") {
     if (positional.length !== 1) usage();
     process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));
