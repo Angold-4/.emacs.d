@@ -1151,6 +1151,9 @@ attention line are restored here, matching `+tt--render-status-from'."
               (beg (line-beginning-position))
               (end (line-end-position))
               (vbeg nil))
+          ;; A row longer than the window wraps under its value, not under
+          ;; column 0, exactly as +tt--status-row sets it (B-16).
+          (put-text-property beg end 'wrap-prefix (make-string 10 ?\s))
           (put-text-property beg (min end (+ beg 10)) 'face 'shadow)
           (setq vbeg (min end (+ beg 10)))
           (when (equal label "phase")
@@ -1498,39 +1501,45 @@ After a refresh a message may have disappeared; point then goes to the top."
     (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
     (find-file file)))
 
+(defun +tt-review--binding-at-point ()
+  "The six binding property values at point, or nil when any is missing.
+A heading the runtime has not fully rendered must not silently fall back to
+the run's current state, which could settle a version the owner never saw;
+the caller refuses locally instead."
+  (let ((values (mapcar (lambda (key) (org-entry-get nil key))
+                        '("CANDIDATE_SHA" "MESSAGE_VERSION" "CONTRACT_VERSION"
+                          "CONTRACT_SHA256" "RUN_ID" "PHASE_ID"))))
+    (when (seq-every-p (lambda (v) (and v (not (string-empty-p v)))) values)
+      values)))
+
 (defun +tt-review--verdict-args (id verdict reason)
   "The `tt verdict' arguments for message ID from its heading properties.
-The full binding a verdict needs travels with the command, so a heading the
-runtime has not refreshed yet cannot silently accept the wrong version.  A
-missing property is left out, so `tt verdict' falls back to the run's state
-rather than to an empty binding."
-  (append
-   (list "verdict" +tt--run-dir id verdict)
-   (when (and reason (not (string-empty-p reason))) (list "--reason" reason))
-   (let ((cand (org-entry-get nil "CANDIDATE_SHA"))
-         (version (org-entry-get nil "MESSAGE_VERSION"))
-         (contract (org-entry-get nil "CONTRACT_VERSION"))
-         (sha (org-entry-get nil "CONTRACT_SHA256"))
-         (runid (org-entry-get nil "RUN_ID"))
-         (phaseid (org-entry-get nil "PHASE_ID")))
-     (append
-      (when (and cand (not (string-empty-p cand))) (list "--candidate-sha" cand))
-      (when (and version (not (string-empty-p version))) (list "--message-version" version))
-      (when (and contract (not (string-empty-p contract))) (list "--contract-version" contract))
-      (when (and sha (not (string-empty-p sha))) (list "--contract-sha256" sha))
-      (when (and runid (not (string-empty-p runid))) (list "--run-id" runid))
-      (when (and phaseid (not (string-empty-p phaseid))) (list "--phase-id" phaseid))))))
+The full binding travels with the command, so the CLI checks exactly the
+tuple the owner saw; a missing property is refused before this runs."
+  (let ((binding (+tt-review--binding-at-point)))
+    (append
+     (list "verdict" +tt--run-dir id verdict)
+     (when (and reason (not (string-empty-p reason))) (list "--reason" reason))
+     (list "--candidate-sha" (nth 0 binding)
+           "--message-version" (nth 1 binding)
+           "--contract-version" (nth 2 binding)
+           "--contract-sha256" (nth 3 binding)
+           "--run-id" (nth 4 binding)
+           "--phase-id" (nth 5 binding)))))
 
 (defun +tt-review--verdict (verdict reason)
   "Send VERDICT (`accept'/`refuse') for the message at point.
 A raw message cannot be settled yet (contract v1: it is not yet frozen);
 one already published is sent through `tt verdict' with its full binding.
-A stale verdict's reason is shown in the echo area and the buffer refreshes."
+A missing binding property is refused locally, and a stale verdict's reason
+is shown in the echo area and the buffer refreshes."
   (let ((id (+tt-review--message-id))
         (state (org-entry-get nil "STATE")))
     (unless id (user-error "No message on this line"))
     (when (equal state "raw")
       (user-error "message %s is not yet frozen; it must be published before a verdict" id))
+    (unless (+tt-review--binding-at-point)
+      (user-error "message %s has no full binding in its heading; refresh the review (g) and try again" id))
     (condition-case err
         (message "%s" (apply #'+tt--cli (+tt-review--verdict-args id verdict reason)))
       (error (message "%s" (error-message-string err))))

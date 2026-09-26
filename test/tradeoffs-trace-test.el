@@ -1387,7 +1387,36 @@ used: shadow `previous'/`cost' values, and a DONE `verdict' as success."
               (should (eq (funcall face-at "1 round · 0m total") 'shadow))
               (should (eq (funcall face-at "base fails") 'warning))
               (should (eq (funcall face-at "no candidate") 'error))
-              (should (eq (funcall face-at "sum validation") 'bold))))) 
+              (should (eq (funcall face-at "sum validation") 'bold))
+              ;; B-16: a row's continuation wraps under its value, not column 0.
+              (goto-char (point-min))
+              (search-forward "1 round · 0m total")
+              (should (equal (get-text-property (match-beginning 0) 'wrap-prefix) (make-string 10 ?\s)))))) 
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-review-verdict-refuses-a-partial-binding ()
+  "A heading without the full binding is refused locally, never settling a
+version the owner never saw (the M/B objection to the silent fallback)."
+  (let ((dir (make-temp-file "tt-ert-review" t)))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir))
+              (called nil))
+          (with-current-buffer buf
+            (let ((inhibit-read-only t))
+              (goto-char (point-min))
+              (search-forward "B-1")
+              (goto-char (match-beginning 0))
+              (org-entry-delete nil "CONTRACT_SHA256"))
+            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) (setq called t) ""))
+                      ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
+              (goto-char (point-min))
+              (search-forward "B-1")
+              (goto-char (match-beginning 0))
+              (let ((err (condition-case e (progn (+tt-review-accept) nil) (user-error e))))
+                (should err)
+                (should (string-match-p "no full binding" (error-message-string err))))
+              (should-not called)))
+          (kill-buffer buf))
       (delete-directory dir t))))
 
 (provide 'tradeoffs-trace-test)
