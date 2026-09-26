@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -607,8 +607,10 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     const statusBefore = readFileSync(p.status, "utf8");
     assert.match(statusBefore, /^run: /m);
     assert.match(statusBefore, /^phase: /m);
+    const statusMtime = statSync(p.status).mtimeMs;
 
-    // A finding message is added; both views are rewritten from the new state.
+    // A finding message is added; both views are rewritten from the new state
+    // (the status view at most once a second, so it is waited for).
     await waitFor(() => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "finding"), 90_000, 20, setup.runDir);
     await waitFor(() => readFileSync(p.review, "utf8") !== reviewBefore, 30_000, 20, setup.runDir);
     const reviewAfter = readFileSync(p.review, "utf8");
@@ -616,6 +618,7 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(reviewAfter, /^\* Findings$/m);
     assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
     assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
+    await waitFor(() => statSync(p.status).mtimeMs !== statusMtime, 30_000, 20, setup.runDir);
     assert.notEqual(readFileSync(p.status, "utf8"), "");
   } finally {
     await setup.conductor.stop();

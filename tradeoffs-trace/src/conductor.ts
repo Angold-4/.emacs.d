@@ -922,6 +922,10 @@ export class Conductor {
   #steerInFlight = new Set<string>();
   /** The inbox poll timer; cleared by `#doStop`. */
   #inboxTimer: NodeJS.Timeout | undefined;
+  /** Plan 03b: a coalesced `views/status.txt` write, at most once a second.
+   * `buildView` rebuilds the timeline, so it must stay off the message-event
+   * path (the discovery-barrier tests are timing-sensitive). */
+  #statusTimer: NodeJS.Timeout | undefined;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -1024,6 +1028,9 @@ export class Conductor {
     // killed between an event and its projection write leaves stale or
     // missing files; the log is authoritative and this restores them.
     this.#writeContractProjections();
+    // Plan 03b: the status view exists immediately; the coalesced write keeps
+    // it fresh afterwards without rebuilding the view on every message event.
+    this.#writeStatusViewSafe();
     // Plan 01b: seed the park-episode counter from the log, so a restarted
     // conductor keeps the same notification key for the wait it is resuming.
     this.#awaitingEpisode = rebuildTimeline(this.#runDir, this.#plan).phases.filter((p) => p.phase === "AWAITING_OWNER").length;
@@ -1408,6 +1415,12 @@ export class Conductor {
     this.#stopRequested = true;
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
     if (this.#inboxTimer) clearInterval(this.#inboxTimer);
+    if (this.#statusTimer) {
+      clearTimeout(this.#statusTimer);
+      this.#statusTimer = undefined;
+    }
+    // Plan 03b: flush the status view once before the log closes.
+    this.#writeStatusViewSafe();
     // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
@@ -3844,8 +3857,9 @@ export class Conductor {
   }
 
   /** Contract v1: writes `messages.jsonl`, `ledger.jsonl` and the rendered
-   * views (`views/review.org`, `views/messages/<id>.org`, `views/status.txt`)
-   * from state. */
+   * views (`views/review.org`, `views/messages/<id>.org`) from state. The
+   * status view is coalesced (see `#scheduleStatusView`) because `buildView`
+   * is expensive and these writes run on the message-event path. */
   #writeContractProjections(): void {
     try {
       const phase = this.#state.phase;
@@ -3853,9 +3867,29 @@ export class Conductor {
       fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
       fs.writeFileSync(this.#paths.review, projectReview(phase));
       this.#writeMessageViews();
-      this.#writeStatusView();
+      this.#scheduleStatusView();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
+    }
+  }
+
+  /** Plan 03b: write `views/status.txt` at most once a second. Several
+   * message events in a burst produce one write; a pending write is left for
+   * the next tick and never blocks event application. */
+  #scheduleStatusView(): void {
+    if (this.#statusTimer) return;
+    this.#statusTimer = setTimeout(() => {
+      this.#statusTimer = undefined;
+      this.#writeStatusViewSafe();
+    }, 1000);
+    this.#statusTimer.unref?.();
+  }
+
+  #writeStatusViewSafe(): void {
+    try {
+      this.#writeStatusView();
+    } catch (err) {
+      this.#logUnexpected("write_status_view", err);
     }
   }
 
@@ -3876,7 +3910,7 @@ export class Conductor {
   /** Plan 03b: `views/status.txt`, the same text `tt status` prints, so the
    * Emacs status buffer reads a file instead of calling `tt state`. */
   #writeStatusView(): void {
-    const view = buildView(this.#runDir, this.#plan, true);
+    const view = buildView(this.#runDir, this.#plan, !this.#closed);
     const text = renderStatusText(this.#runDir, this.#state, view, {
       missing: this.#missingSecrets,
       tooShort: this.#tooShortSecrets,
