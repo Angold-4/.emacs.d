@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -285,7 +285,11 @@ test("a conductor killed before its projection write rebuilds them on start", as
 
 test("MESSAGE_CARRIED is emitted per live message, and a changed decision invalidates its settlement", async () => {
   let priorId = "";
-  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 };
+  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 30_000 };
+  // A-27: capture the repair attempt's prompt (and the reviewers') so the
+  // ledger-reaching-prompts criterion has a conductor-level proof.
+  const promptDir = mkdtempSync("/tmp/tt-carried-prompts-");
+  const workerPromptLog = `${promptDir}/worker.log`;
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
@@ -350,6 +354,8 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
         ],
       };
     },
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: workerPromptLog },
+    extraReviewerEnv: (reviewer) => ({ FAKE_PI_PROMPT_LOG: `${promptDir}/${reviewer}.log` }),
     deadlines,
   });
 
@@ -402,10 +408,24 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
     const entry = ledger.find((e: { messageId: string }) => e.messageId === published.id)!;
     assert.equal(entry.settledBy, "owner");
     assert.equal(entry.invalidated?.reason, "content changed");
+
+    // A-27: the repair attempt's worker prompt and a reviewer's later turn-2
+    // prompt carry the settled ledger.
+    const attempts = readFileSync(workerPromptLog, "utf8")
+      .split("\n=====\n")
+      .filter((a) => a.trim().length > 0);
+    assert.ok(attempts.length >= 2, "expected a repair attempt's prompt");
+    assert.match(attempts[attempts.length - 1], /Settled \(do not re-raise\)/);
+    assert.match(attempts[attempts.length - 1], new RegExp(`${published.id} \\[tradeoff\\]`));
+    for (const r of ["M", "A", "B"]) {
+      const prompts = readFileSync(`${promptDir}/${r}.log`, "utf8");
+      assert.match(prompts, /Settled \(do not re-raise\)/, `${r}'s turn-2 prompt must carry the ledger`);
+    }
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+    rmSync(promptDir, { recursive: true, force: true });
   }
 });
 

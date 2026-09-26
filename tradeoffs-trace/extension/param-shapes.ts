@@ -43,8 +43,8 @@ export const SUBMIT_DISCOVERY_PARAMS: ParamShape = {
 };
 
 /** Plan 04a: `raise_tradeoff` — the worker raises a choice the plan did not
- * fix the moment it makes it (also callable by an evaluator that spots one).
- * The anchor names the code location the choice lives at. */
+ * fix the moment it makes it. Worker-only: the evaluator role's tool set
+ * (roles.ts) does not include it. The anchor names the code location. */
 export const RAISE_TRADEOFF_PARAMS: ParamShape = {
   properties: ["choice", "alternative", "why", "anchor", "planRef"],
   required: ["choice", "alternative", "why", "anchor"],

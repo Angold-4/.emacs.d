@@ -125,6 +125,15 @@ test("plan 04a: BASELINE is its own stage, no worker runs during it, and the wor
       Date.parse(baselineDone.ts) <= Date.parse(firstWorkerAction.ts),
       "the worker's dispatch must begin after BASELINE_COMPLETED",
     );
+    // A-27: the worker's own attempt (its intent) also starts strictly after
+    // the baseline, so its attempt deadline is measured from its launch.
+    const workerIntent = readEvents(setup.runDir).find(
+      (r) => r.kind === "intent" && String((r.event as { agentId?: string }).agentId ?? "").startsWith("worker-"),
+    )!;
+    assert.ok(
+      Date.parse(baselineDone.ts) <= Date.parse(workerIntent.ts),
+      "the worker attempt must start after the baseline, so its deadline runs from its launch",
+    );
     assert.ok(!types.includes("BASELINE_TIMED_OUT"), "a 3s baseline against a 30s deadline must complete");
   } finally {
     await setup.conductor.stop();
@@ -512,12 +521,16 @@ test("plan 04a: an addressed:false report is recorded, not silently dropped", ()
     messageId: "T-1",
     addressed: false,
     reason: "the candidate never touched the cancel path",
+    at: "2026-01-01T00:00:00.000Z",
     boundCandidateSha: "C1",
     boundContractVersion: K,
     boundRecordVersion: 1,
   });
   assert.equal(result.ok, true, !result.ok ? result.reason : "");
   assert.equal(result.state.phase.messages?.[0].addressedReport?.addressed, false);
+  // OD-2: reduce() copies the event's timestamp; it never reads a clock, so a
+  // rebuild from events.jsonl is identical.
+  assert.equal(result.state.phase.messages?.[0].addressedReport?.at, "2026-01-01T00:00:00.000Z");
   assert.equal(result.state.phase.messages?.[0].state, "refused", "the refusal still stands");
 });
 

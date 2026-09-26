@@ -1116,6 +1116,8 @@ export interface EvCriterionReverted {
   amendmentId: string;
   newAcceptance: string[]; // the restored acceptance list
   newContractVersion: ContractVersion;
+  /** OD-2: the time of the revert, carried on the event so reduce() is pure. */
+  at?: string;
 }
 
 export interface EvAmend {
@@ -1360,6 +1362,10 @@ export interface EvMessageAddressReported {
   messageId: string;
   addressed: boolean;
   reason?: string;
+  /** Plan 04a / OD-2: the time the report was made. Carried on the event (the
+   * conductor stamps it) so reduce() stays a pure function of (state, event)
+   * and a rebuild from events.jsonl is byte-identical. */
+  at?: string;
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   boundRecordVersion: number;

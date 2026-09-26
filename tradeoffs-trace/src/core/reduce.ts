@@ -492,7 +492,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
               ...d,
               version: d.version + 1,
               boundContractVersion: event.newContractVersion,
-              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: event.at },
             }
           : d,
       );
@@ -557,7 +557,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, `owner directive ${event.directiveId} is already withdrawn`);
       }
       const ownerDirectives = (p.ownerDirectives ?? []).map((d) =>
-        d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at ?? new Date().toISOString() } : d,
+        d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at } : d,
       );
       return ok({ ...state, phase: { ...p, ownerDirectives } });
     }
@@ -694,7 +694,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!binding.ok) return rejected(state, binding.reason!);
       const messages = (p.messages ?? []).map((m) =>
         m.id === event.messageId
-          ? { ...m, addressedReport: { addressed: event.addressed, ...(event.reason ? { reason: event.reason } : {}), at: new Date().toISOString() } }
+          ? { ...m, addressedReport: { addressed: event.addressed, ...(event.reason ? { reason: event.reason } : {}), at: event.at } }
           : m,
       );
       return ok({ ...state, phase: { ...p, messages } });

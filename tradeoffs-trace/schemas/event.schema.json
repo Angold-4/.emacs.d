@@ -22,7 +22,7 @@
         "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED",
         "CRITERION_AMENDED", "CRITERION_REVERTED",
         "NOTE_ADDED", "OWNER_INPUT_RECORDED", "OWNER_CORRECTION", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED",
-        "MESSAGE_RAISED", "MESSAGE_PUBLISHED", "MESSAGE_MERGED", "MESSAGE_DROPPED", "OWNER_VERDICT", "MESSAGE_RESOLVED", "MESSAGE_SUPERSEDED", "MESSAGE_CARRIED"
+        "MESSAGE_RAISED", "MESSAGE_PUBLISHED", "MESSAGE_MERGED", "MESSAGE_DROPPED", "OWNER_VERDICT", "MESSAGE_RESOLVED", "MESSAGE_ADDRESS_REPORTED", "MESSAGE_SUPERSEDED", "MESSAGE_CARRIED"
       ]
     }
   },
@@ -90,6 +90,7 @@
     { "type": "object", "required": ["type", "messageId", "by", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_DROPPED" }, "messageId": { "type": "string", "minLength": 1 }, "by": { "enum": ["owner", "evaluator", "panel", "vote"] } } },
     { "type": "object", "required": ["type", "messageId", "verdict", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "OWNER_VERDICT" }, "messageId": { "type": "string", "minLength": 1 }, "verdict": { "enum": ["accept", "refuse"] } } },
     { "type": "object", "required": ["type", "messageId", "by", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_RESOLVED" }, "messageId": { "type": "string", "minLength": 1 }, "by": { "enum": ["owner", "evaluator", "panel", "vote"] } } },
+    { "type": "object", "required": ["type", "messageId", "addressed", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_ADDRESS_REPORTED" }, "messageId": { "type": "string", "minLength": 1 }, "addressed": { "type": "boolean" }, "reason": { "type": "string" }, "at": { "type": "string" } } },
     { "type": "object", "required": ["type", "messageId", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_SUPERSEDED" }, "messageId": { "type": "string", "minLength": 1 } } },
     { "type": "object", "required": ["type", "messageId", "fromCandidate", "toCandidate", "fromVersion", "toVersion", "contentHash", "unchanged"], "properties": { "type": { "const": "MESSAGE_CARRIED" }, "messageId": { "type": "string", "minLength": 1 }, "fromCandidate": { "type": "string", "minLength": 1 }, "toCandidate": { "type": "string", "minLength": 1 }, "fromVersion": { "type": "integer" }, "toVersion": { "type": "integer" }, "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "unchanged": { "type": "boolean" }, "content": { "type": "object" } } }
   ]

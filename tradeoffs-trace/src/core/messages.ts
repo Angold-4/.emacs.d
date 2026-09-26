@@ -503,6 +503,11 @@ export interface LedgerEntry {
   /** A refusal recorded after the phase reached DONE: a follow-up, not a
    * blocker. */
   followUp?: boolean;
+  /** Plan 04a item 4: the evaluator's report on an owner-refused message —
+   * whether this candidate addressed the owner's reason. `false` leaves the
+   * refusal standing but records that it was checked. */
+  addressed?: boolean;
+  addressedReason?: string;
 }
 
 /** Every settled message, in id order. A settlement is a terminal message
@@ -530,6 +535,9 @@ export function ledgerEntries(messages: Message[]): LedgerEntry[] {
         ...(m.invalidated ? { invalidated: m.invalidated } : {}),
         ...(m.supersededBy ? { supersededBy: m.supersededBy } : {}),
         ...(m.followUp ? { followUp: true } : {}),
+        ...(m.addressedReport
+          ? { addressed: m.addressedReport.addressed, ...(m.addressedReport.reason ? { addressedReason: m.addressedReport.reason } : {}) }
+          : {}),
       };
     });
 }
@@ -573,6 +581,7 @@ export function projectReview(phase: { messages?: Message[]; phaseId?: string; c
     lines.push(`  :CONTENT_HASH: ${m.contentHash}`);
     if (m.settlement) lines.push(`  :SETTLED_BY: ${m.settlement.settledBy}`);
     if (m.followUp) lines.push(`  :FOLLOW_UP: true`);
+    if (m.addressedReport) lines.push(`  :ADDRESSED: ${m.addressedReport.addressed}`);
     if (m.invalidated) lines.push(`  :INVALIDATED: ${m.invalidated.reason} (${m.invalidated.atCandidate})`);
     lines.push(`  :END:`);
     lines.push(`  ${m.summary}`);

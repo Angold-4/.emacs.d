@@ -877,6 +877,8 @@ export class Conductor {
   /** Plan 04a: the current baseline action's id, so each baseline command's
    * process group can be recorded for crash recovery (advisory A-15). */
   #baselineActionId: string | undefined;
+  /** B-24: the baseline stage timed out; a late run must not be recorded. */
+  #baselineTimedOut = false;
   #runStartedAt = Date.now();
   #budgetTimer: NodeJS.Timeout | undefined;
   /** design §8.1/§8.2: "the execution budget counts only time spent
@@ -1654,6 +1656,9 @@ export class Conductor {
           amendmentId,
           newAcceptance: restored,
           newContractVersion: amendContractVersion(this.#state.phase.contract, restored),
+          // OD-2: the conductor stamps the time on the event, so reduce()
+          // never reads a clock and a rebuild is byte-identical.
+          at: new Date().toISOString(),
         },
         commandId,
       );
@@ -1862,7 +1867,9 @@ export class Conductor {
     // withdrawal file (the program scheduler writes it on every tick) is
     // moved without being re-processed — hence without a second, spurious
     // "already withdrawn" refusal.
-    this.#applyEvent({ type: "DIRECTIVE_WITHDRAWN", directiveId }, commandId);
+    // OD-2: the withdrawal time rides on the event; reduce() never reads a
+    // clock.
+    this.#applyEvent({ type: "DIRECTIVE_WITHDRAWN", directiveId, at: new Date().toISOString() }, commandId);
     this.#appliedCommandIds.add(commandId);
     const message = `Owner directive ${directiveId} is withdrawn; it no longer applies.`;
     for (const { target, agentId, agent } of this.#liveAgents()) {
@@ -3035,7 +3042,13 @@ export class Conductor {
       }
       if (entry.action === "merge") {
         const into = typeof entry.into === "string" ? entry.into : "";
-        if (!into || !ids.has(into)) return `merge of ${id} names an unknown target ${JSON.stringify(into)}`;
+        // OD-1 / A-28: the target must be ANOTHER raw message of this type
+        // this round — never the message itself, an already merged/dropped
+        // one, a message of another type, or one from an earlier round.
+        if (!into || !rawSet.has(into)) {
+          return `merge of ${id} must name another raw ${messageType} message of this round (got ${JSON.stringify(into)})`;
+        }
+        if (into === id) return `merge of ${id} cannot target itself`;
       }
     }
     for (const id of rawIds) {
@@ -3072,7 +3085,7 @@ export class Conductor {
         } else {
           // addressed: false — record the report so the ledger distinguishes
           // "checked and not addressed" from "never checked".
-          events.push({ type: "MESSAGE_ADDRESS_REPORTED", ...binding, addressed: false, ...(reason ? { reason } : {}) });
+          events.push({ type: "MESSAGE_ADDRESS_REPORTED", ...binding, addressed: false, ...(reason ? { reason } : {}), at: new Date().toISOString() });
         }
         continue;
       }
@@ -4460,6 +4473,7 @@ export class Conductor {
     const timer = cancelableTimeout(this.#deadlines.checkMs, "timeout" as const);
     let outcome: "done" | "timeout";
     this.#baselineActionId = actionId;
+    this.#baselineTimedOut = false;
     try {
       outcome = await Promise.race([this.#ensureBaseline().then(() => "done" as const), timer.promise]);
     } catch (err) {
@@ -4471,6 +4485,18 @@ export class Conductor {
       this.#baselineActionId = undefined;
     }
     timer.cancel();
+    if (outcome === "timeout") {
+      // B-24: kill the baseline command's own group (recorded as
+      // baseline-sh-<actionId>-<pgid>) and mark the stage timed out, so a
+      // slow suite cannot keep running and its late record is ignored.
+      this.#baselineTimedOut = true;
+      for (const rec of readLog(this.#paths.events).records) {
+        if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
+        if (!rec.actionId.startsWith(`baseline-sh-${actionId}-`)) continue;
+        const pgid = (rec.event as { pgid?: number }).pgid;
+        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
+    }
     crashAt("after_run_baseline");
     this.#log.completion(actionId, { outcome: outcome === "done" ? "completed" : "timed out" });
     this.#applyEvent({ type: outcome === "done" ? "BASELINE_COMPLETED" : "BASELINE_TIMED_OUT" });
@@ -4543,11 +4569,18 @@ export class Conductor {
     let record: Baseline;
     try {
       record = await this.#runBaseline(commands, key);
-      this.#recordBaselineLocal(record);
     } catch (err) {
       this.#log.append("baseline_error", { error: String((err as Error)?.message ?? err) });
       return undefined;
     }
+    // B-24: the stage timed out (or was interrupted) while this command ran;
+    // its record is late and must NOT be written or treated as a baseline —
+    // the checks then stay strict, which is the honest direction.
+    if (this.#baselineTimedOut) {
+      this.#log.append("baseline_late_ignored", { key, reason: "the baseline stage timed out before this run finished" });
+      return undefined;
+    }
+    this.#recordBaselineLocal(record);
     if (shared) this.#publishBaselineShared(record, shared);
     this.#log.append("baseline", { ...record, reused: false });
     return record;
