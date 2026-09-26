@@ -816,6 +816,7 @@ the longer one behind — the same order secrets.ts's byLengthDesc uses."
     ("delivered" "delivered")
     ("noted" "noted")
     ("correction-started" "correction started")
+    ("reverted" "reverted an amendment")
     ("delivery-uncertain" (format "delivery uncertain%s" (if reason (format " (%s)" reason) "")))
     ("refused" (format "refused: %s" (or reason "not accepted")))
     (_ (or state "sent"))))
@@ -937,6 +938,8 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
     (+tt--status-row "gate" (alist-get 'gate v))
     ;; Plan 01e: the base's own pre-existing check failures (D2), when any.
     (+tt--status-row "base" (alist-get 'baseline v) 'warning)
+    ;; Plan 01g: every amendment record, applied or reverted, old → new.
+    (+tt--status-row "amended" (alist-get 'amendments v) 'warning)
     (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)
     (+tt--status-row "reviews" (alist-get 'reviewLine v))
     (+tt--status-row "verdict" (alist-get 'verdict v)
@@ -1043,7 +1046,7 @@ program-wide by construction (S is nil then)."
         (format "Sending steers worker attempt %s now (at most once; C-c C-c or RET), and becomes an owner directive %s."
                 attempt (+tt--input-scope-note nil (not in-program))))
        (t
-        (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s)."
+        (format "Sending notes the next worker attempt, steers every live reviewer agent now, and becomes an owner directive %s (phase %s). A text that is exactly `revert <amendment-id> is sent as a correction that reverts that amendment."
                 (+tt--input-scope-note nil (not in-program)) (or name "?")))))))
 
 (defun +tt-input-send (&optional program-wide)
@@ -1094,6 +1097,22 @@ never told a ruling was retracted when it was not."
       (let ((id (+tt--cli "program" "directive" dir text)))
         (message "tradeoffs-trace: program-wide directive %s recorded; every running node is steered at once" id)))))
 
+(defun +tt--revert-amendment-id (s text)
+  "The applied amendment id an explicit `revert AM-…' command names, or nil.
+Plan 01g: only the command form counts — text that merely mentions the id
+must stay a steer/note so it still reaches an agent (B-16) — and the input
+box sends it as a correction even when the phase is not AWAITING_OWNER."
+  (when (string-match "\\`[ \t]*revert[ \t]+\\([^ \t]+\\)" text)
+    (let* ((id (match-string 1 text))
+           (phase (and s (+tt--get s 'state 'phase)))
+           (decisions (and phase (alist-get 'decisions phase))))
+      (seq-some (lambda (d)
+                  (let ((a (alist-get 'amendment d)))
+                    (when (and a (equal (alist-get 'status a) "applied")
+                               (equal (alist-get 'id a) id))
+                      id)))
+                decisions))))
+
 (defun +tt--send-run-input (run-dir text program-wide)
   "Queue TEXT as the owner input RUN-DIR's phase calls for.
 PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
@@ -1109,7 +1128,9 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
         (user-error "Refused: the phase is BLOCKED%s" (if why (format " (%s)" why) ""))))
      (t
       (let* ((binding `((runId . ,(+tt--get phase 'runId)) (phaseId . ,(+tt--get phase 'phaseId))))
+             (revert-id (and (not program-wide) (+tt--revert-amendment-id s text)))
              (kind (cond ((equal name "AWAITING_OWNER") "correction")
+                         (revert-id "correction")
                          ((member name '("IMPLEMENTING" "FREEZING")) "steer")
                          (t "note")))
              ;; A run that is not part of a program has nothing program-wide
@@ -1123,8 +1144,11 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
                     (scope . ,effective)
                     (binding . ,binding)))))
         (erase-buffer)
-        (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
-                 kind id (if (equal effective "program") "the whole program" "this phase")))))))
+        (if revert-id
+            (message "tradeoffs-trace: correction %s queued in the inbox (%s) — it reverts %s; see Owner input in the status buffer"
+                     kind id revert-id)
+          (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
+                   kind id (if (equal effective "program") "the whole program" "this phase"))))))))
 
 (defun +tt-program-input ()
   "Open this program's input box: text sent there is a program-wide directive."
@@ -1188,21 +1212,52 @@ program-wide owner directive."
 ;; intervenes only through the input box.  Every state label comes from the
 ;; tally (`decisionStatuses' in `tt state'), never from individual ballots.
 
+(defun +tt--amendment-label (amendment status)
+  "The heading an amendment record's AMENDMENT and tally STATUS deserve.
+Plan 01g: an applied amendment reads `⚑ AMENDED', a reverted one
+`⚑ REVERTED', and one still proposed or rejected reads as the vote's
+outcome."
+  (pcase (alist-get 'status amendment)
+    ("applied" "⚑ AMENDED")
+    ("reverted" "⚑ REVERTED")
+    (_ (format "AMENDMENT (%s)"
+               (pcase (alist-get 'status status)
+                 ("passed" "approved, applying")
+                 ("failed" (format "rejected: %s" (or (alist-get 'reason status) "vote failed")))
+                 ("superseded" "superseded")
+                 (_ "pending vote"))))))
+
+(defun +tt--amendment-line (decision)
+  "The `old → new' line for DECISION's amendment record, or nil.
+Plan 01g: a reverted amendment restored the original wording, so its arrow
+points back and the view never claims the replacement is in force (A-14)."
+  (let* ((a (alist-get 'amendment decision))
+         (criterion (or (alist-get 'criterion a) ""))
+         (proposed (or (alist-get 'proposedWording a) "")))
+    (when a
+      (if (equal (alist-get 'status a) "reverted")
+          (format "  %s → %s\n" proposed criterion)
+        (format "  %s → %s\n" criterion proposed)))))
+
 (defun +tt--decision-label (status d phase)
   "Heading label for decision D with tally STATUS in PHASE."
   (let ((dissent (seq-some (lambda (b) (and (equal (alist-get 'decisionId b) (alist-get 'id d))
                                             (equal (alist-get 'vote b) "reject")))
-                           (alist-get 'ballots phase))))
+                           (alist-get 'ballots phase)))
+        (amendment (alist-get 'amendment status)))
     (concat
-     (pcase (alist-get 'status status)
-       ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
-       ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
-       ("suspended" "SUSPENDED")
-       ("owner" "NEEDS YOU")
-       ("detail" "DETAIL")
-       (_ "PENDING"))
-     ;; A reserved decision: voted like any other, flagged for the owner.
-     (if (eq (alist-get 'flagged status) t) " ⚑ FLAGGED" ""))))
+     (if amendment
+         (+tt--amendment-label amendment status)
+       (pcase (alist-get 'status status)
+         ("passed" (if dissent "ACCEPTED with dissent" "ACCEPTED"))
+         ("failed" (format "REJECTED (%s)" (or (alist-get 'reason status) "vote failed")))
+         ("suspended" "SUSPENDED")
+         ("owner" "NEEDS YOU")
+         ("detail" "DETAIL")
+         (_ "PENDING")))
+     ;; A reserved decision: voted like any other, flagged for the owner (an
+     ;; amendment is already marked, so the flag would only repeat it).
+     (if (and (not amendment) (eq (alist-get 'flagged status) t)) " ⚑ FLAGGED" ""))))
 
 (defun +tt--decision-block (d status phase)
   "Insert decision D (tally STATUS) as one self-contained Org entry."
@@ -1215,6 +1270,8 @@ program-wide owner directive."
          (ballots (seq-filter (lambda (b) (equal (alist-get 'decisionId b) (alist-get 'id d)))
                               (alist-get 'ballots phase))))
     (insert (format "* %s  %s\n" (+tt--decision-label status d phase) short))
+    ;; Plan 01g: the reworded acceptance item, verbatim old → new.
+    (when-let* ((line (+tt--amendment-line d))) (insert line))
     (unless (equal short (+tt--one-line choice 200)) (insert (format "  %s\n" choice)))
     (insert (format "  raised by %s%s\n"
                     (if (equal source "reviewer-discovered")

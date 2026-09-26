@@ -68,6 +68,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "GATE_INTERRUPTED",
   "REVISE",
   "AMEND",
+  "CRITERION_AMENDED",
+  "CRITERION_REVERTED",
   "RUN_BUDGET_EXCEEDED",
   "RUN_RESUMED",
   "LAUNCH_FAILED",
@@ -340,6 +342,54 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return undefined;
     }
 
+    case "CRITERION_REVERTED": {
+      // Plan 01g: the owner's correction naming an amendment id restores the
+      // criterion's original wording. A phase with a candidate has its own
+      // transition rows (transitions.ts) that also invalidate the evidence
+      // bound to the replaced contract version and return to CHECKING. This
+      // handler is the fallback for a phase with no candidate yet
+      // (IMPLEMENTING/FREEZING/REPAIRING), where there is no evidence to
+      // invalidate: it only restores the wording so the next freeze binds to
+      // it. Both paths reject an unknown, not-yet-applied or already-reverted
+      // amendment, and the row guard and this handler agree on validity so
+      // next() can never emit an event the reducer refuses.
+      const decision = p.decisions.find((d) => d.amendment?.id === event.amendmentId);
+      if (!decision || !decision.amendment) {
+        return rejected(state, `unknown amendment ${event.amendmentId}`);
+      }
+      if (decision.amendment.status === "reverted") {
+        return rejected(state, `amendment ${event.amendmentId} is already reverted`);
+      }
+      if (decision.amendment.status !== "applied") {
+        return rejected(state, `amendment ${event.amendmentId} has not been applied, so there is no wording to restore`);
+      }
+      if (!Array.isArray(event.newAcceptance) || event.newAcceptance.length === 0 || event.newAcceptance.some((a) => typeof a !== "string" || a.length === 0)) {
+        return rejected(state, `reverting amendment ${event.amendmentId} needs the restored acceptance list`);
+      }
+      if (!p.contract.acceptance.includes(decision.amendment.proposedWording)) {
+        return rejected(state, `amendment ${event.amendmentId}'s wording is not in the current contract, so there is nothing to restore`);
+      }
+      const decisions = p.decisions.map((d) =>
+        d.id === decision.id
+          ? {
+              ...d,
+              version: d.version + 1,
+              boundContractVersion: event.newContractVersion,
+              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+            }
+          : d,
+      );
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          contract: { ...p.contract, acceptance: event.newAcceptance, contractVersion: event.newContractVersion },
+          candidate: p.candidate && { sha: p.candidate.sha, contractVersion: event.newContractVersion },
+          decisions,
+        },
+      });
+    }
+
     case "NOTE_ADDED": {
       // §7.4 `note` (conductor state): queued for the next worker attempt's
       // prompt. Record-only — it moves no phase.
@@ -581,7 +631,10 @@ export function reduce(state: State, event: unknown): ReduceResult {
     // pending until FREEZE_COMPLETED assembles and binds them.
     let working = state;
     if (ev.type === "SUBMIT_PHASE") {
-      working = { ...state, phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior } };
+      working = {
+        ...state,
+        phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior, pendingDispute: ev.dispute },
+      };
     }
 
     const rows = rowsFor(working, ev.type);

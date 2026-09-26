@@ -59,7 +59,22 @@
           "type": "array",
           "description": "Plan 2c, repair attempts only: kept, changed (with the new text) or withdrawn, for each prior decision listed in the repair prompt.",
           "items": { "$ref": "#/$defs/priorDecision" }
+        },
+        "criterionDispute": {
+          "$ref": "#/$defs/criterionDispute",
+          "description": "Plan 01g: say a criterion cannot be met as written, naming it verbatim; the conductor records an amendment the reviewers vote on. A criterion that is merely unmet is a normal repair, not a dispute."
         }
+      }
+    },
+    "criterionDispute": {
+      "type": "object",
+      "required": ["criterion", "why", "proposedWording"],
+      "additionalProperties": false,
+      "description": "Plan 01g: a criterion the worker says cannot be met as written. `criterion` names one acceptance item of the phase contract verbatim; the conductor records an amendment (a reserved decision) the reviewers vote on.",
+      "properties": {
+        "criterion": { "type": "string", "minLength": 1 },
+        "why": { "type": "string", "minLength": 1 },
+        "proposedWording": { "type": "string", "minLength": 1 }
       }
     },
     "priorDecision": {

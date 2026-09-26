@@ -641,5 +641,96 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (setenv "TT" nil)
       (delete-directory root t))))
 
+(defconst +tt-test--amended-state
+  '((meta (title . "sum validation"))
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "IMPLEMENTING")
+                  (attempt (n . 2))
+                  (candidate (sha . "7c1e0a4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+                  (contract (contractVersion (snapshot . 2) (sectionSha256 . "9e2c")))
+                  (decisions ((id . "D-p1-C1-amendment") (version . 2) (class . "reserved")
+                              (source . "worker")
+                              (choice . "the tests pass")
+                              (whyItMatters . "the literal wording cannot be met")
+                              (alternatives ((option . "it works") (consequence . "no candidate can satisfy it")))
+                              (recommendation (choice . "the tests pass") (reason . "satisfiable and still meaningful"))
+                              (amendment (id . "AM-p1-C1")
+                                         (criterion . "it works")
+                                         (proposedWording . "the tests pass")
+                                         (why . "the literal wording cannot be met")
+                                         (raisedBy . "worker") (status . "applied"))))
+                  (ballots)
+                  (findings)
+                  (ownerRequests)
+                  (corrections)))
+    (decisionStatuses (D-p1-C1-amendment (status . "passed") (reason . "vote passed")
+                                         (amendment (id . "AM-p1-C1")
+                                                    (criterion . "it works")
+                                                    (proposedWording . "the tests pass")
+                                                    (status . "applied"))))
+    (view (round . 2) (reviewLine . "M ✓   A ✓   B ✓") (needsYou . 0)))
+  "Plan 01g: a `tt state' whose only record is an applied amendment.")
+
+(ert-deftest tradeoffs-trace-amendment-decision-render ()
+  "Plan 01g: the decision view shows an amendment as `⚑ AMENDED' with the old
+wording → the new one, read from the tally status the conductor emits."
+  (with-temp-buffer
+    (+tt--render-decisions +tt-test--amended-state)
+    (let ((text (buffer-string)))
+      (should (string-match-p "\\* ⚑ AMENDED" text))
+      (should (string-match-p (regexp-quote "it works → the tests pass") text)))))
+
+(defconst +tt-test--amendment-input-state
+  '((conductorAlive . t)
+    (program . nil)
+    (ownerInputs) (pendingOwnerInputs)
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "REVIEWING")
+                  (attempt (n . 2))
+                  (decisions ((id . "D-am") (class . "reserved")
+                              (amendment (id . "AM-p1-C1") (status . "applied")
+                                         (criterion . "it works")
+                                         (proposedWording . "the tests pass")))))))
+  "Plan 01g: a state with one applied amendment, for the input-box tests.")
+
+(ert-deftest tradeoffs-trace-amendment-revert-input ()
+  "Plan 01g: text naming an applied amendment id is sent as a correction, and
+a near-miss is not."
+  (should (equal (+tt--revert-amendment-id +tt-test--amendment-input-state "revert AM-p1-C1") "AM-p1-C1"))
+  ;; Only the command form counts: a mention in a steer/note must not revert.
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "AM-p1-C1 still looks wrong"))
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "please revert AM-p1-C1 later"))
+  ;; A longer id that merely begins with the same text is not a revert.
+  (should-not (+tt--revert-amendment-id +tt-test--amendment-input-state "revert AM-p1-C10"))
+  (let ((written nil))
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) +tt-test--amendment-input-state))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
+      (with-temp-buffer
+        (insert "revert AM-p1-C1 because the owner disagrees")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'type written) "correction")))))
+  ;; A mention inside a steer reaches the worker as its natural kind.
+  (let ((written nil))
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) +tt-test--amendment-input-state))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-2")))
+      (with-temp-buffer
+        (insert "AM-p1-C1 still looks wrong, also fix the retry loop")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'type written) "note"))))))
+
+(ert-deftest tradeoffs-trace-amendment-reverted-render ()
+  "Plan 01g: a reverted amendment's line points back to the restored wording,
+so the view never claims the replacement is still in force (A-14)."
+  (let* ((a '((id . "AM-p1-C1") (criterion . "it works")
+              (proposedWording . "the tests pass") (status . "reverted")))
+         (d `((amendment . ,a))))
+    (should (equal (+tt--amendment-line d) "  the tests pass → it works\n")))
+  (let* ((a '((id . "AM-p1-C1") (criterion . "it works")
+              (proposedWording . "the tests pass") (status . "applied")))
+         (d `((amendment . ,a))))
+    (should (equal (+tt--amendment-line d) "  it works → the tests pass\n"))))
+
 (provide 'tradeoffs-trace-test)
 ;;; tradeoffs-trace-test.el ends here

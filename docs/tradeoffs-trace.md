@@ -730,6 +730,60 @@ changes code, and that cost is intended.
   as correcting one (§7.5): supported only while no later phase has been
   integrated; otherwise a new run is required.
 
+### 7.3a Criterion disputes and the amendments they become
+
+The runtime evidence (§4) shows contract findings come in two kinds the
+pipeline used to conflate. "**Unmet but clear**" is a defect: the worker can
+fix it, and a repair round is the right answer. "**Unmeetable as written**" is
+a contract problem: `gate_is_rerun_when_the_base_moves` needs the tip the
+conductor only creates when it commits; `cargo test --workspace` passes on a
+base that already fails; `p99 ≤ 500 ms` is missed by every vendor by a little;
+"the owner records a live run" is the owner's duty, not a worker's. Left
+unspoken, these return every round until the 3-round budget runs out and the
+run parks — all eight owner waits in the evidence began that way.
+
+So a worker (in `submit_phase`) or a reviewer (in a turn-2 finding) may carry
+`criterionDispute: { criterion, why, proposedWording }`, where `criterion`
+names **one acceptance item of the phase contract verbatim**. The conductor
+turns it into an **amendment record**: a `reserved` decision (flagged for the
+owner, §3.4) that the reviewers vote on like any other reserved decision. A
+worker's dispute is part of the candidate's own disclosure set, so it is
+balloted in that candidate's turn 2. A reviewer's dispute arrives *during*
+turn 2, after that round's demanded-ballot set was snapshotted, so it is
+carried to the phase's next dispatch and balloted there; if nothing else
+blocks, the candidate may be accepted first, in which case the amendment
+stays recorded as `proposed` (visible in the decision view and `tt summary`)
+and never blocks the run. It is not a finding and does not open a contract
+finding of its own.
+
+Under D1's default, an amendment that passes the normal tally (M, plus one of
+A/B) replaces the criterion's wording in the phase contract **for this phase
+only, from the next candidate on**:
+
+- the change is logged as a `CRITERION_AMENDED` event;
+- `contract` findings that cited the old wording are closed as **superseded**,
+  never left open to fail every later round;
+- the contract version bumps, so the next candidate's checks, probe and
+  reviews are bound to the new wording;
+- the phase starts a **fresh attempt** under the new contract version — the
+  amendment itself consumes no repair round — and the status, the decision
+  view and `tt summary` show `⚑ AMENDED` with the old and the new text.
+
+An amendment that fails (for example M vetoes it) leaves the criterion
+unchanged; the round is handled exactly as today, and the amendment is never
+an acceptance blocker on its own. **A dispute never consumes a repair round by
+itself, and the run never waits for the owner because of one.** The owner can
+still rule later: a **correction** naming the amendment id (`revert AM-p1-…`)
+restores the original wording and returns the phase to checks under the
+restored contract version, recorded as an owner input in state `reverted`. A
+note that merely mentions an amendment id stays advisory and never rewrites
+the contract.
+`tt summary` lists every amendment, applied or reverted.
+
+Clear wording and plain disagreements still go through normal repair: if the
+criterion is satisfiable and the candidate simply misses it, the right artefact
+is a blocking finding, not a dispute.
+
 ### 7.4 Owner commands
 
 Commands differ in where their effect lands, and that decides what recovery can
@@ -745,6 +799,8 @@ promise (§9.3):
 | accept-finding | the owner's disposition of a finding (§4.2) | conductor state | finding version, candidate, contract |
 | revise | correct a decision or finding and repair the phase (§7.5) | conductor state (then its own attempt) | record version, candidate, contract |
 | amend | new contract version (§7.3) | conductor state | contract version being replaced |
+| criterionDispute | a `reserved` amendment decision the reviewers vote on; a passing tally rewrites one acceptance item for this phase (§7.3a) | conductor state | acceptance item verbatim |
+| revert an amendment | a correction naming an amendment id (`revert AM-p1-…`) restores the original wording (§7.3a) | conductor state (record-only) | amendment id |
 | unneeded | mark an owner request as "did not need me" (a pilot metric) | conductor state | request id |
 | pause / resume / mode | control only | conductor state | run |
 

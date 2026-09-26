@@ -96,6 +96,15 @@ const RecommendationParam = Type.Object({
   reason: Type.String({ description: "Why that option is recommended" }),
 });
 
+// Plan 01g: a criterion the agent says cannot be met as written, named
+// verbatim, with replacement wording. The conductor records it as a reserved
+// amendment decision the reviewers vote on like any other.
+const CriterionDisputeParam = Type.Object({
+  criterion: Type.String({ description: "One acceptance item of the phase contract, verbatim" }),
+  why: Type.String({ description: "Why it cannot be met as written" }),
+  proposedWording: Type.String({ description: "The wording that replaces it if the amendment passes" }),
+});
+
 const decisionDisclosureFields: Record<string, TSchema> = {
   choice: Type.String({ description: "One plain sentence naming the choice made" }),
   whyItMatters: Type.String({ description: "Why it matters in terms of the plan's goal, not the code" }),
@@ -143,6 +152,13 @@ const FindingParam = Type.Object({
   sameAs: Type.Optional(
     Type.String({ description: "Id of an already-open finding this repeats; you are recorded on it instead of a duplicate" }),
   ),
+  criterionDispute: Type.Optional(
+    Type.Object({
+      criterion: Type.String({ description: "One acceptance item of the phase contract, verbatim" }),
+      why: Type.String({ description: "Why it cannot be met as written" }),
+      proposedWording: Type.String({ description: "The wording that replaces it if the amendment passes" }),
+    }),
+  ),
   reproduction: Type.Optional(
     Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
   ),
@@ -166,6 +182,7 @@ const submitPhaseFields: Record<string, TSchema> = {
       description: "Repair attempts only: for each prior decision listed in the prompt, kept, changed (with the new text) or withdrawn",
     }),
   ),
+  criterionDispute: Type.Optional(CriterionDisputeParam),
 };
 const SubmitPhaseParams = Type.Object(Object.fromEntries(SUBMIT_PHASE_PARAMS.properties.map((key) => [key, submitPhaseFields[key]])));
 

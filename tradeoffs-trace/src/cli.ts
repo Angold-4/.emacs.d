@@ -415,6 +415,8 @@ function renderStatus(runDir: string): string {
   // Plan 01e: the base's own pre-existing check failures (D2), when it has any.
   if (view.baseline) lines.push(`base: ${view.baseline}`);
   lines.push(`reviews: ${view.reviewLine}`);
+  // Plan 01g: every amendment record, applied or reverted, with old → new.
+  if (view.amendments) lines.push(`amendments: ${view.amendments}`);
   if (view.verdict) lines.push(`verdict: ${view.verdict}`);
   if (view.time) lines.push(`time: ${view.time}`);
   return `${lines.join("\n")}\n`;
