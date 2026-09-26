@@ -19,7 +19,7 @@
 // returns [] (no double dispatch) for the dispatch-shaped ones.
 
 import { gateCommandOf } from "./gate.ts";
-import { accept, amendmentToApply, resolvedCorrectionIdsFor, sameVersion } from "./predicate.ts";
+import { accept, amendmentToApply, evaluationSettled, resolvedCorrectionIdsFor, sameVersion } from "./predicate.ts";
 import type { Action, PhaseState, Reviewer, State } from "./types.ts";
 
 function hasValidReview(phase: PhaseState, who: Reviewer): boolean {
@@ -45,6 +45,13 @@ export function next(state: State): Action[] {
       // worker, so ACTION_STARTED bookkeeping is never asked for a phase
       // that has no worktree yet.
       return [{ type: "start_attempt" }];
+
+    // Plan 04a: the base baseline is its own stage, with its own deadline —
+    // never hidden inside the worker's first dispatch. An identical base
+    // tree with a recorded baseline skips it (the conductor routes READY
+    // straight to IMPLEMENTING).
+    case "BASELINE":
+      return p.inFlight.run_baseline ? [] : [{ type: "run_baseline" }];
 
     case "IMPLEMENTING":
       return p.inFlight.dispatch_worker ? [] : [{ type: "dispatch_worker" }];
@@ -72,6 +79,14 @@ export function next(state: State): Action[] {
         }
       }
       return actions;
+    }
+
+    // Plan 04a: the evaluator settles the round's raw messages; the phase
+    // only asks for `evaluation_complete` once everything it waits for has
+    // settled. Acceptance can never outrun evaluation.
+    case "EVALUATING": {
+      if (evaluationSettled(p)) return [{ type: "evaluation_complete" }];
+      return p.inFlight.dispatch_evaluation ? [] : [{ type: "dispatch_evaluation" }];
     }
 
     case "RESOLVING": {

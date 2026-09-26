@@ -293,6 +293,13 @@ export interface Message {
   sourceRecordId?: string;
   /** A refusal after the phase reached DONE is a follow-up, not a blocker. */
   followUp?: boolean;
+  /** Plan 04a: the code location a `raise_tradeoff` call anchored the
+   * trade-off to (`{path, lines}`), carried through to the published
+   * message so the owner sees where the choice lives. */
+  anchor?: { path: string; lines: [number, number] };
+  /** Plan 04a: an evaluator timed out (or did not evaluate this message), so
+   * the raw message was published unchanged, marked unevaluated. */
+  unevaluated?: boolean;
   supersededBy?: string;
   /** Every past version's contentHash, so a verdict bound to a pre-carry
    * version of an unchanged message is still recognised as current. */
@@ -582,11 +589,13 @@ export type OwnerCommand =
 
 export type PhaseStateName =
   | "READY"
+  | "BASELINE"
   | "IMPLEMENTING"
   | "FREEZING"
   | "CHECKING"
   | "PROBING"
   | "REVIEWING"
+  | "EVALUATING"
   | "RESOLVING"
   | "GATING"
   | "ACCEPTED"
@@ -708,6 +717,7 @@ export interface InFlightEntry {
 }
 
 export type InFlightKey =
+  | "run_baseline"
   | "dispatch_worker"
   | "freeze"
   | "run_checks"
@@ -715,6 +725,7 @@ export type InFlightKey =
   | "review_M"
   | "review_A"
   | "review_B"
+  | "dispatch_evaluation"
   | "run_gate"
   | "publish_cas";
 
@@ -795,6 +806,15 @@ export interface PhaseState {
    * raised in this phase, in raise order. Folded from MESSAGE_* events, so a
    * conductor restart rebuilds it from the log alone. */
   messages?: Message[];
+  /** Plan 04a: the base-baseline stage's own recovery bookkeeping. Set once
+   * an interrupted `run_baseline` has been re-dispatched, so a second loss
+   * takes the timed-out path instead of re-dispatching again. */
+  baseline?: { interruptedOnce?: boolean };
+  /** Plan 04a: the EVALUATING stage's own state. `settled` is set by
+   * `EVALUATOR_FINISHED` (the evaluator's own outcome record event);
+   * `timedOut` records that its raw messages were published unevaluated;
+   * `interruptedOnce` is the same one-redispatch bookkeeping as `baseline`. */
+  evaluation?: { settled?: boolean; timedOut?: boolean; interruptedOnce?: boolean };
 }
 
 export type RunStatus = RunStateName;
@@ -812,6 +832,10 @@ export interface State {
 
 export interface EvAttemptStarted {
   type: "ATTEMPT_STARTED";
+  /** Plan 04a: whether this attempt must take the base baseline first. The
+   * conductor decides it (a baseline already on disk for this exact base
+   * tree skips the stage — the 01e reuse rule); reduce() only routes it. */
+  baselineNeeded?: boolean;
 }
 /** Phase 1b addition (pure, additive — round of review item 3): carries the
  * *raw* disclosures, not assembled Decision records. A worker's submit_phase
@@ -829,6 +853,43 @@ export interface EvSubmitPhase {
    * new candidate. */
   dispute?: CriterionDispute;
 }
+/** Plan 04a: the base baseline finished (run or reused). */
+export interface EvBaselineCompleted {
+  type: "BASELINE_COMPLETED";
+}
+/** Plan 04a: the base baseline could not be taken in time; the checks stay
+ * strict and the work continues. */
+export interface EvBaselineTimedOut {
+  type: "BASELINE_TIMED_OUT";
+}
+/** Plan 04a: a conductor died during BASELINE. Re-dispatched once; a second
+ * loss is BASELINE_TIMED_OUT. */
+export interface EvBaselineInterrupted {
+  type: "BASELINE_INTERRUPTED";
+}
+/** Plan 04a: all three reviewers have submitted and the phase enters
+ * EVALUATING (the evaluator is about to check the round's raw messages). */
+export interface EvEvaluationCompleted {
+  type: "EVALUATION_COMPLETED";
+}
+/** Plan 04a: the evaluator did not settle in time; its raw messages are
+ * published unchanged, marked `unevaluated`, and the phase moves on. */
+export interface EvEvaluationTimedOut {
+  type: "EVALUATION_TIMED_OUT";
+}
+/** Plan 04a: a conductor died during EVALUATING; the evaluation is
+ * re-dispatched once. */
+export interface EvEvaluationInterrupted {
+  type: "EVALUATION_INTERRUPTED";
+}
+/** Plan 04a: the evaluator's own outcome, a record event inside EVALUATING.
+ * It settles the round so next() asks for `evaluation_complete`. */
+export interface EvEvaluatorFinished {
+  type: "EVALUATOR_FINISHED";
+  /** How many raw messages the evaluator resolved (observability only). */
+  evaluated: number;
+}
+
 export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
 }
@@ -1200,13 +1261,26 @@ export interface EvMessageRaised {
   type: "MESSAGE_RAISED";
   message: Message;
 }
-/** A raw message is published (reviewable by the owner). */
+/** A raw message is published (reviewable by the owner). Plan 04a: the
+ * evaluator's clean wording rides along as `content`; a bare publish (no
+ * evaluator) leaves the raised fields as they were. */
 export interface EvMessagePublished {
   type: "MESSAGE_PUBLISHED";
   messageId: string;
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   boundRecordVersion: number;
+  content?: {
+    type: MessageType;
+    title: string;
+    summary: string;
+    context: string;
+    evidence: string[];
+    planRef?: string;
+  };
+  /** Set when the evaluator did not evaluate this message (it missed it, or
+   * the evaluation timed out): it is published unchanged, marked so. */
+  unevaluated?: boolean;
 }
 /** An evaluator merged a message into another (or into the plan). */
 export interface EvMessageMerged {
@@ -1272,6 +1346,13 @@ export interface EvMessageCarried {
 
 export type Event =
   | EvAttemptStarted
+  | EvBaselineCompleted
+  | EvBaselineTimedOut
+  | EvBaselineInterrupted
+  | EvEvaluationCompleted
+  | EvEvaluationTimedOut
+  | EvEvaluationInterrupted
+  | EvEvaluatorFinished
   | EvSubmitPhase
   | EvAttemptTimedOut
   | EvAttemptNoSubmission

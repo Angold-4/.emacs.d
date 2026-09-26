@@ -52,7 +52,7 @@ import {
   type Baseline,
   type BaselineCommand,
 } from "./core/test-failures.ts";
-import { contentHashOf, type MessageContent } from "./core/messages.ts";
+import { contentHashOf, ledgerEntries, type MessageContent } from "./core/messages.ts";
 import type {
   Action,
   Ballot,
@@ -153,6 +153,10 @@ export interface Deadlines {
    * `#+TT_GATE_MINUTES` (default 30): a 15-minute `--clean --build` fits,
    * the old 8-minute `sh` limit did not (runtime doc §6). */
   gateMs: number;
+  /** Plan 04a: how long the EVALUATING stage's fresh evaluator may run before
+   * its raw messages are published `unevaluated` and the phase moves on. The
+   * plan sets it with `#+TT_EVALUATE_MINUTES` (default 10). */
+  evaluateMs: number;
   reviewMs: number;
   reproductionMs: number;
   abortGraceMs: number;
@@ -204,6 +208,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   checkMs: 5 * 60_000,
   probeMs: 10 * 60_000,
   gateMs: 30 * 60_000,
+  evaluateMs: 10 * 60_000,
   reviewMs: 15 * 60_000,
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
@@ -858,6 +863,11 @@ export class Conductor {
   #discoverySubmitted = new Set<string>();
   #driving = false;
   #redriveRequested = false;
+  /** Plan 04a: while applying a batch of events that must become visible
+   * together (the evaluator's message outcomes plus its own outcome record),
+   * suppress the per-event `drive()` so next() cannot act on a half-applied
+   * batch — the batch helper drives once at the end. */
+  #driveSuspended = false;
   #runStartedAt = Date.now();
   #budgetTimer: NodeJS.Timeout | undefined;
   /** design §8.1/§8.2: "the execution budget counts only time spent
@@ -1193,6 +1203,34 @@ export class Conductor {
     const intentRecord = records.find((r) => r.kind === "intent" && r.actionId === actionId);
     const payload = (intentRecord?.event ?? {}) as Record<string, unknown>;
 
+    if (key === "run_baseline") {
+      // Plan 04a: a conductor died during BASELINE. Re-dispatch once; a
+      // second loss takes the timed-out path (the strict rule then applies).
+      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#applyEvent(
+        this.#state.phase.baseline?.interruptedOnce ? { type: "BASELINE_TIMED_OUT" } : { type: "BASELINE_INTERRUPTED" },
+      );
+      return;
+    }
+
+    if (key === "dispatch_evaluation") {
+      // Plan 04a: a conductor died during EVALUATING. Kill whatever survived
+      // and re-dispatch once; a second loss publishes the raw messages
+      // `unevaluated` and moves on (EVALUATION_TIMED_OUT).
+      const pgid = payload.pgid as number | undefined;
+      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
+        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
+      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#applyEvent(
+        this.#state.phase.evaluation?.interruptedOnce
+          ? { type: "EVALUATION_TIMED_OUT" }
+          : { type: "EVALUATION_INTERRUPTED" },
+      );
+      return;
+    }
+
     if (key === "dispatch_worker") {
       const pgid = payload.pgid as number | undefined;
       if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
@@ -1488,10 +1526,21 @@ export class Conductor {
     // is not.
     if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") this.#awaitingEpisode += 1;
     this.#syncBudgetTimer();
-    this.drive();
+    if (!this.#driveSuspended) this.drive();
     // Plan 01b: before `#maybeAutoStop` can tear the log down for BLOCKED.
     this.#checkNotifications();
     this.#maybeAutoStop();
+  }
+
+  /** Plan 04a: apply a batch of events as one visible step, then drive once. */
+  #applyEvents(events: Event[]): void {
+    this.#driveSuspended = true;
+    try {
+      for (const event of events) this.#applyEvent(event);
+    } finally {
+      this.#driveSuspended = false;
+    }
+    this.drive();
   }
 
   // -- inbox: owner commands (design §7.4, §9.3) --------------------------
@@ -2485,7 +2534,26 @@ export class Conductor {
     const kind = action.type === "dispatch_review" ? `dispatch_review_${action.reviewer}` : action.type;
     switch (action.type) {
       case "start_attempt":
-        this.#applyEvent({ type: "ATTEMPT_STARTED" });
+        // Plan 04a: the base baseline is its own state. It is needed exactly
+        // when the phase has effective checks and no baseline on disk already
+        // covers this base tree and check list (plan 01e's reuse rule,
+        // including a sibling program node's shared record).
+        this.#applyEvent({ type: "ATTEMPT_STARTED", baselineNeeded: this.#baselineNeeded() });
+        return;
+      case "run_baseline": {
+        const actionId = this.#log.actionId(kind);
+        this.#applyEvent({ type: "ACTION_STARTED", action: "run_baseline", actionId });
+        void this.#runBaselineStage(actionId).catch((err) => this.#logUnexpected("run_baseline", err));
+        return;
+      }
+      case "dispatch_evaluation": {
+        const actionId = this.#log.actionId(kind);
+        this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_evaluation", actionId });
+        void this.#runEvaluation(actionId).catch((err) => this.#logUnexpected("dispatch_evaluation", err));
+        return;
+      }
+      case "evaluation_complete":
+        this.#applyEvent({ type: "EVALUATION_COMPLETED" });
         return;
       case "dispatch_worker": {
         const actionId = this.#log.actionId(kind);
@@ -2853,7 +2921,115 @@ export class Conductor {
       handle.discoveryResolve();
       return { ok: true };
     }
+    if (msg.tool === "raise_tradeoff") {
+      // Plan 04a: the worker raises a choice the plan did not fix the moment
+      // it makes it; an evaluator may also raise one it spots. Callable any
+      // time during implementation. It is a raw message; the evaluator
+      // publishes it later.
+      if (handle.role !== "worker" && handle.role !== "evaluator") {
+        return { ok: false, reason: `raise_tradeoff is not accepted from role ${handle.role}` };
+      }
+      if (this.#state.phase.phase !== "IMPLEMENTING") {
+        return { ok: false, reason: `raise_tradeoff is only accepted during implementation (phase ${this.#state.phase.phase})` };
+      }
+      const args = msg.args as { choice?: unknown; alternative?: unknown; why?: unknown; anchor?: unknown; planRef?: unknown };
+      const choice = typeof args.choice === "string" ? args.choice.trim() : "";
+      const alternative = typeof args.alternative === "string" ? args.alternative.trim() : "";
+      const why = typeof args.why === "string" ? args.why.trim() : "";
+      if (!choice || !alternative || !why) {
+        return { ok: false, reason: "raise_tradeoff needs a non-empty choice, alternative and why" };
+      }
+      const anchor = parseAnchor(args.anchor);
+      if (!anchor) return { ok: false, reason: "raise_tradeoff needs anchor = {path, lines: [start, end]}" };
+      // Bind to the current candidate when one exists; otherwise to the
+      // integration head, and let the freeze's MESSAGE_CARRIED rebind it.
+      const candidateSha = this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead;
+      const planRef = typeof args.planRef === "string" && args.planRef.trim().length > 0 ? args.planRef.trim() : this.#state.phase.phaseId;
+      this.#raiseMessage(
+        "tradeoff",
+        undefined,
+        { type: "tradeoff", title: choice, summary: why, context: alternative, evidence: [`${anchor.path}:${anchor.lines[0]}-${anchor.lines[1]}`], planRef },
+        candidateSha,
+        { anchor },
+      );
+      this.#log.append("tradeoff_raised", { role: handle.role, choice, anchor });
+      return { ok: true };
+    }
+    if (msg.tool === "submit_evaluation") {
+      // Plan 04a: the evaluator's per-message outcome. It is the only way a
+      // raw message becomes published/merged/dropped in this profile.
+      if (handle.role !== "evaluator" || this.#state.phase.phase !== "EVALUATING") {
+        return { ok: false, reason: `submit_evaluation is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      const entries = (msg.args as { evaluations?: unknown }).evaluations;
+      if (!Array.isArray(entries)) {
+        return { ok: false, reason: "submit_evaluation needs an evaluations array" };
+      }
+      // Build every message event AND the evaluator's own outcome record in
+      // one batch, then apply it as one visible step: next() must never act
+      // on a half-resolved round (a premature EVALUATION_COMPLETED).
+      const events = this.#evaluationEvents(entries as EvaluationEntry[]);
+      this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", evaluated: entries.length }]);
+      handle.doneResolve();
+      return { ok: true };
+    }
     return { ok: false, reason: `unknown submission tool ${msg.tool}` };
+  }
+
+  /** Plan 04a: the message events one evaluator submission produces. Each
+   * raw message the evaluator named is published (with its clean wording),
+   * merged or dropped; any raw message it did not name is published
+   * unchanged, marked `unevaluated`, so nothing is lost. */
+  #evaluationEvents(entries: EvaluationEntry[]): Event[] {
+    const messages = this.#state.phase.messages ?? [];
+    const byId = new Map(messages.map((m) => [m.id, m]));
+    const events: Event[] = [];
+    const handled = new Set<string>();
+    for (const entry of entries) {
+      const id = typeof entry?.messageId === "string" ? entry.messageId : "";
+      const message = byId.get(id);
+      if (!message || message.state !== "raw") continue;
+      handled.add(id);
+      const binding = {
+        messageId: id,
+        boundCandidateSha: message.boundCandidateSha,
+        boundContractVersion: message.boundContractVersion,
+        boundRecordVersion: message.messageVersion,
+      };
+      if (entry.action === "merge") {
+        const into = typeof entry.into === "string" && entry.into.trim().length > 0 ? entry.into.trim() : undefined;
+        events.push({ type: "MESSAGE_MERGED", ...binding, by: "evaluator", reason: into ? `merged into ${into}` : "merged" });
+      } else if (entry.action === "drop") {
+        const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : "dropped by the evaluator";
+        events.push({ type: "MESSAGE_DROPPED", ...binding, by: "evaluator", reason });
+      } else {
+        const text = (v: unknown, fallback: string) => (typeof v === "string" && v.trim().length > 0 ? v.trim() : fallback);
+        events.push({
+          type: "MESSAGE_PUBLISHED",
+          ...binding,
+          content: {
+            type: message.type,
+            title: clampMessageTitle(text(entry.title, message.title)),
+            summary: text(entry.summary, message.summary),
+            context: text(entry.context, message.context),
+            evidence: Array.isArray(entry.evidence) && entry.evidence.length > 0 ? entry.evidence.map(String) : message.evidence,
+            planRef: message.planRef,
+          },
+        });
+      }
+    }
+    for (const message of messages) {
+      if (message.state !== "raw" || handled.has(message.id)) continue;
+      events.push({
+        type: "MESSAGE_PUBLISHED",
+        messageId: message.id,
+        boundCandidateSha: message.boundCandidateSha,
+        boundContractVersion: message.boundContractVersion,
+        boundRecordVersion: message.messageVersion,
+        unevaluated: true,
+      });
+    }
+    return events;
   }
 
   /** Plan 01d: the records this dispatch's turn-2 prompt demanded a ballot
@@ -3389,15 +3565,9 @@ export class Conductor {
       createWorktree(this.#plan.repo, this.#paths.worktree, sha);
     }
 
-    // Plan 01e: before the run's first attempt, run the phase's checks once on
-    // the base and remember which test names already fail there, so (D2) the
-    // candidate's gate can tell a pre-existing failure from a new one and the
-    // worker is told which ones are not its to fix. A repair attempt never
-    // re-runs it — the base tree has not moved — and `#ensureBaseline`
-    // reuses an existing record for the same base tree and check list
-    // (including one a sibling program node already paid for).
-    if (this.#state.phase.attempt.n === 1) await this.#ensureBaseline();
-
+    // Plan 04a: the base baseline now runs entirely in its own BASELINE
+    // state, before this dispatch; the worker's attempt deadline begins here
+    // at its own launch, exactly as before.
     const agentId = `worker-${this.#state.phase.attempt.n}-${actionId}`;
     const contract = this.#state.phase.contract;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
@@ -3551,6 +3721,7 @@ export class Conductor {
           this.#secretNames,
           this.#state.phase.ownerDirectives,
           this.#baselineFailedCommands(),
+          this.#state.phase.messages,
         ),
       );
       // Record delivery only after the prompt was sent; a crash between the
@@ -3892,7 +4063,9 @@ export class Conductor {
    * isLiveDecision), so its message must be superseded too — never carried
    * with its old settlement intact. */
   #backingStatus(message: Message): "live" | "superseded" | "gone" {
-    if (!message.sourceRecordId) return "gone";
+    // A free-standing `raise_tradeoff` has no backing record to lose: it is
+    // its own message and stays live (plan 04a).
+    if (!message.sourceRecordId) return "live";
     const decision = this.#state.phase.decisions.find((d) => d.id === message.sourceRecordId);
     if (decision && message.type === "tradeoff") return isLiveDecision(decision) ? "live" : "superseded";
     const finding = this.#state.phase.findings.find((f) => f.id === message.sourceRecordId);
@@ -3900,13 +4073,23 @@ export class Conductor {
     return "gone";
   }
 
-  /** Contract v1: raises a raw message from a decision or finding and
-   * publishes it immediately (there is no evaluator in this profile yet).
-   * Deduped by the source record id, so a re-freeze or a re-review never
-   * raises the same message twice. */
-  #raiseMessage(type: MessageType, sourceRecordId: string, content: MessageContent, candidateSha: string): void {
+  /** Plan 04a: raises a raw message. The 03a compatibility producer no
+   * longer publishes directly — the evaluator does, in EVALUATING. Deduped
+   * by the source record id when there is one (a re-freeze or a re-review
+   * never raises the same message twice); a `raise_tradeoff` has none, so
+   * each call is its own message. Returns the new message's id. */
+  #raiseMessage(
+    type: MessageType,
+    sourceRecordId: string | undefined,
+    content: MessageContent,
+    candidateSha: string,
+    opts: { anchor?: Message["anchor"] } = {},
+  ): string {
     const existing = this.#state.phase.messages ?? [];
-    if (existing.some((m) => m.sourceRecordId === sourceRecordId)) return;
+    if (sourceRecordId !== undefined) {
+      const prior = existing.find((m) => m.sourceRecordId === sourceRecordId);
+      if (prior) return prior.id;
+    }
     const letter = type === "tradeoff" ? "T" : type === "finding" ? "F" : "B";
     let n = existing.filter((m) => m.type === type).length + 1;
     while (existing.some((m) => m.id === `${letter}-${n}`)) n += 1;
@@ -3915,21 +4098,16 @@ export class Conductor {
       phaseId: this.#state.phase.phaseId,
       type,
       ...content,
+      ...(opts.anchor ? { anchor: opts.anchor } : {}),
       state: "raw",
       messageVersion: 1,
       boundCandidateSha: candidateSha,
       boundContractVersion: this.#state.phase.contract.contractVersion,
       contentHash: contentHashOf({ type, ...content }),
-      sourceRecordId,
+      ...(sourceRecordId !== undefined ? { sourceRecordId } : {}),
     };
     this.#applyEvent({ type: "MESSAGE_RAISED", message });
-    this.#applyEvent({
-      type: "MESSAGE_PUBLISHED",
-      messageId: message.id,
-      boundCandidateSha: candidateSha,
-      boundContractVersion: message.boundContractVersion,
-      boundRecordVersion: 1,
-    });
+    return message.id;
   }
 
   /** Contract v1 §2: one MESSAGE_CARRIED per live message at a freeze. The
@@ -4146,6 +4324,53 @@ export class Conductor {
     if (record.key !== key || record.tree !== this.#baselineTree()) return false;
     if (record.commands.length !== commands.length) return false;
     return record.commands.every((c, i) => c.command === this.#baselineCommandName(commands[i]));
+  }
+
+  /** Plan 04a: whether the BASELINE state must run. True when the phase has
+   * effective checks and its own run-local baseline does not yet cover this
+   * base tree and check list. A false answer sends READY straight to
+   * IMPLEMENTING (the 01e reuse rule for a restart); reduce() itself cannot
+   * see the disk, so the conductor decides.
+   *
+   * A run-local record that is missing but whose identical base tree already
+   * has a record elsewhere (a sibling program node) still enters BASELINE:
+   * `#ensureBaseline` adopts that record — copying it locally, running
+   * nothing — so the candidate's checks can lean on it. Only a record
+   * already in THIS run's `checks/base/` lets the state be skipped. */
+  #baselineNeeded(): boolean {
+    const commands = this.#resolvedEffectiveChecks();
+    if (commands.length === 0) return false;
+    const key = this.#baselineKey(commands);
+    const local = this.#readBaseline();
+    return !(local && this.#baselineCovers(local, key, commands));
+  }
+
+  /** Plan 04a: the BASELINE stage's own logged action. It runs the base
+   * baseline (or adopts one a sibling already paid for) under its own
+   * deadline; whatever the outcome it completes into IMPLEMENTING and the
+   * strict rule applies to a candidate whose baseline could not be taken. */
+  async #runBaselineStage(actionId: string): Promise<void> {
+    const commands = this.#resolvedEffectiveChecks();
+    this.#log.intent(actionId, { commands });
+    crashAt("before_run_baseline");
+    const deadlineMs = Math.max(
+      this.#deadlines.checkMs,
+      commands.length * this.#deadlines.checkMs + this.#deadlines.termGraceMs,
+    );
+    const timer = cancelableTimeout(deadlineMs, "timeout" as const);
+    let outcome: "done" | "timeout";
+    try {
+      outcome = await Promise.race([this.#ensureBaseline().then(() => "done" as const), timer.promise]);
+    } catch (err) {
+      // `#ensureBaseline` is best-effort and never throws, but a bug in it
+      // must still let the phase move on rather than wedge the run.
+      this.#log.append("error", { where: "baseline", error: String((err as Error)?.message ?? err) });
+      outcome = "done";
+    }
+    timer.cancel();
+    crashAt("after_run_baseline");
+    this.#log.completion(actionId, { outcome: outcome === "done" ? "completed" : "timed out" });
+    this.#applyEvent({ type: outcome === "done" ? "BASELINE_COMPLETED" : "BASELINE_TIMED_OUT" });
   }
 
   /** Plan 01e: run the phase's checks once on the base, at the start of the
@@ -5198,6 +5423,183 @@ export class Conductor {
     }
   }
 
+  // -- plan 04a: evaluation -----------------------------------------------
+
+  /** A timeout or loss applies only while the phase is still evaluating the
+   * candidate this dispatch was started for. A late one is logged and
+   * dropped, like a stale review. */
+  #evaluationTimedOut(dispatchCandidate: string | undefined): void {
+    const phase = this.#state.phase;
+    if (phase.phase !== "EVALUATING" || phase.candidate?.sha !== dispatchCandidate) {
+      this.#log.append("stale_evaluation_ignored", { dispatchCandidate, phase: phase.phase });
+      return;
+    }
+    this.#applyEvent({ type: "EVALUATION_TIMED_OUT" });
+  }
+
+  /** Plan 04a: one fresh evaluator checks this round's raw messages against
+   * the candidate's diff and a read-only checkout, then returns through
+   * `submit_evaluation`. A submit settles the round; a timeout publishes the
+   * raw messages `unevaluated` and moves on. */
+  async #runEvaluation(actionId: string): Promise<void> {
+    const dispatchCandidate = this.#state.phase.candidate?.sha;
+    const agentId = `evaluator-${actionId}`;
+    const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
+    const candidateDir = this.#candidateDir();
+    const env: NodeJS.ProcessEnv = {
+      ...this.#extraEnv,
+      ...this.#piEnvFor?.("evaluator", agentId),
+      TT_SOCKET: this.#paths.sock,
+      TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_RUN_DIR: this.#runDir,
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+      TT_CANDIDATE_SHA: this.#state.phase.candidate?.sha,
+    };
+
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+
+    const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
+    const providerModel = this.#providerModelFor?.("evaluator");
+    const agent = spawnPiAgent({
+      command: evaluatorPiCommand,
+      args: [
+        ...this.#resolvePiArgsPrefix("evaluator"),
+        ...launchArgs("evaluator", {
+          noSession: evaluatorPiCommand !== undefined,
+          provider: providerModel?.provider,
+          model: providerModel?.model,
+        }),
+      ],
+      cwd: candidateDir,
+      env,
+      role: "evaluator",
+      agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(agentId, event);
+        this.#trackRunTokens(agentId, event);
+      },
+    });
+
+    const handle: AgentHandle = {
+      agent,
+      role: "evaluator",
+      agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve: () => undefined,
+      discoveryPromise: Promise.resolve(),
+    };
+    this.#agents.set(agentId, handle);
+    this.#log.intent(actionId, { agentId, pgid: agent.pgid });
+
+    try {
+      // `waitExit` is raced alongside hello: an evaluator that cannot even
+      // start (e.g. no script for the role) must take the timeout path at
+      // once, not wait out helloTimeoutMs.
+      const hello = await Promise.race([
+        raceTimeout(helloPromise, this.#deadlines.helloTimeoutMs, "hello"),
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      if (hello === "timeout" || hello === "exited") {
+        await agent.terminate();
+        this.#log.completion(actionId, { ok: false, reason: hello === "exited" ? "evaluator exited before hello" : "hello timed out" });
+        this.#evaluationTimedOut(dispatchCandidate);
+        return;
+      }
+      if (!hello.ok) {
+        await agent.terminate();
+        this.#log.completion(actionId, { ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
+        // A tool-set mismatch is a launch failure; for an evaluator there is
+        // no repair to spend, so it takes the timeout path (raw published
+        // unevaluated) rather than wedging the phase.
+        this.#evaluationTimedOut(dispatchCandidate);
+        return;
+      }
+
+      const evaluatorTimeout = this.#withStallWatch(
+        agentId,
+        agent,
+        cancelableTimeout(this.#deadlines.evaluateMs, "timeout" as const),
+        "Owner (conductor): no progress for a while. Finish now and call submit_evaluation.",
+      );
+      await agent.prompt(this.#buildEvaluatorPrompt());
+      const outcome = await Promise.race([
+        donePromise.then(() => "submitted" as const),
+        evaluatorTimeout.promise,
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      evaluatorTimeout.cancel();
+      if (outcome === "submitted") {
+        await agent.terminate();
+        this.#log.completion(actionId, { ok: true });
+        return;
+      }
+      await agent.terminate();
+      this.#log.completion(actionId, { ok: false, reason: outcome });
+      this.#evaluationTimedOut(dispatchCandidate);
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** Plan 04a: the evaluator's prompt — the phase contract, the owner
+   * directives in force, the settled ledger, the candidate's diff against
+   * the base (its read-only checkout is the working directory), and this
+   * round's raw messages. */
+  #buildEvaluatorPrompt(): string {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha ?? "";
+    const raw = (phase.messages ?? []).filter((m) => m.state === "raw");
+    let diff = "";
+    try {
+      diff = diffText(this.#plan.repo, phase.integrationHead, C);
+    } catch {
+      diff = "(the diff could not be read)";
+    }
+    const lines = [
+      `You are the evaluator for phase ${phase.phaseId}, candidate ${C.slice(0, 9)} (contract snapshot ${phase.contract.contractVersion.snapshot}).`,
+      `Goal: ${phase.contract.goal}`,
+      "",
+      "Acceptance criteria:",
+      ...phase.contract.acceptance.map((a) => `- ${a}`),
+      ...secretPromptLines(this.#secretNames),
+      ...directiveLines(phase.ownerDirectives),
+      ...ledgerPromptLines(phase.messages),
+      "",
+      "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
+      "```diff",
+      redactText(diff, this.#secretMaskable),
+      "```",
+      "",
+      `Raw messages to evaluate (${raw.length}):`,
+      ...raw.map(
+        (m) => `- ${m.id} [${m.type}]: ${m.title}${m.anchor ? ` (anchor ${m.anchor.path}:${m.anchor.lines[0]}-${m.anchor.lines[1]})` : ""}\n    why: ${m.summary}\n    context: ${m.context}`,
+      ),
+      "",
+      "For EACH raw message above, check its claim against the code and call submit_evaluation with one entry:",
+      "- publish: title (one clean line, at most 80 characters), summary (at most 3 sentences), context, evidence (the code facts you checked), importance (high|medium|low).",
+      "- merge: the message says the same thing as another — name `into` that message id.",
+      "- drop: it is trivial, already settled, or not reviewable — give a reason.",
+    ];
+    return lines.join("\n");
+  }
+
   // -- plan 2c: discovery barrier ------------------------------------------
 
   #discoveryBarrier: { candidate: string; arrived: Set<Reviewer>; released: boolean; waiters: Array<() => void> } | undefined;
@@ -5267,6 +5669,9 @@ export class Conductor {
       `Candidate checkout (read-only): ${this.#candidateDir()}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
+      // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
+      // what is already settled.
+      ...ledgerPromptLines(phase.messages),
       // Plan 01f: turn 1 is told the conductor owns the gate evidence too (a
       // reviewer that only learns it in turn 2 could demand or accept a
       // substitute first). The failed record from an earlier candidate is
@@ -5348,6 +5753,9 @@ export class Conductor {
       // them as this candidate's defect (runtime doc §8: reviewers kept
       // flagging the 14 pre-existing exchange-state-machine failures).
       ...baselinePromptLines(this.#baselineFailedCommands()),
+      // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
+      // what is already settled.
+      ...ledgerPromptLines(phase.messages),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -5428,6 +5836,66 @@ export class Conductor {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/** Plan 04a: one `submit_evaluation` entry, as the evaluator sends it. */
+interface EvaluationEntry {
+  messageId?: unknown;
+  action?: unknown;
+  title?: unknown;
+  summary?: unknown;
+  context?: unknown;
+  evidence?: unknown;
+  importance?: unknown;
+  into?: unknown;
+  reason?: unknown;
+}
+
+/** Plan 04a: an anchor is `{path, lines: [start, end]}`. Anything else is
+ * refused back to the raiser rather than recorded as an unusable anchor. */
+function parseAnchor(raw: unknown): { path: string; lines: [number, number] } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const a = raw as { path?: unknown; lines?: unknown };
+  if (typeof a.path !== "string" || a.path.trim().length === 0) return undefined;
+  if (!Array.isArray(a.lines) || a.lines.length !== 2) return undefined;
+  const [start, end] = a.lines;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) return undefined;
+  return { path: a.path.trim(), lines: [start as number, end as number] };
+}
+
+/** Plan 04a: a published message title is at most 80 characters. */
+function clampMessageTitle(title: string): string {
+  const t = title.replace(/\s+/g, " ").trim();
+  return t.length > 80 ? `${t.slice(0, 79)}…` : t;
+}
+
+/** Plan 04a: the settled ledger every prompt carries under "Settled (do not
+ * re-raise)" — what has already been decided, by whom, and why, so a fresh
+ * agent does not re-argue it. */
+export function ledgerPromptLines(messages: readonly Message[] | undefined): string[] {
+  const entries = ledgerEntries([...(messages ?? [])]);
+  if (entries.length === 0) return [];
+  return [
+    "",
+    "Settled (do not re-raise):",
+    ...entries.map((e) => {
+      const reason = e.reason ? ` — ${e.reason}` : "";
+      const bad = e.invalidated ? ` (invalidated: ${e.invalidated.reason})` : "";
+      return `- ${e.messageId} [${e.type}] ${e.state} by ${e.settledBy}${reason}${bad}`;
+    }),
+  ];
+}
+
+/** Plan 04a: an owner-refused message the next worker attempt must address:
+ * the message, and the owner's reason, verbatim. */
+export function refusedPromptLines(messages: readonly Message[] | undefined): string[] {
+  const refused = (messages ?? []).filter((m) => m.state === "refused");
+  if (refused.length === 0) return [];
+  return [
+    "",
+    "Owner-refused (must address):",
+    ...refused.map((m) => `- ${m.id} "${m.title}" — refused: ${m.settlement?.reason ?? "no reason given"}`),
+  ];
+}
 
 interface SubmitPhaseArgs {
   decisions?: DecisionDisclosure[];
@@ -5705,6 +6173,7 @@ export function buildWorkerPrompt(
   secrets: readonly string[] = [],
   directives?: readonly OwnerDirective[],
   baselineCommands?: readonly BaselineCommand[],
+  messages?: readonly Message[],
 ): string {
   const lines: string[] = [
     `Goal: ${contract.goal}`,
@@ -5718,6 +6187,10 @@ export function buildWorkerPrompt(
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
   lines.push(...directiveLines(directives));
+  // Plan 04a: the settled ledger, and any message the owner refused (which
+  // the next attempt must address, with the owner's reason).
+  lines.push(...refusedPromptLines(messages));
+  lines.push(...ledgerPromptLines(messages));
   // Plan 01f: the gate is the conductor's proof to produce, never the
   // worker's (runtime doc §6's structural incentive to substitute it).
   lines.push(...gatePromptLines(contract.gate));

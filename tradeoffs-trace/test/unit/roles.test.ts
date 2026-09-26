@@ -8,8 +8,11 @@ test("roles: PI_VERSION is the pinned version", () => {
 });
 
 test("roles: ROLE_TOOLS matches design §2.1's launch table exactly", () => {
-  assert.deepEqual(ROLE_TOOLS.worker, ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase"]);
+  assert.deepEqual(ROLE_TOOLS.worker, ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "raise_tradeoff"]);
   assert.deepEqual(ROLE_TOOLS.reviewer, ["read", "grep", "find", "ls", "submit_discovery", "submit_review"]);
+  // Plan 04a: the evaluator reads the candidate and returns through
+  // submit_evaluation (and may raise a trade-off it spots); no write tools.
+  assert.deepEqual(ROLE_TOOLS.evaluator, ["read", "grep", "find", "ls", "raise_tradeoff", "submit_evaluation"]);
 });
 
 test("roles: launchArgs never uses --exclude-tools, always an explicit --tools allowlist", () => {
@@ -78,7 +81,7 @@ test("assertToolSet: extra tools are reported (the --exclude-tools pitfall)", ()
   const result = assertToolSet("worker", ["read", "edit", "write", "sh", "submit_phase", "submit_discovery", "submit_review"]);
   assert.equal(result.ok, false);
   if (!result.ok) {
-    assert.deepEqual(result.missing.sort(), ["find", "grep", "ls"].sort());
+    assert.deepEqual(result.missing.sort(), ["find", "grep", "ls", "raise_tradeoff"].sort());
     assert.deepEqual(result.extra.sort(), ["submit_discovery", "submit_review"].sort());
   }
 });

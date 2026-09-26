@@ -121,6 +121,12 @@ export async function setupConductor(opts: {
    * duplicate decision). Takes precedence over `workerScript` when given. */
   workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 04a: the EVALUATING stage's fresh evaluator. The default script
+   * returns an empty `submit_evaluation`, so the conductor publishes any raw
+   * messages unchanged, marked `unevaluated` — enough for the ~30 tests that
+   * never raise a message to evaluate. A test that wants real publication
+   * supplies its own script. */
+  evaluatorScriptFor?: (state: State) => { hello?: unknown; steps: FakePiStep[] };
   deadlines?: ConductorOptions["deadlines"];
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
    * never parses argv, so these are inert except as a unique, greppable
@@ -201,6 +207,12 @@ export async function setupConductor(opts: {
   const workerScriptPaths = new Map<number, string>();
 
   const reviewerScriptPaths = new Map<string, string>();
+  const evaluatorScriptPaths = new Map<string, string>();
+
+  const defaultEvaluatorScript = () => ({
+    hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+    steps: [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } }],
+  });
 
   const conductor = new Conductor({
     runDir,
@@ -226,6 +238,17 @@ export async function setupConductor(opts: {
           return { FAKE_PI_SCRIPT: workerScriptPaths.get(attempt)!, ...(opts.extraWorkerEnv ?? {}) };
         }
         return { FAKE_PI_SCRIPT: workerScriptPath!, ...(opts.extraWorkerEnv ?? {}) };
+      }
+      if (role === "evaluator") {
+        // One evaluator per dispatch; a fresh script for each so a test can
+        // vary by round if it wants.
+        if (!evaluatorScriptPaths.has(agentId)) {
+          const script = opts.evaluatorScriptFor
+            ? opts.evaluatorScriptFor(conductor.state)
+            : defaultEvaluatorScript();
+          evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+        }
+        return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
       }
       const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1] ?? "M") as Reviewer;
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {

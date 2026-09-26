@@ -42,6 +42,22 @@ export const SUBMIT_DISCOVERY_PARAMS: ParamShape = {
   required: ["discoveries"],
 };
 
+/** Plan 04a: `raise_tradeoff` — the worker raises a choice the plan did not
+ * fix the moment it makes it (also callable by an evaluator that spots one).
+ * The anchor names the code location the choice lives at. */
+export const RAISE_TRADEOFF_PARAMS: ParamShape = {
+  properties: ["choice", "alternative", "why", "anchor", "planRef"],
+  required: ["choice", "alternative", "why", "anchor"],
+};
+
+/** Plan 04a: `submit_evaluation` — the evaluator's per-message outcome:
+ * publish (clean wording), merge (into another message) or drop (with a
+ * reason). One entry per raw message it was shown. */
+export const SUBMIT_EVALUATION_PARAMS: ParamShape = {
+  properties: ["evaluations"],
+  required: ["evaluations"],
+};
+
 /** Matches schemas/review.schema.json's top level exactly — a Review
  * carries no conductor-assigned binding fields, so the model supplies
  * every field the record itself needs. `ballots`/`findings` (work packet

@@ -12,15 +12,19 @@ import { fileURLToPath } from "node:url";
  * tests. */
 export const PI_VERSION = "0.87.0";
 
-export type Role = "worker" | "reviewer";
+export type Role = "worker" | "reviewer" | "evaluator";
 
 /** design §2.1's launch table. Every role uses an explicit allowlist, never
  * `--exclude-tools` (Pi's default set omits `grep`, `find` and `ls`, so a
  * denylist leaves gaps and, for a worker, leaks the reviewer submission
  * tools — see the negative case in role-tool-sets.test.ts). */
 export const ROLE_TOOLS: Record<Role, string[]> = {
-  worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase"],
+  worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "raise_tradeoff"],
   reviewer: ["read", "grep", "find", "ls", "submit_discovery", "submit_review"],
+  // Plan 04a: the evaluator checks a round's raw messages against the code
+  // it can read, and returns through `submit_evaluation`. No write tools: it
+  // reports, it does not change the candidate.
+  evaluator: ["read", "grep", "find", "ls", "raise_tradeoff", "submit_evaluation"],
 };
 
 /** The skeleton extension's own file, resolved relative to this module so

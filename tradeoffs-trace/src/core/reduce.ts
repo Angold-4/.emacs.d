@@ -31,6 +31,13 @@ import type { BindingTuple, ContractVersion, Event, Finding, InFlightKey, Reduce
 
 const KNOWN_EVENT_TYPES = new Set<string>([
   "ATTEMPT_STARTED",
+  "BASELINE_COMPLETED",
+  "BASELINE_TIMED_OUT",
+  "BASELINE_INTERRUPTED",
+  "EVALUATION_COMPLETED",
+  "EVALUATION_TIMED_OUT",
+  "EVALUATION_INTERRUPTED",
+  "EVALUATOR_FINISHED",
   "SUBMIT_PHASE",
   "ATTEMPT_TIMED_OUT",
   "ATTEMPT_NO_SUBMISSION",
@@ -349,6 +356,31 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // itself moves IMPLEMENTING -> FREEZING. FREEZE_COMPLETED is what
       // assembles these into bound Decision records (design §6.2, §7.1).
       return undefined;
+    }
+
+    case "REVIEW_TIMED_OUT": {
+      // Plan 04a: a review dispatch whose phase has already moved on (a
+      // crash-recovery reconciliation after all three reviews landed and the
+      // phase entered EVALUATING) is stale. It has no transition row there;
+      // clear the lingering in-flight entry so it can never block a later
+      // REVIEWING dispatch, and change nothing else.
+      const key = `review_${event.reviewer}` as InFlightKey;
+      if (!(key in p.inFlight)) return rejected(state, `no in-flight review for ${event.reviewer} to clear`);
+      const inFlight = { ...p.inFlight };
+      delete inFlight[key];
+      return ok({ ...state, phase: { ...p, inFlight } });
+    }
+
+    case "EVALUATOR_FINISHED": {
+      // Plan 04a: the evaluator's own outcome, a record event inside
+      // EVALUATING. It settles the round without moving the phase; next()
+      // then asks for `evaluation_complete`, which is the
+      // EVALUATION_COMPLETED transition. Rejected outside EVALUATING, so a
+      // late evaluator cannot settle a different stage.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATOR_FINISHED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      return ok({ ...state, phase: { ...p, evaluation: { ...(p.evaluation ?? {}), settled: true } } });
     }
 
     case "CRITERION_REVERTED": {

@@ -42,15 +42,37 @@ test("a verdict on a live run goes through the inbox", async () => {
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    workerScript: () => ({
-      hello: defaultWorkerHello(),
-      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
-    }),
-    // Reviewers hang, so the phase stays in REVIEWING long enough for the
-    // owner's verdict to arrive through the inbox.
-    reviewerScriptFor: () => ({
+    // Plan 04a: a message is published only once the evaluator has run at
+    // EVALUATING. M raises a blocking finding so the phase parks in a repair
+    // round, and the second attempt hangs — the run stays live with the
+    // message published, long enough for the owner's verdict to arrive.
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? {
+            hello: defaultWorkerHello(),
+            steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
+          }
+        : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
-      steps: [{ kind: "hang-until-abort" }],
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings: reviewer === "M" ? [{ kind: "defect", severity: "blocking", evidence: "the loop does not terminate on empty input" }] : [],
+          },
+        },
+      ],
     }),
     deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 30_000 },
   });
@@ -58,12 +80,12 @@ test("a verdict on a live run goes through the inbox", async () => {
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "tradeoff" && m.state === "published"),
       90_000,
       20,
       setup.runDir,
     );
-    const message = setup.conductor.state.phase.messages![0];
+    const message = setup.conductor.state.phase.messages!.find((m) => m.type === "tradeoff" && m.state === "published")!;
     const inbox = `${setup.runDir}/inbox`;
     mkdirSync(inbox, { recursive: true });
     // The in-process Conductor writes no pid file (only the detached
@@ -85,7 +107,7 @@ test("a verdict on a live run goes through the inbox", async () => {
     assert.equal(refused.settlement?.settledBy, "owner");
     assert.ok(
       setup.conductor.state.phase.findings.some((f) => f.raisedBy === "owner" && f.severity === "blocking"),
-      "a refusal during REVIEWING must raise an owner blocking finding",
+      "a refusal before DONE must raise an owner blocking finding",
     );
 
     // A stale verdict, sent through `tt verdict`'s own binding override, is
@@ -329,10 +351,11 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
 
   try {
     await setup.conductor.start();
-    // Publish attempt 1's trade-off, settle it with an owner accept through
-    // the inbox, then let the repair change the decision it came from.
+    // Publish attempt 1's trade-off (the evaluator publishes it at
+    // EVALUATING), settle it with an owner accept through the inbox, then let
+    // the repair change the decision it came from.
     await waitFor(
-      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "tradeoff" && m.state === "published"),
       90_000,
       20,
       setup.runDir,
@@ -392,6 +415,10 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
       hello: defaultWorkerHello(),
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\\n' > attempt.txt` },
+        // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
+        // the published message (queued through the 1s inbox poll) is applied
+        // before the next freeze carries/supersedes it.
+        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 4000 }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [], priorDecisions: [{ id: priorId, status: "withdrawn" }] } },
@@ -431,7 +458,7 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "tradeoff" && m.state === "published"),
       90_000,
       20,
       setup.runDir,

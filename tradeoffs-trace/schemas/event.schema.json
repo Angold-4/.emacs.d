@@ -8,7 +8,9 @@
   "properties": {
     "type": {
       "enum": [
-        "ATTEMPT_STARTED", "SUBMIT_PHASE", "ATTEMPT_TIMED_OUT", "ATTEMPT_NO_SUBMISSION",
+        "ATTEMPT_STARTED", "BASELINE_COMPLETED", "BASELINE_TIMED_OUT", "BASELINE_INTERRUPTED",
+        "EVALUATION_COMPLETED", "EVALUATION_TIMED_OUT", "EVALUATION_INTERRUPTED", "EVALUATOR_FINISHED",
+        "SUBMIT_PHASE", "ATTEMPT_TIMED_OUT", "ATTEMPT_NO_SUBMISSION",
         "ATTEMPT_INTERRUPTED", "FREEZE_COMPLETED", "FREEZE_TIMED_OUT", "FREEZE_INTERRUPTED",
         "CHECKS_PASSED", "CHECKS_FAILED", "CHECKS_INTERRUPTED", "PROBE_PASSED", "PROBE_FAILED",
         "PROBE_INTERRUPTED", "REVIEW_SUBMITTED", "REVIEW_TIMED_OUT", "ACTION_STARTED",
@@ -25,7 +27,14 @@
     }
   },
   "oneOf": [
-    { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_STARTED" } } },
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_STARTED" }, "baselineNeeded": { "type": "boolean" } } },
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "BASELINE_COMPLETED" } } },
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "BASELINE_TIMED_OUT" } } },
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "BASELINE_INTERRUPTED" } } },
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "EVALUATION_COMPLETED" } } },
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "EVALUATION_TIMED_OUT" } } },
+    { "type": "object", "required": ["type"], "properties": { "type": { "const": "EVALUATION_INTERRUPTED" } } },
+    { "type": "object", "required": ["type", "evaluated"], "properties": { "type": { "const": "EVALUATOR_FINISHED" }, "evaluated": { "type": "integer" } } },
     { "type": "object", "required": ["type", "disclosures"], "properties": { "type": { "const": "SUBMIT_PHASE" }, "disclosures": { "type": "array" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_TIMED_OUT" } } },
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "ATTEMPT_NO_SUBMISSION" } } },

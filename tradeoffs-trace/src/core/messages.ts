@@ -126,7 +126,17 @@ addRow({
   guardName: "always",
   guard: () => true,
   to: "published",
-  apply: (m) => ({ ...m!, state: "published" }),
+  // Plan 04a: the evaluator publishes a message with the clean, human
+  // wording it produced (title ≤ 80 characters, summary, context,
+  // evidence). When the event carries that content it replaces the raw
+  // fields and the contentHash is recomputed; a bare publish (no evaluator)
+  // leaves the raised fields untouched.
+  apply: (m, event) => {
+    const e = event as unknown as { content?: MessageContent; unevaluated?: boolean };
+    const base: Message = { ...m!, state: "published", unevaluated: e.unevaluated === true ? true : undefined };
+    if (!e.content) return base;
+    return { ...base, ...e.content, contentHash: contentHashOf(e.content) };
+  },
 });
 
 addRow({

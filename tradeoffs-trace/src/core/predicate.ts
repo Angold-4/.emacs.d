@@ -77,6 +77,16 @@ export function addressed(correction: Correction, phase: PhaseState, C: string, 
   return true;
 }
 
+/** Plan 04a: whether everything EVALUATING waits for has settled. In 04a
+ * that is the evaluator alone — the phase has no raw messages left for it to
+ * check (`EVALUATOR_FINISHED` resolves them; a timeout publishes them
+ * `unevaluated`), or the evaluator's own outcome record already settled the
+ * round. Plan 04b adds its panels to this same predicate. */
+export function evaluationSettled(phase: PhaseState): boolean {
+  if (!(phase.messages ?? []).some((m) => m.state === "raw")) return true;
+  return phase.evaluation?.settled === true;
+}
+
 /** M, A and B each have a review bound to (C, K) already. Used to decide,
  * after a probe (design §6.4 step 3's stale-publish retry re-probes the
  * SAME candidate against a new head), whether REVIEWING needs to dispatch

@@ -87,6 +87,10 @@ test("amend-contract-finding: design §4.3 — the budget exhausts on B's contra
       review: { reviewer, phaseId: "p1", candidateSha: "C1", contractVersion: K2, correctionStatements: [], findingStatements: [] },
     });
   }
+  // Plan 04a: the last review enters EVALUATING; no raw messages means the
+  // predicate already holds and the phase completes evaluation at once.
+  assert.equal(state.phase.phase, "EVALUATING");
+  state = step(state, { type: "EVALUATION_COMPLETED" });
   assert.equal(state.phase.phase, "RESOLVING");
   state = step(state, { type: "ACCEPTED", resolvedCorrectionIds: [] });
   assert.equal(state.phase.phase, "ACCEPTED");
