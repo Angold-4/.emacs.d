@@ -447,7 +447,7 @@ export type RunStateName = "RUN_ACTIVE" | "RUN_PAUSED_BUDGET";
 // §7.4/§9.3 (plan 2d): owner input, recorded
 // ---------------------------------------------------------------------------
 
-export type OwnerInputKind = "steer" | "note" | "correction";
+export type OwnerInputKind = "steer" | "note" | "correction" | "directive" | "withdraw";
 
 /** The state the conductor actually recorded for one owner input. `sent` is
  * never logged: it is derived by the read-only views from a pending inbox
@@ -469,6 +469,50 @@ export interface OwnerInputRecord {
   attemptId?: string; // steer: the worker attempt id it was bound to
   reason?: string; // refused / delivery-uncertain detail
   at: string; // ISO timestamp the conductor recorded
+}
+
+// ---------------------------------------------------------------------------
+// Plan 01i: owner directives (design 01_ref_design.md D5, runtime §8)
+// ---------------------------------------------------------------------------
+
+/** How far a directive reaches: its own phase (every agent now, and in every
+ * later prompt) or the whole program (every running node now, every node
+ * started later). */
+export type DirectiveScope = "phase" | "program";
+
+/** The outcome of one directive's immediate Pi steer to one live agent of
+ * this run, keyed by the agent's target label ("worker", "M", "A", "B"). A
+ * target with no entry yet is still in flight. */
+export type DirectiveDeliveryState = "delivered" | "delivery-uncertain";
+
+/** Plan 01i: every text the owner sent through the input box, recorded as a
+ * numbered directive (`OD-1`, `OD-2`, …) that is part of the phase until
+ * withdrawn. It is steered at once to every live agent of the run (`targets`,
+ * `deliveries`) and included verbatim, newest last, under "Owner directives
+ * (binding)" in every later prompt — worker attempts and repairs, reviewer
+ * turns 1 and 2, and re-dispatched or fresh agents. It binds reviewers as
+ * part of the contract: a candidate that follows a directive cannot be
+ * faulted for doing so, even where the plan's text says otherwise, and a
+ * candidate that violates one is a blocking contract finding citing the id. */
+export interface OwnerDirective {
+  id: string; // "OD-1"
+  seq: number; // 1
+  text: string; // what the owner typed, verbatim
+  scope: DirectiveScope;
+  status: "in-force" | "withdrawn";
+  commandId: string; // the inbox command id it arrived as
+  at: string; // ISO timestamp the conductor recorded it
+  /** The live agents it was steered to when sent ("worker", "M", "A", "B";
+   * a reviewer letter per live reviewer). Empty when no agent was live — it
+   * still reaches every later prompt. */
+  targets: string[];
+  /** Per-target outcome of that steer; a target in `targets` with no entry
+   * has not acknowledged yet (shown `⧗`). */
+  deliveries: Record<string, DirectiveDeliveryState>;
+  withdrawnAt?: string;
+  /** A program-wide directive that reached this phase through its plan (a
+   * node started after the directive was issued), not through its inbox. */
+  seeded?: boolean;
 }
 
 export interface Attempt {
@@ -581,6 +625,11 @@ export interface PhaseState {
    * buffer's "Owner input" section renders this — never an inferred or
    * optimistic state. Ordered by id (stable across a restart). */
   ownerInputs?: OwnerInputRecord[];
+  /** Plan 01i: the owner directives in force (or withdrawn) in this phase,
+   * in the order the owner sent them. Rebuilt by folding the log, so a
+   * directive survives a conductor restart; included, newest last, in every
+   * later prompt. */
+  ownerDirectives?: OwnerDirective[];
 }
 
 export type RunStatus = RunStateName;
@@ -808,6 +857,32 @@ export interface EvOwnerInputRecorded {
   input: OwnerInputRecord;
 }
 
+/** Plan 01i: records one owner directive (`OD-<seq>`) the moment it is
+ * accepted. Record-only: it moves no phase-state name, it appends a binding
+ * record the phase carries until withdrawn and every later prompt quotes. */
+export interface EvDirectiveAdded {
+  type: "DIRECTIVE_ADDED";
+  directive: OwnerDirective;
+}
+
+/** Plan 01i: `withdraw OD-n` — the directive no longer applies. Record-only:
+ * the record stays (the status shows it withdrawn) and later prompts omit
+ * it. */
+export interface EvDirectiveWithdrawn {
+  type: "DIRECTIVE_WITHDRAWN";
+  directiveId: string;
+  at?: string;
+}
+
+/** Plan 01i: the observed outcome of one directive's immediate steer to one
+ * live agent, keyed by its target label. Record-only. */
+export interface EvDirectiveDelivered {
+  type: "DIRECTIVE_DELIVERED";
+  directiveId: string;
+  target: string;
+  state: DirectiveDeliveryState;
+}
+
 /** Plan 2d (§7.5/§7.4): the owner's correction typed while the phase is
  * AWAITING_OWNER. It resolves every open owner request, grants a fresh
  * 3-round repair allowance (independent of any exhausted budget), queues
@@ -939,6 +1014,9 @@ export type Event =
   | EvDecisionAdded
   | EvNoteAdded
   | EvOwnerInputRecorded
+  | EvDirectiveAdded
+  | EvDirectiveWithdrawn
+  | EvDirectiveDelivered
   | EvOwnerCorrection
   | EvOwnerRequestMarkedUnneeded
   | EvMissRecorded

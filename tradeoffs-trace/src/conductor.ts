@@ -29,12 +29,14 @@ import type {
   ContractVersion,
   Decision,
   DecisionDisclosure,
+  DirectiveScope,
   Event,
   Finding,
   PriorDecisionStatement,
   FindingDisclosure,
   InFlightKey,
   OwnerCommand,
+  OwnerDirective,
   OwnerInputKind,
   OwnerInputState,
   PhaseContract,
@@ -195,6 +197,18 @@ export interface RunPlanFile {
    * conductor writes. A name that is unset at start is reported in the
    * status; the run starts anyway. */
   secrets?: string[];
+  /** Plan 01i: program-wide owner directives already in force when this
+   * run's node was started (D5). They seed the phase's directive list, so a
+   * node started after the owner's ruling still carries it in every prompt.
+   * Written by the program scheduler (`nodePlan`), never by hand. */
+  ownerDirectives?: RunPlanDirectiveSeed[];
+}
+
+/** Plan 01i: a program-wide owner directive a node's plan was started with. */
+export interface RunPlanDirectiveSeed {
+  id?: string;
+  text: string;
+  at?: string;
 }
 
 export interface ConductorOptions {
@@ -334,7 +348,12 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
   };
 }
 
-export function initialState(runId: string, phase: RunPlanPhase, integrationHead: string): State {
+export function initialState(
+  runId: string,
+  phase: RunPlanPhase,
+  integrationHead: string,
+  programDirectives: RunPlanDirectiveSeed[] = [],
+): State {
   const contract = buildContract(phase);
   const phaseState: PhaseState = {
     runId,
@@ -353,8 +372,36 @@ export function initialState(runId: string, phase: RunPlanPhase, integrationHead
     inFlight: {},
     repairRoundsUsed: 0,
     repairRoundsGranted: 3,
+    // Plan 01i: a program-wide directive in force when this node was started
+    // seeds the phase's own list (scope `program`, seeded), so it is quoted
+    // in every prompt from the first attempt. The plan snapshot is on disk,
+    // so a restart folds the identical seeds.
+    ...(programDirectives.length > 0
+      ? {
+          ownerDirectives: programDirectives.map((d, i) => seededDirective(d, i)),
+        }
+      : {}),
   };
   return { run: "RUN_ACTIVE", phase: phaseState };
+}
+
+/** Plan 01i: one seeded program-wide directive as a phase record. It keeps
+ * the program's own `ODP-<n>` id verbatim, so one id names the same ruling at
+ * both levels and `withdraw ODP-n` retires the right record everywhere. */
+function seededDirective(seed: RunPlanDirectiveSeed, index: number): OwnerDirective {
+  const { id, seq } = allocateDirectiveId([], typeof seed.id === "string" ? seed.id : `ODP-${index + 1}`);
+  return {
+    id,
+    seq,
+    text: seed.text,
+    scope: "program",
+    status: "in-force",
+    commandId: `seed-${id}`,
+    at: seed.at ?? "",
+    targets: [],
+    deliveries: {},
+    seeded: true,
+  };
 }
 
 /** Creates a fresh run directory (fails if it already exists) with the
@@ -483,7 +530,11 @@ export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?
     runId = randomUUID().slice(0, 8);
     integrationHead = currentHead(plan.repo, plan.integrationBranch);
   }
-  return foldEvents(initialState(runId, plan.phases[0], integrationHead), records, opts.lenient === true);
+  return foldEvents(
+    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? []),
+    records,
+    opts.lenient === true,
+  );
 }
 
 /** Plan 3b: one entry per phase-state change, and one per finished review
@@ -498,7 +549,7 @@ export interface Timeline {
 export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
   const { records } = readLog(runPaths(runDir).events);
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string } | undefined;
-  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "");
+  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
   for (const record of records) {
@@ -783,12 +834,12 @@ export class Conductor {
           `run was started under runner ${init.runnerRevision}; this conductor is ${mine} — refusing to resume (reinstall that runner, or start a new run)`,
         );
       }
-      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead);
+      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? []);
     } else {
       const head = currentHead(this.#plan.repo, this.#integrationBranch);
       const runId = randomUUID().slice(0, 8);
       this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision() });
-      this.#state = initialState(runId, this.#plan.phases[0], head);
+      this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
     }
     this.#state = foldEvents(this.#state, records);
     if (this.#secretNames.length > 0) this.#recordSecrets();
@@ -1236,18 +1287,287 @@ export class Conductor {
     attemptId?: string,
     reason?: string,
   ): void {
-    this.#applyEvent({
-      type: "OWNER_INPUT_RECORDED",
-      input: {
-        id,
-        kind,
-        text,
-        state,
-        ...(attemptId ? { attemptId } : {}),
-        ...(reason ? { reason } : {}),
-        at: new Date().toISOString(),
+    // `id` is the inbox command id, so the logged event carries it: recovery
+    // then knows a replayed file was already applied (design §9.3) instead of
+    // processing it a second time.
+    this.#applyEvent(
+      {
+        type: "OWNER_INPUT_RECORDED",
+        input: {
+          id,
+          kind,
+          text,
+          state,
+          ...(attemptId ? { attemptId } : {}),
+          ...(reason ? { reason } : {}),
+          at: new Date().toISOString(),
+        },
       },
-    });
+      id,
+    );
+  }
+
+  // -- plan 01i: owner directives (01_ref_design.md D5, runtime §8) --------
+
+  /** Plan 01i: every live agent of this run, each with the target label the
+   * status shows (`worker`, or the reviewer's letter). One entry per live
+   * agent, deliberately: during a re-dispatch overlap two agents can share a
+   * label, and every one of them must be steered (deliveries are then
+   * recorded per label, newest ack wins). */
+  #liveAgents(): Array<{ target: string; agentId: string; agent: PiAgent }> {
+    const out: Array<{ target: string; agentId: string; agent: PiAgent }> = [];
+    for (const h of this.#agents.values()) {
+      if (h.agent.exited) continue;
+      const target = h.role === "worker" ? "worker" : (h.agentId.match(/^reviewer-([MAB])-/)?.[1] ?? h.agentId);
+      out.push({ target, agentId: h.agentId, agent: h.agent });
+    }
+    return out;
+  }
+
+  /** Plan 01i: records one directive, then steers it at once to every live
+   * agent except `exemptAgentIds` (an agent whose steer is already being
+   * handled — the worker in `#processSteerCommand`), recording each delivery
+   * as it is acknowledged. The directive itself is a logged event, so it
+   * survives a restart and every later prompt quotes it verbatim.
+   *
+   * Ids are namespaced so one id always names one ruling: a phase's own
+   * directives are `OD-<n>`, a program-wide one arrives with the program's
+   * `ODP-<n>` and keeps it verbatim (the two spaces never collide, so a node
+   * can never renumber a program ruling into a number of its own). */
+  #addDirective(
+    text: string,
+    scope: DirectiveScope,
+    commandId: string,
+    exemptAgentIds: string[] = [],
+    preferredId?: string,
+  ): OwnerDirective {
+    const existing = this.#state.phase.ownerDirectives ?? [];
+    // Idempotent by inbox command id: a replay (the log already holds the
+    // directive but the file was never moved) must not mint a second id.
+    const already = existing.find((d) => d.commandId === commandId);
+    if (already) return already;
+    const { id, seq } = allocateDirectiveId(existing, preferredId);
+    const live = this.#liveAgents();
+    const directive: OwnerDirective = {
+      id,
+      seq,
+      text,
+      scope,
+      status: "in-force",
+      commandId,
+      at: new Date().toISOString(),
+      targets: [...new Set(live.map((l) => l.target))],
+      deliveries: {},
+    };
+    this.#applyEvent({ type: "DIRECTIVE_ADDED", directive });
+    this.#steerDirectiveTo(directive, exemptAgentIds);
+    return directive;
+  }
+
+  /** Plan 01i: steers one directive's text to every live agent of this run
+   * (except `exemptAgentIds`), logging an intent before each send and a
+   * completion on acknowledgement — the same intent/completion discipline as
+   * a steer, so a crash mid-send leaves a recoverable record and never a
+   * silent loss. */
+  #steerDirectiveTo(directive: OwnerDirective, exemptAgentIds: string[]): void {
+    for (const { target, agentId, agent } of this.#liveAgents()) {
+      if (exemptAgentIds.includes(agentId)) continue;
+      const actionId = `deliver-${directive.commandId}-${target}-${agentId}`;
+      const message = `Owner directive ${directive.id} (binding): ${directive.text}`;
+      this.#log.intent(actionId, { directiveId: directive.id, target, agentId, text: directive.text });
+      void agent.steer(message).then(
+        () => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, { outcome: "directive-steer-acknowledged", target, agentId });
+          this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state: "delivered" });
+        },
+        (err) => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, {
+            outcome: "directive-steer-failed",
+            target,
+            agentId,
+            error: String((err as Error)?.message ?? err),
+          });
+          this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state: "delivery-uncertain" });
+        },
+      );
+    }
+  }
+
+  /** Plan 01i: an owner directive pushed by a program (a node that was
+   * already running when the director sent it, D5). It is a directive like
+   * any other — steered to every live agent now, quoted in every later
+   * prompt — and, when scope is `program`, forwarded to the program's own
+   * inbox so every other running node gets it and every node started later
+   * is started with it. */
+  #processDirective(
+    file: string,
+    commandId: string,
+    text: string,
+    scope: DirectiveScope,
+    forward: boolean,
+    programId?: string,
+  ): void {
+    this.#addDirective(text, scope, commandId, [], programId);
+    // Recorded `noted` (it is part of the phase and in every later prompt);
+    // each steer's real outcome is on the directive itself, so this record
+    // never claims a delivery that has not been acknowledged.
+    this.#recordOwnerInput(commandId, "directive", text, "noted");
+    // Only a directive the *owner* sent from this run's own input box with
+    // `C-u` is forwarded to the program: the scheduler already pushed a
+    // program-wide one here, and forwarding it back would loop.
+    if (forward && scope === "program") this.#forwardProgramDirective(commandId, text);
+    this.#appliedCommandIds.add(commandId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 01i: `withdraw OD-n`. The directive no longer applies: every live
+   * agent is steered that it is withdrawn and every later prompt omits it.
+   * An id that is unknown (or already withdrawn) is refused with the reason,
+   * never silently applied. */
+  #processWithdraw(
+    file: string,
+    commandId: string,
+    text: string,
+    directiveId: string,
+    opts: { forwardProgram: boolean; pushed: boolean },
+  ): void {
+    // `pushed` is a withdrawal the program scheduler delivered (or re-
+    // delivered on its next tick): for a directive that is already gone it is
+    // a no-op success, never a refusal — otherwise the same file would be
+    // rejected again on every tick.
+    const noop = (): void => {
+      this.#appliedCommandIds.add(commandId);
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+    };
+    const directive = (this.#state.phase.ownerDirectives ?? []).find((d) => d.id === directiveId);
+    if (!directive) {
+      if (opts.pushed) return noop();
+      const reason = `no owner directive ${directiveId} exists in phase ${this.#state.phase.phaseId}`;
+      this.#recordOwnerInput(commandId, "withdraw", text, "refused", undefined, reason);
+      this.#rejectInboxFile(file, commandId, reason);
+      return;
+    }
+    if (directive.status === "withdrawn") {
+      if (opts.pushed) return noop();
+      const reason = `owner directive ${directiveId} is already withdrawn`;
+      this.#recordOwnerInput(commandId, "withdraw", text, "refused", undefined, reason);
+      this.#rejectInboxFile(file, commandId, reason);
+      return;
+    }
+    // The command id rides the logged event, so a re-push of the same
+    // withdrawal file (the program scheduler writes it on every tick) is
+    // moved without being re-processed — hence without a second, spurious
+    // "already withdrawn" refusal.
+    this.#applyEvent({ type: "DIRECTIVE_WITHDRAWN", directiveId }, commandId);
+    this.#appliedCommandIds.add(commandId);
+    const message = `Owner directive ${directiveId} is withdrawn; it no longer applies.`;
+    for (const { target, agentId, agent } of this.#liveAgents()) {
+      const actionId = `deliver-${commandId}-${target}-${agentId}`;
+      this.#log.intent(actionId, { directiveId, target, agentId, withdrawn: true });
+      void agent.steer(message).then(
+        () => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, { outcome: "directive-withdraw-acknowledged", target, agentId });
+        },
+        (err) => {
+          if (this.#closed) return;
+          this.#log.completion(actionId, {
+            outcome: "directive-withdraw-failed",
+            target,
+            agentId,
+            error: String((err as Error)?.message ?? err),
+          });
+        },
+      );
+    }
+    if (!opts.pushed) this.#recordOwnerInput(commandId, "withdraw", text, "delivered");
+    // A program-wide ruling is retracted program-wide from wherever it is
+    // withdrawn: the program records it and pushes the notice to every node
+    // (this one included — the pushed copy is the no-op above).
+    if (opts.forwardProgram && directive.scope === "program") this.#forwardProgramWithdraw(commandId, directiveId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 01i: this run's program directory, when the scheduler started it
+   * (its `program.json` names the program). `undefined` for a hand-started
+   * run, which has nothing program-wide to reach. */
+  #programDir(): string | undefined {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      return info.programId ? path.join(path.dirname(this.#runDir), "programs", info.programId) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 01i: a `C-u` input in a run's own box, applied program-wide (D5).
+   * The run does NOT record a directive of its own and does NOT steer: it
+   * forwards the text to the program, which mints the single program-wide id
+   * (`ODP-n`) and pushes that record to every running node — this one
+   * included. That record is what steers each live agent, exactly once, with
+   * the id the owner will withdraw against. So one id names one ruling
+   * everywhere, and no input is ever steered twice. */
+  #processProgramWideInput(file: string, commandId: string, kind: OwnerInputKind, text: string): void {
+    this.#forwardProgramDirective(commandId, text);
+    this.#recordOwnerInput(
+      commandId,
+      kind,
+      text,
+      "noted",
+      undefined,
+      "forwarded to the program as a program-wide directive; the program records it and steers every node",
+    );
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 01i: a run started by a program scheduler (D5) forwards a
+   * program-wide directive to the program's own inbox, so the scheduler
+   * records it once and pushes it to every running node (this one included)
+   * and starts later nodes with it. */
+  #forwardProgramDirective(commandId: string, text: string): void {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      if (!info.programId) return;
+      const inbox = path.join(path.dirname(this.#runDir), "programs", info.programId, "inbox");
+      fs.mkdirSync(inbox, { recursive: true });
+      const file = path.join(inbox, `${commandId}.json`);
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({ type: "directive", text, scope: "program", origin: this.#state.phase.runId, key: commandId }),
+      );
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      // Not a program node (no program.json), or its inbox is unwritable: the
+      // directive still applies to this phase, never dropped from this run.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") this.#logUnexpected("forward_program_directive", err);
+    }
+  }
+
+  /** Plan 01i: `withdraw ODP-n` names a program-wide ruling, so retracting it
+   * here must retract it everywhere: the program records the withdrawal and
+   * pushes the notice to every running node (including this one, whose own
+   * record is already withdrawn — the pushed copy is a no-op) and drops it
+   * from every node started later. */
+  #forwardProgramWithdraw(commandId: string, directiveId: string): void {
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { programId?: string };
+      if (!info.programId) return;
+      const inbox = path.join(path.dirname(this.#runDir), "programs", info.programId, "inbox");
+      fs.mkdirSync(inbox, { recursive: true });
+      const file = path.join(inbox, `${commandId}.json`);
+      const tmp = `${file}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ type: "withdraw", directiveId, key: commandId }));
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") this.#logUnexpected("forward_program_withdraw", err);
+    }
   }
 
   /** Plan 2d (design §7.4/§9.3): external delivery of one steer. The intent
@@ -1256,7 +1576,7 @@ export class Conductor {
    * outcome unknown: on restart an intent with no completion is recorded
    * `delivery-uncertain` and never resent — steering is at most once, or
    * explicitly uncertain. */
-  #processSteerCommand(file: string, commandId: string, raw: unknown, text: string): void {
+  #processSteerCommand(file: string, commandId: string, raw: unknown, text: string, scope: DirectiveScope = "phase"): void {
     const r = raw as Record<string, unknown>;
     const binding = r.binding && typeof r.binding === "object" ? (r.binding as Record<string, unknown>) : undefined;
     const boundAttemptId =
@@ -1278,6 +1598,12 @@ export class Conductor {
     const recorded = (this.#state.phase.ownerInputs ?? []).find((i) => i.id === commandId);
 
     if (intent) {
+      // Plan 01i: the directive was recorded just before this intent, so a
+      // restart folds it back; if the crash landed between the directive's
+      // own event and the intent, add it now (idempotent by command id) so
+      // the recovered input is still a directive in every later prompt.
+      const directive = this.#addDirective(text, scope, commandId, []);
+      const recovered: "delivered" | "delivery-uncertain" = completion ? "delivered" : "delivery-uncertain";
       if (!recorded) {
         if (completion) {
           const outcome = completion.event as { agentId?: string; attemptId?: string };
@@ -1292,6 +1618,7 @@ export class Conductor {
             "the conductor restarted between sending the steer and Pi acknowledging it; it is never resent automatically",
           );
         }
+        this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state: recovered });
       }
       this.#appliedCommandIds.add(commandId);
       crashAt("before_inbox_move");
@@ -1307,6 +1634,12 @@ export class Conductor {
       return;
     }
     const attemptId = boundAttemptId ?? worker.agentId;
+    // Plan 01i: every input is also an owner directive. It is recorded before
+    // the steer is sent (so a crash between the two still leaves the ruling in
+    // every later prompt), and the worker's own steer below is that
+    // directive's delivery — never a second, duplicate steer. The exemption
+    // is that worker's *agent id* (`worker-<n>-<actionId>`), not its label.
+    const directive = this.#addDirective(text, scope, commandId, [worker.agentId]);
     // Mark in flight (NOT applied): the file must stay in the inbox until the
     // acknowledgement decides its fate, so a crash here can still recover it.
     this.#steerInFlight.add(commandId);
@@ -1319,6 +1652,7 @@ export class Conductor {
       this.#steerInFlight.delete(commandId);
       this.#appliedCommandIds.add(commandId);
       this.#recordOwnerInput(commandId, "steer", text, state, attemptId, reason);
+      this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state });
       crashAt("before_inbox_move");
       this.#moveInboxFile(file, this.#paths.inboxApplied);
     };
@@ -1381,12 +1715,52 @@ export class Conductor {
       return;
     }
 
+    // Plan 01i (D5): a program-wide directive the scheduler pushed into this
+    // node's inbox — `{type: "directive", text, scope}` — or a program-level
+    // withdraw of one. Neither is an owner-input kind, so both are handled
+    // before the input-kind detection below.
+    const programDirective = directiveCommandOf(raw);
+    if (programDirective) {
+      if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+        const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
+        this.#recordOwnerInput(commandId, "directive", programDirective.text, "refused", undefined, reason);
+        this.#rejectInboxFile(file, commandId, reason);
+        return;
+      }
+      this.#processDirective(
+        file,
+        commandId,
+        programDirective.text,
+        programDirective.scope,
+        programDirective.forward,
+        programDirective.programId,
+      );
+      return;
+    }
+    const programWithdraw = withdrawCommandOf(raw);
+    if (programWithdraw) {
+      if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+        const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
+        this.#recordOwnerInput(commandId, "withdraw", programWithdraw.text, "refused", undefined, reason);
+        this.#rejectInboxFile(file, commandId, reason);
+        return;
+      }
+      this.#processWithdraw(file, commandId, programWithdraw.text, programWithdraw.directiveId, {
+        forwardProgram: false,
+        pushed: true,
+      });
+      return;
+    }
+
     // Plan 2d: the input box's kinds are handled before the conductor-state
     // mapping. A steer is external delivery, not a core event. A note or
     // correction is a core event but also carries the owner-input record
     // the status view shows. Input after the phase is terminal is refused
-    // with the reason — never silently dropped.
+    // with the reason — never silently dropped. Plan 01i: every one of them
+    // is also an owner directive, phase-scoped unless the sender asked for
+    // `scope: "program"` (`C-u` in a run's input box, D5).
     const inputKind = this.#ownerInputKindOf(raw);
+    let noteKindText: { text: string; scope: DirectiveScope; programWide: boolean } | undefined;
     if (inputKind) {
       const inputText = (raw as { text?: unknown }).text;
       if (typeof inputText !== "string" || inputText.trim().length === 0) {
@@ -1399,10 +1773,39 @@ export class Conductor {
         this.#rejectInboxFile(file, commandId, reason);
         return;
       }
-      if (inputKind === "steer") {
-        this.#processSteerCommand(file, commandId, raw, inputText);
+      const scope: DirectiveScope = (raw as { scope?: unknown }).scope === "program" ? "program" : "phase";
+      // Plan 01i: `withdraw OD-n` (or `withdraw ODP-n`) in the input box
+      // withdraws one directive — whatever kind the phase would otherwise
+      // have made of the text. A withdrawal that names no valid id is
+      // refused visibly: it must never be recorded as a *new* binding ruling,
+      // which would leave the intended one in force.
+      const parsedWithdraw = parseWithdrawInput(inputText);
+      if (parsedWithdraw?.kind === "malformed") {
+        this.#recordOwnerInput(commandId, "withdraw", inputText, "refused", undefined, parsedWithdraw.reason);
+        this.#rejectInboxFile(file, commandId, parsedWithdraw.reason);
         return;
       }
+      if (parsedWithdraw?.kind === "withdraw") {
+        this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
+        return;
+      }
+      // A program-wide input (D5) in a run the scheduler started: the
+      // program mints the one `ODP-n` record, so this run only forwards the
+      // text — it must not mint a local id that could not match the
+      // program's. A run that is NOT part of a program has nothing
+      // program-wide to reach, so the input stays this phase's own directive
+      // (never a `program`-scoped record in a run that has no program).
+      const programWide = scope === "program" && this.#programDir() !== undefined;
+      const effectiveScope: DirectiveScope = programWide ? "program" : "phase";
+      if (inputKind === "steer") {
+        if (programWide) {
+          this.#processProgramWideInput(file, commandId, "steer", inputText);
+          return;
+        }
+        this.#processSteerCommand(file, commandId, raw, inputText, effectiveScope);
+        return;
+      }
+      noteKindText = { text: inputText, scope: effectiveScope, programWide };
     }
 
     // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
@@ -1454,6 +1857,17 @@ export class Conductor {
     }
     this.#appliedCommandIds.add(commandId);
     this.#applyEvent(event, commandId);
+    // Plan 01i: a note or a correction is a directive too — recorded here,
+    // on top of the event above, so it is steered to every live agent now
+    // and quoted in every later prompt (a correction still resolves the open
+    // requests and grants its 3 rounds first: today's behaviour, unchanged).
+    if (noteKindText) {
+      if (noteKindText.programWide) {
+        this.#forwardProgramDirective(commandId, noteKindText.text);
+      } else {
+        this.#addDirective(noteKindText.text, noteKindText.scope, commandId);
+      }
+    }
     // The recorded effect for the input box's status view: a note is queued
     // for the next attempt the moment it is applied; a correction has just
     // resolved the open requests and started a repair.
@@ -2498,6 +2912,7 @@ export class Conductor {
           this.#repairContext(),
           runReferences(this.#runDir),
           this.#secretNames,
+          this.#state.phase.ownerDirectives,
         ),
       );
       // Record delivery only after the prompt was sent; a crash between the
@@ -3080,7 +3495,9 @@ export class Conductor {
       );
 
       if (this.#stubReviews) {
-        await agent.prompt(buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames));
+        await agent.prompt(
+          buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives),
+        );
         const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
         reviewTimeout.cancel();
         if (outcome === "submitted") {
@@ -3233,6 +3650,7 @@ export class Conductor {
       ...secretPromptLines(this.#secretNames),
       `Candidate checkout (read-only): ${this.#candidateDir()}`,
       ...referenceLines(runReferences(this.#runDir)),
+      ...directiveLines(phase.ownerDirectives),
       `Diff vs. phase base (${phase.integrationHead.slice(0, 7)}):`,
       "```diff",
       // Plan 01a: the diff is the candidate's own content, and a candidate can
@@ -3266,6 +3684,9 @@ export class Conductor {
     const lines = [
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
       ...secretPromptLines(this.#secretNames),
+      // Plan 01i: the directives in force, and the contract rule that binds
+      // them — always stated, whether or not one is in force right now.
+      ...reviewerTurn2DirectiveSection(phase.ownerDirectives),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -3297,7 +3718,7 @@ export class Conductor {
       "",
       "Call submit_review with:",
       "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation), except records marked carried: your previous ballot stands for those, and a new ballot replaces it. A ballot with contractObjection=true opens a contract finding and suspends that vote.",
-      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it.",
+      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it.",
       own.length > 0
         ? `- \`discoveryMatches\`: for each of YOUR discoveries (${own.map((d) => d.id).join(", ")}) that is the same choice as another record above, give {discoveryId, sameAs}.`
         : "- `discoveryMatches`: none needed (you have no discoveries on this list).",
@@ -3386,6 +3807,111 @@ function sanitize(command: string): string {
   return command.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 60) || "check";
 }
 
+// -- plan 01i: owner directives (D5) ---------------------------------------
+
+/** Plan 01i: the id a new directive gets.
+ *
+ * A program-wide directive (`preferredId`, `ODP-<n>`) keeps the program's own
+ * id verbatim — the `ODP` space never collides with a phase's `OD` space, so
+ * a node never renumbers a program ruling and `withdraw ODP-n` retires the
+ * same record everywhere. Otherwise the phase's next free `OD-<n>` is used;
+ * program-wide ids never advance that counter. */
+export function allocateDirectiveId(
+  existing: readonly OwnerDirective[],
+  preferredId?: string,
+): { id: string; seq: number } {
+  const preferred = preferredId?.match(/^((?:ODP|OD)-(\d+))$/);
+  if (preferred) return { id: preferred[1], seq: Number(preferred[2]) };
+  const localMax = existing.reduce((m, d) => {
+    const num = d.id.match(/^OD-(\d+)$/);
+    return num ? Math.max(m, Number(num[1])) : m;
+  }, 0);
+  return { id: `OD-${localMax + 1}`, seq: localMax + 1 };
+}
+
+/** Plan 01i: what an input-box text means for withdrawal.
+ * `undefined`: not a withdrawal at all (an ordinary directive).
+ * `withdraw`: retract the named directive; `text` may carry trailing prose
+ * ("withdraw OD-1 because it is stale") without becoming a new ruling.
+ * `malformed`: it opens with `withdraw` but names no valid id — refused with
+ * the reason, never inverted into a fresh binding directive. */
+export type WithdrawInput =
+  | { kind: "withdraw"; id: string }
+  | { kind: "malformed"; reason: string };
+
+export function parseWithdrawInput(text: string): WithdrawInput | undefined {
+  const t = text.trim();
+  if (!/^withdraw\b/i.test(t)) return undefined;
+  const rest = t.replace(/^withdraw\b/i, "").trim();
+  const id = rest.match(/^((?:ODP|OD)-\d+)\b/i);
+  if (!id) {
+    return {
+      kind: "malformed",
+      reason: `a withdrawal must name a directive id, e.g. \`withdraw OD-1\` (got: ${JSON.stringify(t.slice(0, 80))})`,
+    };
+  }
+  return { kind: "withdraw", id: id[1].toUpperCase() };
+}
+
+/** Plan 01i: a directive the program scheduler pushed into this node's inbox
+ * (a node that was already running when the owner ruled program-wide). */
+export function directiveCommandOf(
+  raw: unknown,
+): { text: string; scope: DirectiveScope; forward: boolean; programId?: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
+  if (kind !== "directive") return undefined;
+  if (typeof r.text !== "string" || r.text.trim().length === 0) return undefined;
+  // `pushed` marks a directive the program scheduler delivered here; it must
+  // not be forwarded back to the program (that would loop). `programId` is the
+  // program's own numbering, kept when the local number is free.
+  return {
+    text: r.text,
+    scope: r.scope === "phase" ? "phase" : "program",
+    forward: r.pushed !== true,
+    ...(typeof r.programId === "string" ? { programId: r.programId } : {}),
+  };
+}
+
+/** Plan 01i: a program-level withdrawal the scheduler pushed into this node. */
+export function withdrawCommandOf(raw: unknown): { directiveId: string; text: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
+  if (kind !== "withdraw-directive") return undefined;
+  if (typeof r.directiveId !== "string" || r.directiveId.length === 0) return undefined;
+  const text = typeof r.text === "string" && r.text.trim().length > 0 ? r.text : `withdraw ${r.directiveId}`;
+  return { directiveId: r.directiveId, text };
+}
+
+/** Plan 01i: the prompt section that makes the owner's directives binding —
+ * every directive still in force, verbatim, newest last. Empty when none is
+ * in force, so a prompt with no directive gains no section. */
+export function directiveLines(directives: readonly OwnerDirective[] | undefined): string[] {
+  const inForce = (directives ?? []).filter((d) => d.status === "in-force");
+  if (inForce.length === 0) return [];
+  return [
+    "",
+    "Owner directives (binding):",
+    ...inForce.map((d) => `- ${d.id}${d.scope === "program" ? " (whole program)" : ""}: ${d.text}`),
+  ];
+}
+
+/** Plan 01i: what a reviewer must know about a directive it is shown: it binds
+ * as part of the contract, following one is never a defect even where the plan
+ * says otherwise, and violating one is a blocking contract finding. */
+export const DIRECTIVE_BINDING_STATEMENT =
+  "The owner's directives are binding on you as part of the contract: a candidate that follows one cannot be faulted for doing so, even where the plan's text says otherwise; a candidate that violates one is a blocking contract finding that cites the directive id.";
+
+/** Plan 01i: the reviewer turn-2 directive section — every directive in force,
+ * verbatim, newest last, then the contract rule that binds them. Exported (and
+ * used by `#buildReviewerTurn2Prompt`) so a unit test exercises exactly what
+ * turn 2 sends, rather than a look-alike built from state somewhere else. */
+export function reviewerTurn2DirectiveSection(directives?: readonly OwnerDirective[]): string[] {
+  return [...directiveLines(directives), "", DIRECTIVE_BINDING_STATEMENT];
+}
+
 /** Plan 2c: what a repair attempt must know about the candidate that was
  * not accepted (design §5.2 "the rejecting ballots go to the worker's
  * session as a repair request", §4.2, §7.5). */
@@ -3416,6 +3942,7 @@ export function buildWorkerPrompt(
   repair?: RepairContext,
   references: string[] = [],
   secrets: readonly string[] = [],
+  directives?: readonly OwnerDirective[],
 ): string {
   const lines: string[] = [
     `Goal: ${contract.goal}`,
@@ -3427,6 +3954,7 @@ export function buildWorkerPrompt(
   ];
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
+  lines.push(...directiveLines(directives));
   if (interruptionNote) lines.push("", interruptionNote);
   if (repair) {
     lines.push(
@@ -3459,12 +3987,19 @@ export function buildWorkerPrompt(
   return lines.join("\n");
 }
 
-export function buildReviewerPrompt(phase: PhaseState, reviewer: Reviewer, secrets: readonly string[] = []): string {
+export function buildReviewerPrompt(
+  phase: PhaseState,
+  reviewer: Reviewer,
+  secrets: readonly string[] = [],
+  directives?: readonly OwnerDirective[],
+): string {
   return [
     `You are reviewer ${reviewer}. Review candidate ${phase.candidate?.sha} for phase ${phase.phaseId}.`,
     `Goal: ${phase.contract.goal}`,
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
     ...secretPromptLines(secrets),
+    ...directiveLines(directives),
+    ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),
     "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
   ].join("\n");
 }

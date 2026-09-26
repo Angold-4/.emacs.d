@@ -457,11 +457,22 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   const flagged = live.filter((d) => d.class === "reserved");
   const advisories = phase.findings.filter((f) => f.status === "open" && f.severity === "advisory");
   const fixed = phase.findings.filter((f) => f.severity === "blocking" && f.status === "repaired");
+  // Plan 01i: the owner's rulings in force are part of the PR body — binding
+  // on reviewers, and the reason a `⚑` decision reads the way it does.
+  const directives = (phase.ownerDirectives ?? []).filter((d) => d.status === "in-force");
   const lines = [
     `## ${phase.phaseId}`,
     "",
     goal,
     "",
+    ...(directives.length > 0
+      ? [
+          "### Owner directives (binding)",
+          "",
+          ...directives.map((d) => `- **${d.id}**${d.scope === "program" ? " (whole program)" : ""}: ${d.text}`),
+          "",
+        ]
+      : []),
     "### Review (tradeoffs-trace)",
     "",
     `- Pipeline: ${v.pipeline}`,

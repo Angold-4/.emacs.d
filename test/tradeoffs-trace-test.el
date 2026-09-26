@@ -264,9 +264,10 @@
       (should-not (string-match-p "Owner input" text))
       (should-not (string-match-p "verdict" text)))))
 
-(defun +tt-test--input-state (phase &optional alive blocked requests)
+(defun +tt-test--input-state (phase &optional alive blocked requests program)
   "A minimal `tt state' for the input-header tests."
   `((conductorAlive . ,(if alive t :false))
+    (program . ,(if program '((programId . "prog1") (node . "13a")) nil))
     (ownerInputs)
     (pendingOwnerInputs)
     (state (run . "RUN_ACTIVE")
@@ -322,6 +323,143 @@
       (should (string-match-p "maybe — delivery uncertain (the conductor restarted) (steer)" text))
       (should (string-match-p "too late — refused: the phase is DONE (note)" text))
       (should (string-match-p "waiting — not picked up (note)" text)))))
+
+(defconst +tt-test--directive-state
+  '((meta (title . "sum validation"))
+    (conductorAlive . t)
+    (ownerInputs)
+    (pendingOwnerInputs)
+    (state (run . "RUN_ACTIVE")
+           (phase (runId . "r1") (phaseId . "p1") (phase . "REVIEWING")
+                  (attempt (n . 2)) (repairRoundsUsed . 0) (repairRoundsGranted . 3)
+                  (ownerRequests)
+                  (ownerDirectives
+                   ((id . "OD-1") (seq . 1)
+                    (text . "the 14 exchange-state-machine failures are pre-existing, not yours")
+                    (scope . "phase") (status . "in-force")
+                    (targets "worker" "M" "A" "B")
+                    ;; A has not acknowledged yet, so it renders ⧗ (the plan's
+                    ;; own example): the delivery state is never inferred.
+                    (deliveries (worker . "delivered") (M . "delivered")
+                                (B . "delivered")))
+                   ;; A program-wide ruling lives in its own ODP namespace,
+                   ;; so one id names one ruling at both levels.
+                   ((id . "ODP-2") (seq . 2)
+                    (text . "no node may touch the vendor adapters after this ruling")
+                    (scope . "program") (status . "withdrawn")
+                    (targets) (deliveries))))))
+  "A fixture `tt state' with one directive in force and one withdrawn.")
+
+(ert-deftest tradeoffs-trace-owner-directives-section ()
+  "Plan 01i: the status shows each directive, its scope, whether it is in
+force, and the delivery state per live agent."
+  (with-temp-buffer
+    (+tt--render-owner-inputs +tt-test--directive-state)
+    (let ((text (buffer-string)))
+      (should (string-match-p "Owner directives (2)" text))
+      (should (string-match-p
+               (regexp-quote
+                "OD-1 [this phase, in force] the 14 exchange-state-machine failures are pre-existing, not yours — worker ✓ M ✓ A ⧗ B ✓")
+               text))
+      (should (string-match-p
+               (regexp-quote
+                "ODP-2 [whole program, withdrawn] no node may touch the vendor adapters after this ruling — (no live agent; carried in every later prompt)")
+               text)))))
+
+(ert-deftest tradeoffs-trace-input-header-scope ()
+  "Plan 01i (D5): the input header states the directive's scope, for a run's
+box, a program node's box, and a program buffer's box."
+  ;; A node of a program: `C-u' really can reach the whole program.
+  (should (string-match-p "owner directive applying to this phase"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t nil nil t))))
+  (should (string-match-p "C-u C-c C-c: whole program"
+                          (+tt--input-header (+tt-test--input-state "IMPLEMENTING" t nil nil t))))
+  ;; A hand-started run has nothing program-wide to reach, and says so.
+  (should (string-match-p "this run is not part of a program"
+                          (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
+  (should-not (string-match-p "whole program"
+                              (+tt--input-header (+tt-test--input-state "REVIEWING" t))))
+  (should (string-match-p "program-wide owner directive for the whole program"
+                          (+tt--input-header nil t))))
+
+(ert-deftest tradeoffs-trace-input-program-wide ()
+  "Plan 01i (D5): C-u C-c C-c on a program node's run sends its text as a
+program-wide directive; without the prefix it applies to this phase, and a
+run that is not part of a program can only apply it to its phase."
+  (let ((written nil))
+    ;; A node of a program: C-u really is program-wide.
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t nil nil t)))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-1")))
+      (with-temp-buffer
+        (insert "fix the Stork link")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send)
+        (should (equal (alist-get 'scope written) "phase"))
+        (insert "fix the Stork link")
+        (+tt-input-send '(4))
+        (should (equal (alist-get 'scope written) "program"))))
+    ;; A hand-started run has nothing program-wide to reach: the input is
+    ;; recorded for this phase, and the confirmation says so (never "whole
+    ;; program", which the conductor would demote anyway).
+    (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t)))
+              ((symbol-function '+tt--write-command) (lambda (_dir cmd) (setq written cmd) "id-2")))
+      (with-temp-buffer
+        (insert "fix the Stork link")
+        (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+        (+tt-input-send '(4))
+        (should (equal (alist-get 'scope written) "phase"))))))
+
+(ert-deftest tradeoffs-trace-program-input-writes-a-program-directive ()
+  "Plan 01i: the program buffer's input box records a program-wide directive
+through the CLI, which appends the event and steers every running node now."
+  (let ((called nil)
+        (dir (make-temp-file "tt-ert-prog" t)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "ODP-1")))
+            (with-temp-buffer
+              (insert "no node may touch the vendor adapters")
+              (setq +tt--input-program-dir dir)
+              (+tt-input-send)
+              (should (equal called (list "program" "directive" dir "no node may touch the vendor adapters"))))))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-program-input-withdraws-a-directive ()
+  "Plan 01i: the program input box's `withdraw ODP-n' goes through `tt
+program withdraw' at once; trailing prose does not turn it into a new ruling,
+and an unknown id is refused by that command."
+  (let ((called nil)
+        (dir (make-temp-file "tt-ert-prog" t)))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (with-temp-buffer
+              (insert "withdraw ODP-1 because it is stale")
+              (setq +tt--input-program-dir dir)
+              (+tt-input-send)
+              (should (equal called (list "program" "withdraw" dir "ODP-1")))))
+          ;; A withdrawal that names no id is refused here, never queued as a
+          ;; brand-new program-wide ruling.
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (setq called nil)
+            (with-temp-buffer
+              (insert "withdraw the Stork exception")
+              (setq +tt--input-program-dir dir)
+              (should-error (+tt-input-send) :type 'user-error)
+              (should-not called)))
+          ;; …and so is a phase id, which is not a program-wide ruling.
+          (cl-letf (((symbol-function '+tt--cli)
+                     (lambda (&rest args) (setq called args) "")))
+            (setq called nil)
+            (with-temp-buffer
+              (insert "withdraw OD-2")
+              (setq +tt--input-program-dir dir)
+              (should-error (+tt-input-send) :type 'user-error)
+              (should-not called))))
+      (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-program-parse ()
   "Phase 4: a program file lists plan files with their dependencies."
