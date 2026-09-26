@@ -8,7 +8,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimeline, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
+import { effectiveChecks } from "./core/checks.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
+import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 import { notAcceptedReasons, reviewerOutcomes, type ReviewerOutcome } from "./core/verdict.ts";
 import type { PhaseState } from "./core/types.ts";
 
@@ -285,8 +287,14 @@ export interface RunView {
   elapsed: string;
   pipeline: string;
   /** Checks/probe/reviews for the current candidate only; while a repair
-   * attempt implements they are "pending (round N)". */
+   * attempt implements they are "pending (round N)". A candidate whose checks
+   * passed only because every failure was already on the base says so:
+   * `checks ✓ (base has N failures)`. */
   gates: string;
+  /** Plan 01e: the base's own pre-existing check failures, when it has any
+   * (`base fails: N tests: …`). Undefined when the base passes or no baseline
+   * was taken. */
+  baseline?: string;
   previousRound?: string;
   reviewers: ReviewerOutcome[];
   reviewLine: string;
@@ -322,15 +330,31 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   const reasons = notAcceptedReasons(phase);
   const round = timeline.rounds.length + (C ? 1 : 0);
 
+  // Plan 01e: the base's own baseline, read from `<run>/checks/base/`; a
+  // candidate's passing checks that leaned on it are shown as such, and the
+  // base's failures get their own status line (D2). It is only trusted when it
+  // covers the phase's *current* effective check list: after a contract
+  // amendment changes a check, the gate (and the prompts) no longer use this
+  // record, so the status must not claim a baseline-tolerated pass either.
+  const record = readBaseline(runDir);
+  const baseline = baselineCoversCommands(record, effectiveChecks(plan.checks, phase.contract.checks)) ? record : undefined;
   const gate = (r: { candidateSha: string; passed?: boolean } | undefined, reused = false) =>
     !r || r.candidateSha !== C ? "⧗" : r.passed === true ? `✓${reused ? " (reused)" : ""}` : r.passed === false ? "✗" : "⧗";
+  /** ` (base has N failures)` only on the current candidate's passed checks,
+   * when the base itself has pre-existing failures. */
+  const baseNote = (r: { candidateSha: string; passed?: boolean } | undefined) =>
+    C && r?.candidateSha === C && r.passed === true && baseline && baseline.failures.length > 0
+      ? ` (base has ${baseline.failures.length} failures)`
+      : "";
   let gates: string;
   let previousRound: string | undefined;
   if (repairing && stage === "implement") {
     gates = `pending (round ${round + 1})`;
     previousRound = C ? `round ${round} · ${C.slice(0, 7)} · ${reasons.length > 0 ? `not accepted: ${reasons.join("; ")}` : "not accepted"}` : undefined;
   } else {
-    gates = C ? `checks ${gate(phase.checks)} · probe ${gate(phase.probe, probeReused(runDir, C))}` : "no candidate yet";
+    gates = C
+      ? `checks ${gate(phase.checks)}${baseNote(phase.checks)} · probe ${gate(phase.probe, probeReused(runDir, C))}`
+      : "no candidate yet";
   }
 
   let verdict: string | undefined;
@@ -373,6 +397,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
     pipeline: pipelineLine(spans),
     gates,
+    baseline: baselineStatusLine(baseline),
     previousRound,
     reviewers,
     reviewLine: reviewers.map((r) => r.label).join("   "),
@@ -397,6 +422,14 @@ function lastEventAt(runDir: string): string | undefined {
   try {
     const lines = fs.readFileSync(runPaths(runDir).events, "utf8").trimEnd().split("\n");
     return (JSON.parse(lines[lines.length - 1]) as { ts?: string }).ts;
+  } catch {
+    return undefined;
+  }
+}
+
+function readBaseline(runDir: string): Baseline | undefined {
+  try {
+    return parseBaseline(JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, "base", "baseline.json"), "utf8")));
   } catch {
     return undefined;
   }

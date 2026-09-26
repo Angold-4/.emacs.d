@@ -409,6 +409,9 @@ function renderStatus(runDir: string): string {
   // Plan 3b: the same readable view the status buffer shows.
   const view = buildView(runDir, plan, conductorAlive(runDir));
   lines.push(`pipeline: ${view.pipeline}`);
+  lines.push(`gates: ${view.gates}`);
+  // Plan 01e: the base's own pre-existing check failures (D2), when it has any.
+  if (view.baseline) lines.push(`base: ${view.baseline}`);
   lines.push(`reviews: ${view.reviewLine}`);
   if (view.verdict) lines.push(`verdict: ${view.verdict}`);
   if (view.time) lines.push(`time: ${view.time}`);

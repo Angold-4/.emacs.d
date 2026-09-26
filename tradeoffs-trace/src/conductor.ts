@@ -22,6 +22,20 @@ import { reduce } from "./core/reduce.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
+// Plan 01e: the pure half of the base baseline — parsing recorded check
+// output for failing test names, D2's "all failures pre-existing" rule, and
+// the on-disk record's shape. See the module's own header.
+import {
+  baselineFailureNames,
+  baselineFailedCommands,
+  baselineKey,
+  classifyCheckFailure,
+  failedNormally,
+  parseBaseline,
+  parseTestFailures,
+  type Baseline,
+  type BaselineCommand,
+} from "./core/test-failures.ts";
 import type {
   Action,
   Ballot,
@@ -2840,6 +2854,15 @@ export class Conductor {
       createWorktree(this.#plan.repo, this.#paths.worktree, sha);
     }
 
+    // Plan 01e: before the run's first attempt, run the phase's checks once on
+    // the base and remember which test names already fail there, so (D2) the
+    // candidate's gate can tell a pre-existing failure from a new one and the
+    // worker is told which ones are not its to fix. A repair attempt never
+    // re-runs it — the base tree has not moved — and `#ensureBaseline`
+    // reuses an existing record for the same base tree and check list
+    // (including one a sibling program node already paid for).
+    if (this.#state.phase.attempt.n === 1) await this.#ensureBaseline();
+
     const agentId = `worker-${this.#state.phase.attempt.n}-${actionId}`;
     const contract = this.#state.phase.contract;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
@@ -2992,6 +3015,7 @@ export class Conductor {
           runReferences(this.#runDir),
           this.#secretNames,
           this.#state.phase.ownerDirectives,
+          this.#baselineFailedCommands(),
         ),
       );
       // Record delivery only after the prompt was sent; a crash between the
@@ -3263,12 +3287,19 @@ export class Conductor {
     // Plan 01a: a check or probe command (and its output) may carry a secret
     // value — a vendor key a command echoes, or the plan's own check line.
     fs.writeFileSync(
-      path.join(outDir, `${sanitize(redactText(command, this.#secretMaskable))}.log`),
+      path.join(outDir, this.#checkLogName(command)),
       redactText(
         `$ ${command}\n${result.output}\nexit ${result.exitCode} signal ${result.signal}${result.timedOut ? " (timed out)" : ""}\n`,
         this.#secretMaskable,
       ),
     );
+  }
+
+  /** The log file name a check command's evidence gets under its gate's
+   * directory — shared by `#recordCheck` and the baseline record, which names
+   * the same file. */
+  #checkLogName(command: string): string {
+    return `${sanitize(redactText(command, this.#secretMaskable))}.log`;
   }
 
   /** Plan 01a: the run's plan snapshot on disk is written redacted, and
@@ -3293,6 +3324,378 @@ export class Conductor {
     return out;
   }
 
+  // -- plan 01e: the base baseline -----------------------------------------
+
+  /** Plan 01e: the base baseline's own directory (`<run>/checks/base/`), the
+   * sibling of the per-candidate `<run>/checks/<sha>/` dirs. */
+  #baselineDir(): string {
+    return path.join(this.#paths.checks, "base");
+  }
+
+  #baselinePath(): string {
+    return path.join(this.#baselineDir(), "baseline.json");
+  }
+
+  /** Plan 01e: the phase's current base commit — what a check's failures are
+   * compared against under D2. */
+  #baselineBaseSha(): string {
+    return this.#state.phase.integrationHead;
+  }
+
+  /** The effective check list as it will actually be run (plan secrets
+   * resolved), which is both what the baseline records and what the C gate
+   * and the probe execute. */
+  #resolvedEffectiveChecks(): string[] {
+    return effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks).map((c) => this.#withValues(c));
+  }
+
+  #baselineKey(commands: readonly string[]): string {
+    return baselineKey(this.#baselineTree(), commands);
+  }
+
+  /** The base commit's full tree object id (or the commit id when git cannot
+   * read it) — the identity two nodes must share to reuse one baseline. */
+  #baselineTree(): string {
+    const baseSha = this.#baselineBaseSha();
+    return treeOf(this.#plan.repo, baseSha) ?? baseSha;
+  }
+
+  /** The run-local baseline record, if one exists (and only then). */
+  #readBaseline(): Baseline | undefined {
+    try {
+      return parseBaseline(JSON.parse(fs.readFileSync(this.#baselinePath(), "utf8")));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 01e: the base commands whose pre-existing failures the worker and
+   * the reviewers are told about — the ones whose failures the gate would
+   * actually excuse, so the promise in the prompt and the rule at the gate are
+   * the same rule. Empty when the base passed, when no baseline was taken, when
+   * the record no longer covers this base, or when its failing output held no
+   * parsable names (the strict rule then applies, and there is nothing honest
+   * to call pre-existing). */
+  #baselineFailedCommands(): BaselineCommand[] {
+    const commands = this.#resolvedEffectiveChecks();
+    const baseline = this.#readBaseline();
+    if (!baseline || !this.#baselineCovers(baseline, this.#baselineKey(commands), commands)) return [];
+    return baselineFailedCommands(baseline.commands);
+  }
+
+  /** Plan 01e: the base's failing names for one check command, or none when
+   * no baseline covers this command (D2 then falls back to the strict rule). */
+  #baseFailuresFor(command: string): string[] {
+    const commands = this.#resolvedEffectiveChecks();
+    const baseline = this.#readBaseline();
+    if (!baseline || !this.#baselineCovers(baseline, this.#baselineKey(commands), commands)) return [];
+    const name = this.#baselineCommandName(command);
+    const entry = baseline.commands.find((c) => c.command === name);
+    // The record should never carry names for a command that did not fail
+    // normally (`#runBaseline` does not write them), but a hand-written or
+    // older record is still checked here: only a completed non-zero exit may
+    // excuse a candidate failure (finding M-2).
+    return entry && failedNormally(entry) ? entry.failures : [];
+  }
+
+  /** Plan 01e: the baseline the phase shares with the rest of its program
+   * (`<program>/baselines/<key>/`), or undefined for a hand-started run.
+   * Keyed by base tree plus check list, so two nodes that start from the same
+   * tree run one baseline between them, and a node with different checks
+   * never reuses another's. */
+  #baselineSharedDir(key: string): string | undefined {
+    const programDir = this.#programDir();
+    return programDir ? path.join(programDir, "baselines", key) : undefined;
+  }
+
+  /** The masked form a baseline record is written with: its commands are
+   * resolved (plan secrets put back) when they run, and on disk they keep the
+   * mask every other run file keeps. */
+  #baselineForDisk(record: Baseline): Baseline {
+    return redactRecord(record, this.#secretMaskable) as Baseline;
+  }
+
+  /** The command as a baseline record names it — masked the same way the
+   * record was written, so a lookup and a reuse check compare like forms. */
+  #baselineCommandName(command: string): string {
+    return redactText(command, this.#secretMaskable);
+  }
+
+  /** True iff `record` was taken over this exact base — the same **full** tree
+   * (never the key's shortened prefix, which is only a file name) and exactly
+   * these commands, compared in the masked form the record is stored in. This
+   * is the guard that keeps a stale record, another base's record, or a
+   * whole-program key collision from ever hiding a new failure. */
+  #baselineCovers(record: Baseline, key: string, commands: readonly string[]): boolean {
+    if (record.key !== key || record.tree !== this.#baselineTree()) return false;
+    if (record.commands.length !== commands.length) return false;
+    return record.commands.every((c, i) => c.command === this.#baselineCommandName(commands[i]));
+  }
+
+  /** Plan 01e: run the phase's checks once on the base, at the start of the
+   * first attempt, unless a baseline for this exact base tree and check list
+   * already exists — in this run (a restart) or in this node's program (a
+   * sibling node). Best-effort: any failure leaves no baseline and the checks
+   * stay strict, which is the safe direction. */
+  async #ensureBaseline(): Promise<void> {
+    const commands = this.#resolvedEffectiveChecks();
+    if (commands.length === 0) return;
+    const key = this.#baselineKey(commands);
+    const local = this.#readBaseline();
+    if (local && this.#baselineCovers(local, key, commands)) return;
+
+    // A program node reuses a sibling's identical-base baseline before paying
+    // for its own run (runtime doc §4: every node of atlas plan 13's base paid
+    // for the same 14 failures).
+    const shared = this.#baselineSharedDir(key);
+    if (!shared) {
+      await this.#runBaselineOnce(commands, key);
+      return;
+    }
+
+    const file = path.join(shared, "baseline.json");
+    const sibling = this.#readBaselineFrom(file);
+    if (sibling && this.#baselineCovers(sibling, key, commands)) {
+      this.#adoptBaseline(sibling, shared, "program");
+      return;
+    }
+
+    // "One check run per base tree at most" must hold for the parallel wave
+    // too (two nodes whose branches differ but whose trees are identical): the
+    // first node to take the lock runs it and the others wait for the record
+    // it publishes. A holder that died or stalled is detected by its own pid
+    // and age, so a stale lock can never wedge a run.
+    const waitMs = Math.max(30_000, commands.length * this.#deadlines.checkMs + this.#deadlines.termGraceMs);
+    if (!this.#acquireBaselineLock(shared)) {
+      const waited = await this.#waitForSharedBaseline(file, shared, key, commands, waitMs);
+      if (waited) {
+        this.#adoptBaseline(waited, shared, "program");
+        return;
+      }
+      // The holder never published: compute our own rather than wait further.
+      // Publishing is safe without the lock (a per-writer temp file plus a
+      // rename), and both records hold the same answer for the same tree.
+      await this.#runBaselineOnce(commands, key, shared);
+      return;
+    }
+    try {
+      // Double-check under the lock: another node may have published between
+      // our read above and taking it.
+      const published = this.#readBaselineFrom(file);
+      if (published && this.#baselineCovers(published, key, commands)) {
+        this.#adoptBaseline(published, shared, "program");
+        return;
+      }
+      await this.#runBaselineOnce(commands, key, shared);
+    } finally {
+      this.#releaseBaselineLock(shared);
+    }
+  }
+
+  /** Runs the baseline, records it in this run and (in a program) publishes it,
+   * logging the record. Never throws: a baseline that cannot be taken leaves
+   * every check judged strictly. */
+  async #runBaselineOnce(commands: readonly string[], key: string, shared?: string): Promise<Baseline | undefined> {
+    let record: Baseline;
+    try {
+      record = await this.#runBaseline(commands, key);
+      this.#recordBaselineLocal(record);
+    } catch (err) {
+      this.#log.append("baseline_error", { error: String((err as Error)?.message ?? err) });
+      return undefined;
+    }
+    if (shared) this.#publishBaselineShared(record, shared);
+    this.#log.append("baseline", { ...record, reused: false });
+    return record;
+  }
+
+  /** Reuses a record another run took: the record and its logs are copied into
+   * this run's own `checks/base/`, so the run directory stays self-contained,
+   * and the reuse is logged with where it came from. */
+  #adoptBaseline(record: Baseline, sourceDir: string, source: string): void {
+    this.#writeBaselineLocal(record, sourceDir);
+    this.#log.append("baseline", { ...record, reused: true, source });
+  }
+
+  /** Waits (bounded) for the node that holds the shared baseline lock to
+   * publish its record. The lock names its holder's pid and age, so a dead or
+   * stalled holder is given up on instead of waited out. */
+  async #waitForSharedBaseline(
+    file: string,
+    shared: string,
+    key: string,
+    commands: readonly string[],
+    waitMs: number,
+  ): Promise<Baseline | undefined> {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      if (this.#closed) return undefined;
+      const record = this.#readBaselineFrom(file);
+      if (record && this.#baselineCovers(record, key, commands)) return record;
+      // A lock whose holder is gone (or that outlived any possible run) is
+      // released here, so the next node — or this one — can compute its own.
+      if (this.#baselineLockIsStale(shared, waitMs)) {
+        this.#releaseBaselineLock(shared);
+        return undefined;
+      }
+      if (Date.now() >= deadline) return undefined;
+      await sleepMs(250);
+    }
+  }
+
+  /** Exclusively creates the shared baseline lock, carrying this process's pid
+   * and the time, so a waiter can tell a live holder from a dead one. */
+  #acquireBaselineLock(shared: string): boolean {
+    try {
+      fs.mkdirSync(shared, { recursive: true });
+      fs.writeFileSync(
+        path.join(shared, "lock.json"),
+        JSON.stringify({ pid: process.pid, at: Date.now() }),
+        { flag: "wx" },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #releaseBaselineLock(shared: string): void {
+    try {
+      fs.rmSync(path.join(shared, "lock.json"), { force: true });
+    } catch {
+      // best effort
+    }
+  }
+
+  /** True when the lock's holder is gone or the lock is older than any baseline
+   * could possibly take. An unreadable lock file is treated as live — the
+   * bounded wait handles that case. */
+  #baselineLockIsStale(shared: string, waitMs: number): boolean {
+    let info: { pid?: unknown; at?: unknown };
+    try {
+      info = JSON.parse(fs.readFileSync(path.join(shared, "lock.json"), "utf8")) as { pid?: unknown; at?: unknown };
+    } catch {
+      return false;
+    }
+    if (typeof info.at === "number" && Date.now() - info.at > waitMs) return true;
+    if (typeof info.pid === "number" && !pidRunning(info.pid)) return true;
+    return false;
+  }
+
+  /** Plan 01e: run every effective check command once on a disposable checkout
+   * of the base, recording each one's exit, duration, parsed failing test
+   * names and log. Unlike the C gate the loop does not stop at the first
+   * failure — the whole base picture is the point. */
+  async #runBaseline(commands: readonly string[], key: string): Promise<Baseline> {
+    const outDir = this.#baselineDir();
+    fs.mkdirSync(outDir, { recursive: true });
+    const checkout = disposableCheckout(this.#plan.repo, this.#baselineBaseSha());
+    const results: BaselineCommand[] = [];
+    try {
+      for (const command of commands) {
+        const startedAt = Date.now();
+        // Same isolation and per-command deadline as the C gate (F13).
+        const running = runCommand({
+          command,
+          cwd: checkout.dir,
+          env: childEnv(),
+          deadlineMs: this.#deadlines.checkMs,
+          termGraceMs: this.#deadlines.termGraceMs,
+        });
+        const result = await running.result;
+        this.#recordCheck(outDir, command, result);
+        results.push({
+          command,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          durationMs: Date.now() - startedAt,
+          // Only a command that ran to completion and exited non-zero names a
+          // failure the base is known to have: a timeout's output is truncated,
+          // a signal death never printed its last failure, and a command that
+          // exited 0 did not fail at all — so none of those three may put a
+          // name into the set that excuses a candidate's check.
+          failures: failedNormally(result) ? parseTestFailures(result.output) : [],
+          log: this.#checkLogName(command),
+        });
+      }
+    } finally {
+      checkout.dispose();
+    }
+    return {
+      baseSha: this.#baselineBaseSha(),
+      tree: this.#baselineTree(),
+      key,
+      at: new Date().toISOString(),
+      commands: results,
+      failures: baselineFailureNames(results),
+    };
+  }
+
+  #readBaselineFrom(file: string): Baseline | undefined {
+    try {
+      return parseBaseline(JSON.parse(fs.readFileSync(file, "utf8")));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Writes the run-local record and, when `sourceDir` holds a reused
+   * baseline, copies its logs in too, so `checks/base/` of this run is
+   * self-contained. */
+  #writeBaselineLocal(record: Baseline, sourceDir: string): void {
+    try {
+      const outDir = this.#baselineDir();
+      fs.mkdirSync(outDir, { recursive: true });
+      for (const command of record.commands) {
+        if (!command.log) continue;
+        try {
+          fs.copyFileSync(path.join(sourceDir, command.log), path.join(outDir, command.log));
+        } catch {
+          // best effort: the record still names the command and its failures.
+        }
+      }
+    } catch {
+      // best effort; `#writeBaselineRecord` reports its own failure
+    }
+    this.#writeBaselineRecord(record);
+  }
+
+  #recordBaselineLocal(record: Baseline): void {
+    this.#writeBaselineRecord(record);
+  }
+
+  /** The run-local `baseline.json`, best-effort: an unwritable checks dir must
+   * leave the gate strict, never wedge the attempt. */
+  #writeBaselineRecord(record: Baseline): void {
+    try {
+      fs.mkdirSync(this.#baselineDir(), { recursive: true });
+      fs.writeFileSync(this.#baselinePath(), JSON.stringify(this.#baselineForDisk(record), null, 2));
+    } catch (err) {
+      this.#log.append("baseline_error", { error: String((err as Error)?.message ?? err) });
+    }
+  }
+
+  /** Publishes a freshly-run baseline to the program's shared store, so a
+   * later node with the same base and checks reuses it. Best-effort: a
+   * hand-started run has none, and an unwritable program dir must not fail the
+   * run. Temporary file plus rename, so a concurrent node never reads a
+   * half-written record. */
+  #publishBaselineShared(record: Baseline, shared: string): void {
+    try {
+      fs.mkdirSync(shared, { recursive: true });
+      for (const command of record.commands) {
+        if (!command.log) continue;
+        fs.copyFileSync(path.join(this.#baselineDir(), command.log), path.join(shared, command.log));
+      }
+      const tmp = path.join(shared, `baseline.json.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
+      fs.writeFileSync(tmp, JSON.stringify(this.#baselineForDisk(record), null, 2));
+      fs.renameSync(tmp, path.join(shared, "baseline.json"));
+    } catch (err) {
+      this.#log.append("baseline_shared_error", { error: String((err as Error)?.message ?? err) });
+    }
+  }
+
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
@@ -3304,6 +3707,10 @@ export class Conductor {
       let passed = before;
       let integrityViolated = !before;
       let timedOut = false;
+      /** Plan 01e: the names this candidate's checks failed on that the base
+       * did not — recorded with the check's completion so a repair round (and
+       * the owner) can see exactly what is new. */
+      let newFailures: string[] = [];
       if (before) {
         // F04: the effective list is the global plan checks followed by the
         // phase contract's own checks, deduped by exact command string — the
@@ -3331,7 +3738,43 @@ export class Conductor {
           this.#recordCheck(outDir, command, result);
           const after = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
           if (!after) integrityViolated = true;
-          if (result.exitCode !== 0 || result.timedOut || !after) {
+          const failed = result.exitCode !== 0 || result.timedOut || !after;
+          if (failed) {
+            // Plan 01e / D2's default: a failing check whose every parsed
+            // failing test also failed on the base is not this candidate's
+            // failure — the base already had it before the phase started. The
+            // rule is deliberately narrow: only a check that ran to completion
+            // and exited non-zero can be excused. A timeout's output is
+            // truncated; a signal death (the OOM killer's SIGKILL, a SIGSEGV)
+            // reports `exitCode: null` with a non-null signal and never got to
+            // print its last failure; and an integrity violation is not this
+            // candidate's tree at all. In all three the output could name only
+            // the base's tests while a new failure went unnamed. A check whose
+            // output yields no test name at all keeps the strict rule, and any
+            // parsed name the base did not fail on that same command fails the
+            // gate.
+            if (after && failedNormally(result)) {
+              const baseFailures = this.#baseFailuresFor(command);
+              const verdict = classifyCheckFailure(result.output, baseFailures);
+              if (verdict.excused) {
+                this.#log.append("check_failures_pre_existing", {
+                  candidateSha,
+                  command,
+                  failures: verdict.parsed,
+                  baseFailures,
+                });
+                continue;
+              }
+              if (verdict.newFailures.length > 0) {
+                newFailures = verdict.newFailures;
+                this.#log.append("check_failure_new", {
+                  candidateSha,
+                  command,
+                  newFailures: verdict.newFailures,
+                  failures: verdict.parsed,
+                });
+              }
+            }
             passed = false;
             break;
           }
@@ -3351,6 +3794,7 @@ export class Conductor {
         candidateSha,
         passed,
         integrityViolated,
+        ...(newFailures.length > 0 ? { newFailures } : {}),
         reason: !passed && timedOut ? "timeout" : undefined,
       });
       this.#applyEvent(passed ? { type: "CHECKS_PASSED" } : { type: "CHECKS_FAILED" });
@@ -3786,6 +4230,10 @@ export class Conductor {
       // Plan 01i: the directives in force, and the contract rule that binds
       // them — always stated, whether or not one is in force right now.
       ...reviewerTurn2DirectiveSection(phase.ownerDirectives),
+      // Plan 01e: the base's own failing tests, so a reviewer does not raise
+      // them as this candidate's defect (runtime doc §8: reviewers kept
+      // flagging the 14 pre-existing exchange-state-machine failures).
+      ...baselinePromptLines(this.#baselineFailedCommands()),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -3872,6 +4320,25 @@ async function raceTimeout<T>(promise: Promise<T>, ms: number, _label: string): 
  * won, which is exactly what made every conductor test process hang (round
  * of review item 1). Every `Promise.race([..., timer.promise])` in this
  * file cancels its timer in a `finally` immediately after the race. */
+/** A plain `setTimeout` promise, for the baseline lock's bounded wait (plan
+ * 01e) — unlike `cancelableTimeout` it has no deadline value to return. */
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True iff `pid` still exists (owned by any user, which on this machine means
+ * this account) — how a waiter tells a live baseline-lock holder from a dead
+ * one. A recycled pid can only make a stale lock look live for one bounded
+ * wait, never wedge a run. */
+function pidRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function cancelableTimeout<T>(ms: number, value: T): { promise: Promise<T>; cancel: () => void } {
   let timer: NodeJS.Timeout;
   const promise = new Promise<T>((resolve) => {
@@ -3997,6 +4464,24 @@ export function directiveLines(directives: readonly OwnerDirective[] | undefined
   ];
 }
 
+/** Plan 01e: the prompt section that tells an agent which check failures were
+ * already on the phase base before this phase began, so it neither tries to
+ * fix them nor treats them as a defect. Empty when the base passed (or no
+ * baseline was taken), so a prompt with no pre-existing failure gains no
+ * section. Exported (and used by `buildWorkerPrompt` and
+ * `#buildReviewerTurn2Prompt`) so a unit test exercises exactly the words the
+ * two prompts send, rather than a look-alike built somewhere else. */
+export function baselinePromptLines(commands: readonly BaselineCommand[] | undefined): string[] {
+  const failed = baselineFailedCommands(commands ?? []);
+  if (failed.length === 0) return [];
+  return [
+    "",
+    "Pre-existing check failures on the phase base (NOT this phase's to fix):",
+    "These already failed on the base commit before any change here, each under the command shown. The conductor does not count a check as failed when every failing test it names is one of these for that same command; any other failing test fails the gate.",
+    ...failed.map((c) => `- \`${c.command}\`: ${c.failures.join(", ")}`),
+  ];
+}
+
 /** Plan 01i: what a reviewer must know about a directive it is shown: it binds
  * as part of the contract, following one is never a defect even where the plan
  * says otherwise, and violating one is a blocking contract finding. */
@@ -4042,6 +4527,7 @@ export function buildWorkerPrompt(
   references: string[] = [],
   secrets: readonly string[] = [],
   directives?: readonly OwnerDirective[],
+  baselineCommands?: readonly BaselineCommand[],
 ): string {
   const lines: string[] = [
     `Goal: ${contract.goal}`,
@@ -4050,6 +4536,7 @@ export function buildWorkerPrompt(
     ...contract.acceptance.map((a) => `- ${a}`),
     ...secretPromptLines(secrets),
     ...referenceLines(references),
+    ...baselinePromptLines(baselineCommands),
   ];
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);

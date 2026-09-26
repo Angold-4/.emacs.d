@@ -919,6 +919,8 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
     (+tt--status-row "pipeline" (alist-get 'pipeline v))
     (+tt--status-row "time" (alist-get 'time v))
     (+tt--status-row "gates" (alist-get 'gates v))
+    ;; Plan 01e: the base's own pre-existing check failures (D2), when any.
+    (+tt--status-row "base" (alist-get 'baseline v) 'warning)
     (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)
     (+tt--status-row "reviews" (alist-get 'reviewLine v))
     (+tt--status-row "verdict" (alist-get 'verdict v)
