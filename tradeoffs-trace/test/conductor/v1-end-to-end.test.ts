@@ -29,17 +29,22 @@ import {
 
 const CLI = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
 
+// The stage deadlines are load-tolerant on purpose: under the full suite four
+// test files run at once, and this phase dispatches worker, reviewers,
+// evaluators and panel seats. The run itself is ~15 s when idle; these bounds
+// exist only so a busy host cannot turn a normal stage into a timeout that
+// parks the phase before the test's own assertions run.
 const FAST = {
   abortGraceMs: 150,
   termGraceMs: 150,
-  helloTimeoutMs: 5_000,
-  checkMs: 20_000,
-  freezeMs: 10_000,
-  workerAttemptMs: 30_000,
-  reviewMs: 20_000,
-  probeMs: 5_000,
-  evaluateMs: 15_000,
-  panelMs: 15_000,
+  helloTimeoutMs: 30_000,
+  checkMs: 60_000,
+  freezeMs: 60_000,
+  workerAttemptMs: 120_000,
+  reviewMs: 120_000,
+  probeMs: 60_000,
+  evaluateMs: 120_000,
+  panelMs: 120_000,
   inboxPollMs: 50,
 };
 
