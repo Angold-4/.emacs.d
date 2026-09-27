@@ -535,6 +535,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         if (options.some((o) => !o || typeof o.id !== "string" || o.id.length === 0 || typeof o.label !== "string" || o.label.length === 0)) {
           return rejected(state, `a block vote's options each need a non-empty id and label`);
         }
+        // Two or three DISTINCT options: a repeated id would collapse the
+        // owner's choice to one (round-3 review, advisory B-2).
+        const ids = new Set(options.map((o) => o.id));
+        if (ids.size !== options.length) {
+          return rejected(state, `a block vote's options must have distinct ids`);
+        }
+        if (new Set(options.map((o) => o.label)).size !== options.length) {
+          return rejected(state, `a block vote's options must read differently`);
+        }
       }
       return ok({
         ...state,

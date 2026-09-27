@@ -3095,6 +3095,14 @@ export class Conductor {
             return { ok: false, reason: "every option needs a non-empty id and label" };
           }
         }
+        // Two or three DISTINCT options — a repeated id or label would
+        // collapse the owner's choice (round-3 review, advisory B-2).
+        if (new Set(options.map((o) => o.id.trim())).size !== options.length) {
+          return { ok: false, reason: "a block vote's options must have distinct ids" };
+        }
+        if (new Set(options.map((o) => o.label.trim())).size !== options.length) {
+          return { ok: false, reason: "a block vote's options must read differently" };
+        }
       }
       this.#applyEvent({
         type: "PANEL_VOTE",
@@ -3531,17 +3539,36 @@ export class Conductor {
     // From that moment it is two things: a raw `blocker` message (marked
     // `raisedAsBlocker`, so a panel votes on it) and an open blocking finding
     // — effective at once against acceptance.
+    //
+    // A blocker is NEVER deduped (round-3 review, findings B-1/A-3/M-4):
+    // folding it into an existing finding via `sameAs` could drop the
+    // stop-the-work request entirely — no blocker message, no panel, and no
+    // blocking force at all when the target finding was advisory. It is
+    // always raised and always paneled; a stray `sameAs` (the submission
+    // schema does not offer one on a blocker) is logged, never honoured.
     const raised: Array<{ fd: FindingDisclosure; asBlocker: boolean }> = [
       ...(review.findings ?? []).map((fd) => ({ fd, asBlocker: false })),
-      ...(review.blockers ?? []).map((b) => ({ fd: { ...b, severity: "blocking" as const } as FindingDisclosure, asBlocker: true })),
+      ...(review.blockers ?? []).map((b) => ({
+        fd: { ...b, severity: "blocking" as const } as FindingDisclosure,
+        asBlocker: true,
+      })),
     ];
     for (const { fd, asBlocker } of raised) {
-      // Plan 2c: "same as F-…" records agreement instead of a duplicate.
+      // Plan 2c: "same as F-…" records agreement instead of a duplicate —
+      // for an ordinary FINDING only; a blocker is immune (see above).
       if (fd.sameAs) {
-        const existing = this.#state.phase.findings.find((f) => f.id === fd.sameAs && f.status === "open");
-        if (existing) {
-          this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer: review.reviewer });
-          continue;
+        if (asBlocker) {
+          this.#log.append("blocker_sameas_ignored", {
+            reviewer: review.reviewer,
+            sameAs: fd.sameAs,
+            reason: "a blocker is always raised and paneled, never folded into an existing finding",
+          });
+        } else {
+          const existing = this.#state.phase.findings.find((f) => f.id === fd.sameAs && f.status === "open");
+          if (existing) {
+            this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer: review.reviewer });
+            continue;
+          }
         }
       }
       const { sameAs: _sameAs, ...disclosure } = fd;
@@ -6296,7 +6323,7 @@ export class Conductor {
       "Call submit_review with:",
       "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation), except records marked carried: your previous ballot stands for those, and a new ballot replaces it. A ballot with contractObjection=true opens a contract finding and suspends that vote.",
       "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it. If the problem is that a criterion cannot be met AS WRITTEN, add `criterionDispute` = { criterion: <the acceptance item verbatim>, why, proposedWording }: the conductor records an amendment voted on like any reserved record (a passing one replaces the wording; a failed one leaves it unchanged). An unmet-but-clear criterion is an ordinary defect finding.",
-      "- `blockers`: use this ONLY to stop the work until the owner decides. Each entry is {kind, evidence} like a finding (it is raised at once as a raw blocker message and a blocking finding), and a panel of three fresh agents then votes `block` or `downgrade`. A `block` majority parks the phase for the owner, with options the panel proposes; a `downgrade` majority makes it an ordinary blocking finding for the next worker attempt. An ordinary defect that should be fixed but need not stop the run belongs in `findings`, not here.",
+      "- `blockers`: use this ONLY to stop the work until the owner decides. Each entry is {kind, evidence} like a finding (it is raised at once as a raw blocker message and a blocking finding), and a panel of three fresh agents then votes `block` or `downgrade`. A `block` majority parks the phase for the owner, with options the panel proposes; a `downgrade` majority makes it an ordinary blocking finding for the next worker attempt. A blocker is never folded into an existing finding (no `sameAs`): state the issue's own evidence. An ordinary defect that should be fixed but need not stop the run belongs in `findings`, not here.",
       // Plan 01g: an amendment record is a reserved decision like any other;
       // it must get a ballot, and it never blocks acceptance on its own.
       ...(phase.decisions.some((d) => d.amendment && d.boundCandidateSha === C && isLiveDecision(d))

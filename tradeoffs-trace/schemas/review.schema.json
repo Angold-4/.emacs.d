@@ -87,7 +87,7 @@
     },
     "blockers": {
       "type": "array",
-      "description": "Plan 04b: the reviewer's separate blockers list — 'stop the work until the owner decides'. Each is raised as a raw `blocker` message AND a blocking finding, effective at once.",
+      "description": "Plan 04b: the reviewer's separate blockers list — 'stop the work until the owner decides'. Each is raised as a raw `blocker` message AND a blocking finding, effective at once, and voted by a panel; a blocker is NEVER folded into an existing finding (no `sameAs`), so a stop-the-work request can never be silently dropped.",
       "items": {
         "type": "object",
         "required": ["kind", "evidence"],
@@ -96,7 +96,6 @@
           "kind": { "enum": ["defect", "contract", "integration"] },
           "evidence": { "type": "string", "minLength": 1 },
           "linkedDecisionId": { "type": "string", "minLength": 1 },
-          "sameAs": { "type": "string", "minLength": 1 },
           "criterionDispute": {
             "type": "object",
             "required": ["criterion", "why", "proposedWording"],

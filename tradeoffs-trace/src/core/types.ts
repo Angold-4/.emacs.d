@@ -469,14 +469,19 @@ export interface FindingDisclosure {
 
 /** Plan 04b: one entry of a reviewer's `blockers` list. Exactly a finding
  * disclosure without a severity — a blocker is always `blocking` (there is
- * no such thing as an advisory blocker), so the reviewer never states one. */
+ * no such thing as an advisory blocker), so the reviewer never states one.
+ *
+ * Deliberately no `sameAs`: a blocker is NEVER folded into an existing
+ * finding. Doing so could drop the stop-the-work request entirely (no
+ * blocker message, no panel, and no blocking force at all when the target
+ * finding was advisory), so the reviewer states the issue's evidence instead
+ * (round-3 review, findings B-1/A-3/M-4). */
 export interface BlockerDisclosure {
   kind: FindingKind;
   evidence: string;
   linkedDecisionId?: string;
   criterionDispute?: CriterionDispute;
   reproduction?: { command: string };
-  sameAs?: string;
 }
 
 export interface Review {

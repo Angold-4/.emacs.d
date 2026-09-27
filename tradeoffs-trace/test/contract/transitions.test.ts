@@ -1269,6 +1269,64 @@ test("plan 04b: a raised blocker blocks acceptance from the moment it is raised,
   assert.equal(early.ok, false, "EVALUATION_COMPLETED must be refused while the panel still has undecided seats");
 });
 
+test("plan 04b: an escalated blocker's accept_risk option settles the blocker and lets the candidate stand", () => {
+  // Advisory B-2: every other blocker_panel option is repair-forcing; the one
+  // that says it lets the candidate stand must actually do that, rather than
+  // starting a repair round the option never described.
+  const finding: Finding = {
+    id: "F-blk",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: "src/cancel.ts:10",
+    raisedBy: "B",
+    status: "open",
+    boundCandidateSha: "C1",
+  };
+  const state = baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: acceptableReviews,
+    findings: [finding],
+    messages: [makeMessage({ id: "B-1", type: "blocker", state: "published", raisedAsBlocker: true, sourceRecordId: "F-blk" })],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "the blocker panel voted to stop",
+        origin: "blocker_panel",
+        linkedFindingId: "F-blk",
+        linkedMessageId: "B-1",
+        boundCandidateSha: "C1",
+        boundContractVersion: K,
+        options: [
+          { id: "accept_risk", label: "accept the risk and let the candidate stand" },
+          { id: "repair", label: "repair it (grant 3 rounds)" },
+        ],
+        status: "open",
+      },
+    ],
+  });
+  const resolved = reduce(state, {
+    type: "OWNER_REQUEST_RESOLVED",
+    requestId: "OR-1",
+    option: "accept_risk",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(resolved.ok, true, !resolved.ok ? resolved.reason : "");
+  assert.equal(resolved.state.phase.phase, "RESOLVING", "accepting the risk starts no repair");
+  assert.equal(resolved.state.phase.findings.find((f) => f.id === "F-blk")!.status, "accepted");
+  assert.equal(resolved.state.phase.messages!.find((m) => m.id === "B-1")!.state, "resolved");
+  assert.deepEqual(next(resolved.state), [{ type: "accept", resolvedCorrectionIds: [] }]);
+});
+
 test("next(): no double dispatch — ACTION_STARTED for an outstanding action makes next() return [] for it", () => {
   // CHECKING with a fresh candidate: next() recommends run_checks once.
   let state = baseState({ phase: "CHECKING", candidate: C1 });

@@ -112,12 +112,16 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
 /** The three seats every panel has. */
 export const PANEL_SEATS = [1, 2, 3] as const;
 
-/** The fallback pair of owner options when a `block` vote carried none (the
- * conductor never lets this happen; it exists so the escalation path always
- * leaves the owner something to choose). */
+/** The fallback pair of owner options: what an ordinary open-finding request
+ * for the blocker offers, worded exactly as `applyOwnerRequestResolved` and
+ * `isRepairForcingOption` treat them (`accept_risk` settles the blocker and
+ * lets the candidate stand; every other id starts the repair that carries it
+ * out). A block vote must offer two or three options with distinct ids, so a
+ * well-formed escalation never needs it — but if one ever did, both options
+ * now do exactly what they say (round-3 review, advisory B-2). */
 export const DEFAULT_BLOCKER_OPTIONS: PanelOption[] = [
-  { id: "proceed", label: "proceed with the work as it stands" },
-  { id: "stop", label: "stop the phase" },
+  { id: "accept_risk", label: "accept the risk and let the candidate stand" },
+  { id: "repair", label: "repair it (grant 3 rounds)" },
 ];
 
 /** A seat is settled once it has voted, or is unavailable after its one

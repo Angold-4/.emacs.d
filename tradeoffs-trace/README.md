@@ -536,9 +536,22 @@ The recorded outcome picks that exit's row:
 
 | outcome | row | lands |
 |---|---|---|
-| `escalate` | `panel-escalate` | `AWAITING_OWNER`, an owner request of origin `blocker_panel` carrying the panel's options; no repair round spent. The owner's choice resolves both the blocker message and its blocking finding and resumes into `REPAIRING`. |
+| `escalate` | `panel-escalate` | `AWAITING_OWNER`, an owner request of origin `blocker_panel` carrying the panel's options; no repair round spent. The owner's choice resolves both the blocker message and its blocking finding. `accept_risk` settles it and lets the candidate stand (`RESOLVING`); every other option is the owner's instruction, so it resumes into `REPAIRING` (a fresh 3-round allowance) and is quoted in the next worker prompt. |
 | `downgrade` | `panel-downgrade` | `REPAIRING` (one repair round); the blocking finding is in the next worker prompt. Never parked. |
 | `incomplete` | `panel-incomplete` | `RESOLVING`, where the still-open blocking finding routes to a repair round. Never parked by the panel itself. |
+
+A blocker is **never folded into an existing finding**: there is no `sameAs`
+on a `blockers` entry (neither the schema nor the tool offers one), and the
+conductor never applies the `FINDING_ALSO_RAISED` dedup to a blocker. A
+stop-the-work request is therefore always its own raw message, its own
+blocking finding and its own panel — it can never be silently dropped
+because the issue was already on file (and an advisory target finding could
+not have carried the blocking force anyway). A stray `sameAs` is logged
+(`blocker_sameas_ignored`), never honoured. A `block` vote's two or three
+options must be distinct (id and label), and a degenerate vote that cannot
+offer the owner a real choice falls back to the pair the owner request
+already defines — `accept_risk` / `repair` — each of which now does exactly
+what it says.
 
 An escalated `blocker_panel` owner request is resolved through the ordinary
 inbox path (`type: "resolve"`); `src/core/owner-commands.ts` closes the

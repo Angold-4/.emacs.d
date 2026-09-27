@@ -298,6 +298,97 @@ test("plan 04b: 2 of 3 downgrade spends one repair round and puts the published 
   }
 });
 
+test("plan 04b: a blocker that names an open (advisory) finding is still raised, blocking and paneled, never folded into it", async () => {
+  // Round-3 review, findings B-1/A-3/M-4: the `sameAs` dedup path used to run
+  // for `blockers` too, so a blocker naming an open finding became
+  // FINDING_ALSO_RAISED and nothing else — no `blocker` message, no panel,
+  // and (when the target was advisory) no blocking force at all. A raised
+  // blocker is never lost: it is always its own raw message and its own
+  // blocking finding, and a panel always votes on it.
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer, state) => {
+      const sha8 = (state.phase.candidate?.sha ?? "").slice(0, 8);
+      // B submits FIRST (M and A hold back), so its advisory finding is the
+      // round's first finding and its id is deterministic.
+      const advisoryId = `F-p1-${sha8}-B-1`;
+      const hold = reviewer === "B" ? [] : [{ kind: "sleep" as const, ms: 1500 }];
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          ...hold,
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+              ballots: [],
+              findings: reviewer === "B" ? [{ kind: "defect", severity: "advisory", evidence: "the cancel path can deadlock under load" }] : [],
+              // The blocker names that open finding by id, exactly as the
+              // old dedup path allowed.
+              ...(reviewer === "B"
+                ? { blockers: [{ kind: "defect", evidence: BLOCKER_EVIDENCE, sameAs: advisoryId }] }
+                : {}),
+            },
+          },
+        ],
+      };
+    },
+    evaluatorScriptFor: blockerEvaluator(),
+    panelScriptFor: (blockerId, seat) => ({
+      hello: { role: "panel" as const, tools: ROLE_TOOLS.panel },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_panel_vote",
+          args:
+            seat <= 2
+              ? { blockerId, seat, vote: "block", reason: `seat ${seat}: stop it`, options: BLOCK_OPTIONS }
+              : { blockerId, seat, vote: "downgrade", reason: "seat 3: repairable" },
+        },
+      ],
+    }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    // The blocker was raised, as its own message and its own blocking finding.
+    const blocker = (phase.messages ?? []).find((m) => m.type === "blocker");
+    assert.ok(blocker, `the blocker must have been raised as a blocker message: ${JSON.stringify((phase.messages ?? []).map((m) => [m.id, m.type, m.state]))}`);
+    assert.equal(blocker!.raisedAsBlocker, true);
+    const advisory = phase.findings.find((f) => f.id.endsWith("-B-1"));
+    assert.ok(advisory, "B's advisory finding is still the target of the sameAs");
+    assert.equal(advisory!.severity, "advisory");
+    const blockers = phase.findings.filter((f) => f.severity === "blocking" && f.raisedBy === "B");
+    assert.equal(blockers.length, 1, "the blocker's own blocking finding exists, beside the advisory target");
+    assert.equal(blockers[0].status, "open");
+    // And a panel voted on it.
+    assert.equal(panelVotes(setup).length, 3);
+    assert.equal(
+      (events(setup).find((e) => e.type === "PANEL_DECIDED") as { outcome?: string } | undefined)?.outcome,
+      "escalate",
+    );
+    const request = phase.ownerRequests.find((r) => r.status === "open");
+    assert.equal(request?.origin, "blocker_panel");
+    assert.equal(request?.linkedFindingId, blockers[0].id);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
 test("plan 04b: a seat that times out is retried once and its real vote decides; two seats unavailable after retry leave the panel incomplete and the blocking finding effective, not parked", async () => {
   // (a) One seat times out, its retry votes: the panel is decided on real
   // votes (2 block + 1 downgrade -> escalate).

@@ -159,14 +159,13 @@ const BallotParam = Type.Object({
 });
 
 // Plan 04b: a blocker is a finding without a severity — a blocker is always
-// blocking, so the reviewer never states one.
+// blocking, so the reviewer never states one. Deliberately no `sameAs`: a
+// blocker is never folded into an existing finding, so a stop-the-work
+// request can never be silently dropped; cite the issue's evidence instead.
 const BlockerParam = Type.Object({
   kind: StringEnum(["defect", "contract", "integration"] as const),
   evidence: Type.String({ description: "file:line, scenario, check result or plan clause — required, non-empty" }),
   linkedDecisionId: Type.Optional(Type.String()),
-  sameAs: Type.Optional(
-    Type.String({ description: "Id of an already-open finding this repeats; you are recorded on it instead of a duplicate" }),
-  ),
   criterionDispute: Type.Optional(
     Type.Object({
       criterion: Type.String({ description: "One acceptance item of the phase contract, verbatim" }),
