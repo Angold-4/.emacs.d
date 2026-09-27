@@ -815,7 +815,15 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
         outcome: reasons.length > 0 ? `not accepted: ${reasons.join("; ")}` : "not accepted",
       });
     }
-    if (state.phase.phase !== before.phase.phase || phases.length === 0) {
+    // Plan 05i: READY is the pre-start state, not a stage, and the
+    // environment preflight records its tools (`ENV_CHECKED`) before any
+    // phase change. Seeding an arrival from a non-phase-changing first event
+    // would start the run's timeline at READY, which the pipeline renders as
+    // an `implement` span — so the baseline paid before the worker would read
+    // as implementation (the very defect plan 04a's own test guards). Only a
+    // real phase change (or a non-READY initial phase, defensively) is an
+    // arrival.
+    if (state.phase.phase !== before.phase.phase || (phases.length === 0 && state.phase.phase !== "READY")) {
       phases.push({ phase: state.phase.phase, at: record.ts });
     }
   }
