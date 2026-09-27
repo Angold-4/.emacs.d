@@ -888,8 +888,12 @@ function cmdContract(sub: string | undefined, runDir: string): void {
 }
 
 /** A-13: a live `tt verdict` reports the OUTCOME. The command is written to
- * the inbox, then this waits briefly for the conductor to move it to
- * `inbox/applied` or `inbox/rejected` and returns which, with the reason. */
+ * the inbox, then this waits for the conductor to move it to
+ * `inbox/applied` or `inbox/rejected` and returns which, with the reason.
+ * 20 s (up from 5 s): under the whole suite's four-way load the conductor's
+ * inbox poll can lag far past 5 s, and a live run's verdict then read
+ * `queued` even though the conductor was about to apply it. A genuinely
+ * stopped conductor still returns `queued` after the window. */
 async function awaitInboxVerdict(
   runDir: string,
   commandId: string,
@@ -987,7 +991,7 @@ async function cmdVerdict(
       },
     };
     writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
-    const outcome = await awaitInboxVerdict(runDir, commandId, 5000);
+    const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
     if (outcome.kind === "applied") {
       process.stdout.write(`verdict applied: ${verdict} recorded for ${messageId} in run ${path.basename(runDir)}\n`);
     } else if (outcome.kind === "rejected") {
