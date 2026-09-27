@@ -174,7 +174,14 @@ function eventTypes(setup: TestConductorSetup): string[] {
 }
 
 /** The renderer's projections exist and match state; `tt contract check` is
- * retried so a projection write racing this call is not a false failure. */
+ * retried so a projection write racing this call is not a false failure.
+ *
+ * The retry is ASYNC (`ttAsync`, not the blocking `execFileSync` `tt`): the
+ * conductor runs in this test's own process, so a synchronous check would
+ * freeze its status beat and the log would keep moving under the check,
+ * making the mismatch permanent under load (the v1-end-to-end flake).
+ * Awaiting the subprocess lets the beat keep the projections current while
+ * the check runs. */
 async function assertProjections(setup: TestConductorSetup): Promise<void> {
   const p = runPaths(setup.runDir);
   assert.ok(existsSync(p.review), "views/review.org must exist");
@@ -183,7 +190,15 @@ async function assertProjections(setup: TestConductorSetup): Promise<void> {
   // 250 ms: a check spawned every 50 ms would add many node processes to the
   // already-parallel suite; the retry is only to ride out a projection write
   // that has not caught up with the log yet.
-  await waitFor(() => tt(["contract", "check", setup.runDir]).status === 0, 30_000, 250, setup.runDir);
+  const deadline = Date.now() + 150_000;
+  for (;;) {
+    const r = await ttAsync(["contract", "check", setup.runDir]);
+    if (r.status === 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(`assertProjections: contract check never matched for ${setup.runDir}: ${r.stderr.trim()}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 }
 
 test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, two rounds, and the owner's two D verdicts", async () => {
