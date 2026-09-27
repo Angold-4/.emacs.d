@@ -20,7 +20,10 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
-import { projectLedger, projectMessages, projectReview } from "./core/messages.ts";
+import { projectLedger, projectMessages } from "./core/messages.ts";
+import { projectReview, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
+import { buildView } from "./view.ts";
+import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -386,6 +389,10 @@ export function runPaths(runDir: string) {
     messages: path.join(runDir, "messages.jsonl"),
     ledger: path.join(runDir, "ledger.jsonl"),
     review: path.join(runDir, "views", "review.org"),
+    messagesView: path.join(runDir, "views", "messages"),
+    status: path.join(runDir, "views", "status.txt"),
+    // Plan 03c: the phase state machine as an ASCII chart (TRANSITIONS).
+    loop: path.join(runDir, "views", "loop.txt"),
     inbox: path.join(runDir, "inbox"),
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
@@ -439,6 +446,24 @@ export function runnerRevision(): string {
   } catch {
     return "unknown";
   }
+}
+
+/** Plan 03c: the model Pi uses when no provider/model is passed —
+ * `defaultModel` in Pi's own `~/.pi/agent/settings.json` (the same file the
+ * Emacs front end writes, see core/init-pilish.el). Read once and cached: the
+ * phase chart asks for it on every status beat. Undefined when the file is
+ * missing or unreadable, so the chart says `default` rather than guessing. */
+let cachedPiDefaultModel: string | null | undefined;
+export function piDefaultModel(): string | undefined {
+  if (cachedPiDefaultModel !== undefined) return cachedPiDefaultModel ?? undefined;
+  try {
+    const file = path.join(os.homedir(), ".pi", "agent", "settings.json");
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { defaultModel?: unknown };
+    cachedPiDefaultModel = typeof raw.defaultModel === "string" && raw.defaultModel.length > 0 ? raw.defaultModel : null;
+  } catch {
+    cachedPiDefaultModel = null;
+  }
+  return cachedPiDefaultModel ?? undefined;
 }
 
 /** A conductor whose own revision differs from the one the run was started
@@ -939,6 +964,12 @@ export class Conductor {
   #steerInFlight = new Set<string>();
   /** The inbox poll timer; cleared by `#doStop`. */
   #inboxTimer: NodeJS.Timeout | undefined;
+  /** Plan 03b: the periodic `views/status.txt` refresh, once a second while
+   * the conductor runs. `buildView` rebuilds the timeline, so it stays off
+   * the message-event path (the discovery-barrier tests are timing-sensitive)
+   * but must still track a silent execute stage (B-5), not only message
+   * events. */
+  #statusTimer: NodeJS.Timeout | undefined;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -951,6 +982,7 @@ export class Conductor {
     this.#piArgsPrefix = opts.piArgsPrefix ?? [];
     this.#extraEnv = opts.extraEnv ?? {};
     this.#piEnvFor = opts.piEnvFor;
+    this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
@@ -1041,6 +1073,9 @@ export class Conductor {
     // killed between an event and its projection write leaves stale or
     // missing files; the log is authoritative and this restores them.
     this.#writeContractProjections();
+    // Plan 03b: the status view exists immediately; the coalesced write keeps
+    // it fresh afterwards without rebuilding the view on every message event.
+    this.#writeStatusViewSafe();
     // Plan 01b: seed the park-episode counter from the log, so a restarted
     // conductor keeps the same notification key for the wait it is resuming.
     this.#awaitingEpisode = rebuildTimeline(this.#runDir, this.#plan).phases.filter((p) => p.phase === "AWAITING_OWNER").length;
@@ -1106,6 +1141,10 @@ export class Conductor {
         // The wait's one 30-minute reminder is noticed on the same beat.
         this.#checkNotifications();
       }, this.#deadlines.inboxPollMs);
+      // Plan 03b: refresh views/status.txt once a second through every stage,
+      // including a long silent execute, on its own beat (tests shorten the
+      // inbox poll to tens of ms).
+      this.#statusTimer = setInterval(() => this.#writeStatusViewSafe(), 1000);
     }
 
     this.drive();
@@ -1461,6 +1500,12 @@ export class Conductor {
     this.#stopRequested = true;
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
     if (this.#inboxTimer) clearInterval(this.#inboxTimer);
+    if (this.#statusTimer) {
+      clearInterval(this.#statusTimer);
+      this.#statusTimer = undefined;
+    }
+    // Plan 03b: flush the status view once before the log closes.
+    this.#writeStatusViewSafe();
     // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
@@ -4101,15 +4146,70 @@ export class Conductor {
     this.#recordBoundaryDataAndSample(outcome.candidateSha);
   }
 
-  /** Contract v1: writes `messages.jsonl` and `ledger.jsonl` from state. */
+  /** Contract v1: writes `messages.jsonl`, `ledger.jsonl` and the rendered
+   * views (`views/review.org`, `views/messages/<id>.org`) from state. The
+   * status view has its own one-second beat (`#statusTimer`). */
   #writeContractProjections(): void {
     try {
-      fs.writeFileSync(this.#paths.messages, projectMessages(this.#state.phase));
-      fs.writeFileSync(this.#paths.ledger, projectLedger(this.#state.phase));
-      fs.writeFileSync(this.#paths.review, projectReview(this.#state.phase));
+      const phase = this.#state.phase;
+      fs.writeFileSync(this.#paths.messages, projectMessages(phase));
+      fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
+      fs.writeFileSync(this.#paths.review, projectReview(phase));
+      this.#writeMessageViews();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
     }
+  }
+
+  #writeStatusViewSafe(): void {
+    try {
+      this.#writeStatusView();
+    } catch (err) {
+      this.#logUnexpected("write_status_view", err);
+    }
+  }
+
+  /** Plan 03b: `views/messages/<id>.org`, one per message, pruned of files
+   * whose message no longer exists (a superseded id is never resurrected). */
+  #writeMessageViews(): void {
+    const files = reviewMessageFiles(this.#state.phase);
+    const ids = new Set(files.map((f) => f.id));
+    fs.mkdirSync(this.#paths.messagesView, { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(this.#paths.messagesView, `${f.id}.org`), f.contents);
+    for (const name of fs.readdirSync(this.#paths.messagesView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) {
+        fs.rmSync(path.join(this.#paths.messagesView, name), { force: true });
+      }
+    }
+  }
+
+  /** Plan 03b: `views/status.txt`, the status buffer's own text (title, run
+   * line, rows, trade-offs with their record ids, owner input, checklist),
+   * so Emacs reads a file instead of calling `tt state`. */
+  #writeStatusView(): void {
+    const view = buildView(this.#runDir, this.#plan, !this.#closed);
+    const text = renderStatusView(
+      statusViewInput({
+        runDir: this.#runDir,
+        plan: this.#plan,
+        state: this.#state,
+        view,
+        alive: !this.#closed,
+        secrets: { missing: this.#missingSecrets, tooShort: this.#tooShortSecrets },
+      }),
+    );
+    fs.writeFileSync(this.#paths.status, redactText(text, this.#secretMaskable));
+    // Plan 03c: the same beat keeps the phase chart (`views/loop.txt`) current;
+    // it is generated from TRANSITIONS, so it can never drift from the loop.
+    const stats = statsFromTimeline(view.timeline, new Date());
+    // Plan 03c: each dispatching state shows its own role's model — the
+    // injected provider/model when a caller set one, otherwise Pi's own
+    // default from settings.json, otherwise `default`.
+    const modelFor = (role: Role): string | undefined => this.#providerModelFor?.(role)?.model ?? piDefaultModel();
+    // No evaluator source exists yet, so the evaluator role must read
+    // `default` rather than borrow the reviewers' model (M-9).
+    const models = { worker: modelFor("worker"), reviewer: modelFor("reviewer"), evaluator: undefined };
+    fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
   }
 
   /** Contract v1: the reviewable content of the message a worker decision
@@ -4136,6 +4236,21 @@ export class Conductor {
       evidence: [finding.evidence],
       planRef: this.#state.phase.phaseId,
     };
+  }
+
+  /** Plan 03b: who raised a message and how much it matters, so the runtime
+   * renderer can colour and group it without a second lookup. Derived from
+   * the record the message was raised from. */
+  #messageProvenance(type: MessageType, sourceRecordId: string): { raisedBy: string; importance: "high" | "normal" | "low" } {
+    if (type === "tradeoff") {
+      const d = this.#state.phase.decisions.find((x) => x.id === sourceRecordId);
+      if (d?.source === "reviewer-discovered") {
+        return { raisedBy: d.alsoSeenBy?.[0] ? `reviewer ${d.alsoSeenBy[0]}` : "reviewer", importance: d.class === "reserved" ? "high" : d.class === "detail" ? "low" : "normal" };
+      }
+      return { raisedBy: "worker", importance: d?.class === "reserved" ? "high" : d?.class === "detail" ? "low" : "normal" };
+    }
+    const f = this.#state.phase.findings.find((x) => x.id === sourceRecordId);
+    return { raisedBy: f?.raisedBy ?? "reviewer", importance: type === "blocker" ? "high" : "low" };
   }
 
   /** The current content of the record a message was raised from, or
@@ -4195,10 +4310,11 @@ export class Conductor {
       boundCandidateSha: candidateSha,
       boundContractVersion: this.#state.phase.contract.contractVersion,
       contentHash: contentHashOf({ type, ...content }),
+      ...(sourceRecordId !== undefined ? { sourceRecordId } : {}),
+      ...this.#messageProvenance(type, sourceRecordId),
       // The record-derived hash a later carry compares against, so an
       // evaluator-rewritten title is not mistaken for a changed decision.
       sourceContentHash: contentHashOf({ type, ...content }),
-      ...(sourceRecordId !== undefined ? { sourceRecordId } : {}),
     };
     this.#applyEvent({ type: "MESSAGE_RAISED", message });
     return message.id;

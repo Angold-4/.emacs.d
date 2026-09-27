@@ -559,38 +559,6 @@ export function projectLedger(phase: { messages?: Message[] }): string {
   return entries.map((e) => stableStringify(e)).join("\n") + (entries.length > 0 ? "\n" : "");
 }
 
-/** `views/review.org`: the runtime-rendered review view (contract v1). One
- * subtree per message, with its state and settlement; a front end (Emacs)
- * only displays it. Rebuilt from state, never authoritative. */
-export function projectReview(phase: { messages?: Message[]; phaseId?: string; contract?: { phaseId?: string } }): string {
-  const messages = [...(phase.messages ?? [])].sort((a, b) => a.id.localeCompare(b.id));
-  const phaseId = phase.phaseId ?? phase.contract?.phaseId ?? "";
-  const lines: string[] = ["# tradeoffs-trace review — contract v1", `# phase ${phaseId}`, ""];
-  if (messages.length === 0) {
-    lines.push("(no messages)", "");
-    return lines.join("\n");
-  }
-  for (const m of messages) {
-    const tag = m.state === "accepted" || m.state === "resolved" || m.state === "merged" ? "DONE" : m.state === "refused" || m.state === "dropped" || m.state === "superseded" ? "CANCELLED" : "TODO";
-    lines.push(`* ${tag} ${m.id} [${m.type}] ${m.title}`);
-    lines.push(`  :PROPERTIES:`);
-    lines.push(`  :STATE: ${m.state}`);
-    lines.push(`  :VERSION: ${m.messageVersion}`);
-    lines.push(`  :CANDIDATE: ${m.boundCandidateSha}`);
-    lines.push(`  :CONTRACT: v${m.boundContractVersion.snapshot}`);
-    lines.push(`  :CONTENT_HASH: ${m.contentHash}`);
-    if (m.settlement) lines.push(`  :SETTLED_BY: ${m.settlement.settledBy}`);
-    if (m.followUp) lines.push(`  :FOLLOW_UP: true`);
-    if (m.addressedReport) lines.push(`  :ADDRESSED: ${m.addressedReport.addressed}`);
-    if (m.invalidated) lines.push(`  :INVALIDATED: ${m.invalidated.reason} (${m.invalidated.atCandidate})`);
-    lines.push(`  :END:`);
-    lines.push(`  ${m.summary}`);
-    if (m.settlement?.reason) lines.push(`  Reason: ${m.settlement.reason}`);
-    lines.push("");
-  }
-  return lines.join("\n");
-}
-
 /** The `messageId` prefix for a message type: T-n, F-n, B-n. */
 export function messageIdPrefix(type: MessageType, index: number): string {
   const letter = type === "tradeoff" ? "T" : type === "finding" ? "F" : "B";

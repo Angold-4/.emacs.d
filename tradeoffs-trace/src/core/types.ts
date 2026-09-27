@@ -279,6 +279,14 @@ export interface Message {
   planRef?: string;
   state: MessageState;
   messageVersion: number;
+  /** Plan 03b: who raised the message (`worker', a reviewer, `owner', the
+   * `conductor'), and how much it matters (`high'/`normal'/`low'), so the
+   * rendered review can group and colour it. Both are review metadata, not
+   * part of the reviewable content, so `contentHash` ignores them. Optional:
+   * a message raised before this field existed, or a fixture, derives them
+   * from the record it came from. */
+  raisedBy?: string;
+  importance?: "high" | "normal" | "low";
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   contentHash: string;

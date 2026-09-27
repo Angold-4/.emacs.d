@@ -174,6 +174,12 @@ test("notify-program: a node that needs you, then the program ending done, each 
       () => fs.readFileSync(path.join(root, "programs", programId, "scheduler.log"), "utf8").includes("program done"),
       20_000,
     );
+    // The notifier is its own process: under load its line can land after
+    // "program done" is logged. Wait for both runs, then check that no third
+    // one follows (programs 03 and 14 ran this suite on a busy machine and
+    // counted 1).
+    await waitFor(() => countLines(calls) >= 2, 20_000);
+    await new Promise((r) => setTimeout(r, 1_000));
     assert.equal(countLines(calls), 2, "one notifier run per notification");
   } finally {
     if (programId) {

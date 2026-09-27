@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 
 import { buildView, formatDuration } from "./view.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
+import { renderProgramChart } from "./charts.ts";
 
 import {
   expandProgram,
@@ -28,6 +29,7 @@ import {
   nextProgramDirectiveId,
   nextStarts,
   nodePlan,
+  nodeReadableIds,
   programDirectivesInForce,
   programOutcome,
   reduceProgram,
@@ -50,6 +52,10 @@ export function programPaths(dir: string) {
     events: path.join(dir, "events.jsonl"),
     pid: path.join(dir, "scheduler.pid"),
     log: path.join(dir, "scheduler.log"),
+    /** Plan 03c: the Org program file this program was started from. */
+    source: path.join(dir, "source.json"),
+    /** Plan 03c: the rendered dependency graph Emacs/the owner read. */
+    programView: path.join(dir, "views", "program.txt"),
     /** Plan 01i: the program's own owner-input inbox (a `C-u` directive from
      * a node run is forwarded here; the Emacs program buffer writes here). */
     inbox: path.join(dir, "inbox"),
@@ -60,15 +66,33 @@ export function programPaths(dir: string) {
 
 /** Validates the program (throws on a bad graph) and creates its directory. */
 export function createProgram(root: string, program: ProgramFile, id = randomUUID().slice(0, 8)): string {
-  expandProgram(program);
+  const nodes = expandProgram(program);
+  // Plan 03c: the readable ids are recorded in the program itself, once, at
+  // start — `<program>-NN` by position in the program file.
+  const recorded: ProgramFile = { ...program, readableIds: program.readableIds ?? nodeReadableIds(id, nodes) };
   const dir = path.join(programsRoot(root), id);
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(programPaths(dir).inbox, { recursive: true });
   fs.mkdirSync(programPaths(dir).inboxApplied, { recursive: true });
   fs.mkdirSync(programPaths(dir).inboxRejected, { recursive: true });
-  fs.writeFileSync(programPaths(dir).program, JSON.stringify(program, null, 2));
+  fs.writeFileSync(programPaths(dir).program, JSON.stringify(recorded, null, 2));
   fs.writeFileSync(programPaths(dir).events, "");
   return dir;
+}
+
+/** Plan 03c: record the Org program file this program was started from (Emacs
+ * passes it), so the program buffer's header can name it. */
+export function recordProgramSource(dir: string, source: string): void {
+  fs.writeFileSync(programPaths(dir).source, JSON.stringify({ path: source }));
+}
+
+export function readProgramSource(dir: string): string | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(programPaths(dir).source, "utf8")) as { path?: string };
+    return raw.path;
+  } catch {
+    return undefined;
+  }
 }
 
 export function readProgram(dir: string): ProgramFile {
@@ -79,12 +103,16 @@ export function foldProgram(dir: string): {
   program: ProgramFile;
   nodes: ProgramNode[];
   state: ProgramState;
+  /** Plan 03c: every node's readable id (`<program>-NN`), from the program
+   * file when it recorded them and by position otherwise. */
+  readableIds: Record<string, string>;
   /** Plan 01b: the time each node last changed status (from its own event's
    * `ts`), for the wait duration `tt program status` and the mode-line show. */
   at: Record<string, string>;
 } {
   const program = readProgram(dir);
   const nodes = expandProgram(program);
+  const readableIds = program.readableIds ?? nodeReadableIds(path.basename(dir), nodes);
   let state = initialProgramState(nodes);
   const at: Record<string, string> = {};
   const text = fs.existsSync(programPaths(dir).events) ? fs.readFileSync(programPaths(dir).events, "utf8") : "";
@@ -99,7 +127,7 @@ export function foldProgram(dir: string): {
       // a torn last line from a crash; the next append rewrites nothing
     }
   }
-  return { program, nodes, state, at };
+  return { program, nodes, state, readableIds, at };
 }
 
 export function appendProgramEvent(dir: string, event: ProgramEvent): void {
@@ -350,7 +378,7 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
   // left in the program's inbox become logged program events first, so they
   // are part of the program state this tick observes and delivers.
   scanProgramInbox(dir);
-  let { program, nodes, state } = foldProgram(dir);
+  let { program, nodes, state, readableIds } = foldProgram(dir);
   deliverProgramDirectives(opts.runRoot, state);
   const record = (event: ProgramEvent) => {
     appendProgramEvent(dir, event);
@@ -394,7 +422,7 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     }
     fs.writeFileSync(
       path.join(runDir, "program.json"),
-      JSON.stringify({ programId: path.basename(dir), node: id }),
+      JSON.stringify({ programId: path.basename(dir), node: id, readableId: readableIds[id] }),
     );
     record({
       type: "NODE_STARTED",
@@ -405,6 +433,8 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
     });
     opts.launch(runDir);
   }
+  // Plan 03c: keep `views/program.txt` current after every status change.
+  writeProgramChart(dir);
   return programOutcome(nodes, state);
 }
 
@@ -571,8 +601,48 @@ function nodeCostLine(runDir: string): string | undefined {
  * gets one more indented line: its rounds, minutes, owner wait and its most
  * important trade-off. `tt program list` passes `nodeDetail: false` so it
  * never builds a view for every node. */
+/** Plan 03c: the program's dependency graph as an ASCII chart, written to
+ * `<program>/views/program.txt`. A running node shows its run's current phase
+ * state (read from the run directory; a node that never started shows none). */
+export function programChartText(dir: string): string {
+  const { program, nodes, state, readableIds } = foldProgram(dir);
+  const root = path.dirname(path.dirname(dir));
+  const phaseOf: Record<string, string> = {};
+  for (const n of nodes) {
+    const s = state.nodes[n.id];
+    if (!s.runId || s.status !== "running") continue;
+    try {
+      const runDir = path.join(root, s.runId);
+      const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
+      phaseOf[n.id] = rebuildState(runDir, plan, { lenient: true }).phase.phase;
+    } catch {
+      // the run is not readable (yet); the node still shows its node state
+    }
+  }
+  return renderProgramChart({ ...program, readableIds }, nodes, state, { programId: path.basename(dir), phaseOf });
+}
+
+/** Plan 03c: write the program chart beside the program's other files. */
+export function writeProgramChart(dir: string): void {
+  try {
+    const file = programPaths(dir).programView;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, programChartText(dir));
+  } catch {
+    // a chart that cannot be written must never stop the scheduler
+  }
+}
+
+/** Human-readable program status (the CLI and Emacs render this). Waiting
+ * (needs-you) nodes come first, oldest wait first, each with how long it has
+ * been waiting and the one-line reason. `now` is injectable for tests.
+ *
+ * Plan 01h: with `nodeDetail` (the default), each node with a readable run
+ * gets one more indented line: its rounds, minutes, owner wait and its most
+ * important trade-off. `tt program list` passes `nodeDetail: false` so it
+ * never builds a view for every node. */
 export function programStatusLines(dir: string, now: Date = new Date(), opts: { nodeDetail?: boolean } = {}): string[] {
-  const { program, nodes, state, at } = foldProgram(dir);
+  const { program, nodes, state, readableIds, at } = foldProgram(dir);
   const outcome = programOutcome(nodes, state);
   const alive = pidAlive(programPaths(dir).pid);
   const lines = [
@@ -599,13 +669,14 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
   for (const n of [...waiting, ...rest]) {
     const s = state.nodes[n.id];
     const deps = n.deps.length > 0 ? `  after ${n.deps.join(", ")}` : "";
+    const readable = (readableIds[n.id] ?? "").padEnd(11);
     if (s.status === "needs-you") {
       const since = at[n.id];
       const duration = since ? formatDuration(now.getTime() - Date.parse(since)) : "?";
-      lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${`waiting ${duration}`.padEnd(9)} ${s.runId ?? ""}${deps}`.trimEnd());
+      lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${`waiting ${duration}`.padEnd(9)} ${s.runId ?? ""} ${readable}${deps}`.trimEnd());
       lines.push(`    ${s.reason ?? "needs you"}`);
     } else {
-      lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${s.status.padEnd(9)} ${s.runId ?? ""}${deps}`.trimEnd());
+      lines.push(`${mark[s.status]} ${n.id.padEnd(22)} ${s.status.padEnd(9)} ${s.runId ?? ""} ${readable}${deps}`.trimEnd());
     }
     if (s.branch) lines.push(`    branch ${s.branch}  (PR base: ${s.base ?? "?"})`);
     if (s.status !== "needs-you" && s.reason) lines.push(`    ${s.reason}`);

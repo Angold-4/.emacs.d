@@ -1,0 +1,170 @@
+tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions.ts); do not edit
+current state: DONE   (entered 1x - 2m40s)
+current run: RUN_ACTIVE
+
+phase states:
+  +----------------+
+  | READY          |  entered 1x - 10s
+  +----------------+
+      +- ATTEMPT_STARTED (noBaselineNeeded) -> IMPLEMENTING    [start-attempt]
+      +- ATTEMPT_STARTED (baselineNeeded) -> BASELINE        [start-baseline]
+
+  +----------------+
+  | IMPLEMENTING   |  entered 2x - 41m00s  -  worker - model opus
+  +----------------+
+      +- SUBMIT_PHASE              -> FREEZING        [submit-phase]
+      +- ATTEMPT_TIMED_OUT (budgetRemains) -> REPAIRING       [attempt-timed-out-to-repairing]
+      +- ATTEMPT_TIMED_OUT (budgetExhausted) -> AWAITING_OWNER  [attempt-timed-out-budget-exhausted]
+      +- ATTEMPT_NO_SUBMISSION (budgetRemains) -> REPAIRING       [attempt-no-submission-to-repairing]
+      +- ATTEMPT_NO_SUBMISSION (budgetExhausted) -> AWAITING_OWNER  [attempt-no-submission-budget-exhausted]
+      +- REVISE                    -> REPAIRING       [revise-from-implementing]
+
+  +----------------+
+  | REPAIRING      |  entered 1x - 10s
+  +----------------+
+      +- REPAIR_ATTEMPT_STARTED    -> IMPLEMENTING    [repair-attempt-started]
+      +- REPAIR_BUDGET_EXHAUSTED   -> AWAITING_OWNER  [repairing-budget-exhausted]
+
+  +----------------+
+  | FREEZING       |  entered 2x - 20s
+  +----------------+
+      +- FREEZE_COMPLETED          -> CHECKING        [freeze-completed]
+      +- FREEZE_TIMED_OUT (budgetRemains) -> REPAIRING       [freeze-timed-out-to-repairing]
+      +- FREEZE_TIMED_OUT (budgetExhausted) -> AWAITING_OWNER  [freeze-timed-out-budget-exhausted]
+      +- REVISE                    -> REPAIRING       [revise-from-freezing]
+
+  +----------------+
+  | CHECKING       |  entered 2x - 8m00s
+  +----------------+
+      +- CHECKS_PASSED             -> PROBING         [checks-passed]
+      +- CHECKS_FAILED (budgetRemains) -> REPAIRING       [checks-failed-to-repairing]
+      +- CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [checks-failed-budget-exhausted]
+      +- AMEND                     -> CHECKING        [amend-from-checking]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-checking]
+      +- REVISE                    -> REPAIRING       [revise-from-checking]
+
+  +----------------+
+  | PROBING        |  entered 2x - 12m00s
+  +----------------+
+      +- PROBE_PASSED (reviewsIncomplete) -> REVIEWING       [probe-passed-needs-review]
+      +- PROBE_PASSED (reviewsAlreadyComplete) -> EVALUATING      [probe-passed-reviews-already-valid]
+      +- PROBE_FAILED (budgetRemains) -> REPAIRING       [probe-failed-to-repairing]
+      +- PROBE_FAILED (budgetExhausted) -> AWAITING_OWNER  [probe-failed-budget-exhausted]
+      +- AMEND                     -> CHECKING        [amend-from-probing]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-probing]
+      +- REVISE                    -> REPAIRING       [revise-from-probing]
+
+  +----------------+
+  | REVIEWING      |  entered 2x - 30m00s  -  M, A, B - model sonnet
+  +----------------+
+      +- REVIEW_SUBMITTED (reviewIncomplete) -> REVIEWING       [review-submitted-incomplete]
+      +- REVIEW_SUBMITTED (reviewComplete) -> EVALUATING      [review-submitted-complete]
+      +- REVIEW_TIMED_OUT (firstTimeout) -> REVIEWING       [review-timed-out-first]
+      +- REVIEW_TIMED_OUT (alreadyTimedOut) -> BLOCKED         [review-unavailable]
+      +- AMEND                     -> CHECKING        [amend-from-reviewing]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-reviewing]
+      +- REVISE                    -> REPAIRING       [revise-from-reviewing]
+
+  +----------------+
+  | RESOLVING      |  entered 2x - 20s
+  +----------------+
+      +- CRITERION_AMENDED         -> IMPLEMENTING    [resolving-criterion-amended]
+      +- ACCEPTED                  -> ACCEPTED        [resolving-accept-holds]
+      +- GATE_REQUIRED             -> GATING          [resolving-gate-required]
+      +- RESOLVING_INCOMPLETE (openItemsAndBudgetRemains) -> REPAIRING       [resolving-incomplete-repair]
+      +- RESOLVING_INCOMPLETE (openItemsBudgetExhausted) -> AWAITING_OWNER  [resolving-incomplete-awaiting-owner]
+      +- AMEND                     -> CHECKING        [amend-from-resolving]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-resolving]
+      +- REVISE                    -> REPAIRING       [revise-from-resolving]
+
+  +----------------+
+  | GATING         |  entered 2x - 30m00s
+  +----------------+
+      +- ACCEPTED                  -> ACCEPTED        [gate-accepted]
+      +- GATE_FAILED (budgetRemains) -> REPAIRING       [gate-failed-to-repairing]
+      +- GATE_FAILED (budgetExhausted) -> AWAITING_OWNER  [gate-failed-budget-exhausted]
+      +- AMEND                     -> CHECKING        [amend-from-gating]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-gating]
+      +- REVISE                    -> REPAIRING       [revise-from-gating]
+
+  +----------------+
+  | ACCEPTED       |  entered 1x - 10s
+  +----------------+
+      +- PUBLISH_INTENT            -> PUBLISHING      [accepted-publish-intent]
+      +- AMEND                     -> CHECKING        [amend-from-accepted]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-accepted]
+      +- REVISE                    -> REPAIRING       [revise-from-accepted]
+
+  +----------------+
+  | PUBLISHING     |  entered 1x - 10s
+  +----------------+
+      +- PUBLISH_COMPLETED         -> DONE            [publish-completed]
+      +- PUBLISH_STALE             -> PROBING         [publish-stale]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-publishing]
+
+> +----------------+
+  | DONE           |  entered 1x - 2m40s
+  +----------------+
+
+  +----------------+
+  | AWAITING_OWNER |  not entered
+  +----------------+
+      +- AMEND                     -> CHECKING        [amend-from-awaiting_owner]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-awaiting_owner]
+      +- REVISE (targetRecordBindingCurrentAndClears) -> REPAIRING       [revise-from-awaiting-owner-clears]
+      +- REVISE (targetRecordBindingCurrentAndStays) -> AWAITING_OWNER  [revise-from-awaiting-owner-stays]
+      +- OWNER_CORRECTION          -> REPAIRING       [owner-correction-from-awaiting-owner]
+      +- OWNER_REQUEST_RESOLVED (budgetGateGrant) -> REPAIRING       [awaiting-owner-request-resolved-grant]
+      +- OWNER_REQUEST_RESOLVED (budgetGateStop) -> BLOCKED         [awaiting-owner-request-resolved-stop]
+      +- OWNER_REQUEST_RESOLVED (repairForcingClears) -> REPAIRING       [awaiting-owner-request-resolved-repair-clears]
+      +- OWNER_REQUEST_RESOLVED (repairForcingStays) -> AWAITING_OWNER  [awaiting-owner-request-resolved-repair-stays]
+      +- OWNER_REQUEST_RESOLVED (clearsToResolving) -> RESOLVING       [awaiting-owner-request-resolved-clears-to-resolving]
+      +- OWNER_REQUEST_RESOLVED (clearsToRepairing) -> REPAIRING       [awaiting-owner-request-resolved-clears-to-repairing]
+      +- OWNER_REQUEST_RESOLVED (staysOpen) -> AWAITING_OWNER  [awaiting-owner-request-resolved-stays]
+      +- FINDING_ACCEPTED_BY_OWNER (clearsToResolving) -> RESOLVING       [awaiting-owner-finding-accepted-clears-to-resolving]
+      +- FINDING_ACCEPTED_BY_OWNER (clearsToRepairing) -> REPAIRING       [awaiting-owner-finding-accepted-clears-to-repairing]
+      +- FINDING_ACCEPTED_BY_OWNER (staysOpen) -> AWAITING_OWNER  [awaiting-owner-finding-accepted-stays]
+      +- OVERRIDE_CAST (clearsToResolving) -> RESOLVING       [awaiting-owner-override-clears-to-resolving]
+      +- OVERRIDE_CAST (clearsToRepairing) -> REPAIRING       [awaiting-owner-override-clears-to-repairing]
+      +- OVERRIDE_CAST (staysOpen) -> AWAITING_OWNER  [awaiting-owner-override-stays]
+
+  +----------------+
+  | BLOCKED        |  not entered
+  +----------------+
+      +- REVISE                    -> REPAIRING       [revise-from-blocked]
+
+  +----------------+
+  | BASELINE       |  not entered
+  +----------------+
+      +- BASELINE_COMPLETED        -> IMPLEMENTING    [baseline-completed]
+      +- BASELINE_TIMED_OUT        -> IMPLEMENTING    [baseline-timed-out]
+
+  +----------------+
+  | EVALUATING     |  not entered  -  evaluator, panel - model default
+  +----------------+
+      +- EVALUATION_COMPLETED      -> RESOLVING       [evaluation-completed]
+      +- AMEND                     -> CHECKING        [amend-from-evaluating]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-evaluating]
+      +- REVISE                    -> REPAIRING       [revise-from-evaluating]
+
+rare edges (crash recovery, launch failure):
+  BASELINE -- BASELINE_INTERRUPTED -> BASELINE      [baseline-interrupted]
+  IMPLEMENTING -- ATTEMPT_INTERRUPTED  -> IMPLEMENTING  [attempt-interrupted]
+  FREEZING -- FREEZE_INTERRUPTED   -> FREEZING      [freeze-interrupted]
+  CHECKING -- CHECKS_INTERRUPTED   -> CHECKING      [checks-interrupted]
+  PROBING -- PROBE_INTERRUPTED    -> PROBING       [probe-interrupted]
+  GATING -- GATE_INTERRUPTED     -> GATING        [gate-interrupted]
+  IMPLEMENTING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-implementing]
+  EVALUATING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-evaluating]
+  REVIEWING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-reviewing]
+
+run states:
+> +-------------------+
+  | RUN_ACTIVE        |  current
+  +-------------------+
+      +- RUN_BUDGET_EXCEEDED -> RUN_PAUSED_BUDGET  [run-budget-exceeded]
+
+  +-------------------+
+  | RUN_PAUSED_BUDGET |  not current
+  +-------------------+
+      +- RUN_RESUMED         -> RUN_ACTIVE         [run-resumed]
