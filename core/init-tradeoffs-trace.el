@@ -319,35 +319,79 @@ reads: the values live in the environment (design §7)."
 (defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel")
   "Roles #+TT_MODELS may assign a model to (design §2.1).")
 
+(defconst +tt--reviewer-seats '("M" "A" "B")
+  "Reviewer seats #+TT_MODELS may name as `reviewer.SEAT' (design §2.1).")
+
+(defconst +tt--panel-seats '("1" "2" "3")
+  "Panel seats #+TT_MODELS may name as `panel.SEAT' (design §2.1).")
+
+(defun +tt--model-of-value (val)
+  "Split VAL into an alist ((provider . P)? (model . M)) for the plan JSON.
+Every value is Pi's `--model' syntax.  The part before the first `:' is the
+provider ONLY when it has no `/': Pi's `--model' itself accepts a thinking
+suffix (`openai/gpt-6-sol:high'), so `openai/gpt-6-sol:high' is all model.
+`vercel-ai-gateway:openai/gpt-6-sol:high' names provider
+`vercel-ai-gateway' and model `openai/gpt-6-sol:high' (finding #20)."
+  (let* ((colon (string-match ":" val))
+         (provider (and colon (> colon 0)
+                        (let ((before (substring val 0 colon)))
+                          (and (not (string-match-p "/" before)) before))))
+         (model (if provider (substring val (1+ colon)) val)))
+    (if provider
+        `((provider . ,provider) (model . ,model))
+      `((model . ,model)))))
+
 (defun +tt--plan-models ()
   "Parse #+TT_MODELS into (MODELS LINE REPEATED), or nil when absent/empty.
-MODELS is an alist of (ROLE . ((provider . P)? (model . M))) for the plan
-JSON.  The part before the first `:' is the provider, which is optional; the
-rest is the model and may itself contain `/'.  LINE is the 1-based line of
-the keyword.  REPEATED lists the roles the keyword named more than once (the
-later declaration wins): a JSON object cannot carry a duplicate key, so
-the parser records them for `tt lint' to report."
+MODELS is an alist for the plan JSON: plain roles as
+(ROLE . ((provider . P)? (model . M))), the reviewer seats as
+(reviewerSeats . ((M . ...) (A . ...) ...)), the panel seats as
+(panelSeats . ((1 . ...) ...)), and (panelFrom . \"reviewers\") for the
+`panel=reviewers' value that makes every panel seat follow the reviewer of
+its position.  A key is `role' or `role.SEAT' (e.g. `reviewer.M', `panel.2').
+LINE is the 1-based line of the keyword.  REPEATED lists the keys the keyword
+named more than once (the later declaration wins): a JSON object cannot carry
+a duplicate key, so the parser records them for `tt lint' to report."
   (when-let* ((at (+tt--keyword-at "TT_MODELS")))
-    (let ((seen nil) (repeated nil) (models nil))
+    (let ((seen nil) (repeated nil)
+          (models nil) (reviewer-seats nil) (panel-seats nil) (panel-from nil))
       (dolist (tok (split-string (car at) "[ \t,]+" t))
         (let* ((eq (string-match "=" tok))
-               (role (if eq (substring tok 0 eq) tok))
+               (key (if eq (substring tok 0 eq) tok))
                (val (if eq (substring tok (1+ eq)) ""))
-               (colon (string-match ":" val))
-               (provider (and colon (> colon 0) (substring val 0 colon)))
-               (model (if colon (substring val (1+ colon)) val)))
-          (when (member role seen) (push role repeated))
-          (push role seen)
-          ;; A role named twice keeps only its LAST declaration (the run is
-          ;; blocked by lint anyway); one entry per role keeps the JSON object
-          ;; valid and the winner unambiguous.
-          (let ((key (intern role)))
-            (setq models (cons (cons key (if provider
-                                             `((provider . ,provider) (model . ,model))
-                                           `((model . ,model))))
-                               (assq-delete-all key models))))))
-      (when models
-        (list (nreverse models) (cdr at) (delete-dups (nreverse repeated)))))))
+               (dot (string-match "\\." key))
+               (role (if dot (substring key 0 dot) key))
+               (seat (and dot (substring key (1+ dot))))
+               (entry (+tt--model-of-value val)))
+          (when (member key seen) (push key repeated))
+          (push key seen)
+          (cond
+           ;; `panel=reviewers' is the one non-model value.
+           ((and (not dot) (equal key "panel") (equal val "reviewers"))
+            (setq panel-from "reviewers"))
+           ((and dot (equal role "reviewer"))
+            (let ((sym (intern seat)))
+              (setq reviewer-seats (cons (cons sym entry)
+                                         (assq-delete-all sym reviewer-seats)))))
+           ((and dot (equal role "panel"))
+            (let ((sym (intern seat)))
+              (setq panel-seats (cons (cons sym entry)
+                                      (assq-delete-all sym panel-seats)))))
+           (t
+            ;; A key named twice keeps only its LAST declaration (the run is
+            ;; blocked by lint anyway); one entry per key keeps the JSON object
+            ;; valid and the winner unambiguous.
+            (let ((sym (intern key)))
+              (setq models (cons (cons sym entry) (assq-delete-all sym models))))))))
+      (when (or models reviewer-seats panel-seats panel-from)
+        (let ((out (nreverse models)))
+          (when reviewer-seats
+            (setq out (append out (list (cons 'reviewerSeats (nreverse reviewer-seats))))))
+          (when panel-seats
+            (setq out (append out (list (cons 'panelSeats (nreverse panel-seats))))))
+          (when panel-from
+            (setq out (append out (list (cons 'panelFrom panel-from)))))
+          (list out (cdr at) (delete-dups (nreverse repeated))))))))
 
 (defun +tt-parse-plan ()
   "Parse the current Org plan buffer.
@@ -558,24 +602,53 @@ continues.  FILE names the Org file for the errors buffer."
             (mapcar (lambda (e) (cons (car e) (format "%s:%d: %s" (file-name-nondirectory file) (car e) (cdr e))))
                     (plist-get parsed :errors))))))
 
+(defun +tt--merge-seat-map (own prog prefix)
+  "Merge the program's seat map PROG under OWN; return (MERGED . INHERITED).
+OWN's seat wins; a seat only PROG names is inherited, and PREFIX
+(\"reviewer\" or \"panel\") spells it (`reviewer.M') for `tt lint'."
+  (let ((merged (append own nil)) (inherited nil))
+    (dolist (cell prog)
+      (unless (assq (car cell) own)
+        (push cell merged)
+        (push (intern (format "%s.%s" prefix (car cell))) inherited)))
+    (cons (nreverse merged) (nreverse inherited))))
+
 (defun +tt--merge-models (plan program)
-  "PLAN with the program's #+TT_MODELS as a per-role default.
-An entry's own value for a role wins; PROGRAM is the (MODELS LINE REPEATED)
-triple from `+tt--plan-models', or nil (then PLAN is returned unchanged).
-The roles the program supplied are recorded as `modelsFromProgram', so
-`tt lint' checks each declaration exactly once: the program's own at the
-program level, the entry's own on the entry — the inherited copies are not
-rechecked per entry, which would name the program's line against the entry's
-file."
+  "PLAN with the program's #+TT_MODELS as a per-key default.
+An entry's own value for a key (`worker', `reviewer.M', `panelFrom', ...)
+wins; a key the entry does not name still gets the program's.  PROGRAM is the
+(MODELS LINE REPEATED) triple from `+tt--plan-models', or nil (then PLAN is
+returned unchanged).  The keys the program supplied are recorded as
+`modelsFromProgram', so `tt lint' checks each declaration exactly once: the
+program's own at the program level, the entry's own on the entry — the
+inherited copies are not rechecked per entry, which would name the program's
+line against the entry's file."
   (if (not program)
       plan
     (let* ((own (append (alist-get 'models plan) nil))
-           (inherited (seq-remove (lambda (m) (assq (car m) own)) (nth 0 program)))
-           (merged (append own inherited)))
-      (setq plan (cons `(models . ,merged)
+           (prog (nth 0 program))
+           (merged nil)
+           (inherited nil))
+      (dolist (cell prog)
+        (let ((key (car cell)))
+          (cond
+           ((memq key '(reviewerSeats panelSeats))
+            (let* ((prefix (if (eq key 'reviewerSeats) "reviewer" "panel"))
+                   (m (+tt--merge-seat-map (alist-get key own) (cdr cell) prefix)))
+              (push (cons key (car m)) merged)
+              (setq inherited (append (cdr m) inherited))))
+           ((assq key own) nil) ; the entry's own value wins
+           (t
+            (push cell merged)
+            (push key inherited)))))
+      ;; The entry's own top-level keys survive even when the program does
+      ;; not mention them.
+      (dolist (cell own)
+        (unless (assq (car cell) merged) (push cell merged)))
+      (setq plan (cons `(models . ,(nreverse merged))
                        (assq-delete-all 'models (copy-alist plan))))
       (when inherited
-        (setq plan (cons `(modelsFromProgram . ,(vconcat (mapcar #'car inherited)))
+        (setq plan (cons `(modelsFromProgram . ,(vconcat (delete-dups (nreverse inherited))))
                          (assq-delete-all 'modelsFromProgram (copy-alist plan)))))
       (unless (assq 'modelsLine plan)
         (setq plan (cons `(modelsLine . ,(nth 1 program))

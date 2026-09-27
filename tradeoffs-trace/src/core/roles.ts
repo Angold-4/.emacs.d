@@ -14,22 +14,88 @@ export const PI_VERSION = "0.87.0";
 
 export type Role = "worker" | "reviewer" | "evaluator" | "panel";
 
+/** The reviewer seats (design §2.1): three reviewers of different model
+ * families, whose disagreement is the point of having three. */
+export type ReviewerSeat = "M" | "A" | "B";
+
+/** The three panel seats, named by position. */
+export type PanelSeat = 1 | 2 | 3;
+
+/** `panel=reviewers`: each panel seat gets the reviewer model of its
+ * position, so the panel disagrees with the same variety the reviewers do. */
+export type PanelFrom = "reviewers";
+
 /** A role's provider/model as a plan declares it (#+TT_MODELS). `provider`
- * is the part before the first `:` and is optional; a model id may itself
- * contain `/` (`vercel-ai-gateway:anthropic/claude-sonnet-5`). */
+ * is the part before the first `:` **when that part has no `/`** — Pi's
+ * `--model` accepts a thinking suffix (`openai/gpt-6-sol:high`), so a value
+ * whose first `:` follows a `/` is all model. A model id may itself contain
+ * `/` (`vercel-ai-gateway:anthropic/claude-sonnet-5`). */
 export interface RoleModel {
   provider?: string;
   model?: string;
 }
 
-export type PlanModels = Partial<Record<Role, RoleModel>>;
+/** A plan's `#+TT_MODELS` map (design §2.1). The four flat roles are how 05a
+ * declared it; the per-seat maps are how 05b lets M, A, B and panel seats 1–3
+ * each run on a different model, and `panelFrom: "reviewers"` makes each
+ * panel seat follow the reviewer of its position. Absent: every role and seat
+ * keeps Pi's `defaultModel`. */
+export interface PlanModels {
+  worker?: RoleModel;
+  reviewer?: RoleModel;
+  evaluator?: RoleModel;
+  panel?: RoleModel;
+  /** Done by Emacs for `reviewer.M`, `reviewer.A`, `reviewer.B`; a seat with
+   * no entry uses `reviewer`'s. */
+  reviewerSeats?: Partial<Record<ReviewerSeat, RoleModel>>;
+  /** Done by Emacs for `panel.1`, `panel.2`, `panel.3`; a seat with no entry
+   * uses the reviewer of its position when `panelFrom` is set, else `panel`'s. */
+  panelSeats?: Partial<Record<string, RoleModel>>;
+  /** `panel=reviewers` in the keyword. */
+  panelFrom?: PanelFrom;
+}
 
-/** The one place that answers "which provider/model does ROLE run with?":
- * a plan's own `models` map, when it declares one. Absent (the default): the
- * caller passes neither `--provider` nor `--model` and Pi uses its
- * `defaultModel`. */
-export function planModelSelector(plan: { models?: PlanModels }): (role: Role) => RoleModel | undefined {
-  return (role) => plan.models?.[role];
+/** The model each panel seat takes from the reviewer seats, by position. */
+const PANEL_SEAT_REVIEWER: Record<string, ReviewerSeat> = { "1": "M", "2": "A", "3": "B" };
+
+/** The one place that answers "which provider/model does ROLE (and, for the
+ * reviewer and panel roles, which seat) run with?" — a plan's own `models`
+ * map, when it declares one. Resolution, exactly as the runbook documents:
+ *
+ *  - reviewer M/A/B: the seat's own model, else `reviewer`'s;
+ *  - panel seat N: `panel.N`, else the reviewer of position N when
+ *    `panelFrom` is `"reviewers"`, else `panel`'s.
+ *
+ * Absent (the default): the caller passes neither `--provider` nor `--model`
+ * and Pi uses its `defaultModel`. */
+export function planModelSelector(
+  plan: { models?: PlanModels },
+): (role: Role, seat?: ReviewerSeat | PanelSeat | string | number) => RoleModel | undefined {
+  const models = plan.models;
+  const select = (role: Role, seat?: ReviewerSeat | PanelSeat | string | number): RoleModel | undefined => {
+    if (!models) return undefined;
+    if (role === "reviewer") {
+      if (seat !== undefined) {
+        const own = models.reviewerSeats?.[String(seat) as ReviewerSeat];
+        if (own) return own;
+      }
+      return models.reviewer;
+    }
+    if (role === "panel") {
+      if (seat !== undefined) {
+        const own = models.panelSeats?.[String(seat)];
+        if (own) return own;
+        if (models.panelFrom === "reviewers") {
+          const from = PANEL_SEAT_REVIEWER[String(seat)];
+          const inherited = from ? select("reviewer", from) : undefined;
+          if (inherited) return inherited;
+        }
+      }
+      return models.panel;
+    }
+    return models[role];
+  };
+  return select;
 }
 
 /** design §2.1's launch table. Every role uses an explicit allowlist, never

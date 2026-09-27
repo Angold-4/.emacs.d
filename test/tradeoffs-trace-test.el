@@ -709,6 +709,75 @@ entry's own value for a role wins over it."
               (should (equal (alist-get 'modelsFromProgram pb) [reviewer])))))
       (delete-directory dir t))))
 
+(ert-deftest tradeoffs-trace-plan-model-seats ()
+  "#+TT_MODELS names a seat as `reviewer.M' / `panel.2', and
+`panel=reviewers' records panelFrom for every panel seat; Pi's thinking
+suffix stays in the model because a provider is the text before the first
+`:' only when it has no `/` (finding #20)."
+  (let* ((text (concat "#+TT_MODELS: worker=deepseek/deepseek-v4.1-flash reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=deepseek/deepseek-v4.1-flash reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers\n"
+                       +tt-test--valid-plan))
+         (models (alist-get 'models (plist-get (+tt-test--parse text) :plan)))
+         (seats (alist-get 'reviewerSeats models)))
+    (should (equal (alist-get 'model (alist-get 'worker models)) "deepseek/deepseek-v4.1-flash"))
+    (should (equal (alist-get 'panelFrom models) "reviewers"))
+    (should-not (assq 'panel models))
+    (should (equal (alist-get 'provider (alist-get 'M seats)) "vercel-ai-gateway"))
+    (should (equal (alist-get 'model (alist-get 'M seats)) "anthropic/claude-opus-5.5"))
+    (should (equal (alist-get 'model (alist-get 'A seats)) "deepseek/deepseek-v4.1-flash"))
+    (should (equal (alist-get 'model (alist-get 'B seats)) "spacexai/grok-4.6"))
+    (should (equal (alist-get 'model (alist-get 'evaluator models)) "anthropic/claude-opus-5.5")))
+  ;; Pi's --model accepts a thinking suffix; a `/` before the first `:' means
+  ;; the whole value is the model, and the suffix is kept.
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_MODELS: reviewer=openai/gpt-6-sol:high\n" +tt-test--valid-plan)) :plan))
+         (reviewer (alist-get 'reviewer (alist-get 'models plan))))
+    (should (equal (alist-get 'model reviewer) "openai/gpt-6-sol:high"))
+    (should-not (assq 'provider reviewer)))
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_MODELS: reviewer=vercel-ai-gateway:openai/gpt-6-sol:high\n" +tt-test--valid-plan)) :plan))
+         (reviewer (alist-get 'reviewer (alist-get 'models plan))))
+    (should (equal (alist-get 'provider reviewer) "vercel-ai-gateway"))
+    (should (equal (alist-get 'model reviewer) "openai/gpt-6-sol:high")))
+  ;; an unknown seat and a repeated seat are preserved for `tt lint'
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_MODELS: reviewer.X=x panel.4=y reviewer.M=a reviewer.M=b\n" +tt-test--valid-plan)) :plan))
+         (models (alist-get 'models plan)))
+    (should (equal (alist-get 'model (alist-get 'X (alist-get 'reviewerSeats models))) "x"))
+    (should (equal (alist-get 'model (alist-get (intern "4") (alist-get 'panelSeats models))) "y"))
+    (should (equal (alist-get 'model (alist-get 'M (alist-get 'reviewerSeats models))) "b"))
+    (should (equal (alist-get 'modelsRepeated plan) ["reviewer.M"]))))
+
+(ert-deftest tradeoffs-trace-program-model-seats ()
+  "A program's #+TT_MODELS merges seat by seat: the entry's own seat wins,
+an unnamed seat still gets the program's, and the inherited keys are
+recorded for `tt lint'."
+  (let* ((dir (make-temp-file "tt-ert-prog-seats" t))
+         (plan-a (expand-file-name "a.org" dir))
+         (plan-b (expand-file-name "b.org" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file plan-a (insert +tt-test--valid-plan))
+          (with-temp-file plan-b (insert (concat "#+TT_MODELS: worker=entry-w reviewer.A=entry-a\n"
+                                                 (replace-regexp-in-string "p1" "q1" +tt-test--valid-plan))))
+          (with-temp-buffer
+            (insert "#+TITLE: pm\n#+TT_PROGRAM: 2\n#+TT_MODELS: worker=prog-w reviewer.M=prog-m panel=reviewers\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
+            (setq buffer-file-name (expand-file-name "program.org" dir) default-directory dir)
+            (org-mode)
+            (let* ((program (plist-get (+tt-parse-program) :program))
+                   (entries (alist-get 'entries program))
+                   (pa (alist-get 'plan (aref entries 0)))
+                   (pb (alist-get 'plan (aref entries 1))))
+              (set-buffer-modified-p nil) (setq buffer-file-name nil)
+              ;; an entry with none of its own inherits the program's seat
+              (should (equal (alist-get 'model (alist-get 'M (alist-get 'reviewerSeats (alist-get 'models pa)))) "prog-m"))
+              (should (equal (alist-get 'panelFrom (alist-get 'models pa)) "reviewers"))
+              (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models pa))) "prog-w"))
+              ;; the entry's own worker and reviewer.A win; the program's M stays
+              (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models pb))) "entry-w"))
+              (should (equal (alist-get 'model (alist-get 'A (alist-get 'reviewerSeats (alist-get 'models pb)))) "entry-a"))
+              (should (equal (alist-get 'model (alist-get 'M (alist-get 'reviewerSeats (alist-get 'models pb)))) "prog-m"))
+              ;; the inherited keys are recorded so `tt lint' checks each once
+              (should (equal (alist-get 'modelsFromProgram pb) [reviewer.M panelFrom]))
+              (should (equal (alist-get 'modelsFromProgram pa) [worker reviewer.M panelFrom])))))
+      (delete-directory dir t))))
+
 (ert-deftest tradeoffs-trace-trace-never-shows-a-secret-value ()
   "Plan 01a: the trace masks a declared secret's value (read from Emacs's own
 environment) wherever a stream file happens to hold one; the name shows."

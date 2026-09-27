@@ -306,3 +306,27 @@ test("plan-lint CLI: `tt program start` prints warnings and starts", async () =>
     cleanupDir(repo.dir);
   }
 });
+
+test("plan-lint CLI: `tt lint` reports a bad seat and a panel=reviewers conflict with file and line", async () => {
+  const dir = tmpDir("tt-lint-seats");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({
+        ...planWith(["all existing tests still pass"], [9], "/tmp/repo"),
+        models: { reviewerSeats: { X: { model: "x" } }, panelFrom: "reviewers", panelSeats: { "2": { model: "own" } } },
+        modelsRepeated: ["reviewer.M"],
+        modelsLine: 4,
+      }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout, /\/tmp\/PLAN\.org:4: error: \[models\]/);
+    assert.match(r.stdout, /unknown reviewer seat reviewer\.X/);
+    assert.match(r.stdout, /panel=reviewers together with an explicit panel seat/);
+    assert.match(r.stdout, /reviewer\.M more than once/);
+  } finally {
+    cleanupDir(dir);
+  }
+});

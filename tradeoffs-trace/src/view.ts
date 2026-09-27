@@ -9,7 +9,7 @@ import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { effectiveChecks } from "./core/checks.ts";
-import type { PlanModels } from "./core/roles.ts";
+import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
@@ -118,14 +118,34 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
 
 /** #+TT_MODELS, in the order the roles appear in the pipeline, as
  * `role=provider:model` (provider only when the plan declared one). Empty
- * when the plan set no models, so a view can omit the line entirely. */
+ * when the plan set no models, so a view can omit the line entirely.
+ *
+ * When the plan sets per-seat models, the reviewer and panel roles expand to
+ * one entry per seat (`reviewer.M`, `panel.1`, …), each resolved with the
+ * same selector the launch sites use — so the line names what each seat ran
+ * on, not just the role's shared default. A plan that only sets the four flat
+ * roles keeps the four-entry line unchanged. */
 export function modelEntries(models: PlanModels | undefined): Array<{ role: string; value: string }> {
   if (!models) return [];
+  const select = planModelSelector({ models });
   const out: Array<{ role: string; value: string }> = [];
-  for (const role of ["worker", "reviewer", "evaluator", "panel"] as const) {
-    const m = models[role];
-    if (!m) continue;
+  const push = (role: string, m: RoleModel | undefined): void => {
+    if (!m) return;
     out.push({ role, value: m.provider ? `${m.provider}:${m.model ?? ""}` : m.model ?? "" });
+  };
+  push("worker", models.worker);
+  const reviewerSeats = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
+  if (reviewerSeats) {
+    for (const seat of ["M", "A", "B"] as const) push(`reviewer.${seat}`, select("reviewer", seat));
+  } else {
+    push("reviewer", models.reviewer);
+  }
+  push("evaluator", models.evaluator);
+  const panelSeats = models.panelFrom === "reviewers" || (models.panelSeats ? Object.keys(models.panelSeats).length > 0 : false);
+  if (panelSeats) {
+    for (const seat of ["1", "2", "3"] as const) push(`panel.${seat}`, select("panel", seat));
+  } else {
+    push("panel", models.panel);
   }
   return out;
 }

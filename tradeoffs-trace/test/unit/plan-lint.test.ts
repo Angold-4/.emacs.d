@@ -252,3 +252,60 @@ test("plan-lint: the existing atlas plans have no false error except 13j's owner
   // Warnings are allowed on the real plans; they never stop a run.
   assert.ok(warnings >= 1, "expected at least the 13i future/tolerance warnings");
 });
+
+test("plan-lint: #+TT_MODELS rejects an unknown reviewer/panel seat with file and line", () => {
+  const base = plan([{ id: "p1", acceptance: ["fine"] }], "/x/PLAN.org");
+  const unknownSeat = lintPlan({ ...base, models: { reviewerSeats: { X: { model: "x" } } }, modelsLine: 4 });
+  assert.deepEqual(unknownSeat.map((f) => f.rule), ["model-declaration"]);
+  assert.equal(unknownSeat[0].severity, "error");
+  assert.equal(unknownSeat[0].line, 4);
+  assert.equal(unknownSeat[0].sourceFile, "/x/PLAN.org");
+  assert.match(unknownSeat[0].problem, /unknown reviewer seat reviewer\.X/);
+  assert.match(unknownSeat[0].fix, /reviewer\.M, reviewer\.A or reviewer\.B/);
+
+  const unknownPanel = lintPlan({ ...base, models: { panelSeats: { "4": { model: "y" } } }, modelsLine: 6 });
+  assert.match(unknownPanel[0].problem, /unknown panel seat panel\.4/);
+  assert.match(unknownPanel[0].fix, /panel\.1, panel\.2 or panel\.3/);
+});
+
+test("plan-lint: a seat named twice is an error at the keyword's line", () => {
+  const base = plan([{ id: "p1", acceptance: ["fine"] }], "/x/PLAN.org");
+  const findings = lintPlan({ ...base, models: { reviewerSeats: { M: { model: "b" } } }, modelsRepeated: ["reviewer.M"], modelsLine: 5 });
+  assert.deepEqual(findings.map((f) => f.rule), ["model-declaration"]);
+  assert.equal(findings[0].line, 5);
+  assert.match(findings[0].problem, /reviewer\.M more than once/);
+});
+
+test("plan-lint: panel=reviewers with an explicit panel.N is an error", () => {
+  const base = plan([{ id: "p1", acceptance: ["fine"] }], "/x/PLAN.org");
+  const findings = lintPlan({
+    ...base,
+    models: { panelFrom: "reviewers", reviewerSeats: { M: { model: "m" } }, panelSeats: { "2": { model: "own" } } },
+    modelsLine: 8,
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].severity, "error");
+  assert.equal(findings[0].line, 8);
+  assert.equal(findings[0].sourceFile, "/x/PLAN.org");
+  assert.match(findings[0].problem, /panel=reviewers together with an explicit panel seat/);
+});
+
+test("plan-lint: a full per-seat declaration passes and an empty seat model fails", () => {
+  const base = plan([{ id: "p1", acceptance: ["fine"] }], "/x/PLAN.org");
+  const ok = lintPlan({
+    ...base,
+    models: {
+      worker: { model: "deepseek/deepseek-v4.1-flash" },
+      reviewerSeats: { M: { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" }, A: { model: "deepseek/deepseek-v4.1-flash" } },
+      evaluator: { model: "anthropic/claude-opus-5.5" },
+      panelFrom: "reviewers",
+    },
+    modelsLine: 3,
+  });
+  assert.deepEqual(ok, []);
+
+  const empty = lintPlan({ ...base, models: { reviewerSeats: { B: {} } }, modelsLine: 3 });
+  assert.deepEqual(empty.map((f) => f.rule), ["model-declaration"]);
+  assert.match(empty[0].problem, /empty model/);
+  assert.match(empty[0].problem, /reviewer\.B/);
+});

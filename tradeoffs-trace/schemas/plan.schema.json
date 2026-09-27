@@ -15,14 +15,39 @@
       "items": { "$ref": "#/$defs/PlanPhase" }
     },
     "models": {
-      "description": "#+TT_MODELS: an optional provider/model per role. A role absent from the object keeps Pi's defaultModel.",
+      "description": "#+TT_MODELS: an optional provider/model per role and per seat. A role or seat absent from the object keeps Pi's defaultModel.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "worker": { "$ref": "#/$defs/RoleModel" },
         "reviewer": { "$ref": "#/$defs/RoleModel" },
+        "reviewerSeats": {
+          "description": "Per-seat reviewer models (reviewer.M, reviewer.A, reviewer.B); a seat without one uses reviewer's.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "M": { "$ref": "#/$defs/RoleModel" },
+            "A": { "$ref": "#/$defs/RoleModel" },
+            "B": { "$ref": "#/$defs/RoleModel" }
+          }
+        },
         "evaluator": { "$ref": "#/$defs/RoleModel" },
-        "panel": { "$ref": "#/$defs/RoleModel" }
+        "panel": { "$ref": "#/$defs/RoleModel" },
+        "panelSeats": {
+          "description": "Per-seat panel models (panel.1, panel.2, panel.3); a seat without one uses the reviewer of its position when panelFrom is reviewers, else panel's.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "1": { "$ref": "#/$defs/RoleModel" },
+            "2": { "$ref": "#/$defs/RoleModel" },
+            "3": { "$ref": "#/$defs/RoleModel" }
+          }
+        },
+        "panelFrom": {
+          "description": "`panel=reviewers`: each panel seat follows the reviewer model of its position.",
+          "type": "string",
+          "enum": ["reviewers"]
+        }
       }
     },
     "modelsLine": {
