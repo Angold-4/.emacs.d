@@ -1755,11 +1755,14 @@ every call (`wrong-type-argument stringp'), and every other test stubs it."
 node list; without the file it shows a one-line notice and the node list."
   (let* ((dir (make-temp-file "tt-ert-prog" t))
          (+tt-root (file-name-as-directory dir))
+         (node-line "\u25b6 13a                    running   run-a prog1-01")
          (chart "program prog1 - title\n\n+-------+\n| 13a   |  running - IMPLEMENTING\n+-------+\n")
          (state `((id . "prog1")
                   (sourcePath . "/tmp/prog.org")
                   (state (nodes (13a (runId . "run-a") (readableId . "prog1-01"))))
-                  (lines "\u25b6 13a                    running   run-a prog1-01"))))
+                  ;; An explicit list of strings: `+tt--render-program' walks it
+                  ;; with `dolist', which never iterates a bare string.
+                  (lines . ,(list node-line)))))
     (unwind-protect
         (progn
           (make-directory (expand-file-name "views" dir) t)
@@ -1791,6 +1794,38 @@ node list; without the file it shows a one-line notice and the node list."
               (let ((text (buffer-string)))
                 (should (string-match-p "\\`no program chart yet (views/program.txt)\n" text))
                 (should (string-match-p "\u25b6 13a" text))))))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-program-buffer-keeps-point-on-the-node ()
+  "Plan 03c (A-3/B-1): the chart above the node list changes length between
+refreshes; point must stay on the node the owner was on, not drift to a
+neighbouring line (which would make RET open the wrong run)."
+  (let* ((dir (make-temp-file "tt-ert-prog" t))
+         (+tt-root (file-name-as-directory dir))
+         (state `((id . "prog1")
+                  (sourcePath . "/tmp/prog.org")
+                  (state (nodes (13a (runId . "run-a") (readableId . "prog1-01"))
+                                (13b (runId . "run-b") (readableId . "prog1-02"))))
+                  (lines . ,(list "\u25b6 13a running run-a prog1-01"
+                                  "\u25b6 13b running run-b prog1-02")))))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/program.txt" dir)
+            (insert "program prog1 - title\n"))
+          (cl-letf (((symbol-function '+tt--program-state) (lambda (_) state)))
+            (with-temp-buffer
+              (+tt-program-mode)
+              (setq +tt--program-dir dir)
+              (+tt--render-program)
+              (goto-char (point-min))
+              (search-forward "13b")
+              ;; The runtime appends `run:' and `reason' lines to the chart as
+              ;; the program moves, so the node list shifts down.
+              (with-temp-file (expand-file-name "views/program.txt" dir)
+                (insert "program prog1 - title\n\nrun: r-a\nreason: waiting on you\nmore\n"))
+              (+tt--render-program)
+              (should (equal (get-text-property (point) '+tt-run-id) "run-b")))))
       (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-chart-keys-open-the-chart ()

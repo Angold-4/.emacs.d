@@ -681,6 +681,28 @@ whole program; warnings are shown and it starts."
   (json-parse-string (+tt--cli "program" "state" dir) :object-type 'alist :array-type 'list
                      :null-object nil :false-object :false))
 
+(defun +tt--program-point-anchor ()
+  "The run id on the program line at point, for restoring point after a refresh.
+A node line (and its indented detail lines) carries `+tt-run-id'; a line of
+the prepended chart does not.  Anchoring to the run id keeps point on the
+same node when the chart above the node list changes length between ticks
+(findings A-3/B-1), never a raw character offset into the shifted text."
+  (get-text-property (point) '+tt-run-id))
+
+(defun +tt--program-goto-anchor (anchor)
+  "Move point to the first program line carrying run id ANCHOR; nil when none."
+  (when anchor
+    (goto-char (point-min))
+    (let ((pos (point-min))
+          (limit (point-max))
+          (found nil))
+      (while (and (not found) (< pos limit))
+        (if (equal (get-text-property pos '+tt-run-id) anchor)
+            (setq found pos)
+          (setq pos (next-single-property-change pos '+tt-run-id nil limit))))
+      (when found (goto-char found))
+      found)))
+
 (defun +tt--render-program ()
   "Render the program buffer from `tt program state'.
 Plan 03c: the header line carries the program id and the Org program file it
@@ -692,6 +714,7 @@ run and does nothing on the chart."
          (nodes (alist-get 'nodes (alist-get 'state s)))
          (source (alist-get 'sourcePath s))
          (chart (expand-file-name "views/program.txt" +tt--program-dir))
+         (anchor (+tt--program-point-anchor))
          (inhibit-read-only t)
          (pt (point)))
     (setq header-line-format
@@ -721,7 +744,10 @@ run and does nothing on the chart."
            ;; trade-off) belongs to the node above it; RET opens the same run.
            ((and run-id (string-prefix-p "    " line))
             (put-text-property start (point) '+tt-run-id run-id))))))
-    (goto-char (min pt (point-max)))))
+    ;; Prefer the node the owner was on; only when point was not in the node
+    ;; list (a chart line, or the first render) fall back to the old offset.
+    (unless (+tt--program-goto-anchor anchor)
+      (goto-char (min pt (point-max))))))
 
 (defun +tt-program-open-node ()
   "Open the workspace of the node's run at point."
