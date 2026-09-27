@@ -80,14 +80,24 @@ test("stale reviews: a reviewer calling submit_review twice at once never crashe
       // The first submission waits on a slow reproduction; the second
       // arrives while it is being recorded.
       const slow = [{ kind: "defect", severity: "advisory", evidence: "check the loop — reproduction command: `sleep 2`", reproduction: { command: "sleep 2" } }];
+      // The submit reply is recorded asynchronously; let the conductor finish
+      // recording the discovery (and resolve its own discovery promise) before
+      // the turn-1 settle, so a loaded machine cannot process the settle first
+      // and record REVIEW_TIMED_OUT (the test's own assertion caught that).
       const steps: FakePiStep[] = [
         { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "sleep", ms: 1_000 },
         { kind: "wait-for-prompt" },
       ];
       if (reviewer === "B") steps.push({ kind: "call-submit", tool: "submit_review", args: review(slow), noWait: true }, { kind: "sleep", ms: 200 });
       steps.push({ kind: "call-submit", tool: "submit_review", args: review([]) });
-      // A real agent's turn lasts until its tool call returns.
-      if (reviewer === "B") steps.push({ kind: "sleep", ms: 4_000 });
+      // A real agent's turn lasts until its tool call returns, and the first
+      // submission is still being recorded while its `sleep 2` reproduction
+      // runs. Keep the turn alive comfortably past that reproduction so the
+      // recorded submission, not a settle, wins the race: a load-sensitive
+      // 4s margin let the agent settle first under a busy check run and
+      // recorded REVIEW_TIMED_OUT (the test's own assertion caught it).
+      if (reviewer === "B") steps.push({ kind: "sleep", ms: 15_000 });
       return { hello: defaultReviewerHello(), steps };
     },
   });
