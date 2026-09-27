@@ -1754,6 +1754,7 @@ every call (`wrong-type-argument stringp'), and every other test stubs it."
   "Plan 03c: the program buffer begins with `views/program.txt', then the
 node list; without the file it shows a one-line notice and the node list."
   (let* ((dir (make-temp-file "tt-ert-prog" t))
+         (+tt-root (file-name-as-directory dir))
          (chart "program prog1 - title\n\n+-------+\n| 13a   |  running - IMPLEMENTING\n+-------+\n")
          (state `((id . "prog1")
                   (sourcePath . "/tmp/prog.org")
@@ -1772,7 +1773,14 @@ node list; without the file it shows a one-line notice and the node list."
               (should (string-match-p "\u25b6 13a" (buffer-string)))
               ;; the node list comes after the chart
               (should (< (string-match-p "program prog1" (buffer-string))
-                         (string-match-p "\u25b6 13a" (buffer-string))))))
+                         (string-match-p "\u25b6 13a" (buffer-string))))
+              ;; RET on a node line still opens that node's run
+              (let (opened)
+                (cl-letf (((symbol-function '+tt--workspace) (lambda (d) (setq opened d))))
+                  (goto-char (point-min))
+                  (search-forward "\u25b6 13a")
+                  (+tt-program-open-node))
+                (should (equal opened (expand-file-name "run-a" +tt-root))))))
           ;; Without the file: one-line notice, then the node list.
           (delete-file (expand-file-name "views/program.txt" dir))
           (cl-letf (((symbol-function '+tt--program-state) (lambda (_) state)))
@@ -1851,6 +1859,9 @@ state's line, and the current state's box and `current state:' line are faced."
             (insert (replace-regexp-in-string
                      "current state: IMPLEMENTING" "current state: REVIEWING" +tt-test--loop-chart))
             (insert "\n  | REVIEWING     |  entered 1x - 8s\n"))
+          ;; Force a different stored mtime, so the test does not depend on
+          ;; the filesystem's timestamp granularity between the two writes.
+          (setq +tt-chart--mtime '(0 0))
           (+tt-chart-refresh)
           (should (string-match-p "current state: REVIEWING" (buffer-string)))
           (should (looking-at "  | IMPLEMENTING")))
