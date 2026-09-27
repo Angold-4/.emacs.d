@@ -6058,6 +6058,11 @@ export class Conductor {
       this.#log.completion(actionId, { blockerId, seat, ok: false, reason: outcome });
       this.#panelSeatUnavailable(blockerId, seat, dispatchCandidate, `the seat did not vote (${outcome})`);
     } finally {
+      // Defensive: every path above terminates the seat, but a throw between
+      // the spawn and its own terminate must not leave a pi process (and its
+      // session) behind, invisible to `stop()` once the handle is dropped.
+      // `terminate()` is idempotent/memoized, so the normal paths pay nothing.
+      await agent.terminate().catch(() => undefined);
       this.#agents.delete(agentId);
     }
   }

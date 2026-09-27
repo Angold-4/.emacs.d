@@ -36,17 +36,21 @@ import {
   type TestConductorSetup,
 } from "./harness.ts";
 
+// Small graces: a fake-pi agent replies to `abort` but never exits on its own,
+// so every terminate pays the whole abort grace. These tests spend their time
+// in that grace and in the pipeline itself, so keep both short (the suite's
+// total wall time is what the phase's own check command is budgeted against).
 const FAST = {
-  abortGraceMs: 200,
-  termGraceMs: 200,
+  abortGraceMs: 60,
+  termGraceMs: 60,
   helloTimeoutMs: 5_000,
   checkMs: 20_000,
-  freezeMs: 15_000,
-  workerAttemptMs: 30_000,
-  reviewMs: 20_000,
-  probeMs: 5_000,
-  evaluateMs: 20_000,
-  panelMs: 20_000,
+  freezeMs: 10_000,
+  workerAttemptMs: 20_000,
+  reviewMs: 15_000,
+  probeMs: 4_000,
+  evaluateMs: 15_000,
+  panelMs: 15_000,
 };
 
 const BLOCKER_EVIDENCE = "src/cancel.ts:10 the cancel path can deadlock";
@@ -223,11 +227,8 @@ test("plan 04b: 2 of 3 block parks the phase with the panel's options and no rep
       "the owner's choice resolves the blocker message",
     );
     // The phase continues into the repair that carries the choice out.
-    await waitFor(() => ["DONE", "IMPLEMENTING", "REPAIRING", "BLOCKED"].includes(setup.conductor.state.phase.phase), 60_000, 20, setup.runDir);
-    assert.ok(
-      countType(setup, "REPAIR_ATTEMPT_STARTED") >= 1,
-      "the owner's choice starts a repair attempt",
-    );
+    await waitFor(() => countType(setup, "REPAIR_ATTEMPT_STARTED") >= 1, 60_000, 20, setup.runDir);
+    assert.notEqual(setup.conductor.state.phase.phase, "AWAITING_OWNER", "the phase resumes after the owner's choice");
     // The choice itself reaches the next worker attempt's prompt.
     await waitFor(
       () => fs.existsSync(path.join(promptDir, "worker.log")) && fs.readFileSync(path.join(promptDir, "worker.log"), "utf8").includes("repair the cancel path"),
@@ -330,7 +331,7 @@ test("plan 04b: a seat that times out is retried once and its real vote decides;
           ],
         };
       },
-      deadlines: { ...FAST, panelMs: 1200 },
+      deadlines: { ...FAST, panelMs: 700 },
     });
     await setup.conductor.start();
     try {
@@ -372,11 +373,18 @@ test("plan 04b: a seat that times out is retried once and its real vote decides;
                 },
               ],
             },
-      deadlines: { ...FAST, panelMs: 1200 },
+      deadlines: { ...FAST, panelMs: 700 },
     });
     await setup.conductor.start();
     try {
-      await waitFor(() => setup.conductor.state.phase.repairRoundsUsed >= 1, 120_000, 20, setup.runDir);
+      // The panel's verdict is in as soon as it leaves EVALUATING; no need to
+      // wait for the whole repair round on top.
+      await waitFor(
+        () => countType(setup, "PANEL_DECIDED") === 1 && setup.conductor.state.phase.phase !== "EVALUATING",
+        120_000,
+        20,
+        setup.runDir,
+      );
       assert.equal(countType(setup, "PANEL_SEAT_UNAVAILABLE"), 4, "two seats lost twice each");
       assert.equal(
         (events(setup).find((e) => e.type === "PANEL_DECIDED") as { outcome?: string } | undefined)?.outcome,
