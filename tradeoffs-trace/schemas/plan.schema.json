@@ -33,6 +33,11 @@
       "description": "Lint-only: roles #+TT_MODELS named more than once (a JSON object cannot carry a duplicate key).",
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
+    },
+    "modelsFromProgram": {
+      "description": "A program entry only: roles its plan inherited from the program's #+TT_MODELS, already linted once at the program level.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
     }
   },
   "$defs": {

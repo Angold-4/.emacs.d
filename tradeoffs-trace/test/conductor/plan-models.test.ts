@@ -167,7 +167,7 @@ test("plan-models: a plan's models launch every role with its own --provider/--m
     const loop = fs.readFileSync(path.join(setup.runDir, "views", "loop.txt"), "utf8");
     assert.match(loop, /IMPLEMENTING.*worker - model m-w/);
     assert.match(loop, /REVIEWING.*M, A, B - model m-r/);
-    assert.match(loop, /EVALUATING.*evaluator, panel - model m-e/);
+    assert.match(loop, /EVALUATING.*evaluator, panel - model m-e \(panel model m-p\)/);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

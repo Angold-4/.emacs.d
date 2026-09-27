@@ -699,7 +699,14 @@ entry's own value for a role wins over it."
               (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models pb))) "entry-w"))
               (should (equal (alist-get 'model (alist-get 'reviewer (alist-get 'models pb))) "prog-r"))
               ;; the program object keeps its own declaration for `tt lint'
-              (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models program))) "prog-w")))))
+              (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models program))) "prog-w"))
+              ;; ... and names its own Org file, not the temporary JSON copy
+              (should (equal (alist-get 'sourceFile program) (expand-file-name "program.org" dir)))
+              ;; which roles came from the program is recorded, so `tt lint'
+              ;; checks each declaration exactly once (the entry's own here,
+              ;; the program's on the program object)
+              (should (equal (alist-get 'modelsFromProgram pa) [worker reviewer]))
+              (should (equal (alist-get 'modelsFromProgram pb) [reviewer])))))
       (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-trace-never-shows-a-secret-value ()

@@ -71,9 +71,16 @@ export interface LintPlanInput {
   models?: Record<string, LintRoleModel>;
   modelsLine?: number;
   modelsRepeated?: string[];
+  /** Roles this entry inherited from a program-level #+TT_MODELS. They are
+   * already checked once at the program level; rechecking them per entry
+   * would report the program's line against the entry's own file. */
+  modelsFromProgram?: string[];
 }
 
 export interface LintProgramInput {
+  /** The Org program file, so a program-level finding names it rather than
+   * the temporary JSON copy Emacs deletes. */
+  sourceFile?: string;
   entries?: Array<{ id?: string; plan?: LintPlanInput }>;
   /** A program file may also declare #+TT_MODELS; Emacs records the same
    * three fields at the program level so a bad default is reported once. */
@@ -181,10 +188,13 @@ function modelFinding(plan: LintPlanInput, item: string, problem: string, fix: s
  * flag). Absent: no findings, so a plan without the keyword is unchanged. */
 export function lintModels(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [];
+  const inherited = new Set(plan.modelsFromProgram ?? []);
   for (const role of plan.modelsRepeated ?? []) {
+    if (inherited.has(role)) continue;
     out.push(modelFinding(plan, role, `#+TT_MODELS names ${role} more than once`, `declare each role once: ${role}=<provider>:<model>`));
   }
   for (const [role, raw] of Object.entries(plan.models ?? {})) {
+    if (inherited.has(role)) continue;
     if (!MODEL_ROLES.has(role)) {
       out.push(modelFinding(plan, role, `#+TT_MODELS names the unknown role ${role}`, "use one of worker, reviewer, evaluator, panel"));
       continue;

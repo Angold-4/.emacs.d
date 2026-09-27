@@ -184,6 +184,40 @@ test("plan-lint CLI: a plan that uses #+TT_MODELS cleanly passes", async () => {
   }
 });
 
+test("plan-lint CLI: a program-level #+TT_MODELS is reported once, at the program file", async () => {
+  const dir = tmpDir("tt-lint-prog-models");
+  try {
+    const programPath = path.join(dir, "program.json");
+    const entry = planWith(["all existing tests still pass"], [9], "/tmp/repo");
+    // The shape Emacs emits: the program's `foo` copied into every entry and
+    // recorded in `modelsFromProgram`. It must be reported once, at the
+    // program's own Org file, never once per entry or as the temp JSON path.
+    fs.writeFileSync(
+      programPath,
+      JSON.stringify({
+        title: "program-models",
+        sourceFile: "/tmp/PROGRAM.org",
+        maxParallel: 1,
+        branches: "stack",
+        models: { foo: { model: "x" } },
+        modelsLine: 3,
+        entries: [
+          { id: "e1", after: [], plan: { ...entry, sourceFile: "/tmp/e1.org", models: { foo: { model: "x" } }, modelsLine: 3, modelsFromProgram: ["foo"] } },
+          { id: "e2", after: [], plan: { ...entry, sourceFile: "/tmp/e2.org", models: { foo: { model: "x" } }, modelsLine: 3, modelsFromProgram: ["foo"] } },
+        ],
+      }),
+    );
+    const r = await runCli(["lint", programPath], {});
+    assert.notEqual(r.code, 0);
+    assert.equal((r.stdout.match(/error: \[models\]/g) ?? []).length, 1, `exactly one program-level finding:\n${r.stdout}`);
+    assert.match(r.stdout, /\/tmp\/PROGRAM\.org:3: error: \[models\]/);
+    assert.doesNotMatch(r.stdout, /\[e[12]\/models\]/);
+    assert.doesNotMatch(r.stdout, /program\.json/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
 test("plan-lint CLI: `tt lint` on a program lints every entry", async () => {
   const dir = tmpDir("tt-lint");
   try {

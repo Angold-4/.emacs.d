@@ -161,8 +161,10 @@ Runs on DIR's host, so a plan opened over TRAMP asks the server's repo."
 
 (defun +tt--keyword-at (name)
   "Return (VALUE . LINE) for the first #+NAME in the current buffer, or nil.
-LINE is the 1-based line of the keyword itself, so `tt lint' can point at the
-Org line the owner edited (as `acceptanceLines' does for a list item)."
+The first keyword wins, as for every other plan keyword (`+tt--keyword'): a
+second declaration is ignored, not merged.  LINE is the 1-based line of the
+keyword itself, so `tt lint' can point at the Org line the owner edited (as
+`acceptanceLines' does for a list item)."
   (org-element-map (org-element-parse-buffer 'element) 'keyword
     (lambda (k) (when (string= (org-element-property :key k) name)
                   (cons (org-element-property :value k)
@@ -557,14 +559,21 @@ continues.  FILE names the Org file for the errors buffer."
   "PLAN with the program's #+TT_MODELS as a per-role default.
 An entry's own value for a role wins; PROGRAM is the (MODELS LINE REPEATED)
 triple from `+tt--plan-models', or nil (then PLAN is returned unchanged).
-The entry's modelsLine falls back to the program's, so `tt lint' can still
-point at the keyword for a role the program supplied."
+The roles the program supplied are recorded as `modelsFromProgram', so
+`tt lint' checks each declaration exactly once: the program's own at the
+program level, the entry's own on the entry — the inherited copies are not
+rechecked per entry, which would name the program's line against the entry's
+file."
   (if (not program)
       plan
     (let* ((own (append (alist-get 'models plan) nil))
-           (merged (append own (seq-remove (lambda (m) (assq (car m) own)) (nth 0 program)))))
+           (inherited (seq-remove (lambda (m) (assq (car m) own)) (nth 0 program)))
+           (merged (append own inherited)))
       (setq plan (cons `(models . ,merged)
                        (assq-delete-all 'models (copy-alist plan))))
+      (when inherited
+        (setq plan (cons `(modelsFromProgram . ,(vconcat (mapcar #'car inherited)))
+                         (assq-delete-all 'modelsFromProgram (copy-alist plan)))))
       (unless (assq 'modelsLine plan)
         (setq plan (cons `(modelsLine . ,(nth 1 program))
                          (assq-delete-all 'modelsLine (copy-alist plan)))))
@@ -620,7 +629,11 @@ several phases runs them in order."
                   (setq plan (+tt--merge-models plan program-models))
                   (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
     (unless entries (push (cons 1 "program has no entries") errors))
-    (list :program (append `((title . ,title) (maxParallel . ,max) (branches . ,branches)
+    (list :program (append `((title . ,title)
+                             ;; The Org program file, so `tt lint' names it
+                             ;; rather than the temporary JSON copy.
+                             (sourceFile . ,file)
+                             (maxParallel . ,max) (branches . ,branches)
                              (entries . ,(vconcat (nreverse entries))))
                            ;; The program file's own #+TT_MODELS, for `tt lint'
                            ;; (the entries already carry the merged form).

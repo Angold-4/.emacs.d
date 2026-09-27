@@ -149,15 +149,36 @@ test("plan-lint: #+TT_MODELS rejects an unknown role, a repeated role and an emp
 });
 
 test("plan-lint: a program's own #+TT_MODELS is reported once, not per entry", () => {
+  // Mirrors what Emacs emits: the program's `foo` is copied into the entry's
+  // `models` and recorded in `modelsFromProgram`, so the entry must not
+  // re-report it (which would name the program's line against the entry file).
   const findings = lintProgram({
+    sourceFile: "/x/program.org",
     models: { foo: { model: "x" } },
     modelsLine: 2,
-    entries: [{ id: "e1", plan: plan([{ id: "p1", acceptance: ["fine"] }]) }],
+    entries: [
+      {
+        id: "e1",
+        plan: {
+          ...plan([{ id: "p1", acceptance: ["fine"] }], "/x/e1.org"),
+          models: { foo: { model: "x" }, bar: { model: "y" } },
+          modelsLine: 5,
+          modelsFromProgram: ["foo"],
+        },
+      },
+    ],
   });
-  assert.equal(findings.length, 1);
-  assert.equal(findings[0].rule, "model-declaration");
-  assert.equal(findings[0].phaseId, "models");
-  assert.equal(findings[0].line, 2);
+  // Once for the program's `foo`, at the program's own file and line; once
+  // for the entry's own `bar`, at the entry's file and line.
+  assert.equal(findings.length, 2);
+  const programFinding = findings.find((f) => f.sourceFile === "/x/program.org")!;
+  assert.match(programFinding.problem, /unknown role foo/);
+  assert.equal(programFinding.line, 2);
+  assert.equal(programFinding.phaseId, "models");
+  const entryFinding = findings.find((f) => f.sourceFile === "/x/e1.org")!;
+  assert.match(entryFinding.problem, /unknown role bar/);
+  assert.equal(entryFinding.line, 5);
+  assert.equal(entryFinding.phaseId, "e1/models");
 });
 
 test("plan-lint: a program lints every entry and prefixes the phase id", () => {

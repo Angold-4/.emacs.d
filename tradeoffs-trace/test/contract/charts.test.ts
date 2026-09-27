@@ -112,6 +112,10 @@ test("loop.txt matches its golden file, with the current-state marker", () => {
   // own model too, not a placeholder `default` (the criterion for this work).
   const withEvaluator = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet", evaluator: "haiku" } });
   assert.match(withEvaluator, /EVALUATING.*evaluator, panel - model haiku/);
+  // A panel with its own model is named too, so the box does not claim the
+  // evaluator's model ran on the panel seat.
+  const withPanel = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet", evaluator: "haiku", panel: "gpt" } });
+  assert.match(withPanel, /EVALUATING.*evaluator, panel - model haiku \(panel model gpt\)/);
   // The run axis carries its own current marker, not phase counts (M-5).
   assert.match(chart, /^> .*\n  \| RUN_ACTIVE\s+\|  current/m);
 });

@@ -4400,10 +4400,15 @@ export class Conductor {
     // injected provider/model when a caller set one, otherwise Pi's own
     // default from settings.json, otherwise `default`.
     const modelFor = (role: Role): string | undefined => this.#providerModelFor?.(role)?.model ?? piDefaultModel();
-    // The evaluator (and the panel, which shares the EVALUATING box) has a
-    // model source now (#+TT_MODELS), so it reads its own instead of M-9's
+    // The evaluator and the panel (which shares the EVALUATING box) have a
+    // model source now (#+TT_MODELS), so each reads its own instead of M-9's
     // placeholder `default`.
-    const models = { worker: modelFor("worker"), reviewer: modelFor("reviewer"), evaluator: modelFor("evaluator") };
+    const models = {
+      worker: modelFor("worker"),
+      reviewer: modelFor("reviewer"),
+      evaluator: modelFor("evaluator"),
+      panel: modelFor("panel"),
+    };
     fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
   }
 
