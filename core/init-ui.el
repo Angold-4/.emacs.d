@@ -181,6 +181,20 @@
 ;; (setq display-line-numbers-type 'relative)
 
 ;; =============================================================================
+;; Line Wrapping
+;; =============================================================================
+
+;; Wrap long lines at the window's edge, between words, so no line runs past
+;; the border: prose, Org (the tradeoffs-trace review buffer included) and
+;; code alike.  Only the display wraps; the file keeps its long lines.  It is
+;; enabled per mode rather than globally, so column layouts (tabulated lists,
+;; the git UIs, which set `truncate-lines' themselves) keep one row per line.
+;; `visual-line-mode' overrides both the global `truncate-lines' default in
+;; init.el and `org-startup-truncated'.
+(dolist (hook '(text-mode-hook prog-mode-hook conf-mode-hook))
+  (add-hook hook #'visual-line-mode))
+
+;; =============================================================================
 ;; Mode Line
 ;; =============================================================================
 
