@@ -369,8 +369,11 @@ function dumpDebugState(runDir: string): void {
  * several times slower than a single-file run; a correct run whose
  * transition takes 40 s instead of 3 s must not be reported as a failure
  * just because the host was busy. A genuinely stuck run still fails, just
- * after at least this many milliseconds. */
-export const WAIT_FOR_FLOOR_MS = 90_000;
+ * after at least this many milliseconds. 150 s (up from 90 s): measured under
+ * the phase's own `make check` (4-way file concurrency, the whole suite), a
+ * stage that takes ~15 s alone can exceed 90 s — the base's notify test ran
+ * 34 s and then timed out past 90 s on a loaded candidate. */
+export const WAIT_FOR_FLOOR_MS = 150_000;
 
 /** Polls `check()` until it returns true or its (load-tolerant) budget
  * elapses. `debugRunDir` (work packet 2a addition), if given, is dumped via

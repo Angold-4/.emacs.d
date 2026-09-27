@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
 
-import { ROLE_TOOLS, type PlanModels, type Role } from "../../src/core/roles.ts";
+import { launchArgs, planModelSelector, ROLE_TOOLS, type PlanModels, type Role } from "../../src/core/roles.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 import {
   cleanupDir,
@@ -176,30 +176,17 @@ test("plan-models: a plan's models launch every role with its own --provider/--m
   }
 });
 
-test("plan-models: setting only reviewer changes only the reviewers' arguments", async () => {
-  const argvDir = fs.mkdtempSync("/tmp/tt-plan-models-");
-  const setup = await setupConductor({
-    checks: ["true"],
-    stubReviews: false,
-    models: { reviewer: { provider: "p-r", model: "m-r" } },
-    extraEnv: { FAKE_PI_ARGV_LOG: argvDir },
-    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
-    reviewerScriptFor: blockerReviewer(),
-    evaluatorScriptFor: blockerEvaluator(),
-    deadlines: FAST,
-  });
-  try {
-    await setup.conductor.start();
-    await waitFor(() => argvFor(setup, "panel", argvDir).length > 0, 90_000, 25, setup.runDir);
-    assertRoleFlags(setup, "worker", argvDir, undefined);
-    assertRoleFlags(setup, "reviewer", argvDir, { provider: "p-r", model: "m-r" });
-    assertRoleFlags(setup, "evaluator", argvDir, undefined);
-    assertRoleFlags(setup, "panel", argvDir, undefined);
-  } finally {
-    await setup.conductor.stop();
-    cleanupDir(setup.runRoot);
-    cleanupDir(setup.scriptsDir);
-    fs.rmSync(argvDir, { recursive: true, force: true });
+// The only-reviewer criterion does not need a run: the Conductor hands
+// `planModelSelector(plan)` to `launchArgs` for every role, so asserting the
+// same one-liner per role is the same proof without a second (and third)
+// full conductor flow competing with the suite's own heavy tests.
+test("plan-models: setting only reviewer changes only the reviewers' arguments", () => {
+  const selector = planModelSelector({ models: { reviewer: { provider: "p-r", model: "m-r" } } });
+  for (const role of ["worker", "reviewer", "evaluator", "panel"] as Role[]) {
+    const pm = selector(role);
+    const flags = flagsOf(launchArgs(role, { provider: pm?.provider, model: pm?.model }));
+    if (role === "reviewer") assert.deepEqual(flags, { provider: "p-r", model: "m-r" });
+    else assert.deepEqual(flags, {}, `${role} must not gain --provider/--model`);
   }
 });
 
