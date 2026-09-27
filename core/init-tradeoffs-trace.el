@@ -1401,6 +1401,12 @@ open the decision view at that record."
                                (if (> b 0) (format " · boundary files changed: %d (reviewers classify)" b) ""))))
     (when-let* ((why (alist-get 'blockedReason phase)))
       (+tt--status-row "blocked" why 'error))
+    ;; Plan 05i: the toolchain the preflight resolved at start, then the one
+    ;; `env blocked · …` line while the environment blocks the run.
+    (dolist (tool (alist-get 'envTools v))
+      (insert (propertize (format "%-10s" "env") 'face 'shadow) tool "\n"))
+    (when-let* ((blocked (alist-get 'envBlocked v)))
+      (insert (propertize blocked 'face 'error) "\n"))
     ;; Plan 01a: a declared secret that was unset or unusable when the run
     ;; started (names only; the value is never shown, and the run still runs).
     (dolist (name (alist-get 'missing (alist-get 'secrets s)))
@@ -1473,6 +1479,7 @@ attention line are restored here, matching `+tt--render-status-from'."
               (setq name (match-string 1 value))))
           (pcase label
             ((or "base" "amended" "secret") (put-text-property vbeg end 'face 'warning))
+            ("env" (put-text-property vbeg end 'face (if (string-prefix-p "blocked" value) 'error 'warning)))
             ((or "previous" "cost") (put-text-property vbeg end 'face 'shadow))
             ("verdict" (put-text-property vbeg end 'face (if (equal name "DONE") 'success 'warning)))
             ("blocked" (put-text-property vbeg end 'face 'error)))))

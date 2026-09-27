@@ -33,6 +33,11 @@ import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { planModelSelector } from "./core/roles.ts";
+import { effectiveChecks } from "./core/checks.ts";
+// Plan 05i: the program commands preflight every node they will start, before
+// any run is created, so a missing toolchain refuses visibly instead of
+// creating runs that are immediately environment-blocked.
+import { envPreflight } from "./core/env-preflight.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
 import {
@@ -271,6 +276,58 @@ function refuseMissingSecrets(declared: readonly (string | undefined)[] | undefi
   return true;
 }
 
+/** Plan 05i: resolve one executable in this caller's own environment with
+ * `command -v`, exactly as the shell that would run a node's checks does. */
+function resolveExecutable(name: string, env: NodeJS.ProcessEnv, cwd: string): string | undefined {
+  try {
+    const out = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "tt-env-preflight", name], {
+      encoding: "utf8",
+      env,
+      cwd: existsSync(cwd) ? cwd : undefined,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out.length > 0 ? out.split("\n")[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Plan 05i: every command a plan could run for any of its phases. */
+function planPreflightCommands(plan: RunPlanFile): string[] {
+  const commands: string[] = [];
+  for (const phase of plan.phases) {
+    commands.push(...effectiveChecks(plan.checks, phase.checks));
+    if (phase.gate) commands.push(phase.gate);
+    if (phase.gateCleanup) commands.push(phase.gateCleanup);
+  }
+  return commands;
+}
+
+/** Plan 05i: refuse a program command when a node it would start needs a
+ * command this caller's PATH cannot resolve — naming the missing tools, and
+ * before any run is created. Mirrors `refuseMissingSecrets`'s honest, visible
+ * refusal. */
+function refuseMissingTools(plans: readonly RunPlanFile[], what: string): boolean {
+  const missing = new Set<string>();
+  let pathValue = process.env.PATH ?? "";
+  for (const plan of plans) {
+    const result = envPreflight(planPreflightCommands(plan), {
+      path: process.env.PATH ?? "",
+      resolve: (name) => resolveExecutable(name, process.env, plan.repo),
+    });
+    pathValue = result.path;
+    for (const name of result.missing) missing.add(name);
+  }
+  if (missing.size === 0) return false;
+  process.stderr.write(
+    `refusing to ${what}: command(s) not on PATH: ${[...missing].join(", ")}\n` +
+      `PATH: ${pathValue}\n` +
+      `fix the PATH in the shell (or Emacs) that runs this command, then retry\n`,
+  );
+  process.exitCode = 1;
+  return true;
+}
+
 /** The secrets every not-yet-done entry of a program declares. */
 function programSecrets(dir: string): string[] {
   const { program, state } = foldProgram(dir);
@@ -290,6 +347,9 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       return;
     }
     if (refuseMissingSecrets(program.entries.flatMap((e) => e.plan.secrets ?? []), "start the program")) return;
+    // Plan 05i: every node's declared commands must resolve in THIS caller's
+    // PATH before the program (or any of its runs) exists.
+    if (refuseMissingTools(program.entries.map((e) => e.plan), "start the program")) return;
     const dir = createProgram(root, program);
     // Plan 03c: the Org program file the program was started from (Emacs
     // passes it), shown in the program buffer's header.
@@ -345,9 +405,21 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     if (args.length !== 1) usage();
     const dir = resolveProgramDir(args[0], root);
     if (refuseMissingSecrets(programSecrets(dir), `resume program ${path.basename(dir)}`)) return;
+    // Plan 05i: preflight every node this resume could start — the stopped /
+    // crashed runs it restarts now AND the waiting nodes the scheduler will
+    // start later — before it starts any of them, so a missing tool refuses
+    // visibly rather than launching runs that are immediately
+    // environment-blocked. An entry every one of whose nodes is done or
+    // blocked can never start again and is not preflighted.
+    const { program, nodes, state } = foldProgram(dir);
+    const resumePlans = program.entries
+      .filter((e) =>
+        nodes.some((n) => n.entry === e.id && !["done", "blocked"].includes(state.nodes[n.id]?.status ?? "waiting")),
+      )
+      .map((e) => e.plan);
+    if (refuseMissingTools(resumePlans, `resume program ${path.basename(dir)}`)) return;
     // Undo a stop, restart every node run that is not running (stopped by
     // the owner or crashed), then the scheduler if it is not running.
-    const { state } = foldProgram(dir);
     if (state.stopped) appendProgramEvent(dir, { type: "PROGRAM_RESUMED" });
     const restarted: string[] = [];
     for (const [node, s] of Object.entries(state.nodes)) {
@@ -367,7 +439,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     // branch; the scheduler is (re)started to pick it up.
     if (args.length !== 2) usage();
     const dir = resolveProgramDir(args[0], root);
-    const { state } = foldProgram(dir);
+    const { program, state } = foldProgram(dir);
     const node = state.nodes[args[1]];
     if (!node) {
       process.stderr.write(`no node ${args[1]} in program ${path.basename(dir)}\n`);
@@ -380,6 +452,10 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       return;
     }
     if (refuseMissingSecrets(programSecrets(dir), `retry ${args[1]}`)) return;
+    // Plan 05i: the retried node's declared commands must resolve now, before
+    // its fresh run is created.
+    const retryEntry = program.entries.find((e) => e.id === args[1] || args[1].startsWith(`${e.id}/`));
+    if (refuseMissingTools(retryEntry ? [retryEntry.plan] : [], `retry ${args[1]}`)) return;
     if (node.runId && conductorAlive(path.join(root, node.runId))) await cmdStop(node.runId, root);
     if (state.stopped) appendProgramEvent(dir, { type: "PROGRAM_RESUMED" });
     appendProgramEvent(dir, { type: "NODE_RETRY", node: args[1] });

@@ -28,6 +28,10 @@ import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
+// Plan 05i: the pure environment preflight — parse every declared shell
+// command's executable and resolve it in the conductor's own PATH. See the
+// module's header.
+import { envPreflight } from "./core/env-preflight.ts";
 // Plan 01f: the pure half of the gate — the record's shape, its parser, the
 // log tail a failure quotes, and the reuse rule (see core/gate.ts's header).
 import {
@@ -53,6 +57,7 @@ import {
   failedNormally,
   parseBaseline,
   parseTestFailures,
+  baselineHasEnvironmentFailure,
   type Baseline,
   type BaselineCommand,
 } from "./core/test-failures.ts";
@@ -354,6 +359,11 @@ export interface ConductorOptions {
    * `--provider`/`--model` flag is added, i.e. Pi's own default. */
   providerModelFor?: (role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined;
   extraEnv?: NodeJS.ProcessEnv;
+  /** Plan 05i: the environment the preflight resolves declared executables
+   * in (defaults to `process.env`, the conductor's own environment). Tests
+   * point it at a scratch PATH to prove a missing tool blocks a run and a
+   * fixed one lets `tt resume` proceed. */
+  preflightEnv?: NodeJS.ProcessEnv;
   /** Per-agent environment override — tests use this to give each fake-pi
    * agent (worker, reviewer M/A/B) its own `FAKE_PI_SCRIPT`. */
   piEnvFor?: (role: Role, agentId: string) => NodeJS.ProcessEnv | undefined;
@@ -504,6 +514,34 @@ export function piDefaultModel(): string | undefined {
 /** A conductor whose own revision differs from the one the run was started
  * under refuses to resume it (plan, "How this plan is executed"). */
 export class RunnerMismatchError extends Error {}
+
+/** Plan 05i: a check/baseline/probe/gate command exited 126/127 — the shell
+ * could not execute it. Thrown out of the command loop so no baseline record
+ * is written and no `checks failed` is recorded; `#runBaselineStage` catches
+ * it and emits `ENV_CHECK_FAILED`. */
+class EnvFailure extends Error {
+  readonly stage: "baseline" | "checks" | "probe" | "gate";
+  readonly command: string;
+  readonly exitCode: number | null;
+  readonly tail: string;
+  constructor(stage: "baseline" | "checks" | "probe" | "gate", command: string, exitCode: number | null, output: string) {
+    super(`environment failure: ${command} exited ${exitCode}`);
+    this.name = "EnvFailure";
+    this.stage = stage;
+    this.command = command;
+    this.exitCode = exitCode;
+    this.tail = lastLines(output, 60);
+  }
+}
+
+/** The last `n` lines of a command's output, for an environment failure's
+ * evidence (the same tail shape the gate finding quotes). */
+function lastLines(text: string, n: number): string {
+  if (text.length === 0) return "";
+  const all = text.split("\n");
+  if (all[all.length - 1] === "") all.pop();
+  return all.slice(Math.max(0, all.length - n)).join("\n");
+}
 
 export function contractVersionFor(phase: RunPlanPhase, snapshot = 1): ContractVersion {
   const sectionSha256 = createHash("sha256").update(JSON.stringify(phase)).digest("hex");
@@ -910,6 +948,8 @@ export class Conductor {
   #piArgsPrefixFor: ((role: Role) => string[] | undefined) | undefined;
   #providerModelFor: ((role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined) | undefined;
   #extraEnv: NodeJS.ProcessEnv;
+  /** Plan 05i: the environment `#runEnvPreflight` resolves tools in. */
+  #preflightEnv: NodeJS.ProcessEnv;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
   #probeReuse: boolean;
@@ -1022,6 +1062,10 @@ export class Conductor {
    * but must still track a silent execute stage (B-5), not only message
    * events. */
   #statusTimer: NodeJS.Timeout | undefined;
+  /** Plan 05i: true while `#envPreflightGate` applies its events, so its
+   * `ENV_CHECKED` on an already-terminal (DONE/BLOCKED) run does not trip the
+   * auto-stop before `start()` finishes scanning the inbox. */
+  #envGateActive = false;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -1033,6 +1077,7 @@ export class Conductor {
     this.#piArgsPrefixFor = opts.piArgsPrefixFor;
     this.#piArgsPrefix = opts.piArgsPrefix ?? [];
     this.#extraEnv = opts.extraEnv ?? {};
+    this.#preflightEnv = opts.preflightEnv ?? process.env;
     this.#piEnvFor = opts.piEnvFor;
     this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
@@ -1121,6 +1166,15 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
     }
     this.#state = foldEvents(this.#state, records);
+    // Plan 05i: resolve every declared command's executable before the
+    // baseline and before any agent launch. A missing tool stops the run in
+    // ENV_BLOCKED (visible, and recoverable with `tt resume` once the
+    // environment is fixed); it is never a code failure. A run already
+    // ENV_BLOCKED whose tools now resolve is unblocked here and continues.
+    if (!this.#envPreflightGate()) {
+      await this.stop();
+      return;
+    }
     // Contract v1: rebuild the projections on every start. A conductor
     // killed between an event and its projection write leaves stale or
     // missing files; the log is authoritative and this restores them.
@@ -2642,7 +2696,18 @@ export class Conductor {
    * conductor listening for owner commands while parked there — so tests
    * that end in one of those states must call `stop()` themselves. */
   #maybeAutoStop(): void {
-    if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+    // Plan 05i: the environment gate applies its events before `start()` has
+    // finished its own setup (and its inbox scan); the blocked case is stopped
+    // by `start()` explicitly after the gate returns false.
+    if (this.#envGateActive) return;
+    // Plan 05i: an environment block freezes the run until `tt resume`, so
+    // the conductor stops itself exactly like a terminal phase — the node's
+    // run is then observed as env-blocked, not left as a live no-op.
+    if (
+      this.#state.phase.phase === "DONE" ||
+      this.#state.phase.phase === "BLOCKED" ||
+      this.#state.run === "ENV_BLOCKED"
+    ) {
       void this.stop();
     }
   }
@@ -4632,6 +4697,91 @@ export class Conductor {
     return out;
   }
 
+  // -- plan 05i: environment preflight --------------------------------------
+
+  /** Every shell command the phase declares, resolved for secrets: its
+   * effective checks, its `:GATE:` command and its `:GATE_CLEANUP:`. This is
+   * exactly the set the preflight resolves before a baseline or any agent. */
+  #preflightCommands(): string[] {
+    const commands = this.#resolvedEffectiveChecks();
+    const gate = gateCommandOf(this.#state.phase.contract);
+    if (gate) commands.push(this.#withValues(gate));
+    const cleanup = this.#state.phase.contract.gateCleanup;
+    if (cleanup && cleanup.trim().length > 0) commands.push(this.#withValues(cleanup));
+    return commands;
+  }
+
+  /** Resolve one executable in the conductor's own environment with
+   * `command -v`, exactly as the shell that runs the checks would. Runs in
+   * the repo (so a relative `./script` resolves against it) and never throws:
+   * a non-zero `command -v` is a missing tool, not an error. */
+  #resolveExecutable(name: string): string | undefined {
+    try {
+      const out = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "tt-env-preflight", name], {
+        encoding: "utf8",
+        env: this.#preflightEnv,
+        cwd: this.#plan.repo,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      return out.length > 0 ? out.split("\n")[0] : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 05i: the one gate that runs at `start()`, before the baseline and
+   * before any agent. It resolves every declared executable, records the
+   * resolved paths (`ENV_CHECKED`), and either applies `ENV_PREFLIGHT_FAILED`
+   * (a missing tool — the run stops in `ENV_BLOCKED`) or unblocks a run whose
+   * tools now resolve (`RUN_RESUMED`, so its preserved phase continues). The
+   * event application is drive-suspended so nothing is dispatched between the
+   * resolution and the block decision. Returns false when the run is blocked. */
+  #envPreflightGate(): boolean {
+    const commands = this.#preflightCommands();
+    const result = envPreflight(commands, {
+      path: this.#preflightEnv.PATH ?? "",
+      resolve: (name) => this.#resolveExecutable(name),
+    });
+    this.#driveSuspended = true;
+    this.#envGateActive = true;
+    try {
+      // Unblock BEFORE recording the tools: an `ENV_CHECKED` applied while the
+      // run is still ENV_BLOCKED would otherwise be the state the auto-stop
+      // sees, freezing the log before `RUN_RESUMED` could be applied.
+      if (result.missing.length === 0 && this.#state.run === "ENV_BLOCKED") {
+        this.#applyEvent({ type: "RUN_RESUMED" });
+      }
+      // No declared command means no tool to record; skip the (otherwise
+      // empty) record so an unchanged run's log stays quiet.
+      if (result.tools.length > 0) {
+        this.#applyEvent({ type: "ENV_CHECKED", path: result.path, tools: result.tools, at: new Date().toISOString() });
+      }
+      if (result.missing.length > 0) {
+        this.#applyEvent({ type: "ENV_PREFLIGHT_FAILED", missing: result.missing, path: result.path, at: new Date().toISOString() });
+      }
+    } finally {
+      this.#envGateActive = false;
+      this.#driveSuspended = false;
+    }
+    return result.missing.length === 0;
+  }
+
+  /** Plan 05i: a 126/127 exit is an environment failure wherever a command
+   * runs. The event moves the run to `ENV_BLOCKED` with the command and the
+   * log tail; the caller must return without applying the stage's own
+   * failure event, so it is never a baseline, a `checks failed`, a repair or
+   * a finding. */
+  #applyEnvFailure(stage: "baseline" | "checks" | "probe" | "gate", command: string, result: RunCommandResult): void {
+    this.#applyEvent({
+      type: "ENV_CHECK_FAILED",
+      stage,
+      command,
+      exitCode: result.exitCode,
+      tail: lastLines(result.output, 60),
+      at: new Date().toISOString(),
+    });
+  }
+
   // -- plan 01e: the base baseline -----------------------------------------
 
   /** Plan 01e: the base baseline's own directory (`<run>/checks/base/`), the
@@ -4755,6 +4905,11 @@ export class Conductor {
   #baselineCovers(record: Baseline, key: string, commands: readonly string[]): boolean {
     if (record.key !== key || record.tree !== this.#baselineTree()) return false;
     if (record.commands.length !== commands.length) return false;
+    // Plan 05i: a record whose commands exited 126/127 describes an
+    // environment that could not run them, not a base that fails its own
+    // tests (a record from before this change, or a sibling's shared copy).
+    // It is ignored so the baseline re-runs and the strict rule applies.
+    if (baselineHasEnvironmentFailure(record)) return false;
     return record.commands.every((c, i) => c.command === this.#baselineCommandName(commands[i]));
   }
 
@@ -4808,6 +4963,22 @@ export class Conductor {
     try {
       outcome = await Promise.race([this.#ensureBaseline().then(() => "done" as const), timer.promise]);
     } catch (err) {
+      // Plan 05i: a 126/127 during the baseline is an environment failure.
+      // No record was written (`#runBaselineOnce` rethrows it), so block the
+      // run here instead of completing the stage into IMPLEMENTING.
+      if (err instanceof EnvFailure) {
+        timer.cancel();
+        this.#log.completion(actionId, { outcome: "environment", command: err.command, exitCode: err.exitCode });
+        this.#applyEvent({
+          type: "ENV_CHECK_FAILED",
+          stage: "baseline",
+          command: err.command,
+          exitCode: err.exitCode,
+          tail: err.tail,
+          at: new Date().toISOString(),
+        });
+        return;
+      }
       // `#ensureBaseline` is best-effort and never throws, but a bug in it
       // must still let the phase move on rather than wedge the run.
       this.#log.append("error", { where: "baseline", error: String((err as Error)?.message ?? err) });
@@ -4901,6 +5072,10 @@ export class Conductor {
     try {
       record = await this.#runBaseline(commands, key);
     } catch (err) {
+      // Plan 05i: an environment failure is not a baseline that "could not be
+      // taken" — it must reach `#runBaselineStage`, which blocks the run and
+      // writes no record at all.
+      if (err instanceof EnvFailure) throw err;
       this.#log.append("baseline_error", { error: String((err as Error)?.message ?? err) });
       return undefined;
     }
@@ -5018,6 +5193,12 @@ export class Conductor {
         });
         const result = await running.result;
         this.#recordCheck(outDir, command, result);
+        // Plan 05i: 126/127 means the shell could not execute this command.
+        // Abort the whole baseline (no record is written) rather than
+        // recording an environment failure as the base's own failing test.
+        if (!result.timedOut && (result.exitCode === 126 || result.exitCode === 127)) {
+          throw new EnvFailure("baseline", command, result.exitCode, result.output);
+        }
         results.push({
           command,
           exitCode: result.exitCode,
@@ -5150,6 +5331,15 @@ export class Conductor {
           const result = await running.result;
           if (result.timedOut) timedOut = true;
           this.#recordCheck(outDir, command, result);
+          // Plan 05i: 126/127 means the shell could not execute the command
+          // (`command not found` / `not executable`). That is the machine, not
+          // the code: stop the run in ENV_BLOCKED instead of recording a
+          // `checks failed`, a repair round or a finding.
+          if (!result.timedOut && (result.exitCode === 126 || result.exitCode === 127)) {
+            this.#log.completion(actionId, { candidateSha, passed: false, reason: "environment", command, exitCode: result.exitCode });
+            this.#applyEnvFailure("checks", command, result);
+            return;
+          }
           const after = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
           if (!after) integrityViolated = true;
           const failed = result.exitCode !== 0 || result.timedOut || !after;
@@ -5261,6 +5451,15 @@ export class Conductor {
       });
       const commandResult = await running.result;
       this.#recordCheck(outDir, command, commandResult);
+      // Plan 05i: 126/127 is the machine, not the code — discard the probe
+      // branch and block on the environment instead of raising an
+      // `integration` finding.
+      if (!commandResult.timedOut && (commandResult.exitCode === 126 || commandResult.exitCode === 127)) {
+        discardProbe(this.#plan.repo, { probeBranch: result.probeBranch, checkoutDir: result.checkoutDir });
+        this.#log.completion(actionId, { candidateSha, ok: false, I: result.I, reason: "environment", command, exitCode: commandResult.exitCode });
+        this.#applyEnvFailure("probe", command, commandResult);
+        return;
+      }
       if (commandResult.exitCode !== 0 || commandResult.timedOut) {
         if (commandResult.timedOut) timedOutCommand = command;
         passed = false;
@@ -5422,6 +5621,9 @@ export class Conductor {
     let probed: ReturnType<typeof gitProbe> | undefined;
     let record: GateRecord | undefined;
     let logText = "";
+    /** Plan 05i: set when the gate command exited 126/127 — an environment
+     * failure, not a failing gate. */
+    let envExit: number | null | undefined;
     try {
       // The reuse rule (core/gate.ts): a candidate whose tree has already
       // passed this exact command does not run it again — but only a record
@@ -5532,6 +5734,13 @@ export class Conductor {
             onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
           });
           const gateResult = await running.result;
+          // Plan 05i: 126/127 is the shell failing to execute the command, not
+          // the gate failing. Record it (the record carries the exit, and a
+          // non-passing record is never reused) but block on the environment
+          // instead of raising a blocking `integration` finding.
+          if (!gateResult.timedOut && (gateResult.exitCode === 126 || gateResult.exitCode === 127)) {
+            envExit = gateResult.exitCode;
+          }
           // The gate command's own duration: the cleanup runs under its own
           // limit afterwards and is recorded separately (the record must not
           // present teardown time as build time).
@@ -5616,6 +5825,18 @@ export class Conductor {
       if (probed?.ok) discardProbe(this.#plan.repo, { probeBranch: probed.probeBranch, checkoutDir: probed.checkoutDir });
     }
     if (!record) return;
+    if (envExit !== undefined) {
+      this.#log.append("gate_environment_failure", { candidateSha, command: maskedCommand, exitCode: envExit });
+      this.#applyEvent({
+        type: "ENV_CHECK_FAILED",
+        stage: "gate",
+        command: maskedCommand,
+        exitCode: envExit,
+        tail: gateLogTail(logText),
+        at: new Date().toISOString(),
+      });
+      return;
+    }
     if (record.passed) {
       this.#applyEvent({ type: "ACCEPTED", resolvedCorrectionIds: resolvedCorrectionIdsFor(this.#state.phase, candidateSha, contract.contractVersion) });
     } else {

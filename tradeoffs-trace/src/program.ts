@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor.ts";
+import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
 
 import { buildView, formatDuration } from "./view.ts";
@@ -324,12 +325,18 @@ function pidAlive(file: string): boolean {
  * the conductor died without a clean stop (no `stopped` marker). */
 export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "crashed" {
   let phase: string | undefined;
+  let envBlocked = false;
   try {
     const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8"));
-    phase = rebuildState(runDir, plan, { lenient: true }).phase.phase;
+    const state = rebuildState(runDir, plan, { lenient: true });
+    phase = state.phase.phase;
+    // Plan 05i: an environment block is its own node status, distinct from a
+    // code BLOCKED: it is recoverable by fixing the environment and resuming.
+    envBlocked = state.run === "ENV_BLOCKED";
   } catch {
     phase = undefined;
   }
+  if (envBlocked) return "env-blocked";
   if (phase === "DONE") return "done";
   if (phase === "BLOCKED") return "blocked";
   const alive = pidAlive(path.join(runDir, "conductor.pid"));
@@ -349,6 +356,9 @@ export function runWaitReason(runDir: string): string | undefined {
   try {
     const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
     const state = rebuildState(runDir, plan, { lenient: true });
+    if (state.run === "ENV_BLOCKED") {
+      return state.phase.env?.blocked ? envBlockedLine(state.phase.env.blocked) : "environment blocked";
+    }
     if (state.phase.phase === "AWAITING_OWNER" || state.phase.phase === "BLOCKED") return waitReason(state.phase);
   } catch {
     // a run whose plan or log cannot be read yet
@@ -401,7 +411,10 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       continue;
     }
     if (seen !== s.status) {
-      record({ type: "NODE_STATUS", node: n.id, status: seen, ...(seen === "needs-you" ? reasonField(runWaitReason(runDir)) : {}) });
+      // Plan 05i: an env-blocked node carries the `env blocked · …` reason,
+      // like a needs-you node, so the program buffer names the missing tool.
+      const withReason = seen === "needs-you" || seen === "blocked" || seen === "env-blocked";
+      record({ type: "NODE_STATUS", node: n.id, status: seen, ...(withReason ? reasonField(runWaitReason(runDir)) : {}) });
     }
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
@@ -657,6 +670,7 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
     stopped: "○",
     done: "✓",
     blocked: "✗",
+    "env-blocked": "E",
   };
   const order = (id: string) => {
     const t = at[id];

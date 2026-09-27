@@ -662,7 +662,41 @@ export type PhaseStateName =
   | "AWAITING_OWNER"
   | "BLOCKED";
 
-export type RunStateName = "RUN_ACTIVE" | "RUN_PAUSED_BUDGET";
+export type RunStateName = "RUN_ACTIVE" | "RUN_PAUSED_BUDGET" | "ENV_BLOCKED";
+
+// ---------------------------------------------------------------------------
+// Plan 05i: environment preflight
+// ---------------------------------------------------------------------------
+
+/** One executable the preflight resolved (or could not). */
+export interface EnvTool {
+  name: string;
+  path?: string;
+}
+
+/** The reason a run is `ENV_BLOCKED`: a declared command's executable is not
+ * on the conductor's PATH (`preflight`), or a check/gate exited 126/127
+ * (`check`). The details are shown in `tt status`, the status view and the
+ * program buffer, and are what `tt resume` retries the preflight over. */
+export interface EnvBlockInfo {
+  kind: "preflight" | "check";
+  at?: string;
+  /** preflight: the executables not found; check: the command that exited. */
+  missing?: string[];
+  path?: string;
+  stage?: "baseline" | "checks" | "probe" | "gate";
+  command?: string;
+  exitCode?: number | null;
+  tail?: string;
+}
+
+/** Plan 05i: what the run recorded about its environment — every tool the
+ * preflight resolved at start, and the block when one is missing. */
+export interface PhaseEnv {
+  path?: string;
+  tools?: EnvTool[];
+  blocked?: EnvBlockInfo;
+}
 
 // ---------------------------------------------------------------------------
 // §7.4/§9.3 (plan 2d): owner input, recorded
@@ -870,6 +904,9 @@ export interface PhaseState {
    * an interrupted `run_baseline` has been re-dispatched, so a second loss
    * takes the timed-out path instead of re-dispatching again. */
   baseline?: { interruptedOnce?: boolean };
+  /** Plan 05i: what the run recorded about its environment at start — every
+   * tool the preflight resolved, and the block when one is missing. */
+  env?: PhaseEnv;
   /** Plan 04a: the EVALUATING stage's own state, PER MESSAGE TYPE (one
    * fresh evaluator per type that has raw messages this round): `settled` is
    * set by that type's `EVALUATOR_FINISHED` (or its timeout); `timedOut`
@@ -1086,6 +1123,42 @@ export interface EvChecksFailed {
 }
 export interface EvChecksInterrupted {
   type: "CHECKS_INTERRUPTED";
+}
+
+// ---------------------------------------------------------------------------
+// Plan 05i: environment preflight / environment failures
+// ---------------------------------------------------------------------------
+
+/** The run's tools were resolved at start (a record-only event: it stores the
+ * resolved paths in `phase.env` for the status views, and never moves the
+ * phase). */
+export interface EvEnvChecked {
+  type: "ENV_CHECKED";
+  path: string;
+  tools: EnvTool[];
+  at?: string;
+}
+
+/** The preflight found declared command(s) whose executable is not on the
+ * conductor's PATH: RUN_ACTIVE -> ENV_BLOCKED, before a baseline or any agent
+ * launch. `missing` and `path` are the visible reason. */
+export interface EvEnvPreflightFailed {
+  type: "ENV_PREFLIGHT_FAILED";
+  missing: string[];
+  path: string;
+  at?: string;
+}
+
+/** A check, baseline, probe or gate command exited 126/127 — the shell could
+ * not execute it. RUN_ACTIVE -> ENV_BLOCKED, with the command and the log
+ * tail; never a baseline, a `checks failed`, a repair or a finding. */
+export interface EvEnvCheckFailed {
+  type: "ENV_CHECK_FAILED";
+  stage: "baseline" | "checks" | "probe" | "gate";
+  command: string;
+  exitCode: number | null;
+  tail: string;
+  at?: string;
 }
 export interface EvProbePassed {
   type: "PROBE_PASSED";
@@ -1552,6 +1625,9 @@ export type Event =
   | EvChecksPassed
   | EvChecksFailed
   | EvChecksInterrupted
+  | EvEnvChecked
+  | EvEnvPreflightFailed
+  | EvEnvCheckFailed
   | EvProbePassed
   | EvProbeFailed
   | EvProbeInterrupted

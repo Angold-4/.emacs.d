@@ -347,6 +347,27 @@ const BUILD: Record<string, Fixture> = {
     state: baseState({ phase: "READY" }, "RUN_PAUSED_BUDGET"),
     event: { type: "RUN_RESUMED" },
   },
+  // Plan 05i: the environment preflight and environment (126/127) failures.
+  "env-preflight-failed": {
+    state: baseState({ phase: "READY" }),
+    event: { type: "ENV_PREFLIGHT_FAILED", missing: ["cargo"], path: "/usr/bin:/bin" },
+  },
+  "env-preflight-failed-already-blocked": {
+    state: baseState({ phase: "READY" }, "ENV_BLOCKED"),
+    event: { type: "ENV_PREFLIGHT_FAILED", missing: ["cargo"], path: "/usr/bin:/bin" },
+  },
+  "env-check-failed": {
+    state: baseState({ phase: "CHECKING", candidate: C1, inFlight: { run_checks: { actionId: "a1" } } }),
+    event: { type: "ENV_CHECK_FAILED", stage: "checks", command: "cargo test", exitCode: 127, tail: "cargo: not found" },
+  },
+  "env-check-failed-already-blocked": {
+    state: baseState({ phase: "CHECKING", candidate: C1 }, "ENV_BLOCKED"),
+    event: { type: "ENV_CHECK_FAILED", stage: "checks", command: "cargo test", exitCode: 127, tail: "cargo: not found" },
+  },
+  "env-resumed": {
+    state: baseState({ phase: "READY" }, "ENV_BLOCKED"),
+    event: { type: "RUN_RESUMED" },
+  },
   "launch-failed-from-implementing": {
     state: baseState({ phase: "IMPLEMENTING", inFlight: { dispatch_worker: { actionId: "a1" } } }),
     event: { type: "LAUNCH_FAILED", role: "worker", expected: ["read", "edit"], missing: ["edit"], extra: ["submit_review"] },

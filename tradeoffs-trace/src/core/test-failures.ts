@@ -239,6 +239,17 @@ export function parseBaseline(value: unknown): Baseline | undefined {
   };
 }
 
+/** True iff any baseline command exited 126 or 127: the shell could not run
+ * it (`command not found` / `not executable`). Such a record is not a base
+ * that fails its own tests — it is an environment problem — so plan 05i
+ * ignores it everywhere a baseline is read (a record from before the fix,
+ * or a sibling's shared copy) and the baseline re-runs in a fixed
+ * environment instead of excusing a candidate's checks against it. */
+export function baselineHasEnvironmentFailure(baseline: Baseline | undefined): boolean {
+  if (!baseline) return false;
+  return baseline.commands.some((c) => c.exitCode === 126 || c.exitCode === 127);
+}
+
 /** The status line for a base that already fails its own checks, or undefined
  * when the base passes (or no baseline was taken). The `N tests` shape is
  * deliberate — the count is the number of *parsed* names, and a base whose

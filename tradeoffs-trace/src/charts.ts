@@ -105,7 +105,7 @@ const PHASE_ORDER = [
   "BLOCKED",
 ];
 
-const RUN_ORDER = ["RUN_ACTIVE", "RUN_PAUSED_BUDGET"];
+const RUN_ORDER = ["RUN_ACTIVE", "RUN_PAUSED_BUDGET", "ENV_BLOCKED"];
 
 function orderStates(rows: readonly TransitionRow[], fixed: readonly string[]): string[] {
   const present = new Set<string>();
@@ -534,6 +534,7 @@ const NODE_MARK: Record<string, string> = {
   stopped: "o",
   done: "v",
   blocked: "x",
+  "env-blocked": "E",
 };
 
 /** The program dependency graph as an ASCII chart: one box per node, carrying

@@ -1640,6 +1640,138 @@ addRow({
   },
 });
 
+// --- plan 05i: environment preflight / environment failures ---------------
+// The environment is a run-axis concern: `ENV_BLOCKED` freezes dispatch the
+// same way `RUN_PAUSED_BUDGET` does, while the phase state stays exactly
+// where it was — a 127 in CHECKING leaves the phase in CHECKING, so a
+// `tt resume` whose preflight now passes re-runs the checks instead of losing
+// the candidate. `ENV_PREFLIGHT_FAILED` is emitted before the baseline and
+// before any agent launch; `ENV_CHECK_FAILED` is emitted when any check,
+// baseline, probe or gate command exits 126/127.
+
+/** The in-flight entry an environment failure interrupts, per stage, so that
+ * after a passing `tt resume` next() re-dispatches the stage instead of
+ * waiting forever on an intent that will never complete. */
+function envStageInFlight(stage: "baseline" | "checks" | "probe" | "gate"): InFlightKey {
+  switch (stage) {
+    case "baseline": return "run_baseline";
+    case "checks": return "run_checks";
+    case "probe": return "dispatch_probe";
+    case "gate": return "run_gate";
+  }
+}
+
+addRow({
+  id: "env-preflight-failed",
+  axis: "run",
+  from: "RUN_ACTIVE",
+  trigger: "ENV_PREFLIGHT_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "ENV_BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>;
+    return {
+      ...s,
+      run: "ENV_BLOCKED",
+      phase: {
+        ...s.phase,
+        env: { ...(s.phase.env ?? {}), path: e.path, blocked: { kind: "preflight", missing: e.missing, path: e.path, at: e.at } },
+      },
+    };
+  },
+});
+
+// Idempotent: a `tt resume` whose preflight still fails re-records the block
+// rather than being rejected by reduce().
+addRow({
+  id: "env-preflight-failed-already-blocked",
+  axis: "run",
+  from: "ENV_BLOCKED",
+  trigger: "ENV_PREFLIGHT_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "ENV_BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>;
+    return {
+      ...s,
+      phase: {
+        ...s.phase,
+        env: { ...(s.phase.env ?? {}), path: e.path, blocked: { kind: "preflight", missing: e.missing, path: e.path, at: e.at } },
+      },
+    };
+  },
+});
+
+addRow({
+  id: "env-check-failed",
+  axis: "run",
+  from: "RUN_ACTIVE",
+  trigger: "ENV_CHECK_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "ENV_BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>;
+    return {
+      ...s,
+      run: "ENV_BLOCKED",
+      phase: {
+        ...s.phase,
+        env: {
+          ...(s.phase.env ?? {}),
+          blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
+        },
+        inFlight: clearInFlight(s.phase, envStageInFlight(e.stage)),
+      },
+    };
+  },
+});
+
+addRow({
+  id: "env-check-failed-already-blocked",
+  axis: "run",
+  from: "ENV_BLOCKED",
+  trigger: "ENV_CHECK_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "ENV_BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>;
+    return {
+      ...s,
+      phase: {
+        ...s.phase,
+        env: {
+          ...(s.phase.env ?? {}),
+          blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
+        },
+      },
+    };
+  },
+});
+
+// A passing `tt resume` preflight clears the block and the phase continues
+// from wherever it was frozen.
+addRow({
+  id: "env-resumed",
+  axis: "run",
+  from: "ENV_BLOCKED",
+  trigger: "RUN_RESUMED",
+  guardName: "always",
+  guard: () => true,
+  to: "RUN_ACTIVE",
+  // The fixture resumes with the phase at READY, so next() recommends
+  // start_attempt once the environment is unblocked.
+  actions: [{ type: "start_attempt" }],
+  apply: (s) => ({ ...s, run: "RUN_ACTIVE", phase: { ...s.phase, env: { ...(s.phase.env ?? {}), blocked: undefined } } }),
+});
+
 // --- run execution budget (§8.1) --------------------------------------
 addRow({
   id: "run-budget-exceeded",

@@ -15,6 +15,8 @@ import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
+// Plan 05i: the environment block's one-line reason and the resolved tool rows.
+import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
 import { computeMetrics, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
@@ -440,6 +442,12 @@ export interface RunView {
   /** Plan 05h: the tape's current-row cell (`▶ REVIEW 4m12s of 15m`), the
    * status buffer's one `loop` row. Undefined before the first step. */
   loop?: string;
+  /** Plan 05i: the one `env blocked · …` line while the run's environment is
+   * blocked (a missing tool, or a 126/127 at a check). Undefined otherwise. */
+  envBlocked?: string;
+  /** Plan 05i: `env  cargo /path` for every tool the preflight resolved at
+   * start, so the owner can see which toolchain the run is using. */
+  envTools: string[];
 }
 
 /** Plan 01h: what the run costs so far. `stageMinutes` excludes `needs you`,
@@ -624,8 +632,13 @@ export function buildView(
           .join("; ");
   const amendedCount = amendments.filter((d) => d.amendment!.status === "applied").length;
 
+  // Plan 05i: what the environment block is, in one line (`env blocked · …`).
+  const envBlocked = phase.env?.blocked ? envBlockedLine(phase.env.blocked) : undefined;
+  const envTools = envToolsLines(phase.env?.tools);
+
   let attention: string | undefined;
-  if (phase.phase === "BLOCKED") attention = "BLOCKED";
+  if (envBlocked) attention = envBlocked;
+  else if (phase.phase === "BLOCKED") attention = "BLOCKED";
   else if (needsYou > 0 || phase.phase === "AWAITING_OWNER") attention = "needs you";
   else if (!alive && phase.phase !== "DONE") attention = "conductor stopped";
   else if (idleMinutes !== undefined && idleMinutes > 5) attention = `idle ${Math.round(idleMinutes)}m`;
@@ -689,6 +702,8 @@ export function buildView(
     needsYou,
     idleMinutes,
     attention,
+    envBlocked,
+    envTools,
   };
 }
 
