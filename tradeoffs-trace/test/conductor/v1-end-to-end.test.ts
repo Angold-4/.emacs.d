@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -179,6 +179,12 @@ async function assertProjections(setup: TestConductorSetup): Promise<void> {
 }
 
 test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, two rounds, and the owner's two D verdicts", async () => {
+  // The repair attempt waits on a release file the test writes only after the
+  // owner's D and its finding acceptance have landed on C1. Without this the
+  // round-two freeze can beat the owner's commands under a loaded suite, which
+  // is a test race, not a product behaviour.
+  const releaseDir = mkdtempSync("/tmp/tt-e2e-release-");
+  const releaseFile = path.join(releaseDir, "go");
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
@@ -188,9 +194,10 @@ test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, 
         : {
             hello: defaultWorkerHello(),
             steps: [
-              // Hold the repair attempt briefly so the owner's D and its
-              // finding acceptance both land while the phase is still on C1.
-              { kind: "sleep", ms: 4000 },
+              {
+                kind: "call-sh",
+                command: `i=0; while [ $i -lt 600 ]; do if [ -f '${releaseFile}' ]; then exit 0; fi; i=$((i+1)); sleep 0.1; done; exit 1`,
+              },
               {
                 kind: "call-submit",
                 tool: "raise_tradeoff",
@@ -266,6 +273,8 @@ test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, 
     );
     await waitFor(() => setup.conductor.state.phase.findings.find((f) => f.id === ownerFinding.id)?.status === "accepted", 30_000, 20, setup.runDir);
     await assertProjections(setup);
+    // Now let the repair attempt proceed: its freeze is C2.
+    writeFileSync(releaseFile, "go");
 
     // --- state: the panel's downgrade starts round two, then DONE --------
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 180_000, 30, setup.runDir);
@@ -336,5 +345,6 @@ test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, 
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+    rmSync(releaseDir, { recursive: true, force: true });
   }
 });
