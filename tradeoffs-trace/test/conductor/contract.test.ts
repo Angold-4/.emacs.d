@@ -7,7 +7,7 @@
 // itself is what is exercised.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -19,6 +19,28 @@ const CLI = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
 
 function tt(args: string[]): string {
   return execFileSync(process.execPath, [CLI, ...args], { encoding: "utf8" });
+}
+
+/** `tt` that does not throw on a non-zero exit, so a rejected verdict's
+ * stdout and status can be asserted (A-13). */
+function ttResult(args: string[]): { status: number; stdout: string; stderr: string } {
+  const r = spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8" });
+  return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+/** `tt` that runs while the test's event loop keeps turning, so an
+ * in-process conductor can process the inbox while `tt verdict` waits for the
+ * outcome (A-13). */
+function ttAsync(args: string[]): Promise<{ status: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, ...args]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += c.toString()));
+    child.stderr.on("data", (c) => (stderr += c.toString()));
+    child.once("error", reject);
+    child.once("exit", (code) => resolve({ status: code ?? 1, stdout, stderr }));
+  });
 }
 
 const DECISIONS = [
@@ -92,10 +114,11 @@ test("a verdict on a live run goes through the inbox", async () => {
     // `tt __run-conductor` does), so fake it: `tt verdict` then sees a live
     // run and must go through the inbox rather than appending the event.
     writeFileSync(`${setup.runDir}/conductor.pid`, String(process.pid));
-    assert.match(
-      tt(["verdict", setup.runDir, message.id, "refuse", "--reason", "not the trade-off the goal needed"]),
-      /queued verdict/,
-    );
+    // A-13: the CLI reports the outcome; the conductor processes the inbox
+    // while the CLI waits, so the verdict is reported applied.
+    const accepted = await ttAsync(["verdict", setup.runDir, message.id, "refuse", "--reason", "not the trade-off the goal needed"]);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.stdout, /verdict applied: refuse recorded/);
     await waitFor(
       () => (setup.conductor.state.phase.messages ?? []).some((m) => m.id === message.id && m.state === "refused"),
       30_000,
@@ -111,11 +134,17 @@ test("a verdict on a live run goes through the inbox", async () => {
     );
 
     // A stale verdict, sent through `tt verdict`'s own binding override, is
-    // rejected into inbox/rejected with its reason (not hand-written JSON).
-    assert.match(
-      tt(["verdict", setup.runDir, message.id, "accept", "--candidate-sha", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]),
-      /queued verdict/,
-    );
+    // rejected into inbox/rejected, and the CLI reports the reason (A-13).
+    const stale = await ttAsync([
+      "verdict",
+      setup.runDir,
+      message.id,
+      "accept",
+      "--candidate-sha",
+      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    ]);
+    assert.equal(stale.status, 1, "a rejected verdict must exit non-zero");
+    assert.match(stale.stdout, /verdict rejected: .*candidate/);
     await waitFor(
       () => readdirSync(runPaths(setup.runDir).inboxRejected).some((n) => n.endsWith(".reason.txt")),
       30_000,
@@ -375,7 +404,9 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
     const published = setup.conductor.state.phase.messages!.find((m) => m.type === "tradeoff" && m.state === "published")!;
     priorId = setup.conductor.state.phase.decisions.find((d) => d.source === "worker")!.id;
     writeFileSync(`${setup.runDir}/conductor.pid`, String(process.pid));
-    assert.match(tt(["verdict", setup.runDir, published.id, "accept"]), /queued verdict/);
+    const accepted = await ttAsync(["verdict", setup.runDir, published.id, "accept"]);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.stdout, /verdict applied: accept recorded/);
     await waitFor(
       () => (setup.conductor.state.phase.messages ?? []).some((m) => m.id === published.id && m.state === "accepted"),
       30_000,
@@ -494,7 +525,9 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
     const published = setup.conductor.state.phase.messages!.find((m) => m.type === "tradeoff" && m.state === "published")!;
     priorId = setup.conductor.state.phase.decisions.find((d) => d.source === "worker")!.id;
     writeFileSync(`${setup.runDir}/conductor.pid`, String(process.pid));
-    assert.match(tt(["verdict", setup.runDir, published.id, "accept"]), /queued verdict/);
+    const accepted = await ttAsync(["verdict", setup.runDir, published.id, "accept"]);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.stdout, /verdict applied: accept recorded/);
     await waitFor(
       () => (setup.conductor.state.phase.messages ?? []).some((m) => m.id === published.id && m.state === "accepted"),
       30_000,
@@ -590,6 +623,16 @@ test("contract v1 projections pass check, rebuild identically, and record a late
     assert.equal(readFileSync(p.ledger, "utf8"), before.ledger);
     assert.match(tt(["contract", "check", setup.runDir]), /contract check ok/);
 
+    // B-12/A-14: a file for a message id state no longer has is a mismatch,
+    // and rebuild prunes it (the projection is state, not an accumulation).
+    writeFileSync(`${p.messagesView}/OLD-99.org`, "* stale\n");
+    const staleCheck = ttResult(["contract", "check", setup.runDir]);
+    assert.equal(staleCheck.status, 1, "an extra message file must fail the check");
+    assert.match(staleCheck.stderr, /views\/messages\/OLD-99\.org/);
+    tt(["contract", "rebuild", setup.runDir]);
+    assert.ok(!existsSync(`${p.messagesView}/OLD-99.org`), "rebuild must prune the stale file");
+    assert.match(tt(["contract", "check", setup.runDir]), /contract check ok/);
+
     // A late verdict: the daemon has exited (the in-process conductor wrote no
     // pid file), so `tt verdict` must append the event itself.
     const target = tradeoffs[0] as { id: string };
@@ -606,6 +649,98 @@ test("contract v1 projections pass check, rebuild identically, and record a late
     assert.match(readFileSync(p.review, "utf8"), /FOLLOW_UP: true/);
     assert.match(tt(["summary", setup.runDir]), /Follow-ups/);
     assert.match(tt(["summary", setup.runDir]), new RegExp(target.id));
+
+    // A-13 (exited path): a stale late verdict prints its reason on stdout and
+    // exits non-zero, and the event is never written.
+    const other = tradeoffs[1] as { id: string };
+    const staleLate = ttResult(["verdict", setup.runDir, other.id, "accept", "--candidate-sha", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]);
+    assert.equal(staleLate.status, 1, "a stale late verdict must exit non-zero");
+    assert.match(staleLate.stdout, /verdict rejected: .*candidate/);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("a run writes views/review.org and views/status.txt, and a new message updates both", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
+    }),
+    // The reviewers raise one advisory finding while the phase is REVIEWING,
+    // after a pause, so the views are written once for the trade-offs and
+    // again when the finding is added (a message is added).
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        ...(reviewer === "M" ? [{ kind: "sleep" as const, ms: 1500 }] : []),
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings:
+              reviewer === "M"
+                ? [{ kind: "defect", severity: "advisory", evidence: "src/sum.ts:9 a slow path" }]
+                : [],
+          },
+        },
+      ],
+    }),
+    deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+  });
+
+  try {
+    await setup.conductor.start();
+    const p = runPaths(setup.runDir);
+    // The trade-offs are raised at freeze; the views exist before any finding.
+    await waitFor(() => (setup.conductor.state.phase.messages ?? []).filter((m) => m.type === "tradeoff").length >= 2, 90_000, 20, setup.runDir);
+    await waitFor(() => existsSync(p.review) && existsSync(p.status), 30_000, 20, setup.runDir);
+    // Plan 03c: the same beat writes the phase chart from TRANSITIONS.
+    await waitFor(() => existsSync(p.loop), 30_000, 20, setup.runDir);
+    assert.match(readFileSync(p.loop, "utf8"), /^tradeoffs-trace phase chart — generated from TRANSITIONS/);
+    assert.match(readFileSync(p.loop, "utf8"), /IMPLEMENTING|REVIEWING|CHECKING/);
+    const reviewBefore = readFileSync(p.review, "utf8");
+    assert.match(reviewBefore, /T-1/);
+    assert.match(reviewBefore, /^\* Trade-offs$/m);
+    const statusBefore = readFileSync(p.status, "utf8");
+    assert.match(statusBefore, /^run /m);
+    assert.match(statusBefore, /^phase /m);
+
+    // A finding message is added; both views are rewritten from the new state
+    // (the status view is coalesced, so it is waited for).
+    await waitFor(() => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "finding"), 90_000, 20, setup.runDir);
+    await waitFor(() => readFileSync(p.review, "utf8") !== reviewBefore, 30_000, 20, setup.runDir);
+    const reviewAfter = readFileSync(p.review, "utf8");
+    assert.match(reviewAfter, /F-1/);
+    assert.match(reviewAfter, /^\* Findings$/m);
+    assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
+    assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
+    // Wait until the status reflects the published finding: the review outcome
+    // alone changes the file, and asserting the merged behaviour on that
+    // intermediate write is a race. The finding is an open advisory, so the
+    // plan 01h trade-offs panel carries its record line.
+    await waitFor(() => {
+      const s = readFileSync(p.status, "utf8");
+      return s !== statusBefore && /\t:RECORD:F-/.test(s);
+    }, 30_000, 20, setup.runDir);
+    // The status view is the buffer's own text: it carries the trade-offs and,
+    // on each trade-off line, the record marker that keeps plan 01h's RET.
+    const statusAfter = readFileSync(p.status, "utf8");
+    assert.match(statusAfter, /^Trade-offs \(\d+\)$/m);
+    assert.match(statusAfter, /\t:RECORD:[A-Za-z][-A-Za-z0-9]*/);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

@@ -39,7 +39,9 @@ import { next } from "../../src/core/next.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { evaluationSettled, typesNeedingEvaluation } from "../../src/core/predicate.ts";
 import { baseState, makeMessage } from "../unit/helpers.ts";
-import { contentHashOf, projectLedger, projectMessages, projectReview } from "../../src/core/messages.ts";
+import { contentHashOf, projectLedger, projectMessages } from "../../src/core/messages.ts";
+// The review view moved to src/render.ts in 03b; 04a wrote this test before the merge.
+import { projectReview } from "../../src/render.ts";
 import { baselineKey } from "../../src/core/test-failures.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { buildView } from "../../src/view.ts";

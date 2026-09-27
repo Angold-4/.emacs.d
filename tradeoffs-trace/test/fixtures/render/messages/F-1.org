@@ -1,0 +1,34 @@
+#+TITLE: F-1 — a slow path returns NaN to callers
+#+TYPE: finding
+
+* F-1 a slow path returns NaN to callers
+  :PROPERTIES:
+  :ID: F-1
+  :TYPE: finding
+  :STATE: published
+  :RAISED_BY: M
+  :IMPORTANCE: low
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  raised by M against C1
+
+* Evidence
+  - src/util.ts:3 a slow path. It returns NaN to callers.
+
+* Plan
+  plan/03b.org
+
+* History
+  - v1 · C1 · 4fa1e2cd34bf5902656c01fb2fac50324f5222b824a441c51a6ef5dcff0159fa
+
+* Ledger
+  (not settled)
+
+* Votes
+  (none)

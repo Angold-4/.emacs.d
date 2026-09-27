@@ -1,0 +1,35 @@
+#+TITLE: T-3 — Keep the existing file layout
+#+TYPE: tradeoff
+
+* T-3 Keep the existing file layout
+  :PROPERTIES:
+  :ID: T-3
+  :TYPE: tradeoff
+  :STATE: refused
+  :RAISED_BY: worker
+  :IMPORTANCE: normal
+  :VERDICT: refused
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :FOLLOW_UP: true
+  :END:
+  a layout change would make the diff harder to review
+
+* Evidence
+  - src/layout.ts:1
+
+* Plan
+  plan/03b.org
+
+* History
+  - v1 · C1 · 8886ca862c220bc4c34fd82cd81d090079e50ea54e4f77c798a1928d7cf154ad
+
+* Ledger
+  - refused by owner (v1, C1) — worth revisiting after the run
+
+* Votes
+  (none)
