@@ -24,6 +24,7 @@ import { projectLedger, projectMessages } from "./core/messages.ts";
 import { projectReview, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
+import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -399,6 +400,9 @@ export function runPaths(runDir: string) {
     status: path.join(runDir, "views", "status.txt"),
     // Plan 03c: the phase state machine as an ASCII chart (TRANSITIONS).
     loop: path.join(runDir, "views", "loop.txt"),
+    // Plan 04c: the balance metrics (a deterministic projection of state and
+    // the control log; `tt contract rebuild`/`check` include it).
+    metrics: path.join(runDir, "views", "metrics.json"),
     inbox: path.join(runDir, "inbox"),
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
@@ -4309,8 +4313,22 @@ export class Conductor {
       fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
       fs.writeFileSync(this.#paths.review, projectReview(phase));
       this.#writeMessageViews();
+      this.#writeMetricsProjection();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
+    }
+  }
+
+  /** Plan 04c: `views/metrics.json`, the balance metrics. A deterministic
+   * projection of state and the control log, computed the same way `tt
+   * contract rebuild`/`check` compute it. The timeline is rebuilt here because
+   * a message event can arrive between two status beats. */
+  #writeMetricsProjection(): void {
+    try {
+      const metrics = metricsForRunDir(this.#runDir, this.#state.phase, rebuildTimeline(this.#runDir, this.#plan));
+      fs.writeFileSync(this.#paths.metrics, projectMetrics(metrics));
+    } catch (err) {
+      this.#logUnexpected("write_metrics_projection", err);
     }
   }
 
@@ -4352,6 +4370,11 @@ export class Conductor {
       }),
     );
     fs.writeFileSync(this.#paths.status, redactText(text, this.#secretMaskable));
+    // Plan 04c: the same beat keeps `views/metrics.json` current. The metrics
+    // read the control log fresh (not this beat's earlier timeline), so the
+    // file can never mix a timeline read at one instant with events read at
+    // another — `tt contract check` recomputes both from the same file.
+    this.#writeMetricsProjection();
     // Plan 03c: the same beat keeps the phase chart (`views/loop.txt`) current;
     // it is generated from TRANSITIONS, so it can never drift from the loop.
     const stats = statsFromTimeline(view.timeline, new Date());

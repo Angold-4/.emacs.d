@@ -728,12 +728,23 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(reviewAfter, /^\* Findings$/m);
     assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
     assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
-    await waitFor(() => readFileSync(p.status, "utf8") !== statusBefore, 30_000, 20, setup.runDir);
+    // Plan 04c join: wait until the status reflects the published finding —
+    // the review outcome alone changes the file, and asserting the joined
+    // behaviour on that intermediate write is a race. The finding is an open
+    // advisory, so the plan 01h trade-offs panel now carries its record line.
+    await waitFor(() => {
+      const s = readFileSync(p.status, "utf8");
+      return s !== statusBefore && /\t:RECORD:F-/.test(s);
+    }, 30_000, 20, setup.runDir);
     // The status view is the buffer's own text: it carries the trade-offs and,
     // on each trade-off line, the record marker that keeps plan 01h's RET.
     const statusAfter = readFileSync(p.status, "utf8");
     assert.match(statusAfter, /^Trade-offs \(\d+\)$/m);
     assert.match(statusAfter, /\t:RECORD:[A-Za-z][-A-Za-z0-9]*/);
+    // Plan 04c: the same beat writes the balance metrics line.
+    assert.match(statusAfter, /^metrics   /m);
+    assert.ok(existsSync(p.metrics), "the balance metrics projection is written");
+    assert.match(readFileSync(p.metrics, "utf8"), /"reviewShare"/);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

@@ -95,6 +95,12 @@ test("loop.txt matches its golden file, with the current-state marker", () => {
   const stats = statsFromTimeline(TIMELINE, new Date("2026-09-27T11:05:00.000Z"));
   const chart = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet" } });
   assertGolden("loop.txt", chart);
+  // Plan 04c join: the golden must draw EVERY row, including the 04a/04b
+  // BASELINE and EVALUATING states the merged TRANSITIONS added. A row that
+  // stops being drawn fails here before the golden can hide it.
+  for (const row of TRANSITIONS) {
+    assert.ok(chart.includes(`[${row.id}]`), `TRANSITIONS row '${row.id}' is not drawn in loop.txt`);
+  }
   assert.match(chart, /^current state: DONE/m);
   assert.match(chart, /^current run: RUN_ACTIVE/m);
   assert.match(chart, /^> \+/m);

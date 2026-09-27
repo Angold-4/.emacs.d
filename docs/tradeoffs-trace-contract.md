@@ -28,6 +28,7 @@ Everything else under a run directory is a **projection** rebuilt from state:
 | `views/messages/<id>.org` | one message's evidence, plan excerpt, history, ledger and votes (`renderMessageFile`) |
 | `views/status.txt` | the status buffer's own text (`renderStatusView`), with trade-off record markers |
 | `views/loop.txt` | the phase state machine as a chart (`renderPhaseChart`), drawn from `TRANSITIONS` and refreshed with `views/status.txt` |
+| `views/metrics.json` | the balance metrics (`computeMetrics`, `projectMetrics`), a deterministic projection of state, the timeline and the control log; `tt summary` renders the same numbers |
 
 Projections are written when an event can have changed them (any `MESSAGE_*`
 or `OWNER_VERDICT` event) and again on every conductor start. Because
@@ -37,9 +38,12 @@ projection write rebuilds them on the next start — the log is the only
 authority.
 
 `tt contract rebuild <run>` rewrites the projections (including one file per
-message) from `events.jsonl`. `tt contract check <run>` compares them to
-state and exits non-zero with the mismatching file names when they differ.
-`views/status.txt` is time-dependent and is regenerated, not compared.
+message and `views/metrics.json`) from `events.jsonl`. `tt contract check <run>`
+compares them to state and exits non-zero with the mismatching file names when
+they differ. `views/status.txt` is time-dependent and is
+generated, not compared; `views/metrics.json` is deterministic (every
+duration ends at the last event timestamp in the log, never at a wall
+clock), so it is compared like the other projections.
 
 ## 1. Messages and the message state machine
 
@@ -274,7 +278,13 @@ binding check rejects it.
   ledger entry and its votes.
 - `views/status.txt` is the text the Emacs status buffer shows: the title, the run line, every status row, the trade-offs (each tagged `\t:RECORD:<id>` so RET still opens the decision view), the cost and record counts, the DONE owner checklist, the owner input and directives, and the attention line. `tt status` keeps its own plain-text rendering.
 - `tt summary` (the PR body) lists refused-after-`DONE` follow-ups under
-  `### Follow-ups`.
+  `### Follow-ups` and the same balance numbers under `### Balance metrics`.
+- `views/metrics.json` is the machine view of the same balance: review share
+  of wall time, rounds, raw vs published messages per type, merge and drop
+  rates, the owner's A/D counts and D rate, owner wait time, blockers
+  escalated vs downgraded, and the unexposed-decision proxy (trade-offs a
+  reviewer raised that the worker did not raise itself). The status view
+  renders it as one `metrics` line.
 
 Front ends never infer a message's outcome from anything but these
 projections (or the `tt state` payload, which carries the same state).

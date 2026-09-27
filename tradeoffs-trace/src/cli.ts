@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { pendingOwnerInputs, projectReview, renderStatusText, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
+import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
@@ -30,7 +31,7 @@ import {
 } from "./core/plan-lint.ts";
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
-import { Conductor, createRun, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
+import { Conductor, createRun, rebuildState, rebuildTimeline, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
 import {
@@ -829,10 +830,13 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   const ledger = projectLedger(state.phase);
   const review = projectReview(state.phase);
   const messageFiles = reviewMessageFiles(state.phase);
+  // Plan 04c: `views/metrics.json` is a projection of state and the log.
+  const metrics = projectMetrics(metricsForRunDir(runDir, state.phase, rebuildTimeline(runDir, plan)));
   if (sub === "rebuild") {
     writeFileSync(p.messages, messages);
     writeFileSync(p.ledger, ledger);
     writeFileSync(p.review, review);
+    writeFileSync(p.metrics, metrics);
     mkdirSync(p.messagesView, { recursive: true });
     const ids = new Set(messageFiles.map((f) => f.id));
     for (const f of messageFiles) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
@@ -841,17 +845,19 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     for (const name of readdirSync(p.messagesView)) {
       if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
     }
-    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/messages/\n`);
+    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/messages/, views/metrics.json\n`);
     return;
   }
   if (sub !== "check") usage();
   const actualMessages = existsSync(p.messages) ? readFileSync(p.messages, "utf8") : "";
   const actualLedger = existsSync(p.ledger) ? readFileSync(p.ledger, "utf8") : "";
   const actualReview = existsSync(p.review) ? readFileSync(p.review, "utf8") : "";
+  const actualMetrics = existsSync(p.metrics) ? readFileSync(p.metrics, "utf8") : "";
   const mismatches: string[] = [];
   if (actualMessages !== messages) mismatches.push("messages.jsonl");
   if (actualLedger !== ledger) mismatches.push("ledger.jsonl");
   if (actualReview !== review) mismatches.push("views/review.org");
+  if (actualMetrics !== metrics) mismatches.push("views/metrics.json");
   for (const f of messageFiles) {
     const file = path.join(p.messagesView, `${f.id}.org`);
     const actual = existsSync(file) ? readFileSync(file, "utf8") : "";
@@ -1009,6 +1015,7 @@ async function cmdVerdict(
   writeFileSync(p.messages, projectMessages(after.phase));
   writeFileSync(p.ledger, projectLedger(after.phase));
   writeFileSync(p.review, projectReview(after.phase));
+  writeFileSync(p.metrics, projectMetrics(metricsForRunDir(runDir, after.phase, rebuildTimeline(runDir, plan))));
   // A run from before this view has no views/messages/: create it, and prune
   // ids the state no longer has (same as the conductor and the rebuild path).
   const files = reviewMessageFiles(after.phase);

@@ -6,7 +6,8 @@ phase states:
   +----------------+
   | READY          |  entered 1x - 10s
   +----------------+
-      +- ATTEMPT_STARTED           -> IMPLEMENTING    [start-attempt]
+      +- ATTEMPT_STARTED (noBaselineNeeded) -> IMPLEMENTING    [start-attempt]
+      +- ATTEMPT_STARTED (baselineNeeded) -> BASELINE        [start-baseline]
 
   +----------------+
   | IMPLEMENTING   |  entered 2x - 41m00s  -  worker - model opus
@@ -46,7 +47,7 @@ phase states:
   | PROBING        |  entered 2x - 12m00s
   +----------------+
       +- PROBE_PASSED (reviewsIncomplete) -> REVIEWING       [probe-passed-needs-review]
-      +- PROBE_PASSED (reviewsAlreadyComplete) -> RESOLVING       [probe-passed-reviews-already-valid]
+      +- PROBE_PASSED (reviewsAlreadyComplete) -> EVALUATING      [probe-passed-reviews-already-valid]
       +- PROBE_FAILED (budgetRemains) -> REPAIRING       [probe-failed-to-repairing]
       +- PROBE_FAILED (budgetExhausted) -> AWAITING_OWNER  [probe-failed-budget-exhausted]
       +- AMEND                     -> CHECKING        [amend-from-probing]
@@ -57,7 +58,7 @@ phase states:
   | REVIEWING      |  entered 2x - 30m00s  -  M, A, B - model sonnet
   +----------------+
       +- REVIEW_SUBMITTED (reviewIncomplete) -> REVIEWING       [review-submitted-incomplete]
-      +- REVIEW_SUBMITTED (reviewComplete) -> RESOLVING       [review-submitted-complete]
+      +- REVIEW_SUBMITTED (reviewComplete) -> EVALUATING      [review-submitted-complete]
       +- REVIEW_TIMED_OUT (firstTimeout) -> REVIEWING       [review-timed-out-first]
       +- REVIEW_TIMED_OUT (alreadyTimedOut) -> BLOCKED         [review-unavailable]
       +- AMEND                     -> CHECKING        [amend-from-reviewing]
@@ -132,14 +133,33 @@ phase states:
   +----------------+
       +- REVISE                    -> REPAIRING       [revise-from-blocked]
 
+  +----------------+
+  | BASELINE       |  not entered
+  +----------------+
+      +- BASELINE_COMPLETED        -> IMPLEMENTING    [baseline-completed]
+      +- BASELINE_TIMED_OUT        -> IMPLEMENTING    [baseline-timed-out]
+
+  +----------------+
+  | EVALUATING     |  not entered  -  evaluator, panel - model default
+  +----------------+
+      +- EVALUATION_COMPLETED (evaluationSettledAndPanelEscalated) -> AWAITING_OWNER  [panel-escalate]
+      +- EVALUATION_COMPLETED (evaluationSettledAndPanelDowngraded) -> REPAIRING       [panel-downgrade]
+      +- EVALUATION_COMPLETED (evaluationSettledAndPanelIncomplete) -> RESOLVING       [panel-incomplete]
+      +- EVALUATION_COMPLETED (evaluationSettledNoPanel) -> RESOLVING       [evaluation-completed]
+      +- AMEND                     -> CHECKING        [amend-from-evaluating]
+      +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-evaluating]
+      +- REVISE                    -> REPAIRING       [revise-from-evaluating]
+
 rare edges (crash recovery, launch failure):
-  IMPLEMENTING -- ATTEMPT_INTERRUPTED -> IMPLEMENTING  [attempt-interrupted]
-  FREEZING -- FREEZE_INTERRUPTED  -> FREEZING      [freeze-interrupted]
-  CHECKING -- CHECKS_INTERRUPTED  -> CHECKING      [checks-interrupted]
-  PROBING -- PROBE_INTERRUPTED   -> PROBING       [probe-interrupted]
-  GATING -- GATE_INTERRUPTED    -> GATING        [gate-interrupted]
-  IMPLEMENTING -- LAUNCH_FAILED       -> BLOCKED       [launch-failed-from-implementing]
-  REVIEWING -- LAUNCH_FAILED       -> BLOCKED       [launch-failed-from-reviewing]
+  BASELINE -- BASELINE_INTERRUPTED -> BASELINE      [baseline-interrupted]
+  IMPLEMENTING -- ATTEMPT_INTERRUPTED  -> IMPLEMENTING  [attempt-interrupted]
+  FREEZING -- FREEZE_INTERRUPTED   -> FREEZING      [freeze-interrupted]
+  CHECKING -- CHECKS_INTERRUPTED   -> CHECKING      [checks-interrupted]
+  PROBING -- PROBE_INTERRUPTED    -> PROBING       [probe-interrupted]
+  GATING -- GATE_INTERRUPTED     -> GATING        [gate-interrupted]
+  IMPLEMENTING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-implementing]
+  EVALUATING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-evaluating]
+  REVIEWING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-reviewing]
 
 run states:
 > +-------------------+
