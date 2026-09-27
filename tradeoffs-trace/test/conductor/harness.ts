@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { Conductor, createRun, runPaths, type ConductorOptions, type RunPlanFile } from "../../src/conductor.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
+
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { readLog, type LogRecord } from "../../src/effects/log.ts";
 
@@ -129,6 +130,14 @@ export async function setupConductor(opts: {
    * evaluate. A test that wants real publication supplies its own script,
    * keyed by the message type it is dispatched for. */
   evaluatorScriptFor?: (messageType: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 04b: one fresh panel seat per raw blocker per seat number. The
+   * default script calls `submit_panel_vote` with a `downgrade` vote, so a
+   * blocker that a test raises never parks an otherwise-passing run. A test
+   * that wants a real panel verdict supplies its own script, keyed by the
+   * blocker id and seat. */
+  panelScriptFor?: (blockerId: string, seat: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 04b: the default panel seat script's vote. */
+  defaultPanelVote?: "block" | "downgrade";
   deadlines?: ConductorOptions["deadlines"];
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
    * never parses argv, so these are inert except as a unique, greppable
@@ -210,6 +219,30 @@ export async function setupConductor(opts: {
 
   const reviewerScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
+  const panelScriptPaths = new Map<string, string>();
+
+  const defaultPanelScript = (blockerId: string, seat: number) => ({
+    hello: { role: "panel" as const, tools: ROLE_TOOLS.panel },
+    steps: [
+      {
+        kind: "call-submit",
+        tool: "submit_panel_vote",
+        args:
+          opts.defaultPanelVote === "block"
+            ? {
+                blockerId,
+                seat,
+                vote: "block",
+                reason: `seat ${seat} votes to stop`,
+                options: [
+                  { id: "repair", label: "repair it (grant 3 rounds)" },
+                  { id: "accept_risk", label: "accept the risk" },
+                ],
+              }
+            : { blockerId, seat, vote: "downgrade", reason: `seat ${seat} votes to keep working` },
+      },
+    ],
+  });
 
   const defaultEvaluatorScript = () => ({
     hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
@@ -252,6 +285,24 @@ export async function setupConductor(opts: {
           evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
         }
         return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
+      }
+      if (role === "panel") {
+        // Plan 04b: one script per dispatched seat (the agentId is
+        // `panel-<blockerId>-<seat>-<actionId>`); a retry has a fresh
+        // actionId, so a test can give the retry different behaviour.
+        // Blocker message ids are `B-<n>`; anchoring on that keeps the
+        // blocker id out of the greedy match (the actionId's own `<kind>` has
+        // dashes and digits too).
+        const m = agentId.match(/^panel-(B-\d+)-(\d+)-/);
+        const blockerId = m?.[1] ?? "B-1";
+        const seat = Number(m?.[2] ?? "1");
+        if (!panelScriptPaths.has(agentId)) {
+          const script = opts.panelScriptFor
+            ? opts.panelScriptFor(blockerId, seat, conductor.state)
+            : defaultPanelScript(blockerId, seat);
+          panelScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+        }
+        return { FAKE_PI_SCRIPT: panelScriptPaths.get(agentId)! };
       }
       const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1] ?? "M") as Reviewer;
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {

@@ -74,6 +74,15 @@ export const SUBMIT_REVIEW_PARAMS: ParamShape = {
     "ballots",
     "findings",
     "discoveryMatches",
+    "blockers",
   ],
   required: ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
+};
+
+/** Plan 04b: `submit_panel_vote` — one panel seat's single vote on one raw
+ * blocker. A `block` vote proposes two or three options for the owner; a
+ * `downgrade` vote does not. Matches schemas/panel-vote.schema.json. */
+export const SUBMIT_PANEL_VOTE_PARAMS: ParamShape = {
+  properties: ["blockerId", "seat", "vote", "reason", "options"],
+  required: ["blockerId", "seat", "vote", "reason"],
 };

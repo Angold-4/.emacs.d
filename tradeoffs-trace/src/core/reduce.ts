@@ -25,7 +25,7 @@ import {
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
-import { isLiveDecision, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { isLiveDecision, panelOutcome, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
 import type {
   BindingTuple,
@@ -48,6 +48,9 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "EVALUATION_TIMED_OUT",
   "EVALUATION_INTERRUPTED",
   "EVALUATOR_FINISHED",
+  "PANEL_VOTE",
+  "PANEL_SEAT_UNAVAILABLE",
+  "PANEL_DECIDED",
   "SUBMIT_PHASE",
   "ATTEMPT_TIMED_OUT",
   "ATTEMPT_NO_SUBMISSION",
@@ -138,12 +141,29 @@ function bindingTupleForRecord(
   };
 }
 
-function inFlightKeyFor(action: string, reviewer?: string, messageType?: string): string {
+function inFlightKeyFor(action: string, reviewer?: string, messageType?: string, blockerId?: string, seat?: number): string {
   if (action === "dispatch_review") return `review_${reviewer}`;
   // Plan 04a: one evaluator per message type, so each dispatch has its own
   // in-flight key (`dispatch_evaluation_tradeoff`, …).
   if (action === "dispatch_evaluation") return `dispatch_evaluation_${messageType}`;
+  // Plan 04b: one panel seat per raw blocker, each its own dispatch.
+  if (action === "dispatch_panel") return `dispatch_panel_${blockerId}_${seat}`;
   return action;
+}
+
+/** Plan 04b: merge one panel seat's state. */
+function withPanelSeat(
+  p: PhaseState,
+  blockerId: string,
+  seat: string,
+  patch: Partial<import("./types.ts").PanelSeatState>,
+): PhaseState["panel"] {
+  const blockers = { ...(p.panel?.blockers ?? {}) };
+  const panel = { ...(blockers[blockerId] ?? {}) };
+  const seats = { ...(panel.seats ?? {}) };
+  seats[seat] = { dispatches: 0, ...(seats[seat] ?? {}), ...patch };
+  blockers[blockerId] = { ...panel, seats };
+  return { blockers };
 }
 
 /** Plan 04a: merge one message type's evaluator outcome into `evaluation`. */
@@ -156,6 +176,15 @@ function withEvaluatorOutcome(p: PhaseState, type: MessageType, patch: { settled
 function withoutEvaluationInFlight(p: PhaseState, type: MessageType): PhaseState["inFlight"] {
   const inFlight = { ...p.inFlight };
   delete inFlight[`dispatch_evaluation_${type}` as InFlightKey];
+  return inFlight;
+}
+
+/** Plan 04b: the three seats a panel may have. */
+const PANEL_SEAT_KEYS = new Set(["1", "2", "3"]);
+
+function withoutPanelSeatInFlight(p: PhaseState, blockerId: string, seat: string): PhaseState["inFlight"] {
+  const inFlight = { ...p.inFlight };
+  delete inFlight[`dispatch_panel_${blockerId}_${seat}` as InFlightKey];
   return inFlight;
 }
 
@@ -175,16 +204,33 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         (a) =>
           a.type === event.action &&
           (event.action !== "dispatch_review" || a.reviewer === event.reviewer) &&
-          (event.action !== "dispatch_evaluation" || a.messageType === event.messageType),
+          (event.action !== "dispatch_evaluation" || a.messageType === event.messageType) &&
+          (event.action !== "dispatch_panel" ||
+            (a.blockerId === event.blockerId && a.seat === event.seat)),
       );
       if (!outstanding) {
         return rejected(
           state,
-          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""}${event.messageType ? ` (${event.messageType})` : ""} is not currently outstanding in phase ${p.phase}`,
+          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""}${event.messageType ? ` (${event.messageType})` : ""}${event.blockerId ? ` (${event.blockerId} seat ${event.seat})` : ""} is not currently outstanding in phase ${p.phase}`,
         );
       }
-      const key = inFlightKeyFor(event.action, event.reviewer, event.messageType) as InFlightKey;
-      return ok({ ...state, phase: { ...p, inFlight: { ...p.inFlight, [key]: { actionId: event.actionId } } } });
+      const key = inFlightKeyFor(event.action, event.reviewer, event.messageType, event.blockerId, event.seat) as InFlightKey;
+      // Plan 04b: a panel seat's dispatch count is the one-retry bookkeeping
+      // (a second loss makes the seat unavailable), recorded here so it
+      // survives a conductor restart.
+      const panel =
+        event.action === "dispatch_panel" && event.blockerId && event.seat !== undefined
+          ? withPanelSeat(p, event.blockerId, String(event.seat), {
+              dispatches: (p.panel?.blockers?.[event.blockerId]?.seats?.[String(event.seat)]?.dispatches ?? 0) + 1,
+              // A re-dispatch clears the first loss's marker; the seat is
+              // being tried again.
+              unavailable: false,
+            })
+          : p.panel;
+      return ok({
+        ...state,
+        phase: { ...p, panel, inFlight: { ...p.inFlight, [key]: { actionId: event.actionId } } },
+      });
     }
 
     case "BALLOT_CAST": {
@@ -457,6 +503,116 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           inFlight: withoutEvaluationInFlight(p, event.messageType),
         },
       });
+    }
+
+    case "PANEL_VOTE": {
+      // Plan 04b: one seat's vote on one raw blocker. Record-only inside
+      // EVALUATING: the phase leaves only through EVALUATION_COMPLETED once
+      // every evaluator AND every panel has settled.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `PANEL_VOTE is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const panel = p.panel?.blockers?.[event.blockerId];
+      if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
+      const seatKey = String(event.seat);
+      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      const seat = panel.seats?.[seatKey];
+      if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
+      if (seat?.unavailable) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is unavailable`);
+      if (event.vote !== "block" && event.vote !== "downgrade") {
+        return rejected(state, `a panel vote must be block or downgrade, not ${String(event.vote)}`);
+      }
+      if (typeof event.reason !== "string" || event.reason.trim().length === 0) {
+        return rejected(state, `panel seat ${seatKey} must give a reason for its ${event.vote} vote`);
+      }
+      // A `block` vote proposes two or three options for the owner: the whole
+      // point of an escalation is that the owner has something to choose.
+      const options = event.options ?? [];
+      if (event.vote === "block") {
+        if (options.length < 2 || options.length > 3) {
+          return rejected(state, `a block vote must propose two or three options for the owner, got ${options.length}`);
+        }
+        if (options.some((o) => !o || typeof o.id !== "string" || o.id.length === 0 || typeof o.label !== "string" || o.label.length === 0)) {
+          return rejected(state, `a block vote's options each need a non-empty id and label`);
+        }
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          panel: withPanelSeat(p, event.blockerId, seatKey, {
+            vote: event.vote,
+            reason: event.reason.trim(),
+            ...(event.vote === "block" ? { options } : {}),
+          }),
+          inFlight: withoutPanelSeatInFlight(p, event.blockerId, seatKey),
+        },
+      });
+    }
+
+    case "PANEL_SEAT_UNAVAILABLE": {
+      // Plan 04b: a seat that did not produce a vote after its own retry.
+      // Record-only: the other seats can still decide, and a panel with two
+      // unavailable seats becomes `incomplete`.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `PANEL_SEAT_UNAVAILABLE is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const panel = p.panel?.blockers?.[event.blockerId];
+      if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
+      const seatKey = String(event.seat);
+      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      const seat = panel.seats?.[seatKey];
+      if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
+      if (panelSeatSettled(seat)) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is already unavailable`);
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          panel: withPanelSeat(p, event.blockerId, seatKey, {
+            unavailable: true,
+            ...(event.reason ? { reason: event.reason } : {}),
+          }),
+          inFlight: withoutPanelSeatInFlight(p, event.blockerId, seatKey),
+        },
+      });
+    }
+
+    case "PANEL_DECIDED": {
+      // Plan 04b: the panel's counted verdict. The recorded outcome must be
+      // exactly what the votes imply — the conductor may not invent one —
+      // and every seat must have settled first.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `PANEL_DECIDED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const panel = p.panel?.blockers?.[event.blockerId];
+      if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
+      if (panel.decided) return rejected(state, `blocker ${event.blockerId}'s panel has already decided`);
+      if (!panelSeatsSettled(panel)) {
+        return rejected(state, `blocker ${event.blockerId}'s panel still has undecided seats`);
+      }
+      const computed = panelOutcome(panel);
+      if (event.outcome !== computed) {
+        return rejected(
+          state,
+          `blocker ${event.blockerId}'s votes imply '${computed}', not '${String(event.outcome)}'`,
+        );
+      }
+      if (event.outcome === "escalate") {
+        const options = event.options ?? [];
+        if (options.length < 2 || options.length > 3) {
+          return rejected(state, `an escalated blocker needs two or three options for the owner, got ${options.length}`);
+        }
+      }
+      const blockers = { ...(p.panel?.blockers ?? {}) };
+      blockers[event.blockerId] = {
+        ...panel,
+        decided: {
+          outcome: event.outcome,
+          ...(event.reason ? { reason: event.reason } : {}),
+          ...(event.outcome === "escalate" ? { options: event.options } : {}),
+        },
+      };
+      return ok({ ...state, phase: { ...p, panel: { blockers } } });
     }
 
     case "CRITERION_REVERTED": {

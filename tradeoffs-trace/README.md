@@ -503,6 +503,52 @@ into `live-single-phase.test.ts` before its fixtures are deleted, with a
 normal-suite test proving it accepts a correct candidate and rejects a
 no-op one.
 
+## Plan 04b: the blocker panel
+
+A reviewer's `submit_review` gained a separate **`blockers`** list — "stop
+the work until the owner decides". From the moment one is raised it is two
+things: a raw `blocker` message and an open blocking finding, effective at
+once (the blocking finding blocks acceptance exactly like any other, so a
+raised blocker cannot be accepted away while the panel is still working).
+Only a blocker raised through this list is voted by a panel; a blocking
+*finding* raised through the ordinary `findings` list keeps its pre-04b
+meaning (it blocks acceptance and forces a repair, without parking the run
+on the owner).
+
+Inside `EVALUATING`, next() dispatches three fresh panel seats per raw
+blocker, in parallel, each as its own logged `dispatch_panel` action with
+its own `panelMs` deadline (default 10 min). Each seat sees the phase
+contract, the owner directives, the settled ledger, the blocker and its
+evidence, and the candidate's diff, and returns one vote through the new
+`submit_panel_vote` tool: `block` (and, when it votes block, two or three
+options for the owner) or `downgrade`. A seat that times out is retried
+once; a second loss makes it unavailable.
+
+The votes are counted by the pure core (`panelOutcome` in
+`src/core/predicate.ts`), never by the conductor: 2 of 3 `block` is
+`escalate`, 2 of 3 `downgrade` is `downgrade`, anything else (including two
+unavailable seats) is `incomplete`. `PANEL_VOTE`,
+`PANEL_SEAT_UNAVAILABLE` and `PANEL_DECIDED` are record events;
+`EVALUATION_COMPLETED` stays the single exit from EVALUATING, gated on BOTH
+the evaluators and the panels, so the phase stays in EVALUATING until the
+last of the two settles and EVALUATION_COMPLETED is emitted exactly once.
+The recorded outcome picks that exit's row:
+
+| outcome | row | lands |
+|---|---|---|
+| `escalate` | `panel-escalate` | `AWAITING_OWNER`, an owner request of origin `blocker_panel` carrying the panel's options; no repair round spent. The owner's choice resolves both the blocker message and its blocking finding and resumes into `REPAIRING`. |
+| `downgrade` | `panel-downgrade` | `REPAIRING` (one repair round); the blocking finding is in the next worker prompt. Never parked. |
+| `incomplete` | `panel-incomplete` | `RESOLVING`, where the still-open blocking finding routes to a repair round. Never parked by the panel itself. |
+
+An escalated `blocker_panel` owner request is resolved through the ordinary
+inbox path (`type: "resolve"`); `src/core/owner-commands.ts` closes the
+linked finding as accepted under the chosen option and resolves the linked
+message by the owner. Crash recovery treats a panel seat left in flight
+exactly like a timeout (retried once, then unavailable).
+`test/conductor/blocker-panel.test.ts` is the exit gate: escalate with the
+owner's resolution, downgrade into the repair prompt, a timeout+retry and a
+two-unavailable incomplete, and the two completion orders in one test.
+
 ## Running the tests
 
 ```sh

@@ -59,7 +59,11 @@ export function isRepairForcingOption(origin: OwnerRequest["origin"], optionId: 
     (origin === "failed_vote" && optionId === "reject_and_repair") ||
     (origin === "reserved_decision" && optionId === "reject_and_repair") ||
     (origin === "open_finding" && optionId === "repair") ||
-    (origin === "unaddressed_correction" && optionId === "grant_correction")
+    (origin === "unaddressed_correction" && optionId === "grant_correction") ||
+    // Plan 04b: an escalated blocker's every panel option is a decision the
+    // owner makes about the work; resolving one always starts the repair
+    // that carries it out (a fresh allowance, exactly like a correction).
+    origin === "blocker_panel"
   );
 }
 

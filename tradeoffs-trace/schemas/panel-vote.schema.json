@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tradeoffs-trace/panel-vote",
+  "title": "Panel vote",
+  "description": "Plan 04b: one seat of a blocker panel's vote on one raw blocker. `block` means stop the work until the owner decides and must propose two or three options for the owner; `downgrade` means it is an ordinary blocking finding for the next worker attempt. Every vote carries a reason.",
+  "type": "object",
+  "required": ["blockerId", "seat", "vote", "reason"],
+  "additionalProperties": false,
+  "properties": {
+    "blockerId": { "type": "string", "minLength": 1, "description": "The raw blocker message id this vote is about" },
+    "seat": { "enum": [1, 2, 3], "description": "This seat's number (1, 2 or 3)" },
+    "vote": { "enum": ["block", "downgrade"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "options": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 3,
+      "description": "block only: the two or three options the owner chooses from",
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "label": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

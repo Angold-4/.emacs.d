@@ -85,6 +85,37 @@
         }
       }
     },
+    "blockers": {
+      "type": "array",
+      "description": "Plan 04b: the reviewer's separate blockers list — 'stop the work until the owner decides'. Each is raised as a raw `blocker` message AND a blocking finding, effective at once.",
+      "items": {
+        "type": "object",
+        "required": ["kind", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["defect", "contract", "integration"] },
+          "evidence": { "type": "string", "minLength": 1 },
+          "linkedDecisionId": { "type": "string", "minLength": 1 },
+          "sameAs": { "type": "string", "minLength": 1 },
+          "criterionDispute": {
+            "type": "object",
+            "required": ["criterion", "why", "proposedWording"],
+            "additionalProperties": false,
+            "properties": {
+              "criterion": { "type": "string", "minLength": 1 },
+              "why": { "type": "string", "minLength": 1 },
+              "proposedWording": { "type": "string", "minLength": 1 }
+            }
+          },
+          "reproduction": {
+            "type": "object",
+            "required": ["command"],
+            "additionalProperties": false,
+            "properties": { "command": { "type": "string", "minLength": 1 } }
+          }
+        }
+      }
+    },
     "discoveryMatches": {
       "type": "array",
       "description": "Plan 2c: for each of this reviewer's own turn-1 discoveries that is the same choice as another listed record, {discoveryId, sameAs}.",

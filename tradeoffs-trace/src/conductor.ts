@@ -81,7 +81,7 @@ import type {
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
 import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
-import { decisionStatus, isLiveDecision, sameVersion } from "./core/predicate.ts";
+import { decisionStatus, isLiveDecision, panelOptionsFor, panelOutcome, panelSeatsSettled, sameVersion } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
@@ -157,6 +157,10 @@ export interface Deadlines {
    * its raw messages are published `unevaluated` and the phase moves on. The
    * plan sets it with `#+TT_EVALUATE_MINUTES` (default 10). */
   evaluateMs: number;
+  /** Plan 04b: each panel seat's own deadline. A seat that times out is
+   * re-dispatched once; a second loss makes that seat unavailable. The plan
+   * sets it with `#+TT_PANEL_MINUTES` (default 10). */
+  panelMs: number;
   reviewMs: number;
   reproductionMs: number;
   abortGraceMs: number;
@@ -209,6 +213,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   probeMs: 10 * 60_000,
   gateMs: 30 * 60_000,
   evaluateMs: 10 * 60_000,
+  panelMs: 10 * 60_000,
   reviewMs: 15 * 60_000,
   reproductionMs: 5 * 60_000,
   abortGraceMs: 30_000,
@@ -806,6 +811,10 @@ interface AgentHandle {
   discoveryPromise: Promise<void>;
   /** Plan 04a: the message type this evaluator handles. */
   messageType?: MessageType;
+  /** Plan 04b: the raw blocker this panel seat votes on, and its seat number.
+   * Set only for a `panel` handle. */
+  blockerId?: string;
+  panelSeat?: number;
   /** Plan 01d: the records this dispatch's turn-2 prompt demanded a ballot
    * for (id → its one-line choice), captured when that prompt was built and
    * never recomputed, so a record added after it (a late discovery) is never
@@ -1247,6 +1256,24 @@ export class Conductor {
           ? { type: "EVALUATION_TIMED_OUT", messageType }
           : { type: "EVALUATION_INTERRUPTED", messageType },
       );
+      return;
+    }
+
+    if (key.startsWith("dispatch_panel_")) {
+      // Plan 04b: a conductor died while one panel seat voted. Kill whatever
+      // survived and treat the seat exactly like a timeout — it is retried
+      // once, and a second loss makes it unavailable.
+      const rest = key.slice("dispatch_panel_".length);
+      const sep = rest.lastIndexOf("_");
+      const blockerId = rest.slice(0, sep);
+      const seat = Number(rest.slice(sep + 1));
+      const pgid = payload.pgid as number | undefined;
+      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
+        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
+      this.#log.completion(actionId, { blockerId, seat, interrupted: true, reason: "crash-recovery" });
+      this.#panelSeatUnavailable(blockerId, seat, this.#state.phase.candidate?.sha, "the conductor died while the seat voted");
       return;
     }
 
@@ -2585,6 +2612,34 @@ export class Conductor {
       case "evaluation_complete":
         this.#applyEvent({ type: "EVALUATION_COMPLETED" });
         return;
+      case "dispatch_panel": {
+        const blockerId = action.blockerId as string;
+        const seat = action.seat as number;
+        const actionId = this.#log.actionId(`${kind}_${blockerId}_${seat}`);
+        this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_panel", actionId, blockerId, seat });
+        void this.#runPanelSeat(actionId, blockerId, seat).catch((err) => this.#logUnexpected("dispatch_panel", err));
+        return;
+      }
+      case "panel_decide": {
+        // Plan 04b: every seat has settled. The OUTCOME is computed here
+        // from the recorded votes by the pure core rule; the conductor may
+        // not invent one.
+        const blockerId = action.blockerId as string;
+        const panel = this.#state.phase.panel?.blockers?.[blockerId];
+        if (!panel || panel.decided || !panelSeatsSettled(panel)) return;
+        const outcome = panelOutcome(panel);
+        const blockReasons = Object.values(panel.seats ?? {})
+          .filter((s) => s.vote === "block" && s.reason)
+          .map((s) => s.reason as string);
+        this.#applyEvent({
+          type: "PANEL_DECIDED",
+          blockerId,
+          outcome,
+          ...(blockReasons.length > 0 ? { reason: blockReasons.join("; ") } : {}),
+          ...(outcome === "escalate" ? { options: panelOptionsFor(panel) } : {}),
+        });
+        return;
+      }
       case "dispatch_worker": {
         const actionId = this.#log.actionId(kind);
         this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_worker", actionId });
@@ -3007,6 +3062,51 @@ export class Conductor {
       handle.doneResolve();
       return { ok: true };
     }
+    if (msg.tool === "submit_panel_vote") {
+      // Plan 04b: one panel seat's vote on one raw blocker. Validated whole
+      // (a partial vote is never recorded), then applied as a record event;
+      // the phase leaves EVALUATING only once every evaluator AND panel has
+      // settled.
+      if (handle.role !== "panel" || this.#state.phase.phase !== "EVALUATING") {
+        return { ok: false, reason: `submit_panel_vote is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      const blockerId = handle.blockerId;
+      const seat = handle.panelSeat;
+      if (!blockerId || seat === undefined) return { ok: false, reason: "this panel seat is not bound to a blocker" };
+      const seatState = this.#state.phase.panel?.blockers?.[blockerId]?.seats?.[String(seat)];
+      if (seatState?.vote !== undefined) return { ok: false, reason: `this seat (${seat}) already voted` };
+      if (seatState?.unavailable === true && seatState.dispatches >= 2) {
+        return { ok: false, reason: `this seat (${seat}) is unavailable` };
+      }
+      const args = msg.args as { vote?: unknown; reason?: unknown; options?: unknown };
+      const vote = args.vote;
+      if (vote !== "block" && vote !== "downgrade") {
+        return { ok: false, reason: "submit_panel_vote needs vote: 'block' or 'downgrade'" };
+      }
+      const reason = typeof args.reason === "string" ? args.reason.trim() : "";
+      if (!reason) return { ok: false, reason: "submit_panel_vote needs a non-empty reason" };
+      const options = Array.isArray(args.options) ? (args.options as PanelOptionInput[]) : undefined;
+      if (vote === "block") {
+        if (!options || options.length < 2 || options.length > 3) {
+          return { ok: false, reason: "a block vote must propose two or three options for the owner" };
+        }
+        for (const option of options) {
+          if (!option || typeof option.id !== "string" || option.id.trim().length === 0 || typeof option.label !== "string" || option.label.trim().length === 0) {
+            return { ok: false, reason: "every option needs a non-empty id and label" };
+          }
+        }
+      }
+      this.#applyEvent({
+        type: "PANEL_VOTE",
+        blockerId,
+        seat,
+        vote,
+        reason,
+        ...(vote === "block" ? { options: options!.map((o) => ({ id: o.id.trim(), label: o.label.trim() })) } : {}),
+      });
+      handle.doneResolve();
+      return { ok: true };
+    }
     return { ok: false, reason: `unknown submission tool ${msg.tool}` };
   }
 
@@ -3246,7 +3346,12 @@ export class Conductor {
    * live worktree or the reviewer's own read-only candidate checkout) if
    * one was given, and emits `FINDING_RAISED`. Returns an error string
    * instead of throwing, like `#applyDiscoveries`. */
-  async #raiseFinding(fd: FindingDisclosure, reviewer: Reviewer, candidateSha: string): Promise<string | undefined> {
+  async #raiseFinding(
+    fd: FindingDisclosure,
+    reviewer: Reviewer,
+    candidateSha: string,
+    opts: { raisedAsBlocker?: boolean } = {},
+  ): Promise<string | undefined> {
     let reproduction: Finding["reproduction"];
     if (fd.reproduction) {
       const result = await this.#runReproduction(fd.reproduction.command, candidateSha);
@@ -3277,8 +3382,15 @@ export class Conductor {
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
     this.#applyEvent({ type: "FINDING_RAISED", finding });
     // Contract v1 §1: a finding (or, at blocking severity, a blocker) is a
-    // published message too.
-    this.#raiseMessage(finding.severity === "blocking" ? "blocker" : "finding", finding.id, this.#findingContent(finding), candidateSha);
+    // published message too. Plan 04b: only one raised through a reviewer's
+    // `blockers` list is marked as a blocker, so only it is voted by a panel.
+    this.#raiseMessage(
+      finding.severity === "blocking" ? "blocker" : "finding",
+      finding.id,
+      this.#findingContent(finding),
+      candidateSha,
+      opts.raisedAsBlocker ? { raisedAsBlocker: true } : {},
+    );
     // Plan 01g: a reviewer's finding may say the criterion cannot be met as
     // written. That is recorded as an amendment the reviewers vote on later;
     // a criterion the contract does not carry is ignored (the finding itself
@@ -3414,7 +3526,16 @@ export class Conductor {
       this.#applyEvent({ type: "DECISION_MATCHED", decisionId: discovery.id, sameAs: target.id, reviewer: review.reviewer });
     }
 
-    for (const fd of review.findings ?? []) {
+    // Plan 04b: a reviewer's separate `blockers` list is raised exactly like
+    // a finding, at `blocking` severity (a blocker has no other severity).
+    // From that moment it is two things: a raw `blocker` message (marked
+    // `raisedAsBlocker`, so a panel votes on it) and an open blocking finding
+    // — effective at once against acceptance.
+    const raised: Array<{ fd: FindingDisclosure; asBlocker: boolean }> = [
+      ...(review.findings ?? []).map((fd) => ({ fd, asBlocker: false })),
+      ...(review.blockers ?? []).map((b) => ({ fd: { ...b, severity: "blocking" as const } as FindingDisclosure, asBlocker: true })),
+    ];
+    for (const { fd, asBlocker } of raised) {
       // Plan 2c: "same as F-…" records agreement instead of a duplicate.
       if (fd.sameAs) {
         const existing = this.#state.phase.findings.find((f) => f.id === fd.sameAs && f.status === "open");
@@ -3424,7 +3545,7 @@ export class Conductor {
         }
       }
       const { sameAs: _sameAs, ...disclosure } = fd;
-      const error = await this.#raiseFinding(disclosure, review.reviewer, candidate.sha);
+      const error = await this.#raiseFinding(disclosure, review.reviewer, candidate.sha, { raisedAsBlocker: asBlocker });
       if (error) return error;
       if (!this.#reviewStillCurrent(candidate.sha)) return STALE_REVIEW;
     }
@@ -3924,6 +4045,15 @@ export class Conductor {
           (tail ? ` Last ${GATE_TAIL_LINES} lines of its log:\n${tail}` : ""),
       );
     }
+    // Plan 04b: the owner's choice on an escalated blocker is an instruction
+    // to the next attempt, so it reaches the worker in the same
+    // "must be fixed" section. (Resolving it also closed the blocking
+    // finding, so without this line the choice would be invisible.)
+    for (const r of phase.ownerRequests) {
+      if (r.origin !== "blocker_panel" || r.status !== "resolved" || !r.resolution?.option) continue;
+      const label = r.options.find((o) => o.id === r.resolution!.option)?.label ?? r.resolution.option;
+      blocking.push(`The owner's choice on blocker ${r.linkedMessageId ?? r.linkedFindingId ?? r.id}: ${label}. Carry that choice out.`);
+    }
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
@@ -4174,7 +4304,7 @@ export class Conductor {
     sourceRecordId: string | undefined,
     content: MessageContent,
     candidateSha: string,
-    opts: { anchor?: Message["anchor"] } = {},
+    opts: { anchor?: Message["anchor"]; raisedAsBlocker?: boolean } = {},
   ): string {
     const existing = this.#state.phase.messages ?? [];
     if (sourceRecordId !== undefined) {
@@ -4190,6 +4320,7 @@ export class Conductor {
       type,
       ...content,
       ...(opts.anchor ? { anchor: opts.anchor } : {}),
+      ...(opts.raisedAsBlocker ? { raisedAsBlocker: true } : {}),
       state: "raw",
       messageVersion: 1,
       boundCandidateSha: candidateSha,
@@ -5773,6 +5904,205 @@ export class Conductor {
     return lines.join("\n");
   }
 
+  // -- plan 04b: the blocker panel -----------------------------------------
+
+  /** A late timeout/loss for a seat whose phase has moved on is logged and
+   * dropped, exactly like a stale evaluation or review. */
+  #panelSeatUnavailable(blockerId: string, seat: number, dispatchCandidate: string | undefined, reason: string): void {
+    const phase = this.#state.phase;
+    const panel = phase.panel?.blockers?.[blockerId];
+    const seatState = panel?.seats?.[String(seat)];
+    if (
+      phase.phase !== "EVALUATING" ||
+      phase.candidate?.sha !== dispatchCandidate ||
+      !panel ||
+      panel.decided ||
+      // Already voted, or already unavailable after its one retry: a late
+      // loss must not be applied twice.
+      seatState?.vote !== undefined ||
+      (seatState?.unavailable === true && seatState.dispatches >= 2)
+    ) {
+      this.#log.append("stale_panel_ignored", { blockerId, seat, dispatchCandidate, phase: phase.phase });
+      return;
+    }
+    // The same one-retry rule REVIEWING uses: the first loss clears the
+    // in-flight seat so next() re-dispatches it; the second settles it as
+    // unavailable, leaving the other seats to decide.
+    this.#applyEvent({ type: "PANEL_SEAT_UNAVAILABLE", blockerId, seat, reason });
+  }
+
+  /** Plan 04b: one fresh panel seat for one raw blocker. It reads the phase
+   * contract, the owner directives, the settled ledger, the blocker and its
+   * evidence, and the candidate's diff, then votes `block` or `downgrade`
+   * through `submit_panel_vote`. Three of these run in parallel; each has its
+   * own deadline and its own one retry. */
+  async #runPanelSeat(actionId: string, blockerId: string, seat: number): Promise<void> {
+    const dispatchCandidate = this.#state.phase.candidate?.sha;
+    const agentId = `panel-${blockerId}-${seat}-${actionId}`;
+    const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
+    const candidateDir = this.#candidateDir();
+    const env: NodeJS.ProcessEnv = {
+      ...this.#extraEnv,
+      ...this.#piEnvFor?.("panel", agentId),
+      TT_SOCKET: this.#paths.sock,
+      TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_RUN_DIR: this.#runDir,
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+      TT_CANDIDATE_SHA: this.#state.phase.candidate?.sha,
+      TT_BLOCKER_ID: blockerId,
+      TT_PANEL_SEAT: String(seat),
+    };
+
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+
+    const panelPiCommand = this.#resolvePiCommand("panel");
+    const providerModel = this.#providerModelFor?.("panel");
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
+    const agent = spawnPiAgent({
+      command: panelPiCommand,
+      args: [
+        ...this.#resolvePiArgsPrefix("panel"),
+        ...launchArgs("panel", {
+          noSession: panelPiCommand !== undefined,
+          provider: providerModel?.provider,
+          model: providerModel?.model,
+        }),
+      ],
+      cwd: candidateDir,
+      env,
+      role: "panel",
+      agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(agentId, event);
+        this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
+    });
+
+    const handle: AgentHandle = {
+      agent,
+      role: "panel",
+      agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve: () => undefined,
+      discoveryPromise: Promise.resolve(),
+      blockerId,
+      panelSeat: seat,
+    };
+    this.#agents.set(agentId, handle);
+    this.#log.intent(actionId, { agentId, pgid: agent.pgid, blockerId, seat });
+
+    try {
+      const hello = await Promise.race([
+        raceTimeout(helloPromise, this.#deadlines.helloTimeoutMs, "hello"),
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      if (hello === "timeout" || hello === "exited") {
+        await agent.terminate();
+        this.#log.completion(actionId, { blockerId, seat, ok: false, reason: hello === "exited" ? "panel seat exited before hello" : "hello timed out" });
+        this.#panelSeatUnavailable(blockerId, seat, dispatchCandidate, "the seat never started");
+        return;
+      }
+      if (!hello.ok) {
+        await agent.terminate();
+        this.#log.completion(actionId, { blockerId, seat, ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
+        // design §2.1: a tool-set mismatch is a launch failure, not a
+        // warning — the whole run stops with evidence.
+        if (hello.mismatch) {
+          this.#applyEvent({ type: "LAUNCH_FAILED", role: "panel", ...hello.mismatch });
+        } else {
+          this.#panelSeatUnavailable(blockerId, seat, dispatchCandidate, "hello failed");
+        }
+        return;
+      }
+
+      const seatTimeout = this.#withStallWatch(
+        agentId,
+        agent,
+        cancelableTimeout(this.#deadlines.panelMs, "timeout" as const),
+        "Owner (conductor): no progress for a while. Finish now and call submit_panel_vote.",
+      );
+      const settled = nextSettle();
+      await agent.prompt(this.#buildPanelPrompt(blockerId, seat));
+      const outcome = await Promise.race([
+        donePromise.then(() => "submitted" as const),
+        seatTimeout.promise,
+        settled,
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      seatTimeout.cancel();
+      if (outcome === "submitted") {
+        await agent.terminate();
+        this.#log.completion(actionId, { blockerId, seat, ok: true });
+        return;
+      }
+      await agent.terminate();
+      this.#log.completion(actionId, { blockerId, seat, ok: false, reason: outcome });
+      this.#panelSeatUnavailable(blockerId, seat, dispatchCandidate, `the seat did not vote (${outcome})`);
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** Plan 04b: one panel seat's prompt — the phase contract, the owner
+   * directives in force, the settled ledger, the candidate's diff against the
+   * base, and the blocker (with its evidence). */
+  #buildPanelPrompt(blockerId: string, seat: number): string {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha ?? "";
+    const message = (phase.messages ?? []).find((m) => m.id === blockerId);
+    let diff = "";
+    try {
+      diff = diffText(this.#plan.repo, phase.integrationHead, C);
+    } catch {
+      diff = "(the diff could not be read)";
+    }
+    return [
+      `You are panel seat ${seat} of 3, voting on blocker ${blockerId} for phase ${phase.phaseId}, candidate ${C.slice(0, 9)} (contract snapshot ${phase.contract.contractVersion.snapshot}).`,
+      `Goal: ${phase.contract.goal}`,
+      "",
+      "Acceptance criteria:",
+      ...phase.contract.acceptance.map((a) => `- ${a}`),
+      ...secretPromptLines(this.#secretNames),
+      ...directiveLines(phase.ownerDirectives),
+      ...ledgerPromptLines(phase.messages),
+      "",
+      "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
+      "```diff",
+      redactText(diff, this.#secretMaskable),
+      "```",
+      "",
+      "The blocker (a raw `blocker` message, and a blocking finding effective at once):",
+      `- ${blockerId}: ${message?.title ?? "(the message could not be read)"}`,
+      `    why: ${message?.summary ?? ""}`,
+      `    context: ${message?.context ?? ""}`,
+      `    evidence: ${(message?.evidence ?? []).join("; ")}`,
+      "",
+      "Check the blocker's claim against the code and vote once with submit_panel_vote:",
+      "- `block`: the work must stop until the owner decides. Propose TWO OR THREE options the owner can choose from (id + label) — the escalation reaches the owner with them.",
+      "- `downgrade`: the work should not stop for the owner; it becomes an ordinary blocking finding the worker must repair. Give no options.",
+      "Either way, give a reason. You are one of three independent seats; vote what the evidence shows.",
+    ].join("\n");
+  }
+
   // -- plan 2c: discovery barrier ------------------------------------------
 
   #discoveryBarrier: { candidate: string; arrived: Set<Reviewer>; released: boolean; waiters: Array<() => void> } | undefined;
@@ -5961,6 +6291,7 @@ export class Conductor {
       "Call submit_review with:",
       "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation), except records marked carried: your previous ballot stands for those, and a new ballot replaces it. A ballot with contractObjection=true opens a contract finding and suspends that vote.",
       "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it. If the problem is that a criterion cannot be met AS WRITTEN, add `criterionDispute` = { criterion: <the acceptance item verbatim>, why, proposedWording }: the conductor records an amendment voted on like any reserved record (a passing one replaces the wording; a failed one leaves it unchanged). An unmet-but-clear criterion is an ordinary defect finding.",
+      "- `blockers`: use this ONLY to stop the work until the owner decides. Each entry is {kind, evidence} like a finding (it is raised at once as a raw blocker message and a blocking finding), and a panel of three fresh agents then votes `block` or `downgrade`. A `block` majority parks the phase for the owner, with options the panel proposes; a `downgrade` majority makes it an ordinary blocking finding for the next worker attempt. An ordinary defect that should be fixed but need not stop the run belongs in `findings`, not here.",
       // Plan 01g: an amendment record is a reserved decision like any other;
       // it must get a ballot, and it never blocks acceptance on its own.
       ...(phase.decisions.some((d) => d.amendment && d.boundCandidateSha === C && isLiveDecision(d))
@@ -6009,6 +6340,12 @@ export class Conductor {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/** Plan 04b: one option a panel seat's `block` vote proposes. */
+interface PanelOptionInput {
+  id: string;
+  label: string;
+}
 
 /** Plan 04a: one `submit_evaluation` entry, as the evaluator sends it. */
 interface EvaluationEntry {
