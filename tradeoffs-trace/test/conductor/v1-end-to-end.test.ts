@@ -175,7 +175,10 @@ async function assertProjections(setup: TestConductorSetup): Promise<void> {
   assert.ok(existsSync(p.review), "views/review.org must exist");
   assert.ok(existsSync(p.loop), "views/loop.txt must exist");
   assert.ok(existsSync(p.metrics), "views/metrics.json must exist");
-  await waitFor(() => tt(["contract", "check", setup.runDir]).status === 0, 30_000, 50, setup.runDir);
+  // 250 ms: a check spawned every 50 ms would add many node processes to the
+  // already-parallel suite; the retry is only to ride out a projection write
+  // that has not caught up with the log yet.
+  await waitFor(() => tt(["contract", "check", setup.runDir]).status === 0, 30_000, 250, setup.runDir);
 }
 
 test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, two rounds, and the owner's two D verdicts", async () => {

@@ -24,7 +24,7 @@ import { projectLedger, projectMessages } from "./core/messages.ts";
 import { projectReview, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
-import { metricsForRunDir, projectMetrics } from "./metrics.ts";
+import { metricEvents, metricsForRunDir, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -729,8 +729,7 @@ export interface Timeline {
   restarts?: string[];
 }
 
-export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
-  const { records } = readLog(runPaths(runDir).events);
+function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string } | undefined;
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
   const phases: Timeline["phases"] = [];
@@ -758,6 +757,20 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
     }
   }
   return { state, phases, rounds, restarts };
+}
+
+export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
+  const { records } = readLog(runPaths(runDir).events);
+  return timelineFromRecords(records, plan);
+}
+
+/** The timeline AND the reduced events, from one read of the control log.
+ * The balance metrics need both; building them from a single snapshot keeps
+ * the projection consistent with the timeline it is drawn beside, and avoids
+ * re-parsing the whole log once per status beat. */
+export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { timeline: Timeline; events: MetricEvent[] } {
+  const { records } = readLog(runPaths(runDir).events);
+  return { timeline: timelineFromRecords(records, plan), events: metricEvents(records) };
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
@@ -4325,7 +4338,8 @@ export class Conductor {
    * a message event can arrive between two status beats. */
   #writeMetricsProjection(): void {
     try {
-      const metrics = metricsForRunDir(this.#runDir, this.#state.phase, rebuildTimeline(this.#runDir, this.#plan));
+      const { timeline, events } = rebuildTimelineWithEvents(this.#runDir, this.#plan);
+      const metrics = metricsForRunDir(this.#runDir, timeline.state.phase, timeline, events);
       fs.writeFileSync(this.#paths.metrics, projectMetrics(metrics));
     } catch (err) {
       this.#logUnexpected("write_metrics_projection", err);
@@ -4370,11 +4384,10 @@ export class Conductor {
       }),
     );
     fs.writeFileSync(this.#paths.status, redactText(text, this.#secretMaskable));
-    // Plan 04c: the same beat keeps `views/metrics.json` current. The metrics
-    // read the control log fresh (not this beat's earlier timeline), so the
-    // file can never mix a timeline read at one instant with events read at
-    // another — `tt contract check` recomputes both from the same file.
-    this.#writeMetricsProjection();
+    // Plan 04c: the same beat keeps `views/metrics.json` current. `buildView`
+    // already built the metrics from this beat's one log snapshot, so writing
+    // them here reuses it instead of parsing the whole log a second time.
+    fs.writeFileSync(this.#paths.metrics, projectMetrics(view.metrics));
     // Plan 03c: the same beat keeps the phase chart (`views/loop.txt`) current;
     // it is generated from TRANSITIONS, so it can never drift from the loop.
     const stats = statsFromTimeline(view.timeline, new Date());

@@ -31,7 +31,7 @@ import {
 } from "./core/plan-lint.ts";
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
-import { Conductor, createRun, rebuildState, rebuildTimeline, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
+import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
 import {
@@ -831,7 +831,8 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   const review = projectReview(state.phase);
   const messageFiles = reviewMessageFiles(state.phase);
   // Plan 04c: `views/metrics.json` is a projection of state and the log.
-  const metrics = projectMetrics(metricsForRunDir(runDir, state.phase, rebuildTimeline(runDir, plan)));
+  const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
+  const metrics = projectMetrics(metricsForRunDir(runDir, state.phase, timeline, events));
   if (sub === "rebuild") {
     writeFileSync(p.messages, messages);
     writeFileSync(p.ledger, ledger);
@@ -1015,7 +1016,8 @@ async function cmdVerdict(
   writeFileSync(p.messages, projectMessages(after.phase));
   writeFileSync(p.ledger, projectLedger(after.phase));
   writeFileSync(p.review, projectReview(after.phase));
-  writeFileSync(p.metrics, projectMetrics(metricsForRunDir(runDir, after.phase, rebuildTimeline(runDir, plan))));
+  const lateTimeline = rebuildTimelineWithEvents(runDir, plan);
+  writeFileSync(p.metrics, projectMetrics(metricsForRunDir(runDir, after.phase, lateTimeline.timeline, lateTimeline.events)));
   // A run from before this view has no views/messages/: create it, and prune
   // ids the state no longer has (same as the conductor and the rebuild path).
   const files = reviewMessageFiles(after.phase);

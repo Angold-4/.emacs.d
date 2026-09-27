@@ -7,14 +7,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { DEFAULT_DEADLINES, rebuildTimeline, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
+import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { effectiveChecks } from "./core/checks.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
-import { metricsForRunDir, metricsLine, metricsSummary, type PhaseMetrics } from "./metrics.ts";
+import { computeMetrics, metricsLine, metricsSummary, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -454,7 +454,9 @@ export function runCost(timeline: Timeline, spans: StageSpan[], now: Date): RunC
 }
 
 export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now = new Date()): RunView & { timeline: Timeline } {
-  const timeline = rebuildTimeline(runDir, plan);
+  // One read of the control log gives both the timeline and the events the
+  // balance metrics need, so nothing here parses the log twice.
+  const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
   const spans = stageSpans(timeline, now, alive ? undefined : lastEventAt(runDir));
   const current = spans[spans.length - 1];
@@ -563,7 +565,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   const cost = runCost(timeline, spans, now);
   // Plan 04c: the balance metrics are a deterministic projection of the same
   // timeline; the status view and `tt summary` render the one line / section.
-  const metrics = metricsForRunDir(runDir, phase, timeline);
+  const metrics = computeMetrics(phase, timeline, events);
   return {
     timeline,
     metrics,

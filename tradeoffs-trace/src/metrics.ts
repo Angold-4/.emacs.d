@@ -252,11 +252,25 @@ export function metricsSummary(m: PhaseMetrics): string[] {
   ];
 }
 
+/** One log record, structurally (so metrics.ts never imports the log module's
+ * record type). */
+export interface LogLike {
+  kind: string;
+  ts: string;
+  event: unknown;
+}
+
+/** The reduced events, as metrics read them: one per `kind:"event"` record,
+ * carrying its log timestamp. Exported so a caller that already read the log
+ * (the conductor's timeline rebuild) can reuse the same snapshot. */
+export function metricEvents(records: readonly LogLike[]): MetricEvent[] {
+  return records.filter((r) => r.kind === "event").map((r) => ({ ...(r.event as MetricEvent), ts: r.ts }));
+}
+
 /** Read a run's control log and compute its metrics from the given state and
- * timeline. The event log is read here so the projection cannot diverge from
- * `tt contract rebuild` (which reads the same file). */
-export function metricsForRunDir(runDir: string, phase: PhaseState, timeline: MetricsTimeline): PhaseMetrics {
-  const { records } = readLog(`${runDir}/events.jsonl`);
-  const events = records.filter((r) => r.kind === "event").map((r) => ({ ...(r.event as MetricEvent), ts: r.ts }));
-  return computeMetrics(phase, timeline, events);
+ * timeline. `events` may be supplied when the caller already read the log, so
+ * the projection cannot diverge from the timeline it was built beside. */
+export function metricsForRunDir(runDir: string, phase: PhaseState, timeline: MetricsTimeline, events?: readonly MetricEvent[]): PhaseMetrics {
+  const evs = events ?? metricEvents(readLog(`${runDir}/events.jsonl`).records);
+  return computeMetrics(phase, timeline, evs);
 }
