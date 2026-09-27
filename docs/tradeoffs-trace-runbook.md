@@ -619,7 +619,8 @@ the code.
 Emacs shows both where the owner already looks. The **program buffer**
 (`C-c m p`) begins with `views/program.txt` — the dependency chart — and its
 node list follows below it; the chart is text, so only the node lines open a
-run with `RET`. The **phase chart** (`views/loop.txt`) opens with `C-c m g`
+run with `RET`, and point stays on the node it was on as the chart above the
+list grows or shrinks. The **phase chart** (`views/loop.txt`) opens with `C-c m g`
 from any of the run's own buffers (status, review, trace, input, decisions) or
 from a node line in the program buffer, in a read-only `*tt-chart <readable
 id>*` buffer: it re-reads the file whenever it changes (as the review buffer
