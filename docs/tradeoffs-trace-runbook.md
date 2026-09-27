@@ -235,7 +235,7 @@ configuration, with a different model family per reviewer seat and the panel
 following the reviewers:
 
 ```org
-#+TT_MODELS: worker=deepseek/deepseek-v4.1-flash reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=deepseek/deepseek-v4.1-flash reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers
+#+TT_MODELS: worker=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers
 ```
 
 Space-separated declarations, one per line in the real plans:
@@ -249,7 +249,8 @@ Space-separated declarations, one per line in the real plans:
   the model `openai/gpt-6-sol:high`, while
   `reviewer=vercel-ai-gateway:openai/gpt-6-sol:high` passes provider
   `vercel-ai-gateway` and that same model. `worker=deepseek/deepseek-v4.1-flash`
-  passes no provider; a model id may contain `/`.
+  passes no provider, so Pi may select another provider for that model even
+  when `defaultProvider` is set. Name the provider when it matters.
 - `panel=reviewers` is the one non-model value: every panel seat runs on the
   reviewer model of its position (seat 1 → M, 2 → A, 3 → B), so the panel
   disagrees with the same variety the reviewers do. Do not also write an
