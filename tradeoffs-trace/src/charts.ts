@@ -13,7 +13,7 @@ import type { MessageTransitionRow } from "./core/messages.ts";
 import { MESSAGE_TRANSITIONS } from "./core/messages.ts";
 import type { ProgramNode, ProgramState } from "./core/program.ts";
 import type { TransitionRow } from "./core/transitions.ts";
-import { TRANSITIONS } from "./core/transitions.ts";
+import { MAIN_PATH, TRANSITIONS } from "./core/transitions.ts";
 
 /** How often and how long each state was entered — what a chart shows beside
 each state. `current` names the phase state the run is in now; `currentRun`
@@ -305,26 +305,10 @@ export interface LoopTapeRow {
   arrow?: string;
 }
 
-/** The rows the tape draws, in order. `state` names the phase state each row
- * accounts for; REPAIRING is deliberately absent (it is off the main path). */
-const TAPE_STEPS: ReadonlyArray<{ name: string; state: string }> = [
-  { name: "BASELINE", state: "BASELINE" },
-  { name: "IMPLEMENT", state: "IMPLEMENTING" },
-  { name: "FREEZE", state: "FREEZING" },
-  { name: "CHECKS", state: "CHECKING" },
-  { name: "PROBE", state: "PROBING" },
-  { name: "REVIEW", state: "REVIEWING" },
-  { name: "EVALUATE", state: "EVALUATING" },
-  { name: "RESOLVE", state: "RESOLVING" },
-  { name: "GATE", state: "GATING" },
-  { name: "PUBLISH", state: "PUBLISHING" },
-  { name: "DONE", state: "DONE" },
-];
-
-/** ACCEPTED is a moment between GATING and PUBLISHING: its time belongs to the
- * PUBLISH row. */
-const TAPE_STEP_OF_STATE: Record<string, string> = {
-  BASELINE: "BASELINE",
+/** The row label each main-path state draws under. A state absent here keeps
+ * its own name (BASELINE, DONE), so a state added to MAIN_PATH still gets a
+ * row instead of being silently dropped. */
+const TAPE_STEP_NAME: Record<string, string> = {
   IMPLEMENTING: "IMPLEMENT",
   FREEZING: "FREEZE",
   CHECKING: "CHECKS",
@@ -335,8 +319,32 @@ const TAPE_STEP_OF_STATE: Record<string, string> = {
   GATING: "GATE",
   ACCEPTED: "PUBLISH",
   PUBLISHING: "PUBLISH",
-  DONE: "DONE",
 };
+
+/** READY is the state before the first step; the tape has no row for it. */
+const TAPE_SKIP_STATE = new Set(["READY"]);
+
+/** The rows the tape draws, in order, DERIVED from the declared `MAIN_PATH`
+ * (`src/core/transitions.ts`) — never a second hand-kept list. States that
+ * fold to one row (ACCEPTED into PUBLISH) are merged, so the tape can only
+ * ever draw the declared path. */
+export const TAPE_STEPS: ReadonlyArray<{ name: string; states: readonly string[] }> = (() => {
+  const out: Array<{ name: string; states: string[] }> = [];
+  for (const state of MAIN_PATH) {
+    if (TAPE_SKIP_STATE.has(state)) continue;
+    const name = TAPE_STEP_NAME[state] ?? state;
+    const last = out[out.length - 1];
+    if (last && last.name === name) last.states.push(state);
+    else out.push({ name, states: [state] });
+  }
+  return out;
+})();
+
+/** Which row a phase state belongs to, from the same derived list. REPAIRING,
+ * AWAITING_OWNER, BLOCKED and the run-axis states are off the main path and
+ * have none. */
+const TAPE_STEP_OF_STATE: Record<string, string> = {};
+for (const step of TAPE_STEPS) for (const state of step.states) TAPE_STEP_OF_STATE[state] = step.name;
 
 const TAPE_STEP_LIMIT: Record<string, string> = {
   BASELINE: "baseline",
@@ -351,11 +359,13 @@ const TAPE_STEP_LIMIT: Record<string, string> = {
 
 const TAPE_OFF_PATH = new Set(["REPAIRING", "AWAITING_OWNER", "BLOCKED"]);
 
-/** A new attempt begins at an IMPLEMENTING whose predecessor is not the
- * front of the same attempt (READY), the base baseline, the attempt itself, a
- * freeze that just committed, or a repair about to start it. Everything after
- * such an entry belongs to the current round. */
-const TAPE_ROUND_CONTINUES = new Set(["READY", "BASELINE", "IMPLEMENTING", "FREEZING", "REPAIRING"]);
+/** A new round begins at an IMPLEMENTING whose predecessor is NOT the front
+ * of the same attempt (READY), the base baseline, or the attempt itself — so
+ * a repair (REPAIRING -> IMPLEMENTING) or a criterion amendment
+ * (RESOLVING -> IMPLEMENTING) starts a FRESH round, matching `view.round`,
+ * which increments at each frozen candidate. FREEZING is included defensively:
+ * a stray IMPLEMENTING after a freeze would not be a new attempt. */
+const TAPE_ROUND_CONTINUES = new Set(["READY", "BASELINE", "IMPLEMENTING", "FREEZING"]);
 
 /** `05h loop tape`: the readable id (the phase id without its `tt-` prefix and
  * with its first token kept whole) and the id's tail as the short title. */
