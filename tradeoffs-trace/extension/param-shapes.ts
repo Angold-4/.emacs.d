@@ -42,6 +42,22 @@ export const SUBMIT_DISCOVERY_PARAMS: ParamShape = {
   required: ["discoveries"],
 };
 
+/** Plan 04a: `raise_tradeoff` — the worker raises a choice the plan did not
+ * fix the moment it makes it. Worker-only: the evaluator role's tool set
+ * (roles.ts) does not include it. The anchor names the code location. */
+export const RAISE_TRADEOFF_PARAMS: ParamShape = {
+  properties: ["choice", "alternative", "why", "anchor", "planRef"],
+  required: ["choice", "alternative", "why", "anchor"],
+};
+
+/** Plan 04a: `submit_evaluation` — the evaluator's per-message outcome:
+ * publish (clean wording), merge (into another message) or drop (with a
+ * reason). One entry per raw message it was shown. */
+export const SUBMIT_EVALUATION_PARAMS: ParamShape = {
+  properties: ["evaluations"],
+  required: ["evaluations"],
+};
+
 /** Matches schemas/review.schema.json's top level exactly — a Review
  * carries no conductor-assigned binding fields, so the model supplies
  * every field the record itself needs. `ballots`/`findings` (work packet
@@ -58,6 +74,15 @@ export const SUBMIT_REVIEW_PARAMS: ParamShape = {
     "ballots",
     "findings",
     "discoveryMatches",
+    "blockers",
   ],
   required: ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
+};
+
+/** Plan 04b: `submit_panel_vote` — one panel seat's single vote on one raw
+ * blocker. A `block` vote proposes two or three options for the owner; a
+ * `downgrade` vote does not. Matches schemas/panel-vote.schema.json. */
+export const SUBMIT_PANEL_VOTE_PARAMS: ParamShape = {
+  properties: ["blockerId", "seat", "vote", "reason", "options"],
+  required: ["blockerId", "seat", "vote", "reason"],
 };

@@ -301,6 +301,34 @@ export interface Message {
   sourceRecordId?: string;
   /** A refusal after the phase reached DONE is a follow-up, not a blocker. */
   followUp?: boolean;
+  /** Plan 04a: the code location a `raise_tradeoff` call anchored the
+   * trade-off to (`{path, lines}`), carried through to the published
+   * message so the owner sees where the choice lives. */
+  anchor?: { path: string; lines: [number, number] };
+  /** Plan 04a: an evaluator timed out (or did not evaluate this message), so
+   * the raw message was published unchanged, marked unevaluated. */
+  unevaluated?: boolean;
+  /** Plan 04a: how important the evaluator judged this message
+   * (high|medium|low). Metadata, not part of the reviewable contentHash. */
+  importance?: "high" | "medium" | "low";
+  /** Plan 04b: this `blocker` message was raised through a reviewer's
+   * separate `blockers` list — "stop the work until the owner decides". Only
+   * such a blocker is voted by a panel: a blocking *finding* raised through
+   * the ordinary `findings` list keeps its pre-04b meaning (it blocks
+   * acceptance and forces a repair), and never parks the run on the owner
+   * through a panel. */
+  raisedAsBlocker?: boolean;
+  /** Plan 04a item 4: the evaluator's report on an owner-refused message —
+   * whether this candidate addressed the owner's reason. `addressed: false`
+   * leaves the refusal standing but records the report, so the ledger can
+   * tell "checked and not addressed" from "never checked". */
+  addressedReport?: { addressed: boolean; reason?: string; at?: string };
+  /** Plan 04a: the contentHash of the content RE-DERIVED from the backing
+   * record when the message was last raised/carried. The evaluator may
+   * rewrite the visible content, so a carry must compare the record against
+   * this, not against `contentHash`, or an unchanged record would look
+   * changed and lose the evaluator's wording. */
+  sourceContentHash?: string;
   supersededBy?: string;
   /** Every past version's contentHash, so a verdict bound to a pre-carry
    * version of an unchanged message is still recognised as current. */
@@ -334,10 +362,14 @@ export interface OwnerRequest {
     | "repair_budget_exhausted"
     | "amend_conflict"
     | "reserved_decision"
-    | "unaddressed_correction";
+    | "unaddressed_correction"
+    | "blocker_panel";
   linkedDecisionId?: string; // set when origin is `reserved_decision` or `failed_vote`
-  linkedFindingId?: string; // set when origin is `open_finding`
+  linkedFindingId?: string; // set when origin is `open_finding` or `blocker_panel`
   linkedCorrectionId?: string; // set when origin is `unaddressed_correction`
+  /** Plan 04b: set when origin is `blocker_panel` — the raw `blocker` message
+   * the panel escalated, so resolving the request resolves the message too. */
+  linkedMessageId?: string;
   relatedBallots?: Ballot[]; // set when origin is `failed_vote` (design §5.2: "carrying every ballot")
   /** The (candidate, contract) this request was raised against, when a
    * candidate existed at the time (design §7.1). Absent only for a gate
@@ -443,6 +475,23 @@ export interface FindingDisclosure {
   sameAs?: string;
 }
 
+/** Plan 04b: one entry of a reviewer's `blockers` list. Exactly a finding
+ * disclosure without a severity — a blocker is always `blocking` (there is
+ * no such thing as an advisory blocker), so the reviewer never states one.
+ *
+ * Deliberately no `sameAs`: a blocker is NEVER folded into an existing
+ * finding. Doing so could drop the stop-the-work request entirely (no
+ * blocker message, no panel, and no blocking force at all when the target
+ * finding was advisory), so the reviewer states the issue's evidence instead
+ * (round-3 review, findings B-1/A-3/M-4). */
+export interface BlockerDisclosure {
+  kind: FindingKind;
+  evidence: string;
+  linkedDecisionId?: string;
+  criterionDispute?: CriterionDispute;
+  reproduction?: { command: string };
+}
+
 export interface Review {
   reviewer: Reviewer;
   phaseId: string;
@@ -450,6 +499,13 @@ export interface Review {
   contractVersion: ContractVersion;
   correctionStatements: { correctionId: string; status: HonoredStatus }[];
   findingStatements: { findingId: string; status: FindingStatement; evidence?: string }[];
+  /** Plan 04b: a reviewer's separate `blockers` list — "stop the work until
+   * the owner decides". Each entry is a finding in substance (kind, evidence,
+   * optional linked decision / criterion dispute / reproduction) and is
+   * always raised at `blocking` severity: a raised blocker is, from that
+   * moment, a `blocker` message (raw) AND a blocking finding, effective at
+   * once, exactly like today's blocking findings. */
+  blockers?: BlockerDisclosure[];
   /** Work packet 2a addition: present on a real reviewer's turn-2
    * submission; absent (or empty) for phase 1's stub reviews, which cast
    * ballots outside the Review record entirely (see conductor.ts's
@@ -590,11 +646,13 @@ export type OwnerCommand =
 
 export type PhaseStateName =
   | "READY"
+  | "BASELINE"
   | "IMPLEMENTING"
   | "FREEZING"
   | "CHECKING"
   | "PROBING"
   | "REVIEWING"
+  | "EVALUATING"
   | "RESOLVING"
   | "GATING"
   | "ACCEPTED"
@@ -716,6 +774,7 @@ export interface InFlightEntry {
 }
 
 export type InFlightKey =
+  | "run_baseline"
   | "dispatch_worker"
   | "freeze"
   | "run_checks"
@@ -723,6 +782,10 @@ export type InFlightKey =
   | "review_M"
   | "review_A"
   | "review_B"
+  | "dispatch_evaluation_tradeoff"
+  | "dispatch_evaluation_finding"
+  | "dispatch_evaluation_blocker"
+  | `dispatch_panel_${string}_${number}`
   | "run_gate"
   | "publish_cas";
 
@@ -803,6 +866,20 @@ export interface PhaseState {
    * raised in this phase, in raise order. Folded from MESSAGE_* events, so a
    * conductor restart rebuilds it from the log alone. */
   messages?: Message[];
+  /** Plan 04a: the base-baseline stage's own recovery bookkeeping. Set once
+   * an interrupted `run_baseline` has been re-dispatched, so a second loss
+   * takes the timed-out path instead of re-dispatching again. */
+  baseline?: { interruptedOnce?: boolean };
+  /** Plan 04a: the EVALUATING stage's own state, PER MESSAGE TYPE (one
+   * fresh evaluator per type that has raw messages this round): `settled` is
+   * set by that type's `EVALUATOR_FINISHED` (or its timeout); `timedOut`
+   * records that only that type's raw messages were published unevaluated;
+   * `interruptedOnce` is the same one-redispatch bookkeeping as `baseline`. */
+  evaluation?: { types?: Partial<Record<MessageType, EvaluatorOutcome>> };
+  /** Plan 04b: the blocker panel's state, one entry per raw blocker message
+   * of this round (keyed by the blocker message id). EVALUATING completes
+   * only once every evaluator AND every panel has settled. */
+  panel?: { blockers?: Record<string, PanelState> };
 }
 
 export type RunStatus = RunStateName;
@@ -820,6 +897,10 @@ export interface State {
 
 export interface EvAttemptStarted {
   type: "ATTEMPT_STARTED";
+  /** Plan 04a: whether this attempt must take the base baseline first. The
+   * conductor decides it (a baseline already on disk for this exact base
+   * tree skips the stage — the 01e reuse rule); reduce() only routes it. */
+  baselineNeeded?: boolean;
 }
 /** Phase 1b addition (pure, additive — round of review item 3): carries the
  * *raw* disclosures, not assembled Decision records. A worker's submit_phase
@@ -837,8 +918,140 @@ export interface EvSubmitPhase {
    * new candidate. */
   dispute?: CriterionDispute;
 }
+/** Plan 04a: the base baseline finished (run or reused). */
+export interface EvBaselineCompleted {
+  type: "BASELINE_COMPLETED";
+}
+/** Plan 04a: the base baseline could not be taken in time; the checks stay
+ * strict and the work continues. */
+export interface EvBaselineTimedOut {
+  type: "BASELINE_TIMED_OUT";
+}
+/** Plan 04a: a conductor died during BASELINE. Re-dispatched once; a second
+ * loss is BASELINE_TIMED_OUT. */
+export interface EvBaselineInterrupted {
+  type: "BASELINE_INTERRUPTED";
+}
 export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
+}
+
+/** Plan 04a: one message type's evaluator state inside EVALUATING. */
+export interface EvaluatorOutcome {
+  settled?: boolean;
+  timedOut?: boolean;
+  interruptedOnce?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Plan 04b: the blocker panel (inside EVALUATING)
+// ---------------------------------------------------------------------------
+
+/** One option a `block` vote puts to the owner when the panel escalates. */
+export interface PanelOption {
+  id: string;
+  label: string;
+}
+
+export type PanelVoteValue = "block" | "downgrade";
+
+/** One panel seat's state for one raw blocker. `dispatches` is the retry
+ * bookkeeping: a seat that times out once is re-dispatched (2), and a second
+ * loss makes it `unavailable` — the same one-retry rule REVIEWING uses, kept
+ * in state so it survives a conductor restart. */
+export interface PanelSeatState {
+  dispatches: number;
+  vote?: PanelVoteValue;
+  reason?: string;
+  /** A `block` vote's two or three options for the owner. */
+  options?: PanelOption[];
+  unavailable?: boolean;
+}
+
+/** The panel's verdict on one blocker: `escalate` (2 of 3 voted `block`),
+ * `downgrade` (2 of 3 voted `downgrade`), or `incomplete` (no two seats
+ * agreed — including two seats unavailable after their retry). */
+export type PanelOutcome = "escalate" | "downgrade" | "incomplete";
+
+export interface PanelDecision {
+  outcome: PanelOutcome;
+  reason?: string;
+  /** Escalations only: the options the owner chooses from. */
+  options?: PanelOption[];
+}
+
+/** One raw blocker's panel. The entry exists from the moment the phase
+ * enters EVALUATING (transitions.ts records the raw blocker ids there), so
+ * "which blockers need a panel" is a fact of state, never a race with the
+ * blocker evaluator publishing the message. */
+export interface PanelState {
+  seats?: Record<string, PanelSeatState>;
+  decided?: PanelDecision;
+}
+
+/** Plan 04a: one type's evaluator finished its round. A record event inside
+ * EVALUATING; the phase completes only once every dispatched type has. */
+export interface EvEvaluatorFinished {
+  type: "EVALUATOR_FINISHED";
+  messageType: MessageType;
+  evaluated: number;
+}
+
+/** Plan 04a: one type's evaluator did not settle in time; only that type's
+ * raw messages are published unchanged, marked `unevaluated`. A record event
+ * inside EVALUATING. */
+export interface EvEvaluationTimedOut {
+  type: "EVALUATION_TIMED_OUT";
+  messageType: MessageType;
+}
+
+/** Plan 04a: a conductor died while one type's evaluator ran; that dispatch
+ * is re-dispatched once. A record event inside EVALUATING. */
+export interface EvEvaluationInterrupted {
+  type: "EVALUATION_INTERRUPTED";
+  messageType: MessageType;
+}
+
+/** Plan 04a: all dispatched evaluators settled; EVALUATING -> RESOLVING. */
+export interface EvEvaluationCompleted {
+  type: "EVALUATION_COMPLETED";
+}
+
+/** Plan 04b: one panel seat's vote on one raw blocker, a record event inside
+ * EVALUATING. A `block` vote must propose two or three options for the
+ * owner. The seat must not have voted or been marked unavailable already. */
+export interface EvPanelVote {
+  type: "PANEL_VOTE";
+  blockerId: string;
+  seat: number; // 1, 2 or 3
+  vote: PanelVoteValue;
+  reason: string;
+  options?: PanelOption[];
+}
+
+/** Plan 04b: one seat is unavailable after its own retry (a second timeout,
+ * or a conductor crash during its dispatch). A record event; the other seats
+ * still decide the panel. */
+export interface EvPanelSeatUnavailable {
+  type: "PANEL_SEAT_UNAVAILABLE";
+  blockerId: string;
+  seat: number;
+  reason?: string;
+}
+
+/** Plan 04b: the panel has counted its seats and decided. A record event
+ * inside EVALUATING — the SINGLE exit from EVALUATING stays
+ * EVALUATION_COMPLETED, so the phase cannot leave while an evaluator is
+ * still working; the recorded outcome picks which row that exit takes
+ * (escalate -> AWAITING_OWNER, downgrade -> REPAIRING, incomplete ->
+ * RESOLVING). `outcome` must equal what the recorded votes imply. */
+export interface EvPanelDecided {
+  type: "PANEL_DECIDED";
+  blockerId: string;
+  outcome: PanelOutcome;
+  reason?: string;
+  /** Escalations only: the two or three options the owner chooses from. */
+  options?: PanelOption[];
 }
 export interface EvAttemptNoSubmission {
   type: "ATTEMPT_NO_SUBMISSION";
@@ -898,6 +1111,9 @@ export interface EvActionStarted {
   action: string; // one of the Action["type"] values next() emits
   actionId: string;
   reviewer?: Reviewer; // required when action === "dispatch_review"
+  messageType?: MessageType; // required when action === "dispatch_evaluation"
+  blockerId?: string; // required when action === "dispatch_panel"
+  seat?: number; // required when action === "dispatch_panel"
 }
 export interface EvBallotCast {
   type: "BALLOT_CAST";
@@ -1033,6 +1249,8 @@ export interface EvCriterionReverted {
   amendmentId: string;
   newAcceptance: string[]; // the restored acceptance list
   newContractVersion: ContractVersion;
+  /** OD-2: the time of the revert, carried on the event so reduce() is pure. */
+  at?: string;
 }
 
 export interface EvAmend {
@@ -1060,7 +1278,7 @@ export interface EvRunResumed {
  * missing, extra) for whoever looks at BLOCKED next. */
 export interface EvLaunchFailed {
   type: "LAUNCH_FAILED";
-  role: "worker" | "reviewer";
+  role: "worker" | "reviewer" | "evaluator" | "panel";
   reviewer?: Reviewer; // set when role === "reviewer"
   expected: string[];
   missing: string[];
@@ -1208,13 +1426,27 @@ export interface EvMessageRaised {
   type: "MESSAGE_RAISED";
   message: Message;
 }
-/** A raw message is published (reviewable by the owner). */
+/** A raw message is published (reviewable by the owner). Plan 04a: the
+ * evaluator's clean wording rides along as `content`; a bare publish (no
+ * evaluator) leaves the raised fields as they were. */
 export interface EvMessagePublished {
   type: "MESSAGE_PUBLISHED";
   messageId: string;
   boundCandidateSha: string;
   boundContractVersion: ContractVersion;
   boundRecordVersion: number;
+  content?: {
+    type: MessageType;
+    title: string;
+    summary: string;
+    context: string;
+    evidence: string[];
+    planRef?: string;
+    importance?: "high" | "medium" | "low";
+  };
+  /** Set when the evaluator did not evaluate this message (it missed it, or
+   * the evaluation timed out): it is published unchanged, marked so. */
+  unevaluated?: boolean;
 }
 /** An evaluator merged a message into another (or into the plan). */
 export interface EvMessageMerged {
@@ -1256,6 +1488,22 @@ export interface EvMessageResolved {
   boundContractVersion: ContractVersion;
   boundRecordVersion: number;
 }
+/** Plan 04a item 4: the evaluator reports whether an owner-refused message
+ * was addressed. A record event on the message, not a state change. */
+export interface EvMessageAddressReported {
+  type: "MESSAGE_ADDRESS_REPORTED";
+  messageId: string;
+  addressed: boolean;
+  reason?: string;
+  /** Plan 04a / OD-2: the time the report was made. Carried on the event (the
+   * conductor stamps it) so reduce() stays a pure function of (state, event)
+   * and a rebuild from events.jsonl is byte-identical. */
+  at?: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+
 /** A message is superseded (never votable again). */
 export interface EvMessageSuperseded {
   type: "MESSAGE_SUPERSEDED";
@@ -1276,10 +1524,24 @@ export interface EvMessageCarried {
   toVersion: number;
   contentHash: string;
   unchanged: boolean;
+  /** Plan 04a: the record-derived content hash this carry compares against,
+   * so a later carry can tell an unchanged record from a changed one even
+   * when the evaluator rewrote the visible content. */
+  sourceContentHash?: string;
 }
 
 export type Event =
   | EvAttemptStarted
+  | EvBaselineCompleted
+  | EvBaselineTimedOut
+  | EvBaselineInterrupted
+  | EvEvaluationCompleted
+  | EvEvaluationTimedOut
+  | EvEvaluationInterrupted
+  | EvEvaluatorFinished
+  | EvPanelVote
+  | EvPanelSeatUnavailable
+  | EvPanelDecided
   | EvSubmitPhase
   | EvAttemptTimedOut
   | EvAttemptNoSubmission
@@ -1342,6 +1604,7 @@ export type Event =
   | EvMessageDropped
   | EvOwnerVerdict
   | EvMessageResolved
+  | EvMessageAddressReported
   | EvMessageSuperseded
   | EvMessageCarried;
 

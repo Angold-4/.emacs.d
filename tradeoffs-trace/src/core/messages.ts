@@ -41,6 +41,9 @@ export interface MessageContent {
   context: string;
   evidence: string[];
   planRef?: string;
+  /** Plan 04a: evaluator metadata. Deliberately NOT part of `contentHashOf`:
+   * it is the evaluator's judgement, not the reviewable claim. */
+  importance?: "high" | "medium" | "low";
 }
 
 export function contentHashOf(content: MessageContent): string {
@@ -126,7 +129,17 @@ addRow({
   guardName: "always",
   guard: () => true,
   to: "published",
-  apply: (m) => ({ ...m!, state: "published" }),
+  // Plan 04a: the evaluator publishes a message with the clean, human
+  // wording it produced (title ≤ 80 characters, summary, context,
+  // evidence). When the event carries that content it replaces the raw
+  // fields and the contentHash is recomputed; a bare publish (no evaluator)
+  // leaves the raised fields untouched.
+  apply: (m, event) => {
+    const e = event as unknown as { content?: MessageContent; unevaluated?: boolean };
+    const base: Message = { ...m!, state: "published", unevaluated: e.unevaluated === true ? true : undefined };
+    if (!e.content) return base;
+    return { ...base, ...e.content, contentHash: contentHashOf(e.content) };
+  },
 });
 
 addRow({
@@ -403,6 +416,7 @@ export function applyCarry(messages: Message[], message: Message, event: Message
     messageVersion: event.toVersion,
     boundCandidateSha: event.toCandidate,
     contentHash: event.contentHash,
+    sourceContentHash: event.sourceContentHash ?? message.sourceContentHash,
     versionContentHashes,
     carriedFrom,
   };
@@ -489,6 +503,11 @@ export interface LedgerEntry {
   /** A refusal recorded after the phase reached DONE: a follow-up, not a
    * blocker. */
   followUp?: boolean;
+  /** Plan 04a item 4: the evaluator's report on an owner-refused message —
+   * whether this candidate addressed the owner's reason. `false` leaves the
+   * refusal standing but records that it was checked. */
+  addressed?: boolean;
+  addressedReason?: string;
 }
 
 /** Every settled message, in id order. A settlement is a terminal message
@@ -516,6 +535,9 @@ export function ledgerEntries(messages: Message[]): LedgerEntry[] {
         ...(m.invalidated ? { invalidated: m.invalidated } : {}),
         ...(m.supersededBy ? { supersededBy: m.supersededBy } : {}),
         ...(m.followUp ? { followUp: true } : {}),
+        ...(m.addressedReport
+          ? { addressed: m.addressedReport.addressed, ...(m.addressedReport.reason ? { addressedReason: m.addressedReport.reason } : {}) }
+          : {}),
       };
     });
 }

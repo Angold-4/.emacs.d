@@ -15,7 +15,7 @@
 // mismatch, before anything else about the event is considered.
 
 import { checkBallotBinding, checkBinding, checkTupleBinding, currentVersionsFor } from "./binding.ts";
-import { applyCarryWithContract, applyMessageEvent } from "./messages.ts";
+import { applyCarryWithContract, applyMessageEvent, checkMessageBinding } from "./messages.ts";
 import { next as computeNext } from "./next.ts";
 import {
   applyFindingAcceptedByOwner,
@@ -25,12 +25,32 @@ import {
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
-import { isLiveDecision, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { isLiveDecision, panelOutcome, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
-import type { BindingTuple, ContractVersion, Event, Finding, InFlightKey, ReduceResult, State } from "./types.ts";
+import type {
+  BindingTuple,
+  ContractVersion,
+  Event,
+  Finding,
+  InFlightKey,
+  MessageType,
+  PhaseState,
+  ReduceResult,
+  State,
+} from "./types.ts";
 
 const KNOWN_EVENT_TYPES = new Set<string>([
   "ATTEMPT_STARTED",
+  "BASELINE_COMPLETED",
+  "BASELINE_TIMED_OUT",
+  "BASELINE_INTERRUPTED",
+  "EVALUATION_COMPLETED",
+  "EVALUATION_TIMED_OUT",
+  "EVALUATION_INTERRUPTED",
+  "EVALUATOR_FINISHED",
+  "PANEL_VOTE",
+  "PANEL_SEAT_UNAVAILABLE",
+  "PANEL_DECIDED",
   "SUBMIT_PHASE",
   "ATTEMPT_TIMED_OUT",
   "ATTEMPT_NO_SUBMISSION",
@@ -93,6 +113,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "MESSAGE_DROPPED",
   "OWNER_VERDICT",
   "MESSAGE_RESOLVED",
+  "MESSAGE_ADDRESS_REPORTED",
   "MESSAGE_SUPERSEDED",
   "MESSAGE_CARRIED",
 ]);
@@ -120,8 +141,51 @@ function bindingTupleForRecord(
   };
 }
 
-function inFlightKeyFor(action: string, reviewer?: string): string {
-  return action === "dispatch_review" ? `review_${reviewer}` : action;
+function inFlightKeyFor(action: string, reviewer?: string, messageType?: string, blockerId?: string, seat?: number): string {
+  if (action === "dispatch_review") return `review_${reviewer}`;
+  // Plan 04a: one evaluator per message type, so each dispatch has its own
+  // in-flight key (`dispatch_evaluation_tradeoff`, …).
+  if (action === "dispatch_evaluation") return `dispatch_evaluation_${messageType}`;
+  // Plan 04b: one panel seat per raw blocker, each its own dispatch.
+  if (action === "dispatch_panel") return `dispatch_panel_${blockerId}_${seat}`;
+  return action;
+}
+
+/** Plan 04b: merge one panel seat's state. */
+function withPanelSeat(
+  p: PhaseState,
+  blockerId: string,
+  seat: string,
+  patch: Partial<import("./types.ts").PanelSeatState>,
+): PhaseState["panel"] {
+  const blockers = { ...(p.panel?.blockers ?? {}) };
+  const panel = { ...(blockers[blockerId] ?? {}) };
+  const seats = { ...(panel.seats ?? {}) };
+  seats[seat] = { dispatches: 0, ...(seats[seat] ?? {}), ...patch };
+  blockers[blockerId] = { ...panel, seats };
+  return { blockers };
+}
+
+/** Plan 04a: merge one message type's evaluator outcome into `evaluation`. */
+function withEvaluatorOutcome(p: PhaseState, type: MessageType, patch: { settled?: boolean; timedOut?: boolean; interruptedOnce?: boolean }): PhaseState["evaluation"] {
+  const types = { ...(p.evaluation?.types ?? {}) };
+  types[type] = { ...(types[type] ?? {}), ...patch };
+  return { types };
+}
+
+function withoutEvaluationInFlight(p: PhaseState, type: MessageType): PhaseState["inFlight"] {
+  const inFlight = { ...p.inFlight };
+  delete inFlight[`dispatch_evaluation_${type}` as InFlightKey];
+  return inFlight;
+}
+
+/** Plan 04b: the three seats a panel may have. */
+const PANEL_SEAT_KEYS = new Set(["1", "2", "3"]);
+
+function withoutPanelSeatInFlight(p: PhaseState, blockerId: string, seat: string): PhaseState["inFlight"] {
+  const inFlight = { ...p.inFlight };
+  delete inFlight[`dispatch_panel_${blockerId}_${seat}` as InFlightKey];
+  return inFlight;
 }
 
 /** Events handled directly by reduce.ts, not by the transitions table: they
@@ -137,16 +201,36 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // is exactly what makes a second next() call return [] (no double
       // dispatch).
       const outstanding = computeNext(state).some(
-        (a) => a.type === event.action && (event.action !== "dispatch_review" || a.reviewer === event.reviewer),
+        (a) =>
+          a.type === event.action &&
+          (event.action !== "dispatch_review" || a.reviewer === event.reviewer) &&
+          (event.action !== "dispatch_evaluation" || a.messageType === event.messageType) &&
+          (event.action !== "dispatch_panel" ||
+            (a.blockerId === event.blockerId && a.seat === event.seat)),
       );
       if (!outstanding) {
         return rejected(
           state,
-          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""} is not currently outstanding in phase ${p.phase}`,
+          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""}${event.messageType ? ` (${event.messageType})` : ""}${event.blockerId ? ` (${event.blockerId} seat ${event.seat})` : ""} is not currently outstanding in phase ${p.phase}`,
         );
       }
-      const key = inFlightKeyFor(event.action, event.reviewer) as InFlightKey;
-      return ok({ ...state, phase: { ...p, inFlight: { ...p.inFlight, [key]: { actionId: event.actionId } } } });
+      const key = inFlightKeyFor(event.action, event.reviewer, event.messageType, event.blockerId, event.seat) as InFlightKey;
+      // Plan 04b: a panel seat's dispatch count is the one-retry bookkeeping
+      // (a second loss makes the seat unavailable), recorded here so it
+      // survives a conductor restart.
+      const panel =
+        event.action === "dispatch_panel" && event.blockerId && event.seat !== undefined
+          ? withPanelSeat(p, event.blockerId, String(event.seat), {
+              dispatches: (p.panel?.blockers?.[event.blockerId]?.seats?.[String(event.seat)]?.dispatches ?? 0) + 1,
+              // A re-dispatch clears the first loss's marker; the seat is
+              // being tried again.
+              unavailable: false,
+            })
+          : p.panel;
+      return ok({
+        ...state,
+        phase: { ...p, panel, inFlight: { ...p.inFlight, [key]: { actionId: event.actionId } } },
+      });
     }
 
     case "BALLOT_CAST": {
@@ -351,6 +435,195 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return undefined;
     }
 
+    case "REVIEW_TIMED_OUT": {
+      // Plan 04a: a review dispatch whose phase has already moved on (a
+      // crash-recovery reconciliation after all three reviews landed and the
+      // phase entered EVALUATING) is stale. It has no transition row there;
+      // clear the lingering in-flight entry so it can never block a later
+      // REVIEWING dispatch, and change nothing else.
+      const key = `review_${event.reviewer}` as InFlightKey;
+      if (!(key in p.inFlight)) return rejected(state, `no in-flight review for ${event.reviewer} to clear`);
+      const inFlight = { ...p.inFlight };
+      delete inFlight[key];
+      return ok({ ...state, phase: { ...p, inFlight } });
+    }
+
+    case "EVALUATOR_FINISHED": {
+      // Plan 04a: one type's evaluator outcome, a record event inside
+      // EVALUATING. It settles that type without moving the phase; next()
+      // asks for `evaluation_complete` once every dispatched type has
+      // settled. Rejected outside EVALUATING, so a late evaluator cannot
+      // settle a different stage.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATOR_FINISHED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { settled: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
+    case "EVALUATION_TIMED_OUT": {
+      // Plan 04a: only THIS type's raw messages are published unchanged,
+      // marked unevaluated; the type is settled so the phase can move on once
+      // every type has. A record event (no phase change) — EVALUATION_COMPLETED
+      // is the transition that leaves EVALUATING.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_TIMED_OUT is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const messages = (p.messages ?? []).map((m) =>
+        m.type === event.messageType && m.state === "raw" ? { ...m, state: "published" as const, unevaluated: true } : m,
+      );
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          messages,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { settled: true, timedOut: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
+    case "EVALUATION_INTERRUPTED": {
+      // Plan 04a: one type's evaluator was interrupted by a conductor crash;
+      // re-dispatched once, tracked per type.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_INTERRUPTED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { interruptedOnce: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
+    case "PANEL_VOTE": {
+      // Plan 04b: one seat's vote on one raw blocker. Record-only inside
+      // EVALUATING: the phase leaves only through EVALUATION_COMPLETED once
+      // every evaluator AND every panel has settled.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `PANEL_VOTE is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const panel = p.panel?.blockers?.[event.blockerId];
+      if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
+      const seatKey = String(event.seat);
+      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      const seat = panel.seats?.[seatKey];
+      if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
+      if (seat?.unavailable) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is unavailable`);
+      if (event.vote !== "block" && event.vote !== "downgrade") {
+        return rejected(state, `a panel vote must be block or downgrade, not ${String(event.vote)}`);
+      }
+      if (typeof event.reason !== "string" || event.reason.trim().length === 0) {
+        return rejected(state, `panel seat ${seatKey} must give a reason for its ${event.vote} vote`);
+      }
+      // A `block` vote proposes two or three options for the owner: the whole
+      // point of an escalation is that the owner has something to choose.
+      const options = event.options ?? [];
+      if (event.vote === "block") {
+        if (options.length < 2 || options.length > 3) {
+          return rejected(state, `a block vote must propose two or three options for the owner, got ${options.length}`);
+        }
+        if (options.some((o) => !o || typeof o.id !== "string" || o.id.length === 0 || typeof o.label !== "string" || o.label.length === 0)) {
+          return rejected(state, `a block vote's options each need a non-empty id and label`);
+        }
+        // Two or three DISTINCT options: a repeated id would collapse the
+        // owner's choice to one (round-3 review, advisory B-2).
+        const ids = new Set(options.map((o) => o.id));
+        if (ids.size !== options.length) {
+          return rejected(state, `a block vote's options must have distinct ids`);
+        }
+        if (new Set(options.map((o) => o.label)).size !== options.length) {
+          return rejected(state, `a block vote's options must read differently`);
+        }
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          panel: withPanelSeat(p, event.blockerId, seatKey, {
+            vote: event.vote,
+            reason: event.reason.trim(),
+            ...(event.vote === "block" ? { options } : {}),
+          }),
+          inFlight: withoutPanelSeatInFlight(p, event.blockerId, seatKey),
+        },
+      });
+    }
+
+    case "PANEL_SEAT_UNAVAILABLE": {
+      // Plan 04b: a seat that did not produce a vote after its own retry.
+      // Record-only: the other seats can still decide, and a panel with two
+      // unavailable seats becomes `incomplete`.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `PANEL_SEAT_UNAVAILABLE is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const panel = p.panel?.blockers?.[event.blockerId];
+      if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
+      const seatKey = String(event.seat);
+      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      const seat = panel.seats?.[seatKey];
+      if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
+      if (panelSeatSettled(seat)) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is already unavailable`);
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          panel: withPanelSeat(p, event.blockerId, seatKey, {
+            unavailable: true,
+            ...(event.reason ? { reason: event.reason } : {}),
+          }),
+          inFlight: withoutPanelSeatInFlight(p, event.blockerId, seatKey),
+        },
+      });
+    }
+
+    case "PANEL_DECIDED": {
+      // Plan 04b: the panel's counted verdict. The recorded outcome must be
+      // exactly what the votes imply — the conductor may not invent one —
+      // and every seat must have settled first.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `PANEL_DECIDED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const panel = p.panel?.blockers?.[event.blockerId];
+      if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
+      if (panel.decided) return rejected(state, `blocker ${event.blockerId}'s panel has already decided`);
+      if (!panelSeatsSettled(panel)) {
+        return rejected(state, `blocker ${event.blockerId}'s panel still has undecided seats`);
+      }
+      const computed = panelOutcome(panel);
+      if (event.outcome !== computed) {
+        return rejected(
+          state,
+          `blocker ${event.blockerId}'s votes imply '${computed}', not '${String(event.outcome)}'`,
+        );
+      }
+      if (event.outcome === "escalate") {
+        const options = event.options ?? [];
+        if (options.length < 2 || options.length > 3) {
+          return rejected(state, `an escalated blocker needs two or three options for the owner, got ${options.length}`);
+        }
+      }
+      const blockers = { ...(p.panel?.blockers ?? {}) };
+      blockers[event.blockerId] = {
+        ...panel,
+        decided: {
+          outcome: event.outcome,
+          ...(event.reason ? { reason: event.reason } : {}),
+          ...(event.outcome === "escalate" ? { options: event.options } : {}),
+        },
+      };
+      return ok({ ...state, phase: { ...p, panel: { blockers } } });
+    }
+
     case "CRITERION_REVERTED": {
       // Plan 01g: the owner's correction naming an amendment id restores the
       // criterion's original wording. A phase with a candidate has its own
@@ -384,7 +657,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
               ...d,
               version: d.version + 1,
               boundContractVersion: event.newContractVersion,
-              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: event.at },
             }
           : d,
       );
@@ -449,7 +722,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, `owner directive ${event.directiveId} is already withdrawn`);
       }
       const ownerDirectives = (p.ownerDirectives ?? []).map((d) =>
-        d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at ?? new Date().toISOString() } : d,
+        d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at } : d,
       );
       return ok({ ...state, phase: { ...p, ownerDirectives } });
     }
@@ -573,6 +846,23 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const result = applyMessageEvent(p.messages ?? [], event);
       if (!result.ok) return rejected(state, result.reason);
       return ok({ ...state, phase: { ...p, messages: result.messages } });
+    }
+
+    case "MESSAGE_ADDRESS_REPORTED": {
+      // Plan 04a item 4: the evaluator's report on an owner-refused message.
+      // Record-only (no state change): `addressed: true` is separately a
+      // MESSAGE_RESOLVED; `false` is recorded here so the ledger can tell
+      // "checked and not addressed" from "never checked" (findings M-20/A-21).
+      const message = (p.messages ?? []).find((m) => m.id === event.messageId);
+      if (!message) return rejected(state, `unknown message ${event.messageId}`);
+      const binding = checkMessageBinding(message, event);
+      if (!binding.ok) return rejected(state, binding.reason!);
+      const messages = (p.messages ?? []).map((m) =>
+        m.id === event.messageId
+          ? { ...m, addressedReport: { addressed: event.addressed, ...(event.reason ? { reason: event.reason } : {}), at: event.at } }
+          : m,
+      );
+      return ok({ ...state, phase: { ...p, messages } });
     }
 
     case "MESSAGE_CARRIED": {

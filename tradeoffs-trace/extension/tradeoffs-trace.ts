@@ -43,7 +43,15 @@ import {
   type ShOutputMessage,
   type SubmitReply,
 } from "../src/core/protocol.ts";
-import { DECISION_DISCLOSURE_PARAMS, SUBMIT_DISCOVERY_PARAMS, SUBMIT_PHASE_PARAMS, SUBMIT_REVIEW_PARAMS } from "./param-shapes.ts";
+import {
+  DECISION_DISCLOSURE_PARAMS,
+  RAISE_TRADEOFF_PARAMS,
+  SUBMIT_DISCOVERY_PARAMS,
+  SUBMIT_EVALUATION_PARAMS,
+  SUBMIT_PANEL_VOTE_PARAMS,
+  SUBMIT_PHASE_PARAMS,
+  SUBMIT_REVIEW_PARAMS,
+} from "./param-shapes.ts";
 
 function loadSchema(relPath: string): JSONSchema {
   return JSON.parse(readFileSync(new URL(relPath, import.meta.url), "utf8")) as JSONSchema;
@@ -65,6 +73,12 @@ function subschema(file: JSONSchema, name: string): JSONSchema {
 // candidateSha and contractVersion (it is told them; design §2.1's process
 // table), so the shared schemas/review.schema.json is used as-is.
 const REVIEW_SCHEMA = loadSchema("../schemas/review.schema.json");
+
+// Plan 04b: one panel seat's vote on one raw blocker. No conductor-assigned
+// binding fields at submission time — the seat already knows its blocker and
+// seat number (the conductor tells it), exactly like a reviewer's own
+// candidateSha/contractVersion.
+const PANEL_VOTE_SCHEMA = loadSchema("../schemas/panel-vote.schema.json");
 
 // A Decision's binding fields (boundCandidateSha, boundContractVersion) and
 // identity fields (id, version, phaseId) are assigned by the conductor —
@@ -144,6 +158,26 @@ const BallotParam = Type.Object({
   ),
 });
 
+// Plan 04b: a blocker is a finding without a severity — a blocker is always
+// blocking, so the reviewer never states one. Deliberately no `sameAs`: a
+// blocker is never folded into an existing finding, so a stop-the-work
+// request can never be silently dropped; cite the issue's evidence instead.
+const BlockerParam = Type.Object({
+  kind: StringEnum(["defect", "contract", "integration"] as const),
+  evidence: Type.String({ description: "file:line, scenario, check result or plan clause — required, non-empty" }),
+  linkedDecisionId: Type.Optional(Type.String()),
+  criterionDispute: Type.Optional(
+    Type.Object({
+      criterion: Type.String({ description: "One acceptance item of the phase contract, verbatim" }),
+      why: Type.String({ description: "Why it cannot be met as written" }),
+      proposedWording: Type.String({ description: "The wording that replaces it if the amendment passes" }),
+    }),
+  ),
+  reproduction: Type.Optional(
+    Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
+  ),
+});
+
 const FindingParam = Type.Object({
   kind: StringEnum(["defect", "contract", "integration"] as const),
   severity: StringEnum(["blocking", "advisory"] as const),
@@ -207,9 +241,76 @@ const submitReviewFields: Record<string, TSchema> = {
       description: "For each of YOUR turn-1 discoveries that is the same choice as another listed record: {discoveryId, sameAs}",
     }),
   ),
+  blockers: Type.Optional(
+    Type.Array(BlockerParam, {
+      description:
+        "Plan 04b: findings that STOP the work until the owner decides. Raised at once as a raw blocker message and a blocking finding, then voted by a panel of three.",
+    }),
+  ),
 };
 const SubmitReviewParams = Type.Object(
   Object.fromEntries(SUBMIT_REVIEW_PARAMS.properties.map((key) => [key, submitReviewFields[key]])),
+);
+
+// Plan 04a: `raise_tradeoff` — the worker raises a choice the plan did not
+// fix the moment it makes it; the anchor names the code location.
+const raiseTradeoffFields: Record<string, TSchema> = {
+  choice: Type.String({ description: "One plain sentence naming the choice made" }),
+  alternative: Type.String({ description: "The alternative given up" }),
+  why: Type.String({ description: "Why it matters for the goal" }),
+  anchor: Type.Object({
+    path: Type.String({ description: "The file path the choice lives at" }),
+    lines: Type.Array(Type.Integer(), { minItems: 2, maxItems: 2, description: "[start, end] line numbers" }),
+  }),
+  planRef: Type.Optional(Type.String({ description: "The plan clause this choice relates to, if any" })),
+};
+const RaiseTradeoffParams = Type.Object(
+  Object.fromEntries(RAISE_TRADEOFF_PARAMS.properties.map((key) => [key, raiseTradeoffFields[key]])),
+);
+
+// Plan 04a: `submit_evaluation` — one entry per raw message the evaluator
+// was shown. `publish` carries the clean wording (title ≤ 80 characters,
+// summary ≤ 3 sentences); `merge` names the message it folds into; `drop`
+// carries a reason.
+const EvaluationParam = Type.Object({
+  messageId: Type.String({ description: "The raw message this outcome is for" }),
+  action: StringEnum(["publish", "merge", "drop"] as const),
+  title: Type.Optional(Type.String({ maxLength: 80, description: "publish only: one clean line, at most 80 characters" })),
+  summary: Type.Optional(Type.String({ description: "publish only: at most 3 sentences" })),
+  context: Type.Optional(Type.String({ description: "publish only: what makes the message reviewable" })),
+  evidence: Type.Optional(Type.Array(Type.String(), { description: "publish only: the evidence the evaluator checked" })),
+  importance: Type.Optional(StringEnum(["high", "medium", "low"] as const)),
+  into: Type.Optional(Type.String({ description: "merge only: the message id it folds into" })),
+  reason: Type.Optional(Type.String({ description: "drop only: why it is not reviewable" })),
+  addressed: Type.Optional(
+    Type.Boolean({ description: "owner-refused messages only: whether this candidate addressed the owner's reason" }),
+  ),
+});
+const submitEvaluationFields: Record<string, TSchema> = {
+  evaluations: Type.Array(EvaluationParam, { description: "One entry per raw message you were shown" }),
+};
+const SubmitEvaluationParams = Type.Object(
+  Object.fromEntries(SUBMIT_EVALUATION_PARAMS.properties.map((key) => [key, submitEvaluationFields[key]])),
+);
+
+// Plan 04b: `submit_panel_vote` — one panel seat's vote on one raw blocker.
+const PanelOptionParam = Type.Object({
+  id: Type.String({ description: "A stable id for this option" }),
+  label: Type.String({ description: "The option as the owner reads it" }),
+});
+const submitPanelVoteFields: Record<string, TSchema> = {
+  blockerId: Type.String({ description: "The raw blocker message id this vote is about" }),
+  seat: Type.Integer({ description: "This seat's number (1, 2 or 3)" }),
+  vote: StringEnum(["block", "downgrade"] as const, {
+    description: "block: stop the work until the owner decides; downgrade: an ordinary blocking finding for the next worker attempt",
+  }),
+  reason: Type.String({ description: "Why you voted this way" }),
+  options: Type.Optional(
+    Type.Array(PanelOptionParam, { minItems: 2, maxItems: 3, description: "block only: the two or three options the owner chooses from" }),
+  ),
+};
+const SubmitPanelVoteParams = Type.Object(
+  Object.fromEntries(SUBMIT_PANEL_VOTE_PARAMS.properties.map((key) => [key, submitPanelVoteFields[key]])),
 );
 
 function readEnv(name: string): string | undefined {
@@ -291,7 +392,17 @@ class RunSocketClient {
     this.#socket.write(encodeLine(msg));
   }
 
-  async submit(tool: "submit_phase" | "submit_discovery" | "submit_review", args: unknown, timeoutMs = 60000): Promise<SubmitReply> {
+  async submit(
+    tool:
+      | "submit_phase"
+      | "submit_discovery"
+      | "submit_review"
+      | "raise_tradeoff"
+      | "submit_evaluation"
+      | "submit_panel_vote",
+    args: unknown,
+    timeoutMs = 60000,
+  ): Promise<SubmitReply> {
     const id = randomUUID();
     const reply = new Promise<SubmitReply>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -334,7 +445,7 @@ export default function (pi: ExtensionAPI) {
   const client = new RunSocketClient();
   const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
-  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | undefined) ?? "worker";
+  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | undefined) ?? "worker";
   const accepted = new Set<string>();
   // A reviewer's turn 2 starts with the first agent_start after its
   // discovery (turn 1) was accepted; before that, turn 1 is still running.
@@ -347,6 +458,8 @@ export default function (pi: ExtensionAPI) {
    * 1, then submit_review in turn 2 (design §3.3 two-turn review). */
   function owedSubmission(): string | undefined {
     if (role === "worker") return accepted.has("submit_phase") ? undefined : "submit_phase";
+    if (role === "evaluator") return accepted.has("submit_evaluation") ? undefined : "submit_evaluation";
+    if (role === "panel") return accepted.has("submit_panel_vote") ? undefined : "submit_panel_vote";
     if (!accepted.has("submit_discovery")) return "submit_discovery";
     if (reviewTurnStarted && !accepted.has("submit_review")) return "submit_review";
     return undefined;
@@ -359,6 +472,10 @@ export default function (pi: ExtensionAPI) {
       "You have not called submit_discovery yet. List the behavioural choices you see in the diff and call submit_discovery before finishing. Do not call any other submission tool in this turn.",
     submit_review:
       "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every record the prompt lists as delegated or reserved and does not mark carried — the conductor rejects a review that omits one, names the missing ids and their choices, and expects you to resubmit — plus your findings and your statements. submit_review is the only submission tool you may use now.",
+    submit_evaluation:
+      "You have not called submit_evaluation yet. Return one entry per raw message you were shown: publish (with a title of at most 80 characters, a summary of at most 3 sentences, context, evidence and importance), merge (into another message), or drop (with a reason).",
+    submit_panel_vote:
+      "You have not called submit_panel_vote yet. Vote block (stop the work until the owner decides — propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
   };
 
   pi.on("session_start", async () => {
@@ -454,7 +571,17 @@ export default function (pi: ExtensionAPI) {
     return `invalid arguments: ${result.errors.join("; ")}`;
   }
 
-  async function submitTool(tool: "submit_phase" | "submit_discovery" | "submit_review", args: unknown) {
+  async function submitTool(
+    tool:
+      | "submit_phase"
+      | "submit_discovery"
+      | "submit_review"
+      | "raise_tradeoff"
+      | "submit_evaluation"
+      | "submit_panel_vote",
+    args: unknown,
+    markAccepted = true,
+  ) {
     if (!client.connected) {
       return {
         isError: true,
@@ -476,7 +603,7 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: reply.reason ?? "submission rejected" }],
         };
       }
-      accepted.add(tool);
+      if (markAccepted) accepted.add(tool);
       return { content: [{ type: "text" as const, text: "submission accepted" }] };
     } catch (err) {
       return {
@@ -529,6 +656,47 @@ export default function (pi: ExtensionAPI) {
       const issue = reviewIngestionIssue(params as Review);
       if (issue) return { isError: true, content: [{ type: "text", text: `invalid arguments: ${issue}` }] };
       return submitTool("submit_review", params);
+    },
+  });
+
+  pi.registerTool({
+    name: "raise_tradeoff",
+    label: "Raise Tradeoff",
+    description:
+      "Raise a trade-off the moment you make a choice the plan did not fix: the choice, the alternative given up, why it matters, and the code location (anchor) it lives at. Callable at any time during implementation.",
+    promptSnippet: "Raise a trade-off the moment you make a choice the plan did not fix",
+    parameters: RaiseTradeoffParams,
+    async execute(_toolCallId, params) {
+      // Plan 04a: a raise is not the turn's owed submission; it never marks
+      // submit_phase accepted. The conductor binds it to the current
+      // candidate/contract and records it raw for the evaluator.
+      return submitTool("raise_tradeoff", params, false);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_panel_vote",
+    label: "Submit Panel Vote",
+    description:
+      "Vote on one raw blocker: block (stop the work until the owner decides; propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
+    promptSnippet: "Vote block or downgrade on the raw blocker",
+    parameters: SubmitPanelVoteParams,
+    async execute(_toolCallId, params) {
+      const error = validateOrError(PANEL_VOTE_SCHEMA, params);
+      if (error) return { isError: true, content: [{ type: "text", text: error }] };
+      return submitTool("submit_panel_vote", params);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_evaluation",
+    label: "Submit Evaluation",
+    description:
+      "Return one entry per raw message you were shown: publish (clean wording), merge (into another message), or drop (with a reason).",
+    promptSnippet: "Return one publish/merge/drop entry per raw message",
+    parameters: SubmitEvaluationParams,
+    async execute(_toolCallId, params) {
+      return submitTool("submit_evaluation", params);
     },
   });
 
