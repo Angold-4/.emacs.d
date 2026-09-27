@@ -24,7 +24,7 @@ import { projectLedger, projectMessages } from "./core/messages.ts";
 import { projectReview, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
-import { metricEvents, metricsForRunDir, projectMetrics, type MetricEvent } from "./metrics.ts";
+import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -4326,23 +4326,8 @@ export class Conductor {
       fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
       fs.writeFileSync(this.#paths.review, projectReview(phase));
       this.#writeMessageViews();
-      this.#writeMetricsProjection();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
-    }
-  }
-
-  /** Plan 04c: `views/metrics.json`, the balance metrics. A deterministic
-   * projection of state and the control log, computed the same way `tt
-   * contract rebuild`/`check` compute it. The timeline is rebuilt here because
-   * a message event can arrive between two status beats. */
-  #writeMetricsProjection(): void {
-    try {
-      const { timeline, events } = rebuildTimelineWithEvents(this.#runDir, this.#plan);
-      const metrics = metricsForRunDir(this.#runDir, timeline.state.phase, timeline, events);
-      fs.writeFileSync(this.#paths.metrics, projectMetrics(metrics));
-    } catch (err) {
-      this.#logUnexpected("write_metrics_projection", err);
     }
   }
 

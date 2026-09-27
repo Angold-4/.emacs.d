@@ -35,7 +35,9 @@ or `OWNER_VERDICT` event) and again on every conductor start. Because
 messages only change through those events, a mid-run `tt contract check` sees
 current projections; and a conductor killed between an event and its
 projection write rebuilds them on the next start — the log is the only
-authority.
+authority. `views/metrics.json` has no state-only write path of its own (it
+re-times the timeline), so it is refreshed on every status beat and on stop;
+a mid-run `tt contract check` may lag it by up to a second.
 
 `tt contract rebuild <run>` rewrites the projections (including one file per
 message and `views/metrics.json`) from `events.jsonl`. `tt contract check <run>`
