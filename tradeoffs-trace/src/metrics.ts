@@ -112,13 +112,20 @@ function reviewerRaisedTradeoff(message: Message, phase: PhaseState): boolean {
   return phase.decisions.find((d) => d.id === message.sourceRecordId)?.source === "reviewer-discovered";
 }
 
+/** The projection's own clock: the latest state arrival or logged event
+ * timestamp, never a wall clock. The metrics and the loop tape both end every
+ * duration here, so `tt contract rebuild` reproduces the live bytes. */
+export function timelineEndMs(timeline: MetricsTimeline, events: readonly MetricEvent[] = []): number {
+  const phaseTimes = timeline.phases.map((p) => Date.parse(p.at)).filter((t) => Number.isFinite(t));
+  const eventTimes = events.map((e) => Date.parse(e.ts ?? "")).filter((t) => Number.isFinite(t));
+  return Math.max(0, ...phaseTimes, ...eventTimes);
+}
+
 /** The balance metrics for one phase, from its state, the state timeline and
  * the reduced events. Deterministic: every duration ends at the last event
  * timestamp in the log, never at a caller's clock. */
 export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, events: readonly MetricEvent[] = []): PhaseMetrics {
-  const phaseTimes = timeline.phases.map((p) => Date.parse(p.at)).filter((t) => Number.isFinite(t));
-  const eventTimes = events.map((e) => Date.parse(e.ts ?? "")).filter((t) => Number.isFinite(t));
-  const endMs = Math.max(0, ...phaseTimes, ...eventTimes);
+  const endMs = timelineEndMs(timeline, events);
   const wallMs = timeline.phases.length === 0 ? 0 : Math.max(0, endMs - Date.parse(timeline.phases[0].at));
   const timeMs = timeByState(timeline, endMs);
   const reviewMs = (timeMs.REVIEWING ?? 0) + (timeMs.EVALUATING ?? 0);

@@ -27,6 +27,7 @@ Everything else under a run directory is a **projection** rebuilt from state:
 | `views/review.org` | the runtime-rendered review view (`projectReview`, `src/render.ts`) |
 | `views/messages/<id>.org` | one message's evidence, plan excerpt, history, ledger and votes (`renderMessageFile`) |
 | `views/status.txt` | the status buffer's own text (`renderStatusView`), with trade-off record markers |
+| `views/tape.txt` | the current round as a vertical tape (`renderLoopTape`), drawn from the declared `MAIN_PATH` and refreshed with `views/status.txt` |
 | `views/loop.txt` | the phase state machine as a chart (`renderPhaseChart`), drawn from `TRANSITIONS` and refreshed with `views/status.txt` |
 | `views/metrics.json` | the balance metrics (`computeMetrics`, `projectMetrics`), a deterministic projection of state, the timeline and the control log; `tt summary` renders the same numbers |
 
@@ -40,12 +41,12 @@ re-times the timeline), so it is refreshed on every status beat and on stop;
 a mid-run `tt contract check` may lag it by up to a second.
 
 `tt contract rebuild <run>` rewrites the projections (including one file per
-message and `views/metrics.json`) from `events.jsonl`. `tt contract check <run>`
-compares them to state and exits non-zero with the mismatching file names when
-they differ. `views/status.txt` is time-dependent and is
-generated, not compared; `views/metrics.json` is deterministic (every
-duration ends at the last event timestamp in the log, never at a wall
-clock), so it is compared like the other projections.
+message, `views/metrics.json` and `views/tape.txt`) from `events.jsonl`.
+`tt contract check <run>` compares them to state and exits non-zero with the
+mismatching file names when they differ. `views/status.txt` is time-dependent
+and is generated, not compared; `views/metrics.json` and `views/tape.txt` are
+deterministic (every duration ends at the last event timestamp in the log,
+never at a wall clock), so they are compared like the other projections.
 
 ## 1. Messages and the message state machine
 

@@ -261,6 +261,262 @@ export function renderMessageChart(rows: readonly MessageTransitionRow[] = MESSA
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// The live loop tape (plan 05h)
+// ---------------------------------------------------------------------------
+
+/** The phase state a tape reads. Structural, so charts.ts stays free of a
+ * conductor import cycle. */
+export interface LoopTapePhase {
+  phase: string;
+  attempt: { n: number; interrupted?: boolean };
+  repairRoundsUsed: number;
+  repairRoundsGranted: number;
+  contract: { gate?: string };
+  blockedReason?: string;
+  ownerRequests?: Array<{ origin?: string; status?: string; linkedMessageId?: string }>;
+}
+
+/** Everything the tape needs: the phase's state timeline (one round starts at
+ * the last new attempt), the current state, and the projection's own clock.
+ * `endMs` is the last log timestamp, not a wall clock, so `tt contract
+ * rebuild` reproduces the live file byte for byte. */
+export interface LoopTapeInput {
+  /** The phase's readable id and short title (`tapeLabel`), e.g. `05g seat models`. */
+  label: string;
+  /** The phase's current round (`view.round`). */
+  round: number;
+  phases: ReadonlyArray<{ phase: string; at: string }>;
+  phase: LoopTapePhase;
+  /** The run-axis state (`RUN_ACTIVE`/`RUN_PAUSED_BUDGET`). */
+  run?: string;
+  endMs: number;
+  models?: ChartModels;
+  /** Per-stage deadlines (`view.stageLimits`); the current row shows `x of y`. */
+  limits?: Record<string, number>;
+}
+
+/** One drawn tape row. */
+export interface LoopTapeRow {
+  name: string;
+  mark: string; // ✓ passed, ✗ failed, ▶ current, blank not reached
+  time: string;
+  annotation?: string;
+  arrow?: string;
+}
+
+/** The rows the tape draws, in order. `state` names the phase state each row
+ * accounts for; REPAIRING is deliberately absent (it is off the main path). */
+const TAPE_STEPS: ReadonlyArray<{ name: string; state: string }> = [
+  { name: "BASELINE", state: "BASELINE" },
+  { name: "IMPLEMENT", state: "IMPLEMENTING" },
+  { name: "FREEZE", state: "FREEZING" },
+  { name: "CHECKS", state: "CHECKING" },
+  { name: "PROBE", state: "PROBING" },
+  { name: "REVIEW", state: "REVIEWING" },
+  { name: "EVALUATE", state: "EVALUATING" },
+  { name: "RESOLVE", state: "RESOLVING" },
+  { name: "GATE", state: "GATING" },
+  { name: "PUBLISH", state: "PUBLISHING" },
+  { name: "DONE", state: "DONE" },
+];
+
+/** ACCEPTED is a moment between GATING and PUBLISHING: its time belongs to the
+ * PUBLISH row. */
+const TAPE_STEP_OF_STATE: Record<string, string> = {
+  BASELINE: "BASELINE",
+  IMPLEMENTING: "IMPLEMENT",
+  FREEZING: "FREEZE",
+  CHECKING: "CHECKS",
+  PROBING: "PROBE",
+  REVIEWING: "REVIEW",
+  EVALUATING: "EVALUATE",
+  RESOLVING: "RESOLVE",
+  GATING: "GATE",
+  ACCEPTED: "PUBLISH",
+  PUBLISHING: "PUBLISH",
+  DONE: "DONE",
+};
+
+const TAPE_STEP_LIMIT: Record<string, string> = {
+  BASELINE: "baseline",
+  IMPLEMENT: "implement",
+  FREEZE: "freeze",
+  CHECKS: "checks",
+  PROBE: "probe",
+  REVIEW: "review",
+  EVALUATE: "evaluate",
+  GATE: "gate",
+};
+
+const TAPE_OFF_PATH = new Set(["REPAIRING", "AWAITING_OWNER", "BLOCKED"]);
+
+/** A new attempt begins at an IMPLEMENTING whose predecessor is not the
+ * front of the same attempt (READY), the base baseline, the attempt itself, a
+ * freeze that just committed, or a repair about to start it. Everything after
+ * such an entry belongs to the current round. */
+const TAPE_ROUND_CONTINUES = new Set(["READY", "BASELINE", "IMPLEMENTING", "FREEZING", "REPAIRING"]);
+
+/** `05h loop tape`: the readable id (the phase id without its `tt-` prefix and
+ * with its first token kept whole) and the id's tail as the short title. */
+export function tapeLabel(phaseId: string): string {
+  const tail = phaseId.replace(/^tt-/, "");
+  const parts = tail.split("-");
+  return parts.length <= 1 ? tail : `${parts[0]} ${parts.slice(1).join(" ")}`;
+}
+
+/** Tape durations: whole minutes drop the seconds (`7m`), so the row stays
+ * readable; the header's hour form is `1h04m`, as in the owner's layout. */
+function formatTapeMs(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return s % 60 === 0 ? `${m}m` : `${m}m${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+function tapeModel(models: ChartModels | undefined, role: ModelRole): string {
+  return models?.[role] ?? "default";
+}
+
+function tapeSeat(models: ChartModels | undefined, role: "reviewer" | "panel", seat: string): string {
+  const own = role === "reviewer" ? models?.reviewerSeats?.[seat as "M" | "A" | "B"] : models?.panelSeats?.[seat];
+  return own ?? tapeModel(models, role);
+}
+
+/** Who is on the current step, and on which model, matching the chart's own
+ * per-seat resolution. Only the three dispatching steps name anyone. */
+function tapeWorking(step: string, models: ChartModels | undefined): string | undefined {
+  if (step === "IMPLEMENT") return `worker · ${tapeModel(models, "worker")}`;
+  if (step === "REVIEW") {
+    const seats = (["M", "A", "B"] as const).map((s) => [s, tapeSeat(models, "reviewer", s)] as const);
+    return seats.every(([, m]) => m === seats[0][1])
+      ? `M·A·B · ${seats[0][1]}`
+      : seats.map(([s, m]) => `${s} ${m}`).join(" · ");
+  }
+  if (step === "EVALUATE") {
+    const evaluator = tapeModel(models, "evaluator");
+    const panel = tapeSeat(models, "panel", "1");
+    return panel !== evaluator ? `evaluator · ${evaluator} · panel · ${panel}` : `evaluator · ${evaluator}`;
+  }
+  return undefined;
+}
+
+/** The plain-words reason the head carries when the round is off the main
+ * path: a repair, the owner's desk, a block or a run-budget pause. */
+function tapeOffPathReason(input: LoopTapeInput): string | undefined {
+  if (input.run === "RUN_PAUSED_BUDGET") return "paused (run budget)";
+  switch (input.phase.phase) {
+    case "REPAIRING":
+      return `repairing, attempt ${input.phase.attempt.n}/${input.phase.repairRoundsGranted}`;
+    case "AWAITING_OWNER": {
+      const escalated = (input.phase.ownerRequests ?? []).find(
+        (r) => r.status === "open" && r.origin === "blocker_panel" && r.linkedMessageId,
+      );
+      return escalated ? `waiting for you · panel escalated ${escalated.linkedMessageId}` : "waiting for you";
+    }
+    case "BLOCKED":
+      return input.phase.blockedReason ? `blocked · ${input.phase.blockedReason}` : "blocked";
+    default:
+      return undefined;
+  }
+}
+
+/** Build the tape's header and rows from the phase timeline. Pure. */
+export function buildLoopTape(input: LoopTapeInput): { header: string; rows: LoopTapeRow[]; head?: LoopTapeRow } {
+  const { phases, phase } = input;
+  // The current round starts at the last new attempt (an IMPLEMENTING after a
+  // round-ending state), or at the top for round one, so BASELINE is included.
+  let startIdx = 0;
+  for (let i = 1; i < phases.length; i++) {
+    if (phases[i].phase === "IMPLEMENTING" && !TAPE_ROUND_CONTINUES.has(phases[i - 1].phase)) startIdx = i;
+  }
+  const slice = phases.slice(startIdx);
+
+  const times: Record<string, number> = {};
+  const seen = new Set<string>();
+  let lastMain: string | undefined;
+  for (let i = 0; i < slice.length; i++) {
+    const step = TAPE_STEP_OF_STATE[slice[i].phase];
+    const end = i + 1 < slice.length ? Date.parse(slice[i + 1].at) : input.endMs;
+    const ms = Math.max(0, end - Date.parse(slice[i].at));
+    if (!step) continue;
+    times[step] = (times[step] ?? 0) + ms;
+    seen.add(step);
+    lastMain = step;
+  }
+
+  const runPaused = input.run === "RUN_PAUSED_BUDGET";
+  const offPath = TAPE_OFF_PATH.has(phase.phase) || runPaused;
+  // Off the path, the head stays on the step the round left from; REPAIRING
+  // and BLOCKED are a failure (`✗`), a pause or the owner's desk are not (`▶`).
+  const currentStep = offPath ? lastMain : TAPE_STEP_OF_STATE[phase.phase];
+  const headMark = offPath ? (phase.phase === "AWAITING_OWNER" || runPaused ? "▶" : "✗") : "▶";
+  const wholeRunBaseline = phases.some((p) => p.phase === "BASELINE");
+  const displayed = TAPE_STEPS.filter((s) =>
+    s.name === "BASELINE" ? wholeRunBaseline : s.name === "GATE" ? Boolean(phase.contract.gate) : true,
+  );
+  const ci = currentStep ? displayed.findIndex((s) => s.name === currentStep) : -1;
+  const arrow = offPath ? tapeOffPathReason(input) : undefined;
+
+  const rows = displayed.map((s, k): LoopTapeRow => {
+    const ms = times[s.name];
+    let mark = " ";
+    if (k === ci && ci >= 0) mark = headMark;
+    else if (k < ci) mark = seen.has(s.name) || (s.name === "BASELINE" && wholeRunBaseline) ? "✓" : " ";
+    let time = "";
+    if (mark === "✓" || mark === "✗") time = ms === undefined ? "" : formatTapeMs(ms);
+    else if (mark === "▶" && ms !== undefined) {
+      const limitKey = TAPE_STEP_LIMIT[s.name];
+      const limit = limitKey ? input.limits?.[limitKey] : undefined;
+      time = limit === undefined ? formatTapeMs(ms) : `${formatTapeMs(ms)} of ${formatTapeMs(limit)}`;
+    }
+    return {
+      name: s.name,
+      mark,
+      time,
+      // Off the path nobody is on the step any more: the arrow names the
+      // reason instead of a model.
+      annotation: mark === "▶" && !offPath ? tapeWorking(s.name, input.models) : undefined,
+      arrow: k === ci ? arrow : undefined,
+    };
+  });
+
+  const firstAt = phases[0]?.at;
+  const elapsed = firstAt ? formatTapeMs(Math.max(0, input.endMs - Date.parse(firstAt))) : "0s";
+  const header = `${input.label} · round ${input.round} · attempt ${phase.attempt.n}/${phase.repairRoundsGranted} · ${elapsed}`;
+  return { header, rows, head: ci >= 0 ? rows[ci] : undefined };
+}
+
+/** `views/tape.txt`: the current round as a vertical tape, one main-path step
+ * per row, the head `▶` (or `✗`) on the step the phase is in, with its elapsed
+ * time against the stage limit and who is on which model. Off the main path
+ * the head carries `→` and the reason in plain words. */
+export function renderLoopTape(input: LoopTapeInput): string {
+  const { header, rows } = buildLoopTape(input);
+  const lines = [header, ""];
+  for (const r of rows) {
+    let line = `  ${r.mark}  ${r.name.padEnd(12)}`;
+    if (r.time) line += r.time;
+    if (r.annotation) line += `   ${r.annotation}`;
+    if (r.arrow) line += `  → ${r.arrow}`;
+    lines.push(line.replace(/ +$/, ""));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/** The current step's cell, one line: the status buffer's `loop` row and the
+ * one thing the owner reads at a glance. Undefined before the first step. */
+export function loopTapeHead(input: LoopTapeInput): string | undefined {
+  const { head } = buildLoopTape(input);
+  if (!head || head.mark === " ") return undefined;
+  let line = `${head.mark} ${head.name}`;
+  if (head.time) line += ` ${head.time}`;
+  if (head.annotation) line += ` · ${head.annotation}`;
+  if (head.arrow) line += ` → ${head.arrow}`;
+  return line;
+}
+
 const NODE_MARK: Record<string, string> = {
   waiting: ".",
   running: ">",
