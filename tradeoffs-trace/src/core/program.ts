@@ -143,8 +143,9 @@ export function initialProgramState(nodes: ProgramNode[]): ProgramState {
 }
 
 /** Plan 03c: the readable id of every node, by position in the expanded node
- * list (two digits, so `<program>-01` sorts and reads): `<program>-NN`. A node
- * keeps its readable id across a retry — the id names the position in the
+ * list (`<program>-01`, `<program>-02`, …; two digits is a minimum, so node
+ * 100 is `<program>-100` and `cli.ts`'s resolver accepts any digit count). A
+ * node keeps its readable id across a retry — the id names the position in the
  * program, not the run. */
 export function nodeReadableIds(programId: string, nodes: readonly ProgramNode[]): Record<string, string> {
   return Object.fromEntries(nodes.map((n, i) => [n.id, `${programId}-${String(i + 1).padStart(2, "0")}`]));

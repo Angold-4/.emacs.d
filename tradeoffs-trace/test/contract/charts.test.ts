@@ -45,10 +45,12 @@ test("every MESSAGE_TRANSITIONS row appears as a drawn edge tagged with its row 
   }
 });
 
-/** The chart text between the doc's markers, if the doc is present. */
-function docMessageChart(rel: string): string | undefined {
+/** The chart text between the doc's markers. The doc must exist: a moved or
+ * renamed document must fail this guard, not silently stop being checked
+ * (finding A-3). */
+function docMessageChart(rel: string): string {
   const file = fileURLToPath(new URL(rel, import.meta.url));
-  if (!existsSync(file)) return undefined;
+  assert.ok(existsSync(file), `missing ${rel}; the message chart cannot be checked`);
   const m = readFileSync(file, "utf8").match(/<!-- BEGIN message-chart[^>]*-->\n```text\n([\s\S]*?)```\n<!-- END message-chart -->/);
   assert.ok(m, `no message-chart block in ${rel}`);
   return m![1];
@@ -57,9 +59,7 @@ function docMessageChart(rel: string): string | undefined {
 test("the contract doc and the runbook quote the generated message chart", () => {
   const chart = renderMessageChart(MESSAGE_TRANSITIONS);
   for (const rel of ["../../../docs/tradeoffs-trace-contract.md", "../../../docs/tradeoffs-trace-runbook.md"]) {
-    const embedded = docMessageChart(rel);
-    if (embedded === undefined) continue;
-    assert.equal(embedded, chart, `${rel}'s message chart is stale; regenerate it (renderMessageChart)`);
+    assert.equal(docMessageChart(rel), chart, `${rel}'s message chart is stale; regenerate it (renderMessageChart)`);
   }
 });
 
@@ -67,7 +67,7 @@ test("the contract doc and the runbook quote the generated message chart", () =>
  * resolve → gate (fails) → repair, then a second round whose gate passes and
  * the phase publishes. */
 const TIMELINE: TimelineLike = {
-  state: { phase: { phase: "DONE" } },
+  state: { run: "RUN_ACTIVE", phase: { phase: "DONE" } },
   phases: [
     ["READY", "2026-09-27T09:00:00.000Z"],
     ["IMPLEMENTING", "2026-09-27T09:00:10.000Z"],
@@ -93,11 +93,17 @@ const TIMELINE: TimelineLike = {
 
 test("loop.txt matches its golden file, with the current-state marker", () => {
   const stats = statsFromTimeline(TIMELINE, new Date("2026-09-27T11:05:00.000Z"));
-  const chart = renderPhaseChart(TRANSITIONS, { stats, model: "default" });
+  const chart = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet" } });
   assertGolden("loop.txt", chart);
   assert.match(chart, /^current state: DONE/m);
+  assert.match(chart, /^current run: RUN_ACTIVE/m);
   assert.match(chart, /^> \+/m);
   assert.match(chart, /entered 2x/);
+  // Per-role models: the worker and the reviewers each show their own (D-18).
+  assert.match(chart, /IMPLEMENTING.*worker - model opus/);
+  assert.match(chart, /REVIEWING.*M, A, B - model sonnet/);
+  // The run axis carries its own current marker, not phase counts (M-5).
+  assert.match(chart, /^> .*\n  \| RUN_ACTIVE\s+\|  current/m);
 });
 
 function phasePlan(title: string): RunPlanFile {

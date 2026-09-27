@@ -94,6 +94,26 @@ test("tt program state carries the id, the readable ids and the source path", ()
   }
 });
 
+test("a 100th node's readable id (three digits) still resolves", () => {
+  const root = fs.mkdtempSync("/tmp/tt-readable-100-");
+  try {
+    const run100 = path.basename(createRun(root, plan("14a"), "run-100"));
+    const dir = path.join(root, "programs", "prog0100");
+    fs.mkdirSync(dir, { recursive: true });
+    const phases = Array.from({ length: 100 }, (_, i) => ({ id: `p${i + 1}`, goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [] }));
+    const program: ProgramFile = { title: "100 nodes", maxParallel: 1, entries: [{ id: "e", after: [], plan: { ...plan("e"), phases } as RunPlanFile }] };
+    fs.writeFileSync(path.join(dir, "program.json"), JSON.stringify(program));
+    fs.writeFileSync(
+      path.join(dir, "events.jsonl"),
+      `${JSON.stringify({ ts: new Date().toISOString(), event: { type: "NODE_STARTED", node: "e/p100", runId: run100 } })}\n`,
+    );
+    // The id is <program>-100; the resolver must accept three digits (A-4).
+    assert.equal(cli(root, "status", "prog0100-100"), cli(root, "status", run100));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a retried node keeps its readable id and points at the new run", () => {
   const root = fs.mkdtempSync("/tmp/tt-readable-retry-");
   try {

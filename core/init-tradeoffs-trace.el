@@ -729,17 +729,21 @@ id everywhere."
 
 (defun +tt--workspace (run-dir)
   "Open (or rebuild) the workspace for RUN-DIR.
-Plan 03c: with `+tt-use-tab-bar' (default nil) the workspace is a `tab-bar'
-tab as before; without it the run opens in ordinary windows and no tab is
-created."
+Plan 03c: with `+tt-use-tab-bar' (default nil) the run opens in ordinary
+windows: no tab is created, and the owner's current layout is left alone (a
+tab would be the only way back to it).  With the tab bar on, the run gets its
+own tab and takes the whole frame."
   (let* ((id (+tt--readable-id run-dir))
          (tab (format "tt:%s" id)))
     (when +tt-use-tab-bar
       (if (tab-bar--tab-index-by-name tab)
           (tab-bar-select-tab-by-name tab)
         (tab-bar-new-tab)
-        (tab-bar-rename-tab tab)))
-    (delete-other-windows)
+        (tab-bar-rename-tab tab))
+      ;; Only with a tab to return to may the workspace own the whole frame
+      ;; (finding M-6/M-21: with the default nil it must not destroy the
+      ;; layout the owner is working in).
+      (delete-other-windows))
     (let* ((trace (+tt--buffer "trace" run-dir))
            (status (+tt--buffer "status" run-dir))
            (input (+tt--buffer "input" run-dir))

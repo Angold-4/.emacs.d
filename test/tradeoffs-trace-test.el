@@ -1574,18 +1574,22 @@ version the owner never saw (the M/B objection to the silent fallback)."
       (kill-buffer buf))))
 
 (ert-deftest tradeoffs-trace-tab-bar-is-opt-in ()
-  "With `+tt-use-tab-bar' nil (the default) opening a run creates no tab."
+  "With `+tt-use-tab-bar' nil (the default) opening a run creates no tab and
+leaves the owner's window layout alone (finding M-21)."
   (should-not +tt-use-tab-bar)
   (let ((tabbed nil)
+        (took-frame nil)
         (+tt-use-tab-bar nil)
         (run-dir (make-temp-file "tt-ert-run" t)))
     (unwind-protect
         (cl-letf (((symbol-function 'tab-bar-new-tab) (lambda () (setq tabbed t)))
                   ((symbol-function 'tab-bar--tab-index-by-name) (lambda (&rest _) nil))
+                  ((symbol-function 'delete-other-windows) (lambda (&optional _) (setq took-frame t)))
                   ((symbol-function '+tt--refresh-all) (lambda (&rest _) nil))
                   ((symbol-function '+tt--ensure-timer) (lambda () nil)))
           (+tt--workspace run-dir)
           (should-not tabbed)
+          (should-not took-frame)
           ;; The run's buffers exist and carry the run's readable id.
           (should (get-buffer (format "*tt-status: %s*" (file-name-nondirectory run-dir)))))
       (dolist (buf (buffer-list)) (when (string-prefix-p "*tt-" (buffer-name buf)) (kill-buffer buf)))

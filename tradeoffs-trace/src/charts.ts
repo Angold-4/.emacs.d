@@ -16,9 +16,12 @@ import type { TransitionRow } from "./core/transitions.ts";
 import { TRANSITIONS } from "./core/transitions.ts";
 
 /** How often and how long each state was entered — what a chart shows beside
- * each state. `current` names the state the run is in now. */
+each state. `current` names the phase state the run is in now; `currentRun`
+the run-axis state. Only the phase timeline records arrivals, so the run
+section shows no counts (its rows are the run budget, not a visited loop). */
 export interface ChartStats {
   current?: string;
+  currentRun?: string;
   entries: Record<string, number>;
   timeMs: Record<string, number>;
 }
@@ -26,7 +29,7 @@ export interface ChartStats {
 /** The slice of a `Timeline` (src/conductor.ts) the chart needs. Structural,
  * so charts.ts stays free of a conductor import cycle. */
 export interface TimelineLike {
-  state: { phase: { phase: string } };
+  state: { run?: string; phase: { phase: string } };
   phases: Array<{ phase: string; at: string }>;
 }
 
@@ -43,7 +46,7 @@ export function statsFromTimeline(timeline: TimelineLike, now: Date): ChartStats
     const end = i + 1 < phases.length ? Date.parse(phases[i + 1].at) : now.getTime();
     timeMs[phase] = (timeMs[phase] ?? 0) + Math.max(0, end - Date.parse(at));
   }
-  return { current: timeline.state.phase.phase, entries, timeMs };
+  return { current: timeline.state.phase.phase, currentRun: timeline.state.run, entries, timeMs };
 }
 
 function formatMs(ms: number | undefined): string {
@@ -55,15 +58,23 @@ function formatMs(ms: number | undefined): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
 }
 
-/** The states that dispatch agents and the role(s) each one dispatches. A
- * state not in this map shows no role. EVALUATING appears once the 04a/04b
- * generator adds it to `TRANSITIONS`: the chart draws the states the table
- * has, never a hard-coded list. */
-const DISPATCH_ROLES: Record<string, string> = {
-  IMPLEMENTING: "worker",
-  REVIEWING: "M, A, B",
-  EVALUATING: "evaluator, panel",
+/** The states that dispatch agents, the role(s) each one dispatches, and the
+ * model role their model comes from. A state not in this map shows no role.
+ * EVALUATING appears once the 04a/04b generator adds it to `TRANSITIONS`: the
+ * chart draws the states the table has, never a hard-coded list. */
+const DISPATCH_ROLES: Record<string, { roles: string; model: "worker" | "reviewer" | "evaluator" }> = {
+  IMPLEMENTING: { roles: "worker", model: "worker" },
+  REVIEWING: { roles: "M, A, B", model: "reviewer" },
+  EVALUATING: { roles: "evaluator, panel", model: "evaluator" },
 };
+
+/** The models the chart may show, one per role. A role with no model (Pi's
+ * settings unread, or a test) reads as `default`. */
+export interface ChartModels {
+  worker?: string;
+  reviewer?: string;
+  evaluator?: string;
+}
 
 /** Triggers whose edges are rare enough to fold out of the graph: a crash
  * recovery (interrupted) or a launch failure. Anything else is drawn. */
@@ -121,18 +132,26 @@ function edgeLine(row: TransitionRow, triggerWidth: number, toWidth: number, gua
  * readable; the run-axis rows get their own small section. */
 export function renderPhaseChart(
   rows: readonly TransitionRow[] = TRANSITIONS,
-  opts: { stats?: ChartStats; model?: string; now?: Date } = {},
+  opts: { stats?: ChartStats; model?: string; models?: ChartModels; now?: Date } = {},
 ): string {
   const stats = opts.stats ?? { entries: {}, timeMs: {} };
-  const model = opts.model && opts.model.length > 0 ? opts.model : "default";
+  const fallback = opts.model && opts.model.length > 0 ? opts.model : "default";
+  const modelFor = (role: "worker" | "reviewer" | "evaluator") => opts.models?.[role] ?? fallback;
   const phaseRows = rows.filter((r) => r.axis === "phase");
   const runRows = rows.filter((r) => r.axis === "run");
   const lines: string[] = [];
   lines.push("tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions.ts); do not edit");
   lines.push(`current state: ${stats.current ?? "?"}${stats.current ? `   (entered ${stats.entries[stats.current] ?? 0}x - ${formatMs(stats.timeMs[stats.current])})` : ""}`);
+  if (stats.currentRun) lines.push(`current run: ${stats.currentRun}`);
   lines.push("");
 
-  const section = (title: string, sectionRows: readonly TransitionRow[], order: readonly string[], foldRare: boolean) => {
+  const section = (
+    title: string,
+    sectionRows: readonly TransitionRow[],
+    order: readonly string[],
+    foldRare: boolean,
+    axis: "phase" | "run",
+  ) => {
     lines.push(`${title}:`);
     const states = orderStates(sectionRows, order);
     const drawn = foldRare ? sectionRows.filter((r) => !isRare(r)) : sectionRows;
@@ -140,16 +159,24 @@ export function renderPhaseChart(
     const inner = Math.max(...states.map((s) => s.length), 8) + 2;
     const triggerWidth = Math.max(0, ...drawn.map((r) => r.trigger.length));
     const toWidth = Math.max(0, ...drawn.map((r) => r.to.length));
+    const currentName = axis === "phase" ? stats.current : stats.currentRun;
     const shareKey = new Map<string, number>();
     for (const r of drawn) shareKey.set(`${r.from}\0${r.trigger}`, (shareKey.get(`${r.from}\0${r.trigger}`) ?? 0) + 1);
     for (const state of states) {
-      const marker = stats.current === state ? "> " : "  ";
+      const marker = currentName === state ? "> " : "  ";
       const bits: string[] = [];
-      const entered = stats.entries[state] ?? 0;
-      if (entered === 0) bits.push(state === stats.current ? "current, not yet counted" : "not entered");
-      else bits.push(`entered ${entered}x - ${formatMs(stats.timeMs[state])}`);
-      const role = DISPATCH_ROLES[state];
-      if (role) bits.push(`${role} - model ${model}`);
+      if (axis === "phase") {
+        const entered = stats.entries[state] ?? 0;
+        if (entered === 0) bits.push(state === stats.current ? "current, not yet counted" : "not entered");
+        else bits.push(`entered ${entered}x - ${formatMs(stats.timeMs[state])}`);
+      } else {
+        // The timeline records phase arrivals only, so the run budget rows are
+        // never given counts that would read as "not entered" when the run is
+        // plainly active (finding M-5).
+        bits.push(state === currentName ? "current" : "not current");
+      }
+      const dispatch = DISPATCH_ROLES[state];
+      if (dispatch) bits.push(`${dispatch.roles} - model ${modelFor(dispatch.model)}`);
       lines.push(...boxLines(state, inner, marker, bits.join("  -  ")));
       const outgoing = drawn.filter((r) => r.from === state);
       for (const r of outgoing) {
@@ -166,8 +193,8 @@ export function renderPhaseChart(
     }
   };
 
-  section("phase states", phaseRows, PHASE_ORDER, true);
-  section("run states", runRows, RUN_ORDER, false);
+  section("phase states", phaseRows, PHASE_ORDER, true, "phase");
+  section("run states", runRows, RUN_ORDER, false, "run");
   return lines.join("\n");
 }
 

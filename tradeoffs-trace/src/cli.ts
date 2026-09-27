@@ -166,7 +166,7 @@ function parseArgs(argv: string[]): {
  * directory. NN is the node's position in the program file, so the id survives
  * a retry (which starts a fresh run for the same position). */
 function resolveReadableRunDir(ref: string, root: string): string | undefined {
-  const m = ref.match(/^(.+)-([0-9]{1,2})$/);
+  const m = ref.match(/^(.+)-([0-9]+)$/);
   if (!m) return undefined;
   const dir = path.join(programsRoot(root), m[1]);
   if (!existsSync(path.join(dir, "program.json"))) return undefined;

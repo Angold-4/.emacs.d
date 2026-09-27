@@ -1,5 +1,6 @@
 tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions.ts); do not edit
 current state: DONE   (entered 1x - 2m40s)
+current run: RUN_ACTIVE
 
 phase states:
   +----------------+
@@ -8,7 +9,7 @@ phase states:
       +- ATTEMPT_STARTED           -> IMPLEMENTING    [start-attempt]
 
   +----------------+
-  | IMPLEMENTING   |  entered 2x - 41m00s  -  worker - model default
+  | IMPLEMENTING   |  entered 2x - 41m00s  -  worker - model opus
   +----------------+
       +- SUBMIT_PHASE              -> FREEZING        [submit-phase]
       +- ATTEMPT_TIMED_OUT (budgetRemains) -> REPAIRING       [attempt-timed-out-to-repairing]
@@ -53,7 +54,7 @@ phase states:
       +- REVISE                    -> REPAIRING       [revise-from-probing]
 
   +----------------+
-  | REVIEWING      |  entered 2x - 30m00s  -  M, A, B - model default
+  | REVIEWING      |  entered 2x - 30m00s  -  M, A, B - model sonnet
   +----------------+
       +- REVIEW_SUBMITTED (reviewIncomplete) -> REVIEWING       [review-submitted-incomplete]
       +- REVIEW_SUBMITTED (reviewComplete) -> RESOLVING       [review-submitted-complete]
@@ -141,12 +142,12 @@ rare edges (crash recovery, launch failure):
   REVIEWING -- LAUNCH_FAILED       -> BLOCKED       [launch-failed-from-reviewing]
 
 run states:
-  +-------------------+
-  | RUN_ACTIVE        |  not entered
+> +-------------------+
+  | RUN_ACTIVE        |  current
   +-------------------+
       +- RUN_BUDGET_EXCEEDED -> RUN_PAUSED_BUDGET  [run-budget-exceeded]
 
   +-------------------+
-  | RUN_PAUSED_BUDGET |  not entered
+  | RUN_PAUSED_BUDGET |  not current
   +-------------------+
       +- RUN_RESUMED         -> RUN_ACTIVE         [run-resumed]

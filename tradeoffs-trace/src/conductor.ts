@@ -439,6 +439,24 @@ export function runnerRevision(): string {
   }
 }
 
+/** Plan 03c: the model Pi uses when no provider/model is passed —
+ * `defaultModel` in Pi's own `~/.pi/agent/settings.json` (the same file the
+ * Emacs front end writes, see core/init-pilish.el). Read once and cached: the
+ * phase chart asks for it on every status beat. Undefined when the file is
+ * missing or unreadable, so the chart says `default` rather than guessing. */
+let cachedPiDefaultModel: string | null | undefined;
+export function piDefaultModel(): string | undefined {
+  if (cachedPiDefaultModel !== undefined) return cachedPiDefaultModel ?? undefined;
+  try {
+    const file = path.join(os.homedir(), ".pi", "agent", "settings.json");
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { defaultModel?: unknown };
+    cachedPiDefaultModel = typeof raw.defaultModel === "string" && raw.defaultModel.length > 0 ? raw.defaultModel : null;
+  } catch {
+    cachedPiDefaultModel = null;
+  }
+  return cachedPiDefaultModel ?? undefined;
+}
+
 /** A conductor whose own revision differs from the one the run was started
  * under refuses to resume it (plan, "How this plan is executed"). */
 export class RunnerMismatchError extends Error {}
@@ -943,6 +961,7 @@ export class Conductor {
     this.#piArgsPrefix = opts.piArgsPrefix ?? [];
     this.#extraEnv = opts.extraEnv ?? {};
     this.#piEnvFor = opts.piEnvFor;
+    this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
@@ -3921,8 +3940,12 @@ export class Conductor {
     // Plan 03c: the same beat keeps the phase chart (`views/loop.txt`) current;
     // it is generated from TRANSITIONS, so it can never drift from the loop.
     const stats = statsFromTimeline(view.timeline, new Date());
-    const model = this.#providerModelFor?.("worker")?.model ?? this.#providerModelFor?.("reviewer")?.model;
-    fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, model }), this.#secretMaskable));
+    // Plan 03c: each dispatching state shows its own role's model — the
+    // injected provider/model when a caller set one, otherwise Pi's own
+    // default from settings.json, otherwise `default`.
+    const modelFor = (role: Role): string | undefined => this.#providerModelFor?.(role)?.model ?? piDefaultModel();
+    const models = { worker: modelFor("worker"), reviewer: modelFor("reviewer"), evaluator: modelFor("reviewer") };
+    fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
   }
 
   /** Contract v1: the reviewable content of the message a worker decision
