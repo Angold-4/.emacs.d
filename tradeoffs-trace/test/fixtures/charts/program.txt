@@ -1,0 +1,26 @@
+program atlas — plan 14
+4 nodes · max 2 in parallel
+
+  +------------------+
+  | atlas-01  a      |  done
+  +------------------+
+      after: (none)
+      run: r-a
+
+> +------------------+
+  | atlas-02  b      |  running - REVIEWING
+  +------------------+
+      after: atlas-01
+      run: r-b
+
+  +------------------+
+  | atlas-03  c      |  needs-you
+  +------------------+
+      after: atlas-01
+      the repair budget ran out
+      run: r-c
+
+  +------------------+
+  | atlas-04  d      |  waiting
+  +------------------+
+      after: atlas-02, atlas-03

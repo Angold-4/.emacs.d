@@ -23,6 +23,7 @@ import { reduce } from "./core/reduce.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { projectReview, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
+import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -381,6 +382,8 @@ export function runPaths(runDir: string) {
     review: path.join(runDir, "views", "review.org"),
     messagesView: path.join(runDir, "views", "messages"),
     status: path.join(runDir, "views", "status.txt"),
+    // Plan 03c: the phase state machine as an ASCII chart (TRANSITIONS).
+    loop: path.join(runDir, "views", "loop.txt"),
     inbox: path.join(runDir, "inbox"),
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
@@ -3915,6 +3918,11 @@ export class Conductor {
       }),
     );
     fs.writeFileSync(this.#paths.status, redactText(text, this.#secretMaskable));
+    // Plan 03c: the same beat keeps the phase chart (`views/loop.txt`) current;
+    // it is generated from TRANSITIONS, so it can never drift from the loop.
+    const stats = statsFromTimeline(view.timeline, new Date());
+    const model = this.#providerModelFor?.("worker")?.model ?? this.#providerModelFor?.("reviewer")?.model;
+    fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, model }), this.#secretMaskable));
   }
 
   /** Contract v1: the reviewable content of the message a worker decision

@@ -18,9 +18,11 @@
 ;;             offers to resume a run whose conductor is not running
 ;;   C-c m d   the run's review view (read-only; TAB folds, RET opens a
 ;;             message's file, A/D send the owner's verdict)
-;;   C-c m l   every run: open (RET), stop (k), resume (R)
+;;   C-c m l   every run: open (RET)
 ;;   C-c m p   a program (several plans / phases as one graph): RET opens a
-;;             phase's run, k stops, R resumes
+;;             phase's run, i sends a program-wide directive
+;;   C-c m k   stop the program or phase whose buffer point is in (asks first)
+;;   C-c m c   continue (resume) it
 ;;
 ;; The conductor always comes from the *installed runner*
 ;; (`<root>/runner/current/tradeoffs-trace', see `tt runner install <sha>'),
@@ -69,6 +71,14 @@ With a remote `+tt-root' it runs on that host: use an absolute path there
 (defcustom +tt-refresh-interval 2
   "Seconds between workspace refreshes."
   :type 'number)
+
+(defcustom +tt-use-tab-bar nil
+  "Whether opening a run creates a `tab-bar' tab for it.
+Plan 03c: the tab bar is opt-in.  Off (the default), a run opens in ordinary
+windows and nothing depends on tab-bar being displayed — the run's own buffers
+and their headers carry the identity, and the workspace works on a terminal
+with no tab bar."
+  :type 'boolean)
 
 (defconst +tt--terminal-phases '("DONE" "BLOCKED" "AWAITING_OWNER")
   "Phase states that need no further execution without the owner.")
@@ -558,7 +568,12 @@ whole program; warnings are shown and it starts."
       (let ((json-file (make-temp-file "tt-program-" nil ".json" (json-encode (plist-get parsed :program)))))
         (unwind-protect
             (when (+tt--lint-plan-json json-file file)
-              (let ((id (car (last (split-string (+tt--cli "program" "start" json-file) "\n" t)))))
+              ;; Plan 03c: record the Org program file, so the program buffer's
+              ;; header can show it (the tab bar may be off).
+              (let ((id (car (last (split-string (apply #'+tt--cli
+                                                        (append (list "program" "start" json-file)
+                                                                (when file (list "--source" file))))
+                                                  "\n" t)))))
                 (message "tradeoffs-trace: started program %s" id)
                 (+tt-program (expand-file-name (concat "programs/" id) +tt-root))))
           (delete-file json-file))))))
@@ -569,11 +584,16 @@ whole program; warnings are shown and it starts."
                      :null-object nil :false-object :false))
 
 (defun +tt--render-program ()
-  "Render the program buffer from `tt program state'."
+  "Render the program buffer from `tt program state'.
+Plan 03c: the header line carries the program id and the Org program file it
+was started from (recorded by `tt program start --source')."
   (let* ((s (+tt--program-state +tt--program-dir))
          (nodes (alist-get 'nodes (alist-get 'state s)))
+         (source (alist-get 'sourcePath s))
          (inhibit-read-only t)
          (pt (point)))
+    (setq header-line-format
+          (format "program %s%s" (alist-get 'id s) (if source (format "   %s" source) "")))
     (erase-buffer)
     (let ((run-id nil))
       (dolist (line (alist-get 'lines s))
@@ -597,33 +617,73 @@ whole program; warnings are shown and it starts."
     (unless run (user-error "No run on this line"))
     (+tt--workspace (expand-file-name run +tt-root))))
 
-(defun +tt-program-stop ()
-  "Stop this program: its scheduler and every running node."
-  (interactive)
-  (when (y-or-n-p "Stop this program and its running phases? ")
-    (message "%s" (+tt--cli "program" "stop" +tt--program-dir))
-    (+tt--render-program)))
+;;; The global stop/continue keys (plan 03c)
 
-(defun +tt-program-resume ()
-  "Restart this program's scheduler."
+;; The owner's `k' and `R' lived in the program and runs buffers, where Evil
+;; reaches them when moving around.  Plan 03c moves them under the `C-c m'
+;; prefix and makes them act on whichever buffer point is in, after a
+;; confirmation: `C-c m k' stops, `C-c m c' continues.
+
+(defun +tt--confirm (prompt)
+  "Ask PROMPT; return t on RET and nil on `n'.
+Anything else is ignored and the question repeats, so a stray key can never
+stop a run by accident."
+  (let (answer)
+    (while (null answer)
+      (message "%s (RET to confirm, n to cancel)" prompt)
+      (let ((key (read-key)))
+        (cond ((or (eq key 'return) (eq key ?\r) (eq key ?\n) (eql key 13)) (setq answer t))
+              ((or (eq key ?n) (eq key ?N)) (setq answer 'no))
+              (t (message "Please answer RET to confirm or n to cancel")))))
+    (eq answer t)))
+
+(defun +tt--program-buffer-p ()
+  "Non-nil when the current buffer is a program, or the program's input box."
+  (or (derived-mode-p '+tt-program-mode)
+      (and (boundp '+tt--input-program-dir) +tt--input-program-dir)))
+
+(defun +tt-stop ()
+  "Stop (pause) the program or phase whose buffer point is in (`C-c m k').
+Only a program buffer (or its input box) or a phase buffer; anywhere else it
+says so.  Asks first: RET confirms, `n' cancels."
   (interactive)
-  (message "%s" (+tt--cli "program" "resume" +tt--program-dir))
-  (+tt--render-program))
+  (cond
+   ((+tt--program-buffer-p)
+    (let ((dir (or +tt--program-dir +tt--input-program-dir)))
+      (when (+tt--confirm (format "Stop program %s and its running phases?" (file-name-nondirectory (directory-file-name dir))))
+        (message "%s" (+tt--cli "program" "stop" dir))
+        (if +tt--program-dir (+tt--render-program) (+tt--refresh-all)))))
+   ((and +tt--run-dir (not (+tt--program-buffer-p)))
+    (when (+tt--confirm (format "Stop run %s?" (+tt--readable-id +tt--run-dir)))
+      (message "%s" (+tt--cli "stop" +tt--run-dir))
+      (+tt--refresh-all)))
+   (t (user-error "Not a phase or program buffer"))))
+
+(defun +tt-continue ()
+  "Continue (resume) the program or phase whose buffer point is in (`C-c m c')."
+  (interactive)
+  (cond
+   ((+tt--program-buffer-p)
+    (let ((dir (or +tt--program-dir +tt--input-program-dir)))
+      (message "%s" (+tt--cli "program" "resume" dir))
+      (if +tt--program-dir (+tt--render-program) (+tt--refresh-all))))
+   ((and +tt--run-dir (not (+tt--program-buffer-p)))
+    (message "%s" (+tt--cli "resume" +tt--run-dir))
+    (+tt--refresh-all))
+   (t (user-error "Not a phase or program buffer"))))
 
 (defvar-keymap +tt-program-mode-map
   :parent special-mode-map
   "RET" #'+tt-program-open-node
-  "k" #'+tt-program-stop
-  "R" #'+tt-program-resume
   "i" #'+tt-program-input
   "g" #'+tt--refresh-all)
 
 (define-derived-mode +tt-program-mode special-mode "tt-program"
-  "A tradeoffs-trace program.  \\<+tt-program-mode-map>\\[+tt-program-open-node] opens a phase's run, \\[+tt-program-input] sends a program-wide directive, \\[+tt-program-stop] stops, \\[+tt-program-resume] resumes."
+  "A tradeoffs-trace program.  \\<+tt-program-mode-map>\\[+tt-program-open-node] opens a phase's run, \\[+tt-program-input] sends a program-wide directive.  Stop and continue with `C-c m k' / `C-c m c'."
   (visual-line-mode 1)
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +tt-program-mode-map
-      (kbd "RET") #'+tt-program-open-node "k" #'+tt-program-stop "R" #'+tt-program-resume
+      (kbd "RET") #'+tt-program-open-node
       "i" #'+tt-program-input "g" #'+tt--refresh-all)))
 
 ;;;###autoload
@@ -644,9 +704,20 @@ whole program; warnings are shown and it starts."
 
 ;;;; Workspace
 
+(defun +tt--readable-id (run-dir)
+  "The run's readable id (`<program>-NN'), or its run id when it has none.
+Plan 03c: a program node's run records its readable id in `program.json';
+Emacs names the run's buffers and headers with it, so the owner reads the same
+id everywhere."
+  (let ((f (expand-file-name "program.json" run-dir)))
+    (or (and (file-exists-p f)
+             (let ((id (alist-get 'readableId (ignore-errors (json-read-file f)))))
+               (and (stringp id) (not (string-empty-p id)) id)))
+        (file-name-nondirectory (directory-file-name run-dir)))))
+
 (defun +tt--buffer (kind run-dir)
   "Return the KIND buffer for RUN-DIR, creating it if needed."
-  (let* ((id (file-name-nondirectory (directory-file-name run-dir)))
+  (let* ((id (+tt--readable-id run-dir))
          (buf (get-buffer-create (format "*tt-%s: %s*" kind id))))
     (with-current-buffer buf
       (pcase kind
@@ -657,13 +728,17 @@ whole program; warnings are shown and it starts."
     buf))
 
 (defun +tt--workspace (run-dir)
-  "Open (or rebuild) the workspace tab for RUN-DIR."
-  (let* ((id (file-name-nondirectory (directory-file-name run-dir)))
+  "Open (or rebuild) the workspace for RUN-DIR.
+Plan 03c: with `+tt-use-tab-bar' (default nil) the workspace is a `tab-bar'
+tab as before; without it the run opens in ordinary windows and no tab is
+created."
+  (let* ((id (+tt--readable-id run-dir))
          (tab (format "tt:%s" id)))
-    (if (tab-bar--tab-index-by-name tab)
-        (tab-bar-select-tab-by-name tab)
-      (tab-bar-new-tab)
-      (tab-bar-rename-tab tab))
+    (when +tt-use-tab-bar
+      (if (tab-bar--tab-index-by-name tab)
+          (tab-bar-select-tab-by-name tab)
+        (tab-bar-new-tab)
+        (tab-bar-rename-tab tab)))
     (delete-other-windows)
     (let* ((trace (+tt--buffer "trace" run-dir))
            (status (+tt--buffer "status" run-dir))
@@ -1943,36 +2018,19 @@ To intervene, type into the run's input box."
   (interactive)
   (when-let* ((run (tabulated-list-get-id))) (+tt--workspace run)))
 
-(defun +tt-runs-stop ()
-  "Stop the conductor of the run at point (`tt stop')."
-  (interactive)
-  (when-let* ((run (tabulated-list-get-id)))
-    (when (y-or-n-p (format "Stop run %s? " (file-name-nondirectory run)))
-      (message "%s" (+tt--cli "stop" run))
-      (tabulated-list-revert))))
-
-(defun +tt-runs-resume ()
-  "Relaunch the conductor of the run at point (`tt resume')."
-  (interactive)
-  (when-let* ((run (tabulated-list-get-id)))
-    (+tt--cli "resume" run)
-    (message "tradeoffs-trace: conductor relaunched for %s" (file-name-nondirectory run))))
-
 (defvar-keymap +tt-runs-mode-map
   :parent tabulated-list-mode-map
-  "RET" #'+tt-runs-open
-  "k" #'+tt-runs-stop
-  "R" #'+tt-runs-resume)
+  "RET" #'+tt-runs-open)
 
 (define-derived-mode +tt-runs-mode tabulated-list-mode "tt-runs"
-  "Every tradeoffs-trace run.  \\<+tt-runs-mode-map>\\[+tt-runs-open] opens, \\[+tt-runs-stop] stops, \\[+tt-runs-resume] resumes, g refreshes."
+  "Every tradeoffs-trace run.  \\<+tt-runs-mode-map>\\[+tt-runs-open] opens, g refreshes.  Stop and continue a run with `C-c m k' / `C-c m c' in its own buffer."
   (setq tabulated-list-format [("run" 9 t) ("" 1 nil) ("stage" 10 t) ("for" 7 nil)
                                ("reviews" 26 nil) ("attention" 20 t) ("title" 0 t)]
         tabulated-list-entries #'+tt--runs-entries)
   (tabulated-list-init-header)
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +tt-runs-mode-map
-      (kbd "RET") #'+tt-runs-open "k" #'+tt-runs-stop "R" #'+tt-runs-resume "g" #'tabulated-list-revert)))
+      (kbd "RET") #'+tt-runs-open "g" #'tabulated-list-revert)))
 
 ;;;###autoload
 (defun +tt-runs ()
@@ -2129,6 +2187,8 @@ Reads `tt program list --json'; nil when there is no program or no wait."
 (keymap-global-set "C-c m d" #'+tt-review)
 (keymap-global-set "C-c m l" #'+tt-runs)
 (keymap-global-set "C-c m p" #'+tt-program)
+(keymap-global-set "C-c m k" #'+tt-stop)
+(keymap-global-set "C-c m c" #'+tt-continue)
 (+tt--ensure-mode-line)
 
 (provide 'init-tradeoffs-trace)

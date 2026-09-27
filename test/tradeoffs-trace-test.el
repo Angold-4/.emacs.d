@@ -1512,3 +1512,95 @@ version the owner never saw (the M/B objection to the silent fallback)."
       (setq calls nil)
       (+tt--git "/ssh:mac:/Users/me/work/repo" "rev-parse" "HEAD")
       (should (equal (nth 2 (car calls)) '("-C" "/Users/me/work/repo" "rev-parse" "HEAD"))))))
+
+;;; Plan 03c: the stop/continue keys, the opt-in tab bar and the program header.
+
+(defun +tt-test--program-state (id source)
+  "A minimal `tt program state' payload for the program buffer."
+  `((id . ,id)
+    (sourcePath . ,source)
+    (state (nodes))
+    (lines)))
+
+(ert-deftest tradeoffs-trace-c-c-m-k-confirms-in-a-program-buffer ()
+  "`C-c m k' asks first: `n' cancels (no `tt program stop'), RET stops."
+  (should (eq (keymap-lookup nil "C-c m k") '+tt-stop))
+  (should (eq (keymap-lookup nil "C-c m c") '+tt-continue))
+  (let* ((dir (make-temp-file "tt-ert-prog" t))
+         (calls nil)
+         (buf (get-buffer-create "*tt-test-prog-k*")))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (push args calls) "stopped"))
+                  ((symbol-function '+tt--program-state)
+                   (lambda (_) (+tt-test--program-state "p1" "/tmp/prog.org"))))
+          (with-current-buffer buf
+            (+tt-program-mode)
+            (setq +tt--program-dir dir)
+            ;; `n' cancels the confirmation: nothing is stopped.
+            (cl-letf (((symbol-function 'read-key) (lambda () ?n)))
+              (+tt-stop))
+            (should-not calls)
+            ;; RET confirms: `tt program stop <dir>' runs exactly once.
+            (cl-letf (((symbol-function 'read-key) (lambda () ?\r)))
+              (+tt-stop))
+            (should (equal (car calls) (list "program" "stop" dir)))))
+      (delete-directory dir t)
+      (kill-buffer buf))))
+
+(ert-deftest tradeoffs-trace-c-c-m-k-refuses-elsewhere ()
+  "Outside a program or phase buffer both keys say so and call nothing."
+  (let ((calls nil))
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (push args calls) "")))
+      (with-temp-buffer
+        (should-error (+tt-stop) :type 'user-error)
+        (should-error (+tt-continue) :type 'user-error)))
+    (should-not calls)))
+
+(ert-deftest tradeoffs-trace-c-c-m-c-continues-a-program ()
+  "`C-c m c' resumes the program whose buffer point is in."
+  (let* ((dir (make-temp-file "tt-ert-prog" t))
+         (calls nil)
+         (buf (get-buffer-create "*tt-test-prog-c*")))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (push args calls) "resumed"))
+                  ((symbol-function '+tt--program-state)
+                   (lambda (_) (+tt-test--program-state "p1" "/tmp/prog.org"))))
+          (with-current-buffer buf
+            (+tt-program-mode)
+            (setq +tt--program-dir dir)
+            (+tt-continue)
+            (should (equal (car calls) (list "program" "resume" dir)))))
+      (delete-directory dir t)
+      (kill-buffer buf))))
+
+(ert-deftest tradeoffs-trace-tab-bar-is-opt-in ()
+  "With `+tt-use-tab-bar' nil (the default) opening a run creates no tab."
+  (should-not +tt-use-tab-bar)
+  (let ((tabbed nil)
+        (+tt-use-tab-bar nil)
+        (run-dir (make-temp-file "tt-ert-run" t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'tab-bar-new-tab) (lambda () (setq tabbed t)))
+                  ((symbol-function 'tab-bar--tab-index-by-name) (lambda (&rest _) nil))
+                  ((symbol-function '+tt--refresh-all) (lambda (&rest _) nil))
+                  ((symbol-function '+tt--ensure-timer) (lambda () nil)))
+          (+tt--workspace run-dir)
+          (should-not tabbed)
+          ;; The run's buffers exist and carry the run's readable id.
+          (should (get-buffer (format "*tt-status: %s*" (file-name-nondirectory run-dir)))))
+      (dolist (buf (buffer-list)) (when (string-prefix-p "*tt-" (buffer-name buf)) (kill-buffer buf)))
+      (delete-directory run-dir t))))
+
+(ert-deftest tradeoffs-trace-program-header-shows-id-and-source ()
+  "The program buffer's header carries the program id and the source path."
+  (let ((buf (get-buffer-create "*tt-test-prog-header*")))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--program-state)
+                   (lambda (_) (+tt-test--program-state "prog0001" "/home/me/orgw/work/atlas/indexps/14_program.org"))))
+          (with-current-buffer buf
+            (+tt-program-mode)
+            (setq +tt--program-dir "/tmp/x")
+            (+tt--render-program)
+            (should (string-match-p "prog0001" header-line-format))
+            (should (string-match-p "14_program\\.org" header-line-format))))
+      (kill-buffer buf))))

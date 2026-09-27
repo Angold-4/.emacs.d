@@ -54,6 +54,8 @@ import {
   programsRoot,
   programStatusLines,
   programWaitingNodes,
+  readProgramSource,
+  recordProgramSource,
   runScheduler,
   withdrawProgramDirective,
 } from "./program.ts";
@@ -62,7 +64,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -102,6 +104,7 @@ function parseArgs(argv: string[]): {
   contractSha256?: string;
   runId?: string;
   phaseId?: string;
+  source?: string;
 } {
   const positional: string[] = [];
   let root: string | undefined;
@@ -113,6 +116,7 @@ function parseArgs(argv: string[]): {
   let contractSha256: string | undefined;
   let runId: string | undefined;
   let phaseId: string | undefined;
+  let source: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--root") {
@@ -147,11 +151,35 @@ function parseArgs(argv: string[]): {
       phaseId = argv[++i];
     } else if (arg.startsWith("--phase-id=")) {
       phaseId = arg.slice("--phase-id=".length);
+    } else if (arg === "--source") {
+      source = argv[++i];
+    } else if (arg.startsWith("--source=")) {
+      source = arg.slice("--source=".length);
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId };
+  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source };
+}
+
+/** Plan 03c: resolve a readable id `<program>-NN` to the node's run
+ * directory. NN is the node's position in the program file, so the id survives
+ * a retry (which starts a fresh run for the same position). */
+function resolveReadableRunDir(ref: string, root: string): string | undefined {
+  const m = ref.match(/^(.+)-([0-9]{1,2})$/);
+  if (!m) return undefined;
+  const dir = path.join(programsRoot(root), m[1]);
+  if (!existsSync(path.join(dir, "program.json"))) return undefined;
+  try {
+    const { nodes, state } = foldProgram(dir);
+    const node = nodes[Number(m[2]) - 1];
+    const runId = node ? state.nodes[node.id]?.runId : undefined;
+    if (!runId) return undefined;
+    const runDir = path.join(root, runId);
+    return existsSync(path.join(runDir, "meta.json")) ? runDir : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function resolveRunDir(rootOrId: string, root: string): string {
@@ -161,6 +189,8 @@ function resolveRunDir(rootOrId: string, root: string): string {
   }
   const candidate = path.join(root, rootOrId);
   if (existsSync(path.join(candidate, "meta.json"))) return candidate;
+  const readable = resolveReadableRunDir(rootOrId, root);
+  if (readable) return readable;
   return path.resolve(rootOrId);
 }
 
@@ -244,7 +274,7 @@ function programSecrets(dir: string): string[] {
   return program.entries.filter((e) => state.nodes[e.id]?.status !== "done").flatMap((e) => e.plan.secrets ?? []);
 }
 
-async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean): Promise<void> {
+async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean, source?: string): Promise<void> {
   if (sub === "start") {
     if (args.length !== 1) usage();
     const program = JSON.parse(readFileSync(args[0], "utf8")) as ProgramFile;
@@ -258,6 +288,9 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     }
     if (refuseMissingSecrets(program.entries.flatMap((e) => e.plan.secrets ?? []), "start the program")) return;
     const dir = createProgram(root, program);
+    // Plan 03c: the Org program file the program was started from (Emacs
+    // passes it), shown in the program buffer's header.
+    if (source) recordProgramSource(dir, source);
     launchProgramScheduler(dir);
     process.stdout.write(`${path.basename(dir)}\n`);
   } else if (sub === "status") {
@@ -268,7 +301,17 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     const dir = resolveProgramDir(args[0], root);
     const { program, nodes, state } = foldProgram(dir);
     process.stdout.write(
-      `${JSON.stringify({ dir, title: program.title, maxParallel: program.maxParallel, nodes, state, schedulerAlive: programPidAlive(dir), lines: programStatusLines(dir) })}\n`,
+      `${JSON.stringify({
+        id: path.basename(dir),
+        dir,
+        title: program.title,
+        sourcePath: readProgramSource(dir) ?? null,
+        maxParallel: program.maxParallel,
+        nodes,
+        state,
+        schedulerAlive: programPidAlive(dir),
+        lines: programStatusLines(dir),
+      })}\n`,
     );
   } else if (sub === "stop") {
     if (args.length !== 1) usage();
@@ -1001,7 +1044,7 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId } = parseArgs(rest);
+  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
@@ -1019,7 +1062,7 @@ async function main(): Promise<void> {
     if (refuseMissingSecrets(readPlan(runDir).secrets, "resume the run")) return;
     launchDetached(runDir);
   } else if (cmd === "program") {
-    await cmdProgram(positional[0], positional.slice(1), runRoot, json);
+    await cmdProgram(positional[0], positional.slice(1), runRoot, json, source);
   } else if (cmd === "list") {
     cmdList(runRoot, json);
   } else if (cmd === "contract") {

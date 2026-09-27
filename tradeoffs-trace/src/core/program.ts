@@ -31,6 +31,10 @@ export interface ProgramFile {
    * dependencies' branches, so every phase becomes its own (stacked) PR.
    * "shared": every node publishes to its plan's TT_BRANCH. */
   branches?: "stack" | "shared";
+  /** Plan 03c: every node's readable id (`<program>-NN`, NN its position in
+   * this file, two digits). Written once by `createProgram`, so the owner can
+   * name a phase (and `tt` accept it wherever it accepts a run id). */
+  readableIds?: Record<string, string>;
 }
 
 export interface ProgramNode {
@@ -136,6 +140,14 @@ function assertAcyclic(nodes: ProgramNode[]): void {
 
 export function initialProgramState(nodes: ProgramNode[]): ProgramState {
   return { nodes: Object.fromEntries(nodes.map((n) => [n.id, { status: "waiting" as NodeStatus }])), stopped: false, directives: [] };
+}
+
+/** Plan 03c: the readable id of every node, by position in the expanded node
+ * list (two digits, so `<program>-01` sorts and reads): `<program>-NN`. A node
+ * keeps its readable id across a retry — the id names the position in the
+ * program, not the run. */
+export function nodeReadableIds(programId: string, nodes: readonly ProgramNode[]): Record<string, string> {
+  return Object.fromEntries(nodes.map((n, i) => [n.id, `${programId}-${String(i + 1).padStart(2, "0")}`]));
 }
 
 /** Plan 01i: the program-wide directives still in force, oldest first by

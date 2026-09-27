@@ -27,6 +27,7 @@ Everything else under a run directory is a **projection** rebuilt from state:
 | `views/review.org` | the runtime-rendered review view (`projectReview`, `src/render.ts`) |
 | `views/messages/<id>.org` | one message's evidence, plan excerpt, history, ledger and votes (`renderMessageFile`) |
 | `views/status.txt` | the status buffer's own text (`renderStatusView`), with trade-off record markers |
+| `views/loop.txt` | the phase state machine as a chart (`renderPhaseChart`), drawn from `TRANSITIONS` and refreshed with `views/status.txt` |
 
 Projections are written when an event can have changed them (any `MESSAGE_*`
 or `OWNER_VERDICT` event) and again on every conductor start. Because
@@ -46,7 +47,64 @@ A **message** is a trade-off, a finding or a blocker. Ids are `T-n`, `F-n`
 and `B-n`, unique within a run. The lifecycle is a transition table,
 `MESSAGE_TRANSITIONS` in `src/core/messages.ts`, with the same discipline as
 `TRANSITIONS`: every row has a test fixture, and `reduce()` rejects any event
-with no matching row.
+with no matching row. The same states and rows as a chart, drawn by the
+generator (`renderMessageChart`, `src/charts.ts`), so this document and the
+runbook quote exactly what the code says:
+
+<!-- BEGIN message-chart (generated from MESSAGE_TRANSITIONS; do not edit by hand) -->
+```text
+tradeoffs-trace message chart — generated from MESSAGE_TRANSITIONS (src/core/messages.ts); do not edit
+
+  +------------+
+  | none       |
+  +------------+
+      +- MESSAGE_RAISED                 -> raw         [message-raised]
+
+  +------------+
+  | raw        |
+  +------------+
+      +- MESSAGE_PUBLISHED              -> published   [message-published]
+      +- MESSAGE_MERGED                 -> merged      [message-merged]
+      +- MESSAGE_DROPPED                -> dropped     [message-dropped]
+
+  +------------+
+  | published  |
+  +------------+
+      +- OWNER_VERDICT (verdictAccept)  -> accepted    [owner-verdict-accept]
+      +- OWNER_VERDICT (verdictRefuse)  -> refused     [owner-verdict-refuse]
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-published]
+      +- MESSAGE_RESOLVED               -> resolved    [message-resolved-published]
+
+  +------------+
+  | merged     |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-merged]
+
+  +------------+
+  | dropped    |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-dropped]
+
+  +------------+
+  | accepted   |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-accepted]
+
+  +------------+
+  | refused    |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-refused]
+      +- MESSAGE_RESOLVED               -> resolved    [message-resolved-refused]
+
+  +------------+
+  | resolved   |
+  +------------+
+
+  +------------+
+  | superseded |
+  +------------+
+```
+<!-- END message-chart -->
 
 ```
 raw       → published | merged | dropped
