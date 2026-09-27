@@ -86,8 +86,10 @@ test("stale reviews: a reviewer calling submit_review twice at once never crashe
       ];
       if (reviewer === "B") steps.push({ kind: "call-submit", tool: "submit_review", args: review(slow), noWait: true }, { kind: "sleep", ms: 200 });
       steps.push({ kind: "call-submit", tool: "submit_review", args: review([]) });
-      // A real agent's turn lasts until its tool call returns.
-      if (reviewer === "B") steps.push({ kind: "sleep", ms: 4_000 });
+      // A real agent's turn lasts until its tool calls return: wait for the
+      // slow first submission itself, not a guessed time (a fixed 4 s sleep
+      // was shorter than the reproduction under a loaded full-suite run).
+      if (reviewer === "B") steps.push({ kind: "await-pending" });
       return { hello: defaultReviewerHello(), steps };
     },
   });
