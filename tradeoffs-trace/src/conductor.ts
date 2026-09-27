@@ -3944,7 +3944,9 @@ export class Conductor {
     // injected provider/model when a caller set one, otherwise Pi's own
     // default from settings.json, otherwise `default`.
     const modelFor = (role: Role): string | undefined => this.#providerModelFor?.(role)?.model ?? piDefaultModel();
-    const models = { worker: modelFor("worker"), reviewer: modelFor("reviewer"), evaluator: modelFor("reviewer") };
+    // No evaluator source exists yet, so the evaluator role must read
+    // `default` rather than borrow the reviewers' model (M-9).
+    const models = { worker: modelFor("worker"), reviewer: modelFor("reviewer"), evaluator: undefined };
     fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
   }
 

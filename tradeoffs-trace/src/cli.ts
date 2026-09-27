@@ -58,6 +58,7 @@ import {
   recordProgramSource,
   runScheduler,
   withdrawProgramDirective,
+  writeProgramChart,
 } from "./program.ts";
 
 const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
@@ -322,6 +323,10 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     } catch {
       // not running
     }
+    // Let the scheduler die before recording statuses, so its last tick cannot
+    // overwrite the chart this command is about to write (M-7).
+    const deadBy = Date.now() + 5_000;
+    while (programPidAlive(dir) && Date.now() < deadBy) await new Promise((r) => setTimeout(r, 50));
     const { state } = foldProgram(dir);
     for (const [node, n] of Object.entries(state.nodes)) {
       if (!n.runId || !["running", "needs-you"].includes(n.status)) continue;
@@ -330,6 +335,9 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       // must not keep showing the node as running.
       appendProgramEvent(dir, { type: "NODE_STATUS", node, status: "stopped" });
     }
+    // The chart is a projection like the status lines: rewrite it now that
+    // every node is stopped, since no scheduler is left to tick (F-A-6/M-7).
+    writeProgramChart(dir);
     process.stdout.write(`stopped program ${path.basename(dir)}\n`);
   } else if (sub === "resume") {
     if (args.length !== 1) usage();

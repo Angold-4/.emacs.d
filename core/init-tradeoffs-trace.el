@@ -642,10 +642,20 @@ stop a run by accident."
   (or (derived-mode-p '+tt-program-mode)
       (and (boundp '+tt--input-program-dir) +tt--input-program-dir)))
 
+(defun +tt--phase-buffer-p ()
+  "Non-nil for the phase's own buffers: its status, trace or input box.
+The read-only review (`C-c m d') and decision (`C-c m d') views also carry
+`+tt--run-dir', but stopping is not their job, so they are excluded (M-8)."
+  (and +tt--run-dir
+       (or (derived-mode-p '+tt-status-mode)
+           (derived-mode-p '+tt-trace-mode)
+           (derived-mode-p '+tt-input-mode))))
+
 (defun +tt-stop ()
   "Stop (pause) the program or phase whose buffer point is in (`C-c m k').
-Only a program buffer (or its input box) or a phase buffer; anywhere else it
-says so.  Asks first: RET confirms, `n' cancels."
+Only a program buffer (or its input box) or the phase's own status, trace or
+input buffer; anywhere else it says so.  Asks first: RET confirms, `n'
+cancels."
   (interactive)
   (cond
    ((+tt--program-buffer-p)
@@ -653,7 +663,7 @@ says so.  Asks first: RET confirms, `n' cancels."
       (when (+tt--confirm (format "Stop program %s and its running phases?" (file-name-nondirectory (directory-file-name dir))))
         (message "%s" (+tt--cli "program" "stop" dir))
         (if +tt--program-dir (+tt--render-program) (+tt--refresh-all)))))
-   ((and +tt--run-dir (not (+tt--program-buffer-p)))
+   ((+tt--phase-buffer-p)
     (when (+tt--confirm (format "Stop run %s?" (+tt--readable-id +tt--run-dir)))
       (message "%s" (+tt--cli "stop" +tt--run-dir))
       (+tt--refresh-all)))
@@ -667,7 +677,7 @@ says so.  Asks first: RET confirms, `n' cancels."
     (let ((dir (or +tt--program-dir +tt--input-program-dir)))
       (message "%s" (+tt--cli "program" "resume" dir))
       (if +tt--program-dir (+tt--render-program) (+tt--refresh-all))))
-   ((and +tt--run-dir (not (+tt--program-buffer-p)))
+   ((+tt--phase-buffer-p)
     (message "%s" (+tt--cli "resume" +tt--run-dir))
     (+tt--refresh-all))
    (t (user-error "Not a phase or program buffer"))))

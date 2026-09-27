@@ -564,8 +564,8 @@ around (`k`, `R`, `g`, `i`).
 | `C-c m d` | anywhere | the run's review view (TAB folds, RET opens a message's file, `A`/`D` send the owner's verdict) |
 | `C-c m l` | anywhere | the runs list (RET opens) |
 | `C-c m p` | anywhere | a program (RET opens a node's run, `i` sends a program-wide directive) |
-| `C-c m k` | a program buffer/its input box, or a phase buffer | stop it, after a confirmation (`RET` confirms, `n` cancels) |
-| `C-c m c` | a program buffer/its input box, or a phase buffer | continue (resume) it |
+| `C-c m k` | a program buffer/its input box, or the phase's status, trace or input buffer | stop it, after a confirmation (`RET` confirms, `n` cancels) |
+| `C-c m c` | a program buffer/its input box, or the phase's status, trace or input buffer | continue (resume) it |
 | `RET` / `C-c C-c` | an input box | send (RET in Evil normal state; `C-u` sends program-wide) |
 
 **Readable ids.** Each program node gets `<program>-NN` (NN its position in

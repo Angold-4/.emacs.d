@@ -114,6 +114,22 @@ test("a 100th node's readable id (three digits) still resolves", () => {
   }
 });
 
+test("tt program stop rewrites views/program.txt, so stopped nodes do not read running", () => {
+  const root = fs.mkdtempSync("/tmp/tt-program-stop-");
+  try {
+    const runA = path.basename(createRun(root, plan("14a"), "run-a"));
+    const dir = makeProgram(root, { a: runA });
+    cli(root, "program", "stop", "prog0001");
+    const chart = fs.readFileSync(programPaths(dir).programView, "utf8");
+    // The stop command is the last writer, so a node it stopped cannot keep
+    // reading `running` with no scheduler left to tick (F-A-6/M-7).
+    assert.match(chart, /prog0001-01\s+a\s+\|\s+stopped/);
+    assert.doesNotMatch(chart, /prog0001-01\s+a\s+\|\s+running/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a retried node keeps its readable id and points at the new run", () => {
   const root = fs.mkdtempSync("/tmp/tt-readable-retry-");
   try {

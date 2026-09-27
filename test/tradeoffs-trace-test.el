@@ -1556,6 +1556,24 @@ version the owner never saw (the M/B objection to the silent fallback)."
         (should-error (+tt-continue) :type 'user-error)))
     (should-not calls)))
 
+(ert-deftest tradeoffs-trace-c-c-m-k-only-in-phase-buffers ()
+  "A buffer that merely carries `+tt--run-dir' (the read-only review or
+decisions view) is not a phase buffer, so both keys refuse (M-8)."
+  (let ((calls nil))
+    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (push args calls) "")))
+      ;; A read-only view is not one of the phase's own buffers.
+      (with-temp-buffer
+        (setq +tt--run-dir "/tmp/run-x")
+        (should-not (+tt--phase-buffer-p))
+        (should-error (+tt-stop) :type 'user-error)
+        (should-error (+tt-continue) :type 'user-error))
+      ;; A run's status buffer is.
+      (with-temp-buffer
+        (+tt-status-mode)
+        (setq +tt--run-dir "/tmp/run-x")
+        (should (+tt--phase-buffer-p))))
+    (should-not calls)))
+
 (ert-deftest tradeoffs-trace-c-c-m-c-continues-a-program ()
   "`C-c m c' resumes the program whose buffer point is in."
   (let* ((dir (make-temp-file "tt-ert-prog" t))
