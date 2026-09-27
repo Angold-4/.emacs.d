@@ -83,6 +83,7 @@ import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/bo
 import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
 import { decisionStatus, isLiveDecision, panelOptionsFor, panelOutcome, panelSeatsSettled, sameVersion } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
+import { isRepairForcingOption } from "./core/owner-requests.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -4073,14 +4074,9 @@ export class Conductor {
       );
     }
     // Plan 04b: the owner's choice on an escalated blocker is an instruction
-    // to the next attempt, so it reaches the worker in the same
-    // "must be fixed" section. (Resolving it also closed the blocking
-    // finding, so without this line the choice would be invisible.)
-    for (const r of phase.ownerRequests) {
-      if (r.origin !== "blocker_panel" || r.status !== "resolved" || !r.resolution?.option) continue;
-      const label = r.options.find((o) => o.id === r.resolution!.option)?.label ?? r.resolution.option;
-      blocking.push(`The owner's choice on blocker ${r.linkedMessageId ?? r.linkedFindingId ?? r.id}: ${label}. Carry that choice out.`);
-    }
+    // to the NEXT attempt (round-3 review, advisory A-6), never a permanent
+    // must-fix item — see ownerBlockerChoiceLines' own rule.
+    blocking.push(...ownerBlockerChoiceLines(phase, C));
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
@@ -6427,6 +6423,29 @@ export function ledgerPromptLines(messages: readonly Message[] | undefined): str
       return `- ${e.messageId} [${e.type}] ${e.state} by ${e.settledBy}${reason}${bad}`;
     }),
   ];
+}
+
+/** Plan 04b: the "must be fixed" lines carrying an owner's choice on an
+ * escalated blocker (round-3 review, advisory A-6). The choice is an
+ * instruction to the NEXT attempt only, so a line is produced only when:
+ *   - the request was resolved against `currentCandidate` — at the moment a
+ *     repair attempt's prompt is built, `phase.candidate` is still the
+ *     candidate the owner was looking at, and a later round's is not; and
+ *   - the option actually asks for work (`accept_risk` settles the blocker
+ *     and lets the candidate stand, so nothing is "to be fixed"; it must not
+ *     appear under a must-fix heading even when some unrelated open
+ *     correction is what sent the phase back to a repair).
+ * Exported so a unit test exercises exactly what a repair prompt carries. */
+export function ownerBlockerChoiceLines(phase: PhaseState, currentCandidate: string | undefined): string[] {
+  const out: string[] = [];
+  for (const r of phase.ownerRequests) {
+    if (r.origin !== "blocker_panel" || r.status !== "resolved" || !r.resolution?.option) continue;
+    if (r.resolvedBinding?.candidateSha !== currentCandidate) continue;
+    if (!isRepairForcingOption(r.origin, r.resolution.option)) continue;
+    const label = r.options.find((o) => o.id === r.resolution!.option)?.label ?? r.resolution.option;
+    out.push(`The owner's choice on blocker ${r.linkedMessageId ?? r.linkedFindingId ?? r.id}: ${label}. Carry that choice out.`);
+  }
+  return out;
 }
 
 /** Plan 04a: an owner-refused message the next worker attempt must address:

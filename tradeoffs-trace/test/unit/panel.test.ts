@@ -23,7 +23,9 @@ import {
   panelSeatsSettled,
 } from "../../src/core/predicate.ts";
 import { reduce } from "../../src/core/reduce.ts";
-import { baseState, CV, makeMessage } from "./helpers.ts";
+import { ownerBlockerChoiceLines } from "../../src/conductor.ts";
+import type { OwnerRequest } from "../../src/core/types.ts";
+import { baseState, basePhase, CV, makeMessage } from "./helpers.ts";
 
 const K = CV();
 
@@ -96,6 +98,46 @@ test("panel rules: the defensive fallback options do what they say (advisory B-2
   assert.equal(isRepairForcingOption("blocker_panel", "accept_risk"), false, "accepting the risk starts no repair");
   assert.equal(isRepairForcingOption("blocker_panel", "repair"), true);
   assert.equal(isRepairForcingOption("blocker_panel", "repair_cancel"), true);
+});
+
+test("panel rules: an owner's blocker choice reaches the NEXT attempt's must-fix list only (advisory A-6)", () => {
+  const option = { id: "repair_cancel", label: "repair the cancel path (grant 3 rounds)" };
+  const acceptRisk = { id: "accept_risk", label: "accept the risk and let the candidate stand" };
+  const request = (over: Partial<OwnerRequest> = {}): OwnerRequest => ({
+    id: "OR-p1-blocker-1",
+    version: 1,
+    phaseId: "p1",
+    reason: "the blocker panel voted to stop",
+    origin: "blocker_panel",
+    linkedFindingId: "F-blk",
+    linkedMessageId: "B-1",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    options: [option, acceptRisk],
+    status: "resolved",
+    resolution: { option: option.id },
+    resolvedBinding: { candidateSha: "C1", contractVersion: K },
+    ...over,
+  });
+  const phase = (requests: OwnerRequest[]) => basePhase({ ownerRequests: requests });
+
+  // Resolved against the candidate the attempt is repairing -> the line is there.
+  const lines = ownerBlockerChoiceLines(phase([request()]), "C1");
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /blocker B-1: repair the cancel path \(grant 3 rounds\)\. Carry that choice out\./);
+
+  // A later round (an unrelated checks failure) must not repeat it: the request
+  // was bound to the previous candidate, not this one.
+  assert.deepEqual(ownerBlockerChoiceLines(phase([request()]), "C2"), []);
+
+  // accept_risk settles the blocker; nothing about it is "to be fixed".
+  assert.deepEqual(
+    ownerBlockerChoiceLines(phase([request({ resolution: { option: acceptRisk.id } })]), "C1"),
+    [],
+  );
+
+  // An unresolved (or still-open) request is not an instruction yet.
+  assert.deepEqual(ownerBlockerChoiceLines(phase([request({ status: "open", resolution: undefined })]), "C1"), []);
 });
 
 test("panel rules: a block vote with a repeated option id or label is refused, whole", () => {
