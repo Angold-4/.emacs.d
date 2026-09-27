@@ -323,7 +323,7 @@ and runs independent phases in parallel.
 
 | Where | What |
 |---|---|
-| program buffer (`C-c m p`) | the program id and its Org source file in the header, then every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its readable id (`<program>-NN`), node id, run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive). Stop and continue the whole program with `C-c m k` / `C-c m c` (point in the program buffer or its input box). It also lists the program's owner directives in force, and `views/program.txt` holds the same graph as text. |
+| program buffer (`C-c m p`) | the program id and its Org source file in the header, then the dependency chart (`views/program.txt`), then every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its readable id (`<program>-NN`), node id, run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive). Stop and continue the whole program with `C-c m k` / `C-c m c` (point in the program buffer or its input box). It also lists the program's owner directives in force. `C-c m g` on a node line opens that run's phase chart. |
 | CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program directive <id> <text>`, `tt program withdraw <id> <ODP-n>`, `tt program stop <id>`, `tt program resume <id>` |
 
 **Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
@@ -593,7 +593,8 @@ around (`k`, `R`, `g`, `i`).
 | `C-c m s` | anywhere | focus or rebuild a run's workspace |
 | `C-c m d` | anywhere | the run's review view (TAB folds, RET opens a message's file, `A`/`D` send the owner's verdict) |
 | `C-c m l` | anywhere | the runs list (RET opens) |
-| `C-c m p` | anywhere | a program (RET opens a node's run, `i` sends a program-wide directive) |
+| `C-c m p` | anywhere | a program: its dependency chart (`views/program.txt`) then its node list (RET opens a node's run, `i` sends a program-wide directive) |
+| `C-c m g` | a run's buffer (status, review, trace, input, decisions) or a node line in the program buffer | the run's phase chart (`views/loop.txt`) in a read-only `*tt-chart <id>*` buffer; it re-reads the file when it changes and highlights the current state |
 | `C-c m k` | a program buffer/its input box, or the phase's status, trace or input buffer | stop it, after a confirmation (`RET` confirms, `n` cancels) |
 | `C-c m c` | a program buffer/its input box, or the phase's status, trace or input buffer | continue (resume) it |
 | `RET` / `C-c C-c` | an input box | send (RET in Evil normal state; `C-u` sends program-wide) |
@@ -614,6 +615,18 @@ generated from the same `TRANSITIONS` table the conductor obeys;
 its readable id, its node state and (while running) its current phase state.
 Both are regenerated as the run/program moves, so they can never drift from
 the code.
+
+Emacs shows both where the owner already looks. The **program buffer**
+(`C-c m p`) begins with `views/program.txt` — the dependency chart — and its
+node list follows below it; the chart is text, so only the node lines open a
+run with `RET`. The **phase chart** (`views/loop.txt`) opens with `C-c m g`
+from any of the run's own buffers (status, review, trace, input, decisions) or
+from a node line in the program buffer, in a read-only `*tt-chart <readable
+id>*` buffer: it re-reads the file whenever it changes (as the review buffer
+does), keeps point on the same state's line, and highlights the current
+state's box and the `current state:` line. The status buffer shows a one-line
+hint (`chart     C-c m g`). A run or program that has not written its chart
+yet says so in one line instead of erroring.
 
 **The tab bar is opt-in.** With `+tt-use-tab-bar` nil (the default), opening
 a run leaves the tab bar alone and uses ordinary windows; the run's buffers

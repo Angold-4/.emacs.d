@@ -1716,3 +1716,182 @@ every call (`wrong-type-argument stringp'), and every other test stubs it."
             (should (string-match-p "partial" (cadr err)))
             (should (string-match-p "boom" (cadr err)))))
       (delete-directory root t))))
+
+;;; Plan 03c: the two runtime charts in the Emacs views.
+
+(defun +tt-test--chart-run (root id &optional readable loop)
+  "A fake run ID under ROOT, with READABLE in program.json and LOOP as its chart."
+  (let ((dir (expand-file-name id root)))
+    (make-directory (expand-file-name "views" dir) t)
+    (with-temp-file (expand-file-name "meta.json" dir) (insert (format "{\"title\":\"%s\"}" id)))
+    (with-temp-file (expand-file-name "events.jsonl" dir) (insert "{}\n"))
+    (when readable
+      (with-temp-file (expand-file-name "program.json" dir)
+        (insert (json-encode `((readableId . ,readable))))))
+    (when loop
+      (with-temp-file (expand-file-name "views/loop.txt" dir) (insert loop)))
+    dir))
+
+(defconst +tt-test--loop-chart
+  (concat "phase chart\n"
+          "current state: IMPLEMENTING   (entered 1x - 5s)\n"
+          "\n"
+          "phase states:\n"
+          "  +---------------+\n"
+          "  | READY         |  not entered\n"
+          "  +---------------+\n"
+          "\n"
+          "> +---------------+\n"
+          "  | IMPLEMENTING  |  entered 1x - 5s\n"
+          "  +---------------+\n"
+          "\n"
+          "> +---------------+\n"
+          "  | RUN_ACTIVE    |  current\n"
+          "  +---------------+\n")
+  "A small `views/loop.txt' shaped like `renderPhaseChart'.")
+
+(ert-deftest tradeoffs-trace-program-buffer-shows-chart ()
+  "Plan 03c: the program buffer begins with `views/program.txt', then the
+node list; without the file it shows a one-line notice and the node list."
+  (let* ((dir (make-temp-file "tt-ert-prog" t))
+         (chart "program prog1 - title\n\n+-------+\n| 13a   |  running - IMPLEMENTING\n+-------+\n")
+         (state `((id . "prog1")
+                  (sourcePath . "/tmp/prog.org")
+                  (state (nodes (13a (runId . "run-a") (readableId . "prog1-01"))))
+                  (lines "\u25b6 13a                    running   run-a prog1-01"))))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/program.txt" dir) (insert chart))
+          (cl-letf (((symbol-function '+tt--program-state) (lambda (_) state)))
+            (with-temp-buffer
+              (+tt-program-mode)
+              (setq +tt--program-dir dir)
+              (+tt--render-program)
+              (should (string-prefix-p chart (buffer-string)))
+              (should (string-match-p "\u25b6 13a" (buffer-string)))
+              ;; the node list comes after the chart
+              (should (< (string-match-p "program prog1" (buffer-string))
+                         (string-match-p "\u25b6 13a" (buffer-string))))))
+          ;; Without the file: one-line notice, then the node list.
+          (delete-file (expand-file-name "views/program.txt" dir))
+          (cl-letf (((symbol-function '+tt--program-state) (lambda (_) state)))
+            (with-temp-buffer
+              (+tt-program-mode)
+              (setq +tt--program-dir dir)
+              (+tt--render-program)
+              (let ((text (buffer-string)))
+                (should (string-match-p "\\`no program chart yet (views/program.txt)\n" text))
+                (should (string-match-p "\u25b6 13a" text))))))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-chart-keys-open-the-chart ()
+  "Plan 03c: C-c m g opens `*tt-chart <readable-id>*' read-only, showing
+`views/loop.txt', from a status buffer, a review buffer and a program node line."
+  (should (eq (keymap-lookup nil "C-c m g") '+tt-chart))
+  (let* ((root (make-temp-file "tt-ert-root" t))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart))
+         (+tt-root (file-name-as-directory root))
+         (bufs nil))
+    (unwind-protect
+        (progn
+          ;; From a status buffer.
+          (with-temp-buffer (+tt-status-mode) (setq +tt--run-dir dir) (+tt-chart))
+          (let ((b (get-buffer "*tt-chart prog1-01*")))
+            (push b bufs)
+            (should b)
+            (with-current-buffer b
+              (should (string-search "current state: IMPLEMENTING" (buffer-string)))
+              (should buffer-read-only)))
+          ;; From a review buffer.
+          (with-temp-buffer (+tt-review-mode) (setq +tt--run-dir dir) (+tt-chart))
+          (should (equal (with-current-buffer (get-buffer "*tt-chart prog1-01*") (buffer-string))
+                         (with-temp-buffer
+                           (insert-file-contents (expand-file-name "views/loop.txt" dir))
+                           (buffer-string))))
+          ;; From a node line in the program buffer.
+          (with-temp-buffer
+            (insert "\u25b6 13a running run-a prog1-01\n")
+            (put-text-property (point-min) (point-max) '+tt-run-id "run-a")
+            (+tt-program-mode)
+            (setq +tt--program-dir root +tt--run-dir root)
+            (goto-char (point-min))
+            (+tt-chart))
+          (should (get-buffer "*tt-chart prog1-01*")))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (dolist (b bufs) (when (buffer-live-p b) (kill-buffer b)))
+      (dolist (b (buffer-list)) (when (string-prefix-p "*tt-chart " (buffer-name b)) (kill-buffer b)))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-chart-refresh-keeps-point-and-highlights ()
+  "Plan 03c: a changed `views/loop.txt' is re-read, point stays on the same
+state's line, and the current state's box and `current state:' line are faced."
+  (let* ((root (make-temp-file "tt-ert-root" t))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart))
+         (+tt-root (file-name-as-directory root))
+         (buf (get-buffer-create "*tt-chart prog1-01*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (+tt-chart-mode)
+          (setq +tt--run-dir dir
+                +tt-chart--file (expand-file-name "views/loop.txt" dir))
+          (+tt-chart-refresh t)
+          ;; The current state's box and the `current state:' line carry the face.
+          (goto-char (point-min))
+          (search-forward "| IMPLEMENTING")
+          (should (eq (get-text-property (match-beginning 0) 'face) '+tt-chart-current-face))
+          (goto-char (point-min))
+          (search-forward "current state: IMPLEMENTING")
+          (should (eq (get-text-property (match-beginning 0) 'face) '+tt-chart-current-face))
+          ;; Point on the IMPLEMENTING box survives a refresh that changed the
+          ;; file's current state and counts.
+          (goto-char (point-min))
+          (search-forward "| IMPLEMENTING")
+          (with-temp-file (expand-file-name "views/loop.txt" dir)
+            (insert (replace-regexp-in-string
+                     "current state: IMPLEMENTING" "current state: REVIEWING" +tt-test--loop-chart))
+            (insert "\n  | REVIEWING     |  entered 1x - 8s\n"))
+          (+tt-chart-refresh)
+          (should (string-match-p "current state: REVIEWING" (buffer-string)))
+          (should (looking-at "  | IMPLEMENTING")))
+      (kill-buffer buf)
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-chart-missing-file-is-one-line ()
+  "Plan 03c: a run without `views/loop.txt' opens the chart buffer with a
+one-line notice and no error."
+  (let* ((root (make-temp-file "tt-ert-root" t))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" nil))
+         (+tt-root (file-name-as-directory root))
+         (buf (get-buffer-create "*tt-chart prog1-01*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (+tt-chart-mode)
+          (setq +tt--run-dir dir
+                +tt-chart--file (expand-file-name "views/loop.txt" dir))
+          (should-not (file-exists-p +tt-chart--file))
+          (+tt-chart-refresh t)
+          (should (string-match-p "\\`no chart yet" (buffer-string)))
+          (should (= 1 (how-many "\n" (point-min) (point-max))))
+          (should buffer-read-only))
+      (kill-buffer buf)
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-status-shows-chart-hint ()
+  "Plan 03c: the status buffer names where the chart is (`chart  C-c m g'),
+in the rendered and the file-backed path alike."
+  (with-temp-buffer
+    (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
+    (should (string-match-p "^chart     C-c m g" (buffer-string))))
+  (let ((dir (make-temp-file "tt-ert-status" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/status.txt" dir)
+            (insert "sum validation\nrun r1 \u00b7 conductor running \u00b7 1m\n\nphase     p1 \u00b7 REVIEWING\n"))
+          (with-temp-buffer
+            (+tt-status-mode)
+            (setq +tt--run-dir dir)
+            (+tt--render-status)
+            (should (string-match-p "^chart     C-c m g" (buffer-string)))))
+      (delete-directory dir t))))
