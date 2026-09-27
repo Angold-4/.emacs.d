@@ -33,6 +33,22 @@ test("schema: plan rejects a missing required field (phases)", () => {
   assert.equal(result.valid, false);
 });
 
+test("schema: plan accepts a #+TT_MODELS map (provider optional, slash in the model)", () => {
+  const data = {
+    ...(fixture("plan") as Record<string, unknown>),
+    models: { worker: { model: "deepseek/deepseek-v4.1-flash" }, reviewer: { provider: "vercel-ai-gateway", model: "anthropic/claude-sonnet-5" } },
+    modelsLine: 4,
+  };
+  const result = validate(schema("plan"), data);
+  assert.equal(result.valid, true, result.errors.join("; "));
+});
+
+test("schema: plan rejects a role model with no model", () => {
+  const data = { ...(fixture("plan") as Record<string, unknown>), models: { worker: { provider: "p" } } };
+  const result = validate(schema("plan"), data);
+  assert.equal(result.valid, false);
+});
+
 test("schema: plan phase rejects a wrong enum-shaped value (provisional not boolean)", () => {
   const data = structuredClone(fixture("plan")) as { phases: { provisional: unknown }[] };
   data.phases[0].provisional = "yes";

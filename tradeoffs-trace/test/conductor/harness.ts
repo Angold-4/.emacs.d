@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Conductor, createRun, runPaths, type ConductorOptions, type RunPlanFile } from "../../src/conductor.ts";
-import { ROLE_TOOLS } from "../../src/core/roles.ts";
+import { planModelSelector, ROLE_TOOLS, type PlanModels } from "../../src/core/roles.ts";
 
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { readLog, type LogRecord } from "../../src/effects/log.ts";
@@ -185,6 +185,14 @@ export async function setupConductor(opts: {
   gateLockPath?: string;
   /** The plan's title (default "test plan") — plan prose like any other. */
   title?: string;
+  /** #+TT_MODELS: per-role provider/model for the plan (design §2.1). The
+   * harness turns it into `providerModelFor` with the same one-liner
+   * `tt start` uses; a test asserts the resulting launch argv. */
+  models?: PlanModels;
+  /** Extra env merged into every agent's own environment (the Conductor's
+   * `extraEnv`), e.g. `FAKE_PI_ARGV_LOG` to record what each role was
+   * launched with. */
+  extraEnv?: NodeJS.ProcessEnv;
   /** Plan 01b: the conductor's notification clock (injectable), so a test
    * can advance past the 30-minute reminder without waiting. */
   now?: () => number;
@@ -199,6 +207,7 @@ export async function setupConductor(opts: {
     integrationBranch: "main",
     checks: opts.globalChecks ?? opts.checks ?? ["true"],
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
+    ...(opts.models ? { models: opts.models } : {}),
     phases: [
       {
         id: "p1",
@@ -258,6 +267,10 @@ export async function setupConductor(opts: {
     // argv — before it, `node` would try to parse them as its own CLI
     // flags and refuse to start.
     piArgsPrefix: [FAKE_PI_PATH, ...(opts.extraPiArgsPrefix ?? [])],
+    // The same one-liner `tt start` uses, so a plan's #+TT_MODELS reaches
+    // every launch in tests exactly as it does in production.
+    providerModelFor: planModelSelector(plan),
+    extraEnv: opts.extraEnv,
     deadlines: opts.deadlines,
     stubReviews: opts.stubReviews ?? true,
     probeReuse: opts.probeReuse,

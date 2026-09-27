@@ -296,6 +296,7 @@ export function renderStatusText(
   if (view.baseline) lines.push(`base: ${view.baseline}`);
   lines.push(`reviews: ${view.reviewLine}`);
   if (view.metricsLine) lines.push(view.metricsLine);
+  if (view.models) lines.push(view.models);
   if (view.amendments) lines.push(`amendments: ${view.amendments}`);
   if (view.verdict) lines.push(`verdict: ${view.verdict}`);
   for (const t of view.tradeoffs ?? []) lines.push(`trade-off: ${t.text}`);
@@ -484,6 +485,7 @@ export function renderStatusView(input: StatusViewInput): string {
   push(row("amended", view.amendments));
   push(row("previous", view.previousRound));
   push(row("reviews", view.reviewLine));
+  push(view.models);
   push(view.metricsLine);
   push(row("verdict", view.verdict));
   const tradeoffs = view.tradeoffs ?? [];

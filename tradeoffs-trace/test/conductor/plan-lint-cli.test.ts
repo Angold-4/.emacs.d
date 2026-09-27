@@ -108,6 +108,82 @@ test("plan-lint CLI: `tt lint` on a clean plan prints nothing and exits zero", a
   }
 });
 
+test("plan-lint CLI: `tt lint` reports an unknown #+TT_MODELS role with file and line", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({ ...planWith(["all existing tests still pass"], [9], "/tmp/repo"), models: { foo: { model: "x" } }, modelsLine: 4 }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout, /\/tmp\/PLAN\.org:4: error: \[models\]/);
+    assert.match(r.stdout, /unknown role foo/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test("plan-lint CLI: `tt lint` reports a role given twice", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({
+        ...planWith(["all existing tests still pass"], [9], "/tmp/repo"),
+        models: { worker: { model: "b" } },
+        modelsRepeated: ["worker"],
+        modelsLine: 5,
+      }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout, /\/tmp\/PLAN\.org:5: error: \[models\]/);
+    assert.match(r.stdout, /worker more than once/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test("plan-lint CLI: `tt lint` reports an empty model", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({ ...planWith(["all existing tests still pass"], [9], "/tmp/repo"), models: { reviewer: {} }, modelsLine: 6 }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout, /\/tmp\/PLAN\.org:6: error: \[models\]/);
+    assert.match(r.stdout, /empty model/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test("plan-lint CLI: a plan that uses #+TT_MODELS cleanly passes", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({
+        ...planWith(["all existing tests still pass"], [9], "/tmp/repo"),
+        models: { worker: { model: "deepseek/deepseek-v4.1-flash" }, reviewer: { provider: "vercel-ai-gateway", model: "anthropic/claude-sonnet-5" } },
+        modelsLine: 3,
+      }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.equal(r.code, 0, r.stdout);
+    assert.equal(r.stdout.trim(), "");
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
 test("plan-lint CLI: `tt lint` on a program lints every entry", async () => {
   const dir = tmpDir("tt-lint");
   try {

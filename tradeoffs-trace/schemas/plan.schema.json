@@ -13,6 +13,26 @@
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/PlanPhase" }
+    },
+    "models": {
+      "description": "#+TT_MODELS: an optional provider/model per role. A role absent from the object keeps Pi's defaultModel.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "worker": { "$ref": "#/$defs/RoleModel" },
+        "reviewer": { "$ref": "#/$defs/RoleModel" },
+        "evaluator": { "$ref": "#/$defs/RoleModel" },
+        "panel": { "$ref": "#/$defs/RoleModel" }
+      }
+    },
+    "modelsLine": {
+      "description": "Lint-only: the 1-based line of #+TT_MODELS in the source Org file.",
+      "type": "integer"
+    },
+    "modelsRepeated": {
+      "description": "Lint-only: roles #+TT_MODELS named more than once (a JSON object cannot carry a duplicate key).",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
     }
   },
   "$defs": {
@@ -28,6 +48,16 @@
         "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "provisional": { "type": "boolean" }
+      }
+    },
+    "RoleModel": {
+      "description": "The provider and model a role runs with. Model ids may contain '/'.",
+      "type": "object",
+      "required": ["model"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 }
       }
     }
   }

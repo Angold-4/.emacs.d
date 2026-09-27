@@ -32,6 +32,7 @@ import {
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
+import { planModelSelector } from "./core/roles.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
 import {
@@ -573,7 +574,11 @@ async function runConductorProcess(runDir: string): Promise<void> {
   // crashed, and a program scheduler restarts it (src/program.ts).
   const stoppedMarker = path.join(runDir, "stopped");
   rmSync(stoppedMarker, { force: true });
-  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, deadlines, stubReviews });
+  // #+TT_MODELS: the plan's per-role provider/model reaches every launch here,
+  // the one place a run's Conductor is built. `testPiInjection` above still
+  // supplies the fake-pi command for a test-launched run; the two do not
+  // interact (one picks the binary, the other the model flags).
+  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan), deadlines, stubReviews });
   const cleanStop = () =>
     void conductor.stop().then(() => {
       writeFileSync(stoppedMarker, new Date().toISOString());

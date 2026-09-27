@@ -23,7 +23,19 @@
 
 export type LintSeverity = "error" | "warning";
 
-export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no-tolerance";
+export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no-tolerance" | "model-declaration";
+
+/** The roles #+TT_MODELS may assign a model to. */
+const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel"]);
+
+/** The slice of #+TT_MODELS the linter reads. `models` is what Emacs parsed
+ * (`{ worker?: { provider?, model }, … }`); `modelsRepeated` lists roles the
+ * keyword named more than once (a JSON object cannot carry a duplicate key);
+ * `modelsLine` is the 1-based line of the keyword, for `file:line:`. */
+export interface LintRoleModel {
+  provider?: string;
+  model?: string;
+}
 
 export interface LintFinding {
   severity: LintSeverity;
@@ -56,10 +68,18 @@ export interface LintPlanInput {
   /** The Org file this JSON came from, when known. */
   sourceFile?: string;
   phases?: LintPhaseInput[];
+  models?: Record<string, LintRoleModel>;
+  modelsLine?: number;
+  modelsRepeated?: string[];
 }
 
 export interface LintProgramInput {
   entries?: Array<{ id?: string; plan?: LintPlanInput }>;
+  /** A program file may also declare #+TT_MODELS; Emacs records the same
+   * three fields at the program level so a bad default is reported once. */
+  models?: Record<string, LintRoleModel>;
+  modelsLine?: number;
+  modelsRepeated?: string[];
 }
 
 /** True for the JSON shape `tt program start` reads (a list of plan entries
@@ -141,9 +161,47 @@ function humanActorFinding(phaseId: string, item: string, line: number | undefin
   };
 }
 
-/** Lint one plan (all its phases' acceptance items). Pure. */
-export function lintPlan(plan: LintPlanInput): LintFinding[] {
+function modelFinding(plan: LintPlanInput, item: string, problem: string, fix: string): LintFinding {
+  return {
+    severity: "error",
+    rule: "model-declaration",
+    // A model declaration is plan-wide, not phase-scoped; the "models" label
+    // keeps `formatFinding`'s shape and reads as `e1/models` in a program.
+    phaseId: "models",
+    item,
+    line: plan.modelsLine,
+    sourceFile: plan.sourceFile,
+    problem,
+    fix,
+  };
+}
+
+/** Lint #+TT_MODELS: an unknown role, a role given twice, or a role with no
+ * model is an error (it would reach `launchArgs` as a broken or ambiguous
+ * flag). Absent: no findings, so a plan without the keyword is unchanged. */
+export function lintModels(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [];
+  for (const role of plan.modelsRepeated ?? []) {
+    out.push(modelFinding(plan, role, `#+TT_MODELS names ${role} more than once`, `declare each role once: ${role}=<provider>:<model>`));
+  }
+  for (const [role, raw] of Object.entries(plan.models ?? {})) {
+    if (!MODEL_ROLES.has(role)) {
+      out.push(modelFinding(plan, role, `#+TT_MODELS names the unknown role ${role}`, "use one of worker, reviewer, evaluator, panel"));
+      continue;
+    }
+    const model = raw?.model;
+    if (typeof model !== "string" || model.length === 0) {
+      out.push(
+        modelFinding(plan, `${role}=`, `#+TT_MODELS gives ${role} an empty model`, `write ${role}=<model>, or ${role}=<provider>:<model> when another provider is needed`),
+      );
+    }
+  }
+  return out;
+}
+
+/** Lint one plan (all its phases' acceptance items and its #+TT_MODELS). Pure. */
+export function lintPlan(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [...lintModels(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
     const acceptance = phase.acceptance ?? [];
@@ -193,7 +251,7 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
 /** Lint every entry's plan in a program file; phase ids are prefixed with the
  * entry id so two entries with the same phase id stay tellable apart. */
 export function lintProgram(program: LintProgramInput): LintFinding[] {
-  const out: LintFinding[] = [];
+  const out: LintFinding[] = [...lintModels(program)];
   for (const entry of program.entries ?? []) {
     for (const finding of lintPlan(entry.plan ?? { phases: [] })) {
       out.push({ ...finding, phaseId: entry.id ? `${entry.id}/${finding.phaseId}` : finding.phaseId });

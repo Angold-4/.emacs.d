@@ -113,6 +113,53 @@ test("plan-lint: a clean plan has no findings", () => {
   assert.deepEqual(findings, []);
 });
 
+test("plan-lint: #+TT_MODELS rejects an unknown role, a repeated role and an empty model", () => {
+  const base = plan([{ id: "p1", acceptance: ["fine"] }]);
+  // A plan without the keyword: no model findings at all.
+  assert.deepEqual(lintPlan(base).filter((f) => f.rule === "model-declaration"), []);
+
+  const unknown = lintPlan({ ...base, models: { foo: { model: "x" } }, modelsLine: 7 });
+  assert.deepEqual(unknown.map((f) => f.rule), ["model-declaration"]);
+  assert.equal(unknown[0].severity, "error");
+  assert.equal(unknown[0].line, 7);
+  assert.equal(unknown[0].phaseId, "models");
+  assert.match(unknown[0].problem, /unknown role foo/);
+  assert.match(unknown[0].fix, /worker, reviewer, evaluator, panel/);
+
+  // A JSON object cannot hold a duplicate key, so the parser records the
+  // role it saw twice; the linter reports it.
+  const repeated = lintPlan({ ...base, models: { worker: { model: "b" } }, modelsRepeated: ["worker"], modelsLine: 3 });
+  assert.deepEqual(repeated.map((f) => f.rule), ["model-declaration"]);
+  assert.equal(repeated[0].line, 3);
+  assert.match(repeated[0].problem, /worker more than once/);
+
+  // An empty (or missing) model is an error: it would reach launchArgs as a
+  // bare --model with nothing after it.
+  const empty = lintPlan({ ...base, models: { reviewer: {} }, modelsLine: 12 });
+  assert.deepEqual(empty.map((f) => f.rule), ["model-declaration"]);
+  assert.equal(empty[0].line, 12);
+  assert.match(empty[0].problem, /empty model/);
+
+  // A well-formed declaration (provider optional, model with a slash) passes.
+  const ok = lintPlan({
+    ...base,
+    models: { worker: { model: "deepseek/deepseek-v4.1-flash" }, reviewer: { provider: "vercel-ai-gateway", model: "anthropic/claude-sonnet-5" } },
+  });
+  assert.deepEqual(ok, []);
+});
+
+test("plan-lint: a program's own #+TT_MODELS is reported once, not per entry", () => {
+  const findings = lintProgram({
+    models: { foo: { model: "x" } },
+    modelsLine: 2,
+    entries: [{ id: "e1", plan: plan([{ id: "p1", acceptance: ["fine"] }]) }],
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].rule, "model-declaration");
+  assert.equal(findings[0].phaseId, "models");
+  assert.equal(findings[0].line, 2);
+});
+
 test("plan-lint: a program lints every entry and prefixes the phase id", () => {
   const findings = lintProgram({
     entries: [
