@@ -275,8 +275,9 @@ binding check rejects it.
   needs it. Three top-level sections follow (Blockers, Trade-offs, Findings),
   blockers first. Only a message the evaluator **published** (and its later
   states, accepted/refused/resolved/superseded) is a titled entry: a raw
-  message is one `N raw, awaiting evaluation` line per section, a dropped one
-  only `N dropped`, and a merged one is named in its target's own file (under
+  message — or one an evaluator timeout left `unevaluated` with its raw
+  wording — is one `N raw, awaiting evaluation` line per section, a dropped
+  one only `N dropped`, and a merged one is named in its target's own file (under
   `* Merged in`). Each entry is one heading (`<id> <title>`) carrying its
   summary and context and a property drawer with its id, type, severity (for
   a finding), state, `raisedBy`, `importance`, the owner's verdict (if any)

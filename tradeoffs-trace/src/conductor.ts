@@ -3365,7 +3365,12 @@ export class Conductor {
       const id = typeof entry.messageId === "string" ? entry.messageId : "";
       const message = messages.find((m) => m.id === id && m.type === messageType);
       if (!message) continue;
-      const issue = titleIssue(message.title, typeof entry.title === "string" ? entry.title : undefined);
+      // A publish with no title falls back to the raw message's own title, so
+      // the EFFECTIVE title is what the owner will read: a raw title over the
+      // cap would be clamped to an ellipsis just the same, and is refused here
+      // (finding A-3).
+      const provided = typeof entry.title === "string" && entry.title.trim().length > 0 ? entry.title : message.title;
+      const issue = titleIssue(message.title, provided);
       if (issue) return `${id}: ${issue}`;
     }
     return undefined;

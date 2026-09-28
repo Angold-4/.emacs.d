@@ -62,12 +62,20 @@ export function sectionOf(message: Message): ReviewSection {
   return "finding";
 }
 
+/** Whether a message is still awaiting an evaluator: a raw message, or one an
+ * evaluator timeout published unchanged (`unevaluated', the raw title kept).
+ * Neither may be shown as if it had been evaluated. */
+export function awaitingEvaluation(message: Message): boolean {
+  return message.state === "raw" || (message.state === "published" && message.unevaluated === true);
+}
+
 /** Whether the review lists a message as a titled entry. Only a message an
- * evaluator published (and its later states) is an entry: a raw message is
- * one `N raw, awaiting evaluation' line, a merged one is named in its
- * target's own file, and a dropped one is only a `N dropped' count. */
+ * evaluator published (and its later states) is an entry: a message still
+ * awaiting evaluation is one `N raw, awaiting evaluation' line, a merged one
+ * is named in its target's own file, and a dropped one is only a `N dropped'
+ * count. */
 export function isReviewEntry(message: Message): boolean {
-  return message.state !== "raw" && message.state !== "merged" && message.state !== "dropped";
+  return !awaitingEvaluation(message) && message.state !== "merged" && message.state !== "dropped";
 }
 
 /** The run's readable id and directory id, read from `program.json' when the
@@ -92,7 +100,7 @@ export function reviewSummary(messages: readonly Message[] | undefined): string 
   const part = (kind: ReviewSection, letter: string): string => {
     const own = (messages ?? []).filter((m) => sectionOf(m) === kind);
     const entries = own.filter(isReviewEntry).length;
-    const raw = own.filter((m) => m.state === "raw").length;
+    const raw = own.filter(awaitingEvaluation).length;
     const dropped = own.filter((m) => m.state === "dropped").length;
     const bits: string[] = [];
     if (raw > 0) bits.push(`${raw} raw`);
@@ -251,7 +259,7 @@ function heading(message: Message, level: number, phase: ReviewPhase): string[] 
 function section(phase: ReviewPhase, kind: ReviewSection, label: string, messages: Message[]): string[] {
   const own = messages.filter((m) => sectionOf(m) === kind);
   const entries = own.filter(isReviewEntry);
-  const rawCount = own.filter((m) => m.state === "raw").length;
+  const rawCount = own.filter(awaitingEvaluation).length;
   const droppedCount = own.filter((m) => m.state === "dropped").length;
   const out = [`* ${label}`];
   if (rawCount > 0) out.push(`${rawCount} raw, awaiting evaluation`);

@@ -292,6 +292,28 @@ test("after evaluation only the published entries show; drops count, merges live
   assert.match(file, /- T-5 A duplicate trade-off/);
 });
 
+test("a message published unevaluated by a timeout is not an entry", () => {
+  // An evaluator timeout publishes the raw message unchanged with
+  // `unevaluated: true` (core/reduce.ts). Its raw title must not be shown as
+  // if an evaluator had rewritten it; it is one awaiting-evaluation line.
+  const unevaluated = makeMessage({
+    id: "T-1",
+    state: "published",
+    unevaluated: true,
+    title: "The raw first sentence the evaluator never rewrote",
+  });
+  const phase = basePhase({ messages: [unevaluated] });
+  const review = projectReview(phase);
+  assert.doesNotMatch(review, /^\*\* T-1/m);
+  assert.match(review, /^1 raw, awaiting evaluation$/m);
+  assert.equal(reviewSummary(phase.messages), "T 1 (1 raw) · F 0 · B 0 · C-c m d");
+  // Once the owner settles it, it is a real entry with its verdict again.
+  const accepted = settleMessage(unevaluated, "accepted", "the raw wording is fine", "owner");
+  const after = basePhase({ messages: [accepted] });
+  assert.match(projectReview(after), /^\*\* T-1 The raw first sentence the evaluator never rewrote$/m);
+  assert.equal(reviewSummary(after.messages), "T 1 · F 0 · B 0 · C-c m d");
+});
+
 test("the header names the readable id and directory id; the internal runId stays in the drawers", () => {
   const review = projectReview(fixturePhase());
   assert.match(review, /^#\+TITLE: tradeoffs-trace review — cebd7fcb-01 · 33c41174$/m);

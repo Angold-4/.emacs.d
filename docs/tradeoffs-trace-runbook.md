@@ -887,7 +887,9 @@ accepted/refused/resolved/superseded) is a titled entry. Nothing raw is ever
 shown as if it had been evaluated:
 
 - a raw message is one line per section, `6 raw, awaiting evaluation`, never
-  an entry;
+  an entry; a message an evaluator timed out on is published `unevaluated`
+  with its raw wording kept, so it counts the same way and is never shown as a
+  rewritten entry;
 - a **merged** message is not an entry at all — the message it was merged
   **into** names it in that target's own `views/messages/<id>.org` (under
   `* Merged in`);
