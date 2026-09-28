@@ -198,17 +198,19 @@ reason on each item message (`panelOutcome`, `panelVotes`).
 
 Three deterministic checks precede any model:
 
-- **3a, facts first:** the conductor compares a finding's claim with the check
-  records it already holds for that candidate. A claim that a named check,
-  test or command fails while the record shows it passing is rejected
-  (`FINDING_DISPROVED` + `MESSAGE_DROPPED`, both citing the record) before any
-  agent sees it; a claim the record confirms gets
-  `verified: record (confirmed by record: …)`.
+- **3a, facts first:** the conductor compares a finding's claim with the
+  check, probe and gate records it already holds for that candidate. A claim
+  that a named check, test or command fails while the record shows it passing
+  is rejected (`FINDING_DISPROVED` + `MESSAGE_DROPPED`, both citing the
+  record) before any agent sees it; a claim the record confirms gets
+  `verified: record (confirmed by record: …)`. Only a sentence that names the
+  command AND carries a failure word is a claim about it. This runs for a
+  blocker's finding too.
 - **3b, run what can be run:** a finding naming a runnable test or command is
   re-run in the candidate's disposable checkout, bounded by the check
   deadline. Exit 0, or a timeout that reproduces nothing, drops it (`run <cmd>
   exit 0` / `run <cmd> timed out`); a non-zero exit records `verified: run
-  <cmd> exit N`.
+  <cmd> exit N`. A blocker's `runnable` is checked the same way.
 - **severity against the plan (5):** a blocking finding that cites no
   acceptance item or reserved rule is lowered by the evaluator
   (`FINDING_SEVERITY_CHANGED`, by `evaluator`, with its reason). A citation is
@@ -220,6 +222,9 @@ Three deterministic checks precede any model:
 `FINDING_VERIFIED` records what validated a finding — `record`, `run <cmd>
 exit N`, a `file:line …` citation, or `panel keep` — and the renderer shows it
 in the property drawer (`VERIFIED`) and in `views/messages/<id>.org`.
+Validations accumulate: the 3a/3b evidence, the panel's vote and an
+evaluator-supplied citation (`evaluator: <text>`, tagged because the conductor
+did not check it) are joined rather than overwritten.
 
 ### Resolution across rounds (plan 05e)
 

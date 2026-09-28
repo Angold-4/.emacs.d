@@ -1067,15 +1067,20 @@ reason.
 Three deterministic rules run **before any model**:
 
 1. **Facts first (3a).** The conductor compares a finding's claim with the
-   check records it already holds for that candidate. A finding that claims a
-   check, test or command fails while the record shows it passing is rejected
-   with the record cited, and never reaches an agent; a claim the record
-   confirms is marked `confirmed by record`.
+   check, probe and gate records it already holds for that candidate. A
+   finding that claims a check, test or command fails while the record shows
+   it passing is rejected with the record cited, and never reaches an agent;
+   a claim the record confirms is marked `confirmed by record`. Only a
+   sentence that names the command AND carries a failure word counts as a
+   claim, so merely mentioning a passing check is not a claim that it fails.
+   This runs for a blocker's finding too.
 2. **Run what can be run (3b).** A finding that names a runnable test or
    command (`runnable`) is re-run in the candidate's disposable checkout,
-   bounded by the check deadline. The finding is published only if the run
-   reproduces it (a non-zero exit); a passing run — or a timeout, which
-   reproduces nothing — drops it, recording the command and exit status.
+   bounded by the check deadline, and its output tail is recorded. The
+   finding is published only if the run reproduces it (a non-zero exit); a
+   passing run — or a timeout, which reproduces nothing — drops it, recording
+   the command and exit status. A blocker's `runnable` is checked the same
+   way.
 3. **Severity against the plan (5).** A blocking finding may stay blocking
    only when it is a defect against an acceptance item or a reserved rule.
    A citation is accepted as the item verbatim, a paraphrase that keeps its
@@ -1086,8 +1091,10 @@ Three deterministic rules run **before any model**:
    reviewer's re-raise never makes an advisory finding block.
 
 Every finding records what validated it in its property drawer and in
-`views/messages/<id>.org` (`verified: record | run <cmd> exit N | file:line …
-| panel keep`).
+`views/messages/<id>.org` (`verified: record … | run <cmd> exit N |
+file:line … | panel keep`). Validations accumulate — the 3a/3b evidence, the
+panel's vote and an evaluator-supplied citation (`evaluator: <text>`, tagged
+because the conductor did not check it) are joined, never overwritten.
 
 **Resolution across rounds.** Every later round's turn-2 prompt lists the
 earlier rounds' open findings and blockers; each reviewer marks each

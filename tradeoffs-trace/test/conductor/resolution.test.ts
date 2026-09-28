@@ -110,12 +110,14 @@ function findingEvaluator() {
 }
 
 test("plan 05e: a finding marked resolved by 2 of 3 reviewers moves to resolved and leaves review.org's live entries", async () => {
+  const promptDir = fs.mkdtempSync("/tmp/tt-05e-resolve-prompts-");
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
     workerScriptForAttempt: workerAttempt(false),
     reviewerScriptFor: resolutionReviewer({ resolved: true }),
     evaluatorScriptFor: findingEvaluator(),
+    extraReviewerEnv: () => ({ FAKE_PI_PROMPT_LOG: `${promptDir}/reviewer.log` }),
     deadlines: FAST,
   });
   await setup.conductor.start();
@@ -126,10 +128,17 @@ test("plan 05e: a finding marked resolved by 2 of 3 reviewers moves to resolved 
     assert.equal(message.settlement?.settledBy, "vote");
     const review = fs.readFileSync(`${setup.runDir}/views/review.org`, "utf8");
     assert.doesNotMatch(review, /\bF-1\b/, "a resolved message leaves the live view");
+    // Round-3 reviews M-8/A-11/B-14: the turn-2 prompt must actually LIST the
+    // earlier round's finding, even though MESSAGE_CARRIED rebound it to the
+    // current candidate.
+    const prompt = fs.readFileSync(`${promptDir}/reviewer.log`, "utf8");
+    assert.match(prompt, /Earlier rounds' live findings and blockers/);
+    assert.match(prompt, /- F-1 \[finding, published\]/);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+    fs.rmSync(promptDir, { recursive: true, force: true });
   }
 });
 

@@ -3704,10 +3704,14 @@ export class Conductor {
           },
         });
         if (sourceFinding) {
-          // Plan 05e: the evaluator's own citation is the finding's verified
-          // evidence; without one, its `file:line` evidence is the citation.
-          const verified = typeof entry.verified === "string" && entry.verified.trim().length > 0 ? entry.verified.trim() : sourceFinding.verified;
-          if (verified) events.push({ type: "FINDING_VERIFIED", findingId: sourceFinding.id, verified });
+          // Plan 05e: the evaluator's own citation is tagged as evaluator
+          // supplied (`evaluator: …`, round-3 review disc-A-38/M-10) and
+          // APPENDED to whatever already validated the finding (the 3a record
+          // or a 3b run), so no earlier validation evidence is lost.
+          const supplied = typeof entry.verified === "string" && entry.verified.trim().length > 0 ? entry.verified.trim() : undefined;
+          const addition = supplied ? (supplied.startsWith("evaluator:") ? supplied : `evaluator: ${supplied}`) : undefined;
+          const combined = appendVerified(sourceFinding.verified, addition);
+          if (combined && combined !== sourceFinding.verified) events.push({ type: "FINDING_VERIFIED", findingId: sourceFinding.id, verified: combined });
           // Plan 05e (5): a blocking finding may stay blocking only when it is
           // a defect against an acceptance item or a reserved rule; the
           // evaluator lowers anything else, recording the reason.
@@ -4035,10 +4039,12 @@ export class Conductor {
         severity = "advisory";
       }
     }
-    // Plan 05e (3a/3b): only an ordinary finding goes through the record and
-    // run checks; a blocker's own panel is unchanged.
+    // Plan 05e (3a/3b): every finding — including one raised through a
+    // reviewer's `blockers` list, which is a blocking finding too — goes
+    // through the record comparison and the runnable re-run before any agent
+    // sees it (round-3 reviews disc-A-36, M-9).
     let verified: string | undefined;
-    if (!opts.raisedAsBlocker) {
+    {
       const claim = this.#claimAgainstCheckRecords(fd.evidence, candidateSha);
       if (claim?.kind === "rejected") {
         this.#rejectFinding(fd, reviewer, candidateSha, claim.reason, opts);
@@ -4447,7 +4453,7 @@ export class Conductor {
     const K = phase.contract.contractVersion;
     if (!reviewsComplete(phase, C, K)) return;
     if ((phase.approvedCandidates ?? []).some((a) => a.candidateSha === C)) return;
-    if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open" && f.boundCandidateSha === C)) return;
+    if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open")) return;
     if (phase.ownerRequests.some((r) => r.status === "open")) return;
     for (const decision of phase.decisions) {
       if (!isLiveDecision(decision)) continue;
@@ -7921,7 +7927,9 @@ export class Conductor {
       }
       // #34 / plan 05e: approved code stays approved — a new blocking point
       // on bytes the reviewers already approved is advisory, not a blocker.
-      this.#applyEvent({ type: "FINDING_VERIFIED", findingId, verified: `panel ${outcome} (${reason || "no reason"})` });
+      const finding = (this.#state.phase.findings ?? []).find((f) => f.id === findingId);
+      const combined = appendVerified(finding?.verified, `panel ${outcome} (${reason || "no reason"})`);
+      this.#applyEvent({ type: "FINDING_VERIFIED", findingId, verified: combined ?? `panel ${outcome}` });
     }
   }
 
@@ -8101,9 +8109,19 @@ export class Conductor {
     // Plan 05e (4): every earlier round's open finding/blocker message, so
     // each reviewer marks each `resolved` or `open` with evidence; a 2-of-3
     // `resolved` majority moves it out of the owner's live view.
-    const earlierRound = (phase.messages ?? []).filter(
-      (m) => (m.type === "finding" || m.type === "blocker") && m.boundCandidateSha !== C && (m.state === "published" || m.state === "refused"),
-    );
+    //
+    // The message itself is REBOUND to the current candidate by
+    // MESSAGE_CARRIED at every freeze, so the filter reads the source
+    // RECORD's own binding (carried messages keep pointing at the finding,
+    // whose binding is the round it was raised on) — round-3 reviews M-8,
+    // A-11, B-14.
+    const earlierRound = (phase.messages ?? []).filter((m) => {
+      if (m.type !== "finding" && m.type !== "blocker") return false;
+      if (m.state !== "published" && m.state !== "refused") return false;
+      const record = m.sourceRecordId ? phase.findings.find((f) => f.id === m.sourceRecordId) : undefined;
+      if (record) return record.boundCandidateSha !== C;
+      return m.messageVersion > 1 || (m.carriedFrom ?? []).length > 0;
+    });
     if (earlierRound.length > 0) {
       lines.push(
         "Earlier rounds' live findings and blockers (mark each resolved or open in `resolutionStatements`, with evidence):",
@@ -8201,6 +8219,19 @@ interface PanelOptionInput {
 }
 
 /** Plan 04a: one `submit_evaluation` entry, as the evaluator sends it. */
+/** Plan 05e: join validation markers without duplicating or dropping an
+ * earlier one, so `verified` accumulates (`record …; run …; evaluator: …;
+ * panel keep`). */
+function appendVerified(existing: string | undefined, addition: string | undefined): string | undefined {
+  const parts = [existing, addition]
+    .flatMap((v) => (v ?? "").split("; "))
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  const unique: string[] = [];
+  for (const part of parts) if (!unique.includes(part)) unique.push(part);
+  return unique.length > 0 ? unique.join("; ") : undefined;
+}
+
 interface EvaluationEntry {
   messageId?: unknown;
   action?: unknown;

@@ -1167,10 +1167,6 @@ export interface RoundPanelState {
   seats?: Record<string, RoundPanelSeatState>;
   /** Set once the seats' votes have been counted and applied. */
   decided?: boolean;
-  /** The items this round's panel covered, in id order, recorded when the
-   * round enters EVALUATING so a restarted conductor does not recompute a
-   * different set after an evaluator polished the messages. */
-  items?: string[];
 }
 
 /** The round panel's outcome for one item. */

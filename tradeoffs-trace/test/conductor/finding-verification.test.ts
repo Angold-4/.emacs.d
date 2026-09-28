@@ -170,7 +170,7 @@ test("plan 05e (3c): a finding the evaluator cannot confirm is dropped with its 
     assert.match(f1.settlement?.reason ?? "", /could not confirm/);
     assert.equal(phase.findings.find((f) => f.id === (f1.sourceRecordId ?? ""))?.status, "disproved");
     assert.equal(f2.state, "published");
-    assert.equal(phase.findings.find((f) => f.id === (f2.sourceRecordId ?? ""))?.verified, "src/b.ts:12");
+    assert.match(phase.findings.find((f) => f.id === (f2.sourceRecordId ?? ""))?.verified ?? "", /evaluator: src\/b\.ts:12/);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -240,14 +240,14 @@ test("plan 05e (5): the evaluator lowers a blocking finding that cites no accept
   await setup.conductor.start();
   try {
     await waitFor(
-      () => setup.conductor.state.phase.findings.some((f) => f.verified === "src/a.ts:10"),
+      () => setup.conductor.state.phase.findings.some((f) => (f.verified ?? "").includes("src/a.ts:10")),
       90_000,
       20,
       setup.runDir,
     );
     const phase = setup.conductor.state.phase;
-    const f1 = phase.findings.find((f) => f.verified === "src/a.ts:10")!;
-    const f2 = phase.findings.find((f) => f.verified === "src/b.ts:12")!;
+    const f1 = phase.findings.find((f) => (f.verified ?? "").includes("src/a.ts:10"))!;
+    const f2 = phase.findings.find((f) => (f.verified ?? "").includes("src/b.ts:12"))!;
     assert.equal(f1.severity, "advisory", "a blocking finding that cites no acceptance item or reserved rule is lowered");
     assert.match(f1.severityReason ?? "", /acceptance item|reserved rule/);
     assert.equal(f2.severity, "blocking", "a blocking finding that cites an acceptance item stays blocking");
@@ -302,6 +302,57 @@ test("plan 05e (3b): a runnable command that times out does not publish the find
     assert.equal(message.state, "dropped", "a timed-out run reproduces nothing");
     assert.match(message.settlement?.reason ?? "", /timed out/);
     assert.equal(phase.findings.find((f) => f.raisedBy === "M")!.status, "disproved");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 05e (3a): a blocker claiming a named check fails is rejected before its panel too (round-3 disc-A-36)", async () => {
+  const setup = await setupConductor({
+    checks: ["make check"],
+    stubReviews: false,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-sh", command: "printf 'check:\\n\\ttrue\\n' > Makefile" }, submitPhaseStep()],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            blockers: reviewer === "B" ? [{ kind: "defect", evidence: "the ERT target of make check fails" }] : [],
+          },
+        },
+      ],
+    }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const blocker = (phase.messages ?? []).find((m) => m.type === "blocker")!;
+    assert.ok(blocker, "the blocker message was raised");
+    assert.equal(blocker.state, "dropped", "a record-contradicted blocker never reaches a panel");
+    assert.match(blocker.settlement?.reason ?? "", /make check/);
+    assert.equal(
+      events(setup).filter((e) => e.type === "ROUND_PANEL_VOTE" || e.type === "PANEL_VOTE").length,
+      0,
+      "no panel votes on a blocker the record already contradicted",
+    );
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
