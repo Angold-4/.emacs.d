@@ -409,8 +409,13 @@ failureRows("checks-failed", "CHECKING", "CHECKS_FAILED", REPAIR_ATTEMPT_ACTIONS
   // classification into state, so the repair prompt and the reviewers' prompts
   // label a real regression and a flake apart (finding #35).
   const failures = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failures;
+  const candidateSha = s.phase.candidate!.sha;
   return withPhase(s, {
-    checks: { candidateSha: s.phase.candidate!.sha, passed: false, ...(failures && failures.length > 0 ? { failures } : {}) },
+    checks: { candidateSha, passed: false, ...(failures && failures.length > 0 ? { failures } : {}) },
+    // Plan 05d: keep the split across the repair freeze too, so the reviewers
+    // of the repaired candidate see which tests failed and how each was
+    // classified (finding A-5).
+    ...(failures && failures.length > 0 ? { lastCheckFailures: { candidateSha, failures } } : {}),
     inFlight: clearInFlight(s.phase, "run_checks"),
   });
 });

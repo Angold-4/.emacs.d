@@ -165,7 +165,12 @@ deadline — and classifies it:
   new failures are load-only passes, with one `FLAKE_OBSERVED` event per test
   (its name, the check command, the re-run command, both exit statuses and the
   machine's load average at the failing run). A check that names no test at all
-  still fails, without any re-run.
+  still fails, without any re-run. An exit status of 0 is **not** enough on its
+  own: `node --test --test-name-pattern` exits 0 when the pattern matches
+  nothing and `cargo test` exits 0 when its filter selects no test, so a re-run
+  counts as a flake only when its own output shows a test really ran and passed
+  (a runner summary or a passing test line). That is what keeps a real failure
+  from being excused by a filter that missed it.
 
 The worker's repair prompt and each reviewer's turn-2 prompt list every new
 failing test as `reproduces alone` or `load-only`, so a real regression is
@@ -176,20 +181,30 @@ ones are recorded, not repaired.
 ### `#+TT_RERUN:` (the single-test command)
 
 The re-run needs the repository's own way to run one test. `#+TT_RERUN:` gives
-it, with `{name}` and `{file}` placeholders:
+it, with `{name}`, `{file}` and `{crate}` placeholders:
 
 ```org
 #+TT_RERUN: node --test --test-name-pattern {name} {file}
 #+TT_RERUN: cargo test -p {crate} --test {file} -- --exact {name}
 ```
 
+Each placeholder is substituted as **one single-quoted shell word**, so a name
+with spaces or a quote is one argument and never runs as shell; the template
+must not quote `{name}` itself. `{file}` is the file the reporter located
+(node:test's `location:`/`test at …` line, or cargo's `Running tests/x.rs …`
+line); `{crate}` is the first `::` segment of a cargo test path. A template
+that uses a placeholder whose value is unknown (no located file, no `::` path)
+is **not run**, so a half-applied template never targets the wrong test.
+
 The built-in defaults cover the Node test runner
-(`node --test --test-name-pattern "<name>" <file>`, quoting the name) and cargo
-(`cargo test -- --exact <name>`), reading the file from the reporter's own
-location line when it wrote one. A plan that gives neither a template nor a
-runner with a default keeps the strict rule: nothing is re-run and the failure
-stands. `tt lint` rejects a template with any placeholder other than `{name}`
-and `{file}`, or one that never names the failing test.
+(`node --test --test-name-pattern '<escaped name>' '<file>'`; the name is
+escaped because Node reads the pattern as a regular expression and an
+unescaped `(`, `.` or `*` would match nothing) and cargo
+(`cargo test -- --exact '<name>'`), and need the reporter's file. A plan that
+gives neither a template nor a runner with a default keeps the strict rule:
+nothing is re-run and the failure stands. `tt lint` rejects a template with any
+placeholder other than `{name}`, `{file}` and `{crate}`, or one that never
+names the failing test.
 
 `tt summary` and the status buffer's `flakes` row show flakes per test (count,
 last seen), the repair rounds saved, and launch retries.

@@ -812,9 +812,19 @@ export interface ChecksResult {
   passed?: boolean;
   interrupted?: boolean;
   /** Plan 05d: every new failing test of the candidate's last check (each
-   * re-run alone), so the worker's repair prompt and the reviewers' prompts
-   * label a real failure and a flake apart (finding #35). */
+   * re-run alone), so the worker's repair prompt labels a real failure and a
+   * flake apart (finding #35). Cleared when the next candidate freezes. */
   failures?: CheckFailureClass[];
+}
+
+/** Plan 05d: the last check failure of a candidate, kept across the repair
+ * freeze (`checks` is cleared then), so the reviewers of the repaired
+ * candidate are told which tests failed and how each was classified — the
+ * reviewer half of requirement (2), which would otherwise never see a failed
+ * check (finding A-5). */
+export interface LastCheckFailures {
+  candidateSha: string;
+  failures: CheckFailureClass[];
 }
 
 export interface ReviewSlot {
@@ -951,6 +961,10 @@ export interface PhaseState {
    * passed when re-run alone), folded from FLAKE_OBSERVED events. Evidence
    * for the status, `tt summary` and a restart. */
   flakes?: FlakeObservation[];
+  /** Plan 05d: the previous candidate's check failures and their
+   * classifications, kept across the repair freeze so the reviewers of the
+   * repaired candidate see them (finding A-5). */
+  lastCheckFailures?: LastCheckFailures;
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */

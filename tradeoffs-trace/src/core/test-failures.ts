@@ -110,15 +110,22 @@ const ANSI = /\u001b\[[0-9;]*m/g;
  * give a `#+TT_RERUN:` template. */
 export type TestRunner = "node" | "cargo" | "ert";
 
-/** One parsed failing test: its name, the runner whose output named it, and —
- * for node:test — the file the output located it in, when the reporter wrote
- * one (TAP's `location: …` block, or the spec reporter's `test at <file>…`
- * line). The file is what `{file}` in a `#+TT_RERUN:` template substitutes. */
+/** One parsed failing test: its name, the runner whose output named it, and
+ * the file the output located it in, when it did. For node:test the file comes
+ * from the reporter (TAP's `location: …` block or the spec reporter's
+ * `test at <file>…` line); for cargo, from the `Running <desc> <path>` line
+ * above the test (an integration test's target). It is what `{file}` in a
+ * `#+TT_RERUN:` template substitutes. */
 export interface ParsedTestFailure {
   name: string;
   runner: TestRunner;
   file?: string;
 }
+
+/** Cargo's `Running … (target/<…>/deps/…)` line. It is `Running <kind> <path>`
+ * for a unit-test target (`unittests src/lib.rs`) but `Running <path>` for an
+ * integration test target (`tests/x.rs`). */
+const CARGO_RUNNING = /^\s*Running\s+(.+?)\s+\(target\/[^)]*\/deps\/.*\)\s*$/;
 
 /** TAP's location line (`location: '/tmp/x.test.js:3:1'`). */
 const NODE_TAP_LOCATION = /^\s*location: '(.+?):\d+:\d+'\s*$/;
@@ -134,6 +141,7 @@ export function parseTestFailuresDetailed(output: string): ParsedTestFailure[] {
   const out: ParsedTestFailure[] = [];
   const byName = new Map<string, ParsedTestFailure>();
   let specFile: string | undefined;
+  let cargoFile: string | undefined;
   const add = (raw: string, runner: TestRunner, file?: string): void => {
     const name = raw.trim();
     if (name.length === 0 || NOT_A_TEST_NAME.test(name)) return;
@@ -146,15 +154,26 @@ export function parseTestFailuresDetailed(output: string): ParsedTestFailure[] {
       if (existing.file === undefined && file !== undefined) existing.file = file;
       return;
     }
-    const parsed: ParsedTestFailure = file ? { name, runner, file } : { name, runner };
+    const parsed: ParsedTestFailure = file !== undefined ? { name, runner, file } : { name, runner };
     byName.set(name, parsed);
     out.push(parsed);
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    // A `Running …` line sets the test target every following
+    // `test <name> … FAILED` line belongs to. A unit-test target
+    // (`unittests src/lib.rs`) is not a `--test` target, so it names no file.
+    const running = line.match(CARGO_RUNNING);
+    if (running) {
+      const parts = running[1].trim().split(/\s+/);
+      const path = parts[parts.length - 1];
+      const desc = parts.length > 1 ? parts[0] : "";
+      cargoFile = desc === "unittests" || !path.endsWith(".rs") ? undefined : path.replace(/^.*\//, "").replace(/\.rs$/, "");
+      continue;
+    }
     const cargo = line.match(CARGO_FAILED);
     if (cargo) {
-      add(cargo[1], "cargo");
+      add(cargo[1], "cargo", cargoFile);
       continue;
     }
     // The spec reporter writes `test at <file>:<line>:<col>` just above the
@@ -205,22 +224,44 @@ export function parseTestFailures(output: string): string[] {
 // is broken (findings #4, #10, #18, #25, #31, #35). Before a check that names
 // new failures may fail the gate, each such test is re-run alone: a test that
 // passes when re-run is `load-only`, one that still fails `reproduces alone`.
-// The command comes from the plan's `#+TT_RERUN:` template (with `{name}` and
-// `{file}`) or from a built-in default for the Node test runner and cargo —
-// the two runners this module parses. With no template and no default the
-// strict rule applies: nothing is re-run and the failure stands.
+// The command comes from the plan's `#+TT_RERUN:` template (with `{name}`,
+// `{file}` and `{crate}`) or from a built-in default for the Node test runner
+// and cargo — the two runners this module parses. With no template and no
+// default the strict rule applies: nothing is re-run and the failure stands.
+
+/** One single-quoted shell word. A substituted test name, file or crate must
+ * never split on a space or run as shell, so every value goes through this. */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** A literal string as a JavaScript regular expression (Node reads
+ * `--test-name-pattern` as one, so an unescaped name with metacharacters —
+ * `a failing test ... (plan 14h)` — matches nothing and exits 0). */
+export function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /** Every `{...}` placeholder a `#+TT_RERUN:` template contains. */
 export function rerunPlaceholders(template: string): string[] {
   return [...template.matchAll(/\{([^}]*)\}/g)].map((m) => m[1]);
 }
 
+/** The placeholders a `#+TT_RERUN:` template may use, and what each resolves
+ * to. `{crate}` is the crate the failing test lives in: cargo's own output
+ * names its test module path, whose first `::` segment is the crate (a
+ * template that cannot resolve one is never run, so a wrong crate can never
+ * excuse a failure). */
+export const RERUN_PLACEHOLDERS = ["name", "file", "crate"] as const;
+
 /** Why a `#+TT_RERUN:` template cannot be used, or undefined when it is fine.
- * Only `{name}` and `{file}` are known, and a template that never names the
+ * Only the `RERUN_PLACEHOLDERS` are known, and a template that never names the
  * failing test would run the same command for every one of them. */
 export function rerunTemplateIssue(template: string): string | undefined {
   for (const placeholder of rerunPlaceholders(template)) {
-    if (placeholder !== "name" && placeholder !== "file") return `the unknown placeholder {${placeholder}}`;
+    if (!(RERUN_PLACEHOLDERS as readonly string[]).includes(placeholder)) {
+      return `the unknown placeholder {${placeholder}}`;
+    }
   }
   if (!template.includes("{name}")) return "the template does not name the failing test ({name})";
   return undefined;
@@ -230,31 +271,45 @@ function runnerAndFileFor(output: string, name: string): ParsedTestFailure | und
   return parseTestFailuresDetailed(output).find((f) => f.name === name);
 }
 
+/** The crate a cargo test path belongs to: its first `::` segment. Undefined
+ * for a name with no `::`, so a `{crate}` template is then never run. */
+export function crateOf(name: string): string | undefined {
+  const parts = name.split("::");
+  return parts.length > 1 && parts[0].length > 0 ? parts[0] : undefined;
+}
+
 /** Plan 05d: the single-test command for one failing name: the plan's
  * `#+TT_RERUN:` template when given, otherwise the built-in default for the
  * runner the name's own output line came from. Undefined means "no command is
  * known", and the caller must then keep the strict rule (no re-run).
  *
- * A template that uses `{file}` needs a file the output located; without one
- * the command cannot be built (`{file}` has no safe default). */
+ * Every substituted value is one single-quoted shell word, and a template
+ * that uses a placeholder whose value is unknown (`{file}` without the
+ * reporter locating one, `{crate}` without a `::` path) cannot be built — so
+ * a half-applied template never runs the wrong test. */
 export function singleTestCommand(name: string, output: string, template?: string): string | undefined {
   const named = runnerAndFileFor(output, name);
   const file = named?.file;
+  // `{crate}` is the failing test's own module path root (`a::b::c` → `a`); a
+  // name with no `::` has none, so a `{crate}` template is then never run.
+  const crate = crateOf(name);
   if (template !== undefined && template.trim().length > 0) {
-    if (template.includes("{file}") && file === undefined) return undefined;
-    // A function replacement, so a `$` in a test name is never read as a
+    const values: Record<string, string | undefined> = { name, file, crate };
+    for (const placeholder of rerunPlaceholders(template)) {
+      if (values[placeholder] === undefined) return undefined;
+    }
+    // A function replacement, so a `$` in a name is never read as a
     // replacement pattern.
-    return template.replace(/\{name\}/g, () => name).replace(/\{file\}/g, () => file ?? "");
+    return template.replace(/\{(name|file|crate)\}/g, (_m, key: string) => shellQuote(values[key]!));
   }
-  if (named?.runner === "cargo") return `cargo test -- --exact ${name}`;
+  if (named?.runner === "cargo") return `cargo test -- --exact ${shellQuote(name)}`;
   if (named?.runner === "node") {
     // The file must be known: `node --test --test-name-pattern` exits 0 when
     // nothing matches, so a pattern with no file could report a real failure
-    // as a flake. Node's test names routinely contain spaces, so the pattern
-    // is quoted (a plan that needs different quoting supplies a template).
+    // as a flake. The name is escaped (Node reads the pattern as a regular
+    // expression) and single-quoted (names routinely contain spaces).
     if (!file) return undefined;
-    const pattern = `"${name.replace(/(["$\\])/g, "\\$1")}"`;
-    return `node --test --test-name-pattern ${pattern} ${file}`;
+    return `node --test --test-name-pattern ${shellQuote(escapeRegExp(name))} ${shellQuote(file)}`;
   }
   return undefined;
 }
@@ -279,6 +334,28 @@ export interface TestRerunOutcome {
   /** Process exit status, or null when the re-run was killed by a signal. */
   exitCode: number | null;
   timedOut: boolean;
+  /** The re-run's own output, when the caller kept it: the evidence that the
+   * named test actually ran (see `rerunProvesTheTestRan`). */
+  output?: string;
+}
+
+/** True when a re-run's output shows a test actually ran and passed. An exit
+ * status of 0 alone is not enough: `node --test --test-name-pattern` exits 0
+ * when nothing matches, and cargo exits 0 when its filter selects no test, so
+ * a re-run that skipped the test would otherwise excuse a real failure as a
+ * flake (review finding M-1). Only a positive runner summary or a passing
+ * test line counts. */
+export function rerunProvesTheTestRan(output: string): boolean {
+  const text = output.replace(ANSI, "");
+  return (
+    /(?:^|\n)\s*(?:\u2139\s*)?(?:tests|pass|suites)\s+[1-9]\d*/.test(text) || // node:test spec summary
+    /(?:^|\n)#\s*pass\s+[1-9]\d*/.test(text) || // TAP summary
+    /test result: ok\. [1-9]\d* passed/.test(text) || // cargo
+    /(?:^|\n)\s*[\u2714\u2713]\s+\S/.test(text) || // spec pass line
+    /(?:^|\n)\s*ok \d+ - /.test(text) || // TAP ok
+    /(?:^|\n)\s*test \S+ \.\.\. ok\b/.test(text) || // cargo ok line
+    /\b[1-9]\d*\s+results? as expected\b/.test(text) // ERT
+  );
 }
 
 /** A new failing test's classification: `reproduces alone` (a real failure)
@@ -304,7 +381,10 @@ export function classifyRerun(
   failingExitCode: number | null,
   reruns: readonly TestRerunOutcome[],
 ): TestClassification {
-  const loadOnly = reruns.some((r) => !r.timedOut && r.exitCode === 0);
+  // A re-run only proves a flake when it both exited 0 AND shows the test
+  // ran: `node --test --test-name-pattern` (and a cargo filter) exit 0 when
+  // nothing matches, which would otherwise excuse a real failure (M-1).
+  const loadOnly = reruns.some((r) => !r.timedOut && r.exitCode === 0 && rerunProvesTheTestRan(r.output ?? ""));
   const base: TestClassification = {
     name,
     ...(command !== undefined ? { rerunCommand: command } : {}),

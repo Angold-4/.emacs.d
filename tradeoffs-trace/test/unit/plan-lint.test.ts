@@ -27,13 +27,17 @@ test("plan-lint: #+TT_RERUN accepts {name}/{file} and rejects any other placehol
   const ok = lintPlan({ ...base, rerun: "node --test --test-name-pattern {name} {file}", rerunLine: 5 });
   assert.deepEqual(ok.filter((f) => f.rule === "rerun-template"), []);
 
-  const unknown = lintPlan({ ...base, rerun: "cargo test --test {file} -- --exact {crate}", rerunLine: 6 });
+  // The plan's own cargo example is accepted: {crate} is a known placeholder.
+  const cargoExample = lintPlan({ ...base, rerun: "cargo test -p {crate} --test {file} -- --exact {name}", rerunLine: 6 });
+  assert.deepEqual(cargoExample.filter((f) => f.rule === "rerun-template"), []);
+
+  const unknown = lintPlan({ ...base, rerun: "cargo test --test {file} -- --exact {suite}", rerunLine: 6 });
   const finding = unknown.find((f) => f.rule === "rerun-template");
   assert.ok(finding, "the unknown placeholder must be reported");
   assert.equal(finding!.severity, "error");
   assert.equal(finding!.phaseId, "rerun");
   assert.equal(finding!.line, 6);
-  assert.match(finding!.problem, /unknown placeholder \{crate\}/);
+  assert.match(finding!.problem, /unknown placeholder \{suite\}/);
   assert.match(finding!.fix, /\{name\}/);
 
   const noName = lintPlan({ ...base, rerun: "sh -c 'exit 0'", rerunLine: 7 });

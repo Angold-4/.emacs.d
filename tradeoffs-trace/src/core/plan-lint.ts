@@ -294,10 +294,10 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
   return out;
 }
 
-/** Plan 05d: lint `#+TT_RERUN:` — only `{name}` and `{file}` are known, and
- * a template that never names the failing test would run the same command
- * for every one of them. Absent: no findings, so a plan without the keyword
- * is unchanged. */
+/** Plan 05d: lint `#+TT_RERUN:` — only `{name}`, `{file}` and `{crate}` are
+ * known (each substituted as one shell word), and a template that never names
+ * the failing test would run the same command for every one of them. Absent:
+ * no findings, so a plan without the keyword is unchanged. */
 export function lintRerun(plan: LintPlanInput): LintFinding[] {
   if (typeof plan.rerun !== "string" || plan.rerun.trim().length === 0) return [];
   const issue = rerunTemplateIssue(plan.rerun);
@@ -313,7 +313,9 @@ export function lintRerun(plan: LintPlanInput): LintFinding[] {
       line: plan.rerunLine,
       sourceFile: plan.sourceFile,
       problem: `#+TT_RERUN has ${issue}`,
-      fix: "write one command that runs one test, using {name} (and {file} only when the runner's output locates the test), for example `node --test --test-name-pattern {name} {file}` or `cargo test -- --exact {name}`",
+      fix: "write one command that runs one test, using {name} (and {file} only when the runner's output locates the test, {crate} only for a cargo `::` path), for example `node --test --test-name-pattern {name} {file}` or `cargo test -p {crate} --test {file} -- --exact {name}`",
+      // A rerun template may name any of the known placeholders; each is
+      // substituted as one single-quoted shell word.
     },
   ];
 }

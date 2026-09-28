@@ -61,6 +61,7 @@ import {
   parseBaseline,
   parseTestFailures,
   rerunCommandsFor,
+  rerunProvesTheTestRan,
   baselineHasEnvironmentFailure,
   type Baseline,
   type BaselineCommand,
@@ -5934,8 +5935,11 @@ export class Conductor {
             termGraceMs: this.#deadlines.termGraceMs,
           });
           const result = await running.result;
-          reruns.push({ exitCode: result.exitCode, timedOut: result.timedOut });
-          if (!result.timedOut && result.exitCode === 0) break;
+          // Review finding M-1: exit 0 alone is not proof — a filter that
+          // matched no test exits 0. Keep the output so the classification can
+          // require evidence that the test ran.
+          reruns.push({ exitCode: result.exitCode, timedOut: result.timedOut, output: result.output });
+          if (!result.timedOut && result.exitCode === 0 && rerunProvesTheTestRan(result.output)) break;
         }
       }
       const classified = classifyRerun(plan.name, plan.command, params.failingExitCode, reruns);
@@ -7792,15 +7796,28 @@ export function checkFailureLines(phase: PhaseState): string[] {
   );
 }
 
-/** Plan 05d: the reviewer turn-2 section for the candidate's check failures,
- * or none when there is nothing to report. */
+/** Plan 05d: the reviewer section for a check failure. A check that fails
+ * sends its candidate to REPAIRING, never to REVIEWING, so in the normal flow
+ * the reviewers see the split of the candidate they are reviewing **only** as
+ * the failure their candidate repairs: the previous candidate's split, kept
+ * across the freeze in `lastCheckFailures` (finding A-5). */
 export function checkFailurePromptLines(phase: PhaseState): string[] {
-  const lines = checkFailureLines(phase);
-  if (lines.length === 0) return [];
+  const current = checkFailureLines(phase);
+  if (current.length > 0) {
+    return [
+      "",
+      "Candidate check failures, each re-run alone (a real regression is not a flake, and a flake is not a repair item):",
+      ...current.map((l) => `- ${l}`),
+    ];
+  }
+  const last = phase.lastCheckFailures;
+  if (!last || last.failures.length === 0 || last.candidateSha === phase.candidate?.sha) return [];
   return [
     "",
-    "Candidate check failures, each re-run alone (a real regression is not a flake, and a flake is not a repair item):",
-    ...lines.map((l) => `- ${l}`),
+    `The check failure this candidate repairs (previous candidate ${last.candidateSha.slice(0, 7)}; every test was re-run alone):`,
+    ...last.failures.map(
+      (f) => `- \`${f.name}\`: ${f.loadOnly ? "load-only (a flake; the check passed on it)" : "reproduces alone (a real failure)"}`,
+    ),
   ];
 }
 

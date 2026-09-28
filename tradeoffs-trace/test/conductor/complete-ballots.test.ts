@@ -281,10 +281,12 @@ test("complete-ballots: a discovery that arrives after the reviewer's turn-2 pro
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    // 30s, not 5s: B's first dispatch hangs by design, so the re-dispatch must
-    // spawn and finish both turns inside this budget — 5s misses it on a loaded
-    // machine (a timing flake, not a defect).
-    deadlines: { ...FAST, reviewMs: 30_000 },
+    // B's first dispatch ENDS without submitting turn 2, so the conductor's
+    // agent_settled fast-fail re-dispatches it at once rather than waiting out
+    // reviewMs (the wait was the load flake: 30 s was too short once the
+    // machine was busy). The limit is still generous for the re-dispatch's own
+    // two turns under load.
+    deadlines: { ...FAST, reviewMs: 120_000 },
     workerScript: () => ({
       hello: defaultWorkerHello(),
       steps: [
@@ -299,10 +301,11 @@ test("complete-ballots: a discovery that arrives after the reviewer's turn-2 pro
         // re-dispatched — and by then the discovery barrier has released.
         return {
           hello: defaultReviewerHello(),
+          // Ends after turn 1: no turn-2 submit, so the conductor fails this
+          // dispatch fast and re-dispatches it.
           steps: [
             { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
             { kind: "wait-for-prompt" },
-            { kind: "hang-forever" },
           ],
         };
       }

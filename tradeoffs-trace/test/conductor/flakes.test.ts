@@ -86,6 +86,14 @@ function failingCheck(names: readonly string[]): string {
   return `${names.map((n) => `printf '✖ %s\\n' '${n}'`).join("; ")}; exit 1`;
 }
 
+/** A `#+TT_RERUN:` template that exits 0 and prints a node pass line, so the
+ * classification can see the named test really ran (finding M-1). `{name}` is
+ * substituted as one already-quoted shell word, so the template must not quote
+ * it itself. */
+const PASS_TEMPLATE = "printf '✔ %s\\n' {name}; printf 'ℹ pass 1\\n'; exit 0";
+/** A template that exits non-zero: the test reproduces alone. */
+const FAIL_TEMPLATE = "printf '✖ %s\\n' {name}; exit 1";
+
 test("launch retry: the retry limit scales with the session size and is capped at 60 s", () => {
   // No session: the retry keeps the configured limit.
   assert.equal(helloRetryTimeoutMs(10_000, 0), 10_000);
@@ -97,7 +105,7 @@ test("launch retry: the retry limit scales with the session size and is capped a
   assert.equal(helloRetryTimeoutMs(30_000, 1024), 30_000);
 });
 
-test("flake: the prompt labels each failing test, and an empty check failure adds nothing", async () => {
+test("flake: the prompt labels each failing test, and an empty check failure adds nothing", () => {
   const phase = basePhase({
     runId: "r",
     phaseId: "p1",
@@ -118,21 +126,64 @@ test("flake: the prompt labels each failing test, and an empty check failure add
   assert.match(section.join("\n"), /Candidate check failures, each re-run alone/);
   // A passed check (or one whose output named no test) adds nothing.
   assert.deepEqual(checkFailurePromptLines(basePhase({ runId: "r", phaseId: "p1", checks: { candidateSha: "C1", passed: true } })), []);
+  // Finding A-5: a failed check never reaches REVIEWING, so the reviewers of
+  // the repaired candidate are shown the PREVIOUS candidate's split, kept
+  // across the freeze in lastCheckFailures.
+  const repaired = basePhase({
+    runId: "r",
+    phaseId: "p1",
+    candidate: { sha: "C2", contractVersion: { snapshot: 1, sectionSha256: "x" } },
+    checks: { candidateSha: "C2", passed: true },
+    lastCheckFailures: {
+      candidateSha: "C1",
+      failures: [
+        { name: "real", reproducesAlone: true, loadOnly: false, failingExitCode: 1, rerunExitCodes: [1] },
+        { name: "flaky", reproducesAlone: false, loadOnly: true, failingExitCode: 1, rerunExitCodes: [0] },
+      ],
+    },
+  });
+  const repairedSection = checkFailurePromptLines(repaired).join("\n");
+  assert.match(repairedSection, /previous candidate C1; every test was re-run alone/);
+  assert.match(repairedSection, /`real`: reproduces alone \(a real failure\)/);
+  assert.match(repairedSection, /`flaky`: load-only \(a flake; the check passed on it\)/);
+  // The worker prompt helper never falls back to the previous candidate.
+  assert.deepEqual(checkFailureLines(repaired), []);
 });
 
-test("flake: a candidate whose only new failure passes alone passes checks and records FLAKE_OBSERVED", async () => {
+test("flake: a real `node --test` failure re-run by the built-in default passes the checks and records FLAKE_OBSERVED", async () => {
+  // The 05j attempt-5 fixture shape: a real spec-reporter failure the parser
+  // reads (with its `test at <file>` location), re-run by the built-in Node
+  // default — no `#+TT_RERUN` template (finding M-4). The counter lives in
+  // /tmp, never in the checkout: a file written inside the checkout would
+  // trip `verifyIntegrity` and the check would fail with no classification.
+  const counter = `/tmp/tt-flake-counter-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  const testFile = [
+    "const test = require('node:test');",
+    "const fs = require('node:fs');",
+    `const counter = ${JSON.stringify(counter)};`,
+    "test('no-unshown-ballots: a discovery after the barrier released', () => {",
+    "  const n = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;",
+    "  fs.writeFileSync(counter, String(n + 1));",
+    "  if (n >= 1) return;",
+    "  throw new Error('the first run under load fails');",
+    "});",
+    "",
+  ].join("\n");
   const setup = await setupConductor({
-    checks: [failingCheck(["no-unshown-ballots"])],
-    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    checks: ["node --test flake.test.cjs"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `cat > flake.test.cjs <<'TTEOF'\n${testFile}TTEOF` },
+        submitPhaseStep(),
+      ],
+    }),
     reviewerScriptFor: reviewerFor(),
     deadlines: FAST,
   });
-  // Every new failure is re-run alone and passes.
-  setup.plan.rerun = "sh -c 'exit 0; # {name}'";
   await setup.conductor.start();
   try {
-    // Stop as soon as the check is decided and the flake is recorded: the
-    // review loop that follows adds load the suite does not need to prove it.
     await waitFor(
       () => eventTypes(setup.runDir).includes("CHECKS_PASSED") && flakeEvents(setup.runDir).length > 0,
       90_000,
@@ -140,24 +191,54 @@ test("flake: a candidate whose only new failure passes alone passes checks and r
       setup.runDir,
     );
 
-    assert.ok(eventTypes(setup.runDir).includes("CHECKS_PASSED"), "a load-only failure must pass the checks");
     assert.ok(!eventTypes(setup.runDir).includes("CHECKS_FAILED"));
     assert.ok(!eventTypes(setup.runDir).includes("REPAIR_ATTEMPT_STARTED"), "no repair round for a flake");
 
     const flakes = flakeEvents(setup.runDir);
     assert.equal(flakes.length, 1);
-    assert.equal(flakes[0].name, "no-unshown-ballots");
+    assert.equal(flakes[0].name, "no-unshown-ballots: a discovery after the barrier released");
     assert.equal(flakes[0].failingExitCode, 1, "the failing run's exit status");
     assert.deepEqual(flakes[0].rerunExitCodes, [0], "the re-run's exit status");
     assert.equal(flakes[0].savedRound, true);
     assert.equal(typeof flakes[0].loadAverage, "number", "the load average at the failing run");
-    // The recorded evidence also names the check command and the re-run.
-    assert.match(String(flakes[0].command), /printf/);
-    assert.match(String(flakes[0].rerunCommand), /exit 0/);
+    // The re-run command is the built-in default, with the name escaped and
+    // the file the reporter located.
+    assert.equal(
+      flakes[0].rerunCommand,
+      "node --test --test-name-pattern 'no-unshown-ballots: a discovery after the barrier released' 'flake.test.cjs'",
+    );
     // The excused check is recorded as load-only, not as pre-existing.
     const loadOnly = readEvents(setup.runDir).find((r) => r.kind === "check_failures_load_only");
     assert.ok(loadOnly, "the load-only classification is recorded");
     assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "check_failures_pre_existing").length, 0);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
+});
+
+test("flake: a re-run that exits 0 without running the test does not excuse a real failure", async () => {
+  // Review finding M-1: `node --test --test-name-pattern` exits 0 when nothing
+  // matches. A template that does the same must leave the failure standing.
+  const setup = await setupConductor({
+    checks: [`if grep -q tt-flake README.md; then ${failingCheck(["plan models route per seat"])}; fi`],
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'tt-flake\\n' >> README.md" }, submitPhaseStep()] }
+        : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  setup.plan.rerun = "printf 'nothing ran\\n'; exit 0";
+  await setup.conductor.start();
+  try {
+    await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);
+    const marked = readEvents(setup.runDir).find((r) => r.kind === "check_failure_new")!;
+    const classifications = (marked.event as { classifications: Array<{ name: string; loadOnly: boolean }> }).classifications;
+    assert.deepEqual(classifications.map((c) => [c.name, c.loadOnly]), [["plan models route per seat", false]]);
+    assert.equal(flakeEvents(setup.runDir).length, 0);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
@@ -185,8 +266,9 @@ test("flake: a real failure reproduces alone, and a mixed check labels each test
     extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
     deadlines: FAST,
   });
-  // The first test reproduces (exit 1), the second passes alone (exit 0).
-  setup.plan.rerun = `sh -c 'case "{name}" in "complete-ballots") exit 0;; *) exit 1;; esac'`;
+  // The first test reproduces (exit 1); the second passes alone (exit 0 with
+  // the evidence that it ran).
+  setup.plan.rerun = `case {name} in complete-ballots) ${PASS_TEMPLATE};; *) ${FAIL_TEMPLATE};; esac`;
   await setup.conductor.start();
   try {
     await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);
@@ -228,7 +310,7 @@ test("flake: a check whose output names no test fails without any re-run", async
     reviewerScriptFor: reviewerFor(),
     deadlines: FAST,
   });
-  setup.plan.rerun = `sh -c 'echo "{name}" >> ${marker}; exit 1'`;
+  setup.plan.rerun = `printf '%s\\n' {name} >> ${marker}; exit 1`;
   await setup.conductor.start();
   try {
     await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);
@@ -252,9 +334,9 @@ test("baseline: a base failure that passes alone is a `base flake` and never exc
     reviewerScriptFor: reviewerFor(),
     deadlines: FAST,
   });
-  // The base's single re-run (invocation 1) passes; the candidate's re-run
-  // (invocation 2) fails, so it reproduces alone.
-  setup.plan.rerun = `sh -c 'n=$(cat ${marker} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${marker}; test $n -eq 1; # {name}'`;
+  // The base's single re-run (invocation 1) passes with evidence; the
+  // candidate's re-run (invocation 2) fails, so it reproduces alone.
+  setup.plan.rerun = `n=$(cat ${marker} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${marker}; if [ $n -eq 1 ]; then ${PASS_TEMPLATE}; fi; ${FAIL_TEMPLATE}`;
   await setup.conductor.start();
   try {
     await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);
@@ -355,7 +437,7 @@ test("flake: a re-run that times out counts as `reproduces alone` and stays with
     // A short check deadline so the re-run's own deadline binds.
     deadlines: { ...FAST, checkMs: 1_500 },
   });
-  setup.plan.rerun = `sh -c 'sleep 30; echo "{name}" >> ${marker}'`;
+  setup.plan.rerun = `sleep 30; printf '%s\\n' {name} >> ${marker}`;
   await setup.conductor.start();
   try {
     await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_FAILED"), 90_000, undefined, setup.runDir);
