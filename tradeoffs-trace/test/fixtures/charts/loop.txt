@@ -1,6 +1,7 @@
 tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions.ts); do not edit
 current state: DONE   (entered 1x - 2m40s)
 current run: RUN_ACTIVE
+note: a check that names new failures re-runs each alone before it may fail; a load-only flake passes it (FLAKE_OBSERVED)
 
 phase states:
   +----------------+

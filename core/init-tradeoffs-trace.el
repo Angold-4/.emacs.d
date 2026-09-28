@@ -408,6 +408,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                      (and repo (+tt--git repo "symbolic-ref" "--short" "HEAD"))))
          (title (or (+tt--keyword "TITLE") (file-name-base file)))
          (global-checks (+tt--keyword "TT_CHECKS"))
+         ;; Plan 05d: the single-test template a candidate's newly failing
+         ;; tests are re-run with (`{name}` and `{file}` placeholders).
+         (rerun (+tt--keyword-at "TT_RERUN"))
          (errors nil) (phases nil) (ids nil))
     (unless repo (push (cons 1 "not inside a git repository and no #+TT_REPO") errors))
     (unless branch (push (cons 1 "cannot determine the integration branch; set #+TT_BRANCH") errors))
@@ -430,6 +433,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   (integrationBranch . ,(or branch ""))
                   (checks . ,(vconcat (and global-checks (list global-checks))))
                   (phases . ,(vconcat (nreverse phases)))
+                  ,@(when rerun
+                      `((rerun . ,(car rerun))
+                        (rerunLine . ,(cdr rerun))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))
@@ -1411,6 +1417,8 @@ open the decision view at that record."
     (+tt--status-row "gate" (alist-get 'gate v))
     ;; Plan 01e: the base's own pre-existing check failures (D2), when any.
     (+tt--status-row "base" (alist-get 'baseline v) 'warning)
+    ;; Plan 05d: flakes observed, rounds saved and launch retries, when any.
+    (+tt--status-row "flakes" (alist-get 'flakes v) 'warning)
     ;; Plan 01g: every amendment record, applied or reverted, old → new.
     (+tt--status-row "amended" (alist-get 'amendments v) 'warning)
     (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)

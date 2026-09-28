@@ -142,7 +142,57 @@ candidate's check.
 
 When the base fails, the status shows `base fails: N tests: <names>` — or
 `base fails: 0 tests (no test names parsed; checks stay strict)` when its
-failing output names none.
+failing output names none. **Each base failure is re-run alone once before it
+is recorded:** only a failure that reproduces is a base failure, and one that
+passes alone is recorded as a `base flake` (shown in the status and in a
+`baseline_flake` record). A base flake is visible and **never excuses** — a
+candidate that fails the same test is judged on its own, so a real regression
+is never hidden behind a flake that landed in the baseline (finding #25).
+
+## Flaky tests: re-run before failing
+
+One test of ~750 failing under machine load is not the candidate's failure:
+findings #4, #10, #18, #31 and #35 each cost a whole repair round for a test
+that passed when run alone. So when a candidate's check fails and its output
+names test failures that did not fail on the base, the conductor **re-runs each
+such test alone** — up to two times, inside the failing check command's own
+deadline — and classifies it:
+
+- **`reproduces alone`** — it still fails when run alone. A real failure; the
+  check fails. A re-run that times out counts here too (a truncated run proves
+  nothing), as does a test whose single-test command cannot be built.
+- **`load-only`** — it passes when run alone. A flake. A check whose **only**
+  new failures are load-only passes, with one `FLAKE_OBSERVED` event per test
+  (its name, the check command, the re-run command, both exit statuses and the
+  machine's load average at the failing run). A check that names no test at all
+  still fails, without any re-run.
+
+The worker's repair prompt and each reviewer's turn-2 prompt list every new
+failing test as `reproduces alone` or `load-only`, so a real regression is
+never read as a flake and a flake is never repaired (finding #35). When the
+check fails, only the `reproduces alone` names fail the gate; the load-only
+ones are recorded, not repaired.
+
+### `#+TT_RERUN:` (the single-test command)
+
+The re-run needs the repository's own way to run one test. `#+TT_RERUN:` gives
+it, with `{name}` and `{file}` placeholders:
+
+```org
+#+TT_RERUN: node --test --test-name-pattern {name} {file}
+#+TT_RERUN: cargo test -p {crate} --test {file} -- --exact {name}
+```
+
+The built-in defaults cover the Node test runner
+(`node --test --test-name-pattern "<name>" <file>`, quoting the name) and cargo
+(`cargo test -- --exact <name>`), reading the file from the reporter's own
+location line when it wrote one. A plan that gives neither a template nor a
+runner with a default keeps the strict rule: nothing is re-run and the failure
+stands. `tt lint` rejects a template with any placeholder other than `{name}`
+and `{file}`, or one that never names the failing test.
+
+`tt summary` and the status buffer's `flakes` row show flakes per test (count,
+last seen), the repair rounds saved, and launch retries.
 
 ## Prerequisites
 

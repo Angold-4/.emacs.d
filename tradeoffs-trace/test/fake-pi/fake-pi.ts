@@ -73,6 +73,10 @@ type Step =
 
 interface Script {
   hello?: HelloSpec;
+  /** Plan 05d: how long to wait before sending `hello` (mirrors loading a
+   * long `--continue` session). A test sets it so the first launch misses the
+   * conductor's hello limit and the retry — with its longer limit — gets it. */
+  helloDelayMs?: number;
   steps: Step[];
 }
 
@@ -225,6 +229,9 @@ async function main(): Promise<void> {
 
   if (socketPath && script.hello) {
     await runSocket.connect(socketPath);
+    if (typeof script.helloDelayMs === "number" && script.helloDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, script.helloDelayMs));
+    }
     runSocket.send({
       type: "hello",
       agentId: script.hello.agentId ?? readEnv("TT_AGENT_ID") ?? "fake-1",

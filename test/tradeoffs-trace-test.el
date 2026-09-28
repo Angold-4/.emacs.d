@@ -52,6 +52,30 @@
     (should (equal (alist-get 'reserved p1) ["public API types" "persistence format"]))
     (should (eq (alist-get 'provisional (aref (alist-get 'phases plan) 1)) t))))
 
+(ert-deftest tradeoffs-trace-plan-rerun-keyword ()
+  "Plan 05d: #+TT_RERUN becomes the plan's rerun template and its line."
+  (let* ((text (concat "#+TITLE: rerun\n"
+                      "#+TT_REPO: /tmp/tt-ert-repo\n"
+                      "#+TT_BRANCH: main\n"
+                      "#+TT_CHECKS: node --test\n"
+                      "#+TT_RERUN: node --test --test-name-pattern {name} {file}\n"
+                      "\n"
+                      "* Phase 1: p\n"
+                      "  :PROPERTIES:\n"
+                      "  :ID:          p1\n"
+                      "  :CHECKS:      node --test\n"
+                      "  :END:\n"
+                      "  Goal: g\n"
+                      "  Acceptance:\n"
+                      "  - a\n"))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (alist-get 'rerun plan) "node --test --test-name-pattern {name} {file}"))
+    (should (= (alist-get 'rerunLine plan) 5)))
+  ;; A plan without the keyword carries neither field.
+  (let ((plan (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+    (should (null (alist-get 'rerun plan)))
+    (should (null (alist-get 'rerunLine plan)))))
+
 (ert-deftest tradeoffs-trace-plan-validation ()
   "Invalid plans report errors at the right lines and start no run."
   (let* ((bad "#+TITLE: bad\n#+TT_REPO: /tmp/x\n#+TT_BRANCH: main\n\n* Phase 1: no id\n  Goal: something\n\n* Phase 2: dup\n  :PROPERTIES:\n  :ID: p2\n  :CHECKS: true\n  :END:\n  Goal: g\n  Acceptance:\n  - a\n* Phase 3: dup again\n  :PROPERTIES:\n  :ID: p2\n  :CHECKS: true\n  :END:\n  Goal: g\n  Acceptance:\n  - a\n")

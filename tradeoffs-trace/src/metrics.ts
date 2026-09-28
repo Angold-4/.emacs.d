@@ -31,6 +31,31 @@ export interface MetricEvent {
   ts?: string;
   verdict?: string;
   outcome?: string;
+  /** Plan 05d: FLAKE_OBSERVED carries the test's name, the command and
+   * whether the check it belonged to was saved by it. */
+  name?: string;
+  command?: string;
+  candidateSha?: string;
+  savedRound?: boolean;
+}
+
+/** Plan 05d: one test's flakes: how often it was observed and when last. */
+export interface FlakeCount {
+  name: string;
+  count: number;
+  lastSeen: string;
+}
+
+/** Plan 05d: the flake evidence — flakes per test, repair rounds saved, and
+ * launch retries (finding #33). */
+export interface FlakeMetrics {
+  /** One entry per test name, in first-seen order. */
+  perTest: FlakeCount[];
+  total: number;
+  /** Checks that passed only because every new failure was load-only. */
+  roundsSaved: number;
+  /** Worker launches retried after a hello timeout. */
+  launchRetries: number;
 }
 
 /** Per type: how many messages were raised, and where they ended up. `raw`
@@ -75,6 +100,8 @@ export interface PhaseMetrics {
   /** The unexposed-decision proxy: trade-offs a reviewer raised that the
    * worker did not raise itself (a `reviewer-discovered` decision). */
   unexposedTradeoffs: number;
+  /** Plan 05d: flakes per test, rounds saved and launch retries. */
+  flakes: FlakeMetrics;
   /** Plan 05j: the cleanness of the entry ledger. */
   cleanness: {
     /** Live entries in the phase's review. */
@@ -205,6 +232,37 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
     }
   }
 
+  // Plan 05d: flakes per test (count, last seen), the repair rounds saved by
+  // load-only classifications, and launch retries. Folded from the reduced
+  // events, so a restart and `tt contract rebuild` produce the same numbers.
+  const flakeOrder: string[] = [];
+  const flakeCounts = new Map<string, FlakeCount>();
+  const savedKeys = new Set<string>();
+  let launchRetries = 0;
+  for (const e of events) {
+    if (e.type === "LAUNCH_RETRIED") {
+      launchRetries += 1;
+      continue;
+    }
+    if (e.type !== "FLAKE_OBSERVED") continue;
+    const name = e.name ?? "(unnamed)";
+    let entry = flakeCounts.get(name);
+    if (!entry) {
+      entry = { name, count: 0, lastSeen: "" };
+      flakeCounts.set(name, entry);
+      flakeOrder.push(name);
+    }
+    entry.count += 1;
+    if ((e.ts ?? "") > entry.lastSeen) entry.lastSeen = e.ts ?? "";
+    if (e.savedRound === true) savedKeys.add(e.candidateSha ?? e.command ?? name);
+  }
+  const flakes: FlakeMetrics = {
+    perTest: flakeOrder.map((name) => flakeCounts.get(name)!),
+    total: flakeOrder.reduce((n, name) => n + (flakeCounts.get(name)?.count ?? 0), 0),
+    roundsSaved: savedKeys.size,
+    launchRetries,
+  };
+
   const projected = projectEntries({ messages: phase.messages ?? [], entries: phase.entries ?? [] });
   const liveEntries = projected.views.filter((v) => v.live).length;
   const distinctAnchors = new Set(projected.views.filter((v) => v.live).map((v) => JSON.stringify(v.anchor))).size;
@@ -233,6 +291,7 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
     refuseRate: ratio(refuse, accept + refuse),
     blockers,
     unexposedTradeoffs,
+    flakes,
     cleanness,
   };
 }
@@ -276,7 +335,30 @@ export function metricsLine(m: PhaseMetrics): string {
     `unexposed ${m.unexposedTradeoffs}`,
     `entries ${m.cleanness.liveEntries}${m.cleanness.entryBudgetWarning ? ` (over budget ${m.cleanness.entryBudget})` : ""} · hints ${m.cleanness.openHints} · m/s ${m.cleanness.ownerMerges}/${m.cleanness.ownerSplits} · lint ${m.cleanness.lintViolations}`,
   ];
+  const flakes = flakesLine(m);
+  if (flakes) parts.push(flakes);
   return `metrics   ${parts.join(" · ")}`;
+}
+
+/** Plan 05d: the status buffer's own `flakes` row (flakes per test, rounds
+ * saved, launch retries), or undefined when there is nothing to show. */
+export function flakesLine(m: PhaseMetrics): string | undefined {
+  if (m.flakes.total === 0 && m.flakes.launchRetries === 0) return undefined;
+  return `flakes ${m.flakes.total}${flakeDetail(m.flakes)} · saved ${m.flakes.roundsSaved} round${m.flakes.roundsSaved === 1 ? "" : "s"} · launch retries ${m.flakes.launchRetries}`;
+}
+
+/** `(name ×count, last HH:MM)` for the flakes line, or an empty string when
+ * none was observed. Every test name the plan observed is named, so the owner
+ * sees WHICH test is flaking, not just a count. */
+function flakeDetail(f: FlakeMetrics): string {
+  if (f.perTest.length === 0) return "";
+  const last = [...f.perTest].map((t) => t.lastSeen).filter((t) => t.length > 0).sort().pop();
+  const who = [...f.perTest]
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, 4)
+    .map((t) => `${t.name} ×${t.count}`)
+    .join(", ");
+  return ` (${who}${last ? `, last ${last.slice(11, 16)}` : ""})`;
 }
 
 /** The same numbers as a small Markdown section for the `tt summary` PR body. */
@@ -295,6 +377,8 @@ export function metricsSummary(m: PhaseMetrics): string[] {
     `- Owner wait: ${duration(m.ownerWaitMs)}`,
     `- Blockers: ${m.blockers.escalated} escalated, ${m.blockers.downgraded} downgraded, ${m.blockers.incomplete} incomplete`,
     `- Unexposed-decision proxy (reviewer-raised trade-offs the worker did not raise): ${m.unexposedTradeoffs}`,
+    `- Flakes per test: ${m.flakes.perTest.length === 0 ? "none" : m.flakes.perTest.map((t) => `\`${t.name}\` ×${t.count} (last ${t.lastSeen || "?"})`).join(", ")}`,
+    `- Rounds saved by load-only re-runs: ${m.flakes.roundsSaved}; launch retries: ${m.flakes.launchRetries}`,
     `- Cleanness: ${m.cleanness.liveEntries} live entries (budget ${m.cleanness.entryBudget}${m.cleanness.entryBudgetWarning ? ", OVER BUDGET" : ""}) · ${m.cleanness.entriesPerAnchor} entries per distinct anchor · ${m.cleanness.openHints} open ≈ hints · owner merges/splits ${m.cleanness.ownerMerges}/${m.cleanness.ownerSplits} · lint violations ${m.cleanness.lintViolations}`,
   ];
 }

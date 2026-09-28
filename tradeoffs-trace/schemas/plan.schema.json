@@ -63,6 +63,15 @@
       "description": "A program entry only: roles its plan inherited from the program's #+TT_MODELS, already linted once at the program level.",
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
+    },
+    "rerun": {
+      "description": "#+TT_RERUN: the single-test command newly failing tests are re-run with, using the {name} and {file} placeholders. Absent: the built-in Node/cargo defaults, or the strict rule.",
+      "type": "string",
+      "minLength": 1
+    },
+    "rerunLine": {
+      "description": "Lint-only: the 1-based line of #+TT_RERUN in the source Org file.",
+      "type": "integer"
     }
   },
   "$defs": {

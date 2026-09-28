@@ -20,6 +20,26 @@ const FIXTURES = fileURLToPath(new URL("../fixtures/atlas-plans", import.meta.ur
 
 const plan = (phases: LintPhaseInput[], sourceFile = "/x/PLAN.org"): LintPlanInput => ({ sourceFile, phases });
 
+test("plan-lint: #+TT_RERUN accepts {name}/{file} and rejects any other placeholder", () => {
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  assert.deepEqual(lintPlan(base).filter((f) => f.rule === "rerun-template"), []);
+
+  const ok = lintPlan({ ...base, rerun: "node --test --test-name-pattern {name} {file}", rerunLine: 5 });
+  assert.deepEqual(ok.filter((f) => f.rule === "rerun-template"), []);
+
+  const unknown = lintPlan({ ...base, rerun: "cargo test --test {file} -- --exact {crate}", rerunLine: 6 });
+  const finding = unknown.find((f) => f.rule === "rerun-template");
+  assert.ok(finding, "the unknown placeholder must be reported");
+  assert.equal(finding!.severity, "error");
+  assert.equal(finding!.phaseId, "rerun");
+  assert.equal(finding!.line, 6);
+  assert.match(finding!.problem, /unknown placeholder \{crate\}/);
+  assert.match(finding!.fix, /\{name\}/);
+
+  const noName = lintPlan({ ...base, rerun: "sh -c 'exit 0'", rerunLine: 7 });
+  assert.match(noName.find((f) => f.rule === "rerun-template")!.problem, /does not name the failing test/);
+});
+
 test("plan-lint: an owner-actor acceptance item is an error with its line", () => {
   const findings = lintPlan(
     plan([{ id: "13.10", acceptance: ["the owner records a live run", "the report is in the repo"], acceptanceLines: [39, 40] }]),

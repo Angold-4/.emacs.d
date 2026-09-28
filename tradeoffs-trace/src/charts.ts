@@ -149,6 +149,9 @@ export function renderPhaseChart(
   lines.push("tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions.ts); do not edit");
   lines.push(`current state: ${stats.current ?? "?"}${stats.current ? `   (entered ${stats.entries[stats.current] ?? 0}x - ${formatMs(stats.timeMs[stats.current])})` : ""}`);
   if (stats.currentRun) lines.push(`current run: ${stats.currentRun}`);
+  // Plan 05d: CHECKING's own re-run step (a newly failing test is re-run
+  // alone before the check may fail; a load-only flake passes it).
+  lines.push("note: a check that names new failures re-runs each alone before it may fail; a load-only flake passes it (FLAKE_OBSERVED)");
   lines.push("");
 
   const section = (

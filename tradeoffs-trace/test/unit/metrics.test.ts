@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 
-import { computeMetrics, metricsForRunDir, metricsLine, metricsSummary, projectMetrics, type MetricsTimeline } from "../../src/metrics.ts";
+import { computeMetrics, flakesLine, metricsForRunDir, metricsLine, metricsSummary, projectMetrics, type MetricsTimeline } from "../../src/metrics.ts";
 import { applyEntryEvent, planEntryEvents, type Entry } from "../../src/core/entries.ts";
 import { basePhase, makeMessage } from "./helpers.ts";
 
@@ -135,6 +135,37 @@ test("the cleanness metrics join views/metrics.json, the status line and tt summ
   assert.ok(metricsLine(m).includes("entries 13 (over budget 12)"));
   assert.ok(metricsLine(m).includes("lint 0"));
   assert.ok(metricsSummary(m).some((l) => l.includes("Cleanness") && l.includes("13 live entries")));
+});
+
+test("flakes per test, rounds saved and launch retries are counted and shown (plan 05d)", () => {
+  const phase = basePhase({ runId: "r-metrics", phaseId: "p1" });
+  const events = [
+    { type: "FLAKE_OBSERVED", name: "no-unshown-ballots", command: "node --test", candidateSha: "C1", savedRound: true, ts: "2026-09-27T09:00:10.000Z" },
+    { type: "FLAKE_OBSERVED", name: "no-unshown-ballots", command: "node --test", candidateSha: "C2", savedRound: true, ts: "2026-09-27T09:20:00.000Z" },
+    { type: "FLAKE_OBSERVED", name: "complete-ballots", command: "node --test", candidateSha: "C2", savedRound: false, ts: "2026-09-27T09:21:00.000Z" },
+    { type: "LAUNCH_RETRIED", role: "worker", ts: "2026-09-27T09:22:00.000Z" },
+    { type: "LAUNCH_RETRIED", role: "worker", ts: "2026-09-27T09:23:00.000Z" },
+  ];
+  const m = computeMetrics(phase, TIMELINE, events);
+  assert.deepEqual(m.flakes.perTest, [
+    { name: "no-unshown-ballots", count: 2, lastSeen: "2026-09-27T09:20:00.000Z" },
+    { name: "complete-ballots", count: 1, lastSeen: "2026-09-27T09:21:00.000Z" },
+  ]);
+  assert.equal(m.flakes.total, 3);
+  // Two candidates' checks were saved by load-only re-runs; the third
+  // observation belonged to a check that still failed.
+  assert.equal(m.flakes.roundsSaved, 2);
+  assert.equal(m.flakes.launchRetries, 2);
+
+  const line = metricsLine(m);
+  assert.match(line, /flakes 3 \(no-unshown-ballots ×2, complete-ballots ×1, last 09:21\)/);
+  assert.match(line, /saved 2 rounds/);
+  assert.match(line, /launch retries 2/);
+  const summary = metricsSummary(m).join("\n");
+  assert.match(summary, /`no-unshown-ballots` ×2/);
+  assert.match(summary, /Rounds saved by load-only re-runs: 2; launch retries: 2/);
+  // A run with no flakes has no `flakes` row in the status.
+  assert.equal(flakesLine(computeMetrics(basePhase({ runId: "r", phaseId: "p1" }), TIMELINE, [])), undefined);
 });
 
 test("the metrics projection is deterministic and the status line carries every number", () => {

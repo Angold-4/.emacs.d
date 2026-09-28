@@ -21,9 +21,11 @@
 // numbers come from the Org source: Emacs records them on `acceptanceLines`
 // when it parses the plan, and a hand-written JSON plan simply gets no line.
 
+import { rerunTemplateIssue } from "./test-failures.ts";
+
 export type LintSeverity = "error" | "warning";
 
-export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no-tolerance" | "model-declaration";
+export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no-tolerance" | "model-declaration" | "rerun-template";
 
 /** The roles #+TT_MODELS may assign a model to. */
 const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
@@ -82,6 +84,11 @@ export interface LintPlanInput {
   phases?: LintPhaseInput[];
   models?: LintModels;
   modelsLine?: number;
+  /** Plan 05d: the `#+TT_RERUN:` single-test template (`{name}`/`{file}`).
+   * Absent means the built-in Node/cargo defaults (or the strict rule). */
+  rerun?: string;
+  /** Lint-only: the 1-based line of `#+TT_RERUN:` in the source Org file. */
+  rerunLine?: number;
   modelsRepeated?: string[];
   /** Roles this entry inherited from a program-level #+TT_MODELS. They are
    * already checked once at the program level; rechecking them per entry
@@ -287,9 +294,34 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
   return out;
 }
 
-/** Lint one plan (all its phases' acceptance items and its #+TT_MODELS). Pure. */
+/** Plan 05d: lint `#+TT_RERUN:` — only `{name}` and `{file}` are known, and
+ * a template that never names the failing test would run the same command
+ * for every one of them. Absent: no findings, so a plan without the keyword
+ * is unchanged. */
+export function lintRerun(plan: LintPlanInput): LintFinding[] {
+  if (typeof plan.rerun !== "string" || plan.rerun.trim().length === 0) return [];
+  const issue = rerunTemplateIssue(plan.rerun);
+  if (!issue) return [];
+  return [
+    {
+      severity: "error",
+      rule: "rerun-template",
+      // A rerun template is plan-wide, not phase-scoped; the `rerun` label
+      // keeps `formatFinding`'s shape.
+      phaseId: "rerun",
+      item: plan.rerun,
+      line: plan.rerunLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_RERUN has ${issue}`,
+      fix: "write one command that runs one test, using {name} (and {file} only when the runner's output locates the test), for example `node --test --test-name-pattern {name} {file}` or `cargo test -- --exact {name}`",
+    },
+  ];
+}
+
+/** Lint one plan (all its phases' acceptance items, its #+TT_MODELS and its
+ * #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(plan)];
+  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
     const acceptance = phase.acceptance ?? [];

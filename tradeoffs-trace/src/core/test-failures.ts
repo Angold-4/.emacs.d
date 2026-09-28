@@ -27,6 +27,10 @@ export interface BaselineCommand {
   durationMs: number;
   /** Failing test names parsed from this command's output (deduped, in order). */
   failures: string[];
+  /** Plan 05d: names that failed this command on the base but PASSED when
+   * re-run alone — a base flake, visible and never excusing (finding #25).
+   * Never part of `failures`, so a candidate failing one is never excused. */
+  flakes?: string[];
   /** Base name of the command's log under `<run>/checks/base/`. */
   log?: string;
 }
@@ -46,6 +50,8 @@ export interface Baseline {
   commands: BaselineCommand[];
   /** Every failing test name across `commands`, deduped, in order. */
   failures: string[];
+  /** Plan 05d: every `base flake` across `commands`, deduped, in order. */
+  flakes?: string[];
 }
 
 /** True iff the command ran to completion and exited non-zero. Only this shape
@@ -98,40 +104,217 @@ const TAP_COMMENT = /\s+#.*$/;
 /** Color codes make every one of the patterns above miss. */
 const ANSI = /\u001b\[[0-9;]*m/g;
 
-/** Every failing test name `output` yields, deduped, in first-seen order.
- * An empty array means "nothing parseable" — the caller must then treat the
- * check as strictly failed. */
-export function parseTestFailures(output: string): string[] {
+/** Plan 05d: which runner a parsed failing name came from. Only the Node test
+ * runner and cargo have built-in single-test commands (`singleTestCommand`);
+ * ERT names parse but have no default, so a plan that wants them re-run must
+ * give a `#+TT_RERUN:` template. */
+export type TestRunner = "node" | "cargo" | "ert";
+
+/** One parsed failing test: its name, the runner whose output named it, and —
+ * for node:test — the file the output located it in, when the reporter wrote
+ * one (TAP's `location: …` block, or the spec reporter's `test at <file>…`
+ * line). The file is what `{file}` in a `#+TT_RERUN:` template substitutes. */
+export interface ParsedTestFailure {
+  name: string;
+  runner: TestRunner;
+  file?: string;
+}
+
+/** TAP's location line (`location: '/tmp/x.test.js:3:1'`). */
+const NODE_TAP_LOCATION = /^\s*location: '(.+?):\d+:\d+'\s*$/;
+/** The spec reporter's own file line (`test at x.test.js:3:1`). */
+const NODE_SPEC_LOCATION = /^\s*test at (.+?):\d+:\d+\s*$/;
+
+/** Every failing test `output` yields, in first-seen order, each tagged with
+ * the runner its line came from and (for node:test) the file the reporter
+ * located it in, when one was written. Deduped by name. */
+export function parseTestFailuresDetailed(output: string): ParsedTestFailure[] {
   const text = output.replace(ANSI, "");
-  const names: string[] = [];
-  const seen = new Set<string>();
-  const add = (raw: string): void => {
+  const lines = text.split("\n").map((l) => l.trimEnd());
+  const out: ParsedTestFailure[] = [];
+  const byName = new Map<string, ParsedTestFailure>();
+  let specFile: string | undefined;
+  const add = (raw: string, runner: TestRunner, file?: string): void => {
     const name = raw.trim();
-    if (name.length === 0 || NOT_A_TEST_NAME.test(name) || seen.has(name)) return;
-    seen.add(name);
-    names.push(name);
+    if (name.length === 0 || NOT_A_TEST_NAME.test(name)) return;
+    const existing = byName.get(name);
+    if (existing) {
+      // The spec reporter lists a failure twice (in the run, then under
+      // `failing tests:` after its `test at <file>` line); the later mention
+      // is the one that carries the file, so fill it in rather than dropping
+      // it with the duplicate.
+      if (existing.file === undefined && file !== undefined) existing.file = file;
+      return;
+    }
+    const parsed: ParsedTestFailure = file ? { name, runner, file } : { name, runner };
+    byName.set(name, parsed);
+    out.push(parsed);
   };
-  for (const rawLine of text.split("\n")) {
-    const line = rawLine.trimEnd();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const cargo = line.match(CARGO_FAILED);
     if (cargo) {
-      add(cargo[1]);
+      add(cargo[1], "cargo");
+      continue;
+    }
+    // The spec reporter writes `test at <file>:<line>:<col>` just above the
+    // `✖ <name>` line it belongs to.
+    const specLoc = line.match(NODE_SPEC_LOCATION);
+    if (specLoc) {
+      specFile = specLoc[1];
       continue;
     }
     const tap = line.match(NODE_TAP_FAILED);
     if (tap) {
-      add(tap[1].replace(TAP_COMMENT, ""));
+      // TAP puts the location inside the test's YAML block, after the
+      // `not ok` line; read forward until the next test line.
+      let file: string | undefined;
+      for (let j = i + 1; j < Math.min(lines.length, i + 16); j++) {
+        if (/^\s*(?:not ok|ok) \d+/.test(lines[j])) break;
+        const loc = lines[j].match(NODE_TAP_LOCATION);
+        if (loc) {
+          file = loc[1];
+          break;
+        }
+      }
+      add(tap[1].replace(TAP_COMMENT, ""), "node", file);
       continue;
     }
     const spec = line.match(NODE_SPEC_FAILED);
     if (spec) {
-      add(spec[1]);
+      add(spec[1], "node", specFile);
       continue;
     }
     const ert = line.match(ERT_FAILED);
-    if (ert) add(ert[1]);
+    if (ert) add(ert[1], "ert");
   }
-  return names;
+  return out;
+}
+
+/** Every failing test name `output` yields, deduped, in first-seen order.
+ * An empty array means "nothing parseable" — the caller must then treat the
+ * check as strictly failed. */
+export function parseTestFailures(output: string): string[] {
+  return parseTestFailuresDetailed(output).map((f) => f.name);
+}
+
+// ---------------------------------------------------------------------------
+// Plan 05d: re-running a newly failing test alone.
+//
+// A check can fail because the machine was loaded, not because the candidate
+// is broken (findings #4, #10, #18, #25, #31, #35). Before a check that names
+// new failures may fail the gate, each such test is re-run alone: a test that
+// passes when re-run is `load-only`, one that still fails `reproduces alone`.
+// The command comes from the plan's `#+TT_RERUN:` template (with `{name}` and
+// `{file}`) or from a built-in default for the Node test runner and cargo —
+// the two runners this module parses. With no template and no default the
+// strict rule applies: nothing is re-run and the failure stands.
+
+/** Every `{...}` placeholder a `#+TT_RERUN:` template contains. */
+export function rerunPlaceholders(template: string): string[] {
+  return [...template.matchAll(/\{([^}]*)\}/g)].map((m) => m[1]);
+}
+
+/** Why a `#+TT_RERUN:` template cannot be used, or undefined when it is fine.
+ * Only `{name}` and `{file}` are known, and a template that never names the
+ * failing test would run the same command for every one of them. */
+export function rerunTemplateIssue(template: string): string | undefined {
+  for (const placeholder of rerunPlaceholders(template)) {
+    if (placeholder !== "name" && placeholder !== "file") return `the unknown placeholder {${placeholder}}`;
+  }
+  if (!template.includes("{name}")) return "the template does not name the failing test ({name})";
+  return undefined;
+}
+
+function runnerAndFileFor(output: string, name: string): ParsedTestFailure | undefined {
+  return parseTestFailuresDetailed(output).find((f) => f.name === name);
+}
+
+/** Plan 05d: the single-test command for one failing name: the plan's
+ * `#+TT_RERUN:` template when given, otherwise the built-in default for the
+ * runner the name's own output line came from. Undefined means "no command is
+ * known", and the caller must then keep the strict rule (no re-run).
+ *
+ * A template that uses `{file}` needs a file the output located; without one
+ * the command cannot be built (`{file}` has no safe default). */
+export function singleTestCommand(name: string, output: string, template?: string): string | undefined {
+  const named = runnerAndFileFor(output, name);
+  const file = named?.file;
+  if (template !== undefined && template.trim().length > 0) {
+    if (template.includes("{file}") && file === undefined) return undefined;
+    // A function replacement, so a `$` in a test name is never read as a
+    // replacement pattern.
+    return template.replace(/\{name\}/g, () => name).replace(/\{file\}/g, () => file ?? "");
+  }
+  if (named?.runner === "cargo") return `cargo test -- --exact ${name}`;
+  if (named?.runner === "node") {
+    // The file must be known: `node --test --test-name-pattern` exits 0 when
+    // nothing matches, so a pattern with no file could report a real failure
+    // as a flake. Node's test names routinely contain spaces, so the pattern
+    // is quoted (a plan that needs different quoting supplies a template).
+    if (!file) return undefined;
+    const pattern = `"${name.replace(/(["$\\])/g, "\\$1")}"`;
+    return `node --test --test-name-pattern ${pattern} ${file}`;
+  }
+  return undefined;
+}
+
+/** The single-test commands for every name in `names`, in order. A name whose
+ * command cannot be built stays in the list with `command: undefined`, so the
+ * caller records it as `reproduces alone` (unproven flake = real failure)
+ * instead of silently dropping it. */
+export function rerunCommandsFor(
+  output: string,
+  names: readonly string[],
+  template?: string,
+): Array<{ name: string; command?: string }> {
+  return names.map((name) => {
+    const command = singleTestCommand(name, output, template);
+    return command === undefined ? { name } : { name, command };
+  });
+}
+
+/** One re-run's outcome, as the caller observed it. */
+export interface TestRerunOutcome {
+  /** Process exit status, or null when the re-run was killed by a signal. */
+  exitCode: number | null;
+  timedOut: boolean;
+}
+
+/** A new failing test's classification: `reproduces alone` (a real failure)
+ * or `load-only` (it passed alone). A re-run that timed out counts as
+ * `reproduces alone` — a truncated run proves nothing, so the strict
+ * direction is kept; a name with no command at all is real for the same
+ * reason. */
+export interface TestClassification {
+  name: string;
+  /** The single-test command that was re-run, when one could be built. */
+  rerunCommand?: string;
+  reproducesAlone: boolean;
+  loadOnly: boolean;
+  failingExitCode: number | null;
+  /** The exit status of every re-run that was attempted, in order. */
+  rerunExitCodes: Array<number | null>;
+  rerunTimedOut: boolean;
+}
+
+export function classifyRerun(
+  name: string,
+  command: string | undefined,
+  failingExitCode: number | null,
+  reruns: readonly TestRerunOutcome[],
+): TestClassification {
+  const loadOnly = reruns.some((r) => !r.timedOut && r.exitCode === 0);
+  const base: TestClassification = {
+    name,
+    ...(command !== undefined ? { rerunCommand: command } : {}),
+    reproducesAlone: !loadOnly,
+    loadOnly,
+    failingExitCode,
+    rerunExitCodes: reruns.map((r) => r.exitCode),
+    rerunTimedOut: reruns.some((r) => r.timedOut),
+  };
+  return base;
 }
 
 export interface CheckFailureVerdict {
@@ -205,6 +388,22 @@ export function baselineFailureNames(commands: readonly BaselineCommand[]): stri
   return names;
 }
 
+/** Plan 05d: every `base flake` across a baseline's commands, deduped, in
+ * order. A base flake is visible and never excuses a candidate's failure of
+ * the same test. */
+export function baselineFlakeNames(commands: readonly BaselineCommand[]): string[] {
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const command of commands) {
+    for (const name of command.flakes ?? []) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
+  }
+  return names;
+}
+
 /** Shape-check a JSON-parsed baseline. Undefined for anything that is not one
  * (a corrupt or pre-01e file), so callers fall back to the strict rule. */
 export function parseBaseline(value: unknown): Baseline | undefined {
@@ -223,10 +422,12 @@ export function parseBaseline(value: unknown): Baseline | undefined {
       timedOut: c.timedOut === true,
       durationMs: typeof c.durationMs === "number" ? c.durationMs : 0,
       failures: Array.isArray(c.failures) ? c.failures.filter((f): f is string => typeof f === "string") : [],
+      ...(Array.isArray(c.flakes) ? { flakes: c.flakes.filter((f): f is string => typeof f === "string") } : {}),
       ...(typeof c.log === "string" ? { log: c.log } : {}),
     });
   }
   const stored = Array.isArray(raw.failures) ? raw.failures.filter((f): f is string => typeof f === "string") : undefined;
+  const storedFlakes = Array.isArray(raw.flakes) ? raw.flakes.filter((f): f is string => typeof f === "string") : undefined;
   return {
     baseSha: raw.baseSha,
     // A record written before the tree field existed has no identity to trust,
@@ -236,6 +437,7 @@ export function parseBaseline(value: unknown): Baseline | undefined {
     at: typeof raw.at === "string" ? raw.at : "",
     commands,
     failures: stored ?? baselineFailureNames(commands),
+    ...((storedFlakes ?? baselineFlakeNames(commands)).length > 0 ? { flakes: storedFlakes ?? baselineFlakeNames(commands) } : {}),
   };
 }
 
@@ -259,6 +461,8 @@ export function baselineStatusLine(baseline: Baseline | undefined): string | und
   const failed = baseline.commands.some((c) => c.timedOut || c.exitCode !== 0 || c.signal != null);
   if (!failed) return undefined;
   const names = baseline.failures;
-  if (names.length === 0) return "base fails: 0 tests (no test names parsed; checks stay strict)";
-  return `base fails: ${names.length} tests: ${names.join(", ")}`;
+  const flakes = baseline.flakes ?? baselineFlakeNames(baseline.commands);
+  const flakeNote = flakes.length > 0 ? `; base flakes (passed alone, never excusing): ${flakes.join(", ")}` : "";
+  if (names.length === 0) return `base fails: 0 tests (no test names parsed; checks stay strict)${flakeNote}`;
+  return `base fails: ${names.length} tests: ${names.join(", ")}${flakeNote}`;
 }
