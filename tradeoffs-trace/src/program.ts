@@ -668,6 +668,12 @@ export function programReviewText(dir: string): string {
   const { nodes, state, readableIds } = foldProgram(dir);
   const root = path.dirname(path.dirname(dir));
   const phases: Array<{ phaseId: string; readableId?: string; candidate?: { sha: string }; messages?: unknown[]; entries?: unknown[] }> = [];
+  // The lint runs per phase, on each phase's OWN entries and message ids
+  // (every phase numbers E-1/T-1 from scratch, so a single combined
+  // projection would collide ids and fire one-anchor on a topic that recurs
+  // across phases — findings M-16/A-20). The program view itself folds those
+  // cross-phase duplicates into one row.
+  const violations: Array<{ detail: string }> = [];
   for (const n of nodes) {
     const s = state.nodes[n.id];
     if (!s.runId) continue;
@@ -675,10 +681,18 @@ export function programReviewText(dir: string): string {
       const runDir = path.join(root, s.runId);
       const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
       const phase = rebuildState(runDir, plan, { lenient: true }).phase;
+      const sha = phase.candidate?.sha;
+      const projected = projectEntries({
+        messages: phase.messages ?? [],
+        entries: phase.entries ?? [],
+        newestCandidateSha: sha,
+        anchorResolves: candidateAnchorResolves(sha ? path.join(runDir, "candidates", sha) : undefined),
+      });
+      violations.push(...runReviewLint({ projected, newestCandidateSha: sha, messages: phase.messages ?? [] }).violations);
       phases.push({
         phaseId: phase.phaseId,
         readableId: readableIds[n.id],
-        candidate: phase.candidate ? { sha: phase.candidate.sha } : undefined,
+        candidate: sha ? { sha } : undefined,
         messages: phase.messages ?? [],
         entries: phase.entries ?? [],
       });
@@ -686,21 +700,11 @@ export function programReviewText(dir: string): string {
       // the run is not readable (yet): it contributes no entries
     }
   }
-  // Plan 05j: the header names the newest candidate the program reflects, and
-  // the lint runs on the program render too (finding M-3). The newest is the
-  // last node candidate; the combined projection is what the lint checks.
   const newestCandidateSha = [...phases].reverse().map((ph) => ph.candidate?.sha).find((sha) => typeof sha === "string" && sha.length > 0);
-  const combined = projectEntries({
-    messages: phases.flatMap((ph) => (ph.messages ?? []) as never[]),
-    entries: phases.flatMap((ph) => (ph.entries ?? []) as never[]),
-    newestCandidateSha,
-    anchorResolves: candidateAnchorResolves(undefined),
-  });
-  const lint = runReviewLint({ projected: combined, newestCandidateSha, messages: phases.flatMap((ph) => (ph.messages ?? []) as never[]) });
   return renderProgramEntryReview({
     program: { id: path.basename(dir), phases: phases as never },
     newestCandidateSha,
-    lintError: lint.ok ? undefined : lint.firstLine,
+    lintError: violations.length > 0 ? violations[0].detail : undefined,
   });
 }
 

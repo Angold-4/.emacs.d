@@ -405,18 +405,19 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   is raised (a round-time pass, so `ENTRY_OPENED`/`MESSAGE_LINKED` are in the
   log and entry ids are stable), linking a message to an open entry it
   shares an anchor with. Once per round, after the reviews and before the
-  evaluators, that pass runs again and records `ENTRY_CURATED`; the
-  evaluators wait for it. When a plan names a `curator` model (`#+TT_MODELS
-  curator=…`, typically the evaluator's model), that pass is a curator AGENT
-  instead: it sees every message of every type plus every open entry and
-  returns through `curate_entries`, whose only ops are `link`, `open` and
-  `retitle` (any other op is refused before an event is applied; it cannot
-  drop, resolve, merge or change a type). Without a `curator` model the
-  runtime's own anchor pass is the round's curator step, so a plan that names
-  no curator launches exactly the roles it always did.
+  evaluators, that pass also starts a curator AGENT on the evaluator's model
+  (a plan may override it with `#+TT_MODELS curator=…`) and records
+  `ENTRY_CURATED`. The agent is launched first but never blocks the
+  evaluators: the evaluator and panel still launch with their own models even
+  when the curator cannot run. The agent sees every message of every type plus
+  every open entry and returns through `curate_entries`, whose only ops are
+  `link`, `open` and `retitle` (any other op is refused before an event is
+  applied; it cannot drop, resolve, merge or change a type).
   Reviewers' prompts also list the open entries, and a reviewer's
   `sameAs E-n` links its raise to that entry (refused and logged when they
-  share no anchor).
+  share no anchor). The owner's `m` is the one exception to the anchor rule:
+  it merges two near-duplicates that deliberately share no anchor, so the
+  links it moves are kept.
 - **Latest state.** Each entry's state is computed against the newest
   candidate; the view's header names it. An entry whose messages all concern
   older candidates and that a later round resolved leaves the live view. An

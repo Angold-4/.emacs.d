@@ -298,6 +298,15 @@ test("near-duplicates without a shared anchor stay separate with a ≈ hint and 
   assert.match(view, /≈ E-\d/);
   const merged = applyEntryEvent(projected.views.map((v) => v.entry), { type: "ENTRY_MERGED_BY_OWNER", entryId: projected.views[0].entry.id, intoEntryId: projected.views[1].entry.id, by: "owner" });
   assert.ok(merged.ok);
+  // The merged entry keeps BOTH messages even though they share no anchor
+  // (finding M-14): the owner's `m` is the exception to the anchor rule.
+  const afterMerge = merged.ok ? merged.entries : [];
+  const target = afterMerge.find((e) => e.id === projected.views[1].entry.id)!;
+  assert.deepEqual(target.links.map((l) => l.messageId).sort(), ["T-2", "T-41"]);
+  const mergedProjection = projectEntries({ messages: [a, b], entries: afterMerge });
+  assert.equal(mergedProjection.views.filter((v) => v.live).length, 1);
+  assert.deepEqual(mergedProjection.views[0].messages.map((m) => m.id).sort(), ["T-2", "T-41"]);
+  assert.equal(mergedProjection.accounting.unaccounted, 0);
 });
 
 test("the curator's tool rejects any operation other than link, open and retitle", () => {
@@ -376,12 +385,12 @@ function atlas15aRound1(): A15Fixture {
     message("T-17", "tradeoff", ["src/c.rs:1 rename it"], { raisedBy: "worker", title: "rename it" }),
     message("T-5", "tradeoff", ["src/d.rs:1 one lock"], { raisedBy: "worker", title: "one lock per request" }),
     message("T-11", "tradeoff", ["src/d.rs:1 one lock"], { raisedBy: "worker", title: "one lock per request" }),
-    // Five findings of one round, linked by a shared decision anchor.
-    message("F-5", "finding", ["src/e.rs:1 a missing test"], { raisedBy: "M", title: "a missing test", sourceRecordId: "D-M-5" }),
-    message("F-6", "finding", ["src/f.rs:1 a wrong error"], { raisedBy: "A", title: "a wrong error", sourceRecordId: "D-M-5" }),
-    message("F-7", "finding", ["src/g.rs:1 an off-by-one"], { raisedBy: "B", title: "an off-by-one", sourceRecordId: "D-M-5" }),
-    message("F-8", "finding", ["src/h.rs:1 a leak"], { raisedBy: "M", title: "a leak", sourceRecordId: "D-M-5" }),
-    message("F-9", "finding", ["src/i.rs:1 a stale cache"], { raisedBy: "A", title: "a stale cache", sourceRecordId: "D-M-5" }),
+    // Five findings of one round, each its own topic (distinct files).
+    message("F-5", "finding", ["src/e.rs:1 a missing test"], { raisedBy: "M", title: "a missing test" }),
+    message("F-6", "finding", ["src/f.rs:1 a wrong error"], { raisedBy: "A", title: "a wrong error" }),
+    message("F-7", "finding", ["src/g.rs:1 an off-by-one"], { raisedBy: "B", title: "an off-by-one" }),
+    message("F-8", "finding", ["src/h.rs:1 a leak"], { raisedBy: "M", title: "a leak" }),
+    message("F-9", "finding", ["src/i.rs:1 a stale cache"], { raisedBy: "A", title: "a stale cache" }),
   ];
   // Two dropped with a reason.
   const dropped = (id: string, title: string, reason: string): Message => {
@@ -391,31 +400,10 @@ function atlas15aRound1(): A15Fixture {
     return m;
   };
   messages.push(dropped("T-3", "a trivial rename", "trivial, not reviewable"), dropped("T-6", "a whitespace change", "trivial, not reviewable"));
-  const link = (entry: string, ids: string[], anchor: Entry["anchor"]): Entry => ({
-    id: entry,
-    phaseId: "p1",
-    title: messages.find((m) => m.id === ids[0])!.title,
-    type: entryTypeOf(ids.map((id) => messages.find((m) => m.id === id)!)),
-    state: "open",
-    anchor,
-    links: ids.map((id) => ({ messageId: id, anchor, reason: "shared anchor" })),
-  });
-  const entries: Entry[] = [
-    link("E-1", ["B-1", "T-14", "F-1", "T-40"], { kind: "file", path: "src/priced_frame.rs", lines: [88, 104] }),
-    link("E-2", ["T-7", "F-3"], { kind: "file", path: "src/priced_frame.rs", lines: [210, 224] }),
-    link("E-3", ["T-15", "F-4"], { kind: "file", path: "src/fixtures/rth.rs", lines: [1, 40] }),
-    link("E-4", ["F-2", "T-27"], { kind: "file", path: "src/util.rs", lines: [3, 3] }),
-    link("E-5", ["T-8", "T-10", "T-20", "T-25"], { kind: "file", path: "src/a.rs", lines: [1, 1] }),
-    link("E-6", ["T-1", "T-9", "T-18"], { kind: "file", path: "src/b.rs", lines: [1, 1] }),
-    link("E-7", ["T-4", "T-12", "T-17"], { kind: "file", path: "src/c.rs", lines: [1, 1] }),
-    link("E-8", ["T-5", "T-11"], { kind: "file", path: "src/d.rs", lines: [1, 1] }),
-    link("E-9", ["F-5", "F-6", "F-7", "F-8", "F-9"], { kind: "decision", id: "D-M-5" }),
-    // The two near-duplicates the curator did NOT merge (no shared anchor):
-    // each opens its own entry and carries a deterministic ≈ hint.
-    link("E-10", ["T-2"], { kind: "file", path: "src/fills.rs", lines: [12, 18] }),
-    link("E-11", ["T-41"], { kind: "file", path: "src/fills.rs", lines: [90, 96] }),
-  ];
-  return { messages, entries };
+  // The entries are the RUNTIME's own linking pass over these messages
+  // (`planEntryEvents`), not a hand-built list: this fixture shows that the
+  // shared-anchor rule collapses the cross-type duplicates (finding M-17).
+  return { messages, entries: openAll(messages) };
 }
 
 test("15a's first round renders as one entry per topic, three sections only, with 0 unaccounted", () => {
@@ -430,16 +418,17 @@ test("15a's first round renders as one entry per topic, three sections only, wit
   assert.ok(review.indexOf("* Findings") < review.indexOf("* Trade-offs"));
   // One entry per topic: the blocker topic shows once, with its trade-off and
   // finding under it. The two near-duplicates without a shared anchor stay
-  // separate (11 = 9 topics + 2 hinted near-duplicates).
+  // separate and carry the ≈ hint.
   const projected0 = projectEntries({ messages, entries });
   assert.equal([...review.matchAll(/^\*\* /gm)].length, projected0.views.filter((v) => v.live).length);
-  assert.equal(projected0.views.length, 11);
+  assert.equal(projected0.views.length, 15);
+  assert.equal(projected0.views.filter((v) => v.hint).length, 2);
   // The blocker topic appears as exactly one entry heading.
   assert.match(review, /^\*\* E-1 no priced-frame counter/m);
   assert.equal([...review.matchAll(/^\*\* E-1 /gm)].length, 1);
   // Accounting reconciles.
   const line = review.trim().split("\n").pop()!;
-  assert.match(line, /^31 raw → 11 entries · \d+ linked · 2 dropped · 0 unaccounted · unexposed \d+$/);
+  assert.match(line, /^31 raw → 15 entries · 29 linked · 2 dropped · 0 unaccounted · unexposed \d+$/);
   const projected = projectEntries({ messages, entries });
   assert.equal(projected.accounting.unaccounted, 0);
   const lint = runReviewLint({ projected, newestCandidateSha: "C1", messages });

@@ -20,7 +20,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
-import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, type CuratorProposal, type Entry } from "./core/entries.ts";
+import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { candidateAnchorResolves, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
@@ -2817,16 +2817,13 @@ export class Conductor {
       do {
         this.#redriveRequested = false;
         const actions = next(this.#state);
-        // Plan 05j: the curator pass runs once per round, after the reviews
-        // and before the evaluators. It is a real step in the loop: while the
-        // candidate is uncurated, evaluator dispatches wait.
+        // Plan 05j: the curator pass starts once per round, after the reviews
+        // and before the evaluators. It is launched first, but it never BLOCKS
+        // the evaluators: OD-1 requires the evaluator and panel to keep
+        // launching with their models even when the curator agent cannot run.
         const p = this.#state.phase;
-        const curating = p.phase === "EVALUATING" && !!p.candidate && p.curatedFor !== p.candidate.sha;
-        if (curating) this.#curateRound(p.candidate!.sha);
-        for (const action of actions) {
-          if (curating && action.type === "dispatch_evaluation") continue;
-          this.#dispatch(action);
-        }
+        if (p.phase === "EVALUATING" && p.candidate && p.curatedFor !== p.candidate.sha) this.#curateRound(p.candidate!.sha);
+        for (const action of actions) this.#dispatch(action);
       } while (this.#redriveRequested);
     } finally {
       this.#driving = false;
@@ -3390,11 +3387,33 @@ export class Conductor {
       if (handle.role !== "curator") return { ok: false, reason: `curate_entries is not accepted from role ${handle.role}` };
       const proposals = (msg.args as { proposals?: unknown }).proposals;
       if (!Array.isArray(proposals)) return { ok: false, reason: "curate_entries needs a proposals array" };
+      const entries = this.#state.phase.entries ?? [];
+      const messages = this.#state.phase.messages ?? [];
       const events: Array<{ type: string; [key: string]: unknown }> = [];
       for (const proposal of proposals) {
         const built = curatorEvent(proposal as CuratorProposal, this.#state.phase.phaseId);
         if (!built.ok) return { ok: false, reason: built.reason };
-        events.push(built.event as unknown as { type: string; [key: string]: unknown });
+        const event = built.event as unknown as { type: string; [key: string]: unknown };
+        // A link is refused (and logged) when the message and entry share no
+        // anchor; the message keeps its own entry (finding A-21). Any other
+        // refusal is caught by the whole-batch dry run below, so no partial
+        // application can happen and #applyEvent never throws (finding A-19).
+        if (event.type === "MESSAGE_LINKED") {
+          const entry = entries.find((e) => e.id === (event as { entryId?: string }).entryId);
+          const message = messages.find((m) => m.id === (event as { messageId?: string }).messageId);
+          const check = entry && message ? validateLink(entry, message, (event as { anchor?: never }).anchor) : { ok: false as const, reason: "unknown entry or message" };
+          if (!check.ok) {
+            this.#log.append("entry_link_refused", { entryId: (event as { entryId?: string }).entryId, messageId: (event as { messageId?: string }).messageId, reason: check.reason });
+            continue;
+          }
+        }
+        events.push(event);
+      }
+      let check = this.#state;
+      for (const event of events) {
+        const result = reduce(check, event as never);
+        if (!result.ok) return { ok: false, reason: result.reason };
+        check = result.state;
       }
       for (const event of events) this.#applyEvent(event as never);
       this.#log.append("entries_curated", { count: events.length });
@@ -6443,6 +6462,10 @@ export class Conductor {
     const donePromise = new Promise<void>((resolve) => {
       doneResolve = resolve;
     });
+    // A curator that settles without submitting (or with an empty pass) ends
+    // the round at once instead of waiting out evaluateMs.
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
     const agent = spawnPiAgent({
       command: this.#resolvePiCommand("curator"),
       args: [
@@ -6460,6 +6483,7 @@ export class Conductor {
       onEvent: (event) => {
         this.#noteActivity(agentId, event);
         this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
       },
     });
     const handle: AgentHandle = {
@@ -6487,13 +6511,19 @@ export class Conductor {
         return;
       }
       await agent.prompt(this.#buildCuratorPrompt());
+      const settled = nextSettle();
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
+        settled,
         // A never-resolving promise, so only the timer can win the race.
         raceTimeout(new Promise<never>(() => undefined), this.#deadlines.evaluateMs, "timeout"),
       ]);
       await agent.terminate();
-      this.#log.completion(actionId, { candidateSha, ok: outcome === "submitted", ...(outcome === "submitted" ? {} : { reason: "curator timed out" }) });
+      this.#log.completion(actionId, {
+        candidateSha,
+        ok: outcome === "submitted",
+        ...(outcome === "submitted" ? {} : { reason: outcome === "settled" ? "curator settled without submitting" : "curator timed out" }),
+      });
     } finally {
       this.#agents.delete(agentId);
       this.#finishCurator(candidateSha);

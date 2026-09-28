@@ -388,7 +388,9 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
       return {
         ok: true,
         entries: entries.map((e) => {
-          if (e.id === entry.id) return { ...e, state: "dropped", stateReason: `merged into ${into.id}`, mergedInto: into.id };
+          // The links MOVE, not copy: the source keeps none, so the message
+          // is linked to exactly one (live) entry after the merge (M-14).
+          if (e.id === entry.id) return { ...e, state: "dropped", stateReason: `merged into ${into.id}`, mergedInto: into.id, links: [] };
           if (e.id === into.id) {
             const existing = new Set(e.links.map((l) => l.messageId));
             return { ...e, links: [...e.links, ...moved.filter((l) => !existing.has(l.messageId))] };
@@ -675,7 +677,14 @@ export function planEntryEvents(messages: readonly Message[], entries: readonly 
       events.push({ type: "MESSAGE_LINKED", messageId: m.id, entryId: host.id, anchor, reason: "shared anchor", by: "runtime" });
       continue;
     }
-    const anchor = anchorForMessage(m) ?? { kind: "decision" as const, id: m.id };
+    const anchor = anchorForMessage(m);
+    if (!anchor) {
+      // No anchor at all (no evidence, no decision, no plan clause): do not
+      // invent one. The message stays unaccounted and the accounting lint
+      // says so, rather than a made-up anchor letting the lint pass (record
+      // M-38).
+      continue;
+    }
     const id = nextEntryId(working);
     working.push({
       id,
@@ -719,8 +728,12 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
     entry.links = entry.links.filter((link) => {
       const message = byId.get(link.messageId);
       if (!message) return true; // keep a link to a message not in this slice
+      // The owner's `m` is the ONE exception to the anchor rule: it merges two
+      // near-duplicates that deliberately share no anchor, so the links it
+      // moved must survive this filter (finding M-14).
+      const ownerMerged = link.reason?.startsWith("merged from") ?? false;
       const shared = sharedAnchor([entry.anchor], anchorsOfMessage(message));
-      if (!shared) {
+      if (!shared && !ownerMerged) {
         refusedLinks.push({ messageId: message.id, entryId: entry.id, reason: `message ${message.id} and entry ${entry.id} share no anchor` });
         return false;
       }
@@ -730,7 +743,7 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
         refusedLinks.push({ messageId: message.id, entryId: entry.id, reason: `message ${message.id} is already linked to another entry` });
         return false;
       }
-      link.anchor = shared;
+      if (shared) link.anchor = shared;
       linked.add(message.id);
       return true;
     });
@@ -805,15 +818,17 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
   let dropped = 0;
   let merged = 0;
   let resolved = 0;
-  let linkedLive = 0;
   for (const m of messages) {
     const l = messageLiveness(m);
     if (l === "dropped") dropped += 1;
     else if (l === "merged") merged += 1;
     else if (l === "resolved") resolved += 1;
     else if (l === "superseded") merged += 1;
-    else linkedLive += 1;
   }
+  // `linked` is the set of messages an entry actually holds, so a live
+  // message no entry links is unaccounted (finding M-15) — the lint's
+  // accounting rule can then genuinely fail.
+  const linkedLive = messages.filter((m) => isLiveMessage(m) && linked.has(m.id)).length;
   const unaccounted = messages.length - (linkedLive + dropped + merged + resolved);
   const unexposed = messages.filter((m) => m.type === "tradeoff" && m.raisedBy !== undefined && m.raisedBy !== "worker").length;
   const accounting: Accounting = {

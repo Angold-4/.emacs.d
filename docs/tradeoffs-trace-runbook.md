@@ -1064,13 +1064,14 @@ Keys in the review buffer:
 The runtime opens an entry for every live message as it is raised, so entry
 ids are stable and an owner command always names an entry the log records.
 The linking pass runs once per round, after the reviews and before the
-evaluators (`ENTRY_CURATED` marks it). A plan enables a curator AGENT by
-naming a model (`#+TT_MODELS curator=…`, typically the evaluator's); without
-one the runtime's deterministic anchor pass is the curator step, so no extra
-role is launched. The `curate_entries` tool may only propose `link`, `open`
-and `retitle`; it can never drop, resolve or change a type. A link with no
-shared anchor is refused and logged; a reviewer's `sameAs E-n` follows the
-same rule. If the review lint fails, the view's first
+evaluators (`ENTRY_CURATED` marks it). It also starts a curator AGENT on the
+evaluator's model (override with `#+TT_MODELS curator=…`); the agent is
+launched first but never blocks the evaluators, so the evaluator and panel
+always launch with their own models. The `curate_entries` tool may only
+propose `link`, `open` and `retitle`; it can never drop, resolve or change a
+type. A link with no shared anchor is refused and logged; a reviewer's
+`sameAs E-n` follows the same rule, and the owner's `m` (which merges
+near-duplicates that share no anchor) is the one exception. If the review lint fails, the view's first
 line names the violation and a `REVIEW_LINT_FAILED` event is recorded on
 every render — the runtime never repairs a view silently.
 

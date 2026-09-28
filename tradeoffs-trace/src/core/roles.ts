@@ -86,6 +86,10 @@ export function planModelSelector(
       }
       return models.reviewer;
     }
+    // Plan 05j: the curator runs on the evaluator's model by default (there
+    // is no separate #+TT_MODELS role required for it); a plan may override
+    // it with `curator=...`.
+    if (role === "curator") return models.curator ?? models.evaluator;
     if (role === "panel") {
       if (seat !== undefined) {
         const own = models.panelSeats?.[String(seat)];
