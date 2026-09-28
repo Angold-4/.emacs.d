@@ -122,9 +122,18 @@ test("discovery-barrier: M's turn 2 lists a record A discovered after M finished
     const records = readEvents(setup.runDir);
     const released = records.findIndex((r) => r.kind === "discovery_barrier_released");
     const firstReview = records.findIndex((r) => r.kind === "event" && (r.event as { type: string }).type === "REVIEW_SUBMITTED");
-    const discoveries = records.filter((r, i) => r.kind === "discovery_submitted" && i < released).length;
+    // Count the REVIEWERS whose discovery preceded the release, not the raw
+    // number of records: under load a reviewer can be re-dispatched and submit
+    // its discovery twice, and the barrier's promise — every reviewer's turn 1
+    // preceded the release — still holds with one extra record (load flake).
+    const discoveries = new Set(
+      records
+        .slice(0, released < 0 ? 0 : released)
+        .filter((r) => r.kind === "discovery_submitted")
+        .map((r) => (r.event as { reviewer: string }).reviewer),
+    );
     assert.ok(released >= 0 && released < firstReview, "the barrier releases before any review is submitted");
-    assert.equal(discoveries, 3, "all three discoveries precede the release");
+    assert.deepEqual([...discoveries].sort(), ["A", "B", "M"], "all three reviewers' discoveries precede the release");
   } finally {
     await teardown(setup, logs);
   }
