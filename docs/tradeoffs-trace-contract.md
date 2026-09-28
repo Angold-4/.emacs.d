@@ -406,10 +406,11 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   log and entry ids are stable), linking a message to an open entry it
   shares an anchor with. Once per round, after the reviews and before the
   evaluators, that pass also starts a curator AGENT on the evaluator's model
-  (a plan may override it with `#+TT_MODELS curator=…`) and records
-  `ENTRY_CURATED`. The agent is launched first but never blocks the
-  evaluators: the evaluator and panel still launch with their own models even
-  when the curator cannot run. The agent sees every message of every type plus
+  (a plan may override it with `#+TT_MODELS curator=…`; with no model
+  configured it launches on Pi's default exactly like an evaluator, never
+  skipped) and records `ENTRY_CURATED`. The agent is launched first but never
+  blocks the evaluators: the evaluator and panel still launch with their own
+  models even when the curator cannot run. The agent sees every message of every type plus
   every open entry and returns through `curate_entries`, whose only ops are
   `link`, `open` and `retitle` (any other op is refused before an event is
   applied; it cannot drop, resolve, merge or change a type).
@@ -419,8 +420,9 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   it merges two near-duplicates that deliberately share no anchor, so the
   links it moves are kept.
 - **Latest state.** Each entry's state is computed against the newest
-  candidate; the view's header names it. An entry whose messages all concern
-  older candidates and that a later round resolved leaves the live view. An
+  candidate; the view's header names it. An entry all of whose linked
+  messages are settled — resolved, dropped, merged or superseded — leaves the
+  live view. An
   open entry whose anchor no longer resolves in the newest code is kept and
   tagged `stale anchor`, never hidden.
 - **Views.** `views/review.org` (phase, `C-c m d`) and
@@ -429,8 +431,10 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   tags (phase id in the program view; who raised it, e.g. `M·A`; `+2 linked`;
   its anchor). `TAB` shows the entry's summary and each linked message; `RET`
   opens `views/entries/<id>.org` with the full history; `s` on a linked
-  message splits it into its own entry; `m` on a `≈` hint merges the two as
-  the owner's own action; `A`/`D` are verdicts on every linked message
+  message splits it into its own entry, which takes that message's OWN anchor
+  (the owner has decided the two are separate topics, so the pair the split
+  produced is exempt from the one-anchor rule); `m` on a `≈` hint merges the
+  two as the owner's own action; `A`/`D` are verdicts on every linked message
   (`OWNER_VERDICT`, so accepting a trade-off is not a code fix). The program view links
   entries across phases only through shared anchors, the same rule.
 - **Accounting.** The last line reconciles every raw message:

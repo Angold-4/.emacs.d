@@ -1054,7 +1054,9 @@ Keys in the review buffer:
 - `TAB` shows the entry's summary and each linked message.
 - `RET` opens the entry's own file (`views/entries/<id>.org`, full history) or
   a linked message's file (`views/messages/<id>.org`).
-- `s` on a linked message splits it into its own entry (`ENTRY_SPLIT`).
+- `s` on a linked message splits it into its own entry (`ENTRY_SPLIT`); the new
+  entry stands on that message's own anchor, and the split pair is exempt from
+  the one-anchor lint (the owner decided they are separate topics).
 - `m` on an entry carrying a `≈ E-n` hint merges the two as the owner's own
   action (`ENTRY_MERGED_BY_OWNER`).
 - `A` / `D` are verdicts on every linked message (`OWNER_VERDICT`), D with an
@@ -1065,9 +1067,10 @@ The runtime opens an entry for every live message as it is raised, so entry
 ids are stable and an owner command always names an entry the log records.
 The linking pass runs once per round, after the reviews and before the
 evaluators (`ENTRY_CURATED` marks it). It also starts a curator AGENT on the
-evaluator's model (override with `#+TT_MODELS curator=…`); the agent is
-launched first but never blocks the evaluators, so the evaluator and panel
-always launch with their own models. The `curate_entries` tool may only
+evaluator's model (override with `#+TT_MODELS curator=…`; with no model
+configured it runs on Pi's default like an evaluator, never skipped); the
+agent is launched first but never blocks the evaluators, so the evaluator and
+panel always launch with their own models. The `curate_entries` tool may only
 propose `link`, `open` and `retitle`; it can never drop, resolve or change a
 type. A link with no shared anchor is refused and logged; a reviewer's
 `sameAs E-n` follows the same rule, and the owner's `m` (which merges

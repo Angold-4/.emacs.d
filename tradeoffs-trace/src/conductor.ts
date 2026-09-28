@@ -4631,20 +4631,15 @@ export class Conductor {
    * `curate_entries`; the deterministic anchor pass is the same rule. */
   #curateRound(candidateSha: string): void {
     this.#syncEntries();
-    // The curator runs on the evaluator's model. With no model configured
-    // (unit tests, a stub run) the deterministic anchor pass above already
-    // did the linking and the round is marked curated at once.
-    const model = this.#providerModelFor?.("curator");
-    if (model && !this.#curatorInFlight.has(candidateSha)) {
-      this.#curatorInFlight.add(candidateSha);
-      const actionId = this.#log.actionId("dispatch_curator");
-      void this.#runCurator(actionId, candidateSha).catch((err) => {
-        this.#logUnexpected("dispatch_curator", err);
-        this.#finishCurator(candidateSha);
-      });
-      return;
-    }
-    if (!model) this.#finishCurator(candidateSha);
+    if (this.#curatorInFlight.has(candidateSha)) return;
+    this.#curatorInFlight.add(candidateSha);
+    const actionId = this.#log.actionId("dispatch_curator");
+    // The curator always runs (OD-2): with no configured model it launches
+    // on Pi's default exactly like an evaluator would, never skipped.
+    void this.#runCurator(actionId, candidateSha).catch((err) => {
+      this.#logUnexpected("dispatch_curator", err);
+      this.#finishCurator(candidateSha);
+    });
   }
 
   /** Plan 05j: the round is curated (the curator submitted, timed out or
@@ -4709,7 +4704,16 @@ export class Conductor {
     const signature = lint.violations.map((v) => `${v.rule}:${v.detail}`).join("|");
     if (signature === this.#lastLintSignature) return;
     this.#lastLintSignature = signature;
+    // Dedup against the LOG, not just memory (finding M-23): after a restart
+    // the same violation would otherwise be appended again.
+    let existing = "";
+    try {
+      existing = fs.readFileSync(this.#paths.events, "utf8");
+    } catch {
+      // no log yet: every violation is new
+    }
     for (const v of lint.violations) {
+      if (existing.includes(JSON.stringify(v.detail))) continue;
       try {
         this.#applyEvent({ type: "REVIEW_LINT_FAILED", rule: v.rule, detail: v.detail });
       } catch (err) {
@@ -6512,17 +6516,27 @@ export class Conductor {
       }
       await agent.prompt(this.#buildCuratorPrompt());
       const settled = nextSettle();
-      const outcome = await Promise.race([
-        donePromise.then(() => "submitted" as const),
-        settled,
-        // A never-resolving promise, so only the timer can win the race.
-        raceTimeout(new Promise<never>(() => undefined), this.#deadlines.evaluateMs, "timeout"),
-      ]);
+      // A cancelable deadline (never `raceTimeout`, whose timer survives the
+      // race and keeps the process alive): the conductor's own `stop()`
+      // terminates the agent, `waitExit` then ends the wait, and the finally
+      // cancels the timer — so a spawned conductor still exits by itself.
+      const timeout = cancelableTimeout(this.#deadlines.evaluateMs, "timeout" as const);
+      let outcome: "submitted" | "settled" | "exited" | "timeout";
+      try {
+        outcome = await Promise.race([
+          donePromise.then(() => "submitted" as const),
+          settled,
+          agent.waitExit().then(() => "exited" as const),
+          timeout.promise,
+        ]);
+      } finally {
+        timeout.cancel();
+      }
       await agent.terminate();
       this.#log.completion(actionId, {
         candidateSha,
         ok: outcome === "submitted",
-        ...(outcome === "submitted" ? {} : { reason: outcome === "settled" ? "curator settled without submitting" : "curator timed out" }),
+        ...(outcome === "submitted" ? {} : { reason: outcome === "settled" ? "curator settled without submitting" : outcome === "exited" ? "curator exited" : "curator timed out" }),
       });
     } finally {
       this.#agents.delete(agentId);

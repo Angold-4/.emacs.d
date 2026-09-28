@@ -24,7 +24,6 @@ import {
   anchorsOverlap,
   entryTypeOf,
   formatAnchor,
-  type Accounting,
   type Entry,
   type EntryView,
   type ProjectedEntries,
@@ -78,12 +77,16 @@ export function runReviewLint(input: ReviewLintInput): ReviewLintResult {
     for (let j = i + 1; j < live.length; j++) {
       const a = live[i];
       const b = live[j];
-      if (anchorsOverlap(a.anchor, b.anchor)) {
-        violations.push({
-          rule: "one-anchor",
-          detail: `2 entries share ${formatAnchor(a.anchor)} (${a.entry.id} and ${b.entry.id})`,
-        });
-      }
+      if (!anchorsOverlap(a.anchor, b.anchor)) continue;
+      // The owner's `s` decided these are separate topics; the ENTRY_SPLIT is
+      // the record of that decision, so the pair it produced is exempt from
+      // the one-anchor rule (OD-2 / finding A-25).
+      const splitPair = a.entry.splitFrom === b.entry.id || b.entry.splitFrom === a.entry.id;
+      if (splitPair) continue;
+      violations.push({
+        rule: "one-anchor",
+        detail: `2 entries share ${formatAnchor(a.anchor)} (${a.entry.id} and ${b.entry.id})`,
+      });
     }
   }
 
@@ -164,12 +167,20 @@ export function runReviewLint(input: ReviewLintInput): ReviewLintResult {
     }
   }
 
-  // accounting: the footer must reconcile.
-  const expected = expectedAccounting(projected.accounting);
-  if (projected.accounting.unaccounted !== expected) {
+  // accounting: the footer must reconcile, recomputed FROM the messages and
+  // the rendered entries (not from the footer's own fields, which would make
+  // the rule a tautology — finding A-27). A live message no live entry holds
+  // is unaccounted.
+  const linkedIds = new Set(live.flatMap((v) => v.messages.map((m) => m.id)));
+  const liveMessages = (input.messages ?? []).filter((m) => !isNonLive(m));
+  const expectedUnaccounted = liveMessages.filter((m) => !linkedIds.has(m.id)).length;
+  if (input.messages && projected.accounting.raw !== input.messages.length) {
+    violations.push({ rule: "accounting", detail: `footer counts ${projected.accounting.raw} raw, but there are ${input.messages.length} messages` });
+  }
+  if (projected.accounting.unaccounted !== expectedUnaccounted) {
     violations.push({
       rule: "accounting",
-      detail: `${projected.accounting.unaccounted} unaccounted messages (${accountingLine(projected.accounting)})`,
+      detail: `${projected.accounting.unaccounted} unaccounted messages (${expectedUnaccounted} live message(s) no live entry holds; ${accountingLine(projected.accounting)})`,
     });
   }
 
@@ -179,12 +190,6 @@ export function runReviewLint(input: ReviewLintInput): ReviewLintResult {
 
 function isNonLive(m: Message): boolean {
   return m.state === "merged" || m.state === "dropped" || m.state === "resolved" || m.state === "superseded";
-}
-
-/** unaccounted — raw − (linked + dropped + merged + resolved) — is 0 exactly
- * when every raw message is accounted for. */
-function expectedAccounting(a: Accounting): number {
-  return a.raw - (a.linked + a.dropped + a.merged + a.resolved);
 }
 
 /** A REVIEW_LINT_FAILED event, one per violation, so the log records what the

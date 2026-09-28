@@ -33,10 +33,11 @@ import {
   type Entry,
   type EntryEvent,
 } from "../../src/core/entries.ts";
+import { reduce } from "../../src/core/reduce.ts";
 import { runReviewLint, reviewLintFailedEvents } from "../../src/core/review-lint.ts";
 import { computeMetrics } from "../../src/metrics.ts";
 import type { Finding, Message } from "../../src/core/types.ts";
-import { basePhase, makeMessage } from "../unit/helpers.ts";
+import { basePhase, baseState, makeMessage } from "../unit/helpers.ts";
 
 const GOLDEN = fileURLToPath(new URL("../fixtures/entries", import.meta.url));
 
@@ -323,13 +324,21 @@ test("the curator's tool rejects any operation other than link, open and retitle
   assert.ok(!built.ok);
 });
 
-test("ENTRY_SPLIT pulls one message into its own entry", () => {
+test("opening a second entry for a message an open entry holds is refused (finding M-22)", () => {
   const a = message("B-1", "blocker", ["src/a.rs:10-20 one"]);
-  const b = message("F-1", "finding", ["src/a.rs:10-20 two"]);
+  const entries = openAll([a]);
+  const again = applyEntryEvent(entries, { type: "ENTRY_OPENED", phaseId: "p1", title: "another look", messageId: "B-1", by: "curator" }, [a]);
+  assert.equal(again.ok, false);
+  assert.match(!again.ok ? again.reason : "", /already belongs to entry/);
+});
+
+test("ENTRY_SPLIT pulls one message into its own entry, on the message's own anchor, and the lint stays clean", () => {
+  const a = message("B-1", "blocker", ["src/a.rs:10-20 one"]);
+  const b = message("F-1", "finding", ["src/a.rs:15-25 two"]);
   const entries: Entry[] = [
-    { id: "E-1", phaseId: "p1", title: "one topic", type: "blocker", state: "open", anchor: { kind: "file", path: "src/a.rs", lines: [10, 20] }, links: [{ messageId: "B-1", anchor: { kind: "file", path: "src/a.rs", lines: [10, 20] }, reason: "opened" }, { messageId: "F-1", anchor: { kind: "file", path: "src/a.rs", lines: [10, 20] }, reason: "linked" }] },
+    { id: "E-1", phaseId: "p1", title: "one topic", type: "blocker", state: "open", anchor: { kind: "file", path: "src/a.rs", lines: [10, 20] }, links: [{ messageId: "B-1", anchor: { kind: "file", path: "src/a.rs", lines: [10, 20] }, reason: "opened" }, { messageId: "F-1", anchor: { kind: "file", path: "src/a.rs", lines: [15, 25] }, reason: "linked" }] },
   ];
-  const split = applyEntryEvent(entries, { type: "ENTRY_SPLIT", entryId: "E-1", messageId: "F-1", newEntryId: "E-2" }, [a, b]);
+  const split = applyEntryEvent(entries, { type: "ENTRY_SPLIT", entryId: "E-1", messageId: "F-1", newEntryId: "E-2", by: "owner" }, [a, b]);
   assert.ok(split.ok);
   if (split.ok) {
     const e1 = split.entries.find((e) => e.id === "E-1")!;
@@ -337,7 +346,36 @@ test("ENTRY_SPLIT pulls one message into its own entry", () => {
     assert.deepEqual(e1.links.map((l) => l.messageId), ["B-1"]);
     assert.deepEqual(e2.links.map((l) => l.messageId), ["F-1"]);
     assert.equal(e2.splitFrom, "E-1");
+    // OD-2: the split entry stands on the message's OWN anchor, and the pair
+    // the owner split apart is exempt from the one-anchor lint.
+    assert.deepEqual(e2.anchor, { kind: "file", path: "src/a.rs", lines: [15, 25] });
+    const projected = projectEntries({ messages: [a, b], entries: split.entries, newestCandidateSha: "C1" });
+    assert.equal(projected.views.filter((v) => v.live).length, 2);
+    assert.ok(runReviewLint({ projected, newestCandidateSha: "C1", messages: [a, b] }).ok, JSON.stringify(runReviewLint({ projected, newestCandidateSha: "C1", messages: [a, b] }).violations));
   }
+});
+
+test("an entry whose only message an evaluator MERGED leaves the live view and lints clean (OD-2 / A-24, A-28)", () => {
+  const m = message("F-1", "finding", ["src/a.rs:10-20 a bug"], { state: "raw" });
+  const entries = openAll([m]);
+  const state = baseState({ phaseId: "p1", messages: [m], entries });
+  const merged = reduce(state, {
+    type: "MESSAGE_MERGED",
+    messageId: "F-1",
+    by: "evaluator",
+    reason: "merged into F-9",
+    boundCandidateSha: m.boundCandidateSha,
+    boundContractVersion: m.boundContractVersion,
+    boundRecordVersion: m.messageVersion,
+  });
+  assert.ok(merged.ok, !merged.ok ? merged.reason : "");
+  const after = merged.ok ? merged.state.phase : state.phase;
+  const projected = projectEntries({ messages: after.messages ?? [], entries: after.entries ?? [], newestCandidateSha: "C1" });
+  assert.equal(projected.views.filter((v) => v.live).length, 0);
+  const lint = runReviewLint({ projected, newestCandidateSha: "C1", messages: after.messages ?? [] });
+  assert.ok(lint.ok, JSON.stringify(lint.violations));
+  // And the round pass never re-opens an entry for the merged message.
+  assert.equal(planEntryEvents(after.messages ?? [], after.entries ?? []).length, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -477,8 +515,8 @@ test("programs/<id>/views/review.org lists entries of every phase with phase tag
   assert.match(view, /prog-01·prog-02/);
   // The different anchor stays its own entry, tagged to its phase.
   assert.match(view, /^\*\* E-\d+ a different point.*prog-02/m);
-  const lint = runReviewLint({ projected: projectEntries({ messages: [a] }), newestCandidateSha: "C1" });
-  assert.ok(lint.ok);
+  const lint = runReviewLint({ projected: projectEntries({ messages: [a], entries: openAll([a]) }), newestCandidateSha: "C1", messages: [a] });
+  assert.ok(lint.ok, JSON.stringify(lint.violations));
   // Determinism: the same program state renders byte-identical bytes.
   const opts = {
     program: {

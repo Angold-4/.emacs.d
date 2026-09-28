@@ -285,6 +285,13 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
         return { ok: false, reason: `entry ${id} must have a non-empty title` };
       }
       const opener = event.messageId ? messages.find((m) => m.id === event.messageId) : undefined;
+      // Opening a NEW entry for a message an open entry already holds would
+      // be a split in disguise, which the plan reserves to the owner (OD-2 /
+      // finding M-22). Refused, never applied.
+      if (opener) {
+        const holder = entries.find((e) => e.state === "open" && e.links.some((l) => l.messageId === opener.id));
+        if (holder) return { ok: false, reason: `message ${opener.id} already belongs to entry ${holder.id}; splitting is the owner's action` };
+      }
       const anchor = event.anchor ?? (opener ? anchorsOfMessage(opener)[0] : undefined);
       if (!anchor) return { ok: false, reason: `entry ${id} has no anchor (no message to derive one from)` };
       const link: EntryLink[] = [];
@@ -302,10 +309,7 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
         ...(event.by ? { createdBy: event.by } : {}),
         ...(event.at ? { createdAt: event.at } : {}),
       };
-      const rest = opener
-        ? entries.map((e) => (e.links.some((l) => l.messageId === opener.id) ? { ...e, links: e.links.filter((l) => l.messageId !== opener.id) } : e))
-        : [...entries];
-      return { ok: true, entries: [...rest, entry] };
+      return { ok: true, entries: [...entries, entry] };
     }
     case "MESSAGE_LINKED": {
       const entry = findEntry(entries, event.entryId);
@@ -347,7 +351,11 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
       const id = event.newEntryId ?? nextEntryId(entries);
       if (findEntry(entries, id)) return { ok: false, reason: `entry ${id} already exists` };
       const message = messages.find((m) => m.id === event.messageId);
-      const anchor = event.anchor ?? link.anchor;
+      // The split entry takes the SPLIT MESSAGE's own anchor, not the source
+      // entry's (OD-2 / finding A-25): the owner has decided they are two
+      // separate topics, so the new entry must stand on its own anchor.
+      const own = message ? anchorForMessage(message) : undefined;
+      const anchor = event.anchor ?? own ?? link.anchor;
       const split: Entry = {
         id,
         phaseId: entry.phaseId,
@@ -626,14 +634,14 @@ function isLiveMessage(m: Message): boolean {
 }
 
 /** An entry's state against the messages it links: an explicit state stands;
- * otherwise an entry all of whose messages are settled leaves the live view
- * (resolved when one was resolved, dropped when one was dropped). */
+ * otherwise an entry all of whose messages are settled leaves the live view —
+ * resolved when one was resolved, otherwise dropped (a merged or superseded
+ * message is just as settled as a dropped one; OD-2 / findings A-24, A-28). */
 function resolveStateOf(entry: Entry, byId: Map<string, Message>): EntryStateName {
   if (entry.state !== "open") return entry.state;
   const own = entry.links.map((l) => byId.get(l.messageId)).filter((m): m is Message => !!m);
   if (own.length > 0 && own.every((m) => !isLiveMessage(m))) {
-    if (own.some((m) => m.state === "resolved")) return "resolved";
-    if (own.some((m) => m.state === "dropped")) return "dropped";
+    return own.some((m) => m.state === "resolved") ? "resolved" : "dropped";
   }
   return "open";
 }
@@ -1005,12 +1013,16 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
   const all: Array<{ view: EntryView; phaseTag: string; phaseIndex: number }> = [];
   for (const ph of perPhase) {
     const tag = ph.readableId ?? ph.phaseId;
-    for (const view of ph.projected.views) {
-      if (!view.live) continue;
+    for (const raw of ph.projected.views) {
+      if (!raw.live) continue;
+      // Message ids are numbered per phase (T-1 repeats), so qualify every
+      // message with its phase tag: a colliding id is then never mistaken for
+      // an already-shown one and silently dropped (finding A-26).
+      const view: EntryView = { ...raw, messages: raw.messages.map((m) => ({ ...m, id: `${tag}:${m.id}` })) };
       const existing = all.find((x) => sharedAnchor([x.view.anchor], [view.anchor]));
       if (existing) {
         // Same anchor across phases: one topic, both phases. Merge the
-        // messages so nothing is hidden.
+        // messages so nothing is hidden; ids are already phase-qualified.
         const ids = new Set(existing.view.messages.map((m) => m.id));
         existing.view.messages = [...existing.view.messages, ...view.messages.filter((m) => !ids.has(m.id))];
         existing.view.raisedBy = [...new Set([...existing.view.raisedBy, ...view.raisedBy])];
