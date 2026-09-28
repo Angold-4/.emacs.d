@@ -862,7 +862,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     ...(phase.contract.gate ? [`- Gate: ${v.gate ?? "no record for the accepted candidate"}`] : []),
     `- Reviews on the accepted candidate ${C ? C.slice(0, 9) : "?"}: ${v.reviewLine}`,
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
-    `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
+    `- ${live.length} trade-off(s), ${flagged.length} flagged for the owner`,
     "",
     ...(models.length > 0
       ? ["### Models per role", "", ...models.map((m) => `- ${m.role}: ${m.value}`), ""]
@@ -895,7 +895,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     for (const f of fixed) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 300)}`);
   }
   if (flagged.length > 0) {
-    lines.push("", "### Flagged decisions (reserved: worth an owner's look)", "");
+    lines.push("", "### Flagged trade-offs (reserved: worth an owner's look)", "");
     for (const d of flagged) lines.push(`- ${d.choice} — ${decisionStatus(d, phase).status}`);
   }
   if (advisories.length > 0) {
