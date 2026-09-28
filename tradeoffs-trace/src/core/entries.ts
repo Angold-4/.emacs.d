@@ -888,7 +888,16 @@ export interface EntryReviewOptions {
   /** The program view: entries of every phase, tagged by phase. */
   program?: {
     id: string;
-    phases: Array<{ phaseId: string; readableId?: string; messages?: readonly Message[]; entries?: readonly Entry[] }>;
+    phases: Array<{
+      phaseId: string;
+      readableId?: string;
+      /** Each phase's OWN newest candidate: a state must be computed against
+       * the candidate that phase is at, not the program's last one (finding
+       * A-30). */
+      candidate?: { sha: string };
+      messages?: readonly Message[];
+      entries?: readonly Entry[];
+    }>;
   };
   newestCandidateSha?: string;
   anchorResolves?: (anchor: EntryAnchor) => boolean;
@@ -1008,7 +1017,7 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
   const perPhase = program.phases.map((p) => ({
     phaseId: p.phaseId,
     readableId: p.readableId,
-    projected: projectEntries({ messages: p.messages, entries: p.entries, newestCandidateSha: opts.newestCandidateSha, anchorResolves: opts.anchorResolves }),
+    projected: projectEntries({ messages: p.messages, entries: p.entries, newestCandidateSha: p.candidate?.sha ?? opts.newestCandidateSha, anchorResolves: opts.anchorResolves }),
   }));
   const all: Array<{ view: EntryView; phaseTag: string; phaseIndex: number }> = [];
   for (const ph of perPhase) {

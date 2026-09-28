@@ -342,11 +342,13 @@ export interface EntryReviewPhase {
 
 /** Plan 05j: the anchor checker the live view uses. A file anchor whose file
  * or lines no longer exist in the candidate checkout is `stale anchor`. When
- * the checkout itself is gone (a pruned run), every anchor is treated as
- * resolvable rather than guessing — the view is then only as fresh as the
- * code it can see, never wrong about it. */
+ * no candidate exists yet there is nothing to verify, so anchors count as
+ * resolvable; when a candidate EXISTS but its checkout is gone, freshness
+ * cannot be confirmed and file anchors are shown `stale anchor`, never
+ * silently treated as fresh (record A-68 / M-67). */
 export function candidateAnchorResolves(candidateDir: string | undefined): (anchor: EntryAnchor) => boolean {
-  if (!candidateDir || !fs.existsSync(candidateDir)) return () => true;
+  if (!candidateDir) return () => true;
+  if (!fs.existsSync(candidateDir)) return (anchor) => anchor.kind !== "file";
   return (anchor) => {
     if (anchor.kind !== "file") return true;
     try {

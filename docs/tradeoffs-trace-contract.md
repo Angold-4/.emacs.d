@@ -414,9 +414,9 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   every open entry and returns through `curate_entries`, whose only ops are
   `link`, `open` and `retitle` (any other op is refused before an event is
   applied; it cannot drop, resolve, merge or change a type).
-  Reviewers' prompts also list the open entries, and a reviewer's
-  `sameAs E-n` links its raise to that entry (refused and logged when they
-  share no anchor). The owner's `m` is the one exception to the anchor rule:
+  Reviewers' and evaluators' prompts also list the open entries, so an agent
+  sees the topic a message belongs to, and a reviewer's `sameAs E-n` links its
+  raise to that entry (refused and logged when they share no anchor). The owner's `m` is the one exception to the anchor rule:
   it merges two near-duplicates that deliberately share no anchor, so the
   links it moves are kept.
 - **Latest state.** Each entry's state is computed against the newest
@@ -424,7 +424,9 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   messages are settled — resolved, dropped, merged or superseded — leaves the
   live view. An
   open entry whose anchor no longer resolves in the newest code is kept and
-  tagged `stale anchor`, never hidden.
+  tagged `stale anchor`, never hidden; when a candidate exists but its
+  checkout is gone, freshness cannot be confirmed and file anchors are shown
+  `stale anchor` rather than assumed fresh.
 - **Views.** `views/review.org` (phase, `C-c m d`) and
   `programs/<id>/views/review.org` (program, `C-c m D`) have three sections —
   Blockers, Findings, Trade-offs — one heading per live entry: title, then its
@@ -435,7 +437,9 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   (the owner has decided the two are separate topics, so the pair the split
   produced is exempt from the one-anchor rule); `m` on a `≈` hint merges the
   two as the owner's own action; `A`/`D` are verdicts on every linked message
-  (`OWNER_VERDICT`, so accepting a trade-off is not a code fix). The program view links
+  (`OWNER_VERDICT`, so accepting a trade-off is not a code fix) — a message
+  still raw cannot be settled and is reported to the owner, never silently
+  skipped. The program view links
   entries across phases only through shared anchors, the same rule.
 - **Accounting.** The last line reconciles every raw message:
   `31 raw → 9 entries · 18 linked · 2 dropped · 0 unaccounted · unexposed 3`.

@@ -268,11 +268,12 @@ test("owner-inbox: the review view's entry commands expand to ENTRY_*/OWNER_VERD
   const locate = { runId: "r1", phaseId: "p1" };
   const a = makeMessage({ id: "F-1", type: "finding", evidence: ["src/a.rs:10 x"], state: "published" });
   const b = makeMessage({ id: "T-2", type: "tradeoff", evidence: ["src/a.rs:11 y"], state: "published" });
+  const raw = makeMessage({ id: "F-3", type: "finding", evidence: ["src/a.rs:12 z"], state: "raw" });
   const entries: Entry[] = [
-    { id: "E-1", phaseId: "p1", title: "one topic", type: "finding", state: "open", anchor: { kind: "file", path: "src/a.rs", lines: [1, 20] }, links: [{ messageId: "F-1", anchor: { kind: "file", path: "src/a.rs", lines: [10, 10] }, reason: "opened" }, { messageId: "T-2", anchor: { kind: "file", path: "src/a.rs", lines: [11, 11] }, reason: "linked" }] },
+    { id: "E-1", phaseId: "p1", title: "one topic", type: "finding", state: "open", anchor: { kind: "file", path: "src/a.rs", lines: [1, 20] }, links: [{ messageId: "F-1", anchor: { kind: "file", path: "src/a.rs", lines: [10, 10] }, reason: "opened" }, { messageId: "T-2", anchor: { kind: "file", path: "src/a.rs", lines: [11, 11] }, reason: "linked" }, { messageId: "F-3", anchor: { kind: "file", path: "src/a.rs", lines: [12, 12] }, reason: "linked" }] },
     { id: "E-2", phaseId: "p1", title: "another", type: "tradeoff", state: "open", anchor: { kind: "file", path: "src/b.rs", lines: [1, 2] }, links: [] },
   ];
-  const expand = (raw: Record<string, unknown>) => expandEntryCommand({ ...locate, ...raw }, entries, [a, b]);
+  const expand = (raw: Record<string, unknown>) => expandEntryCommand({ ...locate, ...raw }, entries, [a, b, raw]);
   const split = expand({ type: "entry-split", entryId: "E-1", messageId: "T-2" });
   assert.ok(split.ok);
   assert.deepEqual(split.ok ? split.events : [], [{ type: "ENTRY_SPLIT", entryId: "E-1", messageId: "T-2", by: "owner" }]);
@@ -283,6 +284,9 @@ test("owner-inbox: the review view's entry commands expand to ENTRY_*/OWNER_VERD
   const refuse = expand({ type: "entry-verdict", entryId: "E-1", verdict: "refuse", reason: "not this round" });
   assert.ok(refuse.ok);
   assert.equal(refuse.ok ? refuse.events.length : 0, 2);
+  // A raw linked message cannot be settled yet, and is REPORTED, not silently
+  // skipped (record A-72 / M-63).
+  assert.deepEqual(refuse.ok ? refuse.skipped : [], ["F-3"]);
   assert.deepEqual(refuse.ok ? refuse.events[0] : {}, {
     type: "OWNER_VERDICT",
     messageId: "F-1",

@@ -2056,6 +2056,11 @@ export class Conductor {
       this.#rejectInboxFile(file, commandId, expanded.reason);
       return;
     }
+    // A raw message cannot be settled yet; it is reported, not silently
+    // skipped (record A-72 / M-63).
+    if (expanded.skipped.length > 0) {
+      this.#log.append("entry_verdict_skipped", { commandId, entryId: raw.entryId, skipped: expanded.skipped });
+    }
     if (expanded.runId && expanded.runId !== this.#state.phase.runId) {
       this.#rejectInboxFile(file, commandId, `command is bound to run ${expanded.runId}, but this run is ${this.#state.phase.runId}`);
       return;
@@ -6737,6 +6742,10 @@ export class Conductor {
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
       ...ledgerPromptLines(phase.messages),
+      // Plan 05j: the evaluator sees the entries its messages belong to, so a
+      // topic raised as another type is visible to it (plan item 3's
+      // cross-type view of the round; finding M-18).
+      ...entryPromptLines(phase.entries),
       "",
       "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
       "```diff",

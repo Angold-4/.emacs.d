@@ -23,7 +23,7 @@ export function expandEntryCommand(
   raw: unknown,
   entries: readonly Entry[],
   messages: readonly Message[],
-): { ok: true; runId: string; phaseId: string; events: Event[] } | { ok: false; reason: string } {
+): { ok: true; runId: string; phaseId: string; events: Event[]; skipped: string[] } | { ok: false; reason: string } {
   if (!raw || typeof raw !== "object") return { ok: false, reason: "entry command must be a JSON object" };
   const r = raw as Record<string, unknown>;
   if (typeof r.type !== "string" || !r.type.startsWith("entry-")) {
@@ -43,18 +43,18 @@ export function expandEntryCommand(
         return { ok: false, reason: `entry ${entryId} does not link message ${messageId}` };
       }
       const newEntryId = typeof r.newEntryId === "string" && r.newEntryId.length > 0 ? r.newEntryId : undefined;
-      return { ok: true, runId, phaseId, events: [{ type: "ENTRY_SPLIT", entryId, messageId, ...(newEntryId ? { newEntryId } : {}), by: "owner" }] };
+      return { ok: true, runId, phaseId, skipped: [], events: [{ type: "ENTRY_SPLIT", entryId, messageId, ...(newEntryId ? { newEntryId } : {}), by: "owner" }] };
     }
     case "entry-merge": {
       const intoEntryId = typeof r.intoEntryId === "string" && r.intoEntryId.length > 0 ? r.intoEntryId : undefined;
       if (!intoEntryId) return { ok: false, reason: "'entry-merge' needs an intoEntryId" };
       if (!entries.some((e) => e.id === intoEntryId)) return { ok: false, reason: `unknown entry ${intoEntryId}` };
-      return { ok: true, runId, phaseId, events: [{ type: "ENTRY_MERGED_BY_OWNER", entryId, intoEntryId, by: "owner" }] };
+      return { ok: true, runId, phaseId, skipped: [], events: [{ type: "ENTRY_MERGED_BY_OWNER", entryId, intoEntryId, by: "owner" }] };
     }
     case "entry-retitle": {
       const title = typeof r.title === "string" ? r.title.trim() : "";
       if (!title) return { ok: false, reason: "'entry-retitle' needs a non-empty title" };
-      return { ok: true, runId, phaseId, events: [{ type: "ENTRY_RETITLED", entryId, title, by: "owner" }] };
+      return { ok: true, runId, phaseId, skipped: [], events: [{ type: "ENTRY_RETITLED", entryId, title, by: "owner" }] };
     }
     case "entry-verdict": {
       if (r.verdict !== "accept" && r.verdict !== "refuse") return { ok: false, reason: "'entry-verdict' needs verdict accept or refuse" };
@@ -63,7 +63,9 @@ export function expandEntryCommand(
       if (plan.events.length === 0) {
         return { ok: false, reason: `entry ${entryId} has no published message to settle` };
       }
-      return { ok: true, runId, phaseId, events: plan.events };
+      // The settleable messages are settled; a raw one is REPORTED, never
+      // silently dropped (record A-72 / M-63).
+      return { ok: true, runId, phaseId, events: plan.events, skipped: plan.skipped };
     }
     default:
       return { ok: false, reason: `unknown entry command '${r.type}'` };

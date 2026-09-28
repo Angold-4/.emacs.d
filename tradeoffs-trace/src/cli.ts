@@ -1236,6 +1236,18 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
   } else {
     usage();
   }
+  // Expand once, against the rebuilt state, so a rejected command is refused
+  // before it is queued and a raw message that will not be settled is
+  // REPORTED to the owner (record A-72 / M-63).
+  const expanded = expandEntryCommand(command, state.phase.entries ?? [], state.phase.messages ?? []);
+  if (!expanded.ok) {
+    process.stdout.write(`entry ${op} rejected: ${expanded.reason}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (expanded.skipped.length > 0) {
+    process.stdout.write(`entry ${op}: ${expanded.skipped.length} message(s) not yet frozen, not settled: ${expanded.skipped.join(", ")}\n`);
+  }
   if (conductorAlive(runDir)) {
     const inbox = path.join(runDir, "inbox");
     mkdirSync(inbox, { recursive: true });
@@ -1247,12 +1259,6 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
       process.stdout.write(`entry ${op} rejected: ${outcome.reason}\n`);
       process.exitCode = 1;
     } else process.stdout.write(`queued entry ${op} ${commandId} for run ${path.basename(runDir)} (queued, not yet applied)\n`);
-    return;
-  }
-  const expanded = expandEntryCommand(command, state.phase.entries ?? [], state.phase.messages ?? []);
-  if (!expanded.ok) {
-    process.stdout.write(`entry ${op} rejected: ${expanded.reason}\n`);
-    process.exitCode = 1;
     return;
   }
   let check = state;

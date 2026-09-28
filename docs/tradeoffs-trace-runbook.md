@@ -1061,7 +1061,8 @@ Keys in the review buffer:
   action (`ENTRY_MERGED_BY_OWNER`).
 - `A` / `D` are verdicts on every linked message (`OWNER_VERDICT`), D with an
   optional one-line reason. Accepting a trade-off does not mark it a code
-  fix.
+  fix. A linked message that is still raw cannot be settled; it is reported to
+  you (and logged), never silently skipped.
 
 The runtime opens an entry for every live message as it is raised, so entry
 ids are stable and an owner command always names an entry the log records.
@@ -1077,6 +1078,9 @@ type. A link with no shared anchor is refused and logged; a reviewer's
 near-duplicates that share no anchor) is the one exception. If the review lint fails, the view's first
 line names the violation and a `REVIEW_LINT_FAILED` event is recorded on
 every render — the runtime never repairs a view silently.
+
+If a candidate's checkout is gone, its file anchors are shown `stale anchor`
+(freshness cannot be confirmed) rather than assumed fresh.
 
 Cleanness joins the balance numbers: `views/metrics.json`, the status `metrics`
 line and `tt summary` carry live entries per phase (a warning above 12),

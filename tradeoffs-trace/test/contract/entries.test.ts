@@ -34,6 +34,7 @@ import {
   type EntryEvent,
 } from "../../src/core/entries.ts";
 import { reduce } from "../../src/core/reduce.ts";
+import { candidateAnchorResolves } from "../../src/render.ts";
 import { runReviewLint, reviewLintFailedEvents } from "../../src/core/review-lint.ts";
 import { computeMetrics } from "../../src/metrics.ts";
 import type { Finding, Message } from "../../src/core/types.ts";
@@ -74,6 +75,14 @@ test("anchors overlap only in the same file or on the same id/clause", () => {
   assert.ok(anchorsOverlap({ kind: "decision", id: "D-1" }, { kind: "decision", id: "D-1" }));
   assert.ok(!anchorsOverlap({ kind: "decision", id: "D-1" }, { kind: "decision", id: "D-2" }));
   assert.ok(anchorsOverlap({ kind: "plan", clause: "plan/14a.org" }, { kind: "plan", clause: "plan/14a.org " }));
+});
+
+test("an anchor whose candidate checkout is gone is stale, never assumed fresh (record A-68)", () => {
+  const gone = candidateAnchorResolves("/nonexistent/tt-candidate-for-test");
+  assert.equal(gone({ kind: "file", path: "src/a.rs", lines: [1, 2] }), false);
+  assert.equal(gone({ kind: "decision", id: "D-1" }), true);
+  // With no candidate at all there is nothing to verify.
+  assert.equal(candidateAnchorResolves(undefined)({ kind: "file", path: "src/a.rs", lines: [1, 2] }), true);
 });
 
 test("a message derives file, decision and plan anchors from its evidence", () => {
@@ -517,6 +526,22 @@ test("programs/<id>/views/review.org lists entries of every phase with phase tag
   assert.match(view, /^\*\* E-\d+ a different point.*prog-02/m);
   const lint = runReviewLint({ projected: projectEntries({ messages: [a], entries: openAll([a]) }), newestCandidateSha: "C1", messages: [a] });
   assert.ok(lint.ok, JSON.stringify(lint.violations));
+  // Each phase's state is computed against ITS OWN candidate, not the
+  // program's last one (finding A-30): no spurious `stale state` tag.
+  const p1 = message("T-1", "tradeoff", ["src/one.rs:1 a"], { phaseId: "p1", title: "a", boundCandidateSha: "C1" });
+  const p2 = message("T-2", "tradeoff", ["src/two.rs:1 b"], { phaseId: "p2", title: "b", boundCandidateSha: "C2" });
+  const cross = renderProgramEntryReview({
+    program: {
+      id: "prog",
+      phases: [
+        { phaseId: "p1", readableId: "prog-01", candidate: { sha: "C1" }, messages: [p1], entries: openAll([p1]) },
+        { phaseId: "p2", readableId: "prog-02", candidate: { sha: "C2" }, messages: [p2], entries: openAll([p2]) },
+      ],
+    },
+    newestCandidateSha: "C2",
+  });
+  assert.doesNotMatch(cross, /stale state/);
+
   // Determinism: the same program state renders byte-identical bytes.
   const opts = {
     program: {

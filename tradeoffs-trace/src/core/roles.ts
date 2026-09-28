@@ -53,10 +53,9 @@ export interface PlanModels {
   panelSeats?: Partial<Record<string, RoleModel>>;
   /** `panel=reviewers` in the keyword. */
   panelFrom?: PanelFrom;
-  /** Plan 05j: the optional curator agent's model. Absent (the default): no
-   * curator agent is launched, and the runtime's deterministic anchor pass is
-   * the round's curator step — so a plan that does not name one launches
-   * exactly the roles it always did. */
+  /** Plan 05j: the curator agent's model. Absent: the curator still runs —
+   * on the evaluator's model when that is configured, else on Pi's default,
+   * exactly like an evaluator (OD-2) — so it is never skipped. */
   curator?: RoleModel;
 }
 

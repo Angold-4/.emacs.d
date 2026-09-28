@@ -319,9 +319,9 @@ reads: the values live in the environment (design §7)."
 
 (defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel" "curator")
   "Roles #+TT_MODELS may assign a model to (design §2.1).
-Plan 05j adds `curator': when it names a model the round's linking pass runs
-as an agent (typically on the evaluator's model); absent it, the runtime's
-deterministic anchor pass is the curator step.")
+Plan 05j adds `curator': the round's linking agent. It runs whether or not
+the plan names a model — on the `curator' model when given, else the
+evaluator's, else Pi's default, exactly like an evaluator (OD-2).")
 
 (defconst +tt--reviewer-seats '("M" "A" "B")
   "Reviewer seats #+TT_MODELS may name as `reviewer.SEAT' (design §2.1).")
