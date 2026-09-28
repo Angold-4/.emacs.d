@@ -33,6 +33,7 @@ import {
   ledgerPromptLines,
   refusedPromptLines,
   runPaths,
+  titleIssue,
   type RunPlanFile,
 } from "../../src/conductor.ts";
 import { next } from "../../src/core/next.ts";
@@ -390,6 +391,77 @@ test("plan 04a: raise_tradeoff anchors, the evaluator merges/drops/publishes, an
     assert.match(projected, /"id":"T-1"/);
     assert.match(projected, /"id":"T-2"/);
     assert.match(projected, /"anchor":\{"path":"src\/cancel.ts","lines":\[10,24\]\}/);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 05c: titleIssue flags a truncated title and accepts a complete one", () => {
+  const raw = "Batch cancels per tick so the repetition is recorded once";
+  assert.match(titleIssue(raw, "Batch cancels per tick so the re") ?? "", /mid-word/);
+  assert.equal(titleIssue(raw, "Batch cancels per tick"), undefined);
+  assert.match(titleIssue(raw, "x".repeat(81)) ?? "", /80-character cap/);
+  assert.match(titleIssue(raw, `${raw.slice(0, 40)}…`) ?? "", /ellipsis/);
+});
+
+test("plan 05c: a publish title that ends mid-word is refused, then a complete one is accepted", async () => {
+  const choice = "Batch cancels per tick so the repetition is recorded once in the cancel path";
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "raise_tradeoff",
+          args: { choice, alternative: "a lock per request", why: "matters", anchor: { path: "src/a.ts", lines: [1, 2] } },
+        },
+        submitPhaseStep(),
+      ],
+    }),
+    reviewerScriptFor: stubReviewer(),
+    // The trade-off evaluator first truncates the raw title mid-word (the
+    // conductor refuses it), then publishes a complete rewrite.
+    evaluatorScriptFor: (messageType) => ({
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps:
+        messageType === "tradeoff"
+          ? [
+              {
+                kind: "call-submit",
+                tool: "submit_evaluation",
+                args: { evaluations: [{ messageId: "T-1", action: "publish", title: "Batch cancels per tick so the re" }] },
+              },
+              {
+                kind: "call-submit",
+                tool: "submit_evaluation",
+                args: { evaluations: [{ messageId: "T-1", action: "publish", title: "Batch cancels per tick" }] },
+              },
+            ]
+          : [],
+    }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 60_000, 20, setup.runDir);
+    const message = (setup.conductor.state.phase.messages ?? []).find((m) => m.type === "tradeoff")!;
+    assert.equal(message.state, "published");
+    assert.equal(message.title, "Batch cancels per tick", "the complete title is the one published");
+    const streamDir = runPaths(setup.runDir).stream;
+    const text = fs
+      .readdirSync(streamDir)
+      .filter((f) => f.startsWith("evaluator-tradeoff-"))
+      .map((f) => fs.readFileSync(path.join(streamDir, f), "utf8"))
+      .join("\n");
+    assert.match(text, /ends mid-word/);
+    assert.match(text, /one complete line of at most 80 characters/);
+    assert.ok(
+      readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "EVALUATOR_FINISHED"),
+      "the corrected submission settles the evaluator",
+    );
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

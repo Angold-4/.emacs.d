@@ -5,6 +5,7 @@
   :PROPERTIES:
   :ID: B-1
   :TYPE: blocker
+  :SEVERITY: blocking
   :STATE: published
   :RAISED_BY: M
   :IMPORTANCE: high
@@ -13,19 +14,19 @@
   :CANDIDATE_SHA: C1
   :CONTRACT_VERSION: 1
   :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
+  :RUN_ID: 07ca06e2
   :PHASE_ID: p1
   :END:
   raised by M against C1
 
 * Evidence
-  - src/loop.ts:12 does not break on empty input
+  - src/cancel.ts:10 the cancel path can deadlock
 
 * Plan
   plan/03b.org
 
 * History
-  - v1 · C1 · a23cc118bb88b15a417bbf607157d6b6a3ef441255efd31662eedbb8e9474f05
+  - v1 · C1 · 4c9459c47adbabdc402e454a834c9ccc71303427318bfe65f8ab5c580f5802b3
 
 * Ledger
   (not settled)

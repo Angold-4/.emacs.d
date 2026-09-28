@@ -1391,14 +1391,10 @@ open the decision view at that record."
     ;; this stage carries neither).
     (+tt--render-tradeoffs v)
     (+tt--status-row "cost" (alist-get 'text (alist-get 'cost v)) 'shadow)
-    (+tt--status-row "records"
-                     (format "%d decisions%s%s · %d open findings%s"
-                             (alist-get 'liveDecisions v)
-                             (let ((f (alist-get 'failedDecisions v))) (if (> f 0) (format " (%d failed)" f) ""))
-                             (let ((f (or (alist-get 'flaggedDecisions v) 0))) (if (> f 0) (format " · %d flagged for you" f) ""))
-                             (alist-get 'openFindings v)
-                             (let ((b (alist-get 'boundaryFilesChanged v)))
-                               (if (> b 0) (format " · boundary files changed: %d (reviewers classify)" b) ""))))
+    ;; Plan 05c: the old `records … decisions' row is gone.  The `review' row
+    ;; is in trade-off vocabulary and counts the same messages `review.org'
+    ;; shows (entries plus raw, with dropped broken out).
+    (+tt--status-row "review" (alist-get 'review v))
     (when-let* ((why (alist-get 'blockedReason phase)))
       (+tt--status-row "blocked" why 'error))
     ;; Plan 05i: the toolchain the preflight resolved at start, then the one
@@ -2038,12 +2034,66 @@ The id text property is what RET and A/D read at point; the section heading
             (put-text-property beg end '+tt-message-id id)
             (put-text-property beg end 'face (+tt-review--face-for-type type))))))))
 
+(defun +tt-review--message-heading-p ()
+  "Non-nil when point is on a message heading (one carrying an `:ID:')."
+  (and (org-at-heading-p) (org-entry-get nil "ID")))
+
+(defun +tt-review--fold-messages ()
+  "Fold every message's body and property drawer, keeping every title visible.
+Plan 05c: the layout is deterministic, independent of the user's
+`org-startup-folded'.  Only a heading carrying an `:ID:' is a message, so the
+section headings and the `Minor (N)' group headings stay expanded and every
+message's one-line title is on screen."
+  (org-fold-show-all)
+  (save-excursion
+    (goto-char (point-max))
+    (while (re-search-backward "^\\*+ " nil t)
+      (when (save-excursion (goto-char (match-beginning 0)) (org-entry-get nil "ID"))
+        (org-fold-hide-subtree)))))
+
+(defun +tt-review--body-folded-p ()
+  "Non-nil when the message at point has its body hidden.
+The property drawer stays hidden while the body is shown, so the fold state
+is read from the line after the drawer (`:END:'), not from the drawer."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((limit (save-excursion (org-end-of-subtree t) (point)))
+          (pos nil))
+      (save-excursion
+        (when (re-search-forward "^[ \t]*:END:[ \t]*$" limit t)
+          (setq pos (line-end-position))))
+      (org-fold-folded-p (or pos (line-end-position))))))
+
+(defun +tt-review--expanded-ids ()
+  "The ids of every message whose body is currently visible."
+  (let (ids)
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "^\\*+ " nil t)
+        (let ((id (save-excursion (goto-char (match-beginning 0)) (org-entry-get nil "ID"))))
+          (when (and id (not (+tt-review--body-folded-p)))
+            (push id ids)))))
+    ids))
+
+(defun +tt-review-toggle ()
+  "Toggle the message at point: show its body, keep its property drawer folded.
+Plan 05c: `TAB' never opens the drawer; `RET' opens the message's own file."
+  (interactive)
+  (unless (+tt-review--message-heading-p)
+    (user-error "No message on this line"))
+  (if (+tt-review--body-folded-p)
+      (org-fold-show-entry 'hide-drawers)
+    (org-fold-hide-subtree)))
+
 (defun +tt-review--setup ()
-  "Put the review buffer in its read-only, file-only display state."
+  "Put the review buffer in its read-only, file-only display state.
+Every message shows one folded title line, whatever `org-startup-folded' the
+user set."
   (setq buffer-read-only t)
   (setq-local font-lock-defaults nil)
   (when (fboundp 'font-lock-mode) (font-lock-mode -1))
-  (+tt-review--apply-faces))
+  (+tt-review--apply-faces)
+  (+tt-review--fold-messages))
 
 (defun +tt-review--message-id ()
   "The id of the message at point, or nil."
@@ -2133,25 +2183,31 @@ A message that cannot be settled is reported before the reason is asked for
 
 (defun +tt-review-refresh (&optional force)
   "Re-read `views/review.org' when it changed, keeping point on the same id.
-A no-op when the file's modification time is unchanged, so the timer poll
-costs one `file-attributes' and never a CLI call.  FORCE re-reads anyway
-(after a verdict)."
+Plan 05c: which messages were expanded before the refresh stay expanded
+afterwards, and point stays on the same message.  A no-op when the file's
+modification time is unchanged, so the timer poll costs one `file-attributes'
+and never a CLI call.  FORCE re-reads anyway (after a verdict)."
   (interactive "p")
   (let* ((file (or +tt-review--file buffer-file-name))
          (mtime (and file (file-exists-p file) (file-attribute-modification-time (file-attributes file)))))
     (when (and file mtime (or force (not (equal mtime +tt-review--mtime))))
       (let ((id (+tt-review--message-id))
+            (expanded (+tt-review--expanded-ids))
             (inhibit-read-only t))
         (erase-buffer)
         (insert-file-contents file)
         (set-buffer-modified-p nil)
         (setq +tt-review--mtime mtime)
         (+tt-review--setup)
+        (dolist (x expanded)
+          (when (and (+tt-review--goto-id x)
+                     (+tt-review--message-heading-p))
+            (org-fold-show-entry 'hide-drawers)))
         (+tt-review--goto-id id)))))
 
 (defvar-keymap +tt-review-mode-map
   :parent org-mode-map
-  "TAB" #'org-cycle
+  "TAB" #'+tt-review-toggle
   "RET" #'+tt-review-open-message
   "A" #'+tt-review-accept
   "D" #'+tt-review-refuse
@@ -2161,11 +2217,12 @@ costs one `file-attributes' and never a CLI call.  FORCE re-reads anyway
   "Read-only review view of a tradeoffs-trace phase.
 \<+tt-review-mode-map>\[+tt-review-open-message] opens a message's file,
 \[+tt-review-accept] accepts and \[+tt-review-refuse] refuses the message at
-point, \[org-cycle] folds and \[+tt-review-refresh] refreshes."
+point, \[+tt-review-toggle] shows its body (never its drawer) and
+\[+tt-review-refresh] refreshes."
   (+tt-review--setup)
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +tt-review-mode-map
-      (kbd "TAB") #'org-cycle (kbd "RET") #'+tt-review-open-message
+      (kbd "TAB") #'+tt-review-toggle (kbd "RET") #'+tt-review-open-message
       "A" #'+tt-review-accept "D" #'+tt-review-refuse "g" #'+tt-review-refresh)))
 
 (defun +tt-review ()

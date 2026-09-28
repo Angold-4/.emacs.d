@@ -1,31 +1,32 @@
-#+TITLE: F-1 — a slow path returns NaN to callers
+#+TITLE: F-1 — the loop does not terminate on empty input
 #+TYPE: finding
 
-* F-1 a slow path returns NaN to callers
+* F-1 the loop does not terminate on empty input [blocking]
   :PROPERTIES:
   :ID: F-1
   :TYPE: finding
+  :SEVERITY: blocking
   :STATE: published
   :RAISED_BY: M
-  :IMPORTANCE: low
+  :IMPORTANCE: high
   :VERDICT: none
   :MESSAGE_VERSION: 1
   :CANDIDATE_SHA: C1
   :CONTRACT_VERSION: 1
   :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
+  :RUN_ID: 07ca06e2
   :PHASE_ID: p1
   :END:
   raised by M against C1
 
 * Evidence
-  - src/util.ts:3 a slow path. It returns NaN to callers.
+  - src/loop.ts:12 does not break on empty input
 
 * Plan
   plan/03b.org
 
 * History
-  - v1 · C1 · 4fa1e2cd34bf5902656c01fb2fac50324f5222b824a441c51a6ef5dcff0159fa
+  - v1 · C1 · 88fa9bca619607a8da970e9b5158c5a6d51e13f032c6b2be65cba10faa926025
 
 * Ledger
   (not settled)

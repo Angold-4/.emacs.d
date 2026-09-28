@@ -1,0 +1,11 @@
+#+TITLE: tradeoffs-trace review — p1
+#+CONTRACT_VERSION: v1
+
+* Blockers
+(none)
+
+* Trade-offs
+6 raw, awaiting evaluation
+
+* Findings
+(none)

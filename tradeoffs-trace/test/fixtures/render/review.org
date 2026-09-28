@@ -1,5 +1,4 @@
-#+TITLE: tradeoffs-trace review — p1
-#+RUN_ID: r-03b
+#+TITLE: tradeoffs-trace review — cebd7fcb-01 · 33c41174
 #+CONTRACT_VERSION: v1
 
 * Blockers
@@ -7,6 +6,7 @@
   :PROPERTIES:
   :ID: B-1
   :TYPE: blocker
+  :SEVERITY: blocking
   :STATE: published
   :RAISED_BY: M
   :IMPORTANCE: high
@@ -15,12 +15,15 @@
   :CANDIDATE_SHA: C1
   :CONTRACT_VERSION: 1
   :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
+  :RUN_ID: 07ca06e2
   :PHASE_ID: p1
   :END:
   raised by M against C1
 
   an empty input leaves the cursor where it started
+
+  Panel: escalate — the cancel path can deadlock
+
 
 * Trade-offs
 ** T-1 Batch cancels per tick
@@ -35,7 +38,7 @@
   :CANDIDATE_SHA: C1
   :CONTRACT_VERSION: 1
   :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
+  :RUN_ID: 07ca06e2
   :PHASE_ID: p1
   :END:
   fewer lock acquisitions under load
@@ -56,7 +59,7 @@
   :CANDIDATE_SHA: C1
   :CONTRACT_VERSION: 1
   :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
+  :RUN_ID: 07ca06e2
   :PHASE_ID: p1
   :FOLLOW_UP: true
   :END:
@@ -80,19 +83,42 @@
   :CANDIDATE_SHA: C1
   :CONTRACT_VERSION: 1
   :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
+  :RUN_ID: 07ca06e2
   :PHASE_ID: p1
   :END:
   the name hid the retry behaviour
 
   callers had to read the body to know it retried
 
+
 * Findings
-** Minor (2)
-*** F-1 a slow path returns NaN to callers
+1 raw, awaiting evaluation
+** F-1 the loop does not terminate on empty input [blocking]
   :PROPERTIES:
   :ID: F-1
   :TYPE: finding
+  :SEVERITY: blocking
+  :STATE: published
+  :RAISED_BY: M
+  :IMPORTANCE: high
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: 07ca06e2
+  :PHASE_ID: p1
+  :END:
+  raised by M against C1
+
+  src/loop.ts:12 does not break on empty input
+
+** Minor (1)
+*** F-2 a slow path returns NaN to callers
+  :PROPERTIES:
+  :ID: F-2
+  :TYPE: finding
+  :SEVERITY: advisory
   :STATE: published
   :RAISED_BY: M
   :IMPORTANCE: low
@@ -101,28 +127,10 @@
   :CANDIDATE_SHA: C1
   :CONTRACT_VERSION: 1
   :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
+  :RUN_ID: 07ca06e2
   :PHASE_ID: p1
   :END:
   raised by M against C1
 
   accepted, not fixed
 
-*** F-2 an unreachable branch
-  :PROPERTIES:
-  :ID: F-2
-  :TYPE: finding
-  :STATE: raw
-  :RAISED_BY: A
-  :IMPORTANCE: low
-  :VERDICT: none
-  :MESSAGE_VERSION: 1
-  :CANDIDATE_SHA: C1
-  :CONTRACT_VERSION: 1
-  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  :RUN_ID: r-03b
-  :PHASE_ID: p1
-  :END:
-  raised by A
-
-  not frozen yet

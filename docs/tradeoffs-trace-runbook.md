@@ -875,19 +875,49 @@ rejects any other move.
 
 ## The review buffer and its keys
 
-`C-c m d` opens `views/review.org`. It has three top-level sections, in order
-**Blockers, Trade-offs, Findings**. Each message is one heading carrying its
-title, summary, context and a property drawer: its id, type, state,
-`raisedBy`, `importance`, the owner's verdict (if any), and the binding a
-verdict needs (`messageVersion`, `candidateSha`, `contractVersion`, `runId`,
-`phaseId`). Low-importance messages fold under `Minor (N)`.
+`C-c m d` opens `views/review.org`. The header names the run the way the
+owner says it: its readable id and its run-directory id
+(`cebd7fcb-01 · 33c41174`). The internal `runId` never appears in the header;
+it stays inside each message's property drawer, where a verdict's binding
+needs it.
+
+The buffer has three top-level sections, in order **Blockers, Trade-offs,
+Findings**. Only a message the evaluator **published** (and its later states,
+accepted/refused/resolved/superseded) is a titled entry. Nothing raw is ever
+shown as if it had been evaluated:
+
+- a raw message is one line per section, `6 raw, awaiting evaluation`, never
+  an entry;
+- a **merged** message is not an entry at all — the message it was merged
+  **into** names it in that target's own `views/messages/<id>.org` (under
+  `* Merged in`);
+- a **dropped** message is only a count, `5 dropped`;
+- `* Blockers` holds only messages raised through a reviewer's `blockers`
+  list, each with its panel's outcome (`Panel: escalate — …`); a reviewer's
+  ordinary `blocking` **finding** is listed under `* Findings`, marked
+  `[blocking]`, never under Blockers.
+
+Each message is one heading carrying its title, summary, context and a
+property drawer: its id, type, severity (for a finding), state, `raisedBy`,
+`importance`, the owner's verdict (if any), and the binding a verdict needs
+(`messageVersion`, `candidateSha`, `contractVersion`, `runId`, `phaseId`).
+Low-importance messages fold under `Minor (N)`.
+
+The layout is the same whatever the user's `org-startup-folded` is: every
+message's one-line title is visible, and every message's body and property
+drawer are folded. `TAB` shows one message's body (its drawer stays folded);
+a refresh keeps the expanded messages and point on the same one.
 
 | Key | In the review buffer | What it does |
 |---|---|---|
-| `TAB` | on a message heading | folds the description and context in place |
-| `RET` | on a message heading | opens the message's own `views/messages/<id>.org`: its evidence (path and lines), the plan excerpt it concerns, every version's history, its ledger entry and its votes |
+| `TAB` | on a message heading | shows the description and context in place; the property drawer stays folded |
+| `RET` | on a message heading | opens the message's own `views/messages/<id>.org`: its evidence (path and lines), the plan excerpt it concerns, what was merged into it, every version's history, its ledger entry and its votes |
 | `A` | normal state | accepts the message: writes a `verdict` command with `verdict: "accept"` |
 | `D` | normal state | refuses it: asks for a one-line reason, then writes `verdict: "refuse"` with that reason |
+
+The status buffer's `review` row counts the same messages in trade-off
+vocabulary: `T 6 (6 raw) · F 0 · B 0 · C-c m d` — the titled entries plus the
+raw ones, with the raw and dropped counts broken out, matching `review.org`.
 
 `A`/`D` are accepted and refused in the buffer; `A` and `D` override Evil's
 append and delete-to-end-of-line, which is safe in a read-only view. On a
@@ -980,7 +1010,7 @@ bytes. `tt contract check <run>` verifies that.
   <run>/views/loop.txt              the phase state machine as a chart (from TRANSITIONS)
   <run>/views/metrics.json          the balance metrics (tt summary renders the same numbers)
   <run>/messages.jsonl, ledger.jsonl  the message and settled-ledger projections
-  <run>/views/review.org            the review buffer: Blockers, Trade-offs, Findings
+  <run>/views/review.org            the review buffer: Blockers, Trade-offs, Findings; published entries only
   <run>/views/messages/<id>.org     one message's evidence, history, ledger entry and votes
   <run>/inbox/{,applied/,rejected/} owner input and commands, with rejection reasons
   programs/<id>/program.json        the program as started, with every node's readable id
