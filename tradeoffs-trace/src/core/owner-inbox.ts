@@ -137,6 +137,47 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
   if (typeof r.type !== "string") {
     return { ok: false, reason: "owner command is neither the flat 'kind' schema form nor a decision-view 'type' command" };
   }
+  // Plan 05j: the entry commands the review view sends. They are not bound to
+  // a message version (an entry is a topic spanning messages), only to the
+  // run/phase they were viewed in. Handled before the message-binding check.
+  if (r.type.startsWith("entry-")) {
+    const runId = typeof r.runId === "string" ? r.runId : "";
+    const phaseId = typeof r.phaseId === "string" ? r.phaseId : "";
+    const entryId = typeof r.entryId === "string" && r.entryId.length > 0 ? r.entryId : undefined;
+    if (!entryId) return { ok: false, reason: `'${r.type}' needs an entryId` };
+    const by = "owner";
+    switch (r.type) {
+      case "entry-split": {
+        const messageId = typeof r.messageId === "string" && r.messageId.length > 0 ? r.messageId : undefined;
+        if (!messageId) return { ok: false, reason: "'entry-split' needs a messageId" };
+        const newEntryId = typeof r.newEntryId === "string" && r.newEntryId.length > 0 ? r.newEntryId : undefined;
+        return { ok: true, runId, phaseId, event: { type: "ENTRY_SPLIT", entryId, messageId, ...(newEntryId ? { newEntryId } : {}), by } };
+      }
+      case "entry-merge": {
+        const intoEntryId = typeof r.intoEntryId === "string" && r.intoEntryId.length > 0 ? r.intoEntryId : undefined;
+        if (!intoEntryId) return { ok: false, reason: "'entry-merge' needs an intoEntryId" };
+        return { ok: true, runId, phaseId, event: { type: "ENTRY_MERGED_BY_OWNER", entryId, intoEntryId, by } };
+      }
+      case "entry-retitle": {
+        const title = typeof r.title === "string" ? r.title.trim() : "";
+        if (!title) return { ok: false, reason: "'entry-retitle' needs a non-empty title" };
+        return { ok: true, runId, phaseId, event: { type: "ENTRY_RETITLED", entryId, title, by } };
+      }
+      case "entry-verdict": {
+        if (r.verdict !== "accept" && r.verdict !== "refuse") return { ok: false, reason: "'entry-verdict' needs verdict accept or refuse" };
+        const reason = typeof r.reason === "string" && r.reason.trim().length > 0 ? r.reason.trim() : undefined;
+        const sha = typeof r.sha === "string" && r.sha.length > 0 ? r.sha : undefined;
+        return {
+          ok: true,
+          runId,
+          phaseId,
+          event: { type: "ENTRY_STATE", entryId, state: r.verdict === "accept" ? "resolved" : "dropped", ...(sha ? { sha } : {}), ...(reason ? { reason } : {}), by },
+        };
+      }
+      default:
+        return { ok: false, reason: `unknown entry command '${r.type}'` };
+    }
+  }
   const binding = r.binding;
   if (!binding || typeof binding !== "object") {
     return { ok: false, reason: `decision-view '${r.type}' command needs a 'binding' tuple` };

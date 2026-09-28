@@ -375,3 +375,67 @@ before any run is created.
 This is contract version 1. A future change to the message states, the event
 names, the binding shape, the `contentHash` inputs or the carry rule bumps the
 version and is documented here.
+
+## 7. Entries (plan 05j)
+
+The message ledger counts messages; the owner decides on TOPICS. An **entry**
+is one topic: a trade-off the implementation made where it departed from or
+filled a gap in the plan (its choice, the alternative given up, and who
+approved it), a finding that is a defect against the plan or the code, or a
+blocker that stops acceptance. The same issue raised as a blocker, a
+trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
+
+- **Type.** An entry's type is the highest type of its linked messages: a
+  blocker if a blocker vote or a blocking finding stops acceptance, otherwise
+  a finding if any linked message is a defect, otherwise a trade-off. No
+  curator may change it.
+- **Events.** `ENTRY_OPENED`, `MESSAGE_LINKED` (message, entry, shared anchor,
+  reason), `ENTRY_RETITLED`, `ENTRY_SPLIT` (owner), `ENTRY_STATE` (open,
+  resolved in `<sha>`, dropped with a reason) and `ENTRY_MERGED_BY_OWNER`
+  (owner). They are appended to `events.jsonl`; the entries are a pure
+  projection of them.
+- **Anchors.** Every message gets a normalised anchor from its evidence: a
+  file and line range, a decision id, or a plan clause. The runtime accepts a
+  link only when the message and the entry share an anchor (an overlapping
+  line range in the same file, the same decision id, or the same plan clause).
+  Any other link is refused and logged, and the message opens its own entry —
+  nothing is silently merged, nothing hidden.
+- **The curator.** Once per round, after the reviews and before the
+  evaluators, a curator agent (the evaluator's model) sees every new raw
+  message of every type plus every open entry of the program. Its tool
+  (`curate_entries`) accepts only `link`, `open` and `retitle`; any other op
+  is refused before an event is applied. It cannot drop, resolve, merge or
+  change a type. Reviewers' prompts also list the open entries, so a reviewer
+  can link at raise time with `sameAs`.
+- **Latest state.** Each entry's state is computed against the newest
+  candidate; the view's header names it. An entry whose messages all concern
+  older candidates and that a later round resolved leaves the live view. An
+  open entry whose anchor no longer resolves in the newest code is kept and
+  tagged `stale anchor`, never hidden.
+- **Views.** `views/review.org` (phase, `C-c m d`) and
+  `programs/<id>/views/review.org` (program, `C-c m D`) have three sections —
+  Blockers, Findings, Trade-offs — one heading per live entry: title, then its
+  tags (phase id in the program view; who raised it, e.g. `M·A`; `+2 linked`;
+  its anchor). `TAB` shows the entry's summary and each linked message; `RET`
+  opens `views/entries/<id>.org` with the full history; `s` on a linked
+  message splits it into its own entry; `m` on a `≈` hint merges the two as
+  the owner's own action; `A`/`D` settle the entry. The program view links
+  entries across phases only through shared anchors, the same rule.
+- **Accounting.** The last line reconciles every raw message:
+  `31 raw → 9 entries · 18 linked · 2 dropped · 0 unaccounted · unexposed 3`.
+  A message that is neither linked, dropped, merged nor resolved is
+  unaccounted, and the lint fails. Near-duplicates that share no anchor are
+  never merged by the curator; a deterministic similarity over normalised
+  words (threshold in `ENTRY_SIMILARITY_THRESHOLD`) gives each an `≈ E-n` hint
+  tag instead.
+- **Review lint** (`src/core/review-lint.ts`) runs on every render: one live
+  entry per anchor; only live entries rendered; every entry has a type, an
+  anchor and its validation evidence; titles non-empty, at most 80 characters,
+  not cut mid-word; every state computed against the newest candidate; the
+  accounting reconciles to 0 unaccounted. A violation is never repaired
+  silently: the view's first line names it (`review lint: 2 entries share
+  capital.rs:88-104`) and a `REVIEW_LINT_FAILED` event records it.
+- **Cleanness metrics** (`views/metrics.json`, the status `metrics` line and
+  `tt summary`): live entries per phase (a warning above a budget, default
+  12), entries per distinct anchor, open `≈` hints, the owner's `m`/`s`
+  corrections (the ground truth of curator errors) and lint violations.

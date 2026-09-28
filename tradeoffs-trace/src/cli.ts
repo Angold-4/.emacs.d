@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { pendingOwnerInputs, projectReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
+import { candidateAnchorResolves, pendingOwnerInputs, projectEntryReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
 import { decisionStatus } from "./core/predicate.ts";
@@ -911,7 +911,13 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   const state = rebuildState(runDir, plan, { lenient: true });
   const messages = projectMessages(state.phase);
   const ledger = projectLedger(state.phase);
-  const review = projectReview({ ...state.phase, ...runIds(runDir) });
+  // Plan 05j: review.org is the entry projection (one topic once), linted on
+  // every render. `views/entries/<id>.org` is each live entry's own file.
+  const entryReview = projectEntryReview(
+    { ...state.phase, ...runIds(runDir) },
+    { anchorResolves: candidateAnchorResolves(state.phase.candidate ? path.join(p.candidates, state.phase.candidate.sha) : undefined) },
+  );
+  const review = entryReview.text;
   const messageFiles = reviewMessageFiles(state.phase);
   // Plan 04c: `views/metrics.json` is a projection of state and the log.
   const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
@@ -935,7 +941,14 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     for (const name of readdirSync(p.messagesView)) {
       if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
     }
-    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/messages/, views/metrics.json, views/tape.txt\n`);
+    // Plan 05j: one file per live entry, pruned the same way.
+    mkdirSync(p.entriesView, { recursive: true });
+    const entryIds = new Set(entryReview.files.map((f) => f.id));
+    for (const f of entryReview.files) writeFileSync(path.join(p.entriesView, `${f.id}.org`), f.contents);
+    for (const name of readdirSync(p.entriesView)) {
+      if (name.endsWith(".org") && !entryIds.has(name.slice(0, -4))) rmSync(path.join(p.entriesView, name), { force: true });
+    }
+    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/entries/, views/messages/, views/metrics.json, views/tape.txt\n`);
     return;
   }
   if (sub !== "check") usage();
@@ -954,6 +967,11 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     const file = path.join(p.messagesView, `${f.id}.org`);
     const actual = existsSync(file) ? readFileSync(file, "utf8") : "";
     if (actual !== f.contents) mismatches.push(`views/messages/${f.id}.org`);
+  }
+  for (const f of entryReview.files) {
+    const file = path.join(p.entriesView, `${f.id}.org`);
+    const actual = existsSync(file) ? readFileSync(file, "utf8") : "";
+    if (actual !== f.contents) mismatches.push(`views/entries/${f.id}.org`);
   }
   // B-12/A-14: an extra file for an id state no longer has is a mismatch, so
   // `check` sees the same stale file `rebuild` now prunes.
@@ -1110,7 +1128,17 @@ async function cmdVerdict(
   const after = rebuildState(runDir, plan, { lenient: true });
   writeFileSync(p.messages, projectMessages(after.phase));
   writeFileSync(p.ledger, projectLedger(after.phase));
-  writeFileSync(p.review, projectReview({ ...after.phase, ...runIds(runDir) }));
+  const lateEntryReview = projectEntryReview(
+    { ...after.phase, ...runIds(runDir) },
+    { anchorResolves: candidateAnchorResolves(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
+  );
+  writeFileSync(p.review, lateEntryReview.text);
+  mkdirSync(p.entriesView, { recursive: true });
+  const lateEntryIds = new Set(lateEntryReview.files.map((f) => f.id));
+  for (const f of lateEntryReview.files) writeFileSync(path.join(p.entriesView, `${f.id}.org`), f.contents);
+  for (const name of readdirSync(p.entriesView)) {
+    if (name.endsWith(".org") && !lateEntryIds.has(name.slice(0, -4))) rmSync(path.join(p.entriesView, name), { force: true });
+  }
   const lateTimeline = rebuildTimelineWithEvents(runDir, plan);
   writeFileSync(p.metrics, projectMetrics(metricsForRunDir(runDir, after.phase, lateTimeline.timeline, lateTimeline.events)));
   // A run from before this view has no views/messages/: create it, and prune
@@ -1145,6 +1173,86 @@ async function cmdVerdict(
   );
   writeFileSync(p.tape, redactText(lateView.tape, maskable));
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
+}
+
+/** Plan 05j: the owner's entry corrections the review view sends. `s` sends
+ * ENTRY_SPLIT, `m` ENTRY_MERGED_BY_OWNER, `A`/`D` an ENTRY_STATE; a retitle is
+ * the same path. A live run goes through the inbox (the conductor applies
+ * it); a stopped run's late command is validated by a dry-run reduce and then
+ * appended to the log. */
+async function cmdEntry(positional: string[], root: string, reason: string | undefined): Promise<void> {
+  const runDir = resolveRunDir(positional[0], root);
+  const op = positional[1];
+  const entryId = positional[2];
+  if (!op || !entryId) usage();
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const base = { runId: state.phase.runId, phaseId: state.phase.phaseId, entryId };
+  let command: Record<string, unknown>;
+  let event: Record<string, unknown>;
+  if (op === "split") {
+    const messageId = positional[3];
+    if (!messageId) usage();
+    command = { type: "entry-split", ...base, messageId };
+    event = { type: "ENTRY_SPLIT", entryId, messageId, by: "owner" };
+  } else if (op === "merge") {
+    const intoEntryId = positional[3];
+    if (!intoEntryId) usage();
+    command = { type: "entry-merge", ...base, intoEntryId };
+    event = { type: "ENTRY_MERGED_BY_OWNER", entryId, intoEntryId, by: "owner" };
+  } else if (op === "retitle") {
+    const title = positional.slice(3).join(" ").trim();
+    if (!title) usage();
+    command = { type: "entry-retitle", ...base, title };
+    event = { type: "ENTRY_RETITLED", entryId, title, by: "owner" };
+  } else if (op === "accept" || op === "refuse" || op === "resolve") {
+    const verdict = op === "accept" ? "accept" : "refuse";
+    const sha = state.phase.candidate?.sha;
+    command = { type: "entry-verdict", ...base, verdict, ...(reason ? { reason } : {}), ...(sha ? { sha } : {}) };
+    event = { type: "ENTRY_STATE", entryId, state: verdict === "accept" ? "resolved" : "dropped", ...(sha ? { sha } : {}), ...(reason ? { reason } : {}), by: "owner" };
+  } else {
+    usage();
+  }
+  if (conductorAlive(runDir)) {
+    const inbox = path.join(runDir, "inbox");
+    mkdirSync(inbox, { recursive: true });
+    const commandId = `entry-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+    writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
+    const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
+    if (outcome.kind === "applied") process.stdout.write(`entry ${op} applied: ${entryId} in run ${path.basename(runDir)}\n`);
+    else if (outcome.kind === "rejected") {
+      process.stdout.write(`entry ${op} rejected: ${outcome.reason}\n`);
+      process.exitCode = 1;
+    } else process.stdout.write(`queued entry ${op} ${commandId} for run ${path.basename(runDir)} (queued, not yet applied)\n`);
+    return;
+  }
+  const result = reduce(state, event as never);
+  if (!result.ok) {
+    process.stdout.write(`entry ${op} rejected: ${result.reason}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const p = runPaths(runDir);
+  const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
+  const log = new EventLog(p.events, maskable);
+  try {
+    log.append("event", event);
+  } finally {
+    log.close();
+  }
+  const after = rebuildState(runDir, plan, { lenient: true });
+  const entryReview = projectEntryReview(
+    { ...after.phase, ...runIds(runDir) },
+    { anchorResolves: candidateAnchorResolves(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
+  );
+  writeFileSync(p.review, entryReview.text);
+  mkdirSync(p.entriesView, { recursive: true });
+  const entryIds = new Set(entryReview.files.map((f) => f.id));
+  for (const f of entryReview.files) writeFileSync(path.join(p.entriesView, `${f.id}.org`), f.contents);
+  for (const name of readdirSync(p.entriesView)) {
+    if (name.endsWith(".org") && !entryIds.has(name.slice(0, -4))) rmSync(path.join(p.entriesView, name), { force: true });
+  }
+  process.stdout.write(`recorded entry ${op} for ${entryId} in run ${path.basename(runDir)}\n`);
 }
 
 async function main(): Promise<void> {
@@ -1187,6 +1295,9 @@ async function main(): Promise<void> {
   } else if (cmd === "verdict") {
     if (positional.length !== 3) usage();
     await cmdVerdict(positional, runRoot, reason, { candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId });
+  } else if (cmd === "entry") {
+    if (positional.length < 3) usage();
+    await cmdEntry(positional, runRoot, reason);
   } else if (cmd === "summary") {
     if (positional.length !== 1) usage();
     process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));

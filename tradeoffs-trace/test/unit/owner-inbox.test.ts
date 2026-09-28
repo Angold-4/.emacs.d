@@ -261,3 +261,31 @@ test("owner-inbox: the decision view's encoding (type + binding) maps to the sam
   assert.equal(unknown.ok, false);
   assert.match(!unknown.ok ? unknown.reason : "", /not a conductor-state command/);
 });
+
+// Plan 05j: the owner's entry corrections (s / m / A / D in the review view).
+test("owner-inbox: the review view's entry commands map to ENTRY_* events and reduce", () => {
+  const locate = { runId: "r1", phaseId: "p1" };
+  const split = normalizeDecisionViewCommand({ type: "entry-split", entryId: "E-1", messageId: "T-2", ...locate }, "e-1");
+  assert.equal(split.ok, true);
+  assert.deepEqual((split as { event: Event }).event, { type: "ENTRY_SPLIT", entryId: "E-1", messageId: "T-2", by: "owner" });
+  const merge = normalizeDecisionViewCommand({ type: "entry-merge", entryId: "E-1", intoEntryId: "E-2", ...locate }, "e-2");
+  assert.equal(merge.ok, true);
+  assert.deepEqual((merge as { event: Event }).event, { type: "ENTRY_MERGED_BY_OWNER", entryId: "E-1", intoEntryId: "E-2", by: "owner" });
+  const refuse = normalizeDecisionViewCommand({ type: "entry-verdict", entryId: "E-1", verdict: "refuse", reason: "not this round", ...locate }, "e-3");
+  assert.equal(refuse.ok, true);
+  assert.deepEqual((refuse as { event: Event }).event, { type: "ENTRY_STATE", entryId: "E-1", state: "dropped", reason: "not this round", by: "owner" });
+  // A bad op, or one missing its message, is refused with a reason.
+  assert.equal(normalizeDecisionViewCommand({ type: "entry-split", entryId: "E-1", ...locate }, "e-4").ok, false);
+  assert.equal(normalizeDecisionViewCommand({ type: "entry-frobnicate", entryId: "E-1", ...locate }, "e-5").ok, false);
+
+  // The event reduces: an entry opens with a message, and ENTRY_STATE settles it.
+  const opened = step(baseState({ entries: [] }), {
+    type: "ENTRY_OPENED",
+    phaseId: "p1",
+    title: "a topic",
+    anchor: { kind: "decision", id: "D-1" },
+  });
+  const settled = step(opened, { type: "ENTRY_STATE", entryId: "E-1", state: "resolved", sha: "C1", by: "owner" });
+  assert.equal(settled.phase.entries?.[0].state, "resolved");
+  assert.equal(settled.phase.entries?.[0].stateSha, "C1");
+});

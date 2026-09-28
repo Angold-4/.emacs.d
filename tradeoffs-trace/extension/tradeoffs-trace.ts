@@ -31,6 +31,7 @@ import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-codin
 import { guardedSearchPath, guardedShCommand, guardedWritePath, readGuardConfigFromEnv, readSearchRootsFromEnv } from "./guards.ts";
 
 import { validate, type JSONSchema } from "../src/core/schema.ts";
+import { validateCuratorProposal } from "../src/core/entries.ts";
 import { reviewIngestionIssue } from "../src/core/predicate.ts";
 import type { Review } from "../src/core/types.ts";
 import {
@@ -401,7 +402,8 @@ class RunSocketClient {
       | "submit_review"
       | "raise_tradeoff"
       | "submit_evaluation"
-      | "submit_panel_vote",
+      | "submit_panel_vote"
+      | "curate_entries",
     args: unknown,
     timeoutMs = 60000,
   ): Promise<SubmitReply> {
@@ -580,7 +582,8 @@ export default function (pi: ExtensionAPI) {
       | "submit_review"
       | "raise_tradeoff"
       | "submit_evaluation"
-      | "submit_panel_vote",
+      | "submit_panel_vote"
+      | "curate_entries",
     args: unknown,
     markAccepted = true,
   ) {
@@ -699,6 +702,36 @@ export default function (pi: ExtensionAPI) {
     parameters: SubmitEvaluationParams,
     async execute(_toolCallId, params) {
       return submitTool("submit_evaluation", params);
+    },
+  });
+
+  // Plan 05j: the curator's tool. It may ONLY propose link, open and retitle
+  // (validateCuratorProposal enforces the allow-list before the socket). It
+  // cannot drop, resolve or change a type.
+  pi.registerTool({
+    name: "curate_entries",
+    label: "Curate Entries",
+    description:
+      "Propose links between raw messages and open entries. Allowed ops: link (messageId, entryId, anchor, reason), open (title, optional messageId/anchor) and retitle (entryId, title). You may not drop, resolve or change a type.",
+    promptSnippet: "Propose link/open/retitle for the review entries",
+    parameters: Type.Object({
+      proposals: Type.Array(
+        Type.Object({
+          op: Type.String(),
+          entryId: Type.Optional(Type.String()),
+          messageId: Type.Optional(Type.String()),
+          title: Type.Optional(Type.String()),
+          reason: Type.Optional(Type.String()),
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      const proposals = (params as { proposals?: Array<{ op: string }> }).proposals ?? [];
+      for (const p of proposals) {
+        const valid = validateCuratorProposal(p as never);
+        if (!valid.ok) return { isError: true, content: [{ type: "text" as const, text: `invalid arguments: ${valid.reason}` }] };
+      }
+      return submitTool("curate_entries", params, false);
     },
   });
 

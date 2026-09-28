@@ -925,6 +925,37 @@ cancels."
     (pop-to-buffer buf)
     (+tt--ensure-timer)))
 
+(defun +tt--program-dir-for (dir)
+  "The program directory DIR names, or one chosen from `+tt-root'/programs.
+Point's program buffer, or a program input box, wins over the prompt."
+  (or dir
+      (and (boundp '+tt--program-dir) +tt--program-dir)
+      (and (boundp '+tt--input-program-dir) +tt--input-program-dir)
+      (let ((ids (directory-files (expand-file-name "programs" +tt-root) nil "\\`[^.]")))
+        (unless ids (user-error "No programs under %s" +tt-root))
+        (expand-file-name (concat "programs/" (completing-read "Program: " (reverse ids) nil t)) +tt-root))))
+
+;;;###autoload
+(defun +tt-program-review ()
+  "Open the program-wide entry review (`C-c m D').
+Reads `programs/<id>/views/review.org', the runtime's projection of every
+phase's entries; entries from different phases are linked only through shared
+anchors."
+  (interactive)
+  (let* ((dir (+tt--program-dir-for nil))
+         (file (expand-file-name "views/review.org" dir)))
+    (unless (file-exists-p file)
+      (user-error "No rendered program review at %s; the scheduler writes it after a node run" file))
+    (let ((buf (find-file-noselect file)))
+      (with-current-buffer buf
+        (+tt-review-mode)
+        (setq +tt--run-dir dir +tt-review--file file)
+        (setq +tt-review--mtime (file-attribute-modification-time (file-attributes file)))
+        (+tt-review--setup)
+        (goto-char (point-min)))
+      (pop-to-buffer buf)
+      (+tt--ensure-timer))))
+
 ;;;; Workspace
 
 (defun +tt--readable-id (run-dir)
@@ -2113,14 +2144,70 @@ After a refresh a message may have disappeared; point then goes to the top."
       (goto-char (match-beginning 0))
     (goto-char (point-min))))
 
+(defun +tt-review--bullet-message-id ()
+  "The `T-n'/`F-n'/`B-n' id of a linked-message bullet on this line, or nil."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^[ \t]*- \\([A-Z]-[0-9]+\\) ")
+      (match-string-no-properties 1))))
+
 (defun +tt-review-open-message ()
-  "Open `views/messages/<id>.org' for the message at point (RET)."
+  "Open the detail file for the entry or message at point (RET).
+Plan 05j: an entry heading (`E-n') opens `views/entries/<id>.org', a linked
+message line opens `views/messages/<id>.org'."
   (interactive)
-  (let* ((id (+tt-review--message-id))
-         (file (and id +tt--run-dir (expand-file-name (concat "views/messages/" id ".org") +tt--run-dir))))
-    (unless id (user-error "No message on this line"))
+  (let* ((entry (+tt-review--entry-id))
+         (id (cond (entry entry)
+                   ((+tt-review--bullet-message-id))
+                   (t (+tt-review--message-id))))
+         (dir (if (and id (string-prefix-p "E-" id)) "views/entries/" "views/messages/"))
+         (file (and id +tt--run-dir (expand-file-name (concat dir id ".org") +tt--run-dir))))
+    (unless id (user-error "No entry or message on this line"))
     (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
     (find-file file)))
+
+(defun +tt-review--entry-id ()
+  "The `E-n' id of the entry at point, or nil."
+  (let ((id (+tt-review--message-id)))
+    (and id (string-prefix-p "E-" id) id)))
+
+(defun +tt-review--linked-message-at-point ()
+  "The `T-n'/`F-n'/`B-n' id `s' should act on: a linked-message bullet on this
+line, or the entry's first linked id when point is on the entry heading."
+  (or (+tt-review--bullet-message-id)
+      (when (+tt-review--entry-id)
+        (let ((linked (org-entry-get nil "LINKED")))
+          (when (and linked (not (string-empty-p linked)))
+            (car (split-string linked ",")))))))
+
+(defun +tt-review--entry-hint ()
+  "The `≈ E-n' hint entry id at point, or nil."
+  (when (+tt-review--entry-id)
+    (let ((hint (org-entry-get nil "HINT")))
+      (when (and hint (not (string-empty-p hint))) hint))))
+
+(defun +tt-review-split ()
+  "Split the linked message at point into its own entry (s).
+Sends ENTRY_SPLIT; the runtime records it as the owner's own action."
+  (interactive)
+  (let ((entry (+tt-review--entry-id))
+        (message (+tt-review--linked-message-at-point)))
+    (unless entry (user-error "No entry on this line"))
+    (unless message (user-error "No linked message on this line to split out"))
+    (message "%s" (+tt--cli "entry" +tt--run-dir "split" entry message))
+    (+tt-review-refresh t)))
+
+(defun +tt-review-merge ()
+  "Merge the entry at point into its `≈' neighbour (m).
+Only the owner can merge two near-duplicates; the runtime records
+ENTRY_MERGED_BY_OWNER."
+  (interactive)
+  (let ((entry (+tt-review--entry-id))
+        (into (+tt-review--entry-hint)))
+    (unless entry (user-error "No entry on this line"))
+    (unless into (user-error "Entry %s carries no ≈ hint; nothing to merge" entry))
+    (message "%s" (+tt--cli "entry" +tt--run-dir "merge" entry into))
+    (+tt-review-refresh t)))
 
 (defun +tt-review--binding-at-point ()
   "The six binding property values at point, or nil when any is missing.
@@ -2167,14 +2254,22 @@ A raw message cannot be settled yet (contract v1: it is not yet frozen);
 one already published is sent through `tt verdict' with its full binding.
 A missing binding property is refused locally, and a stale verdict's reason
 is shown in the echo area and the buffer refreshes."
-  (let ((id (+tt-review--settleable-id)))
-    (condition-case err
-        (message "%s" (apply #'+tt--cli (+tt-review--verdict-args id verdict reason)))
-      (error (message "%s" (error-message-string err))))
-    (+tt-review-refresh t)))
+  (if (+tt-review--entry-id)
+      ;; Plan 05j: A/D act on the ENTRY, not one message: the owner settles the
+      ;; topic once. Refusing asks for a one-line reason like a message.
+      (progn
+        (condition-case err
+            (message "%s" (apply #'+tt--cli (append (list "entry" +tt--run-dir (if (equal verdict "accept") "accept" "refuse") (+tt-review--entry-id)) (when (and reason (not (string-empty-p reason))) (list "--reason" reason)))))
+          (error (message "%s" (error-message-string err))))
+        (+tt-review-refresh t))
+    (let ((id (+tt-review--settleable-id)))
+      (condition-case err
+          (message "%s" (apply #'+tt--cli (+tt-review--verdict-args id verdict reason)))
+        (error (message "%s" (error-message-string err))))
+      (+tt-review-refresh t))))
 
 (defun +tt-review-accept ()
-  "Accept the message at point (A)."
+  "Accept the entry or message at point (A)."
   (interactive)
   (+tt-review--verdict "accept" nil))
 
@@ -2183,8 +2278,10 @@ is shown in the echo area and the buffer refreshes."
 A message that cannot be settled is reported before the reason is asked for
 (A-18), so D on a raw message just says it is not yet frozen."
   (interactive)
-  (+tt-review--settleable-id)
-  (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))
+  (if (+tt-review--entry-id)
+      (+tt-review--verdict "refuse" (read-string "Reason (optional): "))
+    (+tt-review--settleable-id)
+    (+tt-review--verdict "refuse" (read-string "Reason (optional): "))))
 
 (defun +tt-review-refresh (&optional force)
   "Re-read `views/review.org' when it changed, keeping point on the same id.
@@ -2216,6 +2313,8 @@ and never a CLI call.  FORCE re-reads anyway (after a verdict)."
   "RET" #'+tt-review-open-message
   "A" #'+tt-review-accept
   "D" #'+tt-review-refuse
+  "s" #'+tt-review-split
+  "m" #'+tt-review-merge
   "g" #'+tt-review-refresh)
 
 (define-derived-mode +tt-review-mode org-mode "tt-review"
@@ -2228,7 +2327,9 @@ point, \[+tt-review-toggle] shows its body (never its drawer) and
   (when (fboundp 'evil-define-key)
     (evil-define-key 'normal +tt-review-mode-map
       (kbd "TAB") #'+tt-review-toggle (kbd "RET") #'+tt-review-open-message
-      "A" #'+tt-review-accept "D" #'+tt-review-refuse "g" #'+tt-review-refresh)))
+      "A" #'+tt-review-accept "D" #'+tt-review-refuse
+      "s" #'+tt-review-split "m" #'+tt-review-merge
+      "g" #'+tt-review-refresh)))
 
 (defun +tt-review ()
   "Open the runtime-rendered review of the run this buffer means (C-c m d)."
@@ -2738,6 +2839,7 @@ Reads `tt program list --json'; nil when there is no program or no wait."
 (keymap-global-set "C-c m r" #'+tt-run)
 (keymap-global-set "C-c m s" #'+tt-show)
 (keymap-global-set "C-c m d" #'+tt-review)
+(keymap-global-set "C-c m D" #'+tt-program-review)
 (keymap-global-set "C-c m l" #'+tt-runs)
 (keymap-global-set "C-c m p" #'+tt-program)
 (keymap-global-set "C-c m g" #'+tt-tape)

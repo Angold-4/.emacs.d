@@ -252,7 +252,9 @@ test("a verdict file left in the inbox before exit is applied on the next start"
       assert.equal(refused.followUp, true);
       const p = runPaths(setup.runDir);
       assert.match(readFileSync(p.ledger, "utf8"), /"followUp":true/);
-      assert.match(readFileSync(p.review, "utf8"), /FOLLOW_UP: true/);
+      // Plan 05j: the entry view carries the topic; the message's own file
+      // (views/messages/<id>.org) still carries FOLLOW_UP and the verdict.
+      assert.match(readFileSync(`${p.messagesView}/${message.id}.org`, "utf8"), /FOLLOW_UP: true/);
       assert.match(tt(["summary", setup.runDir]), /Follow-ups/);
     } finally {
       await restarted.stop();
@@ -690,8 +692,9 @@ test("contract v1 projections pass check, rebuild identically, and record a late
     assert.equal(entry.followUp, true, "the ledger must show the follow-up");
     assert.match(JSON.stringify(messages), /tradeoff/);
     assert.match(tt(["contract", "check", setup.runDir]), /contract check ok/);
-    // The review view and `tt summary` show the follow-up too.
-    assert.match(readFileSync(p.review, "utf8"), /FOLLOW_UP: true/);
+    // The review view and `tt summary` show the follow-up too. Plan 05j: the
+    // entry view is the topic; FOLLOW_UP lives in the message's own file.
+    assert.match(readFileSync(`${p.messagesView}/${target.id}.org`, "utf8"), /FOLLOW_UP: true/);
     assert.match(tt(["summary", setup.runDir]), /Follow-ups/);
     assert.match(tt(["summary", setup.runDir]), new RegExp(target.id));
 
@@ -758,11 +761,11 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(readFileSync(p.loop, "utf8"), /^tradeoffs-trace phase chart — generated from TRANSITIONS/);
     assert.match(readFileSync(p.loop, "utf8"), /IMPLEMENTING|REVIEWING|CHECKING/);
     const reviewBefore = readFileSync(p.review, "utf8");
-    // Plan 05c: a raw message is never shown as if it had been evaluated —
-    // the review lists it only as a count until an evaluator publishes it.
-    assert.match(reviewBefore, /^2 raw, awaiting evaluation$/m);
+    // Plan 05j: the view is the entry projection — each raw trade-off is one
+    // topic entry, and the accounting footer reconciles.
     assert.match(reviewBefore, /^\* Trade-offs$/m);
-    assert.doesNotMatch(reviewBefore, /^\*\* T-/m);
+    assert.match(reviewBefore, /^\*\* E-\d+/m);
+    assert.match(reviewBefore, /raw → \d+ entries/);
     const statusBefore = readFileSync(p.status, "utf8");
     assert.match(statusBefore, /^run /m);
     assert.match(statusBefore, /^phase /m);
@@ -772,10 +775,10 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     await waitFor(() => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "finding"), 90_000, 20, setup.runDir);
     await waitFor(() => readFileSync(p.review, "utf8") !== reviewBefore, 30_000, 20, setup.runDir);
     const reviewAfter = readFileSync(p.review, "utf8");
-    // Plan 05c: the new raw finding is a count line under Findings, not an
-    // entry; its own file is still written for when it is published.
-    assert.match(reviewAfter, /^1 raw, awaiting evaluation$/m);
+    // Plan 05j: the new raw finding opens its own entry under Findings; its
+    // message file is still written for when it is published.
     assert.match(reviewAfter, /^\* Findings$/m);
+    assert.match(reviewAfter, /^\*\* E-\d+/m);
     assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
     assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
     // Plan 04c join: wait until the status reflects the published finding —

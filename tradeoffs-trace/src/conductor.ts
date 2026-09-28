@@ -20,8 +20,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { curatorEvent, formatAnchor, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { projectReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
+import { candidateAnchorResolves, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
@@ -432,6 +433,8 @@ export function runPaths(runDir: string) {
     ledger: path.join(runDir, "ledger.jsonl"),
     review: path.join(runDir, "views", "review.org"),
     messagesView: path.join(runDir, "views", "messages"),
+    // Plan 05j: one file per live ENTRY, the RET target from the review view.
+    entriesView: path.join(runDir, "views", "entries"),
     status: path.join(runDir, "views", "status.txt"),
     // Plan 03c: the phase state machine as an ASCII chart (TRANSITIONS).
     loop: path.join(runDir, "views", "loop.txt"),
@@ -955,6 +958,9 @@ const STALE_REVIEW = "stale review";
 export class Conductor {
   #runDir: string;
   #paths: ReturnType<typeof runPaths>;
+  /** Plan 05j: the last lint violation signature written/logged, so the
+   * conductor does not append a REVIEW_LINT_FAILED on every render beat. */
+  #lastLintSignature = "";
   #plan: RunPlanFile;
   #deadlines: Deadlines;
   #piCommand: string | undefined;
@@ -3300,6 +3306,21 @@ export class Conductor {
       handle.doneResolve();
       return { ok: true };
     }
+    if (msg.tool === "curate_entries") {
+      // Plan 05j: the curator's link/open/retitle pass. The allow-list is the
+      // tool's contract: any other op is refused before an event is applied.
+      const proposals = (msg.args as { proposals?: unknown }).proposals;
+      if (!Array.isArray(proposals)) return { ok: false, reason: "curate_entries needs a proposals array" };
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      for (const proposal of proposals) {
+        const built = curatorEvent(proposal as CuratorProposal, this.#state.phase.phaseId);
+        if (!built.ok) return { ok: false, reason: built.reason };
+        events.push(built.event as unknown as { type: string; [key: string]: unknown });
+      }
+      for (const event of events) this.#applyEvent(event as never);
+      this.#log.append("entries_curated", { count: events.length });
+      return { ok: true };
+    }
     return { ok: false, reason: `unknown submission tool ${msg.tool}` };
   }
 
@@ -4474,8 +4495,13 @@ export class Conductor {
       fs.writeFileSync(this.#paths.messages, projectMessages(phase));
       fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
       // Plan 05c: the header names the run by its readable id and directory
-      // id, never by the internal runId.
-      fs.writeFileSync(this.#paths.review, projectReview({ ...phase, ...runIds(this.#runDir) }));
+      // id, never by the internal runId. Plan 05j: the view is the entry
+      // projection (one topic once), linted on every render.
+      const ids = runIds(this.#runDir);
+      const rendered = projectEntryReview({ ...phase, ...ids }, { anchorResolves: candidateAnchorResolves(this.#candidateDir()) });
+      fs.writeFileSync(this.#paths.review, rendered.text);
+      this.#writeEntryViews(rendered.files);
+      this.#recordReviewLint(rendered.lint);
       this.#writeMessageViews();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
@@ -4487,6 +4513,35 @@ export class Conductor {
       this.#writeStatusView();
     } catch (err) {
       this.#logUnexpected("write_status_view", err);
+    }
+  }
+
+  /** Plan 05j: `views/entries/<id>.org`, one per live entry, pruned of files
+   * whose entry is no longer live (a resolved or merged entry is not shown). */
+  #writeEntryViews(files: Array<{ id: string; contents: string }>): void {
+    const ids = new Set(files.map((f) => f.id));
+    fs.mkdirSync(this.#paths.entriesView, { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(this.#paths.entriesView, `${f.id}.org`), f.contents);
+    for (const name of fs.readdirSync(this.#paths.entriesView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) {
+        fs.rmSync(path.join(this.#paths.entriesView, name), { force: true });
+      }
+    }
+  }
+
+  /** Plan 05j: `REVIEW_LINT_FAILED` records a violation the view's first line
+   * already names. One event per distinct violation, so a steady violation is
+   * not logged on every render beat. */
+  #recordReviewLint(lint: { ok: boolean; violations: Array<{ rule: string; detail: string }> }): void {
+    const signature = lint.violations.map((v) => `${v.rule}:${v.detail}`).join("|");
+    if (signature === this.#lastLintSignature) return;
+    this.#lastLintSignature = signature;
+    for (const v of lint.violations) {
+      try {
+        this.#applyEvent({ type: "REVIEW_LINT_FAILED", rule: v.rule, detail: v.detail });
+      } catch (err) {
+        this.#logUnexpected("review_lint_event", err);
+      }
     }
   }
 
@@ -6677,6 +6732,9 @@ export class Conductor {
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
+      // Plan 05j: the open ENTRIES, so a reviewer links to an existing topic
+      // instead of re-raising it under a new id.
+      ...entryPromptLines(phase.entries),
       // Plan 01f: turn 1 is told the conductor owns the gate evidence too (a
       // reviewer that only learns it in turn 2 could demand or accept a
       // substitute first). The failed record from an earlier candidate is
@@ -6761,6 +6819,8 @@ export class Conductor {
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
+      // Plan 05j: the same open-entry list on the turn-2 prompt.
+      ...entryPromptLines(phase.entries),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -7132,6 +7192,18 @@ export function directiveLines(directives: readonly OwnerDirective[] | undefined
  * section. Exported (and used by `buildWorkerPrompt` and
  * `#buildReviewerTurn2Prompt`) so a unit test exercises exactly the words the
  * two prompts send, rather than a look-alike built somewhere else. */
+/** Plan 05j: the open entries a reviewer's prompt lists, so it can link at
+ * raise time instead of re-raising a topic under a new id. */
+export function entryPromptLines(entries: readonly Entry[] | undefined): string[] {
+  const open = (entries ?? []).filter((e) => e.state === "open");
+  if (open.length === 0) return [];
+  return [
+    "",
+    "Open entries (one topic each; raise the topic once, and do not repeat one already listed):",
+    ...open.map((e) => `- ${e.id} [${e.type}] ${e.title} (${formatAnchor(e.anchor)})`),
+  ];
+}
+
 export function baselinePromptLines(commands: readonly BaselineCommand[] | undefined): string[] {
   const failed = baselineFailedCommands(commands ?? []);
   if (failed.length === 0) return [];

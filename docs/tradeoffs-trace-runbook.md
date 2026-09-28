@@ -1040,3 +1040,35 @@ Each row was observed in a real run.
 - **Publishing is local.** Pushing and PRs stay manual.
 - **Stopping during reviewer dispatch** can log `ERR_STREAM_WRITE_AFTER_END` from a late prompt write; the run is still stopped.
 - **The write guard checks paths, not git commands.** A worker's `git worktree add /tmp/...` is not refused. Clean up with `git worktree prune`.
+
+## Entries and the review view (plan 05j)
+
+`C-c m d` opens the phase review; `C-c m D` opens the program review. Both are
+pure projections of `events.jsonl`: one heading per TOPIC (entry), in three
+sections — Blockers, Findings, Trade-offs — with the candidate the view
+reflects in the header and an accounting footer that reconciles every raw
+message to zero unaccounted.
+
+Keys in the review buffer:
+
+- `TAB` shows the entry's summary and each linked message.
+- `RET` opens the entry's own file (`views/entries/<id>.org`, full history) or
+  a linked message's file (`views/messages/<id>.org`).
+- `s` on a linked message splits it into its own entry (`ENTRY_SPLIT`).
+- `m` on an entry carrying a `≈ E-n` hint merges the two as the owner's own
+  action (`ENTRY_MERGED_BY_OWNER`).
+- `A` / `D` settle the entry (`ENTRY_STATE`), D with an optional one-line
+  reason.
+
+The curator that links messages to entries runs once per round, after the
+reviews and before the evaluators. It may only propose `link`, `open` and
+`retitle`; it can never drop, resolve or change a type. A link with no shared
+anchor is refused and logged, and the message opens its own entry. If the
+review lint fails, the view's first line names the violation and a
+`REVIEW_LINT_FAILED` event is recorded — the runtime never repairs a view
+silently.
+
+Cleanness joins the balance numbers: `views/metrics.json`, the status `metrics`
+line and `tt summary` carry live entries per phase (a warning above 12),
+entries per distinct anchor, open `≈` hints, the owner's merges/splits and
+lint violations.
