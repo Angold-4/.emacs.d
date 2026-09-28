@@ -20,6 +20,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Conductor, contractVersionFor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
+import { EventLog } from "../../src/effects/log.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { baselineHasEnvironmentFailure, baselineKey, parseBaseline } from "../../src/core/test-failures.ts";
 import { appendProgramEvent, createProgram, observeRun } from "../../src/program.ts";
@@ -312,9 +313,7 @@ test("env-budget: a budget-paused run resumed without its tool reaches ENV_BLOCK
   const originalPath = process.env.PATH;
   const tool = "tt-budget-tool";
   const toolPath = path.join(toolDir, tool);
-  // Slow enough that the execution budget fires while the baseline runs, so
-  // the run is reliably RUN_PAUSED_BUDGET rather than reaching DONE first.
-  fs.writeFileSync(toolPath, "#!/bin/sh\nsleep 5\nexit 0\n");
+  fs.writeFileSync(toolPath, "#!/bin/sh\nexit 0\n");
   fs.chmodSync(toolPath, 0o755);
   process.env.PATH = `${toolDir}:${originalPath}`;
   let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
@@ -323,12 +322,17 @@ test("env-budget: a budget-paused run resumed without its tool reaches ENV_BLOCK
       checks: [`${tool} --check`],
       workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
       reviewerScriptFor: () => ({ hello: defaultReviewerHello(), steps: [] }),
-      // A tiny execution budget pauses the run (RUN_PAUSED_BUDGET) after the
-      // first start.
-      deadlines: { ...FAST, runBudgetMs: 150 },
+      deadlines: FAST,
     });
+    // Pause the run for budget deterministically in the log, before the
+    // conductor starts: relying on the wall-clock budget timer was flaky
+    // under load (the timer is re-armed on every event and never fires once
+    // the remaining budget is consumed).
+    const preLog = new EventLog(runPaths(setup.runDir).events);
+    preLog.append("event", { type: "RUN_BUDGET_EXCEEDED" });
+    preLog.close();
     await setup.conductor.start();
-    await waitFor(() => setup.conductor.state.run === "RUN_PAUSED_BUDGET", 30_000, 10, setup.runDir);
+    assert.equal(setup.conductor.state.run, "RUN_PAUSED_BUDGET", "the run starts paused for budget");
     await setup.conductor.stop();
 
     // The tool disappears before the resume; `tt resume` must reach
