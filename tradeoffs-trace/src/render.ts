@@ -20,6 +20,7 @@ import {
   renderEntryFile,
   renderEntryReview,
   renderProgramEntryReview,
+  type AnchorFreshness,
   type Entry,
   type EntryAnchor,
 } from "./core/entries.ts";
@@ -340,28 +341,35 @@ export interface EntryReviewPhase {
   };
 }
 
-/** Plan 05j: the anchor checker the live view uses. A file anchor whose file
- * or lines no longer exist in the candidate checkout is `stale anchor`. When
- * no candidate exists yet there is nothing to verify, so anchors count as
- * resolvable; when a candidate EXISTS but its checkout is gone, freshness
- * cannot be confirmed and file anchors are shown `stale anchor`, never
- * silently treated as fresh (record A-68 / M-67). */
-export function candidateAnchorResolves(candidateDir: string | undefined): (anchor: EntryAnchor) => boolean {
-  if (!candidateDir) return () => true;
-  if (!fs.existsSync(candidateDir)) return (anchor) => anchor.kind !== "file";
+/** Plan 05j: the three-way anchor freshness the live view uses. A file
+ * anchor whose file or lines no longer exist in the candidate checkout is
+ * `stale anchor`. When no candidate exists yet there is nothing to verify, so
+ * anchors are fresh; when a candidate EXISTS but its checkout cannot be read,
+ * freshness could not be re-checked and the view says `anchor unverified`,
+ * never silently treating it as fresh (record A-68 / M-67). */
+export function candidateAnchorFreshness(candidateDir: string | undefined): (anchor: EntryAnchor) => AnchorFreshness {
+  if (!candidateDir) return () => "fresh";
+  if (!fs.existsSync(candidateDir)) return (anchor) => (anchor.kind === "file" ? "unverified" : "fresh");
   return (anchor) => {
-    if (anchor.kind !== "file") return true;
+    if (anchor.kind !== "file") return "fresh";
     try {
       const file = path.join(candidateDir, anchor.path);
-      if (!fs.existsSync(file)) return false;
+      if (!fs.existsSync(file)) return "stale";
       const lineCount = fs.readFileSync(file, "utf8").split("\n").length;
       // Both ends of the range must exist (finding A-10): an anchor whose
       // END line is past EOF no longer exists either.
-      return anchor.lines[0] >= 1 && anchor.lines[1] <= lineCount;
+      return anchor.lines[0] >= 1 && anchor.lines[1] <= lineCount ? "fresh" : "stale";
     } catch {
-      return true;
+      return "unverified";
     }
   };
+}
+
+/** The two-way answer, kept for callers/tests that only ask whether an anchor
+ * resolves (`unverified` counts as not resolved). */
+export function candidateAnchorResolves(candidateDir: string | undefined): (anchor: EntryAnchor) => boolean {
+  const freshness = candidateAnchorFreshness(candidateDir);
+  return (anchor) => freshness(anchor) === "fresh";
 }
 
 export interface EntryReviewRender {
@@ -378,19 +386,20 @@ export interface EntryReviewRender {
  * `phase.entries` and `phase.messages`; no agent writes it. */
 export function projectEntryReview(
   phase: EntryReviewPhase,
-  opts: { anchorResolves?: (anchor: EntryAnchor) => boolean; lintError?: string } = {},
+  opts: { anchorResolves?: (anchor: EntryAnchor) => boolean; anchorFreshness?: (anchor: EntryAnchor) => AnchorFreshness; lintError?: string } = {},
   program = false,
 ): EntryReviewRender {
   const messages = phase.messages ?? [];
   const entries = phase.entries ?? [];
   const newestCandidateSha = phase.candidate?.sha;
-  const projected = projectEntries({ messages, entries, newestCandidateSha, anchorResolves: opts.anchorResolves });
+  const projected = projectEntries({ messages, entries, newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness });
   const lint = runReviewLint({ projected, newestCandidateSha, messages });
   const text = program
     ? renderProgramEntryReview({
         program: phase.program,
         newestCandidateSha,
         anchorResolves: opts.anchorResolves,
+        anchorFreshness: opts.anchorFreshness,
         lintError: opts.lintError ?? (lint.ok ? undefined : lint.firstLine),
       })
     : renderEntryReview({
@@ -401,6 +410,7 @@ export function projectEntryReview(
         dirId: phase.dirId,
         newestCandidateSha,
         anchorResolves: opts.anchorResolves,
+        anchorFreshness: opts.anchorFreshness,
         lintError: opts.lintError ?? (lint.ok ? undefined : lint.firstLine),
       });
   const files = projected.views.filter((v) => v.live).map((v) => ({ id: v.entry.id, contents: renderEntryFile(v) }));

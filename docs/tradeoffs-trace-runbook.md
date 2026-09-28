@@ -1079,8 +1079,8 @@ near-duplicates that share no anchor) is the one exception. If the review lint f
 line names the violation and a `REVIEW_LINT_FAILED` event is recorded on
 every render — the runtime never repairs a view silently.
 
-If a candidate's checkout is gone, its file anchors are shown `stale anchor`
-(freshness cannot be confirmed) rather than assumed fresh.
+If a candidate's checkout could not be read, its file anchors are shown
+`anchor unverified` (they could not be re-checked) rather than assumed fresh.
 
 Cleanness joins the balance numbers: `views/metrics.json`, the status `metrics`
 line and `tt summary` carry live entries per phase (a warning above 12),

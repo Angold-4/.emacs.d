@@ -34,7 +34,7 @@ import {
   type EntryEvent,
 } from "../../src/core/entries.ts";
 import { reduce } from "../../src/core/reduce.ts";
-import { candidateAnchorResolves } from "../../src/render.ts";
+import { candidateAnchorFreshness, candidateAnchorResolves } from "../../src/render.ts";
 import { runReviewLint, reviewLintFailedEvents } from "../../src/core/review-lint.ts";
 import { computeMetrics } from "../../src/metrics.ts";
 import type { Finding, Message } from "../../src/core/types.ts";
@@ -77,12 +77,28 @@ test("anchors overlap only in the same file or on the same id/clause", () => {
   assert.ok(anchorsOverlap({ kind: "plan", clause: "plan/14a.org" }, { kind: "plan", clause: "plan/14a.org " }));
 });
 
-test("an anchor whose candidate checkout is gone is stale, never assumed fresh (record A-68)", () => {
+test("an anchor whose candidate checkout is gone is unverified, never assumed fresh (record A-68)", () => {
   const gone = candidateAnchorResolves("/nonexistent/tt-candidate-for-test");
   assert.equal(gone({ kind: "file", path: "src/a.rs", lines: [1, 2] }), false);
   assert.equal(gone({ kind: "decision", id: "D-1" }), true);
+  // The three-way answer says the anchor could not be re-checked.
+  assert.equal(candidateAnchorFreshness("/nonexistent/tt-candidate-for-test")({ kind: "file", path: "src/a.rs", lines: [1, 2] }), "unverified");
   // With no candidate at all there is nothing to verify.
   assert.equal(candidateAnchorResolves(undefined)({ kind: "file", path: "src/a.rs", lines: [1, 2] }), true);
+  assert.equal(candidateAnchorFreshness(undefined)({ kind: "file", path: "src/a.rs", lines: [1, 2] }), "fresh");
+});
+
+test("a view says `anchor unverified` when the candidate checkout could not be re-checked", () => {
+  const m = message("F-1", "finding", ["src/a.rs:10-20 a bug"], { sourceRecordId: "D-1", state: "raw" });
+  const entries = openAll([m]);
+  const view = renderEntryReview({
+    messages: [m],
+    entries,
+    phaseId: "p1",
+    newestCandidateSha: "C1",
+    anchorFreshness: candidateAnchorFreshness("/nonexistent/tt-candidate-for-test"),
+  });
+  assert.match(view, /anchor unverified/);
 });
 
 test("a message derives file, decision and plan anchors from its evidence", () => {
@@ -588,7 +604,7 @@ test("live-only: a merged/dropped/resolved message is never rendered as its own 
   // A crafted projection that (wrongly) renders the dropped message as a live
   // entry of its own; the lint must catch it without touching the entries.
   const entry: Entry = { id: "E-1", phaseId: "p1", title: "x", type: "tradeoff", state: "open", anchor: { kind: "file", path: "src/a.rs", lines: [1, 1] }, links: [{ messageId: "T-1", anchor: { kind: "file", path: "src/a.rs", lines: [1, 1] }, reason: "opened" }] };
-  const projected = { views: [{ entry, type: "tradeoff" as const, state: "open" as const, live: true, messages: [dropped], anchor: entry.anchor, staleAnchor: false, raisedBy: ["worker"], staleState: false }], accounting: { raw: 1, entries: 1, linked: 1, dropped: 0, merged: 0, resolved: 0, unaccounted: 0, unexposed: 0 }, refusedLinks: [] };
+  const projected = { views: [{ entry, type: "tradeoff" as const, state: "open" as const, live: true, messages: [dropped], anchor: entry.anchor, staleAnchor: false, unverifiedAnchor: false, raisedBy: ["worker"], staleState: false }], accounting: { raw: 1, entries: 1, linked: 1, dropped: 0, merged: 0, resolved: 0, unaccounted: 0, unexposed: 0 }, refusedLinks: [] };
   const lint = runReviewLint({ projected, newestCandidateSha: "C1", messages: [dropped] });
   assert.ok(lint.violations.some((v) => v.rule === "live-only"));
 });

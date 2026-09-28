@@ -57,6 +57,9 @@ export interface PlanAnchor {
 }
 export type EntryAnchor = FileAnchor | DecisionAnchor | PlanAnchor;
 
+/** How fresh a file anchor is against the newest candidate. */
+export type AnchorFreshness = "fresh" | "stale" | "unverified";
+
 function normalisePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\.\//, "").trim();
 }
@@ -559,6 +562,10 @@ export interface EntryView {
   anchor: EntryAnchor;
   /** The anchor's file or lines no longer exist in the newest candidate. */
   staleAnchor: boolean;
+  /** The candidate checkout could not be read, so the anchor's freshness
+   * could not be re-checked. Shown as `anchor unverified`, never silently
+   * treated as fresh (record A-68). */
+  unverifiedAnchor: boolean;
   /** The near-duplicate hint (`≈ E-4`) the view carries, if any. */
   hint?: string;
   raisedBy: string[];
@@ -590,8 +597,12 @@ export interface ProjectEntriesOptions {
   /** The newest candidate the view reflects (the header names it). */
   newestCandidateSha?: string;
   /** Whether a file anchor still resolves in the newest candidate. Defaults
-   * to "yes" (nothing known to be missing). */
+   * to "yes" (nothing known to be missing). Kept for callers that only need
+   * the two-way answer; `anchorFreshness` distinguishes "could not check". */
   anchorResolves?: (anchor: EntryAnchor) => boolean;
+  /** The three-way answer: a file anchor is fresh, stale (its file or lines
+   * are gone), or unverified (the candidate checkout could not be read). */
+  anchorFreshness?: (anchor: EntryAnchor) => AnchorFreshness;
   /** The deterministic near-duplicate threshold over normalised titles. */
   similarityThreshold?: number;
 }
@@ -787,7 +798,11 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
     }
   }
 
-  const anchorResolves = opts.anchorResolves ?? (() => true);
+  const freshnessOf = (anchor: EntryAnchor): AnchorFreshness => {
+    if (opts.anchorFreshness) return opts.anchorFreshness(anchor);
+    if (opts.anchorResolves) return opts.anchorResolves(anchor) ? "fresh" : "stale";
+    return "fresh";
+  };
   const views: EntryView[] = entries
     // An entry with no linked message has no topic left (a reviewer's
     // `sameAs E-n` moved the message it was auto-opened for): it is not
@@ -798,7 +813,9 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
       const state = resolveFor(entry);
       const liveEntry = state === "open";
       const anchor = entry.anchor;
-      const staleAnchor = liveEntry && anchor.kind === "file" && !anchorResolves(anchor);
+      const freshness = liveEntry && anchor.kind === "file" ? freshnessOf(anchor) : "fresh";
+      const staleAnchor = freshness === "stale";
+      const unverifiedAnchor = freshness === "unverified";
       const stateSha = entry.stateSha ?? opts.newestCandidateSha;
       // Only a LIVE message can make an entry stale: an old settled message
       // that was linked as history is not a computation against an older
@@ -812,6 +829,7 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
         messages: own,
         anchor,
         staleAnchor,
+        unverifiedAnchor,
         hint: hints.get(entry.id),
         raisedBy: raisedByTags(own),
         staleState,
@@ -901,6 +919,7 @@ export interface EntryReviewOptions {
   };
   newestCandidateSha?: string;
   anchorResolves?: (anchor: EntryAnchor) => boolean;
+  anchorFreshness?: (anchor: EntryAnchor) => AnchorFreshness;
   /** A lint violation, if any: it becomes the view's first line. */
   lintError?: string;
 }
@@ -925,6 +944,7 @@ function entryTags(view: EntryView, phaseTag?: string): string {
   if (extra > 0) tags.push(`+${extra} linked`);
   tags.push(formatAnchor(view.anchor));
   if (view.staleAnchor) tags.push("stale anchor");
+  if (view.unverifiedAnchor) tags.push("anchor unverified");
   if (view.staleState) tags.push("stale state");
   if (view.hint) tags.push(`≈ ${view.hint}`);
   return `[${tags.join(" · ")}]`;
@@ -992,7 +1012,7 @@ function entryReviewLabel(opts: EntryReviewOptions): string {
 /** `views/review.org` for one phase: three sections (Blockers, Findings,
  * Trade-offs), one heading per live entry, and the accounting footer. */
 export function renderEntryReview(opts: EntryReviewOptions): string {
-  const projected = projectEntries({ messages: opts.messages, entries: opts.entries, newestCandidateSha: opts.newestCandidateSha, anchorResolves: opts.anchorResolves });
+  const projected = projectEntries({ messages: opts.messages, entries: opts.entries, newestCandidateSha: opts.newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness });
   const lines = reviewHeader(opts);
   lines.push("");
   for (const s of SECTION_ORDER) lines.push(...renderSection(projected.views, s.kind, s.label, () => undefined));
@@ -1017,7 +1037,7 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
   const perPhase = program.phases.map((p) => ({
     phaseId: p.phaseId,
     readableId: p.readableId,
-    projected: projectEntries({ messages: p.messages, entries: p.entries, newestCandidateSha: p.candidate?.sha ?? opts.newestCandidateSha, anchorResolves: opts.anchorResolves }),
+    projected: projectEntries({ messages: p.messages, entries: p.entries, newestCandidateSha: p.candidate?.sha ?? opts.newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness }),
   }));
   const all: Array<{ view: EntryView; phaseTag: string; phaseIndex: number }> = [];
   for (const ph of perPhase) {

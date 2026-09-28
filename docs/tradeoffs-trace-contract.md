@@ -425,8 +425,8 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   live view. An
   open entry whose anchor no longer resolves in the newest code is kept and
   tagged `stale anchor`, never hidden; when a candidate exists but its
-  checkout is gone, freshness cannot be confirmed and file anchors are shown
-  `stale anchor` rather than assumed fresh.
+  checkout could not be read, the anchor could not be re-checked and is tagged
+  `anchor unverified`, never assumed fresh.
 - **Views.** `views/review.org` (phase, `C-c m d`) and
   `programs/<id>/views/review.org` (program, `C-c m D`) have three sections —
   Blockers, Findings, Trade-offs — one heading per live entry: title, then its

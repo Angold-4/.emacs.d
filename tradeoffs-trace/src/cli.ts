@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { expandEntryCommand } from "./core/owner-inbox.ts";
 import type { ReviewLintResult } from "./core/review-lint.ts";
-import { candidateAnchorResolves, pendingOwnerInputs, projectEntryReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
+import { candidateAnchorFreshness, pendingOwnerInputs, projectEntryReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
 import { decisionStatus } from "./core/predicate.ts";
@@ -917,7 +917,7 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   // every render. `views/entries/<id>.org` is each live entry's own file.
   const entryReview = projectEntryReview(
     { ...state.phase, ...runIds(runDir) },
-    { anchorResolves: candidateAnchorResolves(state.phase.candidate ? path.join(p.candidates, state.phase.candidate.sha) : undefined) },
+    { anchorFreshness: candidateAnchorFreshness(state.phase.candidate ? path.join(p.candidates, state.phase.candidate.sha) : undefined) },
   );
   const review = entryReview.text;
   const messageFiles = reviewMessageFiles(state.phase);
@@ -1135,7 +1135,7 @@ async function cmdVerdict(
   writeFileSync(p.ledger, projectLedger(after.phase));
   const lateEntryReview = projectEntryReview(
     { ...after.phase, ...runIds(runDir) },
-    { anchorResolves: candidateAnchorResolves(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
+    { anchorFreshness: candidateAnchorFreshness(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
   );
   recordLintFailures(runDir, lateEntryReview.lint);
   writeFileSync(p.review, lateEntryReview.text);
@@ -1282,7 +1282,7 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
   const after = rebuildState(runDir, plan, { lenient: true });
   const entryReview = projectEntryReview(
     { ...after.phase, ...runIds(runDir) },
-    { anchorResolves: candidateAnchorResolves(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
+    { anchorFreshness: candidateAnchorFreshness(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
   );
   recordLintFailures(runDir, entryReview.lint);
   writeFileSync(p.review, entryReview.text);

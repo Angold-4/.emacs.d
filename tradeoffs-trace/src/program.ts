@@ -23,7 +23,7 @@ import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 import { renderProgramChart } from "./charts.ts";
 import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
 import { runReviewLint } from "./core/review-lint.ts";
-import { candidateAnchorResolves } from "./render.ts";
+import { candidateAnchorFreshness } from "./render.ts";
 
 import {
   expandProgram,
@@ -686,7 +686,7 @@ export function programReviewText(dir: string): string {
         messages: phase.messages ?? [],
         entries: phase.entries ?? [],
         newestCandidateSha: sha,
-        anchorResolves: candidateAnchorResolves(sha ? path.join(runDir, "candidates", sha) : undefined),
+        anchorFreshness: candidateAnchorFreshness(sha ? path.join(runDir, "candidates", sha) : undefined),
       });
       violations.push(...runReviewLint({ projected, newestCandidateSha: sha, messages: phase.messages ?? [] }).violations);
       phases.push({

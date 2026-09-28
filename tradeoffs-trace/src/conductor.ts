@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { reduce } from "./core/reduce.ts";
 import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { candidateAnchorResolves, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
+import { candidateAnchorFreshness, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
@@ -4611,7 +4611,7 @@ export class Conductor {
       // id, never by the internal runId. Plan 05j: the view is the entry
       // projection (one topic once), linted on every render.
       const ids = runIds(this.#runDir);
-      const rendered = projectEntryReview({ ...phase, ...ids }, { anchorResolves: candidateAnchorResolves(this.#candidateDir()) });
+      const rendered = projectEntryReview({ ...phase, ...ids }, { anchorFreshness: candidateAnchorFreshness(this.#candidateDir()) });
       fs.writeFileSync(this.#paths.review, rendered.text);
       this.#writeEntryViews(rendered.files);
       this.#recordReviewLint(rendered.lint);
