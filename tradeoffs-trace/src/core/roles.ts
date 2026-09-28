@@ -53,6 +53,11 @@ export interface PlanModels {
   panelSeats?: Partial<Record<string, RoleModel>>;
   /** `panel=reviewers` in the keyword. */
   panelFrom?: PanelFrom;
+  /** Plan 05j: the optional curator agent's model. Absent (the default): no
+   * curator agent is launched, and the runtime's deterministic anchor pass is
+   * the round's curator step — so a plan that does not name one launches
+   * exactly the roles it always did. */
+  curator?: RoleModel;
 }
 
 /** The model each panel seat takes from the reviewer seats, by position. */
@@ -81,9 +86,6 @@ export function planModelSelector(
       }
       return models.reviewer;
     }
-    // Plan 05j: the curator runs on the evaluator's model (there is no
-    // separate #+TT_MODELS role for it).
-    if (role === "curator") return models.evaluator;
     if (role === "panel") {
       if (seat !== undefined) {
         const own = models.panelSeats?.[String(seat)];

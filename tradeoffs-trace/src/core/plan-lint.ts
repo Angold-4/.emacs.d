@@ -26,7 +26,7 @@ export type LintSeverity = "error" | "warning";
 export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no-tolerance" | "model-declaration";
 
 /** The roles #+TT_MODELS may assign a model to. */
-const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel"]);
+const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
 
 /** The seat names `reviewer.N` and `panel.N` accept (design §2.1). */
 const REVIEWER_SEATS = new Set(["M", "A", "B"]);
@@ -242,7 +242,7 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
   for (const decl of modelDeclarations(plan.models)) {
     if (inherited.has(decl.key)) continue;
     if (decl.kind === "role" && !MODEL_ROLES.has(decl.key)) {
-      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown role ${decl.key}`, "use one of worker, reviewer, evaluator, panel"));
+      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown role ${decl.key}`, "use one of worker, reviewer, evaluator, panel, curator"));
       continue;
     }
     if (decl.kind === "reviewer-seat" && !REVIEWER_SEATS.has(decl.seat!)) {

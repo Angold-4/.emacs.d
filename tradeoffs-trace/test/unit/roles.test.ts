@@ -143,7 +143,14 @@ test("planModelSelector: panel.N wins over a flat panel model; a plan without mo
   assert.deepEqual(select("panel", 1), { model: "one" });
   assert.deepEqual(select("panel", 2), { model: "flat" });
   const none = planModelSelector({});
-  for (const role of ["worker", "reviewer", "evaluator", "panel"] as const) assert.equal(none(role), undefined);
+  for (const role of ["worker", "reviewer", "evaluator", "panel", "curator"] as const) assert.equal(none(role), undefined);
   assert.equal(none("reviewer", "M"), undefined);
+  // Plan 05j: the curator agent is opt-in — a plan must name `curator`; it is
+  // never inferred from the evaluator's model, so a plan that names only the
+  // four roles launches exactly those four.
+  const four = planModelSelector({ models: { worker: { model: "w" }, reviewer: { model: "r" }, evaluator: { model: "e" }, panel: { model: "p" } } });
+  assert.equal(four("curator"), undefined);
+  const withCurator = planModelSelector({ models: { curator: { provider: "p-c", model: "m-c" } } });
+  assert.deepEqual(withCurator("curator"), { provider: "p-c", model: "m-c" });
   assert.equal(none("panel", 3), undefined);
 });

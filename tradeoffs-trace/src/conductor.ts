@@ -6489,7 +6489,8 @@ export class Conductor {
       await agent.prompt(this.#buildCuratorPrompt());
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
-        raceTimeout(Promise.resolve(), this.#deadlines.evaluateMs, "timeout"),
+        // A never-resolving promise, so only the timer can win the race.
+        raceTimeout(new Promise<never>(() => undefined), this.#deadlines.evaluateMs, "timeout"),
       ]);
       await agent.terminate();
       this.#log.completion(actionId, { candidateSha, ok: outcome === "submitted", ...(outcome === "submitted" ? {} : { reason: "curator timed out" }) });

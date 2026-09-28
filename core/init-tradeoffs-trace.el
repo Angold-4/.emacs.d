@@ -317,8 +317,11 @@ reads: the values live in the environment (design §7)."
   (seq-remove #'string-empty-p
               (split-string (or (+tt--keyword "TT_SECRETS") "") "[ \t,]+" t)))
 
-(defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel")
-  "Roles #+TT_MODELS may assign a model to (design §2.1).")
+(defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel" "curator")
+  "Roles #+TT_MODELS may assign a model to (design §2.1).
+Plan 05j adds `curator': when it names a model the round's linking pass runs
+as an agent (typically on the evaluator's model); absent it, the runtime's
+deterministic anchor pass is the curator step.")
 
 (defconst +tt--reviewer-seats '("M" "A" "B")
   "Reviewer seats #+TT_MODELS may name as `reviewer.SEAT' (design §2.1).")

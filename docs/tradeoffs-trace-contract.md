@@ -406,9 +406,14 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   log and entry ids are stable), linking a message to an open entry it
   shares an anchor with. Once per round, after the reviews and before the
   evaluators, that pass runs again and records `ENTRY_CURATED`; the
-  evaluators wait for it. The `curate_entries` tool (the evaluator's model)
-  accepts only `link`, `open` and `retitle`; any other op is refused before an
-  event is applied. It cannot drop, resolve, merge or change a type.
+  evaluators wait for it. When a plan names a `curator` model (`#+TT_MODELS
+  curator=…`, typically the evaluator's model), that pass is a curator AGENT
+  instead: it sees every message of every type plus every open entry and
+  returns through `curate_entries`, whose only ops are `link`, `open` and
+  `retitle` (any other op is refused before an event is applied; it cannot
+  drop, resolve, merge or change a type). Without a `curator` model the
+  runtime's own anchor pass is the round's curator step, so a plan that names
+  no curator launches exactly the roles it always did.
   Reviewers' prompts also list the open entries, and a reviewer's
   `sameAs E-n` links its raise to that entry (refused and logged when they
   share no anchor).
