@@ -131,7 +131,14 @@ test("flake: a candidate whose only new failure passes alone passes checks and r
   setup.plan.rerun = "sh -c 'exit 0; # {name}'";
   await setup.conductor.start();
   try {
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, undefined, setup.runDir);
+    // Stop as soon as the check is decided and the flake is recorded: the
+    // review loop that follows adds load the suite does not need to prove it.
+    await waitFor(
+      () => eventTypes(setup.runDir).includes("CHECKS_PASSED") && flakeEvents(setup.runDir).length > 0,
+      90_000,
+      undefined,
+      setup.runDir,
+    );
 
     assert.ok(eventTypes(setup.runDir).includes("CHECKS_PASSED"), "a load-only failure must pass the checks");
     assert.ok(!eventTypes(setup.runDir).includes("CHECKS_FAILED"));
@@ -286,7 +293,9 @@ test("launch retry: a worker that misses the first hello and answers the retry s
   fs.writeFileSync(path.join(sessionDir, "session.jsonl"), "x".repeat(1024 * 1024));
   await setup.conductor.start();
   try {
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, undefined, setup.runDir);
+    // CHECKS_PASSED proves the worker created a candidate after the retry; the
+    // review loop adds nothing to the assertions below.
+    await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_PASSED"), 90_000, undefined, setup.runDir);
     const types = eventTypes(setup.runDir);
     assert.equal(types.filter((t) => t === "LAUNCH_RETRIED").length, 1, "the launch was retried once");
     assert.ok(!types.includes("ATTEMPT_TIMED_OUT"), "a hello timeout is not an attempt timeout");

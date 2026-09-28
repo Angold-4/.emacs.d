@@ -127,7 +127,17 @@ test("complete-ballots: a submit omitting two listed records is rejected naming 
     const streamDir = runPaths(setup.runDir).stream;
     const mStream = fs.readdirSync(streamDir).find((f) => f.startsWith("reviewer-M-"));
     assert.ok(mStream, "the M reviewer's RPC stream was written");
-    const streamText = fs.readFileSync(path.join(streamDir, mStream!), "utf8");
+    const streamPath = path.join(streamDir, mStream!);
+    // The stream's tool result is written by the agent's own stdout capture, so
+    // under load it can land a moment after DONE. Read once, then wait briefly
+    // for the ids rather than race the writer (the "names the ids" flake).
+    let streamText = fs.readFileSync(streamPath, "utf8");
+    const namesBoth = () => [decisions[1], decisions[2]].every((d) => streamText.includes(d.id));
+    const deadline = Date.now() + 5_000;
+    while (!namesBoth() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      streamText = fs.readFileSync(streamPath, "utf8");
+    }
     for (const d of [decisions[1], decisions[2]]) {
       assert.ok(streamText.includes(d.id), `the rejection message names ${d.id}`);
       assert.ok(streamText.includes(d.choice), `the rejection message gives ${d.id}'s choice`);
