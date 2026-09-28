@@ -339,22 +339,29 @@ export interface TestRerunOutcome {
   output?: string;
 }
 
-/** True when a re-run's output shows a test actually ran and passed. An exit
- * status of 0 alone is not enough: `node --test --test-name-pattern` exits 0
- * when nothing matches, and cargo exits 0 when its filter selects no test, so
- * a re-run that skipped the test would otherwise excuse a real failure as a
- * flake (review finding M-1). Only a positive runner summary or a passing
- * test line counts. */
-export function rerunProvesTheTestRan(output: string): boolean {
+/** True when a re-run's output shows the NAMED test itself passed. An exit
+ * status of 0 alone is not enough, and neither is a runner's summary count:
+ *
+ * - `node --test --test-name-pattern` exits 0 when its pattern selects no
+ *   test, and a describe block whose tests were all filtered prints
+ *   `ℹ tests 0`, `ℹ suites 1` and only its own `✔ <suite>` line;
+ * - older Node reports filtered tests as `ℹ tests 3` / `ℹ skipped 3`;
+ * - TAP writes a skipped test as `ok N - <name> # SKIP`;
+ * - a template whose `{name}` is used unescaped inside a regular expression
+ *   (`a+b`) can select some OTHER test and exit 0.
+ *
+ * So the evidence must be the named test's own passing line, in the shape its
+ * runner writes: the spec reporter's `✔ <name>`, TAP's `ok N - <name>`
+ * (never a `# SKIP`/`# TODO` one), cargo's `test <name> ... ok`, or ERT's
+ * `passed  1/1  <name>`. Anything else keeps the strict rule. */
+export function rerunProvesTheTestRan(output: string, name: string): boolean {
   const text = output.replace(ANSI, "");
+  const literal = escapeRegExp(name);
   return (
-    /(?:^|\n)\s*(?:\u2139\s*)?(?:tests|pass|suites)\s+[1-9]\d*/.test(text) || // node:test spec summary
-    /(?:^|\n)#\s*pass\s+[1-9]\d*/.test(text) || // TAP summary
-    /test result: ok\. [1-9]\d* passed/.test(text) || // cargo
-    /(?:^|\n)\s*[\u2714\u2713]\s+\S/.test(text) || // spec pass line
-    /(?:^|\n)\s*ok \d+ - /.test(text) || // TAP ok
-    /(?:^|\n)\s*test \S+ \.\.\. ok\b/.test(text) || // cargo ok line
-    /\b[1-9]\d*\s+results? as expected\b/.test(text) // ERT
+    new RegExp(`^\\s*[\\u2714\\u2713]\\s+${literal}(?:\\s+\\(\\d+(?:\\.\\d+)?ms\\))?\\s*$`, "m").test(text) || // node spec
+    new RegExp(`^\\s*ok \\d+ - ${literal}\\s*$`, "m").test(text) || // TAP, not skipped/todo
+    new RegExp(`^\\s*test ${literal} \\.\\.\\. ok\\s*$`, "m").test(text) || // cargo
+    new RegExp(`^\\s*passed\\s+\\d+/\\d+\\s+${literal}\\b`, "m").test(text) // ERT
   );
 }
 
@@ -384,7 +391,7 @@ export function classifyRerun(
   // A re-run only proves a flake when it both exited 0 AND shows the test
   // ran: `node --test --test-name-pattern` (and a cargo filter) exit 0 when
   // nothing matches, which would otherwise excuse a real failure (M-1).
-  const loadOnly = reruns.some((r) => !r.timedOut && r.exitCode === 0 && rerunProvesTheTestRan(r.output ?? ""));
+  const loadOnly = reruns.some((r) => !r.timedOut && r.exitCode === 0 && rerunProvesTheTestRan(r.output ?? "", name));
   const base: TestClassification = {
     name,
     ...(command !== undefined ? { rerunCommand: command } : {}),

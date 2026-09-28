@@ -825,6 +825,11 @@ export interface ChecksResult {
 export interface LastCheckFailures {
   candidateSha: string;
   failures: CheckFailureClass[];
+  /** Plan 05d: the candidate whose freeze followed this failure — the only
+   * candidate whose reviewers are told about it. Set once, when that
+   * candidate freezes, so a LATER candidate (which repairs a review finding,
+   * not the check) is never shown a two-candidates-stale split. */
+  repairedBy?: string;
 }
 
 export interface ReviewSlot {
@@ -963,7 +968,8 @@ export interface PhaseState {
   flakes?: FlakeObservation[];
   /** Plan 05d: the previous candidate's check failures and their
    * classifications, kept across the repair freeze so the reviewers of the
-   * repaired candidate see them (finding A-5). */
+   * repaired candidate see them (finding A-5), and marked with that candidate
+   * so a later one is not shown a stale split (finding A-9). */
   lastCheckFailures?: LastCheckFailures;
 }
 

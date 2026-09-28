@@ -5939,7 +5939,7 @@ export class Conductor {
           // matched no test exits 0. Keep the output so the classification can
           // require evidence that the test ran.
           reruns.push({ exitCode: result.exitCode, timedOut: result.timedOut, output: result.output });
-          if (!result.timedOut && result.exitCode === 0 && rerunProvesTheTestRan(result.output)) break;
+          if (!result.timedOut && result.exitCode === 0 && rerunProvesTheTestRan(result.output, plan.name)) break;
         }
       }
       const classified = classifyRerun(plan.name, plan.command, params.failingExitCode, reruns);
@@ -7811,7 +7811,10 @@ export function checkFailurePromptLines(phase: PhaseState): string[] {
     ];
   }
   const last = phase.lastCheckFailures;
-  if (!last || last.failures.length === 0 || last.candidateSha === phase.candidate?.sha) return [];
+  // Only the candidate that repairs the failed check is told about it: the
+  // freeze marks it `repairedBy`, so a later candidate (repairing a review
+  // finding, say) is never shown a two-candidates-stale split (finding A-9).
+  if (!last || last.failures.length === 0 || last.repairedBy !== phase.candidate?.sha) return [];
   return [
     "",
     `The check failure this candidate repairs (previous candidate ${last.candidateSha.slice(0, 7)}; every test was re-run alone):`,

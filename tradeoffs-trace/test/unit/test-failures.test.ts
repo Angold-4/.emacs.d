@@ -320,19 +320,40 @@ test("test-failures: a #+TT_RERUN template substitutes {name}/{file}/{crate} as 
   assert.match(rerunTemplateIssue("sh -c 'exit 0'") ?? "", /does not name the failing test/);
 });
 
-test("test-failures: a re-run counts as a flake only when it passed AND shows the test ran", () => {
-  // A real node pass: exit 0 plus its summary/✔ line.
+test("test-failures: a re-run counts as a flake only when it passed AND shows the named test ran", () => {
+  // A real node pass: exit 0 plus the named test's own `✔` line.
   const passed = classifyRerun("alpha", "node --test alpha", 1, [{ exitCode: 0, timedOut: false, output: "✔ alpha (0.1ms)\nℹ pass 1" }]);
   assert.equal(passed.loadOnly, true);
   assert.equal(passed.reproducesAlone, false);
   assert.deepEqual(passed.rerunExitCodes, [0]);
   assert.equal(passed.failingExitCode, 1);
 
-  // Review finding M-1: exit 0 with no test run — node's pattern matched
-  // nothing, or a cargo filter selected no test — must NOT excuse a failure.
-  const noTestRan = classifyRerun("alpha", "node --test --test-name-pattern x", 1, [{ exitCode: 0, timedOut: false, output: "ℹ tests 0\nℹ pass 0" }]);
-  assert.equal(noTestRan.loadOnly, false);
-  assert.equal(noTestRan.reproducesAlone, true);
+  // Review finding M-7: a summary count is NOT evidence. A describe block
+  // whose tests were all filtered out exits 0 with `tests 0`, `suites 1` and
+  // only the suite's own `✔` line.
+  const suiteOnly = classifyRerun("the test", "node --test x", 1, [
+    { exitCode: 0, timedOut: false, output: "✔ describe suite (0.2ms)\nℹ tests 0\nℹ suites 1\nℹ pass 0" },
+  ]);
+  assert.equal(suiteOnly.loadOnly, false);
+  assert.equal(suiteOnly.reproducesAlone, true);
+
+  // Older Node reports filtered tests as skipped: `tests 3`, `skipped 3`,
+  // `pass 0` must not be read as a pass.
+  assert.equal(rerunProvesTheTestRan("ℹ tests 3\nℹ suites 1\nℹ pass 0\nℹ skipped 3", "the test"), false);
+  // A TAP skipped test is not a pass either.
+  assert.equal(rerunProvesTheTestRan("ok 1 - the test # SKIP", "the test"), false);
+  // Nor is another test that happened to match an unescaped pattern.
+  assert.equal(rerunProvesTheTestRan("✔ aab (0.1ms)\nℹ pass 1", "a+b"), false);
+  assert.equal(rerunProvesTheTestRan("ℹ tests 0\nℹ pass 0", "alpha"), false);
+  assert.equal(rerunProvesTheTestRan("nothing here", "alpha"), false);
+
+  // The named test's own passing line is evidence, per runner.
+  assert.equal(rerunProvesTheTestRan("✔ alpha (0.1ms)", "alpha"), true);
+  assert.equal(rerunProvesTheTestRan("  ✔ alpha", "alpha"), true);
+  assert.equal(rerunProvesTheTestRan("ok 1 - alpha", "alpha"), true);
+  assert.equal(rerunProvesTheTestRan("test alpha ... ok\n\ntest result: ok. 1 passed; 0 failed", "alpha"), true);
+  assert.equal(rerunProvesTheTestRan("   passed  1/1  alpha (0.001 sec)", "alpha"), true);
+  assert.equal(rerunProvesTheTestRan("✔ beta (0.1ms)", "alpha"), false, "another test's pass is not this test's proof");
 
   const failedTwice = classifyRerun("alpha", "node --test alpha", 1, [
     { exitCode: 1, timedOut: false, output: "✖ alpha" },
@@ -351,12 +372,6 @@ test("test-failures: a re-run counts as a flake only when it passed AND shows th
   const noCommand = classifyRerun("alpha", undefined, 1, []);
   assert.equal(noCommand.reproducesAlone, true);
   assert.equal(noCommand.rerunCommand, undefined);
-
-  // cargo and ERT pass summaries are evidence too.
-  assert.equal(rerunProvesTheTestRan("test alpha ... ok\n\ntest result: ok. 1 passed; 0 failed"), true);
-  assert.equal(rerunProvesTheTestRan("Ran 1 tests, 1 results as expected"), true);
-  assert.equal(rerunProvesTheTestRan("ok 1 - alpha"), true);
-  assert.equal(rerunProvesTheTestRan("nothing here"), false);
 });
 
 // Plan 05d / finding #25: a base flake is recorded, visible, and never

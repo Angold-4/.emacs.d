@@ -167,10 +167,14 @@ deadline — and classifies it:
   machine's load average at the failing run). A check that names no test at all
   still fails, without any re-run. An exit status of 0 is **not** enough on its
   own: `node --test --test-name-pattern` exits 0 when the pattern matches
-  nothing and `cargo test` exits 0 when its filter selects no test, so a re-run
-  counts as a flake only when its own output shows a test really ran and passed
-  (a runner summary or a passing test line). That is what keeps a real failure
-  from being excused by a filter that missed it.
+  nothing, a `describe` block whose tests were all filtered exits 0 with only
+  its own `✔` suite line, older Node reports filtered tests as `skipped`, and
+  `cargo test` exits 0 when its filter selects no test. A re-run is therefore a
+  flake only when its output carries the **named test's own passing line** —
+  `✔ <name>`, `ok N - <name>` (never a `# SKIP`/`# TODO` one),
+  `test <name> ... ok`, or ERT's `passed 1/1 <name>`. A summary count alone, or
+  another test's pass, keeps the check strict. That is what keeps a real
+  failure from being excused by a filter that missed it.
 
 The worker's repair prompt and each reviewer's turn-2 prompt list every new
 failing test as `reproduces alone` or `load-only`, so a real regression is
@@ -195,6 +199,12 @@ must not quote `{name}` itself. `{file}` is the file the reporter located
 line); `{crate}` is the first `::` segment of a cargo test path. A template
 that uses a placeholder whose value is unknown (no located file, no `::` path)
 is **not run**, so a half-applied template never targets the wrong test.
+
+A runner that reads the value as a **regular expression** (Node's
+`--test-name-pattern`) needs it escaped: `a+b` unescaped selects `aab`, not the
+test named `a+b`. The built-in Node default escapes it; a hand-written template
+must do the same (the evidence rule above is the backstop, but an unescaped
+pattern then never proves the test ran and no round is saved).
 
 The built-in defaults cover the Node test runner
 (`node --test --test-name-pattern '<escaped name>' '<file>'`; the name is

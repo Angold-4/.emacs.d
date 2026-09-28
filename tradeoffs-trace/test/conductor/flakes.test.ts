@@ -136,6 +136,7 @@ test("flake: the prompt labels each failing test, and an empty check failure add
     checks: { candidateSha: "C2", passed: true },
     lastCheckFailures: {
       candidateSha: "C1",
+      repairedBy: "C2",
       failures: [
         { name: "real", reproducesAlone: true, loadOnly: false, failingExitCode: 1, rerunExitCodes: [1] },
         { name: "flaky", reproducesAlone: false, loadOnly: true, failingExitCode: 1, rerunExitCodes: [0] },
@@ -148,6 +149,10 @@ test("flake: the prompt labels each failing test, and an empty check failure add
   assert.match(repairedSection, /`flaky`: load-only \(a flake; the check passed on it\)/);
   // The worker prompt helper never falls back to the previous candidate.
   assert.deepEqual(checkFailureLines(repaired), []);
+  // Finding A-9: a LATER candidate (C3) whose freeze did not follow the check
+  // failure is never shown the stale C1 split.
+  const stale = checkFailurePromptLines({ ...repaired, candidate: { sha: "C3", contractVersion: { snapshot: 1, sectionSha256: "x" } } });
+  assert.deepEqual(stale, []);
 });
 
 test("flake: a real `node --test` failure re-run by the built-in default passes the checks and records FLAKE_OBSERVED", async () => {

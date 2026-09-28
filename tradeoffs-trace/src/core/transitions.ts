@@ -338,6 +338,12 @@ addRow({
       decisions: [...carried, ...e.decisions],
       round: (s.phase.round ?? 0) + 1,
       checks: undefined,
+      // Plan 05d: this candidate is the one that repairs the previous check
+      // failure, so mark the kept split with its sha (finding A-9): the
+      // reviewers of a LATER candidate are never shown a stale one.
+      ...(s.phase.lastCheckFailures
+        ? { lastCheckFailures: { ...s.phase.lastCheckFailures, repairedBy: e.candidateSha } }
+        : {}),
       pendingDisclosures: undefined,
       pendingPrior: undefined,
       pendingDispute: undefined,
