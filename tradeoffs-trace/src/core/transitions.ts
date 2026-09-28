@@ -1661,6 +1661,25 @@ function envStageInFlight(stage: "baseline" | "checks" | "probe" | "gate"): InFl
   }
 }
 
+/** Set an environment block, remembering the run state to restore when it
+ * clears (finding M-6): a run that was paused for budget must return to
+ * `RUN_PAUSED_BUDGET`, not silently run past an exhausted budget. */
+function applyEnvPreflightFailedState(s: State, e: Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>, from: RunStateName): State {
+  return {
+    ...s,
+    run: "ENV_BLOCKED",
+    phase: {
+      ...s.phase,
+      env: {
+        ...(s.phase.env ?? {}),
+        path: e.path,
+        resumeRun: from,
+        blocked: { kind: "preflight", missing: e.missing, path: e.path, at: e.at },
+      },
+    },
+  };
+}
+
 addRow({
   id: "env-preflight-failed",
   axis: "run",
@@ -1670,21 +1689,11 @@ addRow({
   guard: () => true,
   to: "ENV_BLOCKED",
   actions: [],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>;
-    return {
-      ...s,
-      run: "ENV_BLOCKED",
-      phase: {
-        ...s.phase,
-        env: { ...(s.phase.env ?? {}), path: e.path, blocked: { kind: "preflight", missing: e.missing, path: e.path, at: e.at } },
-      },
-    };
-  },
+  apply: (s, ev) => applyEnvPreflightFailedState(s, ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>, "RUN_ACTIVE"),
 });
 
 // Idempotent: a `tt resume` whose preflight still fails re-records the block
-// rather than being rejected by reduce().
+// rather than being rejected by reduce(), preserving the state to restore.
 addRow({
   id: "env-preflight-failed-already-blocked",
   axis: "run",
@@ -1694,23 +1703,19 @@ addRow({
   guard: () => true,
   to: "ENV_BLOCKED",
   actions: [],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>;
-    return {
-      ...s,
-      phase: {
-        ...s.phase,
-        env: { ...(s.phase.env ?? {}), path: e.path, blocked: { kind: "preflight", missing: e.missing, path: e.path, at: e.at } },
-      },
-    };
-  },
+  apply: (s, ev) =>
+    applyEnvPreflightFailedState(
+      s,
+      ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>,
+      s.phase.env?.resumeRun ?? "RUN_ACTIVE",
+    ),
 });
 
-// Plan 05i / finding M-1: a conductor also starts (resumes) a run that is
-// PAUSED for budget, where `#envPreflightGate` runs unconditionally too. A
-// missing tool must block it rather than being rejected by reduce() and
-// crashing the conductor. The budget pause is replaced by the environment
-// block; a later resume with the tool present returns to RUN_ACTIVE.
+// Plan 05i / findings M-1 and M-6: a conductor also starts (resumes) a run
+// that is PAUSED for budget, where `#envPreflightGate` runs unconditionally
+// too. A missing tool must block it rather than being rejected by reduce()
+// and crashing the conductor; and clearing the block must return to the
+// budget pause, never to RUN_ACTIVE.
 addRow({
   id: "env-preflight-failed-from-budget",
   axis: "run",
@@ -1720,18 +1725,24 @@ addRow({
   guard: () => true,
   to: "ENV_BLOCKED",
   actions: [],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>;
-    return {
-      ...s,
-      run: "ENV_BLOCKED",
-      phase: {
-        ...s.phase,
-        env: { ...(s.phase.env ?? {}), path: e.path, blocked: { kind: "preflight", missing: e.missing, path: e.path, at: e.at } },
-      },
-    };
-  },
+  apply: (s, ev) => applyEnvPreflightFailedState(s, ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>, "RUN_PAUSED_BUDGET"),
 });
+
+function applyEnvCheckFailedState(s: State, e: Extract<Event, { type: "ENV_CHECK_FAILED" }>, from: RunStateName): State {
+  return {
+    ...s,
+    run: "ENV_BLOCKED",
+    phase: {
+      ...s.phase,
+      env: {
+        ...(s.phase.env ?? {}),
+        resumeRun: from,
+        blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
+      },
+      inFlight: clearInFlight(s.phase, envStageInFlight(e.stage)),
+    },
+  };
+}
 
 addRow({
   id: "env-check-failed",
@@ -1742,21 +1753,7 @@ addRow({
   guard: () => true,
   to: "ENV_BLOCKED",
   actions: [],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>;
-    return {
-      ...s,
-      run: "ENV_BLOCKED",
-      phase: {
-        ...s.phase,
-        env: {
-          ...(s.phase.env ?? {}),
-          blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
-        },
-        inFlight: clearInFlight(s.phase, envStageInFlight(e.stage)),
-      },
-    };
-  },
+  apply: (s, ev) => applyEnvCheckFailedState(s, ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>, "RUN_ACTIVE"),
 });
 
 addRow({
@@ -1768,19 +1765,12 @@ addRow({
   guard: () => true,
   to: "ENV_BLOCKED",
   actions: [],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>;
-    return {
-      ...s,
-      phase: {
-        ...s.phase,
-        env: {
-          ...(s.phase.env ?? {}),
-          blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
-        },
-      },
-    };
-  },
+  apply: (s, ev) =>
+    applyEnvCheckFailedState(
+      s,
+      ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>,
+      s.phase.env?.resumeRun ?? "RUN_ACTIVE",
+    ),
 });
 
 // Finding A-4: same missing row for the check-failure event, from the paused
@@ -1795,37 +1785,47 @@ addRow({
   guard: () => true,
   to: "ENV_BLOCKED",
   actions: [],
-  apply: (s, ev) => {
-    const e = ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>;
-    return {
-      ...s,
-      run: "ENV_BLOCKED",
-      phase: {
-        ...s.phase,
-        env: {
-          ...(s.phase.env ?? {}),
-          blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
-        },
-        inFlight: clearInFlight(s.phase, envStageInFlight(e.stage)),
-      },
-    };
-  },
+  apply: (s, ev) => applyEnvCheckFailedState(s, ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>, "RUN_PAUSED_BUDGET"),
 });
 
 // A passing `tt resume` preflight clears the block and the phase continues
-// from wherever it was frozen.
+// from wherever it was frozen. The run returns to the state it was blocked
+// from (finding M-6): a budget pause is restored, not dropped.
 addRow({
   id: "env-resumed",
   axis: "run",
   from: "ENV_BLOCKED",
   trigger: "RUN_RESUMED",
-  guardName: "always",
-  guard: () => true,
+  guardName: "resumeRunWasNotBudget",
+  guard: (s) => s.phase.env?.resumeRun !== "RUN_PAUSED_BUDGET",
   to: "RUN_ACTIVE",
-  // The fixture resumes with the phase at READY, so next() recommends
-  // start_attempt once the environment is unblocked.
+  // The fixture resumes with the phase at READY and no prior pause, so next()
+  // recommends start_attempt once the environment is unblocked.
   actions: [{ type: "start_attempt" }],
-  apply: (s) => ({ ...s, run: "RUN_ACTIVE", phase: { ...s.phase, env: { ...(s.phase.env ?? {}), blocked: undefined } } }),
+  apply: (s) => ({
+    ...s,
+    run: s.phase.env?.resumeRun ?? "RUN_ACTIVE",
+    phase: { ...s.phase, env: { ...(s.phase.env ?? {}), blocked: undefined, resumeRun: undefined } },
+  }),
+});
+
+// Finding M-6: the block was entered from a budget pause, so clearing it
+// restores that pause instead of running past an exhausted budget.
+addRow({
+  id: "env-resumed-to-budget",
+  axis: "run",
+  from: "ENV_BLOCKED",
+  trigger: "RUN_RESUMED",
+  guardName: "resumeRunWasBudget",
+  guard: (s) => s.phase.env?.resumeRun === "RUN_PAUSED_BUDGET",
+  to: "RUN_PAUSED_BUDGET",
+  // The run is paused again, so next() dispatches nothing.
+  actions: [],
+  apply: (s) => ({
+    ...s,
+    run: "RUN_PAUSED_BUDGET",
+    phase: { ...s.phase, env: { ...(s.phase.env ?? {}), blocked: undefined, resumeRun: undefined } },
+  }),
 });
 
 // --- run execution budget (§8.1) --------------------------------------

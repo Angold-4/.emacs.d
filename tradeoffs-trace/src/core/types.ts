@@ -696,6 +696,11 @@ export interface PhaseEnv {
   path?: string;
   tools?: EnvTool[];
   blocked?: EnvBlockInfo;
+  /** Plan 05i / finding M-6: the run-axis state to restore when the
+   * environment block clears. A run that was paused for budget returns to
+   * `RUN_PAUSED_BUDGET`, so clearing the block never silently runs past an
+   * exhausted budget. Absent defaults to `RUN_ACTIVE`. */
+  resumeRun?: RunStateName;
 }
 
 // ---------------------------------------------------------------------------

@@ -4753,6 +4753,10 @@ export class Conductor {
       path: this.#preflightEnv.PATH ?? "",
       resolve: (name) => this.#resolveExecutable(name),
     });
+    // A terminal phase has no baseline to take and no agent to launch, so a
+    // missing tool must not flip a DONE/BLOCKED run to ENV_BLOCKED (findings
+    // M-7 / disc-A-26). The tools are still recorded below.
+    const terminal = this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED";
     this.#driveSuspended = true;
     this.#envGateActive = true;
     try {
@@ -4767,14 +4771,14 @@ export class Conductor {
       if (result.tools.length > 0) {
         this.#applyEvent({ type: "ENV_CHECKED", path: result.path, tools: result.tools, at: new Date().toISOString() });
       }
-      if (result.missing.length > 0) {
+      if (result.missing.length > 0 && !terminal) {
         this.#applyEvent({ type: "ENV_PREFLIGHT_FAILED", missing: result.missing, path: result.path, at: new Date().toISOString() });
       }
     } finally {
       this.#envGateActive = false;
       this.#driveSuspended = false;
     }
-    return result.missing.length === 0;
+    return result.missing.length === 0 || terminal;
   }
 
   /** Plan 05i: a 126/127 exit is an environment failure wherever a command

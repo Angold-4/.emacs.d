@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { Conductor, contractVersionFor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { baselineHasEnvironmentFailure, baselineKey, parseBaseline } from "../../src/core/test-failures.ts";
-import { appendProgramEvent, createProgram } from "../../src/program.ts";
+import { appendProgramEvent, createProgram, observeRun } from "../../src/program.ts";
 import type { ProgramFile } from "../../src/core/program.ts";
 import { buildView } from "../../src/view.ts";
 import { renderStatusText } from "../../src/render.ts";
@@ -345,6 +345,72 @@ test("env-budget: a budget-paused run resumed without its tool reaches ENV_BLOCK
       !readEvents(setup.runDir).some((r) => r.kind === "rejected"),
       "no event was rejected (the conductor did not crash on the missing row)",
     );
+
+    // Finding M-6: once the tool is back, clearing the block restores the
+    // budget pause it was entered from, never RUN_ACTIVE.
+    fs.writeFileSync(toolPath, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(toolPath, 0o755);
+    const reResumed = resumeConductor(setup.runDir, setup.plan, setup.scriptsDir, process.env);
+    await reResumed.start();
+    assert.equal(reResumed.state.run, "RUN_PAUSED_BUDGET", "clearing the block must restore the budget pause");
+    await reResumed.stop();
+    await resumed.stop();
+  } finally {
+    process.env.PATH = originalPath;
+    if (setup) {
+      await setup.conductor.stop();
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+    }
+    cleanupDir(toolDir);
+  }
+});
+
+test("env-terminal: resuming a DONE run with a missing tool records the tools but stays DONE", async () => {
+  const toolDir = fs.mkdtempSync("/tmp/tt-terminal-tool-");
+  const originalPath = process.env.PATH;
+  const tool = "tt-terminal-tool";
+  const toolPath = path.join(toolDir, tool);
+  fs.writeFileSync(toolPath, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(toolPath, 0o755);
+  process.env.PATH = `${toolDir}:${originalPath}`;
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      checks: [`${tool} --check`],
+      workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+      reviewerScriptFor: (reviewer, state) => ({
+        hello: defaultReviewerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+            },
+          },
+        ],
+      }),
+      deadlines: FAST,
+    });
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, undefined, setup.runDir);
+    await setup.conductor.stop();
+
+    // Findings M-7 / disc-A-26: the tool disappears and the finished run is
+    // resumed. A terminal phase has no baseline or agent to guard, so it
+    // must stay DONE — never flip to ENV_BLOCKED.
+    fs.rmSync(toolPath, { force: true });
+    const resumed = resumeConductor(setup.runDir, setup.plan, setup.scriptsDir, process.env);
+    await resumed.start();
+    assert.equal(resumed.state.phase.phase, "DONE");
+    assert.notEqual(resumed.state.run, "ENV_BLOCKED", "a terminal phase must not be flipped to ENV_BLOCKED");
+    assert.equal(observeRun(setup.runDir), "done", "the program still observes the node as done");
     await resumed.stop();
   } finally {
     process.env.PATH = originalPath;

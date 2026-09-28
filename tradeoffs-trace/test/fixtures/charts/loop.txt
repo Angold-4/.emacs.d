@@ -181,4 +181,5 @@ run states:
   +-------------------+
       +- ENV_PREFLIGHT_FAILED -> ENV_BLOCKED        [env-preflight-failed-already-blocked]
       +- ENV_CHECK_FAILED     -> ENV_BLOCKED        [env-check-failed-already-blocked]
-      +- RUN_RESUMED          -> RUN_ACTIVE         [env-resumed]
+      +- RUN_RESUMED (resumeRunWasNotBudget) -> RUN_ACTIVE         [env-resumed]
+      +- RUN_RESUMED (resumeRunWasBudget) -> RUN_PAUSED_BUDGET  [env-resumed-to-budget]

@@ -378,6 +378,12 @@ const BUILD: Record<string, Fixture> = {
     state: baseState({ phase: "READY" }, "ENV_BLOCKED"),
     event: { type: "RUN_RESUMED" },
   },
+  // Finding M-6: clearing an environment block entered from a budget pause
+  // restores RUN_PAUSED_BUDGET, not RUN_ACTIVE.
+  "env-resumed-to-budget": {
+    state: baseState({ phase: "READY", env: { resumeRun: "RUN_PAUSED_BUDGET" } }, "ENV_BLOCKED"),
+    event: { type: "RUN_RESUMED" },
+  },
   "launch-failed-from-implementing": {
     state: baseState({ phase: "IMPLEMENTING", inFlight: { dispatch_worker: { actionId: "a1" } } }),
     event: { type: "LAUNCH_FAILED", role: "worker", expected: ["read", "edit"], missing: ["edit"], extra: ["submit_review"] },

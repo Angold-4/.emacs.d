@@ -323,6 +323,7 @@ The run-axis rows (all in `TRANSITIONS`):
 | `env-check-failed-already-blocked` | `ENV_BLOCKED` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
 | `env-check-failed-from-budget` | `RUN_PAUSED_BUDGET` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
 | `env-resumed` | `ENV_BLOCKED` | `RUN_RESUMED` | `RUN_ACTIVE` |
+| `env-resumed-to-budget` | `ENV_BLOCKED` | `RUN_RESUMED` | `RUN_PAUSED_BUDGET` |
 
 A run that a conductor can start or resume is in `RUN_ACTIVE`, `RUN_PAUSED_BUDGET`
 or `ENV_BLOCKED`, and the preflight runs on every start — so the failure rows
@@ -342,7 +343,10 @@ Events:
   a repair or a finding.
 - `RUN_RESUMED` — from `ENV_BLOCKED` (and, separately, from
   `RUN_PAUSED_BUDGET`): the preflight (or the budget) no longer blocks; the
-  frozen phase continues.
+  frozen phase continues. A block entered from a budget pause remembers that
+  pause (`phase.env.resumeRun`) and clears back to `RUN_PAUSED_BUDGET`, so
+  clearing the environment block never silently runs past an exhausted
+  budget (`env-resumed-to-budget`).
 
 A baseline record whose commands exited 126/127 — a record written before
 this change, or a sibling's shared copy — is **ignored on read**

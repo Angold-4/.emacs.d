@@ -336,9 +336,12 @@ export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "cr
   } catch {
     phase = undefined;
   }
-  if (envBlocked) return "env-blocked";
+  // A terminal phase wins over an environment block (finding M-7): a DONE or
+  // BLOCKED run can never be re-blocked by a resume, so the program must not
+  // report a finished node as env-blocked.
   if (phase === "DONE") return "done";
   if (phase === "BLOCKED") return "blocked";
+  if (envBlocked) return "env-blocked";
   const alive = pidAlive(path.join(runDir, "conductor.pid"));
   if (phase === "AWAITING_OWNER") return "needs-you";
   // A run just launched may not have written its pid yet.
@@ -571,11 +574,14 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
   try {
     const program = readProgram(dir);
     const { nodes, state } = foldProgram(dir);
-    const blocked = nodes.find((n) => state.nodes[n.id].status === "blocked");
+    // An env-blocked node is what makes the program `stuck` (findings A-8),
+    // so the notification must name its `env blocked · …` reason, not omit
+    // the tool.
+    const stuck = nodes.find((n) => state.nodes[n.id].status === "blocked" || state.nodes[n.id].status === "env-blocked");
     const reason =
       outcome === "done"
         ? "program done"
-        : `program stuck${blocked ? `: ${oneLine(state.nodes[blocked.id].reason ?? `${blocked.id} blocked`)}` : ""}`;
+        : `program stuck${stuck ? `: ${oneLine(state.nodes[stuck.id].reason ?? `${stuck.id} ${state.nodes[stuck.id].status}`)}` : ""}`;
     notify(
       { id, kind: "program", title: program.title, reason, waitKey: `program:${id}:${outcome}` },
       { root: path.dirname(path.dirname(dir)), ...(opts.reminderMs !== undefined ? { reminderMs: opts.reminderMs } : {}), onError: (message) => log(`notify: ${message}`) },
