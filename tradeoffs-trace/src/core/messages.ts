@@ -163,6 +163,19 @@ addRow({
 });
 
 addRow({
+  id: "message-dropped-published",
+  from: "published",
+  trigger: "MESSAGE_DROPPED",
+  guardName: "always",
+  guard: () => true,
+  to: "dropped",
+  // Plan 05e: the round panel drops a published trade-off whose panel
+  // majority is not `keep` (a description of what the code does is not a
+  // real trade-off). A dropped message leaves the owner's live view.
+  apply: (m, event) => settle(m!, "dropped", event.by ?? "panel", event),
+});
+
+addRow({
   id: "owner-verdict-accept",
   from: "published",
   trigger: "OWNER_VERDICT",

@@ -78,7 +78,14 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "FINDING_DISPROVED",
   "FINDING_ACCEPTED_BY_OWNER",
   "FINDING_SEVERITY_LOWERED",
+  "FINDING_SEVERITY_CHANGED",
+  "FINDING_VERIFIED",
+  "FINDING_RESOLVED_BY_VOTE",
   "DECISION_CLASS_LOWERED",
+  "ROUND_PANEL_VOTE",
+  "ROUND_PANEL_SEAT_UNAVAILABLE",
+  "ROUND_PANEL_DECIDED",
+  "CANDIDATE_APPROVED",
   "OWNER_REQUEST_OPENED",
   "OWNER_REQUEST_RESOLVED",
   "ACCEPTED",
@@ -162,6 +169,8 @@ function inFlightKeyFor(action: string, reviewer?: string, messageType?: string,
   if (action === "dispatch_evaluation") return `dispatch_evaluation_${messageType}`;
   // Plan 04b: one panel seat per raw blocker, each its own dispatch.
   if (action === "dispatch_panel") return `dispatch_panel_${blockerId}_${seat}`;
+  // Plan 05e: one round-panel seat per round, its own dispatch.
+  if (action === "dispatch_round_panel") return `dispatch_round_panel_${seat}`;
   return action;
 }
 
@@ -202,6 +211,21 @@ function withoutPanelSeatInFlight(p: PhaseState, blockerId: string, seat: string
   return inFlight;
 }
 
+/** Plan 05e: merge one round-panel seat's state. */
+function withRoundPanelSeat(p: PhaseState, seat: string, patch: Partial<import("./types.ts").RoundPanelSeatState>): PhaseState["panel"] {
+  const round = { ...(p.panel?.round ?? {}) };
+  const seats = { ...(round.seats ?? {}) };
+  seats[seat] = { dispatches: 0, ...(seats[seat] ?? {}), ...patch };
+  round.seats = seats;
+  return { ...(p.panel ?? {}), round };
+}
+
+function withoutRoundPanelSeatInFlight(p: PhaseState, seat: string): PhaseState["inFlight"] {
+  const inFlight = { ...p.inFlight };
+  delete inFlight[`dispatch_round_panel_${seat}` as InFlightKey];
+  return inFlight;
+}
+
 /** Events handled directly by reduce.ts, not by the transitions table: they
  * only ever append or amend a record without moving the phase's own FSM
  * state, so they have no row in transitions.ts (which is scoped to
@@ -220,7 +244,8 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           (event.action !== "dispatch_review" || a.reviewer === event.reviewer) &&
           (event.action !== "dispatch_evaluation" || a.messageType === event.messageType) &&
           (event.action !== "dispatch_panel" ||
-            (a.blockerId === event.blockerId && a.seat === event.seat)),
+            (a.blockerId === event.blockerId && a.seat === event.seat)) &&
+          (event.action !== "dispatch_round_panel" || a.seat === event.seat),
       );
       if (!outstanding) {
         return rejected(
@@ -240,7 +265,12 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
               // being tried again.
               unavailable: false,
             })
-          : p.panel;
+          : event.action === "dispatch_round_panel" && event.seat !== undefined
+            ? withRoundPanelSeat(p, String(event.seat), {
+                dispatches: (p.panel?.round?.seats?.[String(event.seat)]?.dispatches ?? 0) + 1,
+                unavailable: false,
+              })
+            : p.panel;
       return ok({
         ...state,
         phase: { ...p, panel, inFlight: { ...p.inFlight, [key]: { actionId: event.actionId } } },
@@ -400,6 +430,53 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const check = checkTupleBinding(tuple, p);
       if (!check.ok) return rejected(state, check.reason!);
       const findings = p.findings.map((f) => (f.id === event.findingId ? { ...f, severity: event.severity } : f));
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "FINDING_SEVERITY_CHANGED": {
+      // Plan 05e: the evaluator's plan check, or the round panel's vote,
+      // changes a finding's severity. Unlike FINDING_SEVERITY_LOWERED (the
+      // owner's command) this carries its own reason and may raise severity
+      // back only through the recorded round.
+      if (event.by !== "evaluator" && event.by !== "panel" && event.by !== "reviewer") {
+        return rejected(state, `FINDING_SEVERITY_CHANGED is only evaluator, panel or reviewer, not '${String(event.by)}'`);
+      }
+      if (!event.reason || event.reason.trim().length === 0) {
+        return rejected(state, `a severity change on ${event.findingId} needs a reason`);
+      }
+      if (event.severity !== "blocking" && event.severity !== "advisory") {
+        return rejected(state, `severity must be blocking or advisory, not '${String(event.severity)}'`);
+      }
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      const findings = p.findings.map((f) =>
+        f.id === event.findingId ? { ...f, severity: event.severity, severityReason: event.reason.trim() } : f,
+      );
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "FINDING_VERIFIED": {
+      // Plan 05e: record what validated a finding (the record, a run, a
+      // citation, or the panel's vote).
+      if (typeof event.verified !== "string" || event.verified.trim().length === 0) {
+        return rejected(state, `verifying ${event.findingId} needs a non-empty verified marker`);
+      }
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      const findings = p.findings.map((f) => (f.id === event.findingId ? { ...f, verified: event.verified.trim() } : f));
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "FINDING_RESOLVED_BY_VOTE": {
+      // Plan 05e: a reviewer majority marked the finding's message resolved,
+      // so the finding is repaired on the candidate the round reviewed.
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      const findings = p.findings.map((f) =>
+        f.id === event.findingId && f.status === "open"
+          ? { ...f, status: "repaired" as const, repairedByCandidateSha: event.candidateSha }
+          : f,
+      );
       return ok({ ...state, phase: { ...p, findings } });
     }
 
@@ -643,7 +720,101 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           ...(event.outcome === "escalate" ? { options: event.options } : {}),
         },
       };
-      return ok({ ...state, phase: { ...p, panel: { blockers } } });
+      // Plan 05e: keep the round panel beside the blocker panels.
+      return ok({ ...state, phase: { ...p, panel: { blockers, ...(p.panel?.round ? { round: p.panel.round } : {}) } } });
+    }
+
+    case "ROUND_PANEL_VOTE": {
+      // Plan 05e: one round-panel seat's batched votes on every pending
+      // trade-off and blocking finding. Record-only inside EVALUATING.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `ROUND_PANEL_VOTE is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const seatKey = String(event.seat);
+      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `round panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      const seat = p.panel?.round?.seats?.[seatKey];
+      if (seat?.votes !== undefined) return rejected(state, `round panel seat ${seatKey} already voted`);
+      if (seat?.unavailable) return rejected(state, `round panel seat ${seatKey} is unavailable`);
+      if (!Array.isArray(event.votes) || event.votes.length === 0) {
+        return rejected(state, `round panel seat ${seatKey} must vote on at least one item`);
+      }
+      for (const vote of event.votes) {
+        if (!vote || typeof vote.messageId !== "string" || vote.messageId.length === 0) {
+          return rejected(state, `every round panel vote must name a messageId`);
+        }
+        if (vote.verdict !== "keep" && vote.verdict !== "drop" && vote.verdict !== "downgrade") {
+          return rejected(state, `a round panel verdict must be keep, drop or downgrade, not ${String(vote.verdict)}`);
+        }
+        if (typeof vote.reason !== "string" || vote.reason.trim().length === 0) {
+          return rejected(state, `round panel seat ${seatKey} must give a reason for ${vote.messageId}`);
+        }
+      }
+      return ok({
+        ...state,
+        phase: { ...p, panel: withRoundPanelSeat(p, seatKey, { votes: event.votes }), inFlight: withoutRoundPanelSeatInFlight(p, seatKey) },
+      });
+    }
+
+    case "ROUND_PANEL_SEAT_UNAVAILABLE": {
+      // Plan 05e: the round panel's one-retry rule, exactly like a blocker
+      // seat's. With two seats unavailable the remaining real votes decide.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `ROUND_PANEL_SEAT_UNAVAILABLE is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const seatKey = String(event.seat);
+      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `round panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      const seat = p.panel?.round?.seats?.[seatKey];
+      if (seat?.votes !== undefined) return rejected(state, `round panel seat ${seatKey} already voted`);
+      if (seat?.unavailable === true && (seat.dispatches ?? 0) >= 2) {
+        return rejected(state, `round panel seat ${seatKey} is already unavailable`);
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          panel: withRoundPanelSeat(p, seatKey, { unavailable: true }),
+          inFlight: withoutRoundPanelSeatInFlight(p, seatKey),
+        },
+      });
+    }
+
+    case "ROUND_PANEL_DECIDED": {
+      // Plan 05e: the seats' batched votes are counted and stamped on each
+      // item message so its file shows the three reasons after the round.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `ROUND_PANEL_DECIDED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      if (p.panel?.round?.decided) return rejected(state, "the round panel has already decided");
+      if (!Array.isArray(event.decisions) || event.decisions.length === 0) {
+        return rejected(state, "a round panel decision must cover at least one item");
+      }
+      const round = p.panel?.round ?? {};
+      const messages = (p.messages ?? []).map((m) => {
+        const decision = event.decisions.find((d) => d.messageId === m.id);
+        if (!decision) return m;
+        const panelVotes: Array<{ seat: number; verdict: string; reason: string }> = [];
+        for (const seatKey of ["1", "2", "3"]) {
+          const vote = round.seats?.[seatKey]?.votes?.find((v) => v.messageId === m.id);
+          if (vote) panelVotes.push({ seat: Number(seatKey), verdict: vote.verdict, reason: vote.reason });
+        }
+        return { ...m, panelOutcome: decision.outcome, panelVotes };
+      });
+      return ok({ ...state, phase: { ...p, messages, panel: { ...(p.panel ?? {}), round: { ...round, decided: true } } } });
+    }
+
+    case "CANDIDATE_APPROVED": {
+      // Plan 05e: the three reviewers approved this candidate with no open
+      // blocking finding. Record-only; the tree is what an amendment-only
+      // resubmission is compared against.
+      if (typeof event.candidateSha !== "string" || event.candidateSha.length === 0 || typeof event.tree !== "string" || event.tree.length === 0) {
+        return rejected(state, "CANDIDATE_APPROVED must carry the candidate sha and its tree");
+      }
+      const already = (p.approvedCandidates ?? []).some((a) => a.candidateSha === event.candidateSha);
+      if (already) return ok(state);
+      return ok({
+        ...state,
+        phase: { ...p, approvedCandidates: [...(p.approvedCandidates ?? []), { candidateSha: event.candidateSha, tree: event.tree }] },
+      });
     }
 
     case "CRITERION_REVERTED": {

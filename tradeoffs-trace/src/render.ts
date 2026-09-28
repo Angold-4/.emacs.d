@@ -178,6 +178,24 @@ export function severityOf(message: Message, phase: ReviewPhase = {}): "blocking
   return f?.severity;
 }
 
+/** Plan 05e: what validated a finding (the check record, a run, a citation,
+ * or the round panel), or undefined. */
+export function verifiedOf(message: Message, phase: ReviewPhase = {}): string | undefined {
+  const f = sourceRecord(phase, message) as Finding | undefined;
+  return f?.verified;
+}
+
+/** Plan 05e: the message ids this message closes / is fixed by. A worker
+ * trade-off names the finding it closes (`closes: F-n`); the finding's own
+ * file names the trade-offs that close it. */
+export function closesLinks(message: Message, phase: ReviewPhase = {}): { closes: string[]; fixedBy: string[] } {
+  const messages = phase.messages ?? [];
+  if (message.type === "tradeoff") {
+    return { closes: message.closes ? [message.closes] : [], fixedBy: [] };
+  }
+  return { closes: [], fixedBy: messages.filter((m) => m.closes === message.id).map((m) => m.id) };
+}
+
 function prop(key: string, value: string | undefined): string {
   return `:${key}: ${oneLine(value)}`;
 }
@@ -204,6 +222,11 @@ function messageProperties(message: Message, phase: ReviewPhase): string[] {
     prop("RUN_ID", phase.runId ?? ""),
     prop("PHASE_ID", phaseId),
   ];
+  const verified = verifiedOf(message, phase);
+  if (verified) lines.push(prop("VERIFIED", verified));
+  const links = closesLinks(message, phase);
+  for (const c of links.closes) lines.push(prop("CLOSES", c));
+  for (const f of links.fixedBy) lines.push(prop("FIXED_BY", f));
   if (message.followUp) lines.push(prop("FOLLOW_UP", "true"));
   if (message.invalidated) lines.push(prop("INVALIDATED", `${message.invalidated.reason} (${message.invalidated.atCandidate})`));
   // 04a/04b: the evaluator's report on an owner-refused message.
@@ -444,6 +467,17 @@ export function renderMessageFile(message: Message, phase: ReviewPhase = {}): st
   lines.push("", "* Evidence");
   if ((message.evidence ?? []).length === 0) lines.push("  (none)");
   else for (const ev of message.evidence) lines.push(`  - ${ev}`);
+  // Plan 05e: what validated a finding, and the round panel's own votes (so
+  // a dropped item shows the three reasons).
+  const verified = verifiedOf(message, phase);
+  if (verified) lines.push("", "* Validation", `  verified: ${oneLine(verified)}`);
+  if ((message.panelVotes ?? []).length > 0) {
+    lines.push("", `* Panel votes (${oneLine(message.panelOutcome)} by ${message.panelVotes!.length} seat(s))`);
+    for (const v of [...message.panelVotes!].sort((a, b) => a.seat - b.seat)) lines.push(`  - seat ${v.seat}: ${v.verdict} — ${oneLine(v.reason)}`);
+  }
+  const links = closesLinks(message, phase);
+  if (links.closes.length > 0) lines.push("", "* Closes", ...links.closes.map((c) => `  - ${c}`));
+  if (links.fixedBy.length > 0) lines.push("", "* Fixed by", ...links.fixedBy.map((f) => `  - ${f}`));
   lines.push("", "* Plan", `  ${oneLine(message.planRef) || "(none)"}`);
   const mergedIn = mergedInto(message, phase);
   if (mergedIn.length > 0) {

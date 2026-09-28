@@ -30,6 +30,7 @@
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
+import type { RoundPanelOutcome, RoundPanelState } from "./types.ts";
 import type {
   ContractVersion,
   Correction,
@@ -186,13 +187,102 @@ export function blockerWithOutcome(phase: PhaseState, outcome: PanelOutcome): st
 }
 
 /** Plan 04a/04b: whether everything EVALUATING waits for has settled: every
- * dispatched type's evaluator finished or timed out, and every raw blocker's
- * panel reached a verdict. This is the gate that keeps the phase EVALUATING
- * until the last of the two settles. */
+ * dispatched type's evaluator finished or timed out, every raw blocker's
+ * panel reached a verdict, and (plan 05e) the round panel decided. This is
+ * the gate that keeps the phase EVALUATING until the last of them settles. */
 export function evaluationSettled(phase: PhaseState): boolean {
   return (
-    typesNeedingEvaluation(phase).every((t) => phase.evaluation?.types?.[t]?.settled === true) && panelsSettled(phase)
+    typesNeedingEvaluation(phase).every((t) => phase.evaluation?.types?.[t]?.settled === true) &&
+    panelsSettled(phase) &&
+    roundPanelSettled(phase)
   );
+}
+
+// ---------------------------------------------------------------------------
+// Plan 05e: the round panel (trade-offs and blocking findings, one per round)
+// ---------------------------------------------------------------------------
+
+/** The three round-panel seats, same as every panel. */
+export function roundPanelSeatSettled(seat: import("./types.ts").RoundPanelSeatState | undefined): boolean {
+  if (!seat) return false;
+  if (seat.votes !== undefined) return true;
+  return seat.unavailable === true && seat.dispatches >= 2;
+}
+
+export function roundPanelSeatsSettled(round: RoundPanelState | undefined): boolean {
+  return PANEL_SEATS.every((n) => roundPanelSeatSettled(round?.seats?.[String(n)]));
+}
+
+/** The items this round's panel votes on: every published trade-off message
+ * whose backing decision does not already carry valid ballots from M, A and
+ * B, plus every published open blocking finding (never a blocker message —
+ * its own panel handles it). Computed from live state after the evaluators
+ * publish, so it is stable for the panel's own dispatch. */
+export function roundPanelItemsNeedingVote(phase: PhaseState): string[] {
+  const C = phase.candidate?.sha;
+  const K = phase.contract.contractVersion;
+  if (!C) return [];
+  const out: string[] = [];
+  for (const m of phase.messages ?? []) {
+    if (m.state !== "published" || m.boundCandidateSha !== C) continue;
+    if (m.type === "tradeoff") {
+      const decision = m.sourceRecordId ? phase.decisions.find((d) => d.id === m.sourceRecordId) : undefined;
+      if (decision) {
+        const all = (["M", "A", "B"] as const).every((who) =>
+          isValidBallot(currentBallot(phase.ballots, decision.id, who, C, K, decision.version)),
+        );
+        if (all) continue;
+      }
+      out.push(m.id);
+      continue;
+    }
+    if (m.type === "finding" && m.raisedAsBlocker !== true) {
+      const finding = m.sourceRecordId ? phase.findings.find((f) => f.id === m.sourceRecordId) : undefined;
+      if (!finding || finding.severity !== "blocking" || finding.status !== "open") continue;
+      out.push(m.id);
+    }
+  }
+  return out.sort();
+}
+
+/** One round-panel item's outcome from the recorded votes. A `keep` majority
+ * keeps it (a trade-off is published to the owner; a blocking finding keeps
+ * blocking). Otherwise a trade-off is dropped and a finding becomes
+ * advisory — a 2-of-3 majority is the only way a finding blocks. */
+export function roundPanelOutcomeFor(round: RoundPanelState | undefined, messageId: string, kind: "tradeoff" | "finding"): RoundPanelOutcome {
+  const votes = PANEL_SEATS.map((n) => round?.seats?.[String(n)]?.votes?.find((v) => v.messageId === messageId)).filter(
+    (v): v is NonNullable<typeof v> => v !== undefined,
+  );
+  const count = (verdict: string) => votes.filter((v) => v.verdict === verdict).length;
+  if (count("keep") >= 2) return "keep";
+  if (count("drop") >= 2) return "drop";
+  if (count("downgrade") >= 2) return "downgrade";
+  return kind === "finding" ? "downgrade" : "drop";
+}
+
+/** True when the round panel has nothing to do (no pending item) or has
+ * decided. A round with pending items cannot leave EVALUATING until it has. */
+export function roundPanelSettled(phase: PhaseState): boolean {
+  if (roundPanelItemsNeedingVote(phase).length === 0) return true;
+  return phase.panel?.round?.decided === true;
+}
+
+/** Plan 05e: a blocking finding is only legitimate when it is a defect against
+ * an acceptance item or a reserved rule (finding #32, atlas 15.3). A
+ * preference, or a defect that cites neither, may not block; the evaluator
+ * lowers it and records the reason. A `criterionDispute` names an acceptance
+ * item by construction. */
+export function findingCitesAcceptanceOrReserved(
+  finding: Finding,
+  contract: { acceptance: string[]; reserved: string[] },
+): boolean {
+  if (finding.kind !== "defect" && finding.kind !== "contract") return false;
+  const text = `${finding.evidence} ${finding.criterionDisputed ?? ""}`.toLowerCase();
+  const cites = (item: string): boolean => {
+    const needle = item.trim().toLowerCase();
+    return needle.length > 0 && text.includes(needle);
+  };
+  return contract.acceptance.some(cites) || contract.reserved.some(cites);
 }
 
 /** M, A and B each have a review bound to (C, K) already. Used to decide,

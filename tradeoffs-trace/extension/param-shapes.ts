@@ -46,7 +46,7 @@ export const SUBMIT_DISCOVERY_PARAMS: ParamShape = {
  * fix the moment it makes it. Worker-only: the evaluator role's tool set
  * (roles.ts) does not include it. The anchor names the code location. */
 export const RAISE_TRADEOFF_PARAMS: ParamShape = {
-  properties: ["choice", "alternative", "why", "anchor", "planRef"],
+  properties: ["choice", "alternative", "why", "anchor", "planRef", "closes"],
   required: ["choice", "alternative", "why", "anchor"],
 };
 
@@ -75,6 +75,7 @@ export const SUBMIT_REVIEW_PARAMS: ParamShape = {
     "findings",
     "discoveryMatches",
     "blockers",
+    "resolutionStatements",
   ],
   required: ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
 };
@@ -85,4 +86,11 @@ export const SUBMIT_REVIEW_PARAMS: ParamShape = {
 export const SUBMIT_PANEL_VOTE_PARAMS: ParamShape = {
   properties: ["blockerId", "seat", "vote", "reason", "options"],
   required: ["blockerId", "seat", "vote", "reason"],
+};
+
+/** Plan 05e: `submit_round_panel_votes` — one round-panel seat's batched
+ * `keep`/`drop` votes on every pending trade-off and blocking finding. */
+export const SUBMIT_ROUND_PANEL_VOTES_PARAMS: ParamShape = {
+  properties: ["votes"],
+  required: ["votes"],
 };

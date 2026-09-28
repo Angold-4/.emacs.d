@@ -61,6 +61,10 @@ const FIXTURES: Record<string, RowFixture> = {
     state: withMessage(makeMessage({ state: "raw" })),
     event: { type: "MESSAGE_DROPPED", messageId: "T-1", by: "evaluator", reason: "not reviewable", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },
   },
+  "message-dropped-published": {
+    state: withMessage(makeMessage({ state: "published" })),
+    event: { type: "MESSAGE_DROPPED", messageId: "T-1", by: "panel", reason: "the panel did not keep it", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },
+  },
   "owner-verdict-accept": {
     state: withMessage(makeMessage({ state: "published" })),
     event: { type: "OWNER_VERDICT", messageId: "T-1", verdict: "accept", boundCandidateSha: C1, boundContractVersion: K, boundRecordVersion: 1 },

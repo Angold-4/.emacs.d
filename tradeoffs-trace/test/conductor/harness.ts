@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { Conductor, createRun, runPaths, type ConductorOptions, type RunPlanFile } from "../../src/conductor.ts";
 import { planModelSelector, ROLE_TOOLS, type PlanModels } from "../../src/core/roles.ts";
+import { roundPanelItemsNeedingVote } from "../../src/core/predicate.ts";
 
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { readLog, type LogRecord } from "../../src/effects/log.ts";
@@ -140,6 +141,12 @@ export async function setupConductor(opts: {
   panelScriptFor?: (blockerId: string, seat: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04b: the default panel seat script's vote. */
   defaultPanelVote?: "block" | "downgrade";
+  /** Plan 05e: one script per round-panel seat. The default votes `keep` on
+   * every pending item, which changes no message's state (the pre-05e
+   * behaviour for a published trade-off / blocking finding). */
+  roundPanelScriptFor?: (seat: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 05e: the default round-panel vote for every item. */
+  defaultRoundPanelVote?: "keep" | "drop" | "downgrade";
   deadlines?: ConductorOptions["deadlines"];
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
    * never parses argv, so these are inert except as a unique, greppable
@@ -232,6 +239,7 @@ export async function setupConductor(opts: {
   const evaluatorScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
   const panelScriptPaths = new Map<string, string>();
+  const roundPanelScriptPaths = new Map<string, string>();
 
   const defaultPanelScript = (blockerId: string, seat: number) => ({
     hello: { role: "panel" as const, tools: ROLE_TOOLS.panel },
@@ -255,6 +263,21 @@ export async function setupConductor(opts: {
       },
     ],
   });
+
+  const defaultRoundPanelScript = (state: State) => {
+    const vote = opts.defaultRoundPanelVote ?? "keep";
+    const items = roundPanelItemsNeedingVote(state.phase);
+    return {
+      hello: { role: "panel" as const, tools: ROLE_TOOLS.panel },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_round_panel_votes",
+          args: { votes: items.map((messageId) => ({ messageId, verdict: vote, reason: `default round-panel ${vote}` })) },
+        },
+      ],
+    };
+  };
 
   const defaultEvaluatorScript = () => ({
     hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
@@ -315,6 +338,16 @@ export async function setupConductor(opts: {
         return { FAKE_PI_SCRIPT: curatorScriptPaths.get(agentId)! };
       }
       if (role === "panel") {
+        // Plan 05e: the round panel's agentId is `round-panel-<seat>-<actionId>`.
+        const round = agentId.match(/^round-panel-(\d+)-/);
+        if (round) {
+          const seat = Number(round[1]);
+          if (!roundPanelScriptPaths.has(agentId)) {
+            const script = opts.roundPanelScriptFor ? opts.roundPanelScriptFor(seat, conductor.state) : defaultRoundPanelScript(conductor.state);
+            roundPanelScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+          }
+          return { FAKE_PI_SCRIPT: roundPanelScriptPaths.get(agentId)! };
+        }
         // Plan 04b: one script per dispatched seat (the agentId is
         // `panel-<blockerId>-<seat>-<actionId>`); a retry has a fresh
         // actionId, so a test can give the retry different behaviour.

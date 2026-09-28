@@ -324,6 +324,17 @@ export function treeHashOf(repo: string, dir: string, sha: string): string {
   }
 }
 
+/** Plan 05e: the full git tree object id of a commit (`git rev-parse
+ * <sha>^{tree}`) — the identity a later amendment-only resubmission is
+ * compared against. Returns undefined when git cannot resolve it. */
+export function candidateTree(repo: string, sha: string): string | undefined {
+  try {
+    return git(["-C", repo, "rev-parse", `${sha}^{tree}`]);
+  } catch {
+    return undefined;
+  }
+}
+
 /** True iff `dir`'s actual content, computed by `treeHashOf` (which
  * ignores `dir`'s own `.git` entirely — see its doc comment for exactly
  * what that does and does not defend against), equals candidate `sha`'s

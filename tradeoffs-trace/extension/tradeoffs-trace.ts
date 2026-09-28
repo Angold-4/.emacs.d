@@ -52,6 +52,7 @@ import {
   SUBMIT_PANEL_VOTE_PARAMS,
   SUBMIT_PHASE_PARAMS,
   SUBMIT_REVIEW_PARAMS,
+  SUBMIT_ROUND_PANEL_VOTES_PARAMS,
 } from "./param-shapes.ts";
 
 function loadSchema(relPath: string): JSONSchema {
@@ -177,6 +178,7 @@ const BlockerParam = Type.Object({
   reproduction: Type.Optional(
     Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
   ),
+  runnable: Type.Optional(Type.String({ description: "A runnable test or command that shows the claimed failure; the conductor re-runs it and publishes only if it fails" })),
 });
 
 const FindingParam = Type.Object({
@@ -197,6 +199,7 @@ const FindingParam = Type.Object({
   reproduction: Type.Optional(
     Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
   ),
+  runnable: Type.Optional(Type.String({ description: "A runnable test or command that shows the claimed failure; the conductor re-runs it and publishes only if it fails" })),
 });
 
 const PriorDecisionParam = Type.Object({
@@ -248,6 +251,16 @@ const submitReviewFields: Record<string, TSchema> = {
         "Plan 04b: findings that STOP the work until the owner decides. Raised at once as a raw blocker message and a blocking finding, then voted by a panel of three.",
     }),
   ),
+  resolutionStatements: Type.Optional(
+    Type.Array(
+      Type.Object({
+        messageId: Type.String({ description: "An earlier-round finding or blocker message the prompt listed" }),
+        status: StringEnum(["resolved", "open"] as const),
+        evidence: Type.Optional(Type.String({ description: "What you checked" })),
+      }),
+      { description: "Plan 05e: mark every earlier-round finding/blocker resolved or open; a 2-of-3 resolved majority closes it" },
+    ),
+  ),
 };
 const SubmitReviewParams = Type.Object(
   Object.fromEntries(SUBMIT_REVIEW_PARAMS.properties.map((key) => [key, submitReviewFields[key]])),
@@ -264,6 +277,7 @@ const raiseTradeoffFields: Record<string, TSchema> = {
     lines: Type.Array(Type.Integer(), { minItems: 2, maxItems: 2, description: "[start, end] line numbers" }),
   }),
   planRef: Type.Optional(Type.String({ description: "The plan clause this choice relates to, if any" })),
+  closes: Type.Optional(Type.String({ description: "Plan 05e: the message id (F-n/B-n) this trade-off is a fix for" })),
 };
 const RaiseTradeoffParams = Type.Object(
   Object.fromEntries(RAISE_TRADEOFF_PARAMS.properties.map((key) => [key, raiseTradeoffFields[key]])),
@@ -314,6 +328,22 @@ const submitPanelVoteFields: Record<string, TSchema> = {
 };
 const SubmitPanelVoteParams = Type.Object(
   Object.fromEntries(SUBMIT_PANEL_VOTE_PARAMS.properties.map((key) => [key, submitPanelVoteFields[key]])),
+);
+
+// Plan 05e: `submit_round_panel_votes` — one round-panel seat's batched
+// keep/drop votes on every pending trade-off and blocking finding.
+const RoundPanelItemVoteParam = Type.Object({
+  messageId: Type.String({ description: "The trade-off or blocking finding message id this vote is for" }),
+  verdict: StringEnum(["keep", "drop", "downgrade"] as const, {
+    description: "keep: publish it (and keep a finding blocking); drop/downgrade: drop a trade-off or make a finding advisory",
+  }),
+  reason: Type.String({ description: "Why you voted this way" }),
+});
+const submitRoundPanelVotesFields: Record<string, TSchema> = {
+  votes: Type.Array(RoundPanelItemVoteParam, { minItems: 1, description: "One vote per item the prompt listed" }),
+};
+const SubmitRoundPanelVotesParams = Type.Object(
+  Object.fromEntries(SUBMIT_ROUND_PANEL_VOTES_PARAMS.properties.map((key) => [key, submitRoundPanelVotesFields[key]])),
 );
 
 function readEnv(name: string): string | undefined {
@@ -403,6 +433,7 @@ class RunSocketClient {
       | "raise_tradeoff"
       | "submit_evaluation"
       | "submit_panel_vote"
+      | "submit_round_panel_votes"
       | "curate_entries",
     args: unknown,
     timeoutMs = 60000,
@@ -466,7 +497,13 @@ export default function (pi: ExtensionAPI) {
     // valid pass and settling without one is allowed.
     if (role === "curator") return undefined;
     if (role === "evaluator") return accepted.has("submit_evaluation") ? undefined : "submit_evaluation";
-    if (role === "panel") return accepted.has("submit_panel_vote") ? undefined : "submit_panel_vote";
+    if (role === "panel") {
+      // Plan 05e: a round-panel seat owes `submit_round_panel_votes`; a
+      // blocker seat owes `submit_panel_vote`.
+      const round = readEnv("TT_ROUND_PANEL") === "1";
+      const owed = round ? "submit_round_panel_votes" : "submit_panel_vote";
+      return accepted.has(owed) ? undefined : owed;
+    }
     if (!accepted.has("submit_discovery")) return "submit_discovery";
     if (reviewTurnStarted && !accepted.has("submit_review")) return "submit_review";
     return undefined;
@@ -483,6 +520,8 @@ export default function (pi: ExtensionAPI) {
       "You have not called submit_evaluation yet. Return one entry per raw message you were shown: publish (with ONE COMPLETE title of at most 80 characters — never truncate the raw title, rewrite it shorter; plus a summary of at most 3 sentences, context, evidence and importance), merge (into another message), or drop (with a reason).",
     submit_panel_vote:
       "You have not called submit_panel_vote yet. Vote block (stop the work until the owner decides — propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
+    submit_round_panel_votes:
+      "You have not called submit_round_panel_votes yet. Return one {messageId, verdict: 'keep'|'drop', reason} for EVERY item the prompt listed, in one call.",
   };
 
   pi.on("session_start", async () => {
@@ -586,6 +625,7 @@ export default function (pi: ExtensionAPI) {
       | "raise_tradeoff"
       | "submit_evaluation"
       | "submit_panel_vote"
+      | "submit_round_panel_votes"
       | "curate_entries",
     args: unknown,
     markAccepted = true,
@@ -693,6 +733,18 @@ export default function (pi: ExtensionAPI) {
       const error = validateOrError(PANEL_VOTE_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_panel_vote", params);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_round_panel_votes",
+    label: "Submit Round Panel Votes",
+    description:
+      "Vote keep or drop, with a reason, on EVERY trade-off and blocking finding the prompt listed — one batched call for the round. keep publishes a trade-off to the owner and keeps a finding blocking; drop/downgrade drops a trade-off or makes a finding advisory.",
+    promptSnippet: "Vote keep or drop on every pending item",
+    parameters: SubmitRoundPanelVotesParams,
+    async execute(_toolCallId, params) {
+      return submitTool("submit_round_panel_votes", params);
     },
   });
 

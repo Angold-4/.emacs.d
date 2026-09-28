@@ -127,7 +127,7 @@ export const ROLE_TOOLS: Record<Role, string[]> = {
   // contract, the owner directives, the ledger, the blocker and its evidence,
   // and the candidate's diff, and returns a single `block`/`downgrade` vote
   // through `submit_panel_vote`.
-  panel: ["read", "grep", "find", "ls", "submit_panel_vote"],
+  panel: ["read", "grep", "find", "ls", "submit_panel_vote", "submit_round_panel_votes"],
 };
 
 /** The skeleton extension's own file, resolved relative to this module so

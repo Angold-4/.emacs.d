@@ -468,3 +468,15 @@ test("the status `review` line counts the same messages review.org shows, with n
   assert.equal(reviewSummary(evaluated.messages), "T 4 (1 dropped) · F 0 · B 0 · C-c m d");
   assert.match(projectReview(evaluated), /^1 dropped$/m);
 });
+
+test("plan 05e: a worker trade-off with closes: F-n renders the link in both message files", () => {
+  const findingMessage = makeMessage({ id: "F-1", type: "finding", title: "the guard is missing", state: "published" });
+  const tradeoff = makeMessage({ id: "T-1", type: "tradeoff", title: "add the guard", state: "published", closes: "F-1" });
+  const phase = { messages: [findingMessage, tradeoff], findings: [] };
+  const tradeoffFile = renderMessageFile(tradeoff, phase);
+  const findingFile = renderMessageFile(findingMessage, phase);
+  assert.match(tradeoffFile, /:CLOSES: F-1/);
+  assert.match(tradeoffFile, /\* Closes\n  - F-1/);
+  assert.match(findingFile, /:FIXED_BY: T-1/);
+  assert.match(findingFile, /\* Fixed by\n  - T-1/);
+});

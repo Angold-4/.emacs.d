@@ -220,6 +220,15 @@ export interface Finding {
   /** Plan 2c: other reviewers who raised the same finding ("same as F-…")
    * instead of filing a duplicate. */
   alsoRaisedBy?: Reviewer[];
+  /** Plan 05e: what validated this finding — `record` (the check record
+   * confirmed the claim), `run <cmd> exit N` (the validator ran it in the
+   * candidate's checkout), a `file:line …` citation the evaluator checked,
+   * or `panel 2/3 keep` (the round panel). Absent until something validated
+   * it. */
+  verified?: string;
+  /** Plan 05e: why the finding's severity changed from the raised one (the
+   * evaluator's plan check, or the round panel's vote). */
+  severityReason?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +320,17 @@ export interface Message {
   /** Plan 04a: how important the evaluator judged this message
    * (high|medium|low). Metadata, not part of the reviewable contentHash. */
   importance?: "high" | "medium" | "low";
+  /** Plan 05e: the message id this trade-off closes (a fix names the
+   * finding/blocker message it closes, `closes: F-3`), so the owner sees the
+   * link on both messages. */
+  closes?: string;
+  /** Plan 05e: the round panel's per-seat votes on this trade-off or blocking
+   * finding, kept on the message so its file shows the three reasons after
+   * the round (and after a carry). */
+  panelVotes?: Array<{ seat: number; verdict: string; reason: string }>;
+  /** Plan 05e: the round panel's outcome for this message (`keep`, `drop` or
+   * `downgrade`), kept beside the votes. */
+  panelOutcome?: string;
   /** Plan 04b: this `blocker` message was raised through a reviewer's
    * separate `blockers` list — "stop the work until the owner decides". Only
    * such a blocker is voted by a panel: a blocking *finding* raised through
@@ -473,6 +493,11 @@ export interface FindingDisclosure {
   /** Plan 2c: the id of an already-open finding this one repeats; the
    * conductor records the reviewer on that finding instead of a duplicate. */
   sameAs?: string;
+  /** Plan 05e: a runnable test or command that shows the claimed failure.
+   * The conductor re-runs it in the candidate's checkout; the finding is
+   * published only if it exits non-zero (and dropped with the run recorded
+   * when it passes). */
+  runnable?: string;
 }
 
 /** Plan 04b: one entry of a reviewer's `blockers` list. Exactly a finding
@@ -490,6 +515,9 @@ export interface BlockerDisclosure {
   linkedDecisionId?: string;
   criterionDispute?: CriterionDispute;
   reproduction?: { command: string };
+  /** Plan 05e: a runnable test or command, checked by the same 3a/3b rule as
+   * an ordinary finding. */
+  runnable?: string;
 }
 
 export interface Review {
@@ -515,6 +543,19 @@ export interface Review {
   /** Plan 2c: this reviewer's own turn-1 discoveries that are the same
    * choice as another listed record. */
   discoveryMatches?: Array<{ discoveryId: string; sameAs: string }>;
+  /** Plan 05e: this reviewer's mark on every open finding/blocker from an
+   * earlier round that the turn-2 prompt listed — `resolved` or `open`, with
+   * evidence. A majority `resolved` moves the message to `resolved`; a
+   * majority `open` (or no majority) leaves it live. */
+  resolutionStatements?: FindingResolutionStatement[];
+}
+
+/** Plan 05e: one reviewer's mark on an earlier round's open finding/blocker
+ * message. */
+export interface FindingResolutionStatement {
+  messageId: string;
+  status: "resolved" | "open";
+  evidence?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +898,7 @@ export type InFlightKey =
   | "dispatch_evaluation_finding"
   | "dispatch_evaluation_blocker"
   | `dispatch_panel_${string}_${number}`
+  | `dispatch_round_panel_${number}`
   | "run_gate"
   | "publish_cas";
 
@@ -959,9 +1001,15 @@ export interface PhaseState {
    * `interruptedOnce` is the same one-redispatch bookkeeping as `baseline`. */
   evaluation?: { types?: Partial<Record<MessageType, EvaluatorOutcome>> };
   /** Plan 04b: the blocker panel's state, one entry per raw blocker message
-   * of this round (keyed by the blocker message id). EVALUATING completes
+   * of this round (keyed by the blocker message id). Plan 05e adds the
+   * round panel for trade-offs and blocking findings. EVALUATING completes
    * only once every evaluator AND every panel has settled. */
-  panel?: { blockers?: Record<string, PanelState> };
+  panel?: { blockers?: Record<string, PanelState>; round?: RoundPanelState };
+  /** Plan 05e: candidates the three reviewers approved (all three reviews
+   * in, no open blocking finding bound to the candidate), keyed by their
+   * full git tree object id. A resubmission whose tree matches an approved
+   * one re-reviews only the amended criterion (finding #34). */
+  approvedCandidates?: Array<{ candidateSha: string; tree: string }>;
   /** Plan 05d: every flake observed in this phase (a new failing test that
    * passed when re-run alone), folded from FLAKE_OBSERVED events. Evidence
    * for the status, `tt summary` and a restart. */
@@ -1092,6 +1140,42 @@ export interface PanelState {
   decided?: PanelDecision;
 }
 
+// ---------------------------------------------------------------------------
+// Plan 05e: the round panel (trade-offs and blocking findings)
+// ---------------------------------------------------------------------------
+
+/** One item's verdict from one round-panel seat. `keep` publishes a trade-off
+ * to the owner (and blocks acceptance for a finding); `drop` drops a
+ * trade-off and makes a finding advisory; `downgrade` makes a finding
+ * advisory. */
+export type RoundPanelVerdict = "keep" | "drop" | "downgrade";
+export interface RoundPanelItemVote {
+  messageId: string;
+  verdict: RoundPanelVerdict;
+  reason: string;
+}
+
+/** One round-panel seat: it votes on EVERY pending item in one batch. A seat
+ * that times out once is re-dispatched, exactly like a blocker seat. */
+export interface RoundPanelSeatState {
+  dispatches: number;
+  votes?: RoundPanelItemVote[];
+  unavailable?: boolean;
+}
+
+export interface RoundPanelState {
+  seats?: Record<string, RoundPanelSeatState>;
+  /** Set once the seats' votes have been counted and applied. */
+  decided?: boolean;
+  /** The items this round's panel covered, in id order, recorded when the
+   * round enters EVALUATING so a restarted conductor does not recompute a
+   * different set after an evaluator polished the messages. */
+  items?: string[];
+}
+
+/** The round panel's outcome for one item. */
+export type RoundPanelOutcome = "keep" | "drop" | "downgrade";
+
 /** Plan 04a: one type's evaluator finished its round. A record event inside
  * EVALUATING; the phase completes only once every dispatched type has. */
 export interface EvEvaluatorFinished {
@@ -1155,6 +1239,70 @@ export interface EvPanelDecided {
   reason?: string;
   /** Escalations only: the two or three options the owner chooses from. */
   options?: PanelOption[];
+}
+
+// ---------------------------------------------------------------------------
+// Plan 05e: the round panel, finding verification and approved candidates
+// ---------------------------------------------------------------------------
+
+/** One round-panel seat's batched votes on every pending trade-off and
+ * blocking finding. Record event inside EVALUATING. */
+export interface EvRoundPanelVote {
+  type: "ROUND_PANEL_VOTE";
+  seat: number;
+  votes: RoundPanelItemVote[];
+}
+
+/** One round-panel seat is unavailable after its own retry. */
+export interface EvRoundPanelSeatUnavailable {
+  type: "ROUND_PANEL_SEAT_UNAVAILABLE";
+  seat: number;
+  reason?: string;
+}
+
+/** The round panel's votes have been counted and applied. Record event. */
+export interface EvRoundPanelDecided {
+  type: "ROUND_PANEL_DECIDED";
+  decisions: Array<{ messageId: string; outcome: RoundPanelOutcome; reason?: string }>;
+}
+
+/** Plan 05e: a finding's severity changed against the plan (the evaluator's
+ * check) or by the round panel's vote. */
+export interface EvFindingSeverityChanged {
+  type: "FINDING_SEVERITY_CHANGED";
+  findingId: string;
+  severity: FindingSeverity;
+  reason: string;
+  /** `reviewer` is a `sameAs` re-raise, which takes the re-raiser's
+   * severity (plan 05e, finding #32). */
+  by: "evaluator" | "panel" | "reviewer";
+}
+
+/** Plan 05e: a majority of reviewers marked the finding's message resolved,
+ * so the finding itself is repaired on the current candidate. */
+export interface EvFindingResolvedByVote {
+  type: "FINDING_RESOLVED_BY_VOTE";
+  findingId: string;
+  candidateSha: string;
+  reason?: string;
+}
+
+/** Plan 05e: what validated a finding — the check record, a run (with its
+ * command and exit status), a file:line citation the evaluator checked, or
+ * the round panel's vote. */
+export interface EvFindingVerified {
+  type: "FINDING_VERIFIED";
+  findingId: string;
+  verified: string;
+}
+
+/** Plan 05e: all three reviewers reviewed this candidate with no open
+ * blocking finding bound to it. `tree` (the candidate's git tree object id)
+ * is what a later amendment-only resubmission is compared against. */
+export interface EvCandidateApproved {
+  type: "CANDIDATE_APPROVED";
+  candidateSha: string;
+  tree: string;
 }
 export interface EvAttemptNoSubmission {
   type: "ATTEMPT_NO_SUBMISSION";
@@ -1741,6 +1889,13 @@ export type Event =
   | EvPanelVote
   | EvPanelSeatUnavailable
   | EvPanelDecided
+  | EvRoundPanelVote
+  | EvRoundPanelSeatUnavailable
+  | EvRoundPanelDecided
+  | EvFindingSeverityChanged
+  | EvFindingResolvedByVote
+  | EvFindingVerified
+  | EvCandidateApproved
   | EvSubmitPhase
   | EvAttemptTimedOut
   | EvAttemptNoSubmission

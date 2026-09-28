@@ -152,6 +152,9 @@ export function renderPhaseChart(
   // Plan 05d: CHECKING's own re-run step (a newly failing test is re-run
   // alone before the check may fail; a load-only flake passes it).
   lines.push("note: a check that names new failures re-runs each alone before it may fail; a load-only flake passes it (FLAKE_OBSERVED)");
+  // Plan 05e: EVALUATING also runs the round panel (trade-offs and blocking
+  // findings) after the evaluators publish, inside the same state.
+  lines.push("note: EVALUATING publishes through the evaluators, then a per-round panel (ROUND_PANEL_VOTE) keeps or drops each pending trade-off and blocking finding");
   lines.push("");
 
   const section = (

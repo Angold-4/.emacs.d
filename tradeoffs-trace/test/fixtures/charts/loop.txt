@@ -2,6 +2,7 @@ tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions
 current state: DONE   (entered 1x - 2m40s)
 current run: RUN_ACTIVE
 note: a check that names new failures re-runs each alone before it may fail; a load-only flake passes it (FLAKE_OBSERVED)
+note: EVALUATING publishes through the evaluators, then a per-round panel (ROUND_PANEL_VOTE) keeps or drops each pending trade-off and blocking finding
 
 phase states:
   +----------------+
