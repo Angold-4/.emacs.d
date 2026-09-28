@@ -331,7 +331,12 @@ test("a conductor killed before its projection write rebuilds them on start", as
 
 test("MESSAGE_CARRIED is emitted per live message, and a changed decision invalidates its settlement", async () => {
   let priorId = "";
-  const deadlines = { abortGraceMs: 100, termGraceMs: 100, helloTimeoutMs: 5_000, reviewMs: 30_000, inboxPollMs: 100 };
+  // Generous hello/review limits: a fake-pi turn that takes >30 s under the
+  // suite's own 4-way load used to time out, adding a review re-dispatch and
+  // more rounds than this test's two-freeze expectation allows (the
+  // MESSAGE_CARRIED gate flake). The limits are only ever reached on a loaded
+  // machine; a quiet run is unaffected.
+  const deadlines = { abortGraceMs: 100, termGraceMs: 100, helloTimeoutMs: 30_000, reviewMs: 180_000, inboxPollMs: 100 };
   // A-27: capture the repair attempt's prompt (and the reviewers') so the
   // ledger-reaching-prompts criterion has a conductor-level proof.
   const promptDir = mkdtempSync("/tmp/tt-carried-prompts-");
@@ -512,7 +517,9 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
 
 test("a withdrawn decision supersedes its message and keeps the settlement marked", async () => {
   let priorId = "";
-  const deadlines = { abortGraceMs: 100, termGraceMs: 100, helloTimeoutMs: 5_000, reviewMs: 30_000, inboxPollMs: 100 };
+  // Same generous limits as the MESSAGE_CARRIED test above: a load-induced
+  // review timeout used to keep this run from reaching DONE inside its budget.
+  const deadlines = { abortGraceMs: 100, termGraceMs: 100, helloTimeoutMs: 30_000, reviewMs: 180_000, inboxPollMs: 100 };
   const gate = releaseGate();
   const setup = await setupConductor({
     checks: ["true"],
