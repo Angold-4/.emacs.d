@@ -112,7 +112,10 @@ export function runReviewLint(input: ReviewLintInput): ReviewLintResult {
     if (!view.type || !["blocker", "finding", "tradeoff"].includes(view.type)) {
       violations.push({ rule: "evidence", detail: `entry ${view.entry.id} has no type` });
     }
-    if (!view.anchor) {
+    // A `message` anchor is a placeholder for a message that carries no real
+    // anchor: the entry still renders (nothing hidden), but the lint reports
+    // it rather than letting a made-up anchor pass (findings A-34, M-38).
+    if (!view.anchor || view.anchor.kind === "message") {
       violations.push({ rule: "evidence", detail: `entry ${view.entry.id} has no anchor` });
     }
     for (const m of view.messages) {

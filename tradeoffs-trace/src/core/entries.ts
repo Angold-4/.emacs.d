@@ -55,7 +55,16 @@ export interface PlanAnchor {
   kind: "plan";
   clause: string;
 }
-export type EntryAnchor = FileAnchor | DecisionAnchor | PlanAnchor;
+/** A message that carries NO real anchor (no file:line evidence, no decision
+ * id, no plan clause). It still gets an entry, so nothing is hidden, but the
+ * anchor is the message's own id: two such messages never merge, and the
+ * lint reports the entry as having no anchor rather than letting a made-up
+ * one pass (findings A-34, M-38). */
+export interface MessageAnchor {
+  kind: "message";
+  id: string;
+}
+export type EntryAnchor = FileAnchor | DecisionAnchor | PlanAnchor | MessageAnchor;
 
 /** How fresh a file anchor is against the newest candidate. */
 export type AnchorFreshness = "fresh" | "stale" | "unverified";
@@ -92,7 +101,11 @@ export function anchorsOfMessage(message: Message): EntryAnchor[] {
   for (const ev of message.evidence ?? []) push(anchorFromEvidence(ev));
   const record = message.sourceRecordId;
   if (record && /^D[-\w]/.test(record)) push({ kind: "decision", id: record });
-  if (message.planRef && message.planRef.trim().length > 0) push({ kind: "plan", clause: normalisePlanClause(message.planRef) });
+  // A planRef equal to the phase id is a placeholder the conductor once set on
+  // every message; treating it as a plan clause made two unrelated prose
+  // findings share ONE anchor and merge (finding A-34).
+  const planRef = message.planRef?.trim() ?? "";
+  if (planRef.length > 0 && planRef !== message.phaseId) push({ kind: "plan", clause: normalisePlanClause(planRef) });
   return out;
 }
 
@@ -104,6 +117,7 @@ export function anchorsEqual(a: EntryAnchor, b: EntryAnchor): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "file" && b.kind === "file") return a.path === b.path && a.lines[0] === b.lines[0] && a.lines[1] === b.lines[1];
   if (a.kind === "decision" && b.kind === "decision") return a.id === b.id;
+  if (a.kind === "message" && b.kind === "message") return a.id === b.id;
   if (a.kind === "plan" && b.kind === "plan") return normalisePlanClause(a.clause) === normalisePlanClause(b.clause);
   return false;
 }
@@ -117,6 +131,8 @@ export function anchorsOverlap(a: EntryAnchor, b: EntryAnchor): boolean {
   }
   if (a.kind === "decision" && b.kind === "decision") return a.id === b.id;
   if (a.kind === "plan" && b.kind === "plan") return normalisePlanClause(a.clause) === normalisePlanClause(b.clause);
+  // A no-anchor message's anchor is its own id: only itself.
+  if (a.kind === "message" && b.kind === "message") return a.id === b.id;
   return false;
 }
 
@@ -129,6 +145,7 @@ export function sharedAnchor(a: readonly EntryAnchor[], b: readonly EntryAnchor[
 export function anchorKey(a: EntryAnchor): string {
   if (a.kind === "file") return `file:${a.path}:${a.lines[0]}-${a.lines[1]}`;
   if (a.kind === "decision") return `decision:${a.id}`;
+  if (a.kind === "message") return `message:${a.id}`;
   return `plan:${normalisePlanClause(a.clause)}`;
 }
 
@@ -136,6 +153,7 @@ export function formatAnchor(a: EntryAnchor | undefined): string {
   if (!a) return "no anchor";
   if (a.kind === "file") return `${a.path}:${a.lines[0]}-${a.lines[1]}`;
   if (a.kind === "decision") return a.id;
+  if (a.kind === "message") return "no anchor";
   return a.clause;
 }
 
@@ -262,6 +280,12 @@ export type LinkCheck = { ok: true; anchor: EntryAnchor } | { ok: false; reason:
 export function validateLink(entry: Entry, message: Message, proposed?: EntryAnchor): LinkCheck {
   const messageAnchors = anchorsOfMessage(message);
   const entryAnchors = entry.anchor ? [entry.anchor] : [];
+  // A no-anchor entry holds exactly the message it names.
+  if (entry.anchor.kind === "message") {
+    return entry.anchor.id === message.id
+      ? { ok: true, anchor: entry.anchor }
+      : { ok: false, reason: `entry ${entry.id} has no real anchor and holds only ${entry.anchor.id}` };
+  }
   // The message and the ENTRY must share an anchor. A proposed anchor that
   // matches neither (or matches only the entry) is not a shared anchor and
   // does not make the link valid.
@@ -473,6 +497,11 @@ export function validateCuratorProposal(proposal: CuratorProposal): CuratorValid
   }
   if (op === "link" && (!proposal.entryId || !proposal.messageId)) {
     return { ok: false, reason: "a link proposal must name its messageId and entryId" };
+  }
+  if (op === "retitle" && !proposal.entryId) {
+    // A retitle with no entryId would emit an undefined target and, under the
+    // batch dry run, discard every other proposal (findings A-36, M-31).
+    return { ok: false, reason: "a retitle proposal must name its entryId" };
   }
   if ((op === "open" || op === "retitle") && typeof proposal.title !== "string") {
     return { ok: false, reason: `a ${op} proposal must carry a title` };
@@ -696,14 +725,11 @@ export function planEntryEvents(messages: readonly Message[], entries: readonly 
       events.push({ type: "MESSAGE_LINKED", messageId: m.id, entryId: host.id, anchor, reason: "shared anchor", by: "runtime" });
       continue;
     }
-    const anchor = anchorForMessage(m);
-    if (!anchor) {
-      // No anchor at all (no evidence, no decision, no plan clause): do not
-      // invent one. The message stays unaccounted and the accounting lint
-      // says so, rather than a made-up anchor letting the lint pass (record
-      // M-38).
-      continue;
-    }
+    // No real anchor (no file:line evidence, no decision id, no plan clause):
+    // the entry anchors to the message's own id, so the message still renders
+    // (nothing hidden) and two such messages never merge; the lint reports the
+    // entry as having no anchor (findings A-34, M-38).
+    const anchor = anchorForMessage(m) ?? ({ kind: "message" as const, id: m.id });
     const id = nextEntryId(working);
     working.push({
       id,
@@ -751,8 +777,10 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
       // near-duplicates that deliberately share no anchor, so the links it
       // moved must survive this filter (finding M-14).
       const ownerMerged = link.reason?.startsWith("merged from") ?? false;
+      // A no-anchor entry holds exactly the message it names (finding A-34).
+      const selfAnchor = entry.anchor.kind === "message" && entry.anchor.id === message.id;
       const shared = sharedAnchor([entry.anchor], anchorsOfMessage(message));
-      if (!shared && !ownerMerged) {
+      if (!shared && !ownerMerged && !selfAnchor) {
         refusedLinks.push({ messageId: message.id, entryId: entry.id, reason: `message ${message.id} and entry ${entry.id} share no anchor` });
         return false;
       }
@@ -1056,6 +1084,10 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
         existing.view.messages = [...existing.view.messages, ...view.messages.filter((m) => !ids.has(m.id))];
         existing.view.raisedBy = [...new Set([...existing.view.raisedBy, ...view.raisedBy])];
         existing.phaseTag = [...new Set([...existing.phaseTag.split("·"), tag])].join("·");
+        // The folded topic's TYPE is the highest of all its messages: a
+        // blocker raised in a later phase must not stay a trade-off (findings
+        // M-32, A-35).
+        existing.view.type = entryTypeOf(existing.view.messages);
         continue;
       }
       all.push({ view, phaseTag: tag, phaseIndex: perPhase.indexOf(ph) });
@@ -1069,7 +1101,10 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
       continue;
     }
     for (const x of own) {
-      lines.push(`** ${x.view.entry.id} ${oneLine(x.view.entry.title)}  ${entryTags(x.view, x.phaseTag)}`);
+      // Entry ids are phase-local (every phase numbers E-1 from scratch), so
+      // the heading qualifies the id with its phase tags: two `** E-1`
+      // headings can never be confused (finding M-32).
+      lines.push(`** ${x.phaseTag}:${x.view.entry.id} ${oneLine(x.view.entry.title)}  ${entryTags(x.view, x.phaseTag)}`);
       lines.push("   :PROPERTIES:");
       lines.push(`   :ID: ${x.view.entry.id}`);
       lines.push(`   :TYPE: ${x.view.type}`);

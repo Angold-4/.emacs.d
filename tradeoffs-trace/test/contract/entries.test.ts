@@ -347,6 +347,40 @@ test("the curator's tool rejects any operation other than link, open and retitle
   // A curator proposal that is allowed still cannot name a state.
   const built = curatorEvent({ op: "state", entryId: "E-1", title: "x" }, "p1");
   assert.ok(!built.ok);
+  // A retitle without an entryId is refused (finding A-36).
+  assert.equal(validateCuratorProposal({ op: "retitle", title: "x" }).ok, false);
+});
+
+test("two prose-evidence findings never share the phase-id anchor (finding A-34)", () => {
+  const a = message("F-1", "finding", ["the loop can spin"], { title: "the loop can spin", planRef: "p1" });
+  const b = message("F-2", "finding", ["a naming nit"], { title: "a naming nit", planRef: "p1" });
+  const entries = openAll([a, b]);
+  const projected = projectEntries({ messages: [a, b], entries });
+  assert.equal(projected.views.filter((v) => v.live).length, 2, "unrelated prose findings must not merge");
+  assert.equal(projected.accounting.unaccounted, 0);
+  // The anchor is the placeholder, and the lint says so rather than passing.
+  assert.equal(projected.views[0].anchor.kind, "message");
+  const lint = runReviewLint({ projected, newestCandidateSha: "C1", messages: [a, b] });
+  assert.ok(lint.violations.some((v) => v.rule === "evidence"), JSON.stringify(lint.violations));
+});
+
+test("a cross-phase folded entry takes the highest type (findings M-32, A-35)", () => {
+  const t = message("T-1", "tradeoff", ["src/shared.rs:10-20 the same point"], { phaseId: "p1", title: "the same point", boundCandidateSha: "C1" });
+  const b = message("B-2", "blocker", ["src/shared.rs:15-25 the same point"], { phaseId: "p2", title: "the same point", raisedAsBlocker: true, boundCandidateSha: "C2" });
+  const view = renderProgramEntryReview({
+    program: {
+      id: "prog",
+      phases: [
+        { phaseId: "p1", readableId: "prog-01", candidate: { sha: "C1" }, messages: [t], entries: openAll([t]) },
+        { phaseId: "p2", readableId: "prog-02", candidate: { sha: "C2" }, messages: [b], entries: openAll([b]) },
+      ],
+    },
+    newestCandidateSha: "C2",
+  });
+  const blockerSection = view.slice(view.indexOf("* Blockers"), view.indexOf("* Findings"));
+  const tradeoffSection = view.slice(view.indexOf("* Trade-offs"));
+  assert.match(blockerSection, /^\*\* prog-01·prog-02:E-\d+ the same point/m);
+  assert.doesNotMatch(tradeoffSection, /the same point/);
 });
 
 test("opening a second entry for a message an open entry holds is refused (finding M-22)", () => {
@@ -536,10 +570,10 @@ test("programs/<id>/views/review.org lists entries of every phase with phase tag
     newestCandidateSha: "C1",
   });
   // The cross-phase entry (same anchor) is shown once with both phase tags.
-  assert.equal([...view.matchAll(/^\*\* E-\d+ batch per tick/gm)].length, 1);
+  assert.equal([...view.matchAll(/^\*\* \S+:E-\d+ batch per tick/gm)].length, 1);
   assert.match(view, /prog-01·prog-02/);
   // The different anchor stays its own entry, tagged to its phase.
-  assert.match(view, /^\*\* E-\d+ a different point.*prog-02/m);
+  assert.match(view, /^\*\* \S+:E-\d+ a different point.*prog-02/m);
   const lint = runReviewLint({ projected: projectEntries({ messages: [a], entries: openAll([a]) }), newestCandidateSha: "C1", messages: [a] });
   assert.ok(lint.ok, JSON.stringify(lint.violations));
   // Each phase's state is computed against ITS OWN candidate, not the

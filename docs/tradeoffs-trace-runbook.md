@@ -1081,6 +1081,11 @@ every render — the runtime never repairs a view silently.
 
 If a candidate's checkout could not be read, its file anchors are shown
 `anchor unverified` (they could not be re-checked) rather than assumed fresh.
+A message with no real anchor (prose evidence, no decision id, no plan clause)
+still gets its own entry, anchored to the message itself, so two such messages
+never merge; the lint reports that entry as having no anchor. In the program
+view the entry id is qualified with its phase tags (`prog-01:E-1`) because
+entry ids are numbered per phase.
 
 Cleanness joins the balance numbers: `views/metrics.json`, the status `metrics`
 line and `tt summary` carry live entries per phase (a warning above 12),

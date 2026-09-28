@@ -3283,11 +3283,13 @@ export class Conductor {
       // Bind to the current candidate when one exists; otherwise to the
       // integration head, and let the freeze's MESSAGE_CARRIED rebind it.
       const candidateSha = this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead;
-      const planRef = typeof args.planRef === "string" && args.planRef.trim().length > 0 ? args.planRef.trim() : this.#state.phase.phaseId;
+      // Only a planRef the worker actually named; the phase id is not a plan
+      // clause (finding A-34).
+      const planRef = typeof args.planRef === "string" && args.planRef.trim().length > 0 ? args.planRef.trim() : undefined;
       this.#raiseMessage(
         "tradeoff",
         undefined,
-        { type: "tradeoff", title: choice, summary: why, context: alternative, evidence: [`${anchor.path}:${anchor.lines[0]}-${anchor.lines[1]}`], planRef },
+        { type: "tradeoff", title: choice, summary: why, context: alternative, evidence: [`${anchor.path}:${anchor.lines[0]}-${anchor.lines[1]}`], ...(planRef ? { planRef } : {}) },
         candidateSha,
         { anchor },
       );
@@ -3411,6 +3413,23 @@ export class Conductor {
             this.#log.append("entry_link_refused", { entryId: (event as { entryId?: string }).entryId, messageId: (event as { messageId?: string }).messageId, reason: check.reason });
             continue;
           }
+        }
+        // A curator `open` naming a message an open entry already holds is
+        // redundant (the runtime opened its entry at raise time); skip just
+        // that proposal instead of refusing the whole batch (finding M-31).
+        if (event.type === "ENTRY_OPENED") {
+          const messageId = (event as { messageId?: string }).messageId;
+          const holder = messageId ? entries.find((e) => e.state === "open" && e.links.some((l) => l.messageId === messageId)) : undefined;
+          if (holder) {
+            this.#log.append("entry_open_skipped", { messageId, entryId: holder.id, reason: "the message already belongs to an open entry" });
+            continue;
+          }
+        }
+        // A retitle of an entry that does not exist is skipped, not fatal to
+        // the batch.
+        if (event.type === "ENTRY_RETITLED" && !entries.some((e) => e.id === (event as { entryId?: string }).entryId)) {
+          this.#log.append("entry_retitle_skipped", { entryId: (event as { entryId?: string }).entryId, reason: "no such entry" });
+          continue;
         }
         events.push(event);
       }
@@ -4799,7 +4818,8 @@ export class Conductor {
       summary: decision.recommendation.reason,
       context: decision.whyItMatters,
       evidence: decision.alternatives.map((a) => `${a.option}: ${a.consequence}`),
-      planRef: this.#state.phase.phaseId,
+      // No fabricated planRef: the phase id is not a plan clause, and using it
+      // as one made unrelated prose messages share an anchor (finding A-34).
     };
   }
 
@@ -4814,7 +4834,8 @@ export class Conductor {
       summary: `raised by ${finding.raisedBy} against ${finding.boundCandidateSha}`,
       context: finding.evidence,
       evidence: [finding.evidence],
-      planRef: this.#state.phase.phaseId,
+      // No fabricated planRef (finding A-34): a prose-evidence finding has no
+      // real anchor, so it gets its own entry, never merged with another.
     };
   }
 

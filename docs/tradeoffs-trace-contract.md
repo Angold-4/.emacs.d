@@ -400,7 +400,11 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   link only when the message and the entry share an anchor (an overlapping
   line range in the same file, the same decision id, or the same plan clause).
   Any other link is refused and logged, and the message opens its own entry —
-  nothing is silently merged, nothing hidden.
+  nothing is silently merged, nothing hidden. A message with NO real anchor
+  (prose evidence, no decision id, no plan clause) still gets its own entry,
+  anchored to the message itself, so two such messages never merge; the lint
+  reports that entry as having no anchor. The phase id is never treated as a
+  plan clause (`A-34`).
 - **The curator.** The runtime opens an entry for every live message as it
   is raised (a round-time pass, so `ENTRY_OPENED`/`MESSAGE_LINKED` are in the
   log and entry ids are stable), linking a message to an open entry it
@@ -431,7 +435,9 @@ trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
   `programs/<id>/views/review.org` (program, `C-c m D`) have three sections —
   Blockers, Findings, Trade-offs — one heading per live entry: title, then its
   tags (phase id in the program view; who raised it, e.g. `M·A`; `+2 linked`;
-  its anchor). `TAB` shows the entry's summary and each linked message; `RET`
+  its anchor). In the program view the heading id is qualified with its phase
+  tags (`prog-01:E-1`), since entry ids are numbered per phase, and a folded
+  cross-phase topic takes the highest type of its messages. `TAB` shows the entry's summary and each linked message; `RET`
   opens `views/entries/<id>.org` with the full history; `s` on a linked
   message splits it into its own entry, which takes that message's OWN anchor
   (the owner has decided the two are separate topics, so the pair the split
