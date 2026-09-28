@@ -126,6 +126,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ENTRY_SPLIT",
   "ENTRY_STATE",
   "ENTRY_MERGED_BY_OWNER",
+  "ENTRY_CURATED",
   "REVIEW_LINT_FAILED",
 ]);
 
@@ -904,6 +905,12 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const result = applyEntryEvent(p.entries ?? [], event as EntryEvent, p.messages ?? []);
       if (!result.ok) return rejected(state, result.reason);
       return ok({ ...state, phase: { ...p, entries: result.entries } });
+    }
+
+    // Plan 05j: the round's curator pass is done for this candidate, so the
+    // evaluators may start. Record-only on the entries themselves.
+    case "ENTRY_CURATED": {
+      return ok({ ...state, phase: { ...p, curatedFor: event.candidateSha } });
     }
 
     // Plan 05j: the review lint's own record. Record-only: nothing about the

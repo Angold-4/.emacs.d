@@ -302,7 +302,10 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
         ...(event.by ? { createdBy: event.by } : {}),
         ...(event.at ? { createdAt: event.at } : {}),
       };
-      return { ok: true, entries: [...entries, entry] };
+      const rest = opener
+        ? entries.map((e) => (e.links.some((l) => l.messageId === opener.id) ? { ...e, links: e.links.filter((l) => l.messageId !== opener.id) } : e))
+        : [...entries];
+      return { ok: true, entries: [...rest, entry] };
     }
     case "MESSAGE_LINKED": {
       const entry = findEntry(entries, event.entryId);
@@ -316,7 +319,16 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
       if (entry.links.some((l) => l.messageId === message.id)) return { ok: true, entries: [...entries] };
       const anchor = check.anchor;
       const link: EntryLink = { messageId: message.id, anchor, reason: event.reason, ...(event.by ? { by: event.by } : {}), ...(event.at ? { at: event.at } : {}) };
-      return { ok: true, entries: entries.map((e) => (e.id === entry.id ? { ...e, links: [...e.links, link] } : e)) };
+      // One message belongs to one entry: linking it here removes it from any
+      // other entry (the auto-opened one a reviewer's `sameAs` supersedes).
+      return {
+        ok: true,
+        entries: entries.map((e) => {
+          if (e.id === entry.id) return { ...e, links: [...e.links, link] };
+          if (e.links.some((l) => l.messageId === message.id)) return { ...e, links: e.links.filter((l) => l.messageId !== message.id) };
+          return e;
+        }),
+      };
     }
     case "ENTRY_RETITLED": {
       const entry = findEntry(entries, event.entryId);
@@ -476,6 +488,56 @@ export function curatorEvent(proposal: CuratorProposal, phaseId: string): { ok: 
   }
 }
 
+/** Plan 05j: the owner's A/D on an entry is a verdict on each linked
+ * message, not a new entry state: approving a trade-off is not "resolved in a
+ * sha" (a fix, 05e) and it keeps the message's full binding (record M-12).
+ * Only published (and owner-refused) messages can be settled; a raw one is
+ * skipped and its id reported. */
+export interface EntryVerdictPlan {
+  events: Array<{
+    type: "OWNER_VERDICT";
+    messageId: string;
+    verdict: "accept" | "refuse";
+    reason?: string;
+    boundCandidateSha: string;
+    boundContractVersion: Message["boundContractVersion"];
+    boundRecordVersion: number;
+  }>;
+  skipped: string[];
+}
+
+export function entryVerdictEvents(
+  entry: Entry,
+  messages: readonly Message[],
+  verdict: "accept" | "refuse",
+  reason?: string,
+): EntryVerdictPlan {
+  const byId = new Map(messages.map((m) => [m.id, m]));
+  const events: EntryVerdictPlan["events"] = [];
+  const skipped: string[] = [];
+  for (const link of entry.links) {
+    const message = byId.get(link.messageId);
+    if (!message) {
+      skipped.push(link.messageId);
+      continue;
+    }
+    if (message.state !== "published" && message.state !== "refused") {
+      skipped.push(message.id);
+      continue;
+    }
+    events.push({
+      type: "OWNER_VERDICT",
+      messageId: message.id,
+      verdict,
+      ...(reason ? { reason } : {}),
+      boundCandidateSha: message.boundCandidateSha,
+      boundContractVersion: message.boundContractVersion,
+      boundRecordVersion: message.messageVersion,
+    });
+  }
+  return { events, skipped };
+}
+
 export interface EntryView {
   entry: Entry;
   type: EntryType;
@@ -577,24 +639,57 @@ function resolveStateOf(entry: Entry, byId: Map<string, Message>): EntryStateNam
 /** The anchor a message-grounded new entry uses: the message's strongest
  * anchor, preferring a file anchor (the code keeps moving; the line range is
  * what a reviewer checks), then a decision, then a plan clause. */
-const MAX_TITLE = 80;
-
-/** A title safe to render: never longer than MAX_TITLE, cut at a word
- * boundary when it has to be. A raw message's title may be longer (the
- * evaluator rewrites it to ≤80 when it publishes), so the projection clamps
- * it rather than letting the live view fail its own lint. */
-export function clampTitle(title: string): string {
-  const clean = oneLine(title);
-  if (clean.length <= MAX_TITLE) return clean;
-  const cut = clean.slice(0, MAX_TITLE);
-  const space = cut.lastIndexOf(" ");
-  const safe = space > 0 ? cut.slice(0, space) : cut;
-  return safe.trimEnd().length > 0 ? safe.trimEnd() : cut.trimEnd();
-}
-
 function anchorForMessage(m: Message): EntryAnchor | undefined {
   const anchors = anchorsOfMessage(m);
   return anchors.find((a) => a.kind === "file") ?? anchors[0];
+}
+
+/**
+ * Plan 05j: the entry events the RUNTIME must persist for the messages it has
+ * that no entry links yet. This is the round-time pass — not a render-time
+ * one — so `ENTRY_OPENED`/`MESSAGE_LINKED` are in the log, entry ids are
+ * stable, and an owner's `s`/`m`/`A`/`D` names an entry `applyEntryEvent` can
+ * find.
+ *
+ * A live message that shares an anchor with an OPEN entry is linked to it by
+ * the same rule the curator's links are checked against; every other live
+ * message opens its own entry. Merged, dropped and resolved messages never
+ * open an entry (the lint forbids rendering one as a topic). Deterministic:
+ * messages in raise order, ids assigned in that order.
+ */
+export function planEntryEvents(messages: readonly Message[], entries: readonly Entry[] = []): EntryEvent[] {
+  const byId = new Map(messages.map((m) => [m.id, m]));
+  const linked = new Set<string>();
+  for (const entry of entries) for (const l of entry.links) linked.add(l.messageId);
+  const events: EntryEvent[] = [];
+  const working: Entry[] = entries.map((e) => ({ ...e, links: [...e.links] }));
+  for (const m of messages) {
+    if (linked.has(m.id)) continue;
+    if (!isLiveMessage(m)) continue;
+    const anchors = anchorsOfMessage(m);
+    const host = working.find((e) => resolveStateOf(e, byId) === "open" && sharedAnchor([e.anchor], anchors) !== undefined);
+    if (host) {
+      const anchor = sharedAnchor([host.anchor], anchors)!;
+      host.links = [...host.links, { messageId: m.id, anchor, reason: "shared anchor" }];
+      linked.add(m.id);
+      events.push({ type: "MESSAGE_LINKED", messageId: m.id, entryId: host.id, anchor, reason: "shared anchor", by: "runtime" });
+      continue;
+    }
+    const anchor = anchorForMessage(m) ?? { kind: "decision" as const, id: m.id };
+    const id = nextEntryId(working);
+    working.push({
+      id,
+      phaseId: m.phaseId,
+      title: m.title,
+      type: entryTypeOf([m]),
+      state: "open",
+      anchor,
+      links: [{ messageId: m.id, anchor, reason: "opened" }],
+    });
+    linked.add(m.id);
+    events.push({ type: "ENTRY_OPENED", phaseId: m.phaseId, title: m.title, entryType: entryTypeOf([m]), anchor, messageId: m.id, by: "runtime" });
+  }
+  return events;
 }
 
 /**
@@ -625,64 +720,26 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
       const message = byId.get(link.messageId);
       if (!message) return true; // keep a link to a message not in this slice
       const shared = sharedAnchor([entry.anchor], anchorsOfMessage(message));
-      if (shared) {
-        link.anchor = shared;
-        return true;
+      if (!shared) {
+        refusedLinks.push({ messageId: message.id, entryId: entry.id, reason: `message ${message.id} and entry ${entry.id} share no anchor` });
+        return false;
       }
-      refusedLinks.push({ messageId: message.id, entryId: entry.id, reason: `message ${message.id} and entry ${entry.id} share no anchor` });
-      return false;
+      if (linked.has(message.id)) {
+        // A message belongs to exactly one entry; a second link is refused
+        // (and logged), so the projection never shows a topic twice.
+        refusedLinks.push({ messageId: message.id, entryId: entry.id, reason: `message ${message.id} is already linked to another entry` });
+        return false;
+      }
+      link.anchor = shared;
+      linked.add(message.id);
+      return true;
     });
-    for (const link of entry.links) linked.add(link.messageId);
   }
 
-  // 2. Any live message not linked to a live entry opens its own entry. Its
-  //    anchor is derived from its own evidence. Messages that are merged,
-  //    dropped or resolved never open an entry (lint: never render a
-  //    non-live message as an entry).
-  for (const m of messages) {
-    if (linked.has(m.id)) continue;
-    if (!isLiveMessage(m)) continue;
-    const messageAnchors = anchorsOfMessage(m);
-    // Never open a second entry for an anchor an open entry already holds:
-    // a message that shares an anchor with an existing live entry is linked
-    // to it by the SAME rule the curator's links are checked against, so the
-    // "one live entry per anchor" lint holds even before any curator runs.
-    const host = entries.find(
-      (e) => resolveStateOf(e, byId) === "open" && sharedAnchor([e.anchor], messageAnchors) !== undefined,
-    );
-    if (host) {
-      const anchor = sharedAnchor([host.anchor], messageAnchors)!;
-      host.links = [...host.links, { messageId: m.id, anchor, reason: "shared anchor (auto)" }];
-      linked.add(m.id);
-      continue;
-    }
-    const anchor = anchorForMessage(m);
-    if (!anchor) {
-      // No anchor at all (a message with no evidence and no plan ref): it can
-      // still open an entry, anchored to its own id, so nothing is hidden.
-      entries.push({
-        id: nextEntryId(entries),
-        phaseId: m.phaseId,
-        title: clampTitle(m.title),
-        type: entryTypeOf([m]),
-        state: "open",
-        anchor: { kind: "decision", id: m.id },
-        links: [{ messageId: m.id, anchor: { kind: "decision", id: m.id }, reason: "no anchor; own entry" }],
-      });
-      linked.add(m.id);
-      continue;
-    }
-    entries.push({
-      id: nextEntryId(entries),
-      phaseId: m.phaseId,
-      title: clampTitle(m.title),
-      type: entryTypeOf([m]),
-      state: "open",
-      anchor,
-      links: [{ messageId: m.id, anchor, reason: "unlinked; own entry" }],
-    });
-    linked.add(m.id);
-  }
+  // 2. `planEntryEvents` (the conductor's round-time pass) is what persists
+  //    an entry for every message; the projection itself is a pure fold of
+  //    the stored entries, so a log that never persisted one leaves its
+  //    messages deliberately unaccounted (the lint then says so).
 
   // 3. Resolve state from the messages: an entry all of whose messages are
   //    settled (resolved/dropped/merged/superseded) is not live. An explicit
@@ -694,12 +751,16 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
   const live = entries.filter((e) => resolveFor(e) === "open").sort((a, b) => a.id.localeCompare(b.id));
   const hints = new Map<string, string>();
   const threshold = opts.similarityThreshold ?? ENTRY_SIMILARITY_THRESHOLD;
+  // The plan's near-duplicate signal is "an entry whose title AND summary are
+  // close to another's", so the compared text is the title plus the first
+  // linked message's summary (finding A-9 / record B-21).
+  const textOf = (e: Entry): string => `${e.title} ${e.links.map((l) => byId.get(l.messageId)?.summary ?? "").find((s) => s.length > 0) ?? ""}`;
   for (let i = 0; i < live.length; i++) {
     for (let j = i + 1; j < live.length; j++) {
       const a = live[i];
       const b = live[j];
       if (sharedAnchor([a.anchor], [b.anchor])) continue; // shared anchor: already the same topic
-      if (titleSimilarity(a.title, b.title) < threshold) continue;
+      if (titleSimilarity(textOf(a), textOf(b)) < threshold) continue;
       if (!hints.has(a.id)) hints.set(a.id, b.id);
       if (!hints.has(b.id)) hints.set(b.id, a.id);
     }
@@ -707,6 +768,10 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
 
   const anchorResolves = opts.anchorResolves ?? (() => true);
   const views: EntryView[] = entries
+    // An entry with no linked message has no topic left (a reviewer's
+    // `sameAs E-n` moved the message it was auto-opened for): it is not
+    // rendered, so no two entries can share the anchor it would carry.
+    .filter((entry) => entry.links.length > 0)
     .map((entry) => {
       const own = entry.links.map((l) => byId.get(l.messageId)).filter((m): m is Message => !!m);
       const state = resolveFor(entry);
@@ -714,7 +779,10 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
       const anchor = entry.anchor;
       const staleAnchor = liveEntry && anchor.kind === "file" && !anchorResolves(anchor);
       const stateSha = entry.stateSha ?? opts.newestCandidateSha;
-      const staleState = liveEntry && !!stateSha && own.some((m) => m.boundCandidateSha !== stateSha);
+      // Only a LIVE message can make an entry stale: an old settled message
+      // that was linked as history is not a computation against an older
+      // candidate (finding M-6).
+      const staleState = liveEntry && !!stateSha && own.some((m) => isLiveMessage(m) && m.boundCandidateSha !== stateSha);
       return {
         entry,
         type: entryTypeOf(own.length > 0 ? own : [{ ...emptyMessage(entry) } as Message]),
@@ -750,7 +818,7 @@ export function projectEntries(opts: ProjectEntriesOptions): ProjectedEntries {
   const unexposed = messages.filter((m) => m.type === "tradeoff" && m.raisedBy !== undefined && m.raisedBy !== "worker").length;
   const accounting: Accounting = {
     raw: messages.length,
-    entries: entries.length,
+    entries: views.filter((v) => v.live).length,
     linked: linkedLive,
     dropped,
     merged,

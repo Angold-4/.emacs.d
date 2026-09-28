@@ -449,7 +449,7 @@ export default function (pi: ExtensionAPI) {
   const client = new RunSocketClient();
   const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
-  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | undefined) ?? "worker";
+  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | "curator" | undefined) ?? "worker";
   const accepted = new Set<string>();
   // A reviewer's turn 2 starts with the first agent_start after its
   // discovery (turn 1) was accepted; before that, turn 1 is still running.
@@ -462,6 +462,9 @@ export default function (pi: ExtensionAPI) {
    * 1, then submit_review in turn 2 (design §3.3 two-turn review). */
   function owedSubmission(): string | undefined {
     if (role === "worker") return accepted.has("submit_phase") ? undefined : "submit_phase";
+    // Plan 05j: the curator owes no submission; an empty proposals list is a
+    // valid pass and settling without one is allowed.
+    if (role === "curator") return undefined;
     if (role === "evaluator") return accepted.has("submit_evaluation") ? undefined : "submit_evaluation";
     if (role === "panel") return accepted.has("submit_panel_vote") ? undefined : "submit_panel_vote";
     if (!accepted.has("submit_discovery")) return "submit_discovery";

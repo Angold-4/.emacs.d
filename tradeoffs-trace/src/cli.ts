@@ -15,6 +15,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { projectLedger, projectMessages } from "./core/messages.ts";
+import { expandEntryCommand } from "./core/owner-inbox.ts";
+import type { ReviewLintResult } from "./core/review-lint.ts";
 import { candidateAnchorResolves, pendingOwnerInputs, projectEntryReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
@@ -948,6 +950,9 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     for (const name of readdirSync(p.entriesView)) {
       if (name.endsWith(".org") && !entryIds.has(name.slice(0, -4))) rmSync(path.join(p.entriesView, name), { force: true });
     }
+    // Plan 05j: a render that named a violation records it (findings A-18,
+    // B-13). `check` never mutates, only `rebuild`.
+    recordLintFailures(runDir, entryReview.lint);
     process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/entries/, views/messages/, views/metrics.json, views/tape.txt\n`);
     return;
   }
@@ -1132,6 +1137,7 @@ async function cmdVerdict(
     { ...after.phase, ...runIds(runDir) },
     { anchorResolves: candidateAnchorResolves(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
   );
+  recordLintFailures(runDir, lateEntryReview.lint);
   writeFileSync(p.review, lateEntryReview.text);
   mkdirSync(p.entriesView, { recursive: true });
   const lateEntryIds = new Set(lateEntryReview.files.map((f) => f.id));
@@ -1175,6 +1181,30 @@ async function cmdVerdict(
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
 }
 
+/** Plan 05j: record a lint violation the render just named. Every render
+ * (conductor, `tt contract rebuild`, a late verdict, an entry command) must
+ * leave the log's copy, not just the view's red first line (findings A-18,
+ * B-13, A-11). A detail already in the log is not appended twice. */
+function recordLintFailures(runDir: string, lint: ReviewLintResult): void {
+  if (lint.ok) return;
+  const p = runPaths(runDir);
+  let existing = "";
+  try {
+    existing = readFileSync(p.events, "utf8");
+  } catch {
+    // no log yet: every violation is new
+  }
+  const missing = lint.violations.filter((v) => !existing.includes(JSON.stringify(v.detail)));
+  if (missing.length === 0) return;
+  const maskable = resolveSecrets(secretNames(readPlan(runDir).secrets)).maskable;
+  const log = new EventLog(p.events, maskable);
+  try {
+    for (const v of missing) log.append("event", { type: "REVIEW_LINT_FAILED", rule: v.rule, detail: v.detail });
+  } finally {
+    log.close();
+  }
+}
+
 /** Plan 05j: the owner's entry corrections the review view sends. `s` sends
  * ENTRY_SPLIT, `m` ENTRY_MERGED_BY_OWNER, `A`/`D` an ENTRY_STATE; a retitle is
  * the same path. A live run goes through the inbox (the conductor applies
@@ -1189,27 +1219,20 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
   const state = rebuildState(runDir, plan, { lenient: true });
   const base = { runId: state.phase.runId, phaseId: state.phase.phaseId, entryId };
   let command: Record<string, unknown>;
-  let event: Record<string, unknown>;
   if (op === "split") {
     const messageId = positional[3];
     if (!messageId) usage();
     command = { type: "entry-split", ...base, messageId };
-    event = { type: "ENTRY_SPLIT", entryId, messageId, by: "owner" };
   } else if (op === "merge") {
     const intoEntryId = positional[3];
     if (!intoEntryId) usage();
     command = { type: "entry-merge", ...base, intoEntryId };
-    event = { type: "ENTRY_MERGED_BY_OWNER", entryId, intoEntryId, by: "owner" };
   } else if (op === "retitle") {
     const title = positional.slice(3).join(" ").trim();
     if (!title) usage();
     command = { type: "entry-retitle", ...base, title };
-    event = { type: "ENTRY_RETITLED", entryId, title, by: "owner" };
-  } else if (op === "accept" || op === "refuse" || op === "resolve") {
-    const verdict = op === "accept" ? "accept" : "refuse";
-    const sha = state.phase.candidate?.sha;
-    command = { type: "entry-verdict", ...base, verdict, ...(reason ? { reason } : {}), ...(sha ? { sha } : {}) };
-    event = { type: "ENTRY_STATE", entryId, state: verdict === "accept" ? "resolved" : "dropped", ...(sha ? { sha } : {}), ...(reason ? { reason } : {}), by: "owner" };
+  } else if (op === "accept" || op === "refuse") {
+    command = { type: "entry-verdict", ...base, verdict: op === "accept" ? "accept" : "refuse", ...(reason ? { reason } : {}) };
   } else {
     usage();
   }
@@ -1226,17 +1249,27 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
     } else process.stdout.write(`queued entry ${op} ${commandId} for run ${path.basename(runDir)} (queued, not yet applied)\n`);
     return;
   }
-  const result = reduce(state, event as never);
-  if (!result.ok) {
-    process.stdout.write(`entry ${op} rejected: ${result.reason}\n`);
+  const expanded = expandEntryCommand(command, state.phase.entries ?? [], state.phase.messages ?? []);
+  if (!expanded.ok) {
+    process.stdout.write(`entry ${op} rejected: ${expanded.reason}\n`);
     process.exitCode = 1;
     return;
+  }
+  let check = state;
+  for (const event of expanded.events) {
+    const result = reduce(check, event);
+    if (!result.ok) {
+      process.stdout.write(`entry ${op} rejected: ${result.reason}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    check = result.state;
   }
   const p = runPaths(runDir);
   const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
   const log = new EventLog(p.events, maskable);
   try {
-    log.append("event", event);
+    for (const event of expanded.events) log.append("event", event);
   } finally {
     log.close();
   }
@@ -1245,6 +1278,7 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
     { ...after.phase, ...runIds(runDir) },
     { anchorResolves: candidateAnchorResolves(after.phase.candidate ? path.join(p.candidates, after.phase.candidate.sha) : undefined) },
   );
+  recordLintFailures(runDir, entryReview.lint);
   writeFileSync(p.review, entryReview.text);
   mkdirSync(p.entriesView, { recursive: true });
   const entryIds = new Set(entryReview.files.map((f) => f.id));

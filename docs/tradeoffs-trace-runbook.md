@@ -1057,16 +1057,19 @@ Keys in the review buffer:
 - `s` on a linked message splits it into its own entry (`ENTRY_SPLIT`).
 - `m` on an entry carrying a `≈ E-n` hint merges the two as the owner's own
   action (`ENTRY_MERGED_BY_OWNER`).
-- `A` / `D` settle the entry (`ENTRY_STATE`), D with an optional one-line
-  reason.
+- `A` / `D` are verdicts on every linked message (`OWNER_VERDICT`), D with an
+  optional one-line reason. Accepting a trade-off does not mark it a code
+  fix.
 
-The curator that links messages to entries runs once per round, after the
-reviews and before the evaluators. It may only propose `link`, `open` and
-`retitle`; it can never drop, resolve or change a type. A link with no shared
-anchor is refused and logged, and the message opens its own entry. If the
-review lint fails, the view's first line names the violation and a
-`REVIEW_LINT_FAILED` event is recorded — the runtime never repairs a view
-silently.
+The runtime opens an entry for every live message as it is raised, so entry
+ids are stable and an owner command always names an entry the log records.
+The linking pass runs once per round, after the reviews and before the
+evaluators (`ENTRY_CURATED` marks it). The `curate_entries` tool may only
+propose `link`, `open` and `retitle`; it can never drop, resolve or change a
+type. A link with no shared anchor is refused and logged; a reviewer's
+`sameAs E-n` follows the same rule. If the review lint fails, the view's first
+line names the violation and a `REVIEW_LINT_FAILED` event is recorded on
+every render — the runtime never repairs a view silently.
 
 Cleanness joins the balance numbers: `views/metrics.json`, the status `metrics`
 line and `tt summary` carry live entries per phase (a warning above 12),

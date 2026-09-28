@@ -22,6 +22,8 @@ import { buildView, formatDuration } from "./view.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 import { renderProgramChart } from "./charts.ts";
 import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
+import { runReviewLint } from "./core/review-lint.ts";
+import { candidateAnchorResolves } from "./render.ts";
 
 import {
   expandProgram,
@@ -684,7 +686,22 @@ export function programReviewText(dir: string): string {
       // the run is not readable (yet): it contributes no entries
     }
   }
-  return renderProgramEntryReview({ program: { id: path.basename(dir), phases: phases as never }, newestCandidateSha: undefined });
+  // Plan 05j: the header names the newest candidate the program reflects, and
+  // the lint runs on the program render too (finding M-3). The newest is the
+  // last node candidate; the combined projection is what the lint checks.
+  const newestCandidateSha = [...phases].reverse().map((ph) => ph.candidate?.sha).find((sha) => typeof sha === "string" && sha.length > 0);
+  const combined = projectEntries({
+    messages: phases.flatMap((ph) => (ph.messages ?? []) as never[]),
+    entries: phases.flatMap((ph) => (ph.entries ?? []) as never[]),
+    newestCandidateSha,
+    anchorResolves: candidateAnchorResolves(undefined),
+  });
+  const lint = runReviewLint({ projected: combined, newestCandidateSha, messages: phases.flatMap((ph) => (ph.messages ?? []) as never[]) });
+  return renderProgramEntryReview({
+    program: { id: path.basename(dir), phases: phases as never },
+    newestCandidateSha,
+    lintError: lint.ok ? undefined : lint.firstLine,
+  });
 }
 
 /** Plan 05j: write the program review beside the program chart. */

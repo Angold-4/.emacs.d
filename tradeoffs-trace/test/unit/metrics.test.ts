@@ -11,8 +11,18 @@ import * as path from "node:path";
 import { test } from "node:test";
 
 import { computeMetrics, metricsForRunDir, metricsLine, metricsSummary, projectMetrics, type MetricsTimeline } from "../../src/metrics.ts";
-import type { Entry } from "../../src/core/entries.ts";
+import { applyEntryEvent, planEntryEvents, type Entry } from "../../src/core/entries.ts";
 import { basePhase, makeMessage } from "./helpers.ts";
+
+/** The runtime's round-time pass: an entry for every message. */
+function openAll(messages: ReturnType<typeof makeMessage>[]): Entry[] {
+  let es: Entry[] = [];
+  for (const ev of planEntryEvents(messages, es)) {
+    const r = applyEntryEvent(es, ev, messages);
+    if (r.ok) es = r.entries;
+  }
+  return es;
+}
 
 /** READY 0s → implement 20s → review 20s → evaluate 10s → resolve 5s →
  * owner 5s → DONE, with the last event at 1m00s. */
@@ -113,7 +123,7 @@ test("the cleanness metrics join views/metrics.json, the status line and tt summ
   );
   messages[11] = makeMessage({ id: "T-12", title: "tolerances raised on the fill path", evidence: ["src/f11.rs:1 x"], summary: "s", boundCandidateSha: "C1" });
   messages[12] = makeMessage({ id: "T-13", title: "tolerances raised on the fill path again", evidence: ["src/f12.rs:1 x"], summary: "s", boundCandidateSha: "C1" });
-  const phase = basePhase({ runId: "r-metrics", phaseId: "p1", messages, entries: [] as Entry[] });
+  const phase = basePhase({ runId: "r-metrics", phaseId: "p1", messages, entries: openAll(messages) });
   const m = computeMetrics(phase, TIMELINE, EVENTS.map((e) => ({ ...e.event, ts: e.ts })));
   assert.equal(m.cleanness.liveEntries, 13);
   assert.equal(m.cleanness.entryBudget, 12);

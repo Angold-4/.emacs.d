@@ -22,6 +22,7 @@ import {
   formatAnchor,
   normalisedTitleWords,
   curatorEvent,
+  planEntryEvents,
   projectEntries,
   renderEntryFile,
   renderEntryReview,
@@ -92,6 +93,16 @@ function message(id: string, type: Message["type"], evidence: string[], override
   return makeMessage({ id, type, evidence, summary: `summary of ${id}`, ...overrides });
 }
 
+/** Fold the runtime's round-time pass: an entry for every message. */
+function openAll(messages: Message[], entries: Entry[] = []): Entry[] {
+  let es = entries;
+  for (const ev of planEntryEvents(messages, es)) {
+    const r = applyEntryEvent(es, ev, messages);
+    if (r.ok) es = r.entries;
+  }
+  return es;
+}
+
 test("a link without a shared anchor is refused and logged; the message opens its own entry", () => {
   const entry: Entry = {
     id: "E-1",
@@ -107,11 +118,52 @@ test("a link without a shared anchor is refused and logged; the message opens it
   assert.ok(refused.ok);
   assert.ok(refused.ok && refused.refused);
   assert.match(refused.ok && refused.refused ? refused.refused.reason : "", /share no anchor/);
-  // The message opens its own entry when projected.
-  const projected = projectEntries({ messages: [far], entries: [entry] });
-  assert.equal(projected.views.length, 2);
-  assert.ok(projected.refusedLinks.length >= 0);
+  // The runtime's round-time pass opens the message its own entry.
+  const planned = planEntryEvents([far], [entry]);
+  assert.equal(planned.length, 1);
+  assert.equal(planned[0].type, "ENTRY_OPENED");
+  const opened = openAll([far], [entry]);
+  const projected = projectEntries({ messages: [far], entries: opened });
+  // Only the message's own entry is a topic; the empty pre-existing entry
+  // renders nothing.
+  assert.equal(projected.views.length, 1);
+  assert.equal(projected.views[0].entry.links[0].messageId, "F-9");
   assert.equal(projected.accounting.unaccounted, 0);
+});
+
+test("the runtime links the same topic raised as a blocker, a trade-off and a finding into one entry", () => {
+  // 15a's B-1 = T-14 = F-1: the same point under three types, one anchor.
+  const anchor = "src/priced_frame.rs:88-104 the counter is never priced";
+  const b = message("B-1", "blocker", [anchor], { raisedAsBlocker: true, title: "no priced-frame counter" });
+  const t = message("T-14", "tradeoff", [anchor], { title: "no priced-frame counter" });
+  const f = message("F-1", "finding", [anchor], { title: "no priced-frame counter" });
+  const entries = openAll([b, t, f]);
+  const projected = projectEntries({ messages: [b, t, f], entries });
+  assert.equal(projected.views.length, 1);
+  assert.equal(projected.views[0].type, "blocker");
+  assert.deepEqual(projected.views[0].messages.map((m) => m.id).sort(), ["B-1", "F-1", "T-14"]);
+  assert.equal(projected.accounting.unaccounted, 0);
+});
+
+test("entries are persisted as events, so an owner's split names an entry reduce() can find (finding M-1)", () => {
+  const m = message("F-1", "finding", ["src/a.rs:10-20 a bug"]);
+  // The conductor's round-time pass produces the events and reduces them.
+  const planned = planEntryEvents([m], []);
+  assert.equal(planned.length, 1);
+  const opened = applyEntryEvent([], planned[0], [m]);
+  assert.ok(opened.ok);
+  const entryId = opened.ok ? opened.entries[0].id : "";
+  // A second message sharing the anchor is linked by the same pass.
+  const m2 = message("T-2", "tradeoff", ["src/a.rs:15-25 the fix"]);
+  const planned2 = planEntryEvents([m, m2], opened.ok ? opened.entries : []);
+  assert.equal(planned2.length, 1);
+  assert.equal(planned2[0].type, "MESSAGE_LINKED");
+  const linked = applyEntryEvent(opened.ok ? opened.entries : [], planned2[0], [m, m2]);
+  assert.ok(linked.ok);
+  // The persisted entry id is what an owner command names: a split resolves.
+  const split = applyEntryEvent(linked.ok ? linked.entries : [], { type: "ENTRY_SPLIT", entryId, messageId: "T-2", by: "owner" }, [m, m2]);
+  assert.ok(split.ok, !split.ok ? split.reason : "");
+  assert.equal(split.ok ? split.entries.length : 0, 2);
 });
 
 test("a link with overlapping line ranges or the same decision id is accepted", () => {
@@ -180,7 +232,7 @@ test("conservation: for random logs every message is linked to one entry or drop
       }
       messages.push(m);
     }
-    const projected = projectEntries({ messages });
+    const projected = projectEntries({ messages, entries: openAll(messages) });
     assert.equal(projected.accounting.unaccounted, 0, `iteration ${iter}: ${accountingLine(projected.accounting)}`);
     // Every message is in exactly one bucket.
     const live = messages.filter((m) => m.state !== "dropped" && m.state !== "merged" && m.state !== "resolved" && m.state !== "superseded").length;
@@ -236,13 +288,13 @@ test("near-duplicates without a shared anchor stay separate with a ≈ hint and 
   const a = message("T-2", "tradeoff", ["src/one.rs:1 tolerances raised on the fill path"]);
   const b = message("T-41", "tradeoff", ["src/two.rs:9 tolerances raised on the fill path again"]);
   assert.ok(titleSimilarity(a.title, b.title) >= ENTRY_SIMILARITY_THRESHOLD);
-  const projected = projectEntries({ messages: [a, b] });
+  const projected = projectEntries({ messages: [a, b], entries: openAll([a, b]) });
   assert.equal(projected.views.length, 2);
   const hints = projected.views.map((v) => v.hint).filter(Boolean);
   assert.equal(hints.length, 2);
   assert.ok(hints.every((h) => h!.startsWith("E-")));
   // The hint is only a tag until the owner merges.
-  const view = renderEntryReview({ messages: [a, b], phaseId: "p1", newestCandidateSha: "C1" });
+  const view = renderEntryReview({ messages: [a, b], entries: openAll([a, b]), phaseId: "p1", newestCandidateSha: "C1" });
   assert.match(view, /≈ E-\d/);
   const merged = applyEntryEvent(projected.views.map((v) => v.entry), { type: "ENTRY_MERGED_BY_OWNER", entryId: projected.views[0].entry.id, intoEntryId: projected.views[1].entry.id, by: "owner" });
   assert.ok(merged.ok);
@@ -358,6 +410,10 @@ function atlas15aRound1(): A15Fixture {
     link("E-7", ["T-4", "T-12", "T-17"], { kind: "file", path: "src/c.rs", lines: [1, 1] }),
     link("E-8", ["T-5", "T-11"], { kind: "file", path: "src/d.rs", lines: [1, 1] }),
     link("E-9", ["F-5", "F-6", "F-7", "F-8", "F-9"], { kind: "decision", id: "D-M-5" }),
+    // The two near-duplicates the curator did NOT merge (no shared anchor):
+    // each opens its own entry and carries a deterministic ≈ hint.
+    link("E-10", ["T-2"], { kind: "file", path: "src/fills.rs", lines: [12, 18] }),
+    link("E-11", ["T-41"], { kind: "file", path: "src/fills.rs", lines: [90, 96] }),
   ];
   return { messages, entries };
 }
@@ -392,13 +448,7 @@ test("15a's first round renders as one entry per topic, three sections only, wit
 
 test("the entry view is a pure projection: the curator linking does not change the metrics over the raw messages", () => {
   const { messages } = atlas15aRound1();
-  const before = projectEntries({ messages });
-  const entries = before.views.map((v) => v.entry);
-  const after = projectEntries({ messages, entries });
-  // Same raw count, same drop count, same unexposed proxy.
-  assert.equal(before.accounting.raw, after.accounting.raw);
-  assert.equal(before.accounting.dropped, after.accounting.dropped);
-  assert.equal(before.accounting.unexposed, after.accounting.unexposed);
+  const entries = openAll(messages);
   // The balance metrics read phase.messages, which linking never edits, so
   // every balance number is identical before and after the curator runs.
   const timeline = { phases: [{ phase: "READY", at: "2026-09-28T00:00:00.000Z" }] };
@@ -410,9 +460,9 @@ test("the entry view is a pure projection: the curator linking does not change t
     { messages: mBefore.messages, mergeRate: mBefore.mergeRate, dropRate: mBefore.dropRate, unexposed: mBefore.unexposedTradeoffs },
     { messages: mAfter.messages, mergeRate: mAfter.mergeRate, dropRate: mAfter.dropRate, unexposed: mAfter.unexposedTradeoffs },
   );
-  // Every live message is in exactly one entry either way, so the live-entry
-  // count is the same too: linking groups, it never hides.
-  assert.equal(mBefore.cleanness.liveEntries, mAfter.cleanness.liveEntries);
+  // Only the cleanness metric moves: linking groups messages into topics.
+  assert.equal(mBefore.cleanness.liveEntries, 0);
+  assert.equal(mAfter.cleanness.liveEntries, projectEntries({ messages, entries }).views.filter((v) => v.live).length);
 });
 
 // ---------------------------------------------------------------------------
@@ -427,8 +477,8 @@ test("programs/<id>/views/review.org lists entries of every phase with phase tag
     program: {
       id: "prog",
       phases: [
-        { phaseId: "p1", readableId: "prog-01", messages: [a] },
-        { phaseId: "p2", readableId: "prog-02", messages: [b, c] },
+        { phaseId: "p1", readableId: "prog-01", messages: [a], entries: openAll([a]) },
+        { phaseId: "p2", readableId: "prog-02", messages: [b, c], entries: openAll([b, c]) },
       ],
     },
     newestCandidateSha: "C1",
@@ -445,8 +495,8 @@ test("programs/<id>/views/review.org lists entries of every phase with phase tag
     program: {
       id: "prog",
       phases: [
-        { phaseId: "p1", readableId: "prog-01", messages: [a] },
-        { phaseId: "p2", readableId: "prog-02", messages: [b, c] },
+        { phaseId: "p1", readableId: "prog-01", messages: [a], entries: openAll([a]) },
+        { phaseId: "p2", readableId: "prog-02", messages: [b, c], entries: openAll([b, c]) },
       ],
     },
     newestCandidateSha: "C1",
@@ -492,12 +542,16 @@ test("live-only: a merged/dropped/resolved message is never rendered as its own 
 });
 
 test("evidence: an entry whose message has neither evidence nor a vote fails the lint", () => {
-  const bare = message("T-1", "tradeoff", []);
+  const bare = message("F-1", "finding", [], { sourceRecordId: "D-1" });
   const entries: Entry[] = [
-    { id: "E-1", phaseId: "p1", title: "x", type: "tradeoff", state: "open", anchor: { kind: "decision", id: "T-1" }, links: [{ messageId: "T-1", anchor: { kind: "decision", id: "T-1" }, reason: "opened" }] },
+    { id: "E-1", phaseId: "p1", title: "x", type: "finding", state: "open", anchor: { kind: "decision", id: "D-1" }, links: [{ messageId: "F-1", anchor: { kind: "decision", id: "D-1" }, reason: "opened" }] },
   ];
   const lint = lintFor(entries, [bare]);
   assert.ok(lint.violations.some((v) => v.rule === "evidence"));
+  // A finding with words but no citation and no vote is not validation either.
+  const words = message("F-2", "finding", ["just some words here"], { sourceRecordId: "D-1" });
+  const wordsEntry: Entry[] = [{ ...entries[0], id: "E-2", links: [{ messageId: "F-2", anchor: { kind: "decision", id: "D-1" }, reason: "opened" }] }];
+  assert.ok(lintFor(wordsEntry, [words]).violations.some((v) => v.rule === "evidence"));
 });
 
 test("title: an empty title or one cut mid-word fails the lint", () => {

@@ -20,6 +20,7 @@
 
 import {
   accountingLine,
+  anchorFromEvidence,
   anchorsOverlap,
   entryTypeOf,
   formatAnchor,
@@ -112,12 +113,22 @@ export function runReviewLint(input: ReviewLintInput): ReviewLintResult {
       violations.push({ rule: "evidence", detail: `entry ${view.entry.id} has no anchor` });
     }
     for (const m of view.messages) {
-      const hasEvidence = (m.evidence ?? []).some((e) => e.trim().length > 0);
+      const evidence = (m.evidence ?? []).map((e) => e.trim()).filter((e) => e.length > 0);
       const hasVote = m.settlement !== undefined;
-      if (!hasEvidence && !hasVote) {
+      // Plan 05j: evidence is a citation (file:line), a `verified:` marker or
+      // a vote — not merely any non-empty string (finding M-4). A trade-off's
+      // evidence is its choice/alternative by construction, so it passes on
+      // its own text; a finding without a citation fails until it is voted.
+      const validated = evidence.some((e) => /verified:/i.test(e) || anchorFromEvidence(e) !== undefined);
+      if (evidence.length === 0 && !hasVote) {
         violations.push({
           rule: "evidence",
           detail: `entry ${view.entry.id}: message ${m.id} has neither evidence nor a vote`,
+        });
+      } else if (!validated && !hasVote && m.type !== "tradeoff") {
+        violations.push({
+          rule: "evidence",
+          detail: `entry ${view.entry.id}: message ${m.id} has no citation, verified: marker or vote`,
         });
       }
     }

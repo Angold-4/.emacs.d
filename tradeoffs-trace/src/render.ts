@@ -353,7 +353,9 @@ export function candidateAnchorResolves(candidateDir: string | undefined): (anch
       const file = path.join(candidateDir, anchor.path);
       if (!fs.existsSync(file)) return false;
       const lineCount = fs.readFileSync(file, "utf8").split("\n").length;
-      return anchor.lines[0] <= lineCount;
+      // Both ends of the range must exist (finding A-10): an anchor whose
+      // END line is past EOF no longer exists either.
+      return anchor.lines[0] >= 1 && anchor.lines[1] <= lineCount;
     } catch {
       return true;
     }
