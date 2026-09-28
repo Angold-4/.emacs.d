@@ -172,6 +172,8 @@ run states:
   +-------------------+
   | RUN_PAUSED_BUDGET |  not current
   +-------------------+
+      +- ENV_PREFLIGHT_FAILED -> ENV_BLOCKED        [env-preflight-failed-from-budget]
+      +- ENV_CHECK_FAILED     -> ENV_BLOCKED        [env-check-failed-from-budget]
       +- RUN_RESUMED          -> RUN_ACTIVE         [run-resumed]
 
   +-------------------+

@@ -31,7 +31,7 @@ export const SHELL_BUILTINS = new Set<string>([
   "jobs", "kill", "pwd", "read", "true", "type", "ulimit", "umask", "unalias",
   "wait", "test", "[", "]",
   // Common shell builtins / reserved words
-  "echo", "printf", "let", "local", "declare", "typeset", "source", "builtin",
+  "printf", "let", "local", "declare", "typeset", "source", "builtin",
   "if", "then", "else", "elif", "fi", "while", "until", "for", "do", "done",
   "case", "esac", "in", "{", "}", "!", "select", "function", "time",
 ]);
@@ -42,22 +42,80 @@ const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /** Reserved words that may precede a command in a shell compound statement
  * (`then sleep 1`, `do echo x`, `while [ ... ]`). They are skipped like a
- * leading assignment so the command they introduce is still resolved. */
+ * leading assignment so the command they introduce is still resolved; a
+ * segment that opens with `for`/`select`/`case` names no executable at all
+ * (the command is in the body), so it yields nothing. */
 const SHELL_KEYWORDS = new Set<string>([
   "if", "then", "else", "elif", "fi", "while", "until", "for", "do",
   "done", "case", "esac", "in", "select", "function", "time", "{", "}",
 ]);
 
-/** A plausible executable word: a bare name, a relative/absolute path or a
- * name with an extension. Anything starting with `$`, a redirection, a
- * parenthesis or a quote after tokenizing is not an executable this preflight
- * can resolve and is ignored (never reported missing). */
-const COMMAND_WORD = /^[A-Za-z0-9_][A-Za-z0-9_./:+-]*$/;
+/** A plausible executable word: a bare name, a relative or absolute path
+ * (`/usr/bin/foo`, `./gradlew`, `~/bin/x`) or a name with an extension.
+ * Anything starting with `$`, a redirection, a parenthesis or a quote after
+ * tokenizing is not an executable this preflight can resolve and is ignored
+ * (never reported missing). */
+const COMMAND_WORD = /^[A-Za-z0-9_~./][A-Za-z0-9_./:+-]*$/;
 
-/** Split a shell expression on its control operators, longest first so `&&`
- * and `||` do not split into two single-character operators. */
+/** A file-descriptor redirection: `>`, `2>`, `2>&1`, `>&2`, `&>file`, `2>>`,
+ * `<`, `<<`, `<>`, … The leading fd is optional. A token beginning with one
+ * of these is not a command word. */
+const REDIRECTION = /^(?:[0-9]*(?:>>?|<<?|<>)|&>>?)/;
+
+function isRedirection(token: string): boolean {
+  return REDIRECTION.test(token);
+}
+
+/** Split a shell expression on its control operators: `&&`, `||`, `;`, `|`,
+ * a newline and a LONE `&`. A `&` that belongs to a redirection (`2>&1`,
+ * `>&2`, `&>file`, `2<&0`) is not a separator, so `cargo test 2>&1` is one
+ * simple command whose first word is `cargo` — never `1`. Quotes are
+ * respected. */
 function splitSimpleCommands(command: string): string[] {
-  return command.split(/\s*(?:&&|\|\||;|&|\||\n)\s*/);
+  const segments: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (quote) {
+      current += c;
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      current += c;
+      continue;
+    }
+    if ((c === "&" && command[i + 1] === "&") || (c === "|" && command[i + 1] === "|")) {
+      segments.push(current);
+      current = "";
+      i += 1;
+      continue;
+    }
+    if (c === ";" || c === "|" || c === "\n") {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    if (c === "&") {
+      // A redirection's ampersand: the previous non-space character is a
+      // redirection operator (`2>&1`, `>&2`) or the next character is `>`
+      // (`&>file`, `&>>file`). Anything else is a lone `&` (background).
+      let prev = i - 1;
+      while (prev >= 0 && /\s/.test(command[prev])) prev -= 1;
+      if (command[i + 1] === ">" || command[prev] === ">" || command[prev] === "<") {
+        current += c;
+        continue;
+      }
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += c;
+  }
+  segments.push(current);
+  return segments;
 }
 
 /** Tokenize one simple command on whitespace, honouring single and double
@@ -98,11 +156,21 @@ function tokenize(segment: string): string[] {
 function firstCommandWord(segment: string): string | undefined {
   const tokens = tokenize(segment);
   let i = 0;
-  while (i < tokens.length && (ASSIGNMENT.test(tokens[i]) || tokens[i] === "!" || SHELL_KEYWORDS.has(tokens[i]))) {
-    if (ASSIGNMENT.test(tokens[i]) && (tokens[i].includes("$(") || tokens[i].includes("`"))) return undefined;
+  while (i < tokens.length && ASSIGNMENT.test(tokens[i])) {
+    if (tokens[i].includes("$(") || tokens[i].includes("`")) return undefined;
     i += 1;
   }
-  return i < tokens.length ? tokens[i] : undefined;
+  while (i < tokens.length && (tokens[i] === "!" || SHELL_KEYWORDS.has(tokens[i]))) {
+    // A `for`/`select` header names its loop variable(s) and `case` names the
+    // word under test; the executable is in the body, so the segment yields
+    // nothing (never the loop variable `f`).
+    if (tokens[i] === "for" || tokens[i] === "select" || tokens[i] === "case") return undefined;
+    i += 1;
+  }
+  if (i >= tokens.length) return undefined;
+  // A segment that begins with a redirection has no command word before it.
+  if (isRedirection(tokens[i])) return undefined;
+  return tokens[i];
 }
 
 /** Every executable a shell command string would resolve, in first-seen
@@ -117,7 +185,11 @@ export function commandExecutables(command: string): string[] {
     const word = firstCommandWord(segment);
     if (word === undefined) continue;
     if (SHELL_BUILTINS.has(word)) continue;
+    if (isRedirection(word)) continue;
     if (!COMMAND_WORD.test(word)) continue;
+    // A bare file-descriptor number (`1` from a mis-split `2>&1`, or `0`) is
+    // never a command, even though it matches COMMAND_WORD.
+    if (/^[0-9]+$/.test(word)) continue;
     if (seen.has(word)) continue;
     seen.add(word);
     out.push(word);

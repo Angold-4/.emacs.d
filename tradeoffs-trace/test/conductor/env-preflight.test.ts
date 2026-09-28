@@ -307,6 +307,56 @@ test("env-baseline: a baseline that exits 127 is not written, and a shared exit-
   }
 });
 
+test("env-budget: a budget-paused run resumed without its tool reaches ENV_BLOCKED, not a crash", async () => {
+  const toolDir = fs.mkdtempSync("/tmp/tt-budget-tool-");
+  const originalPath = process.env.PATH;
+  const tool = "tt-budget-tool";
+  const toolPath = path.join(toolDir, tool);
+  // Slow enough that the execution budget fires while the baseline runs, so
+  // the run is reliably RUN_PAUSED_BUDGET rather than reaching DONE first.
+  fs.writeFileSync(toolPath, "#!/bin/sh\nsleep 5\nexit 0\n");
+  fs.chmodSync(toolPath, 0o755);
+  process.env.PATH = `${toolDir}:${originalPath}`;
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      checks: [`${tool} --check`],
+      workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+      reviewerScriptFor: () => ({ hello: defaultReviewerHello(), steps: [] }),
+      // A tiny execution budget pauses the run (RUN_PAUSED_BUDGET) after the
+      // first start.
+      deadlines: { ...FAST, runBudgetMs: 150 },
+    });
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.run === "RUN_PAUSED_BUDGET", 30_000, 10, setup.runDir);
+    await setup.conductor.stop();
+
+    // The tool disappears before the resume; `tt resume` must reach
+    // ENV_BLOCKED with the visible reason, not throw a rejected event.
+    fs.rmSync(toolPath, { force: true });
+    const resumed = resumeConductor(setup.runDir, setup.plan, setup.scriptsDir, process.env);
+    await resumed.start();
+    assert.equal(resumed.state.run, "ENV_BLOCKED", "a budget-paused resume with a missing tool must not crash");
+    assert.equal(resumed.state.phase.env?.blocked?.kind, "preflight");
+    assert.deepEqual(resumed.state.phase.env?.blocked?.missing, [tool]);
+    const view = buildView(setup.runDir, setup.plan, false);
+    assert.match(view.envBlocked ?? "", new RegExp(`${tool} not found on PATH`));
+    assert.ok(
+      !readEvents(setup.runDir).some((r) => r.kind === "rejected"),
+      "no event was rejected (the conductor did not crash on the missing row)",
+    );
+    await resumed.stop();
+  } finally {
+    process.env.PATH = originalPath;
+    if (setup) {
+      await setup.conductor.stop();
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+    }
+    cleanupDir(toolDir);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // tt program start | resume | retry preflight
 // ---------------------------------------------------------------------------

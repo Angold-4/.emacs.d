@@ -306,8 +306,11 @@ command (each effective check, the contract's `:GATE:` and `:GATE_CLEANUP:`)
 with `command -v` in its own `PATH`. It records the resolved path of each tool
 it checked (`ENV_CHECKED`, a record-only event stored in `phase.env.tools`,
 shown as `env  cargo /Users/…/.cargo/bin/cargo`). The preflight parses a
-shell command into the first word of every simple command, skipping shell
-builtins, keywords and variable assignments (`src/core/env-preflight.ts`).
+shell command into the first word of every simple command, splitting on `&&`,
+`||`, `;`, `|` and a lone `&`, treating file-descriptor redirections
+(`2>&1`, `>&2`, `&>file`, `2>/dev/null`) as redirections rather than
+separators, and skipping shell builtins, keywords (and a `for`/`select`
+loop's variables) and variable assignments (`src/core/env-preflight.ts`).
 
 The run-axis rows (all in `TRANSITIONS`):
 
@@ -315,9 +318,15 @@ The run-axis rows (all in `TRANSITIONS`):
 | --- | --- | --- | --- |
 | `env-preflight-failed` | `RUN_ACTIVE` | `ENV_PREFLIGHT_FAILED` | `ENV_BLOCKED` |
 | `env-preflight-failed-already-blocked` | `ENV_BLOCKED` | `ENV_PREFLIGHT_FAILED` | `ENV_BLOCKED` |
+| `env-preflight-failed-from-budget` | `RUN_PAUSED_BUDGET` | `ENV_PREFLIGHT_FAILED` | `ENV_BLOCKED` |
 | `env-check-failed` | `RUN_ACTIVE` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
 | `env-check-failed-already-blocked` | `ENV_BLOCKED` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
+| `env-check-failed-from-budget` | `RUN_PAUSED_BUDGET` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
 | `env-resumed` | `ENV_BLOCKED` | `RUN_RESUMED` | `RUN_ACTIVE` |
+
+A run that a conductor can start or resume is in `RUN_ACTIVE`, `RUN_PAUSED_BUDGET`
+or `ENV_BLOCKED`, and the preflight runs on every start — so the failure rows
+exist from all three.
 
 Events:
 

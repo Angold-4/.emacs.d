@@ -1706,6 +1706,33 @@ addRow({
   },
 });
 
+// Plan 05i / finding M-1: a conductor also starts (resumes) a run that is
+// PAUSED for budget, where `#envPreflightGate` runs unconditionally too. A
+// missing tool must block it rather than being rejected by reduce() and
+// crashing the conductor. The budget pause is replaced by the environment
+// block; a later resume with the tool present returns to RUN_ACTIVE.
+addRow({
+  id: "env-preflight-failed-from-budget",
+  axis: "run",
+  from: "RUN_PAUSED_BUDGET",
+  trigger: "ENV_PREFLIGHT_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "ENV_BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "ENV_PREFLIGHT_FAILED" }>;
+    return {
+      ...s,
+      run: "ENV_BLOCKED",
+      phase: {
+        ...s.phase,
+        env: { ...(s.phase.env ?? {}), path: e.path, blocked: { kind: "preflight", missing: e.missing, path: e.path, at: e.at } },
+      },
+    };
+  },
+});
+
 addRow({
   id: "env-check-failed",
   axis: "run",
@@ -1751,6 +1778,35 @@ addRow({
           ...(s.phase.env ?? {}),
           blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
         },
+      },
+    };
+  },
+});
+
+// Finding A-4: same missing row for the check-failure event, from the paused
+// state (defensive: a check cannot start while paused, but every run state
+// the gate can be applied in must have a row).
+addRow({
+  id: "env-check-failed-from-budget",
+  axis: "run",
+  from: "RUN_PAUSED_BUDGET",
+  trigger: "ENV_CHECK_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "ENV_BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "ENV_CHECK_FAILED" }>;
+    return {
+      ...s,
+      run: "ENV_BLOCKED",
+      phase: {
+        ...s.phase,
+        env: {
+          ...(s.phase.env ?? {}),
+          blocked: { kind: "check", stage: e.stage, command: e.command, exitCode: e.exitCode, tail: e.tail, at: e.at },
+        },
+        inFlight: clearInFlight(s.phase, envStageInFlight(e.stage)),
       },
     };
   },

@@ -279,8 +279,10 @@ function refuseMissingSecrets(declared: readonly (string | undefined)[] | undefi
 /** Plan 05i: resolve one executable in this caller's own environment with
  * `command -v`, exactly as the shell that would run a node's checks does. */
 function resolveExecutable(name: string, env: NodeJS.ProcessEnv, cwd: string): string | undefined {
+  // `command -v` does not expand a tilde, so do it here (A-3).
+  const target = name.startsWith("~/") ? path.join(os.homedir(), name.slice(2)) : name;
   try {
-    const out = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "tt-env-preflight", name], {
+    const out = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "tt-env-preflight", target], {
       encoding: "utf8",
       env,
       cwd: existsSync(cwd) ? cwd : undefined,

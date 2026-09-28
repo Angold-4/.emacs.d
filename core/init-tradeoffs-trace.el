@@ -1402,9 +1402,12 @@ open the decision view at that record."
     (when-let* ((why (alist-get 'blockedReason phase)))
       (+tt--status-row "blocked" why 'error))
     ;; Plan 05i: the toolchain the preflight resolved at start, then the one
-    ;; `env blocked · …` line while the environment blocks the run.
+    ;; `env blocked · …` line while the environment blocks the run. The tool
+    ;; strings already carry their `env  ` label (`envToolsLines`), so insert
+    ;; them verbatim — prepending another label printed `env  env  cargo`
+    ;; (finding A-5).
     (dolist (tool (alist-get 'envTools v))
-      (insert (propertize (format "%-10s" "env") 'face 'shadow) tool "\n"))
+      (insert tool "\n"))
     (when-let* ((blocked (alist-get 'envBlocked v)))
       (insert (propertize blocked 'face 'error) "\n"))
     ;; Plan 01a: a declared secret that was unset or unusable when the run

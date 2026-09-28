@@ -364,6 +364,16 @@ const BUILD: Record<string, Fixture> = {
     state: baseState({ phase: "CHECKING", candidate: C1 }, "ENV_BLOCKED"),
     event: { type: "ENV_CHECK_FAILED", stage: "checks", command: "cargo test", exitCode: 127, tail: "cargo: not found" },
   },
+  // Finding M-1 / A-4: a run PAUSED for budget can still be started
+  // (resumed), so the preflight's failure must have a row from there too.
+  "env-preflight-failed-from-budget": {
+    state: baseState({ phase: "READY" }, "RUN_PAUSED_BUDGET"),
+    event: { type: "ENV_PREFLIGHT_FAILED", missing: ["cargo"], path: "/usr/bin:/bin" },
+  },
+  "env-check-failed-from-budget": {
+    state: baseState({ phase: "CHECKING", candidate: C1 }, "RUN_PAUSED_BUDGET"),
+    event: { type: "ENV_CHECK_FAILED", stage: "checks", command: "cargo test", exitCode: 127, tail: "cargo: not found" },
+  },
   "env-resumed": {
     state: baseState({ phase: "READY" }, "ENV_BLOCKED"),
     event: { type: "RUN_RESUMED" },

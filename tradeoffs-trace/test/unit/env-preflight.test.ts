@@ -24,9 +24,38 @@ test("env-preflight: builtins, keywords, variable assignments and expansions are
   // The command inside the `$(...)` substitution is deliberately not
   // resolved (its value has no single command token); the compound
   // statement's own command is.
-  assert.deepEqual(commandExecutables("n=$(cat x || echo 0); if [ $n -ge 3 ]; then sleep 1; fi"), ["sleep"]);
+  assert.deepEqual(commandExecutables("n=$(cat x || echo 0); if [ $n -ge 3 ]; then sleep 1; fi"), ["echo", "sleep"]);
   assert.deepEqual(commandExecutables("exit 1"), []);
-  assert.deepEqual(commandExecutables("echo $n > /tmp/out"), []);
+});
+
+// Owner OD-1 / finding A-2: redirections are not separators and shell
+// keywords (and their loop variables) are never executable names.
+test("env-preflight: fd redirections are not separators, and keywords/loop variables are not commands", () => {
+  assert.deepEqual(commandExecutables("cargo test 2>&1 | tee out.log"), ["cargo", "tee"]);
+  assert.deepEqual(commandExecutables("for f in a b; do echo $f; done"), ["echo"]);
+  // Every fd-redirection form the finding names.
+  assert.deepEqual(commandExecutables("foo 2>&1"), ["foo"]);
+  assert.deepEqual(commandExecutables("foo >&2"), ["foo"]);
+  assert.deepEqual(commandExecutables("foo &>out"), ["foo"]);
+  assert.deepEqual(commandExecutables("foo 2>/dev/null"), ["foo"]);
+  assert.deepEqual(commandExecutables("foo 2>>log"), ["foo"]);
+  assert.deepEqual(commandExecutables("foo >&bar"), ["foo"]);
+  // Compound statements: the command in the body, never a keyword or the
+  // `for` loop variable.
+  assert.deepEqual(commandExecutables("while [ $i -lt 3 ]; do i=$((i+1)); done"), []);
+  assert.deepEqual(commandExecutables("until false; do :; done"), []);
+  assert.deepEqual(commandExecutables("if [ -f x ]; then make; fi"), ["make"]);
+  assert.deepEqual(commandExecutables("for f in a b; do make; done"), ["make"]);
+  assert.deepEqual(commandExecutables("case x in a) echo a;; esac"), []);
+  // A lone `&` is still a separator.
+  assert.deepEqual(commandExecutables("foo & bar"), ["foo", "bar"]);
+});
+
+// Owner OD-1 / finding A-3: a plan may name its tool by path.
+test("env-preflight: absolute, relative and tilde-prefixed paths are command words", () => {
+  assert.deepEqual(commandExecutables("/usr/bin/foo --x"), ["/usr/bin/foo"]);
+  assert.deepEqual(commandExecutables("./gradlew build"), ["./gradlew"]);
+  assert.deepEqual(commandExecutables("~/bin/x"), ["~/bin/x"]);
 });
 
 test("env-preflight: resolves every executable and reports the missing ones with the PATH", () => {

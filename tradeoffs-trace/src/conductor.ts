@@ -4724,8 +4724,11 @@ export class Conductor {
    * the repo (so a relative `./script` resolves against it) and never throws:
    * a non-zero `command -v` is a missing tool, not an error. */
   #resolveExecutable(name: string): string | undefined {
+    // `command -v` does not expand a tilde, so do it here: a plan-authored
+    // `~/bin/tool` names a real path A-3 asks us to resolve.
+    const target = name.startsWith("~/") ? path.join(os.homedir(), name.slice(2)) : name;
     try {
-      const out = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "tt-env-preflight", name], {
+      const out = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "tt-env-preflight", target], {
         encoding: "utf8",
         env: this.#preflightEnv,
         cwd: this.#plan.repo,
