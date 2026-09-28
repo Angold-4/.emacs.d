@@ -257,3 +257,54 @@ test("plan 05e (5): the evaluator lowers a blocking finding that cites no accept
     cleanupDir(setup.scriptsDir);
   }
 });
+
+test("plan 05e (3a): a finding that merely mentions a passing check is not auto-dropped (round-2 A-6)", async () => {
+  const setup = await setupConductor({
+    checks: ["make check"],
+    stubReviews: false,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-sh", command: "printf 'check:\\n\\ttrue\\n' > Makefile" }, submitPhaseStep()],
+    }),
+    reviewerScriptFor: reviewerRaising([
+      { kind: "defect", severity: "advisory", evidence: "the cancel loop is unbounded; make check passes but does not cover it" },
+    ]),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const finding = phase.findings.find((f) => f.raisedBy === "M")!;
+    assert.equal(finding.status, "open", "mentioning a passing check is not a claim that it fails");
+    const message = phase.messages.find((m) => m.type === "finding")!;
+    assert.notEqual(message.state, "dropped");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 05e (3b): a runnable command that times out does not publish the finding (round-2 A-7/M-3)", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: reviewerRaising([{ kind: "defect", severity: "advisory", evidence: "run_x hangs", runnable: "sleep 5" }]),
+    deadlines: { ...FAST, checkMs: 1_000 },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const message = phase.messages.find((m) => m.type === "finding")!;
+    assert.equal(message.state, "dropped", "a timed-out run reproduces nothing");
+    assert.match(message.settlement?.reason ?? "", /timed out/);
+    assert.equal(phase.findings.find((f) => f.raisedBy === "M")!.status, "disproved");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});

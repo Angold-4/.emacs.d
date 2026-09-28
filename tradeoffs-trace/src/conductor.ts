@@ -58,6 +58,7 @@ import {
   classifyCheckFailure,
   classifyRerun,
   failedNormally,
+  escapeRegExp,
   parseBaseline,
   parseTestFailures,
   rerunCommandsFor,
@@ -108,12 +109,14 @@ import {
 } from "./core/roles.ts";
 import { rerunBudgetMs } from "./core/checks.ts";
 import {
+  decisionSettled,
   decisionStatus,
   findingCitesAcceptanceOrReserved,
   isLiveDecision,
   panelOptionsFor,
   panelOutcome,
   panelSeatsSettled,
+  reviewsComplete,
   roundPanelItemsNeedingVote,
   roundPanelOutcomeFor,
   roundPanelSeatSettled,
@@ -2915,6 +2918,13 @@ export class Conductor {
         return;
       }
       case "evaluation_complete":
+        // Plan 05e (finding #34): the round's evaluators and panels have
+        // settled, so the candidate's final approval state is known.
+        try {
+          this.#recordCandidateApproval();
+        } catch (err) {
+          this.#log.append("error", { where: "candidate_approval", error: String((err as Error)?.message ?? err) });
+        }
         this.#applyEvent({ type: "EVALUATION_COMPLETED" });
         return;
       case "dispatch_panel": {
@@ -3287,11 +3297,10 @@ export class Conductor {
         }
         // Plan 05e: once all three reviews are in, the round's resolution
         // ballots are counted (a majority `resolved` moves a message out of
-        // the live view), and the candidate is recorded as approved when no
-        // blocking finding stands against it (finding #34).
+        // the live view). Candidate approval is recorded later, when the
+        // round's EVALUATING has settled (see `evaluation_complete`).
         try {
           this.#applyRoundResolutions(review);
-          this.#recordCandidateApproval(review);
         } catch (err) {
           this.#log.append("error", { where: "round_resolutions", error: String((err as Error)?.message ?? err) });
         }
@@ -3706,7 +3715,7 @@ export class Conductor {
             sourceFinding.severity === "blocking" &&
             message.type === "finding" &&
             !message.raisedAsBlocker &&
-            !findingCitesAcceptanceOrReserved(sourceFinding, this.#state.phase.contract)
+            !findingCitesAcceptanceOrReserved(sourceFinding, this.#state.phase.contract, this.#directiveIds())
           ) {
             events.push({
               type: "FINDING_SEVERITY_CHANGED",
@@ -3849,63 +3858,91 @@ export class Conductor {
    * live worktree or the reviewer's own read-only candidate checkout) if
    * one was given, and emits `FINDING_RAISED`. Returns an error string
    * instead of throwing, like `#applyDiscoveries`. */
+  /** Plan 05e: the ids of the owner directives in force, which a blocking
+   * finding may cite as its ground (`cite the directive id`). */
+  #directiveIds(): string[] {
+    return (this.#state.phase.ownerDirectives ?? []).map((d) => d.id).filter((id) => typeof id === "string" && id.length > 0);
+  }
+
   /** Plan 05e (3a): the check, probe and gate records this candidate's run
    * already holds, as `{command, exitCode, output}` per command. A log's
    * first line is `$ <command>`, its last `exit <n> signal <s>`. Read-only;
    * an absent directory is no records. */
   #checkRecordsFor(candidateSha: string): Array<{ command: string; exitCode: number | null; output: string }> {
-    const dir = path.join(this.#paths.checks, candidateSha);
-    let names: string[];
-    try {
-      names = fs.readdirSync(dir).filter((n) => n.endsWith(".log"));
-    } catch {
-      return [];
+    // The candidate's own check and gate logs, plus the probe's own records
+    // for the integration it probed onto (recorded under a probe-specific
+    // directory), so 3a compares against every record the run holds for the
+    // candidate (plan 05e, disc-A-17).
+    const dirs = [path.join(this.#paths.checks, candidateSha)];
+    const probe = this.#state.phase.probe;
+    if (probe && probe.candidateSha === candidateSha && typeof probe.probedI === "string" && probe.probedI.length > 0) {
+      dirs.push(path.join(this.#paths.checks, "probe", probe.probedI));
     }
     const out: Array<{ command: string; exitCode: number | null; output: string }> = [];
-    for (const name of names) {
+    for (const dir of dirs) {
+      let names: string[];
       try {
-        const lines = fs.readFileSync(path.join(dir, name), "utf8").split("\n");
-        const first = lines[0] ?? "";
-        if (!first.startsWith("$ ")) continue;
-        const command = first.slice(2).trim();
-        const last = [...lines].reverse().find((l) => l.startsWith("exit ")) ?? "";
-        const m = last.match(/^exit (\d+)/);
-        out.push({ command, exitCode: m ? Number(m[1]) : null, output: lines.slice(1).join("\n") });
+        names = fs.readdirSync(dir).filter((n) => n.endsWith(".log"));
       } catch {
-        // best effort: a corrupt record proves nothing
+        continue;
+      }
+      for (const name of names) {
+        try {
+          const lines = fs.readFileSync(path.join(dir, name), "utf8").split("\n");
+          const first = lines[0] ?? "";
+          if (!first.startsWith("$ ")) continue;
+          const command = first.slice(2).trim();
+          const last = [...lines].reverse().find((l) => l.startsWith("exit ")) ?? "";
+          const m = last.match(/^exit (\d+)/);
+          out.push({ command, exitCode: m ? Number(m[1]) : null, output: lines.slice(1).join("\n") });
+        } catch {
+          // best effort: a corrupt record proves nothing
+        }
       }
     }
     return out;
   }
 
   /** Plan 05e (3a): compare a finding's own words with the candidate's check
-   * record, before any agent sees it. A claim naming a check command or a
-   * test the record lists as failing is `confirmed`; a claim naming a command
-   * the record shows passing is `rejected` with the record cited. A short
-   * command (the ubiquitous `true`) is never matched, so prose containing the
-   * word cannot trip the rule. */
+   * record, before any agent sees it. A claim that names a check command or
+   * a test the record lists as failing is `confirmed`; a claim that a named
+   * command fails while the record shows it passing is `rejected` with the
+   * record cited.
+   *
+   * Only a sentence that both names the command AND carries a failure word is
+   * read as a claim about it, so a finding that merely mentions a passing
+   * check ("make check passes but does not cover it") is not auto-dropped
+   * (round-2 reviews A-6, M-12, B-21). */
   #claimAgainstCheckRecords(
     evidence: string,
     candidateSha: string,
   ): { kind: "rejected"; reason: string } | { kind: "confirmed"; reason: string } | undefined {
-    const text = evidence.toLowerCase();
+    const sentences = evidence
+      .split(/[.;\n]+/)
+      .map((s) => s.toLowerCase())
+      .filter((s) => s.trim().length > 0);
+    const failureWord = /(fail|fails|failed|failing|failure|error|errors|broken|crash|crashes|crashed|does not pass|doesn't pass|not pass|red|non-zero|nonzero|times out|timed out|timeout|regression|invalid)/;
     for (const record of this.#checkRecordsFor(candidateSha)) {
       const command = record.command.trim();
-      if (command.length < 5) continue;
-      const needle = command.toLowerCase();
-      if (text.includes(needle)) {
-        if (record.exitCode === 0) {
-          return {
-            kind: "rejected",
-            reason: `check record for ${candidateSha.slice(0, 9)}: \`${command}\` exit 0 (passed) — the claim that it fails is contradicted by the record`,
-          };
-        }
-        if (record.exitCode !== null) {
-          return { kind: "confirmed", reason: `record (confirmed by record: \`${command}\` exit ${record.exitCode})` };
+      if (command.length >= 5) {
+        const needle = command.toLowerCase();
+        const claiming = sentences.find((s) => s.includes(needle) && failureWord.test(s));
+        if (claiming) {
+          if (record.exitCode === 0) {
+            return {
+              kind: "rejected",
+              reason: `check record for ${candidateSha.slice(0, 9)}: \`${command}\` exit 0 (passed) — the claim that it fails is contradicted by the record`,
+            };
+          }
+          if (record.exitCode !== null) {
+            return { kind: "confirmed", reason: `record (confirmed by record: \`${command}\` exit ${record.exitCode})` };
+          }
         }
       }
       for (const name of parseTestFailures(record.output)) {
-        if (name.length > 2 && text.includes(name.toLowerCase())) {
+        if (name.length < 4) continue;
+        const re = new RegExp(`(^|[^a-z0-9_])${escapeRegExp(name.toLowerCase())}([^a-z0-9_]|$)`);
+        if (re.test(evidence.toLowerCase())) {
           return { kind: "confirmed", reason: `record (confirmed by record: \`${command}\` lists failing test ${name})` };
         }
       }
@@ -3991,6 +4028,7 @@ export class Conductor {
         !findingCitesAcceptanceOrReserved(
           { kind: fd.kind, evidence: fd.evidence, criterionDisputed: fd.criterionDispute?.criterion } as Finding,
           this.#state.phase.contract,
+          this.#directiveIds(),
         )
       ) {
         this.#log.append("amendment_only_downgrade", { reviewer, approvedCandidateSha: approvedSha, candidateSha });
@@ -4010,11 +4048,16 @@ export class Conductor {
       if (fd.runnable && fd.runnable.trim().length > 0) {
         const run = await this.#runRunnable(fd.runnable.trim(), candidateSha);
         this.#log.append("finding_run", { reviewer, command: fd.runnable.trim(), exitCode: run.exitCode, timedOut: run.timedOut, tail: run.tail });
-        if (!run.timedOut && run.exitCode === 0) {
-          this.#rejectFinding(fd, reviewer, candidateSha, `run \`${fd.runnable.trim()}\` exit 0 — the claimed failure did not reproduce`, opts);
+        // Plan 05e (3b): the finding is published only if the run reproduces
+        // it. Exit 0 did not reproduce it; a timeout is inconclusive and must
+        // not count as a reproduced failure either (round-2 reviews A-7,
+        // M-3, B-22).
+        if (run.timedOut || run.exitCode === 0) {
+          const why = run.timedOut ? "timed out" : "exit 0";
+          this.#rejectFinding(fd, reviewer, candidateSha, `run \`${fd.runnable.trim()}\` ${why} — the claimed failure did not reproduce`, opts);
           return undefined;
         }
-        verified = `run \`${fd.runnable.trim()}\` exit ${run.timedOut ? "timeout" : run.exitCode}`;
+        verified = `run \`${fd.runnable.trim()}\` exit ${run.exitCode}`;
       }
     }
     let reproduction: Finding["reproduction"];
@@ -4230,16 +4273,24 @@ export class Conductor {
           if (existing) {
             this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer: review.reviewer });
             // Plan 05e (5, finding #32): a `sameAs` re-raise takes the
-            // re-raiser's severity, so a narrower advisory re-raise of a
-            // fixed blocking finding no longer keeps it blocking. A blocker
-            // is immune (checked above).
-            if (fd.severity !== existing.severity) {
+            // re-raiser's severity DOWNWARD — a narrower advisory re-raise of
+            // a fixed blocking finding no longer keeps it blocking. It never
+            // raises one: a single reviewer making an advisory finding
+            // blocking would block the worker on one agent's word (round-2
+            // reviews A-5, M-2).
+            if (fd.severity === "advisory" && existing.severity === "blocking") {
               this.#applyEvent({
                 type: "FINDING_SEVERITY_CHANGED",
                 findingId: existing.id,
-                severity: fd.severity,
-                reason: `re-raised by ${review.reviewer} at ${fd.severity} severity`,
+                severity: "advisory",
+                reason: `re-raised by ${review.reviewer} at advisory severity`,
                 by: "reviewer",
+              });
+            } else if (fd.severity === "blocking" && existing.severity === "advisory") {
+              this.#log.append("sameas_severity_raise_refused", {
+                reviewer: review.reviewer,
+                findingId: existing.id,
+                reason: "a sameAs re-raise may lower a finding's severity, never raise it",
               });
             }
             continue;
@@ -4383,16 +4434,27 @@ export class Conductor {
   }
 
   /** Plan 05e (finding #34): record the candidate as approved once all three
-   * reviewers have reviewed it and no open blocking finding stands against
-   * it. The tree object id is what a later amendment-only resubmission is
-   * compared against. */
-  #recordCandidateApproval(review: Review): void {
+   * reviewers have reviewed it, every live decision bound to it has settled,
+   * no owner request is open and no open blocking finding stands against it
+   * (round-2 reviews A-4, disc-A-19, B-23). It runs when the round's
+   * EVALUATING has settled, so the round panel's and evaluator's severity
+   * decisions are already final. The tree object id is what a later
+   * amendment-only resubmission is compared against. */
+  #recordCandidateApproval(): void {
     const phase = this.#state.phase;
     const C = phase.candidate?.sha;
     if (!C) return;
-    if (!this.#threeReviewsWith(review)) return;
+    const K = phase.contract.contractVersion;
+    if (!reviewsComplete(phase, C, K)) return;
     if ((phase.approvedCandidates ?? []).some((a) => a.candidateSha === C)) return;
     if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open" && f.boundCandidateSha === C)) return;
+    if (phase.ownerRequests.some((r) => r.status === "open")) return;
+    for (const decision of phase.decisions) {
+      if (!isLiveDecision(decision)) continue;
+      if (decision.amendment) continue;
+      if (decision.boundCandidateSha !== C) continue;
+      if (!decisionSettled(decision, phase, C, K)) return;
+    }
     const tree = candidateTree(this.#plan.repo, C);
     if (!tree) return;
     this.#applyEvent({ type: "CANDIDATE_APPROVED", candidateSha: C, tree });

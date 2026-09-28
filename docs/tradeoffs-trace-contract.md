@@ -206,12 +206,16 @@ Three deterministic checks precede any model:
   `verified: record (confirmed by record: …)`.
 - **3b, run what can be run:** a finding naming a runnable test or command is
   re-run in the candidate's disposable checkout, bounded by the check
-  deadline. Exit 0 drops it (`run <cmd> exit 0`); a non-zero exit records
-  `verified: run <cmd> exit N`.
+  deadline. Exit 0, or a timeout that reproduces nothing, drops it (`run <cmd>
+  exit 0` / `run <cmd> timed out`); a non-zero exit records `verified: run
+  <cmd> exit N`.
 - **severity against the plan (5):** a blocking finding that cites no
   acceptance item or reserved rule is lowered by the evaluator
-  (`FINDING_SEVERITY_CHANGED`, by `evaluator`, with its reason). A `sameAs`
-  re-raise takes the re-raiser's severity.
+  (`FINDING_SEVERITY_CHANGED`, by `evaluator`, with its reason). A citation is
+  the item verbatim, a phrasing-preserving paraphrase, a numbered reference, a
+  reserved rule, an owner directive id, or a `criterionDispute`. A `sameAs`
+  re-raise takes the re-raiser's severity **downward only**; one reviewer
+  cannot raise an advisory finding to blocking.
 
 `FINDING_VERIFIED` records what validated a finding — `record`, `run <cmd>
 exit N`, a `file:line …` citation, or `panel keep` — and the renderer shows it
@@ -230,11 +234,15 @@ majority, or no majority, leaves it live. A trade-off may carry
 
 ### Approved code stays approved (plan 05e)
 
-When all three reviewers review a candidate with no open blocking finding
-bound to it, `CANDIDATE_APPROVED` records its git tree. A later round whose
-candidate ships the same tree (an amendment-only resubmission) re-reviews only
-the amended criterion; a new blocking finding on the unchanged code is raised
-as advisory, unless it cites an acceptance item or a reserved rule.
+When all three reviewers review a candidate, every live decision bound to it
+has settled, no owner request is open and no open blocking finding stands,
+`CANDIDATE_APPROVED` records its git tree. It is emitted when the round's
+`EVALUATING` has settled, so the round panel's severity decisions are already
+final. A later round whose candidate ships the same tree (an amendment-only
+resubmission) re-reviews only the amended criterion; a new blocking finding on
+the unchanged code is raised as advisory, unless it cites an acceptance item
+or a reserved rule. A candidate whose ballots were rejected is never approved,
+so an identical resubmission is re-reviewed normally.
 
 ## 2. Bindings and `contentHash`
 

@@ -283,3 +283,79 @@ test("plan 05e (finding #34): an amendment-only resubmission of identical bytes 
     fs.rmSync(promptDir, { recursive: true, force: true });
   }
 });
+
+test("plan 05e (round-2 A-5): an advisory sameAs re-raise cannot raise a finding to blocking", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScriptForAttempt: workerAttempt(false),
+    reviewerScriptFor: (reviewer, state) => {
+      const round = state.phase.round ?? 1;
+      const advisory = state.phase.findings.find((f) => f.raisedBy === "M" && f.severity === "advisory");
+      const votable = state.phase.decisions.filter((d) => (d.class === "delegated" || d.class === "reserved") && !d.supersededBy && !d.supersededByCorrection);
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+              ballots: round === 1 ? votable.map((d) => ({ decisionId: d.id, vote: "approve", rationale: "right for the goal", evidence: ["src/a.ts:1"] })) : [],
+              findings:
+                round === 1 && reviewer === "M"
+                  ? [
+                      { kind: "defect", severity: "advisory", evidence: "the helper's name is misleading" },
+                      { kind: "defect", severity: "blocking", evidence: "the acceptance item 'it works' does not hold" },
+                    ]
+                  : round === 2 && reviewer === "A" && advisory
+                    ? [{ kind: "defect", severity: "blocking", evidence: "the same naming point, now claimed blocking", sameAs: advisory.id }]
+                    : [],
+            },
+          },
+        ],
+      };
+    },
+    evaluatorScriptFor: (messageType) => ({
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps:
+        messageType === "finding"
+          ? [
+              {
+                kind: "call-submit",
+                tool: "submit_evaluation",
+                args: {
+                  evaluations: [
+                    { messageId: "F-1", action: "publish", title: "the helper's name is misleading", summary: "naming", context: "src/a.ts:1", evidence: ["src/a.ts:1"], verified: "src/a.ts:1" },
+                    { messageId: "F-2", action: "publish", title: "the criterion does not hold", summary: "not validated", context: "src/b.ts:1", evidence: ["src/b.ts:1"], verified: "src/b.ts:1" },
+                  ],
+                },
+              },
+            ]
+          : [],
+    }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(
+      () => setup.conductor.state.phase.findings.some((f) => f.raisedBy === "M" && f.severity === "advisory" && (f.alsoRaisedBy ?? []).includes("A")),
+      120_000,
+      20,
+      setup.runDir,
+    );
+    const advisory = setup.conductor.state.phase.findings.find((f) => f.raisedBy === "M" && f.severity === "advisory")!;
+    assert.equal(advisory.severity, "advisory", "one reviewer's sameAs re-raise cannot raise a finding to blocking");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});

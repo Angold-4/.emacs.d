@@ -267,22 +267,69 @@ export function roundPanelSettled(phase: PhaseState): boolean {
   return phase.panel?.round?.decided === true;
 }
 
+/** Words too common to carry a citation on their own. */
+const STOPWORDS = new Set([
+  "that", "this", "with", "from", "into", "when", "then", "than", "have", "has", "had", "does", "done", "must", "should", "would", "could", "will", "shall", "each", "every", "before", "after", "over", "under", "their", "there", "where", "which", "while", "then", "them", "they", "your", "yours", "still", "only", "also", "very", "more", "most", "less", "much", "many", "some", "such", "been", "being", "were", "was", "are", "not",
+]);
+
 /** Plan 05e: a blocking finding is only legitimate when it is a defect against
  * an acceptance item or a reserved rule (finding #32, atlas 15.3). A
  * preference, or a defect that cites neither, may not block; the evaluator
- * lowers it and records the reason. A `criterionDispute` names an acceptance
- * item by construction. */
+ * lowers it and records the reason.
+ *
+ * A citation is accepted in the forms a reviewer actually writes (round-2
+ * review, M-1): the item's text verbatim, a distinctive run of the item's own
+ * words (a paraphrase that keeps its phrasing), a numbered reference
+ * (`acceptance item 3`, `criterion 3`), an owner directive id the review
+ * prompt tells a reviewer to cite, or a `criterionDispute` (which names an
+ * acceptance item by construction). */
 export function findingCitesAcceptanceOrReserved(
   finding: Finding,
   contract: { acceptance: string[]; reserved: string[] },
+  directiveIds: readonly string[] = [],
 ): boolean {
   if (finding.kind !== "defect" && finding.kind !== "contract") return false;
-  const text = `${finding.evidence} ${finding.criterionDisputed ?? ""}`.toLowerCase();
+  const evidence = `${finding.evidence} ${finding.criterionDisputed ?? ""}`.toLowerCase();
+  const words = (s: string): string[] => s.toLowerCase().replace(/[^a-z0-9\s]+/g, " ").split(/\s+/).filter(Boolean);
+  const runs = (s: string, len: number): Set<string> => {
+    const w = words(s);
+    const n = Math.min(len, w.length);
+    const out = new Set<string>();
+    for (let i = 0; i + n <= w.length; i += 1) out.add(w.slice(i, i + n).join(" "));
+    return out;
+  };
+  const evidenceRuns = runs(evidence, 4);
+  const evidenceWords = new Set(words(evidence));
+  const significant = (ws: string[]): string[] => ws.filter((w) => w.length >= 4 && !STOPWORDS.has(w));
   const cites = (item: string): boolean => {
     const needle = item.trim().toLowerCase();
-    return needle.length > 0 && text.includes(needle);
+    if (needle.length > 0 && evidence.includes(needle)) return true;
+    // A paraphrase: most of the item's significant words, or a distinctive
+    // four-word run of its own phrasing (round-2 review M-1).
+    const itemSignificant = significant(words(item));
+    if (itemSignificant.length >= 3) {
+      const matched = itemSignificant.filter((w) => evidenceWords.has(w)).length;
+      if (matched >= 3 && matched / itemSignificant.length >= 0.6) return true;
+    }
+    const n = Math.min(4, words(item).length);
+    if (n >= 2) for (const run of runs(item, n)) if (evidenceRuns.has(run)) return true;
+    return false;
   };
-  return contract.acceptance.some(cites) || contract.reserved.some(cites);
+  if (contract.acceptance.some(cites) || contract.reserved.some(cites)) return true;
+  if (finding.criterionDisputed && finding.criterionDisputed.trim().length > 0 && contract.acceptance.includes(finding.criterionDisputed)) return true;
+  // A numbered reference to an acceptance item (`acceptance item 3`).
+  for (const m of evidence.matchAll(/(?:acceptance\s+(?:item|criteria|criterion)|criterion|item)\s*#?\s*(\d+)/g)) {
+    const idx = Number(m[1]);
+    if (Number.isInteger(idx) && idx >= 1 && idx <= contract.acceptance.length) return true;
+  }
+  // An owner directive id cited as the blocking ground.
+  for (const id of directiveIds) {
+    const needle = id.trim().toLowerCase();
+    if (needle.length === 0) continue;
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`).test(evidence)) return true;
+  }
+  return false;
 }
 
 /** M, A and B each have a review bound to (C, K) already. Used to decide,

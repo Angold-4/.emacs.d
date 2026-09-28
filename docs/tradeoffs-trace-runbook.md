@@ -1074,12 +1074,16 @@ Three deterministic rules run **before any model**:
 2. **Run what can be run (3b).** A finding that names a runnable test or
    command (`runnable`) is re-run in the candidate's disposable checkout,
    bounded by the check deadline. The finding is published only if the run
-   reproduces it (a non-zero exit); a passing run drops it, recording the
-   command and exit status.
+   reproduces it (a non-zero exit); a passing run — or a timeout, which
+   reproduces nothing — drops it, recording the command and exit status.
 3. **Severity against the plan (5).** A blocking finding may stay blocking
-   only when it is a defect against an acceptance item or a reserved rule;
-   the evaluator lowers anything else to advisory, recording the reason. A
-   `sameAs` re-raise takes the re-raiser's severity.
+   only when it is a defect against an acceptance item or a reserved rule.
+   A citation is accepted as the item verbatim, a paraphrase that keeps its
+   phrasing or most of its significant words, a numbered reference
+   (`acceptance item 3`), an owner directive id, or a `criterionDispute`; the
+   evaluator lowers anything else to advisory, recording the reason. A
+   `sameAs` re-raise takes the re-raiser's severity **downward only** — one
+   reviewer's re-raise never makes an advisory finding block.
 
 Every finding records what validated it in its property drawer and in
 `views/messages/<id>.org` (`verified: record | run <cmd> exit N | file:line …
@@ -1098,7 +1102,11 @@ tree as a candidate M, A and B already approved (an amendment-only
 resubmission), the round's prompt says so and the reviewers re-review only the
 amended criterion; a new blocking point on the unchanged code is raised as an
 advisory finding, not a blocker, unless it violates an acceptance item or a
-reserved rule.
+reserved rule. Approval is recorded once the round's `EVALUATING` has settled
+(the round panel's severity decisions are final), and only when every live
+decision bound to the candidate has settled and no owner request or blocking
+finding stands — a candidate whose ballots were rejected is not approved, so
+identical bytes are re-reviewed.
 
 ## Balance metrics
 
