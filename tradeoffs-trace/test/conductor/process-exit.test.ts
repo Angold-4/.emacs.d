@@ -93,6 +93,11 @@ test("a spawned conductor process for a fake-pi happy path exits by itself short
       stubReviews: true,
       piEnvFor: (role, agentId) => {
         if (role === "worker") return { FAKE_PI_SCRIPT: workerScriptPath };
+        if (role === "curator") {
+          const file = path.join(scriptsDir, agentId + ".json");
+          fs.writeFileSync(file, JSON.stringify({ hello: { role: "curator", tools: ROLE_TOOLS.curator }, steps: [{ kind: "call-submit", tool: "curate_entries", args: { proposals: [] } }] }));
+          return { FAKE_PI_SCRIPT: file };
+        }
         const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1]) ?? "M";
         if (!reviewerScriptPaths.has(agentId)) {
           const state = conductor.state;

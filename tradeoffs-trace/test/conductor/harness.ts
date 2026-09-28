@@ -130,6 +130,8 @@ export async function setupConductor(opts: {
    * evaluate. A test that wants real publication supplies its own script,
    * keyed by the message type it is dispatched for. */
   evaluatorScriptFor?: (messageType: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 05j: the curator's script. Default: an empty `curate_entries` pass. */
+  curatorScriptFor?: (agentId: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04b: one fresh panel seat per raw blocker per seat number. The
    * default script calls `submit_panel_vote` with a `downgrade` vote, so a
    * blocker that a test raises never parks an otherwise-passing run. A test
@@ -228,6 +230,7 @@ export async function setupConductor(opts: {
 
   const reviewerScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
+  const curatorScriptPaths = new Map<string, string>();
   const panelScriptPaths = new Map<string, string>();
 
   const defaultPanelScript = (blockerId: string, seat: number) => ({
@@ -298,6 +301,18 @@ export async function setupConductor(opts: {
           evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
         }
         return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
+      }
+      if (role === "curator") {
+        // Plan 05j: the round's curator. The default pass proposes nothing,
+        // so the round is marked curated at once and the evaluators are never
+        // delayed; a test may supply its own proposals.
+        if (!curatorScriptPaths.has(agentId)) {
+          const script = opts.curatorScriptFor
+            ? opts.curatorScriptFor(agentId, conductor.state)
+            : { hello: { role: "curator" as const, tools: ROLE_TOOLS.curator }, steps: [{ kind: "call-submit", tool: "curate_entries", args: { proposals: [] } }] };
+          curatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+        }
+        return { FAKE_PI_SCRIPT: curatorScriptPaths.get(agentId)! };
       }
       if (role === "panel") {
         // Plan 04b: one script per dispatched seat (the agentId is
