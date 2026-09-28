@@ -180,8 +180,17 @@ test("tainted-reset: after a tainted freeze, the next attempt's worktree is rese
     assert.ok(candidate1Sha, "expected the worktree_reset record to name candidate C1's sha");
 
     // Attempt 2's own in-worktree check (run against the freshly reset
-    // worktree, before it does anything else) found it clean.
-    await waitFor(() => fs.existsSync(verifyResultPath), 20_000);
+    // worktree, before it does anything else) found it clean. Wait for the
+    // file's CONTENT, not just its existence: the shell's `>` creates the file
+    // before `echo` writes it, so a load-delayed write was read as '' and
+    // flaked this assertion.
+    await waitFor(() => {
+      try {
+        return fs.readFileSync(verifyResultPath, "utf8").trim().length > 0;
+      } catch {
+        return false;
+      }
+    }, 20_000);
     const verifyResult = fs.readFileSync(verifyResultPath, "utf8").trim();
     assert.equal(verifyResult, "yes", "the reset worktree must exactly equal candidate C1: attempt1.txt present, git status clean");
 
