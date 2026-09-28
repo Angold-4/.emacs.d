@@ -653,6 +653,13 @@ export function renderStatusView(input: StatusViewInput): string {
   // review; the `review' row counts in trade-off vocabulary, matching the
   // entries, the raw count and the dropped count `review.org' shows.
   push(row("review", view.review));
+  // Plan 3b: boundary files changed are the worker's trigger records the
+  // reviewers must classify. The old `records' row carried this; it keeps its
+  // own row so the owner still sees a change that no reviewer has classified
+  // (advisory A-5).
+  if (view.boundaryFilesChanged > 0) {
+    push(row("boundary", `files changed: ${view.boundaryFilesChanged} (reviewers classify)`));
+  }
   push(row("blocked", phase.blockedReason as string | undefined));
   // Plan 05i: the resolved tools, then the environment block itself.
   for (const line of view.envTools) lines.push(line);

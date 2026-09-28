@@ -322,7 +322,8 @@ then.  It is never part of the worker's or a reviewer's acceptance."
              (time . "reviewer-M: model 80% · polling 0% · full tests 0%")
              (gates . "checks ✓ · probe ✓ (reused)")
              (reviewLine . "M ✗ 2 reject · 1 blocking   A ✓   B ⧗")
-             (review . "T 4 (2 raw) · F 1 · B 0 · C-c m d")))
+             (review . "T 4 (2 raw) · F 1 · B 0 · C-c m d")
+             (boundaryFilesChanged . 2)))
      "/tmp/tt-ert/abcd1234")
     (let ((text (buffer-string)))
       (should (string-match-p "run abcd1234 · conductor running · 1m02s" text))
@@ -333,6 +334,8 @@ then.  It is never part of the worker's or a reviewer's acceptance."
       ;; is in trade-off vocabulary.
       (should (string-match-p "review    T 4 (2 raw) · F 1 · B 0 · C-c m d" text))
       (should-not (string-match-p "decisions" text))
+      ;; Advisory A-5: the boundary-changed note survives as its own row.
+      (should (string-match-p "boundary  files changed: 2 (reviewers classify)" text))
       ;; Plan 01a: an unset declared secret is reported by name; a set one is
       ;; not, and a value too short to mask is reported too.
       (should (string-match-p "secret    FAKE_KEY not set" text))

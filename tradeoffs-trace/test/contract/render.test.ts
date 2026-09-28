@@ -19,7 +19,8 @@ import { projectReview, renderMessageFile, reviewSummary } from "../../src/rende
 import { renderStatusView, type StatusViewInput } from "../../src/render.ts";
 import { contentHashOf } from "../../src/core/messages.ts";
 import type { Ballot, Decision, Finding, Message, MessageSettlement, PhaseState } from "../../src/core/types.ts";
-import { basePhase, CV, makeMessage } from "../unit/helpers.ts";
+import { notAcceptedReasons } from "../../src/core/verdict.ts";
+import { approvingReview, basePhase, CV, makeMessage } from "../unit/helpers.ts";
 
 const GOLDEN = fileURLToPath(new URL("../fixtures/render", import.meta.url));
 
@@ -390,6 +391,49 @@ test("history records every version a carry produced", () => {
   assert.match(file, /- v2 · C2 · [0-9a-f]{64}/);
 });
 
+test("failed records read as trade-offs, and no status or review text says `decisions`", () => {
+  const C = { sha: "C1", contractVersion: CV() };
+  const decisions = Array.from({ length: 16 }, (_, i) =>
+    decision({ id: `D-${i + 1}`, choice: `choice ${i + 1}`, boundCandidateSha: "C1" }),
+  );
+  const phase = basePhase({
+    phase: "REVIEWING",
+    candidate: C,
+    decisions,
+    checks: { candidateSha: "C1", passed: true },
+    reviews: {
+      M: { review: approvingReview("M", "C1", CV()) },
+      A: { review: approvingReview("A", "C1", CV()) },
+      B: { review: approvingReview("B", "C1", CV()) },
+    },
+  });
+  const reasons = notAcceptedReasons(phase);
+  assert.match(reasons.join("; "), /16 trade-offs failed \(missing ballot from M/);
+  assert.doesNotMatch(reasons.join("; "), /decisions/);
+  const summary = reviewSummary(phase.messages);
+  const status = renderStatusView({
+    runDir: "/tmp/tt-render-status",
+    title: "sum validation",
+    phase: phase as unknown as Record<string, unknown>,
+    alive: false,
+    view: {
+      elapsed: "1m",
+      pipeline: "review 12s",
+      gates: "checks ✓",
+      reviewLine: "M ✓   A ✓   B ✓",
+      review: summary,
+      verdict: `not accepted: ${reasons.join("; ")} → repair attempt 2`,
+      previousRound: `round 1 · C1 · not accepted: ${reasons.join("; ")}`,
+      envTools: [],
+    },
+    ownerInputs: [],
+    pendingOwnerInputs: [],
+    ownerDirectives: [],
+  } as unknown as StatusViewInput);
+  assert.doesNotMatch(status, /decisions/);
+  assert.match(status, /16 trade-offs failed/);
+});
+
 test("the status `review` line counts the same messages review.org shows, with no `decisions`", () => {
   const phase = sixRawPhase();
   const review = projectReview(phase);
@@ -406,6 +450,7 @@ test("the status `review` line counts the same messages review.org shows, with n
       gates: "checks ✓",
       reviewLine: "M ✓   A ✓   B ✓",
       review: summary,
+      boundaryFilesChanged: 2,
       envTools: [],
     },
     ownerInputs: [],
@@ -415,6 +460,8 @@ test("the status `review` line counts the same messages review.org shows, with n
   const status = renderStatusView(input);
   assert.match(status, new RegExp(`^review {4}${escapeRe(summary)}$`, "m"));
   assert.doesNotMatch(status, /decisions/);
+  // Advisory A-5: the boundary-changed note keeps a row of its own.
+  assert.match(status, /^boundary {2}files changed: 2 \(reviewers classify\)$/m);
   assert.match(review, /^6 raw, awaiting evaluation$/m);
   // A phase with entries: the counts follow the entries and the drop count.
   const evaluated = evaluatedPhase();

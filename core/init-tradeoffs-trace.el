@@ -1395,6 +1395,11 @@ open the decision view at that record."
     ;; is in trade-off vocabulary and counts the same messages `review.org'
     ;; shows (entries plus raw, with dropped broken out).
     (+tt--status-row "review" (alist-get 'review v))
+    ;; Plan 3b, kept (advisory A-5): boundary files changed are trigger records
+    ;; the reviewers must classify, so the owner still sees them.
+    (let ((b (or (alist-get 'boundaryFilesChanged v) 0)))
+      (when (> b 0)
+        (+tt--status-row "boundary" (format "files changed: %d (reviewers classify)" b))))
     (when-let* ((why (alist-get 'blockedReason phase)))
       (+tt--status-row "blocked" why 'error))
     ;; Plan 05i: the toolchain the preflight resolved at start, then the one
