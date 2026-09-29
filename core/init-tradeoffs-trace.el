@@ -54,16 +54,33 @@
   :group 'tools)
 
 (defcustom +tt-root (expand-file-name "~/.tradeoffs-trace/")
-  "Directory holding tradeoffs-trace runs and installed runners.
-It may be remote, e.g. \"/ssh:mac:~/.tradeoffs-trace/\": every file is then
-read over TRAMP, and `tt' and git run on that host (`process-file'), so a
-laptop Emacs is only a renderer of the server's runs and they keep running
+  "Local directory holding tradeoffs-trace runs and installed runners.
+It may itself be remote, e.g. \"/ssh:mac:~/.tradeoffs-trace/\": every file is
+then read over TRAMP, and `tt' and git run on that host (`process-file'), so
+a laptop Emacs is only a renderer of the server's runs and they keep running
 while it is closed."
   :type 'directory)
 
+(defcustom +tt-remote-hosts nil
+  "SSH host names whose tradeoffs-trace root to show beside the local one.
+For each HOST here the root \"/ssh:HOST:~/.tradeoffs-trace/\" is added to
+`+tt-root', so one git-managed config on a laptop lists and opens the runs
+and programs of every machine it can reach.  A HOST equal to this machine's
+`system-name' (or \"localhost\") is skipped, so the same config works
+unchanged on the server too."
+  :type '(repeat string))
+
+(defcustom +tt-connect-timeout 5
+  "Seconds a listing call waits for one root before skipping it.
+Bound to `tramp-connection-timeout' around each per-root `tt' call, so a dead
+host costs seconds, not the TRAMP default of a minute."
+  :type 'number)
+
 (defcustom +tt-runner nil
-  "Package directory of the runner to launch.
-Nil means `<+tt-root>/runner/current/tradeoffs-trace'."
+  "Package directory of the runner to launch, overriding every root.
+Nil (the default) means `<root>/runner/current/tradeoffs-trace' for the root
+the command belongs to.  Set it only when every root shares one runner; a
+remote root needs a runner on that host."
   :type '(choice (const nil) directory))
 
 (defcustom +tt-node "node"
@@ -90,30 +107,123 @@ with no tab bar."
 (defvar-local +tt--run-dir nil
   "Run directory shown by this tradeoffs-trace buffer.")
 
+(defvar-local +tt--run-root nil
+  "Root `+tt--run-dir' belongs to, when a buffer knows it.")
+
+(defvar-local +tt--program-root nil
+  "Root `+tt--program-dir' belongs to, when a buffer knows it.")
+
 (defvar-local +tt--trace-agent nil
   "Agent id pinned in a trace buffer, or nil to follow the active agent.")
 
 ;;;; CLI
 
-(defun +tt--runner-dir ()
-  "Return the installed runner's package directory, or signal an error."
+(defun +tt--runner-dir (&optional root)
+  "Return ROOT's installed runner package directory, or signal an error.
+ROOT defaults to `+tt-root'.  `+tt-runner', when set, overrides every root."
   (let ((dir (or +tt-runner
-                 (expand-file-name "runner/current/tradeoffs-trace" +tt-root))))
+                 (expand-file-name "runner/current/tradeoffs-trace" (or root +tt-root)))))
     (unless (file-exists-p (expand-file-name "src/cli.ts" dir))
       (user-error "No tradeoffs-trace runner at %s; run `tt runner install <sha>'" dir))
     dir))
+
+(defun +tt--self-host-p (host)
+  "Non-nil when HOST names this machine, so its root is not added twice."
+  (let ((h (downcase (string-remove-suffix "." (or host "")))))
+    (or (string-empty-p h)
+        (member h '("localhost" "127.0.0.1" "::1"))
+        (equal h (downcase (or (system-name) "")))
+        (equal h (downcase (car (split-string (or (system-name) "") "\\.")))))))
+
+(defun +tt--remote-root (host)
+  "The tradeoffs-trace root for SSH HOST."
+  (file-name-as-directory (format "/ssh:%s:~/.tradeoffs-trace/" host)))
+
+(defun +tt--roots ()
+  "Every root this Emacs lists: `+tt-root', then one per `+tt-remote-hosts'.
+A host that names this machine is skipped, and a duplicate root is dropped."
+  (let ((roots (list (file-name-as-directory +tt-root))))
+    (dolist (host +tt-remote-hosts)
+      (unless (+tt--self-host-p host)
+        (let ((root (+tt--remote-root host)))
+          (unless (member root roots) (setq roots (append roots (list root)))))))
+    roots))
+
+(defun +tt--under-root (root relative)
+  "ROOT with RELATIVE appended, without expanding `~' over TRAMP.
+`expand-file-name' on a remote root would open a connection just to expand
+`~', which a listing must never do."
+  (concat (file-name-as-directory root) relative))
+
+(defun +tt--host-of-root (root)
+  "The SSH host naming ROOT, or nil when ROOT is local."
+  (when (stringp root)
+    (or (and (string-prefix-p "/ssh:" root)
+             (car (split-string (substring root 5) ":")))
+        (file-remote-p root 'host))))
+
+(defun +tt--root-label (root)
+  "The host naming ROOT, else ROOT itself (a local root's own path)."
+  (or (+tt--host-of-root root) root))
+
+(defun +tt--root-of (dir)
+  "The root among `+tt--roots' that DIR lives under, or nil.
+The longest matching root wins, so a root nested under another is not
+misattributed."
+  (when (and dir (stringp dir))
+    (let ((dir (file-name-as-directory dir)) (best nil))
+      (dolist (root (+tt--roots))
+        (let ((r (file-name-as-directory root)))
+          (when (and (string-prefix-p r dir)
+                     (or (null best) (> (length r) (length best))))
+            (setq best r))))
+      best)))
 
 (defun +tt--local-arg (arg)
   "ARG as the host that runs `tt' sees it: a remote file name loses its
 TRAMP prefix, anything else is passed through."
   (if (and (stringp arg) (file-remote-p arg)) (file-local-name arg) arg))
 
+(defvar +tt--cli-root nil
+  "The root the next `+tt--cli' call should use, when a caller knows it.")
+
+(defun +tt--arg-root (args)
+  "The root among `+tt--roots' that one of ARGS lives under, or nil."
+  (let (best)
+    (dolist (a args)
+      (when (stringp a)
+        (let ((r (+tt--root-of a)))
+          (when (and r (or (null best) (> (length r) (length best)))) (setq best r)))))
+    best))
+
+(defun +tt--cli-root-for (args)
+  "The root the `+tt--cli' call with ARGS belongs to.
+An explicit `+tt--cli-root', the buffer's run or program directory, a path in
+ARGS, then the local `+tt-root' — in that order."
+  (or +tt--cli-root
+      (and (boundp '+tt--run-root) +tt--run-root)
+      (and (boundp '+tt--run-dir) +tt--run-dir (+tt--root-of +tt--run-dir))
+      (and (boundp '+tt--program-root) +tt--program-root)
+      (and (boundp '+tt--program-dir) +tt--program-dir (+tt--root-of +tt--program-dir))
+      (+tt--arg-root args)
+      +tt-root))
+
 (defun +tt--cli (&rest args)
-  "Run the tradeoffs-trace CLI with ARGS; return its stdout, trimmed.
-It runs where `+tt-root' lives (`process-file' with that directory as
+  "Run the tradeoffs-trace CLI with ARGS on the root this call belongs to.
+The root is a path in ARGS, the buffer's run/program root, or `+tt-root';
+`+tt--cli-on' runs where that root lives (`process-file' with it as
 `default-directory'), so a remote root drives the server's runner."
-  (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir)))
-         (default-directory (file-name-as-directory +tt-root))
+  (apply #'+tt--cli-on (+tt--cli-root-for args) args))
+
+(defun +tt--cli-on (root &rest args)
+  "Run `tt' ARGS against ROOT, returning its stdout, trimmed.
+ROOT is the root the command belongs to and decides the host it runs on."
+  (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir root)))
+         (default-directory (file-name-as-directory root))
+         ;; A dead host must cost seconds, not TRAMP's default minute.
+         (tramp-connection-timeout (min (if (bound-and-true-p tramp-connection-timeout)
+                                            tramp-connection-timeout 60)
+                                        +tt-connect-timeout))
          ;; `process-file' takes stderr only as a (local) file name, never a
          ;; buffer: a buffer there signals `wrong-type-argument' on every call.
          (err-file (make-temp-file "tt-stderr-")))
@@ -123,7 +233,7 @@ It runs where `+tt-root' lives (`process-file' with that directory as
           ;; reported (A-13: a stale verdict's reason is on stderr).
           (let* ((status (apply #'process-file +tt-node nil (list t err-file) nil (+tt--local-arg cli)
                                 (append (mapcar #'+tt--local-arg args)
-                                        (list "--root" (directory-file-name (+tt--local-arg +tt-root))))))
+                                        (list "--root" (directory-file-name (+tt--local-arg root))))))
                  (out (string-trim (buffer-string)))
                  (err (with-temp-buffer
                         (insert-file-contents err-file)
@@ -133,6 +243,42 @@ It runs where `+tt-root' lives (`process-file' with that directory as
                      (string-trim (concat out (if (string-empty-p err) "" (concat "\n" err))))))
             out))
       (delete-file err-file))))
+
+(defvar +tt--failed-roots nil
+  "Roots whose last listing call failed, so a repeated failure is not re-echoed.
+A root is removed again the next time it answers.")
+
+(defun +tt--root-call (root thunk)
+  "Call THUNK with ROOT's CLI context; on failure, one message and nil.
+A root that cannot be reached (or whose call fails) is skipped rather than
+signalling: one listing must not take the picker down with it.  A root that
+keeps failing is still retried, but its echo line is shown once per streak."
+  (condition-case err
+      (prog1 (let ((+tt--cli-root root)) (funcall thunk))
+        (setq +tt--failed-roots (delete root +tt--failed-roots)))
+    (error
+     (unless (member root +tt--failed-roots)
+       (push root +tt--failed-roots)
+       (message "tradeoffs-trace: %s skipped: %s" (+tt--root-label root) (error-message-string err)))
+     nil)))
+
+(defvar +tt--evil-normal-maps nil
+  "Alist of (MODE-MAP . AUX-KEYMAP) recording each mode's Evil normal bindings.
+`+tt--evil-normal-key' fills it whether or not Evil is loaded, so the batch
+key contract test can inspect normal-state bindings without requiring Evil.")
+
+(defun +tt--evil-normal-key (mode-map &rest bindings)
+  "Bind BINDINGS (KEY DEF ...) in MODE-MAP's Evil normal state.
+With Evil loaded the bindings go into the state's auxiliary keymap; in every
+case they are recorded in `+tt--evil-normal-maps' so the batch test can
+assert there is no bare `g' in any normal-state map."
+  (when (fboundp 'evil-define-key*)
+    (apply #'evil-define-key* 'normal mode-map bindings))
+  (let* ((entry (or (assq mode-map +tt--evil-normal-maps)
+                    (car (push (cons mode-map (make-sparse-keymap)) +tt--evil-normal-maps))))
+         (map (cdr entry)))
+    (while bindings
+      (define-key map (kbd (pop bindings)) (pop bindings)))))
 
 (defun +tt--state (run-dir)
   "Return the parsed `tt state' of RUN-DIR as nested alists."
@@ -476,46 +622,48 @@ shown verbatim, since it already carries `file:line:' prefixes."
 
 ;;;; Runs
 
-(defun +tt--runs ()
-  "Return run directories under `+tt-root', most recently active first."
-  (let ((dirs (seq-filter
-               (lambda (d) (file-exists-p (expand-file-name "meta.json" d)))
-               (directory-files +tt-root t "\\`[^.]" t))))
-    (sort dirs (lambda (a b)
-                 (time-less-p (+tt--activity b) (+tt--activity a))))))
+(defun +tt--run-rows ()
+  "Every run of every root, newest activity first.
+One `tt list --json' call per root (never a per-run file read over TRAMP);
+each row gains `root', `host' and `dir' (the TRAMP-correct directory).  A
+root whose call fails is skipped with a message naming it."
+  (let (rows)
+    (dolist (root (+tt--roots))
+      (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "list" "--json")))))
+        (when json
+          (dolist (row (json-parse-string json :object-type 'alist :array-type 'list
+                                          :null-object nil :false-object :false))
+            (push (append row
+                          (list (cons 'root root)
+                                (cons 'host (+tt--host-of-root root))
+                                (cons 'dir (+tt--under-root root (alist-get 'id row)))))
+                  rows)))))
+    (sort rows (lambda (a b)
+                 (> (or (alist-get 'activity a) 0) (or (alist-get 'activity b) 0))))))
 
-(defun +tt--activity (run-dir)
-  "Return the last modification time of RUN-DIR's control log."
-  (let ((f (expand-file-name "events.jsonl" run-dir)))
-    (if (file-exists-p f) (file-attribute-modification-time (file-attributes f)) 0)))
-
-(defun +tt--run-plan-path (run-dir)
-  "Return the plan file recorded for RUN-DIR by Emacs, or nil."
-  (let ((f (expand-file-name "emacs.json" run-dir)))
-    (when (file-exists-p f)
-      (alist-get 'planPath (json-read-file f)))))
-
-(defun +tt--label (run-dir)
-  "Completion label for RUN-DIR."
-  (let* ((meta (ignore-errors (json-read-file (expand-file-name "meta.json" run-dir)))))
-    (format "%s  %s" (file-name-nondirectory (directory-file-name run-dir))
-            ;; Plan 01a: a title could quote a value; names are all that show.
-            (+tt--redact (or (alist-get 'title meta) "") (+tt--secret-values run-dir)))))
+(defun +tt--run-label (row)
+  "Picker label for a run ROW: title, state, readable id and host."
+  (string-join
+   (delq nil (list (alist-get 'title row)
+                   (alist-get 'phase row)
+                   (or (alist-get 'readableId row) (alist-get 'id row))
+                   (alist-get 'host row)))
+   "  ·  "))
 
 (defun +tt--resolve-run ()
-  "Resolve the run a `C-c m' command means (design §1.4)."
+  "Resolve the run a `C-c m' command means (design §1.4).
+Runs of the buffer's plan, from every root, come first; only then all runs."
   (or +tt--run-dir
       (let* ((plan buffer-file-name)
-             (mine (and plan (seq-filter (lambda (d) (equal (+tt--run-plan-path d) plan))
-                                         (+tt--runs)))))
+             (rows (+tt--run-rows))
+             (mine (and plan (seq-filter (lambda (r) (equal (alist-get 'planPath r) plan)) rows))))
         (cond
-         ((= (length mine) 1) (car mine))
+         ((= (length mine) 1) (alist-get 'dir (car mine)))
          ((> (length mine) 1)
-          (let ((alist (mapcar (lambda (d) (cons (+tt--label d) d)) mine)))
+          (let ((alist (mapcar (lambda (r) (cons (+tt--run-label r) (alist-get 'dir r))) mine)))
             (cdr (assoc (completing-read "Run of this plan: " alist nil t) alist))))
-         (t (let* ((runs (+tt--runs))
-                   (alist (mapcar (lambda (d) (cons (+tt--label d) d)) runs)))
-              (unless runs (user-error "No tradeoffs-trace runs under %s" +tt-root))
+         (t (let ((alist (mapcar (lambda (r) (cons (+tt--run-label r) (alist-get 'dir r))) rows)))
+              (unless rows (user-error "No tradeoffs-trace runs in any root"))
               (cdr (assoc (completing-read "tradeoffs-trace run: " alist nil t) alist))))))))
 
 ;;;###autoload
@@ -553,8 +701,8 @@ continues.  FILE names the Org file for the errors buffer."
          (file buffer-file-name))
     (if errors
         (+tt--show-plan-errors (or file (buffer-name)) errors)
-      (let ((existing (and file (seq-find (lambda (d) (equal (+tt--run-plan-path d) file))
-                                          (+tt--runs)))))
+      (let ((existing (and file (seq-find (lambda (r) (equal (alist-get 'planPath r) file))
+                                          (+tt--run-rows)))))
         (if (and existing
                  (not (member (+tt--phase-name (ignore-errors (+tt--state existing)))
                               +tt--terminal-phases))
@@ -565,7 +713,7 @@ continues.  FILE names the Org file for the errors buffer."
             (unwind-protect
                 (when (+tt--lint-plan-json json-file file)
                   (let* ((run-id (car (last (split-string (+tt--cli "start" json-file) "\n" t))))
-                         (run-dir (expand-file-name run-id +tt-root)))
+                         (run-dir (+tt--under-root +tt-root run-id)))
                     (with-temp-file (expand-file-name "emacs.json" run-dir)
                       (insert (json-encode `((planPath . ,file)))))
                     (write-region nil nil (expand-file-name "plan/v1.org" run-dir) nil 'silent)
@@ -801,7 +949,10 @@ run and does nothing on the chart."
          (inhibit-read-only t)
          (pt (point)))
     (setq header-line-format
-          (format "program %s%s" (alist-get 'id s) (if source (format "   %s" source) "")))
+          (format "program %s · %s%s"
+                  (alist-get 'id s)
+                  (or (alist-get 'title s) "")
+                  (if source (format " · %s" (file-name-nondirectory source)) "")))
     (erase-buffer)
     ;; Plan 03c: `views/program.txt' (the program dependency graph) first, then
     ;; the node list.  A program that has not written it yet says so in one
@@ -835,9 +986,12 @@ run and does nothing on the chart."
 (defun +tt-program-open-node ()
   "Open the workspace of the node's run at point."
   (interactive)
-  (let ((run (get-text-property (point) '+tt-run-id)))
+  (let ((run (get-text-property (point) '+tt-run-id))
+        (root (or +tt--program-root
+                  (and +tt--program-dir (+tt--root-of +tt--program-dir))
+                  +tt-root)))
     (unless run (user-error "No run on this line"))
-    (+tt--workspace (expand-file-name run +tt-root))))
+    (+tt--workspace (+tt--under-root root run))))
 
 ;;; The global stop/continue keys (plan 03c)
 
@@ -912,37 +1066,95 @@ cancels."
 
 (define-derived-mode +tt-program-mode special-mode "tt-program"
   "A tradeoffs-trace program.  \\<+tt-program-mode-map>\\[+tt-program-open-node] opens a phase's run, \\[+tt-program-input] sends a program-wide directive.  Stop and continue with `C-c m k' / `C-c m c'."
-  (visual-line-mode 1)
-  (when (fboundp 'evil-define-key)
-    (evil-define-key 'normal +tt-program-mode-map
-      (kbd "RET") #'+tt-program-open-node
-      "i" #'+tt-program-input "g" #'+tt--refresh-all)))
+  (visual-line-mode 1))
 
-;;;###autoload
-(defun +tt-program (&optional dir)
-  "Show the program in DIR, or choose one."
-  (interactive)
-  (let* ((dir (or dir
-                  (let ((ids (directory-files (expand-file-name "programs" +tt-root) nil "\\`[^.]")))
-                    (unless ids (user-error "No programs under %s" +tt-root))
-                    (expand-file-name (concat "programs/" (completing-read "Program: " (reverse ids) nil t)) +tt-root))))
-         (buf (get-buffer-create (format "*tt-program: %s*" (file-name-nondirectory (directory-file-name dir))))))
+(+tt--evil-normal-key +tt-program-mode-map
+  (kbd "RET") #'+tt-program-open-node
+  "i" #'+tt-program-input "gr" #'+tt--refresh-all)
+
+(defun +tt--program-rows ()
+  "Every program of every root, newest activity first.
+One `tt program list --json' call per root (never a per-program file read
+over TRAMP); each row gains `root', `host' and `dir'.  A root whose call
+fails is skipped with a message naming it."
+  (let (rows)
+    (dolist (root (+tt--roots))
+      (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "program" "list" "--json")))))
+        (when json
+          (dolist (row (json-parse-string json :object-type 'alist :array-type 'list
+                                          :null-object nil :false-object :false))
+            (push (append row
+                          (list (cons 'root root)
+                                (cons 'host (+tt--host-of-root root))
+                                (cons 'dir (+tt--under-root root (concat "programs/" (alist-get 'id row))))))
+                  rows)))))
+    (sort rows (lambda (a b)
+                 (> (or (alist-get 'activity a) 0) (or (alist-get 'activity b) 0))))))
+
+(defun +tt--program-label (row &optional with-start)
+  "Picker label for a program ROW: title, its Org file, state, id and host.
+WITH-START also names the program's start time (the source-file picker)."
+  (let* ((source (alist-get 'source row))
+         (parts (list (alist-get 'title row)
+                      (and source (file-name-nondirectory source))
+                      (alist-get 'state row)
+                      (alist-get 'id row)
+                      (alist-get 'host row)
+                      (and with-start (alist-get 'started row)
+                           (format-time-string "%Y-%m-%d %H:%M"
+                                               (seconds-to-time (/ (float (alist-get 'started row)) 1000)))))))
+    (string-join (delq nil parts) "  ·  ")))
+
+(defun +tt--program-open (dir)
+  "Show the program in DIR on its own root."
+  (let ((buf (get-buffer-create (format "*tt-program: %s*" (file-name-nondirectory (directory-file-name dir))))))
     (with-current-buffer buf
       (+tt-program-mode)
-      (setq +tt--program-dir dir +tt--run-dir dir)
+      (setq +tt--program-dir dir
+            +tt--program-root (+tt--root-of dir)
+            +tt--run-dir dir
+            +tt--run-root (+tt--root-of dir))
       (+tt--render-program))
     (pop-to-buffer buf)
     (+tt--ensure-timer)))
 
+;;;###autoload
+(defun +tt-program (&optional dir)
+  "Show the program in DIR, or choose one.
+In a buffer visiting a program's Org source file, choose only that file's
+programs: the running one when exactly one is running, else a picker limited
+to them, newest first.  Anywhere else, every program of every root."
+  (interactive)
+  (if dir
+      (+tt--program-open dir)
+    (let* ((rows (+tt--program-rows))
+           (source (and buffer-file-name (expand-file-name buffer-file-name)))
+           (mine (and source
+                      (seq-filter (lambda (r)
+                                    (let ((s (alist-get 'source r)))
+                                      (and s (equal (expand-file-name s) source))))
+                                  rows))))
+      (cond
+       ((and mine (= (length (seq-filter (lambda (r) (eq (alist-get 'alive r) t)) mine)) 1))
+        (+tt--program-open (alist-get 'dir (seq-find (lambda (r) (eq (alist-get 'alive r) t)) mine))))
+       (mine
+        (let ((alist (mapcar (lambda (r) (cons (+tt--program-label r t) (alist-get 'dir r))) mine)))
+          (+tt--program-open (cdr (assoc (completing-read "Program of this file: " alist nil t) alist)))))
+       (t
+        (unless rows (user-error "No programs in any root"))
+        (let ((alist (mapcar (lambda (r) (cons (+tt--program-label r) (alist-get 'dir r))) rows)))
+          (+tt--program-open (cdr (assoc (completing-read "Program: " alist nil t) alist)))))))))
+
 (defun +tt--program-dir-for (dir)
-  "The program directory DIR names, or one chosen from `+tt-root'/programs.
+  "The program directory DIR names, or one chosen from every root.
 Point's program buffer, or a program input box, wins over the prompt."
   (or dir
       (and (boundp '+tt--program-dir) +tt--program-dir)
       (and (boundp '+tt--input-program-dir) +tt--input-program-dir)
-      (let ((ids (directory-files (expand-file-name "programs" +tt-root) nil "\\`[^.]")))
-        (unless ids (user-error "No programs under %s" +tt-root))
-        (expand-file-name (concat "programs/" (completing-read "Program: " (reverse ids) nil t)) +tt-root))))
+      (let ((rows (+tt--program-rows)))
+        (unless rows (user-error "No programs in any root"))
+        (let ((alist (mapcar (lambda (r) (cons (+tt--program-label r) (alist-get 'dir r))) rows)))
+          (cdr (assoc (completing-read "Program: " alist nil t) alist))))))
 
 ;;;###autoload
 (defun +tt-program-review ()
@@ -987,7 +1199,8 @@ id everywhere."
         ("trace" (unless (derived-mode-p '+tt-trace-mode) (+tt-trace-mode)))
         ("status" (unless (derived-mode-p '+tt-status-mode) (+tt-status-mode)))
         ("input" (unless (derived-mode-p '+tt-input-mode) (+tt-input-mode))))
-      (setq +tt--run-dir run-dir))
+      (setq +tt--run-dir run-dir
+            +tt--run-root (or (+tt--root-of run-dir) +tt-root)))
     buf))
 
 (defun +tt--workspace (run-dir)
@@ -1027,7 +1240,10 @@ own tab and takes the whole frame."
     (setq +tt--timer (run-with-timer +tt-refresh-interval +tt-refresh-interval #'+tt--refresh-all))))
 
 (defun +tt--refresh-all ()
-  "Refresh every visible tradeoffs-trace buffer; stop the timer if none."
+  "Refresh every visible tradeoffs-trace buffer; stop the timer if none.
+Interactive, and bound to `gr' in Evil normal state (never a bare `g', which
+would swallow Evil's `g' prefix) and to `g' elsewhere."
+  (interactive)
   (let ((any nil))
     (dolist (win (window-list-1 nil 'nomini t))
       (with-current-buffer (window-buffer win)
@@ -1266,6 +1482,8 @@ the longer one behind — the same order secrets.ts's byLengthDesc uses."
 (define-derived-mode +tt-trace-mode special-mode "tt-trace"
   "Live trace of a tradeoffs-trace agent (read-only)."
   (visual-line-mode 1))
+
+(+tt--evil-normal-key +tt-trace-mode-map "gr" #'+tt--refresh-all "a" #'+tt-trace-pick-agent)
 
 ;;;;; Status
 
@@ -1574,6 +1792,9 @@ existed (finding B-5: a row with no record must not raise)."
   "Status of a tradeoffs-trace run."
   (visual-line-mode 1))
 
+(+tt--evil-normal-key +tt-status-mode-map "gr" #'+tt--refresh-all
+                      (kbd "RET") #'+tt-open-tradeoff "d" #'+tt-decisions)
+
 ;;;;; Chart view (plan 03c)
 
 ;; Plan 05h: the runtime draws a run's live loop as a vertical tape at
@@ -1818,6 +2039,8 @@ the program buffer.  `f' toggles to the full phase chart and back."
   (visual-line-mode 1)
   (setq buffer-read-only t))
 
+(+tt--evil-normal-key +tt-tape-mode-map "gr" #'+tt-tape-refresh "f" #'+tt-tape-toggle-view)
+
 ;;;;; Input
 
 (defun +tt--write-command (run-dir command)
@@ -2009,12 +2232,11 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
   "Owner input for a tradeoffs-trace run, or for a program (whole program).
 \\<+tt-input-mode-map>\\[+tt-input-send] sends; a prefix argument sends as a
 program-wide owner directive."
-  (visual-line-mode 1)
-  ;; In Evil normal state RET must send; in insert state it must insert a
-  ;; newline (the mode-map RET binding covers emacs/insert, this covers
-  ;; normal). Guarded so loading this file never requires Evil.
-  (when (fboundp 'evil-define-key)
-    (evil-define-key 'normal +tt-input-mode-map (kbd "RET") #'+tt-input-send)))
+  (visual-line-mode 1))
+
+;; In Evil normal state RET must send; in insert state it inserts a newline
+;; (the mode-map RET binding covers emacs/insert, this covers normal).
+(+tt--evil-normal-key +tt-input-mode-map (kbd "RET") #'+tt-input-send)
 
 ;;;; Show, resume
 
@@ -2506,13 +2728,13 @@ and never a CLI call.  FORCE re-reads anyway (after a verdict)."
 \[+tt-review-accept] accepts and \[+tt-review-refuse] refuses the message at
 point, \[+tt-review-toggle] shows its body (never its drawer) and
 \[+tt-review-refresh] refreshes."
-  (+tt-review--setup)
-  (when (fboundp 'evil-define-key)
-    (evil-define-key 'normal +tt-review-mode-map
-      (kbd "TAB") #'+tt-review-toggle (kbd "RET") #'+tt-review-open-message
-      "A" #'+tt-review-accept "D" #'+tt-review-refuse
-      "s" #'+tt-review-split "m" #'+tt-review-merge
-      "g" #'+tt-review-refresh)))
+  (+tt-review--setup))
+
+(+tt--evil-normal-key +tt-review-mode-map
+  (kbd "TAB") #'+tt-review-toggle (kbd "RET") #'+tt-review-open-message
+  "A" #'+tt-review-accept "D" #'+tt-review-refuse
+  "s" #'+tt-review-split "m" #'+tt-review-merge
+  "gr" #'+tt-review-refresh)
 
 (defun +tt-review ()
   "Open the runtime-rendered review of the run this buffer means (C-c m d)."
@@ -2814,10 +3036,10 @@ the target of RET on a Trade-offs line."
 \\<+tt-decisions-mode-map>\\[+tt-decisions-refresh] refreshes, \\[org-cycle] folds, \\[quit-window] quits.
 To intervene, type into the run's input box."
   (setq buffer-read-only t)
-  (visual-line-mode 1)
-  (when (fboundp 'evil-define-key)
-    (evil-define-key 'normal +tt-decisions-mode-map
-      "g" #'+tt-decisions-refresh (kbd "TAB") #'org-cycle "q" #'quit-window)))
+  (visual-line-mode 1))
+
+(+tt--evil-normal-key +tt-decisions-mode-map
+  "gr" #'+tt-decisions-refresh (kbd "TAB") #'org-cycle "q" #'quit-window)
 
 ;;;; Runs list and mode line
 
@@ -2826,20 +3048,21 @@ To intervene, type into the run's input box."
 ;; `tt list --json' call, never one `tt state' per run.
 
 (defun +tt--list ()
-  "Parsed `tt list --json'."
-  (json-parse-string (+tt--cli "list" "--json") :object-type 'alist :array-type 'list
-                     :null-object nil :false-object :false))
+  "Every run row from every root, newest activity first.
+One `tt list --json' call per root; each row carries `root', `host' and the
+TRAMP-correct `dir'."
+  (+tt--run-rows))
 
 (defun +tt--attention-face (row)
   "Face for ROW's attention, or nil."
   (when (alist-get 'attention row) 'error))
 
 (defun +tt--runs-entries ()
-  "Tabulated-list entries for every run."
+  "Tabulated-list entries for every run, every root."
   (mapcar (lambda (r)
             (let ((face (+tt--attention-face r)))
-              (list (alist-get 'runDir r)
-                    (vector (alist-get 'id r)
+              (list (alist-get 'dir r)
+                    (vector (or (alist-get 'readableId r) (alist-get 'id r))
                             (if (eq (alist-get 'alive r) t) "●" "○")
                             (alist-get 'stage r)
                             (alist-get 'stageElapsed r)
@@ -2847,6 +3070,7 @@ To intervene, type into the run's input box."
                             (if (alist-get 'attention r)
                                 (propertize (concat "⚑ " (alist-get 'attention r)) 'face face)
                               "")
+                            (or (alist-get 'host r) "")
                             (alist-get 'title r)))))
           (+tt--list)))
 
@@ -2861,13 +3085,13 @@ To intervene, type into the run's input box."
 
 (define-derived-mode +tt-runs-mode tabulated-list-mode "tt-runs"
   "Every tradeoffs-trace run.  \\<+tt-runs-mode-map>\\[+tt-runs-open] opens, g refreshes.  Stop and continue a run with `C-c m k' / `C-c m c' in its own buffer."
-  (setq tabulated-list-format [("run" 9 t) ("" 1 nil) ("stage" 10 t) ("for" 7 nil)
-                               ("reviews" 26 nil) ("attention" 20 t) ("title" 0 t)]
+  (setq tabulated-list-format [("run" 11 t) ("" 1 nil) ("stage" 10 t) ("for" 7 nil)
+                               ("reviews" 26 nil) ("attention" 20 t) ("host" 8 nil) ("title" 0 t)]
         tabulated-list-entries #'+tt--runs-entries)
-  (tabulated-list-init-header)
-  (when (fboundp 'evil-define-key)
-    (evil-define-key 'normal +tt-runs-mode-map
-      (kbd "RET") #'+tt-runs-open "g" #'tabulated-list-revert)))
+  (tabulated-list-init-header))
+
+(+tt--evil-normal-key +tt-runs-mode-map
+  (kbd "RET") #'+tt-runs-open "gr" #'tabulated-list-revert)
 
 ;;;###autoload
 (defun +tt-runs ()
@@ -2952,14 +3176,17 @@ Emacs started are not replayed."
           (setq +tt--notifications-offset size)))))))
 
 (defun +tt--waiting-nodes ()
-  "Waiting nodes across every program, oldest wait first.
-Reads `tt program list --json'; nil when there is no program or no wait."
+  "Waiting nodes across every program of every root, oldest wait first.
+One `tt program list --json' call per root; nil when there is no program or
+no wait.  A root whose call fails is skipped with a message."
   (let (rows)
-    (dolist (p (ignore-errors (json-parse-string (+tt--cli "program" "list" "--json")
-                                                :object-type 'alist :array-type 'list
-                                                :null-object nil :false-object :false)))
-      (dolist (w (alist-get 'waiting p))
-        (push (cons (or (alist-get 'since w) "") w) rows)))
+    (dolist (root (+tt--roots))
+      (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "program" "list" "--json")))))
+        (when json
+          (dolist (p (json-parse-string json :object-type 'alist :array-type 'list
+                                        :null-object nil :false-object :false))
+            (dolist (w (alist-get 'waiting p))
+              (push (cons (or (alist-get 'since w) "") w) rows))))))
     (mapcar #'cdr (sort rows (lambda (a b) (string< (car a) (car b)))))))
 
 (defun +tt--mode-line-wait ()
@@ -2970,19 +3197,13 @@ Reads `tt program list --json'; nil when there is no program or no wait."
                                (< (float-time (time-since +tt--notify-flash)) 10))
                           'warning 'error))))
 
-(defun +tt--live-run-p (run-dir)
-  "Non-nil when RUN-DIR's conductor process is alive (no Node call)."
-  (let* ((f (expand-file-name "conductor.pid" run-dir))
-         (pid (and (file-exists-p f)
-                   (string-to-number (with-temp-buffer (insert-file-contents f) (buffer-string))))))
-    (and pid (> pid 0) (process-attributes pid) t)))
-
 (defun +tt--mode-line-update ()
   "Refresh the mode-line indicator from `tt list' when any run is live."
   (let* ((wait (+tt--mode-line-wait))
          (flash (and +tt--notify-flash
                      (< (float-time (time-since +tt--notify-flash)) 10)))
-         (live (seq-some #'+tt--live-run-p (ignore-errors (+tt--runs)))))
+         (rows (ignore-errors (+tt--list)))
+         (live (seq-some (lambda (r) (eq (alist-get 'alive r) t)) rows)))
     (setq +tt--mode-line-string
           (if (not live)
               ;; A waiting program whose run conductor is stopped or dead
@@ -3000,7 +3221,7 @@ Reads `tt program list --json'; nil when there is no program or no wait."
                  (concat " ["
                          (mapconcat
                           (lambda (r)
-                            (propertize (format "tt:%s %s %s %s" (substring (alist-get 'id r) 0 4)
+                            (propertize (format "tt:%s %s %s %s" (substring (or (alist-get 'readableId r) (alist-get 'id r)) 0 4)
                                                 (alist-get 'stage r) (alist-get 'stageElapsed r)
                                                 (replace-regexp-in-string " +" "" (alist-get 'reviews r)))
                                         'face (+tt--attention-face r)))

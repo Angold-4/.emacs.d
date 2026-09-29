@@ -52,7 +52,7 @@ import {
   secretNames,
   type Secret,
 } from "./effects/secrets.ts";
-import type { ProgramFile } from "./core/program.ts";
+import { programOutcome, type ProgramFile } from "./core/program.ts";
 import {
   addProgramDirective,
   appendProgramEvent,
@@ -511,15 +511,34 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     if (json) {
       // Plan 01b: Emacs's mode-line reads the oldest wait from here, so a
       // node that needs the owner shows as `⚑ <node> waiting <duration>`.
-      const rows = dirs.map((dir) => {
-        const { program } = foldProgram(dir);
-        return {
-          id: path.basename(dir),
-          title: program.title,
-          alive: programPidAlive(dir),
-          waiting: programWaitingNodes(dir),
-        };
-      });
+      // The multi-root picker (this packet) also reads one JSON object per
+      // program: its title, aggregate state, node count, the Org file it was
+      // started from and its last activity, so choosing a program across
+      // roots costs one call per root and never a per-program file read.
+      const rows = dirs
+        .map((dir) => {
+          try {
+            const { program, nodes, state } = foldProgram(dir);
+            const started = statMtime(programPaths(dir).program);
+            return {
+              id: path.basename(dir),
+              title: program.title,
+              state: programOutcome(nodes, state),
+              nodeCount: nodes.length,
+              source: readProgramSource(dir) ?? null,
+              started,
+              activity: statMtime(programPaths(dir).events) ?? started ?? 0,
+              alive: programPidAlive(dir),
+              waiting: programWaitingNodes(dir),
+            };
+          } catch {
+            // A program directory without a readable program.json: skipped,
+            // exactly as a run with no meta.json is skipped by `tt list`.
+            return undefined;
+          }
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== undefined)
+        .sort((a, b) => b.activity - a.activity);
       process.stdout.write(`${JSON.stringify(rows)}\n`);
     } else {
       // Plan 01h: `tt program list` only shows the first two lines, so it
@@ -695,6 +714,39 @@ function readPlan(runDir: string): RunPlanFile {
   return JSON.parse(readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
 }
 
+/** The mtime of FILE in milliseconds, or undefined when it is missing. */
+function statMtime(file: string): number | undefined {
+  try {
+    return statSync(file).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The readable id (`<program>-NN`) recorded in a program node's run, or
+ * undefined for a hand-started run. Read here, on the host that owns the run,
+ * so the Emacs picker never has to read the run's files over TRAMP. */
+function runReadableId(runDir: string): string | undefined {
+  try {
+    const info = JSON.parse(readFileSync(path.join(runDir, "program.json"), "utf8")) as { readableId?: unknown };
+    return typeof info.readableId === "string" ? info.readableId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The Org file a run was started from, recorded by Emacs in `emacs.json'.
+ * Present in `tt list --json` so resolving a plan's run is a filter over the
+ * listing, never one file read per run over TRAMP. */
+function runPlanPath(runDir: string): string | undefined {
+  try {
+    const info = JSON.parse(readFileSync(path.join(runDir, "emacs.json"), "utf8")) as { planPath?: unknown };
+    return typeof info.planPath === "string" ? info.planPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Plan 3b: `tt list` — one line per run (newest activity first), the
  * summary the Emacs runs list and mode-line indicator render. */
 function cmdList(root: string, json: boolean): void {
@@ -716,6 +768,8 @@ function cmdList(root: string, json: boolean): void {
         return {
           id: n,
           runDir,
+          readableId: runReadableId(runDir) ?? null,
+          planPath: runPlanPath(runDir) ?? null,
           title: redactText(meta.title ?? "", secrets),
           phase: v.timeline.state.phase.phase,
           stage: v.stage,
