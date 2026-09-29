@@ -15,15 +15,18 @@ import {
   briefIssue,
   checkTodayExample,
   fallbackBrief,
+  fallbackDecisionBrief,
   hasCodeIdentifier,
   impactAnswersPublishing,
   parseCatalogs,
   relatedOpenItems,
   renderBriefsSection,
+  briefCommandFor,
   briefResolveCommand,
   resolveCommandFor,
   type Catalogs,
 } from "../../src/core/briefs.ts";
+import { normalizeDecisionViewCommand } from "../../src/core/owner-inbox.ts";
 import type { DecisionBrief, OwnerRequest } from "../../src/core/types.ts";
 
 const FIXTURE = fileURLToPath(new URL("../fixtures/briefs/atlas-15d", import.meta.url));
@@ -124,11 +127,64 @@ test("resolving from a brief writes the identical resolve command as resolving t
     recordVersion: 1,
     contractVersion: f.contractVersion,
   };
-  const fromRequest = resolveCommandFor(request, "repair", binding);
-  const fromBrief = briefResolveCommand(brief, "repair", binding);
-  assert.deepEqual(fromBrief, fromRequest);
-  assert.equal((fromBrief.binding as { recordId: string }).recordId, "F-M-9");
-  assert.equal(fromBrief.option, "repair");
+  // The literal decision-view encoding the existing request resolve writes.
+  const expected = {
+    type: "resolve",
+    option: "repair",
+    binding: {
+      runId: f.run,
+      phaseId: f.phase,
+      recordId: "F-M-9",
+      candidateSha: f.candidateSha,
+      recordVersion: 1,
+      contractVersion: { snapshot: 4, sectionSha256: "a1b2c3d4" },
+    },
+  };
+  assert.deepEqual(briefCommandFor(brief, "repair", binding), expected);
+  assert.deepEqual(briefResolveCommand(brief, "repair", binding), expected);
+  assert.deepEqual(resolveCommandFor(request, "repair", binding), expected);
+  // Both paths normalize to the same core event.
+  const fromBrief = normalizeDecisionViewCommand(briefCommandFor(brief, "repair", binding), "cmd-brief");
+  const fromRequest = normalizeDecisionViewCommand(resolveCommandFor(request, "repair", binding), "cmd-brief");
+  assert.equal(fromBrief.ok, true);
+  assert.equal(fromRequest.ok, true);
+  if (fromBrief.ok && fromRequest.ok) assert.deepEqual(fromBrief.event, fromRequest.event);
+});
+
+test("a reserved decision's override brief sends an override, not a resolve", () => {
+  const f = fixture();
+  const brief = fallbackDecisionBrief({ id: "D-A-80", choice: "widen the re-entry band to ten seconds", whyItMatters: "fewer stale rejoins" });
+  const binding = { runId: f.run, phaseId: f.phase, candidateSha: f.candidateSha, recordVersion: 2, contractVersion: f.contractVersion };
+  const command = briefCommandFor(brief, "reject_and_repair", binding);
+  assert.equal(command.type, "override");
+  assert.equal(command.vote, "reject");
+  assert.equal((command.binding as { recordId: string }).recordId, "D-A-80");
+  assert.equal((command.binding as { recordVersion: number }).recordVersion, 2);
+  // `approve` maps to an approve override.
+  assert.equal((briefCommandFor(brief, "approve", binding) as { vote: string }).vote, "approve");
+  // The override brief passes the same gate with its own option ids.
+  assert.equal(briefIssue(brief, { requestOptions: ["approve", "reject_and_repair"] }), undefined);
+});
+
+test("a today that names a market and time cannot excuse itself with the unverified marker", () => {
+  const good = fixture().briefs[0];
+  const wrong = { ...good, today: "Pyth's NVDA product reopens Monday 09:31 ET. (example unverified)" };
+  const issue = briefIssue(wrong, { catalogs: catalogs() });
+  assert.ok(issue, "a wrong time must be refused even with the marker");
+  assert.match(issue!, /cannot be checked|not a .* session boundary/);
+  const noExample = { ...good, today: "No concrete example was recorded. (example unverified)" };
+  assert.equal(briefIssue(noExample, { catalogs: catalogs() }), undefined);
+});
+
+test("the deterministic backstop lists related items on the same concern and never asserts an unchecked impact", () => {
+  const f = fixture();
+  const concerns = f.openItems;
+  const request = f.requests.find((r) => r.id === "F-M-9")!;
+  const brief = fallbackBrief(request, { catalogs: null, allItems: concerns, files: ["src/core/blend.rs"], planRefs: ["IC §5"] });
+  assert.equal(impactAnswersPublishing(brief.impact), true);
+  assert.match(brief.impact, /not established/i);
+  assert.deepEqual(brief.related.map((r) => r.id).sort(), ["D-A-80", "T-54"]);
+  assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id) }), undefined);
 });
 
 test("briefIssue rejects a code identifier in the question", () => {

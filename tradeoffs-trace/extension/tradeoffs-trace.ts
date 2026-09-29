@@ -368,6 +368,11 @@ const BriefRelatedParam = Type.Object({
 });
 const submitBriefFields: Record<string, TSchema> = {
   requestId: Type.String({ description: "The open owner item this brief is for" }),
+  command: Type.Optional(
+    StringEnum(["resolve", "override"] as const, {
+      description: "resolve (default) for an owner request, override for a flagged reserved decision",
+    }),
+  ),
   question: Type.String({ description: "One plain line, no code identifiers" }),
   today: Type.String({ description: "What the system does now, with one concrete example naming a real market and time from the plan's calendars" }),
   impact: Type.String({ description: "What the owner would notice; always say whether any market stops publishing" }),
@@ -531,7 +536,13 @@ export default function (pi: ExtensionAPI) {
     // Plan 05j: the curator owes no submission; an empty proposals list is a
     // valid pass and settling without one is allowed.
     if (role === "curator") return undefined;
-    if (role === "evaluator") return accepted.has("submit_evaluation") ? undefined : "submit_evaluation";
+    if (role === "evaluator") {
+      // Decision briefs: the brief-writing pass ends when the conductor has a
+      // brief for every item it listed, so the agent owes no single submission
+      // and settles naturally after its last submit_brief.
+      if (readEnv("TT_BRIEF") === "1") return undefined;
+      return accepted.has("submit_evaluation") ? undefined : "submit_evaluation";
+    }
     if (role === "panel") {
       // Plan 05e: a round-panel seat owes `submit_round_panel_votes`; a
       // blocker seat owes `submit_panel_vote`.

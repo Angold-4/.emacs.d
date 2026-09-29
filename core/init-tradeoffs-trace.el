@@ -2254,19 +2254,42 @@ sends the identical resolve command choosing it on the request sends."
             (cons 'contractVersion (list (cons 'snapshot (string-to-number (nth 4 vals)))
                                          (cons 'sectionSha256 (nth 5 vals))))))))
 
+(defun +tt-review--brief-option (key fallback)
+  "The brief's option id under property KEY, or FALLBACK."
+  (let ((v (org-entry-get nil key)))
+    (if (and v (not (string-empty-p v))) v fallback)))
+
 (defun +tt-review--brief-resolve (option)
-  "Write the resolve command for the brief at point with OPTION.
-This is the same decision-view encoding (`type: resolve', option id, full
-binding) the request itself uses, so the conductor applies it unchanged."
-  (let ((binding (+tt-review--brief-binding)))
+  "Write the command for the brief at point with OPTION.
+The brief's `:COMMAND:' says whether OPTION is a `resolve' (an owner request)
+or an `override' (a flagged reserved decision); either way the same encoding
+the request/decision itself uses is written. An `accept_risk' option also
+prompts for the non-empty scope note the request requires."
+  (let ((binding (+tt-review--brief-binding))
+        (command (or (org-entry-get nil "COMMAND") "resolve")))
     (unless binding
       (user-error "This brief has no full binding; refresh the review (g) and try again"))
-    (+tt--write-command
-     +tt--run-dir
-     (list (cons 'type "resolve") (cons 'option option) (cons 'binding binding)))))
+    (cond
+     ((equal command "override")
+      (+tt--write-command
+       +tt--run-dir
+       (list (cons 'type "override")
+             (cons 'vote (if (equal option "approve") "approve" "reject"))
+             (cons 'binding binding))))
+     (t
+      (let ((note (when (equal option "accept_risk")
+                    (let ((n (read-string "Scope note for accepting the risk: ")))
+                      (when (string-empty-p n)
+                        (user-error "accepting the risk needs a non-empty scope note"))
+                      n))))
+        (+tt--write-command
+         +tt--run-dir
+         (append (list (cons 'type "resolve") (cons 'option option))
+                 (when note (list (cons 'note note)))
+                 (list (cons 'binding binding)))))))))
 
 (defun +tt-review--brief-choose ()
-  "Prompt for one of the brief's options and resolve it (RET on a brief)."
+  "Prompt for one of the brief's options and send it (RET on a brief)."
   (let ((opts (+tt-review--brief-options)))
     (unless opts (user-error "This brief carries no options"))
     (let ((choice (completing-read "Resolve with: " opts nil t)))
@@ -2332,26 +2355,27 @@ is shown in the echo area and the buffer refreshes."
       (+tt-review-refresh t))))
 
 (defun +tt-review-accept ()
-  "Resolve the brief at point with its first option (A), or accept the entry
-or message at point."
+  "Resolve the brief at point with its accept option (A), or accept the entry
+or message at point. The brief's `:ACCEPT_OPTION:' names the option by its own
+meaning, never by its position."
   (interactive)
   (if (+tt-review--brief-kind)
       (let ((opts (+tt-review--brief-options)))
         (unless opts (user-error "This brief carries no options"))
-        (message "%s" (+tt-review--brief-resolve (car opts))))
+        (message "%s" (+tt-review--brief-resolve (+tt-review--brief-option "ACCEPT_OPTION" (car opts)))))
     (+tt-review--verdict "accept" nil)))
 
 (defun +tt-review-refuse ()
-  "Resolve the brief at point with its last option (D), or refuse the message
-at point, asking for an optional one-line reason. A message that cannot be
-settled is reported before the reason is asked for (A-18), so D on a raw
-message just says it is not yet frozen."
+  "Resolve the brief at point with its refuse option (D), or refuse the message
+at point, asking for an optional one-line reason. The brief's `:REFUSE_OPTION:'
+names the option by its own meaning, never by its position. A message that
+cannot be settled is reported before the reason is asked for (A-18)."
   (interactive)
   (cond
    ((+tt-review--brief-kind)
     (let ((opts (+tt-review--brief-options)))
       (unless opts (user-error "This brief carries no options"))
-      (message "%s" (+tt-review--brief-resolve (car (last opts))))))
+      (message "%s" (+tt-review--brief-resolve (+tt-review--brief-option "REFUSE_OPTION" (car (last opts)))))))
    ((+tt-review--entry-id)
     (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))
    (t

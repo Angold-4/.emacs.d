@@ -667,7 +667,18 @@ export function writeProgramChart(dir: string): void {
 export function programReviewText(dir: string): string {
   const { nodes, state, readableIds } = foldProgram(dir);
   const root = path.dirname(path.dirname(dir));
-  const phases: Array<{ phaseId: string; readableId?: string; candidate?: { sha: string }; messages?: unknown[]; entries?: unknown[] }> = [];
+  const phases: Array<{
+    phaseId: string;
+    readableId?: string;
+    candidate?: { sha: string };
+    runId?: string;
+    contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
+    messages?: unknown[];
+    entries?: unknown[];
+    decisions?: unknown[];
+    briefs?: unknown[];
+    ownerRequests?: unknown[];
+  }> = [];
   // The lint runs per phase, on each phase's OWN entries and message ids
   // (every phase numbers E-1/T-1 from scratch, so a single combined
   // projection would collide ids and fire one-anchor on a topic that recurs
@@ -695,6 +706,9 @@ export function programReviewText(dir: string): string {
         candidate: sha ? { sha } : undefined,
         messages: phase.messages ?? [],
         entries: phase.entries ?? [],
+        decisions: phase.decisions ?? [],
+        runId: phase.runId,
+        contract: phase.contract ? { contractVersion: phase.contract.contractVersion } : undefined,
         // Decision briefs: the program review shows each node's open owner
         // items as briefs too (renderProgramEntryReview).
         briefs: phase.briefs ?? [],

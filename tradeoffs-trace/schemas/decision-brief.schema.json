@@ -11,6 +11,10 @@
       "type": "string",
       "minLength": 1
     },
+    "command": {
+      "description": "The owner command choosing an option sends: `resolve` (default) for an owner request, `override` for a flagged reserved decision.",
+      "enum": ["resolve", "override"]
+    },
     "question": {
       "type": "string",
       "minLength": 1

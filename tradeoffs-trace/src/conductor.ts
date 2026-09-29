@@ -77,6 +77,7 @@ import type {
   ContractVersion,
   CriterionDispute,
   Decision,
+  DecisionBrief,
   DecisionDisclosure,
   EvFlakeObserved,
   DirectiveScope,
@@ -125,7 +126,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
-import { briefIssue, fallbackBrief, parseCatalogs, type Catalogs } from "./core/briefs.ts";
+import { briefIssue, evidenceFile, fallbackBrief, fallbackDecisionBrief, parseCatalogs, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -1021,6 +1022,9 @@ export class Conductor {
   #lastLintSignature = "";
   /** Plan 05j: re-entrancy guard while #syncEntries appends entry events. */
   #syncingEntries = false;
+  /** Decision briefs: the item ids the current brief-writing agent was asked
+   * for, so #refreshBriefs does not dispatch a second agent for them. */
+  #briefInFlight = new Set<string>();
   /** Plan 05j: candidates whose curator agent is in flight. */
   #curatorInFlight = new Set<string>();
   #plan: RunPlanFile;
@@ -3450,14 +3454,19 @@ export class Conductor {
       const brief = (msg.args ?? {}) as { requestId?: unknown };
       const requestId = typeof brief.requestId === "string" ? brief.requestId : "";
       const request = this.#state.phase.ownerRequests.find((r) => r.id === requestId && r.status === "open");
-      if (!request) return { ok: false, reason: `brief ${requestId || "(no requestId)"} does not name an open owner request` };
-      const issue = briefIssue(brief as never, {
-        requestOptions: (request.options ?? []).map((o) => o.id),
-        catalogs: this.#briefCatalogs(),
-      });
+      // A flagged reserved decision never becomes an owner request, so a brief
+      // for it is accepted here too (its options are its own owner commands).
+      const decision = !request ? this.#liveReservedDecisions().find((d) => d.id === requestId) : undefined;
+      if (!request && !decision) return { ok: false, reason: `brief ${requestId || "(no requestId)"} does not name an open owner item` };
+      const requestOptions = request ? (request.options ?? []).map((o) => o.id) : ["approve", "reject_and_repair"];
+      const issue = briefIssue(brief as never, { requestOptions, catalogs: this.#briefCatalogs() });
       if (issue) return { ok: false, reason: `invalid brief for ${requestId}: ${issue}` };
       this.#applyEvent({ type: "BRIEFS_RECORDED", briefs: [brief as never] });
       this.#log.append("brief_recorded", { requestId, options: (brief as { options?: unknown }).options });
+      // The brief agent is done once every item it was asked for has a brief.
+      if (this.#briefInFlight.size > 0 && [...this.#briefInFlight].every((id) => (this.#state.phase.briefs ?? []).some((b) => b.requestId === id))) {
+        this.#agents.get(agentId)?.doneResolve();
+      }
       return { ok: true };
     }
     if (msg.tool === "submit_round_panel_votes") {
@@ -7348,14 +7357,247 @@ export class Conductor {
     if (this.#closed || !this.#briefsEnabled) return;
     const phase = this.#state.phase;
     if (phase.phase !== "AWAITING_OWNER" && phase.phase !== "BLOCKED") return;
-    const open = phase.ownerRequests.filter((r) => r.status === "open");
-    if (open.length === 0) return;
     const existing = new Set((phase.briefs ?? []).map((b) => b.requestId));
-    const missing = open.filter((r) => !existing.has(r.id));
+    const missing: string[] = [
+      ...phase.ownerRequests.filter((r) => r.status === "open" && !existing.has(r.id)).map((r) => r.id),
+      ...this.#liveReservedDecisions(phase)
+        .filter((d) => !existing.has(d.id))
+        .map((d) => d.id),
+    ];
     if (missing.length === 0) return;
+    if (missing.every((id) => this.#briefInFlight.has(id))) return;
+    // Dispatch the evaluator's model to write the briefs; #runBriefAgent
+    // records the deterministic backstop for anything it does not cover.
+    const actionId = this.#log.actionId("briefs");
+    this.#briefInFlight = new Set(missing);
+    void this.#runBriefAgent(actionId, missing).catch((err) => this.#logUnexpected("briefs", err));
+  }
+
+  /** The live, flagged reserved decisions of the current candidate. A
+   * reserved decision never becomes an owner request, so without a brief it
+   * reaches the owner as an engineer note. */
+  #liveReservedDecisions(phase = this.#state.phase): Decision[] {
+    const C = phase.candidate?.sha;
+    return phase.decisions.filter(
+      (d) => d.class === "reserved" && !d.amendment && !d.supersededBy && !d.supersededByCorrection && isLiveDecision(d) && (!C || d.boundCandidateSha === C),
+    );
+  }
+
+  /** One open item's concern (the files and plan clauses it touches), from its
+   * linked finding and messages, so `related` can name a bigger silence on the
+   * same concern. */
+  #concernFor(id: string, question: string, recordIds: string[]): OpenItemConcern {
+    const phase = this.#state.phase;
+    const files = new Set<string>();
+    const planRefs = new Set<string>();
+    for (const f of phase.findings) {
+      if (!recordIds.includes(f.id)) continue;
+      const file = evidenceFile(f.evidence);
+      if (file) files.add(file);
+    }
+    for (const m of phase.messages ?? []) {
+      if (!m.sourceRecordId || !recordIds.includes(m.sourceRecordId)) continue;
+      if (m.planRef) planRefs.add(m.planRef);
+      if (m.anchor?.path) files.add(m.anchor.path);
+      for (const ev of m.evidence ?? []) {
+        const file = evidenceFile(ev);
+        if (file) files.add(file);
+      }
+    }
+    return { id, question, files: [...files], planRefs: [...planRefs] };
+  }
+
+  /** Every open owner item of the phase as a plain concern, so a brief's
+   * `related` can list the others that touch the same file or plan clause. */
+  #briefConcerns(): OpenItemConcern[] {
+    const phase = this.#state.phase;
+    const out: OpenItemConcern[] = [];
+    for (const r of phase.ownerRequests.filter((r) => r.status === "open")) {
+      const linked = [r.linkedFindingId, r.linkedDecisionId, r.linkedMessageId, r.linkedCorrectionId].filter((v): v is string => typeof v === "string");
+      out.push(this.#concernFor(r.id, r.reason, linked));
+    }
+    for (const d of this.#liveReservedDecisions(phase)) out.push(this.#concernFor(d.id, d.choice, [d.id]));
+    return out;
+  }
+
+  /** The deterministic backstop brief for every item the evaluator's model did
+   * not cover: an owner request gets a resolve brief, a reserved decision an
+   * override brief. It never asserts an unchecked impact and carries
+   * `related`. Idempotent (already-recorded items are skipped). */
+  #recordFallbackBriefs(ids: readonly string[]): void {
+    const phase = this.#state.phase;
+    const existing = new Set((phase.briefs ?? []).map((b) => b.requestId));
+    const concerns = this.#briefConcerns();
     const catalogs = this.#briefCatalogs();
-    const briefs = missing.map((r) => fallbackBrief(r, { catalogs }));
-    this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
+    const briefs: DecisionBrief[] = [];
+    for (const id of ids) {
+      if (existing.has(id)) continue;
+      const concern = concerns.find((c) => c.id === id);
+      const request = phase.ownerRequests.find((r) => r.id === id);
+      if (request) {
+        briefs.push(fallbackBrief(request, { catalogs, allItems: concerns, files: concern?.files, planRefs: concern?.planRefs }));
+        continue;
+      }
+      const decision = this.#liveReservedDecisions(phase).find((d) => d.id === id);
+      if (decision) briefs.push(fallbackDecisionBrief(decision, { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs }));
+    }
+    if (briefs.length > 0) this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
+  }
+
+  /** The brief-writing evaluator pass. One fresh evaluator-role agent is
+   * shown every item that still needs a brief and the plan's calendars, and
+   * writes one owner-readable brief per item through `submit_brief`. A timeout
+   * or a settle without complete coverage leaves the deterministic backstop to
+   * fill the rest, so the owner is never left without a brief. */
+  async #runBriefAgent(actionId: string, ids: readonly string[]): Promise<void> {
+    const dispatchCandidate = this.#state.phase.candidate?.sha;
+    const agentId = `briefs-${actionId}`;
+    const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
+    const candidateDir = this.#candidateDir();
+    const env: NodeJS.ProcessEnv = {
+      ...this.#extraEnv,
+      ...this.#piEnvFor?.("evaluator", agentId),
+      TT_SOCKET: this.#paths.sock,
+      TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_RUN_DIR: this.#runDir,
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+      TT_CANDIDATE_SHA: dispatchCandidate,
+      TT_BRIEF: "1",
+    };
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
+    const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
+    const providerModel = this.#providerModelFor?.("evaluator");
+    const agent = spawnPiAgent({
+      command: evaluatorPiCommand,
+      args: [
+        ...this.#resolvePiArgsPrefix("evaluator"),
+        ...launchArgs("evaluator", { noSession: evaluatorPiCommand !== undefined, provider: providerModel?.provider, model: providerModel?.model }),
+      ],
+      cwd: candidateDir,
+      env,
+      role: "evaluator",
+      agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(agentId, event);
+        this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
+    });
+    const handle: AgentHandle = {
+      agent,
+      role: "evaluator",
+      agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve: () => undefined,
+      discoveryPromise: Promise.resolve(),
+    };
+    this.#agents.set(agentId, handle);
+    this.#log.intent(actionId, { agentId, pgid: agent.pgid, briefs: ids });
+    try {
+      const hello = await Promise.race([
+        raceTimeout(helloPromise, this.#deadlines.helloTimeoutMs, "hello"),
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      if (hello === "timeout" || hello === "exited") {
+        await agent.terminate();
+        this.#log.completion(actionId, { ok: false, reason: hello === "exited" ? "brief agent exited before hello" : "hello timed out" });
+        return;
+      }
+      if (!hello.ok) {
+        await agent.terminate();
+        this.#log.completion(actionId, { ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
+        if (hello.mismatch) this.#applyEvent({ type: "LAUNCH_FAILED", role: "evaluator", ...hello.mismatch });
+        return;
+      }
+      const briefTimeout = this.#withStallWatch(
+        agentId,
+        agent,
+        cancelableTimeout(this.#deadlines.evaluateMs, "timeout" as const),
+        "Owner (conductor): no progress for a while. Finish now and call submit_brief for each item listed.",
+      );
+      const settled = nextSettle();
+      await agent.prompt(this.#buildBriefPrompt(ids));
+      const outcome = await Promise.race([
+        donePromise.then(() => "submitted" as const),
+        briefTimeout.promise,
+        settled,
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      briefTimeout.cancel();
+      await agent.terminate();
+      this.#log.completion(actionId, { ok: outcome === "submitted", reason: outcome === "submitted" ? undefined : outcome });
+    } finally {
+      this.#agents.delete(agentId);
+      this.#briefInFlight.clear();
+      // Whatever the model did not cover, the backstop fills in. Stale (the
+      // phase moved on): nothing to record and the next park re-runs it.
+      if (dispatchCandidate === this.#state.phase.candidate?.sha) this.#recordFallbackBriefs(ids);
+    }
+  }
+
+  /** The brief-writing evaluator prompt: each item that still needs a brief,
+   * its own option ids, the underlying evidence, the other open items on the
+   * same concern, and the plan's calendars/products so `today` can name a real
+   * market and session time. */
+  #buildBriefPrompt(ids: readonly string[]): string {
+    const phase = this.#state.phase;
+    const catalogs = this.#briefCatalogs();
+    const lines: string[] = [
+      `You write the owner-facing decision briefs for phase ${phase.phaseId}, candidate ${(phase.candidate?.sha ?? "").slice(0, 9)}.`,
+      "The owner must be able to decide from each brief alone, in under a minute.",
+      "",
+      "For EACH item below call submit_brief exactly once, with:",
+      "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. \"Should a vendor excluded before a weekend stay excluded when its market reopens?\"",
+      "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; if you cannot check it, write \"(example unverified)\".",
+      "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing.",
+      "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",
+      "- recommendation: one option id and why, citing the plan or an IC section.",
+      "- related: the other item ids below that touch the same file or plan clause.",
+      "- evidence: the original message/finding/file:line. Any time, count or duration MUST cite the config or code you read (config: ... or code: path:line).",
+      "",
+      "Calendars (calendars.yaml):",
+      ...(catalogs ? Object.entries(catalogs.calendars).map(([name, c]) => `- ${name}: ${Object.entries(c.sessions).map(([s, t]) => `${s} ${t}`).join(", ")}`) : ["(none readable)"]),
+      "Products (products.yaml):",
+      ...(catalogs ? Object.entries(catalogs.products).map(([sym, p]) => `- ${sym}: vendor ${p.vendor ?? "?"}, calendar ${p.calendar ?? "?"}`) : ["(none readable)"]),
+      "",
+      `Items needing a brief (${ids.length}):`,
+    ];
+    const concerns = this.#briefConcerns();
+    for (const id of ids) {
+      const request = phase.ownerRequests.find((r) => r.id === id);
+      const decision = !request ? this.#liveReservedDecisions(phase).find((d) => d.id === id) : undefined;
+      const others = concerns.find((c) => c.id === id);
+      if (request) {
+        lines.push(`- ${id} (owner request, origin ${request.origin}): ${request.reason}`);
+        lines.push(`    its options: ${request.options.map((o) => o.id).join(", ")}`);
+      } else if (decision) {
+        lines.push(`- ${id} (flagged reserved decision, command override): ${decision.choice}`);
+        lines.push(`    why it matters: ${decision.whyItMatters}`);
+        lines.push("    its options: approve, reject_and_repair; set command to override");
+      }
+      lines.push(`    same-concern items: ${(others?.planRefs ?? []).join(", ")} ${(others?.files ?? []).join(", ")}`.trim());
+    }
+    lines.push("", "Call submit_brief once per item above, then finish.");
+    return lines.join("\n");
   }
 
   /** Plan 04a: one fresh evaluator PER MESSAGE TYPE checks that type's raw

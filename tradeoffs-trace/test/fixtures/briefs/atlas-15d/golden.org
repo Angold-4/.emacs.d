@@ -3,7 +3,10 @@
    :PROPERTIES:
    :ID:       F-M-9
    :KIND:     brief
+   :COMMAND:  resolve
    :OPTIONS:  accept_risk,repair
+   :ACCEPT_OPTION: accept_risk
+   :REFUSE_OPTION: repair
    :QUESTION: Should a vendor excluded before a weekend stay excluded when its market reopens?
    :RECORD_VERSION: 1
    :CANDIDATE_SHA:  c0ffee15d0000000000000000000000000000000
@@ -29,7 +32,10 @@
    :PROPERTIES:
    :ID:       D-A-80
    :KIND:     brief
+   :COMMAND:  resolve
    :OPTIONS:  accept_as_implemented,reject_and_repair
+   :ACCEPT_OPTION: accept_as_implemented
+   :REFUSE_OPTION: reject_and_repair
    :QUESTION: Should the re-entry band be ten seconds wide?
    :RECORD_VERSION: 2
    :CANDIDATE_SHA:  c0ffee15d0000000000000000000000000000000
@@ -53,7 +59,10 @@
    :PROPERTIES:
    :ID:       D-B-82
    :KIND:     brief
+   :COMMAND:  resolve
    :OPTIONS:  accept_as_implemented,reject_and_repair
+   :ACCEPT_OPTION: accept_as_implemented
+   :REFUSE_OPTION: reject_and_repair
    :QUESTION: Should the last good price be published while a market is held?
    :RECORD_VERSION: 1
    :CANDIDATE_SHA:  c0ffee15d0000000000000000000000000000000

@@ -133,6 +133,13 @@ export async function setupConductor(opts: {
   evaluatorScriptFor?: (messageType: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 05j: the curator's script. Default: an empty `curate_entries` pass. */
   curatorScriptFor?: (agentId: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Decision briefs: the brief-writing evaluator pass. Default: settle
+   * without a brief, so the conductor's deterministic backstop covers every
+   * item. A test supplies a script that calls `submit_brief`. */
+  briefScriptFor?: (state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Decision briefs: enable the conductor's brief step (default false, as
+   * for every existing test). */
+  briefs?: boolean;
   /** Plan 04b: one fresh panel seat per raw blocker per seat number. The
    * default script calls `submit_panel_vote` with a `downgrade` vote, so a
    * blocker that a test raises never parks an otherwise-passing run. A test
@@ -237,6 +244,7 @@ export async function setupConductor(opts: {
 
   const reviewerScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
+  const briefScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
   const panelScriptPaths = new Map<string, string>();
   const roundPanelScriptPaths = new Map<string, string>();
@@ -299,6 +307,7 @@ export async function setupConductor(opts: {
     extraEnv: opts.extraEnv,
     deadlines: opts.deadlines,
     stubReviews: opts.stubReviews ?? true,
+    briefs: opts.briefs ?? false,
     probeReuse: opts.probeReuse,
     ...(opts.now ? { now: opts.now } : {}),
     gateLockPath: opts.gateLockPath,
@@ -314,6 +323,18 @@ export async function setupConductor(opts: {
         return { FAKE_PI_SCRIPT: workerScriptPath!, ...(opts.extraWorkerEnv ?? {}) };
       }
       if (role === "evaluator") {
+        // Decision briefs: the brief-writing pass is its own evaluator agent
+        // (`briefs-<actionId>`); if a test did not script it, it settles with
+        // no submission and the deterministic backstop covers the items.
+        if (agentId.startsWith("briefs-")) {
+          if (!briefScriptPaths.has(agentId)) {
+            const script = opts.briefScriptFor
+              ? opts.briefScriptFor(conductor.state)
+              : { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [] };
+            briefScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+          }
+          return { FAKE_PI_SCRIPT: briefScriptPaths.get(agentId)! };
+        }
         // One evaluator per message type per dispatch; a fresh script for
         // each so a test can vary by type and round.
         const messageType = agentId.match(/^evaluator-([a-z]+)-/)?.[1] ?? "tradeoff";

@@ -86,9 +86,14 @@ export function isEvidenceCitation(entry: string): boolean {
 }
 
 /** Whether IMPACT answers the owner's first question: "does any market stop
- * publishing?" Either a plain "no market stops publishing"/"every market
- * keeps publishing", or an explicit "one market stops publishing". */
+ * publishing?". Either a plain "no market stops publishing"/"every market
+ * keeps publishing", an explicit "one market stops publishing", or an honest
+ * "this was not established" (the backstop never asserts an unchecked
+ * claim). */
 export function impactAnswersPublishing(impact: string): boolean {
+  if (/\b(?:not|never)\s+(?:been\s+)?(?:established|checked|verified|known)\b|\bunknown\b|\bcannot be (?:established|checked)\b|\bcould not (?:be )?(?:establish|check)\b/i.test(impact)) {
+    return true;
+  }
   return /\b(?:no|any|every|each|one|two|three|all)\b[^.]{0,80}\bmarket[s]?\b[^.]{0,40}\b(?:stop|stops|stopping|keep|keeps|keeping|continue|continues|continuing|publish|publishes|publishing|halt|halts|go(?:es)?\s+(?:dark|silent))\b/i.test(
     impact,
   ) || /\b(?:publishing|publication)\b[^.]{0,40}\b(?:stop|stops|continue|continues|halt|halts|go(?:es)?)\b/i.test(impact);
@@ -202,10 +207,18 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
     return "a time, count or duration needs an evidence citation to the config or code it read";
   }
   if (opts.catalogs !== undefined) {
+    // `(example unverified)` may only excuse a today that names NO market and
+    // NO time. If it already names a product or a clock time, the example is
+    // checkable, so an inconsistency is refused even with the marker (a
+    // wrong reopen must never reach the owner behind it).
     const unverified = today.includes("(example unverified)");
     const check = checkTodayExample(today, opts.catalogs ?? undefined);
-    if (!check.ok && !unverified) {
-      return `the today example cannot be checked: ${check.reason}; either name a real product and session time or say "(example unverified)"`;
+    if (!check.ok) {
+      const namesTime = /\b\d{1,2}:\d{2}\b/.test(today);
+      const namesProduct = opts.catalogs ? Object.keys(opts.catalogs.products ?? {}).some((s) => new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(today)) : false;
+      if (namesTime || namesProduct || !unverified) {
+        return `the today example cannot be checked: ${check.reason}; either name a real product and session time or say "(example unverified)"`;
+      }
     }
   }
   return undefined;
@@ -242,6 +255,20 @@ export function relatedOpenItems(item: OpenItemConcern, all: readonly OpenItemCo
 export function evidenceFile(evidence: string): string | undefined {
   const m = evidence.match(/\b([\w./-]+\.[A-Za-z][A-Za-z0-9]{0,7})(?::\d+)?\b/);
   return m?.[1];
+}
+
+/** The two option ids the owner's A/D keys name: the option that accepts and
+ * the option that refuses. Chosen by the option's own meaning (its id), never
+ * by its position in the list, so the mapping is stable however the request
+ * orders its options. RET still prompts for any option. */
+const ACCEPT_OPTION_IDS = new Set(["approve", "accept_as_implemented", "accept_risk", "grant", "grant_correction"]);
+const REFUSE_OPTION_IDS = new Set(["reject_and_repair", "repair", "stop", "withdraw"]);
+
+export function briefVerdictOptions(brief: DecisionBrief): { accept?: string; refuse?: string } {
+  const ids = brief.options.map((o) => o.id);
+  const accept = ids.find((id) => ACCEPT_OPTION_IDS.has(id)) ?? ids[0];
+  const refuse = ids.find((id) => REFUSE_OPTION_IDS.has(id)) ?? ids[ids.length - 1];
+  return { ...(accept ? { accept } : {}), ...(refuse ? { refuse } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +320,27 @@ export function briefResolveCommand(brief: DecisionBrief, optionId: string, bind
   return resolveCommandFor(source, optionId, binding);
 }
 
+/** The command a brief's option sends: a `resolve` (the underlying owner
+ * request) or an `override` (a flagged reserved decision). The brief's own
+ * `command` decides; the option id is passed through unchanged. */
+export function briefCommandFor(brief: DecisionBrief, optionId: string, binding: BriefBinding, request?: OwnerRequest): Record<string, unknown> {
+  if ((brief.command ?? "resolve") === "override") {
+    return {
+      type: "override",
+      vote: optionId === "approve" ? "approve" : "reject",
+      binding: {
+        runId: binding.runId,
+        phaseId: binding.phaseId,
+        recordId: brief.requestId,
+        candidateSha: binding.candidateSha,
+        recordVersion: binding.recordVersion,
+        contractVersion: binding.contractVersion,
+      },
+    };
+  }
+  return briefResolveCommand(brief, optionId, binding, request);
+}
+
 /** The core event a resolve command maps to, identical for the request and the
  * brief path (used by the tests to prove the two are the same). */
 export function briefResolveEvent(brief: DecisionBrief, optionId: string, binding: BriefBinding, request?: OwnerRequest): Event {
@@ -342,18 +390,24 @@ export function renderGlossaryOrg(): string {
  * request id and — when a binding is given — the same tuple a resolve command
  * needs, so choosing an option from the brief sends exactly the resolve
  * command the request sends. */
-export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequest; binding?: BriefBinding; heading?: string } = {}): string {
+export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequest; binding?: BriefBinding; heading?: string; tag?: string; recordVersion?: number } = {}): string {
   const heading = opts.heading ?? "**";
   const indent = " ".repeat(heading.length + 1);
+  const verdict = briefVerdictOptions(brief);
+  const recordVersion = opts.recordVersion ?? opts.request?.version;
   const lines: string[] = [];
-  lines.push(`${heading} ${brief.question}`);
+  lines.push(`${heading} ${brief.question}${opts.tag ? `  [${opts.tag}]` : ""}`);
   lines.push(`${indent}:PROPERTIES:`);
   lines.push(`${indent}:ID:       ${brief.requestId}`);
   lines.push(`${indent}:KIND:     brief`);
+  lines.push(`${indent}:COMMAND:  ${brief.command ?? "resolve"}`);
   lines.push(`${indent}:OPTIONS:  ${brief.options.map((o) => o.id).join(",")}`);
+  if (verdict.accept) lines.push(`${indent}:ACCEPT_OPTION: ${verdict.accept}`);
+  if (verdict.refuse) lines.push(`${indent}:REFUSE_OPTION: ${verdict.refuse}`);
+  if (opts.tag) lines.push(`${indent}:PHASE:    ${opts.tag}`);
   lines.push(`${indent}:QUESTION: ${brief.question}`);
-  if (opts.request && opts.binding) {
-    lines.push(`${indent}:RECORD_VERSION: ${opts.request.version}`);
+  if (opts.binding && recordVersion !== undefined) {
+    lines.push(`${indent}:RECORD_VERSION: ${recordVersion}`);
     lines.push(`${indent}:CANDIDATE_SHA:  ${opts.binding.candidateSha}`);
     lines.push(`${indent}:CONTRACT_VERSION: ${opts.binding.contractVersion.snapshot}`);
     lines.push(`${indent}:CONTRACT_SHA256:  ${opts.binding.contractVersion.sectionSha256}`);
@@ -382,21 +436,34 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
 
 /** The `* Needs you (N)` section the review view puts above every other
  * section: one brief per open owner item. */
-export function renderBriefsSection(briefs: readonly DecisionBrief[], opts: { requestFor?: (id: string) => OwnerRequest | undefined; binding?: BriefBinding } = {}): string[] {
+export function renderBriefsSection(
+  briefs: readonly DecisionBrief[],
+  opts: { requestFor?: (id: string) => OwnerRequest | undefined; binding?: BriefBinding; recordVersionFor?: (id: string) => number | undefined } = {},
+): string[] {
   if (briefs.length === 0) return [];
   const lines = [`* Needs you (${briefs.length})`];
   for (const brief of briefs) {
-    lines.push(renderBriefOrg(brief, { request: opts.requestFor?.(brief.requestId), binding: opts.binding }), "");
+    lines.push(
+      renderBriefOrg(brief, {
+        request: opts.requestFor?.(brief.requestId),
+        binding: opts.binding,
+        recordVersion: opts.recordVersionFor?.(brief.requestId),
+      }),
+      "",
+    );
   }
   return lines;
 }
 
 /** A deterministic brief derived from an owner request when the evaluator did
- * not (or could not) produce one. It never invents a market time: if no
- * catalog is available, `today` says the example is unverified, and the
- * `briefIssue` gate then allows it. The option ids are the request's own, so
- * resolving is unchanged. */
-export function fallbackBrief(request: OwnerRequest, opts: { question?: string; catalogs?: Catalogs | null } = {}): DecisionBrief {
+ * not (or could not) produce one. It never invents a market time and never
+ * asserts an unchecked impact (it says the impact was not established); if no
+ * catalog is available, `today` says the example is unverified. The option ids
+ * are the request's own, so resolving is unchanged. */
+export function fallbackBrief(
+  request: OwnerRequest,
+  opts: { question?: string; catalogs?: Catalogs | null; allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[] } = {},
+): DecisionBrief {
   // The request's reason is engineer prose; strip its code identifiers and
   // digits so the fallback question is plain and asserts no uncited count.
   const plain = request.reason
@@ -410,11 +477,15 @@ export function fallbackBrief(request: OwnerRequest, opts: { question?: string; 
   const today = opts.catalogs
     ? "The plan's calendars and products were available when this brief was written, but no concrete example was recorded. (example unverified)"
     : "No calendars.yaml/products.yaml was readable when this brief was written, so the example could not be checked. (example unverified)";
+  const related = opts.allItems
+    ? relatedOpenItems({ id: request.id, question, files: opts.files, planRefs: opts.planRefs }, opts.allItems).map((r) => ({ id: r.id, question: r.question }))
+    : [];
   return {
     requestId: request.id,
     question,
     today,
-    impact: "No market stops publishing under any option; this request is about how the price is formed, not whether it is published.",
+    // The backstop never asserts what it did not check.
+    impact: "Whether any market stops publishing is not established by this backstop; the request's own evidence is below.",
     // Plain labels only: the request's own label may carry a count
     // ("grant 3 rounds") that would then demand a citation this backstop
     // never read. The underlying option id is untouched, so resolving is
@@ -426,8 +497,43 @@ export function fallbackBrief(request: OwnerRequest, opts: { question?: string; 
       cost: "as the request's own option defines it",
     })),
     recommendation: { option: request.options[0]?.id ?? "", why: "the request's first option, until the evaluator writes a brief" },
-    related: [],
+    related,
     evidence: [`message: ${request.reason}`],
+  };
+}
+
+/** A deterministic brief for a flagged reserved decision the evaluator did
+ * not brief. Its options are the decision's own owner commands (`approve` /
+ * `reject_and_repair`), and it carries `command: override`, so A/D/RET send
+ * an override command instead of a resolve. */
+export function fallbackDecisionBrief(
+  decision: { id: string; choice: string; whyItMatters?: string },
+  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[] } = {},
+): DecisionBrief {
+  const plain = (decision.choice ?? "")
+    .replace(PATH_LIKE, "the code")
+    .replace(CODE_EXT, "the code")
+    .replace(SNAKE_CASE, "that setting")
+    .replace(/\d+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const question = `Should this choice stand? ${plain}`;
+  const related = opts.allItems
+    ? relatedOpenItems({ id: decision.id, question, files: opts.files, planRefs: opts.planRefs }, opts.allItems).map((r) => ({ id: r.id, question: r.question }))
+    : [];
+  return {
+    requestId: decision.id,
+    command: "override",
+    question,
+    today: "No concrete example was recorded for this flagged choice. (example unverified)",
+    impact: "Whether any market stops publishing is not established by this backstop; the decision's own reasoning is what the reviewers voted on.",
+    options: [
+      { id: "approve", label: "Approve it", effect: "the choice stands", cost: "none beyond what the choice already does" },
+      { id: "reject_and_repair", label: "Reject and repair", effect: "a new attempt revisits the choice with three more rounds", cost: "one more round" },
+    ],
+    recommendation: { option: "approve", why: "the worker made the choice and the reviewers voted on it" },
+    related,
+    evidence: [`decision: ${decision.id} ${plain}`],
   };
 }
 

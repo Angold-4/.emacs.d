@@ -360,6 +360,7 @@ export interface EntryReviewPhase {
    * section above every entry. */
   briefs?: DecisionBrief[];
   ownerRequests?: OwnerRequest[];
+  decisions?: Decision[];
   contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
   messages?: Message[];
   entries?: Entry[];
@@ -440,6 +441,7 @@ export function projectEntryReview(
         newestCandidateSha,
         briefs: phase.briefs,
         ownerRequests: phase.ownerRequests,
+        decisions: phase.decisions,
         resolveBinding:
           phase.contract?.contractVersion && phase.candidate?.sha && phase.runId && phase.phaseId
             ? {

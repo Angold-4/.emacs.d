@@ -1284,7 +1284,10 @@ inert as it was before the key existed — no error, and nothing opened."
           "   :PROPERTIES:\n"
           "   :ID: F-M-9\n"
           "   :KIND: brief\n"
+          "   :COMMAND: resolve\n"
           "   :OPTIONS: accept_risk,repair\n"
+          "   :ACCEPT_OPTION: accept_risk\n"
+          "   :REFUSE_OPTION: repair\n"
           "   :QUESTION: Should a vendor excluded before a weekend stay excluded when its market reopens?\n"
           "   :RECORD_VERSION: 1\n"
           "   :CANDIDATE_SHA: C1\n"
@@ -1618,15 +1621,17 @@ shows the question, never a finding id."
       (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-brief-resolve-sends-the-request-command ()
-  "Decision briefs: A writes the resolve command with the brief's first option
-and full binding; RET chooses an option and sends the same encoding."
+  "Decision briefs: A writes the resolve command with the brief's own accept
+option id and full binding, prompting for the scope note accept_risk needs;
+RET chooses an option and sends the same encoding."
   (let ((dir (make-temp-file "tt-ert-review" t))
         (written nil))
     (unwind-protect
         (let ((buf (+tt-test--review-buffer dir)))
           (with-current-buffer buf
             (cl-letf (((symbol-function '+tt--write-command)
-                       (lambda (run-dir command) (setq written (list run-dir command)) "cmd-1")))
+                       (lambda (run-dir command) (setq written (list run-dir command)) "cmd-1"))
+                      ((symbol-function 'read-string) (lambda (&rest _) "known race, accepted for one release")))
               (goto-char (point-min))
               (search-forward "Should a vendor excluded")
               (goto-char (match-beginning 0))
@@ -1634,6 +1639,7 @@ and full binding; RET chooses an option and sends the same encoding."
               (should (equal (nth 0 written) dir))
               (should (equal (alist-get 'type (nth 1 written)) "resolve"))
               (should (equal (alist-get 'option (nth 1 written)) "accept_risk"))
+              (should (equal (alist-get 'note (nth 1 written)) "known race, accepted for one release"))
               (let ((binding (alist-get 'binding (nth 1 written))))
                 (should (equal (alist-get 'recordId binding) "F-M-9"))
                 (should (equal (alist-get 'candidateSha binding) "C1"))
@@ -1649,6 +1655,57 @@ and full binding; RET chooses an option and sends the same encoding."
                 (should (equal (alist-get 'option (nth 1 written)) "repair"))
                 (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "F-M-9")))))
           (kill-buffer buf))
+      (delete-directory dir t))))
+
+(defconst +tt-test--brief-override-org
+  (concat "#+TITLE: tradeoffs-trace review\n"
+          "#+CONTRACT_VERSION: v1\n"
+          "\n"
+          "* Needs you (1)\n"
+          "** Should this choice stand? widen the re-entry band\n"
+          "   :PROPERTIES:\n"
+          "   :ID: D-A-80\n"
+          "   :KIND: brief\n"
+          "   :COMMAND: override\n"
+          "   :OPTIONS: approve,reject_and_repair\n"
+          "   :ACCEPT_OPTION: approve\n"
+          "   :REFUSE_OPTION: reject_and_repair\n"
+          "   :RECORD_VERSION: 2\n"
+          "   :CANDIDATE_SHA: C1\n"
+          "   :CONTRACT_VERSION: 4\n"
+          "   :CONTRACT_SHA256: aaaa\n"
+          "   :RUN_ID: r1\n"
+          "   :PHASE_ID: p1\n"
+          "   :END:\n"
+          "   Impact: Whether any market stops publishing is not established.\n")
+  "A fixture review with one override brief (a flagged reserved decision).")
+
+(ert-deftest tradeoffs-trace-brief-override-sends-an-override ()
+  "Decision briefs: a flagged reserved decision's brief A/D send an override
+(approve/reject) command with the decision's own binding."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (written nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--brief-override-org))
+          (with-temp-file (expand-file-name "views/status.txt" dir) (insert "run: r1\n"))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              (cl-letf (((symbol-function '+tt--write-command)
+                         (lambda (run-dir command) (setq written (list run-dir command)) "cmd-2")))
+                (goto-char (point-min))
+                (search-forward "Should this choice stand")
+                (goto-char (match-beginning 0))
+                (+tt-review-accept)
+                (should (equal (alist-get 'type (nth 1 written)) "override"))
+                (should (equal (alist-get 'vote (nth 1 written)) "approve"))
+                (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "D-A-80"))
+                (should (equal (alist-get 'recordVersion (alist-get 'binding (nth 1 written))) 2))))
+            (kill-buffer buf)))
       (delete-directory dir t))))
 
 (ert-deftest tradeoffs-trace-status-needs-you-shows-the-question ()

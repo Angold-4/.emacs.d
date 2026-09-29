@@ -436,6 +436,11 @@ export interface BriefRelated {
 export interface DecisionBrief {
   /** The owner request (or entry/message id) this brief is for. */
   requestId: string;
+  /** The owner command choosing an option sends. `resolve` (default) settles
+   * an owner request; `override` approves or rejects a flagged reserved
+   * decision. A brief for a reserved decision carries `override`, so the same
+   * A/D/RET keys send the command that decision needs. */
+  command?: "resolve" | "override";
   /** One plain line, no code identifiers. */
   question: string;
   /** What the system does today, with one concrete example using real market

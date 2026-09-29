@@ -662,10 +662,25 @@ under a minute:
 
 A brief that states a time, a count or a duration must cite the config or code
 it read, and a question that names code (`within_band_active`) is refused back
-to the evaluator. The same briefs appear at the top of `views/review.org` (and
-the program review) under `* Needs you (N)`; `TAB` on a question unfolds its
-evidence. The status buffer's `needs you` line shows the question, not a
-finding id.
+to the evaluator. An example can only excuse itself with `(example unverified)`
+when it names no market and no time; a named time is always checked against the
+calendars.
+
+After evaluation the conductor runs one brief-writing pass by the evaluator's
+model for every open owner request **and** every flagged reserved decision (a
+reserved decision never becomes an owner request, so without a brief it would
+reach you as an engineer note). A flagged decision's brief sends an override
+(approve / reject) rather than a request resolve. `A` and `D` choose the
+brief's accept and refuse option by the option's own meaning, never by its
+position; `RET` prompts for any option. If the model misses an item, a
+deterministic backstop records a brief that never invents an example and never
+asserts an unchecked impact (it says the impact was not established) and lists
+the other items on the same file or plan clause.
+
+The same briefs appear at the top of `views/review.org` (and the program
+review) under `* Needs you (N)`; `TAB` on a question unfolds its evidence. An
+item already settled is never shown here again. The status buffer's `needs you`
+line shows the question, not a finding id.
 
 ### Owner glossary
 
