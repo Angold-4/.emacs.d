@@ -80,7 +80,9 @@ export function hasCodeIdentifier(text: string): boolean {
 const CLOCK_TIME = /\b\d{1,2}:\d{2}\b/;
 const DURATION = /\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|min|mins|minute|minutes|h|hr|hrs|hour|hours|day|days|week|weeks)\b/i;
 const DIGIT_COUNT = /\b\d+\b/;
-const WORD_COUNT = /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:vendor|vendors|market|markets|instrument|instruments|product|products|round|rounds|day|days|week|weeks|hour|hours|minute|minutes|second|seconds|tick|ticks|price|prices|session|sessions|source|sources)\b/i;
+// Up to two words may sit between the number word and its noun, so 'three
+// more rounds' and 'one more round' are counts too (finding A-27).
+const WORD_COUNT = /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?:\s+\w+){0,2}\s+(?:vendor|vendors|market|markets|instrument|instruments|product|products|round|rounds|day|days|week|weeks|hour|hours|minute|minutes|second|seconds|tick|ticks|price|prices|session|sessions|source|sources)\b/i;
 
 export function hasQuantifiedFact(text: string): boolean {
   // A plan/IC section reference (`§5`) is not a count; only strip the section
@@ -306,19 +308,46 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
       }
     }
   }
-  // Every quantified claim must carry its OWN citation, not borrow one from
-  // elsewhere in the brief: one `config:` line cannot license an unrelated
-  // `10 s` somewhere else (finding disc-M-85).
+  // The owner-facing text stays plain: no file paths or code identifiers in
+  // today, impact or the options (OD-3 / D-M-126). A claim cites the evidence
+  // by number (`[n]`) instead, and the path is rendered only under Evidence.
+  const ownerText: Array<[string, string]> = [
+    ["today", today],
+    ["impact", impact],
+    ...brief.options.flatMap((o): Array<[string, string]> => [
+      [`option ${o.id} label`, o.label],
+      [`option ${o.id} effect`, o.effect],
+      [`option ${o.id} cost`, o.cost],
+    ]),
+  ];
+  for (const [where, text] of ownerText) {
+    if (hasCodeIdentifier(text)) return `the ${where} names code; keep the owner-facing text plain and cite the evidence with [n]`;
+  }
+  // Every quantified claim must carry its OWN evidence reference, and that
+  // evidence must be the config/code it read: one citation cannot license an
+  // unrelated `10 s` somewhere else (finding disc-M-85).
+  const evidence = brief.evidence ?? [];
+  const cited = (claim: string): boolean =>
+    [...claim.matchAll(/\[(\d+)\]/g)].some((m) => {
+      const n = Number(m[1]);
+      return n >= 1 && isEvidenceCitation(evidence[n - 1] ?? "");
+    });
   const claims = [
     ...sentences(today),
     ...sentences(impact),
-    ...brief.options.flatMap((o) => [o.effect, o.cost]),
+    ...brief.options.flatMap((o) => [o.label, o.effect, o.cost]),
     ...(rec?.why ? [rec.why] : []),
   ];
   for (const claim of claims) {
-    if (hasQuantifiedFact(claim) && !isEvidenceCitation(claim)) {
-      return `the claim "${claim.trim()}" states a time, count or duration without its own config or code citation`;
+    if (hasQuantifiedFact(claim) && !cited(claim)) {
+      return `the claim "${claim.trim()}" states a time, count or duration without its own evidence reference [n]`;
     }
+  }
+  // The publishing answer is the claim the owner relies on most, so it must be
+  // cited too (OD-3 / D-M-127); only the backstop's honest "unverified" is
+  // exempt.
+  if (!impactUnestablished(impact) && !cited(impact)) {
+    return "the impact's answer to whether any market stops publishing must cite the evidence it was checked against";
   }
   return undefined;
 }
@@ -489,7 +518,7 @@ export function renderGlossaryOrg(): string {
  * subtree. The heading carries enough properties for the Emacs view to fold
  * TAB and to send the same resolve command. */
 /** The runbook's owner glossary, the target of every glossary link in a brief. */
-export const GLOSSARY_LINK = "docs/tradeoffs-trace-runbook.md::Owner glossary";
+export const GLOSSARY_LINK = "glossary.org::Owner glossary";
 
 /** The glossary terms BRIEF actually uses, so the renderer links exactly those
  * and never explains a term inline (goal item 4). */
@@ -555,7 +584,9 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
       `${indent}Recommendation: ${brief.options.find((o) => o.id === brief.recommendation!.option)?.label ?? brief.recommendation.option} — ${brief.recommendation.why}`,
     );
   } else {
-    lines.push(`${indent}Recommendation: none established by this brief.`);
+    // The backstop says, in plain words where the recommendation would be,
+    // why there is none (OD-3 / D-B-79).
+    lines.push(`${indent}No recommendation: the brief writer was unavailable${brief.noRecommendationReason ? ` (${brief.noRecommendationReason})` : ""}; decide from the evidence.`);
   }
   if (brief.related.length > 0) {
     lines.push(`${indent}Related:`);
@@ -567,7 +598,7 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
     lines.push(`${indent}Glossary: ${terms.map((t) => `[[file:${GLOSSARY_LINK}][${t}]]`).join(" ")}`);
   }
   lines.push(`${indent}Evidence (original):`);
-  for (const ev of brief.evidence) lines.push(`${indent}- ${ev}`);
+  brief.evidence.forEach((ev, i) => lines.push(`${indent}- [${i + 1}] ${ev}`));
   return lines.join("\n");
 }
 
@@ -599,7 +630,7 @@ export function renderBriefsSection(
  * are the request's own, so resolving is unchanged. */
 export function fallbackBrief(
   request: OwnerRequest,
-  opts: { question?: string; catalogs?: Catalogs | null; allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[] } = {},
+  opts: { question?: string; catalogs?: Catalogs | null; allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
 ): DecisionBrief {
   // The request's reason is engineer prose; strip its code identifiers and
   // digits so the fallback question is plain and asserts no uncited count.
@@ -612,8 +643,8 @@ export function fallbackBrief(
     .trim();
   const question = opts.question ?? `Should this stay as it is? ${plain}`;
   const today = opts.catalogs
-    ? "The plan's calendars and products were available when this brief was written, but no concrete example was recorded. (example unverified)"
-    : "No calendars.yaml/products.yaml was readable when this brief was written, so the example could not be checked. (example unverified)";
+    ? "The plan's calendars were available, but no concrete example was recorded. (example unverified)"
+    : "No readable calendars were available when this brief was written, so the example could not be checked. (example unverified)";
   const related = opts.allItems
     ? relatedOpenItems({ id: request.id, question, files: opts.files, planRefs: opts.planRefs }, opts.allItems).map((r) => ({ id: r.id, question: r.question }))
     : [];
@@ -623,18 +654,21 @@ export function fallbackBrief(
     today,
     // The backstop never asserts what it did not check.
     impact: "Whether any market stops publishing is not established by this backstop; the request's own evidence is below.",
+    noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
+    // No recommendation: the backstop never recommends an option by position
+    // without a citation (finding M-31).
     // Plain labels only: the request's own label may carry a count
     // ("grant 3 rounds") that would then demand a citation this backstop
     // never read. The underlying option id is untouched, so resolving is
     // unchanged.
     options: request.options.map((o) => ({
       id: o.id,
-      label: o.label,
+      // Plain labels only: a count in the request's own label ("grant 3
+      // rounds") would otherwise state an uncited number.
+      label: o.label.replace(/\s*\([^)]*\)\s*$/, ""),
       effect: o.label.replace(/\s*\([^)]*\)\s*$/, ""),
       cost: "as the request's own option defines it",
     })),
-    // No recommendation: the backstop never recommends an option by position
-    // without a citation (finding M-31).
     related,
     evidence: [`message: ${request.reason}`],
   };
@@ -646,7 +680,7 @@ export function fallbackBrief(
  * an override command instead of a resolve. */
 export function fallbackDecisionBrief(
   decision: { id: string; choice: string; whyItMatters?: string },
-  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[] } = {},
+  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
 ): DecisionBrief {
   const plain = (decision.choice ?? "")
     .replace(PATH_LIKE, "the code")
@@ -665,9 +699,10 @@ export function fallbackDecisionBrief(
     question,
     today: "No concrete example was recorded for this flagged choice. (example unverified)",
     impact: "Whether any market stops publishing is not established by this backstop; the decision's own reasoning is what the reviewers voted on.",
+    noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     options: [
       { id: "approve", label: "Approve it", effect: "the choice stands", cost: "none beyond what the choice already does" },
-      { id: "reject_and_repair", label: "Reject and repair", effect: "a new attempt revisits the choice with three more rounds", cost: "one more round" },
+      { id: "reject_and_repair", label: "Reject and repair", effect: "a new attempt revisits the choice with a further allowance", cost: "a further repair round" },
     ],
     related,
     evidence: [`decision: ${decision.id} ${plain}`],
@@ -680,7 +715,7 @@ export function fallbackDecisionBrief(
  * review view does. */
 export function fallbackEntryBrief(
   entry: { id: string; title: string; messages?: ReadonlyArray<{ id: string; title?: string; evidence?: string[] }> },
-  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[] } = {},
+  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
 ): DecisionBrief {
   const plain = (entry.title ?? "")
     .replace(PATH_LIKE, "the code")
@@ -700,9 +735,10 @@ export function fallbackEntryBrief(
     question,
     today: "No concrete example was recorded for this entry. (example unverified)",
     impact: "Whether any market stops publishing is not established by this backstop; the entry's own linked messages are below.",
+    noRecommendationReason: opts.noRecommendationReason ?? "the brief writer did not run",
     options: [
       { id: "accept", label: "Accept it", effect: "the entry is settled as it stands", cost: "none beyond what it already does" },
-      { id: "refuse", label: "Refuse it", effect: "the entry is refused; your reason reaches the next worker attempt", cost: "one more round" },
+      { id: "refuse", label: "Refuse it", effect: "the entry is refused; your reason reaches the next worker attempt", cost: "a further repair round" },
     ],
     related,
     evidence: evidence.length > 0 ? evidence : [`entry: ${entry.id} ${plain}`],

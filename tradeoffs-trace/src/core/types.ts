@@ -450,10 +450,14 @@ export interface DecisionBrief {
    * publishing. */
   impact: string;
   options: BriefOption[];
-  /** One option and why, citing the plan or an IC section. Absent when the
-   * deterministic backstop could not establish a checked recommendation; it
-   * never recommends an option by position without evidence. */
+  /** One option and why, citing the plan or an IC section. Absent only for
+   * the deterministic backstop; it never recommends an option by position
+   * without evidence. */
   recommendation?: { option: string; why: string };
+  /** The reason the backstop has no recommendation (the writer timed out, its
+   * tools did not match, or it did not run), rendered in plain words where the
+   * recommendation would be (OD-3 / D-B-79). */
+  noRecommendationReason?: string;
   related: BriefRelated[];
   /** The original message/finding/file:line, folded under TAB. */
   evidence: string[];

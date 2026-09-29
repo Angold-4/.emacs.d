@@ -691,16 +691,21 @@ reason, and the reason reaches the next worker attempt. A model brief must
 state one recommended option, with why, citing the plan or an IC section; only
 the deterministic backstop may omit it. A model brief must also state whether
 any market stops publishing; only the deterministic backstop may say the
-impact was not established. Every time, count or duration must carry its OWN
-citation in that claim's sentence (`config: ...`, `code: ...`, or a
-`path:line`); one citation does not cover another claim, and a plan clause or
-a bare `§` reference does not count. The glossary terms `T_in` and `T_out` are
-allowed in a brief's question.
+impact was not established. The owner-facing text — today, impact and the
+options — stays plain: no file paths and no code identifiers. Every time,
+count or duration carries its own numbered reference into the evidence list
+(`[2]`); one reference does not cover another claim, and the impact's answer to
+whether any market stops publishing must be referenced too. The path itself is
+rendered only under Evidence, folded behind `TAB`. The glossary terms `T_in`
+and `T_out` are allowed in a brief's question.
 
 If the model misses an item, the backstop records a brief that never invents
 an example, never asserts an unchecked impact (it says the impact was not
-established), omits a recommendation rather than recommending an option by
-position, and lists the other items on the same file or plan clause. `related`
+established), and says in plain words where the recommendation would be that
+no recommendation was checked — `No recommendation: the brief writer was
+unavailable (<reason>); decide from the evidence.` It never recommends an
+option by position, and it lists the other items on the same file or plan
+clause. `related`
 names both other owner items and same-concern live trade-offs or findings
 that never became owner items — the T-54 silence the goal says must not hide.
 The conductor merges its own same-concern items into a model brief's `related`

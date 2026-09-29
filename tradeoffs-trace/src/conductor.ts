@@ -126,7 +126,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
-import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
+import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -5221,6 +5221,9 @@ export class Conductor {
       const ids = runIds(this.#runDir);
       const rendered = projectEntryReview({ ...phase, ...ids }, { anchorFreshness: candidateAnchorFreshness(this.#candidateDir()) });
       fs.writeFileSync(this.#paths.review, rendered.text);
+      // Goal (4): the glossary a brief links to, written beside review.org so
+      // the link resolves inside the run directory (finding M-25).
+      fs.writeFileSync(path.join(path.dirname(this.#paths.review), "glossary.org"), `* Owner glossary\n${renderGlossaryOrg()}\n`);
       this.#writeEntryViews(rendered.files);
       this.#recordReviewLint(rendered.lint);
       this.#writeMessageViews();
@@ -7411,7 +7414,7 @@ export class Conductor {
       // stay 'in flight' and every later pass would skip them (finding A-24).
       this.#logUnexpected("briefs", err);
       for (const id of toDispatch) this.#briefInFlight.delete(id);
-      this.#recordFallbackBriefs(toDispatch);
+      this.#recordFallbackBriefs(toDispatch, "the brief writer could not start");
     });
   }
 
@@ -7496,7 +7499,7 @@ export class Conductor {
    * override brief, a live entry an entry brief. It never asserts an
    * unchecked impact, omits a recommendation, and carries the conductor's own
    * `related`. Idempotent for this candidate. */
-  #recordFallbackBriefs(ids: readonly string[]): void {
+  #recordFallbackBriefs(ids: readonly string[], reason = "the brief writer did not run"): void {
     const phase = this.#state.phase;
     const C = phase.candidate?.sha;
     const existing = new Set((phase.briefs ?? []).filter((b) => b.candidateSha === C).map((b) => b.requestId));
@@ -7506,7 +7509,7 @@ export class Conductor {
     for (const id of ids) {
       if (existing.has(id)) continue;
       const concern = concerns.find((c) => c.id === id);
-      const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs };
+      const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
       const request = phase.ownerRequests.find((r) => r.id === id);
       if (request) {
         briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
@@ -7555,6 +7558,7 @@ export class Conductor {
     });
     const settleWaiters: Array<() => void> = [];
     const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
+    let fallbackReason = "the brief writer did not run";
     const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
     const providerModel = this.#providerModelFor?.("evaluator");
     const agent = spawnPiAgent({
@@ -7598,11 +7602,13 @@ export class Conductor {
       ]);
       if (hello === "timeout" || hello === "exited") {
         await agent.terminate();
+        fallbackReason = hello === "exited" ? "the brief writer exited before it started" : "the brief writer did not start in time";
         this.#log.completion(actionId, { ok: false, reason: hello === "exited" ? "brief agent exited before hello" : "hello timed out" });
         return;
       }
       if (!hello.ok) {
         await agent.terminate();
+        fallbackReason = hello.mismatch ? "the brief writer's tools did not match at launch" : "the brief writer failed to start";
         this.#log.completion(actionId, { ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
         // A tool-set mismatch is NOT a phase launch failure here: the brief
         // pass runs only in AWAITING_OWNER/BLOCKED, where no LAUNCH_FAILED
@@ -7629,15 +7635,20 @@ export class Conductor {
       ]);
       briefTimeout.cancel();
       await agent.terminate();
+      if (outcome === "timeout") fallbackReason = "the brief writer timed out";
+      else if (outcome === "exited") fallbackReason = "the brief writer exited";
+      else if (outcome === "settled") fallbackReason = "the brief writer settled without covering every item";
+      else fallbackReason = "the brief writer did not cover every item";
       this.#log.completion(actionId, { ok: outcome === "submitted", reason: outcome === "submitted" ? undefined : outcome });
     } finally {
       this.#agents.delete(agentId);
       // Remove only THIS agent's ids: a later agent may be covering others
       // (finding M-18).
       for (const id of ids) this.#briefInFlight.delete(id);
-      // Whatever the model did not cover, the backstop fills in. Stale (the
+      // Whatever the model did not cover, the backstop fills in with the
+      // reason the owner reads where the recommendation would be. Stale (the
       // phase moved on): nothing to record and the next park re-runs it.
-      if (dispatchCandidate === this.#state.phase.candidate?.sha) this.#recordFallbackBriefs(ids);
+      if (dispatchCandidate === this.#state.phase.candidate?.sha) this.#recordFallbackBriefs(ids, fallbackReason);
     }
   }
 
@@ -7655,12 +7666,12 @@ export class Conductor {
       "For EACH item below call submit_brief exactly once, with:",
       "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. \"Should a vendor excluded before a weekend stay excluded when its market reopens?\"",
       "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; a weekday reopen must match the calendar's weekly reopen. If you cannot check it, write \"(example unverified)\".",
-      "- Cite EVERY time, count or duration in that claim's own sentence, with config: ... or code: path:line — one citation does not cover another claim.",
-      "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing.",
+      "- The owner-facing text (today, impact, the options) must stay PLAIN: no file paths and no code identifiers. Cite a claim by its evidence number in square brackets, e.g. '10 s after a reopen[2]'.",
+      "- evidence: the numbered list of what you read, e.g. 'message: ...' then 'config: ...' or 'code: path:line'. Every time, count or duration in today, impact or an option must carry its OWN [n] reference into this list; one reference does not cover another claim.",
+      "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing. The publishing answer itself must cite the config or code it was checked against, or say it is unverified.",
       "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",
       "- recommendation: one option id and why, citing the plan or an IC section.",
       "- related: the other item ids below that touch the same file or plan clause.",
-      "- evidence: the original message/finding/file:line. Any time, count or duration MUST cite the config or code you read (config: ... or code: path:line).",
       "",
       "Calendars (calendars.yaml):",
       ...(catalogs

@@ -74,20 +74,20 @@
     {
       "requestId": "F-M-9",
       "question": "Should a vendor excluded before a weekend stay excluded when its market reopens?",
-      "today": "Pyth's NVDA product reopens Sunday 20:00 ET (config: calendars.yaml us_equity opens Sun 20:00). Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.",
-      "impact": "No market stops publishing. At most one vendor is missing for about 10 s after a weekend reopen (code: src/core/blend.rs:88), so the published price is formed from one vendor fewer for that window.",
+      "today": "Pyth's NVDA product reopens Sunday 20:00 ET[2]. Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.",
+      "impact": "No market stops publishing[2]. At most one vendor is missing for about 10 s after a weekend reopen, so the published price is formed from one vendor fewer for that window[3].",
       "options": [
         {
           "id": "accept_risk",
           "label": "Keep as is",
-          "effect": "the vendor rejoins immediately at the first tick after the reopen (code: src/core/blend.rs:88)",
-          "cost": "one stale first quote can enter the price for up to 10 s (code: src/core/blend.rs:88)"
+          "effect": "the vendor rejoins immediately at the first tick after the reopen[3]",
+          "cost": "one stale first quote can enter the price for up to 10 s[3]"
         },
         {
           "id": "repair",
-          "label": "Hold it out for 10 s",
-          "effect": "the vendor stays excluded until 10 s after the reopen, then rejoins (code: src/core/blend.rs:41)",
-          "cost": "10 s with one vendor fewer at a reopen (code: src/core/blend.rs:41)"
+          "label": "Hold it out",
+          "effect": "the vendor stays excluded until 10 s after the reopen, then rejoins[4]",
+          "cost": "10 s with one vendor fewer at a reopen[4]"
         }
       ],
       "recommendation": { "option": "repair", "why": "IC §5's re-entry rule asks for a settled first tick, not the first tick after a break" },
@@ -97,42 +97,43 @@
       ],
       "evidence": [
         "message: F-M-9 a vendor excluded before the weekend rejoins immediately at the first tick after a reopen",
-        "config: calendars.yaml us_equity overnight starts at 20:00",
-        "code: src/core/blend.rs:88 the re-entry test reads the band only"
+        "config: calendars.yaml us_equity opens Sun 20:00",
+        "code: src/core/blend.rs:88 the re-entry test reads the band only",
+        "code: src/core/blend.rs:41 the band constant is read here"
       ]
     },
     {
       "requestId": "D-A-80",
       "question": "Should the re-entry band be ten seconds wide?",
-      "today": "Stork's BTCUSD product trades around the clock: its 24/7 calendar runs every minute of 00:00 to 23:59 (config: calendars.yaml crypto_24_7 rth 00:00-23:59), so it has no reopen. The band now uses 10 s (code: src/core/blend.rs:41), the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.",
-      "impact": "No market stops publishing. The wider band lets one more vendor back in after a quiet spell (code: src/core/blend.rs:41), so the price is formed from more vendors more of the time.",
+      "today": "Stork's BTCUSD product trades around the clock: its 24/7 calendar runs every minute of 00:00 to 23:59[2], so it has no reopen. The band now uses 10 s[3], the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.",
+      "impact": "No market stops publishing[2]. The wider band lets one more vendor back in after a quiet spell, so the price is formed from more vendors more of the time[3].",
       "options": [
         {
           "id": "accept_as_implemented",
           "label": "Accept it as implemented",
-          "effect": "10 s stays the re-entry band (code: src/core/blend.rs:41)",
-          "cost": "a genuinely stale vendor can rejoin after 10 s (code: src/core/blend.rs:41)"
+          "effect": "10 s stays the re-entry band[3]",
+          "cost": "a genuinely stale vendor can rejoin after 10 s[3]"
         },
         {
           "id": "reject_and_repair",
           "label": "Reject and repair",
-          "effect": "a new attempt picks the band again, with three more repair rounds",
-          "cost": "one more round; no market stops publishing either way"
+          "effect": "a new attempt picks the band again, with a further allowance",
+          "cost": "a further repair round; no market stops publishing either way"
         }
       ],
-      "recommendation": { "option": "accept_as_implemented", "why": "the panel's own count of re-entries agrees with IC §5's 10 s (code: src/core/blend.rs:41)" },
+      "recommendation": { "option": "accept_as_implemented", "why": "the panel's own count of re-entries agrees with IC §5's 10 s[3]" },
       "related": [],
       "evidence": [
         "message: D-A-80 widen the re-entry band to 10 s failed its vote",
-        "config: calendars.yaml crypto_24_7 has no reopen",
+        "config: calendars.yaml crypto_24_7 rth 00:00-23:59",
         "code: src/core/blend.rs:41 the band constant is read here"
       ]
     },
     {
       "requestId": "D-B-82",
       "question": "Should the last good price be published while a market is held?",
-      "today": "Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend (config: calendars.yaml metal_otc sessions 18:00-17:00). The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET (config: calendars.yaml metal_otc opens Sun 18:00) the first fresh price is published.",
-      "impact": "No market stops publishing. While XAUUSD is held there is simply no offer, which is the documented behaviour; the change only affects whether the last price is repeated.",
+      "today": "Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend[2]. The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET[2] the first fresh price is published.",
+      "impact": "No market stops publishing[2]. While XAUUSD is held there is simply no offer, which is the documented behaviour; the change only affects whether the last price is repeated[3].",
       "options": [
         {
           "id": "accept_as_implemented",
@@ -144,7 +145,7 @@
           "id": "reject_and_repair",
           "label": "Reject and repair",
           "effect": "a new attempt makes the held market repeat its last good price",
-          "cost": "one more round; a stale price can be mistaken for a live one"
+          "cost": "a further repair round; a stale price can be mistaken for a live one"
         }
       ],
       "recommendation": { "option": "accept_as_implemented", "why": "IC §7 says a held market makes no offer, and a repeated price would read as live" },
@@ -153,7 +154,7 @@
       ],
       "evidence": [
         "message: D-B-82 publish the last good price while the market is held failed its vote",
-        "config: calendars.yaml metal_otc closes Friday 17:00 and reopens Sunday 18:00",
+        "config: calendars.yaml metal_otc opens Sun 18:00; sessions 18:00-17:00",
         "code: src/core/publish.rs:120 the held branch skips the offer"
       ]
     }

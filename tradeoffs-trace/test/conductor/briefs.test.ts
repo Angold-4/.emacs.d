@@ -81,14 +81,14 @@ function budgetBrief(request: OwnerRequest) {
     requestId: request.id,
     question: "Should the phase get more repair rounds or stop?",
     today: "No concrete example was recorded for this item. (example unverified)",
-    impact: "No market stops publishing under either option; only the repair budget changes.",
+    impact: "No market stops publishing under either option; only the repair budget changes[2].",
     options: [
-      { id: "grant", label: "Give three more rounds", effect: "the worker tries again", cost: "more time" },
+      { id: "grant", label: "Give more repair rounds", effect: "the worker tries again[2]", cost: "more time" },
       { id: "stop", label: "Stop the phase", effect: "the phase stops", cost: "the work is not finished" },
     ],
     recommendation: { option: "grant", why: "IC §5 says to try again before stopping" },
     related: [],
-    evidence: ["message: the repair budget ran out", "plan: the phase's own repair budget"],
+    evidence: ["message: the repair budget ran out", "code: src/core/blend.rs:88 the re-entry test reads the band only"],
   };
 }
 
