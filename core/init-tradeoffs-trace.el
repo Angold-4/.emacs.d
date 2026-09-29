@@ -2118,6 +2118,13 @@ today, impact, options and recommendation visible and folds only its
         (cond
          ((equal kind "brief")
           (let ((end (save-excursion (goto-char start) (org-end-of-subtree t) (point))))
+            ;; A-47: the brief's own property drawer is folded like every other
+            ;; message's, while today/impact/options/recommendation stay visible.
+            (save-excursion
+              (goto-char start)
+              (when (re-search-forward "^[ \t]*:PROPERTIES:[ \t]*$" end t)
+                (goto-char (match-beginning 0))
+                (org-fold-hide-drawer-toggle)))
             (save-excursion
               (goto-char start)
               (when (re-search-forward "^\\*\\*\\* Evidence" end t)

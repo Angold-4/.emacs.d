@@ -1602,6 +1602,11 @@ shows the question, never a finding id."
             (goto-char (match-beginning 0))
             (should (not (get-char-property (line-beginning-position) 'invisible)))
             (should-not (org-fold-folded-p (line-end-position)))
+            ;; A-47: the brief's own property drawer is folded like every other
+            ;; message's, so the owner never sees the engineer ids on open.
+            (goto-char (point-min))
+            (search-forward ":ID: F-M-9")
+            (should (org-fold-folded-p (line-end-position)))
             (goto-char (point-min))
             (search-forward "Today: Pyth's")
             (should (not (org-fold-folded-p (line-beginning-position))))

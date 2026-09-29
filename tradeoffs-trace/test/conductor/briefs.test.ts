@@ -166,6 +166,7 @@ function reservedBrief(decision: { id: string }) {
  * briefs stay backstops until a model replaces them. */
 async function awaitingOwnerWithReserved(
   briefScriptFor: (state: State) => { hello?: unknown; steps: any[] },
+  briefMs = 800,
 ): Promise<TestConductorSetup> {
   const setup = await setupConductor({
     checks: ["false"],
@@ -192,7 +193,9 @@ async function awaitingOwnerWithReserved(
     reviewerScriptFor: (reviewer, state) => ({ hello: defaultReviewerHello(), steps: [submitReviewStep(reviewer, state)] }),
     briefs: true,
     briefScriptFor,
-    deadlines: FAST,
+    // OD-7: a short brief deadline is set IN THE TEST so a writer can really
+    // time out (no existing test's timeout is widened).
+    deadlines: { ...FAST, briefMs },
   });
   await setup.conductor.start();
   await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000);
@@ -252,14 +255,25 @@ const retriedIds = (setup: TestConductorSetup): string[] =>
     .filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "BRIEF_RETRY_ATTEMPTED")
     .flatMap((r) => ((r.event as { requestIds?: string[] }).requestIds ?? []));
 
-test("briefs: a later park in BLOCKED also gets the one backstop retry", async () => {
+/** How many brief-writer runs ended in a real timeout (OD-7). */
+const briefTimeouts = (setup: TestConductorSetup): number =>
+  readEvents(setup.runDir).filter(
+    (r) =>
+      r.kind === "completion" &&
+      String(r.actionId ?? "").startsWith("briefs-") &&
+      (r.event as { reason?: string }).reason === "timeout",
+  ).length;
+
+test("briefs: entering BLOCKED writes no retry and does not spend it", async () => {
   let dispatches = 0;
   const setup = await awaitingOwnerWithReserved(() => {
     dispatches += 1;
-    return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 500 }] };
+    // Sleep past the short briefMs so this writer really TIMES OUT.
+    return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 3_000 }] };
   });
   try {
     const reserved = RESERVED_IDS(setup);
+    const candidate = setup.conductor.state.phase.candidate!.sha;
     const gate = setup.conductor.state.phase.ownerRequests.find(
       (r) => r.status === "open" && r.origin === "repair_budget_exhausted",
     )!;
@@ -271,12 +285,21 @@ test("briefs: a later park in BLOCKED also gets the one backstop retry", async (
         ),
       60_000,
     );
+    // The recorded outcome is the timeout, not merely 'settled without a brief'.
+    await waitFor(() => briefTimeouts(setup) >= 1, 15_000);
     assert.equal(dispatches, 1, "one writer run covers the first park");
-    // The owner stops the phase: AWAITING_OWNER -> BLOCKED. BLOCKED is also a
-    // parked-on-the-owner state where briefs are written (F-8), so entering it
-    // is a later park and must spend the one retry (finding disc-M-230).
+    // The owner stops the phase: AWAITING_OWNER -> BLOCKED. OD-7: that is NOT a
+    // later park for the retry — no retry is dispatched or spent, and any
+    // missing briefs are still written (none here).
     resolveCommand(setup, "cmd-stop", gate, "stop");
-    await waitFor(() => setup.conductor.state.phase.phase === "BLOCKED", 30_000);    await waitFor(() => reserved.every((id) => retriedIds(setup).includes(id)), 30_000);
+    await waitFor(() => setup.conductor.state.phase.phase === "BLOCKED", 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    assert.equal(dispatches, 1, "BLOCKED dispatches no retry");
+    assert.deepEqual(setup.conductor.state.phase.briefRetries ?? [], [], "BLOCKED does not spend the retry");
+    for (const id of reserved) {
+      const held = (setup.conductor.state.phase.briefs ?? []).find((b) => b.requestId === id && b.candidateSha === candidate);
+      assert.ok(held?.noRecommendationReason !== undefined, "the backstop stays shown");
+    }
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runDir);
@@ -285,31 +308,29 @@ test("briefs: a later park in BLOCKED also gets the one backstop retry", async (
   }
 });
 
-test("briefs: a backstop is retried only on a later park, and one submit does not end the writer", async () => {
+test("briefs: a timed-out backstop is retried once on the next AWAITING_OWNER park", async () => {
   let dispatches = 0;
   const setup = await awaitingOwnerWithReserved((state) => {
     dispatches += 1;
     if (dispatches === 1) {
-      // Park 1: settle without submitting, so every item gets a backstop.
-      return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 500 }] };
+      // Park 1: time out, so the recorded outcome is the timeout.
+      return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 3_000 }] };
     }
-    // Park 2 (after the AMEND re-check): submit the gate request's brief FIRST,
-    // then each reserved decision. If the agent ended as soon as every in-flight
-    // id had *a* brief, the first submit would look like full coverage and the
-    // later two would never be recorded (finding M-41).
+    // Park 2 (a LATER AWAITING_OWNER park via AMEND): submit the gate request's
+    // brief FIRST, then each reserved decision. If the agent ended as soon as
+    // every in-flight id had *a* brief, the first submit would look like full
+    // coverage and the later two would never be recorded (finding M-41).
     const gate = state.phase.ownerRequests.find((r) => r.status === "open" && r.origin === "repair_budget_exhausted");
     const reserved = liveReserved(state);
     const steps: any[] = [];
-    if (gate) steps.push({ kind: "call-submit", tool: "submit_brief", args: budgetBrief(gate) }, { kind: "sleep", ms: 300 });
-    for (const d of reserved) steps.push({ kind: "call-submit", tool: "submit_brief", args: reservedBrief(d) }, { kind: "sleep", ms: 300 });
+    if (gate) steps.push({ kind: "call-submit", tool: "submit_brief", args: budgetBrief(gate) }, { kind: "sleep", ms: 200 });
+    for (const d of reserved) steps.push({ kind: "call-submit", tool: "submit_brief", args: reservedBrief(d) }, { kind: "sleep", ms: 200 });
     return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps };
   });
   try {
     const reserved = RESERVED_IDS(setup);
     assert.equal(reserved.length, 2, "two live reserved decisions need briefs");
     const candidate = setup.conductor.state.phase.candidate!.sha;
-    // Park 1: every item gets a backstop (the gate request plus both reserved
-    // decisions), all from the one writer run.
     await waitFor(
       () =>
         reserved.every((id) =>
@@ -317,16 +338,13 @@ test("briefs: a backstop is retried only on a later park, and one submit does no
         ),
       60_000,
     );
+    await waitFor(() => briefTimeouts(setup) >= 1, 15_000);
     assert.equal(dispatches, 1, "one writer run covers every item of the first park");
-    // OD-6: the SAME park must never retry. Several drive beats pass with no
-    // second dispatch and no retry recorded.
-    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    // The SAME park must never retry.
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
     assert.equal(dispatches, 1, "a backstop is not retried on the next beat of the same park");
-    assert.ok(
-      !readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "BRIEF_RETRY_ATTEMPTED"),
-      "no retry is recorded while the park is the same",
-    );
-    // A LATER park on the same candidate: AMEND re-checks the same tree.
+    assert.deepEqual(setup.conductor.state.phase.briefRetries ?? [], []);
+    // A LATER AWAITING_OWNER park on the same candidate: AMEND re-checks.
     amendCommand(setup, "cmd-amend");
     await waitFor(() => setup.conductor.state.phase.phase !== "AWAITING_OWNER", 30_000);
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 60_000);
@@ -335,7 +353,7 @@ test("briefs: a backstop is retried only on a later park, and one submit does no
     // brief: the first submit did not end the writer (finding M-41).
     await waitFor(() => dispatches >= 2, 30_000);
     await waitFor(() => reserved.every((id) => hasModelBrief(setup, id, candidate)), 30_000);
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await new Promise((resolve) => setTimeout(resolve, 800));
     assert.equal(dispatches, 2, "exactly one retry dispatch on this candidate");
   } finally {
     await setup.conductor.stop();
@@ -345,13 +363,12 @@ test("briefs: a backstop is retried only on a later park, and one submit does no
   }
 });
 
-test("briefs: a failed retry keeps the backstop and never dispatches again", async () => {
+test("briefs: a second timeout keeps the backstop and never dispatches again", async () => {
   let dispatches = 0;
   const setup = await awaitingOwnerWithReserved(() => {
     dispatches += 1;
-    // Every writer run settles without submitting: the backstop covers the
-    // items, and the one retry on the later park also fails.
-    return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 500 }] };
+    // Every writer run times out.
+    return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 3_000 }] };
   });
   try {
     const reserved = RESERVED_IDS(setup);
@@ -363,13 +380,13 @@ test("briefs: a failed retry keeps the backstop and never dispatches again", asy
         ),
       60_000,
     );
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    await waitFor(() => briefTimeouts(setup) >= 1, 15_000);
     assert.equal(dispatches, 1, "no retry on the same park");
     amendCommand(setup, "cmd-amend");
     await waitFor(() => setup.conductor.state.phase.phase !== "AWAITING_OWNER", 30_000);
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 60_000);
-    // The single retry is dispatched once and fails; the backstop is kept and
-    // the failure is recorded.
+    // The single retry times out too; the backstop is kept and the failure is
+    // recorded.
     await waitFor(() => (setup.conductor.state.phase.briefRetries ?? []).some((k) => k === `${candidate}::${reserved[0]}`), 30_000);
     await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "brief_retry_failed"), 30_000);
     assert.equal(dispatches, 2, "one retry dispatch for the backstop-only items");
@@ -377,17 +394,14 @@ test("briefs: a failed retry keeps the backstop and never dispatches again", asy
       const held = (setup.conductor.state.phase.briefs ?? []).find((b) => b.requestId === id && b.candidateSha === candidate);
       assert.ok(held?.noRecommendationReason !== undefined, "the backstop stays shown until a model brief replaces it");
     }
-    // A second later park must not spend another retry on the reserved items
-    // (it may brief the new park's own new gate request).
+    // A second later AWAITING_OWNER park spends no second retry on them (it may
+    // brief the new park's own new gate request).
     amendCommand(setup, "cmd-amend-2");
     await waitFor(() => setup.conductor.state.phase.phase !== "AWAITING_OWNER", 30_000);
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 60_000);
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
-    const retriedIds = readEvents(setup.runDir)
-      .filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "BRIEF_RETRY_ATTEMPTED")
-      .flatMap((r) => ((r.event as { requestIds?: string[] }).requestIds ?? []));
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
     for (const id of reserved) {
-      assert.equal(retriedIds.filter((x) => x === id).length, 1, "each reserved item is retried exactly once on this candidate");
+      assert.equal(retriedIds(setup).filter((x) => x === id).length, 1, "each reserved item is retried exactly once");
     }
   } finally {
     await setup.conductor.stop();
