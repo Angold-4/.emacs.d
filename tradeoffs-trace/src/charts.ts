@@ -74,7 +74,9 @@ export interface ChartModels {
   worker?: string;
   reviewer?: string;
   evaluator?: string;
+  panel?: string;
 }
+type ModelRole = "worker" | "reviewer" | "evaluator" | "panel";
 
 /** Triggers whose edges are rare enough to fold out of the graph: a crash
  * recovery (interrupted) or a launch failure. Anything else is drawn. */
@@ -136,7 +138,7 @@ export function renderPhaseChart(
 ): string {
   const stats = opts.stats ?? { entries: {}, timeMs: {} };
   const fallback = opts.model && opts.model.length > 0 ? opts.model : "default";
-  const modelFor = (role: "worker" | "reviewer" | "evaluator") => opts.models?.[role] ?? fallback;
+  const modelFor = (role: ModelRole) => opts.models?.[role] ?? fallback;
   const phaseRows = rows.filter((r) => r.axis === "phase");
   const runRows = rows.filter((r) => r.axis === "run");
   const lines: string[] = [];
@@ -176,7 +178,14 @@ export function renderPhaseChart(
         bits.push(state === currentName ? "current" : "not current");
       }
       const dispatch = DISPATCH_ROLES[state];
-      if (dispatch) bits.push(`${dispatch.roles} - model ${modelFor(dispatch.model)}`);
+      if (dispatch) {
+        const roles = `${dispatch.roles} - model ${modelFor(dispatch.model)}`;
+        // EVALUATING dispatches the evaluator and the panel; when the panel
+        // has its own model, name it rather than showing the evaluator's for
+        // a seat that ran on something else.
+        const panelModel = state === "EVALUATING" ? modelFor("panel") : undefined;
+        bits.push(panelModel !== undefined && panelModel !== modelFor(dispatch.model) ? `${roles} (panel model ${panelModel})` : roles);
+      }
       lines.push(...boxLines(state, inner, marker, bits.join("  -  ")));
       const outgoing = drawn.filter((r) => r.from === state);
       for (const r of outgoing) {

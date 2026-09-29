@@ -108,6 +108,116 @@ test("plan-lint CLI: `tt lint` on a clean plan prints nothing and exits zero", a
   }
 });
 
+test("plan-lint CLI: `tt lint` reports an unknown #+TT_MODELS role with file and line", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({ ...planWith(["all existing tests still pass"], [9], "/tmp/repo"), models: { foo: { model: "x" } }, modelsLine: 4 }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout, /\/tmp\/PLAN\.org:4: error: \[models\]/);
+    assert.match(r.stdout, /unknown role foo/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test("plan-lint CLI: `tt lint` reports a role given twice", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({
+        ...planWith(["all existing tests still pass"], [9], "/tmp/repo"),
+        models: { worker: { model: "b" } },
+        modelsRepeated: ["worker"],
+        modelsLine: 5,
+      }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout, /\/tmp\/PLAN\.org:5: error: \[models\]/);
+    assert.match(r.stdout, /worker more than once/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test("plan-lint CLI: `tt lint` reports an empty model", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({ ...planWith(["all existing tests still pass"], [9], "/tmp/repo"), models: { reviewer: {} }, modelsLine: 6 }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.notEqual(r.code, 0);
+    assert.match(r.stdout, /\/tmp\/PLAN\.org:6: error: \[models\]/);
+    assert.match(r.stdout, /empty model/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test("plan-lint CLI: a plan that uses #+TT_MODELS cleanly passes", async () => {
+  const dir = tmpDir("tt-lint-models");
+  try {
+    const planPath = path.join(dir, "plan.json");
+    fs.writeFileSync(
+      planPath,
+      JSON.stringify({
+        ...planWith(["all existing tests still pass"], [9], "/tmp/repo"),
+        models: { worker: { model: "deepseek/deepseek-v4.1-flash" }, reviewer: { provider: "vercel-ai-gateway", model: "anthropic/claude-sonnet-5" } },
+        modelsLine: 3,
+      }),
+    );
+    const r = await runCli(["lint", planPath], {});
+    assert.equal(r.code, 0, r.stdout);
+    assert.equal(r.stdout.trim(), "");
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
+test("plan-lint CLI: a program-level #+TT_MODELS is reported once, at the program file", async () => {
+  const dir = tmpDir("tt-lint-prog-models");
+  try {
+    const programPath = path.join(dir, "program.json");
+    const entry = planWith(["all existing tests still pass"], [9], "/tmp/repo");
+    // The shape Emacs emits: the program's `foo` copied into every entry and
+    // recorded in `modelsFromProgram`. It must be reported once, at the
+    // program's own Org file, never once per entry or as the temp JSON path.
+    fs.writeFileSync(
+      programPath,
+      JSON.stringify({
+        title: "program-models",
+        sourceFile: "/tmp/PROGRAM.org",
+        maxParallel: 1,
+        branches: "stack",
+        models: { foo: { model: "x" } },
+        modelsLine: 3,
+        entries: [
+          { id: "e1", after: [], plan: { ...entry, sourceFile: "/tmp/e1.org", models: { foo: { model: "x" } }, modelsLine: 3, modelsFromProgram: ["foo"] } },
+          { id: "e2", after: [], plan: { ...entry, sourceFile: "/tmp/e2.org", models: { foo: { model: "x" } }, modelsLine: 3, modelsFromProgram: ["foo"] } },
+        ],
+      }),
+    );
+    const r = await runCli(["lint", programPath], {});
+    assert.notEqual(r.code, 0);
+    assert.equal((r.stdout.match(/error: \[models\]/g) ?? []).length, 1, `exactly one program-level finding:\n${r.stdout}`);
+    assert.match(r.stdout, /\/tmp\/PROGRAM\.org:3: error: \[models\]/);
+    assert.doesNotMatch(r.stdout, /\[e[12]\/models\]/);
+    assert.doesNotMatch(r.stdout, /program\.json/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
 test("plan-lint CLI: `tt lint` on a program lints every entry", async () => {
   const dir = tmpDir("tt-lint");
   try {

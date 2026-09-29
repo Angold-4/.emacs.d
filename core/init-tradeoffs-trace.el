@@ -159,6 +159,18 @@ Runs on DIR's host, so a plan opened over TRAMP asks the server's repo."
                   (org-element-property :value k)))
     nil t))
 
+(defun +tt--keyword-at (name)
+  "Return (VALUE . LINE) for the first #+NAME in the current buffer, or nil.
+The first keyword wins, as for every other plan keyword (`+tt--keyword'): a
+second declaration is ignored, not merged.  LINE is the 1-based line of the
+keyword itself, so `tt lint' can point at the Org line the owner edited (as
+`acceptanceLines' does for a list item)."
+  (org-element-map (org-element-parse-buffer 'element) 'keyword
+    (lambda (k) (when (string= (org-element-property :key k) name)
+                  (cons (org-element-property :value k)
+                        (line-number-at-pos (org-element-property :begin k)))))
+    nil t))
+
 (defun +tt--phase-body (hl)
   "Return the body text of headline HL without its property drawer."
   (let ((beg (org-element-property :contents-begin hl))
@@ -301,6 +313,39 @@ reads: the values live in the environment (design §7)."
   (seq-remove #'string-empty-p
               (split-string (or (+tt--keyword "TT_SECRETS") "") "[ \t,]+" t)))
 
+(defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel")
+  "Roles #+TT_MODELS may assign a model to (design §2.1).")
+
+(defun +tt--plan-models ()
+  "Parse #+TT_MODELS into (MODELS LINE REPEATED), or nil when absent/empty.
+MODELS is an alist of (ROLE . ((provider . P)? (model . M))) for the plan
+JSON.  The part before the first `:' is the provider, which is optional; the
+rest is the model and may itself contain `/'.  LINE is the 1-based line of
+the keyword.  REPEATED lists the roles the keyword named more than once (the
+later declaration wins): a JSON object cannot carry a duplicate key, so
+the parser records them for `tt lint' to report."
+  (when-let* ((at (+tt--keyword-at "TT_MODELS")))
+    (let ((seen nil) (repeated nil) (models nil))
+      (dolist (tok (split-string (car at) "[ \t,]+" t))
+        (let* ((eq (string-match "=" tok))
+               (role (if eq (substring tok 0 eq) tok))
+               (val (if eq (substring tok (1+ eq)) ""))
+               (colon (string-match ":" val))
+               (provider (and colon (> colon 0) (substring val 0 colon)))
+               (model (if colon (substring val (1+ colon)) val)))
+          (when (member role seen) (push role repeated))
+          (push role seen)
+          ;; A role named twice keeps only its LAST declaration (the run is
+          ;; blocked by lint anyway); one entry per role keeps the JSON object
+          ;; valid and the winner unambiguous.
+          (let ((key (intern role)))
+            (setq models (cons (cons key (if provider
+                                             `((provider . ,provider) (model . ,model))
+                                           `((model . ,model))))
+                               (assq-delete-all key models))))))
+      (when models
+        (list (nreverse models) (cdr at) (delete-dups (nreverse repeated)))))))
+
 (defun +tt-parse-plan ()
   "Parse the current Org plan buffer.
 Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
@@ -339,7 +384,12 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((r (+tt--plan-references dir)))
                       (and r `((references . ,(vconcat r)))))
                   ,@(let ((s (+tt--plan-secrets)))
-                      (and s `((secrets . ,(vconcat s))))))
+                      (and s `((secrets . ,(vconcat s)))))
+                  ,@(let ((m (+tt--plan-models)))
+                      (and m
+                           (append `((models . ,(nth 0 m))
+                                     (modelsLine . ,(nth 1 m)))
+                                   (when (nth 2 m) `((modelsRepeated . ,(vconcat (nth 2 m)))))))))
           :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
 
 (defun +tt--lint-json (json-file)
@@ -505,6 +555,30 @@ continues.  FILE names the Org file for the errors buffer."
             (mapcar (lambda (e) (cons (car e) (format "%s:%d: %s" (file-name-nondirectory file) (car e) (cdr e))))
                     (plist-get parsed :errors))))))
 
+(defun +tt--merge-models (plan program)
+  "PLAN with the program's #+TT_MODELS as a per-role default.
+An entry's own value for a role wins; PROGRAM is the (MODELS LINE REPEATED)
+triple from `+tt--plan-models', or nil (then PLAN is returned unchanged).
+The roles the program supplied are recorded as `modelsFromProgram', so
+`tt lint' checks each declaration exactly once: the program's own at the
+program level, the entry's own on the entry — the inherited copies are not
+rechecked per entry, which would name the program's line against the entry's
+file."
+  (if (not program)
+      plan
+    (let* ((own (append (alist-get 'models plan) nil))
+           (inherited (seq-remove (lambda (m) (assq (car m) own)) (nth 0 program)))
+           (merged (append own inherited)))
+      (setq plan (cons `(models . ,merged)
+                       (assq-delete-all 'models (copy-alist plan))))
+      (when inherited
+        (setq plan (cons `(modelsFromProgram . ,(vconcat (mapcar #'car inherited)))
+                         (assq-delete-all 'modelsFromProgram (copy-alist plan)))))
+      (unless (assq 'modelsLine plan)
+        (setq plan (cons `(modelsLine . ,(nth 1 program))
+                         (assq-delete-all 'modelsLine (copy-alist plan)))))
+      plan)))
+
 (defun +tt-parse-program ()
   "Parse the current buffer as a program.
 Return a plist (:program ALIST :errors ((LINE . MESSAGE) ...)).  A plan
@@ -522,6 +596,11 @@ several phases runs them in order."
          ;; declaration (plan 14 declared its vendor keys once, here, and no
          ;; entry received them).
          (program-secrets (+tt--plan-secrets))
+         ;; #+TT_MODELS in a *program* file: the per-role default for every
+         ;; entry that does not set its own (an entry's own value wins).  A
+         ;; plan file treated as a one-entry program is parsed by
+         ;; `+tt-parse-plan' below, so it is not parsed again here.
+         (program-models (and (+tt--keyword "TT_PROGRAM") (+tt--plan-models)))
          (entries nil) (errors nil))
     (if (not (+tt--keyword "TT_PROGRAM"))
         (let ((parsed (+tt-parse-plan)))
@@ -547,10 +626,22 @@ several phases runs them in order."
                     (let ((own (append (alist-get 'secrets plan) nil)))
                       (setq plan (cons `(secrets . ,(vconcat (seq-uniq (append own program-secrets))))
                                        (assq-delete-all 'secrets (copy-alist plan))))))
+                  (setq plan (+tt--merge-models plan program-models))
                   (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
     (unless entries (push (cons 1 "program has no entries") errors))
-    (list :program `((title . ,title) (maxParallel . ,max) (branches . ,branches)
-                     (entries . ,(vconcat (nreverse entries))))
+    (list :program (append `((title . ,title)
+                             ;; The Org program file, so `tt lint' names it
+                             ;; rather than the temporary JSON copy.
+                             (sourceFile . ,file)
+                             (maxParallel . ,max) (branches . ,branches)
+                             (entries . ,(vconcat (nreverse entries))))
+                           ;; The program file's own #+TT_MODELS, for `tt lint'
+                           ;; (the entries already carry the merged form).
+                           (when program-models
+                             (append `((models . ,(nth 0 program-models))
+                                       (modelsLine . ,(nth 1 program-models)))
+                                     (when (nth 2 program-models)
+                                       `((modelsRepeated . ,(vconcat (nth 2 program-models))))))))
           :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
 
 (defvar-local +tt--program-dir nil "Program directory shown by this buffer.")

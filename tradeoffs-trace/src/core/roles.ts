@@ -14,6 +14,24 @@ export const PI_VERSION = "0.87.0";
 
 export type Role = "worker" | "reviewer" | "evaluator" | "panel";
 
+/** A role's provider/model as a plan declares it (#+TT_MODELS). `provider`
+ * is the part before the first `:` and is optional; a model id may itself
+ * contain `/` (`vercel-ai-gateway:anthropic/claude-sonnet-5`). */
+export interface RoleModel {
+  provider?: string;
+  model?: string;
+}
+
+export type PlanModels = Partial<Record<Role, RoleModel>>;
+
+/** The one place that answers "which provider/model does ROLE run with?":
+ * a plan's own `models` map, when it declares one. Absent (the default): the
+ * caller passes neither `--provider` nor `--model` and Pi uses its
+ * `defaultModel`. */
+export function planModelSelector(plan: { models?: PlanModels }): (role: Role) => RoleModel | undefined {
+  return (role) => plan.models?.[role];
+}
+
 /** design §2.1's launch table. Every role uses an explicit allowlist, never
  * `--exclude-tools` (Pi's default set omits `grep`, `find` and `ls`, so a
  * denylist leaves gaps and, for a worker, leaks the reviewer submission

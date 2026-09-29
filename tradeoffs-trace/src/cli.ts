@@ -32,6 +32,7 @@ import {
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
+import { planModelSelector } from "./core/roles.ts";
 import { buildView, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
 import {
@@ -573,7 +574,11 @@ async function runConductorProcess(runDir: string): Promise<void> {
   // crashed, and a program scheduler restarts it (src/program.ts).
   const stoppedMarker = path.join(runDir, "stopped");
   rmSync(stoppedMarker, { force: true });
-  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, deadlines, stubReviews });
+  // #+TT_MODELS: the plan's per-role provider/model reaches every launch here,
+  // the one place a run's Conductor is built. `testPiInjection` above still
+  // supplies the fake-pi command for a test-launched run; the two do not
+  // interact (one picks the binary, the other the model flags).
+  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan), deadlines, stubReviews });
   const cleanStop = () =>
     void conductor.stop().then(() => {
       writeFileSync(stoppedMarker, new Date().toISOString());
@@ -883,8 +888,12 @@ function cmdContract(sub: string | undefined, runDir: string): void {
 }
 
 /** A-13: a live `tt verdict` reports the OUTCOME. The command is written to
- * the inbox, then this waits briefly for the conductor to move it to
- * `inbox/applied` or `inbox/rejected` and returns which, with the reason. */
+ * the inbox, then this waits for the conductor to move it to
+ * `inbox/applied` or `inbox/rejected` and returns which, with the reason.
+ * 20 s (up from 5 s): under the whole suite's four-way load the conductor's
+ * inbox poll can lag far past 5 s, and a live run's verdict then read
+ * `queued` even though the conductor was about to apply it. A genuinely
+ * stopped conductor still returns `queued` after the window. */
 async function awaitInboxVerdict(
   runDir: string,
   commandId: string,
@@ -982,7 +991,7 @@ async function cmdVerdict(
       },
     };
     writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
-    const outcome = await awaitInboxVerdict(runDir, commandId, 5000);
+    const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
     if (outcome.kind === "applied") {
       process.stdout.write(`verdict applied: ${verdict} recorded for ${messageId} in run ${path.basename(runDir)}\n`);
     } else if (outcome.kind === "rejected") {

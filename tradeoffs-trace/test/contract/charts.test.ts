@@ -93,7 +93,7 @@ const TIMELINE: TimelineLike = {
 
 test("loop.txt matches its golden file, with the current-state marker", () => {
   const stats = statsFromTimeline(TIMELINE, new Date("2026-09-27T11:05:00.000Z"));
-  const chart = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet" } });
+  const chart = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet" } }); // evaluator stays `default` in the golden
   assertGolden("loop.txt", chart);
   // Plan 04c join: the golden must draw EVERY row, including the 04a/04b
   // BASELINE and EVALUATING states the merged TRANSITIONS added. A row that
@@ -108,6 +108,14 @@ test("loop.txt matches its golden file, with the current-state marker", () => {
   // Per-role models: the worker and the reviewers each show their own (D-18).
   assert.match(chart, /IMPLEMENTING.*worker - model opus/);
   assert.match(chart, /REVIEWING.*M, A, B - model sonnet/);
+  // #+TT_MODELS: the evaluator (and the panel that shares its box) names its
+  // own model too, not a placeholder `default` (the criterion for this work).
+  const withEvaluator = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet", evaluator: "haiku" } });
+  assert.match(withEvaluator, /EVALUATING.*evaluator, panel - model haiku/);
+  // A panel with its own model is named too, so the box does not claim the
+  // evaluator's model ran on the panel seat.
+  const withPanel = renderPhaseChart(TRANSITIONS, { stats, models: { worker: "opus", reviewer: "sonnet", evaluator: "haiku", panel: "gpt" } });
+  assert.match(withPanel, /EVALUATING.*evaluator, panel - model haiku \(panel model gpt\)/);
   // The run axis carries its own current marker, not phase counts (M-5).
   assert.match(chart, /^> .*\n  \| RUN_ACTIVE\s+\|  current/m);
 });

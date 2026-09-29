@@ -14,6 +14,7 @@ import { test } from "node:test";
 
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, FAKE_PI_PATH, readEvents, setupConductor, waitFor } from "./harness.ts";
 import { Conductor, runPaths } from "../../src/conductor.ts";
+import { ROLE_TOOLS } from "../../src/core/roles.ts";
 
 const CLI = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
 
@@ -334,9 +335,35 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
   const promptDir = mkdtempSync("/tmp/tt-carried-prompts-");
   const workerPromptLog = `${promptDir}/worker.log`;
   const gate = releaseGate();
+  // The evaluator holds EVALUATING open until the owner's verdict has landed;
+  // otherwise the repair attempt's prompt can be built before the trade-off
+  // is settled, and the repair does not see the settled ledger. Holding the
+  // worker after its prompt (the `gate` above) was too late for that race —
+  // the prompt exists before the first script step runs.
+  const evalGate = releaseGate();
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
+    evaluatorScriptFor: (messageType) => ({
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps: [
+        ...(messageType === "tradeoff"
+          ? [
+              {
+                kind: "call-submit" as const,
+                tool: "submit_evaluation" as const,
+                args: {
+                  evaluations: [
+                    { messageId: "T-1", action: "publish", title: "carried trade-off", summary: "the trade-off under test", context: "carried", evidence: ["src/x.ts:1"] },
+                  ],
+                },
+              },
+            ]
+          : []),
+        { kind: "call-sh" as const, command: evalGate.waitCommand },
+        ...(messageType === "tradeoff" ? [] : [{ kind: "call-submit" as const, tool: "submit_evaluation" as const, args: { evaluations: [] } }]),
+      ],
+    }),
     workerScriptForAttempt: (attempt) => ({
       hello: defaultWorkerHello(),
       steps: [
@@ -426,6 +453,10 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
       20,
       setup.runDir,
     );
+    // The accept is recorded; let EVALUATING finish, so the repair attempt's
+    // prompt is built after the settlement. The worker gate then holds the
+    // repair itself, as before.
+    evalGate.release();
     gate.release();
 
     await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 150_000, 50, setup.runDir);

@@ -36,7 +36,7 @@
 // `prompt` arrives, so one script can cover both turns.
 
 import { createConnection, type Socket } from "node:net";
-import { appendFileSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -81,6 +81,24 @@ let hangingForever = false;
 function readEnv(name: string): string | undefined {
   const v = process.env[name];
   return v && v.length > 0 ? v : undefined;
+}
+
+/** Test-only: record the argv this fake-pi was actually launched with (after
+ * `node <script>`), one JSONL line per dispatch under `<dir>/<role>.jsonl`,
+ * so a conductor test can assert the conductor's own `--provider`/`--model`
+ * flags. Opt-in via `FAKE_PI_ARGV_LOG` (a directory). */
+function recordArgv(): void {
+  const dir = readEnv("FAKE_PI_ARGV_LOG");
+  if (!dir) return;
+  try {
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(
+      join(dir, `${readEnv("TT_ROLE") ?? "worker"}.jsonl`),
+      `${JSON.stringify({ agentId: readEnv("TT_AGENT_ID") ?? "?", argv: process.argv.slice(2) })}\n`,
+    );
+  } catch {
+    // Best effort: a recording failure must not break the agent.
+  }
 }
 
 /** Phase 1b work-packet item 6: a `call-submit` step's `args` is a static
@@ -200,6 +218,7 @@ class RunSocket {
 // --- main ---
 
 async function main(): Promise<void> {
+  recordArgv();
   const script = loadScript();
   const runSocket = new RunSocket();
   const socketPath = readEnv("TT_SOCKET");

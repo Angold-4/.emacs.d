@@ -150,7 +150,7 @@ failing output names none.
 |---|---|
 | Node 25+ | runs the TypeScript directly, no build step |
 | Pi 0.87.0 | `pi --version`; the conductor asserts this version and each role's tool set |
-| Model and credentials | Pi's own configuration, `~/.pi/agent/settings.json` (`defaultProvider`, `defaultModel`) and `auth.json`. Every role uses Pi's default model. |
+| Model and credentials | Pi's own configuration, `~/.pi/agent/settings.json` (`defaultProvider`, `defaultModel`) and `auth.json`. Without `#+TT_MODELS` (below), every role uses Pi's `defaultModel`. |
 | Emacs front end | `core/init-tradeoffs-trace.el`, loaded by the Emacs config |
 | An installed runner | see below |
 
@@ -205,8 +205,10 @@ Two kinds of finding:
 - **Error — stops the start.** An acceptance item whose actor is the owner or a
   human (`the owner records …`, `manually …`, `someone …`). No worker or
   reviewer can satisfy it. Move it to the plan's `Owner checklist:` list, or
-  rewrite it as an observable result a worker produces. Emacs shows errors in
-  `*tt-plan-errors*` (jump-to-line to the Org file) and starts nothing.
+  rewrite it as an observable result a worker produces. An invalid
+  `#+TT_MODELS` declaration (see "Models per role") is an error too. Emacs
+  shows errors in `*tt-plan-errors*` (jump-to-line to the Org file) and starts
+  nothing.
 - **Warning — shown, and the start continues.** An item that depends on a
   future that does not exist when the checks run and the reviewers judge the
   candidate (`after merge`, `the current rebased tip`, `once deployed`), or a
@@ -221,6 +223,34 @@ the conductor commits the candidate. The existing plans in
 `~/orgw/work/atlas/indexps/` are a lint fixture in the package
 (`tradeoffs-trace/test/fixtures/atlas-plans/`): the linter finds exactly one
 error across them, `13j`'s owner-actor item.
+
+## Models per role
+
+By default every role — the worker, the three reviewers (M, A, B), the
+message evaluators and the blocker panel — runs on Pi's own `defaultModel`
+(`~/.pi/agent/settings.json`). A plan can give a role a stronger model with one
+keyword:
+
+```org
+#+TT_MODELS: worker=deepseek/deepseek-v4.1-flash reviewer=vercel-ai-gateway:anthropic/claude-sonnet-5 evaluator=vercel-ai-gateway:anthropic/claude-opus panel=deepseek/deepseek-v4.1-flash
+```
+
+Space-separated `role=provider:model` declarations:
+
+- the **role** is one of `worker`, `reviewer`, `evaluator`, `panel` (the three
+  reviewers M, A and B all use `reviewer`);
+- the part before the **first** `:` is the provider and is optional —
+  `worker=deepseek/deepseek-v4.1-flash` passes no `--provider` and a model id
+  may itself contain `/`;
+- a role absent from the keyword keeps Pi's `defaultModel`.
+
+A program file may declare `#+TT_MODELS` too: it is the default for every
+entry, and an entry's own `#+TT_MODELS` **wins for each role it names** (a
+role the entry does not name still gets the program's). What ran is visible:
+`views/loop.txt` names each dispatching role's model, `tt status` and the
+status buffer print one `models` line when the plan set any, and `tt summary`'s
+PR body lists the models per role. `tt lint` rejects an unknown role, a role
+named twice, or a role with an empty model.
 
 ## Owner checklist
 

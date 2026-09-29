@@ -84,7 +84,15 @@ import type {
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
-import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS, type Role, type ToolSetMismatch } from "./core/roles.ts";
+import {
+  assertToolSet,
+  launchArgs,
+  PI_VERSION,
+  ROLE_TOOLS,
+  type PlanModels,
+  type Role,
+  type ToolSetMismatch,
+} from "./core/roles.ts";
 import { decisionStatus, isLiveDecision, panelOptionsFor, panelOutcome, panelSeatsSettled, sameVersion } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
@@ -297,6 +305,18 @@ export interface RunPlanFile {
    * node started after the owner's ruling still carries it in every prompt.
    * Written by the program scheduler (`nodePlan`), never by hand. */
   ownerDirectives?: RunPlanDirectiveSeed[];
+  /** #+TT_MODELS: per-role provider/model overrides (design §2.1). Absent on
+   * every plan that predates the keyword, so every role keeps Pi's own
+   * `defaultModel`. Emacs parses it; `planModelSelector` is the one runtime
+   * place that turns it into `launchArgs`'s `provider`/`model`. */
+  models?: PlanModels;
+  /** Lint-only (never read by the conductor): the 1-based line of the
+   * `#+TT_MODELS` keyword in the source Org file, so `tt lint` can point at
+   * it (`acceptanceLines` is the same kind of field). */
+  modelsLine?: number;
+  /** Lint-only: roles the keyword declared more than once. A JSON object
+   * cannot carry a duplicate key, so the parser records them here. */
+  modelsRepeated?: string[];
 }
 
 /** Plan 01i: a program-wide owner directive a node's plan was started with. */
@@ -4380,9 +4400,15 @@ export class Conductor {
     // injected provider/model when a caller set one, otherwise Pi's own
     // default from settings.json, otherwise `default`.
     const modelFor = (role: Role): string | undefined => this.#providerModelFor?.(role)?.model ?? piDefaultModel();
-    // No evaluator source exists yet, so the evaluator role must read
-    // `default` rather than borrow the reviewers' model (M-9).
-    const models = { worker: modelFor("worker"), reviewer: modelFor("reviewer"), evaluator: undefined };
+    // The evaluator and the panel (which shares the EVALUATING box) have a
+    // model source now (#+TT_MODELS), so each reads its own instead of M-9's
+    // placeholder `default`.
+    const models = {
+      worker: modelFor("worker"),
+      reviewer: modelFor("reviewer"),
+      evaluator: modelFor("evaluator"),
+      panel: modelFor("panel"),
+    };
     fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
   }
 

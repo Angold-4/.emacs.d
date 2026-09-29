@@ -646,6 +646,69 @@ and an unknown id is refused by that command."
   ;; An empty #+TT_SECRETS declares nothing.
   (should-not (assq 'secrets (plist-get (+tt-test--parse (concat "#+TT_SECRETS:\n" +tt-test--valid-plan)) :plan))))
 
+(ert-deftest tradeoffs-trace-plan-models ()
+  "#+TT_MODELS becomes the plan's models map: provider optional, model may
+contain a slash, and a role named twice is recorded for `tt lint'."
+  (let* ((text (concat "#+TT_MODELS: worker=deepseek/deepseek-v4.1-flash reviewer=vercel-ai-gateway:anthropic/claude-sonnet-5 evaluator=openai:gpt-x panel=bare\n"
+                       +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan))
+         (models (alist-get 'models plan)))
+    ;; no provider when none was written; the whole value is the model,
+    ;; including the slash
+    (should (equal (alist-get 'model (alist-get 'worker models)) "deepseek/deepseek-v4.1-flash"))
+    (should-not (assq 'provider (alist-get 'worker models)))
+    ;; provider before the FIRST colon; the rest is the model
+    (should (equal (alist-get 'provider (alist-get 'reviewer models)) "vercel-ai-gateway"))
+    (should (equal (alist-get 'model (alist-get 'reviewer models)) "anthropic/claude-sonnet-5"))
+    (should (equal (alist-get 'model (alist-get 'evaluator models)) "gpt-x"))
+    (should (equal (alist-get 'provider (alist-get 'evaluator models)) "openai"))
+    (should (equal (alist-get 'model (alist-get 'panel models)) "bare"))
+    ;; the keyword's own line, for `tt lint'
+    (should (= (alist-get 'modelsLine plan) 1)))
+  ;; a plan without the keyword is unchanged: no models field at all
+  (should-not (assq 'models (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+  ;; a role named twice: the later model wins, and the repetition is recorded
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_MODELS: worker=a worker=b\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'modelsRepeated plan) ["worker"]))
+    (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models plan))) "b"))))
+
+(ert-deftest tradeoffs-trace-program-models ()
+  "A program's #+TT_MODELS is the per-role default for every entry; an
+entry's own value for a role wins over it."
+  (let* ((dir (make-temp-file "tt-ert-prog-models" t))
+         (plan-a (expand-file-name "a.org" dir))
+         (plan-b (expand-file-name "b.org" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file plan-a (insert +tt-test--valid-plan))
+          (with-temp-file plan-b (insert (concat "#+TT_MODELS: worker=entry-w\n"
+                                                 (replace-regexp-in-string "p1" "q1" +tt-test--valid-plan))))
+          (with-temp-buffer
+            (insert "#+TITLE: pm\n#+TT_PROGRAM: 2\n#+TT_MODELS: worker=prog-w reviewer=prog-r\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
+            (setq buffer-file-name (expand-file-name "program.org" dir) default-directory dir)
+            (org-mode)
+            (let* ((program (plist-get (+tt-parse-program) :program))
+                   (entries (alist-get 'entries program))
+                   (pa (alist-get 'plan (aref entries 0)))
+                   (pb (alist-get 'plan (aref entries 1))))
+              (set-buffer-modified-p nil) (setq buffer-file-name nil)
+              ;; the program's declaration reaches an entry with none of its own
+              (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models pa))) "prog-w"))
+              (should (equal (alist-get 'model (alist-get 'reviewer (alist-get 'models pa))) "prog-r"))
+              ;; the entry's own value wins; the program fills the other role
+              (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models pb))) "entry-w"))
+              (should (equal (alist-get 'model (alist-get 'reviewer (alist-get 'models pb))) "prog-r"))
+              ;; the program object keeps its own declaration for `tt lint'
+              (should (equal (alist-get 'model (alist-get 'worker (alist-get 'models program))) "prog-w"))
+              ;; ... and names its own Org file, not the temporary JSON copy
+              (should (equal (alist-get 'sourceFile program) (expand-file-name "program.org" dir)))
+              ;; which roles came from the program is recorded, so `tt lint'
+              ;; checks each declaration exactly once (the entry's own here,
+              ;; the program's on the program object)
+              (should (equal (alist-get 'modelsFromProgram pa) [worker reviewer]))
+              (should (equal (alist-get 'modelsFromProgram pb) [reviewer])))))
+      (delete-directory dir t))))
+
 (ert-deftest tradeoffs-trace-trace-never-shows-a-secret-value ()
   "Plan 01a: the trace masks a declared secret's value (read from Emacs's own
 environment) wherever a stream file happens to hold one; the name shows."

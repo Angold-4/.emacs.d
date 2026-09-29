@@ -9,6 +9,7 @@ import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { effectiveChecks } from "./core/checks.ts";
+import type { PlanModels } from "./core/roles.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
@@ -113,6 +114,27 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
     }
   }
   return spans;
+}
+
+/** #+TT_MODELS, in the order the roles appear in the pipeline, as
+ * `role=provider:model` (provider only when the plan declared one). Empty
+ * when the plan set no models, so a view can omit the line entirely. */
+export function modelEntries(models: PlanModels | undefined): Array<{ role: string; value: string }> {
+  if (!models) return [];
+  const out: Array<{ role: string; value: string }> = [];
+  for (const role of ["worker", "reviewer", "evaluator", "panel"] as const) {
+    const m = models[role];
+    if (!m) continue;
+    out.push({ role, value: m.provider ? `${m.provider}:${m.model ?? ""}` : m.model ?? "" });
+  }
+  return out;
+}
+
+/** One status line naming every role's model, or undefined when the plan set
+ * none (a run that uses Pi's `defaultModel` needs no line). */
+export function modelsLineText(models: PlanModels | undefined): string | undefined {
+  const entries = modelEntries(models);
+  return entries.length > 0 ? `models: ${entries.map((e) => `${e.role}=${e.value}`).join(" ")}` : undefined;
 }
 
 export function formatDuration(ms: number): string {
@@ -371,6 +393,9 @@ export interface RunView {
    * the one status line that renders them. */
   metrics: PhaseMetrics;
   metricsLine: string;
+  /** #+TT_MODELS: one line naming each role's provider/model, only when the
+   * plan set models (otherwise undefined — Pi's defaultModel needs no line). */
+  models?: string;
 }
 
 /** Plan 01h: what the run costs so far. `stageMinutes` excludes `needs you`,
@@ -570,6 +595,7 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
     timeline,
     metrics,
     metricsLine: metricsLine(metrics),
+    models: modelsLineText(plan.models),
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
@@ -726,6 +752,8 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   // Contract v1: a message the owner refused after DONE is a recorded
   // follow-up, not a blocker. The PR body must not hide it.
   const followUps = (phase.messages ?? []).filter((m) => m.followUp);
+  // #+TT_MODELS: the models the run actually used, one line per role.
+  const models = modelEntries(plan.models);
   const lines = [
     `## ${phase.phaseId}`,
     "",
@@ -748,6 +776,9 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
     "",
+    ...(models.length > 0
+      ? ["### Models per role", "", ...models.map((m) => `- ${m.role}: ${m.value}`), ""]
+      : []),
     ...metricsSummary(v.metrics),
   ];
   // Plan 01c: the owner's own checklist (from the plan's `Owner checklist:`
