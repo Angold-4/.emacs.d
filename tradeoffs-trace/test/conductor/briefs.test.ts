@@ -119,6 +119,26 @@ test("briefs: the evaluator's brief is recorded for the open owner request", asy
   }
 });
 
+test("briefs: a brief-agent tool mismatch falls back, with no LAUNCH_FAILED phase event", async () => {
+  const setup = await awaitingOwner({
+    briefScriptFor: () => ({ hello: { role: "evaluator", tools: ["read"] }, steps: [] }),
+  });
+  try {
+    const request = openRequest(setup);
+    await waitFor(() => (setup.conductor.state.phase.briefs ?? []).some((b) => b.requestId === request.id), 30_000);
+    const types = readEvents(setup.runDir).map((r) => (r.event as { type?: string }).type);
+    assert.ok(!types.includes("LAUNCH_FAILED"), "a brief mismatch runs only from AWAITING_OWNER, so it must not emit LAUNCH_FAILED");
+    assert.ok(types.includes("BRIEFS_RECORDED"), "the deterministic backstop still records a brief");
+    const brief = (setup.conductor.state.phase.briefs ?? []).find((b) => b.requestId === request.id)!;
+    assert.match(brief.impact, /not established/i);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runDir);
+    cleanupDir(setup.repo.dir);
+    cleanupDir(setup.runRoot);
+  }
+});
+
 test("briefs: the deterministic backstop fills in when the model submits none, without asserting an unchecked impact", async () => {
   const setup = await awaitingOwner({ briefScriptFor: () => ({ hello: { role: "evaluator", tools: [] }, steps: [] }) });
   try {

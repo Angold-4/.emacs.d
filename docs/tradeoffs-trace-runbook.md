@@ -679,21 +679,28 @@ than keeping an earlier round's `today`.
 
 `A` and `D` choose the brief's accept and refuse option by the option's own
 meaning, never by its position; `RET` prompts on the option's **plain label**,
-never its engineer id. A model brief must state whether any market stops
-publishing; only the deterministic backstop may say the impact was not
-established. A time, count or duration must cite the config or code the brief
-read (`config: ...`, `code: ...`, or a `path:line`) — a plan clause or a bare
-`§` reference does not count. The glossary terms `T_in` and `T_out` are allowed
-in a brief's question.
+never its engineer id. Refusing an entry from its brief asks for the optional
+reason, and the reason reaches the next worker attempt. A model brief must
+state one recommended option, with why, citing the plan or an IC section; only
+the deterministic backstop may omit it. A model brief must also state whether
+any market stops publishing; only the deterministic backstop may say the
+impact was not established. A time, count or duration must cite the config or
+code the brief read (`config: ...`, `code: ...`, or a `path:line`) — a plan
+clause or a bare `§` reference does not count. The glossary terms `T_in` and
+`T_out` are allowed in a brief's question.
 
 If the model misses an item, the backstop records a brief that never invents
 an example, never asserts an unchecked impact (it says the impact was not
 established), omits a recommendation rather than recommending an option by
-position, and lists the other items on the same file or plan clause. The
-conductor merges its own same-concern items into a model brief's `related`
-too, so a bigger silence is never hidden. A brief names a weekday reopen
-example only when the plan's calendar carries a weekly schedule to check it
-against; otherwise it is marked unverified.
+position, and lists the other items on the same file or plan clause. `related`
+names both other owner items and same-concern live trade-offs or findings
+that never became owner items — the T-54 silence the goal says must not hide.
+The conductor merges its own same-concern items into a model brief's `related`
+too. A brief names a weekday reopen example only when the plan's calendar
+carries a weekly schedule to check it against; otherwise it is marked
+unverified. If the brief-writing agent's own tools do not match at launch, the
+conductor records why and uses the deterministic backstop — the brief pass
+never emits a phase launch failure from the parked phases it runs in.
 
 The same briefs appear at the top of `views/review.org` (and the program
 review) under `* Needs you (N)`; `TAB` on a question unfolds its evidence. An

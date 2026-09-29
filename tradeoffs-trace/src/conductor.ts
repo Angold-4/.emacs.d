@@ -3468,10 +3468,14 @@ export class Conductor {
       const issue = briefIssue(brief as never, { requestOptions, catalogs: this.#briefCatalogs() });
       if (issue) return { ok: false, reason: `invalid brief for ${requestId}: ${issue}` };
       const C = this.#state.phase.candidate?.sha;
+      // The item class fixes the command, never the model's own field: a
+      // reserved decision must send an override and an entry an entry verdict,
+      // or the owner's A writes a resolve that matches nothing (F-A-16).
+      const command = request ? "resolve" : decision ? "override" : "entry";
       // The conductor merges its own same-concern items into the model's
       // `related` (finding A-29), and stamps the candidate so the next round
       // rewrites the brief (finding M-30).
-      const enriched = { ...enrichBriefRelated(brief as DecisionBrief, this.#briefConcerns()), candidateSha: C };
+      const enriched = { ...enrichBriefRelated(brief as DecisionBrief, this.#briefConcerns()), candidateSha: C, command };
       this.#applyEvent({ type: "BRIEFS_RECORDED", briefs: [enriched] });
       this.#log.append("brief_recorded", { requestId, options: (brief as { options?: unknown }).options, candidateSha: C });
       // The brief agent is done once every item it was asked for has a brief
@@ -7418,6 +7422,13 @@ export class Conductor {
     ) as never;
   }
 
+  /** Every live entry, marked or not. They are NOT briefed, but they are
+   * concerns: a same-concern trade-off or finding that never became an owner
+   * item is exactly the T-54 silence `related` must surface (OD-2 / D-B-77). */
+  #liveEntriesForRelated(phase = this.#state.phase): Array<{ id: string; title?: string; messages?: Array<{ id: string; title?: string; evidence?: string[] }> }> {
+    return (phase.entries ?? []).filter((e) => (e as { state?: string }).state === "open") as never;
+  }
+
   /** One open item's concern (the files and plan clauses it touches), from its
    * linked finding and messages, so `related` can name a bigger silence on the
    * same concern. */
@@ -7453,7 +7464,10 @@ export class Conductor {
       out.push(this.#concernFor(r.id, r.reason, linked));
     }
     for (const d of this.#liveReservedDecisions(phase)) out.push(this.#concernFor(d.id, d.choice, [d.id]));
-    for (const e of this.#ownerMarkedEntries(phase)) {
+    // Every live entry, not only the marked ones: a same-concern trade-off or
+    // finding that never became an owner item is the T-54 silence the goal
+    // says `related` must surface (OD-2 / D-B-77).
+    for (const e of this.#liveEntriesForRelated(phase)) {
       const messageIds = (e.messages ?? []).map((m) => m.id);
       out.push(this.#concernFor(e.id, e.title ?? "", [], messageIds));
     }
@@ -7573,7 +7587,13 @@ export class Conductor {
       if (!hello.ok) {
         await agent.terminate();
         this.#log.completion(actionId, { ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
-        if (hello.mismatch) this.#applyEvent({ type: "LAUNCH_FAILED", role: "evaluator", ...hello.mismatch });
+        // A tool-set mismatch is NOT a phase launch failure here: the brief
+        // pass runs only in AWAITING_OWNER/BLOCKED, where no LAUNCH_FAILED
+        // transition exists, so applying the event would be rejected and throw
+        // (OD-2 / D-M-70). Record why and let the finally backstop cover it.
+        if (hello.mismatch) {
+          this.#log.append("brief_agent_launch_rejected", { agentId, expected: hello.mismatch.missing, extra: hello.mismatch.extra });
+        }
         return;
       }
       const briefTimeout = this.#withStallWatch(

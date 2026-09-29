@@ -258,13 +258,16 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
       return `the brief's options (${ids.join(", ")}) must map one-to-one to the request's (${opts.requestOptions.join(", ")})`;
     }
   }
+  // Every MODEL brief must carry a recommendation citing the plan or IC (OD-2/
+  // D-B-79). Only the deterministic backstop may omit it, which it signals with
+  // `allowUnverifiedImpact` (its mode).
   const rec = brief.recommendation;
-  // The recommendation is optional: the deterministic backstop omits it
-  // rather than recommending an option by position with no citation
-  // (finding M-31). When present it must name one of the brief's options.
   if (rec !== undefined) {
     if (!rec || typeof rec !== "object" || !rec.option?.trim() || !rec.why?.trim()) return "a brief's recommendation needs one option and why";
     if (!ids.includes(rec.option.trim())) return `the recommended option '${rec.option}' is not one of the brief's options`;
+    if (!/\b(?:IC|plan)\b|§\s*\d/i.test(rec.why)) return "the recommendation must cite the plan or an IC section";
+  } else if (!opts.allowUnverifiedImpact) {
+    return "a brief needs one recommended option and why, citing the plan or IC section";
   }
   if (!Array.isArray(brief.evidence) || brief.evidence.filter((e) => typeof e === "string" && e.trim()).length === 0) {
     return "a brief needs the original evidence";

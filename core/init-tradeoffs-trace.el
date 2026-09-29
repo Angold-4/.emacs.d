@@ -2282,7 +2282,14 @@ requires."
         (command (or (org-entry-get nil "COMMAND") "resolve")))
     (cond
      ((equal command "entry")
-      (message "%s" (+tt--cli "entry" +tt--run-dir (if (equal option "accept") "accept" "refuse") (+tt-review--message-id))))
+      ;; The entry fallback brief's refuse option says the reason reaches the
+      ;; next worker, so refusing here asks for it, exactly as D on the entry
+      ;; heading does (OD-2 / D-B-78).
+      (let ((reason (when (equal option "refuse") (read-string "Reason (optional): "))))
+        (message "%s"
+                 (apply #'+tt--cli
+                        (append (list "entry" +tt--run-dir (if (equal option "accept") "accept" "refuse") (+tt-review--message-id))
+                                (when (and reason (not (string-empty-p reason))) (list "--reason" reason)))))))
      (t
       (unless binding
         (user-error "This brief has no full binding; refresh the review (g) and try again"))

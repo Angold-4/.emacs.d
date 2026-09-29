@@ -244,6 +244,29 @@ test("the deterministic backstop lists related items on the same concern and nev
   assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id), allowUnverifiedImpact: true }), undefined);
 });
 
+test("a model brief without a recommendation, or without a plan/IC citation, is refused", () => {
+  const good = fixture().briefs[0];
+  const without = { ...good, recommendation: undefined };
+  const issue = briefIssue(without);
+  assert.ok(issue, "a model brief must recommend one option");
+  assert.match(issue!, /recommended option/i);
+  // The backstop's mode allows the omission.
+  assert.equal(briefIssue(without, { allowUnverifiedImpact: true }), undefined);
+  const uncited = { ...good, recommendation: { option: "repair", why: "it seems better" } };
+  const issue2 = briefIssue(uncited);
+  assert.ok(issue2, "the recommendation must cite the plan or an IC section");
+  assert.match(issue2!, /cite the plan or an IC/i);
+});
+
+test("the conductor forces a model brief's command to its item class", () => {
+  // The briefIssue gate cannot see the item, so the conductor overwrites the
+  // command: a reserved decision's brief must be an override, not a resolve.
+  const good = fixture().briefs[0];
+  const reserved = fallbackDecisionBrief({ id: "D-A-80", choice: "widen the band" });
+  assert.equal(reserved.command, "override");
+  assert.equal(good.command, undefined);
+});
+
 test("only the backstop may say the impact was not established", () => {
   const f = fixture();
   const model = { ...f.briefs[0], impact: "Whether any market stops publishing is not established." };
