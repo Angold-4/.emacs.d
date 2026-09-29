@@ -1,0 +1,34 @@
+#+TITLE: F-2 — an unreachable branch
+#+TYPE: finding
+
+* F-2 an unreachable branch
+  :PROPERTIES:
+  :ID: F-2
+  :TYPE: finding
+  :STATE: raw
+  :RAISED_BY: A
+  :IMPORTANCE: low
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  raised by A
+
+* Evidence
+  - src/util.ts:9 an unreachable branch
+
+* Plan
+  plan/03b.org
+
+* History
+  - v1 · C1 · bb161aebed78470509cb42f427b7947df099ff8dd8af00ce895b8d3b78293536
+
+* Ledger
+  (not settled)
+
+* Votes
+  (none)

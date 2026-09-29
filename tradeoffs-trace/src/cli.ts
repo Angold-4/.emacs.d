@@ -14,7 +14,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { projectLedger, projectMessages, projectReview } from "./core/messages.ts";
+import { projectLedger, projectMessages } from "./core/messages.ts";
+import { pendingOwnerInputs, projectReview, renderStatusText, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
 import { reduce } from "./core/reduce.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
@@ -61,7 +62,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -97,6 +98,10 @@ function parseArgs(argv: string[]): {
   reason?: string;
   candidateSha?: string;
   messageVersion?: number;
+  contractVersion?: number;
+  contractSha256?: string;
+  runId?: string;
+  phaseId?: string;
 } {
   const positional: string[] = [];
   let root: string | undefined;
@@ -104,6 +109,10 @@ function parseArgs(argv: string[]): {
   let reason: string | undefined;
   let candidateSha: string | undefined;
   let messageVersion: number | undefined;
+  let contractVersion: number | undefined;
+  let contractSha256: string | undefined;
+  let runId: string | undefined;
+  let phaseId: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--root") {
@@ -122,11 +131,27 @@ function parseArgs(argv: string[]): {
       messageVersion = Number(argv[++i]);
     } else if (arg.startsWith("--message-version=")) {
       messageVersion = Number(arg.slice("--message-version=".length));
+    } else if (arg === "--contract-version") {
+      contractVersion = Number(argv[++i]);
+    } else if (arg.startsWith("--contract-version=")) {
+      contractVersion = Number(arg.slice("--contract-version=".length));
+    } else if (arg === "--contract-sha256") {
+      contractSha256 = argv[++i];
+    } else if (arg.startsWith("--contract-sha256=")) {
+      contractSha256 = arg.slice("--contract-sha256=".length);
+    } else if (arg === "--run-id") {
+      runId = argv[++i];
+    } else if (arg.startsWith("--run-id=")) {
+      runId = arg.slice("--run-id=".length);
+    } else if (arg === "--phase-id") {
+      phaseId = argv[++i];
+    } else if (arg.startsWith("--phase-id=")) {
+      phaseId = arg.slice("--phase-id=".length);
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json, reason, candidateSha, messageVersion };
+  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId };
 }
 
 function resolveRunDir(rootOrId: string, root: string): string {
@@ -517,59 +542,8 @@ function renderStatus(runDir: string): string {
   const p = runPaths(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const state = rebuildState(runDir, plan, { lenient: true });
-  const phase = state.phase as unknown as Record<string, unknown>;
-  const lines: string[] = [];
-  lines.push(`run: ${path.basename(runDir)}`);
-  lines.push(`run status: ${state.run}`);
-  // Plan 01a: a declared secret that was unset, or set to a value too short
-  // to mask safely, is reported here (names only); the run still runs.
-  const secretStatus = loggedSecretStatus(runDir);
-  for (const name of secretStatus.missing) lines.push(`secret ${name} not set`);
-  for (const name of secretStatus.tooShort) lines.push(`secret ${name} too short to mask (value under 4 characters)`);
-  lines.push(`phase: ${phase.phaseId} — ${phase.phase}`);
-  const attempt = phase.attempt as { n: number; interrupted?: boolean } | undefined;
-  if (attempt) lines.push(`attempt: ${attempt.n}${attempt.interrupted ? " (interrupted)" : ""}`);
-  const candidate = phase.candidate as { sha: string } | undefined;
-  if (candidate) lines.push(`candidate: ${candidate.sha}`);
-  const checks = phase.checks as { passed?: boolean; interrupted?: boolean } | undefined;
-  if (checks) lines.push(`checks: ${checks.interrupted ? "interrupted" : checks.passed ? "passed" : "failed"}`);
-  const probe = phase.probe as { passed?: boolean; probedI?: string } | undefined;
-  if (probe) lines.push(`probe: ${probe.passed ? `passed (I=${probe.probedI})` : "failed"}`);
-  const reviews = phase.reviews as Record<string, { review?: unknown }> | undefined;
-  if (reviews) {
-    for (const who of ["M", "A", "B"]) {
-      lines.push(`review ${who}: ${reviews[who]?.review ? "submitted" : "pending"}`);
-    }
-  }
-  const ownerRequests = (phase.ownerRequests as Array<{ status: string }>) ?? [];
-  const openRequests = ownerRequests.filter((r) => r.status === "open");
-  lines.push(`open owner requests: ${openRequests.length}`);
-  // Plan 01i: every directive in force, with its scope, so `tt status` names
-  // the rulings the phase is bound to.
-  const directives = (phase.ownerDirectives as Array<{ id: string; text: string; scope: string; status: string }>) ?? [];
-  for (const d of directives.filter((d) => d.status === "in-force")) {
-    lines.push(`directive ${d.id} (${d.scope === "program" ? "whole program" : "this phase"}): ${d.text}`);
-  }
-  if (phase.blockedReason) lines.push(`blocked: ${phase.blockedReason}`);
-  if (phase.publishedI) lines.push(`published: ${phase.publishedI}`);
-  // Plan 3b: the same readable view the status buffer shows.
   const view = buildView(runDir, plan, conductorAlive(runDir));
-  lines.push(`pipeline: ${view.pipeline}`);
-  lines.push(`gates: ${view.gates}`);
-  // Plan 01f: the conductor's gate record, cited (tt summary cites the same).
-  if (view.gate) lines.push(`gate: ${view.gate}`);
-  // Plan 01e: the base's own pre-existing check failures (D2), when it has any.
-  if (view.baseline) lines.push(`base: ${view.baseline}`);
-  lines.push(`reviews: ${view.reviewLine}`);
-  // Plan 01g: every amendment record, applied or reverted, with old → new.
-  if (view.amendments) lines.push(`amendments: ${view.amendments}`);
-  if (view.verdict) lines.push(`verdict: ${view.verdict}`);
-  // Plan 01h: the trade-offs panel (most important first) and the cost row,
-  // directly under the verdict like the status buffer.
-  for (const t of view.tradeoffs ?? []) lines.push(`trade-off: ${t.text}`);
-  if (view.cost) lines.push(`cost: ${view.cost.text}`);
-  if (view.time) lines.push(`time: ${view.time}`);
-  return `${lines.join("\n")}\n`;
+  return renderStatusText(runDir, state, view, loggedSecretStatus(runDir));
 }
 
 function conductorAlive(runDir: string): boolean {
@@ -794,35 +768,6 @@ async function cmdStop(runIdOrDir: string, root: string): Promise<void> {
   }
 }
 
-/** Plan 2d: pending owner-input files the conductor has not yet picked up
- * (design §7.4/§9.3). `tt state` carries them so the status buffer can show
- * a command the owner sent while no conductor was running as "not picked
- * up" after 30 s, rather than silently losing it. */
-function pendingOwnerInputs(runDir: string): Array<{ id: string; kind: string; text: string; at: string }> {
-  let names: string[];
-  try {
-    names = readdirSync(path.join(runDir, "inbox"));
-  } catch {
-    return [];
-  }
-  const out: Array<{ id: string; kind: string; text: string; at: string }> = [];
-  for (const name of names.sort()) {
-    if (!name.endsWith(".json")) continue;
-    try {
-      const raw = JSON.parse(readFileSync(path.join(runDir, "inbox", name), "utf8")) as Record<string, unknown>;
-      const kind = typeof raw.type === "string" ? raw.type : typeof raw.kind === "string" ? raw.kind : undefined;
-      if (kind !== "steer" && kind !== "note" && kind !== "correction") continue;
-      if (typeof raw.text !== "string") continue;
-      const at = statSync(path.join(runDir, "inbox", name)).mtime.toISOString();
-      out.push({ id: name.slice(0, -".json".length), kind, text: raw.text, at });
-    } catch {
-      // A file still being written, or malformed: the conductor will reject
-      // it; not this view's job to guess.
-    }
-  }
-  return out;
-}
-
 /** Contract v1: `tt contract rebuild|check <run>`. The projections are
  * rebuilt from `events.jsonl` (state), never the other way round. */
 function cmdContract(sub: string | undefined, runDir: string): void {
@@ -832,11 +777,20 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   const messages = projectMessages(state.phase);
   const ledger = projectLedger(state.phase);
   const review = projectReview(state.phase);
+  const messageFiles = reviewMessageFiles(state.phase);
   if (sub === "rebuild") {
     writeFileSync(p.messages, messages);
     writeFileSync(p.ledger, ledger);
     writeFileSync(p.review, review);
-    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org\n`);
+    mkdirSync(p.messagesView, { recursive: true });
+    const ids = new Set(messageFiles.map((f) => f.id));
+    for (const f of messageFiles) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
+    // B-12/A-14: rebuild is a projection of state, so it also removes a
+    // message file whose id state no longer has (a superseded id).
+    for (const name of readdirSync(p.messagesView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
+    }
+    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/messages/\n`);
     return;
   }
   if (sub !== "check") usage();
@@ -847,6 +801,19 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   if (actualMessages !== messages) mismatches.push("messages.jsonl");
   if (actualLedger !== ledger) mismatches.push("ledger.jsonl");
   if (actualReview !== review) mismatches.push("views/review.org");
+  for (const f of messageFiles) {
+    const file = path.join(p.messagesView, `${f.id}.org`);
+    const actual = existsSync(file) ? readFileSync(file, "utf8") : "";
+    if (actual !== f.contents) mismatches.push(`views/messages/${f.id}.org`);
+  }
+  // B-12/A-14: an extra file for an id state no longer has is a mismatch, so
+  // `check` sees the same stale file `rebuild` now prunes.
+  if (existsSync(p.messagesView)) {
+    const expected = new Set(messageFiles.map((f) => f.id));
+    for (const name of readdirSync(p.messagesView)) {
+      if (name.endsWith(".org") && !expected.has(name.slice(0, -4))) mismatches.push(`views/messages/${name}`);
+    }
+  }
   if (mismatches.length > 0) {
     process.stderr.write(
       `contract check failed for ${path.basename(runDir)}: ${mismatches.join(", ")} do not match state; run \`tt contract rebuild ${path.basename(runDir)}\`\n`,
@@ -857,15 +824,37 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   process.stdout.write(`contract check ok for ${path.basename(runDir)}\n`);
 }
 
-/** Contract v1 §3: `tt verdict <run> <messageId> <accept|refuse>`. A live
- * run gets an inbox command (the conductor checks the binding); a run whose
- * daemon has exited gets the event appended to `events.jsonl` after a
- * dry-run reduce, so a stale verdict never poisons the log. */
-function cmdVerdict(
+/** A-13: a live `tt verdict` reports the OUTCOME. The command is written to
+ * the inbox, then this waits briefly for the conductor to move it to
+ * `inbox/applied` or `inbox/rejected` and returns which, with the reason. */
+async function awaitInboxVerdict(
+  runDir: string,
+  commandId: string,
+  timeoutMs: number,
+): Promise<{ kind: "applied" | "rejected" | "pending"; reason?: string }> {
+  const p = runPaths(runDir);
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const reasonFile = path.join(p.inboxRejected, `${commandId}.reason.txt`);
+    if (existsSync(reasonFile)) return { kind: "rejected", reason: readFileSync(reasonFile, "utf8").trim() };
+    if (existsSync(path.join(p.inboxApplied, `${commandId}.json`))) return { kind: "applied" };
+    if (Date.now() >= deadline) return { kind: "pending" };
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function cmdVerdict(
   positional: string[],
   root: string,
   reason: string | undefined,
-  overrides: { candidateSha?: string; messageVersion?: number } = {},
+  overrides: {
+    candidateSha?: string;
+    messageVersion?: number;
+    contractVersion?: number;
+    contractSha256?: string;
+    runId?: string;
+    phaseId?: string;
+  } = {},
 ): void {
   const runDir = resolveRunDir(positional[0], root);
   const messageId = positional[1];
@@ -875,19 +864,49 @@ function cmdVerdict(
   const state = rebuildState(runDir, plan, { lenient: true });
   const message = (state.phase.messages ?? []).find((m) => m.id === messageId);
   if (!message) {
-    process.stderr.write(`no message ${messageId} in run ${path.basename(runDir)}\n`);
+    process.stdout.write(`verdict rejected: no message ${messageId} in run ${path.basename(runDir)}\n`);
     process.exitCode = 1;
     return;
   }
-  // `--candidate-sha`/`--message-version` let the caller send the binding it
-  // actually saw (e.g. after a carry), so a stale verdict is expressible and
-  // is rejected by the same path as any other stale command.
+  // `--candidate-sha`/`--message-version`/`--contract-version`/… let the
+  // caller send the binding it actually saw (e.g. after a carry), so a stale
+  // verdict is expressible and is rejected by the same path as any other
+  // stale command. The binding the heading carries is the full tuple.
   const boundCandidateSha = overrides.candidateSha ?? message.boundCandidateSha;
   const boundRecordVersion = overrides.messageVersion ?? message.messageVersion;
+  const boundContractVersion = {
+    ...message.boundContractVersion,
+    ...(overrides.contractVersion !== undefined ? { snapshot: overrides.contractVersion } : {}),
+    ...(overrides.contractSha256 !== undefined ? { sectionSha256: overrides.contractSha256 } : {}),
+  };
+  const boundRunId = overrides.runId ?? state.phase.runId;
+  const boundPhaseId = overrides.phaseId ?? state.phase.phaseId;
+  // The heading carries the full binding. A run/phase id that names another
+  // run is refused here, never silently dropped when the daemon has exited.
+  if (overrides.runId !== undefined && overrides.runId !== "" && overrides.runId !== state.phase.runId) {
+    process.stdout.write(`verdict rejected: run id ${overrides.runId} is not this run (${state.phase.runId})\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (overrides.phaseId !== undefined && overrides.phaseId !== "" && overrides.phaseId !== state.phase.phaseId) {
+    process.stdout.write(`verdict rejected: phase id ${overrides.phaseId} is not this phase (${state.phase.phaseId})\n`);
+    process.exitCode = 1;
+    return;
+  }
   const withReason = reason !== undefined && reason.trim().length > 0 ? { reason } : {};
+  const event = {
+    type: "OWNER_VERDICT" as const,
+    messageId,
+    verdict,
+    ...withReason,
+    boundCandidateSha,
+    boundContractVersion,
+    boundRecordVersion,
+  };
   if (conductorAlive(runDir)) {
-    // Live run: through the inbox, so the conductor checks the binding and a
-    // stale verdict lands in inbox/rejected with its reason.
+    // Live run: through the inbox, so the conductor checks the binding. The
+    // CLI then waits for the outcome (A-13), so the front end shows the
+    // rejection reason rather than only `queued'.
     const inbox = path.join(runDir, "inbox");
     mkdirSync(inbox, { recursive: true });
     const commandId = `verdict-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
@@ -896,38 +915,40 @@ function cmdVerdict(
       verdict,
       ...withReason,
       binding: {
-        runId: state.phase.runId,
-        phaseId: state.phase.phaseId,
+        runId: boundRunId,
+        phaseId: boundPhaseId,
         candidateSha: boundCandidateSha,
-        contractVersion: message.boundContractVersion,
+        contractVersion: boundContractVersion,
         recordId: messageId,
         recordVersion: boundRecordVersion,
       },
     };
     writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
-    process.stdout.write(`queued verdict ${commandId} on ${messageId} for run ${path.basename(runDir)}\n`);
+    const outcome = await awaitInboxVerdict(runDir, commandId, 5000);
+    if (outcome.kind === "applied") {
+      process.stdout.write(`verdict applied: ${verdict} recorded for ${messageId} in run ${path.basename(runDir)}\n`);
+    } else if (outcome.kind === "rejected") {
+      process.stdout.write(`verdict rejected: ${outcome.reason}\n`);
+      process.exitCode = 1;
+    } else {
+      process.stdout.write(`queued verdict ${commandId} on ${messageId} for run ${path.basename(runDir)} (queued, not yet applied)\n`);
+    }
     return;
   }
   // No live conductor: this is a late verdict. Validate it against a dry-run
   // reduce first, then append it to the authoritative log and refresh the
   // projections.
-  const event = {
-    type: "OWNER_VERDICT" as const,
-    messageId,
-    verdict,
-    ...withReason,
-    boundCandidateSha,
-    boundContractVersion: message.boundContractVersion,
-    boundRecordVersion,
-  };
   const result = reduce(state, event);
   if (!result.ok) {
-    process.stderr.write(`verdict rejected: ${result.reason}\n`);
+    // A-13: the rejection reason is the command's outcome, so print it on
+    // stdout; the non-zero exit is what tells the front end it failed.
+    process.stdout.write(`verdict rejected: ${result.reason}\n`);
     process.exitCode = 1;
     return;
   }
   const p = runPaths(runDir);
-  const log = new EventLog(p.events, resolveSecrets(secretNames(plan.secrets)).maskable);
+  const maskable = resolveSecrets(secretNames(plan.secrets)).maskable;
+  const log = new EventLog(p.events, maskable);
   try {
     log.append("event", event);
   } finally {
@@ -937,6 +958,33 @@ function cmdVerdict(
   writeFileSync(p.messages, projectMessages(after.phase));
   writeFileSync(p.ledger, projectLedger(after.phase));
   writeFileSync(p.review, projectReview(after.phase));
+  // A run from before this view has no views/messages/: create it, and prune
+  // ids the state no longer has (same as the conductor and the rebuild path).
+  const files = reviewMessageFiles(after.phase);
+  const ids = new Set(files.map((f) => f.id));
+  mkdirSync(p.messagesView, { recursive: true });
+  for (const f of files) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
+  for (const name of readdirSync(p.messagesView)) {
+    if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
+  }
+  // Plan 03b: the status view is refreshed too, so the Emacs status buffer
+  // never shows a message the review buffer already has.
+  writeFileSync(
+    p.status,
+    redactText(
+      renderStatusView(
+        statusViewInput({
+          runDir,
+          plan,
+          state: after,
+          view: buildView(runDir, plan, false),
+          alive: false,
+          secrets: loggedSecretStatus(runDir),
+        }),
+      ),
+      maskable,
+    ),
+  );
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
 }
 
@@ -953,7 +1001,7 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json, reason, candidateSha, messageVersion } = parseArgs(rest);
+  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
@@ -979,7 +1027,7 @@ async function main(): Promise<void> {
     cmdContract(positional[0], resolveRunDir(positional[1], runRoot));
   } else if (cmd === "verdict") {
     if (positional.length !== 3) usage();
-    cmdVerdict(positional, runRoot, reason, { candidateSha, messageVersion });
+    await cmdVerdict(positional, runRoot, reason, { candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId });
   } else if (cmd === "summary") {
     if (positional.length !== 1) usage();
     process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));

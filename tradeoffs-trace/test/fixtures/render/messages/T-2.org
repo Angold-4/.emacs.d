@@ -1,0 +1,34 @@
+#+TITLE: T-2 — Rename the helper
+#+TYPE: tradeoff
+
+* T-2 Rename the helper
+  :PROPERTIES:
+  :ID: T-2
+  :TYPE: tradeoff
+  :STATE: published
+  :RAISED_BY: worker
+  :IMPORTANCE: low
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  the name hid the retry behaviour
+
+* Evidence
+  - src/util.ts:1
+
+* Plan
+  plan/03b.org
+
+* History
+  - v1 · C1 · 0061dafa065ec924a9ab2f33a6b62ca1ce2a12b253a0d3786b7f5fa5b4047e42
+
+* Ledger
+  (not settled)
+
+* Votes
+  (none)

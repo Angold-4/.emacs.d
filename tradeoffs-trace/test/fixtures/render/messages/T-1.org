@@ -1,0 +1,34 @@
+#+TITLE: T-1 — Batch cancels per tick
+#+TYPE: tradeoff
+
+* T-1 Batch cancels per tick
+  :PROPERTIES:
+  :ID: T-1
+  :TYPE: tradeoff
+  :STATE: accepted
+  :RAISED_BY: worker
+  :IMPORTANCE: high
+  :VERDICT: accepted
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: r-03b
+  :PHASE_ID: p1
+  :END:
+  fewer lock acquisitions under load
+
+* Evidence
+  - src/cancel.ts:42
+
+* Plan
+  plan/03b.org
+
+* History
+  - v1 · C1 · 2a886bb8a274910238e8b11e341b687eb42ee5700b745dba91951ff68e3b180c
+
+* Ledger
+  - accepted by owner (v1, C1) — the goal needs the smaller lock window
+
+* Votes
+  - M approve — within the latency budget

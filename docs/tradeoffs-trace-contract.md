@@ -24,7 +24,9 @@ Everything else under a run directory is a **projection** rebuilt from state:
 | `events.jsonl` | the authoritative history (events, intents, completions, applied commands) |
 | `messages.jsonl` | one current message per line, id order (`projectMessages`) |
 | `ledger.jsonl` | one settled entry per line, id order (`projectLedger`) |
-| `views/review.org` | the runtime-rendered review view (`projectReview`) |
+| `views/review.org` | the runtime-rendered review view (`projectReview`, `src/render.ts`) |
+| `views/messages/<id>.org` | one message's evidence, plan excerpt, history, ledger and votes (`renderMessageFile`) |
+| `views/status.txt` | the status buffer's own text (`renderStatusView`), with trade-off record markers |
 
 Projections are written when an event can have changed them (any `MESSAGE_*`
 or `OWNER_VERDICT` event) and again on every conductor start. Because
@@ -33,9 +35,10 @@ current projections; and a conductor killed between an event and its
 projection write rebuilds them on the next start — the log is the only
 authority.
 
-`tt contract rebuild <run>` rewrites all three projections from
-`events.jsonl`. `tt contract check <run>` compares them to state and exits
-non-zero with the mismatching file names when they differ.
+`tt contract rebuild <run>` rewrites the projections (including one file per
+message) from `events.jsonl`. `tt contract check <run>` compares them to
+state and exits non-zero with the mismatching file names when they differ.
+`views/status.txt` is time-dependent and is regenerated, not compared.
 
 ## 1. Messages and the message state machine
 
@@ -179,7 +182,7 @@ a full `RecordBinding` whose `recordId` is the message id and whose
 The CLI is:
 
 ```
-tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--root <dir>]
+tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]
 ```
 
 `--candidate-sha` and `--message-version` send a binding other than the
@@ -188,18 +191,30 @@ binding check rejects it.
 
 - On a **live** run (a conductor is running) the command is written to
   `<run>/inbox/<id>.json`; the conductor validates the binding and a stale one
-  lands in `inbox/rejected/` with the reason.
+  lands in `inbox/rejected/` with the reason. The CLI then waits briefly for
+  the outcome and prints it on stdout (`verdict applied: …`, or
+  `verdict rejected: <reason>` with a non-zero exit); a command the conductor
+  does not answer in time prints `(queued, not yet applied)`.
 - On a run whose daemon has **exited** the command is a **late verdict**: the
   CLI dry-runs `reduce()` and, if it accepts, appends the `OWNER_VERDICT`
   event to `events.jsonl` and refreshes the projections. A stale or
-  out-of-order verdict is refused, never written.
+  out-of-order verdict is refused, never written, and the reason is printed on
+  stdout with a non-zero exit.
 
 ## 5. Rendering
 
 - `messages.jsonl` and `ledger.jsonl` are the machine view.
-- `views/review.org` is the human view: one subtree per message with its
-  state, version, candidate, contract, `contentHash`, settlement and
-  `FOLLOW_UP: true` where relevant.
+- `views/review.org` is the human view: three top-level sections (Blockers,
+  Trade-offs, Findings), blockers first. Each message is one heading (`<id>
+  <title>`) carrying its summary and context and a property drawer with its
+  id, type, state, `raisedBy`, `importance`, the owner's verdict (if any) and
+  the binding a verdict needs (`messageVersion`, `candidateSha`,
+  `contractVersion`, `runId`, `phaseId`). Within a section, high and normal
+  messages come first; low-importance ones are folded under `Minor (N)`. A
+  message's own file, `views/messages/<id>.org`, carries its evidence (path
+  and lines), the plan excerpt it concerns, every version's history, its
+  ledger entry and its votes.
+- `views/status.txt` is the text the Emacs status buffer shows: the title, the run line, every status row, the trade-offs (each tagged `\t:RECORD:<id>` so RET still opens the decision view), the cost and record counts, the DONE owner checklist, the owner input and directives, and the attention line. `tt status` keeps its own plain-text rendering.
 - `tt summary` (the PR body) lists refused-after-`DONE` follow-ups under
   `### Follow-ups`.
 

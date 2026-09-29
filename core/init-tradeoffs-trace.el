@@ -16,7 +16,8 @@
 ;;             its workspace
 ;;   C-c m s   focus or rebuild a run's workspace (trace, status, input);
 ;;             offers to resume a run whose conductor is not running
-;;   C-c m d   the run's decision view (read-only; intervene via the input box)
+;;   C-c m d   the run's review view (read-only; TAB folds, RET opens a
+;;             message's file, A/D send the owner's verdict)
 ;;   C-c m l   every run: open (RET), stop (k), resume (R)
 ;;   C-c m p   a program (several plans / phases as one graph): RET opens a
 ;;             phase's run, k stops, R resumes
@@ -98,14 +99,22 @@ TRAMP prefix, anything else is passed through."
 It runs where `+tt-root' lives (`process-file' with that directory as
 `default-directory'), so a remote root drives the server's runner."
   (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir)))
-         (default-directory (file-name-as-directory +tt-root)))
-    (with-temp-buffer
-      (let ((status (apply #'process-file +tt-node nil t nil (+tt--local-arg cli)
-                           (append (mapcar #'+tt--local-arg args)
-                                   (list "--root" (directory-file-name (+tt--local-arg +tt-root)))))))
-        (unless (eq status 0)
-          (error "tt %s failed: %s" (string-join args " ") (string-trim (buffer-string))))
-        (string-trim (buffer-string))))))
+         (default-directory (file-name-as-directory +tt-root))
+         (err-buf (generate-new-buffer " *tt-stderr*")))
+    (unwind-protect
+        (with-temp-buffer
+          ;; Capture stdout and stderr separately: on failure both are
+          ;; reported (A-13: a stale verdict's reason is on stderr).
+          (let* ((status (apply #'process-file +tt-node nil (list t err-buf) nil (+tt--local-arg cli)
+                                (append (mapcar #'+tt--local-arg args)
+                                        (list "--root" (directory-file-name (+tt--local-arg +tt-root))))))
+                 (out (string-trim (buffer-string)))
+                 (err (with-current-buffer err-buf (string-trim (buffer-string)))))
+            (unless (eq status 0)
+              (error "tt %s failed: %s" (string-join args " ")
+                     (string-trim (concat out (if (string-empty-p err) "" (concat "\n" err))))))
+            out))
+      (kill-buffer err-buf))))
 
 (defun +tt--state (run-dir)
   "Return the parsed `tt state' of RUN-DIR as nested alists."
@@ -685,6 +694,7 @@ whole program; warnings are shown and it starts."
           (ignore-errors
             (cond ((derived-mode-p '+tt-trace-mode) (+tt--render-trace win))
                   ((derived-mode-p '+tt-status-mode) (+tt--render-status))
+                  ((derived-mode-p '+tt-review-mode) (+tt-review-refresh))
                   ((derived-mode-p '+tt-input-mode) (+tt--render-input-header))
                   ((derived-mode-p '+tt-program-mode) (+tt--render-program)))))))
     (unless any
@@ -1099,18 +1109,79 @@ open the decision view at that record."
     (when attention
       (insert "\n" (propertize (format "⚑ %s%s" attention
                                        (cond ((equal attention "needs you")
-                                              " — type a correction in the input box (C-c m d to read the decisions)")
+                                              " — type a correction in the input box (C-c m d to read the review)")
                                              ((equal attention "conductor stopped") " — M-x +tt-resume")
                                              (t "")))
                                'face 'error)
               "\n"))))
 
+(defun +tt--status-restore-records ()
+  "Restore the `+tt-record' property a rendered trade-off line carries.
+`views/status.txt' appends `\t:RECORD:<id>' to each trade-off line, so the
+plain file still lets RET open the decision view (plan 01h).  The marker is
+removed and the whole line carries the id."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "\t:RECORD:\\([^ \t\n]+\\)" nil t)
+        (let ((id (match-string 1)))
+          (delete-region (match-beginning 0) (match-end 0))
+          (put-text-property (line-beginning-position) (line-end-position) '+tt-record id))))))
+
+(defun +tt--status-restore-faces ()
+  "Re-apply the faces the runtime's plain status text implies.
+`views/status.txt' is text, so the bold title, the shadow run line, row
+labels and `previous'/`cost' values, the warning `base'/`amended'/`secret'
+rows, the `verdict' success/warning, the error `blocked' row and the
+attention line are restored here, matching `+tt--render-status-from'."
+  (let ((inhibit-read-only t)
+        (name nil))
+    (save-excursion
+      (goto-char (point-min))
+      ;; The bold title, then the shadow `run <id> · conductor … · …' line.
+      (put-text-property (line-beginning-position) (line-end-position) 'face 'bold)
+      (forward-line 1)
+      (when (looking-at "run ")
+        (put-text-property (line-beginning-position) (line-end-position) 'face 'shadow))
+      ;; Each status row's label is shadow; its value's face depends on the row
+      ;; (and the phase row tells us whether the verdict is a success).
+      (while (re-search-forward "^\\([a-z]+\\) +\\(.*\\)$" nil t)
+        (let ((label (match-string 1))
+              (value (match-string 2))
+              (beg (line-beginning-position))
+              (end (line-end-position))
+              (vbeg nil))
+          ;; A row longer than the window wraps under its value, not under
+          ;; column 0, exactly as +tt--status-row sets it (B-16).
+          (put-text-property beg end 'wrap-prefix (make-string 10 ?\s))
+          (put-text-property beg (min end (+ beg 10)) 'face 'shadow)
+          (setq vbeg (min end (+ beg 10)))
+          (when (equal label "phase")
+            (when (string-match " · \\([A-Z_]+\\) · " value)
+              (setq name (match-string 1 value))))
+          (pcase label
+            ((or "base" "amended" "secret") (put-text-property vbeg end 'face 'warning))
+            ((or "previous" "cost") (put-text-property vbeg end 'face 'shadow))
+            ("verdict" (put-text-property vbeg end 'face (if (equal name "DONE") 'success 'warning)))
+            ("blocked" (put-text-property vbeg end 'face 'error)))))
+      ;; The attention line.
+      (goto-char (point-min))
+      (when (re-search-forward "^⚑ " nil t)
+        (put-text-property (line-beginning-position) (line-end-position) 'face 'error)))))
+
 (defun +tt--render-status ()
-  "Render the status buffer from `tt state'."
-  (let ((s (+tt--state +tt--run-dir))
-        (inhibit-read-only t))
+  "Render the status buffer.
+Plan 03b: reads the runtime's `views/status.txt' when it exists (a file
+read, so it costs nothing over TRAMP and calls neither `tt' nor
+`process-file'); falls back to `tt state' for a run from before the view."
+  (let ((inhibit-read-only t)
+        (file (and +tt--run-dir (expand-file-name "views/status.txt" +tt--run-dir))))
     (erase-buffer)
-    (+tt--render-status-from s +tt--run-dir)))
+    (if (and file (file-exists-p file))
+        (progn (insert-file-contents file)
+               (+tt--status-restore-records)
+               (+tt--status-restore-faces))
+      (+tt--render-status-from (+tt--state +tt--run-dir) +tt--run-dir))))
 
 (defun +tt-open-tradeoff ()
   "Open the decision view at the trade-off record on this line (RET).
@@ -1350,6 +1421,206 @@ program-wide owner directive."
   (let ((run (+tt--resolve-run)))
     (+tt--cli "resume" run)
     (message "tradeoffs-trace: conductor relaunched for %s" (file-name-nondirectory run))))
+
+;;;; Review view (plan 03b)
+
+;; One clean review buffer per phase, rendered by the runtime into
+;; `views/review.org' and displayed read-only here.  Emacs reads files only
+;; (so it is the same locally and over TRAMP) and writes owner commands
+;; through `tt verdict'.  A for accept, D for refuse (with an optional
+;; one-line reason) in Evil normal state.
+
+(defface +tt-review-blocker-face
+  '((t :inherit error))
+  "A blocker message in the review buffer (red).")
+
+(defface +tt-review-finding-face
+  '((t :inherit warning))
+  "A finding message in the review buffer (yellow).")
+
+(defface +tt-review-tradeoff-face
+  '((t :inherit default))
+  "A trade-off message in the review buffer (default).")
+
+(defvar-local +tt-review--file nil
+  "Absolute path of the `views/review.org' this buffer displays.")
+
+(defvar-local +tt-review--mtime nil
+  "Modification time of `+tt-review--file' the buffer last rendered.")
+
+(defun +tt-review--face-for-type (type)
+  "Face for a message of TYPE, or nil for a heading without one."
+  (pcase type
+    ("blocker" '+tt-review-blocker-face)
+    ("finding" '+tt-review-finding-face)
+    ("tradeoff" '+tt-review-tradeoff-face)
+    (_ nil)))
+
+(defun +tt-review--apply-faces ()
+  "Colour every message heading by its `:TYPE:', and carry its id.
+The id text property is what RET and A/D read at point; the section heading
+(`Minor (N)') carries no id and stays unfaced."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "^\\*+ .+$" nil t)
+        (let* ((beg (match-beginning 0))
+               (end (match-end 0))
+               (id (save-excursion (goto-char beg) (org-entry-get nil "ID")))
+               (type (and id (save-excursion (goto-char beg) (org-entry-get nil "TYPE")))))
+          (when id
+            (put-text-property beg end '+tt-message-id id)
+            (put-text-property beg end 'face (+tt-review--face-for-type type))))))))
+
+(defun +tt-review--setup ()
+  "Put the review buffer in its read-only, file-only display state."
+  (setq buffer-read-only t)
+  (setq-local font-lock-defaults nil)
+  (when (fboundp 'font-lock-mode) (font-lock-mode -1))
+  (+tt-review--apply-faces))
+
+(defun +tt-review--message-id ()
+  "The id of the message at point, or nil."
+  (or (get-text-property (point) '+tt-message-id)
+      (org-entry-get nil "ID")))
+
+(defun +tt-review--goto-id (id)
+  "Move point to the heading whose id is ID; nil when it is gone.
+After a refresh a message may have disappeared; point then goes to the top."
+  (goto-char (point-min))
+  (if (and id (re-search-forward (format "^\\*+ %s " (regexp-quote id)) nil t))
+      (goto-char (match-beginning 0))
+    (goto-char (point-min))))
+
+(defun +tt-review-open-message ()
+  "Open `views/messages/<id>.org' for the message at point (RET)."
+  (interactive)
+  (let* ((id (+tt-review--message-id))
+         (file (and id +tt--run-dir (expand-file-name (concat "views/messages/" id ".org") +tt--run-dir))))
+    (unless id (user-error "No message on this line"))
+    (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
+    (find-file file)))
+
+(defun +tt-review--binding-at-point ()
+  "The six binding property values at point, or nil when any is missing.
+A heading the runtime has not fully rendered must not silently fall back to
+the run's current state, which could settle a version the owner never saw;
+the caller refuses locally instead."
+  (let ((values (mapcar (lambda (key) (org-entry-get nil key))
+                        '("CANDIDATE_SHA" "MESSAGE_VERSION" "CONTRACT_VERSION"
+                          "CONTRACT_SHA256" "RUN_ID" "PHASE_ID"))))
+    (when (seq-every-p (lambda (v) (and v (not (string-empty-p v)))) values)
+      values)))
+
+(defun +tt-review--verdict-args (id verdict reason)
+  "The `tt verdict' arguments for message ID from its heading properties.
+The full binding travels with the command, so the CLI checks exactly the
+tuple the owner saw; a missing property is refused before this runs."
+  (let ((binding (+tt-review--binding-at-point)))
+    (append
+     (list "verdict" +tt--run-dir id verdict)
+     (when (and reason (not (string-empty-p reason))) (list "--reason" reason))
+     (list "--candidate-sha" (nth 0 binding)
+           "--message-version" (nth 1 binding)
+           "--contract-version" (nth 2 binding)
+           "--contract-sha256" (nth 3 binding)
+           "--run-id" (nth 4 binding)
+           "--phase-id" (nth 5 binding)))))
+
+(defun +tt-review--settleable-id ()
+  "The id at point when the message can be settled, else signal an error.
+A raw message is not yet frozen, and a heading without the full binding is
+refused rather than settled against the run's current state."
+  (let ((id (+tt-review--message-id))
+        (state (org-entry-get nil "STATE")))
+    (unless id (user-error "No message on this line"))
+    (when (equal state "raw")
+      (user-error "message %s is not yet frozen; it must be published before a verdict" id))
+    (unless (+tt-review--binding-at-point)
+      (user-error "message %s has no full binding in its heading; refresh the review (g) and try again" id))
+    id))
+
+(defun +tt-review--verdict (verdict reason)
+  "Send VERDICT (`accept'/`refuse') for the message at point.
+A raw message cannot be settled yet (contract v1: it is not yet frozen);
+one already published is sent through `tt verdict' with its full binding.
+A missing binding property is refused locally, and a stale verdict's reason
+is shown in the echo area and the buffer refreshes."
+  (let ((id (+tt-review--settleable-id)))
+    (condition-case err
+        (message "%s" (apply #'+tt--cli (+tt-review--verdict-args id verdict reason)))
+      (error (message "%s" (error-message-string err))))
+    (+tt-review-refresh t)))
+
+(defun +tt-review-accept ()
+  "Accept the message at point (A)."
+  (interactive)
+  (+tt-review--verdict "accept" nil))
+
+(defun +tt-review-refuse ()
+  "Refuse the message at point (D), asking for an optional one-line reason.
+A message that cannot be settled is reported before the reason is asked for
+(A-18), so D on a raw message just says it is not yet frozen."
+  (interactive)
+  (+tt-review--settleable-id)
+  (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))
+
+(defun +tt-review-refresh (&optional force)
+  "Re-read `views/review.org' when it changed, keeping point on the same id.
+A no-op when the file's modification time is unchanged, so the timer poll
+costs one `file-attributes' and never a CLI call.  FORCE re-reads anyway
+(after a verdict)."
+  (interactive "p")
+  (let* ((file (or +tt-review--file buffer-file-name))
+         (mtime (and file (file-exists-p file) (file-attribute-modification-time (file-attributes file)))))
+    (when (and file mtime (or force (not (equal mtime +tt-review--mtime))))
+      (let ((id (+tt-review--message-id))
+            (inhibit-read-only t))
+        (erase-buffer)
+        (insert-file-contents file)
+        (set-buffer-modified-p nil)
+        (setq +tt-review--mtime mtime)
+        (+tt-review--setup)
+        (+tt-review--goto-id id)))))
+
+(defvar-keymap +tt-review-mode-map
+  :parent org-mode-map
+  "TAB" #'org-cycle
+  "RET" #'+tt-review-open-message
+  "A" #'+tt-review-accept
+  "D" #'+tt-review-refuse
+  "g" #'+tt-review-refresh)
+
+(define-derived-mode +tt-review-mode org-mode "tt-review"
+  "Read-only review view of a tradeoffs-trace phase.
+\<+tt-review-mode-map>\[+tt-review-open-message] opens a message's file,
+\[+tt-review-accept] accepts and \[+tt-review-refuse] refuses the message at
+point, \[org-cycle] folds and \[+tt-review-refresh] refreshes."
+  (+tt-review--setup)
+  (when (fboundp 'evil-define-key)
+    (evil-define-key 'normal +tt-review-mode-map
+      (kbd "TAB") #'org-cycle (kbd "RET") #'+tt-review-open-message
+      "A" #'+tt-review-accept "D" #'+tt-review-refuse "g" #'+tt-review-refresh)))
+
+(defun +tt-review ()
+  "Open the runtime-rendered review of the run this buffer means (C-c m d)."
+  (interactive)
+  (let* ((run (+tt--resolve-run))
+         (file (expand-file-name "views/review.org" run)))
+    (unless (file-exists-p file)
+      (user-error "No rendered review at %s; the runtime writes it after a message is raised" file))
+    (let ((buf (find-file-noselect file)))
+      (with-current-buffer buf
+        ;; A-17: the mode first.  `+tt-review-mode' derives from org-mode,
+        ;; whose parent chain runs `kill-all-local-variables', so buffer-locals
+        ;; set before it would be cleared and `+tt--run-dir' would be nil.
+        (+tt-review-mode)
+        (setq +tt--run-dir run +tt-review--file file)
+        (setq +tt-review--mtime (file-attribute-modification-time (file-attributes file)))
+        (+tt-review--setup)
+        (goto-char (point-min)))
+      (pop-to-buffer buf)
+      (+tt--ensure-timer))))
 
 ;;;; Decision view
 
@@ -1855,7 +2126,7 @@ Reads `tt program list --json'; nil when there is no program or no wait."
 
 (keymap-global-set "C-c m r" #'+tt-run)
 (keymap-global-set "C-c m s" #'+tt-show)
-(keymap-global-set "C-c m d" #'+tt-decisions)
+(keymap-global-set "C-c m d" #'+tt-review)
 (keymap-global-set "C-c m l" #'+tt-runs)
 (keymap-global-set "C-c m p" #'+tt-program)
 (+tt--ensure-mode-line)
