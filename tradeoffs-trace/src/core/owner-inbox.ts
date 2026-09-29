@@ -78,6 +78,16 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
       return { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: command.text };
     case "unneeded":
       return { type: "OWNER_REQUEST_MARKED_UNNEEDED", requestId: command.requestId };
+    case "verdict":
+      return {
+        type: "OWNER_VERDICT",
+        messageId: command.messageId,
+        verdict: command.verdict,
+        ...(command.reason && command.reason.trim().length > 0 ? { reason: command.reason } : {}),
+        boundCandidateSha: command.boundCandidateSha,
+        boundContractVersion: command.boundContractVersion,
+        boundRecordVersion: command.messageVersion,
+      };
     case "miss":
       return { type: "MISS_RECORDED", recordId: command.recordId, sample: command.sample };
     case "steer":
@@ -233,6 +243,20 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
     case "unneeded": {
       if (b.recordId === "") return { ok: false, reason: "an unneeded command needs 'binding.recordId'" };
       return { ok: true, runId: b.runId, phaseId: b.phaseId, event: { type: "OWNER_REQUEST_MARKED_UNNEEDED", requestId: b.recordId } };
+    }
+    case "verdict": {
+      const w = bound();
+      if ("error" in w) return { ok: false, reason: w.error };
+      if (r.verdict !== "accept" && r.verdict !== "refuse") {
+        return { ok: false, reason: "a verdict command needs 'verdict' accept or refuse" };
+      }
+      const reason = typeof r.reason === "string" && r.reason.trim().length > 0 ? r.reason : undefined;
+      return {
+        ok: true,
+        runId: b.runId,
+        phaseId: b.phaseId,
+        event: { type: "OWNER_VERDICT", messageId: b.recordId, verdict: r.verdict, ...(reason ? { reason } : {}), ...w },
+      };
     }
     case "miss": {
       if (b.recordId === "") return { ok: false, reason: "a miss command needs 'binding.recordId'" };

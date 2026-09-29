@@ -13,6 +13,7 @@
     { "$ref": "#/$defs/Revise" },
     { "$ref": "#/$defs/Amend" },
     { "$ref": "#/$defs/Unneeded" },
+    { "$ref": "#/$defs/Verdict" },
     { "$ref": "#/$defs/Miss" },
     { "$ref": "#/$defs/PauseResumeMode" },
     { "$ref": "#/$defs/DVResolve" },
@@ -24,6 +25,7 @@
     { "$ref": "#/$defs/DVSteer" },
     { "$ref": "#/$defs/DVCorrection" },
     { "$ref": "#/$defs/DVUnneeded" },
+    { "$ref": "#/$defs/DVVerdict" },
     { "$ref": "#/$defs/DVMiss" }
   ],
   "$defs": {
@@ -159,6 +161,18 @@
         "binding": { "$ref": "#/$defs/RecordBinding" }
       }
     },
+    "DVVerdict": {
+      "description": "Contract v1 (§3): the decision view's owner verdict on a published message. `binding.recordId` is the message id and `binding.recordVersion` the message version.",
+      "type": "object",
+      "required": ["type", "binding", "verdict"],
+      "properties": {
+        "type": { "const": "verdict" },
+        "recordKind": { "type": "string", "minLength": 1 },
+        "verdict": { "enum": ["accept", "refuse"] },
+        "reason": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
     "ContractVersion": {
       "type": "object",
       "required": ["snapshot", "sectionSha256"],
@@ -283,6 +297,21 @@
         "kind": { "const": "miss" },
         "recordId": { "type": "string", "minLength": 1 },
         "sample": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Verdict": {
+      "description": "Contract v1 (§3): the owner's verdict on a published message, bound to the full record binding (message id and version).",
+      "type": "object",
+      "required": ["kind", "messageId", "verdict", "boundCandidateSha", "boundContractVersion", "messageVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "verdict" },
+        "messageId": { "type": "string", "minLength": 1 },
+        "verdict": { "enum": ["accept", "refuse"] },
+        "reason": { "type": "string", "minLength": 1 },
+        "boundCandidateSha": { "type": "string", "minLength": 1 },
+        "boundContractVersion": { "$ref": "#/$defs/ContractVersion" },
+        "messageVersion": { "type": "integer" }
       }
     },
     "PauseResumeMode": {

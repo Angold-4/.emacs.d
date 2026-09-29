@@ -1,6 +1,7 @@
 // Shared fixture builders for unit tests. Not itself a test file.
 
-import type { Ballot, ContractVersion, Decision, PhaseState, RunStateName, State } from "../../src/core/types.ts";
+import { contentHashOf } from "../../src/core/messages.ts";
+import type { Ballot, ContractVersion, Decision, Message, PhaseState, RunStateName, State } from "../../src/core/types.ts";
 
 export function CV(snapshot = 1, sectionSha256 = "a".repeat(64)): ContractVersion {
   return { snapshot, sectionSha256 };
@@ -67,6 +68,36 @@ export function makeBallot(overrides: Partial<Ballot> = {}): Ballot {
     boundCandidateSha: "C1",
     boundContractVersion: CV(),
     boundRecordVersion: 1,
+    ...overrides,
+  };
+}
+
+export function makeMessage(overrides: Partial<Message> = {}): Message {
+  const base = {
+    type: "tradeoff" as const,
+    title: "Batch cancels per tick",
+    summary: "fewer lock acquisitions",
+    context: "the cancel path took one lock per request",
+    evidence: ["src/cancel.ts:42"],
+    planRef: "plan/14.org",
+  };
+  const content = {
+    type: overrides.type ?? base.type,
+    title: overrides.title ?? base.title,
+    summary: overrides.summary ?? base.summary,
+    context: overrides.context ?? base.context,
+    evidence: overrides.evidence ?? base.evidence,
+    planRef: overrides.planRef ?? base.planRef,
+  };
+  return {
+    id: "T-1",
+    phaseId: "p1",
+    ...content,
+    state: "published",
+    messageVersion: 1,
+    boundCandidateSha: "C1",
+    boundContractVersion: CV(),
+    contentHash: contentHashOf(content),
     ...overrides,
   };
 }

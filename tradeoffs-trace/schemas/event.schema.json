@@ -19,7 +19,8 @@
         "REPAIR_BUDGET_EXHAUSTED", "RESOLVING_INCOMPLETE", "REVISE", "AMEND",
         "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED",
         "CRITERION_AMENDED", "CRITERION_REVERTED",
-        "NOTE_ADDED", "OWNER_INPUT_RECORDED", "OWNER_CORRECTION", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED"
+        "NOTE_ADDED", "OWNER_INPUT_RECORDED", "OWNER_CORRECTION", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED",
+        "MESSAGE_RAISED", "MESSAGE_PUBLISHED", "MESSAGE_MERGED", "MESSAGE_DROPPED", "OWNER_VERDICT", "MESSAGE_RESOLVED", "MESSAGE_SUPERSEDED", "MESSAGE_CARRIED"
       ]
     }
   },
@@ -73,6 +74,14 @@
     { "type": "object", "required": ["type", "recordId"], "properties": { "type": { "const": "MISS_RECORDED" }, "recordId": { "type": "string", "minLength": 1 }, "sample": { "type": "string" } } },
     { "type": "object", "required": ["type", "phaseId", "count"], "properties": { "type": { "const": "NOTES_DELIVERED" }, "phaseId": { "type": "string", "minLength": 1 }, "count": { "type": "integer" } } },
     { "type": "object", "required": ["type", "decisionId", "sameAs", "reviewer"], "properties": { "type": { "const": "DECISION_MATCHED" }, "decisionId": { "type": "string", "minLength": 1 }, "sameAs": { "type": "string", "minLength": 1 }, "reviewer": { "enum": ["M", "A", "B"] } } },
-    { "type": "object", "required": ["type", "findingId", "reviewer"], "properties": { "type": { "const": "FINDING_ALSO_RAISED" }, "findingId": { "type": "string", "minLength": 1 }, "reviewer": { "enum": ["M", "A", "B"] } } }
+    { "type": "object", "required": ["type", "findingId", "reviewer"], "properties": { "type": { "const": "FINDING_ALSO_RAISED" }, "findingId": { "type": "string", "minLength": 1 }, "reviewer": { "enum": ["M", "A", "B"] } } },
+    { "type": "object", "required": ["type", "message"], "properties": { "type": { "const": "MESSAGE_RAISED" }, "message": { "type": "object" } } },
+    { "type": "object", "required": ["type", "messageId", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_PUBLISHED" }, "messageId": { "type": "string", "minLength": 1 } } },
+    { "type": "object", "required": ["type", "messageId", "by", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_MERGED" }, "messageId": { "type": "string", "minLength": 1 }, "by": { "enum": ["owner", "evaluator", "panel", "vote"] } } },
+    { "type": "object", "required": ["type", "messageId", "by", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_DROPPED" }, "messageId": { "type": "string", "minLength": 1 }, "by": { "enum": ["owner", "evaluator", "panel", "vote"] } } },
+    { "type": "object", "required": ["type", "messageId", "verdict", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "OWNER_VERDICT" }, "messageId": { "type": "string", "minLength": 1 }, "verdict": { "enum": ["accept", "refuse"] } } },
+    { "type": "object", "required": ["type", "messageId", "by", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_RESOLVED" }, "messageId": { "type": "string", "minLength": 1 }, "by": { "enum": ["owner", "evaluator", "panel", "vote"] } } },
+    { "type": "object", "required": ["type", "messageId", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_SUPERSEDED" }, "messageId": { "type": "string", "minLength": 1 } } },
+    { "type": "object", "required": ["type", "messageId", "fromCandidate", "toCandidate", "fromVersion", "toVersion", "contentHash", "unchanged"], "properties": { "type": { "const": "MESSAGE_CARRIED" }, "messageId": { "type": "string", "minLength": 1 }, "fromCandidate": { "type": "string", "minLength": 1 }, "toCandidate": { "type": "string", "minLength": 1 }, "fromVersion": { "type": "integer" }, "toVersion": { "type": "integer" }, "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "unchanged": { "type": "boolean" }, "content": { "type": "object" } } }
   ]
 }
