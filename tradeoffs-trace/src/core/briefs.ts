@@ -134,11 +134,18 @@ export function isEvidenceCitation(entry: string): boolean {
  * "not established" wording is reserved for the deterministic backstop and
  * is recognized by `impactUnestablished`, never by this strict check (finding
  * disc-M-56). */
+/** The raw publishing assertion, with no unverified/not-established
+ * exclusion: a sentence that asserts an answer must be checked even when it
+ * also contains a stray word (finding disc-M-157). */
+export function assertsPublishing(text: string): boolean {
+  return /\b(?:no|any|every|each|one|two|three|all)\b[^.]{0,80}\bmarket[s]?\b[^.]{0,40}\b(?:stop|stops|stopping|keep|keeps|keeping|continue|continues|continuing|publish|publishes|publishing|halt|halts|go(?:es)?\s+(?:dark|silent))\b/i.test(
+    text,
+  ) || /\b(?:publishing|publication)\b[^.]{0,40}\b(?:stop|stops|continue|continues|halt|halts|go(?:es)?)\b/i.test(text);
+}
+
 export function impactAnswersPublishing(impact: string): boolean {
   if (impactUnestablished(impact) || impactUnverified(impact)) return false;
-  return /\b(?:no|any|every|each|one|two|three|all)\b[^.]{0,80}\bmarket[s]?\b[^.]{0,40}\b(?:stop|stops|stopping|keep|keeps|keeping|continue|continues|continuing|publish|publishes|publishing|halt|halts|go(?:es)?\s+(?:dark|silent))\b/i.test(
-    impact,
-  ) || /\b(?:publishing|publication)\b[^.]{0,40}\b(?:stop|stops|continue|continues|halt|halts|go(?:es)?)\b/i.test(impact);
+  return assertsPublishing(impact);
 }
 
 /** The backstop's honest "this was not established" wording. */
@@ -147,32 +154,44 @@ export function impactUnestablished(impact: string): boolean {
 }
 
 /** A model brief that could not check the publishing answer says it is
- * unverified instead of asserting it (OD-3 (3)). */
+ * unverified instead of asserting it (OD-3 (3)). The word must refer to
+ * markets/publishing, so a stray 'unverified' does not excuse an impact that
+ * never answers (findings disc-M-157 / M-33). Called per sentence. */
 export function impactUnverified(impact: string): boolean {
-  return /\b(?:is|remains|was)\s+unverified\b|\bunverified\b[^.]{0,40}\b(?:market|publishing|answer)\b|\b(?:whether|if)\b[^.]{0,60}\bunverified\b/i.test(impact) || /\bunverified\b/i.test(impact);
+  return /\bunverified\b/i.test(impact) && (/\bmarket[s]?\b/i.test(impact) || /\b(?:publish|publishes|publishing|publication)\b/i.test(impact));
 }
 
-/** An evidence entry citing code (or a `path:line`); the publishing answer
- * must cite a code path, not a calendar, to show whether publishing stops
- * (findings disc-M-140 / B-142). */
+/** An evidence entry citing SOURCE code: a `code:` entry, or a source-file
+ * `path:line`. A calendar or data file (`calendars.yaml:4`) is not a code
+ * path and cannot show whether publishing stops (findings disc-M-140, M-34). */
 export function isCodeCitation(entry: string): boolean {
   const s = entry.trim();
-  return /^code:/i.test(s) || /\b[\w./-]+\.(?:ya?ml|rs|ts|tsx|js|el|json|org|md|toml|py|go|c|cpp|h|rb|sh):\d+\b/.test(s);
+  return /^code:/i.test(s) || /\b[\w./-]+\.(?:rs|ts|tsx|js|mjs|cjs|el|py|go|c|cc|cpp|h|hpp|java|rb|sh):\d+\b/.test(s);
 }
 
 /** The number a claim is really about: a clock time, else a duration's
  * number, else a digit count, else a number word as its digit. */
 export function primaryQuantifiedValue(input: string): string | undefined {
-  const text = input.replace(/\[\d+\]/g, " ");
-  const clock = text.match(/\b(\d{1,2}:\d{2})\b/);
-  if (clock) return clock[1];
-  const duration = text.match(/\b(\d+)(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|min|mins|minute|minutes|h|hr|hrs|hour|hours|day|days|week|weeks)\b/i);
-  if (duration) return duration[1];
-  const digit = text.match(/\b(\d+)\b/);
-  if (digit) return digit[1];
-  const word = text.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/i);
-  if (word) return String(["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"].indexOf(word[1].toLowerCase()) + 1);
-  return undefined;
+  return quantifiedValues(input)[0];
+}
+
+/** EVERY quantified value in TEXT: clock times, digits, duration numbers and
+ * number words (as digits). `cited` requires a cited entry to hold them ALL,
+ * so a claim with two times cannot hide the second behind one reference
+ * (findings disc-M-160 / M-35). */
+export function quantifiedValues(input: string): string[] {
+  // Strip the `[n]` evidence references and a `§n` section reference: neither
+  // is a quantified value the claim asserts.
+  const text = input.replace(/\[\d+\]/g, " ").replace(/§\s*\d+/g, " ");
+  const out = new Set<string>();
+  for (const m of text.matchAll(/\b\d{1,2}:\d{2}\b/g)) out.add(m[0]);
+  for (const m of text.matchAll(/\b(\d+)(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|min|mins|minute|minutes|h|hr|hrs|hour|hours|day|days|week|weeks)\b/gi)) out.add(m[1]);
+  for (const m of text.matchAll(/\b(\d+)\b/g)) out.add(m[1]);
+  const words = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
+  for (const m of text.matchAll(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/gi)) {
+    out.add(String(words.indexOf(m[1].toLowerCase()) + 1));
+  }
+  return [...out];
 }
 
 /** Whether ENTRY holds VALUE as its own token (so `10` matches `10 s` but not
@@ -307,10 +326,10 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   if (question.includes("\n")) return "the question must be one line";
   if (!today) return "a brief needs a `today` paragraph";
   if (!impact) return "a brief needs an `impact` paragraph";
-  // A model brief answers the publishing question or says it is unverified
-  // (OD-3 (3)); the backstop may also use its own "not established" phrasing.
-  if (!impactAnswersPublishing(impact) && !impactUnverified(impact) && !(opts.allowUnverifiedImpact && impactUnestablished(impact))) {
-    return "the impact must say whether any market stops publishing, or say it is unverified";
+  // The impact must at least talk about markets/publishing; whether each
+  // publishing sentence is answered and cited is checked below, per sentence.
+  if (!/\bmarket[s]?\b|\b(?:publish|publishes|publishing|publication)\b/i.test(impact)) {
+    return "the impact must say whether any market stops publishing";
   }
   if (!Array.isArray(brief.options) || brief.options.length === 0) return "a brief needs at least one option";
   const ids = brief.options.map((o) => (typeof o?.id === "string" ? o.id.trim() : ""));
@@ -384,13 +403,15 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   // holds the claimed value, so `10 s[3]` cannot cite a line that never states
   // 10 (findings disc-M-139 / M-140 / M-85).
   const cited = (claim: string, requireCode = false): boolean => {
-    const value = primaryQuantifiedValue(claim);
+    // ALL of the claim's values must be held by ONE cited entry (finding
+    // disc-M-160), which for the publishing answer must be a code path.
+    const values = quantifiedValues(claim);
     return [...claim.matchAll(/\[(\d+)\]/g)].some((m) => {
       const n = Number(m[1]);
       const entry = evidence[n - 1] ?? "";
       if (!isEvidenceCitation(entry)) return false;
       if (requireCode && !isCodeCitation(entry)) return false;
-      return value === undefined || citationHoldsValue(entry, value);
+      return values.every((v) => citationHoldsValue(entry, v));
     });
   };
   const claims = [
@@ -401,15 +422,37 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
     ...(rec?.why ? [rec.why] : []),
   ];
   for (const claim of claims) {
+    // Any assertion about publishing is a claim the owner acts on, so it needs
+    // its own reference too (finding disc-M-158).
+    if (assertsPublishing(claim) && !impactUnverified(claim) && !impactUnestablished(claim) && !cited(claim)) {
+      return `the claim "${claim.trim()}" asserts whether a market stops publishing without its own evidence reference [n]`;
+    }
     if (hasQuantifiedFact(claim) && !cited(claim)) {
       return `the claim "${claim.trim()}" states a time, count or duration without its own evidence reference [n]`;
     }
   }
-  // The publishing answer's OWN sentence must cite a code path that shows
-  // whether publishing stops (OD-3 (3) / findings disc-M-140, B-142).
-  const publishingSentence = sentences(impact).find((s) => impactAnswersPublishing(s));
-  if (publishingSentence && !cited(publishingSentence, true)) {
-    return "the impact's answer to whether any market stops publishing must cite, in its own sentence, the code path it was checked against";
+  // Each sentence that answers the publishing question must cite a code path
+  // in its OWN sentence; a sentence that says the answer is unverified is
+  // exempt, and the backstop's "not established" is exempt for the backstop
+  // (OD-3 (3) / findings disc-M-140, B-142, disc-M-157).
+  const publishingSentences = sentences(impact).filter((s) => assertsPublishing(s) || impactUnverified(s));
+  if (publishingSentences.length === 0) {
+    if (!(opts.allowUnverifiedImpact && impactUnestablished(impact))) {
+      return "the impact must say whether any market stops publishing, or say it is unverified";
+    }
+  } else {
+    for (const s of publishingSentences) {
+      if (impactUnverified(s)) continue;
+      if (impactUnestablished(s)) {
+        // 'Not established' is the backstop's wording; a model brief must say
+        // the answer is unverified instead (OD-2 disc-M-56 / OD-3 (3)).
+        if (!opts.allowUnverifiedImpact) return "a model brief must say whether any market stops publishing, or say it is unverified";
+        continue;
+      }
+      if (!cited(s, true)) {
+        return "the impact's answer to whether any market stops publishing must cite, in its own sentence, the code path it was checked against";
+      }
+    }
   }
   return undefined;
 }

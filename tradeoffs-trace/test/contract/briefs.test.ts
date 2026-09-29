@@ -301,6 +301,37 @@ test("a model brief may say the publishing answer is unverified, but not 'not es
   assert.equal(briefIssue(notEstablished, { allowUnverifiedImpact: true }), undefined);
 });
 
+test("a stray 'unverified' does not excuse an impact that never answers about publishing", () => {
+  const good = fixture().briefs[0];
+  const stray = { ...good, impact: "The price uses fewer vendors for a while; the count is unverified.[2]" };
+  assert.ok(briefIssue(stray), "the impact must still answer about markets");
+});
+
+test("a claim with two values needs a citation that holds both", () => {
+  const good = fixture().briefs[0];
+  const twoTimes = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET to Sunday 05:00 ET[3]." };
+  assert.ok(briefIssue(twoTimes), "[3] holds 20:00 but not 05:00");
+});
+
+test("an option asserting whether a market stops publishing needs its own reference", () => {
+  const good = fixture().briefs[0];
+  const option = {
+    ...good,
+    options: good.options.map((o) => (o.id === "repair" ? { ...o, cost: "no market stops publishing either way" } : o)),
+  };
+  assert.ok(briefIssue(option), "the safety claim in the option needs a citation");
+});
+
+test("a data file with a line number is not a code citation for the publishing answer", () => {
+  const good = fixture().briefs[0];
+  const yaml = {
+    ...good,
+    evidence: [...good.evidence, "config: config/index/calendars.yaml:4 us_equity opens Sun 20:00"],
+    impact: "No market stops publishing[5].",
+  };
+  assert.ok(briefIssue(yaml), "a calendar line cannot show whether publishing stops");
+});
+
 test("the question is gated for a count like any other claim", () => {
   const good = fixture().briefs[0];
   assert.ok(briefIssue({ ...good, question: "Should the vendor wait ten seconds?" }));

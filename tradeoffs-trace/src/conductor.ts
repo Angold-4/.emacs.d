@@ -126,7 +126,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
-import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
+import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -7481,15 +7481,19 @@ export class Conductor {
     const out: OpenItemConcern[] = [];
     for (const r of phase.ownerRequests.filter((r) => r.status === "open")) {
       const linked = [r.linkedFindingId, r.linkedDecisionId, r.linkedMessageId, r.linkedCorrectionId].filter((v): v is string => typeof v === "string");
-      out.push(this.#concernFor(r.id, r.reason, linked));
+      // The owner-facing `related` label must stay plain, so it uses the brief's
+      // own question when there is one and otherwise strips the request's
+      // engineer prose (finding A-36).
+      const question = (phase.briefs ?? []).find((b) => b.requestId === r.id)?.question ?? stripCounts(stripCodeTokens(r.reason)).replace(/\s+/g, " ").trim();
+      out.push(this.#concernFor(r.id, question, linked));
     }
-    for (const d of this.#liveReservedDecisions(phase)) out.push(this.#concernFor(d.id, d.choice, [d.id]));
+    for (const d of this.#liveReservedDecisions(phase)) out.push(this.#concernFor(d.id, stripCounts(stripCodeTokens(d.choice)).replace(/\s+/g, " ").trim(), [d.id]));
     // Every live entry, not only the marked ones: a same-concern trade-off or
     // finding that never became an owner item is the T-54 silence the goal
     // says `related` must surface (OD-2 / D-B-77).
     for (const e of this.#liveEntriesForRelated(phase)) {
       const messageIds = (e.messages ?? []).map((m) => m.id);
-      out.push(this.#concernFor(e.id, e.title ?? "", [], messageIds));
+      out.push(this.#concernFor(e.id, stripCounts(stripCodeTokens(e.title ?? "")).replace(/\s+/g, " ").trim(), [], messageIds));
     }
     return out;
   }

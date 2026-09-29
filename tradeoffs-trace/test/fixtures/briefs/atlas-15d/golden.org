@@ -51,7 +51,7 @@
    Impact: No market stops publishing[2]. The wider band lets another vendor back in after a quiet spell, so the price is formed from more vendors more of the time.
    Options:
    - Accept it as implemented [option:accept_as_implemented] (recommended) — 10 s stays the re-entry band[2] Cost: a genuinely stale vendor can rejoin after 10 s[2]
-   - Reject and repair [option:reject_and_repair] — a new attempt picks the band again, with a further allowance Cost: a further repair round; no market stops publishing either way
+   - Reject and repair [option:reject_and_repair] — a new attempt picks the band again, with a further allowance Cost: a further repair round
    Recommendation: Accept it as implemented — the panel's own count of re-entries agrees with IC §5's 10 s[2]
    Glossary: [[file:glossary.org::Owner glossary][band]]
    Evidence (original):

@@ -118,7 +118,7 @@
           "id": "reject_and_repair",
           "label": "Reject and repair",
           "effect": "a new attempt picks the band again, with a further allowance",
-          "cost": "a further repair round; no market stops publishing either way"
+          "cost": "a further repair round"
         }
       ],
       "recommendation": { "option": "accept_as_implemented", "why": "the panel's own count of re-entries agrees with IC §5's 10 s[2]" },

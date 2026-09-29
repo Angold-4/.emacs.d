@@ -699,8 +699,12 @@ duration carries its own numbered reference into the evidence list (`[2]`); one
 reference does not cover another claim, and the reference must point at a
 config or code line that actually holds the claimed value. The publishing
 answer's own sentence must cite the code path it was checked against (a
-calendar cannot show whether publishing stops). The path itself is rendered
-only under Evidence, folded behind `TAB`. The glossary terms `T_in` and `T_out`
+calendar or data file cannot show whether publishing stops); a sentence that
+says the answer is unverified is exempt, but the word must refer to markets or
+publishing, and only the backstop may say 'not established'. An option that
+asserts whether a market stops publishing is held to the same rule. A
+reference must hold every time or number its claim states, not just the first.
+The path itself is rendered only under Evidence, folded behind `TAB`. The glossary terms `T_in` and `T_out`
 are allowed in a brief's question.
 
 If the model misses an item, the backstop records a brief that never invents
