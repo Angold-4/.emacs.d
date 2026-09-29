@@ -2700,6 +2700,9 @@ the other root still lists, and nothing signals."
                      (setq captured (cons default-directory args))
                      (when (consp destination)
                        (with-temp-file (cadr destination) (insert "")))
+                     ;; A refresh falls back to `tt state' when no view file
+                     ;; exists; answer with a parseable (if minimal) state.
+                     (when (member "state" args) (insert "{}"))
                      0)))
           (with-temp-buffer
             (setq +tt--run-dir run2 +tt--run-root root2)
@@ -2731,9 +2734,68 @@ the other root still lists, and nothing signals."
                       ((symbol-function '+tt--refresh-all) (lambda () nil)))
               (+tt-stop)))
           (should (equal (car captured) (file-name-as-directory root2)))
+          (should (equal (cadr (member "--root" captured)) (directory-file-name root2)))
+          ;; A refresh of a run buffer on root2 falls back to `tt state',
+          ;; which must run on root2 as well (finding M-5/A-7).
+          (setq captured nil)
+          (with-temp-buffer
+            (+tt-status-mode)
+            (setq +tt--run-dir run2 +tt--run-root root2)
+            (ignore-errors (+tt--render-status)))
+          (should (equal (car captured) (file-name-as-directory root2)))
+          (should (member "--root" captured))
           (should (equal (cadr (member "--root" captured)) (directory-file-name root2))))
       (delete-directory root1 t)
       (delete-directory root2 t)
+      (delete-directory runner t))))
+
+(ert-deftest tradeoffs-trace-source-match-strips-tramp ()
+  "A TRAMP-prefixed buffer file matches the server's recorded plain path.
+The source-file picker and run resolution both go through this (finding M-3)."
+  (cl-letf (((symbol-function 'file-local-name)
+             (lambda (f) (if (and (stringp f) (string-prefix-p "/ssh:mac:" f))
+                             (substring f (length "/ssh:mac:"))
+                           f))))
+    (should (+tt--same-file-p "/ssh:mac:/home/me/05_program.org" "/home/me/05_program.org"))
+    (should-not (+tt--same-file-p "/home/me/a.org" "/home/me/b.org"))))
+
+(ert-deftest tradeoffs-trace-mode-line-does-not-poll-remote-roots ()
+  "The 10-second mode-line timer only touches the local root.
+A dead remote host must never block Emacs in the background (M-2/D-13)."
+  (let* ((root1 (make-temp-file "tt-ert-root1" t))
+         (root2 (file-name-as-directory "/ssh:dead:~/.tradeoffs-trace/"))
+         (called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root1 root2)))
+                  ((symbol-function '+tt--cli-on)
+                   (lambda (root &rest _) (push root called) "[]"))
+                  ((symbol-function '+tt--notify-flash) nil))
+          (let ((+tt-root root1))
+            (+tt--mode-line-update))
+          (should (member (file-name-as-directory root1) called))
+          (should-not (member root2 called)))
+      (delete-directory root1 t))))
+
+(ert-deftest tradeoffs-trace-cli-bounds-connect-before-touching-the-root ()
+  "`+tt--cli-on' binds the short connect timeout before any remote access.
+`+tt--runner-dir' checks the remote runner with `file-exists-p', which must
+not open the connection at TRAMP's long default (finding A-6)."
+  (let* ((root (file-name-as-directory "/ssh:dead:~/.tradeoffs-trace/"))
+         (runner (make-temp-file "tt-ert-runner" t))
+         (seen nil))
+    (make-directory (expand-file-name "src" runner) t)
+    (write-region "" nil (expand-file-name "src/cli.ts" runner))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--runner-dir)
+                   (lambda (&optional _) (setq seen tramp-connection-timeout) runner))
+                  ((symbol-function 'process-file)
+                   (lambda (_p _i destination _d &rest _)
+                     (when (consp destination) (with-temp-file (cadr destination) (insert "")))
+                     0)))
+          (let ((+tt-connect-timeout 7)
+                (tramp-connection-timeout 60))
+            (+tt--cli-on root "list"))
+          (should (equal seen 7)))
       (delete-directory runner t))))
 
 (ert-deftest tradeoffs-trace-program-picker-from-source-file ()
@@ -2800,7 +2862,9 @@ file's programs; exactly one running opens it with no prompt."
 
 (ert-deftest tradeoffs-trace-mode-maps-bind-only-commands ()
   "Every key in every mode map, and every Evil normal-state binding, is a
-command; no Evil normal-state map binds a bare `g'."
+command; no Evil normal-state map binds a bare `g'.
+The mirror `+tt--evil-normal-maps' is checked in batch; when Evil is loaded
+the real auxiliary maps are checked too (finding M-4)."
   (let ((maps (list +tt-program-mode-map +tt-trace-mode-map +tt-status-mode-map
                     +tt-tape-mode-map +tt-input-mode-map +tt-review-mode-map
                     +tt-decisions-mode-map +tt-runs-mode-map)))
@@ -2811,6 +2875,16 @@ command; no Evil normal-state map binds a bare `g'."
                     (when (and (symbolp def) (not (symbolp key)))
                       (should (commandp def))))
                   map)
+      ;; The real Evil normal-state map when Evil is loaded.
+      (when (fboundp 'evil-get-auxiliary-keymap)
+        (let ((real (ignore-errors (evil-get-auxiliary-keymap map 'normal))))
+          (when real
+            (let ((g (lookup-key real "g")))
+              (should (or (null g) (keymapp g))))
+            (map-keymap (lambda (key def)
+                          (when (and (symbolp def) (not (symbolp key)))
+                            (should (commandp def))))
+                        real))))
       (let ((aux (cdr (assq map +tt--evil-normal-maps))))
         (when aux
           (let ((g (lookup-key aux "g")))
@@ -2819,4 +2893,9 @@ command; no Evil normal-state map binds a bare `g'."
                         (when (and (symbolp def) (not (symbolp key)))
                           (should (commandp def))))
                       aux))))
+    ;; A `kbd'-ed key must survive the mirror: `(kbd (kbd "TAB"))' parses to
+    ;; no key, so a doubled conversion would silently drop TAB and RET.
+    (should (commandp (lookup-key (cdr (assq +tt-review-mode-map +tt--evil-normal-maps)) (kbd "TAB"))))
+    (should (commandp (lookup-key (cdr (assq +tt-decisions-mode-map +tt--evil-normal-maps)) (kbd "TAB"))))
+    (should (commandp (lookup-key (cdr (assq +tt-input-mode-map +tt--evil-normal-maps)) (kbd "RET"))))
     (should (commandp '+tt--refresh-all))))

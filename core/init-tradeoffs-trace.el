@@ -149,11 +149,31 @@ A host that names this machine is skipped, and a duplicate root is dropped."
           (unless (member root roots) (setq roots (append roots (list root)))))))
     roots))
 
+(defvar +tt--roots-override nil
+  "When non-nil, the roots a listing call should use instead of `+tt--roots'.")
+
+(defun +tt--listing-roots ()
+  "Roots a listing call should use: `+tt--roots-override' or `+tt--roots'."
+  (or +tt--roots-override (+tt--roots)))
+
+(defun +tt--background-roots ()
+  "Roots the periodic mode line may touch: the local root only.
+Remote roots are listed from a picker or a visible buffer, never on a timer,
+so a dead host can never block Emacs in the background (findings M-2/D-13)."
+  (list (file-name-as-directory +tt-root)))
+
 (defun +tt--under-root (root relative)
   "ROOT with RELATIVE appended, without expanding `~' over TRAMP.
 `expand-file-name' on a remote root would open a connection just to expand
 `~', which a listing must never do."
   (concat (file-name-as-directory root) relative))
+
+(defun +tt--same-file-p (file-a file-b)
+  "Non-nil when FILE-A and FILE-B name the same file on one machine.
+TRAMP prefixes are stripped, so a laptop buffer visiting a server's Org file
+matches the path that server's own Emacs recorded (finding M-3)."
+  (and file-a file-b
+       (equal (file-local-name file-a) (file-local-name file-b))))
 
 (defun +tt--host-of-root (root)
   "The SSH host naming ROOT, or nil when ROOT is local."
@@ -218,12 +238,14 @@ The root is a path in ARGS, the buffer's run/program root, or `+tt-root';
 (defun +tt--cli-on (root &rest args)
   "Run `tt' ARGS against ROOT, returning its stdout, trimmed.
 ROOT is the root the command belongs to and decides the host it runs on."
-  (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir root)))
-         (default-directory (file-name-as-directory root))
-         ;; A dead host must cost seconds, not TRAMP's default minute.
-         (tramp-connection-timeout (min (if (bound-and-true-p tramp-connection-timeout)
+  ;; A dead host must cost seconds, not TRAMP's default minute.  Bind the
+  ;; timeout FIRST: `+tt--runner-dir' below checks the remote runner with
+  ;; `file-exists-p', which opens the very connection being bounded.
+  (let* ((tramp-connection-timeout (min (if (bound-and-true-p tramp-connection-timeout)
                                             tramp-connection-timeout 60)
                                         +tt-connect-timeout))
+         (cli (expand-file-name "src/cli.ts" (+tt--runner-dir root)))
+         (default-directory (file-name-as-directory root))
          ;; `process-file' takes stderr only as a (local) file name, never a
          ;; buffer: a buffer there signals `wrong-type-argument' on every call.
          (err-file (make-temp-file "tt-stderr-")))
@@ -277,8 +299,11 @@ assert there is no bare `g' in any normal-state map."
   (let* ((entry (or (assq mode-map +tt--evil-normal-maps)
                     (car (push (cons mode-map (make-sparse-keymap)) +tt--evil-normal-maps))))
          (map (cdr entry)))
+    ;; The keys are already `define-key' key representations (`"gr"',
+    ;; `(kbd "TAB")'), so they must not be passed through `kbd' a second time:
+    ;; `(kbd (kbd "TAB"))' is `(kbd "\t")' and parses to no key at all.
     (while bindings
-      (define-key map (kbd (pop bindings)) (pop bindings)))))
+      (define-key map (pop bindings) (pop bindings)))))
 
 (defun +tt--state (run-dir)
   "Return the parsed `tt state' of RUN-DIR as nested alists."
@@ -628,7 +653,7 @@ One `tt list --json' call per root (never a per-run file read over TRAMP);
 each row gains `root', `host' and `dir' (the TRAMP-correct directory).  A
 root whose call fails is skipped with a message naming it."
   (let (rows)
-    (dolist (root (+tt--roots))
+    (dolist (root (+tt--listing-roots))
       (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "list" "--json")))))
         (when json
           (dolist (row (json-parse-string json :object-type 'alist :array-type 'list
@@ -656,7 +681,7 @@ Runs of the buffer's plan, from every root, come first; only then all runs."
   (or +tt--run-dir
       (let* ((plan buffer-file-name)
              (rows (+tt--run-rows))
-             (mine (and plan (seq-filter (lambda (r) (equal (alist-get 'planPath r) plan)) rows))))
+             (mine (and plan (seq-filter (lambda (r) (+tt--same-file-p plan (alist-get 'planPath r))) rows))))
         (cond
          ((= (length mine) 1) (alist-get 'dir (car mine)))
          ((> (length mine) 1)
@@ -1078,7 +1103,7 @@ One `tt program list --json' call per root (never a per-program file read
 over TRAMP); each row gains `root', `host' and `dir'.  A root whose call
 fails is skipped with a message naming it."
   (let (rows)
-    (dolist (root (+tt--roots))
+    (dolist (root (+tt--listing-roots))
       (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "program" "list" "--json")))))
         (when json
           (dolist (row (json-parse-string json :object-type 'alist :array-type 'list
@@ -1128,11 +1153,9 @@ to them, newest first.  Anywhere else, every program of every root."
   (if dir
       (+tt--program-open dir)
     (let* ((rows (+tt--program-rows))
-           (source (and buffer-file-name (expand-file-name buffer-file-name)))
+           (source buffer-file-name)
            (mine (and source
-                      (seq-filter (lambda (r)
-                                    (let ((s (alist-get 'source r)))
-                                      (and s (equal (expand-file-name s) source))))
+                      (seq-filter (lambda (r) (+tt--same-file-p source (alist-get 'source r)))
                                   rows))))
       (cond
        ((and mine (= (length (seq-filter (lambda (r) (eq (alist-get 'alive r) t)) mine)) 1))
@@ -3180,7 +3203,7 @@ Emacs started are not replayed."
 One `tt program list --json' call per root; nil when there is no program or
 no wait.  A root whose call fails is skipped with a message."
   (let (rows)
-    (dolist (root (+tt--roots))
+    (dolist (root (+tt--listing-roots))
       (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "program" "list" "--json")))))
         (when json
           (dolist (p (json-parse-string json :object-type 'alist :array-type 'list
@@ -3198,8 +3221,12 @@ no wait.  A root whose call fails is skipped with a message."
                           'warning 'error))))
 
 (defun +tt--mode-line-update ()
-  "Refresh the mode-line indicator from `tt list' when any run is live."
-  (let* ((wait (+tt--mode-line-wait))
+  "Refresh the mode-line indicator from `tt list' when any run is live.
+Only the local root is listed here: this runs on a timer, and a dead remote
+host must never block Emacs in the background (findings M-2/D-13).  The
+pickers and a visible buffer list every other root on demand."
+  (let* ((+tt--roots-override (+tt--background-roots))
+         (wait (+tt--mode-line-wait))
          (flash (and +tt--notify-flash
                      (< (float-time (time-since +tt--notify-flash)) 10)))
          (rows (ignore-errors (+tt--list)))
@@ -3211,13 +3238,14 @@ no wait.  A root whose call fails is skipped with a message."
               (cond (wait wait)
                     (flash (propertize " [⚑]" 'face 'warning))
                     (t ""))
-            (let ((rows (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t) (equal (alist-get 'attention r) "needs you")))
-                                    (ignore-errors (+tt--list)))))
+            (let ((shown (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t)
+                                                      (equal (alist-get 'attention r) "needs you")))
+                                     rows)))
               (concat
                (cond (wait wait)
                      (flash (propertize " [⚑]" 'face 'warning))
                      (t ""))
-               (if (null rows) ""
+               (if (null shown) ""
                  (concat " ["
                          (mapconcat
                           (lambda (r)
@@ -3225,7 +3253,7 @@ no wait.  A root whose call fails is skipped with a message."
                                                 (alist-get 'stage r) (alist-get 'stageElapsed r)
                                                 (replace-regexp-in-string " +" "" (alist-get 'reviews r)))
                                         'face (+tt--attention-face r)))
-                          rows " | ")
+                          shown " | ")
                          "]")))))))
   (force-mode-line-update t))
 

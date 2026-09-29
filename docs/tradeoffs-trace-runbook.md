@@ -957,7 +957,9 @@ host` (the host is omitted for the local root), newest activity first, and
 choosing one opens it on its own root: every later `tt` command on that
 buffer (refresh, `C-c m k`/`C-c m c`, `C-c m d`, A/D verdicts, directives)
 runs against that root, never the default one. No per-run file is read over
-TRAMP while listing.
+TRAMP while listing. Remote roots are listed only from a picker or a visible
+buffer; the periodic mode-line refresh reads the local root alone, so a dead
+host cannot stall Emacs in the background.
 
 `C-c m p` in a buffer visiting a program's Org file (`05_program.org`) skips
 the prompt: the running program of that file opens directly when exactly one
