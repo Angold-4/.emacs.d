@@ -14,12 +14,14 @@ import { test } from "node:test";
 import {
   briefIssue,
   checkTodayExample,
+  renderBriefOrg,
   enrichBriefRelated,
   fallbackBrief,
   fallbackDecisionBrief,
   fallbackEntryBrief,
   hasCodeIdentifier,
   impactAnswersPublishing,
+  impactUnestablished,
   parseCatalogs,
   relatedOpenItems,
   renderBriefsSection,
@@ -165,7 +167,7 @@ test("a reserved decision's override brief sends an override, not a resolve", ()
   // `approve` maps to an approve override.
   assert.equal((briefCommandFor(brief, "approve", binding) as { vote: string }).vote, "approve");
   // The override brief passes the same gate with its own option ids.
-  assert.equal(briefIssue(brief, { requestOptions: ["approve", "reject_and_repair"] }), undefined);
+  assert.equal(briefIssue(brief, { requestOptions: ["approve", "reject_and_repair"], allowUnverifiedImpact: true }), undefined);
 });
 
 test("a weekday reopen claim is checked against the calendar's weekly schedule", () => {
@@ -188,7 +190,7 @@ test("the backstop omits a recommendation and does not recommend the risky first
   const request = f.requests.find((r) => r.id === "F-M-9")!;
   const brief = fallbackBrief(request, { catalogs: null });
   assert.equal(brief.recommendation, undefined);
-  assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id) }), undefined);
+  assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id), allowUnverifiedImpact: true }), undefined);
   // The model briefs still carry one.
   assert.ok(f.briefs[0].recommendation);
 });
@@ -200,7 +202,7 @@ test("a live entry's brief sends an entry verdict, and the conductor merges rela
   assert.equal(brief.command, "entry");
   assert.deepEqual(brief.options.map((o) => o.id), ["accept", "refuse"]);
   assert.equal(brief.recommendation, undefined);
-  assert.equal(briefIssue(brief, { requestOptions: ["accept", "refuse"] }), undefined);
+  assert.equal(briefIssue(brief, { requestOptions: ["accept", "refuse"], allowUnverifiedImpact: true }), undefined);
   assert.ok(brief.related.some((r) => r.id === "T-54"));
 
   const request = f.requests.find((r) => r.id === "F-M-9")!;
@@ -208,6 +210,17 @@ test("a live entry's brief sends an entry verdict, and the conductor merges rela
   const model = { ...f.briefs[0], related: [{ id: "T-54", question: "held" }] };
   const merged = enrichBriefRelated(model, [...concerns, { id: request.id, question: request.reason, files: ["src/core/blend.rs"], planRefs: ["IC §5"] }]);
   assert.ok(merged.related.some((r) => r.id === "D-A-80"), "the conductor's same-file item is merged in");
+});
+
+test("renderBriefOrg renders a backstop brief whose recommendation is omitted", () => {
+  const f = fixture();
+  const request = f.requests.find((r) => r.id === "F-M-9")!;
+  const brief = fallbackBrief(request, { catalogs: null });
+  assert.equal(brief.recommendation, undefined);
+  const org = renderBriefOrg(brief);
+  assert.match(org, /\*\* Should this stay as it is/);
+  assert.match(org, /Recommendation: none established/);
+  assert.match(org, /\[accept_risk\]/);
 });
 
 test("a today that names a market and time cannot excuse itself with the unverified marker", () => {
@@ -225,10 +238,34 @@ test("the deterministic backstop lists related items on the same concern and nev
   const concerns = f.openItems;
   const request = f.requests.find((r) => r.id === "F-M-9")!;
   const brief = fallbackBrief(request, { catalogs: null, allItems: concerns, files: ["src/core/blend.rs"], planRefs: ["IC §5"] });
-  assert.equal(impactAnswersPublishing(brief.impact), true);
-  assert.match(brief.impact, /not established/i);
+  assert.equal(impactUnestablished(brief.impact), true);
+  assert.equal(impactAnswersPublishing(brief.impact), false, "the strict model check refuses the backstop wording");
   assert.deepEqual(brief.related.map((r) => r.id).sort(), ["D-A-80", "T-54"]);
-  assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id) }), undefined);
+  assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id), allowUnverifiedImpact: true }), undefined);
+});
+
+test("only the backstop may say the impact was not established", () => {
+  const f = fixture();
+  const model = { ...f.briefs[0], impact: "Whether any market stops publishing is not established." };
+  const issue = briefIssue(model);
+  assert.ok(issue, "a model brief must answer whether a market stops publishing");
+  assert.match(issue!, /stops publishing/i);
+  assert.equal(briefIssue(model, { allowUnverifiedImpact: true }), undefined);
+});
+
+test("the glossary terms T_in and T_out are allowed in a question", () => {
+  const good = fixture().briefs[0];
+  assert.equal(briefIssue({ ...good, question: "Should the band use T_in and T_out as edge values?" }), undefined);
+});
+
+test("a plan clause or a bare file name does not cite a quantified claim", () => {
+  const good = fixture().briefs[0];
+  const planOnly = { ...good, evidence: ["plan: IC §5 says the vendor stays out", "message: F-M-9"] };
+  const issue = briefIssue(planOnly);
+  assert.ok(issue, "a plan: line is not the config or code the brief read");
+  assert.match(issue!, /citation/i);
+  const code = { ...planOnly, evidence: [...planOnly.evidence, "code: src/core/blend.rs:88"] };
+  assert.equal(briefIssue(code), undefined);
 });
 
 test("briefIssue rejects a code identifier in the question", () => {
@@ -270,9 +307,9 @@ test("the deterministic backstop brief passes the same gate without inventing an
   const f = fixture();
   for (const request of f.requests) {
     const brief = fallbackBrief(request, { catalogs: null });
-    assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id) }), undefined);
+    assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id), allowUnverifiedImpact: true }), undefined);
     assert.equal(briefQuestionHasNoCode(brief.question), true);
-    assert.equal(impactAnswersPublishing(brief.impact), true);
+    assert.equal(impactUnestablished(brief.impact), true);
     assert.match(brief.today, /example unverified/);
     assert.deepEqual(brief.options.map((o) => o.id).sort(), request.options.map((o) => o.id).sort());
   }

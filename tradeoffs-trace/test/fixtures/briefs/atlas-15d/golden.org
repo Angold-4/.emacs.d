@@ -18,8 +18,8 @@
    Today: Pyth's NVDA product reopens Sunday 20:00 ET. Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.
    Impact: No market stops publishing. At most one vendor is missing for about 10 s after a weekend reopen, so the published price is formed from one vendor fewer for that window.
    Options:
-   - Keep as is — the vendor rejoins immediately at the first tick after the reopen Cost: one stale first quote can enter the price for up to 10 s [accept_risk]
-   - Hold it out for 10 s (recommended) — the vendor stays excluded until 10 s after the reopen, then rejoins Cost: 10 s with one vendor fewer at a reopen [repair]
+   - Keep as is [accept_risk] — the vendor rejoins immediately at the first tick after the reopen Cost: one stale first quote can enter the price for up to 10 s
+   - Hold it out for 10 s [repair] (recommended) — the vendor stays excluded until 10 s after the reopen, then rejoins Cost: 10 s with one vendor fewer at a reopen
    Recommendation: Hold it out for 10 s — IC §5's re-entry rule asks for a settled first tick, not the first tick after a break
    Related:
    - D-A-80: Should the re-entry band be ten seconds wide?
@@ -48,8 +48,8 @@
    Today: Stork's BTCUSD product trades around the clock: its 24/7 calendar runs every minute of 00:00 to 23:59, so it has no reopen. The band now uses 10 s, the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.
    Impact: No market stops publishing. The wider band lets one more vendor back in after a quiet spell, so the price is formed from more vendors more of the time.
    Options:
-   - Accept it as implemented (recommended) — 10 s stays the re-entry band Cost: a genuinely stale vendor can rejoin after 10 s [accept_as_implemented]
-   - Reject and repair — a new attempt picks the band again, with three more repair rounds Cost: one more round; no market stops publishing either way [reject_and_repair]
+   - Accept it as implemented [accept_as_implemented] (recommended) — 10 s stays the re-entry band Cost: a genuinely stale vendor can rejoin after 10 s
+   - Reject and repair [reject_and_repair] — a new attempt picks the band again, with three more repair rounds Cost: one more round; no market stops publishing either way
    Recommendation: Accept it as implemented — the panel's own count of re-entries agrees with IC §5's 10 s
    Evidence (original):
    - message: D-A-80 widen the re-entry band to 10 s failed its vote
@@ -75,8 +75,8 @@
    Today: Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend. The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET the first fresh price is published.
    Impact: No market stops publishing. While XAUUSD is held there is simply no offer, which is the documented behaviour; the change only affects whether the last price is repeated.
    Options:
-   - Accept it as implemented (recommended) — no offer is published while the market is held Cost: consumers see no update for the held window [accept_as_implemented]
-   - Reject and repair — a new attempt makes the held market repeat its last good price Cost: one more round; a stale price can be mistaken for a live one [reject_and_repair]
+   - Accept it as implemented [accept_as_implemented] (recommended) — no offer is published while the market is held Cost: consumers see no update for the held window
+   - Reject and repair [reject_and_repair] — a new attempt makes the held market repeat its last good price Cost: one more round; a stale price can be mistaken for a live one
    Recommendation: Accept it as implemented — IC §7 says a held market makes no offer, and a repeated price would read as live
    Related:
    - T-54: Should every held market make no offer at all until a vendor returns?

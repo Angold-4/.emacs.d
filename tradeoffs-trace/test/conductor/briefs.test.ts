@@ -81,7 +81,7 @@ function budgetBrief(request: OwnerRequest) {
     requestId: request.id,
     question: "Should the phase get more repair rounds or stop?",
     today: "No concrete example was recorded for this item. (example unverified)",
-    impact: "Whether any market stops publishing is not established by this brief.",
+    impact: "No market stops publishing under either option; only the repair budget changes.",
     options: [
       { id: "grant", label: "Give three more rounds", effect: "the worker tries again", cost: "more time" },
       { id: "stop", label: "Stop the phase", effect: "the phase stops", cost: "the work is not finished" },

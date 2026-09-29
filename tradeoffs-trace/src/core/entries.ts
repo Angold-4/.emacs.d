@@ -1063,6 +1063,13 @@ function entryReviewLabel(opts: EntryReviewOptions): string {
   return readable ?? dir ?? opts.phaseId ?? "";
 }
 
+/** The entries the owner has explicitly marked: a live entry with a linked
+ * message the owner refused. Not every live entry — showing each one twice
+ * buries the real decisions (findings M-58/disc-B-18). */
+export function ownerMarkedEntryIds(views: readonly EntryView[]): string[] {
+  return views.filter((v) => v.live && v.messages.some((m) => m.state === "refused")).map((v) => v.entry.id);
+}
+
 /** The ids a `Needs you' brief may still be shown for: every open owner
  * request, plus every live flagged reserved decision on the current
  * candidate (a reserved decision never becomes an owner request, so it would
@@ -1083,8 +1090,9 @@ export function briefableIdsFor(
     if ((overrides ?? []).some((o) => o.decisionId === d.id && (!candidateSha || o.boundCandidateSha === candidateSha))) continue;
     ids.add(d.id);
   }
-  // Every live entry is an item the owner settles with A/D, so it gets a
-  // brief (the plan's "entries marked for the owner").
+  // Only an entry the owner has MARKED gets a brief: one whose linked message
+  // the owner refused. Showing every live entry twice buries the real
+  // decisions (findings M-58/disc-B-18).
   for (const id of entryIds) ids.add(id);
   return ids;
 }
@@ -1098,7 +1106,7 @@ export function renderEntryReview(opts: EntryReviewOptions): string {
   // Decision briefs first: the owner reads the question and the choice before
   // any entry's evidence. Only items that are still open are shown; a recorded
   // brief whose request is settled is not resurrected (finding M-3).
-  const entryIds = projected.views.filter((v) => v.live).map((v) => v.entry.id);
+  const entryIds = ownerMarkedEntryIds(projected.views);
   const showable = opts.briefableIds ?? briefableIdsFor(opts.ownerRequests, opts.decisions, opts.overrides, opts.newestCandidateSha, entryIds);
   const briefs = (opts.briefs ?? []).filter((b) => showable.has(b.requestId));
   lines.push(
@@ -1147,7 +1155,7 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
   }> = [];
   for (const p of program.phases) {
     const tag = p.readableId ?? p.phaseId;
-    const entryIds = perPhase.find((ph) => ph.phaseId === p.phaseId)?.projected.views.filter((v) => v.live).map((v) => v.entry.id) ?? [];
+    const entryIds = ownerMarkedEntryIds(perPhase.find((ph) => ph.phaseId === p.phaseId)?.projected.views ?? []);
     const showable = briefableIdsFor(p.ownerRequests, p.decisions, p.overrides, p.candidate?.sha ?? opts.newestCandidateSha, entryIds);
     const requests = p.ownerRequests ?? [];
     const binding =

@@ -63,9 +63,16 @@ const SNAKE_CASE = /\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]*[A-Za-z0-9]\b/;
 const PATH_LIKE = /(?:^|[\s(`"'])(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z][A-Za-z0-9]{0,7}\b/;
 const CODE_EXT = /\b[\w.-]+\.(?:rs|ts|tsx|js|mjs|cjs|el|json|ya?ml|org|md|toml|py|go|c|cc|cpp|h|hpp|java|rb|sh|lock)\b/;
 
-/** True when TEXT carries a `snake_case` or `path/file.ext` code identifier. */
+/** The glossary terms the runbook says a brief may still use: they contain an
+ * underscore but are owner-facing, so the question gate exempts them (finding
+ * disc-M-55). */
+const GLOSSARY_TERM = /\bT_(?:in|out)\b/g;
+
+/** True when TEXT carries a `snake_case` or `path/file.ext` code identifier.
+ * The owner-facing glossary terms (`T_in`, `T_out`) are exempt. */
 export function hasCodeIdentifier(text: string): boolean {
-  return SNAKE_CASE.test(text) || PATH_LIKE.test(text) || CODE_EXT.test(text);
+  const plain = text.replace(GLOSSARY_TERM, "the band edge");
+  return SNAKE_CASE.test(plain) || PATH_LIKE.test(plain) || CODE_EXT.test(plain);
 }
 
 /** Any quantified claim: a clock time (`20:00`), a duration (`10 s`,
@@ -79,29 +86,34 @@ export function hasQuantifiedFact(text: string): boolean {
   return CLOCK_TIME.test(text) || DURATION.test(text) || DIGIT_COUNT.test(text) || WORD_COUNT.test(text);
 }
 
-/** An evidence entry that names the config or code the brief read. Only a
- * citation counts for a quantified claim (the original message alone does
- * not). */
+/** An evidence entry that cites the CONFIG or CODE the brief actually read
+ * (`config: ...` / `code: ...`, or a `path/file.ext:line`). A plan clause or
+ * a bare `§` reference is not a config/code citation and does not satisfy the
+ * quantified-claim rule (finding disc-M-54). */
 export function isEvidenceCitation(entry: string): boolean {
   const s = entry.trim();
   if (!s) return false;
-  if (/^(?:config|code|plan):/i.test(s)) return true;
-  // a file path, optionally with a line number or a section
-  return /\b[\w./-]+\.(?:ya?ml|rs|ts|tsx|js|el|json|org|md|toml|py|go|c|cpp|h|rb|sh)(?::\d+)?\b/.test(s) || /§\s*\d/.test(s);
+  if (/^(?:config|code):/i.test(s)) return true;
+  return /\b[\w./-]+\.(?:ya?ml|rs|ts|tsx|js|el|json|org|md|toml|py|go|c|cpp|h|rb|sh):\d+\b/.test(s);
 }
 
 /** Whether IMPACT answers the owner's first question: "does any market stop
- * publishing?". Either a plain "no market stops publishing"/"every market
- * keeps publishing", an explicit "one market stops publishing", or an honest
- * "this was not established" (the backstop never asserts an unchecked
- * claim). */
+ * publishing?". A model brief must state it plainly; the honest
+ * "not established" wording is reserved for the deterministic backstop and
+ * is recognized by `impactUnestablished`, never by this strict check (finding
+ * disc-M-56). */
 export function impactAnswersPublishing(impact: string): boolean {
-  if (/\b(?:not|never)\s+(?:been\s+)?(?:established|checked|verified|known)\b|\bunknown\b|\bcannot be (?:established|checked)\b|\bcould not (?:be )?(?:establish|check)\b/i.test(impact)) {
-    return true;
-  }
+  if (impactUnestablished(impact)) return false;
   return /\b(?:no|any|every|each|one|two|three|all)\b[^.]{0,80}\bmarket[s]?\b[^.]{0,40}\b(?:stop|stops|stopping|keep|keeps|keeping|continue|continues|continuing|publish|publishes|publishing|halt|halts|go(?:es)?\s+(?:dark|silent))\b/i.test(
     impact,
   ) || /\b(?:publishing|publication)\b[^.]{0,40}\b(?:stop|stops|continue|continues|halt|halts|go(?:es)?)\b/i.test(impact);
+}
+
+/** The backstop's honest "this was not established" wording. Only the
+ * deterministic fallback may use it; a model brief's `impact` is refused when
+ * it does (finding disc-M-56). */
+export function impactUnestablished(impact: string): boolean {
+  return /\b(?:not|never)\s+(?:been\s+)?(?:established|checked|verified|known)\b|\bunknown\b|\bcannot be (?:established|checked)\b|\bcould not (?:be )?(?:establish|check)\b/i.test(impact);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +220,10 @@ export interface BriefIssueOptions {
   /** The plan's calendars/products. When given, `today` is checked; a `today`
    * that cannot be checked must carry "(example unverified)". */
   catalogs?: Catalogs | null;
+  /** Only the deterministic backstop may say the impact was not established;
+   * a model brief must answer whether any market stops publishing (finding
+   * disc-M-56). */
+  allowUnverifiedImpact?: boolean;
 }
 
 /** The first reason a brief is not owner-readable, or undefined when it is.
@@ -225,7 +241,7 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   if (question.includes("\n")) return "the question must be one line";
   if (!today) return "a brief needs a `today` paragraph";
   if (!impact) return "a brief needs an `impact` paragraph";
-  if (!impactAnswersPublishing(impact)) {
+  if (opts.allowUnverifiedImpact ? !impactAnswersPublishing(impact) && !impactUnestablished(impact) : !impactAnswersPublishing(impact)) {
     return "the impact must say whether any market stops publishing";
   }
   if (!Array.isArray(brief.options) || brief.options.length === 0) return "a brief needs at least one option";
@@ -476,8 +492,11 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
   lines.push(`${indent}Impact: ${brief.impact}`);
   lines.push(`${indent}Options:`);
   for (const option of brief.options) {
-    const chosen = brief.recommendation.option === option.id ? " (recommended)" : "";
-    lines.push(`${indent}- ${option.label}${chosen} — ${option.effect} Cost: ${option.cost} [${option.id}]`);
+    // `recommendation` is optional (the backstop omits it), so it is read
+    // defensively here; the `[id]` sits right after the plain label so RET can
+    // complete on the label alone (finding A-14).
+    const chosen = brief.recommendation?.option === option.id ? " (recommended)" : "";
+    lines.push(`${indent}- ${option.label} [${option.id}]${chosen} — ${option.effect} Cost: ${option.cost}`);
   }
   if (brief.recommendation) {
     lines.push(

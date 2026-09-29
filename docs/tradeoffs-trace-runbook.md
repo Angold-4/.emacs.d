@@ -666,24 +666,34 @@ to the evaluator. An example can only excuse itself with `(example unverified)`
 when it names no market and no time; a named time is always checked against the
 calendars.
 
-After evaluation the conductor runs one brief-writing pass by the evaluator's
-model for every item the owner must decide: an open owner request, a flagged
-reserved decision (which never becomes an owner request), and every live
-review entry. A reserved decision's brief sends an override (approve /
-reject) and an entry's sends the entry accept/refuse, rather than a request
-resolve. The pass is per round and per candidate, so a new candidate's item is
-rewritten rather than keeping an earlier round's `today`.
+Once the phase is parked on you, the conductor runs one brief-writing pass by
+the evaluator's model for every item you must decide: an open owner request, a
+flagged reserved decision (which never becomes an owner request), and an entry
+you have explicitly marked (a live entry with a linked message you refused).
+It does not brief every live entry: each one already appears in its own
+section with `A`/`D`, and duplicating them would bury the real decisions. A
+reserved decision's brief sends an override (approve / reject) and a marked
+entry's sends the entry accept/refuse, rather than a request resolve. The pass
+is per round and per candidate, so a new candidate's item is rewritten rather
+than keeping an earlier round's `today`.
 
 `A` and `D` choose the brief's accept and refuse option by the option's own
 meaning, never by its position; `RET` prompts on the option's **plain label**,
-never its engineer id. If the model misses an item, a deterministic backstop
-records a brief that never invents an example, never asserts an unchecked
-impact (it says the impact was not established), omits a recommendation rather
-than recommending an option by position, and lists the other items on the same
-file or plan clause. The conductor merges its own same-concern items into a
-model brief's `related` too, so a bigger silence is never hidden. A brief
-names a weekday reopen example only when the plan's calendar carries a weekly
-schedule to check it against; otherwise it is marked unverified.
+never its engineer id. A model brief must state whether any market stops
+publishing; only the deterministic backstop may say the impact was not
+established. A time, count or duration must cite the config or code the brief
+read (`config: ...`, `code: ...`, or a `path:line`) — a plan clause or a bare
+`§` reference does not count. The glossary terms `T_in` and `T_out` are allowed
+in a brief's question.
+
+If the model misses an item, the backstop records a brief that never invents
+an example, never asserts an unchecked impact (it says the impact was not
+established), omits a recommendation rather than recommending an option by
+position, and lists the other items on the same file or plan clause. The
+conductor merges its own same-concern items into a model brief's `related`
+too, so a bigger silence is never hidden. A brief names a weekday reopen
+example only when the plan's calendar carries a weekly schedule to check it
+against; otherwise it is marked unverified.
 
 The same briefs appear at the top of `views/review.org` (and the program
 review) under `* Needs you (N)`; `TAB` on a question unfolds its evidence. An

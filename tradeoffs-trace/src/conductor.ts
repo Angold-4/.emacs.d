@@ -3458,7 +3458,7 @@ export class Conductor {
       // review entry is settled directly, so a brief for either is accepted
       // here too (each carries its own owner command).
       const decision = !request ? this.#liveReservedDecisions().find((d) => d.id === requestId) : undefined;
-      const entry = !request && !decision ? this.#liveEntries().find((e) => e.id === requestId) : undefined;
+      const entry = !request && !decision ? this.#ownerMarkedEntries().find((e) => e.id === requestId) : undefined;
       if (!request && !decision && !entry) return { ok: false, reason: `brief ${requestId || "(no requestId)"} does not name an open owner item` };
       const requestOptions = request
         ? (request.options ?? []).map((o) => o.id)
@@ -7367,11 +7367,10 @@ export class Conductor {
   #refreshBriefs(): void {
     if (this.#closed || !this.#briefsEnabled) return;
     const phase = this.#state.phase;
-    // After evaluation: a reserved decision or a review entry is settled
-    // while the phase is still RESOLVING/GATING, and an owner request appears
-    // only on entry to AWAITING_OWNER (finding F-8). All four states are the
-    // "after evaluation" window the plan asks for.
-    if (!["RESOLVING", "GATING", "AWAITING_OWNER", "BLOCKED"].includes(phase.phase)) return;
+    // The brief pass runs when the owner is actually needed (F-8), never
+    // during RESOLVING or GATING: briefing a proceeding phase costs a model
+    // run for an item the owner may never see (finding disc-B-60).
+    if (phase.phase !== "AWAITING_OWNER" && phase.phase !== "BLOCKED") return;
     const C = phase.candidate?.sha;
     // Per candidate, not per request id: the plan asks for one brief per
     // round, so a new candidate's item is rewritten (finding M-30). A brief
@@ -7382,7 +7381,7 @@ export class Conductor {
       ...this.#liveReservedDecisions(phase)
         .filter((d) => !existing.has(d.id))
         .map((d) => d.id),
-      ...this.#liveEntries(phase)
+      ...this.#ownerMarkedEntries(phase)
         .filter((e) => !existing.has(e.id))
         .map((e) => e.id),
     ];
@@ -7409,10 +7408,14 @@ export class Conductor {
     });
   }
 
-  /** The live review entries of the current candidate: the owner settles each
-   * with A/D, so each is an owner item the plan wants briefed. */
-  #liveEntries(phase = this.#state.phase): Array<{ id: string; title?: string; messages?: Array<{ id: string; title?: string; evidence?: string[] }> }> {
-    return (phase.entries ?? []).filter((e) => (e as { state?: string }).state === "open") as never;
+  /** The review entries the owner has explicitly MARKED: a live entry with a
+   * linked message the owner refused. Briefing every live entry would show it
+   * twice and bury the real decisions (findings M-58/disc-B-18). */
+  #ownerMarkedEntries(phase = this.#state.phase): Array<{ id: string; title?: string; messages?: Array<{ id: string; title?: string; evidence?: string[] }> }> {
+    const refused = new Set((phase.messages ?? []).filter((m) => m.state === "refused").map((m) => m.id));
+    return (phase.entries ?? []).filter(
+      (e) => (e as { state?: string }).state === "open" && ((e as { links?: Array<{ messageId: string }> }).links ?? []).some((l) => refused.has(l.messageId)),
+    ) as never;
   }
 
   /** One open item's concern (the files and plan clauses it touches), from its
@@ -7450,7 +7453,7 @@ export class Conductor {
       out.push(this.#concernFor(r.id, r.reason, linked));
     }
     for (const d of this.#liveReservedDecisions(phase)) out.push(this.#concernFor(d.id, d.choice, [d.id]));
-    for (const e of this.#liveEntries(phase)) {
+    for (const e of this.#ownerMarkedEntries(phase)) {
       const messageIds = (e.messages ?? []).map((m) => m.id);
       out.push(this.#concernFor(e.id, e.title ?? "", [], messageIds));
     }
@@ -7483,7 +7486,7 @@ export class Conductor {
         briefs.push({ ...fallbackDecisionBrief(decision, opts), candidateSha: C });
         continue;
       }
-      const entry = this.#liveEntries(phase).find((e) => e.id === id);
+      const entry = this.#ownerMarkedEntries(phase).find((e) => e.id === id);
       if (entry) briefs.push({ ...fallbackEntryBrief(entry, opts), candidateSha: C });
     }
     if (briefs.length > 0) this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
@@ -7630,7 +7633,7 @@ export class Conductor {
     for (const id of ids) {
       const request = phase.ownerRequests.find((r) => r.id === id);
       const decision = !request ? this.#liveReservedDecisions(phase).find((d) => d.id === id) : undefined;
-      const entry = !request && !decision ? this.#liveEntries(phase).find((e) => e.id === id) : undefined;
+      const entry = !request && !decision ? this.#ownerMarkedEntries(phase).find((e) => e.id === id) : undefined;
       const others = concerns.find((c) => c.id === id);
       if (request) {
         lines.push(`- ${id} (owner request, origin ${request.origin}): ${request.reason}`);
@@ -7640,7 +7643,7 @@ export class Conductor {
         lines.push(`    why it matters: ${decision.whyItMatters}`);
         lines.push("    its options: approve, reject_and_repair; set command to override");
       } else if (entry) {
-        lines.push(`- ${id} (live review entry, command entry): ${entry.title ?? ""}`);
+        lines.push(`- ${id} (owner-marked review entry, command entry): ${entry.title ?? ""}`);
         lines.push("    its options: accept, refuse; set command to entry");
       }
       lines.push(`    same-concern items: ${(others?.planRefs ?? []).join(", ")} ${(others?.files ?? []).join(", ")}`.trim());

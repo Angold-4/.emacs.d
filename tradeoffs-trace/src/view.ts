@@ -667,7 +667,13 @@ export function buildView(
     if (phase.overrides.some((o) => o.decisionId === d.id && (!C || o.boundCandidateSha === C))) continue;
     waitingIds.add(d.id);
   }
-  for (const e of phase.entries ?? []) if (e.state === "open") waitingIds.add(e.id);
+  // Only an entry the owner explicitly marked (a linked message the owner
+  // refused) is waiting; every live entry would bury the real decisions.
+  const refusedMessages = new Set((phase.messages ?? []).filter((m) => m.state === "refused").map((m) => m.id));
+  for (const e of phase.entries ?? []) {
+    if (e.state !== "open") continue;
+    if ((e.links ?? []).some((l) => refusedMessages.has(l.messageId))) waitingIds.add(e.id);
+  }
   const firstBrief = (phase.briefs ?? []).find((b) => waitingIds.has(b.requestId));
   const attentionQuestion = attention === "needs you" ? firstBrief?.question : undefined;
 
