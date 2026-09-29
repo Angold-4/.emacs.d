@@ -358,6 +358,15 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   } else if (!opts.allowUnverifiedImpact) {
     return "a brief needs one recommended option and why, citing the plan or IC section";
   }
+  // A model-written `related` question is owner-facing (its label is rendered
+  // in the Related line), so it is held to the same plain-text rule as today,
+  // impact and the options (finding A-37).
+  for (const r of brief.related ?? []) {
+    const question = typeof r?.question === "string" ? r.question.trim() : "";
+    const id = typeof r?.id === "string" ? r.id.trim() : "";
+    if (!id || !question) return "every related item needs an id and a question";
+    if (hasCodeIdentifier(question)) return `the related item ${id} names code; keep its question plain`;
+  }
   if (!Array.isArray(brief.evidence) || brief.evidence.filter((e) => typeof e === "string" && e.trim()).length === 0) {
     return "a brief needs the original evidence";
   }
@@ -702,7 +711,10 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
   if (terms.length > 0) {
     lines.push(`${indent}Glossary: ${terms.map((t) => `[[file:${GLOSSARY_LINK}][${t}]]`).join(" ")}`);
   }
-  lines.push(`${indent}Evidence (original):`);
+  // Only the original evidence is folded behind TAB; today, impact, the
+  // options, the recommendation and related stay visible (goal (3) /
+  // disc-M-172).
+  lines.push(`${heading}* Evidence`);
   brief.evidence.forEach((ev, i) => lines.push(`${indent}- [${i + 1}] ${ev}`));
   return lines.join("\n");
 }

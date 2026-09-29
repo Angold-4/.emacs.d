@@ -301,6 +301,21 @@ test("a model brief may say the publishing answer is unverified, but not 'not es
   assert.equal(briefIssue(notEstablished, { allowUnverifiedImpact: true }), undefined);
 });
 
+test("a model related question naming code is refused", () => {
+  const good = fixture().briefs[0];
+  const bad = { ...good, related: [{ id: "T-54", question: "src/core/blend.rs:88 the re-entry" }] };
+  assert.ok(briefIssue(bad), "the related question is owner-facing too");
+});
+
+test("renderBriefOrg folds only Evidence, not the decision paragraphs", () => {
+  const good = fixture().briefs[0];
+  const org = renderBriefOrg(good);
+  assert.match(org, /^\*\* Should a vendor excluded/m);
+  assert.match(org, /\n   Today: /);
+  assert.match(org, /\n   Impact: /);
+  assert.match(org, /\n\*\*\* Evidence\n/);
+});
+
 test("a stray 'unverified' does not excuse an impact that never answers about publishing", () => {
   const good = fixture().briefs[0];
   const stray = { ...good, impact: "The price uses fewer vendors for a while; the count is unverified.[2]" };

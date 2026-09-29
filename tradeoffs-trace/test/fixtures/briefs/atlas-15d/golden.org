@@ -25,7 +25,7 @@
    - [[*Should the re-entry band be widened?][D-A-80 — Should the re-entry band be widened?]]
    - [[file:messages/T-54.org][T-54 — Should every held market make no offer at all until a vendor returns?]]
    Glossary: [[file:glossary.org::Owner glossary][window]]
-   Evidence (original):
+*** Evidence
    - [1] message: F-M-9 a vendor excluded before the weekend rejoins immediately at the first tick after a reopen
    - [2] code: src/core/blend.rs:88 the re-entry wait is 10 s after a reopen
    - [3] config: calendars.yaml us_equity opens Sun 20:00
@@ -54,7 +54,7 @@
    - Reject and repair [option:reject_and_repair] — a new attempt picks the band again, with a further allowance Cost: a further repair round
    Recommendation: Accept it as implemented — the panel's own count of re-entries agrees with IC §5's 10 s[2]
    Glossary: [[file:glossary.org::Owner glossary][band]]
-   Evidence (original):
+*** Evidence
    - [1] message: D-A-80 widen the re-entry band to 10 s failed its vote
    - [2] code: src/core/blend.rs:41 the band constant is 10 s
    - [3] config: calendars.yaml crypto_24_7 rth 00:00-23:59
@@ -84,7 +84,7 @@
    Related:
    - [[file:messages/T-54.org][T-54 — Should every held market make no offer at all until a vendor returns?]]
    Glossary: [[file:glossary.org::Owner glossary][window]] [[file:glossary.org::Owner glossary][held]]
-   Evidence (original):
+*** Evidence
    - [1] message: D-B-82 publish the last good price while the market is held failed its vote
    - [2] code: src/core/publish.rs:120 the held branch skips the offer
    - [3] config: calendars.yaml metal_otc opens Sun 18:00; sessions 18:00-17:00

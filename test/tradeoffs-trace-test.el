@@ -1302,9 +1302,9 @@ inert as it was before the key existed — no error, and nothing opened."
           "   - Keep as is [option:accept_risk] — rejoins at once Cost: one stale quote\n"
           "   - Hold it out for 10 s [option:repair] (recommended) — rejoins after 10 s Cost: 10 s with one vendor fewer\n"
           "   Recommendation: Hold it out for 10 s — IC §5's re-entry rule\n"
-          "   Evidence (original):\n"
-          "   - message: F-M-9 a vendor excluded before the weekend rejoins immediately\n"
-          "   - config: calendars.yaml us_equity overnight starts at 20:00\n"
+          "*** Evidence\n"
+          "   - [1] message: F-M-9 a vendor excluded before the weekend rejoins immediately\n"
+          "   - [2] config: calendars.yaml us_equity overnight starts at 20:00\n"
           "\n"
           "* Blockers\n"
           "** B-1 the loop does not terminate\n"
@@ -1595,13 +1595,27 @@ shows the question, never a finding id."
     (unwind-protect
         (let ((buf (+tt-test--review-buffer dir)))
           (with-current-buffer buf
-            ;; The question is the heading and is visible; its body is folded.
+            ;; The question and the decision's paragraphs are visible; only the
+            ;; original evidence is folded (disc-M-172).
             (goto-char (point-min))
             (search-forward "Should a vendor excluded")
             (goto-char (match-beginning 0))
             (should (not (get-char-property (line-beginning-position) 'invisible)))
+            (should-not (org-fold-folded-p (line-end-position)))
+            (goto-char (point-min))
+            (search-forward "Today: Pyth's")
+            (should (not (org-fold-folded-p (line-beginning-position))))
+            (goto-char (point-min))
+            (search-forward "Impact: No market stops publishing")
+            (should (not (org-fold-folded-p (line-beginning-position))))
+            (goto-char (point-min))
+            (search-forward "*** Evidence")
+            (goto-char (match-beginning 0))
             (should (org-fold-folded-p (line-end-position)))
-            ;; TAB unfolds the evidence the body carries.
+            ;; TAB on the brief unfolds the evidence.
+            (goto-char (point-min))
+            (search-forward "Should a vendor excluded")
+            (goto-char (match-beginning 0))
             (+tt-review-toggle)
             (goto-char (point-min))
             (search-forward "message: F-M-9")

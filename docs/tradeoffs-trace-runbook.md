@@ -724,8 +724,11 @@ conductor records why and uses the deterministic backstop — the brief pass
 never emits a phase launch failure from the parked phases it runs in.
 
 The same briefs appear at the top of `views/review.org` (and the program
-review) under `* Needs you (N)`; `TAB` on a question unfolds its evidence. An
-item already settled is never shown here again. The status buffer's `needs you`
+review) under `* Needs you (N)`. The question heading is followed by the
+today, impact, options and recommendation paragraphs and the `related` links
+as visible text, so you can decide without a keystroke; only the original
+evidence sits under the folded `Evidence` child and `TAB` unfolds it. An item
+already settled is never shown here again. The status buffer's `needs you`
 line shows the question, not a finding id.
 
 ### Owner glossary

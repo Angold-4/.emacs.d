@@ -2090,18 +2090,43 @@ The id text property is what RET and A/D read at point; the section heading
   "Non-nil when point is on a message heading (one carrying an `:ID:')."
   (and (org-at-heading-p) (org-entry-get nil "ID")))
 
+(defun +tt-review--brief-evidence-heading ()
+  "Position of the brief at point's `Evidence' child heading, or nil.
+The decision's paragraphs stay visible; only this child is folded (goal (3))."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((end (save-excursion (org-end-of-subtree t) (point))))
+      (when (re-search-forward "^\\*\\*\\* Evidence" end t)
+        (match-beginning 0)))))
+
 (defun +tt-review--fold-messages ()
   "Fold every message's body and property drawer, keeping every title visible.
 Plan 05c: the layout is deterministic, independent of the user's
 `org-startup-folded'.  Only a heading carrying an `:ID:' is a message, so the
 section headings and the `Minor (N)' group headings stay expanded and every
-message's one-line title is on screen."
+message's one-line title is on screen.  A decision brief keeps its question,
+today, impact, options and recommendation visible and folds only its
+`Evidence' child, so the owner can decide without a keystroke (disc-M-172)."
   (org-fold-show-all)
   (save-excursion
     (goto-char (point-max))
     (while (re-search-backward "^\\*+ " nil t)
-      (when (save-excursion (goto-char (match-beginning 0)) (org-entry-get nil "ID"))
-        (org-fold-hide-subtree)))))
+      (let* ((start (match-beginning 0))
+             (kind (save-excursion (goto-char start) (org-entry-get nil "KIND")))
+             (id (save-excursion (goto-char start) (org-entry-get nil "ID"))))
+        (cond
+         ((equal kind "brief")
+          (let ((end (save-excursion (goto-char start) (org-end-of-subtree t) (point))))
+            (save-excursion
+              (goto-char start)
+              (when (re-search-forward "^\\*\\*\\* Evidence" end t)
+                (org-fold-hide-subtree)))))
+         (id (org-fold-hide-subtree)))))))
+
+(defun +tt-review--brief-evidence-folded-p ()
+  "Non-nil when the brief at point's Evidence child is folded."
+  (let ((pos (+tt-review--brief-evidence-heading)))
+    (and pos (save-excursion (goto-char pos) (org-fold-folded-p (line-end-position))))))
 
 (defun +tt-review--body-folded-p ()
   "Non-nil when the message at point has its body hidden.
@@ -2129,13 +2154,22 @@ is read from the line after the drawer (`:END:'), not from the drawer."
 
 (defun +tt-review-toggle ()
   "Toggle the message at point: show its body, keep its property drawer folded.
-Plan 05c: `TAB' never opens the drawer; `RET' opens the message's own file."
+Plan 05c: `TAB' never opens the drawer; `RET' opens the message's own file.
+A decision brief: `TAB' unfolds the original evidence the plan keeps hidden
+behind `Evidence' (disc-M-172)."
   (interactive)
   (unless (+tt-review--message-heading-p)
     (user-error "No message on this line"))
-  (if (+tt-review--body-folded-p)
-      (org-fold-show-entry 'hide-drawers)
-    (org-fold-hide-subtree)))
+  (if (+tt-review--brief-kind)
+      (let ((pos (+tt-review--brief-evidence-heading)))
+        (unless pos (user-error "This brief has no evidence section"))
+        (goto-char pos)
+        (if (org-fold-folded-p (line-end-position))
+            (org-fold-show-subtree)
+          (org-fold-hide-subtree)))
+    (if (+tt-review--body-folded-p)
+        (org-fold-show-entry 'hide-drawers)
+      (org-fold-hide-subtree))))
 
 (defun +tt-review--setup ()
   "Put the review buffer in its read-only, file-only display state.
