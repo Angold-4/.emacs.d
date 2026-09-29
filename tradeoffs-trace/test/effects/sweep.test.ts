@@ -100,3 +100,44 @@ test("exceptPids protects an intentionally-running process", async () => {
     survivor.kill("SIGKILL");
   }
 });
+
+test("a process that only holds a file under the worktree (a bind mount's file server) is reported, never killed", async () => {
+  // Docker Desktop's file sharing holds worktree files open for a live
+  // gate's bind mounts while its cwd is elsewhere; sweeping it killed Docker
+  // Desktop at every freeze (program 14, 14i).
+  fs.writeFileSync(path.join(dir, "mounted.txt"), "x");
+  const holder = spawn(
+    "/usr/bin/perl",
+    ["-e", 'setpgrp(0,0); open(my $f, "<", "$ARGV[0]/mounted.txt") or die; chdir "/" or die; sleep 100;', dir],
+    { detached: true, stdio: "ignore" },
+  );
+  try {
+    // lsof can exit 1 while still listing a process that holds a file (not
+    // a cwd) under the directory; its stdout is authoritative, as in sweep.ts.
+    await waitFor(() => {
+      let out = "";
+      try {
+        out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+      } catch (err) {
+        out = String((err as { stdout?: string }).stdout ?? "");
+      }
+      return out.includes(`p${holder.pid}`);
+    });
+    const result = await sweep(dir);
+    assert.deepEqual(result.killed, [], "nothing whose cwd is elsewhere is killed");
+    assert.equal(result.tainted, false);
+    assert.equal(result.held?.length, 1);
+    assert.equal(result.held?.[0].pid, holder.pid);
+    assert.ok(processAlive(holder.pid!), "the holder is still alive");
+  } finally {
+    holder.kill("SIGKILL");
+  }
+});
+
+test("system and application processes are protected by path", async () => {
+  const { isProtectedCommand } = await import("../../src/effects/sweep.ts");
+  assert.equal(isProtectedCommand("/Applications/Docker.app/Contents/MacOS/com.docker.backend"), true);
+  assert.equal(isProtectedCommand("/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/x"), true);
+  assert.equal(isProtectedCommand("/usr/bin/perl"), false);
+  assert.equal(isProtectedCommand("node"), false);
+});
