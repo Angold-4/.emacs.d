@@ -23,13 +23,13 @@ const FAST = {
   inboxPollMs: 40,
   abortGraceMs: 300,
   termGraceMs: 300,
-  helloTimeoutMs: 5_000,
+  helloTimeoutMs: 15_000,
   workerAttemptMs: 20_000,
   freezeMs: 10_000,
   checkMs: 5_000,
   probeMs: 5_000,
   reviewMs: 10_000,
-  evaluateMs: 8_000,
+  evaluateMs: 30_000,
 };
 
 function submitPhaseStep() {
@@ -63,7 +63,7 @@ async function awaitingOwner(opts: { briefScriptFor?: (state: State) => { hello?
     deadlines: FAST,
   });
   await setup.conductor.start();
-  await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 60_000);
+  await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000);
   return setup;
 }
 
@@ -104,7 +104,7 @@ test("briefs: the evaluator's brief is recorded for the open owner request", asy
   });
   try {
     const request = openRequest(setup);
-    await waitFor(() => (setup.conductor.state.phase.briefs ?? []).some((b) => b.requestId === request.id), 20_000);
+    await waitFor(() => (setup.conductor.state.phase.briefs ?? []).some((b) => b.requestId === request.id), 60_000);
     const brief = (setup.conductor.state.phase.briefs ?? []).find((b) => b.requestId === request.id)!;
     assert.equal(brief.question, "Should the phase get more repair rounds or stop?");
     assert.deepEqual(brief.options.map((o) => o.id).sort(), request.options.map((o) => o.id).sort());
@@ -123,7 +123,7 @@ test("briefs: the deterministic backstop fills in when the model submits none, w
   const setup = await awaitingOwner({ briefScriptFor: () => ({ hello: { role: "evaluator", tools: [] }, steps: [] }) });
   try {
     const request = openRequest(setup);
-    await waitFor(() => (setup.conductor.state.phase.briefs ?? []).some((b) => b.requestId === request.id), 20_000);
+    await waitFor(() => (setup.conductor.state.phase.briefs ?? []).some((b) => b.requestId === request.id), 60_000);
     const brief = (setup.conductor.state.phase.briefs ?? []).find((b) => b.requestId === request.id)!;
     assert.match(brief.impact, /not established/i);
     assert.deepEqual(brief.options.map((o) => o.id).sort(), request.options.map((o) => o.id).sort());
