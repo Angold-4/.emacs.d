@@ -225,6 +225,66 @@ const hasModelBrief = (setup: TestConductorSetup, id: string, candidate: string)
     (b) => b.requestId === id && b.candidateSha === candidate && b.noRecommendationReason === undefined,
   );
 
+/** The decision view's own resolve encoding (type + binding). */
+function resolveCommand(setup: TestConductorSetup, id: string, request: OwnerRequest, option: string): void {
+  const phase = setup.conductor.state.phase;
+  fs.writeFileSync(
+    path.join(runPaths(setup.runDir).inbox, `${id}.json`),
+    JSON.stringify({
+      commandId: id,
+      type: "resolve",
+      recordKind: "request",
+      option,
+      binding: {
+        runId: phase.runId,
+        phaseId: phase.phaseId,
+        candidateSha: phase.candidate!.sha,
+        contractVersion: phase.contract.contractVersion,
+        recordId: request.id,
+        recordVersion: request.version,
+      },
+    }),
+  );
+}
+
+const retriedIds = (setup: TestConductorSetup): string[] =>
+  readEvents(setup.runDir)
+    .filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "BRIEF_RETRY_ATTEMPTED")
+    .flatMap((r) => ((r.event as { requestIds?: string[] }).requestIds ?? []));
+
+test("briefs: a later park in BLOCKED also gets the one backstop retry", async () => {
+  let dispatches = 0;
+  const setup = await awaitingOwnerWithReserved(() => {
+    dispatches += 1;
+    return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 500 }] };
+  });
+  try {
+    const reserved = RESERVED_IDS(setup);
+    const gate = setup.conductor.state.phase.ownerRequests.find(
+      (r) => r.status === "open" && r.origin === "repair_budget_exhausted",
+    )!;
+    assert.ok(gate, "the first park carries the plain budget-gate request");
+    await waitFor(
+      () =>
+        reserved.every((id) =>
+          (setup.conductor.state.phase.briefs ?? []).some((b) => b.requestId === id && b.noRecommendationReason !== undefined),
+        ),
+      60_000,
+    );
+    assert.equal(dispatches, 1, "one writer run covers the first park");
+    // The owner stops the phase: AWAITING_OWNER -> BLOCKED. BLOCKED is also a
+    // parked-on-the-owner state where briefs are written (F-8), so entering it
+    // is a later park and must spend the one retry (finding disc-M-230).
+    resolveCommand(setup, "cmd-stop", gate, "stop");
+    await waitFor(() => setup.conductor.state.phase.phase === "BLOCKED", 30_000);    await waitFor(() => reserved.every((id) => retriedIds(setup).includes(id)), 30_000);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runDir);
+    cleanupDir(setup.repo.dir);
+    cleanupDir(setup.runRoot);
+  }
+});
+
 test("briefs: a backstop is retried only on a later park, and one submit does not end the writer", async () => {
   let dispatches = 0;
   const setup = await awaitingOwnerWithReserved((state) => {

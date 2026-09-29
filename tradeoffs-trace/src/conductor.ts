@@ -1042,6 +1042,11 @@ export class Conductor {
    * park happens on the same candidate, never on the next beat of the same
    * one. */
   #briefBackstopEpisode = new Map<string, number>();
+  /** Plan 05k (OD-6): how many times the phase has entered a parked-on-the-
+   * owner state. Both AWAITING_OWNER and BLOCKED count: briefs are written in
+   * both (F-8), and a backstop first shown in one must still get its one retry
+   * when the phase later parks in the other (finding disc-M-230). */
+  #parkEpisode = 0;
   /** Plan 05j: candidates whose curator agent is in flight. */
   #curatorInFlight = new Set<string>();
   #plan: RunPlanFile;
@@ -1293,7 +1298,11 @@ export class Conductor {
     this.#writeStatusViewSafe();
     // Plan 01b: seed the park-episode counter from the log, so a restarted
     // conductor keeps the same notification key for the wait it is resuming.
-    this.#awaitingEpisode = rebuildTimeline(this.#runDir, this.#plan).phases.filter((p) => p.phase === "AWAITING_OWNER").length;
+    const timeline = rebuildTimeline(this.#runDir, this.#plan).phases;
+    this.#awaitingEpisode = timeline.filter((p) => p.phase === "AWAITING_OWNER").length;
+    // Plan 05k (OD-6): the same timeline seeds the broader park counter, so a
+    // restart keeps the park a backstop was recorded in.
+    this.#parkEpisode = timeline.filter((p) => p.phase === "AWAITING_OWNER" || p.phase === "BLOCKED").length;
     if (this.#secretNames.length > 0) this.#recordSecrets();
     // design §9.3: "If the command ID is already in the log, the command is
     // only moved to applied/." Every applied conductor-state command's event
@@ -1843,6 +1852,11 @@ export class Conductor {
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
     if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") this.#awaitingEpisode += 1;
+    // Plan 05k (OD-6): a later park in EITHER parked state counts. A backstop
+    // first written in AWAITING_OWNER must still get its one retry when the
+    // phase later parks in BLOCKED (finding disc-M-230).
+    const parked = (p: string) => p === "AWAITING_OWNER" || p === "BLOCKED";
+    if (parked(this.#state.phase.phase) && before !== this.#state.phase.phase) this.#parkEpisode += 1;
     this.#syncBudgetTimer();
     if (!this.#driveSuspended) this.drive();
     // Plan 01b: before `#maybeAutoStop` can tear the log down for BLOCKED.
@@ -7427,10 +7441,10 @@ export class Conductor {
       const key = `${C}::${id}`;
       const recorded = this.#briefBackstopEpisode.get(key);
       if (recorded === undefined) {
-        this.#briefBackstopEpisode.set(key, this.#awaitingEpisode);
+        this.#briefBackstopEpisode.set(key, this.#parkEpisode);
         return false;
       }
-      return this.#awaitingEpisode > recorded;
+      return this.#parkEpisode > recorded;
     });
     // Only ids no running agent already covers are dispatched, and the set is
     // accumulated (never replaced), so a second item opening mid-pass does not
@@ -7561,19 +7575,19 @@ export class Conductor {
       const request = phase.ownerRequests.find((r) => r.id === id);
       if (request) {
         briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
-        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#parkEpisode);
         continue;
       }
       const decision = this.#liveReservedDecisions(phase).find((d) => d.id === id);
       if (decision) {
         briefs.push({ ...fallbackDecisionBrief(decision, opts), candidateSha: C });
-        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#parkEpisode);
         continue;
       }
       const entry = this.#ownerMarkedEntries(phase).find((e) => e.id === id);
       if (entry) {
         briefs.push({ ...fallbackEntryBrief(entry, opts), candidateSha: C });
-        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#parkEpisode);
       }
     }
     if (briefs.length > 0) this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
