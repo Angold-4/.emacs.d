@@ -279,7 +279,7 @@ and runs independent phases in parallel.
 
 - Each heading is an **entry**: `:PLAN:` is a plan file (relative to the program file), and `:AFTER:` lists the entries it waits for (all of their phases).
 - A plan file with several phases expands into one node per phase, run in order. Pressing `C-c m r` on such a plan (no program file) runs its phases in order.
-- Start: `C-c m r` in the program buffer, or `tt program start <program.json>`. Every entry's plan is linted first (see above); one error blocks the whole program.
+- Start: `C-c m r` in the program buffer, or `tt program start <program.json> [--source <program.org>]` (Emacs passes `--source`, and the program buffer's header shows it). Every entry's plan is linted first (see above); one error blocks the whole program.
 
 **Branches (stack mode, the default).** Every node publishes to its own branch,
 `<TT_BRANCH>--<node>`:
@@ -293,7 +293,7 @@ and runs independent phases in parallel.
 
 | Where | What |
 |---|---|
-| program buffer (`C-c m p`) | every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive), `k` stops the program, `R` resumes it. It also lists the program's owner directives in force. |
+| program buffer (`C-c m p`) | the program id and its Org source file in the header, then every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its readable id (`<program>-NN`), node id, run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive). Stop and continue the whole program with `C-c m k` / `C-c m c` (point in the program buffer or its input box). It also lists the program's owner directives in force, and `views/program.txt` holds the same graph as text. |
 | CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program directive <id> <text>`, `tt program withdraw <id> <ODP-n>`, `tt program stop <id>`, `tt program resume <id>` |
 
 **Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
@@ -317,10 +317,10 @@ rebuilds from scratch:
 ```
 
 **Stop, resume and crashes.**
-- `k` in the program buffer or `tt program stop <id>` stops the scheduler and every running phase cleanly. Published branches and each run's state stay on disk.
-- `R` in the program buffer or `tt program resume <id>` undoes the stop, restarts every node run that isn't running (each recovers from its own control log), and relaunches the scheduler. It never recreates an existing node branch.
+- `C-c m k` with point in the program buffer or its input box (`tt program stop <id>`) asks for confirmation (`RET` confirms, `n` cancels), then stops the scheduler and every running phase cleanly. Published branches and each run's state stay on disk.
+- `C-c m c` there (`tt program resume <id>`) undoes the stop, restarts every node run that isn't running (each recovers from its own control log), and relaunches the scheduler. It never recreates an existing node branch.
 - **Crashes recover on their own.** When a node's conductor dies without a clean stop (Ctrl-C, crash, sleep), the scheduler restarts it, up to 3 times per node (`NODE_RESUMED` in the program log). If the scheduler itself died, for example after a reboot, `tt program resume <id>` brings everything back.
-- One phase alone: `k` / `R` in the runs list, or `tt stop <run>` / `tt resume <run>`.
+- One phase alone: `C-c m k` / `C-c m c` in the phase's own buffer (status, trace or input), or `tt stop <run>` / `tt resume <run>`.
 
 **Before an unattended program:**
 1. `TT_BRANCH` exists in the repository, and nothing has it or a node branch checked out.
@@ -442,7 +442,7 @@ past run cannot display one either.
 | cost row | what the run has cost so far: rounds, total minutes and per-stage minutes, owner-wait minutes, and a plain estimate for one more round from this phase's own completed rounds (`4 rounds · 106m total · implement 34m · checks 8m · review 30m · owner wait 34m · next round ≈ 14 min`). Per node, `tt program status` and the program buffer show the same in one line: rounds, minutes, owner wait and the node's top trade-off. |
 | trace buffer | one line per tool call (time, command, ✓/✗ exit, duration, last output line), plus `path +a −r` for each file the call changed; the running call in the header. `a` pins another agent. |
 | decision view (`C-c m d`) | the owner directives in force (so `RET` from a directive trade-off line lands on the ruling), then the current round's decisions in the same order as the Trade-offs panel (amendments, flagged, M vetoes, dissent, the rest), each labelled by the tally, with the options, recommendation and each reviewer's ballot; a passed amendment reads `⚑ AMENDED` and shows the old → new wording; the open advisories folded under one `Advisories (N)` heading; other findings grouped by file; earlier rounds one line each. Read-only. |
-| runs list (`C-c m l`) | every run: `RET` opens, `k` stops, `R` resumes |
+| runs list (`C-c m l`) | every run: `RET` opens; stop and continue with `C-c m k` / `C-c m c` in the run's own buffer |
 | mode line | live runs with stage, time and reviews; the oldest owner wait (`⚑ 13f waiting 1h12m`) with a warning-face flash when a new notification arrives |
 | CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
 
@@ -551,6 +551,45 @@ sent). `tt summary <run>` lists the directives in force in the PR body, and
 
 `RET` sends in Evil normal state; `C-c C-c` sends from any state.
 
+## Keys
+
+Every global action lives under `C-c m`; single letters are used only in the
+read-only view buffers, and never the ones Evil users reach for when moving
+around (`k`, `R`, `g`, `i`).
+
+| Key | Where | What |
+|---|---|---|
+| `C-c m r` | an Org plan/program buffer | validate, snapshot and start a run (or a whole program) |
+| `C-c m s` | anywhere | focus or rebuild a run's workspace |
+| `C-c m d` | anywhere | the run's review view (TAB folds, RET opens a message's file, `A`/`D` send the owner's verdict) |
+| `C-c m l` | anywhere | the runs list (RET opens) |
+| `C-c m p` | anywhere | a program (RET opens a node's run, `i` sends a program-wide directive) |
+| `C-c m k` | a program buffer/its input box, or the phase's status, trace or input buffer | stop it, after a confirmation (`RET` confirms, `n` cancels) |
+| `C-c m c` | a program buffer/its input box, or the phase's status, trace or input buffer | continue (resume) it |
+| `RET` / `C-c C-c` | an input box | send (RET in Evil normal state; `C-u` sends program-wide) |
+
+**Readable ids.** Each program node gets `<program>-NN` (NN its position in
+the program file, two digits); the program records it and the node's run
+carries it in its `program.json`. Use it wherever a run id is accepted —
+`tt status <program>-02`, `tt state <program>-02` — and Emacs names the run's
+buffers with it. A retried node keeps its readable id (the id names the
+position, not the run).
+
+**The two graphs.** `tt` renders both as text the owner reads:
+`<run>/views/loop.txt` is the phase's own state machine (states as boxes with
+entry counts and time, transitions labelled with their trigger, the current
+state marked, the agent-dispatching states showing their role and model),
+generated from the same `TRANSITIONS` table the conductor obeys;
+`<program>/views/program.txt` is the program dependency graph, each node with
+its readable id, its node state and (while running) its current phase state.
+Both are regenerated as the run/program moves, so they can never drift from
+the code.
+
+**The tab bar is opt-in.** With `+tt-use-tab-bar` nil (the default), opening
+a run leaves the tab bar alone and uses ordinary windows; the run's buffers
+and headers carry the identity. Set it non-nil to get one `tab-bar` tab per
+run as before.
+
 ## Stop and resume
 
 ```sh
@@ -558,8 +597,10 @@ tt stop <run>      # clean stop within 15 s: kills agents and their commands, lo
 tt resume <run>    # restarts the conductor; recovers from the control log
 ```
 
-In Emacs, use `k` and `R` in the runs list. The run directory and worktree stay
-on disk after a stop.
+In Emacs, use `C-c m k` to stop and `C-c m c` to continue, with point in the
+program buffer or the phase's own buffer (status, trace or input). `C-c m k`
+asks first: `RET` confirms, `n` cancels. The run directory and worktree stay on
+disk after a stop.
 
 ## Time limits (defaults)
 
@@ -604,6 +645,68 @@ the id does not revert anything.
 - **AWAITING_OWNER ("needs you"):** repair rounds are exhausted. Read the verdict, then type a correction (it grants 3 more rounds), or `tt stop`.
 - **BLOCKED:** the run cannot continue, for example a reviewer is unavailable twice. The reason is in the status buffer. Fix the cause and start a new run.
 
+## Message states (contract v1)
+
+The review buffer renders messages (a trade-off, a finding or a blocker); their
+lifecycle is `MESSAGE_TRANSITIONS` in `src/core/messages.ts`. The chart below
+is drawn by the same generator the contract document quotes
+(`renderMessageChart`, `src/charts.ts`), so the runbook cannot drift from it.
+
+<!-- BEGIN message-chart (generated from MESSAGE_TRANSITIONS; do not edit by hand) -->
+```text
+tradeoffs-trace message chart — generated from MESSAGE_TRANSITIONS (src/core/messages.ts); do not edit
+
+  +------------+
+  | none       |
+  +------------+
+      +- MESSAGE_RAISED                 -> raw         [message-raised]
+
+  +------------+
+  | raw        |
+  +------------+
+      +- MESSAGE_PUBLISHED              -> published   [message-published]
+      +- MESSAGE_MERGED                 -> merged      [message-merged]
+      +- MESSAGE_DROPPED                -> dropped     [message-dropped]
+
+  +------------+
+  | published  |
+  +------------+
+      +- OWNER_VERDICT (verdictAccept)  -> accepted    [owner-verdict-accept]
+      +- OWNER_VERDICT (verdictRefuse)  -> refused     [owner-verdict-refuse]
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-published]
+      +- MESSAGE_RESOLVED               -> resolved    [message-resolved-published]
+
+  +------------+
+  | merged     |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-merged]
+
+  +------------+
+  | dropped    |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-dropped]
+
+  +------------+
+  | accepted   |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-accepted]
+
+  +------------+
+  | refused    |
+  +------------+
+      +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-refused]
+      +- MESSAGE_RESOLVED               -> resolved    [message-resolved-refused]
+
+  +------------+
+  | resolved   |
+  +------------+
+
+  +------------+
+  | superseded |
+  +------------+
+```
+<!-- END message-chart -->
+
 ## Where things are
 
 ```text
@@ -618,7 +721,10 @@ the id does not revert anything.
                                     declares :GATE:, gate.json + gate.log too
   ~/.tradeoffs-trace/gate.lock      the machine-wide gate lock (two phases
                                     never run their gate command at once)
+  <run>/views/loop.txt              the phase state machine as a chart (from TRANSITIONS)
   <run>/inbox/{,applied/,rejected/} owner input and commands, with rejection reasons
+  programs/<id>/program.json        the program as started, with every node's readable id
+  programs/<id>/views/program.txt   the program dependency graph as a chart
   notifications.jsonl               one line per owner wait or finished program (see Notifications)
 ```
 

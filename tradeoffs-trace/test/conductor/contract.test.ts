@@ -653,6 +653,10 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     // The trade-offs are raised at freeze; the views exist before any finding.
     await waitFor(() => (setup.conductor.state.phase.messages ?? []).filter((m) => m.type === "tradeoff").length >= 2, 90_000, 20, setup.runDir);
     await waitFor(() => existsSync(p.review) && existsSync(p.status), 30_000, 20, setup.runDir);
+    // Plan 03c: the same beat writes the phase chart from TRANSITIONS.
+    await waitFor(() => existsSync(p.loop), 30_000, 20, setup.runDir);
+    assert.match(readFileSync(p.loop, "utf8"), /^tradeoffs-trace phase chart — generated from TRANSITIONS/);
+    assert.match(readFileSync(p.loop, "utf8"), /IMPLEMENTING|REVIEWING|CHECKING/);
     const reviewBefore = readFileSync(p.review, "utf8");
     assert.match(reviewBefore, /T-1/);
     assert.match(reviewBefore, /^\* Trade-offs$/m);
