@@ -35,7 +35,8 @@
 // entry carries a deterministic `≈ E-n` hint instead, and only the owner's `m`
 // merges them (as ENTRY_MERGED_BY_OWNER).
 
-import type { Message, MessageType } from "./types.ts";
+import type { DecisionBrief, Message, MessageType, OwnerRequest } from "./types.ts";
+import { renderBriefsSection } from "./briefs.ts";
 
 // ---------------------------------------------------------------------------
 // Anchors
@@ -931,6 +932,15 @@ export interface EntryReviewOptions {
   readableId?: string;
   dirId?: string;
   phaseId?: string;
+  /** Decision briefs: one per open owner item, rendered as a `* Needs you'
+   * section above every entry. Each brief's question is its heading and its
+   * evidence is folded under TAB. */
+  briefs?: readonly DecisionBrief[];
+  /** The open owner requests the briefs answer, so the rendered brief
+   * carries the resolve binding. */
+  ownerRequests?: readonly OwnerRequest[];
+  /** The binding a resolve command from a brief needs. */
+  resolveBinding?: { runId: string; phaseId: string; candidateSha: string; recordVersion: number; contractVersion: { snapshot: number; sectionSha256: string } };
   /** The program view: entries of every phase, tagged by phase. */
   program?: {
     id: string;
@@ -943,6 +953,8 @@ export interface EntryReviewOptions {
       candidate?: { sha: string };
       messages?: readonly Message[];
       entries?: readonly Entry[];
+      briefs?: readonly DecisionBrief[];
+      ownerRequests?: readonly OwnerRequest[];
     }>;
   };
   newestCandidateSha?: string;
@@ -1043,6 +1055,16 @@ export function renderEntryReview(opts: EntryReviewOptions): string {
   const projected = projectEntries({ messages: opts.messages, entries: opts.entries, newestCandidateSha: opts.newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness });
   const lines = reviewHeader(opts);
   lines.push("");
+  // Decision briefs first: the owner reads the question and the choice before
+  // any entry's evidence.
+  const openIds = new Set((opts.ownerRequests ?? []).filter((r) => r.status === "open").map((r) => r.id));
+  const briefs = (opts.briefs ?? []).filter((b) => openIds.size === 0 || openIds.has(b.requestId));
+  lines.push(
+    ...renderBriefsSection(briefs, {
+      requestFor: (id) => (opts.ownerRequests ?? []).find((r) => r.id === id),
+      binding: opts.resolveBinding,
+    }),
+  );
   for (const s of SECTION_ORDER) lines.push(...renderSection(projected.views, s.kind, s.label, () => undefined));
   lines.push(accountingLine(projected.accounting));
   return `${lines.join("\n")}\n`;
@@ -1067,6 +1089,27 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
     readableId: p.readableId,
     projected: projectEntries({ messages: p.messages, entries: p.entries, newestCandidateSha: p.candidate?.sha ?? opts.newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness }),
   }));
+  // Decision briefs: every phase's open owner items, one section at the top.
+  const allBriefs: Array<{ brief: DecisionBrief; tag: string; requests: readonly OwnerRequest[] }> = [];
+  for (const p of program.phases) {
+    const tag = p.readableId ?? p.phaseId;
+    if ((p.briefs ?? []).length === 0) continue;
+    allBriefs.push({ brief: p.briefs![0], tag, requests: p.ownerRequests ?? [] });
+    for (const extra of (p.briefs ?? []).slice(1)) allBriefs.push({ brief: extra, tag, requests: p.ownerRequests ?? [] });
+  }
+  if (allBriefs.length > 0) {
+    lines.push(`* Needs you (${allBriefs.length})`);
+    for (const b of allBriefs) {
+      const qualified = { ...b.brief, requestId: `${b.tag}:${b.brief.requestId}` };
+      lines.push(
+        renderBriefOrg(qualified, {
+          request: (b.requests ?? []).find((r) => r.id === b.brief.requestId),
+          binding: opts.resolveBinding,
+        }),
+        "",
+      );
+    }
+  }
   const all: Array<{ view: EntryView; phaseTag: string; phaseIndex: number }> = [];
   for (const ph of perPhase) {
     const tag = ph.readableId ?? ph.phaseId;

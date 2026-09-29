@@ -1471,13 +1471,18 @@ open the decision view at that record."
           (insert (format "  - %s\n" (+tt--one-line item 200))))))
     (+tt--render-owner-inputs s)
     (when attention
-      (insert "\n" (propertize (format "⚑ %s%s" attention
-                                       (cond ((equal attention "needs you")
-                                              " — type a correction in the input box (C-c m d to read the review)")
-                                             ((equal attention "conductor stopped") " — M-x +tt-resume")
-                                             (t "")))
-                               'face 'error)
-              "\n"))))
+      ;; Decision briefs: the `needs you' line names the owner's actual
+      ;; question, never a finding id.
+      (let ((label (if (and (equal attention "needs you") (alist-get 'attentionQuestion v))
+                       (format "needs you — %s" (alist-get 'attentionQuestion v))
+                     attention)))
+        (insert "\n" (propertize (format "⚑ %s%s" label
+                                         (cond ((equal attention "needs you")
+                                                " — type a correction in the input box (C-c m d to read the review)")
+                                               ((equal attention "conductor stopped") " — M-x +tt-resume")
+                                               (t "")))
+                                 'face 'error)
+                "\n")))))
 
 (defun +tt--status-restore-records ()
   "Restore the `+tt-record' property a rendered trade-off line carries.
@@ -2165,17 +2170,20 @@ After a refresh a message may have disappeared; point then goes to the top."
 (defun +tt-review-open-message ()
   "Open the detail file for the entry or message at point (RET).
 Plan 05j: an entry heading (`E-n') opens `views/entries/<id>.org', a linked
-message line opens `views/messages/<id>.org'."
+message line opens `views/messages/<id>.org'. Decision briefs: RET chooses one
+of the brief's options and resolves the owner request."
   (interactive)
-  (let* ((entry (+tt-review--entry-id))
-         (id (cond (entry entry)
-                   ((+tt-review--bullet-message-id))
-                   (t (+tt-review--message-id))))
-         (dir (if (and id (string-prefix-p "E-" id)) "views/entries/" "views/messages/"))
-         (file (and id +tt--run-dir (expand-file-name (concat dir id ".org") +tt--run-dir))))
-    (unless id (user-error "No entry or message on this line"))
-    (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
-    (find-file file)))
+  (if (+tt-review--brief-kind)
+      (+tt-review--brief-choose)
+    (let* ((entry (+tt-review--entry-id))
+           (id (cond (entry entry)
+                     ((+tt-review--bullet-message-id))
+                     (t (+tt-review--message-id))))
+           (dir (if (and id (string-prefix-p "E-" id)) "views/entries/" "views/messages/"))
+           (file (and id +tt--run-dir (expand-file-name (concat dir id ".org") +tt--run-dir))))
+      (unless id (user-error "No entry or message on this line"))
+      (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
+      (find-file file))))
 
 (defun +tt-review--entry-id ()
   "The `E-n' id of the entry at point, or nil."
@@ -2219,6 +2227,50 @@ ENTRY_MERGED_BY_OWNER."
     (unless into (user-error "Entry %s carries no ≈ hint; nothing to merge" entry))
     (message "%s" (+tt--cli "entry" +tt--run-dir "merge" entry into))
     (+tt-review-refresh t)))
+
+(defun +tt-review--brief-kind ()
+  "Non-nil when point is on a decision brief heading (`:KIND: brief')."
+  (equal (org-entry-get nil "KIND") "brief"))
+
+(defun +tt-review--brief-options ()
+  "The brief's own option ids, in order, or nil."
+  (let ((opts (org-entry-get nil "OPTIONS")))
+    (when (and opts (not (string-empty-p opts)))
+      (split-string opts "," t))))
+
+(defun +tt-review--brief-binding ()
+  "The decision-view binding tuple a resolve from the brief needs, or nil.
+The full binding travels with the command, so choosing an option from a brief
+sends the identical resolve command choosing it on the request sends."
+  (let ((vals (mapcar (lambda (k) (org-entry-get nil k))
+                      '("RUN_ID" "PHASE_ID" "CANDIDATE_SHA" "RECORD_VERSION"
+                        "CONTRACT_VERSION" "CONTRACT_SHA256"))))
+    (when (seq-every-p (lambda (v) (and v (not (string-empty-p v)))) vals)
+      (list (cons 'runId (nth 0 vals))
+            (cons 'phaseId (nth 1 vals))
+            (cons 'recordId (+tt-review--message-id))
+            (cons 'candidateSha (nth 2 vals))
+            (cons 'recordVersion (string-to-number (nth 3 vals)))
+            (cons 'contractVersion (list (cons 'snapshot (string-to-number (nth 4 vals)))
+                                         (cons 'sectionSha256 (nth 5 vals))))))))
+
+(defun +tt-review--brief-resolve (option)
+  "Write the resolve command for the brief at point with OPTION.
+This is the same decision-view encoding (`type: resolve', option id, full
+binding) the request itself uses, so the conductor applies it unchanged."
+  (let ((binding (+tt-review--brief-binding)))
+    (unless binding
+      (user-error "This brief has no full binding; refresh the review (g) and try again"))
+    (+tt--write-command
+     +tt--run-dir
+     (list (cons 'type "resolve") (cons 'option option) (cons 'binding binding)))))
+
+(defun +tt-review--brief-choose ()
+  "Prompt for one of the brief's options and resolve it (RET on a brief)."
+  (let ((opts (+tt-review--brief-options)))
+    (unless opts (user-error "This brief carries no options"))
+    (let ((choice (completing-read "Resolve with: " opts nil t)))
+      (message "%s" (+tt-review--brief-resolve choice)))))
 
 (defun +tt-review--binding-at-point ()
   "The six binding property values at point, or nil when any is missing.
@@ -2280,19 +2332,31 @@ is shown in the echo area and the buffer refreshes."
       (+tt-review-refresh t))))
 
 (defun +tt-review-accept ()
-  "Accept the entry or message at point (A)."
+  "Resolve the brief at point with its first option (A), or accept the entry
+or message at point."
   (interactive)
-  (+tt-review--verdict "accept" nil))
+  (if (+tt-review--brief-kind)
+      (let ((opts (+tt-review--brief-options)))
+        (unless opts (user-error "This brief carries no options"))
+        (message "%s" (+tt-review--brief-resolve (car opts))))
+    (+tt-review--verdict "accept" nil)))
 
 (defun +tt-review-refuse ()
-  "Refuse the message at point (D), asking for an optional one-line reason.
-A message that cannot be settled is reported before the reason is asked for
-(A-18), so D on a raw message just says it is not yet frozen."
+  "Resolve the brief at point with its last option (D), or refuse the message
+at point, asking for an optional one-line reason. A message that cannot be
+settled is reported before the reason is asked for (A-18), so D on a raw
+message just says it is not yet frozen."
   (interactive)
-  (if (+tt-review--entry-id)
-      (+tt-review--verdict "refuse" (read-string "Reason (optional): "))
+  (cond
+   ((+tt-review--brief-kind)
+    (let ((opts (+tt-review--brief-options)))
+      (unless opts (user-error "This brief carries no options"))
+      (message "%s" (+tt-review--brief-resolve (car (last opts))))))
+   ((+tt-review--entry-id)
+    (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))
+   (t
     (+tt-review--settleable-id)
-    (+tt-review--verdict "refuse" (read-string "Reason (optional): "))))
+    (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))))
 
 (defun +tt-review-refresh (&optional force)
   "Re-read `views/review.org' when it changed, keeping point on the same id.

@@ -114,10 +114,13 @@ export const ROLE_TOOLS: Record<Role, string[]> = {
   worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "raise_tradeoff"],
   reviewer: ["read", "grep", "find", "ls", "submit_discovery", "submit_review"],
   // Plan 04a: the evaluator checks a round's raw messages against the code
-  // it can read, and returns through `submit_evaluation`. No write tools, and
-  // no `raise_tradeoff`: the plan gives that tool to the worker, and a tool
-  // the evaluator could never use would be a dead interface.
-  evaluator: ["read", "grep", "find", "ls", "submit_evaluation"],
+  // it can read, and returns through `submit_evaluation`. Decision briefs
+  // add `submit_brief`: after a round's evaluation the same role writes one
+  // plain-language brief per open owner item, checked against the plan's
+  // calendars. No write tools, and no `raise_tradeoff`: the plan gives that
+  // tool to the worker, and a tool the evaluator could never use would be a
+  // dead interface.
+  evaluator: ["read", "grep", "find", "ls", "submit_evaluation", "submit_brief"],
   // Plan 05j: the round's curator. It sees every new raw message of every
   // type plus every open entry, and may only propose link/open/retitle
   // through `curate_entries`. It never writes code and never sees the diff as

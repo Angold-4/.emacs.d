@@ -13,7 +13,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { Ballot, Decision, EnvBlockInfo, EnvTool, Finding, Message } from "./core/types.ts";
+import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, OwnerRequest } from "./core/types.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
   projectEntries,
@@ -354,7 +354,13 @@ export interface EntryReviewPhase {
   phaseId?: string;
   readableId?: string;
   dirId?: string;
+  runId?: string;
   candidate?: { sha: string };
+  /** Decision briefs: one per open owner item, rendered as a `* Needs you'
+   * section above every entry. */
+  briefs?: DecisionBrief[];
+  ownerRequests?: OwnerRequest[];
+  contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
   messages?: Message[];
   entries?: Entry[];
   /** The program a program-level view spans. */
@@ -432,6 +438,18 @@ export function projectEntryReview(
         readableId: phase.readableId,
         dirId: phase.dirId,
         newestCandidateSha,
+        briefs: phase.briefs,
+        ownerRequests: phase.ownerRequests,
+        resolveBinding:
+          phase.contract?.contractVersion && phase.candidate?.sha && phase.runId && phase.phaseId
+            ? {
+                runId: phase.runId,
+                phaseId: phase.phaseId,
+                candidateSha: phase.candidate.sha,
+                recordVersion: 1,
+                contractVersion: phase.contract.contractVersion,
+              }
+            : undefined,
         anchorResolves: opts.anchorResolves,
         anchorFreshness: opts.anchorFreshness,
         lintError: opts.lintError ?? (lint.ok ? undefined : lint.firstLine),
@@ -816,7 +834,13 @@ export function renderStatusView(input: StatusViewInput): string {
       view.attention === "needs you"
         ? " — type a correction in the input box (C-c m d to read the review)"
         : view.attention === "conductor stopped" ? " — M-x +tt-resume" : "";
-    lines.push("", `⚑ ${view.attention}${suffix}`);
+    // Decision briefs: the `needs you` line names the owner's actual
+    // question, not a finding id.
+    const label =
+      view.attention === "needs you" && view.attentionQuestion
+        ? `needs you — ${view.attentionQuestion}`
+        : view.attention;
+    lines.push("", `⚑ ${label}${suffix}`);
   }
   return `${lines.join("\n")}\n`;
 }

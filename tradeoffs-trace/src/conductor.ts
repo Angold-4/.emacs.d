@@ -125,6 +125,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
+import { briefIssue, fallbackBrief, parseCatalogs, type Catalogs } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -421,6 +422,13 @@ export interface ConductorOptions {
    * runs) never gate at once; tests point it at a temp path so they neither
    * contend with a real run nor with each other. */
   gateLockPath?: string;
+  /** Decision briefs: when true, the conductor records a deterministic brief
+   * for every open owner item after evaluation, so the owner always has one
+   * above the evidence even when the evaluator's model did not call
+   * submit_brief. Default false so the many existing tests that reach
+   * AWAITING_OWNER keep their exact event logs; `cli.ts` enables it for a real
+   * run. */
+  briefs?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,6 +1035,7 @@ export class Conductor {
   #preflightEnv: NodeJS.ProcessEnv;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
+  #briefsEnabled: boolean;
   #probeReuse: boolean;
   /** Plan 01b: the clock `#checkNotifications` reads (injectable). */
   #now: () => number;
@@ -1156,6 +1165,7 @@ export class Conductor {
     this.#piEnvFor = opts.piEnvFor;
     this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
+    this.#briefsEnabled = opts.briefs ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
@@ -2875,6 +2885,13 @@ export class Conductor {
     try {
       do {
         this.#redriveRequested = false;
+        // Decision briefs: once the phase is parked on the owner (after
+        // evaluation), make sure every open owner item has a brief. The
+        // evaluator's own model may have supplied one through submit_brief;
+        // this is the deterministic backstop so the owner never faces the
+        // raw finding without one. Idempotent, and a no-op while nothing is
+        // open.
+        this.#refreshBriefs();
         const actions = next(this.#state);
         // Plan 05j: the curator pass starts once per round, after the reviews
         // and before the evaluators. It is launched first, but it never BLOCKS
@@ -3417,6 +3434,30 @@ export class Conductor {
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
       this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
       handle.doneResolve();
+      return { ok: true };
+    }
+    if (msg.tool === "submit_brief") {
+      // Decision briefs: the evaluator's model writes one owner-readable brief
+      // per open owner item after a round's evaluation. Validated whole via
+      // briefIssue (no code identifier in the question; a time, count or
+      // duration cites the config/code it read; the option ids map one-to-one
+      // to the request's; the today example is checked against the plan's
+      // calendars). A record-only event, so a restart rebuilds the briefs the
+      // views render.
+      if (handle.role !== "evaluator") {
+        return { ok: false, reason: `submit_brief is not accepted from role ${handle.role}` };
+      }
+      const brief = (msg.args ?? {}) as { requestId?: unknown };
+      const requestId = typeof brief.requestId === "string" ? brief.requestId : "";
+      const request = this.#state.phase.ownerRequests.find((r) => r.id === requestId && r.status === "open");
+      if (!request) return { ok: false, reason: `brief ${requestId || "(no requestId)"} does not name an open owner request` };
+      const issue = briefIssue(brief as never, {
+        requestOptions: (request.options ?? []).map((o) => o.id),
+        catalogs: this.#briefCatalogs(),
+      });
+      if (issue) return { ok: false, reason: `invalid brief for ${requestId}: ${issue}` };
+      this.#applyEvent({ type: "BRIEFS_RECORDED", briefs: [brief as never] });
+      this.#log.append("brief_recorded", { requestId, options: (brief as { options?: unknown }).options });
       return { ok: true };
     }
     if (msg.tool === "submit_round_panel_votes") {
@@ -7276,6 +7317,45 @@ export class Conductor {
     if (openEntries.length === 0) lines.push("- (none)");
     for (const e of openEntries) lines.push(`- ${e.id} [${e.type}] ${e.title} (${formatAnchor(e.anchor)}; ${e.links.length} linked)`);
     return lines.join("\n");
+  }
+
+  /** The plan's calendars.yaml / products.yaml, or null when neither is
+   * readable. Never throws: a missing catalog makes a brief say its example
+   * is unverified, it never invents one. */
+  #briefCatalogs(): Catalogs | null {
+    const tryRead = (rel: string): string | undefined => {
+      for (const candidate of [path.join(this.#plan.repo, rel), rel]) {
+        try {
+          return fs.readFileSync(candidate, "utf8");
+        } catch {
+          // keep looking
+        }
+      }
+      return undefined;
+    };
+    const calendars = tryRead("config/index/calendars.yaml");
+    const products = tryRead("config/index/products.yaml");
+    if (!calendars && !products) return null;
+    return parseCatalogs(calendars, products);
+  }
+
+  /** Decision briefs (after evaluation): record a deterministic brief for
+   * every open owner item that has none yet, so the owner always has a brief
+   * above the evidence even when the evaluator's model did not (or could
+   * not) call submit_brief. The evaluator's own brief is never overwritten.
+   * Idempotent. */
+  #refreshBriefs(): void {
+    if (this.#closed || !this.#briefsEnabled) return;
+    const phase = this.#state.phase;
+    if (phase.phase !== "AWAITING_OWNER" && phase.phase !== "BLOCKED") return;
+    const open = phase.ownerRequests.filter((r) => r.status === "open");
+    if (open.length === 0) return;
+    const existing = new Set((phase.briefs ?? []).map((b) => b.requestId));
+    const missing = open.filter((r) => !existing.has(r.id));
+    if (missing.length === 0) return;
+    const catalogs = this.#briefCatalogs();
+    const briefs = missing.map((r) => fallbackBrief(r, { catalogs }));
+    this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
   }
 
   /** Plan 04a: one fresh evaluator PER MESSAGE TYPE checks that type's raw

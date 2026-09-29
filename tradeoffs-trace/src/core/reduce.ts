@@ -106,6 +106,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "RUN_RESUMED",
   "LAUNCH_FAILED",
   "INTEGRITY_VIOLATED",
+  "BRIEFS_RECORDED",
   "DECISION_ADDED",
   "NOTE_ADDED",
   "OWNER_INPUT_RECORDED",
@@ -508,6 +509,17 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const check = checkOwnerRequestResolved(p, event);
       if (!check.ok) return rejected(state, check.reason!);
       return ok({ ...state, phase: applyOwnerRequestResolved(p, event) });
+    }
+
+    case "BRIEFS_RECORDED": {
+      // Decision briefs: merge by requestId (a later round's brief for the
+      // same item replaces the earlier one). A record-only event, so the
+      // views and the status `needs you` line survive a conductor restart
+      // via rebuildState folding the log.
+      const incoming = (event as Extract<Event, { type: "BRIEFS_RECORDED" }>).briefs ?? [];
+      const byId = new Map((p.briefs ?? []).map((b) => [b.requestId, b]));
+      for (const brief of incoming) byId.set(brief.requestId, brief);
+      return ok({ ...state, phase: { ...p, briefs: [...byId.values()] } });
     }
 
     case "INTEGRITY_VIOLATED": {

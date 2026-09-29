@@ -94,3 +94,11 @@ export const SUBMIT_ROUND_PANEL_VOTES_PARAMS: ParamShape = {
   properties: ["votes"],
   required: ["votes"],
 };
+
+/** Decision briefs: the evaluator's `submit_brief` — one owner-readable brief
+ * per open owner item. Matches schemas/decision-brief.schema.json's top-level
+ * properties. */
+export const SUBMIT_BRIEF_PARAMS: ParamShape = {
+  properties: ["requestId", "question", "today", "impact", "options", "recommendation", "related", "evidence"],
+  required: ["requestId", "question", "today", "impact", "options", "recommendation", "related", "evidence"],
+};

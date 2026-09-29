@@ -437,6 +437,10 @@ export interface RunView {
   /** Minutes since the active agent last produced an event (agent stages only). */
   idleMinutes?: number;
   attention?: string;
+  /** Decision briefs: when `attention` is `needs you`, the plain question of
+   * the first open item's brief, so the status buffer shows the question
+   * rather than a finding id. Undefined when no brief is recorded. */
+  attentionQuestion?: string;
   /** Plan 04c: the balance metrics (review share, rounds, raw/published per
    * type, merge/drop rates, A/D, owner wait, blockers, unexposed proxy) and
    * the one status line that renders them. */
@@ -653,6 +657,10 @@ export function buildView(
   else if (!alive && phase.phase !== "DONE") attention = "conductor stopped";
   else if (idleMinutes !== undefined && idleMinutes > 5) attention = `idle ${Math.round(idleMinutes)}m`;
   else if (t && t.byCategory.polling.ms > t.elapsedMs / 4) attention = "heavy polling";
+  // Decision briefs: the `needs you` line names the owner's actual question.
+  const openRequestIds = new Set(phase.ownerRequests.filter((r) => r.status === "open").map((r) => r.id));
+  const firstBrief = (phase.briefs ?? []).find((b) => openRequestIds.has(b.requestId));
+  const attentionQuestion = attention === "needs you" ? firstBrief?.question : undefined;
 
   const firstAt = timeline.phases[0]?.at;
   const endAt = phase.phase === "DONE" || phase.phase === "BLOCKED" ? Date.parse(timeline.phases[timeline.phases.length - 1].at) : now.getTime();
@@ -713,6 +721,7 @@ export function buildView(
     needsYou,
     idleMinutes,
     attention,
+    attentionQuestion,
     envBlocked,
     envTools,
     ...(flakesLine(metrics) ? { flakes: flakesLine(metrics)! } : {}),

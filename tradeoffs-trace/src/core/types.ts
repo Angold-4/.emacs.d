@@ -408,6 +408,50 @@ export interface OwnerRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Decision briefs (owner-facing; see src/core/briefs.ts)
+// ---------------------------------------------------------------------------
+
+/** One plain-language option of a brief, carrying the underlying owner
+ * request's own option id, so resolving from the brief sends exactly the
+ * same resolve command as resolving the request. */
+export interface BriefOption {
+  id: string;
+  label: string;
+  /** What happens under this option. */
+  effect: string;
+  /** What it costs. */
+  cost: string;
+}
+
+/** Another open item that touches the same concern as a brief, so the owner
+ * sees the bigger risk beside the narrow request. */
+export interface BriefRelated {
+  id: string;
+  question: string;
+}
+
+/** One owner-facing decision brief for one open item that needs the owner's
+ * decision. Produced once per round after evaluation by the evaluator's
+ * model; validated by `briefIssue` in src/core/briefs.ts. */
+export interface DecisionBrief {
+  /** The owner request (or entry/message id) this brief is for. */
+  requestId: string;
+  /** One plain line, no code identifiers. */
+  question: string;
+  /** What the system does today, with one concrete example using real market
+   * names and times from the plan's calendars. */
+  today: string;
+  /** What the owner would notice; always answers whether any market stops
+   * publishing. */
+  impact: string;
+  options: BriefOption[];
+  recommendation: { option: string; why: string };
+  related: BriefRelated[];
+  /** The original message/finding/file:line, folded under TAB. */
+  evidence: string[];
+}
+
+// ---------------------------------------------------------------------------
 // §7.5 Corrections (revise)
 // ---------------------------------------------------------------------------
 
@@ -1019,6 +1063,11 @@ export interface PhaseState {
    * repaired candidate see them (finding A-5), and marked with that candidate
    * so a later one is not shown a stale split (finding A-9). */
   lastCheckFailures?: LastCheckFailures;
+  /** Decision briefs (one per open owner item), produced once per round after
+   * evaluation and folded from BRIEFS_RECORDED. The views render these above
+   * the evidence; the status `needs you` line shows the first one's
+   * question. */
+  briefs?: DecisionBrief[];
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
@@ -1870,8 +1919,18 @@ export interface EvMessageCarried {
   sourceContentHash?: string;
 }
 
+/** Decision briefs: one per open owner item, produced once per round after
+ * evaluation. A record-only event (no phase-state-name change; handled by
+ * reduce.ts's applyRecordEvent) merged by requestId, so a conductor restart
+ * rebuilds the briefs the views render from the log alone. */
+export interface EvBriefsRecorded {
+  type: "BRIEFS_RECORDED";
+  briefs: DecisionBrief[];
+}
+
 export type Event =
   | EvReviewLintFailed
+  | EvBriefsRecorded
   | EvEntryCurated
   | EntryEvent
   | EvAttemptStarted

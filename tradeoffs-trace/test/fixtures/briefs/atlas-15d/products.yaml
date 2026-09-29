@@ -1,0 +1,10 @@
+# config/index/products.yaml — the instruments the run publishes.
+NVDA:
+  vendor: pyth
+  calendar: us_equity
+BTCUSD:
+  vendor: stork
+  calendar: crypto_24_7
+XAUUSD:
+  vendor: kaiko
+  calendar: metal_otc

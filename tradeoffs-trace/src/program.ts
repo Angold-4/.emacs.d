@@ -695,6 +695,10 @@ export function programReviewText(dir: string): string {
         candidate: sha ? { sha } : undefined,
         messages: phase.messages ?? [],
         entries: phase.entries ?? [],
+        // Decision briefs: the program review shows each node's open owner
+        // items as briefs too (renderProgramEntryReview).
+        briefs: phase.briefs ?? [],
+        ownerRequests: phase.ownerRequests ?? [],
       });
     } catch {
       // the run is not readable (yet): it contributes no entries

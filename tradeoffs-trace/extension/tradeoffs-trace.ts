@@ -32,6 +32,7 @@ import { guardedSearchPath, guardedShCommand, guardedWritePath, readGuardConfigF
 
 import { validate, type JSONSchema } from "../src/core/schema.ts";
 import { validateCuratorProposal } from "../src/core/entries.ts";
+import { briefIssue } from "../src/core/briefs.ts";
 import { reviewIngestionIssue } from "../src/core/predicate.ts";
 import type { Review } from "../src/core/types.ts";
 import {
@@ -47,6 +48,7 @@ import {
 import {
   DECISION_DISCLOSURE_PARAMS,
   RAISE_TRADEOFF_PARAMS,
+  SUBMIT_BRIEF_PARAMS,
   SUBMIT_DISCOVERY_PARAMS,
   SUBMIT_EVALUATION_PARAMS,
   SUBMIT_PANEL_VOTE_PARAMS,
@@ -81,6 +83,11 @@ const REVIEW_SCHEMA = loadSchema("../schemas/review.schema.json");
 // seat number (the conductor tells it), exactly like a reviewer's own
 // candidateSha/contractVersion.
 const PANEL_VOTE_SCHEMA = loadSchema("../schemas/panel-vote.schema.json");
+
+// Decision briefs: one owner-facing brief per open owner item. Structural
+// shape plus the plain-language rules (no code identifier in the question, a
+// quantified claim carries an evidence citation).
+const BRIEF_SCHEMA = loadSchema("../schemas/decision-brief.schema.json");
 
 // A Decision's binding fields (boundCandidateSha, boundContractVersion) and
 // identity fields (id, version, phaseId) are assigned by the conductor —
@@ -346,6 +353,33 @@ const SubmitRoundPanelVotesParams = Type.Object(
   Object.fromEntries(SUBMIT_ROUND_PANEL_VOTES_PARAMS.properties.map((key) => [key, submitRoundPanelVotesFields[key]])),
 );
 
+// Decision briefs: the evaluator's owner-readable brief for one open owner
+// item. The question is plain words; the option ids are the request's own, so
+// resolving from the brief sends the same command.
+const BriefOptionParam = Type.Object({
+  id: Type.String({ description: "The underlying owner request's own option id" }),
+  label: Type.String({ description: "The option in plain words" }),
+  effect: Type.String({ description: "What happens under this option" }),
+  cost: Type.String({ description: "What it costs" }),
+});
+const BriefRelatedParam = Type.Object({
+  id: Type.String({ description: "Another open item id" }),
+  question: Type.String({ description: "That item's question" }),
+});
+const submitBriefFields: Record<string, TSchema> = {
+  requestId: Type.String({ description: "The open owner item this brief is for" }),
+  question: Type.String({ description: "One plain line, no code identifiers" }),
+  today: Type.String({ description: "What the system does now, with one concrete example naming a real market and time from the plan's calendars" }),
+  impact: Type.String({ description: "What the owner would notice; always say whether any market stops publishing" }),
+  options: Type.Array(BriefOptionParam, { minItems: 1, description: "The request's own options, one-to-one by id, relabelled in plain words" }),
+  recommendation: Type.Object({ option: Type.String(), why: Type.String({ description: "Cite the plan or IC section" }) }),
+  related: Type.Array(BriefRelatedParam, { description: "Other open items on the same file or plan clause" }),
+  evidence: Type.Array(Type.String(), { minItems: 1, description: "The original message/finding/file:line; a time, count or duration must cite config: or code:" }),
+};
+const SubmitBriefParams = Type.Object(
+  Object.fromEntries(SUBMIT_BRIEF_PARAMS.properties.map((key) => [key, submitBriefFields[key]])),
+);
+
 function readEnv(name: string): string | undefined {
   const v = process.env[name];
   return v && v.length > 0 ? v : undefined;
@@ -434,6 +468,7 @@ class RunSocketClient {
       | "submit_evaluation"
       | "submit_panel_vote"
       | "submit_round_panel_votes"
+      | "submit_brief"
       | "curate_entries",
     args: unknown,
     timeoutMs = 60000,
@@ -626,6 +661,7 @@ export default function (pi: ExtensionAPI) {
       | "submit_evaluation"
       | "submit_panel_vote"
       | "submit_round_panel_votes"
+      | "submit_brief"
       | "curate_entries",
     args: unknown,
     markAccepted = true,
@@ -757,6 +793,22 @@ export default function (pi: ExtensionAPI) {
     parameters: SubmitEvaluationParams,
     async execute(_toolCallId, params) {
       return submitTool("submit_evaluation", params);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_brief",
+    label: "Submit Decision Brief",
+    description:
+      "Write one owner-facing brief for one open owner item: a plain question with no code identifiers, what the system does today (one concrete example with a real market and time from the plan's calendars), what the owner would notice (always say whether any market stops publishing), the request's own options relabelled with their effects and costs, one recommendation citing the plan, related open items, and the original evidence. A time, count or duration must cite config: or code:",
+    promptSnippet: "Write the owner-facing brief for each open owner item",
+    parameters: SubmitBriefParams,
+    async execute(_toolCallId, params) {
+      const error = validateOrError(BRIEF_SCHEMA, params);
+      if (error) return { isError: true, content: [{ type: "text" as const, text: error }] };
+      const issue = briefIssue(params as never);
+      if (issue) return { isError: true, content: [{ type: "text" as const, text: `invalid brief: ${issue}` }] };
+      return submitTool("submit_brief", params, false);
     },
   });
 

@@ -635,6 +635,53 @@ past run cannot display one either.
 | mode line | live runs with stage, time and reviews; the oldest owner wait (`⚑ 13f waiting 1h12m`) with a warning-face flash when a new notification arrives |
 | CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
 
+## The decision brief (what needs you, in plain words)
+
+Every item that needs your decision — an open owner request, a flagged
+trade-off, an entry marked for the owner — reaches you as a **decision
+brief**, written once per round after evaluation by the evaluator's model and
+checked against the code and the plan. You decide from the brief alone, in
+under a minute:
+
+- **question** — one plain line with no code identifiers, as the heading, e.g.
+  *Should a vendor excluded before a weekend stay excluded when its market
+  reopens?*
+- **today** — what the system does now, with one concrete example that names a
+  real market and session time from the plan's `calendars.yaml`/`products.yaml`.
+  A brief whose example cannot be checked says so instead of inventing one.
+- **impact** — what you would notice (price flow, number of vendors, quality,
+  duration), and always whether any market stops publishing.
+- **options** — each option the request already offered, relabelled in plain
+  words with what happens and its cost. The option ids are unchanged, so
+  choosing one from the brief sends exactly the same resolve command as
+  choosing it on the request.
+- **recommendation** — one option and why, citing the plan or an IC section.
+- **related** — other open items on the same file or plan clause, so a bigger
+  risk is never hidden behind a narrow request.
+- **evidence** — the original message/finding/`file:line`, folded under `TAB`.
+
+A brief that states a time, a count or a duration must cite the config or code
+it read, and a question that names code (`within_band_active`) is refused back
+to the evaluator. The same briefs appear at the top of `views/review.org` (and
+the program review) under `* Needs you (N)`; `TAB` on a question unfolds its
+evidence. The status buffer's `needs you` line shows the question, not a
+finding id.
+
+### Owner glossary
+
+The brief links a term here instead of explaining it inline:
+
+- **band** — a vendor drops out when its last tick is older than the band's
+  upper edge, and rejoins when a fresh tick arrives inside the band's lower
+  edge.
+- **T_in** — the staleness at which an excluded vendor is allowed back in.
+- **T_out** — the staleness at which a live vendor is excluded.
+- **window** — the recent span of ticks the calculator reads to decide a price.
+- **held** — the market is open but no vendor is publishing, so no price can be
+  formed.
+- **degraded** — a price is still published, but from fewer vendors than the
+  full set.
+
 ## Notifications when something needs you
 
 Nothing waits for the owner by default, so the system tells you when a run has
