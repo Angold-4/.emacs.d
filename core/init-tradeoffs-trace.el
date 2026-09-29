@@ -19,8 +19,11 @@
 ;;   C-c m d   the run's review view (read-only; TAB folds, RET opens a
 ;;             message's file, A/D send the owner's verdict)
 ;;   C-c m l   every run: open (RET)
-;;   C-c m p   a program (several plans / phases as one graph): RET opens a
-;;             phase's run, i sends a program-wide directive
+;;   C-c m p   a program (several plans / phases as one graph): the program's
+;;             dependency chart then its nodes; RET opens a phase's run,
+;;             i sends a program-wide directive
+;;   C-c m g   the run's phase chart (`views/loop.txt') read-only, from a run's
+;;             buffer or a node line in the program buffer
 ;;   C-c m k   stop the program or phase whose buffer point is in (asks first)
 ;;   C-c m c   continue (resume) it
 ;;
@@ -678,18 +681,56 @@ whole program; warnings are shown and it starts."
   (json-parse-string (+tt--cli "program" "state" dir) :object-type 'alist :array-type 'list
                      :null-object nil :false-object :false))
 
+(defun +tt--program-point-anchor ()
+  "The run id on the program line at point, for restoring point after a refresh.
+A node line (and its indented detail lines) carries `+tt-run-id'; a line of
+the prepended chart does not.  Anchoring to the run id keeps point on the
+same node when the chart above the node list changes length between ticks
+(findings A-3/B-1), never a raw character offset into the shifted text."
+  (get-text-property (point) '+tt-run-id))
+
+(defun +tt--program-goto-anchor (anchor)
+  "Move point to the first program line carrying run id ANCHOR; nil when none."
+  (when anchor
+    (goto-char (point-min))
+    (let ((pos (point-min))
+          (limit (point-max))
+          (found nil))
+      (while (and (not found) (< pos limit))
+        (if (equal (get-text-property pos '+tt-run-id) anchor)
+            (setq found pos)
+          (setq pos (next-single-property-change pos '+tt-run-id nil limit))))
+      (when found (goto-char found))
+      found)))
+
 (defun +tt--render-program ()
   "Render the program buffer from `tt program state'.
 Plan 03c: the header line carries the program id and the Org program file it
-was started from (recorded by `tt program start --source')."
+was started from (recorded by `tt program start --source'), and the runtime's
+`views/program.txt' chart sits at the top, above the node list.  The chart is
+text: only the node lines below it carry `+tt-run-id', so RET there opens a
+run and does nothing on the chart."
   (let* ((s (+tt--program-state +tt--program-dir))
          (nodes (alist-get 'nodes (alist-get 'state s)))
          (source (alist-get 'sourcePath s))
+         (chart (expand-file-name "views/program.txt" +tt--program-dir))
+         (anchor (+tt--program-point-anchor))
          (inhibit-read-only t)
          (pt (point)))
     (setq header-line-format
           (format "program %s%s" (alist-get 'id s) (if source (format "   %s" source) "")))
     (erase-buffer)
+    ;; Plan 03c: `views/program.txt' (the program dependency graph) first, then
+    ;; the node list.  A program that has not written it yet says so in one
+    ;; line rather than erroring.
+    (if (file-exists-p chart)
+        (progn (insert-file-contents chart)
+               ;; `insert-file-contents' leaves point at the buffer start, not
+               ;; at the end of what it inserted; the node list goes after it.
+               (goto-char (point-max))
+               (unless (bolp) (insert "\n")))
+      (insert "no program chart yet (views/program.txt)\n"))
+    (insert "\n")
     (let ((run-id nil))
       (dolist (line (alist-get 'lines s))
         (let ((start (point)))
@@ -703,7 +744,10 @@ was started from (recorded by `tt program start --source')."
            ;; trade-off) belongs to the node above it; RET opens the same run.
            ((and run-id (string-prefix-p "    " line))
             (put-text-property start (point) '+tt-run-id run-id))))))
-    (goto-char (min pt (point-max)))))
+    ;; Prefer the node the owner was on; only when point was not in the node
+    ;; list (a chart line, or the first render) fall back to the old offset.
+    (unless (+tt--program-goto-anchor anchor)
+      (goto-char (min pt (point-max))))))
 
 (defun +tt-program-open-node ()
   "Open the workspace of the node's run at point."
@@ -880,7 +924,8 @@ own tab and takes the whole frame."
                   ((derived-mode-p '+tt-status-mode) (+tt--render-status))
                   ((derived-mode-p '+tt-review-mode) (+tt-review-refresh))
                   ((derived-mode-p '+tt-input-mode) (+tt--render-input-header))
-                  ((derived-mode-p '+tt-program-mode) (+tt--render-program)))))))
+                  ((derived-mode-p '+tt-program-mode) (+tt--render-program))
+                  ((derived-mode-p '+tt-chart-mode) (+tt-chart-refresh)))))))
     (unless any
       (when (timerp +tt--timer) (cancel-timer +tt--timer))
       (setq +tt--timer nil))))
@@ -1225,6 +1270,20 @@ open the decision view at that record."
             ;; full record id this line is about.
             (put-text-property start (point) '+tt-record record)))))))
 
+(defun +tt--status-chart-hint ()
+  "Insert the one-line `chart  C-c m g' hint under the status header.
+The runtime's `views/status.txt' carries no key hint (keys are Emacs's own
+UI), so the status buffer adds the line itself in both the file and the
+`tt state' path; the row is left alone when the file already has one."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      (unless (re-search-forward "^chart " nil t)
+        ;; after the title and the `run ...' line
+        (goto-char (point-min))
+        (forward-line 2)
+        (insert (propertize (format "%-10s" "chart") 'face 'shadow) "C-c m g\n")))))
+
 (defun +tt--render-status-from (s run-dir)
   "Insert the status of RUN-DIR from `tt state' S (plan 3b layout)."
   (let* ((phase (+tt--get s 'state 'phase))
@@ -1239,6 +1298,7 @@ open the decision view at that record."
                      (if alive "conductor running" "conductor stopped")
                      (alist-get 'elapsed v))
              'face 'shadow))
+    (+tt--status-chart-hint)
     (+tt--status-row "phase"
                      (format "%s · %s · round %s · attempt %s · repairs %s/%s"
                              (alist-get 'phaseId phase) name (alist-get 'round v)
@@ -1363,6 +1423,7 @@ read, so it costs nothing over TRAMP and calls neither `tt' nor
     (erase-buffer)
     (if (and file (file-exists-p file))
         (progn (insert-file-contents file)
+               (+tt--status-chart-hint)
                (+tt--status-restore-records)
                (+tt--status-restore-faces))
       (+tt--render-status-from (+tt--state +tt--run-dir) +tt--run-dir))))
@@ -1386,6 +1447,143 @@ existed (finding B-5: a row with no record must not raise)."
 (define-derived-mode +tt-status-mode special-mode "tt-status"
   "Status of a tradeoffs-trace run."
   (visual-line-mode 1))
+
+;;;;; Chart view (plan 03c)
+
+;; The runtime draws two ASCII charts from the same tables it obeys: the
+;; phase state machine at `<run>/views/loop.txt' and the program graph at
+;; `<program>/views/program.txt'.  Emacs only shows them.  The program buffer
+;; prepends its chart (above), and `C-c m g' opens a run's phase chart in a
+;; read-only `*tt-chart <readable-id>*' buffer that re-reads the file when its
+;; modification time changes — the mechanism the review buffer uses — and
+;; keeps point on the same state's line.
+
+(defface +tt-chart-current-face
+  '((t :inherit highlight))
+  "The current state's box and the `current state:' line of a chart.")
+
+(defvar-local +tt-chart--file nil
+  "Absolute path of the `views/loop.txt' this buffer displays.")
+
+(defvar-local +tt-chart--mtime nil
+  "Modification time of `+tt-chart--file' the buffer last rendered.")
+
+(defun +tt-chart--state-name-at (line)
+  "The state name LINE names in a chart box, or nil.
+Only a box's `| NAME |' body line carries a state name; the `current state:'
+label is matched separately."
+  (when (string-match "\\`[> ]*|[ \t]*\\([A-Z][A-Z0-9_]*\\)[ \t]*|" line)
+    (match-string 1 line)))
+
+(defun +tt-chart--anchor ()
+  "A stable text identifying the chart line at point, or nil.
+Used to put point back after a refresh: a state box keeps its state name and
+the `current state:' line keeps its label; any other non-blank line keeps its
+text."
+  (let ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+    (cond
+     ((+tt-chart--state-name-at line))
+     ((string-match "\\`current state:" line) "current state:")
+     ((not (string-empty-p (string-trim line))) line)
+     (t nil))))
+
+(defun +tt-chart--goto-anchor (anchor)
+  "Move point to the chart line ANCHOR names, else to the top."
+  (goto-char (point-min))
+  (cond
+   ((null anchor) nil)
+   ((equal anchor "current state:")
+    (when (re-search-forward "^current state:" nil t) (goto-char (match-beginning 0))))
+   ((string-match "\\`[A-Z][A-Z0-9_]*\\'" anchor)
+    (when (re-search-forward (format "^[> ]*|[ \t]*%s[ \t]*|" (regexp-quote anchor)) nil t)
+      (goto-char (match-beginning 0))))
+   (t (when (search-forward anchor nil t) (goto-char (match-beginning 0))))))
+
+(defun +tt-chart--highlight ()
+  "Face the `current state:' line and the box of the current state."
+  (let ((inhibit-read-only t)
+        (name nil))
+    (save-excursion
+      (goto-char (point-min))
+      (when (re-search-forward "^current state: \\([^ \t\n]+\\)" nil t)
+        (setq name (match-string 1)))
+      (goto-char (point-min))
+      (when (re-search-forward "^current state:" nil t)
+        (put-text-property (line-beginning-position) (line-end-position)
+                           'face '+tt-chart-current-face))
+      (when name
+        (goto-char (point-min))
+        (when (re-search-forward (format "^[> ]*|[ \t]*%s[ \t]*|" (regexp-quote name)) nil t)
+          (let ((beg (line-beginning-position))
+                (end (line-end-position)))
+            (save-excursion
+              (forward-line -1)
+              (when (looking-at "^> ") (setq beg (line-beginning-position))))
+            (save-excursion
+              (goto-char end)
+              (forward-line 1)
+              (when (looking-at "[ \t]*+") (setq end (line-end-position))))
+            (put-text-property beg end 'face '+tt-chart-current-face)))))))
+
+(defun +tt-chart-refresh (&optional force)
+  "Show this buffer's `views/loop.txt', re-reading it when it changed.
+Keeps point on the same state's line.  A missing file is one line, not an
+error: this runs from the workspace timer, where a signal would be noise.
+FORCE re-reads even when the modification time is unchanged."
+  (interactive "p")
+  (when +tt-chart--file
+    (condition-case nil
+        (let ((mtime (and (file-exists-p +tt-chart--file)
+                          (file-attribute-modification-time (file-attributes +tt-chart--file)))))
+          (when (or force (not (equal mtime +tt-chart--mtime)))
+            (let ((anchor (+tt-chart--anchor))
+                  (inhibit-read-only t))
+              (erase-buffer)
+              (if mtime
+                  (progn (insert-file-contents +tt-chart--file)
+                         (setq +tt-chart--mtime mtime)
+                         (+tt-chart--highlight)
+                         (+tt-chart--goto-anchor anchor))
+                (insert (format "no chart yet: %s\n" +tt-chart--file))
+                (setq +tt-chart--mtime nil))
+              (set-buffer-modified-p nil))))
+      (error nil))))
+
+(defun +tt-chart--run ()
+  "The run directory `C-c m g' should chart, from the buffer point is in."
+  (cond
+   ((+tt--program-buffer-p)
+    (let ((run (get-text-property (point) '+tt-run-id)))
+      (unless run (user-error "No run on this line; put point on a node's line"))
+      (expand-file-name run +tt-root)))
+   ((and (bound-and-true-p +tt--run-dir) +tt--run-dir) +tt--run-dir)
+   (t (user-error "Not a run or program buffer"))))
+
+;;;###autoload
+(defun +tt-chart ()
+  "Open the run's phase chart, `views/loop.txt', read-only (`C-c m g').
+From a run's own buffer (status, review, trace, input) or from a node line in
+the program buffer."
+  (interactive)
+  (let* ((run (+tt-chart--run))
+         (id (+tt--readable-id run))
+         (buf (get-buffer-create (format "*tt-chart %s*" id))))
+    (with-current-buffer buf
+      (unless (derived-mode-p '+tt-chart-mode) (+tt-chart-mode))
+      (setq +tt--run-dir run
+            +tt-chart--file (expand-file-name "views/loop.txt" run))
+      (+tt-chart-refresh t))
+    (pop-to-buffer buf)
+    (+tt--ensure-timer)))
+
+(defvar-keymap +tt-chart-mode-map
+  :parent special-mode-map
+  "g" #'+tt-chart-refresh)
+
+(define-derived-mode +tt-chart-mode special-mode "tt-chart"
+  "Read-only view of a run's phase chart (`views/loop.txt')."
+  (visual-line-mode 1)
+  (setq buffer-read-only t))
 
 ;;;;; Input
 
@@ -2296,6 +2494,7 @@ Reads `tt program list --json'; nil when there is no program or no wait."
 (keymap-global-set "C-c m d" #'+tt-review)
 (keymap-global-set "C-c m l" #'+tt-runs)
 (keymap-global-set "C-c m p" #'+tt-program)
+(keymap-global-set "C-c m g" #'+tt-chart)
 (keymap-global-set "C-c m k" #'+tt-stop)
 (keymap-global-set "C-c m c" #'+tt-continue)
 (+tt--ensure-mode-line)
