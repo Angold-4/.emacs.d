@@ -1639,13 +1639,21 @@ shows the question, never a finding id."
 option id and full binding, prompting for the scope note accept_risk needs;
 RET chooses an option and sends the same encoding."
   (let ((dir (make-temp-file "tt-ert-review" t))
+        (writes nil)
         (written nil))
     (unwind-protect
         (let ((buf (+tt-test--review-buffer dir)))
           (with-current-buffer buf
             (cl-letf (((symbol-function '+tt--write-command)
-                       (lambda (run-dir command) (setq written (list run-dir command)) "cmd-1"))
-                      ((symbol-function 'read-string) (lambda (&rest _) "known race, accepted for one release")))
+                       (lambda (run-dir command) (push command writes) (setq written (list run-dir command)) "cmd-1"))
+                      ((symbol-function 'completing-read)
+                       (lambda (_prompt collection &rest _)
+                         (car (seq-find (lambda (c) (string-match-p "Hold it out" (car c))) collection))))
+                      ((symbol-function 'read-string)
+                       (lambda (prompt &rest _)
+                         (if (string-match-p "Scope note" prompt)
+                             "known race, accepted for one release"
+                           "the rejoin is still too eager"))))
               (goto-char (point-min))
               (search-forward "Should a vendor excluded")
               (goto-char (match-beginning 0))
@@ -1659,21 +1667,26 @@ RET chooses an option and sends the same encoding."
                 (should (equal (alist-get 'candidateSha binding) "C1"))
                 (should (equal (alist-get 'recordVersion binding) 1))
                 (should (equal (alist-get 'contractVersion binding) '((snapshot . 4) (sectionSha256 . "aaaa")))))
-              ;; RET prompts on the PLAIN label and sends the matching id
-              ;; (finding B-35: no engineer id in the owner's prompt).
-              (setq written nil)
-              (cl-letf (((symbol-function 'completing-read)
-                         (lambda (_prompt collection &rest _) (caar collection))))
-                (goto-char (point-min))
-                (search-forward "Should a vendor excluded")
-                (goto-char (match-beginning 0))
-                (+tt-review-open-message)
-                (should (equal (alist-get 'option (nth 1 written)) "accept_risk"))
-                (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "F-M-9"))
-                ;; The collection offered is labels, not ids.
-                (should-not (seq-some (lambda (c) (string-match-p "accept_risk" (car c))) (+tt-review--brief-choices))))))
+              ;; RET prompts on the PLAIN label (finding B-35) and a refuse
+              ;; option asks for the optional reason, which rides both the
+              ;; resolve's note and a note command so it reaches the next
+              ;; worker (OD-2 / D-B-78).
+              (setq writes nil written nil)
+              (goto-char (point-min))
+              (search-forward "Should a vendor excluded")
+              (goto-char (match-beginning 0))
+              (+tt-review-open-message)
+              (let* ((resolve (seq-find (lambda (c) (equal (alist-get 'type c) "resolve")) writes))
+                     (note (seq-find (lambda (c) (equal (alist-get 'type c) "note")) writes)))
+                (should (equal (alist-get 'option resolve) "repair"))
+                (should (equal (alist-get 'note resolve) "the rejoin is still too eager"))
+                (should (equal (alist-get 'recordId (alist-get 'binding resolve)) "F-M-9"))
+                (should (equal (alist-get 'text note) "the rejoin is still too eager"))
+                (should (equal (alist-get 'phaseId (alist-get 'binding note)) "p1")))
+              ;; The collection offered is labels, not ids.
+              (should-not (seq-some (lambda (c) (string-match-p "accept_risk" (car c))) (+tt-review--brief-choices))))
           (kill-buffer buf))
-      (delete-directory dir t))))
+      (delete-directory dir t)))))
 
 (defconst +tt-test--brief-override-org
   (concat "#+TITLE: tradeoffs-trace review\n"
@@ -1702,6 +1715,7 @@ RET chooses an option and sends the same encoding."
   "Decision briefs: a flagged reserved decision's brief A/D send an override
 (approve/reject) command with the decision's own binding."
   (let ((dir (make-temp-file "tt-ert-review" t))
+        (writes nil)
         (written nil))
     (unwind-protect
         (progn
@@ -1714,7 +1728,8 @@ RET chooses an option and sends the same encoding."
           (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
             (with-current-buffer buf
               (cl-letf (((symbol-function '+tt--write-command)
-                         (lambda (run-dir command) (setq written (list run-dir command)) "cmd-2")))
+                         (lambda (run-dir command) (push command writes) (setq written (list run-dir command)) "cmd-2"))
+                        ((symbol-function 'read-string) (lambda (&rest _) "the band stays too wide")))
                 (goto-char (point-min))
                 (search-forward "Should this choice stand")
                 (goto-char (match-beginning 0))
@@ -1722,7 +1737,18 @@ RET chooses an option and sends the same encoding."
                 (should (equal (alist-get 'type (nth 1 written)) "override"))
                 (should (equal (alist-get 'vote (nth 1 written)) "approve"))
                 (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "D-A-80"))
-                (should (equal (alist-get 'recordVersion (alist-get 'binding (nth 1 written))) 2))))
+                (should (equal (alist-get 'recordVersion (alist-get 'binding (nth 1 written))) 2))
+                ;; D (reject) asks for the optional reason and queues it as a
+                ;; note so it reaches the next worker (OD-2 / D-B-78).
+                (setq writes nil written nil)
+                (goto-char (point-min))
+                (search-forward "Should this choice stand")
+                (goto-char (match-beginning 0))
+                (+tt-review-refuse)
+                (let* ((override (seq-find (lambda (c) (equal (alist-get 'type c) "override")) writes))
+                       (note (seq-find (lambda (c) (equal (alist-get 'type c) "note")) writes)))
+                  (should (equal (alist-get 'vote override) "reject"))
+                  (should (equal (alist-get 'text note) "the band stays too wide")))))
             (kill-buffer buf)))
       (delete-directory dir t))))
 

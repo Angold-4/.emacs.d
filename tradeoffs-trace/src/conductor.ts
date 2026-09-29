@@ -7672,7 +7672,7 @@ export class Conductor {
       "For EACH item below call submit_brief exactly once, with:",
       "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. \"Should a vendor excluded before a weekend stay excluded when its market reopens?\"",
       "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; a weekday reopen must match the calendar's weekly reopen. If you cannot check it, write \"(example unverified)\".",
-      "- The owner-facing text (today, impact, the options) must stay PLAIN: no file paths and no code identifiers. Cite a claim by its evidence number in square brackets, e.g. '10 s after a reopen[2]'.",
+      "- ALL owner-facing text (the question, today, impact, the options, the recommendation and the related questions) must stay PLAIN: no file paths and no code identifiers. Cite a claim by its evidence number in square brackets, e.g. '10 s after a reopen[2]'.",
       "- evidence: the numbered list of what you read, e.g. 'message: ...' then 'config: ...' or 'code: path:line'. Every time, count or duration in today, impact or an option must carry its OWN [n] reference into this list; one reference does not cover another claim.",
       "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing. The publishing answer itself must cite the config or code it was checked against, or say it is unverified.",
       "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",

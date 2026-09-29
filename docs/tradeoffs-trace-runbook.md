@@ -692,9 +692,10 @@ state one recommended option, with why, citing the plan or an IC section; only
 the deterministic backstop may omit it. A model brief must also state whether
 any market stops publishing; only the deterministic backstop may say the
 impact was not established. A model brief that could not check the publishing
-answer says it is unverified instead of asserting it. The owner-facing text —
-the question, today, impact and the options — stays plain: no file paths and no
-code identifiers (the question is held to the same rule). Every time, count or
+answer says it is unverified instead of asserting it. ALL owner-facing text —
+the question, today, impact, the options, the recommendation's why and the
+related questions — stays plain: no file paths and no code identifiers. Every
+time, count or
 duration carries its own numbered reference into the evidence list (`[2]`); one
 reference does not cover another claim, and the reference must point at a
 config or code line that actually holds the claimed value. The publishing

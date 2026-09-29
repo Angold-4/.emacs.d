@@ -2306,21 +2306,33 @@ the owner's face (finding B-35)."
           (push (cons (match-string 1) (match-string 2)) choices))))
     (nreverse choices)))
 
+(defun +tt-review--brief-note (text)
+  "Queue TEXT as an owner note, so it reaches the next worker attempt.
+Used for a refusal's optional reason (OD-2 / D-B-78): the resolve/override
+command itself carries no free text, so the reason rides a note command."
+  (let ((binding (+tt-review--brief-binding)))
+    (when binding
+      (+tt--write-command
+       +tt--run-dir
+       (list (cons 'type "note")
+             (cons 'text text)
+             (cons 'binding (list (cons 'runId (alist-get 'runId binding))
+                                  (cons 'phaseId (alist-get 'phaseId binding)))))))))
+
 (defun +tt-review--brief-resolve (option)
   "Write the command for the brief at point with OPTION.
 The brief's `:COMMAND:' says whether OPTION is a `resolve' (an owner request),
 an `override' (a flagged reserved decision) or an entry verdict (a live review
-entry); either way the same encoding the item itself uses is written. An
-`accept_risk' option also prompts for the non-empty scope note the request
-requires."
-  (let ((binding (+tt-review--brief-binding))
-        (command (or (org-entry-get nil "COMMAND") "resolve")))
+entry); either way the same encoding the item itself uses is written. Any
+refusal asks for the optional reason (OD-2 / D-B-78), and an `accept_risk'
+option also prompts for the non-empty scope note the request requires."
+  (let* ((binding (+tt-review--brief-binding))
+         (command (or (org-entry-get nil "COMMAND") "resolve"))
+         (accept-option (org-entry-get nil "ACCEPT_OPTION"))
+         (refuse (and accept-option (not (equal option accept-option)))))
     (cond
      ((equal command "entry")
-      ;; The entry fallback brief's refuse option says the reason reaches the
-      ;; next worker, so refusing here asks for it, exactly as D on the entry
-      ;; heading does (OD-2 / D-B-78).
-      (let ((reason (when (equal option "refuse") (read-string "Reason (optional): "))))
+      (let ((reason (when refuse (read-string "Reason (optional): "))))
         (message "%s"
                  (apply #'+tt--cli
                         (append (list "entry" +tt--run-dir (if (equal option "accept") "accept" "refuse") (+tt-review--message-id))
@@ -2330,22 +2342,27 @@ requires."
         (user-error "This brief has no full binding; refresh the review (g) and try again"))
       (cond
        ((equal command "override")
-        (+tt--write-command
-         +tt--run-dir
-         (list (cons 'type "override")
-               (cons 'vote (if (equal option "approve") "approve" "reject"))
-               (cons 'binding binding))))
+        (let ((reason (when refuse (read-string "Reason (optional): "))))
+          (+tt--write-command
+           +tt--run-dir
+           (list (cons 'type "override")
+                 (cons 'vote (if (equal option "approve") "approve" "reject"))
+                 (cons 'binding binding)))
+          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason))))
        (t
-        (let ((note (when (equal option "accept_risk")
-                      (let ((n (read-string "Scope note for accepting the risk: ")))
-                        (when (string-empty-p n)
-                          (user-error "accepting the risk needs a non-empty scope note"))
-                        n))))
+        (let* ((note (when (equal option "accept_risk")
+                       (let ((n (read-string "Scope note for accepting the risk: ")))
+                         (when (string-empty-p n)
+                           (user-error "accepting the risk needs a non-empty scope note"))
+                         n)))
+               (reason (when (and refuse (not note)) (read-string "Reason (optional): ")))
+               (carried (or note (and reason (not (string-empty-p reason)) reason))))
           (+tt--write-command
            +tt--run-dir
            (append (list (cons 'type "resolve") (cons 'option option))
-                   (when note (list (cons 'note note)))
-                   (list (cons 'binding binding)))))))))))
+                   (when carried (list (cons 'note carried)))
+                   (list (cons 'binding binding))))
+          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason)))))))))
 
 (defun +tt-review--brief-choose ()
   "Prompt for one of the brief's options (by plain label) and send it."
