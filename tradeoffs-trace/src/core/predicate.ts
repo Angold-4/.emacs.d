@@ -288,7 +288,10 @@ export function findingCitesAcceptanceOrReserved(
   contract: { acceptance: string[]; reserved: string[] },
   directiveIds: readonly string[] = [],
 ): boolean {
-  if (finding.kind !== "defect" && finding.kind !== "contract") return false;
+  // Plan (5) ties blocking to the GROUND a finding cites, not to its kind
+  // label: an `integration` finding against an acceptance item may block too
+  // (round-4 reviews disc-M-51, F-M-15). A preference cites nothing, so it
+  // still may not.
   const evidence = `${finding.evidence} ${finding.criterionDisputed ?? ""}`.toLowerCase();
   const words = (s: string): string[] => s.toLowerCase().replace(/[^a-z0-9\s]+/g, " ").split(/\s+/).filter(Boolean);
   const runs = (s: string, len: number): Set<string> => {

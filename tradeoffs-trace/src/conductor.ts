@@ -4023,21 +4023,24 @@ export class Conductor {
   ): Promise<string | undefined> {
     // Plan 05e (finding #34): a new point on bytes the reviewers already
     // approved is an advisory finding, not a blocker, unless it violates an
-    // acceptance item or a reserved rule.
+    // acceptance item or a reserved rule. That applies to a point filed
+    // through the `blockers` list too: it is raised as an ordinary finding
+    // message, so no blocker panel runs on unchanged approved code
+    // (round-4 review A-16).
     let severity = fd.severity;
-    if (!opts.raisedAsBlocker && severity === "blocking") {
-      const approvedSha = this.#amendmentOnlyApprovedSha(candidateSha);
-      if (
-        approvedSha &&
-        !findingCitesAcceptanceOrReserved(
-          { kind: fd.kind, evidence: fd.evidence, criterionDisputed: fd.criterionDispute?.criterion } as Finding,
-          this.#state.phase.contract,
-          this.#directiveIds(),
-        )
-      ) {
-        this.#log.append("amendment_only_downgrade", { reviewer, approvedCandidateSha: approvedSha, candidateSha });
-        severity = "advisory";
-      }
+    let asBlocker = opts.raisedAsBlocker === true;
+    const approvedSha = this.#amendmentOnlyApprovedSha(candidateSha);
+    const citesGround =
+      approvedSha !== undefined &&
+      findingCitesAcceptanceOrReserved(
+        { kind: fd.kind, evidence: fd.evidence, criterionDisputed: fd.criterionDispute?.criterion } as Finding,
+        this.#state.phase.contract,
+        this.#directiveIds(),
+      );
+    if (approvedSha && !citesGround) {
+      this.#log.append("amendment_only_downgrade", { reviewer, approvedCandidateSha: approvedSha, candidateSha, raisedAsBlocker: asBlocker });
+      if (asBlocker) asBlocker = false;
+      if (severity === "blocking") severity = "advisory";
     }
     // Plan 05e (3a/3b): every finding — including one raised through a
     // reviewer's `blockers` list, which is a blocking finding too — goes
@@ -4047,7 +4050,7 @@ export class Conductor {
     {
       const claim = this.#claimAgainstCheckRecords(fd.evidence, candidateSha);
       if (claim?.kind === "rejected") {
-        this.#rejectFinding(fd, reviewer, candidateSha, claim.reason, opts);
+        this.#rejectFinding(fd, reviewer, candidateSha, claim.reason, { raisedAsBlocker: asBlocker });
         return undefined;
       }
       if (claim?.kind === "confirmed") verified = claim.reason;
@@ -4060,7 +4063,7 @@ export class Conductor {
         // M-3, B-22).
         if (run.timedOut || run.exitCode === 0) {
           const why = run.timedOut ? "timed out" : "exit 0";
-          this.#rejectFinding(fd, reviewer, candidateSha, `run \`${fd.runnable.trim()}\` ${why} — the claimed failure did not reproduce`, opts);
+          this.#rejectFinding(fd, reviewer, candidateSha, `run \`${fd.runnable.trim()}\` ${why} — the claimed failure did not reproduce`, { raisedAsBlocker: asBlocker });
           return undefined;
         }
         verified = `run \`${fd.runnable.trim()}\` exit ${run.exitCode}`;
@@ -4102,13 +4105,13 @@ export class Conductor {
     // finding keeps its pre-04b meaning — it blocks acceptance and forces a
     // repair — and stays a `finding` message, listed under Findings marked
     // `blocking', never as a Blocker (plan 05c).
-    const messageType: MessageType = opts.raisedAsBlocker ? "blocker" : "finding";
+    const messageType: MessageType = asBlocker ? "blocker" : "finding";
     this.#raiseMessage(
       messageType,
       finding.id,
       this.#findingContent(finding, messageType),
       candidateSha,
-      opts.raisedAsBlocker ? { raisedAsBlocker: true } : {},
+      asBlocker ? { raisedAsBlocker: true } : {},
     );
     // Plan 01g: a reviewer's finding may say the criterion cannot be met as
     // written. That is recorded as an amendment the reviewers vote on later;

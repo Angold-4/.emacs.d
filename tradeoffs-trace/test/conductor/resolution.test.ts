@@ -20,6 +20,7 @@ import {
   cleanupDir,
   defaultReviewerHello,
   defaultWorkerHello,
+  readEvents,
   setupConductor,
   waitFor,
 } from "./harness.ts";
@@ -362,6 +363,76 @@ test("plan 05e (round-2 A-5): an advisory sameAs re-raise cannot raise a finding
     );
     const advisory = setup.conductor.state.phase.findings.find((f) => f.raisedBy === "M" && f.severity === "advisory")!;
     assert.equal(advisory.severity, "advisory", "one reviewer's sameAs re-raise cannot raise a finding to blocking");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 05e (round-4 A-16): on an amendment-only round a blockers-list point is an advisory finding, not a blocker panel item", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        ...(attempt === 1 ? [{ kind: "call-sh" as const, command: "printf 'one\\n' > a.txt" }] : []),
+        {
+          kind: "call-submit" as const,
+          tool: "submit_phase" as const,
+          args: { decisions: [], assumptions: [], deviations: [], ...(attempt === 1 ? { criterionDispute: DISPUTE } : {}) },
+        },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const round = state.phase.round ?? 1;
+      const votable = state.phase.decisions.filter((d) => (d.class === "delegated" || d.class === "reserved") && !d.supersededBy && !d.supersededByCorrection);
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+              ballots: votable
+                .filter((d) => round === 1 || d.amendment?.status === "proposed")
+                .map((d) => ({ decisionId: d.id, vote: "approve", rationale: "right for the goal", evidence: ["src/a.ts:1"] })),
+              // Round 2: a NEW point on the unchanged code filed through the
+              // blockers list, citing no acceptance item.
+              blockers: round === 2 && reviewer === "A" ? [{ kind: "defect", evidence: "the helper's name is misleading" }] : [],
+            },
+          },
+        ],
+      };
+    },
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 150_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.equal(
+      (phase.messages ?? []).filter((m) => m.type === "blocker").length,
+      0,
+      "no blocker message may be raised on unchanged approved code",
+    );
+    assert.equal(
+      readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "PANEL_VOTE").length,
+      0,
+      "no blocker panel may run on unchanged approved code",
+    );
+    const finding = phase.findings.find((f) => f.raisedBy === "A")!;
+    assert.equal(finding.severity, "advisory");
+    assert.equal(phase.phase, "DONE");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

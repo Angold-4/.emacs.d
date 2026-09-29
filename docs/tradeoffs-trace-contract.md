@@ -213,11 +213,13 @@ Three deterministic checks precede any model:
   <cmd> exit N`. A blocker's `runnable` is checked the same way.
 - **severity against the plan (5):** a blocking finding that cites no
   acceptance item or reserved rule is lowered by the evaluator
-  (`FINDING_SEVERITY_CHANGED`, by `evaluator`, with its reason). A citation is
-  the item verbatim, a phrasing-preserving paraphrase, a numbered reference, a
-  reserved rule, an owner directive id, or a `criterionDispute`. A `sameAs`
-  re-raise takes the re-raiser's severity **downward only**; one reviewer
-  cannot raise an advisory finding to blocking.
+  (`FINDING_SEVERITY_CHANGED`, by `evaluator`, with its reason). The GROUND
+  decides, not the kind: an `integration` finding citing an acceptance item
+  may block. A citation is the item verbatim, a phrasing-preserving
+  paraphrase, a numbered reference, a reserved rule, an owner directive id,
+  or a `criterionDispute`. A `sameAs` re-raise takes the re-raiser's severity
+  **downward only**; one reviewer cannot raise an advisory finding to
+  blocking.
 
 `FINDING_VERIFIED` records what validated a finding — `record`, `run <cmd>
 exit N`, a `file:line …` citation, or `panel keep` — and the renderer shows it
@@ -246,8 +248,11 @@ has settled, no owner request is open and no open blocking finding stands,
 final. A later round whose candidate ships the same tree (an amendment-only
 resubmission) re-reviews only the amended criterion; a new blocking finding on
 the unchanged code is raised as advisory, unless it cites an acceptance item
-or a reserved rule. A candidate whose ballots were rejected is never approved,
-so an identical resubmission is re-reviewed normally.
+or a reserved rule. A point filed through a reviewer's `blockers` list on such
+a round is raised as an ordinary finding message (advisory when it cites no
+ground), so no blocker panel runs on unchanged approved code. A candidate
+whose ballots were rejected is never approved, so an identical resubmission is
+re-reviewed normally.
 
 ## 2. Bindings and `contentHash`
 

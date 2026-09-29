@@ -1082,9 +1082,10 @@ Three deterministic rules run **before any model**:
    the command and exit status. A blocker's `runnable` is checked the same
    way.
 3. **Severity against the plan (5).** A blocking finding may stay blocking
-   only when it is a defect against an acceptance item or a reserved rule.
-   A citation is accepted as the item verbatim, a paraphrase that keeps its
-   phrasing or most of its significant words, a numbered reference
+   only when it cites an acceptance item or a reserved rule — the ground, not
+   the finding's kind, decides, so an `integration` finding that cites one may
+   block too. A citation is accepted as the item verbatim, a paraphrase that
+   keeps its phrasing or most of its significant words, a numbered reference
    (`acceptance item 3`), an owner directive id, or a `criterionDispute`; the
    evaluator lowers anything else to advisory, recording the reason. A
    `sameAs` re-raise takes the re-raiser's severity **downward only** — one
@@ -1109,7 +1110,9 @@ tree as a candidate M, A and B already approved (an amendment-only
 resubmission), the round's prompt says so and the reviewers re-review only the
 amended criterion; a new blocking point on the unchanged code is raised as an
 advisory finding, not a blocker, unless it violates an acceptance item or a
-reserved rule. Approval is recorded once the round's `EVALUATING` has settled
+reserved rule — a point filed through the `blockers` list on such a round is
+raised as an ordinary finding, so no blocker panel runs on unchanged code.
+Approval is recorded once the round's `EVALUATING` has settled
 (the round panel's severity decisions are final), and only when every live
 decision bound to the candidate has settled and no owner request or blocking
 finding stands — a candidate whose ballots were rejected is not approved, so

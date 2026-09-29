@@ -48,6 +48,8 @@ test("plan 05e: a citation is the item verbatim, a phrasing-preserving paraphras
 test("plan 05e: a preference or an uncited defect may not block", () => {
   assert.equal(findingCitesAcceptanceOrReserved(finding({ evidence: "the helper's name is misleading" }), { acceptance: ACCEPTANCE, reserved: [] }), false);
   assert.equal(findingCitesAcceptanceOrReserved(finding({ evidence: "it breaks 'the review buffer shows one topic once'" }), { acceptance: ACCEPTANCE, reserved: [] }), true);
-  // A different kind is never a blocking contract ground by itself.
-  assert.equal(findingCitesAcceptanceOrReserved(finding({ kind: "integration", evidence: "the review buffer shows one topic once" }), { acceptance: ACCEPTANCE, reserved: [] }), false);
+  // Plan (5) ties blocking to the ground cited, not the kind label: an
+  // integration finding against an acceptance item may block (disc-M-51).
+  assert.equal(findingCitesAcceptanceOrReserved(finding({ kind: "integration", evidence: "the review buffer shows one topic once" }), { acceptance: ACCEPTANCE, reserved: [] }), true);
+  assert.equal(findingCitesAcceptanceOrReserved(finding({ kind: "integration", evidence: "the helper's name is misleading" }), { acceptance: ACCEPTANCE, reserved: [] }), false);
 });
