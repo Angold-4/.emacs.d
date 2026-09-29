@@ -203,6 +203,11 @@ export interface Deadlines {
    * its raw messages are published `unevaluated` and the phase moves on. The
    * plan sets it with `#+TT_EVALUATE_MINUTES` (default 10). */
   evaluateMs: number;
+  /** Decision briefs: how long the brief-writing agent may run. It is its own
+   * short deadline (default 90 s), not the evaluator's evaluateMs, so a
+   * stalled writer cannot make the owner wait out a full evaluation budget
+   * after evaluation already finished (finding disc-B-94). */
+  briefMs: number;
   /** Plan 04b: each panel seat's own deadline. A seat that times out is
    * re-dispatched once; a second loss makes that seat unavailable. The plan
    * sets it with `#+TT_PANEL_MINUTES` (default 10). */
@@ -259,6 +264,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   probeMs: 10 * 60_000,
   gateMs: 30 * 60_000,
   evaluateMs: 10 * 60_000,
+  briefMs: 90_000,
   panelMs: 10 * 60_000,
   reviewMs: 15 * 60_000,
   reproductionMs: 5 * 60_000,
@@ -3481,7 +3487,9 @@ export class Conductor {
       // The brief agent is done once every item it was asked for has a brief
       // for this candidate.
       const has = (id: string) => (this.#state.phase.briefs ?? []).some((b) => b.requestId === id && b.candidateSha === C);
-      if (this.#briefInFlight.size > 0 && [...this.#briefInFlight].every(has)) this.#agents.get(agentId)?.doneResolve();
+      if (this.#briefInFlight.size > 0 && [...this.#briefInFlight].every(has)) {
+        for (const h of this.#agents.values()) if (h.agentId.startsWith("briefs-")) h.doneResolve();
+      }
       return { ok: true };
     }
     if (msg.tool === "submit_round_panel_votes") {
@@ -7389,13 +7397,15 @@ export class Conductor {
         .filter((e) => !existing.has(e.id))
         .map((e) => e.id),
     ];
-    if (missing.length === 0) return;
-    if (missing.every((id) => this.#briefInFlight.has(id))) return;
-    // Dispatch the evaluator's model to write the briefs; #runBriefAgent
-    // records the deterministic backstop for anything it does not cover.
+    // Only ids no running agent already covers are dispatched, and the set is
+    // accumulated (never replaced), so a second item opening mid-pass does not
+    // double-brief the first agent's ids or wipe its bookkeeping (finding
+    // M-18).
+    const toDispatch = missing.filter((id) => !this.#briefInFlight.has(id));
+    if (toDispatch.length === 0) return;
     const actionId = this.#log.actionId("briefs");
-    this.#briefInFlight = new Set(missing);
-    void this.#runBriefAgent(actionId, missing).catch((err) => this.#logUnexpected("briefs", err));
+    for (const id of toDispatch) this.#briefInFlight.add(id);
+    void this.#runBriefAgent(actionId, toDispatch).catch((err) => this.#logUnexpected("briefs", err));
   }
 
   /** The live, flagged reserved decisions of the current candidate. A
@@ -7599,7 +7609,7 @@ export class Conductor {
       const briefTimeout = this.#withStallWatch(
         agentId,
         agent,
-        cancelableTimeout(this.#deadlines.evaluateMs, "timeout" as const),
+        cancelableTimeout(this.#deadlines.briefMs, "timeout" as const),
         "Owner (conductor): no progress for a while. Finish now and call submit_brief for each item listed.",
       );
       const settled = nextSettle();
@@ -7615,7 +7625,9 @@ export class Conductor {
       this.#log.completion(actionId, { ok: outcome === "submitted", reason: outcome === "submitted" ? undefined : outcome });
     } finally {
       this.#agents.delete(agentId);
-      this.#briefInFlight.clear();
+      // Remove only THIS agent's ids: a later agent may be covering others
+      // (finding M-18).
+      for (const id of ids) this.#briefInFlight.delete(id);
       // Whatever the model did not cover, the backstop fills in. Stale (the
       // phase moved on): nothing to record and the next park re-runs it.
       if (dispatchCandidate === this.#state.phase.candidate?.sha) this.#recordFallbackBriefs(ids);
@@ -7635,7 +7647,8 @@ export class Conductor {
       "",
       "For EACH item below call submit_brief exactly once, with:",
       "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. \"Should a vendor excluded before a weekend stay excluded when its market reopens?\"",
-      "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; if you cannot check it, write \"(example unverified)\".",
+      "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; a weekday reopen must match the calendar's weekly reopen. If you cannot check it, write \"(example unverified)\".",
+      "- Cite EVERY time, count or duration in that claim's own sentence, with config: ... or code: path:line — one citation does not cover another claim.",
       "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing.",
       "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",
       "- recommendation: one option id and why, citing the plan or an IC section.",
@@ -7643,7 +7656,11 @@ export class Conductor {
       "- evidence: the original message/finding/file:line. Any time, count or duration MUST cite the config or code you read (config: ... or code: path:line).",
       "",
       "Calendars (calendars.yaml):",
-      ...(catalogs ? Object.entries(catalogs.calendars).map(([name, c]) => `- ${name}: ${Object.entries(c.sessions).map(([s, t]) => `${s} ${t}`).join(", ")}`) : ["(none readable)"]),
+      ...(catalogs
+        ? Object.entries(catalogs.calendars).map(
+            ([name, c]) => `- ${name}: weekly reopen ${c.opens ?? "(none declared)"}; sessions ${Object.entries(c.sessions).map(([s, t]) => `${s} ${t}`).join(", ")}`,
+          )
+        : ["(none readable)"]),
       "Products (products.yaml):",
       ...(catalogs ? Object.entries(catalogs.products).map(([sym, p]) => `- ${sym}: vendor ${p.vendor ?? "?"}, calendar ${p.calendar ?? "?"}`) : ["(none readable)"]),
       "",

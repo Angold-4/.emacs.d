@@ -15,11 +15,11 @@
    :RUN_ID:   05661870
    :PHASE_ID: atlas-15d
    :END:
-   Today: Pyth's NVDA product reopens Sunday 20:00 ET. Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.
-   Impact: No market stops publishing. At most one vendor is missing for about 10 s after a weekend reopen, so the published price is formed from one vendor fewer for that window.
+   Today: Pyth's NVDA product reopens Sunday 20:00 ET (config: calendars.yaml us_equity opens Sun 20:00). Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.
+   Impact: No market stops publishing. At most one vendor is missing for about 10 s after a weekend reopen (code: src/core/blend.rs:88), so the published price is formed from one vendor fewer for that window.
    Options:
-   - Keep as is [accept_risk] — the vendor rejoins immediately at the first tick after the reopen Cost: one stale first quote can enter the price for up to 10 s
-   - Hold it out for 10 s [repair] (recommended) — the vendor stays excluded until 10 s after the reopen, then rejoins Cost: 10 s with one vendor fewer at a reopen
+   - Keep as is [accept_risk] — the vendor rejoins immediately at the first tick after the reopen (code: src/core/blend.rs:88) Cost: one stale first quote can enter the price for up to 10 s (code: src/core/blend.rs:88)
+   - Hold it out for 10 s [repair] (recommended) — the vendor stays excluded until 10 s after the reopen, then rejoins (code: src/core/blend.rs:41) Cost: 10 s with one vendor fewer at a reopen (code: src/core/blend.rs:41)
    Recommendation: Hold it out for 10 s — IC §5's re-entry rule asks for a settled first tick, not the first tick after a break
    Related:
    - D-A-80: Should the re-entry band be ten seconds wide?
@@ -45,12 +45,12 @@
    :RUN_ID:   05661870
    :PHASE_ID: atlas-15d
    :END:
-   Today: Stork's BTCUSD product trades around the clock: its 24/7 calendar runs every minute of 00:00 to 23:59, so it has no reopen. The band now uses 10 s, the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.
-   Impact: No market stops publishing. The wider band lets one more vendor back in after a quiet spell, so the price is formed from more vendors more of the time.
+   Today: Stork's BTCUSD product trades around the clock: its 24/7 calendar runs every minute of 00:00 to 23:59 (config: calendars.yaml crypto_24_7 rth 00:00-23:59), so it has no reopen. The band now uses 10 s (code: src/core/blend.rs:41), the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.
+   Impact: No market stops publishing. The wider band lets one more vendor back in after a quiet spell (code: src/core/blend.rs:41), so the price is formed from more vendors more of the time.
    Options:
-   - Accept it as implemented [accept_as_implemented] (recommended) — 10 s stays the re-entry band Cost: a genuinely stale vendor can rejoin after 10 s
+   - Accept it as implemented [accept_as_implemented] (recommended) — 10 s stays the re-entry band (code: src/core/blend.rs:41) Cost: a genuinely stale vendor can rejoin after 10 s (code: src/core/blend.rs:41)
    - Reject and repair [reject_and_repair] — a new attempt picks the band again, with three more repair rounds Cost: one more round; no market stops publishing either way
-   Recommendation: Accept it as implemented — the panel's own count of re-entries agrees with IC §5's 10 s
+   Recommendation: Accept it as implemented — the panel's own count of re-entries agrees with IC §5's 10 s (code: src/core/blend.rs:41)
    Evidence (original):
    - message: D-A-80 widen the re-entry band to 10 s failed its vote
    - config: calendars.yaml crypto_24_7 has no reopen
@@ -72,7 +72,7 @@
    :RUN_ID:   05661870
    :PHASE_ID: atlas-15d
    :END:
-   Today: Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend. The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET the first fresh price is published.
+   Today: Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend (config: calendars.yaml metal_otc sessions 18:00-17:00). The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET (config: calendars.yaml metal_otc opens Sun 18:00) the first fresh price is published.
    Impact: No market stops publishing. While XAUUSD is held there is simply no offer, which is the documented behaviour; the change only affects whether the last price is repeated.
    Options:
    - Accept it as implemented [accept_as_implemented] (recommended) — no offer is published while the market is held Cost: consumers see no update for the held window

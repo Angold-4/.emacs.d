@@ -675,7 +675,11 @@ section with `A`/`D`, and duplicating them would bury the real decisions. A
 reserved decision's brief sends an override (approve / reject) and a marked
 entry's sends the entry accept/refuse, rather than a request resolve. The pass
 is per round and per candidate, so a new candidate's item is rewritten rather
-than keeping an earlier round's `today`.
+than keeping an earlier round's `today`; while a new brief is being written,
+the review and the status line do not show an earlier candidate's brief as
+current. The writer is shown each calendar's weekly reopen as well as its
+sessions, and the brief pass has its own short deadline so a stalled writer
+cannot hold the parked phase for a full evaluation budget.
 
 `A` and `D` choose the brief's accept and refuse option by the option's own
 meaning, never by its position; `RET` prompts on the option's **plain label**,
@@ -684,10 +688,11 @@ reason, and the reason reaches the next worker attempt. A model brief must
 state one recommended option, with why, citing the plan or an IC section; only
 the deterministic backstop may omit it. A model brief must also state whether
 any market stops publishing; only the deterministic backstop may say the
-impact was not established. A time, count or duration must cite the config or
-code the brief read (`config: ...`, `code: ...`, or a `path:line`) — a plan
-clause or a bare `§` reference does not count. The glossary terms `T_in` and
-`T_out` are allowed in a brief's question.
+impact was not established. Every time, count or duration must carry its OWN
+citation in that claim's sentence (`config: ...`, `code: ...`, or a
+`path:line`); one citation does not cover another claim, and a plan clause or
+a bare `§` reference does not count. The glossary terms `T_in` and `T_out` are
+allowed in a brief's question.
 
 If the model misses an item, the backstop records a brief that never invents
 an example, never asserts an unchecked impact (it says the impact was not

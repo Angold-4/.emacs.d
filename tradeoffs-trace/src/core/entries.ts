@@ -1108,7 +1108,14 @@ export function renderEntryReview(opts: EntryReviewOptions): string {
   // brief whose request is settled is not resurrected (finding M-3).
   const entryIds = ownerMarkedEntryIds(projected.views);
   const showable = opts.briefableIds ?? briefableIdsFor(opts.ownerRequests, opts.decisions, opts.overrides, opts.newestCandidateSha, entryIds);
-  const briefs = (opts.briefs ?? []).filter((b) => showable.has(b.requestId));
+  // A brief recorded for another candidate must not read as current after a
+  // repair (finding disc-M-86): hide it until the new candidate's own brief is
+  // recorded. A brief with no candidateSha is a pre-field fixture and shows.
+  const briefs = (opts.briefs ?? []).filter(
+    (b) =>
+      showable.has(b.requestId) &&
+      (b.candidateSha === undefined || opts.newestCandidateSha === undefined || b.candidateSha === opts.newestCandidateSha),
+  );
   lines.push(
     ...renderBriefsSection(briefs, {
       requestFor: (id) => (opts.ownerRequests ?? []).find((r) => r.id === id),
@@ -1162,8 +1169,10 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
       p.contract?.contractVersion && p.candidate?.sha && p.runId && p.phaseId
         ? { runId: p.runId, phaseId: p.phaseId, candidateSha: p.candidate.sha, recordVersion: 1, contractVersion: p.contract.contractVersion }
         : undefined;
+    const phaseSha = p.candidate?.sha ?? opts.newestCandidateSha;
     for (const brief of p.briefs ?? []) {
       if (!showable.has(brief.requestId)) continue;
+      if (brief.candidateSha !== undefined && phaseSha !== undefined && brief.candidateSha !== phaseSha) continue;
       const recordVersion = requests.find((r) => r.id === brief.requestId)?.version ?? (p.decisions ?? []).find((d) => d.id === brief.requestId)?.version;
       allBriefs.push({ brief, tag, requests, recordVersion, binding });
     }

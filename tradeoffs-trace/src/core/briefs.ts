@@ -83,7 +83,19 @@ const DIGIT_COUNT = /\b\d+\b/;
 const WORD_COUNT = /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:vendor|vendors|market|markets|instrument|instruments|product|products|round|rounds|day|days|week|weeks|hour|hours|minute|minutes|second|seconds|tick|ticks|price|prices|session|sessions|source|sources)\b/i;
 
 export function hasQuantifiedFact(text: string): boolean {
-  return CLOCK_TIME.test(text) || DURATION.test(text) || DIGIT_COUNT.test(text) || WORD_COUNT.test(text);
+  // A plan/IC section reference (`§5`) is not a count; only strip the section
+  // marker, so an actual `10 s` in the same sentence is still quantified.
+  const t = text.replace(/§\s*\d+/g, " ");
+  return CLOCK_TIME.test(t) || DURATION.test(t) || DIGIT_COUNT.test(t) || WORD_COUNT.test(t);
+}
+
+/** The sentences of TEXT, so each quantified claim can be paired with its own
+ * citation rather than sharing one across the whole brief. */
+export function sentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /** An evidence entry that cites the CONFIG or CODE the brief actually read
@@ -93,7 +105,9 @@ export function hasQuantifiedFact(text: string): boolean {
 export function isEvidenceCitation(entry: string): boolean {
   const s = entry.trim();
   if (!s) return false;
-  if (/^(?:config|code):/i.test(s)) return true;
+  // `config:` / `code:` may sit inline at the end of a claim, not only at the
+  // start of an evidence line.
+  if (/\b(?:config|code):/i.test(s)) return true;
   return /\b[\w./-]+\.(?:ya?ml|rs|ts|tsx|js|el|json|org|md|toml|py|go|c|cpp|h|rb|sh):\d+\b/.test(s);
 }
 
@@ -272,11 +286,10 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   if (!Array.isArray(brief.evidence) || brief.evidence.filter((e) => typeof e === "string" && e.trim()).length === 0) {
     return "a brief needs the original evidence";
   }
-  const quantified = hasQuantifiedFact([today, impact, ...brief.options.flatMap((o) => [o.effect, o.cost]), rec?.why ?? ""].join(" "));
-  if (quantified && !brief.evidence.some((e) => typeof e === "string" && isEvidenceCitation(e))) {
-    return "a time, count or duration needs an evidence citation to the config or code it read";
-  }
   if (opts.catalogs !== undefined) {
+    // The catalog example is checked before the per-claim citation rule, so a
+    // wrong weekday or an uncheckable example is reported as such rather than
+    // as a missing citation.
     // `(example unverified)` may only excuse a today that names NO market and
     // NO time. If it already names a product or a clock time, the example is
     // checkable, so an inconsistency is refused even with the marker (a
@@ -289,6 +302,20 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
       if (namesTime || namesProduct || !unverified) {
         return `the today example cannot be checked: ${check.reason}; either name a real product and session time or say "(example unverified)"`;
       }
+    }
+  }
+  // Every quantified claim must carry its OWN citation, not borrow one from
+  // elsewhere in the brief: one `config:` line cannot license an unrelated
+  // `10 s` somewhere else (finding disc-M-85).
+  const claims = [
+    ...sentences(today),
+    ...sentences(impact),
+    ...brief.options.flatMap((o) => [o.effect, o.cost]),
+    ...(rec?.why ? [rec.why] : []),
+  ];
+  for (const claim of claims) {
+    if (hasQuantifiedFact(claim) && !isEvidenceCitation(claim)) {
+      return `the claim "${claim.trim()}" states a time, count or duration without its own config or code citation`;
     }
   }
   return undefined;

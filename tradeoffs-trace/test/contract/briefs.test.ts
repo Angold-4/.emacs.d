@@ -31,6 +31,7 @@ import {
   type Catalogs,
 } from "../../src/core/briefs.ts";
 import { normalizeDecisionViewCommand } from "../../src/core/owner-inbox.ts";
+import { renderEntryReview } from "../../src/core/entries.ts";
 import type { DecisionBrief, OwnerRequest } from "../../src/core/types.ts";
 
 const FIXTURE = fileURLToPath(new URL("../fixtures/briefs/atlas-15d", import.meta.url));
@@ -174,14 +175,14 @@ test("a weekday reopen claim is checked against the calendar's weekly schedule",
   const good = fixture().briefs[0];
   // 09:30 is a real us_equity session boundary, so only the weekday check can
   // reject the exact wrong example the goal cites (finding M-10).
-  const monday = { ...good, today: "Pyth's NVDA product reopens Monday 09:30 ET." };
+  const monday = { ...good, today: "Pyth's NVDA product reopens Monday 09:30 ET (config: calendars.yaml us_equity opens Sun 20:00)." };
   const issue = briefIssue(monday, { catalogs: catalogs() });
   assert.ok(issue, "a Monday reopen must be refused when the calendar reopens Sunday");
   assert.match(issue!, /weekly reopen|cannot be checked/);
-  const sunday = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET." };
+  const sunday = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET (config: calendars.yaml us_equity opens Sun 20:00)." };
   assert.equal(briefIssue(sunday, { catalogs: catalogs() }), undefined);
   // A close is not a reopen: Friday 17:00 must not be read as one.
-  const closes = { ...good, today: "Kaiko's XAUUSD product closes Friday 17:00 ET." };
+  const closes = { ...good, today: "Kaiko's XAUUSD product closes Friday 17:00 ET (config: calendars.yaml metal_otc sessions 18:00-17:00)." };
   assert.equal(briefIssue(closes, { catalogs: catalogs() }), undefined);
 });
 
@@ -281,14 +282,34 @@ test("the glossary terms T_in and T_out are allowed in a question", () => {
   assert.equal(briefIssue({ ...good, question: "Should the band use T_in and T_out as edge values?" }), undefined);
 });
 
-test("a plan clause or a bare file name does not cite a quantified claim", () => {
+test("a brief written for another candidate is not shown as current", () => {
+  const f = fixture();
+  const request = f.requests.find((r) => r.id === "F-M-9")!;
+  const stale = { ...f.briefs[0], candidateSha: "old-sha" };
+  const hidden = renderEntryReview({ messages: [], entries: [], ownerRequests: [request], briefs: [stale], newestCandidateSha: "new-sha" });
+  assert.ok(!hidden.includes("Should a vendor excluded"), "a stale brief must not read as current");
+  const current = renderEntryReview({
+    messages: [],
+    entries: [],
+    ownerRequests: [request],
+    briefs: [{ ...stale, candidateSha: "new-sha" }],
+    newestCandidateSha: "new-sha",
+  });
+  assert.ok(current.includes("Should a vendor excluded"), "the current candidate's brief shows");
+});
+
+test("a claim's own citation is required, and plan: or a bare file name does not count", () => {
   const good = fixture().briefs[0];
-  const planOnly = { ...good, evidence: ["plan: IC §5 says the vendor stays out", "message: F-M-9"] };
-  const issue = briefIssue(planOnly);
-  assert.ok(issue, "a plan: line is not the config or code the brief read");
-  assert.match(issue!, /citation/i);
-  const code = { ...planOnly, evidence: [...planOnly.evidence, "code: src/core/blend.rs:88"] };
-  assert.equal(briefIssue(code), undefined);
+  const uncited = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET." };
+  const issue = briefIssue(uncited);
+  assert.ok(issue, "the 20:00 claim has no inline citation");
+  assert.match(issue!, /citation|config|code/i);
+  const planOnly = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET (plan: IC §5)." };
+  assert.ok(briefIssue(planOnly), "plan: is not the config or code read");
+  const bare = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET (calendars.yaml)." };
+  assert.ok(briefIssue(bare), "a bare file name is not a code citation");
+  const cited = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET (config: calendars.yaml us_equity opens Sun 20:00)." };
+  assert.equal(briefIssue(cited), undefined);
 });
 
 test("briefIssue rejects a code identifier in the question", () => {
@@ -300,22 +321,31 @@ test("briefIssue rejects a code identifier in the question", () => {
   }
 });
 
-test("briefIssue rejects a time, count or duration without an evidence citation", () => {
+test("each time, count or duration needs its own citation", () => {
   const good = fixture().briefs[0];
-  const noCitation = { ...good, evidence: ["message: F-M-9 reopened the finding"] };
-  // Each of the three quantified forms in turn: with a config/code citation
-  // the same text passes; without one it is refused.
-  for (const field of [
-    { today: "Pyth's NVDA product reopens Sunday 20:00 ET and the vendor waits 10 s." },
-    { impact: "No market stops publishing; 3 markets keep their full vendor count." },
-    { impact: "No market stops publishing; the wait lasts two minutes." },
+  // One inline citation does not cover a second, unrelated claim.
+  const twoClaims = {
+    ...good,
+    today: "Pyth's NVDA product reopens Sunday 20:00 ET (config: calendars.yaml us_equity opens Sun 20:00). The vendor then waits 10 s.",
+  };
+  const issue = briefIssue(twoClaims);
+  assert.ok(issue, "the 10 s claim is not covered by the 20:00 citation");
+  assert.match(issue!, /10 s|citation/i);
+  const bothCited = {
+    ...good,
+    today: "Pyth's NVDA product reopens Sunday 20:00 ET (config: calendars.yaml us_equity opens Sun 20:00). The vendor then waits 10 s (code: src/core/blend.rs:88).",
+  };
+  assert.equal(briefIssue(bothCited), undefined);
+  // Each quantified form with its own inline citation passes; without it the
+  // same claim is refused.
+  for (const value of [
+    "No market stops publishing; the wait lasts 3 minutes (code: src/core/blend.rs:41).",
+    "No market stops publishing; 3 markets keep their vendor count (config: calendars.yaml us_equity).",
+    "No market stops publishing; the wait lasts two minutes (code: src/core/blend.rs:41).",
   ]) {
-    const bad = { ...noCitation, ...field };
-    const issue = briefIssue(bad);
-    assert.ok(issue, `expected a rejection for ${JSON.stringify(field)}`);
-    assert.match(issue!, /citation|config|code/i);
-    const withCitation = { ...bad, evidence: [...bad.evidence, "config: calendars.yaml us_equity"] };
-    assert.equal(briefIssue(withCitation), undefined, `${JSON.stringify(field)} should pass with a citation`);
+    assert.equal(briefIssue({ ...good, impact: value }), undefined, `${value} should pass with its inline citation`);
+    const uncited = value.replace(/\s*\((?:config|code):[^)]*\)/, "");
+    assert.ok(briefIssue({ ...good, impact: uncited }), `${uncited} should be refused`);
   }
 });
 

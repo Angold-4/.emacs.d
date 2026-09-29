@@ -674,7 +674,11 @@ export function buildView(
     if (e.state !== "open") continue;
     if ((e.links ?? []).some((l) => refusedMessages.has(l.messageId))) waitingIds.add(e.id);
   }
-  const firstBrief = (phase.briefs ?? []).find((b) => waitingIds.has(b.requestId));
+  // A brief written for another candidate must not read as current after a
+  // repair (finding disc-M-86).
+  const firstBrief = (phase.briefs ?? []).find(
+    (b) => waitingIds.has(b.requestId) && (b.candidateSha === undefined || !C || b.candidateSha === C),
+  );
   const attentionQuestion = attention === "needs you" ? firstBrief?.question : undefined;
 
   const firstAt = timeline.phases[0]?.at;
