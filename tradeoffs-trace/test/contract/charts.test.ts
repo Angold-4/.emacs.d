@@ -156,3 +156,27 @@ test("program.txt matches its golden file, with readable ids and a join", () => 
   assert.match(chart, /> \+/);
   assert.match(chart, /after: atlas-02, atlas-03/);
 });
+
+test("the phase chart names each reviewer and panel seat's model (#+TT_MODELS)", () => {
+  const stats = statsFromTimeline(TIMELINE, new Date("2026-09-27T11:05:00.000Z"));
+  const perSeat = renderPhaseChart(TRANSITIONS, {
+    stats,
+    models: {
+      worker: "deepseek-v4.1-flash",
+      reviewerSeats: { M: "claude-opus-5.5", A: "deepseek-v4.1-flash", B: "grok-4.6" },
+      evaluator: "claude-opus-5.5",
+      panelSeats: { "1": "claude-opus-5.5", "2": "deepseek-v4.1-flash", "3": "grok-4.6" },
+    },
+  });
+  // Different model families per reviewer seat: the box names each seat.
+  assert.match(perSeat, /REVIEWING.*M claude-opus-5\.5 · A deepseek-v4\.1-flash · B grok-4\.6/);
+  // EVALUATING names the evaluator and every panel seat.
+  assert.match(perSeat, /EVALUATING.*evaluator claude-opus-5\.5 · panel 1 claude-opus-5\.5 · panel 2 deepseek-v4\.1-flash · panel 3 grok-4\.6/);
+  // Seats that all resolve to the same model keep the compact per-role line,
+  // so a plan using only 05a's four roles reads exactly as before.
+  const shared = renderPhaseChart(TRANSITIONS, {
+    stats,
+    models: { reviewerSeats: { M: "sonnet", A: "sonnet", B: "sonnet" } },
+  });
+  assert.match(shared, /REVIEWING.*M, A, B - model sonnet/);
+});

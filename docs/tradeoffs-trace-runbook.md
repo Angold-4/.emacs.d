@@ -206,7 +206,8 @@ Two kinds of finding:
   human (`the owner records …`, `manually …`, `someone …`). No worker or
   reviewer can satisfy it. Move it to the plan's `Owner checklist:` list, or
   rewrite it as an observable result a worker produces. An invalid
-  `#+TT_MODELS` declaration (see "Models per role") is an error too. Emacs
+  `#+TT_MODELS` declaration (see "Models per role and per seat") is an error
+  too. Emacs
   shows errors in `*tt-plan-errors*` (jump-to-line to the Org file) and starts
   nothing.
 - **Warning — shown, and the start continues.** An item that depends on a
@@ -224,33 +225,58 @@ the conductor commits the candidate. The existing plans in
 (`tradeoffs-trace/test/fixtures/atlas-plans/`): the linter finds exactly one
 error across them, `13j`'s owner-actor item.
 
-## Models per role
+## Models per role and per seat
 
 By default every role — the worker, the three reviewers (M, A, B), the
 message evaluators and the blocker panel — runs on Pi's own `defaultModel`
-(`~/.pi/agent/settings.json`). A plan can give a role a stronger model with one
-keyword:
+(`~/.pi/agent/settings.json`). A plan can give a role, or each of its seats, a
+stronger (or just different) model with one keyword. The owner's own
+configuration, with a different model family per reviewer seat and the panel
+following the reviewers:
 
 ```org
-#+TT_MODELS: worker=deepseek/deepseek-v4.1-flash reviewer=vercel-ai-gateway:anthropic/claude-sonnet-5 evaluator=vercel-ai-gateway:anthropic/claude-opus panel=deepseek/deepseek-v4.1-flash
+#+TT_MODELS: worker=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers
 ```
 
-Space-separated `role=provider:model` declarations:
+Space-separated declarations, one per line in the real plans:
 
-- the **role** is one of `worker`, `reviewer`, `evaluator`, `panel` (the three
-  reviewers M, A and B all use `reviewer`);
-- the part before the **first** `:` is the provider and is optional —
-  `worker=deepseek/deepseek-v4.1-flash` passes no `--provider` and a model id
-  may itself contain `/`;
-- a role absent from the keyword keeps Pi's `defaultModel`.
+- **Roles** are `worker`, `reviewer`, `evaluator`, `panel`. A **seat** is a
+  dotted key: `reviewer.M`, `reviewer.A`, `reviewer.B` for the three reviewer
+  seats, and `panel.1`, `panel.2`, `panel.3` for the panel's three seats.
+- A value is `[provider:]model`. The part before the **first** `:` is the
+  provider **only when it contains no `/`**: Pi's `--model` itself accepts a
+  thinking suffix, so `reviewer=openai/gpt-6-sol:high` passes no provider and
+  the model `openai/gpt-6-sol:high`, while
+  `reviewer=vercel-ai-gateway:openai/gpt-6-sol:high` passes provider
+  `vercel-ai-gateway` and that same model. `worker=deepseek/deepseek-v4.1-flash`
+  passes no provider, so Pi may select another provider for that model even
+  when `defaultProvider` is set. Name the provider when it matters.
+- `panel=reviewers` is the one non-model value: every panel seat runs on the
+  reviewer model of its position (seat 1 → M, 2 → A, 3 → B), so the panel
+  disagrees with the same variety the reviewers do. Do not also write an
+  explicit `panel.N` for the same plan.
+- A role or seat absent from the keyword keeps Pi's `defaultModel`.
 
-A program file may declare `#+TT_MODELS` too: it is the default for every
-entry, and an entry's own `#+TT_MODELS` **wins for each role it names** (a
-role the entry does not name still gets the program's). What ran is visible:
-`views/loop.txt` names each dispatching role's model, `tt status` and the
-status buffer print one `models` line when the plan set any, and `tt summary`'s
-PR body lists the models per role. `tt lint` rejects an unknown role, a role
-named twice, or a role with an empty model.
+Resolution, in order:
+
+1. `reviewer.M`/`A`/`B` use their own seat's model, else the shared
+   `reviewer` model;
+2. `panel.N` uses its own seat's model, else the reviewer of its position
+   when `panel=reviewers` is set, else the shared `panel` model.
+
+An entry's own seat always beats the role's shared model, and a program's
+default is merged **key by key**: an entry that names `reviewer.A` but not
+`reviewer.M` keeps the program's `reviewer.M` and its own `reviewer.A`.
+
+What ran is visible: `views/loop.txt` names each reviewer and panel seat's
+model when the seats differ (and the compact per-role line when they do not),
+`tt status` and the status buffer print one `models` line naming `reviewer.M`,
+`panel.1`, …, and `tt summary`'s PR body lists the models per seat.
+
+`tt lint` rejects, at the keyword's file and line: an unknown role
+(`foo=…`), an unknown seat (`reviewer.X`, `panel.4`), a key named twice, a key
+with an empty model, and `panel=reviewers` together with an explicit
+`panel.N`.
 
 ## Owner checklist
 

@@ -68,13 +68,17 @@ const DISPATCH_ROLES: Record<string, { roles: string; model: "worker" | "reviewe
   EVALUATING: { roles: "evaluator, panel", model: "evaluator" },
 };
 
-/** The models the chart may show, one per role. A role with no model (Pi's
- * settings unread, or a test) reads as `default`. */
+/** The models the chart may show, one per role, plus the per-seat models
+ * (#+TT_MODELS). A role or seat with no model (Pi's settings unread, or a
+ * test) reads as `default`. A plan that only sets the four flat roles leaves
+ * the seat maps empty, so the chart keeps its per-role line unchanged. */
 export interface ChartModels {
   worker?: string;
   reviewer?: string;
   evaluator?: string;
   panel?: string;
+  reviewerSeats?: Partial<Record<"M" | "A" | "B", string>>;
+  panelSeats?: Partial<Record<string, string>>;
 }
 type ModelRole = "worker" | "reviewer" | "evaluator" | "panel";
 
@@ -179,12 +183,35 @@ export function renderPhaseChart(
       }
       const dispatch = DISPATCH_ROLES[state];
       if (dispatch) {
-        const roles = `${dispatch.roles} - model ${modelFor(dispatch.model)}`;
-        // EVALUATING dispatches the evaluator and the panel; when the panel
-        // has its own model, name it rather than showing the evaluator's for
-        // a seat that ran on something else.
-        const panelModel = state === "EVALUATING" ? modelFor("panel") : undefined;
-        bits.push(panelModel !== undefined && panelModel !== modelFor(dispatch.model) ? `${roles} (panel model ${panelModel})` : roles);
+        // Per-seat models (#+TT_MODELS): when M/A/B (or the panel seats) run
+        // on different models, name each seat's own — that disagreement is
+        // the point of three seats. When every seat resolves to the same
+        // model (a plan that only sets the four flat roles), the box keeps
+        // its single per-role line, exactly as before per-seat models.
+        const reviewerSeat = (seat: "M" | "A" | "B") => opts.models?.reviewerSeats?.[seat] ?? modelFor("reviewer");
+        const panelSeat = (seat: string) => opts.models?.panelSeats?.[seat] ?? modelFor("panel");
+        if (state === "REVIEWING") {
+          const seats = (["M", "A", "B"] as const).map((s) => [s, reviewerSeat(s)] as const);
+          bits.push(
+            seats.every(([, m]) => m === seats[0][1])
+              ? `${dispatch.roles} - model ${seats[0][1]}`
+              : seats.map(([s, m]) => `${s} ${m}`).join(" · "),
+          );
+        } else if (state === "EVALUATING") {
+          const evaluatorModel = modelFor("evaluator");
+          const panelSeats = (["1", "2", "3"] as const).map((s) => panelSeat(s));
+          if (panelSeats.every((m) => m === panelSeats[0])) {
+            const roles = `${dispatch.roles} - model ${evaluatorModel}`;
+            // EVALUATING dispatches the evaluator and the panel; when the
+            // panel has its own model, name it rather than showing the
+            // evaluator's for a seat that ran on something else.
+            bits.push(panelSeats[0] !== evaluatorModel ? `${roles} (panel model ${panelSeats[0]})` : roles);
+          } else {
+            bits.push(`evaluator ${evaluatorModel} · ${panelSeats.map((m, i) => `panel ${i + 1} ${m}`).join(" · ")}`);
+          }
+        } else {
+          bits.push(`${dispatch.roles} - model ${modelFor(dispatch.model)}`);
+        }
       }
       lines.push(...boxLines(state, inner, marker, bits.join("  -  ")));
       const outgoing = drawn.filter((r) => r.from === state);

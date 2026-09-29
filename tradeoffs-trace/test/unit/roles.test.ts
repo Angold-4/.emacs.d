@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { assertToolSet, launchArgs, PI_VERSION, ROLE_TOOLS } from "../../src/core/roles.ts";
+import { assertToolSet, launchArgs, PI_VERSION, planModelSelector, ROLE_TOOLS } from "../../src/core/roles.ts";
 
 test("roles: PI_VERSION is the pinned version", () => {
   assert.equal(PI_VERSION, "0.87.0");
@@ -94,4 +94,56 @@ test("assertToolSet: a duplicated tool name is a mismatch even when the set is o
     assert.deepEqual(result.missing, []);
     assert.deepEqual(result.extra, []);
   }
+});
+
+// #+TT_MODELS per seat (design §2.1): one selector answers for a role and,
+// for the reviewer and panel roles, a seat — the same resolution the launch
+// sites and the views use.
+
+test("planModelSelector: a plan with only the four flat roles is unchanged", () => {
+  const select = planModelSelector({ models: { worker: { model: "w" }, reviewer: { model: "r" }, evaluator: { model: "e" }, panel: { model: "p" } } });
+  assert.deepEqual(select("worker"), { model: "w" });
+  assert.deepEqual(select("reviewer"), { model: "r" });
+  assert.deepEqual(select("reviewer", "M"), { model: "r" }, "every seat uses reviewer's model");
+  assert.deepEqual(select("evaluator"), { model: "e" });
+  assert.deepEqual(select("panel"), { model: "p" });
+  assert.deepEqual(select("panel", 2), { model: "p" }, "every panel seat uses panel's model");
+});
+
+test("planModelSelector: reviewer.M/A/B win over reviewer, seat by seat", () => {
+  const select = planModelSelector({
+    models: {
+      reviewer: { model: "fallback" },
+      reviewerSeats: { M: { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" }, B: { model: "spacexai/grok-4.6" } },
+    },
+  });
+  assert.deepEqual(select("reviewer", "M"), { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" });
+  assert.deepEqual(select("reviewer", "A"), { model: "fallback" });
+  assert.deepEqual(select("reviewer", "B"), { model: "spacexai/grok-4.6" });
+});
+
+test("planModelSelector: panel.N wins; panelFrom=reviewers follows the reviewer of the seat's position", () => {
+  const models = {
+    reviewerSeats: { M: { model: "m" }, A: { model: "a" }, B: { model: "b" } },
+    panelFrom: "reviewers" as const,
+  };
+  const select = planModelSelector({ models });
+  assert.deepEqual(select("panel", 1), { model: "m" });
+  assert.deepEqual(select("panel", 2), { model: "a" });
+  assert.deepEqual(select("panel", 3), { model: "b" });
+  // An explicit panel seat beats panelFrom for that seat only.
+  const mixed = planModelSelector({ models: { ...models, panelSeats: { "2": { model: "own" } } } });
+  assert.deepEqual(mixed("panel", 1), { model: "m" });
+  assert.deepEqual(mixed("panel", 2), { model: "own" });
+  assert.deepEqual(mixed("panel", 3), { model: "b" });
+});
+
+test("planModelSelector: panel.N wins over a flat panel model; a plan without models selects nothing", () => {
+  const select = planModelSelector({ models: { panel: { model: "flat" }, panelSeats: { "1": { model: "one" } } } });
+  assert.deepEqual(select("panel", 1), { model: "one" });
+  assert.deepEqual(select("panel", 2), { model: "flat" });
+  const none = planModelSelector({});
+  for (const role of ["worker", "reviewer", "evaluator", "panel"] as const) assert.equal(none(role), undefined);
+  assert.equal(none("reviewer", "M"), undefined);
+  assert.equal(none("panel", 3), undefined);
 });

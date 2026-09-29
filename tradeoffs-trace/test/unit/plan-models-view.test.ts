@@ -80,3 +80,49 @@ test("tt summary's PR body lists the models used per role", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// The owner's per-seat configuration: the status line and the PR body must
+// name every seat's model, not just the role's shared default.
+const SEAT_MODELS: PlanModels = {
+  worker: { model: "deepseek/deepseek-v4.1-flash" },
+  reviewerSeats: {
+    M: { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" },
+    A: { model: "deepseek/deepseek-v4.1-flash" },
+    B: { provider: "vercel-ai-gateway", model: "spacexai/grok-4.6" },
+  },
+  evaluator: { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" },
+  panelFrom: "reviewers",
+};
+
+test("modelEntries: per-seat models expand to one entry per seat", () => {
+  assert.deepEqual(modelEntries(SEAT_MODELS), [
+    { role: "worker", value: "deepseek/deepseek-v4.1-flash" },
+    { role: "reviewer.M", value: "vercel-ai-gateway:anthropic/claude-opus-5.5" },
+    { role: "reviewer.A", value: "deepseek/deepseek-v4.1-flash" },
+    { role: "reviewer.B", value: "vercel-ai-gateway:spacexai/grok-4.6" },
+    { role: "evaluator", value: "vercel-ai-gateway:anthropic/claude-opus-5.5" },
+    { role: "panel.1", value: "vercel-ai-gateway:anthropic/claude-opus-5.5" },
+    { role: "panel.2", value: "deepseek/deepseek-v4.1-flash" },
+    { role: "panel.3", value: "vercel-ai-gateway:spacexai/grok-4.6" },
+  ]);
+});
+
+test("the status line and tt summary name every seat's model", () => {
+  const dir = fs.mkdtempSync("/tmp/tt-plan-models-view-");
+  try {
+    const withSeats = plan(SEAT_MODELS);
+    const view = buildView(dir, withSeats, false);
+    assert.match(
+      view.models ?? "",
+      /^models: worker=deepseek\/deepseek-v4\.1-flash reviewer\.M=vercel-ai-gateway:anthropic\/claude-opus-5\.5 reviewer\.A=deepseek\/deepseek-v4\.1-flash reviewer\.B=vercel-ai-gateway:spacexai\/grok-4\.6 evaluator=vercel-ai-gateway:anthropic\/claude-opus-5\.5 panel\.1=vercel-ai-gateway:anthropic\/claude-opus-5\.5 panel\.2=deepseek\/deepseek-v4\.1-flash panel\.3=vercel-ai-gateway:spacexai\/grok-4\.6$/,
+    );
+    const text = renderStatusText(dir, { run: "RUN_ACTIVE", phase: view.timeline.state.phase }, view);
+    assert.match(text, /^models: worker=.*reviewer\.M=.*panel\.3=/m);
+    const md = prSummary(dir, withSeats);
+    assert.match(md, /- reviewer\.M: vercel-ai-gateway:anthropic\/claude-opus-5\.5/);
+    assert.match(md, /- reviewer\.B: vercel-ai-gateway:spacexai\/grok-4\.6/);
+    assert.match(md, /- panel\.3: vercel-ai-gateway:spacexai\/grok-4\.6/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -215,3 +215,100 @@ test("plan-models: a plan without models launches every role with neither flag",
     fs.rmSync(argvDir, { recursive: true, force: true });
   }
 });
+
+// The owner's configuration (05b): a different model per reviewer seat and
+// every panel seat following the reviewer of its position.
+const OWNER_MODELS: PlanModels = {
+  worker: { model: "deepseek/deepseek-v4.1-flash" },
+  reviewerSeats: {
+    M: { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" },
+    A: { model: "deepseek/deepseek-v4.1-flash" },
+    B: { provider: "vercel-ai-gateway", model: "spacexai/grok-4.6" },
+  },
+  evaluator: { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" },
+  panelFrom: "reviewers",
+};
+
+/** Every dispatch of ROLE as (agentId, flags); the agentId carries the seat
+ * (`reviewer-M-<action>`, `panel-<blocker>-<seat>-<action>`), so a test can
+ * tell which seat a recorded argv belongs to. */
+/** agentId is panel-<blocker>-<seat>-dispatch_panel_<blocker>_<seat>-<seq>-<hex>,
+ * so the seat is the number before the action id's own copy of it. */
+function panelSeatOf(agentId: string): string | undefined {
+  return /_([0-9]+)-[0-9]+-[0-9a-f]+$/.exec(agentId)?.[1];
+}
+
+function launchesFor(role: Role, dir: string): Array<{ agentId: string; flags: { provider?: string; model?: string } }> {
+  const file = path.join(dir, `${role}.jsonl`);
+  if (!fs.existsSync(file)) return [];
+  return fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { agentId: string; argv: string[] })
+    .map((rec) => ({ agentId: rec.agentId, flags: flagsOf(rec.argv) }));
+}
+
+test("plan-models: the owner's per-seat #+TT_MODELS reaches every reviewer and panel seat", async () => {
+  const argvDir = fs.mkdtempSync("/tmp/tt-plan-models-seats-");
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    models: OWNER_MODELS,
+    extraEnv: { FAKE_PI_ARGV_LOG: argvDir },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: blockerReviewer(),
+    evaluatorScriptFor: blockerEvaluator(),
+    deadlines: FAST,
+  });
+  try {
+    await setup.conductor.start();
+    // All three panel seats launch in parallel: wait for every seat, not just
+    // the first, so the per-seat assertions below are not racing the others.
+    await waitFor(
+      () => ["1", "2", "3"].every((n) => launchesFor("panel", argvDir).some((l) => panelSeatOf(l.agentId) === n)),
+      90_000,
+      25,
+      setup.runDir,
+    );
+
+    // The worker and the evaluator are not seated.
+    assertRoleFlags(setup, "worker", argvDir, { model: "deepseek/deepseek-v4.1-flash" });
+    assertRoleFlags(setup, "evaluator", argvDir, { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" });
+
+    // Reviewer M/A/B each get their own seat's model (A keeps no provider).
+    const reviewers = launchesFor("reviewer", argvDir);
+    const reviewerSeat = (seat: string) => {
+      const found = reviewers.find((l) => l.agentId.split("-")[1] === seat);
+      assert.ok(found, `reviewer ${seat} was never launched`);
+      return found.flags;
+    };
+    assert.deepEqual(reviewerSeat("M"), { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" });
+    assert.deepEqual(reviewerSeat("A"), { model: "deepseek/deepseek-v4.1-flash" });
+    assert.deepEqual(reviewerSeat("B"), { provider: "vercel-ai-gateway", model: "spacexai/grok-4.6" });
+
+    // panel=reviewers: seat 1 follows M, 2 follows A, 3 follows B.
+    const panel = launchesFor("panel", argvDir);
+    const panelSeat = (n: number) => {
+      const found = panel.find((l) => panelSeatOf(l.agentId) === String(n));
+      assert.ok(found, `panel seat ${n} was never launched`);
+      return found.flags;
+    };
+    assert.deepEqual(panelSeat(1), { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" });
+    assert.deepEqual(panelSeat(2), { model: "deepseek/deepseek-v4.1-flash" });
+    assert.deepEqual(panelSeat(3), { provider: "vercel-ai-gateway", model: "spacexai/grok-4.6" });
+
+    // What ran is visible: the chart names each seat's model.
+    const loop = fs.readFileSync(path.join(setup.runDir, "views", "loop.txt"), "utf8");
+    assert.match(loop, /REVIEWING.*M anthropic\/claude-opus-5\.5 · A deepseek\/deepseek-v4\.1-flash · B spacexai\/grok-4\.6/);
+    assert.match(
+      loop,
+      /EVALUATING.*evaluator anthropic\/claude-opus-5\.5 · panel 1 anthropic\/claude-opus-5\.5 · panel 2 deepseek\/deepseek-v4\.1-flash · panel 3 spacexai\/grok-4\.6/,
+    );
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(argvDir, { recursive: true, force: true });
+  }
+});

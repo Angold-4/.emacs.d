@@ -305,10 +305,12 @@ export interface RunPlanFile {
    * node started after the owner's ruling still carries it in every prompt.
    * Written by the program scheduler (`nodePlan`), never by hand. */
   ownerDirectives?: RunPlanDirectiveSeed[];
-  /** #+TT_MODELS: per-role provider/model overrides (design §2.1). Absent on
-   * every plan that predates the keyword, so every role keeps Pi's own
+  /** #+TT_MODELS: per-role and per-seat provider/model overrides (design
+   * §2.1: `reviewer.M`, `panel.1`, `panel=reviewers`). Absent on every plan
+   * that predates the keyword, so every role and seat keeps Pi's own
    * `defaultModel`. Emacs parses it; `planModelSelector` is the one runtime
-   * place that turns it into `launchArgs`'s `provider`/`model`. */
+   * place that turns the role (and, for the reviewers and the panel, the
+   * seat) into `launchArgs`'s `provider`/`model`. */
   models?: PlanModels;
   /** Lint-only (never read by the conductor): the 1-based line of the
    * `#+TT_MODELS` keyword in the source Org file, so `tt lint` can point at
@@ -350,7 +352,7 @@ export interface ConductorOptions {
    * against the real `pi` binary must pick a real provider/model, which
    * nothing else on `ConductorOptions` carries. Absent (the default): no
    * `--provider`/`--model` flag is added, i.e. Pi's own default. */
-  providerModelFor?: (role: Role) => { provider?: string; model?: string } | undefined;
+  providerModelFor?: (role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined;
   extraEnv?: NodeJS.ProcessEnv;
   /** Per-agent environment override — tests use this to give each fake-pi
    * agent (worker, reviewer M/A/B) its own `FAKE_PI_SCRIPT`. */
@@ -903,7 +905,7 @@ export class Conductor {
   #piArgsPrefix: string[];
   #piCommandFor: ((role: Role) => string | undefined) | undefined;
   #piArgsPrefixFor: ((role: Role) => string[] | undefined) | undefined;
-  #providerModelFor: ((role: Role) => { provider?: string; model?: string } | undefined) | undefined;
+  #providerModelFor: ((role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined) | undefined;
   #extraEnv: NodeJS.ProcessEnv;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
@@ -4399,15 +4401,19 @@ export class Conductor {
     // Plan 03c: each dispatching state shows its own role's model — the
     // injected provider/model when a caller set one, otherwise Pi's own
     // default from settings.json, otherwise `default`.
-    const modelFor = (role: Role): string | undefined => this.#providerModelFor?.(role)?.model ?? piDefaultModel();
+    const modelFor = (role: Role, seat?: string | number): string | undefined => this.#providerModelFor?.(role, seat)?.model ?? piDefaultModel();
     // The evaluator and the panel (which shares the EVALUATING box) have a
     // model source now (#+TT_MODELS), so each reads its own instead of M-9's
-    // placeholder `default`.
+    // placeholder `default`. The reviewer and panel seats resolve exactly as
+    // their launch sites do, so the chart never names a model a seat did not
+    // run on.
     const models = {
       worker: modelFor("worker"),
       reviewer: modelFor("reviewer"),
       evaluator: modelFor("evaluator"),
       panel: modelFor("panel"),
+      reviewerSeats: { M: modelFor("reviewer", "M"), A: modelFor("reviewer", "A"), B: modelFor("reviewer", "B") },
+      panelSeats: { "1": modelFor("panel", 1), "2": modelFor("panel", 2), "3": modelFor("panel", 3) },
     };
     fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
   }
@@ -5712,7 +5718,9 @@ export class Conductor {
     // design §2: M keeps one session for the run; A and B are kept across
     // the phase's repair rounds. Continue the previous round's session.
     const continueSession = hasSessionFile(sessionDir);
-    const reviewerProviderModel = this.#providerModelFor?.("reviewer");
+    // #+TT_MODELS per-seat: M, A and B each resolve their seat's own model
+    // first, else the role's shared `reviewer` model (see planModelSelector).
+    const reviewerProviderModel = this.#providerModelFor?.("reviewer", reviewer);
 
     const agent = spawnPiAgent({
       command: reviewerPiCommand,
@@ -6151,7 +6159,9 @@ export class Conductor {
     });
 
     const panelPiCommand = this.#resolvePiCommand("panel");
-    const providerModel = this.#providerModelFor?.("panel");
+    // #+TT_MODELS per-seat: `panel.N` first, else the reviewer of this
+    // position when panel=reviewers, else the shared `panel` model.
+    const providerModel = this.#providerModelFor?.("panel", seat);
     const settleWaiters: Array<() => void> = [];
     const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
     const agent = spawnPiAgent({

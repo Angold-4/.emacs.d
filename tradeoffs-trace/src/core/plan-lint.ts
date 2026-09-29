@@ -28,13 +28,25 @@ export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no
 /** The roles #+TT_MODELS may assign a model to. */
 const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel"]);
 
+/** The seat names `reviewer.N` and `panel.N` accept (design §2.1). */
+const REVIEWER_SEATS = new Set(["M", "A", "B"]);
+const PANEL_SEATS = new Set(["1", "2", "3"]);
+
 /** The slice of #+TT_MODELS the linter reads. `models` is what Emacs parsed
- * (`{ worker?: { provider?, model }, … }`); `modelsRepeated` lists roles the
- * keyword named more than once (a JSON object cannot carry a duplicate key);
- * `modelsLine` is the 1-based line of the keyword, for `file:line:`. */
+ * (`{ worker?: { provider?, model }, reviewerSeats?: { M?: … }, … }`), with
+ * unknown keys kept so the linter can name them; `modelsRepeated` lists the
+ * keys the keyword named more than once (a JSON object cannot carry a
+ * duplicate key); `modelsLine` is the 1-based line of the keyword, for
+ * `file:line:`. */
 export interface LintRoleModel {
   provider?: string;
   model?: string;
+}
+
+/** A parsed `models` map. Kept open (`unknown` values) so an unknown role or
+ * seat the parser preserved still reaches the linter. */
+export interface LintModels {
+  [key: string]: unknown;
 }
 
 export interface LintFinding {
@@ -68,7 +80,7 @@ export interface LintPlanInput {
   /** The Org file this JSON came from, when known. */
   sourceFile?: string;
   phases?: LintPhaseInput[];
-  models?: Record<string, LintRoleModel>;
+  models?: LintModels;
   modelsLine?: number;
   modelsRepeated?: string[];
   /** Roles this entry inherited from a program-level #+TT_MODELS. They are
@@ -84,7 +96,7 @@ export interface LintProgramInput {
   entries?: Array<{ id?: string; plan?: LintPlanInput }>;
   /** A program file may also declare #+TT_MODELS; Emacs records the same
    * three fields at the program level so a bad default is reported once. */
-  models?: Record<string, LintRoleModel>;
+  models?: LintModels;
   modelsLine?: number;
   modelsRepeated?: string[];
 }
@@ -183,27 +195,93 @@ function modelFinding(plan: LintPlanInput, item: string, problem: string, fix: s
   };
 }
 
-/** Lint #+TT_MODELS: an unknown role, a role given twice, or a role with no
- * model is an error (it would reach `launchArgs` as a broken or ambiguous
- * flag). Absent: no findings, so a plan without the keyword is unchanged. */
+/** One declaration inside `models`: a flat role, or a `reviewer.M`/`panel.1`
+ * seat. `key` is the spelling the linter reports (`worker`, `reviewer.M`). */
+interface ModelDecl {
+  key: string;
+  model: LintRoleModel | undefined;
+  kind: "role" | "reviewer-seat" | "panel-seat";
+  seat?: string;
+}
+
+function asRoleModel(raw: unknown): LintRoleModel | undefined {
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as LintRoleModel) : undefined;
+}
+
+/** The seats inside a `reviewerSeats`/`panelSeats` object, unknown names
+ * included (the parser keeps them so the linter can report them). */
+function seatEntries(raw: unknown): Array<[string, LintRoleModel | undefined]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  return Object.entries(raw as Record<string, unknown>).map(([seat, model]) => [seat, asRoleModel(model)] as [string, LintRoleModel | undefined]);
+}
+
+/** Every model declaration a parsed `models` map carries, roles and seats. */
+function modelDeclarations(models: LintModels | undefined): ModelDecl[] {
+  if (!models) return [];
+  const out: ModelDecl[] = [];
+  for (const [key, raw] of Object.entries(models)) {
+    if (key === "reviewerSeats" || key === "panelSeats" || key === "panelFrom") continue;
+    out.push({ key, model: asRoleModel(raw), kind: "role" });
+  }
+  for (const [seat, model] of seatEntries(models.reviewerSeats)) out.push({ key: `reviewer.${seat}`, model, kind: "reviewer-seat", seat });
+  for (const [seat, model] of seatEntries(models.panelSeats)) out.push({ key: `panel.${seat}`, model, kind: "panel-seat", seat });
+  return out;
+}
+
+/** Lint #+TT_MODELS: an unknown role or seat name, a key given twice, a key
+ * with no model, or `panel=reviewers` together with an explicit `panel.N` is
+ * an error (each would reach `launchArgs` as a broken or ambiguous flag).
+ * Absent: no findings, so a plan without the keyword is unchanged. */
 export function lintModels(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [];
   const inherited = new Set(plan.modelsFromProgram ?? []);
-  for (const role of plan.modelsRepeated ?? []) {
-    if (inherited.has(role)) continue;
-    out.push(modelFinding(plan, role, `#+TT_MODELS names ${role} more than once`, `declare each role once: ${role}=<provider>:<model>`));
+  for (const key of plan.modelsRepeated ?? []) {
+    if (inherited.has(key)) continue;
+    out.push(modelFinding(plan, key, `#+TT_MODELS names ${key} more than once`, `declare each key once: ${key}=<provider>:<model>`));
   }
-  for (const [role, raw] of Object.entries(plan.models ?? {})) {
-    if (inherited.has(role)) continue;
-    if (!MODEL_ROLES.has(role)) {
-      out.push(modelFinding(plan, role, `#+TT_MODELS names the unknown role ${role}`, "use one of worker, reviewer, evaluator, panel"));
+  for (const decl of modelDeclarations(plan.models)) {
+    if (inherited.has(decl.key)) continue;
+    if (decl.kind === "role" && !MODEL_ROLES.has(decl.key)) {
+      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown role ${decl.key}`, "use one of worker, reviewer, evaluator, panel"));
       continue;
     }
-    const model = raw?.model;
+    if (decl.kind === "reviewer-seat" && !REVIEWER_SEATS.has(decl.seat!)) {
+      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown reviewer seat ${decl.key}`, "use reviewer.M, reviewer.A or reviewer.B"));
+      continue;
+    }
+    if (decl.kind === "panel-seat" && !PANEL_SEATS.has(decl.seat!)) {
+      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown panel seat ${decl.key}`, "use panel.1, panel.2 or panel.3"));
+      continue;
+    }
+    const model = decl.model?.model;
     if (typeof model !== "string" || model.length === 0) {
       out.push(
-        modelFinding(plan, `${role}=`, `#+TT_MODELS gives ${role} an empty model`, `write ${role}=<model>, or ${role}=<provider>:<model> when another provider is needed`),
+        modelFinding(plan, `${decl.key}=`, `#+TT_MODELS gives ${decl.key} an empty model`, `write ${decl.key}=<model>, or ${decl.key}=<provider>:<model> when another provider is needed`),
       );
+    }
+  }
+  // panel=reviewers and an explicit panel seat contradict each other: the
+  // seat's own model would silently lose to the reviewer's, so the owner
+  // cannot tell which ran.
+  if (plan.models?.panelFrom !== undefined) {
+    const value = plan.models.panelFrom;
+    if (value !== "reviewers") {
+      if (!inherited.has("panelFrom")) {
+        out.push(modelFinding(plan, `panel=${String(value)}`, `#+TT_MODELS sets panel to the unknown value ${String(value)}`, "write panel=reviewers to follow the reviewer seats, or panel=<model> for one model"));
+      }
+    } else {
+      const seats = modelDeclarations(plan.models).filter((d) => d.kind === "panel-seat");
+      const allInherited = inherited.has("panelFrom") && seats.length > 0 && seats.every((d) => inherited.has(d.key));
+      if (seats.length > 0 && !allInherited) {
+        out.push(
+          modelFinding(
+            plan,
+            "panel=reviewers",
+            "#+TT_MODELS sets panel=reviewers together with an explicit panel seat",
+            "choose one: panel=reviewers for every seat, or panel.N=<model> for the seats you name",
+          ),
+        );
+      }
     }
   }
   return out;

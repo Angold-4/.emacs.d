@@ -288,3 +288,27 @@ test("schema: event accepts every known event type and rejects an unknown one", 
   const unknown = validate(eventSchema, { type: "SOMETHING_ELSE" });
   assert.equal(unknown.valid, false);
 });
+
+test("schema: plan accepts per-seat #+TT_MODELS (reviewerSeats, panelSeats, panelFrom)", () => {
+  const data = {
+    ...(fixture("plan") as Record<string, unknown>),
+    models: {
+      worker: { model: "deepseek/deepseek-v4.1-flash" },
+      reviewerSeats: { M: { provider: "vercel-ai-gateway", model: "anthropic/claude-opus-5.5" }, B: { model: "spacexai/grok-4.6" } },
+      evaluator: { model: "anthropic/claude-opus-5.5" },
+      panelSeats: { "1": { model: "anthropic/claude-opus-5.5" } },
+      panelFrom: "reviewers",
+    },
+    modelsLine: 4,
+  };
+  const result = validate(schema("plan"), data);
+  assert.equal(result.valid, true, result.errors.join("; "));
+});
+
+test("schema: plan rejects an unknown panelFrom value and an unknown seat", () => {
+  const base = fixture("plan") as Record<string, unknown>;
+  const badPanelFrom = { ...base, models: { panelFrom: "reviewer" } };
+  assert.equal(validate(schema("plan"), badPanelFrom).valid, false);
+  const badSeat = { ...base, models: { reviewerSeats: { C: { model: "x" } } } };
+  assert.equal(validate(schema("plan"), badSeat).valid, false);
+});
