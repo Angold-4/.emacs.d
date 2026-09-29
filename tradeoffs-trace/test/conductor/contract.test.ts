@@ -43,6 +43,20 @@ function ttAsync(args: string[]): Promise<{ status: number; stdout: string; stde
   });
 }
 
+/** A file a repair attempt's fake-pi worker waits on. A test releases it
+ * exactly when the owner's verdict has been recorded, instead of guessing a
+ * sleep the full suite's own load can outlast (the same class of race that
+ * flaked this test on the gate). */
+function releaseGate(): { dir: string; release: () => void; waitCommand: string } {
+  const dir = mkdtempSync("/tmp/tt-release-");
+  const file = `${dir}/go`;
+  return {
+    dir,
+    release: () => writeFileSync(file, "go"),
+    waitCommand: `i=0; while [ $i -lt 1200 ]; do if [ -f '${file}' ]; then exit 0; fi; i=$((i+1)); sleep 0.1; done; exit 1`,
+  };
+}
+
 const DECISIONS = [
   {
     choice: "Use a simple loop rather than a library helper",
@@ -319,6 +333,7 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
   // ledger-reaching-prompts criterion has a conductor-level proof.
   const promptDir = mkdtempSync("/tmp/tt-carried-prompts-");
   const workerPromptLog = `${promptDir}/worker.log`;
+  const gate = releaseGate();
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
@@ -326,12 +341,10 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
       hello: defaultWorkerHello(),
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\n' > attempt.txt` },
-        // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
-        // the published message is applied before the next freeze carries it.
-        // The inbox poll is 100 ms here and the graces are short, so 2 s is
-        // ample; the old 4 s guess was below this machine's pipeline cost
-        // under the full suite's own load (the wait then timed out).
-        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 2000 }]),
+        // Hold the repair attempt until the test releases it, so the owner's
+        // verdict on the published message is recorded before the next freeze
+        // carries it — never a guessed sleep the loaded suite can outlast.
+        ...(attempt === 1 ? [] : [{ kind: "call-sh", command: gate.waitCommand }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : {
@@ -413,6 +426,7 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
       20,
       setup.runDir,
     );
+    gate.release();
 
     await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 150_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.phase, "DONE");
@@ -459,12 +473,14 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
     rmSync(promptDir, { recursive: true, force: true });
+    rmSync(gate.dir, { recursive: true, force: true });
   }
 });
 
 test("a withdrawn decision supersedes its message and keeps the settlement marked", async () => {
   let priorId = "";
   const deadlines = { abortGraceMs: 100, termGraceMs: 100, helloTimeoutMs: 5_000, reviewMs: 30_000, inboxPollMs: 100 };
+  const gate = releaseGate();
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
@@ -472,12 +488,8 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
       hello: defaultWorkerHello(),
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\\n' > attempt.txt` },
-        // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
-        // the published message is applied before the next freeze
-        // carries/supersedes it. The inbox poll is 100 ms here and the graces
-        // are short, so 2 s is ample; the old 4 s guess was below this
-        // machine's pipeline cost under the full suite's own load.
-        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 2000 }]),
+        // Hold the repair attempt until the owner's verdict has been recorded.
+        ...(attempt === 1 ? [] : [{ kind: "call-sh", command: gate.waitCommand }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [], priorDecisions: [{ id: priorId, status: "withdrawn" }] } },
@@ -534,6 +546,7 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
       20,
       setup.runDir,
     );
+    gate.release();
 
     await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 150_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.phase, "DONE");
@@ -558,6 +571,7 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+    rmSync(gate.dir, { recursive: true, force: true });
   }
 });
 
@@ -728,10 +742,10 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(reviewAfter, /^\* Findings$/m);
     assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
     assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
-    // Wait until the status reflects the published finding: the review outcome
-    // alone changes the file, and asserting the merged behaviour on that
-    // intermediate write is a race. The finding is an open advisory, so the
-    // plan 01h trade-offs panel carries its record line.
+    // Plan 04c join: wait until the status reflects the published finding —
+    // the review outcome alone changes the file, and asserting the joined
+    // behaviour on that intermediate write is a race. The finding is an open
+    // advisory, so the plan 01h trade-offs panel now carries its record line.
     await waitFor(() => {
       const s = readFileSync(p.status, "utf8");
       return s !== statusBefore && /\t:RECORD:F-/.test(s);
@@ -741,6 +755,10 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     const statusAfter = readFileSync(p.status, "utf8");
     assert.match(statusAfter, /^Trade-offs \(\d+\)$/m);
     assert.match(statusAfter, /\t:RECORD:[A-Za-z][-A-Za-z0-9]*/);
+    // Plan 04c: the same beat writes the balance metrics line.
+    assert.match(statusAfter, /^metrics   /m);
+    assert.ok(existsSync(p.metrics), "the balance metrics projection is written");
+    assert.match(readFileSync(p.metrics, "utf8"), /"reviewShare"/);
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

@@ -110,21 +110,25 @@ It runs where `+tt-root' lives (`process-file' with that directory as
 `default-directory'), so a remote root drives the server's runner."
   (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir)))
          (default-directory (file-name-as-directory +tt-root))
-         (err-buf (generate-new-buffer " *tt-stderr*")))
+         ;; `process-file' takes stderr only as a (local) file name, never a
+         ;; buffer: a buffer there signals `wrong-type-argument' on every call.
+         (err-file (make-temp-file "tt-stderr-")))
     (unwind-protect
         (with-temp-buffer
           ;; Capture stdout and stderr separately: on failure both are
           ;; reported (A-13: a stale verdict's reason is on stderr).
-          (let* ((status (apply #'process-file +tt-node nil (list t err-buf) nil (+tt--local-arg cli)
+          (let* ((status (apply #'process-file +tt-node nil (list t err-file) nil (+tt--local-arg cli)
                                 (append (mapcar #'+tt--local-arg args)
                                         (list "--root" (directory-file-name (+tt--local-arg +tt-root))))))
                  (out (string-trim (buffer-string)))
-                 (err (with-current-buffer err-buf (string-trim (buffer-string)))))
+                 (err (with-temp-buffer
+                        (insert-file-contents err-file)
+                        (string-trim (buffer-string)))))
             (unless (eq status 0)
               (error "tt %s failed: %s" (string-join args " ")
                      (string-trim (concat out (if (string-empty-p err) "" (concat "\n" err))))))
             out))
-      (kill-buffer err-buf))))
+      (delete-file err-file))))
 
 (defun +tt--state (run-dir)
   "Return the parsed `tt state' of RUN-DIR as nested alists."

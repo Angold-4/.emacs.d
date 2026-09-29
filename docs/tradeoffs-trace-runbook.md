@@ -437,7 +437,7 @@ past run cannot display one either.
 
 | Where | What you see |
 |---|---|
-| status buffer | pipeline with stage times and time left; `time`: where the active agent's time goes (model, polling, full tests) and its running tool; gates for the current candidate; `amended`: every passed or reverted criterion amendment with old → new; each reviewer's **outcome** (`M ✗ 2 reject · 1 blocking`); `verdict`: why the phase did or did not accept, and what happens next; directly under the verdict, the **Trade-offs** panel and the **cost** row |
+| status buffer | pipeline with stage times and time left; `time`: where the active agent's time goes (model, polling, full tests) and its running tool; gates for the current candidate; `amended`: every passed or reverted criterion amendment with old → new; each reviewer's **outcome** (`M ✗ 2 reject · 1 blocking`); the **`metrics`** line (review share, rounds, raw/published per type, merge/drop rates, A/D, owner wait, blockers, unexposed proxy); `verdict`: why the phase did or did not accept, and what happens next; directly under the verdict, the **Trade-offs** panel and the **cost** row |
 | Trade-offs panel (in the status buffer) | the few trade-offs that matter while the run is live, most important first, at most 6 lines: an owner directive some agent has not received yet; a disputed or amended criterion (old → new); a flagged (reserved) decision and its tally; a decision M vetoed this round, with M's one-line reason; a decision that passed with dissent; and **one** line counting the advisories (`3 advisories (2 new) — C-c m d`) instead of listing them. Each line is self-contained, and `RET` on it opens the decision view at that record. |
 | cost row | what the run has cost so far: rounds, total minutes and per-stage minutes, owner-wait minutes, and a plain estimate for one more round from this phase's own completed rounds (`4 rounds · 106m total · implement 34m · checks 8m · review 30m · owner wait 34m · next round ≈ 14 min`). Per node, `tt program status` and the program buffer show the same in one line: rounds, minutes, owner wait and the node's top trade-off. |
 | trace buffer | one line per tool call (time, command, ✓/✗ exit, duration, last output line), plus `path +a −r` for each file the call changed; the running call in the header. `a` pins another agent. |
@@ -707,6 +707,111 @@ tradeoffs-trace message chart — generated from MESSAGE_TRANSITIONS (src/core/m
 ```
 <!-- END message-chart -->
 
+## The three message types
+
+A run's review is one list of **structured messages**, not prose. Each message
+is one of three types, and each is raised in a different place:
+
+| Type | Ids | Raised by | Meaning |
+|---|---|---|---|
+| **Trade-off** | `T-n` | mainly the worker (`submit_phase` decisions and `raise_tradeoff`), plus a reviewer's turn-1 discovery | what was chosen, what was given up, and why it matters for the goal |
+| **Finding** | `F-n` | reviewers (turn-2 `findings`), and the conductor (integration/gate failures, and an owner refusal) | a fact about the implementation, `blocking` or `advisory` |
+| **Blocker** | `B-n` | a reviewer's separate `blockers` list | a finding that says the work should stop until the owner decides; it is also a blocking finding |
+
+A message is **raised** `raw`, then the EVALUATING stage's fresh evaluator
+publishes it (`published`), merges it into another message (`merged`) or
+drops it (`dropped`). The section above is the full lifecycle; `reduce()`
+rejects any other move.
+
+## The review buffer and its keys
+
+`C-c m d` opens `views/review.org`. It has three top-level sections, in order
+**Blockers, Trade-offs, Findings**. Each message is one heading carrying its
+title, summary, context and a property drawer: its id, type, state,
+`raisedBy`, `importance`, the owner's verdict (if any), and the binding a
+verdict needs (`messageVersion`, `candidateSha`, `contractVersion`, `runId`,
+`phaseId`). Low-importance messages fold under `Minor (N)`.
+
+| Key | In the review buffer | What it does |
+|---|---|---|
+| `TAB` | on a message heading | folds the description and context in place |
+| `RET` | on a message heading | opens the message's own `views/messages/<id>.org`: its evidence (path and lines), the plan excerpt it concerns, every version's history, its ledger entry and its votes |
+| `A` | normal state | accepts the message: writes a `verdict` command with `verdict: "accept"` |
+| `D` | normal state | refuses it: asks for a one-line reason, then writes `verdict: "refuse"` with that reason |
+
+`A`/`D` are accepted and refused in the buffer; `A` and `D` override Evil's
+append and delete-to-end-of-line, which is safe in a read-only view. On a
+**live** run the command goes through `<run>/inbox/` and the conductor
+validates its binding; on a run whose conductor has exited it is a **late
+verdict**, dry-run through `reduce()` and appended to `events.jsonl` only if
+it still binds. A verdict naming a superseded candidate, contract or message
+version is refused with the reason, never applied.
+
+- **`D` before DONE** refuses the message and appends an owner-authored
+  **blocking** finding bound to the current candidate. Acceptance cannot hold
+  while it is open, so the run returns to repair (or parks on the owner when
+  the rounds run out). The message is `refused`; the evaluator reports on the
+  next candidate whether the owner's reason was addressed (`addressed: true`
+  resolves the message, `false` is recorded).
+- **`D` after DONE** is a **follow-up**: the message is marked `followUp`, no
+  phase state changes, and `tt summary` lists it under `### Follow-ups`.
+
+## The settled ledger
+
+`ledger.jsonl` is a projection, one line per message that reached a terminal
+state (`accepted`, `refused`, `merged`, `dropped`, `resolved`), with who
+settled it (`owner`, `evaluator`, `panel`, `vote`), the reason and the
+bindings it was settled under. It is derived from `events.jsonl`, never a
+source of truth, and it is what fresh agents receive as settled facts so they
+do not re-litigate a closed point. At every freeze one `MESSAGE_CARRIED` per
+live message moves the settlement: it carries exactly when the reviewable
+`contentHash` and the contract version are unchanged; otherwise the entry is
+**kept** with its old bindings and marked `invalidated` (`content changed` or
+`contract amended`) and the message needs a new verdict. An invalidated
+settlement is never rebound by a later carry.
+
+## The blocker panel
+
+A reviewer's `blockers` list is not sent straight to the owner. Each raw
+blocker is voted by a **panel of three fresh agents**, in parallel with the
+type's evaluator, while the phase stays `EVALUATING` until all of them settle.
+
+- **2 of 3 `block`** escalates: the phase parks in `AWAITING_OWNER` with the
+  panel's own two or three options. No repair round is spent; the owner's
+  choice resolves both the blocker message and its blocking finding.
+- **2 of 3 `downgrade`** turns it into a blocking finding for the next repair
+  round; the phase is never parked.
+- **no majority** (a split, or two seats unavailable after their one retry)
+  is `incomplete`: neither escalated nor parked, and the blocking finding
+  stays effective, so the candidate goes to repair.
+
+The `views/loop.txt` chart draws the `EVALUATING` state, and
+`views/metrics.json` counts how many blockers escalated, downgraded or came
+back incomplete.
+
+## Balance metrics
+
+The pipeline must expose enough for the owner to review, and not so much that
+reviewing is the new bottleneck. Every run measures its own balance in
+`views/metrics.json` (a projection compared by `tt contract check`), in one
+`metrics` line in `views/status.txt`, and in the `### Balance metrics`
+section of `tt summary`:
+
+| Number | Meaning |
+|---|---|
+| review share of wall time | time in `REVIEWING` + `EVALUATING` over the phase's wall time |
+| rounds | candidates frozen (review rounds) so far |
+| raw vs published per type | for trade-offs, findings and blockers: how many are still `raw` and how many reached `published` |
+| merge rate / drop rate | `merged / raised` and `dropped / raised` across all types — how much the evaluators deduplicate and discard |
+| owner A/D counts and D rate | how often the owner accepted vs refused, and `D / (A + D)` |
+| owner wait | time spent in `AWAITING_OWNER`, the owner's desk |
+| blockers escalated vs downgraded | the panel's verdicts (`incomplete` too) |
+| unexposed-decision proxy | trade-offs a reviewer raised that the worker did not raise itself (`reviewer-discovered` records) |
+
+There is no wall clock in the projection: every duration ends at the last
+event timestamp in `events.jsonl`, so a rebuild from scratch produces the same
+bytes. `tt contract check <run>` verifies that.
+
 ## Where things are
 
 ```text
@@ -722,6 +827,10 @@ tradeoffs-trace message chart — generated from MESSAGE_TRANSITIONS (src/core/m
   ~/.tradeoffs-trace/gate.lock      the machine-wide gate lock (two phases
                                     never run their gate command at once)
   <run>/views/loop.txt              the phase state machine as a chart (from TRANSITIONS)
+  <run>/views/metrics.json          the balance metrics (tt summary renders the same numbers)
+  <run>/messages.jsonl, ledger.jsonl  the message and settled-ledger projections
+  <run>/views/review.org            the review buffer: Blockers, Trade-offs, Findings
+  <run>/views/messages/<id>.org     one message's evidence, history, ledger entry and votes
   <run>/inbox/{,applied/,rejected/} owner input and commands, with rejection reasons
   programs/<id>/program.json        the program as started, with every node's readable id
   programs/<id>/views/program.txt   the program dependency graph as a chart

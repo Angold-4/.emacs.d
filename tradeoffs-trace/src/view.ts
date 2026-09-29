@@ -7,13 +7,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { DEFAULT_DEADLINES, rebuildTimeline, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
+import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { effectiveChecks } from "./core/checks.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
+import { computeMetrics, metricsLine, metricsSummary, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -365,6 +366,11 @@ export interface RunView {
   /** Minutes since the active agent last produced an event (agent stages only). */
   idleMinutes?: number;
   attention?: string;
+  /** Plan 04c: the balance metrics (review share, rounds, raw/published per
+   * type, merge/drop rates, A/D, owner wait, blockers, unexposed proxy) and
+   * the one status line that renders them. */
+  metrics: PhaseMetrics;
+  metricsLine: string;
 }
 
 /** Plan 01h: what the run costs so far. `stageMinutes` excludes `needs you`,
@@ -448,7 +454,9 @@ export function runCost(timeline: Timeline, spans: StageSpan[], now: Date): RunC
 }
 
 export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now = new Date()): RunView & { timeline: Timeline } {
-  const timeline = rebuildTimeline(runDir, plan);
+  // One read of the control log gives both the timeline and the events the
+  // balance metrics need, so nothing here parses the log twice.
+  const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
   const spans = stageSpans(timeline, now, alive ? undefined : lastEventAt(runDir));
   const current = spans[spans.length - 1];
@@ -555,8 +563,13 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   // this phase's own records (verdict.ts's tradeoffEntries and runCost).
   const tradeoffs = tradeoffEntries(phase);
   const cost = runCost(timeline, spans, now);
+  // Plan 04c: the balance metrics are a deterministic projection of the same
+  // timeline; the status view and `tt summary` render the one line / section.
+  const metrics = computeMetrics(phase, timeline, events);
   return {
     timeline,
+    metrics,
+    metricsLine: metricsLine(metrics),
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
@@ -734,6 +747,8 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- Reviews on the accepted candidate ${C ? C.slice(0, 9) : "?"}: ${v.reviewLine}`,
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
+    "",
+    ...metricsSummary(v.metrics),
   ];
   // Plan 01c: the owner's own checklist (from the plan's `Owner checklist:`
   // list). It is not a worker/reviewer acceptance criterion, so it is not

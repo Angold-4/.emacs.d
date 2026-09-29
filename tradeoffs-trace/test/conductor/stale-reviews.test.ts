@@ -104,10 +104,17 @@ test("stale reviews: a reviewer calling submit_review twice at once never crashe
     assert.equal(setup.conductor.state.phase.phase, "DONE");
     assert.ok(!records.some((r) => r.kind === "rejected"), "no event was ever rejected by reduce()");
     const submitted = records.filter((r) => r.kind === "event" && (r.event as { type: string }).type === "REVIEW_SUBMITTED");
-    assert.equal(submitted.length, 3, "one review per reviewer");
-    assert.ok(!records.some((r) => r.kind === "event" && (r.event as { type: string }).type === "REVIEW_TIMED_OUT"), "B's first submission counts");
-    const b = submitted.find((r) => (r.event as { review: { reviewer: string } }).review.reviewer === "B")!;
-    assert.equal((b.event as { review: { findings: unknown[] } }).review.findings.length, 1, "the first (slow) submission is the one recorded");
+    // Exactly one review per reviewer. WHICH of B's two submissions is
+    // recorded, and whether B's first dispatch is re-dispatched, depends on
+    // scheduling under load (program 03's 04c checks saw both orders on a
+    // busy machine), so the test asserts only what it exists for: the
+    // conductor never crashes and never records B twice.
+    const byReviewer = new Map<string, number>();
+    for (const r of submitted) {
+      const who = (r.event as { review: { reviewer: string } }).review.reviewer;
+      byReviewer.set(who, (byReviewer.get(who) ?? 0) + 1);
+    }
+    assert.deepEqual([...byReviewer.entries()].sort(), [["A", 1], ["B", 1], ["M", 1]], "one review per reviewer");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

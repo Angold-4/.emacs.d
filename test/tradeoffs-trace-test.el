@@ -1373,8 +1373,10 @@ binding, so a trade-off line still opens the decision view."
           (cl-letf (((symbol-function 'process-file)
                      (lambda (_program _in destination _display &rest _args)
                        (insert "queued verdict v-1")
+                       ;; Like the real `process-file': stderr goes to a file name.
                        (when (consp destination)
-                         (with-current-buffer (cadr destination) (insert "verdict rejected: message T-1 changed v1 → v2")))
+                         (should (stringp (cadr destination)))
+                         (with-temp-file (cadr destination) (insert "verdict rejected: message T-1 changed v1 → v2")))
                        1)))
             (let ((err (condition-case e (+tt--cli "verdict" "/tmp/run" "T-1" "accept") (error e))))
               (should err)
@@ -1626,3 +1628,28 @@ leaves the owner's window layout alone (finding M-21)."
             (should (string-match-p "prog0001" header-line-format))
             (should (string-match-p "14_program\\.org" header-line-format))))
       (kill-buffer buf))))
+
+(ert-deftest tt-cli-runs-a-real-process ()
+  "`+tt--cli' itself, not stubbed: stdout is returned, and a failure reports
+stdout and stderr.  A buffer as `process-file''s stderr destination broke
+every call (`wrong-type-argument stringp'), and every other test stubs it."
+  (let* ((root (make-temp-file "tt-root-" t))
+         (runner (expand-file-name "runner" root))
+         (node (expand-file-name "fake-node" root))
+         (+tt-root (file-name-as-directory root))
+         (+tt-runner runner)
+         (+tt-node node))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "src" runner) t)
+          (write-region "" nil (expand-file-name "src/cli.ts" runner))
+          ;; A stand-in for node: `ok' succeeds, anything else fails loudly.
+          (write-region "#!/bin/sh\nif [ \"$2\" = ok ]; then echo out; exit 0; fi\necho partial; echo boom >&2; exit 1\n"
+                        nil node)
+          (set-file-modes node #o755)
+          (should (equal (+tt--cli "ok") "out"))
+          (let ((err (should-error (+tt--cli "bad"))))
+            (should (string-match-p "tt bad failed" (cadr err)))
+            (should (string-match-p "partial" (cadr err)))
+            (should (string-match-p "boom" (cadr err)))))
+      (delete-directory root t))))
