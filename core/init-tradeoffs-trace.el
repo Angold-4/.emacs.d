@@ -2259,41 +2259,59 @@ sends the identical resolve command choosing it on the request sends."
   (let ((v (org-entry-get nil key)))
     (if (and v (not (string-empty-p v))) v fallback)))
 
+(defun +tt-review--brief-choices ()
+  "The brief's option lines as an alist of (plain label . option id).
+RET completes on the labels, so the engineer option ids never come back into
+the owner's face (finding B-35)."
+  (let (choices)
+    (save-excursion
+      (org-back-to-heading t)
+      (let ((end (save-excursion (org-end-of-subtree t) (point))))
+        (while (re-search-forward "^[ \t]*- \\(.*?\\) \\[\\([A-Za-z0-9_-]+\\)\\][ \t]*$" end t)
+          (push (cons (match-string 1) (match-string 2)) choices))))
+    (nreverse choices)))
+
 (defun +tt-review--brief-resolve (option)
   "Write the command for the brief at point with OPTION.
-The brief's `:COMMAND:' says whether OPTION is a `resolve' (an owner request)
-or an `override' (a flagged reserved decision); either way the same encoding
-the request/decision itself uses is written. An `accept_risk' option also
-prompts for the non-empty scope note the request requires."
+The brief's `:COMMAND:' says whether OPTION is a `resolve' (an owner request),
+an `override' (a flagged reserved decision) or an entry verdict (a live review
+entry); either way the same encoding the item itself uses is written. An
+`accept_risk' option also prompts for the non-empty scope note the request
+requires."
   (let ((binding (+tt-review--brief-binding))
         (command (or (org-entry-get nil "COMMAND") "resolve")))
-    (unless binding
-      (user-error "This brief has no full binding; refresh the review (g) and try again"))
     (cond
-     ((equal command "override")
-      (+tt--write-command
-       +tt--run-dir
-       (list (cons 'type "override")
-             (cons 'vote (if (equal option "approve") "approve" "reject"))
-             (cons 'binding binding))))
+     ((equal command "entry")
+      (message "%s" (+tt--cli "entry" +tt--run-dir (if (equal option "accept") "accept" "refuse") (+tt-review--message-id))))
      (t
-      (let ((note (when (equal option "accept_risk")
-                    (let ((n (read-string "Scope note for accepting the risk: ")))
-                      (when (string-empty-p n)
-                        (user-error "accepting the risk needs a non-empty scope note"))
-                      n))))
+      (unless binding
+        (user-error "This brief has no full binding; refresh the review (g) and try again"))
+      (cond
+       ((equal command "override")
         (+tt--write-command
          +tt--run-dir
-         (append (list (cons 'type "resolve") (cons 'option option))
-                 (when note (list (cons 'note note)))
-                 (list (cons 'binding binding)))))))))
+         (list (cons 'type "override")
+               (cons 'vote (if (equal option "approve") "approve" "reject"))
+               (cons 'binding binding))))
+       (t
+        (let ((note (when (equal option "accept_risk")
+                      (let ((n (read-string "Scope note for accepting the risk: ")))
+                        (when (string-empty-p n)
+                          (user-error "accepting the risk needs a non-empty scope note"))
+                        n))))
+          (+tt--write-command
+           +tt--run-dir
+           (append (list (cons 'type "resolve") (cons 'option option))
+                   (when note (list (cons 'note note)))
+                   (list (cons 'binding binding)))))))))))
 
 (defun +tt-review--brief-choose ()
-  "Prompt for one of the brief's options and send it (RET on a brief)."
-  (let ((opts (+tt-review--brief-options)))
-    (unless opts (user-error "This brief carries no options"))
-    (let ((choice (completing-read "Resolve with: " opts nil t)))
-      (message "%s" (+tt-review--brief-resolve choice)))))
+  "Prompt for one of the brief's options (by plain label) and send it."
+  (let ((choices (+tt-review--brief-choices)))
+    (unless choices (user-error "This brief carries no options"))
+    (let* ((choice (completing-read "Resolve with: " choices nil t))
+           (id (or (cdr (assoc choice choices)) choice)))
+      (message "%s" (+tt-review--brief-resolve id)))))
 
 (defun +tt-review--binding-at-point ()
   "The six binding property values at point, or nil when any is missing.

@@ -14,8 +14,10 @@ import { test } from "node:test";
 import {
   briefIssue,
   checkTodayExample,
+  enrichBriefRelated,
   fallbackBrief,
   fallbackDecisionBrief,
+  fallbackEntryBrief,
   hasCodeIdentifier,
   impactAnswersPublishing,
   parseCatalogs,
@@ -164,6 +166,48 @@ test("a reserved decision's override brief sends an override, not a resolve", ()
   assert.equal((briefCommandFor(brief, "approve", binding) as { vote: string }).vote, "approve");
   // The override brief passes the same gate with its own option ids.
   assert.equal(briefIssue(brief, { requestOptions: ["approve", "reject_and_repair"] }), undefined);
+});
+
+test("a weekday reopen claim is checked against the calendar's weekly schedule", () => {
+  const good = fixture().briefs[0];
+  // 09:30 is a real us_equity session boundary, so only the weekday check can
+  // reject the exact wrong example the goal cites (finding M-10).
+  const monday = { ...good, today: "Pyth's NVDA product reopens Monday 09:30 ET." };
+  const issue = briefIssue(monday, { catalogs: catalogs() });
+  assert.ok(issue, "a Monday reopen must be refused when the calendar reopens Sunday");
+  assert.match(issue!, /weekly reopen|cannot be checked/);
+  const sunday = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET." };
+  assert.equal(briefIssue(sunday, { catalogs: catalogs() }), undefined);
+  // A close is not a reopen: Friday 17:00 must not be read as one.
+  const closes = { ...good, today: "Kaiko's XAUUSD product closes Friday 17:00 ET." };
+  assert.equal(briefIssue(closes, { catalogs: catalogs() }), undefined);
+});
+
+test("the backstop omits a recommendation and does not recommend the risky first option", () => {
+  const f = fixture();
+  const request = f.requests.find((r) => r.id === "F-M-9")!;
+  const brief = fallbackBrief(request, { catalogs: null });
+  assert.equal(brief.recommendation, undefined);
+  assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id) }), undefined);
+  // The model briefs still carry one.
+  assert.ok(f.briefs[0].recommendation);
+});
+
+test("a live entry's brief sends an entry verdict, and the conductor merges related", () => {
+  const f = fixture();
+  const entry = { id: "E-1", title: "widen the re-entry band", messages: [{ id: "T-9", title: "widen the band" }] };
+  const brief = fallbackEntryBrief(entry, { allItems: f.openItems, files: ["src/core/blend.rs"], planRefs: ["IC §5"] });
+  assert.equal(brief.command, "entry");
+  assert.deepEqual(brief.options.map((o) => o.id), ["accept", "refuse"]);
+  assert.equal(brief.recommendation, undefined);
+  assert.equal(briefIssue(brief, { requestOptions: ["accept", "refuse"] }), undefined);
+  assert.ok(brief.related.some((r) => r.id === "T-54"));
+
+  const request = f.requests.find((r) => r.id === "F-M-9")!;
+  const concerns = f.openItems.map((c) => ({ ...c }));
+  const model = { ...f.briefs[0], related: [{ id: "T-54", question: "held" }] };
+  const merged = enrichBriefRelated(model, [...concerns, { id: request.id, question: request.reason, files: ["src/core/blend.rs"], planRefs: ["IC §5"] }]);
+  assert.ok(merged.related.some((r) => r.id === "D-A-80"), "the conductor's same-file item is merged in");
 });
 
 test("a today that names a market and time cannot excuse itself with the unverified marker", () => {

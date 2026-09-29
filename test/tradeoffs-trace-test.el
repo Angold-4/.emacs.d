@@ -1645,15 +1645,19 @@ RET chooses an option and sends the same encoding."
                 (should (equal (alist-get 'candidateSha binding) "C1"))
                 (should (equal (alist-get 'recordVersion binding) 1))
                 (should (equal (alist-get 'contractVersion binding) '((snapshot . 4) (sectionSha256 . "aaaa")))))
-              ;; RET prompts for an option and sends the same encoding.
+              ;; RET prompts on the PLAIN label and sends the matching id
+              ;; (finding B-35: no engineer id in the owner's prompt).
               (setq written nil)
-              (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "repair")))
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (_prompt collection &rest _) (caar collection))))
                 (goto-char (point-min))
                 (search-forward "Should a vendor excluded")
                 (goto-char (match-beginning 0))
                 (+tt-review-open-message)
-                (should (equal (alist-get 'option (nth 1 written)) "repair"))
-                (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "F-M-9")))))
+                (should (equal (alist-get 'option (nth 1 written)) "accept_risk"))
+                (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "F-M-9"))
+                ;; The collection offered is labels, not ids.
+                (should-not (seq-some (lambda (c) (string-match-p "accept_risk" (car c))) (+tt-review--brief-choices))))))
           (kill-buffer buf))
       (delete-directory dir t))))
 
@@ -1705,6 +1709,55 @@ RET chooses an option and sends the same encoding."
                 (should (equal (alist-get 'vote (nth 1 written)) "approve"))
                 (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "D-A-80"))
                 (should (equal (alist-get 'recordVersion (alist-get 'binding (nth 1 written))) 2))))
+            (kill-buffer buf)))
+      (delete-directory dir t))))
+
+(defconst +tt-test--brief-entry-org
+  (concat "#+TITLE: tradeoffs-trace review\n"
+          "#+CONTRACT_VERSION: v1\n"
+          "\n"
+          "* Needs you (1)\n"
+          "** Should this stand? a held market makes no offer\n"
+          "   :PROPERTIES:\n"
+          "   :ID: E-1\n"
+          "   :KIND: brief\n"
+          "   :COMMAND: entry\n"
+          "   :OPTIONS: accept,refuse\n"
+          "   :ACCEPT_OPTION: accept\n"
+          "   :REFUSE_OPTION: refuse\n"
+          "   :END:\n"
+          "   Impact: Whether any market stops publishing is not established.\n"
+          "   Options:\n"
+          "   - Accept it — the entry is settled [accept]\n"
+          "   - Refuse it — your reason reaches the worker [refuse]\n")
+  "A fixture review with one live-entry brief.")
+
+(ert-deftest tradeoffs-trace-brief-entry-settles-via-the-entry-command ()
+  "Decision briefs: a live entry's brief A/D call the entry accept/refuse
+command the review view already uses."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (calls nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--brief-entry-org))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "entry accept applied")))
+                (goto-char (point-min))
+                (search-forward "Should this stand")
+                (goto-char (match-beginning 0))
+                (+tt-review-accept)
+                (should (equal calls (list "entry" dir "accept" "E-1")))
+                (setq calls nil)
+                (goto-char (point-min))
+                (search-forward "Should this stand")
+                (goto-char (match-beginning 0))
+                (+tt-review-refuse)
+                (should (equal calls (list "entry" dir "refuse" "E-1")))))
             (kill-buffer buf)))
       (delete-directory dir t))))
 

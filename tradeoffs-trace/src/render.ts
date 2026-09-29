@@ -13,7 +13,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, OwnerRequest } from "./core/types.ts";
+import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest } from "./core/types.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
   projectEntries,
@@ -361,6 +361,7 @@ export interface EntryReviewPhase {
   briefs?: DecisionBrief[];
   ownerRequests?: OwnerRequest[];
   decisions?: Decision[];
+  overrides?: Override[];
   contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
   messages?: Message[];
   entries?: Entry[];
@@ -442,6 +443,7 @@ export function projectEntryReview(
         briefs: phase.briefs,
         ownerRequests: phase.ownerRequests,
         decisions: phase.decisions,
+        overrides: phase.overrides,
         resolveBinding:
           phase.contract?.contractVersion && phase.candidate?.sha && phase.runId && phase.phaseId
             ? {

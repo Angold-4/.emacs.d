@@ -92,6 +92,7 @@
       ],
       "recommendation": { "option": "repair", "why": "IC §5's re-entry rule asks for a settled first tick, not the first tick after a break" },
       "related": [
+        { "id": "D-A-80", "question": "Should the re-entry band be ten seconds wide?" },
         { "id": "T-54", "question": "Should every held market make no offer at all until a vendor returns?" }
       ],
       "evidence": [

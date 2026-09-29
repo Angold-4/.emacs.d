@@ -676,6 +676,7 @@ export function programReviewText(dir: string): string {
     messages?: unknown[];
     entries?: unknown[];
     decisions?: unknown[];
+    overrides?: unknown[];
     briefs?: unknown[];
     ownerRequests?: unknown[];
   }> = [];
@@ -707,6 +708,7 @@ export function programReviewText(dir: string): string {
         messages: phase.messages ?? [],
         entries: phase.entries ?? [],
         decisions: phase.decisions ?? [],
+        overrides: phase.overrides ?? [],
         runId: phase.runId,
         contract: phase.contract ? { contractVersion: phase.contract.contractVersion } : undefined,
         // Decision briefs: the program review shows each node's open owner

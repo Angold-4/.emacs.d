@@ -22,6 +22,7 @@
    - Hold it out for 10 s (recommended) — the vendor stays excluded until 10 s after the reopen, then rejoins Cost: 10 s with one vendor fewer at a reopen [repair]
    Recommendation: Hold it out for 10 s — IC §5's re-entry rule asks for a settled first tick, not the first tick after a break
    Related:
+   - D-A-80: Should the re-entry band be ten seconds wide?
    - T-54: Should every held market make no offer at all until a vendor returns?
    Evidence (original):
    - message: F-M-9 a vendor excluded before the weekend rejoins immediately at the first tick after a reopen

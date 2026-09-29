@@ -100,5 +100,5 @@ export const SUBMIT_ROUND_PANEL_VOTES_PARAMS: ParamShape = {
  * properties. */
 export const SUBMIT_BRIEF_PARAMS: ParamShape = {
   properties: ["requestId", "command", "question", "today", "impact", "options", "recommendation", "related", "evidence"],
-  required: ["requestId", "question", "today", "impact", "options", "recommendation", "related", "evidence"],
+  required: ["requestId", "question", "today", "impact", "options", "related", "evidence"],
 };

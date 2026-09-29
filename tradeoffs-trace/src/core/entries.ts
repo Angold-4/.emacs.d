@@ -35,7 +35,7 @@
 // entry carries a deterministic `≈ E-n` hint instead, and only the owner's `m`
 // merges them (as ENTRY_MERGED_BY_OWNER).
 
-import type { Decision, DecisionBrief, Message, MessageType, OwnerRequest } from "./types.ts";
+import type { Decision, DecisionBrief, Message, MessageType, Override, OwnerRequest } from "./types.ts";
 import { renderBriefOrg, renderBriefsSection } from "./briefs.ts";
 
 // ---------------------------------------------------------------------------
@@ -946,6 +946,9 @@ export interface EntryReviewOptions {
   /** Live decisions, so a reserved decision's brief is showable while the
    * decision is still on this candidate. */
   decisions?: readonly Decision[];
+  /** Owner overrides, so a reserved decision the owner already approved or
+   * rejected stops showing (finding M-11). */
+  overrides?: readonly Override[];
   /** The binding a resolve command from a brief needs. */
   resolveBinding?: { runId: string; phaseId: string; candidateSha: string; recordVersion: number; contractVersion: { snapshot: number; sectionSha256: string } };
   /** The program view: entries of every phase, tagged by phase. */
@@ -963,6 +966,7 @@ export interface EntryReviewOptions {
       messages?: readonly Message[];
       entries?: readonly Entry[];
       decisions?: readonly Decision[];
+      overrides?: readonly Override[];
       briefs?: readonly DecisionBrief[];
       ownerRequests?: readonly OwnerRequest[];
     }>;
@@ -1066,15 +1070,22 @@ function entryReviewLabel(opts: EntryReviewOptions): string {
 export function briefableIdsFor(
   requests: readonly OwnerRequest[] | undefined,
   decisions: readonly Decision[] | undefined,
+  overrides: readonly Override[] | undefined,
   candidateSha: string | undefined,
+  entryIds: Iterable<string> = [],
 ): Set<string> {
   const ids = new Set((requests ?? []).filter((r) => r.status === "open").map((r) => r.id));
   for (const d of decisions ?? []) {
     if (d.class !== "reserved" || d.amendment) continue;
     if (d.supersededBy || d.supersededByCorrection) continue;
     if (candidateSha && d.boundCandidateSha !== candidateSha) continue;
+    // An owner override settles the decision; it no longer needs the owner.
+    if ((overrides ?? []).some((o) => o.decisionId === d.id && (!candidateSha || o.boundCandidateSha === candidateSha))) continue;
     ids.add(d.id);
   }
+  // Every live entry is an item the owner settles with A/D, so it gets a
+  // brief (the plan's "entries marked for the owner").
+  for (const id of entryIds) ids.add(id);
   return ids;
 }
 
@@ -1087,7 +1098,8 @@ export function renderEntryReview(opts: EntryReviewOptions): string {
   // Decision briefs first: the owner reads the question and the choice before
   // any entry's evidence. Only items that are still open are shown; a recorded
   // brief whose request is settled is not resurrected (finding M-3).
-  const showable = opts.briefableIds ?? briefableIdsFor(opts.ownerRequests, opts.decisions, opts.newestCandidateSha);
+  const entryIds = projected.views.filter((v) => v.live).map((v) => v.entry.id);
+  const showable = opts.briefableIds ?? briefableIdsFor(opts.ownerRequests, opts.decisions, opts.overrides, opts.newestCandidateSha, entryIds);
   const briefs = (opts.briefs ?? []).filter((b) => showable.has(b.requestId));
   lines.push(
     ...renderBriefsSection(briefs, {
@@ -1135,7 +1147,8 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
   }> = [];
   for (const p of program.phases) {
     const tag = p.readableId ?? p.phaseId;
-    const showable = briefableIdsFor(p.ownerRequests, p.decisions, p.candidate?.sha ?? opts.newestCandidateSha);
+    const entryIds = perPhase.find((ph) => ph.phaseId === p.phaseId)?.projected.views.filter((v) => v.live).map((v) => v.entry.id) ?? [];
+    const showable = briefableIdsFor(p.ownerRequests, p.decisions, p.overrides, p.candidate?.sha ?? opts.newestCandidateSha, entryIds);
     const requests = p.ownerRequests ?? [];
     const binding =
       p.contract?.contractVersion && p.candidate?.sha && p.runId && p.phaseId

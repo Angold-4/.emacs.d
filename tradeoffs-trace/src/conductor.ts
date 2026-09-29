@@ -126,7 +126,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
-import { briefIssue, evidenceFile, fallbackBrief, fallbackDecisionBrief, parseCatalogs, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
+import { briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -3442,31 +3442,42 @@ export class Conductor {
     }
     if (msg.tool === "submit_brief") {
       // Decision briefs: the evaluator's model writes one owner-readable brief
-      // per open owner item after a round's evaluation. Validated whole via
+      // per owner item after a round's evaluation. Validated whole via
       // briefIssue (no code identifier in the question; a time, count or
       // duration cites the config/code it read; the option ids map one-to-one
-      // to the request's; the today example is checked against the plan's
-      // calendars). A record-only event, so a restart rebuilds the briefs the
-      // views render.
+      // to the item's own; the today example is checked against the plan's
+      // calendars, including its weekly reopen). A record-only event, so a
+      // restart rebuilds the briefs the views render.
       if (handle.role !== "evaluator") {
         return { ok: false, reason: `submit_brief is not accepted from role ${handle.role}` };
       }
       const brief = (msg.args ?? {}) as { requestId?: unknown };
       const requestId = typeof brief.requestId === "string" ? brief.requestId : "";
       const request = this.#state.phase.ownerRequests.find((r) => r.id === requestId && r.status === "open");
-      // A flagged reserved decision never becomes an owner request, so a brief
-      // for it is accepted here too (its options are its own owner commands).
+      // A flagged reserved decision never becomes an owner request, and a live
+      // review entry is settled directly, so a brief for either is accepted
+      // here too (each carries its own owner command).
       const decision = !request ? this.#liveReservedDecisions().find((d) => d.id === requestId) : undefined;
-      if (!request && !decision) return { ok: false, reason: `brief ${requestId || "(no requestId)"} does not name an open owner item` };
-      const requestOptions = request ? (request.options ?? []).map((o) => o.id) : ["approve", "reject_and_repair"];
+      const entry = !request && !decision ? this.#liveEntries().find((e) => e.id === requestId) : undefined;
+      if (!request && !decision && !entry) return { ok: false, reason: `brief ${requestId || "(no requestId)"} does not name an open owner item` };
+      const requestOptions = request
+        ? (request.options ?? []).map((o) => o.id)
+        : decision
+          ? ["approve", "reject_and_repair"]
+          : ["accept", "refuse"];
       const issue = briefIssue(brief as never, { requestOptions, catalogs: this.#briefCatalogs() });
       if (issue) return { ok: false, reason: `invalid brief for ${requestId}: ${issue}` };
-      this.#applyEvent({ type: "BRIEFS_RECORDED", briefs: [brief as never] });
-      this.#log.append("brief_recorded", { requestId, options: (brief as { options?: unknown }).options });
-      // The brief agent is done once every item it was asked for has a brief.
-      if (this.#briefInFlight.size > 0 && [...this.#briefInFlight].every((id) => (this.#state.phase.briefs ?? []).some((b) => b.requestId === id))) {
-        this.#agents.get(agentId)?.doneResolve();
-      }
+      const C = this.#state.phase.candidate?.sha;
+      // The conductor merges its own same-concern items into the model's
+      // `related` (finding A-29), and stamps the candidate so the next round
+      // rewrites the brief (finding M-30).
+      const enriched = { ...enrichBriefRelated(brief as DecisionBrief, this.#briefConcerns()), candidateSha: C };
+      this.#applyEvent({ type: "BRIEFS_RECORDED", briefs: [enriched] });
+      this.#log.append("brief_recorded", { requestId, options: (brief as { options?: unknown }).options, candidateSha: C });
+      // The brief agent is done once every item it was asked for has a brief
+      // for this candidate.
+      const has = (id: string) => (this.#state.phase.briefs ?? []).some((b) => b.requestId === id && b.candidateSha === C);
+      if (this.#briefInFlight.size > 0 && [...this.#briefInFlight].every(has)) this.#agents.get(agentId)?.doneResolve();
       return { ok: true };
     }
     if (msg.tool === "submit_round_panel_votes") {
@@ -7356,13 +7367,24 @@ export class Conductor {
   #refreshBriefs(): void {
     if (this.#closed || !this.#briefsEnabled) return;
     const phase = this.#state.phase;
-    if (phase.phase !== "AWAITING_OWNER" && phase.phase !== "BLOCKED") return;
-    const existing = new Set((phase.briefs ?? []).map((b) => b.requestId));
+    // After evaluation: a reserved decision or a review entry is settled
+    // while the phase is still RESOLVING/GATING, and an owner request appears
+    // only on entry to AWAITING_OWNER (finding F-8). All four states are the
+    // "after evaluation" window the plan asks for.
+    if (!["RESOLVING", "GATING", "AWAITING_OWNER", "BLOCKED"].includes(phase.phase)) return;
+    const C = phase.candidate?.sha;
+    // Per candidate, not per request id: the plan asks for one brief per
+    // round, so a new candidate's item is rewritten (finding M-30). A brief
+    // recorded for another candidate is stale.
+    const existing = new Set((phase.briefs ?? []).filter((b) => b.candidateSha === C).map((b) => b.requestId));
     const missing: string[] = [
       ...phase.ownerRequests.filter((r) => r.status === "open" && !existing.has(r.id)).map((r) => r.id),
       ...this.#liveReservedDecisions(phase)
         .filter((d) => !existing.has(d.id))
         .map((d) => d.id),
+      ...this.#liveEntries(phase)
+        .filter((e) => !existing.has(e.id))
+        .map((e) => e.id),
     ];
     if (missing.length === 0) return;
     if (missing.every((id) => this.#briefInFlight.has(id))) return;
@@ -7375,18 +7397,28 @@ export class Conductor {
 
   /** The live, flagged reserved decisions of the current candidate. A
    * reserved decision never becomes an owner request, so without a brief it
-   * reaches the owner as an engineer note. */
+   * reaches the owner as an engineer note. A decision the owner already
+   * overrode is settled and no longer needs one (finding M-11). */
   #liveReservedDecisions(phase = this.#state.phase): Decision[] {
     const C = phase.candidate?.sha;
-    return phase.decisions.filter(
-      (d) => d.class === "reserved" && !d.amendment && !d.supersededBy && !d.supersededByCorrection && isLiveDecision(d) && (!C || d.boundCandidateSha === C),
-    );
+    return phase.decisions.filter((d) => {
+      if (d.class !== "reserved" || d.amendment || d.supersededBy || d.supersededByCorrection) return false;
+      if (!isLiveDecision(d)) return false;
+      if (C && d.boundCandidateSha !== C) return false;
+      return !phase.overrides.some((o) => o.decisionId === d.id && (!C || o.boundCandidateSha === C));
+    });
+  }
+
+  /** The live review entries of the current candidate: the owner settles each
+   * with A/D, so each is an owner item the plan wants briefed. */
+  #liveEntries(phase = this.#state.phase): Array<{ id: string; title?: string; messages?: Array<{ id: string; title?: string; evidence?: string[] }> }> {
+    return (phase.entries ?? []).filter((e) => (e as { state?: string }).state === "open") as never;
   }
 
   /** One open item's concern (the files and plan clauses it touches), from its
    * linked finding and messages, so `related` can name a bigger silence on the
    * same concern. */
-  #concernFor(id: string, question: string, recordIds: string[]): OpenItemConcern {
+  #concernFor(id: string, question: string, recordIds: string[], messageIds: string[] = []): OpenItemConcern {
     const phase = this.#state.phase;
     const files = new Set<string>();
     const planRefs = new Set<string>();
@@ -7396,7 +7428,8 @@ export class Conductor {
       if (file) files.add(file);
     }
     for (const m of phase.messages ?? []) {
-      if (!m.sourceRecordId || !recordIds.includes(m.sourceRecordId)) continue;
+      const linked = messageIds.includes(m.id) || (m.sourceRecordId !== undefined && recordIds.includes(m.sourceRecordId));
+      if (!linked) continue;
       if (m.planRef) planRefs.add(m.planRef);
       if (m.anchor?.path) files.add(m.anchor.path);
       for (const ev of m.evidence ?? []) {
@@ -7417,29 +7450,41 @@ export class Conductor {
       out.push(this.#concernFor(r.id, r.reason, linked));
     }
     for (const d of this.#liveReservedDecisions(phase)) out.push(this.#concernFor(d.id, d.choice, [d.id]));
+    for (const e of this.#liveEntries(phase)) {
+      const messageIds = (e.messages ?? []).map((m) => m.id);
+      out.push(this.#concernFor(e.id, e.title ?? "", [], messageIds));
+    }
     return out;
   }
 
   /** The deterministic backstop brief for every item the evaluator's model did
    * not cover: an owner request gets a resolve brief, a reserved decision an
-   * override brief. It never asserts an unchecked impact and carries
-   * `related`. Idempotent (already-recorded items are skipped). */
+   * override brief, a live entry an entry brief. It never asserts an
+   * unchecked impact, omits a recommendation, and carries the conductor's own
+   * `related`. Idempotent for this candidate. */
   #recordFallbackBriefs(ids: readonly string[]): void {
     const phase = this.#state.phase;
-    const existing = new Set((phase.briefs ?? []).map((b) => b.requestId));
+    const C = phase.candidate?.sha;
+    const existing = new Set((phase.briefs ?? []).filter((b) => b.candidateSha === C).map((b) => b.requestId));
     const concerns = this.#briefConcerns();
     const catalogs = this.#briefCatalogs();
     const briefs: DecisionBrief[] = [];
     for (const id of ids) {
       if (existing.has(id)) continue;
       const concern = concerns.find((c) => c.id === id);
+      const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs };
       const request = phase.ownerRequests.find((r) => r.id === id);
       if (request) {
-        briefs.push(fallbackBrief(request, { catalogs, allItems: concerns, files: concern?.files, planRefs: concern?.planRefs }));
+        briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
         continue;
       }
       const decision = this.#liveReservedDecisions(phase).find((d) => d.id === id);
-      if (decision) briefs.push(fallbackDecisionBrief(decision, { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs }));
+      if (decision) {
+        briefs.push({ ...fallbackDecisionBrief(decision, opts), candidateSha: C });
+        continue;
+      }
+      const entry = this.#liveEntries(phase).find((e) => e.id === id);
+      if (entry) briefs.push({ ...fallbackEntryBrief(entry, opts), candidateSha: C });
     }
     if (briefs.length > 0) this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
   }
@@ -7585,6 +7630,7 @@ export class Conductor {
     for (const id of ids) {
       const request = phase.ownerRequests.find((r) => r.id === id);
       const decision = !request ? this.#liveReservedDecisions(phase).find((d) => d.id === id) : undefined;
+      const entry = !request && !decision ? this.#liveEntries(phase).find((e) => e.id === id) : undefined;
       const others = concerns.find((c) => c.id === id);
       if (request) {
         lines.push(`- ${id} (owner request, origin ${request.origin}): ${request.reason}`);
@@ -7593,6 +7639,9 @@ export class Conductor {
         lines.push(`- ${id} (flagged reserved decision, command override): ${decision.choice}`);
         lines.push(`    why it matters: ${decision.whyItMatters}`);
         lines.push("    its options: approve, reject_and_repair; set command to override");
+      } else if (entry) {
+        lines.push(`- ${id} (live review entry, command entry): ${entry.title ?? ""}`);
+        lines.push("    its options: accept, refuse; set command to entry");
       }
       lines.push(`    same-concern items: ${(others?.planRefs ?? []).join(", ")} ${(others?.files ?? []).join(", ")}`.trim());
     }

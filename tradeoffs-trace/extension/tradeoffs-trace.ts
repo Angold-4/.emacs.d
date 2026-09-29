@@ -369,15 +369,15 @@ const BriefRelatedParam = Type.Object({
 const submitBriefFields: Record<string, TSchema> = {
   requestId: Type.String({ description: "The open owner item this brief is for" }),
   command: Type.Optional(
-    StringEnum(["resolve", "override"] as const, {
-      description: "resolve (default) for an owner request, override for a flagged reserved decision",
+    StringEnum(["resolve", "override", "entry"] as const, {
+      description: "resolve (default) for an owner request, override for a flagged reserved decision, entry for a live review entry",
     }),
   ),
   question: Type.String({ description: "One plain line, no code identifiers" }),
   today: Type.String({ description: "What the system does now, with one concrete example naming a real market and time from the plan's calendars" }),
   impact: Type.String({ description: "What the owner would notice; always say whether any market stops publishing" }),
   options: Type.Array(BriefOptionParam, { minItems: 1, description: "The request's own options, one-to-one by id, relabelled in plain words" }),
-  recommendation: Type.Object({ option: Type.String(), why: Type.String({ description: "Cite the plan or IC section" }) }),
+  recommendation: Type.Optional(Type.Object({ option: Type.String(), why: Type.String({ description: "Cite the plan or IC section" }) })),
   related: Type.Array(BriefRelatedParam, { description: "Other open items on the same file or plan clause" }),
   evidence: Type.Array(Type.String(), { minItems: 1, description: "The original message/finding/file:line; a time, count or duration must cite config: or code:" }),
 };

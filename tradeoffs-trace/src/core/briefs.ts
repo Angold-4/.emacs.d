@@ -34,6 +34,11 @@ export interface CalendarDef {
   timezone?: string;
   /** session name -> "HH:MM-HH:MM" (a session may wrap past midnight). */
   sessions: Record<string, string>;
+  /** The weekly reopen, when the calendar has one (`"Sun 20:00"`), or
+   * `"always"`. A weekday claim in `today` can only be checked when this is
+   * present; without it a weekday claim must be refused or marked unverified
+   * (finding M-10). */
+  opens?: string;
 }
 
 export interface ProductDef {
@@ -119,11 +124,38 @@ export interface ExampleCheck {
   time?: string;
 }
 
+const WEEKDAY_WORDS: Record<string, number> = {
+  sun: 0, sunday: 0,
+  mon: 1, monday: 1,
+  tue: 2, tues: 2, tuesday: 2,
+  wed: 3, wednesday: 3,
+  thu: 4, thur: 4, thurs: 4, thursday: 4,
+  fri: 5, friday: 5,
+  sat: 6, saturday: 6,
+};
+
+function normaliseWeekday(token: string): number | undefined {
+  return WEEKDAY_WORDS[token.trim().toLowerCase().replace(/\.$/, "")];
+}
+
+/** The week reopen claim in TEXT, if any: a `reopen`/`open`/`return` verb
+ * followed by `Weekday HH:MM`. Only an OPEN claim is checked against the
+ * calendar's weekly schedule; a `closes Friday 17:00` is a session end, not a
+ * reopen, and must not be read as one. */
+function weekdayClaim(text: string): { day: number; time: string } | undefined {
+  const m = text.match(/(?:reopen(?:s|ing)?|open(?:s|ing)?|return(?:s|ing)?)\b[^.]{0,40}?\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sun|Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat)\b[^0-9]{0,12}(\d{1,2}:\d{2})/i);
+  if (!m) return undefined;
+  const day = normaliseWeekday(m[1]);
+  return day === undefined ? undefined : { day, time: m[2] };
+}
+
 /** Check the one concrete example in `today` against the plan's calendars.
  * The example must name a product from products.yaml and a time that is a
- * session boundary of that product's calendar. When the catalogs are missing
- * (or the example names no known product/time), the check says so — it never
- * invents an example. */
+ * session boundary of that product's calendar (or the calendar's weekly
+ * `opens`). A weekday claim is checked against the calendar's `opens` when it
+ * has one, and refused when it does not — a weekday is never guessed. When
+ * the catalogs are missing (or the example names no known product/time), the
+ * check says so; it never invents an example. */
 export function checkTodayExample(today: string, catalogs: Catalogs | undefined): ExampleCheck {
   if (!catalogs) return { ok: false, reason: "no calendars.yaml/products.yaml to check the example against" };
   const products = catalogs.products ?? {};
@@ -135,16 +167,30 @@ export function checkTodayExample(today: string, catalogs: Catalogs | undefined)
   if (times.length === 0) {
     return { ok: false, reason: "the example names no market time (HH:MM)" };
   }
+  const claim = weekdayClaim(today);
   // Every named product's calendar must exist and must know the named time(s).
   for (const product of named) {
-    const calendar = products[product]?.calendar;
-    if (!calendar || !catalogs.calendars?.[calendar]) {
-      return { ok: false, reason: `product ${product} names calendar '${calendar ?? "(none)"}', which is not in calendars.yaml` };
+    const calendarName = products[product]?.calendar;
+    const calendar = calendarName ? catalogs.calendars?.[calendarName] : undefined;
+    if (!calendar) {
+      return { ok: false, reason: `product ${product} names calendar '${calendarName ?? "(none)"}', which is not in calendars.yaml` };
     }
-    const boundaries = new Set(Object.values(catalogs.calendars[calendar].sessions ?? {}).flatMap(sessionTimes));
+    const boundaries = new Set(Object.values(calendar.sessions ?? {}).flatMap(sessionTimes));
+    const opens = calendar.opens && calendar.opens.trim().toLowerCase() !== "always" ? calendar.opens : undefined;
+    const opensMatch = opens?.match(/(\w+)\s+(\d{1,2}:\d{2})/);
+    const opensDay = opensMatch ? normaliseWeekday(opensMatch[1]) : undefined;
+    const opensTime = opensMatch?.[2];
+    if (claim) {
+      if (!opens || opensDay === undefined) {
+        return { ok: false, reason: `the calendar '${calendarName}' has no weekly schedule to check a weekday claim against` };
+      }
+      if (claim.day !== opensDay || claim.time !== opensTime) {
+        return { ok: false, reason: `${today.match(/\b(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)[a-z]*\b/i)?.[0] ?? "the weekday"} ${claim.time} is not ${calendarName}'s weekly reopen (${opens})` };
+      }
+    }
     for (const time of times) {
-      if (!boundaries.has(time)) {
-        return { ok: false, reason: `${time} is not a ${calendar} session boundary for ${product}` };
+      if (!boundaries.has(time) && time !== opensTime) {
+        return { ok: false, reason: `${time} is not a ${calendarName} session boundary for ${product}` };
       }
     }
   }
@@ -197,12 +243,17 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
     }
   }
   const rec = brief.recommendation;
-  if (!rec || !rec.option?.trim() || !rec.why?.trim()) return "a brief needs one recommended option and why";
-  if (!ids.includes(rec.option.trim())) return `the recommended option '${rec.option}' is not one of the brief's options`;
+  // The recommendation is optional: the deterministic backstop omits it
+  // rather than recommending an option by position with no citation
+  // (finding M-31). When present it must name one of the brief's options.
+  if (rec !== undefined) {
+    if (!rec || typeof rec !== "object" || !rec.option?.trim() || !rec.why?.trim()) return "a brief's recommendation needs one option and why";
+    if (!ids.includes(rec.option.trim())) return `the recommended option '${rec.option}' is not one of the brief's options`;
+  }
   if (!Array.isArray(brief.evidence) || brief.evidence.filter((e) => typeof e === "string" && e.trim()).length === 0) {
     return "a brief needs the original evidence";
   }
-  const quantified = hasQuantifiedFact([today, impact, ...brief.options.flatMap((o) => [o.effect, o.cost]), rec.why].join(" "));
+  const quantified = hasQuantifiedFact([today, impact, ...brief.options.flatMap((o) => [o.effect, o.cost]), rec?.why ?? ""].join(" "));
   if (quantified && !brief.evidence.some((e) => typeof e === "string" && isEvidenceCitation(e))) {
     return "a time, count or duration needs an evidence citation to the config or code it read";
   }
@@ -261,8 +312,8 @@ export function evidenceFile(evidence: string): string | undefined {
  * the option that refuses. Chosen by the option's own meaning (its id), never
  * by its position in the list, so the mapping is stable however the request
  * orders its options. RET still prompts for any option. */
-const ACCEPT_OPTION_IDS = new Set(["approve", "accept_as_implemented", "accept_risk", "grant", "grant_correction"]);
-const REFUSE_OPTION_IDS = new Set(["reject_and_repair", "repair", "stop", "withdraw"]);
+const ACCEPT_OPTION_IDS = new Set(["approve", "accept", "accept_as_implemented", "accept_risk", "grant", "grant_correction"]);
+const REFUSE_OPTION_IDS = new Set(["reject_and_repair", "repair", "stop", "withdraw", "refuse"]);
 
 export function briefVerdictOptions(brief: DecisionBrief): { accept?: string; refuse?: string } {
   const ids = brief.options.map((o) => o.id);
@@ -324,7 +375,8 @@ export function briefResolveCommand(brief: DecisionBrief, optionId: string, bind
  * request) or an `override` (a flagged reserved decision). The brief's own
  * `command` decides; the option id is passed through unchanged. */
 export function briefCommandFor(brief: DecisionBrief, optionId: string, binding: BriefBinding, request?: OwnerRequest): Record<string, unknown> {
-  if ((brief.command ?? "resolve") === "override") {
+  const command = brief.command ?? "resolve";
+  if (command === "override") {
     return {
       type: "override",
       vote: optionId === "approve" ? "approve" : "reject",
@@ -337,6 +389,11 @@ export function briefCommandFor(brief: DecisionBrief, optionId: string, binding:
         contractVersion: binding.contractVersion,
       },
     };
+  }
+  if (command === "entry") {
+    // The entry command the review view's A/D writes: `expandEntryCommand`
+    // turns it into one OWNER_VERDICT per settleable linked message.
+    return { type: "entry-verdict", runId: binding.runId, phaseId: binding.phaseId, entryId: brief.requestId, verdict: optionId === "accept" ? "accept" : "refuse" };
   }
   return briefResolveCommand(brief, optionId, binding, request);
 }
@@ -422,9 +479,13 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
     const chosen = brief.recommendation.option === option.id ? " (recommended)" : "";
     lines.push(`${indent}- ${option.label}${chosen} — ${option.effect} Cost: ${option.cost} [${option.id}]`);
   }
-  lines.push(
-    `${indent}Recommendation: ${brief.options.find((o) => o.id === brief.recommendation.option)?.label ?? brief.recommendation.option} — ${brief.recommendation.why}`,
-  );
+  if (brief.recommendation) {
+    lines.push(
+      `${indent}Recommendation: ${brief.options.find((o) => o.id === brief.recommendation!.option)?.label ?? brief.recommendation.option} — ${brief.recommendation.why}`,
+    );
+  } else {
+    lines.push(`${indent}Recommendation: none established by this brief.`);
+  }
   if (brief.related.length > 0) {
     lines.push(`${indent}Related:`);
     for (const r of brief.related) lines.push(`${indent}- ${r.id}: ${r.question}`);
@@ -496,7 +557,8 @@ export function fallbackBrief(
       effect: o.label.replace(/\s*\([^)]*\)\s*$/, ""),
       cost: "as the request's own option defines it",
     })),
-    recommendation: { option: request.options[0]?.id ?? "", why: "the request's first option, until the evaluator writes a brief" },
+    // No recommendation: the backstop never recommends an option by position
+    // without a citation (finding M-31).
     related,
     evidence: [`message: ${request.reason}`],
   };
@@ -531,10 +593,55 @@ export function fallbackDecisionBrief(
       { id: "approve", label: "Approve it", effect: "the choice stands", cost: "none beyond what the choice already does" },
       { id: "reject_and_repair", label: "Reject and repair", effect: "a new attempt revisits the choice with three more rounds", cost: "one more round" },
     ],
-    recommendation: { option: "approve", why: "the worker made the choice and the reviewers voted on it" },
     related,
     evidence: [`decision: ${decision.id} ${plain}`],
   };
+}
+
+/** A deterministic brief for a live review entry the owner must settle. Its
+ * options are the entry's own owner commands (`accept` / `refuse`), and it
+ * carries `command: entry`, so A/D/RET settle the entry the same way the
+ * review view does. */
+export function fallbackEntryBrief(
+  entry: { id: string; title: string; messages?: ReadonlyArray<{ id: string; title?: string; evidence?: string[] }> },
+  opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[] } = {},
+): DecisionBrief {
+  const plain = (entry.title ?? "")
+    .replace(PATH_LIKE, "the code")
+    .replace(CODE_EXT, "the code")
+    .replace(SNAKE_CASE, "that setting")
+    .replace(/\d+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const question = `Should this stand? ${plain}`;
+  const related = opts.allItems
+    ? relatedOpenItems({ id: entry.id, question, files: opts.files, planRefs: opts.planRefs }, opts.allItems).map((r) => ({ id: r.id, question: r.question }))
+    : [];
+  const evidence = (entry.messages ?? []).map((m) => `message: ${m.id} ${(m.title ?? "").replace(/\s+/g, " ").trim()}`.trim());
+  return {
+    requestId: entry.id,
+    command: "entry",
+    question,
+    today: "No concrete example was recorded for this entry. (example unverified)",
+    impact: "Whether any market stops publishing is not established by this backstop; the entry's own linked messages are below.",
+    options: [
+      { id: "accept", label: "Accept it", effect: "the entry is settled as it stands", cost: "none beyond what it already does" },
+      { id: "refuse", label: "Refuse it", effect: "the entry is refused; your reason reaches the next worker attempt", cost: "one more round" },
+    ],
+    related,
+    evidence: evidence.length > 0 ? evidence : [`entry: ${entry.id} ${plain}`],
+  };
+}
+
+/** Merge the conductor's own same-concern computation into a brief's
+ * `related`, so a bigger silence (e.g. T-54) is never hidden behind the
+ * model's own list (finding A-29). */
+export function enrichBriefRelated(brief: DecisionBrief, allItems: readonly OpenItemConcern[]): DecisionBrief {
+  const concern = allItems.find((c) => c.id === brief.requestId);
+  if (!concern) return brief;
+  const byId = new Map(brief.related.map((r) => [r.id, r]));
+  for (const r of relatedOpenItems(concern, allItems)) if (!byId.has(r.id)) byId.set(r.id, { id: r.id, question: r.question });
+  return { ...brief, related: [...byId.values()] };
 }
 
 // ---------------------------------------------------------------------------
@@ -592,12 +699,13 @@ function asCalendarMap(node: YamlNode): Record<string, CalendarDef> {
   for (const [name, value] of Object.entries(node)) {
     if (typeof value === "string") continue;
     const timezone = typeof value.timezone === "string" ? value.timezone : undefined;
+    const opens = typeof value.opens === "string" ? value.opens : undefined;
     const sessions: Record<string, string> = {};
     const rawSessions = value.sessions;
     if (rawSessions && typeof rawSessions !== "string") {
       for (const [session, spec] of Object.entries(rawSessions)) if (typeof spec === "string") sessions[session] = spec;
     }
-    out[name] = { ...(timezone ? { timezone } : {}), sessions };
+    out[name] = { ...(timezone ? { timezone } : {}), ...(opens ? { opens } : {}), sessions };
   }
   return out;
 }

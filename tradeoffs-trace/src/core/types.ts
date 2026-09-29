@@ -438,9 +438,9 @@ export interface DecisionBrief {
   requestId: string;
   /** The owner command choosing an option sends. `resolve` (default) settles
    * an owner request; `override` approves or rejects a flagged reserved
-   * decision. A brief for a reserved decision carries `override`, so the same
-   * A/D/RET keys send the command that decision needs. */
-  command?: "resolve" | "override";
+   * decision; `entry` settles a live review entry (accept/refuse). A brief for
+   * a reserved decision or an entry carries the command that item needs. */
+  command?: "resolve" | "override" | "entry";
   /** One plain line, no code identifiers. */
   question: string;
   /** What the system does today, with one concrete example using real market
@@ -450,10 +450,17 @@ export interface DecisionBrief {
    * publishing. */
   impact: string;
   options: BriefOption[];
-  recommendation: { option: string; why: string };
+  /** One option and why, citing the plan or an IC section. Absent when the
+   * deterministic backstop could not establish a checked recommendation; it
+   * never recommends an option by position without evidence. */
+  recommendation?: { option: string; why: string };
   related: BriefRelated[];
   /** The original message/finding/file:line, folded under TAB. */
   evidence: string[];
+  /** The candidate this brief was written for, so a later candidate's round
+   * rewrites it (the plan asks for one brief per round). Internal to the
+   * conductor: the evaluator's `submit_brief` does not supply it. */
+  candidateSha?: string;
 }
 
 // ---------------------------------------------------------------------------

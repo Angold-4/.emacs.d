@@ -667,15 +667,23 @@ when it names no market and no time; a named time is always checked against the
 calendars.
 
 After evaluation the conductor runs one brief-writing pass by the evaluator's
-model for every open owner request **and** every flagged reserved decision (a
-reserved decision never becomes an owner request, so without a brief it would
-reach you as an engineer note). A flagged decision's brief sends an override
-(approve / reject) rather than a request resolve. `A` and `D` choose the
-brief's accept and refuse option by the option's own meaning, never by its
-position; `RET` prompts for any option. If the model misses an item, a
-deterministic backstop records a brief that never invents an example and never
-asserts an unchecked impact (it says the impact was not established) and lists
-the other items on the same file or plan clause.
+model for every item the owner must decide: an open owner request, a flagged
+reserved decision (which never becomes an owner request), and every live
+review entry. A reserved decision's brief sends an override (approve /
+reject) and an entry's sends the entry accept/refuse, rather than a request
+resolve. The pass is per round and per candidate, so a new candidate's item is
+rewritten rather than keeping an earlier round's `today`.
+
+`A` and `D` choose the brief's accept and refuse option by the option's own
+meaning, never by its position; `RET` prompts on the option's **plain label**,
+never its engineer id. If the model misses an item, a deterministic backstop
+records a brief that never invents an example, never asserts an unchecked
+impact (it says the impact was not established), omits a recommendation rather
+than recommending an option by position, and lists the other items on the same
+file or plan clause. The conductor merges its own same-concern items into a
+model brief's `related` too, so a bigger silence is never hidden. A brief
+names a weekday reopen example only when the plan's calendar carries a weekly
+schedule to check it against; otherwise it is marked unverified.
 
 The same briefs appear at the top of `views/review.org` (and the program
 review) under `* Needs you (N)`; `TAB` on a question unfolds its evidence. An

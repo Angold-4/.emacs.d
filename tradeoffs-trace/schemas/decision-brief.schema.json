@@ -5,15 +5,15 @@
   "description": "One owner-facing brief for one open item that needs the owner's decision. The question is plain language (no code identifiers); today carries one concrete example checked against calendars.yaml/products.yaml; impact always answers whether any market stops publishing; options map one-to-one to the underlying request's option ids; every time, count or duration cites the config or code it read; the original message/finding/file:line stays in evidence.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["requestId", "question", "today", "impact", "options", "recommendation", "related", "evidence"],
+  "required": ["requestId", "question", "today", "impact", "options", "related", "evidence"],
   "properties": {
     "requestId": {
       "type": "string",
       "minLength": 1
     },
     "command": {
-      "description": "The owner command choosing an option sends: `resolve` (default) for an owner request, `override` for a flagged reserved decision.",
-      "enum": ["resolve", "override"]
+      "description": "The owner command choosing an option sends: `resolve` (default) for an owner request, `override` for a flagged reserved decision, `entry` for a live review entry.",
+      "enum": ["resolve", "override", "entry"]
     },
     "question": {
       "type": "string",

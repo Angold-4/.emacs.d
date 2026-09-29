@@ -658,8 +658,17 @@ export function buildView(
   else if (idleMinutes !== undefined && idleMinutes > 5) attention = `idle ${Math.round(idleMinutes)}m`;
   else if (t && t.byCategory.polling.ms > t.elapsedMs / 4) attention = "heavy polling";
   // Decision briefs: the `needs you` line names the owner's actual question.
-  const openRequestIds = new Set(phase.ownerRequests.filter((r) => r.status === "open").map((r) => r.id));
-  const firstBrief = (phase.briefs ?? []).find((b) => openRequestIds.has(b.requestId));
+  // The wait may be a flagged reserved decision or a live entry, not only an
+  // open request (finding B-38), so all three owner-item classes are walked.
+  const waitingIds = new Set(phase.ownerRequests.filter((r) => r.status === "open").map((r) => r.id));
+  for (const d of phase.decisions) {
+    if (d.class !== "reserved" || d.amendment || d.supersededBy || d.supersededByCorrection) continue;
+    if (C && d.boundCandidateSha !== C) continue;
+    if (phase.overrides.some((o) => o.decisionId === d.id && (!C || o.boundCandidateSha === C))) continue;
+    waitingIds.add(d.id);
+  }
+  for (const e of phase.entries ?? []) if (e.state === "open") waitingIds.add(e.id);
+  const firstBrief = (phase.briefs ?? []).find((b) => waitingIds.has(b.requestId));
   const attentionQuestion = attention === "needs you" ? firstBrief?.question : undefined;
 
   const firstAt = timeline.phases[0]?.at;
