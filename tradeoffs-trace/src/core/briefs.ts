@@ -400,6 +400,9 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
       [`option ${o.id} effect`, o.effect],
       [`option ${o.id} cost`, o.cost],
     ]),
+    // The recommendation's `why` is owner-visible too, so it is held to the
+    // same plain-text rule (finding A-38).
+    ...(rec?.why ? ([["recommendation", rec.why]] as Array<[string, string]>) : []),
   ];
   for (const [where, text] of ownerText) {
     if (hasCodeIdentifier(text)) return `the ${where} names code; keep the owner-facing text plain and cite the evidence with [n]`;

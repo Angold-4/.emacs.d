@@ -838,11 +838,11 @@ export function renderStatusView(input: StatusViewInput): string {
       view.attention === "needs you"
         ? " — type a correction in the input box (C-c m d to read the review)"
         : view.attention === "conductor stopped" ? " — M-x +tt-resume" : "";
-    // Decision briefs: the `needs you` line names the owner's actual
-    // question, not a finding id.
+    // Decision briefs: the `needs you` (or `BLOCKED`) line names the owner's
+    // actual question, not a finding id (disc-M-185).
     const label =
-      view.attention === "needs you" && view.attentionQuestion
-        ? `needs you — ${view.attentionQuestion}`
+      (view.attention === "needs you" || view.attention === "BLOCKED") && view.attentionQuestion
+        ? `${view.attention} — ${view.attentionQuestion}`
         : view.attention;
     lines.push("", `⚑ ${label}${suffix}`);
   }

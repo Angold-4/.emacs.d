@@ -679,7 +679,9 @@ export function buildView(
   const firstBrief = (phase.briefs ?? []).find(
     (b) => waitingIds.has(b.requestId) && (b.candidateSha === undefined || !C || b.candidateSha === C),
   );
-  const attentionQuestion = attention === "needs you" ? firstBrief?.question : undefined;
+  // A parked phase (needs you) AND a BLOCKED phase both wait on the owner and
+  // both get briefs, so the line names the question either way (disc-M-185).
+  const attentionQuestion = attention === "needs you" || attention === "BLOCKED" ? firstBrief?.question : undefined;
 
   const firstAt = timeline.phases[0]?.at;
   const endAt = phase.phase === "DONE" || phase.phase === "BLOCKED" ? Date.parse(timeline.phases[timeline.phases.length - 1].at) : now.getTime();

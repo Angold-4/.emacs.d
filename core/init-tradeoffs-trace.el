@@ -1473,8 +1473,9 @@ open the decision view at that record."
     (when attention
       ;; Decision briefs: the `needs you' line names the owner's actual
       ;; question, never a finding id.
-      (let ((label (if (and (equal attention "needs you") (alist-get 'attentionQuestion v))
-                       (format "needs you — %s" (alist-get 'attentionQuestion v))
+      (let ((label (if (and (alist-get 'attentionQuestion v)
+                            (member attention '("needs you" "BLOCKED")))
+                       (format "%s — %s" attention (alist-get 'attentionQuestion v))
                      attention)))
         (insert "\n" (propertize (format "⚑ %s%s" label
                                          (cond ((equal attention "needs you")

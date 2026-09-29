@@ -301,6 +301,12 @@ test("a model brief may say the publishing answer is unverified, but not 'not es
   assert.equal(briefIssue(notEstablished, { allowUnverifiedImpact: true }), undefined);
 });
 
+test("a model recommendation that names code is refused", () => {
+  const good = fixture().briefs[0];
+  const bad = { ...good, recommendation: { option: "repair", why: "IC §5 says keep the within_band_active flag set" } };
+  assert.ok(briefIssue(bad), "the recommendation's why is owner-facing too");
+});
+
 test("a model related question naming code is refused", () => {
   const good = fixture().briefs[0];
   const bad = { ...good, related: [{ id: "T-54", question: "src/core/blend.rs:88 the re-entry" }] };

@@ -728,8 +728,9 @@ review) under `* Needs you (N)`. The question heading is followed by the
 today, impact, options and recommendation paragraphs and the `related` links
 as visible text, so you can decide without a keystroke; only the original
 evidence sits under the folded `Evidence` child and `TAB` unfolds it. An item
-already settled is never shown here again. The status buffer's `needs you`
-line shows the question, not a finding id.
+already settled is never shown here again. The status buffer's wait line shows
+the question, not a finding id: `needs you — <question>`, or
+`BLOCKED — <question>` when a blocked phase still has a brief waiting.
 
 ### Owner glossary
 

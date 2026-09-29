@@ -1796,6 +1796,25 @@ a finding id."
       (should (string-match-p "needs you" (buffer-string)))
       (should-not (string-match-p "F-M-9" (buffer-string))))))
 
+(ert-deftest tradeoffs-trace-status-blocked-shows-the-question ()
+  "Decision briefs: a BLOCKED phase that has a brief shows its question too,
+not only the word BLOCKED (disc-M-185)."
+  (let ((s `((state (phase (phaseId . "p1") (phase . "BLOCKED")
+                        (blockedReason . "reviewer unavailable")
+                        (attempt (n . 1)) (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
+             (conductorAlive . t)
+             (meta (title . "atlas 15d"))
+             (view (elapsed . "1m") (round . 1) (pipeline . "review 1s…")
+                   (reviewLine . "M ✓   A ✓   B ✓")
+                   (attention . "BLOCKED")
+                   (attentionQuestion . "Should a vendor excluded before a weekend stay excluded when its market reopens?")
+                   (cost (text . "1m"))))))
+    (with-temp-buffer
+      (+tt--render-status-from s "/tmp/does-not-matter")
+      (should (string-match-p
+               "BLOCKED — Should a vendor excluded before a weekend stay excluded when its market reopens?"
+               (buffer-string))))))
+
 (defconst +tt-test--entry-review-org
   (concat "#+TITLE: tradeoffs-trace review — cebd7fcb-01 · 33c41174\n"
           "#+CONTRACT_VERSION: v1\n"
