@@ -3257,18 +3257,20 @@ export class Conductor {
           const rejections = handle.incompleteReviewRejections ?? 0;
           if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
             handle.incompleteReviewRejections = rejections + 1;
+            // The reason is logged beside the missing ids, so the record is the
+            // same text the model is refused with (a test does not have to race
+            // the reviewer's stream file to read it).
+            const reason = `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
+              .map((m) => `${m.id} (${m.choice})`)
+              .join("; ")}`;
             this.#log.append("incomplete_review_rejected", {
               reviewer: review.reviewer,
               agentId,
               missing: missing.map((m) => m.id),
               rejection: rejections + 1,
+              reason,
             });
-            return {
-              ok: false,
-              reason: `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
-                .map((m) => `${m.id} (${m.choice})`)
-                .join("; ")}`,
-            };
+            return { ok: false, reason };
           }
           this.#log.append("incomplete_review", {
             reviewer: review.reviewer,
