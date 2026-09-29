@@ -53,7 +53,7 @@
     },
     {
       "id": "D-A-80",
-      "question": "Should the re-entry band be ten seconds wide?",
+      "question": "Should the re-entry band be widened?",
       "files": ["src/core/blend.rs"],
       "planRefs": ["IC §5"]
     },
@@ -74,45 +74,45 @@
     {
       "requestId": "F-M-9",
       "question": "Should a vendor excluded before a weekend stay excluded when its market reopens?",
-      "today": "Pyth's NVDA product reopens Sunday 20:00 ET[2]. Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.",
-      "impact": "No market stops publishing[2]. At most one vendor is missing for about 10 s after a weekend reopen, so the published price is formed from one vendor fewer for that window[3].",
+      "today": "Pyth's NVDA product reopens Sunday 20:00 ET[3]. Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.",
+      "impact": "No market stops publishing[2]. At most a vendor is missing for about 10 s after a weekend reopen, so the published price is formed from a vendor fewer for that window[2].",
       "options": [
         {
           "id": "accept_risk",
           "label": "Keep as is",
-          "effect": "the vendor rejoins immediately at the first tick after the reopen[3]",
-          "cost": "one stale first quote can enter the price for up to 10 s[3]"
+          "effect": "the vendor rejoins immediately at the first tick after the reopen[2]",
+          "cost": "a stale first quote can enter the price for up to 10 s[2]"
         },
         {
           "id": "repair",
           "label": "Hold it out",
           "effect": "the vendor stays excluded until 10 s after the reopen, then rejoins[4]",
-          "cost": "10 s with one vendor fewer at a reopen[4]"
+          "cost": "10 s with a vendor fewer at a reopen[4]"
         }
       ],
       "recommendation": { "option": "repair", "why": "IC §5's re-entry rule asks for a settled first tick, not the first tick after a break" },
       "related": [
-        { "id": "D-A-80", "question": "Should the re-entry band be ten seconds wide?" },
+        { "id": "D-A-80", "question": "Should the re-entry band be widened?" },
         { "id": "T-54", "question": "Should every held market make no offer at all until a vendor returns?" }
       ],
       "evidence": [
         "message: F-M-9 a vendor excluded before the weekend rejoins immediately at the first tick after a reopen",
+        "code: src/core/blend.rs:88 the re-entry wait is 10 s after a reopen",
         "config: calendars.yaml us_equity opens Sun 20:00",
-        "code: src/core/blend.rs:88 the re-entry test reads the band only",
-        "code: src/core/blend.rs:41 the band constant is read here"
+        "code: src/core/blend.rs:41 the band constant is 10 s"
       ]
     },
     {
       "requestId": "D-A-80",
-      "question": "Should the re-entry band be ten seconds wide?",
-      "today": "Stork's BTCUSD product trades around the clock: its 24/7 calendar runs every minute of 00:00 to 23:59[2], so it has no reopen. The band now uses 10 s[3], the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.",
-      "impact": "No market stops publishing[2]. The wider band lets one more vendor back in after a quiet spell, so the price is formed from more vendors more of the time[3].",
+      "question": "Should the re-entry band be widened?",
+      "today": "Stork's BTCUSD product trades around the clock: its calendar runs every minute of 00:00 to 23:59[3], so it has no reopen. The band now uses 10 s[2], the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.",
+      "impact": "No market stops publishing[2]. The wider band lets another vendor back in after a quiet spell, so the price is formed from more vendors more of the time.",
       "options": [
         {
           "id": "accept_as_implemented",
           "label": "Accept it as implemented",
-          "effect": "10 s stays the re-entry band[3]",
-          "cost": "a genuinely stale vendor can rejoin after 10 s[3]"
+          "effect": "10 s stays the re-entry band[2]",
+          "cost": "a genuinely stale vendor can rejoin after 10 s[2]"
         },
         {
           "id": "reject_and_repair",
@@ -121,19 +121,19 @@
           "cost": "a further repair round; no market stops publishing either way"
         }
       ],
-      "recommendation": { "option": "accept_as_implemented", "why": "the panel's own count of re-entries agrees with IC §5's 10 s[3]" },
+      "recommendation": { "option": "accept_as_implemented", "why": "the panel's own count of re-entries agrees with IC §5's 10 s[2]" },
       "related": [],
       "evidence": [
         "message: D-A-80 widen the re-entry band to 10 s failed its vote",
-        "config: calendars.yaml crypto_24_7 rth 00:00-23:59",
-        "code: src/core/blend.rs:41 the band constant is read here"
+        "code: src/core/blend.rs:41 the band constant is 10 s",
+        "config: calendars.yaml crypto_24_7 rth 00:00-23:59"
       ]
     },
     {
       "requestId": "D-B-82",
       "question": "Should the last good price be published while a market is held?",
-      "today": "Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend[2]. The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET[2] the first fresh price is published.",
-      "impact": "No market stops publishing[2]. While XAUUSD is held there is simply no offer, which is the documented behaviour; the change only affects whether the last price is repeated[3].",
+      "today": "Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend[3]. The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET[3] the first fresh price is published.",
+      "impact": "No market stops publishing[2]. While XAUUSD is held there is simply no offer, which is the documented behaviour; the change only affects whether the last price is repeated[2].",
       "options": [
         {
           "id": "accept_as_implemented",
@@ -154,8 +154,8 @@
       ],
       "evidence": [
         "message: D-B-82 publish the last good price while the market is held failed its vote",
-        "config: calendars.yaml metal_otc opens Sun 18:00; sessions 18:00-17:00",
-        "code: src/core/publish.rs:120 the held branch skips the offer"
+        "code: src/core/publish.rs:120 the held branch skips the offer",
+        "config: calendars.yaml metal_otc opens Sun 18:00; sessions 18:00-17:00"
       ]
     }
   ]

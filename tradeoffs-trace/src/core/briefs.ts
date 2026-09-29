@@ -75,6 +75,21 @@ export function hasCodeIdentifier(text: string): boolean {
   return SNAKE_CASE.test(plain) || PATH_LIKE.test(plain) || CODE_EXT.test(plain);
 }
 
+/** Remove EVERY code token (the patterns above are non-global; a backstop
+ * question must not keep the second one — finding M-29). */
+export function stripCodeTokens(text: string): string {
+  return text
+    .replace(new RegExp(PATH_LIKE.source, "g"), "the code")
+    .replace(new RegExp(CODE_EXT.source, "g"), "the code")
+    .replace(new RegExp(SNAKE_CASE.source, "g"), "that setting");
+}
+
+/** Remove digits and number words from a backstop's prose, so it never states
+ * an uncited count in owner-facing text (findings A-32 / M-29). */
+export function stripCounts(text: string): string {
+  return text.replace(/\b\d+\b/g, "").replace(/\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/gi, "");
+}
+
 /** Any quantified claim: a clock time (`20:00`), a duration (`10 s`,
  * `2 minutes`), a digit count (`3 vendors`), or a word count (`one vendor`). */
 const CLOCK_TIME = /\b\d{1,2}:\d{2}\b/;
@@ -85,9 +100,10 @@ const DIGIT_COUNT = /\b\d+\b/;
 const WORD_COUNT = /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)(?:\s+\w+){0,2}\s+(?:vendor|vendors|market|markets|instrument|instruments|product|products|round|rounds|day|days|week|weeks|hour|hours|minute|minutes|second|seconds|tick|ticks|price|prices|session|sessions|source|sources)\b/i;
 
 export function hasQuantifiedFact(text: string): boolean {
-  // A plan/IC section reference (`§5`) is not a count; only strip the section
-  // marker, so an actual `10 s` in the same sentence is still quantified.
-  const t = text.replace(/§\s*\d+/g, " ");
+  // The `[n]` evidence reference is not a claim, and a plan/IC section
+  // reference (`§5`) is not a count; only strip those markers, so an actual
+  // `10 s` in the same sentence is still quantified.
+  const t = text.replace(/\[\d+\]/g, " ").replace(/§\s*\d+/g, " ");
   return CLOCK_TIME.test(t) || DURATION.test(t) || DIGIT_COUNT.test(t) || WORD_COUNT.test(t);
 }
 
@@ -119,17 +135,51 @@ export function isEvidenceCitation(entry: string): boolean {
  * is recognized by `impactUnestablished`, never by this strict check (finding
  * disc-M-56). */
 export function impactAnswersPublishing(impact: string): boolean {
-  if (impactUnestablished(impact)) return false;
+  if (impactUnestablished(impact) || impactUnverified(impact)) return false;
   return /\b(?:no|any|every|each|one|two|three|all)\b[^.]{0,80}\bmarket[s]?\b[^.]{0,40}\b(?:stop|stops|stopping|keep|keeps|keeping|continue|continues|continuing|publish|publishes|publishing|halt|halts|go(?:es)?\s+(?:dark|silent))\b/i.test(
     impact,
   ) || /\b(?:publishing|publication)\b[^.]{0,40}\b(?:stop|stops|continue|continues|halt|halts|go(?:es)?)\b/i.test(impact);
 }
 
-/** The backstop's honest "this was not established" wording. Only the
- * deterministic fallback may use it; a model brief's `impact` is refused when
- * it does (finding disc-M-56). */
+/** The backstop's honest "this was not established" wording. */
 export function impactUnestablished(impact: string): boolean {
   return /\b(?:not|never)\s+(?:been\s+)?(?:established|checked|verified|known)\b|\bunknown\b|\bcannot be (?:established|checked)\b|\bcould not (?:be )?(?:establish|check)\b/i.test(impact);
+}
+
+/** A model brief that could not check the publishing answer says it is
+ * unverified instead of asserting it (OD-3 (3)). */
+export function impactUnverified(impact: string): boolean {
+  return /\b(?:is|remains|was)\s+unverified\b|\bunverified\b[^.]{0,40}\b(?:market|publishing|answer)\b|\b(?:whether|if)\b[^.]{0,60}\bunverified\b/i.test(impact) || /\bunverified\b/i.test(impact);
+}
+
+/** An evidence entry citing code (or a `path:line`); the publishing answer
+ * must cite a code path, not a calendar, to show whether publishing stops
+ * (findings disc-M-140 / B-142). */
+export function isCodeCitation(entry: string): boolean {
+  const s = entry.trim();
+  return /^code:/i.test(s) || /\b[\w./-]+\.(?:ya?ml|rs|ts|tsx|js|el|json|org|md|toml|py|go|c|cpp|h|rb|sh):\d+\b/.test(s);
+}
+
+/** The number a claim is really about: a clock time, else a duration's
+ * number, else a digit count, else a number word as its digit. */
+export function primaryQuantifiedValue(input: string): string | undefined {
+  const text = input.replace(/\[\d+\]/g, " ");
+  const clock = text.match(/\b(\d{1,2}:\d{2})\b/);
+  if (clock) return clock[1];
+  const duration = text.match(/\b(\d+)(?:\.\d+)?\s*(?:ms|s|sec|secs|second|seconds|min|mins|minute|minutes|h|hr|hrs|hour|hours|day|days|week|weeks)\b/i);
+  if (duration) return duration[1];
+  const digit = text.match(/\b(\d+)\b/);
+  if (digit) return digit[1];
+  const word = text.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/i);
+  if (word) return String(["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"].indexOf(word[1].toLowerCase()) + 1);
+  return undefined;
+}
+
+/** Whether ENTRY holds VALUE as its own token (so `10` matches `10 s` but not
+ * `110`). */
+export function citationHoldsValue(entry: string, value: string): boolean {
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^\\d])${escaped}(?=$|[^\\d])`).test(entry);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +307,10 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   if (question.includes("\n")) return "the question must be one line";
   if (!today) return "a brief needs a `today` paragraph";
   if (!impact) return "a brief needs an `impact` paragraph";
-  if (opts.allowUnverifiedImpact ? !impactAnswersPublishing(impact) && !impactUnestablished(impact) : !impactAnswersPublishing(impact)) {
-    return "the impact must say whether any market stops publishing";
+  // A model brief answers the publishing question or says it is unverified
+  // (OD-3 (3)); the backstop may also use its own "not established" phrasing.
+  if (!impactAnswersPublishing(impact) && !impactUnverified(impact) && !(opts.allowUnverifiedImpact && impactUnestablished(impact))) {
+    return "the impact must say whether any market stops publishing, or say it is unverified";
   }
   if (!Array.isArray(brief.options) || brief.options.length === 0) return "a brief needs at least one option";
   const ids = brief.options.map((o) => (typeof o?.id === "string" ? o.id.trim() : ""));
@@ -312,6 +364,7 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   // today, impact or the options (OD-3 / D-M-126). A claim cites the evidence
   // by number (`[n]`) instead, and the path is rendered only under Evidence.
   const ownerText: Array<[string, string]> = [
+    ["question", question],
     ["today", today],
     ["impact", impact],
     ...brief.options.flatMap((o): Array<[string, string]> => [
@@ -327,12 +380,21 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   // evidence must be the config/code it read: one citation cannot license an
   // unrelated `10 s` somewhere else (finding disc-M-85).
   const evidence = brief.evidence ?? [];
-  const cited = (claim: string): boolean =>
-    [...claim.matchAll(/\[(\d+)\]/g)].some((m) => {
+  // A reference only counts when it points at a config/code line that actually
+  // holds the claimed value, so `10 s[3]` cannot cite a line that never states
+  // 10 (findings disc-M-139 / M-140 / M-85).
+  const cited = (claim: string, requireCode = false): boolean => {
+    const value = primaryQuantifiedValue(claim);
+    return [...claim.matchAll(/\[(\d+)\]/g)].some((m) => {
       const n = Number(m[1]);
-      return n >= 1 && isEvidenceCitation(evidence[n - 1] ?? "");
+      const entry = evidence[n - 1] ?? "";
+      if (!isEvidenceCitation(entry)) return false;
+      if (requireCode && !isCodeCitation(entry)) return false;
+      return value === undefined || citationHoldsValue(entry, value);
     });
+  };
   const claims = [
+    question,
     ...sentences(today),
     ...sentences(impact),
     ...brief.options.flatMap((o) => [o.label, o.effect, o.cost]),
@@ -343,11 +405,11 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
       return `the claim "${claim.trim()}" states a time, count or duration without its own evidence reference [n]`;
     }
   }
-  // The publishing answer is the claim the owner relies on most, so it must be
-  // cited too (OD-3 / D-M-127); only the backstop's honest "unverified" is
-  // exempt.
-  if (!impactUnestablished(impact) && !cited(impact)) {
-    return "the impact's answer to whether any market stops publishing must cite the evidence it was checked against";
+  // The publishing answer's OWN sentence must cite a code path that shows
+  // whether publishing stops (OD-3 (3) / findings disc-M-140, B-142).
+  const publishingSentence = sentences(impact).find((s) => impactAnswersPublishing(s));
+  if (publishingSentence && !cited(publishingSentence, true)) {
+    return "the impact's answer to whether any market stops publishing must cite, in its own sentence, the code path it was checked against";
   }
   return undefined;
 }
@@ -577,7 +639,7 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
     // defensively here; the `[id]` sits right after the plain label so RET can
     // complete on the label alone (finding A-14).
     const chosen = brief.recommendation?.option === option.id ? " (recommended)" : "";
-    lines.push(`${indent}- ${option.label} [${option.id}]${chosen} — ${option.effect} Cost: ${option.cost}`);
+    lines.push(`${indent}- ${option.label} [option:${option.id}]${chosen} — ${option.effect} Cost: ${option.cost}`);
   }
   if (brief.recommendation) {
     lines.push(
@@ -634,13 +696,7 @@ export function fallbackBrief(
 ): DecisionBrief {
   // The request's reason is engineer prose; strip its code identifiers and
   // digits so the fallback question is plain and asserts no uncited count.
-  const plain = request.reason
-    .replace(PATH_LIKE, "the code")
-    .replace(CODE_EXT, "the code")
-    .replace(SNAKE_CASE, "that setting")
-    .replace(/\d+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const plain = stripCounts(stripCodeTokens(request.reason)).replace(/\s+/g, " ").trim();
   const question = opts.question ?? `Should this stay as it is? ${plain}`;
   const today = opts.catalogs
     ? "The plan's calendars were available, but no concrete example was recorded. (example unverified)"
@@ -661,12 +717,14 @@ export function fallbackBrief(
     // ("grant 3 rounds") that would then demand a citation this backstop
     // never read. The underlying option id is untouched, so resolving is
     // unchanged.
+    // The request's own label may state a count ('grant 3 more repair
+    // rounds'); strip every digit so the backstop never shows an uncited
+    // number (finding A-32). The option id is untouched, so resolving is
+    // unchanged.
     options: request.options.map((o) => ({
       id: o.id,
-      // Plain labels only: a count in the request's own label ("grant 3
-      // rounds") would otherwise state an uncited number.
-      label: o.label.replace(/\s*\([^)]*\)\s*$/, ""),
-      effect: o.label.replace(/\s*\([^)]*\)\s*$/, ""),
+      label: stripCounts(o.label.replace(/\s*\([^)]*\)\s*$/, "")).replace(/\s+/g, " ").trim(),
+      effect: stripCounts(o.label.replace(/\s*\([^)]*\)\s*$/, "")).replace(/\s+/g, " ").trim(),
       cost: "as the request's own option defines it",
     })),
     related,
@@ -682,13 +740,7 @@ export function fallbackDecisionBrief(
   decision: { id: string; choice: string; whyItMatters?: string },
   opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
 ): DecisionBrief {
-  const plain = (decision.choice ?? "")
-    .replace(PATH_LIKE, "the code")
-    .replace(CODE_EXT, "the code")
-    .replace(SNAKE_CASE, "that setting")
-    .replace(/\d+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const plain = stripCounts(stripCodeTokens(decision.choice ?? "")).replace(/\s+/g, " ").trim();
   const question = `Should this choice stand? ${plain}`;
   const related = opts.allItems
     ? relatedOpenItems({ id: decision.id, question, files: opts.files, planRefs: opts.planRefs }, opts.allItems).map((r) => ({ id: r.id, question: r.question }))
@@ -717,13 +769,7 @@ export function fallbackEntryBrief(
   entry: { id: string; title: string; messages?: ReadonlyArray<{ id: string; title?: string; evidence?: string[] }> },
   opts: { allItems?: readonly OpenItemConcern[]; files?: string[]; planRefs?: string[]; noRecommendationReason?: string } = {},
 ): DecisionBrief {
-  const plain = (entry.title ?? "")
-    .replace(PATH_LIKE, "the code")
-    .replace(CODE_EXT, "the code")
-    .replace(SNAKE_CASE, "that setting")
-    .replace(/\d+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const plain = stripCounts(stripCodeTokens(entry.title ?? "")).replace(/\s+/g, " ").trim();
   const question = `Should this stand? ${plain}`;
   const related = opts.allItems
     ? relatedOpenItems({ id: entry.id, question, files: opts.files, planRefs: opts.planRefs }, opts.allItems).map((r) => ({ id: r.id, question: r.question }))

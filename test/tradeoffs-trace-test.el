@@ -1299,8 +1299,8 @@ inert as it was before the key existed — no error, and nothing opened."
           "   Today: Pyth's NVDA product reopens Sunday 20:00 ET.\n"
           "   Impact: No market stops publishing.\n"
           "   Options:\n"
-          "   - Keep as is [accept_risk] — rejoins at once Cost: one stale quote\n"
-          "   - Hold it out for 10 s [repair] (recommended) — rejoins after 10 s Cost: 10 s with one vendor fewer\n"
+          "   - Keep as is [option:accept_risk] — rejoins at once Cost: one stale quote\n"
+          "   - Hold it out for 10 s [option:repair] (recommended) — rejoins after 10 s Cost: 10 s with one vendor fewer\n"
           "   Recommendation: Hold it out for 10 s — IC §5's re-entry rule\n"
           "   Evidence (original):\n"
           "   - message: F-M-9 a vendor excluded before the weekend rejoins immediately\n"
@@ -1728,8 +1728,8 @@ RET chooses an option and sends the same encoding."
           "   :END:\n"
           "   Impact: Whether any market stops publishing is not established.\n"
           "   Options:\n"
-          "   - Accept it [accept] — the entry is settled\n"
-          "   - Refuse it [refuse] — your reason reaches the worker\n")
+          "   - Accept it [option:accept] — the entry is settled\n"
+          "   - Refuse it [option:refuse] — your reason reaches the worker\n")
   "A fixture review with one live-entry brief.")
 
 (ert-deftest tradeoffs-trace-brief-entry-settles-via-the-entry-command ()

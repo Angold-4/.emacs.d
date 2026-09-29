@@ -691,13 +691,17 @@ reason, and the reason reaches the next worker attempt. A model brief must
 state one recommended option, with why, citing the plan or an IC section; only
 the deterministic backstop may omit it. A model brief must also state whether
 any market stops publishing; only the deterministic backstop may say the
-impact was not established. The owner-facing text — today, impact and the
-options — stays plain: no file paths and no code identifiers. Every time,
-count or duration carries its own numbered reference into the evidence list
-(`[2]`); one reference does not cover another claim, and the impact's answer to
-whether any market stops publishing must be referenced too. The path itself is
-rendered only under Evidence, folded behind `TAB`. The glossary terms `T_in`
-and `T_out` are allowed in a brief's question.
+impact was not established. A model brief that could not check the publishing
+answer says it is unverified instead of asserting it. The owner-facing text —
+the question, today, impact and the options — stays plain: no file paths and no
+code identifiers (the question is held to the same rule). Every time, count or
+duration carries its own numbered reference into the evidence list (`[2]`); one
+reference does not cover another claim, and the reference must point at a
+config or code line that actually holds the claimed value. The publishing
+answer's own sentence must cite the code path it was checked against (a
+calendar cannot show whether publishing stops). The path itself is rendered
+only under Evidence, folded behind `TAB`. The glossary terms `T_in` and `T_out`
+are allowed in a brief's question.
 
 If the model misses an item, the backstop records a brief that never invents
 an example, never asserts an unchecked impact (it says the impact was not

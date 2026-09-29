@@ -2267,7 +2267,7 @@ the owner's face (finding B-35)."
     (save-excursion
       (org-back-to-heading t)
       (let ((end (save-excursion (org-end-of-subtree t) (point))))
-        (while (re-search-forward "^[ \t]*- \\(.*?\\) \\[\\([A-Za-z0-9_-]+\\)\\]" end t)
+        (while (re-search-forward "^[ \t]*- \\(.*?\\) \\[option:\\([A-Za-z0-9_-]+\\)\\]" end t)
           (push (cons (match-string 1) (match-string 2)) choices))))
     (nreverse choices)))
 

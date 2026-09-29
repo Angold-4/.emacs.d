@@ -177,14 +177,14 @@ test("a weekday reopen claim is checked against the calendar's weekly schedule",
   const good = fixture().briefs[0];
   // 09:30 is a real us_equity session boundary, so only the weekday check can
   // reject the exact wrong example the goal cites (finding M-10).
-  const monday = { ...good, today: "Pyth's NVDA product reopens Monday 09:30 ET[2]." };
+  const monday = { ...good, today: "Pyth's NVDA product reopens Monday 09:30 ET[3]." };
   const issue = briefIssue(monday, { catalogs: catalogs() });
   assert.ok(issue, "a Monday reopen must be refused when the calendar reopens Sunday");
   assert.match(issue!, /weekly reopen|cannot be checked/);
-  const sunday = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[2]." };
+  const sunday = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[3]." };
   assert.equal(briefIssue(sunday, { catalogs: catalogs() }), undefined);
   // A close is not a reopen: Friday 17:00 must not be read as one.
-  const closes = { ...good, today: "Kaiko's XAUUSD product closes Friday 17:00 ET[2]." };
+  const closes = { ...good, today: "Kaiko's XAUUSD product closes Friday 17:00 ET[5].", evidence: [...good.evidence, "config: calendars.yaml metal_otc opens Sun 18:00; sessions 18:00-17:00"] };
   assert.equal(briefIssue(closes, { catalogs: catalogs() }), undefined);
 });
 
@@ -224,7 +224,7 @@ test("renderBriefOrg renders a backstop brief whose recommendation is omitted", 
   const org = renderBriefOrg(brief);
   assert.match(org, /\*\* Should this stay as it is/);
   assert.match(org, /No recommendation: the brief writer was unavailable/);
-  assert.match(org, /\[accept_risk\]/);
+  assert.match(org, /\[option:accept_risk\]/);
 });
 
 test("a today that names a market and time cannot excuse itself with the unverified marker", () => {
@@ -292,6 +292,21 @@ test("the conductor forces a model brief's command to its item class", () => {
   assert.equal(good.command, undefined);
 });
 
+test("a model brief may say the publishing answer is unverified, but not 'not established'", () => {
+  const good = fixture().briefs[0];
+  const unverified = { ...good, impact: "Whether any market stops publishing is unverified.[2]" };
+  assert.equal(briefIssue(unverified), undefined);
+  const notEstablished = { ...good, impact: "Whether any market stops publishing is not established.[2]" };
+  assert.ok(briefIssue(notEstablished), "'not established' is the backstop's wording");
+  assert.equal(briefIssue(notEstablished, { allowUnverifiedImpact: true }), undefined);
+});
+
+test("the question is gated for a count like any other claim", () => {
+  const good = fixture().briefs[0];
+  assert.ok(briefIssue({ ...good, question: "Should the vendor wait ten seconds?" }));
+  assert.equal(briefIssue({ ...good, question: "Should the vendor wait ten seconds?[2]" }), undefined);
+});
+
 test("only the backstop may say the impact was not established", () => {
   const f = fixture();
   const model = { ...f.briefs[0], impact: "Whether any market stops publishing is not established." };
@@ -330,10 +345,12 @@ test("a claim must reference a config/code evidence entry, and its text stays pl
   assert.match(issue!, /evidence reference|plain/i);
   // [1] is a message, not a config/code citation.
   assert.ok(briefIssue({ ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[1]." }), "a message is not a citation");
-  // [2] is the config citation.
-  assert.equal(briefIssue({ ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[2]." }), undefined);
+  // [3] is the config citation that actually holds 20:00.
+  assert.equal(briefIssue({ ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[3]." }), undefined);
+  // A reference whose line does not hold the value is refused.
+  assert.ok(briefIssue({ ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[2]." }), "[2] does not hold 20:00");
   // A path in the owner-facing text is refused, even with a reference.
-  const withPath = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET in src/core/blend.rs:88[2]." };
+  const withPath = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET in src/core/blend.rs:88[3]." };
   assert.match(briefIssue(withPath)!, /plain|names code/i);
 });
 
@@ -349,20 +366,20 @@ test("briefIssue rejects a code identifier in the question", () => {
 test("each time, count or duration needs its own evidence reference", () => {
   const good = fixture().briefs[0];
   // One reference does not cover a second, unrelated claim.
-  const twoClaims = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[2]. The vendor then waits 10 s." };
+  const twoClaims = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[3]. The vendor then waits 10 s." };
   const issue = briefIssue(twoClaims);
   assert.ok(issue, "the 10 s claim is not covered by the 20:00 reference");
   assert.match(issue!, /10 s|evidence reference/i);
-  const bothCited = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[2]. The vendor then waits 10 s[3]." };
+  const bothCited = { ...good, today: "Pyth's NVDA product reopens Sunday 20:00 ET[3]. The vendor then waits 10 s[2]." };
   assert.equal(briefIssue(bothCited), undefined);
   // Each quantified form with its own reference passes; without it refused.
   for (const value of [
-    "No market stops publishing; the wait lasts 3 minutes[3].",
-    "No market stops publishing; 3 markets keep their vendor count[2].",
-    "No market stops publishing; the wait lasts two minutes[3].",
+    "No market stops publishing[2]. The wait lasts 10 minutes[2].",
+    "No market stops publishing[2]. 10 vendors keep their count[2].",
+    "No market stops publishing[2]. Ten vendors keep their count[2].",
   ]) {
     assert.equal(briefIssue({ ...good, impact: value }), undefined, `${value} should pass with its reference`);
-    const uncited = value.replace(/\[\d+\]/, "");
+    const uncited = value.replace(/\[(\d+)\](?=[^[]*$)/, "");
     assert.ok(briefIssue({ ...good, impact: uncited }), `${uncited} should be refused`);
   }
 });
