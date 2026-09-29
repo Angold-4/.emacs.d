@@ -86,7 +86,7 @@ function budgetBrief(request: OwnerRequest) {
       { id: "grant", label: "Give three more rounds", effect: "the worker tries again", cost: "more time" },
       { id: "stop", label: "Stop the phase", effect: "the phase stops", cost: "the work is not finished" },
     ],
-    recommendation: { option: "grant", why: "the plan's repair budget says to try again before stopping" },
+    recommendation: { option: "grant", why: "IC §5 says to try again before stopping" },
     related: [],
     evidence: ["message: the repair budget ran out", "plan: the phase's own repair budget"],
   };

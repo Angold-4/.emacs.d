@@ -229,9 +229,7 @@ test("owner-directives: an input while the reviewers are mid-turn is steered to 
         { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
         { kind: "wait-for-prompt" },
         // Holds each reviewer mid-turn long enough for the owner to steer it.
-        // 20 s (not 10 s) keeps the window open when the full suite runs
-        // three conductor tests at once and RPC delivery is delayed by load.
-        { kind: "sleep", ms: 20_000 },
+        { kind: "sleep", ms: 10_000 },
         submitReviewStep(reviewer, state),
       ],
     }),
@@ -239,7 +237,7 @@ test("owner-directives: an input while the reviewers are mid-turn is steered to 
       FAKE_PI_STEER_LOG: steerLogs.get(reviewer)!,
       FAKE_PI_PROMPT_LOG: promptLogs.get(reviewer)!,
     }),
-    deadlines: { ...FAST, reviewMs: 45_000 },
+    deadlines: FAST,
   });
   await setup.conductor.start();
   try {
@@ -249,7 +247,7 @@ test("owner-directives: an input while the reviewers are mid-turn is steered to 
     await waitFor(() => {
       const d = directives(setup).find((x) => x.commandId === "cmd-note-rev");
       return !!d && d.deliveries.M === "delivered" && d.deliveries.A === "delivered" && d.deliveries.B === "delivered";
-    }, 60_000);
+    }, 30_000);
     const directive = directives(setup).find((d) => d.commandId === "cmd-note-rev")!;
     assert.deepEqual([...directive.targets].sort(), ["A", "B", "M"], "one target per live reviewer");
     // …and the status view's payload shows that per-agent delivery.

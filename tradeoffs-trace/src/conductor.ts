@@ -126,7 +126,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
-import { briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
+import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -7405,7 +7405,14 @@ export class Conductor {
     if (toDispatch.length === 0) return;
     const actionId = this.#log.actionId("briefs");
     for (const id of toDispatch) this.#briefInFlight.add(id);
-    void this.#runBriefAgent(actionId, toDispatch).catch((err) => this.#logUnexpected("briefs", err));
+    void this.#runBriefAgent(actionId, toDispatch).catch((err) => {
+      // A spawn/intent throw happens before #runBriefAgent's own finally, so
+      // clean the ids and record the backstop here too; otherwise they would
+      // stay 'in flight' and every later pass would skip them (finding A-24).
+      this.#logUnexpected("briefs", err);
+      for (const id of toDispatch) this.#briefInFlight.delete(id);
+      this.#recordFallbackBriefs(toDispatch);
+    });
   }
 
   /** The live, flagged reserved decisions of the current candidate. A
@@ -7663,6 +7670,9 @@ export class Conductor {
         : ["(none readable)"]),
       "Products (products.yaml):",
       ...(catalogs ? Object.entries(catalogs.products).map(([sym, p]) => `- ${sym}: vendor ${p.vendor ?? "?"}, calendar ${p.calendar ?? "?"}`) : ["(none readable)"]),
+      "",
+      "Glossary — use these terms as-is and never explain them inline; the brief links each one:",
+      ...BRIEF_GLOSSARY.map((g) => `- ${g.term}: ${g.meaning}`),
       "",
       `Items needing a brief (${ids.length}):`,
     ];

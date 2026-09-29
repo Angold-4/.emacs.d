@@ -279,7 +279,9 @@ export function briefIssue(brief: Partial<DecisionBrief> | undefined, opts: Brie
   if (rec !== undefined) {
     if (!rec || typeof rec !== "object" || !rec.option?.trim() || !rec.why?.trim()) return "a brief's recommendation needs one option and why";
     if (!ids.includes(rec.option.trim())) return `the recommended option '${rec.option}' is not one of the brief's options`;
-    if (!/\b(?:IC|plan)\b|§\s*\d/i.test(rec.why)) return "the recommendation must cite the plan or an IC section";
+    // A bare mention of 'plan' is not a citation; require a section reference
+    // (`IC §5`, `plan §4`, or `§5`) (finding disc-M-103).
+    if (!/(?:\bIC\b|\bplan\b)\s*§?\s*\d|§\s*\d/i.test(rec.why)) return "the recommendation must cite the plan or an IC section";
   } else if (!opts.allowUnverifiedImpact) {
     return "a brief needs one recommended option and why, citing the plan or IC section";
   }
@@ -486,6 +488,26 @@ export function renderGlossaryOrg(): string {
  * paragraphs, `related` as links, evidence folded under a `** Evidence`
  * subtree. The heading carries enough properties for the Emacs view to fold
  * TAB and to send the same resolve command. */
+/** The runbook's owner glossary, the target of every glossary link in a brief. */
+export const GLOSSARY_LINK = "docs/tradeoffs-trace-runbook.md::Owner glossary";
+
+/** The glossary terms BRIEF actually uses, so the renderer links exactly those
+ * and never explains a term inline (goal item 4). */
+export function glossaryTermsIn(brief: DecisionBrief): string[] {
+  const text = [brief.question, brief.today, brief.impact, ...brief.options.flatMap((o) => [o.label, o.effect, o.cost]), brief.recommendation?.why ?? ""].join(" ");
+  return BRIEF_GLOSSARY.filter((g) => new RegExp(`\\b${g.term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(text)).map((g) => g.term);
+}
+
+/** One related item as an Org link the owner can follow (goal item 3): an entry
+ * or message links to its own detail file beside `views/review.org`, anything
+ * else links to its brief heading. */
+export function relatedLink(r: { id: string; question: string }): string {
+  const label = `${r.id} — ${r.question}`;
+  if (/^E-/.test(r.id)) return `[[file:entries/${r.id}.org][${label}]]`;
+  if (/^[TFB]-[0-9]+$/.test(r.id)) return `[[file:messages/${r.id}.org][${label}]]`;
+  return `[[*${r.question.replace(/]/g, ")")}][${label}]]`;
+}
+
 /** `views/review.org`: one owner item's brief as an Org subtree. The question
  * is the heading; today / impact / options / recommendation are short body
  * paragraphs, `related` links the other open items, and the original evidence
@@ -537,7 +559,12 @@ export function renderBriefOrg(brief: DecisionBrief, opts: { request?: OwnerRequ
   }
   if (brief.related.length > 0) {
     lines.push(`${indent}Related:`);
-    for (const r of brief.related) lines.push(`${indent}- ${r.id}: ${r.question}`);
+    for (const r of brief.related) lines.push(`${indent}- ${relatedLink(r)}`);
+  }
+  // Goal (4): a glossary term the brief uses is linked, never explained inline.
+  const terms = glossaryTermsIn(brief);
+  if (terms.length > 0) {
+    lines.push(`${indent}Glossary: ${terms.map((t) => `[[file:${GLOSSARY_LINK}][${t}]]`).join(" ")}`);
   }
   lines.push(`${indent}Evidence (original):`);
   for (const ev of brief.evidence) lines.push(`${indent}- ${ev}`);

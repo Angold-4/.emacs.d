@@ -14,6 +14,8 @@ import { test } from "node:test";
 import {
   briefIssue,
   checkTodayExample,
+  glossaryTermsIn,
+  relatedLink,
   renderBriefOrg,
   enrichBriefRelated,
   fallbackBrief,
@@ -243,6 +245,27 @@ test("the deterministic backstop lists related items on the same concern and nev
   assert.equal(impactAnswersPublishing(brief.impact), false, "the strict model check refuses the backstop wording");
   assert.deepEqual(brief.related.map((r) => r.id).sort(), ["D-A-80", "T-54"]);
   assert.equal(briefIssue(brief, { requestOptions: request.options.map((o) => o.id), allowUnverifiedImpact: true }), undefined);
+});
+
+test("a recommendation must cite a section, not merely mention the word plan", () => {
+  const good = fixture().briefs[0];
+  const vague = { ...good, recommendation: { option: "repair", why: "the plan's repair budget says so" } };
+  assert.ok(briefIssue(vague), "a bare 'plan' mention is not a citation");
+  assert.equal(briefIssue({ ...good, recommendation: { option: "repair", why: "IC §5 says so" } }), undefined);
+});
+
+test("a brief links the glossary terms it uses and its related items", () => {
+  const f = fixture();
+  // D-A-80's question says 'band', a glossary term.
+  assert.deepEqual(glossaryTermsIn(f.briefs[1]), ["band"]);
+  const org = renderBriefOrg(f.briefs[1]);
+  assert.match(org, /Glossary: .*\[\[file:docs\/tradeoffs-trace-runbook\.md::Owner glossary\]\[band\]\]/);
+  // A message related item is a file link the owner can follow.
+  assert.match(relatedLink({ id: "T-54", question: "Should every held market make no offer?" }), /^\[\[file:messages\/T-54\.org\]/);
+  assert.match(relatedLink({ id: "E-1", question: "held market" }), /^\[\[file:entries\/E-1\.org\]/);
+  // The golden F-M-9 brief's T-54 related line is a link.
+  const f9 = renderBriefOrg(f.briefs[0]);
+  assert.match(f9, /- \[\[file:messages\/T-54\.org\]\[T-54/);
 });
 
 test("a model brief without a recommendation, or without a plan/IC citation, is refused", () => {

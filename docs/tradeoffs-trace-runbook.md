@@ -657,7 +657,10 @@ under a minute:
   choosing it on the request.
 - **recommendation** — one option and why, citing the plan or an IC section.
 - **related** — other open items on the same file or plan clause, so a bigger
-  risk is never hidden behind a narrow request.
+  risk is never hidden behind a narrow request; each is an Org link the owner
+  can follow (to its message/entry detail file, or to its own brief).
+- **glossary** — when a brief uses one of the terms below, it links the term to
+  this glossary instead of explaining it inline.
 - **evidence** — the original message/finding/`file:line`, folded under `TAB`.
 
 A brief that states a time, a count or a duration must cite the config or code

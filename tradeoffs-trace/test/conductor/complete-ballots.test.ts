@@ -58,12 +58,7 @@ function reviewArgs(reviewer: Reviewer, state: State, extra: Record<string, unkn
   };
 }
 
-// 150 s (not 90 s): several of these tests re-dispatch a reviewer and run a
-// full evaluation, and the whole suite runs three conductor files at once. At
-// load average 11-13 the 90 s cap expired before the phase reached DONE
-// (05_ref_v1_findings.md #31), which read as a failure though the flow is
-// correct. The per-test node timeout is 180 s, so this stays inside it.
-async function runToTerminal(setup: Setup, timeoutMs = 150_000): Promise<string> {
+async function runToTerminal(setup: Setup, timeoutMs = 90_000): Promise<string> {
   await setup.conductor.start();
   await waitFor(
     () => ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase),
