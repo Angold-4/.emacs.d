@@ -30,7 +30,19 @@
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
-import type { ContractVersion, Correction, CriterionAmendment, Decision, MessageType, PhaseState, Review } from "./types.ts";
+import type {
+  ContractVersion,
+  Correction,
+  CriterionAmendment,
+  Decision,
+  MessageType,
+  PanelOption,
+  PanelOutcome,
+  PanelSeatState,
+  PanelState,
+  PhaseState,
+  Review,
+} from "./types.ts";
 
 export function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
   return a.snapshot === b.snapshot && a.sectionSha256 === b.sectionSha256;
@@ -93,8 +105,94 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
  * that is one fresh evaluator per message type that has work: the predicate
  * holds when every such type's evaluator has finished or timed out. Plan 04b
  * adds its panels to this same predicate. */
+// ---------------------------------------------------------------------------
+// Plan 04b: the blocker panel
+// ---------------------------------------------------------------------------
+
+/** The three seats every panel has. */
+export const PANEL_SEATS = [1, 2, 3] as const;
+
+/** The fallback pair of owner options: what an ordinary open-finding request
+ * for the blocker offers, worded exactly as `applyOwnerRequestResolved` and
+ * `isRepairForcingOption` treat them (`accept_risk` settles the blocker and
+ * lets the candidate stand; every other id starts the repair that carries it
+ * out). A block vote must offer two or three options with distinct ids, so a
+ * well-formed escalation never needs it — but if one ever did, both options
+ * now do exactly what they say (round-3 review, advisory B-2). */
+export const DEFAULT_BLOCKER_OPTIONS: PanelOption[] = [
+  { id: "accept_risk", label: "accept the risk and let the candidate stand" },
+  { id: "repair", label: "repair it (grant 3 rounds)" },
+];
+
+/** A seat is settled once it has voted, or is unavailable after its one
+ * retry (its second dispatch). A first loss marks it unavailable but keeps it
+ * re-dispatchable: `dispatches` is the durable retry bookkeeping. */
+export function panelSeatSettled(seat: PanelSeatState | undefined): boolean {
+  if (!seat) return false;
+  if (seat.vote !== undefined) return true;
+  return seat.unavailable === true && seat.dispatches >= 2;
+}
+
+export function panelSeatsSettled(panel: PanelState | undefined): boolean {
+  return PANEL_SEATS.every((n) => panelSeatSettled(panel?.seats?.[String(n)]));
+}
+
+/** The panel's verdict from its recorded votes: a majority `block` escalates,
+ * a majority `downgrade` downgrades, anything else (including a split or two
+ * unavailable seats) is incomplete. Only the core computes this; the
+ * conductor may not invent an outcome. */
+export function panelOutcome(panel: PanelState): PanelOutcome {
+  const votes = Object.values(panel.seats ?? {})
+    .map((s) => s.vote)
+    .filter((v): v is "block" | "downgrade" => v === "block" || v === "downgrade");
+  const blocks = votes.filter((v) => v === "block").length;
+  const downgrades = votes.filter((v) => v === "downgrade").length;
+  if (blocks >= 2) return "escalate";
+  if (downgrades >= 2) return "downgrade";
+  return "incomplete";
+}
+
+/** The options a `block` majority puts to the owner: every block vote's own
+ * options, in seat order, deduped by id and capped at three (a `block` vote
+ * proposes two or three). Falls back to DEFAULT_BLOCKER_OPTIONS so an
+ * escalation always has options. */
+export function panelOptionsFor(panel: PanelState): PanelOption[] {
+  const out: PanelOption[] = [];
+  for (const n of PANEL_SEATS) {
+    const seat = panel.seats?.[String(n)];
+    if (seat?.vote !== "block") continue;
+    for (const option of seat.options ?? []) {
+      if (out.some((o) => o.id === option.id)) continue;
+      out.push(option);
+      if (out.length >= 3) return out;
+    }
+  }
+  return out.length >= 2 ? out : DEFAULT_BLOCKER_OPTIONS;
+}
+
+/** Every blocker id this round's panel covers, in stable (sorted) order. */
+export function blockersNeedingPanel(phase: PhaseState): string[] {
+  return Object.keys(phase.panel?.blockers ?? {}).sort();
+}
+
+/** True once every panel of the round has a recorded decision. */
+export function panelsSettled(phase: PhaseState): boolean {
+  return Object.values(phase.panel?.blockers ?? {}).every((p) => p.decided !== undefined);
+}
+
+/** The first blocker (sorted order) whose panel decided `outcome`, if any. */
+export function blockerWithOutcome(phase: PhaseState, outcome: PanelOutcome): string | undefined {
+  return blockersNeedingPanel(phase).find((id) => phase.panel?.blockers?.[id]?.decided?.outcome === outcome);
+}
+
+/** Plan 04a/04b: whether everything EVALUATING waits for has settled: every
+ * dispatched type's evaluator finished or timed out, and every raw blocker's
+ * panel reached a verdict. This is the gate that keeps the phase EVALUATING
+ * until the last of the two settles. */
 export function evaluationSettled(phase: PhaseState): boolean {
-  return typesNeedingEvaluation(phase).every((t) => phase.evaluation?.types?.[t]?.settled === true);
+  return (
+    typesNeedingEvaluation(phase).every((t) => phase.evaluation?.types?.[t]?.settled === true) && panelsSettled(phase)
+  );
 }
 
 /** M, A and B each have a review bound to (C, K) already. Used to decide,

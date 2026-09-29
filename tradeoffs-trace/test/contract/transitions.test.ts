@@ -18,6 +18,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { next } from "../../src/core/next.ts";
+import { accept, evaluationSettled } from "../../src/core/predicate.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { TRANSITIONS } from "../../src/core/transitions.ts";
 import type { Event, Finding, PhaseStateName, State } from "../../src/core/types.ts";
@@ -1118,6 +1119,98 @@ BUILD["evaluation-completed"] = {
   event: { type: "EVALUATION_COMPLETED" },
 };
 
+// Plan 04b: the blocker panel. A raised blocker is a raw `blocker` message
+// AND an open blocking finding; each panel's verdict picks the exit from
+// EVALUATING (the message itself is published by the blocker evaluator before
+// EVALUATION_COMPLETED).
+const BLOCK_OPTIONS = [
+  { id: "repair_cancel", label: "repair the cancel path (grant 3 rounds)" },
+  { id: "accept_risk", label: "accept the risk" },
+];
+const blockerMessage = () =>
+  makeMessage({
+    id: "B-1",
+    type: "blocker",
+    state: "published",
+    sourceRecordId: "F-block",
+    title: "defect blocking: the cancel path can deadlock",
+  });
+const blockerFinding = (): Finding => ({
+  id: "F-block",
+  version: 1,
+  phaseId: "p1",
+  kind: "defect",
+  severity: "blocking",
+  evidence: "src/cancel.ts:10",
+  raisedBy: "B",
+  status: "open",
+  boundCandidateSha: "C1",
+});
+function panelState(seats: Record<string, object>, decided: object) {
+  return { blockers: { "B-1": { seats, decided } } };
+}
+const PANEL_BASE = {
+  candidate: C1,
+  integrationHead: "H0",
+  checks: { candidateSha: "C1", passed: true },
+  probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+  reviews: acceptableReviews,
+  findings: [blockerFinding()],
+  messages: [blockerMessage()],
+} as const;
+
+BUILD["panel-escalate"] = {
+  state: baseState({
+    ...PANEL_BASE,
+    phase: "EVALUATING",
+    // 2 of 3 voted block.
+    panel: panelState(
+      {
+        "1": { dispatches: 1, vote: "block", reason: "the deadlock must stop the work", options: BLOCK_OPTIONS },
+        "2": { dispatches: 1, vote: "block", reason: "not safe to continue", options: BLOCK_OPTIONS },
+        "3": { dispatches: 1, vote: "downgrade", reason: "one path only" },
+      },
+      { outcome: "escalate", options: BLOCK_OPTIONS },
+    ),
+  }),
+  event: { type: "EVALUATION_COMPLETED" },
+};
+
+BUILD["panel-downgrade"] = {
+  state: baseState({
+    ...PANEL_BASE,
+    phase: "EVALUATING",
+    // 2 of 3 voted downgrade.
+    panel: panelState(
+      {
+        "1": { dispatches: 1, vote: "downgrade", reason: "repairable" },
+        "2": { dispatches: 1, vote: "downgrade", reason: "no need to stop" },
+        "3": { dispatches: 1, vote: "block", reason: "stop it", options: BLOCK_OPTIONS },
+      },
+      { outcome: "downgrade" },
+    ),
+  }),
+  event: { type: "EVALUATION_COMPLETED" },
+};
+
+BUILD["panel-incomplete"] = {
+  state: baseState({
+    ...PANEL_BASE,
+    phase: "EVALUATING",
+    // No two seats agreed: one block, one downgrade, one unavailable after
+    // its retry (dispatches 2).
+    panel: panelState(
+      {
+        "1": { dispatches: 1, vote: "block", reason: "stop it", options: BLOCK_OPTIONS },
+        "2": { dispatches: 1, vote: "downgrade", reason: "repairable" },
+        "3": { dispatches: 2, unavailable: true, reason: "did not vote after its retry" },
+      },
+      { outcome: "incomplete" },
+    ),
+  }),
+  event: { type: "EVALUATION_COMPLETED" },
+};
+
 test("transition table: every row in transitions.ts has a covering fixture", () => {
   const missing = TRANSITIONS.filter((r) => !BUILD[r.id]).map((r) => r.id);
   assert.deepEqual(missing, [], `rows with no test fixture: ${missing.join(", ")}`);
@@ -1138,6 +1231,101 @@ for (const row of TRANSITIONS) {
     assert.deepEqual(actions, row.actions, `next() of row '${row.id}'s resulting state did not match its actions`);
   });
 }
+
+test("plan 04b: a raised blocker blocks acceptance from the moment it is raised, whatever the panel is doing", () => {
+  // Every input accept(C, K) reads is valid — checks, probe, all three
+  // reviews — and the ONLY thing open is the blocker's blocking finding.
+  // Acceptance must be impossible in every panel state: before the panel is
+  // seeded, while its seats vote, and after each of the three outcomes. The
+  // owner's choice (not the panel's) is what can close it.
+  const panels = [
+    undefined, // not yet seeded / blocked before the panel exists
+    { seats: { "1": { dispatches: 1, vote: "downgrade", reason: "x" } } }, // mid-vote
+    { seats: { "1": { dispatches: 1, vote: "block", reason: "x", options: BLOCK_OPTIONS } }, decided: { outcome: "escalate", options: BLOCK_OPTIONS } },
+    { seats: {}, decided: { outcome: "downgrade" } },
+    { seats: {}, decided: { outcome: "incomplete" } },
+  ];
+  for (const panel of panels) {
+    const state = baseState({
+      ...PANEL_BASE,
+      phase: "RESOLVING",
+      panel: panel ? { blockers: { "B-1": panel } } : undefined,
+    });
+    assert.equal(accept(state.phase, "C1", K), false, `accept() must hold false with an open blocker (panel: ${JSON.stringify(panel)})`);
+    assert.deepEqual(next(state), [{ type: "resolving_incomplete" }]);
+    const accepted = reduce(state, { type: "ACCEPTED", resolvedCorrectionIds: [] });
+    assert.equal(accepted.ok, false, "ACCEPTED must be rejected while the blocker's finding is open");
+  }
+
+  // And the phase cannot leave EVALUATING before the panel settles: an
+  // evaluator that finished is not enough.
+  const midVote = baseState({
+    ...PANEL_BASE,
+    phase: "EVALUATING",
+    panel: { blockers: { "B-1": { seats: { "1": { dispatches: 1, vote: "downgrade", reason: "x" } } } } },
+  });
+  assert.equal(evaluationSettled(midVote.phase), false);
+  const early = reduce(midVote, { type: "EVALUATION_COMPLETED" });
+  assert.equal(early.ok, false, "EVALUATION_COMPLETED must be refused while the panel still has undecided seats");
+});
+
+test("plan 04b: an escalated blocker's accept_risk option settles the blocker and lets the candidate stand", () => {
+  // Advisory B-2: every other blocker_panel option is repair-forcing; the one
+  // that says it lets the candidate stand must actually do that, rather than
+  // starting a repair round the option never described.
+  const finding: Finding = {
+    id: "F-blk",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: "src/cancel.ts:10",
+    raisedBy: "B",
+    status: "open",
+    boundCandidateSha: "C1",
+  };
+  const state = baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: acceptableReviews,
+    findings: [finding],
+    messages: [makeMessage({ id: "B-1", type: "blocker", state: "published", raisedAsBlocker: true, sourceRecordId: "F-blk" })],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "the blocker panel voted to stop",
+        origin: "blocker_panel",
+        linkedFindingId: "F-blk",
+        linkedMessageId: "B-1",
+        boundCandidateSha: "C1",
+        boundContractVersion: K,
+        options: [
+          { id: "accept_risk", label: "accept the risk and let the candidate stand" },
+          { id: "repair", label: "repair it (grant 3 rounds)" },
+        ],
+        status: "open",
+      },
+    ],
+  });
+  const resolved = reduce(state, {
+    type: "OWNER_REQUEST_RESOLVED",
+    requestId: "OR-1",
+    option: "accept_risk",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  });
+  assert.equal(resolved.ok, true, !resolved.ok ? resolved.reason : "");
+  assert.equal(resolved.state.phase.phase, "RESOLVING", "accepting the risk starts no repair");
+  assert.equal(resolved.state.phase.findings.find((f) => f.id === "F-blk")!.status, "accepted");
+  assert.equal(resolved.state.phase.messages!.find((m) => m.id === "B-1")!.state, "resolved");
+  assert.deepEqual(next(resolved.state), [{ type: "accept", resolvedCorrectionIds: [] }]);
+});
 
 test("next(): no double dispatch — ACTION_STARTED for an outstanding action makes next() return [] for it", () => {
   // CHECKING with a fresh candidate: next() recommends run_checks once.
@@ -1211,6 +1399,9 @@ const DESIGN_EDGES: { from: PhaseStateName; to: PhaseStateName; cite: string }[]
   { from: "PROBING", to: "REPAIRING", cite: "§6.1: PROBING │ conflict or failure → raise `integration` finding ──▶ REPAIRING" },
   { from: "REVIEWING", to: "EVALUATING", cite: "plan 04a: the last review enters EVALUATING before acceptance" },
   { from: "EVALUATING", to: "RESOLVING", cite: "plan 04a: EVALUATING --EVALUATION_COMPLETED--> RESOLVING" },
+  { from: "EVALUATING", to: "AWAITING_OWNER", cite: "plan 04b: a `block` majority escalates the blocker to the owner, with the panel's options" },
+  { from: "EVALUATING", to: "REPAIRING", cite: "plan 04b: a `downgrade` majority makes the blocker a blocking finding for the next worker attempt" },
+  { from: "EVALUATING", to: "RESOLVING", cite: "plan 04b: an incomplete panel leaves the blocking finding effective and the ordinary routing repair it" },
   { from: "READY", to: "BASELINE", cite: "plan 04a: READY --ATTEMPT_STARTED[baselineNeeded]--> BASELINE" },
   { from: "BASELINE", to: "IMPLEMENTING", cite: "plan 04a: BASELINE --BASELINE_COMPLETED--> IMPLEMENTING" },
   { from: "RESOLVING", to: "REPAIRING", cite: "§6.1: RESOLVING │ open items remain and budget remains ─...─▶ REPAIRING" },

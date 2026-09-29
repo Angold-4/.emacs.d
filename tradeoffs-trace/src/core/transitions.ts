@@ -25,7 +25,17 @@ import {
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
-import { accept, evaluationSettled, isLiveDecision, resolvedCorrectionIdsFor, reviewsComplete, sameVersion } from "./predicate.ts";
+import {
+  accept,
+  blockerWithOutcome,
+  blockersNeedingPanel,
+  DEFAULT_BLOCKER_OPTIONS,
+  evaluationSettled,
+  isLiveDecision,
+  resolvedCorrectionIdsFor,
+  reviewsComplete,
+  sameVersion,
+} from "./predicate.ts";
 import type {
   Correction,
   Decision,
@@ -33,6 +43,8 @@ import type {
   Finding,
   InFlightKey,
   Message,
+  OwnerRequest,
+  PanelState,
   PhaseState,
   PhaseStateName,
   Review,
@@ -424,6 +436,21 @@ addRow({
 // left for REVIEWING to dispatch, so the phase goes straight to RESOLVING
 // instead of visiting a REVIEWING state next() can do nothing more with —
 // discovered by the no-circularity property test (round-1 review item 2).
+/** Plan 04b: the panel a round starts with — one entry per raw blocker
+ * message raised through a reviewer's `blockers` list at the moment the
+ * phase enters EVALUATING. Recording the set in STATE (not recomputing it
+ * later) is what makes "which blockers need a panel" race-free: the blocker
+ * evaluator may publish the message while the panel votes, and the panel
+ * must still run. A blocking *finding* raised through the ordinary
+ * `findings` list is not a blocker here — it keeps its pre-04b handling. */
+function panelForMessages(messages: readonly Message[] | undefined): { blockers: Record<string, PanelState> } {
+  const blockers: Record<string, PanelState> = {};
+  for (const m of messages ?? []) {
+    if (m.type === "blocker" && m.raisedAsBlocker === true && m.state === "raw") blockers[m.id] = {};
+  }
+  return { blockers };
+}
+
 function applyProbePassed(s: State, ev: Event, targetPhase: PhaseStateName): State {
   const e = ev as Extract<Event, { type: "PROBE_PASSED" }>;
   const findings = s.phase.findings.map((f: Finding) =>
@@ -437,8 +464,8 @@ function applyProbePassed(s: State, ev: Event, targetPhase: PhaseStateName): Sta
     findings,
     // Entering EVALUATING starts a FRESH round: an earlier round's
     // `evaluation.settled` must never let the new round's raw messages skip
-    // evaluation.
-    ...(targetPhase === "EVALUATING" ? { evaluation: undefined } : {}),
+    // evaluation, and the panel starts from this round's own raw blockers.
+    ...(targetPhase === "EVALUATING" ? { evaluation: undefined, panel: panelForMessages(s.phase.messages) } : {}),
     inFlight: clearInFlight(s.phase, "dispatch_probe"),
   });
 }
@@ -557,8 +584,10 @@ addRow({
     return withPhase(s, {
       phase: "EVALUATING",
       reviews: { ...s.phase.reviews, [e.review.reviewer]: { review: e.review } },
-      // A fresh round: never inherit a previous round's settled flag.
+      // A fresh round: never inherit a previous round's settled flag, and
+      // start the panel from this round's own raw blockers (plan 04b).
       evaluation: undefined,
+      panel: panelForMessages(s.phase.messages),
       inFlight: clearInFlight(s.phase, key),
     });
   },
@@ -614,32 +643,144 @@ addRow({
   apply: (s) => withPhase(s, { phase: "BLOCKED", blockedReason: "reviewer unavailable" }),
 });
 
-// --- EVALUATING (plan 04a) ----------------------------------------------
+// --- EVALUATING (plan 04a/04b) ------------------------------------------
 // One fresh evaluator per message type is dispatched from next(); each one's
 // outcome is a RECORD event in reduce.ts (EVALUATOR_FINISHED, or
 // EVALUATION_TIMED_OUT which publishes that type's raw messages unevaluated).
-// The only transition out of EVALUATING is EVALUATION_COMPLETED, and only
-// once every dispatched type has settled.
+// Each raw blocker is ALSO voted by a panel of three fresh agents (also
+// dispatched from next(), each seat its own logged action with a deadline);
+// the panel's verdict is a RECORD event (PANEL_VOTE / PANEL_SEAT_UNAVAILABLE
+// / PANEL_DECIDED).
+//
+// The ONLY transition out of EVALUATING is EVALUATION_COMPLETED, and only
+// once `evaluationSettled` holds — every dispatched type's evaluator AND
+// every raw blocker's panel. So the phase stays in EVALUATING until the LAST
+// of the two settles, and EVALUATION_COMPLETED is emitted exactly once. The
+// recorded panel outcome picks which of these rows that exit takes.
+
+/** Clears every evaluation and panel dispatch left in flight at the exit.
+ * (Both are normally already settled; this is defensive bookkeeping, exactly
+ * as the pre-04b row cleared the evaluation keys.) */
+function clearedAtEvaluationExit(phase: PhaseState): PhaseState["inFlight"] {
+  const inFlight = { ...phase.inFlight };
+  for (const key of Object.keys(inFlight)) {
+    if (key.startsWith("dispatch_panel_")) delete inFlight[key as InFlightKey];
+  }
+  return clearInFlight(
+    { ...phase, inFlight },
+    "dispatch_evaluation_tradeoff",
+    "dispatch_evaluation_finding",
+    "dispatch_evaluation_blocker",
+  );
+}
+
+/** Plan 04b: a `block` majority parks the phase on the owner, carrying the
+ * panel's options. No repair round is spent (AWAITING_OWNER consumes
+ * nothing); the owner's choice resolves the blocker message and its blocking
+ * finding and resumes into REPAIRING. */
+function applyPanelEscalation(s: State): State {
+  const phase = s.phase;
+  const K = phase.contract.contractVersion;
+  const C = phase.candidate?.sha;
+  const requests: OwnerRequest[] = [];
+  let n = phase.ownerRequests.length;
+  for (const id of blockersNeedingPanel(phase)) {
+    if (phase.panel?.blockers?.[id]?.decided?.outcome !== "escalate") continue;
+    if (phase.ownerRequests.some((r) => r.status === "open" && r.linkedMessageId === id)) continue;
+    const decision = phase.panel.blockers![id].decided!;
+    const message = (phase.messages ?? []).find((m) => m.id === id);
+    n += 1;
+    requests.push({
+      id: `OR-${phase.phaseId}-blocker-${n}`,
+      version: 1,
+      phaseId: phase.phaseId,
+      reason: `the blocker panel voted to stop: ${message?.title ?? id}${decision.reason ? ` — ${decision.reason}` : ""}`,
+      origin: "blocker_panel",
+      linkedFindingId: message?.sourceRecordId,
+      linkedMessageId: id,
+      boundCandidateSha: C,
+      boundContractVersion: K,
+      options: decision.options && decision.options.length > 0 ? decision.options : DEFAULT_BLOCKER_OPTIONS,
+      status: "open",
+    });
+  }
+  return withPhase(s, {
+    phase: "AWAITING_OWNER",
+    ownerRequests: [...phase.ownerRequests, ...requests],
+    inFlight: clearedAtEvaluationExit(phase),
+  });
+}
+
+// A majority `block`: stop for the owner, with the options to choose from.
+// No repair round is used, and the blocking finding stays open until the
+// owner's choice resolves it (so acceptance is blocked the whole time).
+addRow({
+  id: "panel-escalate",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "EVALUATION_COMPLETED",
+  guardName: "evaluationSettledAndPanelEscalated",
+  guard: (s) => evaluationSettled(s.phase) && blockerWithOutcome(s.phase, "escalate") !== undefined,
+  to: "AWAITING_OWNER",
+  // AWAITING_OWNER is terminal for next(): the owner must choose.
+  actions: [],
+  apply: applyPanelEscalation,
+});
+
+// A majority `downgrade`: the blocker becomes a blocking finding for the
+// next worker attempt — one repair round, never parked. The blocking finding
+// is still open and blocking, so it appears in the repair prompt, and accept()
+// still refuses this candidate.
+addRow({
+  id: "panel-downgrade",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "EVALUATION_COMPLETED",
+  guardName: "evaluationSettledAndPanelDowngraded",
+  guard: (s) =>
+    evaluationSettled(s.phase) &&
+    blockerWithOutcome(s.phase, "escalate") === undefined &&
+    blockerWithOutcome(s.phase, "downgrade") !== undefined,
+  to: "REPAIRING",
+  actions: REPAIR_ATTEMPT_ACTIONS,
+  apply: (s) => withPhase(s, { phase: "REPAIRING", inFlight: clearedAtEvaluationExit(s.phase) }),
+});
+
+// The panel could not reach a verdict (a split, or two seats unavailable
+// after their retry). Nothing is escalated to the owner and nothing is
+// parked: the blocking finding stays effective, so RESOLVING's ordinary
+// routing sends the candidate to a repair round.
+addRow({
+  id: "panel-incomplete",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "EVALUATION_COMPLETED",
+  guardName: "evaluationSettledAndPanelIncomplete",
+  guard: (s) =>
+    evaluationSettled(s.phase) &&
+    blockerWithOutcome(s.phase, "escalate") === undefined &&
+    blockerWithOutcome(s.phase, "downgrade") === undefined &&
+    blockerWithOutcome(s.phase, "incomplete") !== undefined,
+  to: "RESOLVING",
+  // Fixture has the blocker's blocking finding still open, so RESOLVING
+  // routes to `resolving_incomplete` (a repair round if budget remains).
+  actions: [{ type: "resolving_incomplete" }],
+  apply: (s) => withPhase(s, { phase: "RESOLVING", inFlight: clearedAtEvaluationExit(s.phase) }),
+});
+
+// No blocker panel this round (no raw blocker): EVALUATION_COMPLETED means
+// what it did before plan 04b.
 addRow({
   id: "evaluation-completed",
   axis: "phase",
   from: "EVALUATING",
   trigger: "EVALUATION_COMPLETED",
-  guardName: "evaluationSettled",
-  guard: (s) => evaluationSettled(s.phase),
+  guardName: "evaluationSettledNoPanel",
+  guard: (s) => evaluationSettled(s.phase) && blockersNeedingPanel(s.phase).length === 0,
   to: "RESOLVING",
   // Fixture is acceptable with nothing open, so next() of RESOLVING accepts.
   actions: [{ type: "accept", resolvedCorrectionIds: [] }],
-  apply: (s) =>
-    withPhase(s, {
-      phase: "RESOLVING",
-      inFlight: clearInFlight(
-        s.phase,
-        "dispatch_evaluation_tradeoff",
-        "dispatch_evaluation_finding",
-        "dispatch_evaluation_blocker",
-      ),
-    }),
+  apply: (s) => withPhase(s, { phase: "RESOLVING", inFlight: clearedAtEvaluationExit(s.phase) }),
 });
 
 // --- RESOLVING --------------------------------------------------------

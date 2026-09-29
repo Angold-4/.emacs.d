@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
  * tests. */
 export const PI_VERSION = "0.87.0";
 
-export type Role = "worker" | "reviewer" | "evaluator";
+export type Role = "worker" | "reviewer" | "evaluator" | "panel";
 
 /** design §2.1's launch table. Every role uses an explicit allowlist, never
  * `--exclude-tools` (Pi's default set omits `grep`, `find` and `ls`, so a
@@ -26,6 +26,11 @@ export const ROLE_TOOLS: Record<Role, string[]> = {
   // no `raise_tradeoff`: the plan gives that tool to the worker, and a tool
   // the evaluator could never use would be a dead interface.
   evaluator: ["read", "grep", "find", "ls", "submit_evaluation"],
+  // Plan 04b: one fresh panel seat per blocker vote. It reads the phase
+  // contract, the owner directives, the ledger, the blocker and its evidence,
+  // and the candidate's diff, and returns a single `block`/`downgrade` vote
+  // through `submit_panel_vote`.
+  panel: ["read", "grep", "find", "ls", "submit_panel_vote"],
 };
 
 /** The skeleton extension's own file, resolved relative to this module so

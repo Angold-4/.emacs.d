@@ -48,6 +48,7 @@ import {
   RAISE_TRADEOFF_PARAMS,
   SUBMIT_DISCOVERY_PARAMS,
   SUBMIT_EVALUATION_PARAMS,
+  SUBMIT_PANEL_VOTE_PARAMS,
   SUBMIT_PHASE_PARAMS,
   SUBMIT_REVIEW_PARAMS,
 } from "./param-shapes.ts";
@@ -72,6 +73,12 @@ function subschema(file: JSONSchema, name: string): JSONSchema {
 // candidateSha and contractVersion (it is told them; design §2.1's process
 // table), so the shared schemas/review.schema.json is used as-is.
 const REVIEW_SCHEMA = loadSchema("../schemas/review.schema.json");
+
+// Plan 04b: one panel seat's vote on one raw blocker. No conductor-assigned
+// binding fields at submission time — the seat already knows its blocker and
+// seat number (the conductor tells it), exactly like a reviewer's own
+// candidateSha/contractVersion.
+const PANEL_VOTE_SCHEMA = loadSchema("../schemas/panel-vote.schema.json");
 
 // A Decision's binding fields (boundCandidateSha, boundContractVersion) and
 // identity fields (id, version, phaseId) are assigned by the conductor —
@@ -151,6 +158,26 @@ const BallotParam = Type.Object({
   ),
 });
 
+// Plan 04b: a blocker is a finding without a severity — a blocker is always
+// blocking, so the reviewer never states one. Deliberately no `sameAs`: a
+// blocker is never folded into an existing finding, so a stop-the-work
+// request can never be silently dropped; cite the issue's evidence instead.
+const BlockerParam = Type.Object({
+  kind: StringEnum(["defect", "contract", "integration"] as const),
+  evidence: Type.String({ description: "file:line, scenario, check result or plan clause — required, non-empty" }),
+  linkedDecisionId: Type.Optional(Type.String()),
+  criterionDispute: Type.Optional(
+    Type.Object({
+      criterion: Type.String({ description: "One acceptance item of the phase contract, verbatim" }),
+      why: Type.String({ description: "Why it cannot be met as written" }),
+      proposedWording: Type.String({ description: "The wording that replaces it if the amendment passes" }),
+    }),
+  ),
+  reproduction: Type.Optional(
+    Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
+  ),
+});
+
 const FindingParam = Type.Object({
   kind: StringEnum(["defect", "contract", "integration"] as const),
   severity: StringEnum(["blocking", "advisory"] as const),
@@ -214,6 +241,12 @@ const submitReviewFields: Record<string, TSchema> = {
       description: "For each of YOUR turn-1 discoveries that is the same choice as another listed record: {discoveryId, sameAs}",
     }),
   ),
+  blockers: Type.Optional(
+    Type.Array(BlockerParam, {
+      description:
+        "Plan 04b: findings that STOP the work until the owner decides. Raised at once as a raw blocker message and a blocking finding, then voted by a panel of three.",
+    }),
+  ),
 };
 const SubmitReviewParams = Type.Object(
   Object.fromEntries(SUBMIT_REVIEW_PARAMS.properties.map((key) => [key, submitReviewFields[key]])),
@@ -258,6 +291,26 @@ const submitEvaluationFields: Record<string, TSchema> = {
 };
 const SubmitEvaluationParams = Type.Object(
   Object.fromEntries(SUBMIT_EVALUATION_PARAMS.properties.map((key) => [key, submitEvaluationFields[key]])),
+);
+
+// Plan 04b: `submit_panel_vote` — one panel seat's vote on one raw blocker.
+const PanelOptionParam = Type.Object({
+  id: Type.String({ description: "A stable id for this option" }),
+  label: Type.String({ description: "The option as the owner reads it" }),
+});
+const submitPanelVoteFields: Record<string, TSchema> = {
+  blockerId: Type.String({ description: "The raw blocker message id this vote is about" }),
+  seat: Type.Integer({ description: "This seat's number (1, 2 or 3)" }),
+  vote: StringEnum(["block", "downgrade"] as const, {
+    description: "block: stop the work until the owner decides; downgrade: an ordinary blocking finding for the next worker attempt",
+  }),
+  reason: Type.String({ description: "Why you voted this way" }),
+  options: Type.Optional(
+    Type.Array(PanelOptionParam, { minItems: 2, maxItems: 3, description: "block only: the two or three options the owner chooses from" }),
+  ),
+};
+const SubmitPanelVoteParams = Type.Object(
+  Object.fromEntries(SUBMIT_PANEL_VOTE_PARAMS.properties.map((key) => [key, submitPanelVoteFields[key]])),
 );
 
 function readEnv(name: string): string | undefined {
@@ -340,7 +393,13 @@ class RunSocketClient {
   }
 
   async submit(
-    tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation",
+    tool:
+      | "submit_phase"
+      | "submit_discovery"
+      | "submit_review"
+      | "raise_tradeoff"
+      | "submit_evaluation"
+      | "submit_panel_vote",
     args: unknown,
     timeoutMs = 60000,
   ): Promise<SubmitReply> {
@@ -386,7 +445,7 @@ export default function (pi: ExtensionAPI) {
   const client = new RunSocketClient();
   const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
-  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | undefined) ?? "worker";
+  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | undefined) ?? "worker";
   const accepted = new Set<string>();
   // A reviewer's turn 2 starts with the first agent_start after its
   // discovery (turn 1) was accepted; before that, turn 1 is still running.
@@ -400,6 +459,7 @@ export default function (pi: ExtensionAPI) {
   function owedSubmission(): string | undefined {
     if (role === "worker") return accepted.has("submit_phase") ? undefined : "submit_phase";
     if (role === "evaluator") return accepted.has("submit_evaluation") ? undefined : "submit_evaluation";
+    if (role === "panel") return accepted.has("submit_panel_vote") ? undefined : "submit_panel_vote";
     if (!accepted.has("submit_discovery")) return "submit_discovery";
     if (reviewTurnStarted && !accepted.has("submit_review")) return "submit_review";
     return undefined;
@@ -414,6 +474,8 @@ export default function (pi: ExtensionAPI) {
       "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every record the prompt lists as delegated or reserved and does not mark carried — the conductor rejects a review that omits one, names the missing ids and their choices, and expects you to resubmit — plus your findings and your statements. submit_review is the only submission tool you may use now.",
     submit_evaluation:
       "You have not called submit_evaluation yet. Return one entry per raw message you were shown: publish (with a title of at most 80 characters, a summary of at most 3 sentences, context, evidence and importance), merge (into another message), or drop (with a reason).",
+    submit_panel_vote:
+      "You have not called submit_panel_vote yet. Vote block (stop the work until the owner decides — propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
   };
 
   pi.on("session_start", async () => {
@@ -510,7 +572,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function submitTool(
-    tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation",
+    tool:
+      | "submit_phase"
+      | "submit_discovery"
+      | "submit_review"
+      | "raise_tradeoff"
+      | "submit_evaluation"
+      | "submit_panel_vote",
     args: unknown,
     markAccepted = true,
   ) {
@@ -603,6 +671,20 @@ export default function (pi: ExtensionAPI) {
       // submit_phase accepted. The conductor binds it to the current
       // candidate/contract and records it raw for the evaluator.
       return submitTool("raise_tradeoff", params, false);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_panel_vote",
+    label: "Submit Panel Vote",
+    description:
+      "Vote on one raw blocker: block (stop the work until the owner decides; propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
+    promptSnippet: "Vote block or downgrade on the raw blocker",
+    parameters: SubmitPanelVoteParams,
+    async execute(_toolCallId, params) {
+      const error = validateOrError(PANEL_VOTE_SCHEMA, params);
+      if (error) return { isError: true, content: [{ type: "text", text: error }] };
+      return submitTool("submit_panel_vote", params);
     },
   });
 

@@ -6,8 +6,9 @@
 // command"), so the binding check and the mutation are never duplicated.
 
 import { checkBinding, checkTupleBinding } from "./binding.ts";
+import { applyMessageEvent } from "./messages.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "./owner-requests.ts";
-import type { BindingTuple, ContractVersion, Event, PhaseState } from "./types.ts";
+import type { BindingTuple, ContractVersion, Event, Message, PhaseState } from "./types.ts";
 
 export interface CommandCheck {
   ok: boolean;
@@ -16,6 +17,24 @@ export interface CommandCheck {
 
 function bindingTuple(phase: PhaseState, recordId: string, candidateSha: string, contractVersion: ContractVersion, recordVersion: number): BindingTuple {
   return { runId: phase.runId, phaseId: phase.phaseId, candidateSha, contractVersion, recordId, recordVersion };
+}
+
+/** Plan 04b: resolve a blocker message the owner just decided about. Only a
+ * published (or refused) message can be resolved — a dropped/merged one was
+ * never a standing claim, and resolving it is meaningless. */
+function resolveOwnerBlockerMessage(messages: readonly Message[], messageId: string, reason: string): Message[] {
+  const message = messages.find((m) => m.id === messageId);
+  if (!message || (message.state !== "published" && message.state !== "refused")) return [...messages];
+  const result = applyMessageEvent([...messages], {
+    type: "MESSAGE_RESOLVED",
+    messageId,
+    by: "owner",
+    reason,
+    boundCandidateSha: message.boundCandidateSha,
+    boundContractVersion: message.boundContractVersion,
+    boundRecordVersion: message.messageVersion,
+  });
+  return result.ok ? result.messages : [...messages];
 }
 
 /** Resolve any OPEN owner request linked to `recordId` (a decision,
@@ -107,6 +126,26 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
         c.id === request.linkedCorrectionId ? { ...c, status: "withdrawn" as const } : c,
       ),
     };
+  }
+  if (request.origin === "blocker_panel") {
+    // Plan 04b: the owner's choice resolves the blocker — both things it was
+    // raised as. The blocking finding is accepted under the option the owner
+    // chose (so it can never keep blocking acceptance), and the raw `blocker`
+    // message is resolved by the owner (never left dangling in the ledger).
+    const optionLabel = request.options.find((o) => o.id === event.option)?.label ?? event.option;
+    if (request.linkedFindingId) {
+      next = {
+        ...next,
+        findings: next.findings.map((f) =>
+          f.id === request.linkedFindingId && f.status === "open"
+            ? { ...f, status: "accepted" as const, acceptedScope: `${optionLabel} (owner's choice on blocker ${request.linkedMessageId ?? f.id})` }
+            : f,
+        ),
+      };
+    }
+    if (request.linkedMessageId) {
+      next = { ...next, messages: resolveOwnerBlockerMessage(next.messages ?? [], request.linkedMessageId, optionLabel) };
+    }
   }
   // "accept_as_implemented" (failed_vote) and "approve" (reserved_decision)
   // need no further mutation here: decisionSettled (predicate.ts) reads the

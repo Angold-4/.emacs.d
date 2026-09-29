@@ -314,7 +314,7 @@ test("a conductor killed before its projection write rebuilds them on start", as
 
 test("MESSAGE_CARRIED is emitted per live message, and a changed decision invalidates its settlement", async () => {
   let priorId = "";
-  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 30_000 };
+  const deadlines = { abortGraceMs: 100, termGraceMs: 100, helloTimeoutMs: 5_000, reviewMs: 30_000, inboxPollMs: 100 };
   // A-27: capture the repair attempt's prompt (and the reviewers') so the
   // ledger-reaching-prompts criterion has a conductor-level proof.
   const promptDir = mkdtempSync("/tmp/tt-carried-prompts-");
@@ -327,9 +327,11 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\n' > attempt.txt` },
         // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
-        // the published message (queued through the 1s inbox poll) is applied
-        // before the next freeze carries it.
-        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 4000 }]),
+        // the published message is applied before the next freeze carries it.
+        // The inbox poll is 100 ms here and the graces are short, so 2 s is
+        // ample; the old 4 s guess was below this machine's pipeline cost
+        // under the full suite's own load (the wait then timed out).
+        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 2000 }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : {
@@ -412,7 +414,7 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
       setup.runDir,
     );
 
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 120_000, 50, setup.runDir);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 150_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.phase, "DONE");
     assert.equal(setup.conductor.state.phase.round, 2, "the run must have frozen two candidates");
     const carries = readEvents(setup.runDir).filter(
@@ -462,7 +464,7 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
 
 test("a withdrawn decision supersedes its message and keeps the settlement marked", async () => {
   let priorId = "";
-  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 };
+  const deadlines = { abortGraceMs: 100, termGraceMs: 100, helloTimeoutMs: 5_000, reviewMs: 30_000, inboxPollMs: 100 };
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
@@ -471,9 +473,11 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\\n' > attempt.txt` },
         // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
-        // the published message (queued through the 1s inbox poll) is applied
-        // before the next freeze carries/supersedes it.
-        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 4000 }]),
+        // the published message is applied before the next freeze
+        // carries/supersedes it. The inbox poll is 100 ms here and the graces
+        // are short, so 2 s is ample; the old 4 s guess was below this
+        // machine's pipeline cost under the full suite's own load.
+        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 2000 }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [], priorDecisions: [{ id: priorId, status: "withdrawn" }] } },
@@ -531,7 +535,7 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
       setup.runDir,
     );
 
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 120_000, 50, setup.runDir);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE" || setup.conductor.state.phase.phase === "BLOCKED", 150_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.phase, "DONE");
     const types = readEvents(setup.runDir)
       .filter((r) => r.kind === "event")

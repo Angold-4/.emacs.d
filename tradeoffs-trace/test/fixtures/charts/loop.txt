@@ -142,7 +142,10 @@ phase states:
   +----------------+
   | EVALUATING     |  not entered  -  evaluator, panel - model default
   +----------------+
-      +- EVALUATION_COMPLETED      -> RESOLVING       [evaluation-completed]
+      +- EVALUATION_COMPLETED (evaluationSettledAndPanelEscalated) -> AWAITING_OWNER  [panel-escalate]
+      +- EVALUATION_COMPLETED (evaluationSettledAndPanelDowngraded) -> REPAIRING       [panel-downgrade]
+      +- EVALUATION_COMPLETED (evaluationSettledAndPanelIncomplete) -> RESOLVING       [panel-incomplete]
+      +- EVALUATION_COMPLETED (evaluationSettledNoPanel) -> RESOLVING       [evaluation-completed]
       +- AMEND                     -> CHECKING        [amend-from-evaluating]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-evaluating]
       +- REVISE                    -> REPAIRING       [revise-from-evaluating]

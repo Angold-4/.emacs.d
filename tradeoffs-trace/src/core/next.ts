@@ -19,8 +19,19 @@
 // returns [] (no double dispatch) for the dispatch-shaped ones.
 
 import { gateCommandOf } from "./gate.ts";
-import { accept, amendmentToApply, evaluationSettled, resolvedCorrectionIdsFor, sameVersion, typesNeedingEvaluation } from "./predicate.ts";
-import type { Action, PhaseState, Reviewer, State } from "./types.ts";
+import {
+  accept,
+  amendmentToApply,
+  blockersNeedingPanel,
+  evaluationSettled,
+  PANEL_SEATS,
+  panelSeatSettled,
+  panelSeatsSettled,
+  resolvedCorrectionIdsFor,
+  sameVersion,
+  typesNeedingEvaluation,
+} from "./predicate.ts";
+import type { Action, InFlightKey, PhaseState, Reviewer, State } from "./types.ts";
 
 function hasValidReview(phase: PhaseState, who: Reviewer): boolean {
   const review = phase.reviews[who]?.review;
@@ -92,7 +103,24 @@ export function next(state: State): Action[] {
       for (const t of pending) {
         if (!p.inFlight[`dispatch_evaluation_${t}`]) actions.push({ type: "dispatch_evaluation", messageType: t });
       }
+      // Plan 04b: three fresh panel seats per raw blocker, dispatched in
+      // parallel as their own logged actions, each with its own deadline.
+      for (const blockerId of blockersNeedingPanel(p)) {
+        const panel = p.panel!.blockers![blockerId];
+        if (panel.decided) continue;
+        for (const seat of PANEL_SEATS) {
+          if (panelSeatSettled(panel.seats?.[String(seat)])) continue;
+          const key = `dispatch_panel_${blockerId}_${seat}` as InFlightKey;
+          if (!p.inFlight[key]) actions.push({ type: "dispatch_panel", blockerId, seat });
+        }
+      }
       if (actions.length > 0) return actions;
+      // Every seat has settled; the panel's own verdict is next(), not the
+      // agent's — one action per undecided blocker, computed from the votes.
+      for (const blockerId of blockersNeedingPanel(p)) {
+        const panel = p.panel!.blockers![blockerId];
+        if (!panel.decided && panelSeatsSettled(panel)) return [{ type: "panel_decide", blockerId }];
+      }
       return evaluationSettled(p) ? [{ type: "evaluation_complete" }] : [];
     }
 

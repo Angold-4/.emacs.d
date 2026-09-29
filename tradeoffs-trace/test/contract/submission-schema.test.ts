@@ -28,6 +28,7 @@ import { test } from "node:test";
 import {
   DECISION_DISCLOSURE_PARAMS,
   SUBMIT_DISCOVERY_PARAMS,
+  SUBMIT_PANEL_VOTE_PARAMS,
   SUBMIT_PHASE_PARAMS,
   SUBMIT_REVIEW_PARAMS,
 } from "../../extension/param-shapes.ts";
@@ -39,6 +40,7 @@ function loadJSON(relPath: string): Record<string, unknown> {
 const decisionSchema = loadJSON("../../schemas/decision.schema.json");
 const submissionSchema = loadJSON("../../schemas/submission.schema.json");
 const reviewSchema = loadJSON("../../schemas/review.schema.json");
+const panelVoteSchema = loadJSON("../../schemas/panel-vote.schema.json");
 
 /** Recursively resolves local `#/$defs/...` refs against `root`, so two
  * schemas that spell the same shape via differently-named (but
@@ -116,3 +118,4 @@ assertShapeMatchesSchema("decisionDisclosure", DECISION_DISCLOSURE_PARAMS, submi
 assertShapeMatchesSchema("submit_phase", SUBMIT_PHASE_PARAMS, submissionDefs.submitPhase);
 assertShapeMatchesSchema("submit_discovery", SUBMIT_DISCOVERY_PARAMS, submissionDefs.submitDiscovery);
 assertShapeMatchesSchema("submit_review", SUBMIT_REVIEW_PARAMS, reviewSchema as unknown as { properties: Record<string, unknown>; required: string[] });
+assertShapeMatchesSchema("submit_panel_vote", SUBMIT_PANEL_VOTE_PARAMS, panelVoteSchema as unknown as { properties: Record<string, unknown>; required: string[] });
