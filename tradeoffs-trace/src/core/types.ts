@@ -1084,6 +1084,11 @@ export interface PhaseState {
    * the evidence; the status `needs you` line shows the first one's
    * question. */
   briefs?: DecisionBrief[];
+  /** Plan 05k (OD-6): the `<candidateSha>::<itemId>` keys whose only brief on
+   * that candidate is a backstop and for which the brief writer has already
+   * been re-dispatched once. Folded from BRIEF_RETRY_ATTEMPTED, so the retry
+   * is once per candidate even across a restart. */
+  briefRetries?: string[];
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
@@ -1944,9 +1949,20 @@ export interface EvBriefsRecorded {
   briefs: DecisionBrief[];
 }
 
+/** Plan 05k (OD-6): the brief writer was re-dispatched once for the named
+ * items, whose only brief on `candidateSha` was a backstop. A record-only
+ * event (handled by reduce.ts's applyRecordEvent) so the once-per-candidate
+ * bound survives a conductor restart. */
+export interface EvBriefRetryAttempted {
+  type: "BRIEF_RETRY_ATTEMPTED";
+  candidateSha: string;
+  requestIds: string[];
+}
+
 export type Event =
   | EvReviewLintFailed
   | EvBriefsRecorded
+  | EvBriefRetryAttempted
   | EvEntryCurated
   | EntryEvent
   | EvAttemptStarted

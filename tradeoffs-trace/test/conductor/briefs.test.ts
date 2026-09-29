@@ -139,6 +139,41 @@ test("briefs: a brief-agent tool mismatch falls back, with no LAUNCH_FAILED phas
   }
 });
 
+test("briefs: a backstop is retried once on the same candidate, then left alone", async () => {
+  let dispatches = 0;
+  const setup = await awaitingOwner({
+    briefScriptFor: () => {
+      dispatches += 1;
+      // Settles without submitting, so the conductor records a backstop and
+      // the next beat re-dispatches once (OD-6).
+      return { hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator }, steps: [{ kind: "sleep", ms: 1_000 }] };
+    },
+  });
+  try {
+    const request = openRequest(setup);
+    // The first writer run leaves a backstop.
+    await waitFor(
+      () => (setup.conductor.state.phase.briefs ?? []).some((b) => b.requestId === request.id && b.noRecommendationReason !== undefined),
+      30_000,
+    );
+    // A later beat re-dispatches once for that item (the retry is recorded).
+    await waitFor(() => (setup.conductor.state.phase.briefRetries ?? []).some((k) => k.endsWith(`::${request.id}`)), 30_000);
+    await waitFor(() => dispatches >= 2, 30_000);
+    // A second failure keeps the backstop and never dispatches again.
+    await new Promise((resolve) => setTimeout(resolve, 6_000));
+    assert.equal(dispatches, 2, "the writer is dispatched once for the backstop, then not again on this candidate");
+    const held = (setup.conductor.state.phase.briefs ?? []).find((b) => b.requestId === request.id)!;
+    assert.ok(held.noRecommendationReason !== undefined, "the backstop stays shown until a model brief replaces it");
+    const log = readEvents(setup.runDir).map((r) => r.kind);
+    assert.ok(log.includes("brief_retry_failed"), "the failed retry is recorded");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runDir);
+    cleanupDir(setup.repo.dir);
+    cleanupDir(setup.runRoot);
+  }
+});
+
 test("briefs: the deterministic backstop fills in when the model submits none, without asserting an unchecked impact", async () => {
   const setup = await awaitingOwner({ briefScriptFor: () => ({ hello: { role: "evaluator", tools: [] }, steps: [] }) });
   try {

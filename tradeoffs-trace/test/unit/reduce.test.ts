@@ -93,6 +93,16 @@ const BRIEF = {
   evidence: ["message: F-M-9"],
 };
 
+test("reduce: BRIEF_RETRY_ATTEMPTED records the once-per-candidate retry keys", () => {
+  const state = baseState({ phase: "AWAITING_OWNER" });
+  const result = reduce(state, { type: "BRIEF_RETRY_ATTEMPTED", candidateSha: "C1", requestIds: ["F-M-9", "D-A-80"] });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.state.phase.briefRetries?.sort(), ["C1::D-A-80", "C1::F-M-9"]);
+  const again = reduce(result.state, { type: "BRIEF_RETRY_ATTEMPTED", candidateSha: "C1", requestIds: ["F-M-9"] });
+  assert.equal(again.ok, true);
+  assert.equal((again.state.phase.briefRetries ?? []).length, 2, "a repeated key is recorded once");
+});
+
 test("reduce: BRIEFS_RECORDED records and merges briefs by requestId, changing no phase state", () => {
   const state = baseState({ phase: "AWAITING_OWNER" });
   const first = reduce(state, { type: "BRIEFS_RECORDED", briefs: [BRIEF] });

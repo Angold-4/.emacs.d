@@ -7393,21 +7393,35 @@ export class Conductor {
     // round, so a new candidate's item is rewritten (finding M-30). A brief
     // recorded for another candidate is stale.
     const existing = new Set((phase.briefs ?? []).filter((b) => b.candidateSha === C).map((b) => b.requestId));
-    const missing: string[] = [
-      ...phase.ownerRequests.filter((r) => r.status === "open" && !existing.has(r.id)).map((r) => r.id),
-      ...this.#liveReservedDecisions(phase)
-        .filter((d) => !existing.has(d.id))
-        .map((d) => d.id),
-      ...this.#ownerMarkedEntries(phase)
-        .filter((e) => !existing.has(e.id))
-        .map((e) => e.id),
+    const itemIds: string[] = [
+      ...phase.ownerRequests.filter((r) => r.status === "open").map((r) => r.id),
+      ...this.#liveReservedDecisions(phase).map((d) => d.id),
+      ...this.#ownerMarkedEntries(phase).map((e) => e.id),
     ];
+    const missing = itemIds.filter((id) => !existing.has(id));
+    // Plan 05k (OD-6): an item whose ONLY brief on this candidate is a
+    // backstop gets the writer re-dispatched once, so the owner can still
+    // decide from a real brief; the retry is recorded so a later park never
+    // dispatches again on this candidate. A model brief (no
+    // `noRecommendationReason`) is never retried.
+    const retried = new Set(phase.briefRetries ?? []);
+    const backstops = itemIds.filter((id) => {
+      if (!existing.has(id) || retried.has(`${C}::${id}`)) return false;
+      const brief = (phase.briefs ?? []).find((b) => b.requestId === id && b.candidateSha === C);
+      return brief !== undefined && brief.noRecommendationReason !== undefined;
+    });
     // Only ids no running agent already covers are dispatched, and the set is
     // accumulated (never replaced), so a second item opening mid-pass does not
     // double-brief the first agent's ids or wipe its bookkeeping (finding
     // M-18).
-    const toDispatch = missing.filter((id) => !this.#briefInFlight.has(id));
+    const toRetry = backstops.filter((id) => !this.#briefInFlight.has(id));
+    const toDispatch = [...missing, ...toRetry].filter((id) => !this.#briefInFlight.has(id));
     if (toDispatch.length === 0) return;
+    if (toRetry.length > 0) {
+      // Record the retry BEFORE dispatching, so a crash or a second failure
+      // cannot make it unbounded (OD-6).
+      this.#applyEvent({ type: "BRIEF_RETRY_ATTEMPTED", candidateSha: C ?? "", requestIds: toRetry });
+    }
     const actionId = this.#log.actionId("briefs");
     for (const id of toDispatch) this.#briefInFlight.add(id);
     void this.#runBriefAgent(actionId, toDispatch).catch((err) => {
@@ -7513,7 +7527,13 @@ export class Conductor {
     const catalogs = this.#briefCatalogs();
     const briefs: DecisionBrief[] = [];
     for (const id of ids) {
-      if (existing.has(id)) continue;
+      if (existing.has(id)) {
+        // A retried item keeps its backstop (the model brief never replaced
+        // it); record why the retry did not help (OD-6).
+        const held = (phase.briefs ?? []).find((b) => b.requestId === id && b.candidateSha === C);
+        if (held?.noRecommendationReason !== undefined) this.#log.append("brief_retry_failed", { requestId: id, reason });
+        continue;
+      }
       const concern = concerns.find((c) => c.id === id);
       const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
       const request = phase.ownerRequests.find((r) => r.id === id);

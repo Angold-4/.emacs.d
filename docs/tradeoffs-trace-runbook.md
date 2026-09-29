@@ -714,7 +714,10 @@ established), and says in plain words where the recommendation would be that
 no recommendation was checked — `No recommendation: the brief writer was
 unavailable (<reason>); decide from the evidence.` It never recommends an
 option by position, and it lists the other items on the same file or plan
-clause. `related`
+clause. On a later park in the same candidate the writer is asked once more
+for an item whose only brief is that backstop; if it fails or times out again
+the backstop stays (with why) and is not retried again on that candidate — a
+new candidate is briefed afresh. `related`
 names both other owner items and same-concern live trade-offs or findings
 that never became owner items — the T-54 silence the goal says must not hide.
 The conductor merges its own same-concern items into a model brief's `related`
