@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -64,15 +64,37 @@ test("a verdict on a live run goes through the inbox", async () => {
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    workerScript: () => ({
-      hello: defaultWorkerHello(),
-      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
-    }),
-    // Reviewers hang, so the phase stays in REVIEWING long enough for the
-    // owner's verdict to arrive through the inbox.
-    reviewerScriptFor: () => ({
+    // Plan 04a: a message is published only once the evaluator has run at
+    // EVALUATING. M raises a blocking finding so the phase parks in a repair
+    // round, and the second attempt hangs — the run stays live with the
+    // message published, long enough for the owner's verdict to arrive.
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? {
+            hello: defaultWorkerHello(),
+            steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS, assumptions: [], deviations: [] } }],
+          }
+        : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
-      steps: [{ kind: "hang-until-abort" }],
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings: reviewer === "M" ? [{ kind: "defect", severity: "blocking", evidence: "the loop does not terminate on empty input" }] : [],
+          },
+        },
+      ],
     }),
     deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 30_000 },
   });
@@ -80,12 +102,12 @@ test("a verdict on a live run goes through the inbox", async () => {
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "tradeoff" && m.state === "published"),
       90_000,
       20,
       setup.runDir,
     );
-    const message = setup.conductor.state.phase.messages![0];
+    const message = setup.conductor.state.phase.messages!.find((m) => m.type === "tradeoff" && m.state === "published")!;
     const inbox = `${setup.runDir}/inbox`;
     mkdirSync(inbox, { recursive: true });
     // The in-process Conductor writes no pid file (only the detached
@@ -108,7 +130,7 @@ test("a verdict on a live run goes through the inbox", async () => {
     assert.equal(refused.settlement?.settledBy, "owner");
     assert.ok(
       setup.conductor.state.phase.findings.some((f) => f.raisedBy === "owner" && f.severity === "blocking"),
-      "a refusal during REVIEWING must raise an owner blocking finding",
+      "a refusal before DONE must raise an owner blocking finding",
     );
 
     // A stale verdict, sent through `tt verdict`'s own binding override, is
@@ -292,7 +314,11 @@ test("a conductor killed before its projection write rebuilds them on start", as
 
 test("MESSAGE_CARRIED is emitted per live message, and a changed decision invalidates its settlement", async () => {
   let priorId = "";
-  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 };
+  const deadlines = { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 30_000 };
+  // A-27: capture the repair attempt's prompt (and the reviewers') so the
+  // ledger-reaching-prompts criterion has a conductor-level proof.
+  const promptDir = mkdtempSync("/tmp/tt-carried-prompts-");
+  const workerPromptLog = `${promptDir}/worker.log`;
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
@@ -300,6 +326,10 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
       hello: defaultWorkerHello(),
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\n' > attempt.txt` },
+        // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
+        // the published message (queued through the 1s inbox poll) is applied
+        // before the next freeze carries it.
+        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 4000 }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : {
@@ -353,15 +383,18 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
         ],
       };
     },
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: workerPromptLog },
+    extraReviewerEnv: (reviewer) => ({ FAKE_PI_PROMPT_LOG: `${promptDir}/${reviewer}.log` }),
     deadlines,
   });
 
   try {
     await setup.conductor.start();
-    // Publish attempt 1's trade-off, settle it with an owner accept through
-    // the inbox, then let the repair change the decision it came from.
+    // Publish attempt 1's trade-off (the evaluator publishes it at
+    // EVALUATING), settle it with an owner accept through the inbox, then let
+    // the repair change the decision it came from.
     await waitFor(
-      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "tradeoff" && m.state === "published"),
       90_000,
       20,
       setup.runDir,
@@ -406,10 +439,24 @@ test("MESSAGE_CARRIED is emitted per live message, and a changed decision invali
     const entry = ledger.find((e: { messageId: string }) => e.messageId === published.id)!;
     assert.equal(entry.settledBy, "owner");
     assert.equal(entry.invalidated?.reason, "content changed");
+
+    // A-27: the repair attempt's worker prompt and a reviewer's later turn-2
+    // prompt carry the settled ledger.
+    const attempts = readFileSync(workerPromptLog, "utf8")
+      .split("\n=====\n")
+      .filter((a) => a.trim().length > 0);
+    assert.ok(attempts.length >= 2, "expected a repair attempt's prompt");
+    assert.match(attempts[attempts.length - 1], /Settled \(do not re-raise\)/);
+    assert.match(attempts[attempts.length - 1], new RegExp(`${published.id} \\[tradeoff\\]`));
+    for (const r of ["M", "A", "B"]) {
+      const prompts = readFileSync(`${promptDir}/${r}.log`, "utf8");
+      assert.match(prompts, /Settled \(do not re-raise\)/, `${r}'s turn-2 prompt must carry the ledger`);
+    }
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+    rmSync(promptDir, { recursive: true, force: true });
   }
 });
 
@@ -423,6 +470,10 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
       hello: defaultWorkerHello(),
       steps: [
         { kind: "call-sh", command: `printf 'attempt ${attempt}\\n' > attempt.txt` },
+        // Plan 04a: hold the repair attempt briefly, so the owner's verdict on
+        // the published message (queued through the 1s inbox poll) is applied
+        // before the next freeze carries/supersedes it.
+        ...(attempt === 1 ? [] : [{ kind: "sleep", ms: 4000 }]),
         attempt === 1
           ? { kind: "call-submit", tool: "submit_phase", args: { decisions: DECISIONS.slice(0, 1), assumptions: [], deviations: [] } }
           : { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [], priorDecisions: [{ id: priorId, status: "withdrawn" }] } },
@@ -462,7 +513,7 @@ test("a withdrawn decision supersedes its message and keeps the settlement marke
   try {
     await setup.conductor.start();
     await waitFor(
-      () => setup.conductor.state.phase.phase === "REVIEWING" && (setup.conductor.state.phase.messages ?? []).length >= 1,
+      () => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "tradeoff" && m.state === "published"),
       90_000,
       20,
       setup.runDir,
@@ -673,7 +724,14 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(reviewAfter, /^\* Findings$/m);
     assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
     assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);
-    await waitFor(() => readFileSync(p.status, "utf8") !== statusBefore, 30_000, 20, setup.runDir);
+    // Wait until the status reflects the published finding: the review outcome
+    // alone changes the file, and asserting the merged behaviour on that
+    // intermediate write is a race. The finding is an open advisory, so the
+    // plan 01h trade-offs panel carries its record line.
+    await waitFor(() => {
+      const s = readFileSync(p.status, "utf8");
+      return s !== statusBefore && /\t:RECORD:F-/.test(s);
+    }, 30_000, 20, setup.runDir);
     // The status view is the buffer's own text: it carries the trade-offs and,
     // on each trade-off line, the record marker that keeps plan 01h's RET.
     const statusAfter = readFileSync(p.status, "utf8");

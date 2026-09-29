@@ -15,7 +15,7 @@
 // mismatch, before anything else about the event is considered.
 
 import { checkBallotBinding, checkBinding, checkTupleBinding, currentVersionsFor } from "./binding.ts";
-import { applyCarryWithContract, applyMessageEvent } from "./messages.ts";
+import { applyCarryWithContract, applyMessageEvent, checkMessageBinding } from "./messages.ts";
 import { next as computeNext } from "./next.ts";
 import {
   applyFindingAcceptedByOwner,
@@ -27,10 +27,27 @@ import {
 } from "./owner-commands.ts";
 import { isLiveDecision, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { rowsFor } from "./transitions.ts";
-import type { BindingTuple, ContractVersion, Event, Finding, InFlightKey, ReduceResult, State } from "./types.ts";
+import type {
+  BindingTuple,
+  ContractVersion,
+  Event,
+  Finding,
+  InFlightKey,
+  MessageType,
+  PhaseState,
+  ReduceResult,
+  State,
+} from "./types.ts";
 
 const KNOWN_EVENT_TYPES = new Set<string>([
   "ATTEMPT_STARTED",
+  "BASELINE_COMPLETED",
+  "BASELINE_TIMED_OUT",
+  "BASELINE_INTERRUPTED",
+  "EVALUATION_COMPLETED",
+  "EVALUATION_TIMED_OUT",
+  "EVALUATION_INTERRUPTED",
+  "EVALUATOR_FINISHED",
   "SUBMIT_PHASE",
   "ATTEMPT_TIMED_OUT",
   "ATTEMPT_NO_SUBMISSION",
@@ -93,6 +110,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "MESSAGE_DROPPED",
   "OWNER_VERDICT",
   "MESSAGE_RESOLVED",
+  "MESSAGE_ADDRESS_REPORTED",
   "MESSAGE_SUPERSEDED",
   "MESSAGE_CARRIED",
 ]);
@@ -120,8 +138,25 @@ function bindingTupleForRecord(
   };
 }
 
-function inFlightKeyFor(action: string, reviewer?: string): string {
-  return action === "dispatch_review" ? `review_${reviewer}` : action;
+function inFlightKeyFor(action: string, reviewer?: string, messageType?: string): string {
+  if (action === "dispatch_review") return `review_${reviewer}`;
+  // Plan 04a: one evaluator per message type, so each dispatch has its own
+  // in-flight key (`dispatch_evaluation_tradeoff`, …).
+  if (action === "dispatch_evaluation") return `dispatch_evaluation_${messageType}`;
+  return action;
+}
+
+/** Plan 04a: merge one message type's evaluator outcome into `evaluation`. */
+function withEvaluatorOutcome(p: PhaseState, type: MessageType, patch: { settled?: boolean; timedOut?: boolean; interruptedOnce?: boolean }): PhaseState["evaluation"] {
+  const types = { ...(p.evaluation?.types ?? {}) };
+  types[type] = { ...(types[type] ?? {}), ...patch };
+  return { types };
+}
+
+function withoutEvaluationInFlight(p: PhaseState, type: MessageType): PhaseState["inFlight"] {
+  const inFlight = { ...p.inFlight };
+  delete inFlight[`dispatch_evaluation_${type}` as InFlightKey];
+  return inFlight;
 }
 
 /** Events handled directly by reduce.ts, not by the transitions table: they
@@ -137,15 +172,18 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // is exactly what makes a second next() call return [] (no double
       // dispatch).
       const outstanding = computeNext(state).some(
-        (a) => a.type === event.action && (event.action !== "dispatch_review" || a.reviewer === event.reviewer),
+        (a) =>
+          a.type === event.action &&
+          (event.action !== "dispatch_review" || a.reviewer === event.reviewer) &&
+          (event.action !== "dispatch_evaluation" || a.messageType === event.messageType),
       );
       if (!outstanding) {
         return rejected(
           state,
-          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""} is not currently outstanding in phase ${p.phase}`,
+          `action '${event.action}'${event.reviewer ? ` (${event.reviewer})` : ""}${event.messageType ? ` (${event.messageType})` : ""} is not currently outstanding in phase ${p.phase}`,
         );
       }
-      const key = inFlightKeyFor(event.action, event.reviewer) as InFlightKey;
+      const key = inFlightKeyFor(event.action, event.reviewer, event.messageType) as InFlightKey;
       return ok({ ...state, phase: { ...p, inFlight: { ...p.inFlight, [key]: { actionId: event.actionId } } } });
     }
 
@@ -351,6 +389,76 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return undefined;
     }
 
+    case "REVIEW_TIMED_OUT": {
+      // Plan 04a: a review dispatch whose phase has already moved on (a
+      // crash-recovery reconciliation after all three reviews landed and the
+      // phase entered EVALUATING) is stale. It has no transition row there;
+      // clear the lingering in-flight entry so it can never block a later
+      // REVIEWING dispatch, and change nothing else.
+      const key = `review_${event.reviewer}` as InFlightKey;
+      if (!(key in p.inFlight)) return rejected(state, `no in-flight review for ${event.reviewer} to clear`);
+      const inFlight = { ...p.inFlight };
+      delete inFlight[key];
+      return ok({ ...state, phase: { ...p, inFlight } });
+    }
+
+    case "EVALUATOR_FINISHED": {
+      // Plan 04a: one type's evaluator outcome, a record event inside
+      // EVALUATING. It settles that type without moving the phase; next()
+      // asks for `evaluation_complete` once every dispatched type has
+      // settled. Rejected outside EVALUATING, so a late evaluator cannot
+      // settle a different stage.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATOR_FINISHED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { settled: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
+    case "EVALUATION_TIMED_OUT": {
+      // Plan 04a: only THIS type's raw messages are published unchanged,
+      // marked unevaluated; the type is settled so the phase can move on once
+      // every type has. A record event (no phase change) — EVALUATION_COMPLETED
+      // is the transition that leaves EVALUATING.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_TIMED_OUT is only valid in EVALUATING, not ${p.phase}`);
+      }
+      const messages = (p.messages ?? []).map((m) =>
+        m.type === event.messageType && m.state === "raw" ? { ...m, state: "published" as const, unevaluated: true } : m,
+      );
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          messages,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { settled: true, timedOut: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
+    case "EVALUATION_INTERRUPTED": {
+      // Plan 04a: one type's evaluator was interrupted by a conductor crash;
+      // re-dispatched once, tracked per type.
+      if (p.phase !== "EVALUATING") {
+        return rejected(state, `EVALUATION_INTERRUPTED is only valid in EVALUATING, not ${p.phase}`);
+      }
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          evaluation: withEvaluatorOutcome(p, event.messageType, { interruptedOnce: true }),
+          inFlight: withoutEvaluationInFlight(p, event.messageType),
+        },
+      });
+    }
+
     case "CRITERION_REVERTED": {
       // Plan 01g: the owner's correction naming an amendment id restores the
       // criterion's original wording. A phase with a candidate has its own
@@ -384,7 +492,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
               ...d,
               version: d.version + 1,
               boundContractVersion: event.newContractVersion,
-              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+              amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: event.at },
             }
           : d,
       );
@@ -449,7 +557,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, `owner directive ${event.directiveId} is already withdrawn`);
       }
       const ownerDirectives = (p.ownerDirectives ?? []).map((d) =>
-        d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at ?? new Date().toISOString() } : d,
+        d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at } : d,
       );
       return ok({ ...state, phase: { ...p, ownerDirectives } });
     }
@@ -573,6 +681,23 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const result = applyMessageEvent(p.messages ?? [], event);
       if (!result.ok) return rejected(state, result.reason);
       return ok({ ...state, phase: { ...p, messages: result.messages } });
+    }
+
+    case "MESSAGE_ADDRESS_REPORTED": {
+      // Plan 04a item 4: the evaluator's report on an owner-refused message.
+      // Record-only (no state change): `addressed: true` is separately a
+      // MESSAGE_RESOLVED; `false` is recorded here so the ledger can tell
+      // "checked and not addressed" from "never checked" (findings M-20/A-21).
+      const message = (p.messages ?? []).find((m) => m.id === event.messageId);
+      if (!message) return rejected(state, `unknown message ${event.messageId}`);
+      const binding = checkMessageBinding(message, event);
+      if (!binding.ok) return rejected(state, binding.reason!);
+      const messages = (p.messages ?? []).map((m) =>
+        m.id === event.messageId
+          ? { ...m, addressedReport: { addressed: event.addressed, ...(event.reason ? { reason: event.reason } : {}), at: event.at } }
+          : m,
+      );
+      return ok({ ...state, phase: { ...p, messages } });
     }
 
     case "MESSAGE_CARRIED": {

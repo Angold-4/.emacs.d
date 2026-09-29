@@ -121,6 +121,14 @@ export async function setupConductor(opts: {
    * duplicate decision). Takes precedence over `workerScript` when given. */
   workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 04a: the EVALUATING stage's fresh evaluator, ONE PER MESSAGE TYPE.
+   * The default script returns an empty `submit_evaluation`, which the
+   * conductor refuses (a raw message of the type is uncovered); the type then
+   * times out and its raw messages are published unchanged, marked
+   * `unevaluated` — enough for the ~30 tests that never raise a message to
+   * evaluate. A test that wants real publication supplies its own script,
+   * keyed by the message type it is dispatched for. */
+  evaluatorScriptFor?: (messageType: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
   deadlines?: ConductorOptions["deadlines"];
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
    * never parses argv, so these are inert except as a unique, greppable
@@ -201,6 +209,12 @@ export async function setupConductor(opts: {
   const workerScriptPaths = new Map<number, string>();
 
   const reviewerScriptPaths = new Map<string, string>();
+  const evaluatorScriptPaths = new Map<string, string>();
+
+  const defaultEvaluatorScript = () => ({
+    hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+    steps: [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } }],
+  });
 
   const conductor = new Conductor({
     runDir,
@@ -226,6 +240,18 @@ export async function setupConductor(opts: {
           return { FAKE_PI_SCRIPT: workerScriptPaths.get(attempt)!, ...(opts.extraWorkerEnv ?? {}) };
         }
         return { FAKE_PI_SCRIPT: workerScriptPath!, ...(opts.extraWorkerEnv ?? {}) };
+      }
+      if (role === "evaluator") {
+        // One evaluator per message type per dispatch; a fresh script for
+        // each so a test can vary by type and round.
+        const messageType = agentId.match(/^evaluator-([a-z]+)-/)?.[1] ?? "tradeoff";
+        if (!evaluatorScriptPaths.has(agentId)) {
+          const script = opts.evaluatorScriptFor
+            ? opts.evaluatorScriptFor(messageType, conductor.state)
+            : defaultEvaluatorScript();
+          evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+        }
+        return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
       }
       const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1] ?? "M") as Reviewer;
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {

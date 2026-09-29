@@ -25,13 +25,14 @@ import {
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
-import { accept, isLiveDecision, resolvedCorrectionIdsFor, reviewsComplete, sameVersion } from "./predicate.ts";
+import { accept, evaluationSettled, isLiveDecision, resolvedCorrectionIdsFor, reviewsComplete, sameVersion } from "./predicate.ts";
 import type {
   Correction,
   Decision,
   Event,
   Finding,
   InFlightKey,
+  Message,
   PhaseState,
   PhaseStateName,
   Review,
@@ -95,6 +96,7 @@ function activePhaseStates(): PhaseStateName[] {
     "CHECKING",
     "PROBING",
     "REVIEWING",
+    "EVALUATING",
     "RESOLVING",
     "GATING",
     "ACCEPTED",
@@ -109,17 +111,83 @@ function addRow(row: TransitionRow) {
   rows.push(row);
 }
 
-// --- READY -> IMPLEMENTING ---------------------------------------------
+// --- READY -> BASELINE | IMPLEMENTING -----------------------------------
+// Plan 04a: the base baseline is a real state, not work hidden inside the
+// first `dispatch_worker`. `baselineNeeded` is decided by the conductor (a
+// baseline already recorded for this exact base tree and check list skips
+// the stage — plan 01e's reuse rule, which reduce() cannot see).
+function baselineNeeded(ev: Event): boolean {
+  return (ev as Extract<Event, { type: "ATTEMPT_STARTED" }>).baselineNeeded === true;
+}
+
 addRow({
   id: "start-attempt",
   axis: "phase",
   from: "READY",
   trigger: "ATTEMPT_STARTED",
-  guardName: "always",
-  guard: () => true,
+  guardName: "noBaselineNeeded",
+  guard: (_s, ev) => !baselineNeeded(ev),
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }], // next() of the resulting IMPLEMENTING state
   apply: (s) => withPhase(s, { phase: "IMPLEMENTING" }),
+});
+
+addRow({
+  id: "start-baseline",
+  axis: "phase",
+  from: "READY",
+  trigger: "ATTEMPT_STARTED",
+  guardName: "baselineNeeded",
+  guard: (_s, ev) => baselineNeeded(ev),
+  to: "BASELINE",
+  actions: [{ type: "run_baseline" }], // next() of the resulting BASELINE state
+  apply: (s) => withPhase(s, { phase: "BASELINE" }),
+});
+
+// --- BASELINE (plan 04a) -------------------------------------------------
+// Whatever the outcome, the worker's attempt begins after it: a baseline
+// that could not be taken leaves the checks strict, never wedges the run.
+// The worker's own attempt deadline starts at its launch, not here.
+addRow({
+  id: "baseline-completed",
+  axis: "phase",
+  from: "BASELINE",
+  trigger: "BASELINE_COMPLETED",
+  guardName: "always",
+  guard: () => true,
+  to: "IMPLEMENTING",
+  actions: [{ type: "dispatch_worker" }],
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+});
+
+addRow({
+  id: "baseline-timed-out",
+  axis: "phase",
+  from: "BASELINE",
+  trigger: "BASELINE_TIMED_OUT",
+  guardName: "always",
+  guard: () => true,
+  to: "IMPLEMENTING",
+  actions: [{ type: "dispatch_worker" }],
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+});
+
+addRow({
+  id: "baseline-interrupted",
+  axis: "phase",
+  from: "BASELINE",
+  trigger: "BASELINE_INTERRUPTED",
+  guardName: "firstInterruption",
+  // Re-dispatched once; the conductor emits BASELINE_TIMED_OUT on a second
+  // loss (it reads `baseline.interruptedOnce` before choosing the event).
+  guard: () => true,
+  to: "BASELINE",
+  actions: [{ type: "run_baseline" }],
+  apply: (s) =>
+    withPhase(s, {
+      inFlight: clearInFlight(s.phase, "run_baseline"),
+      baseline: { ...(s.phase.baseline ?? {}), interruptedOnce: true },
+    }),
 });
 
 // --- IMPLEMENTING --------------------------------------------------------
@@ -367,6 +435,10 @@ function applyProbePassed(s: State, ev: Event, targetPhase: PhaseStateName): Sta
     phase: targetPhase,
     probe: { candidateSha: s.phase.candidate!.sha, head: s.phase.integrationHead, probedI: e.probedI, passed: true },
     findings,
+    // Entering EVALUATING starts a FRESH round: an earlier round's
+    // `evaluation.settled` must never let the new round's raw messages skip
+    // evaluation.
+    ...(targetPhase === "EVALUATING" ? { evaluation: undefined } : {}),
     inFlight: clearInFlight(s.phase, "dispatch_probe"),
   });
 }
@@ -394,11 +466,12 @@ addRow({
   trigger: "PROBE_PASSED",
   guardName: "reviewsAlreadyComplete",
   guard: (s) => reviewsComplete(s.phase, s.phase.candidate!.sha, s.phase.contract.contractVersion),
-  to: "RESOLVING",
-  // Canonical fixture: checks/reviews already valid and no open items, so
-  // accept(C, K) holds immediately.
-  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
-  apply: (s, ev) => applyProbePassed(s, ev, "RESOLVING"),
+  to: "EVALUATING",
+  // Plan 04a: reviews were already valid, so this retry still evaluates the
+  // round's raw messages first. The fixture carries none, so the predicate
+  // already holds.
+  actions: [{ type: "evaluation_complete" }],
+  apply: (s, ev) => applyProbePassed(s, ev, "EVALUATING"),
 });
 
 failureRows("probe-failed", "PROBING", "PROBE_FAILED", REPAIR_ATTEMPT_ACTIONS, "the integration probe kept failing", (s) => {
@@ -473,16 +546,19 @@ addRow({
     const e = ev as Extract<Event, { type: "REVIEW_SUBMITTED" }>;
     return allThreeReviewsPresent(s, e.review);
   },
-  to: "RESOLVING",
-  // Fixture also has checks/probe already passed and no open items, so
-  // accept(C, K) holds once all three reviews are in.
-  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  to: "EVALUATING",
+  // Plan 04a: the last review no longer drives straight toward acceptance.
+  // The phase evaluates the round's raw messages first; the fixture carries
+  // none, so the predicate already holds and next() asks to complete.
+  actions: [{ type: "evaluation_complete" }],
   apply: (s, ev) => {
     const e = ev as Extract<Event, { type: "REVIEW_SUBMITTED" }>;
     const key = `review_${e.review.reviewer}` as InFlightKey;
     return withPhase(s, {
-      phase: "RESOLVING",
+      phase: "EVALUATING",
       reviews: { ...s.phase.reviews, [e.review.reviewer]: { review: e.review } },
+      // A fresh round: never inherit a previous round's settled flag.
+      evaluation: undefined,
       inFlight: clearInFlight(s.phase, key),
     });
   },
@@ -536,6 +612,34 @@ addRow({
   to: "BLOCKED",
   actions: [],
   apply: (s) => withPhase(s, { phase: "BLOCKED", blockedReason: "reviewer unavailable" }),
+});
+
+// --- EVALUATING (plan 04a) ----------------------------------------------
+// One fresh evaluator per message type is dispatched from next(); each one's
+// outcome is a RECORD event in reduce.ts (EVALUATOR_FINISHED, or
+// EVALUATION_TIMED_OUT which publishes that type's raw messages unevaluated).
+// The only transition out of EVALUATING is EVALUATION_COMPLETED, and only
+// once every dispatched type has settled.
+addRow({
+  id: "evaluation-completed",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "EVALUATION_COMPLETED",
+  guardName: "evaluationSettled",
+  guard: (s) => evaluationSettled(s.phase),
+  to: "RESOLVING",
+  // Fixture is acceptable with nothing open, so next() of RESOLVING accepts.
+  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  apply: (s) =>
+    withPhase(s, {
+      phase: "RESOLVING",
+      inFlight: clearInFlight(
+        s.phase,
+        "dispatch_evaluation_tradeoff",
+        "dispatch_evaluation_finding",
+        "dispatch_evaluation_blocker",
+      ),
+    }),
 });
 
 // --- RESOLVING --------------------------------------------------------
@@ -912,7 +1016,7 @@ function hasCandidateAndCurrentContract(s: State, ev: Event): boolean {
   return sameVersion(e.replacingContractVersion, s.phase.contract.contractVersion);
 }
 
-for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
+for (const from of ["CHECKING", "PROBING", "REVIEWING", "EVALUATING", "RESOLVING", "GATING", "ACCEPTED", "AWAITING_OWNER"] as PhaseStateName[]) {
   addRow({
     id: `amend-from-${from.toLowerCase()}`,
     axis: "phase",
@@ -954,7 +1058,9 @@ function applyCriterionReverted(s: State, ev: Event): State {
           ...d,
           version: d.version + 1,
           boundContractVersion: e.newContractVersion,
-          amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: new Date().toISOString() },
+          // OD-2 / B-30: the timestamp rides on the event; the transition
+          // never reads a clock, so a rebuild is byte-identical.
+          amendment: { ...d.amendment!, status: "reverted" as const, revertedAt: e.at },
         }
       : d,
   );
@@ -980,7 +1086,7 @@ function applyCriterionReverted(s: State, ev: Event): State {
   });
 }
 
-for (const from of ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "PUBLISHING", "AWAITING_OWNER"] as PhaseStateName[]) {
+for (const from of ["CHECKING", "PROBING", "REVIEWING", "EVALUATING", "RESOLVING", "GATING", "ACCEPTED", "PUBLISHING", "AWAITING_OWNER"] as PhaseStateName[]) {
   addRow({
     id: `criterion-reverted-from-${from.toLowerCase()}`,
     axis: "phase",
@@ -1343,6 +1449,32 @@ addRow({
       phase: "BLOCKED",
       blockedReason: launchFailedReason(e),
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
+    });
+  },
+});
+
+// Plan 04a / B-31: an evaluator whose tool set does not match is a launch
+// failure too — straight to BLOCKED with evidence, never a silent timeout.
+addRow({
+  id: "launch-failed-from-evaluating",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "LAUNCH_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "BLOCKED",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "LAUNCH_FAILED" }>;
+    return withPhase(s, {
+      phase: "BLOCKED",
+      blockedReason: launchFailedReason(e),
+      inFlight: clearInFlight(
+        s.phase,
+        "dispatch_evaluation_tradeoff",
+        "dispatch_evaluation_finding",
+        "dispatch_evaluation_blocker",
+      ),
     });
   },
 });

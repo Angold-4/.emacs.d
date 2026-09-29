@@ -22,12 +22,15 @@ import type { PhaseState } from "./core/types.ts";
 
 const STAGE_OF: Record<string, string> = {
   READY: "implement",
+  // Plan 04a: the base baseline is its own stage, never counted as implement.
+  BASELINE: "baseline",
   IMPLEMENTING: "implement",
   REPAIRING: "implement",
   FREEZING: "freeze",
   CHECKING: "checks",
   PROBING: "probe",
   REVIEWING: "review",
+  EVALUATING: "evaluate",
   RESOLVING: "resolve",
   GATING: "gate",
   ACCEPTED: "publish",
@@ -39,16 +42,18 @@ const STAGE_OF: Record<string, string> = {
 
 /** The stages the conductor runs itself: no agent is expected to be active,
  * so "no agent activity" there is not idleness. */
-export const CONDUCTOR_STAGES = new Set(["freeze", "checks", "probe", "resolve", "gate", "publish"]);
+export const CONDUCTOR_STAGES = new Set(["baseline", "freeze", "checks", "probe", "evaluate", "resolve", "gate", "publish"]);
 
 function stageDeadlineMs(): Record<string, number> {
   return {
+    baseline: DEFAULT_DEADLINES.checkMs,
     implement: DEFAULT_DEADLINES.workerAttemptMs,
     freeze: DEFAULT_DEADLINES.freezeMs,
     checks: DEFAULT_DEADLINES.checkMs,
     probe: DEFAULT_DEADLINES.probeMs,
     gate: DEFAULT_DEADLINES.gateMs,
     review: DEFAULT_DEADLINES.reviewMs,
+    evaluate: DEFAULT_DEADLINES.evaluateMs,
   };
 }
 
@@ -58,12 +63,14 @@ function stageDeadlineMs(): Record<string, number> {
 export function stageLimits(plan: Pick<RunPlanFile, "deadlines">): Record<string, number> {
   const d = { ...DEFAULT_DEADLINES, ...(plan.deadlines ?? {}) };
   return {
+    baseline: d.checkMs,
     implement: d.workerAttemptMs,
     freeze: d.freezeMs,
     checks: d.checkMs,
     probe: d.probeMs,
     gate: d.gateMs,
     review: d.reviewMs,
+    evaluate: d.evaluateMs,
   };
 }
 
@@ -86,8 +93,9 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
     if (last) {
       last.ms = Date.parse(p.at) - Date.parse(last.startedAt);
       last.current = false;
-      // A gate or review that hands the phase back to implement failed.
-      if (stage === "implement" && last.stage !== "implement") last.failed = true;
+      // A gate or review that hands the phase back to implement failed. A
+      // baseline -> implement step is the normal path, not a failure.
+      if (stage === "implement" && last.stage !== "implement" && last.stage !== "baseline") last.failed = true;
     }
     spans.push({ stage, startedAt: p.at, ms: 0, failed: false, current: true });
   }

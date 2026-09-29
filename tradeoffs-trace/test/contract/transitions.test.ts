@@ -21,7 +21,7 @@ import { next } from "../../src/core/next.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { TRANSITIONS } from "../../src/core/transitions.ts";
 import type { Event, Finding, PhaseStateName, State } from "../../src/core/types.ts";
-import { approvingReview, baseState, CV } from "../unit/helpers.ts";
+import { approvingReview, baseState, CV, makeMessage } from "../unit/helpers.ts";
 
 const K = CV();
 const C1 = { sha: "C1", contractVersion: K };
@@ -358,7 +358,7 @@ const BUILD: Record<string, Fixture> = {
 
 // amend-from-* and revise-from-* rows are generated over a list of states in
 // transitions.ts; build fixtures for each the same way here.
-const AMEND_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED"];
+const AMEND_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "EVALUATING", "RESOLVING", "GATING", "ACCEPTED"];
 for (const from of AMEND_FROM) {
   BUILD[`amend-from-${from.toLowerCase()}`] = {
     state: baseState({ phase: from, candidate: C1 }),
@@ -369,7 +369,7 @@ for (const from of AMEND_FROM) {
 // criterion-reverted-from-* (plan 01g): the owner's correction naming an
 // applied amendment restores the original wording, invalidates the evidence
 // bound to the replaced version and returns to CHECKING.
-const REVERT_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "RESOLVING", "GATING", "ACCEPTED", "PUBLISHING", "AWAITING_OWNER"];
+const REVERT_FROM: PhaseStateName[] = ["CHECKING", "PROBING", "REVIEWING", "EVALUATING", "RESOLVING", "GATING", "ACCEPTED", "PUBLISHING", "AWAITING_OWNER"];
 for (const from of REVERT_FROM) {
   BUILD[`criterion-reverted-from-${from.toLowerCase()}`] = {
     state: baseState({
@@ -416,6 +416,7 @@ const REVISE_FROM: PhaseStateName[] = [
   "CHECKING",
   "PROBING",
   "REVIEWING",
+  "EVALUATING",
   "RESOLVING",
   "GATING",
   "ACCEPTED",
@@ -1073,6 +1074,50 @@ BUILD["owner-correction-from-awaiting-owner"] = {
   event: { type: "OWNER_CORRECTION", correctionId: "cmd-correction-1", text: "do it the other way" },
 };
 
+// Plan 04a: the BASELINE and EVALUATING states, each with its own fixture.
+const rawMessage = () => makeMessage({ state: "raw", boundCandidateSha: "C1", boundContractVersion: K });
+
+BUILD["launch-failed-from-evaluating"] = {
+  state: baseState({
+    phase: "EVALUATING",
+    candidate: C1,
+    inFlight: { dispatch_evaluation_tradeoff: { actionId: "a1" } },
+  }),
+  event: { type: "LAUNCH_FAILED", role: "evaluator", expected: ["read"], missing: [], extra: ["write"] },
+};
+
+BUILD["start-baseline"] = {
+  state: baseState({ phase: "READY" }),
+  event: { type: "ATTEMPT_STARTED", baselineNeeded: true },
+};
+BUILD["baseline-completed"] = {
+  state: baseState({ phase: "BASELINE", inFlight: { run_baseline: { actionId: "a1" } } }),
+  event: { type: "BASELINE_COMPLETED" },
+};
+BUILD["baseline-timed-out"] = {
+  state: baseState({ phase: "BASELINE" }),
+  event: { type: "BASELINE_TIMED_OUT" },
+};
+BUILD["baseline-interrupted"] = {
+  state: baseState({ phase: "BASELINE", inFlight: { run_baseline: { actionId: "a1" } } }),
+  event: { type: "BASELINE_INTERRUPTED" },
+};
+BUILD["evaluation-completed"] = {
+  state: baseState({
+    phase: "EVALUATING",
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: acceptableReviews,
+    // A raw trade-off with its type's evaluator already settled: this is the
+    // per-type `evaluationSettled` guard (finding M-19), not a boolean flag.
+    messages: [rawMessage()],
+    evaluation: { types: { tradeoff: { settled: true } } },
+  }),
+  event: { type: "EVALUATION_COMPLETED" },
+};
+
 test("transition table: every row in transitions.ts has a covering fixture", () => {
   const missing = TRANSITIONS.filter((r) => !BUILD[r.id]).map((r) => r.id);
   assert.deepEqual(missing, [], `rows with no test fixture: ${missing.join(", ")}`);
@@ -1164,7 +1209,10 @@ const DESIGN_EDGES: { from: PhaseStateName; to: PhaseStateName; cite: string }[]
   { from: "CHECKING", to: "REPAIRING", cite: "§6.1: CHECKING │ any failure ─...─▶ REPAIRING" },
   { from: "PROBING", to: "REVIEWING", cite: "§6.1: PROBING │ success → close open `integration` findings ▼ REVIEWING" },
   { from: "PROBING", to: "REPAIRING", cite: "§6.1: PROBING │ conflict or failure → raise `integration` finding ──▶ REPAIRING" },
-  { from: "REVIEWING", to: "RESOLVING", cite: "§6.1: REVIEWING ... ▼ RESOLVING" },
+  { from: "REVIEWING", to: "EVALUATING", cite: "plan 04a: the last review enters EVALUATING before acceptance" },
+  { from: "EVALUATING", to: "RESOLVING", cite: "plan 04a: EVALUATING --EVALUATION_COMPLETED--> RESOLVING" },
+  { from: "READY", to: "BASELINE", cite: "plan 04a: READY --ATTEMPT_STARTED[baselineNeeded]--> BASELINE" },
+  { from: "BASELINE", to: "IMPLEMENTING", cite: "plan 04a: BASELINE --BASELINE_COMPLETED--> IMPLEMENTING" },
   { from: "RESOLVING", to: "REPAIRING", cite: "§6.1: RESOLVING │ open items remain and budget remains ─...─▶ REPAIRING" },
   { from: "RESOLVING", to: "AWAITING_OWNER", cite: "§6.1: RESOLVING │ open items remain, budget exhausted ─...─▶ AWAITING_OWNER" },
   { from: "RESOLVING", to: "ACCEPTED", cite: "§6.1: RESOLVING │ accept(C, K) holds (§6.3) ▼ ACCEPTED(C)" },

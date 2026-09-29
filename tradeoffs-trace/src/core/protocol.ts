@@ -171,7 +171,7 @@ export type PiRpcEvent =
 export interface HelloMessage {
   type: "hello";
   agentId: string;
-  role: "worker" | "reviewer";
+  role: "worker" | "reviewer" | "evaluator";
   tools: string[];
   piVersion?: string;
 }
@@ -182,7 +182,10 @@ export interface HelloMessage {
 export interface SubmitMessage {
   type: "submit";
   id: string;
-  tool: "submit_phase" | "submit_discovery" | "submit_review";
+  /** Plan 04a adds `raise_tradeoff` (the worker, at the moment it makes a
+   * choice the plan did not fix) and `submit_evaluation` (the evaluator's
+   * per-message publish/merge/drop outcome). */
+  tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation";
   args: unknown;
 }
 

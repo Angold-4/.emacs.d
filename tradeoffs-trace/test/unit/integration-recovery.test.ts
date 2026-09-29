@@ -71,6 +71,10 @@ function driveToReviewing(): { ctx: { state: State }; step: (event: unknown) => 
   for (const reviewer of ["M", "A", "B"] as const) {
     step({ type: "REVIEW_SUBMITTED", review: approvingReview(reviewer, "C2", K) });
   }
+  // Plan 04a: the last review enters EVALUATING; with no raw messages the
+  // predicate already holds, so the phase completes evaluation at once.
+  assert.equal(ctx.state.phase.phase, "EVALUATING");
+  step({ type: "EVALUATION_COMPLETED" });
   assert.equal(ctx.state.phase.phase, "RESOLVING");
 
   return { ctx, step };

@@ -71,7 +71,16 @@ test("force-kill-shell: SIGKILLing the worker's process group mid-`sh` is notice
     // The recorded shell intent (design §2.2: pgid logged before the
     // command's first side effect).
     const events = readEvents(setup.runDir);
-    const shIntent = events.find((e) => e.kind === "intent" && (e.event as { pgid?: number }).pgid !== undefined);
+    // Plan 04a: the baseline stage records its own command pgids
+    // (`baseline-sh-…`), so select the worker's `sh` intent specifically
+    // (`sh-<agentId>-<pgid>`), not merely the first pgid-bearing intent.
+    const shIntent = events.find(
+      (e) =>
+        e.kind === "intent" &&
+        typeof e.actionId === "string" &&
+        e.actionId.startsWith("sh-") &&
+        (e.event as { pgid?: number }).pgid !== undefined,
+    );
     assert.ok(shIntent, "expected a recorded sh intent with a pgid");
     const shPgid = (shIntent!.event as { pgid: number }).pgid;
     assert.ok(groupAlive(shPgid), "sanity: the sh command's own group is alive before the kill");

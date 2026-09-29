@@ -560,6 +560,21 @@ function driveOnce(rng: () => number): RunResult {
           break;
         }
 
+        // Plan 04a: the EVALUATING stage. The pure test raises no raw
+        // messages, so the predicate already holds and only
+        // evaluation_complete appears; the dispatch case is kept for
+        // completeness (an evaluator that finds nothing).
+        case "dispatch_evaluation": {
+          state = step(state, { type: "ACTION_STARTED", action: "dispatch_evaluation", actionId: freshId("a") });
+          state = step(state, { type: "EVALUATOR_FINISHED", evaluated: 0 });
+          break;
+        }
+
+        case "evaluation_complete": {
+          state = step(state, { type: "EVALUATION_COMPLETED" });
+          break;
+        }
+
         case "accept": {
           acceptCandidate();
           break;

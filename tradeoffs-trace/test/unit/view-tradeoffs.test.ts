@@ -184,6 +184,9 @@ function runDir(root: string): string {
   review("M", at(55));
   review("A", at(56));
   review("B", at(57));
+  // Plan 04a: the last review enters EVALUATING; no raw messages, so the
+  // predicate holds and evaluation completes at once (a 0ms stage).
+  push(at(57), { type: "EVALUATION_COMPLETED" });
 
   push(at(58), { type: "BALLOT_CAST", ballot: ballot({ reviewer: "M", decisionId: "D-p1-3", vote: "approve" }) });
   push(at(58), { type: "BALLOT_CAST", ballot: ballot({ reviewer: "A", decisionId: "D-p1-3", vote: "approve" }) });

@@ -106,6 +106,8 @@ function messageProperties(message: Message, phase: ReviewPhase): string[] {
   ];
   if (message.followUp) lines.push(prop("FOLLOW_UP", "true"));
   if (message.invalidated) lines.push(prop("INVALIDATED", `${message.invalidated.reason} (${message.invalidated.atCandidate})`));
+  // 04a/04b: the evaluator's report on an owner-refused message.
+  if (message.addressedReport) lines.push(prop("ADDRESSED", String(message.addressedReport.addressed)));
   return lines;
 }
 
