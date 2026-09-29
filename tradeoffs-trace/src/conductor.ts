@@ -1015,6 +1015,12 @@ interface AgentHandle {
   /** A `submit_review` from this agent is being recorded. A second call
    * while it is (run cc1992e2: B called the tool twice) is refused. */
   reviewInFlight?: boolean;
+  /** Plan 05k: the item ids this brief agent was dispatched for, and the ones
+   * it actually submitted. The agent is done only when it submitted every id
+   * it was asked for — a retried backstop already has a brief, so existence
+   * alone must never end the pass (finding M-41). */
+  briefInFlightIds?: Set<string>;
+  briefSubmitted?: Set<string>;
 }
 
 /** `#applyReviewFindingsAndBallots` found the round over after an await. */
@@ -1031,6 +1037,11 @@ export class Conductor {
   /** Decision briefs: the item ids the current brief-writing agent was asked
    * for, so #refreshBriefs does not dispatch a second agent for them. */
   #briefInFlight = new Set<string>();
+  /** Plan 05k (OD-6): the park episode at which each backstop was recorded,
+   * keyed `<candidateSha>::<itemId>`. The single retry fires only when a LATER
+   * park happens on the same candidate, never on the next beat of the same
+   * one. */
+  #briefBackstopEpisode = new Map<string, number>();
   /** Plan 05j: candidates whose curator agent is in flight. */
   #curatorInFlight = new Set<string>();
   #plan: RunPlanFile;
@@ -3486,12 +3497,13 @@ export class Conductor {
       const enriched = { ...enrichBriefRelated(brief as DecisionBrief, this.#briefConcerns()), candidateSha: C, command };
       this.#applyEvent({ type: "BRIEFS_RECORDED", briefs: [enriched] });
       this.#log.append("brief_recorded", { requestId, options: (brief as { options?: unknown }).options, candidateSha: C });
-      // The brief agent is done once every item it was asked for has a brief
-      // for this candidate.
-      const has = (id: string) => (this.#state.phase.briefs ?? []).some((b) => b.requestId === id && b.candidateSha === C);
-      if (this.#briefInFlight.size > 0 && [...this.#briefInFlight].every(has)) {
-        for (const h of this.#agents.values()) if (h.agentId.startsWith("briefs-")) h.doneResolve();
-      }
+      // The brief agent is done only once IT has submitted every item it was
+      // asked for. Existence alone is not enough: a retried backstop already
+      // has a brief for this candidate, so checking the phase's briefs would
+      // end the pass after the first submit (finding M-41).
+      handle.briefSubmitted?.add(requestId);
+      const ids = handle.briefInFlightIds ?? new Set<string>();
+      if (ids.size > 0 && [...ids].every((id) => handle.briefSubmitted?.has(id))) handle.doneResolve();
       return { ok: true };
     }
     if (msg.tool === "submit_round_panel_votes") {
@@ -7408,7 +7420,17 @@ export class Conductor {
     const backstops = itemIds.filter((id) => {
       if (!existing.has(id) || retried.has(`${C}::${id}`)) return false;
       const brief = (phase.briefs ?? []).find((b) => b.requestId === id && b.candidateSha === C);
-      return brief !== undefined && brief.noRecommendationReason !== undefined;
+      if (brief === undefined || brief.noRecommendationReason === undefined) return false;
+      // OD-6: the retry is for a LATER park, not the next beat of this one.
+      // The backstop's park episode is remembered when it is recorded; a
+      // missing entry is seeded now, so the retry waits for the next park.
+      const key = `${C}::${id}`;
+      const recorded = this.#briefBackstopEpisode.get(key);
+      if (recorded === undefined) {
+        this.#briefBackstopEpisode.set(key, this.#awaitingEpisode);
+        return false;
+      }
+      return this.#awaitingEpisode > recorded;
     });
     // Only ids no running agent already covers are dispatched, and the set is
     // accumulated (never replaced), so a second item opening mid-pass does not
@@ -7539,15 +7561,20 @@ export class Conductor {
       const request = phase.ownerRequests.find((r) => r.id === id);
       if (request) {
         briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
         continue;
       }
       const decision = this.#liveReservedDecisions(phase).find((d) => d.id === id);
       if (decision) {
         briefs.push({ ...fallbackDecisionBrief(decision, opts), candidateSha: C });
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
         continue;
       }
       const entry = this.#ownerMarkedEntries(phase).find((e) => e.id === id);
-      if (entry) briefs.push({ ...fallbackEntryBrief(entry, opts), candidateSha: C });
+      if (entry) {
+        briefs.push({ ...fallbackEntryBrief(entry, opts), candidateSha: C });
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
+      }
     }
     if (briefs.length > 0) this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
   }
@@ -7618,6 +7645,8 @@ export class Conductor {
       donePromise,
       discoveryResolve: () => undefined,
       discoveryPromise: Promise.resolve(),
+      briefInFlightIds: new Set(ids),
+      briefSubmitted: new Set(),
     };
     this.#agents.set(agentId, handle);
     this.#log.intent(actionId, { agentId, pgid: agent.pgid, briefs: ids });
