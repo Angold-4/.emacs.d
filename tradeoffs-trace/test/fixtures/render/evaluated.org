@@ -1,0 +1,87 @@
+#+TITLE: tradeoffs-trace review — p1
+#+CONTRACT_VERSION: v1
+
+* Blockers
+(none)
+
+* Trade-offs
+1 dropped
+** T-1 A published trade-off 1
+  :PROPERTIES:
+  :ID: T-1
+  :TYPE: tradeoff
+  :STATE: published
+  :RAISED_BY: worker
+  :IMPORTANCE: normal
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: 33c41174
+  :PHASE_ID: p1
+  :END:
+  fewer lock acquisitions
+
+  the cancel path took one lock per request
+
+** T-2 A published trade-off 2
+  :PROPERTIES:
+  :ID: T-2
+  :TYPE: tradeoff
+  :STATE: published
+  :RAISED_BY: worker
+  :IMPORTANCE: normal
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: 33c41174
+  :PHASE_ID: p1
+  :END:
+  fewer lock acquisitions
+
+  the cancel path took one lock per request
+
+** T-3 A published trade-off 3
+  :PROPERTIES:
+  :ID: T-3
+  :TYPE: tradeoff
+  :STATE: published
+  :RAISED_BY: worker
+  :IMPORTANCE: normal
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: 33c41174
+  :PHASE_ID: p1
+  :END:
+  fewer lock acquisitions
+
+  the cancel path took one lock per request
+
+** T-4 A published trade-off 4
+  :PROPERTIES:
+  :ID: T-4
+  :TYPE: tradeoff
+  :STATE: published
+  :RAISED_BY: worker
+  :IMPORTANCE: normal
+  :VERDICT: none
+  :MESSAGE_VERSION: 1
+  :CANDIDATE_SHA: C1
+  :CONTRACT_VERSION: 1
+  :CONTRACT_SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  :RUN_ID: 33c41174
+  :PHASE_ID: p1
+  :END:
+  fewer lock acquisitions
+
+  the cancel path took one lock per request
+
+
+* Findings
+(none)

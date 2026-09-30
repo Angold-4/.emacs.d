@@ -18,6 +18,9 @@ import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baselin
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
+// Plan 05c: the status view's `review' row is counted from the same messages
+// the review renderer shows, so the two views never disagree.
+import { reviewSummary } from "./render.ts";
 import { computeMetrics, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
@@ -420,6 +423,10 @@ export interface RunView {
    * flagged so the owner can look (and override through the input box). */
   flaggedDecisions: number;
   openFindings: number;
+  /** Plan 05c: the status view's `review' row, in trade-off vocabulary
+   * (`T 6 (6 raw) · F 0 · B 0 · C-c m d'), counted from the same messages
+   * `views/review.org' renders. */
+  review: string;
   needsYou: number;
   /** Plan 01h: the few trade-offs that matter while the run is live, most
    * important first, at most 6. Undefined when there is nothing to show. */
@@ -699,6 +706,7 @@ export function buildView(
     ...(tradeoffs.length > 0 ? { tradeoffs } : {}),
     cost,
     openFindings,
+    review: reviewSummary(phase.messages),
     needsYou,
     idleMinutes,
     attention,
@@ -854,7 +862,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     ...(phase.contract.gate ? [`- Gate: ${v.gate ?? "no record for the accepted candidate"}`] : []),
     `- Reviews on the accepted candidate ${C ? C.slice(0, 9) : "?"}: ${v.reviewLine}`,
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
-    `- ${live.length} decision(s), ${flagged.length} flagged for the owner`,
+    `- ${live.length} trade-off(s), ${flagged.length} flagged for the owner`,
     "",
     ...(models.length > 0
       ? ["### Models per role", "", ...models.map((m) => `- ${m.role}: ${m.value}`), ""]
@@ -887,7 +895,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     for (const f of fixed) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 300)}`);
   }
   if (flagged.length > 0) {
-    lines.push("", "### Flagged decisions (reserved: worth an owner's look)", "");
+    lines.push("", "### Flagged trade-offs (reserved: worth an owner's look)", "");
     for (const d of flagged) lines.push(`- ${d.choice} — ${decisionStatus(d, phase).status}`);
   }
   if (advisories.length > 0) {

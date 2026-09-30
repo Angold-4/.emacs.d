@@ -269,17 +269,28 @@ binding check rejects it.
 ## 5. Rendering
 
 - `messages.jsonl` and `ledger.jsonl` are the machine view.
-- `views/review.org` is the human view: three top-level sections (Blockers,
-  Trade-offs, Findings), blockers first. Each message is one heading (`<id>
-  <title>`) carrying its summary and context and a property drawer with its
-  id, type, state, `raisedBy`, `importance`, the owner's verdict (if any) and
-  the binding a verdict needs (`messageVersion`, `candidateSha`,
+- `views/review.org` is the human view. Its header names the run by its
+  readable id and directory id (`cebd7fcb-01 · 33c41174`); the internal
+  `runId` appears only inside the property drawers, where a verdict's binding
+  needs it. Three top-level sections follow (Blockers, Trade-offs, Findings),
+  blockers first. Only a message the evaluator **published** (and its later
+  states, accepted/refused/resolved/superseded) is a titled entry: a raw
+  message — or one an evaluator timeout left `unevaluated` with its raw
+  wording — is one `N raw, awaiting evaluation` line per section, a dropped
+  one only `N dropped`, and a merged one is named in its target's own file (under
+  `* Merged in`). Each entry is one heading (`<id> <title>`) carrying its
+  summary and context and a property drawer with its id, type, severity (for
+  a finding), state, `raisedBy`, `importance`, the owner's verdict (if any)
+  and the binding a verdict needs (`messageVersion`, `candidateSha`,
   `contractVersion`, `runId`, `phaseId`). Within a section, high and normal
-  messages come first; low-importance ones are folded under `Minor (N)`. A
-  message's own file, `views/messages/<id>.org`, carries its evidence (path
-  and lines), the plan excerpt it concerns, every version's history, its
+  messages come first; low-importance ones are folded under `Minor (N)`.
+  `* Blockers` holds only messages raised through a reviewer's `blockers`
+  list, each with its panel's outcome; an ordinary `blocking` finding is a
+  Finding, marked `[blocking]`. A message's own file,
+  `views/messages/<id>.org`, carries its evidence (path and lines), the plan
+  excerpt it concerns, what was merged into it, every version's history, its
   ledger entry and its votes.
-- `views/status.txt` is the text the Emacs status buffer shows: the title, the run line, every status row, the trade-offs (each tagged `\t:RECORD:<id>` so RET still opens the decision view), the cost and record counts, the DONE owner checklist, the owner input and directives, and the attention line. `tt status` keeps its own plain-text rendering.
+- `views/status.txt` is the text the Emacs status buffer shows: the title, the run line, every status row, the trade-offs (each tagged `\t:RECORD:<id>` so RET still opens the decision view), the cost, the `review` row (the same counts `review.org` shows, in trade-off vocabulary: `T 6 (6 raw) · F 0 · B 0 · C-c m d`), the DONE owner checklist, the owner input and directives, and the attention line. `tt status` keeps its own plain-text rendering.
 - `tt summary` (the PR body) lists refused-after-`DONE` follow-ups under
   `### Follow-ups` and the same balance numbers under `### Balance metrics`.
 - `views/metrics.json` is the machine view of the same balance: review share

@@ -322,15 +322,20 @@ then.  It is never part of the worker's or a reviewer's acceptance."
              (time . "reviewer-M: model 80% · polling 0% · full tests 0%")
              (gates . "checks ✓ · probe ✓ (reused)")
              (reviewLine . "M ✗ 2 reject · 1 blocking   A ✓   B ⧗")
-             (liveDecisions . 4) (failedDecisions . 0) (flaggedDecisions . 2) (openFindings . 1) (boundaryFilesChanged . 2)))
+             (review . "T 4 (2 raw) · F 1 · B 0 · C-c m d")
+             (boundaryFilesChanged . 2)))
      "/tmp/tt-ert/abcd1234")
     (let ((text (buffer-string)))
       (should (string-match-p "run abcd1234 · conductor running · 1m02s" text))
       (should (string-match-p "pipeline  implement 30s → freeze 1s" text))
       (should (string-match-p "time      reviewer-M: model 80%" text))
       (should (string-match-p "reviews   M ✗ 2 reject · 1 blocking   A ✓   B ⧗" text))
-      (should (string-match-p "4 decisions · 2 flagged for you · 1 open findings" text))
-      (should (string-match-p "boundary files changed: 2 (reviewers classify)" text))
+      ;; Plan 05c: the old `records … decisions' row is gone; the `review' row
+      ;; is in trade-off vocabulary.
+      (should (string-match-p "review    T 4 (2 raw) · F 1 · B 0 · C-c m d" text))
+      (should-not (string-match-p "decisions" text))
+      ;; Advisory A-5: the boundary-changed note survives as its own row.
+      (should (string-match-p "boundary  files changed: 2 (reviewers classify)" text))
       ;; Plan 01a: an unset declared secret is reported by name; a set one is
       ;; not, and a value too short to mask is reported too.
       (should (string-match-p "secret    FAKE_KEY not set" text))
@@ -1245,8 +1250,7 @@ inert as it was before the key existed — no error, and nothing opened."
 ;;; Plan 03b: the runtime-rendered review buffer
 
 (defconst +tt-test--review-org
-  (concat "#+TITLE: tradeoffs-trace review — p1\n"
-          "#+RUN_ID: r1\n"
+  (concat "#+TITLE: tradeoffs-trace review — cebd7fcb-01 · 33c41174\n"
           "#+CONTRACT_VERSION: v1\n"
           "\n"
           "* Blockers\n"
@@ -1468,6 +1472,67 @@ calls neither `+tt--cli' nor `process-file' — only file reads."
           (should (= cli 0))
           (should (= pf 0)))
       (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-review-fold-layout ()
+  "Plan 05c: review.org opens with every message title visible and every body
+and drawer folded, whatever `org-startup-folded' the user set; TAB shows a
+message's body but never its drawer; a refresh keeps the expanded messages
+and point on the same one."
+  (dolist (startup '(t showeverything nil))
+    (let ((dir (make-temp-file "tt-ert-review" t))
+          (org-startup-folded startup))
+      (unwind-protect
+          (let ((buf (+tt-test--review-buffer dir)))
+            (with-current-buffer buf
+              ;; Every message title is visible; its body and drawer are folded.
+              (dolist (id '("B-1" "T-1" "F-1"))
+                (goto-char (point-min))
+                (search-forward id)
+                (goto-char (match-beginning 0))
+                (should (not (get-char-property (line-beginning-position) 'invisible)))
+                (should (org-fold-folded-p (line-end-position))))
+              ;; TAB on T-1 shows its body, keeps its drawer folded.
+              (goto-char (point-min))
+              (search-forward "T-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-toggle)
+              (goto-char (point-min))
+              (search-forward "fewer lock acquisitions under load")
+              (should (not (org-fold-folded-p (line-beginning-position))))
+              (goto-char (point-min))
+              (search-forward ":ID: T-1")
+              (should (org-fold-folded-p (line-beginning-position)))
+              ;; TAB again folds the body back (the drawer stays hidden).
+              (goto-char (point-min))
+              (search-forward "T-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-toggle)
+              (goto-char (point-min))
+              (search-forward "fewer lock acquisitions under load")
+              (should (org-fold-folded-p (line-beginning-position)))
+              ;; Expand once more so the refresh has something to preserve.
+              (goto-char (point-min))
+              (search-forward "T-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-toggle)
+              ;; Refresh: T-1 stays expanded, B-1 stays folded, point on T-1.
+              (with-temp-file (expand-file-name "views/review.org" dir)
+                (insert (replace-regexp-in-string "Batch cancels per tick" "Batch cancels per tick now" +tt-test--review-org)))
+              (goto-char (point-min))
+              (search-forward "T-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-refresh t)
+              (should (string-search "Batch cancels per tick now" (buffer-string)))
+              (should (equal (org-entry-get nil "ID") "T-1"))
+              (goto-char (point-min))
+              (search-forward "fewer lock acquisitions under load")
+              (should (not (org-fold-folded-p (line-beginning-position))))
+              (goto-char (point-min))
+              (search-forward "B-1")
+              (goto-char (match-beginning 0))
+              (should (org-fold-folded-p (line-end-position))))
+            (kill-buffer buf))
+        (delete-directory dir t)))))
 
 (ert-deftest tradeoffs-trace-status-file-restores-records ()
   "Plan 03b (A-1/B-6): the rendered status file keeps plan 01h's RET

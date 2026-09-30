@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { projectReview, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
+import { projectReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
@@ -394,9 +394,11 @@ export interface ConductorOptions {
 // Run directory layout (design §9.1)
 // ---------------------------------------------------------------------------
 
-/** Contract v1: the events that can change a message projection. An
+/** Contract v1: the events that can change a rendered projection. An
  * EVALUATION_TIMED_OUT publishes a type's raw messages `unevaluated`, so it
- * changes `messages.jsonl`/`ledger.jsonl` too. */
+ * changes `messages.jsonl`/`ledger.jsonl` too. Plan 05c: PANEL_DECIDED
+ * changes `views/review.org`, which shows a blocker's panel outcome, so it
+ * must rewrite the projections the same way a message event does. */
 const MESSAGE_EVENT_TYPES = new Set<string>([
   "EVALUATION_TIMED_OUT",
   "MESSAGE_ADDRESS_REPORTED",
@@ -408,6 +410,7 @@ const MESSAGE_EVENT_TYPES = new Set<string>([
   "MESSAGE_RESOLVED",
   "MESSAGE_SUPERSEDED",
   "MESSAGE_CARRIED",
+  "PANEL_DECIDED",
 ]);
 
 export function runPaths(runDir: string) {
@@ -937,6 +940,10 @@ interface AgentHandle {
   /** Plan 01d: how many incomplete `submit_review` submissions this dispatch
    * has already had rejected (at most MAX_INCOMPLETE_REVIEW_REJECTIONS). */
   incompleteReviewRejections?: number;
+  /** Plan 05c: how many `submit_evaluation` submissions this evaluator has
+   * had rejected for a title that ends mid-word or was cut to fit the cap
+   * (at most MAX_INCOMPLETE_REVIEW_REJECTIONS, then accepted as is). */
+  evaluationTitleRejections?: number;
   /** A `submit_review` from this agent is being recorded. A second call
    * while it is (run cc1992e2: B called the tool twice) is refused. */
   reviewInFlight?: boolean;
@@ -3218,6 +3225,23 @@ export class Conductor {
       // (like an incomplete review), never partly applied.
       const issue = this.#evaluationIssue(messageType, entries as EvaluationEntry[]);
       if (issue) return { ok: false, reason: `invalid evaluation: ${issue}` };
+      // Plan 05c: a published title must be one complete line, not a
+      // truncation at the 80-character cap. Refused back to the model, at
+      // most MAX_INCOMPLETE_REVIEW_REJECTIONS times, then accepted as is —
+      // the same one-turn rule `submit_review` uses for an incomplete ballot.
+      const titleIssue = this.#evaluationTitleIssue(messageType, entries as EvaluationEntry[]);
+      if (titleIssue) {
+        const rejections = handle.evaluationTitleRejections ?? 0;
+        if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
+          handle.evaluationTitleRejections = rejections + 1;
+          this.#log.append("evaluation_title_rejected", { messageType, agentId, detail: titleIssue, rejection: rejections + 1 });
+          return {
+            ok: false,
+            reason: `invalid title: ${titleIssue}. Give one complete line of at most 80 characters — rewrite it shorter rather than cutting it.`,
+          };
+        }
+        this.#log.append("evaluation_title_accepted", { messageType, agentId, detail: titleIssue, rejections });
+      }
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
       this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
       handle.doneResolve();
@@ -3325,6 +3349,29 @@ export class Conductor {
     }
     for (const id of refusedIds) {
       if (!seen.has(id)) return `every owner-refused ${messageType} message must appear exactly once; ${id} is missing`;
+    }
+    return undefined;
+  }
+
+  /** Plan 05c: the first `publish` entry whose title is not one complete line
+   * — longer than the 80-character cap, ending in the ellipsis a cut leaves,
+   * or ending mid-word because the model truncated the raw title — or
+   * undefined when every title is fine. Named by message id so the model can
+   * fix exactly that entry. */
+  #evaluationTitleIssue(messageType: MessageType, entries: EvaluationEntry[]): string | undefined {
+    const messages = this.#state.phase.messages ?? [];
+    for (const entry of entries) {
+      if (entry?.action !== "publish") continue;
+      const id = typeof entry.messageId === "string" ? entry.messageId : "";
+      const message = messages.find((m) => m.id === id && m.type === messageType);
+      if (!message) continue;
+      // A publish with no title falls back to the raw message's own title, so
+      // the EFFECTIVE title is what the owner will read: a raw title over the
+      // cap would be clamped to an ellipsis just the same, and is refused here
+      // (finding A-3).
+      const provided = typeof entry.title === "string" && entry.title.trim().length > 0 ? entry.title : message.title;
+      const issue = titleIssue(message.title, provided);
+      if (issue) return `${id}: ${issue}`;
     }
     return undefined;
   }
@@ -3550,13 +3597,17 @@ export class Conductor {
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
     this.#applyEvent({ type: "FINDING_RAISED", finding });
-    // Contract v1 §1: a finding (or, at blocking severity, a blocker) is a
-    // published message too. Plan 04b: only one raised through a reviewer's
-    // `blockers` list is marked as a blocker, so only it is voted by a panel.
+    // Contract v1 §1: a finding is a published message too. Plan 04b: only
+    // one raised through a reviewer's `blockers` list is a BLOCKER message
+    // (the stop-the-work type, voted by a panel). An ordinary `blocking`
+    // finding keeps its pre-04b meaning — it blocks acceptance and forces a
+    // repair — and stays a `finding` message, listed under Findings marked
+    // `blocking', never as a Blocker (plan 05c).
+    const messageType: MessageType = opts.raisedAsBlocker ? "blocker" : "finding";
     this.#raiseMessage(
-      finding.severity === "blocking" ? "blocker" : "finding",
+      messageType,
       finding.id,
-      this.#findingContent(finding),
+      this.#findingContent(finding, messageType),
       candidateSha,
       opts.raisedAsBlocker ? { raisedAsBlocker: true } : {},
     );
@@ -4422,7 +4473,9 @@ export class Conductor {
       const phase = this.#state.phase;
       fs.writeFileSync(this.#paths.messages, projectMessages(phase));
       fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
-      fs.writeFileSync(this.#paths.review, projectReview(phase));
+      // Plan 05c: the header names the run by its readable id and directory
+      // id, never by the internal runId.
+      fs.writeFileSync(this.#paths.review, projectReview({ ...phase, ...runIds(this.#runDir) }));
       this.#writeMessageViews();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
@@ -4513,10 +4566,13 @@ export class Conductor {
     };
   }
 
-  /** Contract v1: the reviewable content of the message a finding raises. */
-  #findingContent(finding: Finding): MessageContent {
+  /** Contract v1: the reviewable content of the message a finding raises.
+   * `type' is the MESSAGE type the caller will raise (`blocker' only through
+   * a reviewer's `blockers' list; otherwise `finding'), so the message's type
+   * and its content hash never disagree. */
+  #findingContent(finding: Finding, type: MessageType): MessageContent {
     return {
-      type: finding.severity === "blocking" ? "blocker" : "finding",
+      type,
       title: `${finding.kind} ${finding.severity}: ${finding.evidence}`,
       summary: `raised by ${finding.raisedBy} against ${finding.boundCandidateSha}`,
       context: finding.evidence,
@@ -4537,7 +4593,8 @@ export class Conductor {
       return { raisedBy: "worker", importance: d?.class === "reserved" ? "high" : d?.class === "detail" ? "low" : "normal" };
     }
     const f = this.#state.phase.findings.find((x) => x.id === sourceRecordId);
-    return { raisedBy: f?.raisedBy ?? "reviewer", importance: type === "blocker" ? "high" : "low" };
+    // A blocking finding matters as much as a blocker; an advisory one is low.
+    return { raisedBy: f?.raisedBy ?? "reviewer", importance: type === "blocker" || f?.severity === "blocking" ? "high" : "low" };
   }
 
   /** The current content of the record a message was raised from, or
@@ -4547,7 +4604,7 @@ export class Conductor {
     const decision = this.#state.phase.decisions.find((d) => d.id === message.sourceRecordId);
     if (decision && message.type === "tradeoff") return this.#decisionContent(decision);
     const finding = this.#state.phase.findings.find((f) => f.id === message.sourceRecordId);
-    if (finding && (message.type === "finding" || message.type === "blocker")) return this.#findingContent(finding);
+    if (finding && (message.type === "finding" || message.type === "blocker")) return this.#findingContent(finding, message.type);
     return undefined;
   }
 
@@ -6315,7 +6372,7 @@ export class Conductor {
       redactText(diff, this.#secretMaskable),
       "```",
       "",
-      `Raw ${messageType} messages to evaluate (${raw.length}):`,
+      `Raw ${messageType} messages to evaluate (${raw.length}) — each publish title must be ONE COMPLETE line of at most 80 characters:`,
       ...raw.map(
         (m) => `- ${m.id}: ${m.title}${m.anchor ? ` (anchor ${m.anchor.path}:${m.anchor.lines[0]}-${m.anchor.lines[1]})` : ""}\n    why: ${m.summary}\n    context: ${m.context}`,
       ),
@@ -6330,7 +6387,7 @@ export class Conductor {
     lines.push(
       "",
       "For EACH raw message above, check its claim against the code and call submit_evaluation with exactly one entry:",
-      "- publish: title (one clean line, at most 80 characters), summary (at most 3 sentences), context, evidence (the code facts you checked), importance (high|medium|low).",
+      "- publish: title (ONE COMPLETE line of at most 80 characters — rewrite it shorter rather than cutting the raw title mid-word; a title that ends mid-word is refused), summary (at most 3 sentences), context, evidence (the code facts you checked), importance (high|medium|low).",
       "- merge: the message says the same thing as another — name `into` that message id.",
       "- drop: it is trivial, already settled, or not reviewable — give a reason.",
     );
@@ -6823,6 +6880,28 @@ function parseAnchor(raw: unknown): { path: string; lines: [number, number] } | 
 function clampMessageTitle(title: string): string {
   const t = title.replace(/\s+/g, " ").trim();
   return t.length > 80 ? `${t.slice(0, 79)}…` : t;
+}
+
+/** The 80-character cap a published title must fit. */
+export const MESSAGE_TITLE_MAX = 80;
+
+/** Plan 05c: why an evaluator's title is not one complete line, or undefined
+ * when it is. A title is refused when it is longer than the cap, ends with
+ * the ellipsis a cut leaves (`…' or `...'), or ends mid-word — the last case
+ * detected when the evaluator's title is a strict prefix of the raw message's
+ * own title and the raw title continues with a word character, which is what
+ * a model that truncated instead of rewriting produces. */
+export function titleIssue(rawTitle: string | undefined, title: string | undefined): string | undefined {
+  const t = (title ?? "").replace(/\s+/g, " ").trim();
+  // No title given: the raw message's own title is used, already complete.
+  if (t.length === 0) return undefined;
+  if (t.length > MESSAGE_TITLE_MAX) return `the title is ${t.length} characters long, over the ${MESSAGE_TITLE_MAX}-character cap`;
+  if (/…$/.test(t) || /\.\.\.$/.test(t)) return "the title ends with an ellipsis, so it was cut to fit the cap";
+  const raw = (rawTitle ?? "").replace(/\s+/g, " ").trim();
+  if (raw.length > t.length && raw.startsWith(t) && /[A-Za-z0-9]/.test(raw.charAt(t.length))) {
+    return "the title ends mid-word: it is a truncated start of the message's own title";
+  }
+  return undefined;
 }
 
 /** Plan 04a: the settled ledger every prompt carries under "Settled (do not

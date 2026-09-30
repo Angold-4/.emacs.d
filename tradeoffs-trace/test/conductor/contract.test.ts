@@ -758,8 +758,11 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(readFileSync(p.loop, "utf8"), /^tradeoffs-trace phase chart — generated from TRANSITIONS/);
     assert.match(readFileSync(p.loop, "utf8"), /IMPLEMENTING|REVIEWING|CHECKING/);
     const reviewBefore = readFileSync(p.review, "utf8");
-    assert.match(reviewBefore, /T-1/);
+    // Plan 05c: a raw message is never shown as if it had been evaluated —
+    // the review lists it only as a count until an evaluator publishes it.
+    assert.match(reviewBefore, /^2 raw, awaiting evaluation$/m);
     assert.match(reviewBefore, /^\* Trade-offs$/m);
+    assert.doesNotMatch(reviewBefore, /^\*\* T-/m);
     const statusBefore = readFileSync(p.status, "utf8");
     assert.match(statusBefore, /^run /m);
     assert.match(statusBefore, /^phase /m);
@@ -769,7 +772,9 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     await waitFor(() => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "finding"), 90_000, 20, setup.runDir);
     await waitFor(() => readFileSync(p.review, "utf8") !== reviewBefore, 30_000, 20, setup.runDir);
     const reviewAfter = readFileSync(p.review, "utf8");
-    assert.match(reviewAfter, /F-1/);
+    // Plan 05c: the new raw finding is a count line under Findings, not an
+    // entry; its own file is still written for when it is published.
+    assert.match(reviewAfter, /^1 raw, awaiting evaluation$/m);
     assert.match(reviewAfter, /^\* Findings$/m);
     assert.ok(existsSync(`${p.messagesView}/F-1.org`), "a message file is written for the new message");
     assert.match(readFileSync(`${p.messagesView}/F-1.org`, "utf8"), /^\* Evidence$/m);

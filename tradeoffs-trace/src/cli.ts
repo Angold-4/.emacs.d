@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { pendingOwnerInputs, projectReview, renderStatusText, renderStatusView, reviewMessageFiles, statusViewInput } from "./render.ts";
+import { pendingOwnerInputs, projectReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
 import { decisionStatus } from "./core/predicate.ts";
@@ -911,7 +911,7 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   const state = rebuildState(runDir, plan, { lenient: true });
   const messages = projectMessages(state.phase);
   const ledger = projectLedger(state.phase);
-  const review = projectReview(state.phase);
+  const review = projectReview({ ...state.phase, ...runIds(runDir) });
   const messageFiles = reviewMessageFiles(state.phase);
   // Plan 04c: `views/metrics.json` is a projection of state and the log.
   const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
@@ -1110,7 +1110,7 @@ async function cmdVerdict(
   const after = rebuildState(runDir, plan, { lenient: true });
   writeFileSync(p.messages, projectMessages(after.phase));
   writeFileSync(p.ledger, projectLedger(after.phase));
-  writeFileSync(p.review, projectReview(after.phase));
+  writeFileSync(p.review, projectReview({ ...after.phase, ...runIds(runDir) }));
   const lateTimeline = rebuildTimelineWithEvents(runDir, plan);
   writeFileSync(p.metrics, projectMetrics(metricsForRunDir(runDir, after.phase, lateTimeline.timeline, lateTimeline.events)));
   // A run from before this view has no views/messages/: create it, and prune

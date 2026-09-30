@@ -65,8 +65,9 @@ export function notAcceptedReasons(phase: PhaseState): string[] {
   const reasons: string[] = [];
   if (phase.checks?.candidateSha === C && phase.checks.passed === false) reasons.push("checks failed");
   if (phase.probe?.candidateSha === C && phase.probe.passed === false) reasons.push("integration probe failed");
-  // Failed decisions, grouped by why: "D-3 vetoed by M", or "16 decisions
-  // failed (missing ballot from M)" rather than sixteen clauses.
+  // Failed records, grouped by why: "D-3 vetoed by M", or "16 trade-offs
+  // failed (missing ballot from M)" rather than sixteen clauses. Plan 05c:
+  // the owner reads trade-off vocabulary, never the retired word `decisions'.
   const failedBy = new Map<string, string[]>();
   for (const d of phase.decisions) {
     if (!isLiveDecision(d) || d.boundCandidateSha !== C) continue;
@@ -80,7 +81,7 @@ export function notAcceptedReasons(phase: PhaseState): string[] {
   }
   for (const [why, ids] of failedBy) {
     const verb = why === "M veto" ? "vetoed by M" : `failed (${why})`;
-    reasons.push(ids.length <= 2 ? `${ids.join(", ")} ${verb}` : `${ids.length} decisions ${verb}`);
+    reasons.push(ids.length <= 2 ? `${ids.join(", ")} ${verb}` : `${ids.length} trade-offs ${verb}`);
   }
   for (const f of phase.findings) {
     if (f.status === "open" && f.severity === "blocking") reasons.push(`blocking finding ${shortId(f.id)} open`);

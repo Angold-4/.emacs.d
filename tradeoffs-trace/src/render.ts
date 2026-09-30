@@ -24,21 +24,91 @@ import type { RunView } from "./view.ts";
 export interface ReviewPhase {
   runId?: string;
   phaseId?: string;
-  contract?: { phaseId?: string };
+  contract?: { phaseId?: string; readableId?: string; dirId?: string };
+  /** Plan 05c: the run's readable id (`<program>-NN') and the run directory's
+   * basename, so the header names the run the way the owner does. The
+   * internal `runId' never shows here; it stays inside the property drawers,
+   * where a verdict's binding needs it. */
+  readableId?: string;
+  dirId?: string;
   messages?: Message[];
   decisions?: Decision[];
   findings?: Finding[];
   ballots?: Ballot[];
+  /** Plan 04b: each raw blocker's panel, keyed by blocker message id, so a
+   * published blocker shows its panel's outcome. */
+  panel?: { blockers?: Record<string, { decided?: { outcome?: string; reason?: string } }> };
 }
 
 const IMPORTANCE_RANK: Record<string, number> = { high: 0, normal: 1, low: 2 };
 
-/** The type's section, in the order the review buffer shows them. */
-const SECTIONS: Array<{ type: Message["type"]; label: string }> = [
-  { type: "blocker", label: "Blockers" },
-  { type: "tradeoff", label: "Trade-offs" },
-  { type: "finding", label: "Findings" },
+/** The review's three sections, in the order the buffer shows them. */
+export type ReviewSection = "blocker" | "tradeoff" | "finding";
+
+const SECTIONS: Array<{ section: ReviewSection; label: string }> = [
+  { section: "blocker", label: "Blockers" },
+  { section: "tradeoff", label: "Trade-offs" },
+  { section: "finding", label: "Findings" },
 ];
+
+/** Which section a message is listed under. Only a message raised through a
+ * reviewer's `blockers` list is a Blocker; a blocking *finding* raised
+ * through the ordinary `findings` list lists under Findings. A blocker
+ * message raised before plan 05c (so without `raisedAsBlocker`) is treated
+ * as the blocking finding it was, not as a stop-the-work blocker. */
+export function sectionOf(message: Message): ReviewSection {
+  if (message.type === "tradeoff") return "tradeoff";
+  if (message.type === "blocker" && message.raisedAsBlocker === true) return "blocker";
+  return "finding";
+}
+
+/** Whether a message is still awaiting an evaluator: a raw message, or one an
+ * evaluator timeout published unchanged (`unevaluated', the raw title kept).
+ * Neither may be shown as if it had been evaluated. */
+export function awaitingEvaluation(message: Message): boolean {
+  return message.state === "raw" || (message.state === "published" && message.unevaluated === true);
+}
+
+/** Whether the review lists a message as a titled entry. Only a message an
+ * evaluator published (and its later states) is an entry: a message still
+ * awaiting evaluation is one `N raw, awaiting evaluation' line, a merged one
+ * is named in its target's own file, and a dropped one is only a `N dropped'
+ * count. */
+export function isReviewEntry(message: Message): boolean {
+  return !awaitingEvaluation(message) && message.state !== "merged" && message.state !== "dropped";
+}
+
+/** The run's readable id and directory id, read from `program.json' when the
+ * scheduler started this run. The readable id is absent for a hand-started
+ * run, which the directory id then names alone. */
+export function runIds(runDir: string): { readableId?: string; dirId: string } {
+  let readableId: string | undefined;
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(runDir, "program.json"), "utf8")) as { readableId?: unknown };
+    if (typeof raw.readableId === "string" && raw.readableId.length > 0) readableId = raw.readableId;
+  } catch {
+    // no program.json (a hand-started run): the directory id names it
+  }
+  return { readableId, dirId: path.basename(runDir) };
+}
+
+/** The review row the status view shows, in trade-off vocabulary. `T/F/B'
+ * count the messages in front of the owner — the titled entries plus the raw
+ * ones awaiting evaluation — and the parenthetical breaks out how many of
+ * them are raw and how many were dropped, so the counts match `review.org'. */
+export function reviewSummary(messages: readonly Message[] | undefined): string {
+  const part = (kind: ReviewSection, letter: string): string => {
+    const own = (messages ?? []).filter((m) => sectionOf(m) === kind);
+    const entries = own.filter(isReviewEntry).length;
+    const raw = own.filter(awaitingEvaluation).length;
+    const dropped = own.filter((m) => m.state === "dropped").length;
+    const bits: string[] = [];
+    if (raw > 0) bits.push(`${raw} raw`);
+    if (dropped > 0) bits.push(`${dropped} dropped`);
+    return `${letter} ${entries + raw}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`;
+  };
+  return `${part("tradeoff", "T")} · ${part("finding", "F")} · ${part("blocker", "B")} · C-c m d`;
+}
 
 function oneLine(text: string | undefined): string {
   return (text ?? "").replace(/\s+/g, " ").trim();
@@ -72,13 +142,30 @@ export function raisedByOf(message: Message, phase: ReviewPhase = {}): string {
  * low; a trade-off follows its decision's class (reserved high, detail low,
  * delegated normal). Folded under "Minor" when low. */
 export function importanceOf(message: Message, phase: ReviewPhase = {}): "high" | "normal" | "low" {
-  if (message.importance) return message.importance;
+  // The evaluator's own judgement, when it made one (04a uses `medium' for
+  // the middle of the three).
+  if (message.importance === "high") return "high";
+  if (message.importance === "low") return "low";
+  if (message.importance === "normal" || message.importance === "medium") return "normal";
+  // A finding-like message (a finding, or a legacy blocker that is really a
+  // blocking finding) matters by its severity: blocking is high.
+  if (message.type === "finding" || (message.type === "blocker" && message.raisedAsBlocker !== true)) {
+    return (sourceRecord(phase, message) as Finding | undefined)?.severity === "blocking" ? "high" : "low";
+  }
   if (message.type === "blocker") return "high";
-  if (message.type === "finding") return "low";
   const d = sourceRecord(phase, message) as Decision | undefined;
   if (d?.class === "reserved") return "high";
   if (d?.class === "detail") return "low";
   return "normal";
+}
+
+/** The severity of a finding-like message, from the finding it was raised
+ * from. A blocker message is always `blocking'; a trade-off has none. */
+export function severityOf(message: Message, phase: ReviewPhase = {}): "blocking" | "advisory" | undefined {
+  if (message.type === "tradeoff") return undefined;
+  if (message.raisedAsBlocker) return "blocking";
+  const f = sourceRecord(phase, message) as Finding | undefined;
+  return f?.severity;
 }
 
 function prop(key: string, value: string | undefined): string {
@@ -91,9 +178,11 @@ function prop(key: string, value: string | undefined): string {
 function messageProperties(message: Message, phase: ReviewPhase): string[] {
   const phaseId = message.phaseId || phase.phaseId || phase.contract?.phaseId || "";
   const cv = message.boundContractVersion;
+  const severity = severityOf(message, phase);
   const lines = [
     prop("ID", message.id),
     prop("TYPE", message.type),
+    ...(severity ? [prop("SEVERITY", severity)] : []),
     prop("STATE", message.state),
     prop("RAISED_BY", raisedByOf(message, phase)),
     prop("IMPORTANCE", importanceOf(message, phase)),
@@ -119,9 +208,22 @@ function settlementLine(message: Message): string | undefined {
   return `Verdict: ${s.state} by ${s.settledBy}${reason}`;
 }
 
+/** The panel's outcome for a blocker message, one line, or undefined when
+ * the panel has not decided (or the message is not a blocker). */
+function panelLine(phase: ReviewPhase, message: Message): string | undefined {
+  if (sectionOf(message) !== "blocker") return undefined;
+  const decided = phase.panel?.blockers?.[message.id]?.decided;
+  if (!decided?.outcome) return undefined;
+  const reason = decided.reason ? ` — ${oneLine(decided.reason)}` : "";
+  return `Panel: ${decided.outcome}${reason}`;
+}
+
 function heading(message: Message, level: number, phase: ReviewPhase): string[] {
   const body: string[] = [];
-  body.push(`${"*".repeat(level)} ${message.id} ${oneLine(message.title)}`);
+  // A blocker is already in the red stop-the-work section; only a finding-like
+  // message needs the `blocking' mark visible next to its title.
+  const blocking = severityOf(message, phase) === "blocking" && sectionOf(message) !== "blocker";
+  body.push(`${"*".repeat(level)} ${message.id} ${oneLine(message.title)}${blocking ? " [blocking]" : ""}`);
   body.push("  :PROPERTIES:");
   for (const p of messageProperties(message, phase)) body.push(`  ${p}`);
   body.push("  :END:");
@@ -129,6 +231,11 @@ function heading(message: Message, level: number, phase: ReviewPhase): string[] 
   if (message.context && message.context.trim().length > 0) {
     body.push("");
     for (const line of message.context.replace(/\r/g, "").split("\n")) body.push(`  ${line}`);
+  }
+  const panel = panelLine(phase, message);
+  if (panel) {
+    body.push("");
+    body.push(`  ${panel}`);
   }
   const verdict = settlementLine(message);
   if (verdict) {
@@ -145,19 +252,27 @@ function heading(message: Message, level: number, phase: ReviewPhase): string[] 
   return body;
 }
 
-/** One section of `views/review.org`. High and normal messages are direct
- * children (high first); low ones are folded under `** Minor (N)`. */
-function section(phase: ReviewPhase, type: Message["type"], label: string, messages: Message[]): string[] {
-  const own = messages.filter((m) => m.type === type);
+/** One section of `views/review.org`. The counts line comes first (`N raw,
+ * awaiting evaluation' and/or `N dropped'), then the published entries. High
+ * and normal messages are direct children (high first); low ones are folded
+ * under `** Minor (N)`. */
+function section(phase: ReviewPhase, kind: ReviewSection, label: string, messages: Message[]): string[] {
+  const own = messages.filter((m) => sectionOf(m) === kind);
+  const entries = own.filter(isReviewEntry);
+  const rawCount = own.filter(awaitingEvaluation).length;
+  const droppedCount = own.filter((m) => m.state === "dropped").length;
   const out = [`* ${label}`];
-  if (own.length === 0) {
-    out.push("(none)", "");
+  if (rawCount > 0) out.push(`${rawCount} raw, awaiting evaluation`);
+  if (droppedCount > 0) out.push(`${droppedCount} dropped`);
+  if (entries.length === 0) {
+    if (rawCount === 0 && droppedCount === 0) out.push("(none)");
+    out.push("");
     return out;
   }
-  const direct = own
+  const direct = entries
     .filter((m) => importanceOf(m, phase) !== "low")
     .sort((a, b) => (IMPORTANCE_RANK[importanceOf(a, phase)]! - IMPORTANCE_RANK[importanceOf(b, phase)]!) || a.id.localeCompare(b.id));
-  const minor = own
+  const minor = entries
     .filter((m) => importanceOf(m, phase) === "low")
     .sort((a, b) => a.id.localeCompare(b.id));
   for (const m of direct) out.push(...heading(m, 2, phase));
@@ -165,35 +280,57 @@ function section(phase: ReviewPhase, type: Message["type"], label: string, messa
     out.push(`** Minor (${minor.length})`);
     for (const m of minor) out.push(...heading(m, 3, phase));
   }
+  out.push("");
   return out;
 }
 
+/** The run label the review header shows: the readable id and the directory
+ * id (`cebd7fcb-01 · 33c41174'). The internal `runId' is never in the
+ * header; it stays inside the property drawers where a verdict's binding
+ * needs it. */
+function reviewRunLabel(phase: ReviewPhase): string {
+  const readable = [phase.readableId, phase.contract?.readableId].find((v) => typeof v === "string" && v.length > 0);
+  const dir = [phase.dirId, phase.contract?.dirId].find((v) => typeof v === "string" && v.length > 0);
+  if (readable && dir) return `${readable} · ${dir}`;
+  return readable ?? dir ?? phase.phaseId ?? phase.contract?.phaseId ?? "";
+}
+
 /** `views/review.org`: the runtime-rendered review view (contract v1). Three
- * top-level sections (Blockers, Trade-offs, Findings), blockers first; each
- * message one heading carrying its summary, context, reviewable state and the
- * binding a verdict needs. Rebuilt from state, never authoritative. */
+ * top-level sections (Blockers, Trade-offs, Findings), blockers first. Only
+ * published messages (and their later states) are entries; raw messages are
+ * one count line per section, dropped ones only a count, and merged ones live
+ * in their target's own file. Rebuilt from state, never authoritative. */
 export function projectReview(phase: ReviewPhase): string {
-  const phaseId = phase.phaseId ?? phase.contract?.phaseId ?? "";
   const messages = [...(phase.messages ?? [])];
   const lines: string[] = [
-    `#+TITLE: tradeoffs-trace review — ${phaseId}`,
-    `#+RUN_ID: ${phase.runId ?? ""}`,
+    `#+TITLE: tradeoffs-trace review — ${reviewRunLabel(phase)}`,
     "#+CONTRACT_VERSION: v1",
     "",
   ];
-  for (const s of SECTIONS) lines.push(...section(phase, s.type, s.label, messages));
+  for (const s of SECTIONS) lines.push(...section(phase, s.section, s.label, messages));
   return lines.join("\n");
 }
 
+/** The messages an evaluator merged into TARGET, so the target's own file
+ * names what was merged into it (a merged message is not an entry). */
+export function mergedInto(target: Message, phase: ReviewPhase = {}): Message[] {
+  return (phase.messages ?? []).filter((m) => {
+    if (m.id === target.id || m.state !== "merged") return false;
+    return m.settlement?.reason?.match(/^merged into (\S+)/)?.[1] === target.id;
+  });
+}
+
 /** One message's own file: `views/messages/<id>.org`. Evidence (path:lines
- * and the quote), the plan excerpt it concerns, its history (every version),
- * its ledger entry and the votes it drew. */
+ * and the quote), the plan excerpt it concerns, what was merged into it, its
+ * history (every version), its ledger entry and the votes it drew. */
 export function renderMessageFile(message: Message, phase: ReviewPhase = {}): string {
+  const blocking = severityOf(message, phase) === "blocking" && sectionOf(message) !== "blocker";
+  const headingText = `${message.id} ${oneLine(message.title)}${blocking ? " [blocking]" : ""}`;
   const lines: string[] = [
     `#+TITLE: ${message.id} — ${oneLine(message.title)}`,
     `#+TYPE: ${message.type}`,
     "",
-    `* ${message.id} ${oneLine(message.title)}`,
+    `* ${headingText}`,
     "  :PROPERTIES:",
   ];
   for (const p of messageProperties(message, phase)) lines.push(`  ${p}`);
@@ -202,6 +339,11 @@ export function renderMessageFile(message: Message, phase: ReviewPhase = {}): st
   if ((message.evidence ?? []).length === 0) lines.push("  (none)");
   else for (const ev of message.evidence) lines.push(`  - ${ev}`);
   lines.push("", "* Plan", `  ${oneLine(message.planRef) || "(none)"}`);
+  const mergedIn = mergedInto(message, phase);
+  if (mergedIn.length > 0) {
+    lines.push("", "* Merged in");
+    for (const m of mergedIn) lines.push(`  - ${m.id} ${oneLine(m.title)}`);
+  }
   lines.push("", "* History");
   for (const h of messageHistory(message, phase)) lines.push(`  - v${h.version} · ${h.candidate} · ${h.hash}`);
   lines.push("", "* Ledger");
@@ -507,12 +649,17 @@ export function renderStatusView(input: StatusViewInput): string {
     }
   }
   push(row("cost", view.cost?.text));
-  push(
-    row(
-      "records",
-      `${view.liveDecisions} decisions${view.failedDecisions > 0 ? ` (${view.failedDecisions} failed)` : ""}${(view.flaggedDecisions ?? 0) > 0 ? ` · ${view.flaggedDecisions} flagged for you` : ""} · ${view.openFindings} open findings${view.boundaryFilesChanged > 0 ? ` · boundary files changed: ${view.boundaryFilesChanged} (reviewers classify)` : ""}`,
-    ),
-  );
+  // Plan 05c: the `records' row said `decisions' and disagreed with the
+  // review; the `review' row counts in trade-off vocabulary, matching the
+  // entries, the raw count and the dropped count `review.org' shows.
+  push(row("review", view.review));
+  // Plan 3b: boundary files changed are the worker's trigger records the
+  // reviewers must classify. The old `records' row carried this; it keeps its
+  // own row so the owner still sees a change that no reviewer has classified
+  // (advisory A-5).
+  if (view.boundaryFilesChanged > 0) {
+    push(row("boundary", `files changed: ${view.boundaryFilesChanged} (reviewers classify)`));
+  }
   push(row("blocked", phase.blockedReason as string | undefined));
   // Plan 05i: the resolved tools, then the environment block itself.
   for (const line of view.envTools) lines.push(line);

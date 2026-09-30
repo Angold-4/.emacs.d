@@ -275,7 +275,9 @@ const RaiseTradeoffParams = Type.Object(
 const EvaluationParam = Type.Object({
   messageId: Type.String({ description: "The raw message this outcome is for" }),
   action: StringEnum(["publish", "merge", "drop"] as const),
-  title: Type.Optional(Type.String({ maxLength: 80, description: "publish only: one clean line, at most 80 characters" })),
+  title: Type.Optional(
+    Type.String({ maxLength: 80, description: "publish only: one COMPLETE line, at most 80 characters — rewrite it shorter rather than cutting the raw title mid-word" }),
+  ),
   summary: Type.Optional(Type.String({ description: "publish only: at most 3 sentences" })),
   context: Type.Optional(Type.String({ description: "publish only: what makes the message reviewable" })),
   evidence: Type.Optional(Type.Array(Type.String(), { description: "publish only: the evidence the evaluator checked" })),
@@ -473,7 +475,7 @@ export default function (pi: ExtensionAPI) {
     submit_review:
       "You have not called submit_review yet. This turn is not finished until you call submit_review with a ballot for every record the prompt lists as delegated or reserved and does not mark carried — the conductor rejects a review that omits one, names the missing ids and their choices, and expects you to resubmit — plus your findings and your statements. submit_review is the only submission tool you may use now.",
     submit_evaluation:
-      "You have not called submit_evaluation yet. Return one entry per raw message you were shown: publish (with a title of at most 80 characters, a summary of at most 3 sentences, context, evidence and importance), merge (into another message), or drop (with a reason).",
+      "You have not called submit_evaluation yet. Return one entry per raw message you were shown: publish (with ONE COMPLETE title of at most 80 characters — never truncate the raw title, rewrite it shorter; plus a summary of at most 3 sentences, context, evidence and importance), merge (into another message), or drop (with a reason).",
     submit_panel_vote:
       "You have not called submit_panel_vote yet. Vote block (stop the work until the owner decides — propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
   };
