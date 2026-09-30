@@ -1,0 +1,11 @@
+05g per-seat models · round 1 · attempt 2/3 · 23m20s
+
+  ✓  IMPLEMENT   16m
+  ✓  FREEZE      10s
+  ✗  CHECKS      7m  → repairing, attempt 2/3
+     PROBE
+     REVIEW
+     EVALUATE
+     RESOLVE
+     PUBLISH
+     DONE

@@ -422,6 +422,9 @@ export function runPaths(runDir: string) {
     status: path.join(runDir, "views", "status.txt"),
     // Plan 03c: the phase state machine as an ASCII chart (TRANSITIONS).
     loop: path.join(runDir, "views", "loop.txt"),
+    // Plan 05h: the current round as a vertical tape (MAIN_PATH), the owner's
+    // live view; `loop.txt` stays one key away as the reference.
+    tape: path.join(runDir, "views", "tape.txt"),
     // Plan 04c: the balance metrics (a deterministic projection of state and
     // the control log; `tt contract rebuild`/`check` include it).
     metrics: path.join(runDir, "views", "metrics.json"),
@@ -4416,6 +4419,11 @@ export class Conductor {
       panelSeats: { "1": modelFor("panel", 1), "2": modelFor("panel", 2), "3": modelFor("panel", 3) },
     };
     fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
+    // Plan 05h: the same beat keeps the loop tape (`views/tape.txt`) current.
+    // `buildView` already built it from this beat's one log snapshot, so it
+    // is written here rather than rebuilt; its durations end at the log's own
+    // last timestamp, so `tt contract rebuild` writes the same bytes.
+    fs.writeFileSync(this.#paths.tape, redactText(view.tape, this.#secretMaskable));
   }
 
   /** Contract v1: the reviewable content of the message a worker decision

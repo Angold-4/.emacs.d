@@ -1069,6 +1069,8 @@ so the view never claims the replacement is still in force (A-14)."
     (decisionStatuses (D-p1-1 (status . "failed") (reason . "M veto"))
                       (D-p1-flag (status . "passed") (flagged . t)))
     (view (elapsed . "1m02s") (round . 2)
+          (loop . "▶ REVIEW 4m12s of 15m · M·A·B · deepseek-v4.1-flash")
+          (models . "worker=deepseek/deepseek-v4.1-flash reviewer=vercel-ai-gateway:anthropic/claude-opus-5.5")
           (pipeline . "review 12s… (14m48s left)")
           (reviewLine . "M ✗ 1 reject   A ✓   B ✓")
           (verdict . "not accepted: D-1 vetoed by M → repair attempt 2")
@@ -1788,8 +1790,9 @@ every call (`wrong-type-argument stringp'), and every other test stubs it."
 
 ;;; Plan 03c: the two runtime charts in the Emacs views.
 
-(defun +tt-test--chart-run (root id &optional readable loop)
-  "A fake run ID under ROOT, with READABLE in program.json and LOOP as its chart."
+(defun +tt-test--chart-run (root id &optional readable loop tape)
+  "A fake run ID under ROOT, with READABLE in program.json, LOOP its chart and
+TAPE its `views/tape.txt'."
   (let ((dir (expand-file-name id root)))
     (make-directory (expand-file-name "views" dir) t)
     (with-temp-file (expand-file-name "meta.json" dir) (insert (format "{\"title\":\"%s\"}" id)))
@@ -1799,7 +1802,24 @@ every call (`wrong-type-argument stringp'), and every other test stubs it."
         (insert (json-encode `((readableId . ,readable))))))
     (when loop
       (with-temp-file (expand-file-name "views/loop.txt" dir) (insert loop)))
+    (when tape
+      (with-temp-file (expand-file-name "views/tape.txt" dir) (insert tape)))
     dir))
+
+(defconst +tt-test--loop-tape
+  (concat "05g seat models \u00b7 round 2 \u00b7 attempt 2/3 \u00b7 1h04m\n"
+          "\n"
+          "  \u2713  BASELINE    7m\n"
+          "  \u2713  IMPLEMENT   16m\n"
+          "  \u2713  FREEZE      2s\n"
+          "  \u2713  CHECKS      7m\n"
+          "  \u2713  PROBE       1s\n"
+          "  \u25b6  REVIEW      4m12s of 15m   M\u00b7A\u00b7B \u00b7 deepseek-v4.1-flash\n"
+          "     EVALUATE\n"
+          "     RESOLVE\n"
+          "     PUBLISH\n"
+          "     DONE\n")
+  "A small `views/tape.txt' shaped like `renderLoopTape'.")
 
 (defconst +tt-test--loop-chart
   (concat "phase chart\n"
@@ -1897,29 +1917,29 @@ neighbouring line (which would make RET open the wrong run)."
               (should (equal (get-text-property (point) '+tt-run-id) "run-b")))))
       (delete-directory dir t))))
 
-(ert-deftest tradeoffs-trace-chart-keys-open-the-chart ()
-  "Plan 03c: C-c m g opens `*tt-chart <readable-id>*' read-only, showing
-`views/loop.txt', from a status buffer, a review buffer and a program node line."
-  (should (eq (keymap-lookup nil "C-c m g") '+tt-chart))
+(ert-deftest tradeoffs-trace-tape-keys-open-the-tape ()
+  "Plan 05h: C-c m g opens `*tt-tape <readable-id>*' read-only, showing
+`views/tape.txt', from a status buffer, a review buffer and a program node line."
+  (should (eq (keymap-lookup nil "C-c m g") '+tt-tape))
   (let* ((root (make-temp-file "tt-ert-root" t))
-         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart +tt-test--loop-tape))
          (+tt-root (file-name-as-directory root))
          (bufs nil))
     (unwind-protect
         (progn
           ;; From a status buffer.
-          (with-temp-buffer (+tt-status-mode) (setq +tt--run-dir dir) (+tt-chart))
-          (let ((b (get-buffer "*tt-chart prog1-01*")))
+          (with-temp-buffer (+tt-status-mode) (setq +tt--run-dir dir) (+tt-tape))
+          (let ((b (get-buffer "*tt-tape prog1-01*")))
             (push b bufs)
             (should b)
             (with-current-buffer b
-              (should (string-search "current state: IMPLEMENTING" (buffer-string)))
+              (should (string-search "\u25b6  REVIEW" (buffer-string)))
               (should buffer-read-only)))
-          ;; From a review buffer.
-          (with-temp-buffer (+tt-review-mode) (setq +tt--run-dir dir) (+tt-chart))
-          (should (equal (with-current-buffer (get-buffer "*tt-chart prog1-01*") (buffer-string))
+          ;; From a review buffer: the buffer is the tape file's own bytes.
+          (with-temp-buffer (+tt-review-mode) (setq +tt--run-dir dir) (+tt-tape))
+          (should (equal (with-current-buffer (get-buffer "*tt-tape prog1-01*") (buffer-string))
                          (with-temp-buffer
-                           (insert-file-contents (expand-file-name "views/loop.txt" dir))
+                           (insert-file-contents (expand-file-name "views/tape.txt" dir))
                            (buffer-string))))
           ;; From a node line in the program buffer.
           (with-temp-buffer
@@ -1928,85 +1948,146 @@ neighbouring line (which would make RET open the wrong run)."
             (+tt-program-mode)
             (setq +tt--program-dir root +tt--run-dir root)
             (goto-char (point-min))
-            (+tt-chart))
-          (should (get-buffer "*tt-chart prog1-01*")))
+            (+tt-tape))
+          (should (get-buffer "*tt-tape prog1-01*")))
       (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (+tt-tape--stop-timer)
       (dolist (b bufs) (when (buffer-live-p b) (kill-buffer b)))
-      (dolist (b (buffer-list)) (when (string-prefix-p "*tt-chart " (buffer-name b)) (kill-buffer b)))
+      (dolist (b (buffer-list)) (when (string-prefix-p "*tt-tape " (buffer-name b)) (kill-buffer b)))
       (delete-directory root t))))
 
-(ert-deftest tradeoffs-trace-chart-refresh-keeps-point-and-highlights ()
-  "Plan 03c: a changed `views/loop.txt' is re-read, point stays on the same
-state's line, and the current state's box and `current state:' line are faced."
+(ert-deftest tradeoffs-trace-tape-refresh-keeps-point-and-faces ()
+  "Plan 05h: a changed `views/tape.txt' is re-read, point stays on the same
+step, and passed/head/failed rows carry their faces."
   (let* ((root (make-temp-file "tt-ert-root" t))
-         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart +tt-test--loop-tape))
          (+tt-root (file-name-as-directory root))
-         (buf (get-buffer-create "*tt-chart prog1-01*")))
+         (buf (get-buffer-create "*tt-tape prog1-01*")))
     (unwind-protect
         (with-current-buffer buf
-          (+tt-chart-mode)
+          (+tt-tape-mode)
           (setq +tt--run-dir dir
-                +tt-chart--file (expand-file-name "views/loop.txt" dir))
-          (+tt-chart-refresh t)
-          ;; The current state's box and the `current state:' line carry the face.
+                +tt-tape--file (expand-file-name "views/tape.txt" dir)
+                +tt-tape--loop-file (expand-file-name "views/loop.txt" dir))
+          (+tt-tape-refresh t)
+          ;; A passed row is shadowed, the head is highlighted.
           (goto-char (point-min))
-          (search-forward "| IMPLEMENTING")
-          (should (eq (get-text-property (match-beginning 0) 'face) '+tt-chart-current-face))
+          (search-forward "BASELINE")
+          (should (eq (get-text-property (match-beginning 0) 'face) '+tt-tape-passed-face))
           (goto-char (point-min))
-          (search-forward "current state: IMPLEMENTING")
-          (should (eq (get-text-property (match-beginning 0) 'face) '+tt-chart-current-face))
-          ;; Point on the IMPLEMENTING box survives a refresh that changed the
-          ;; file's current state and counts.
+          (search-forward "REVIEW")
+          (should (eq (get-text-property (match-beginning 0) 'face) '+tt-tape-head-face))
+          ;; Point on REVIEW survives a refresh that changed the head's mark.
           (goto-char (point-min))
-          (search-forward "| IMPLEMENTING")
-          (with-temp-file (expand-file-name "views/loop.txt" dir)
-            (insert (replace-regexp-in-string
-                     "current state: IMPLEMENTING" "current state: REVIEWING" +tt-test--loop-chart))
-            (insert "\n  | REVIEWING     |  entered 1x - 8s\n"))
+          (search-forward "REVIEW")
+          (with-temp-file (expand-file-name "views/tape.txt" dir)
+            (insert (replace-regexp-in-string "  \u25b6  REVIEW" "  \u2717  REVIEW" +tt-test--loop-tape)))
           ;; Force a different stored mtime, so the test does not depend on
           ;; the filesystem's timestamp granularity between the two writes.
-          (setq +tt-chart--mtime '(0 0))
-          (+tt-chart-refresh)
-          (should (string-match-p "current state: REVIEWING" (buffer-string)))
-          (should (looking-at "  | IMPLEMENTING")))
+          (setq +tt-tape--mtime '(0 0))
+          (+tt-tape-refresh)
+          (should (string-match-p "\u2717  REVIEW" (buffer-string)))
+          (should (looking-at "  \u2717  REVIEW"))
+          (should (eq (get-text-property (point) 'face) '+tt-tape-failed-face)))
       (kill-buffer buf)
       (delete-directory root t))))
 
-(ert-deftest tradeoffs-trace-chart-missing-file-is-one-line ()
-  "Plan 03c: a run without `views/loop.txt' opens the chart buffer with a
-one-line notice and no error."
+(ert-deftest tradeoffs-trace-tape-toggle-view ()
+  "Plan 05h: `f' switches the tape buffer to `views/loop.txt' and back."
   (let* ((root (make-temp-file "tt-ert-root" t))
-         (dir (+tt-test--chart-run root "run-a" "prog1-01" nil))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart +tt-test--loop-tape))
          (+tt-root (file-name-as-directory root))
-         (buf (get-buffer-create "*tt-chart prog1-01*")))
+         (buf (get-buffer-create "*tt-tape prog1-01*")))
     (unwind-protect
         (with-current-buffer buf
-          (+tt-chart-mode)
+          (+tt-tape-mode)
           (setq +tt--run-dir dir
-                +tt-chart--file (expand-file-name "views/loop.txt" dir))
-          (should-not (file-exists-p +tt-chart--file))
-          (+tt-chart-refresh t)
-          (should (string-match-p "\\`no chart yet" (buffer-string)))
+                +tt-tape--file (expand-file-name "views/tape.txt" dir)
+                +tt-tape--loop-file (expand-file-name "views/loop.txt" dir))
+          (+tt-tape-refresh t)
+          (should (string-match-p "05g seat models" (buffer-string)))
+          (+tt-tape-toggle-view)
+          (should +tt-tape--show-loop)
+          (should (string-match-p "current state: IMPLEMENTING" (buffer-string)))
+          (goto-char (point-min))
+          (search-forward "| IMPLEMENTING")
+          (should (eq (get-text-property (match-beginning 0) 'face) '+tt-chart-current-face))
+          (+tt-tape-toggle-view)
+          (should-not +tt-tape--show-loop)
+          (should (string-match-p "05g seat models" (buffer-string))))
+      (kill-buffer buf)
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-tape-timer-follows-visibility ()
+  "Plan 05h: the tape timer runs at `+tt-tape-refresh-interval' while a tape
+buffer is visible and stops when none is."
+  (let* ((root (make-temp-file "tt-ert-root" t))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart +tt-test--loop-tape))
+         (+tt-root (file-name-as-directory root))
+         (buf (get-buffer-create "*tt-tape prog1-01*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (+tt-tape-mode)
+            (setq +tt--run-dir dir
+                  +tt-tape--file (expand-file-name "views/tape.txt" dir)
+                  +tt-tape--loop-file (expand-file-name "views/loop.txt" dir)
+                  +tt-tape-refresh-interval 5))
+          ;; Visible: the timer is started, at the configured interval.
+          (set-window-buffer (selected-window) buf)
+          (with-current-buffer buf (+tt-tape--ensure-timer))
+          (should (timerp +tt--tape-timer))
+          (should (= (float-time (timer--repeat-delay +tt--tape-timer)) 5.0))
+          ;; Not visible: a tick refreshes nothing and stops the timer.
+          (set-window-buffer (selected-window) (get-buffer-create "*tt-not-tape*"))
+          (+tt-tape--tick)
+          (should-not (timerp +tt--tape-timer)))
+      (+tt-tape--stop-timer)
+      (kill-buffer buf)
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-tape-missing-file-is-one-line ()
+  "Plan 05h: a run without `views/tape.txt' opens the tape buffer with a
+one-line notice and no error."
+  (let* ((root (make-temp-file "tt-ert-root" t))
+         (dir (+tt-test--chart-run root "run-a" "prog1-01" +tt-test--loop-chart nil))
+         (+tt-root (file-name-as-directory root))
+         (buf (get-buffer-create "*tt-tape prog1-01*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (+tt-tape-mode)
+          (setq +tt--run-dir dir
+                +tt-tape--file (expand-file-name "views/tape.txt" dir)
+                +tt-tape--loop-file (expand-file-name "views/loop.txt" dir))
+          (should-not (file-exists-p +tt-tape--file))
+          (+tt-tape-refresh t)
+          (should (string-match-p "\\`no tape yet" (buffer-string)))
           (should (= 1 (how-many "\n" (point-min) (point-max))))
           (should buffer-read-only))
       (kill-buffer buf)
       (delete-directory root t))))
 
-(ert-deftest tradeoffs-trace-status-shows-chart-hint ()
-  "Plan 03c: the status buffer names where the chart is (`chart  C-c m g'),
-in the rendered and the file-backed path alike."
+(ert-deftest tradeoffs-trace-status-shows-tape-row-and-models-row ()
+  "Plan 05h: the status buffer shows the tape's current row as `loop' (and no
+`chart C-c m g' hint), and the `models' row is padded and has no colon."
   (with-temp-buffer
     (+tt--render-status-from +tt-test--tradeoff-state "/tmp/tt-ert/abcd1234")
-    (should (string-match-p "^chart     C-c m g" (buffer-string))))
+    (let ((text (buffer-string)))
+      (should (string-match-p "^loop      \u25b6 REVIEW 4m12s of 15m" text))
+      (should (string-match-p "^models    worker=deepseek" text))
+      (should-not (string-match-p "^chart " text))))
   (let ((dir (make-temp-file "tt-ert-status" t)))
     (unwind-protect
         (progn
           (make-directory (expand-file-name "views" dir) t)
           (with-temp-file (expand-file-name "views/status.txt" dir)
-            (insert "sum validation\nrun r1 \u00b7 conductor running \u00b7 1m\n\nphase     p1 \u00b7 REVIEWING\n"))
+            (insert "sum validation\nrun r1 \u00b7 conductor running \u00b7 1m\n\nloop      \u25b6 REVIEW 4m12s of 15m\nphase     p1 \u00b7 REVIEWING\nmodels    worker=deepseek\n"))
           (with-temp-buffer
             (+tt-status-mode)
             (setq +tt--run-dir dir)
             (+tt--render-status)
-            (should (string-match-p "^chart     C-c m g" (buffer-string)))))
+            (let ((text (buffer-string)))
+              (should (string-match-p "^loop      \u25b6 REVIEW 4m12s of 15m" text))
+              (should (string-match-p "^models    worker=deepseek" text))
+              (should-not (string-match-p "^chart " text)))))
       (delete-directory dir t))))

@@ -838,11 +838,17 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   // Plan 04c: `views/metrics.json` is a projection of state and the log.
   const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
   const metrics = projectMetrics(metricsForRunDir(runDir, state.phase, timeline, events));
+  // Plan 05h: the loop tape is a projection too. `buildView` builds it from
+  // the same log read, and the conductor redacts what it writes, so the
+  // expected bytes are redacted the same way before the comparison.
+  const view = buildView(runDir, plan, false);
+  const tape = redactText(view.tape, secretsForRun(runDir));
   if (sub === "rebuild") {
     writeFileSync(p.messages, messages);
     writeFileSync(p.ledger, ledger);
     writeFileSync(p.review, review);
     writeFileSync(p.metrics, metrics);
+    writeFileSync(p.tape, tape);
     mkdirSync(p.messagesView, { recursive: true });
     const ids = new Set(messageFiles.map((f) => f.id));
     for (const f of messageFiles) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
@@ -851,7 +857,7 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     for (const name of readdirSync(p.messagesView)) {
       if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
     }
-    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/messages/, views/metrics.json\n`);
+    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/messages/, views/metrics.json, views/tape.txt\n`);
     return;
   }
   if (sub !== "check") usage();
@@ -859,11 +865,13 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   const actualLedger = existsSync(p.ledger) ? readFileSync(p.ledger, "utf8") : "";
   const actualReview = existsSync(p.review) ? readFileSync(p.review, "utf8") : "";
   const actualMetrics = existsSync(p.metrics) ? readFileSync(p.metrics, "utf8") : "";
+  const actualTape = existsSync(p.tape) ? readFileSync(p.tape, "utf8") : "";
   const mismatches: string[] = [];
   if (actualMessages !== messages) mismatches.push("messages.jsonl");
   if (actualLedger !== ledger) mismatches.push("ledger.jsonl");
   if (actualReview !== review) mismatches.push("views/review.org");
   if (actualMetrics !== metrics) mismatches.push("views/metrics.json");
+  if (actualTape !== tape) mismatches.push("views/tape.txt");
   for (const f of messageFiles) {
     const file = path.join(p.messagesView, `${f.id}.org`);
     const actual = existsSync(file) ? readFileSync(file, "utf8") : "";
@@ -1037,7 +1045,10 @@ async function cmdVerdict(
     if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) rmSync(path.join(p.messagesView, name), { force: true });
   }
   // Plan 03b: the status view is refreshed too, so the Emacs status buffer
-  // never shows a message the review buffer already has.
+  // never shows a message the review buffer already has. Plan 05h: the loop
+  // tape is refreshed on the same beat, so `tt contract check` stays green
+  // after a late verdict (the tape is a projection too).
+  const lateView = buildView(runDir, plan, false);
   writeFileSync(
     p.status,
     redactText(
@@ -1046,7 +1057,7 @@ async function cmdVerdict(
           runDir,
           plan,
           state: after,
-          view: buildView(runDir, plan, false),
+          view: lateView,
           alive: false,
           secrets: loggedSecretStatus(runDir),
         }),
@@ -1054,6 +1065,7 @@ async function cmdVerdict(
       maskable,
     ),
   );
+  writeFileSync(p.tape, redactText(lateView.tape, maskable));
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
 }
 
@@ -1136,7 +1148,7 @@ async function main(): Promise<void> {
     );
     const round = state.phase.round ?? 0;
     const ownerInputs = state.phase.ownerInputs ?? [];
-    const { timeline: _timeline, ...view } = buildView(runDir, plan, alive);
+    const { timeline: _timeline, tape: _tape, ...view } = buildView(runDir, plan, alive);
     // Plan 01i: the program this run is a node of, when a scheduler started
     // it — the front end needs it to tell the truth about `C-u`'s scope (a
     // hand-started run has nothing program-wide to reach).

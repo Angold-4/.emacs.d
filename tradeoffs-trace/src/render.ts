@@ -296,7 +296,8 @@ export function renderStatusText(
   if (view.baseline) lines.push(`base: ${view.baseline}`);
   lines.push(`reviews: ${view.reviewLine}`);
   if (view.metricsLine) lines.push(view.metricsLine);
-  if (view.models) lines.push(view.models);
+  if (view.loop) lines.push(row("loop", view.loop)!);
+  if (view.models) lines.push(row("models", view.models)!);
   if (view.amendments) lines.push(`amendments: ${view.amendments}`);
   if (view.verdict) lines.push(`verdict: ${view.verdict}`);
   for (const t of view.tradeoffs ?? []) lines.push(`trade-off: ${t.text}`);
@@ -476,6 +477,10 @@ export function renderStatusView(input: StatusViewInput): string {
   lines.push(`run ${path.basename(input.runDir)} · ${input.alive ? "conductor running" : "conductor stopped"} · ${view.elapsed}`);
   lines.push("");
   const attempt = phase.attempt as { n?: number } | undefined;
+  // Plan 05h: the tape's current row, replacing plan 03c's `chart C-c m g`
+  // hint — the owner sees the loop itself in the status, not just where to
+  // find a chart of it.
+  push(row("loop", view.loop));
   push(row("phase", `${phase.phaseId} · ${name} · round ${view.round} · attempt ${attempt?.n ?? "?"} · repairs ${phase.repairRoundsUsed ?? 0}/${phase.repairRoundsGranted ?? 0}`));
   push(row("pipeline", view.pipeline));
   push(row("time", view.time));
@@ -485,7 +490,7 @@ export function renderStatusView(input: StatusViewInput): string {
   push(row("amended", view.amendments));
   push(row("previous", view.previousRound));
   push(row("reviews", view.reviewLine));
-  push(view.models);
+  push(row("models", view.models));
   push(view.metricsLine);
   push(row("verdict", view.verdict));
   const tradeoffs = view.tradeoffs ?? [];

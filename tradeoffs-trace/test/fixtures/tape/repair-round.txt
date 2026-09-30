@@ -1,0 +1,11 @@
+05g per-seat models · round 2 · attempt 2/3 · 1h11m
+
+  ✓  IMPLEMENT   15m
+  ✓  FREEZE      10s
+  ✓  CHECKS      7m
+  ✓  PROBE       10s
+  ▶  REVIEW      4m12s of 15m   M·A·B · deepseek-v4.1-flash
+     EVALUATE
+     RESOLVE
+     PUBLISH
+     DONE

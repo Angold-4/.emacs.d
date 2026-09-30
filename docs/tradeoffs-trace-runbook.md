@@ -349,7 +349,7 @@ and runs independent phases in parallel.
 
 | Where | What |
 |---|---|
-| program buffer (`C-c m p`) | the program id and its Org source file in the header, then the dependency chart (`views/program.txt`), then every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its readable id (`<program>-NN`), node id, run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive). Stop and continue the whole program with `C-c m k` / `C-c m c` (point in the program buffer or its input box). It also lists the program's owner directives in force. `C-c m g` on a node line opens that run's phase chart. |
+| program buffer (`C-c m p`) | the program id and its Org source file in the header, then the dependency chart (`views/program.txt`), then every node: `·` waiting, `▶` running, `⚑` needs you, `○` stopped, `✓` done, `✗` blocked; its readable id (`<program>-NN`), node id, run id, branch and PR base. Nodes waiting for you come first, with `waiting <duration>` and the reason. `RET` opens a node's run workspace (status, trace, decisions, input box), `i` opens the program's input box (a program-wide owner directive). Stop and continue the whole program with `C-c m k` / `C-c m c` (point in the program buffer or its input box). It also lists the program's owner directives in force. `C-c m g` on a node line opens that run's loop tape. |
 | CLI | `tt program status <id>`, `tt program state <id>` (JSON), `tt program list`, `tt program directive <id> <text>`, `tt program withdraw <id> <ODP-n>`, `tt program stop <id>`, `tt program resume <id>` |
 
 **Review economy across rounds.** When the worker keeps a decision unchanged and it passed its vote last round, the reviewers' ballots carry over. The record is marked *carried*, and a reviewer votes again only if the new changes affect it; a fresh ballot replaces the carried one. The reviewers also see every test removed from a file that still exists, and must confirm each one was replaced or that its behaviour was removed on purpose.
@@ -620,7 +620,7 @@ around (`k`, `R`, `g`, `i`).
 | `C-c m d` | anywhere | the run's review view (TAB folds, RET opens a message's file, `A`/`D` send the owner's verdict) |
 | `C-c m l` | anywhere | the runs list (RET opens) |
 | `C-c m p` | anywhere | a program: its dependency chart (`views/program.txt`) then its node list (RET opens a node's run, `i` sends a program-wide directive) |
-| `C-c m g` | a run's buffer (status, review, trace, input, decisions) or a node line in the program buffer | the run's phase chart (`views/loop.txt`) in a read-only `*tt-chart <id>*` buffer; it re-reads the file when it changes and highlights the current state |
+| `C-c m g` | a run's buffer (status, review, trace, input, decisions) or a node line in the program buffer | the run's live loop tape (`views/tape.txt`) in a read-only `*tt-tape <id>*` buffer: every step of the current round, the head on the step the phase is in now; it re-reads the file on its own timer while visible and keeps point. `f` in that buffer toggles to the full phase chart (`views/loop.txt`) and back. |
 | `C-c m k` | a program buffer/its input box, or the phase's status, trace or input buffer | stop it, after a confirmation (`RET` confirms, `n` cancels) |
 | `C-c m c` | a program buffer/its input box, or the phase's status, trace or input buffer | continue (resume) it |
 | `RET` / `C-c C-c` | an input box | send (RET in Evil normal state; `C-u` sends program-wide) |
@@ -632,28 +632,49 @@ carries it in its `program.json`. Use it wherever a run id is accepted —
 buffers with it. A retried node keeps its readable id (the id names the
 position, not the run).
 
-**The two graphs.** `tt` renders both as text the owner reads:
-`<run>/views/loop.txt` is the phase's own state machine (states as boxes with
-entry counts and time, transitions labelled with their trigger, the current
-state marked, the agent-dispatching states showing their role and model),
-generated from the same `TRANSITIONS` table the conductor obeys;
-`<program>/views/program.txt` is the program dependency graph, each node with
-its readable id, its node state and (while running) its current phase state.
-Both are regenerated as the run/program moves, so they can never drift from
-the code.
+**The live tape and the reference chart.** `tt` renders the run's loop as text
+the owner reads. `<run>/views/tape.txt` is the **tape**: the current round
+only, one main-path step per row, no boxes. Line 1 is the phase's readable
+id and short title, `round N`, `attempt k/granted` and the phase's elapsed
+time. Each row carries a mark — `✓` passed this round, `✗` failed this round,
+`▶` the step the phase is in now, blank not reached — the step name, the time
+this round spent in it (the head shows it against the stage's own limit,
+`4m12s of 15m`) and, on the three dispatching steps, who is on which model
+(`worker · claude-opus`, `M·A·B · …` or each seat's own, `evaluator · …`).
+`BASELINE` appears only on a phase that took one, `GATE` only on a phase whose
+contract declares a gate, and earlier rounds are not redrawn (`attempt k` is
+the history). Off the main path the head row carries `→` and the reason in
+plain words: `✗  CHECKS  7m  → repairing, attempt 2/3`,
+`▶  EVALUATE  2m  → waiting for you · panel escalated B-2`. Like
+`views/metrics.json`, every duration in the tape ends at the **last event
+timestamp** in the log, never a wall clock, so `tt contract rebuild` writes
+the same bytes. The step list is the declared `MAIN_PATH` in
+`src/core/transitions.ts`; a contract test proves every consecutive pair is a
+real `TRANSITIONS` edge, so the tape can never draw an impossible path.
 
-Emacs shows both where the owner already looks. The **program buffer**
+`<run>/views/loop.txt` is the **reference chart**: the phase's own state
+machine, states as boxes with entry counts and time, transitions labelled
+with their trigger and row id, the current state marked, the
+dispatching states showing their role and model; generated from the same
+`TRANSITIONS` table the conductor obeys. `<program>/views/program.txt` is the
+program dependency graph, each node with its readable id, its node state and
+(while running) its current phase state. All are regenerated as the
+run/program moves, so they can never drift from the code.
+
+Emacs shows them where the owner already looks. The **program buffer**
 (`C-c m p`) begins with `views/program.txt` — the dependency chart — and its
 node list follows below it; the chart is text, so only the node lines open a
 run with `RET`, and point stays on the node it was on as the chart above the
-list grows or shrinks. The **phase chart** (`views/loop.txt`) opens with `C-c m g`
-from any of the run's own buffers (status, review, trace, input, decisions) or
-from a node line in the program buffer, in a read-only `*tt-chart <readable
-id>*` buffer: it re-reads the file whenever it changes (as the review buffer
-does), keeps point on the same state's line, and highlights the current
-state's box and the `current state:` line. The status buffer shows a one-line
-hint (`chart     C-c m g`). A run or program that has not written its chart
-yet says so in one line instead of erroring.
+list grows or shrinks. `C-c m g` opens the **tape** from any of the run's own
+buffers (status, review, trace, input, decisions) or from a node line in the
+program buffer, in a read-only `*tt-tape <readable-id>*` buffer. The tape
+re-reads `views/tape.txt` on its own `+tt-tape-refresh-interval` timer
+(default 5 s) while the buffer is visible, stops the timer when it is not,
+and keeps point. Press `f` there to toggle the same buffer to the **full
+phase chart** (`views/loop.txt`) and back: the reference is one key away. The
+status buffer shows the tape's current row as its own `loop` row, so the loop
+is visible without opening anything. A run or program that has not written
+its tape yet says so in one line instead of erroring.
 
 **The tab bar is opt-in.** With `+tt-use-tab-bar` nil (the default), opening
 a run leaves the tab bar alone and uses ordinary windows; the run's buffers
@@ -855,9 +876,9 @@ type's evaluator, while the phase stays `EVALUATING` until all of them settle.
   is `incomplete`: neither escalated nor parked, and the blocking finding
   stays effective, so the candidate goes to repair.
 
-The `views/loop.txt` chart draws the `EVALUATING` state, and
-`views/metrics.json` counts how many blockers escalated, downgraded or came
-back incomplete.
+The tape shows the `EVALUATE` step, the `views/loop.txt` chart draws the
+`EVALUATING` state, and `views/metrics.json` counts how many blockers
+escalated, downgraded or came back incomplete.
 
 ## Balance metrics
 
@@ -896,6 +917,7 @@ bytes. `tt contract check <run>` verifies that.
                                     declares :GATE:, gate.json + gate.log too
   ~/.tradeoffs-trace/gate.lock      the machine-wide gate lock (two phases
                                     never run their gate command at once)
+  <run>/views/tape.txt              the current round as a vertical tape (from MAIN_PATH)
   <run>/views/loop.txt              the phase state machine as a chart (from TRANSITIONS)
   <run>/views/metrics.json          the balance metrics (tt summary renders the same numbers)
   <run>/messages.jsonl, ledger.jsonl  the message and settled-ledger projections

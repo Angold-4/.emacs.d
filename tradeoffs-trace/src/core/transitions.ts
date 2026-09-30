@@ -1669,6 +1669,32 @@ addRow({
 
 export const TRANSITIONS: readonly TransitionRow[] = rows;
 
+/** Plan 05h: the declared main path — the states a normal round passes
+ * through, in order, from READY to DONE. `BASELINE` is on it (plan 04a takes
+the base baseline before the first implement on a phase that needs one),
+ * `EVALUATING` (plan 04a's evaluator) and `GATING` (plan 01f's gate) because
+a round may pass through both before ACCEPTED. Off-path states (REPAIRING,
+AWAITING_OWNER, BLOCKED, RUN_PAUSED_BUDGET) are deliberately not steps.
+ *
+ * This list is the tape's own path (`src/charts.ts` draws it) and its
+ * integrity is checked, not assumed: every consecutive pair is a TRANSITIONS
+ * edge and every name appears in the table (`test/contract/tape.test.ts`). */
+export const MAIN_PATH: readonly PhaseStateName[] = [
+  "READY",
+  "BASELINE",
+  "IMPLEMENTING",
+  "FREEZING",
+  "CHECKING",
+  "PROBING",
+  "REVIEWING",
+  "EVALUATING",
+  "RESOLVING",
+  "GATING",
+  "ACCEPTED",
+  "PUBLISHING",
+  "DONE",
+];
+
 export function rowsFor(state: State, trigger: Event["type"]): TransitionRow[] {
   return TRANSITIONS.filter((r) => currentOf(state, r.axis) === r.from && r.trigger === trigger);
 }

@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
+import { loopTapeHead, renderLoopTape, tapeLabel, type ChartModels } from "./charts.ts";
 import { effectiveChecks } from "./core/checks.ts";
 import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
@@ -15,7 +16,7 @@ import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.t
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
-import { computeMetrics, metricsLine, metricsSummary, type PhaseMetrics } from "./metrics.ts";
+import { computeMetrics, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -150,11 +151,30 @@ export function modelEntries(models: PlanModels | undefined): Array<{ role: stri
   return out;
 }
 
-/** One status line naming every role's model, or undefined when the plan set
- * none (a run that uses Pi's `defaultModel` needs no line). */
+/** The models row's value: one `role=provider:model` per role/seat, or
+ * undefined when the plan set none (a run that uses Pi's `defaultModel` needs
+ * no line). The status view pads the `models` label itself, so the value
+ * carries no `models:` prefix. */
 export function modelsLineText(models: PlanModels | undefined): string | undefined {
   const entries = modelEntries(models);
-  return entries.length > 0 ? `models: ${entries.map((e) => `${e.role}=${e.value}`).join(" ")}` : undefined;
+  return entries.length > 0 ? entries.map((e) => `${e.role}=${e.value}`).join(" ") : undefined;
+}
+
+/** The plan's own models in the shape `renderLoopTape` reads. Only what the
+ * plan declares enters the tape, never Pi's settings, so the live file and a
+ * `tt contract rebuild` agree; a role with no declared model reads `default`. */
+export function chartModelsFromPlan(models: PlanModels | undefined): ChartModels | undefined {
+  if (!models) return undefined;
+  const select = planModelSelector({ models });
+  const name = (m: RoleModel | undefined): string | undefined => m?.model;
+  return {
+    worker: name(select("worker")),
+    reviewer: name(select("reviewer")),
+    evaluator: name(select("evaluator")),
+    panel: name(select("panel")),
+    reviewerSeats: { M: name(select("reviewer", "M")), A: name(select("reviewer", "A")), B: name(select("reviewer", "B")) },
+    panelSeats: { "1": name(select("panel", 1)), "2": name(select("panel", 2)), "3": name(select("panel", 3)) },
+  };
 }
 
 export function formatDuration(ms: number): string {
@@ -413,9 +433,13 @@ export interface RunView {
    * the one status line that renders them. */
   metrics: PhaseMetrics;
   metricsLine: string;
-  /** #+TT_MODELS: one line naming each role's provider/model, only when the
-   * plan set models (otherwise undefined — Pi's defaultModel needs no line). */
+  /** #+TT_MODELS: the `models` row's value (one `role=provider:model` per
+   * role/seat), only when the plan set models (otherwise undefined — Pi's
+   * defaultModel needs no line). */
   models?: string;
+  /** Plan 05h: the tape's current-row cell (`▶ REVIEW 4m12s of 15m`), the
+   * status buffer's one `loop` row. Undefined before the first step. */
+  loop?: string;
 }
 
 /** Plan 01h: what the run costs so far. `stageMinutes` excludes `needs you`,
@@ -498,7 +522,12 @@ export function runCost(timeline: Timeline, spans: StageSpan[], now: Date): RunC
   };
 }
 
-export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now = new Date()): RunView & { timeline: Timeline } {
+export function buildView(
+  runDir: string,
+  plan: RunPlanFile,
+  alive: boolean,
+  now = new Date(),
+): RunView & { timeline: Timeline; tape: string } {
   // One read of the control log gives both the timeline and the events the
   // balance metrics need, so nothing here parses the log twice.
   const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
@@ -611,11 +640,27 @@ export function buildView(runDir: string, plan: RunPlanFile, alive: boolean, now
   // Plan 04c: the balance metrics are a deterministic projection of the same
   // timeline; the status view and `tt summary` render the one line / section.
   const metrics = computeMetrics(phase, timeline, events);
+  // Plan 05h: the loop tape is a projection of the same log read as the
+  // metrics — its durations end at `endMs`, the last logged timestamp, never a
+  // wall clock, so `tt contract rebuild` reproduces the live file.
+  const tapeInput = {
+    label: tapeLabel(phase.phaseId),
+    round,
+    phases: timeline.phases,
+    phase,
+    run: timeline.state.run,
+    endMs: timelineEndMs(timeline, events),
+    models: chartModelsFromPlan(plan.models),
+    limits: stageLimits(plan),
+  };
+  const tape = renderLoopTape(tapeInput);
   return {
     timeline,
+    tape,
     metrics,
     metricsLine: metricsLine(metrics),
     models: modelsLineText(plan.models),
+    loop: loopTapeHead(tapeInput),
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",

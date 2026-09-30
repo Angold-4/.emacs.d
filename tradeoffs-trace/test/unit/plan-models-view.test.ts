@@ -47,18 +47,20 @@ test("the status view has a models line only when the plan set models", () => {
   try {
     const withModels = plan(MODELS);
     const view = buildView(dir, withModels, false);
-    assert.equal(view.models, "models: worker=deepseek/deepseek-v4.1-flash reviewer=vercel-ai-gateway:anthropic/claude-sonnet-5 evaluator=p-e:anthropic/claude-opus panel=deepseek/deepseek-v4.1-flash");
+    assert.equal(view.models, "worker=deepseek/deepseek-v4.1-flash reviewer=vercel-ai-gateway:anthropic/claude-sonnet-5 evaluator=p-e:anthropic/claude-opus panel=deepseek/deepseek-v4.1-flash");
     const text = renderStatusView(statusViewInput({ runDir: dir, plan: withModels, state: { phase: view.timeline.state.phase }, view, alive: false }));
-    assert.match(text, /^models: worker=/m);
-    assert.match(renderStatusText(dir, { run: "RUN_ACTIVE", phase: view.timeline.state.phase }, view), /^models: worker=/m);
+    // The models row is a padded row with no colon, aligned with the others.
+    assert.match(text, /^models    worker=/m);
+    assert.doesNotMatch(text, /^models:/m);
+    assert.match(renderStatusText(dir, { run: "RUN_ACTIVE", phase: view.timeline.state.phase }, view), /^models    worker=/m);
 
     // A plan without models: the line is absent from both status views.
     const without = plan();
     const bareView = buildView(dir, without, false);
     assert.equal(bareView.models, undefined);
     const bare = renderStatusView(statusViewInput({ runDir: dir, plan: without, state: { phase: bareView.timeline.state.phase }, view: bareView, alive: false }));
-    assert.doesNotMatch(bare, /models:/);
-    assert.doesNotMatch(renderStatusText(dir, { run: "RUN_ACTIVE", phase: bareView.timeline.state.phase }, bareView), /models:/);
+    assert.doesNotMatch(bare, /^models\b/m);
+    assert.doesNotMatch(renderStatusText(dir, { run: "RUN_ACTIVE", phase: bareView.timeline.state.phase }, bareView), /^models\b/m);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -114,10 +116,10 @@ test("the status line and tt summary name every seat's model", () => {
     const view = buildView(dir, withSeats, false);
     assert.match(
       view.models ?? "",
-      /^models: worker=deepseek\/deepseek-v4\.1-flash reviewer\.M=vercel-ai-gateway:anthropic\/claude-opus-5\.5 reviewer\.A=deepseek\/deepseek-v4\.1-flash reviewer\.B=vercel-ai-gateway:spacexai\/grok-4\.6 evaluator=vercel-ai-gateway:anthropic\/claude-opus-5\.5 panel\.1=vercel-ai-gateway:anthropic\/claude-opus-5\.5 panel\.2=deepseek\/deepseek-v4\.1-flash panel\.3=vercel-ai-gateway:spacexai\/grok-4\.6$/,
+      /^worker=deepseek\/deepseek-v4\.1-flash reviewer\.M=vercel-ai-gateway:anthropic\/claude-opus-5\.5 reviewer\.A=deepseek\/deepseek-v4\.1-flash reviewer\.B=vercel-ai-gateway:spacexai\/grok-4\.6 evaluator=vercel-ai-gateway:anthropic\/claude-opus-5\.5 panel\.1=vercel-ai-gateway:anthropic\/claude-opus-5\.5 panel\.2=deepseek\/deepseek-v4\.1-flash panel\.3=vercel-ai-gateway:spacexai\/grok-4\.6$/,
     );
     const text = renderStatusText(dir, { run: "RUN_ACTIVE", phase: view.timeline.state.phase }, view);
-    assert.match(text, /^models: worker=.*reviewer\.M=.*panel\.3=/m);
+    assert.match(text, /^models    worker=.*reviewer\.M=.*panel\.3=/m);
     const md = prSummary(dir, withSeats);
     assert.match(md, /- reviewer\.M: vercel-ai-gateway:anthropic\/claude-opus-5\.5/);
     assert.match(md, /- reviewer\.B: vercel-ai-gateway:spacexai\/grok-4\.6/);

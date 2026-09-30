@@ -22,8 +22,9 @@
 ;;   C-c m p   a program (several plans / phases as one graph): the program's
 ;;             dependency chart then its nodes; RET opens a phase's run,
 ;;             i sends a program-wide directive
-;;   C-c m g   the run's phase chart (`views/loop.txt') read-only, from a run's
-;;             buffer or a node line in the program buffer
+;;   C-c m g   the run's live loop tape (`views/tape.txt') read-only, from a
+;;             run's buffer or a node line in the program buffer; `f' there
+;;             toggles to the full phase chart (`views/loop.txt')
 ;;   C-c m k   stop the program or phase whose buffer point is in (asks first)
 ;;   C-c m c   continue (resume) it
 ;;
@@ -998,7 +999,10 @@ own tab and takes the whole frame."
                   ((derived-mode-p '+tt-review-mode) (+tt-review-refresh))
                   ((derived-mode-p '+tt-input-mode) (+tt--render-input-header))
                   ((derived-mode-p '+tt-program-mode) (+tt--render-program))
-                  ((derived-mode-p '+tt-chart-mode) (+tt-chart-refresh)))))))
+                  ;; Plan 05h: the tape has its own `+tt-tape-refresh-interval'
+                  ;; timer; the workspace beat only makes sure it is running
+                  ;; while the buffer is visible.
+                  ((derived-mode-p '+tt-tape-mode) (+tt-tape--ensure-timer)))))))
     (unless any
       (when (timerp +tt--timer) (cancel-timer +tt--timer))
       (setq +tt--timer nil))))
@@ -1343,20 +1347,6 @@ open the decision view at that record."
             ;; full record id this line is about.
             (put-text-property start (point) '+tt-record record)))))))
 
-(defun +tt--status-chart-hint ()
-  "Insert the one-line `chart  C-c m g' hint under the status header.
-The runtime's `views/status.txt' carries no key hint (keys are Emacs's own
-UI), so the status buffer adds the line itself in both the file and the
-`tt state' path; the row is left alone when the file already has one."
-  (let ((inhibit-read-only t))
-    (save-excursion
-      (goto-char (point-min))
-      (unless (re-search-forward "^chart " nil t)
-        ;; after the title and the `run ...' line
-        (goto-char (point-min))
-        (forward-line 2)
-        (insert (propertize (format "%-10s" "chart") 'face 'shadow) "C-c m g\n")))))
-
 (defun +tt--render-status-from (s run-dir)
   "Insert the status of RUN-DIR from `tt state' S (plan 3b layout)."
   (let* ((phase (+tt--get s 'state 'phase))
@@ -1371,7 +1361,9 @@ UI), so the status buffer adds the line itself in both the file and the
                      (if alive "conductor running" "conductor stopped")
                      (alist-get 'elapsed v))
              'face 'shadow))
-    (+tt--status-chart-hint)
+    ;; Plan 05h: the tape's current row is the loop the owner reads; the full
+    ;; phase chart is one key away (`C-c m g' opens the tape, `f' toggles).
+    (+tt--status-row "loop" (alist-get 'loop v))
     (+tt--status-row "phase"
                      (format "%s · %s · round %s · attempt %s · repairs %s/%s"
                              (alist-get 'phaseId phase) name (alist-get 'round v)
@@ -1389,6 +1381,9 @@ UI), so the status buffer adds the line itself in both the file and the
     (+tt--status-row "amended" (alist-get 'amendments v) 'warning)
     (+tt--status-row "previous" (alist-get 'previousRound v) 'shadow)
     (+tt--status-row "reviews" (alist-get 'reviewLine v))
+    ;; Plan 05h: the models row is a row like the others (`models` padded, no
+    ;; `models:' prefix), so the label column stays aligned.
+    (+tt--status-row "models" (alist-get 'models v))
     (+tt--status-row "verdict" (alist-get 'verdict v)
                      (if (equal name "DONE") 'success 'warning))
     ;; Plan 01h: the trade-offs panel directly under the verdict, then what
@@ -1496,7 +1491,6 @@ read, so it costs nothing over TRAMP and calls neither `tt' nor
     (erase-buffer)
     (if (and file (file-exists-p file))
         (progn (insert-file-contents file)
-               (+tt--status-chart-hint)
                (+tt--status-restore-records)
                (+tt--status-restore-faces))
       (+tt--render-status-from (+tt--state +tt--run-dir) +tt--run-dir))))
@@ -1523,23 +1517,50 @@ existed (finding B-5: a row with no record must not raise)."
 
 ;;;;; Chart view (plan 03c)
 
-;; The runtime draws two ASCII charts from the same tables it obeys: the
-;; phase state machine at `<run>/views/loop.txt' and the program graph at
-;; `<program>/views/program.txt'.  Emacs only shows them.  The program buffer
-;; prepends its chart (above), and `C-c m g' opens a run's phase chart in a
-;; read-only `*tt-chart <readable-id>*' buffer that re-reads the file when its
-;; modification time changes — the mechanism the review buffer uses — and
-;; keeps point on the same state's line.
+;; Plan 05h: the runtime draws a run's live loop as a vertical tape at
+;; `<run>/views/tape.txt' — one main-path step per row, the head on the step
+;; the phase is in now — and keeps the full state-machine chart at
+;; `<run>/views/loop.txt' as the reference.  `C-c m g' opens the tape in a
+;; read-only `*tt-tape <readable-id>*' buffer that re-reads the file on its
+;; own `+tt-tape-refresh-interval' timer while it is visible; `f' toggles the
+;; same buffer to the full chart and back.  The program graph at
+;; `<program>/views/program.txt' is still prepended to the program buffer.
+
+(defcustom +tt-tape-refresh-interval 5
+  "Seconds between loop-tape refreshes while the tape buffer is visible."
+  :type 'number)
+
+(defface +tt-tape-head-face
+  '((t :inherit highlight))
+  "The tape's current step (the head).")
+
+(defface +tt-tape-passed-face
+  '((t :inherit shadow))
+  "A tape step that passed in this round.")
+
+(defface +tt-tape-failed-face
+  '((t :inherit error))
+  "A tape step that failed in this round.")
 
 (defface +tt-chart-current-face
   '((t :inherit highlight))
   "The current state's box and the `current state:' line of a chart.")
 
-(defvar-local +tt-chart--file nil
-  "Absolute path of the `views/loop.txt' this buffer displays.")
+(defvar-local +tt-tape--file nil
+  "Absolute path of the `views/tape.txt' this buffer displays.")
 
-(defvar-local +tt-chart--mtime nil
-  "Modification time of `+tt-chart--file' the buffer last rendered.")
+(defvar-local +tt-tape--loop-file nil
+  "Absolute path of the `views/loop.txt' `f' toggles to.")
+
+(defvar-local +tt-tape--show-loop nil
+  "Non-nil when this tape buffer shows `views/loop.txt' instead of the tape.")
+
+(defvar-local +tt-tape--mtime nil
+  "Modification time of the file the buffer last rendered.")
+
+(defvar +tt--tape-timer nil
+  "The one loop-tape refresh timer, or nil. It refreshes every visible
+`+tt-tape-mode' buffer and stops itself when none is visible.")
 
 (defun +tt-chart--state-name-at (line)
   "The state name LINE names in a chart box, or nil.
@@ -1598,32 +1619,109 @@ text."
               (when (looking-at "[ \t]*+") (setq end (line-end-position))))
             (put-text-property beg end 'face '+tt-chart-current-face)))))))
 
-(defun +tt-chart-refresh (&optional force)
-  "Show this buffer's `views/loop.txt', re-reading it when it changed.
-Keeps point on the same state's line.  A missing file is one line, not an
-error: this runs from the workspace timer, where a signal would be noise.
-FORCE re-reads even when the modification time is unchanged."
-  (interactive "p")
-  (when +tt-chart--file
-    (condition-case nil
-        (let ((mtime (and (file-exists-p +tt-chart--file)
-                          (file-attribute-modification-time (file-attributes +tt-chart--file)))))
-          (when (or force (not (equal mtime +tt-chart--mtime)))
-            (let ((anchor (+tt-chart--anchor))
-                  (inhibit-read-only t))
-              (erase-buffer)
-              (if mtime
-                  (progn (insert-file-contents +tt-chart--file)
-                         (setq +tt-chart--mtime mtime)
-                         (+tt-chart--highlight)
-                         (+tt-chart--goto-anchor anchor))
-                (insert (format "no chart yet: %s\n" +tt-chart--file))
-                (setq +tt-chart--mtime nil))
-              (set-buffer-modified-p nil))))
-      (error nil))))
+(defun +tt-tape--step-at (line)
+  "The step name LINE names in a tape row, or nil.
+A row is `  MARK  NAME ...'; only the two leading spaces, the one-character
+mark and two spaces are fixed (a blank mark is a space)."
+  (when (string-match "\\`  [^ ]  \\([A-Z][A-Z0-9]*\\)" line)
+    (match-string 1 line)))
 
-(defun +tt-chart--run ()
-  "The run directory `C-c m g' should chart, from the buffer point is in."
+(defun +tt-tape--anchor ()
+  "A stable text identifying the tape line at point, or nil.
+Point is kept across refreshes: a step row keeps its step name, any other
+non-blank line keeps its text."
+  (let ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+    (cond
+     ((+tt-tape--step-at line))
+     ((not (string-empty-p (string-trim line))) line)
+     (t nil))))
+
+(defun +tt-tape--goto-anchor (anchor)
+  "Move point to the tape line ANCHOR names, else to the top."
+  (goto-char (point-min))
+  (cond
+   ((null anchor) nil)
+   ((string-match "\\`[A-Z][A-Z0-9]*\\'" anchor)
+    (when (re-search-forward (format "^  [^ ]  %s" (regexp-quote anchor)) nil t)
+      (goto-char (match-beginning 0))))
+   (t (when (search-forward anchor nil t) (goto-char (match-beginning 0))))))
+
+(defun +tt-tape--highlight ()
+  "Face the tape's rows: passed steps shadowed, the head highlighted, a
+failed step in the error face."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (cond
+         ((looking-at "  ✓") (put-text-property (line-beginning-position) (line-end-position) 'face '+tt-tape-passed-face))
+         ((looking-at "  ▶") (put-text-property (line-beginning-position) (line-end-position) 'face '+tt-tape-head-face))
+         ((looking-at "  ✗") (put-text-property (line-beginning-position) (line-end-position) 'face '+tt-tape-failed-face)))
+        (forward-line 1)))))
+
+(defun +tt-tape--visible-p ()
+  "Non-nil when this tape buffer is shown in a live window."
+  (and (buffer-live-p (current-buffer))
+       (get-buffer-window (current-buffer) t)))
+
+(defun +tt-tape-refresh (&optional force)
+  "Show this buffer's tape (or `views/loop.txt' with `f'), re-reading it when
+it changed.  Keeps point on the same step.  A missing file is one line, not
+an error: this runs from a timer, where a signal would be noise.  FORCE
+re-reads even when the modification time is unchanged."
+  (interactive "p")
+  (let ((file (if +tt-tape--show-loop +tt-tape--loop-file +tt-tape--file)))
+    (when file
+      (condition-case nil
+          (let ((mtime (and (file-exists-p file)
+                            (file-attribute-modification-time (file-attributes file)))))
+            (when (or force (not (equal mtime +tt-tape--mtime)))
+              (let ((anchor (if +tt-tape--show-loop (+tt-chart--anchor) (+tt-tape--anchor)))
+                    (inhibit-read-only t))
+                (erase-buffer)
+                (if mtime
+                    (progn (insert-file-contents file)
+                           (setq +tt-tape--mtime mtime)
+                           (if +tt-tape--show-loop
+                               (progn (+tt-chart--highlight) (+tt-chart--goto-anchor anchor))
+                             (+tt-tape--highlight) (+tt-tape--goto-anchor anchor)))
+                  (insert (format "no %s yet: %s\n" (if +tt-tape--show-loop "chart" "tape") file))
+                  (setq +tt-tape--mtime nil))
+                (set-buffer-modified-p nil))))
+        (error nil)))))
+
+(defun +tt-tape-toggle-view ()
+  "Toggle this buffer between the loop tape and the full phase chart (`f')."
+  (interactive)
+  (setq +tt-tape--show-loop (not +tt-tape--show-loop)
+        +tt-tape--mtime nil)
+  (+tt-tape-refresh t))
+
+(defun +tt-tape--stop-timer ()
+  "Cancel the loop-tape refresh timer, if any."
+  (when (timerp +tt--tape-timer) (cancel-timer +tt--tape-timer))
+  (setq +tt--tape-timer nil))
+
+(defun +tt-tape--tick ()
+  "Refresh every visible tape buffer; stop the timer when none is visible."
+  (let ((any nil))
+    (dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (and (derived-mode-p '+tt-tape-mode) (+tt-tape--visible-p))
+          (setq any t)
+          (+tt-tape-refresh))))
+    (unless any (+tt-tape--stop-timer))))
+
+(defun +tt-tape--ensure-timer ()
+  "Start the loop-tape refresh timer while a tape buffer is visible; the tick
+stops it again when none is."
+  (when (+tt-tape--visible-p)
+    (unless (timerp +tt--tape-timer)
+      (setq +tt--tape-timer
+            (run-with-timer +tt-tape-refresh-interval +tt-tape-refresh-interval #'+tt-tape--tick)))))
+
+(defun +tt-tape--run ()
+  "The run directory `C-c m g' should show the tape for, from point's buffer."
   (cond
    ((+tt--program-buffer-p)
     (let ((run (get-text-property (point) '+tt-run-id)))
@@ -1633,28 +1731,31 @@ FORCE re-reads even when the modification time is unchanged."
    (t (user-error "Not a run or program buffer"))))
 
 ;;;###autoload
-(defun +tt-chart ()
-  "Open the run's phase chart, `views/loop.txt', read-only (`C-c m g').
+(defun +tt-tape ()
+  "Open the run's loop tape, `views/tape.txt', read-only (`C-c m g').
 From a run's own buffer (status, review, trace, input) or from a node line in
-the program buffer."
+the program buffer.  `f' toggles to the full phase chart and back."
   (interactive)
-  (let* ((run (+tt-chart--run))
+  (let* ((run (+tt-tape--run))
          (id (+tt--readable-id run))
-         (buf (get-buffer-create (format "*tt-chart %s*" id))))
+         (buf (get-buffer-create (format "*tt-tape %s*" id))))
     (with-current-buffer buf
-      (unless (derived-mode-p '+tt-chart-mode) (+tt-chart-mode))
+      (unless (derived-mode-p '+tt-tape-mode) (+tt-tape-mode))
       (setq +tt--run-dir run
-            +tt-chart--file (expand-file-name "views/loop.txt" run))
-      (+tt-chart-refresh t))
+            +tt-tape--file (expand-file-name "views/tape.txt" run)
+            +tt-tape--loop-file (expand-file-name "views/loop.txt" run))
+      (+tt-tape-refresh t))
     (pop-to-buffer buf)
+    (with-current-buffer buf (+tt-tape--ensure-timer))
     (+tt--ensure-timer)))
 
-(defvar-keymap +tt-chart-mode-map
+(defvar-keymap +tt-tape-mode-map
   :parent special-mode-map
-  "g" #'+tt-chart-refresh)
+  "g" #'+tt-tape-refresh
+  "f" #'+tt-tape-toggle-view)
 
-(define-derived-mode +tt-chart-mode special-mode "tt-chart"
-  "Read-only view of a run's phase chart (`views/loop.txt')."
+(define-derived-mode +tt-tape-mode special-mode "tt-tape"
+  "Read-only view of a run's loop tape (`views/tape.txt')."
   (visual-line-mode 1)
   (setq buffer-read-only t))
 
@@ -2567,7 +2668,7 @@ Reads `tt program list --json'; nil when there is no program or no wait."
 (keymap-global-set "C-c m d" #'+tt-review)
 (keymap-global-set "C-c m l" #'+tt-runs)
 (keymap-global-set "C-c m p" #'+tt-program)
-(keymap-global-set "C-c m g" #'+tt-chart)
+(keymap-global-set "C-c m g" #'+tt-tape)
 (keymap-global-set "C-c m k" #'+tt-stop)
 (keymap-global-set "C-c m c" #'+tt-continue)
 (+tt--ensure-mode-line)

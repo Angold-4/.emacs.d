@@ -1,0 +1,13 @@
+05g per-seat models · round 1 · attempt 1/3 · 27m38s
+
+  ✓  BASELINE    10s
+  ✓  IMPLEMENT   16m
+  ✓  FREEZE      10s
+  ✓  CHECKS      7m
+  ✓  PROBE       1s
+  ▶  REVIEW      4m12s of 15m   M·A·B · deepseek-v4.1-flash
+     EVALUATE
+     RESOLVE
+     GATE
+     PUBLISH
+     DONE
