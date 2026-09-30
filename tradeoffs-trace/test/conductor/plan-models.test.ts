@@ -203,7 +203,15 @@ test("plan-models: a plan without models launches every role with neither flag",
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => argvFor(setup, "panel", argvDir).length > 0, 90_000, 25, setup.runDir);
+    // Wait for EVERY dispatch to be recorded, not just the panel's: under load
+    // the evaluator's own process can start after the panel's, so waiting on
+    // the panel alone flaked with "evaluator was never launched" (finding #18).
+    await waitFor(
+      () => (["worker", "reviewer", "evaluator", "panel"] as Role[]).every((r) => argvFor(setup, r, argvDir).length > 0),
+      90_000,
+      25,
+      setup.runDir,
+    );
     assertRoleFlags(setup, "worker", argvDir, undefined);
     assertRoleFlags(setup, "reviewer", argvDir, undefined);
     assertRoleFlags(setup, "evaluator", argvDir, undefined);

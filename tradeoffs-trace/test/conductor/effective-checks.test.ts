@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 
-import { effectiveChecks } from "../../src/core/checks.ts";
+import { effectiveChecks, rerunBudgetMs } from "../../src/core/checks.ts";
 import { runPaths } from "../../src/conductor.ts";
 import {
   cleanupDir,
@@ -326,4 +326,11 @@ test("R2.nested-negative: a nested passing `node --test` check is CHECKS_PASSED 
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
   }
+});
+
+// Plan 05d: a re-run alone never overruns the failing check's own deadline.
+test("a re-run's budget is what is left of the check's deadline, never negative", () => {
+  assert.equal(rerunBudgetMs(10_000, 4_000), 6_000);
+  assert.equal(rerunBudgetMs(10_000, 10_000), 0, "the deadline itself leaves no time");
+  assert.equal(rerunBudgetMs(10_000, 12_000), 0, "a passed deadline is not negative");
 });

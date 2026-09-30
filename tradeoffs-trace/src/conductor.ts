@@ -52,25 +52,32 @@ import {
 import {
   baselineFailureNames,
   baselineFailedCommands,
+  baselineFlakeNames,
   testIsNamedIn,
   baselineKey,
   classifyCheckFailure,
+  classifyRerun,
   failedNormally,
   parseBaseline,
   parseTestFailures,
+  rerunCommandsFor,
+  rerunProvesTheTestRan,
   baselineHasEnvironmentFailure,
   type Baseline,
   type BaselineCommand,
+  type TestRerunOutcome,
 } from "./core/test-failures.ts";
 import { contentHashOf, ledgerEntries, type MessageContent } from "./core/messages.ts";
 import type {
   Action,
   Ballot,
   BallotDisclosure,
+  CheckFailureClass,
   ContractVersion,
   CriterionDispute,
   Decision,
   DecisionDisclosure,
+  EvFlakeObserved,
   DirectiveScope,
   Event,
   Finding,
@@ -99,6 +106,7 @@ import {
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
+import { rerunBudgetMs } from "./core/checks.ts";
 import { decisionStatus, isLiveDecision, panelOptionsFor, panelOutcome, panelSeatsSettled, sameVersion } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
@@ -135,6 +143,7 @@ import { secretUseInCommand } from "../extension/guards.ts";
 // Plan 01b: owner-wait notifications (see notify.ts's own header for the rule).
 import { notify, oneLine, waitReason } from "./notify.ts";
 import { crashAt, CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
+import { loadavg } from "node:os";
 
 export { CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
 export type { CrashBoundary } from "./effects/crash.ts";
@@ -325,6 +334,13 @@ export interface RunPlanFile {
   /** Lint-only: roles the keyword declared more than once. A JSON object
    * cannot carry a duplicate key, so the parser records them here. */
   modelsRepeated?: string[];
+  /** Plan 05d: the `#+TT_RERUN:` single-test template, with `{name}` and
+   * `{file}` placeholders. Used to re-run each new failing test alone before
+   * a check fails. Absent: the built-in Node/cargo defaults, or the strict
+   * rule when neither applies. */
+  rerun?: string;
+  /** Lint-only: the 1-based line of `#+TT_RERUN:` in the source Org file. */
+  rerunLine?: number;
 }
 
 /** Plan 01i: a program-wide owner directive a node's plan was started with. */
@@ -4212,61 +4228,76 @@ export class Conductor {
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
     };
 
-    let helloResolve!: (r: HelloResult) => void;
-    const helloPromise = new Promise<HelloResult>((resolve) => {
-      helloResolve = resolve;
-    });
-    let doneResolve!: () => void;
-    const donePromise = new Promise<void>((resolve) => {
-      doneResolve = resolve;
-    });
-    let discoveryResolve!: () => void;
-    const discoveryPromise = new Promise<void>((resolve) => {
-      discoveryResolve = resolve;
-    });
+    // Plan 05d / finding #33: the spawn is a function so a hello timeout can
+    // retry the launch once. `helloPromise`/`donePromise`/`discoveryPromise`
+    // are created per launch and returned, so the rest of the attempt uses the
+    // live process's own promises.
+    const spawnWorkerAgent = (): {
+      agent: PiAgent;
+      handle: AgentHandle;
+      helloPromise: Promise<HelloResult>;
+      donePromise: Promise<void>;
+      discoveryPromise: Promise<void>;
+    } => {
+      let helloResolve!: (r: HelloResult) => void;
+      const helloPromise = new Promise<HelloResult>((resolve) => {
+        helloResolve = resolve;
+      });
+      let doneResolve!: () => void;
+      const donePromise = new Promise<void>((resolve) => {
+        doneResolve = resolve;
+      });
+      let discoveryResolve!: () => void;
+      const discoveryPromise = new Promise<void>((resolve) => {
+        discoveryResolve = resolve;
+      });
 
-    const workerPiCommand = this.#resolvePiCommand("worker");
-    const workerProviderModel = this.#providerModelFor?.("worker");
-    const agent = spawnPiAgent({
-      command: workerPiCommand,
-      args: [
-        ...this.#resolvePiArgsPrefix("worker"),
-        ...launchArgs("worker", {
-          sessionDir,
-          continueSession,
-          noSession: workerPiCommand !== undefined,
-          provider: workerProviderModel?.provider,
-          model: workerProviderModel?.model,
-        }),
-      ],
-      cwd: this.#paths.worktree,
-      env,
-      role: "worker",
-      agentId,
-      streamFile,
-      secrets: this.#secretMaskable,
-      abortGraceMs: this.#deadlines.abortGraceMs,
-      termGraceMs: this.#deadlines.termGraceMs,
-      onEvent: (event) => {
-        this.#noteActivity(agentId, event);
-        this.#trackRunTokens(agentId, event);
-        this.#trackFileChanges(agentId, streamFile, event);
-      },
-    });
+      const workerPiCommand = this.#resolvePiCommand("worker");
+      const workerProviderModel = this.#providerModelFor?.("worker");
+      const agent = spawnPiAgent({
+        command: workerPiCommand,
+        args: [
+          ...this.#resolvePiArgsPrefix("worker"),
+          ...launchArgs("worker", {
+            sessionDir,
+            continueSession,
+            noSession: workerPiCommand !== undefined,
+            provider: workerProviderModel?.provider,
+            model: workerProviderModel?.model,
+          }),
+        ],
+        cwd: this.#paths.worktree,
+        env,
+        role: "worker",
+        agentId,
+        streamFile,
+        secrets: this.#secretMaskable,
+        abortGraceMs: this.#deadlines.abortGraceMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+        onEvent: (event) => {
+          this.#noteActivity(agentId, event);
+          this.#trackRunTokens(agentId, event);
+          this.#trackFileChanges(agentId, streamFile, event);
+        },
+      });
 
-    const handle: AgentHandle = {
-      agent,
-      role: "worker",
-      agentId,
-      helloResolve,
-      helloPromise,
-      shGroups: new Set(),
-      doneResolve,
-      donePromise,
-      discoveryResolve,
-      discoveryPromise,
+      const handle: AgentHandle = {
+        agent,
+        role: "worker",
+        agentId,
+        helloResolve,
+        helloPromise,
+        shGroups: new Set(),
+        doneResolve,
+        donePromise,
+        discoveryResolve,
+        discoveryPromise,
+      };
+      this.#agents.set(agentId, handle);
+      return { agent, handle, helloPromise, donePromise, discoveryPromise };
     };
-    this.#agents.set(agentId, handle);
+
+    let launched = spawnWorkerAgent();
     let submittedKeepHandle = false;
 
     // design §9.3: the "agent attempt" row's own intent/completion pair —
@@ -4275,16 +4306,39 @@ export class Conductor {
     // dangling in-flight entry at all (ACTION_STARTED had not been paired
     // with a live process yet); a crash after it is exactly what
     // `#reconcileOne`'s `dispatch_worker` case reconciles.
-    this.#log.intent(actionId, { agentId, pgid: agent.pgid, sessionDir });
+    this.#log.intent(actionId, { agentId, pgid: launched.agent.pgid, sessionDir });
     crashAt("before_dispatch_worker");
 
     try {
-      const hello = await raceTimeout(helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      let hello = await raceTimeout(launched.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout") {
+        // Plan 05d / finding #33: a slow start (a long `--continue` session
+        // being loaded) is not the code's failure and must not consume a
+        // repair attempt. Retry the launch once with a longer limit, scaled
+        // to the session being continued and capped at 60 s.
+        await launched.agent.terminate();
+        this.#agents.delete(agentId);
+        const bytes = sessionBytes(sessionDir);
+        const retryMs = helloRetryTimeoutMs(this.#deadlines.helloTimeoutMs, bytes);
+        this.#applyEvent({
+          type: "LAUNCH_RETRIED",
+          role: "worker",
+          timeoutMs: this.#deadlines.helloTimeoutMs,
+          retryTimeoutMs: retryMs,
+          sessionBytes: bytes,
+        });
+        launched = spawnWorkerAgent();
+        this.#log.intent(actionId, { agentId, pgid: launched.agent.pgid, sessionDir, retry: true });
+        hello = await raceTimeout(launched.helloPromise, retryMs, "hello");
+      }
+      const { agent, handle, donePromise, discoveryPromise } = launched;
       if (hello === "timeout") {
         await agent.terminate();
         this.#agents.delete(agentId);
         this.#log.completion(actionId, { outcome: "hello-timeout" });
-        this.#applyEvent({ type: "ATTEMPT_TIMED_OUT" });
+        // Two hello timeouts in a row are an environment problem (like 05i's
+        // preflight), never a code failure and never a repair attempt.
+        this.#applyAgentEnvFailure("worker hello");
         return;
       }
       if (!hello.ok) {
@@ -4421,7 +4475,12 @@ export class Conductor {
       `${f.id} (${f.kind}, raised by ${f.raisedBy}${f.alsoRaisedBy?.length ? ` and ${f.alsoRaisedBy.join(", ")}` : ""}): ${clip(f.evidence)}`;
     const open = phase.findings.filter((f) => f.status === "open");
     const blocking = open.filter((f) => f.severity === "blocking").map(findingLine);
-    if (checksFailed) blocking.unshift("The phase checks failed on the candidate (see the check output in your worktree by rerunning the failing test).");
+    if (checksFailed) {
+      blocking.unshift("The phase checks failed on the candidate (see the check output in your worktree by rerunning the failing test).");
+      // Plan 05d: name each failing test's own label, so the worker repairs a
+      // real failure and leaves a load-only flake alone (finding #35).
+      blocking.push(...checkFailureLines(phase));
+    }
     if (probeFailed) blocking.unshift("The integration probe failed: the candidate does not merge cleanly or fails the checks when merged onto the integration branch.");
     // Plan 01f: a failed gate is a repair round that shows the worker the
     // log (design 01_ref_design.md): the conductor's own record, not an
@@ -5112,6 +5171,21 @@ export class Conductor {
     });
   }
 
+  /** Plan 05d / finding #33: two hello timeouts in a row are an agent
+   * environment problem, reported like 05i's preflight: the run blocks in
+   * ENV_BLOCKED, the attempt consumes no repair round, and a passing `tt
+   * resume` re-dispatches the same attempt. */
+  #applyAgentEnvFailure(what: string): void {
+    this.#applyEvent({
+      type: "ENV_CHECK_FAILED",
+      stage: "worker",
+      command: what,
+      exitCode: null,
+      tail: `${what}: no hello after the retry — the agent environment is unhealthy`,
+      at: new Date().toISOString(),
+    });
+  }
+
   // -- plan 01e: the base baseline -----------------------------------------
 
   /** Plan 01e: the base baseline's own directory (`<run>/checks/base/`), the
@@ -5507,6 +5581,9 @@ export class Conductor {
     try {
       for (const command of commands) {
         const startedAt = Date.now();
+        // Plan 05d: a base failure's own single re-run must finish inside the
+        // command's deadline, exactly as a candidate's does.
+        const deadlineAt = startedAt + this.#deadlines.checkMs;
         // Same isolation and per-command deadline as the C gate (F13).
         const running = runCommand({
           command,
@@ -5529,24 +5606,50 @@ export class Conductor {
         if (!result.timedOut && (result.exitCode === 126 || result.exitCode === 127)) {
           throw new EnvFailure("baseline", command, result.exitCode, result.output);
         }
+        // Only a command that ran to completion and exited non-zero names a
+        // failure the base is known to have: a timeout's output is truncated,
+        // a signal death never printed its last failure, and a command that
+        // exited 0 did not fail at all — so none of those three may put a
+        // name into the set that excuses a candidate's check.
+        let failures: string[] = [];
+        let flakes: string[] = [];
+        if (failedNormally(result)) {
+          const parsed = parseTestFailures(result.output);
+          if (parsed.length > 0) {
+            // Plan 05d / finding #25: re-run each base failure alone once. A
+            // name that passes alone is a `base flake` — visible, and never
+            // part of the excuse set, so a candidate failing it is judged on
+            // its own.
+            const classified = await this.#classifyNewFailures({
+              output: result.output,
+              names: parsed,
+              failingExitCode: result.exitCode,
+              cwd: checkout.dir,
+              deadlineAt,
+              maxReruns: 1,
+            });
+            failures = classified.filter((c) => c.reproducesAlone).map((c) => c.name);
+            flakes = classified.filter((c) => c.loadOnly).map((c) => c.name);
+            if (flakes.length > 0) {
+              this.#log.append("baseline_flake", { command, flakes, failures, loadAverage: Math.round(loadavg()[0] * 100) / 100 });
+            }
+          }
+        }
         results.push({
           command,
           exitCode: result.exitCode,
           signal: result.signal,
           timedOut: result.timedOut,
           durationMs: Date.now() - startedAt,
-          // Only a command that ran to completion and exited non-zero names a
-          // failure the base is known to have: a timeout's output is truncated,
-          // a signal death never printed its last failure, and a command that
-          // exited 0 did not fail at all — so none of those three may put a
-          // name into the set that excuses a candidate's check.
-          failures: failedNormally(result) ? parseTestFailures(result.output) : [],
+          failures,
+          ...(flakes.length > 0 ? { flakes } : {}),
           log: this.#checkLogName(command),
         });
       }
     } finally {
       checkout.dispose();
     }
+    const flakes = baselineFlakeNames(results);
     return {
       baseSha: this.#baselineBaseSha(),
       tree: this.#baselineTree(),
@@ -5554,6 +5657,7 @@ export class Conductor {
       at: new Date().toISOString(),
       commands: results,
       failures: baselineFailureNames(results),
+      ...(flakes.length > 0 ? { flakes } : {}),
     };
   }
 
@@ -5634,8 +5738,15 @@ export class Conductor {
       let timedOut = false;
       /** Plan 01e: the names this candidate's checks failed on that the base
        * did not — recorded with the check's completion so a repair round (and
-       * the owner) can see exactly what is new. */
+       * the owner) can see exactly what is new. Plan 05d narrows this to the
+       * names that still fail when re-run alone. */
       let newFailures: string[] = [];
+      /** Plan 05d: every new failing test of the failing command, with its
+       * `reproduces alone` / `load-only` label, for the repair prompt. */
+      let checkFailures: CheckFailureClass[] = [];
+      /** Plan 05d: load-only tests not yet emitted — emitted after the loop so
+       * `savedRound` reflects the check's own outcome. */
+      const pendingFlakes: EvFlakeObserved[] = [];
       if (before) {
         // F04: the effective list is the global plan checks followed by the
         // phase contract's own checks, deduped by exact command string — the
@@ -5648,6 +5759,10 @@ export class Conductor {
           // check failed: timeout" — runCommand's own deadlineMs already
           // kills the command's process group on expiry (shell.ts); this
           // just records *why* the check failed.
+          const startedAt = Date.now();
+          // Plan 05d: a re-run alone must finish inside this same per-command
+          // deadline (design §8.1). `deadlineAt` is that deadline's wall time.
+          const deadlineAt = startedAt + this.#deadlines.checkMs;
           const running = runCommand({
             command,
             cwd: checkoutDir.dir,
@@ -5659,6 +5774,9 @@ export class Conductor {
             termGraceMs: this.#deadlines.termGraceMs,
           });
           const result = await running.result;
+          // Plan 05d: the machine's load average at the failing run is part
+          // of the flake evidence (findings #10, #31).
+          const machineLoad = Math.round(loadavg()[0] * 100) / 100;
           if (result.timedOut) timedOut = true;
           this.#recordCheck(outDir, command, result);
           // Plan 05i: 126/127 means the shell could not execute the command
@@ -5700,12 +5818,51 @@ export class Conductor {
                 continue;
               }
               if (verdict.newFailures.length > 0) {
-                newFailures = verdict.newFailures;
+                // Plan 05d: before any of these may fail the gate, re-run each
+                // alone. `load-only` tests do not fail the check; only the
+                // ones that still fail alone (or whose output named no test)
+                // do (findings #4, #31, #35).
+                const classifications = await this.#classifyNewFailures({
+                  output: result.output,
+                  names: verdict.newFailures,
+                  failingExitCode: result.exitCode,
+                  cwd: checkoutDir.dir,
+                  deadlineAt,
+                });
+                const loadOnly = classifications.filter((c) => c.loadOnly);
+                const real = classifications.filter((c) => c.reproducesAlone);
+                for (const c of loadOnly) {
+                  pendingFlakes.push({
+                    type: "FLAKE_OBSERVED",
+                    name: c.name,
+                    command,
+                    ...(c.rerunCommand !== undefined ? { rerunCommand: c.rerunCommand } : {}),
+                    failingExitCode: result.exitCode,
+                    rerunExitCodes: c.rerunExitCodes,
+                    loadAverage: machineLoad,
+                    savedRound: false,
+                    candidateSha,
+                  });
+                }
+                if (real.length === 0) {
+                  // Every new failure passed alone: the check passes, with one
+                  // recorded observation per test.
+                  this.#log.append("check_failures_load_only", {
+                    candidateSha,
+                    command,
+                    tests: classifications,
+                    loadAverage: machineLoad,
+                  });
+                  continue;
+                }
+                checkFailures = classifications;
+                newFailures = real.map((c) => c.name);
                 this.#log.append("check_failure_new", {
                   candidateSha,
                   command,
-                  newFailures: verdict.newFailures,
+                  newFailures,
                   failures: verdict.parsed,
+                  classifications,
                 });
               }
             }
@@ -5723,18 +5880,79 @@ export class Conductor {
       if (integrityViolated) {
         this.#applyEvent({ type: "INTEGRITY_VIOLATED", stage: "checks", evidence: `candidate ${candidateSha}` });
       }
+      // Plan 05d: emit the flake observations now that the check's outcome is
+      // known, so `savedRound` is true only when the check really passed
+      // because every new failure was load-only.
+      const savedRound = passed && !integrityViolated && pendingFlakes.length > 0;
+      for (const flake of pendingFlakes) this.#applyEvent({ ...flake, savedRound });
       crashAt("after_run_checks");
       this.#log.completion(actionId, {
         candidateSha,
         passed,
         integrityViolated,
         ...(newFailures.length > 0 ? { newFailures } : {}),
+        ...(checkFailures.length > 0 ? { checkFailures } : {}),
         reason: !passed && timedOut ? "timeout" : undefined,
       });
-      this.#applyEvent(passed ? { type: "CHECKS_PASSED" } : { type: "CHECKS_FAILED" });
+      this.#applyEvent(
+        passed
+          ? { type: "CHECKS_PASSED" }
+          : { type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) },
+      );
     } finally {
       checkoutDir.dispose();
     }
+  }
+
+  /** Plan 05d: re-run each newly failing test alone, inside the failing
+   * check's own deadline, and label it. Up to two re-runs per test (a test
+   * that passes on the first is not run again); a re-run that times out or
+   * finds no time left counts as `reproduces alone`, the strict direction. */
+  async #classifyNewFailures(params: {
+    output: string;
+    names: readonly string[];
+    failingExitCode: number | null;
+    cwd: string;
+    deadlineAt: number;
+    /** Plan 05d: a base failure is re-run alone **once** (finding #25); a
+     * candidate's new failure up to twice. */
+    maxReruns?: number;
+  }): Promise<CheckFailureClass[]> {
+    const plans = rerunCommandsFor(params.output, params.names, this.#plan.rerun);
+    const maxReruns = params.maxReruns ?? 2;
+    const out: CheckFailureClass[] = [];
+    for (const plan of plans) {
+      const reruns: TestRerunOutcome[] = [];
+      if (plan.command) {
+        for (let attempt = 0; attempt < maxReruns; attempt++) {
+          const budget = rerunBudgetMs(params.deadlineAt, Date.now());
+          if (budget <= 0) break;
+          const running = runCommand({
+            command: plan.command,
+            cwd: params.cwd,
+            env: childEnv(),
+            deadlineMs: budget,
+            termGraceMs: this.#deadlines.termGraceMs,
+          });
+          const result = await running.result;
+          // Review finding M-1: exit 0 alone is not proof — a filter that
+          // matched no test exits 0. Keep the output so the classification can
+          // require evidence that the test ran.
+          reruns.push({ exitCode: result.exitCode, timedOut: result.timedOut, output: result.output });
+          if (!result.timedOut && result.exitCode === 0 && rerunProvesTheTestRan(result.output, plan.name)) break;
+        }
+      }
+      const classified = classifyRerun(plan.name, plan.command, params.failingExitCode, reruns);
+      out.push({
+        name: classified.name,
+        ...(classified.rerunCommand !== undefined ? { rerunCommand: classified.rerunCommand } : {}),
+        reproducesAlone: classified.reproducesAlone,
+        loadOnly: classified.loadOnly,
+        failingExitCode: classified.failingExitCode,
+        rerunExitCodes: classified.rerunExitCodes,
+      });
+    }
+    return out;
   }
 
   // -- probe ----------------------------------------------------------------
@@ -7162,6 +7380,9 @@ export class Conductor {
       // them as this candidate's defect (runtime doc §8: reviewers kept
       // flagging the 14 pre-existing exchange-state-machine failures).
       ...baselinePromptLines(this.#baselineFailedCommands()),
+      // Plan 05d: the candidate's own failing tests, each re-run alone, so a
+      // reviewer never calls a real regression a flake or a flake a defect.
+      ...checkFailurePromptLines(phase),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
@@ -7561,6 +7782,48 @@ export function baselinePromptLines(commands: readonly BaselineCommand[] | undef
   ];
 }
 
+/** Plan 05d / finding #35: label the current candidate's new failing tests so
+ * a real regression is never read as a flake and a flake is never repaired.
+ * Empty when the last check passed or its output named no test. Exported (and
+ * used by `#repairContext` and `#buildReviewerTurn2Prompt`) so a unit test
+ * exercises the exact words both prompts send. */
+export function checkFailureLines(phase: PhaseState): string[] {
+  const failures = phase.checks?.passed === false ? phase.checks.failures ?? [] : [];
+  return failures.map((f) =>
+    f.loadOnly
+      ? `\`${f.name}\`: load-only (passed when re-run alone; a flake — do not repair it)`
+      : `\`${f.name}\`: reproduces alone (a real failure — fix it)`,
+  );
+}
+
+/** Plan 05d: the reviewer section for a check failure. A check that fails
+ * sends its candidate to REPAIRING, never to REVIEWING, so in the normal flow
+ * the reviewers see the split of the candidate they are reviewing **only** as
+ * the failure their candidate repairs: the previous candidate's split, kept
+ * across the freeze in `lastCheckFailures` (finding A-5). */
+export function checkFailurePromptLines(phase: PhaseState): string[] {
+  const current = checkFailureLines(phase);
+  if (current.length > 0) {
+    return [
+      "",
+      "Candidate check failures, each re-run alone (a real regression is not a flake, and a flake is not a repair item):",
+      ...current.map((l) => `- ${l}`),
+    ];
+  }
+  const last = phase.lastCheckFailures;
+  // Only the candidate that repairs the failed check is told about it: the
+  // freeze marks it `repairedBy`, so a later candidate (repairing a review
+  // finding, say) is never shown a two-candidates-stale split (finding A-9).
+  if (!last || last.failures.length === 0 || last.repairedBy !== phase.candidate?.sha) return [];
+  return [
+    "",
+    `The check failure this candidate repairs (previous candidate ${last.candidateSha.slice(0, 7)}; every test was re-run alone):`,
+    ...last.failures.map(
+      (f) => `- \`${f.name}\`: ${f.loadOnly ? "load-only (a flake; the check passed on it)" : "reproduces alone (a real failure)"}`,
+    ),
+  ];
+}
+
 /** Plan 01i: what a reviewer must know about a directive it is shown: it binds
  * as part of the contract, following one is never a defect even where the plan
  * says otherwise, and violating one is a blocking contract finding. */
@@ -7720,6 +7983,9 @@ export function buildReviewerPrompt(
     // owns the gate evidence, and no agent may run the command or substitute
     // for its record.
     ...gatePromptLines(phase.contract.gate),
+    // Plan 05d: name the candidate's own failing tests (each re-run alone), so
+    // a reviewer never calls a real regression a flake or a flake a defect.
+    ...checkFailurePromptLines(phase),
     ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),
     "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
   ].join("\n");
@@ -7742,6 +8008,36 @@ function hasSessionFile(dir: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Plan 05d / finding #33: the bytes a session directory holds — the scale a
+ * retried hello's longer limit uses. Best-effort: an unreadable directory
+ * reports 0, which leaves the base limit. */
+export function sessionBytes(dir: string): number {
+  let total = 0;
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      try {
+        if (entry.isFile()) total += fs.statSync(file).size;
+        else if (entry.isDirectory()) total += sessionBytes(file);
+      } catch {
+        // best effort per entry
+      }
+    }
+  } catch {
+    return 0;
+  }
+  return total;
+}
+
+/** Plan 05d / finding #33: the limit a retried hello gets. A session being
+ * continued with `--continue` takes longer to load the bigger it is, so the
+ * limit grows with its bytes (50 ms per KiB) but never below the configured
+ * limit and never above 60 s. Pure, so the scale is unit-tested directly. */
+export function helloRetryTimeoutMs(baseMs: number, sessionBytes: number): number {
+  const scaled = Math.ceil(Math.max(0, sessionBytes) / 1024) * 50;
+  return Math.min(60_000, Math.max(baseMs, scaled));
 }
 
 function currentHead(repo: string, branch: string): string {

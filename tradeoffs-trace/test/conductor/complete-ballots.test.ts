@@ -127,7 +127,17 @@ test("complete-ballots: a submit omitting two listed records is rejected naming 
     const streamDir = runPaths(setup.runDir).stream;
     const mStream = fs.readdirSync(streamDir).find((f) => f.startsWith("reviewer-M-"));
     assert.ok(mStream, "the M reviewer's RPC stream was written");
-    const streamText = fs.readFileSync(path.join(streamDir, mStream!), "utf8");
+    const streamPath = path.join(streamDir, mStream!);
+    // The stream's tool result is written by the agent's own stdout capture, so
+    // under load it can land a moment after DONE. Read once, then wait briefly
+    // for the ids rather than race the writer (the "names the ids" flake).
+    let streamText = fs.readFileSync(streamPath, "utf8");
+    const namesBoth = () => [decisions[1], decisions[2]].every((d) => streamText.includes(d.id));
+    const deadline = Date.now() + 5_000;
+    while (!namesBoth() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      streamText = fs.readFileSync(streamPath, "utf8");
+    }
     for (const d of [decisions[1], decisions[2]]) {
       assert.ok(streamText.includes(d.id), `the rejection message names ${d.id}`);
       assert.ok(streamText.includes(d.choice), `the rejection message gives ${d.id}'s choice`);
@@ -271,10 +281,12 @@ test("complete-ballots: a discovery that arrives after the reviewer's turn-2 pro
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    // 30s, not 5s: B's first dispatch hangs by design, so the re-dispatch must
-    // spawn and finish both turns inside this budget — 5s misses it on a loaded
-    // machine (a timing flake, not a defect).
-    deadlines: { ...FAST, reviewMs: 30_000 },
+    // B's first dispatch ENDS without submitting turn 2, so the conductor's
+    // agent_settled fast-fail re-dispatches it at once rather than waiting out
+    // reviewMs (the wait was the load flake: 30 s was too short once the
+    // machine was busy). The limit is still generous for the re-dispatch's own
+    // two turns under load.
+    deadlines: { ...FAST, reviewMs: 120_000 },
     workerScript: () => ({
       hello: defaultWorkerHello(),
       steps: [
@@ -289,10 +301,11 @@ test("complete-ballots: a discovery that arrives after the reviewer's turn-2 pro
         // re-dispatched — and by then the discovery barrier has released.
         return {
           hello: defaultReviewerHello(),
+          // Ends after turn 1: no turn-2 submit, so the conductor fails this
+          // dispatch fast and re-dispatches it.
           steps: [
             { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
             { kind: "wait-for-prompt" },
-            { kind: "hang-forever" },
           ],
         };
       }

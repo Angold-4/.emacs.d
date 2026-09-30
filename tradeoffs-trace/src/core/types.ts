@@ -684,7 +684,7 @@ export interface EnvBlockInfo {
   /** preflight: the executables not found; check: the command that exited. */
   missing?: string[];
   path?: string;
-  stage?: "baseline" | "checks" | "probe" | "gate";
+  stage?: "baseline" | "checks" | "probe" | "gate" | "worker";
   command?: string;
   exitCode?: number | null;
   tail?: string;
@@ -794,10 +794,42 @@ export interface ProbeResult {
   interrupted?: boolean;
 }
 
+/** Plan 05d: one new failing test of a candidate's checks, labelled by its
+ * own single-test re-run: `reproducesAlone` is a real failure; `loadOnly`
+ * passed when re-run alone and is never a repair item. */
+export interface CheckFailureClass {
+  name: string;
+  /** The single-test command that was re-run, when one could be built. */
+  rerunCommand?: string;
+  reproducesAlone: boolean;
+  loadOnly: boolean;
+  failingExitCode: number | null;
+  rerunExitCodes: Array<number | null>;
+}
+
 export interface ChecksResult {
   candidateSha: string;
   passed?: boolean;
   interrupted?: boolean;
+  /** Plan 05d: every new failing test of the candidate's last check (each
+   * re-run alone), so the worker's repair prompt labels a real failure and a
+   * flake apart (finding #35). Cleared when the next candidate freezes. */
+  failures?: CheckFailureClass[];
+}
+
+/** Plan 05d: the last check failure of a candidate, kept across the repair
+ * freeze (`checks` is cleared then), so the reviewers of the repaired
+ * candidate are told which tests failed and how each was classified — the
+ * reviewer half of requirement (2), which would otherwise never see a failed
+ * check (finding A-5). */
+export interface LastCheckFailures {
+  candidateSha: string;
+  failures: CheckFailureClass[];
+  /** Plan 05d: the candidate whose freeze followed this failure — the only
+   * candidate whose reviewers are told about it. Set once, when that
+   * candidate freezes, so a LATER candidate (which repairs a review finding,
+   * not the check) is never shown a two-candidates-stale split. */
+  repairedBy?: string;
 }
 
 export interface ReviewSlot {
@@ -930,6 +962,27 @@ export interface PhaseState {
    * of this round (keyed by the blocker message id). EVALUATING completes
    * only once every evaluator AND every panel has settled. */
   panel?: { blockers?: Record<string, PanelState> };
+  /** Plan 05d: every flake observed in this phase (a new failing test that
+   * passed when re-run alone), folded from FLAKE_OBSERVED events. Evidence
+   * for the status, `tt summary` and a restart. */
+  flakes?: FlakeObservation[];
+  /** Plan 05d: the previous candidate's check failures and their
+   * classifications, kept across the repair freeze so the reviewers of the
+   * repaired candidate see them (finding A-5), and marked with that candidate
+   * so a later one is not shown a stale split (finding A-9). */
+  lastCheckFailures?: LastCheckFailures;
+}
+
+/** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
+export interface FlakeObservation {
+  name: string;
+  command: string;
+  rerunCommand?: string;
+  failingExitCode: number | null;
+  rerunExitCodes: Array<number | null>;
+  loadAverage?: number | null;
+  savedRound: boolean;
+  candidateSha?: string;
 }
 
 export type RunStatus = RunStateName;
@@ -1133,9 +1186,50 @@ export interface EvChecksPassed {
 }
 export interface EvChecksFailed {
   type: "CHECKS_FAILED";
+  /** Plan 05d: the new failing tests, each with its single-test re-run's
+   * classification. Absent for a check whose output named no test (the strict
+   * rule), which stores no classifications. */
+  failures?: CheckFailureClass[];
 }
 export interface EvChecksInterrupted {
   type: "CHECKS_INTERRUPTED";
+}
+
+/** Plan 05d: one new failing test that passed when re-run alone — a flake,
+ * recorded per test with the command, both exit statuses and the machine's
+ * load average at the failing run. `savedRound` says the check passed only
+ * because every new failure was load-only (the repair round it saved). A
+ * record-only event: it moves no phase state. */
+export interface EvFlakeObserved {
+  type: "FLAKE_OBSERVED";
+  name: string;
+  /** The check command that failed. */
+  command: string;
+  /** The single-test command re-run alone, when one could be built. */
+  rerunCommand?: string;
+  /** The failing check's exit status. */
+  failingExitCode: number | null;
+  /** The exit status of every re-run that was attempted, in order. */
+  rerunExitCodes: Array<number | null>;
+  /** The machine's 1-minute load average when the check failed, when read. */
+  loadAverage?: number | null;
+  /** True when the check passed because every new failure was load-only. */
+  savedRound: boolean;
+  candidateSha?: string;
+}
+
+/** Plan 05d / finding #33: a worker (or other agent) launch missed its hello
+ * and was retried once with a longer limit. A record-only event, so the
+ * status and `tt summary` can count launch retries. */
+export interface EvLaunchRetried {
+  type: "LAUNCH_RETRIED";
+  role: string;
+  /** The first limit that timed out, in ms. */
+  timeoutMs: number;
+  /** The longer limit the retry used, in ms. */
+  retryTimeoutMs: number;
+  /** Bytes in the session being continued, the retry limit's scale. */
+  sessionBytes: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,7 +1261,7 @@ export interface EvEnvPreflightFailed {
  * tail; never a baseline, a `checks failed`, a repair or a finding. */
 export interface EvEnvCheckFailed {
   type: "ENV_CHECK_FAILED";
-  stage: "baseline" | "checks" | "probe" | "gate";
+  stage: "baseline" | "checks" | "probe" | "gate" | "worker";
   command: string;
   exitCode: number | null;
   tail: string;
@@ -1714,7 +1808,9 @@ export type Event =
   | EvMessageResolved
   | EvMessageAddressReported
   | EvMessageSuperseded
-  | EvMessageCarried;
+  | EvMessageCarried
+  | EvFlakeObserved
+  | EvLaunchRetried;
 
 export type EventType = Event["type"];
 

@@ -238,6 +238,12 @@ export function envBlockedLine(blocked: EnvBlockInfo): string {
     const path = blocked.path ?? "";
     return `env blocked · ${names} not found on PATH (${path})`;
   }
+  // Plan 05d / finding #33: a worker launch that missed hello twice is an
+  // agent-environment problem, reported like the 05i preflight, not a code
+  // failure and not a repair attempt.
+  if (blocked.stage === "worker") {
+    return `env blocked · ${blocked.command ?? "the worker"} did not answer hello twice — an environment problem, not a code failure; check the machine and resume`;
+  }
   const code = blocked.exitCode === null || blocked.exitCode === undefined ? "on a signal" : `exit ${blocked.exitCode}`;
   return `env blocked · ${blocked.command ?? "check"} ${code} — the tool is not available here`;
 }

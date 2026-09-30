@@ -31,7 +31,12 @@ test:
 	# `tt start`-launched daemon through production DEFAULT_DEADLINES —
 	# dominated by the freeze's default 30s abortGraceMs; the latter is
 	# 11 sub-tests, several of which wait out a real deadline).
-	cd $(CURDIR) && TT_NOTIFY_COMMAND=':' node --test --test-force-exit --test-concurrency=4 --test-timeout=180000 'test/**/*.test.ts'
+	# Plan 05d: --test-concurrency=3, not 4. The five end-to-end conductor
+	# files spawn several fake-pi agents each; at 4 files the machine load made
+	# their own review/hello deadlines expire, which flaked tests that pass
+	# alone (findings #10, #18, #25, #35). 3 keeps the whole suite inside the
+	# plan's 15-minute check limit while cutting that peak load.
+	cd $(CURDIR) && TT_NOTIFY_COMMAND=':' node --test --test-force-exit --test-concurrency=3 --test-timeout=180000 'test/**/*.test.ts'
 
 # The full crash-suite (every phase-1 TT_CRASH_AT boundary, not just
 # `make check`'s 3-boundary FAST_SUBSET), for a reviewer who wants full

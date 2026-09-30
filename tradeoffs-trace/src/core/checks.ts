@@ -35,3 +35,15 @@ export function effectiveChecks(
   }
   return effective;
 }
+
+// Plan 05d: re-running a newly failing test alone happens inside the failing
+// check command's own deadline (design §8.1's per-command limit). The budget
+// helper is pure so the boundary — no re-run may start once the deadline has
+// passed — is unit-tested directly rather than inferred from a timing test.
+
+/** Milliseconds left of a failing check command's deadline, never negative.
+ * Zero means no time is left, so the caller runs no re-run and keeps the
+ * strict rule (a re-run that cannot finish proves nothing). */
+export function rerunBudgetMs(deadlineAt: number, now: number): number {
+  return Math.max(0, deadlineAt - now);
+}

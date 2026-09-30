@@ -338,6 +338,12 @@ addRow({
       decisions: [...carried, ...e.decisions],
       round: (s.phase.round ?? 0) + 1,
       checks: undefined,
+      // Plan 05d: this candidate is the one that repairs the previous check
+      // failure, so mark the kept split with its sha (finding A-9): the
+      // reviewers of a LATER candidate are never shown a stale one.
+      ...(s.phase.lastCheckFailures
+        ? { lastCheckFailures: { ...s.phase.lastCheckFailures, repairedBy: e.candidateSha } }
+        : {}),
       pendingDisclosures: undefined,
       pendingPrior: undefined,
       pendingDispute: undefined,
@@ -404,12 +410,21 @@ addRow({
     }),
 });
 
-failureRows("checks-failed", "CHECKING", "CHECKS_FAILED", REPAIR_ATTEMPT_ACTIONS, "the checks kept failing", (s) =>
-  withPhase(s, {
-    checks: { candidateSha: s.phase.candidate!.sha, passed: false },
+failureRows("checks-failed", "CHECKING", "CHECKS_FAILED", REPAIR_ATTEMPT_ACTIONS, "the checks kept failing", (s, ev) => {
+  // Plan 05d: carry each new failing test's `reproduces alone` / `load-only`
+  // classification into state, so the repair prompt and the reviewers' prompts
+  // label a real regression and a flake apart (finding #35).
+  const failures = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failures;
+  const candidateSha = s.phase.candidate!.sha;
+  return withPhase(s, {
+    checks: { candidateSha, passed: false, ...(failures && failures.length > 0 ? { failures } : {}) },
+    // Plan 05d: keep the split across the repair freeze too, so the reviewers
+    // of the repaired candidate see which tests failed and how each was
+    // classified (finding A-5).
+    ...(failures && failures.length > 0 ? { lastCheckFailures: { candidateSha, failures } } : {}),
     inFlight: clearInFlight(s.phase, "run_checks"),
-  }),
-);
+  });
+});
 
 addRow({
   id: "checks-interrupted",
@@ -1652,12 +1667,16 @@ addRow({
 /** The in-flight entry an environment failure interrupts, per stage, so that
  * after a passing `tt resume` next() re-dispatches the stage instead of
  * waiting forever on an intent that will never complete. */
-function envStageInFlight(stage: "baseline" | "checks" | "probe" | "gate"): InFlightKey {
+function envStageInFlight(stage: "baseline" | "checks" | "probe" | "gate" | "worker"): InFlightKey {
   switch (stage) {
     case "baseline": return "run_baseline";
     case "checks": return "run_checks";
     case "probe": return "dispatch_probe";
     case "gate": return "run_gate";
+    // Plan 05d: a worker launch that missed hello twice is an environment
+    // problem; clearing its in-flight entry lets a passing `tt resume`
+    // re-dispatch the same attempt.
+    case "worker": return "dispatch_worker";
   }
 }
 

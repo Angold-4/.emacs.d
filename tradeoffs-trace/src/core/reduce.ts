@@ -109,6 +109,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "OWNER_REQUEST_MARKED_UNNEEDED",
   "MISS_RECORDED",
   "NOTES_DELIVERED",
+  "FLAKE_OBSERVED",
+  "LAUNCH_RETRIED",
   "DECISION_MATCHED",
   "FINDING_ALSO_RAISED",
   "MESSAGE_RAISED",
@@ -817,6 +819,48 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, "a notes-delivered event must carry a positive integer count");
       }
       return ok({ ...state, phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count } });
+    }
+
+    case "FLAKE_OBSERVED": {
+      // Plan 05d: one new failing test that passed when re-run alone. A
+      // record-only event: it names the test, the command, both exit statuses
+      // and the machine's load average, so the classification is evidence the
+      // status, `tt summary` and a restart all read.
+      if (typeof event.name !== "string" || event.name.trim().length === 0) {
+        return rejected(state, "a flake observation must name the test that flaked");
+      }
+      if (typeof event.command !== "string" || event.command.trim().length === 0) {
+        return rejected(state, "a flake observation must name the check command that failed");
+      }
+      const flakes = p.flakes ?? [];
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          flakes: [
+            ...flakes,
+            {
+              name: event.name,
+              command: event.command,
+              ...(event.rerunCommand !== undefined ? { rerunCommand: event.rerunCommand } : {}),
+              failingExitCode: event.failingExitCode ?? null,
+              rerunExitCodes: Array.isArray(event.rerunExitCodes) ? event.rerunExitCodes : [],
+              ...(event.loadAverage !== undefined ? { loadAverage: event.loadAverage } : {}),
+              savedRound: event.savedRound === true,
+              ...(event.candidateSha !== undefined ? { candidateSha: event.candidateSha } : {}),
+            },
+          ],
+        },
+      });
+    }
+
+    case "LAUNCH_RETRIED": {
+      // Plan 05d / finding #33: a launch missed its hello and was retried
+      // once with a longer limit. Record-only; the metrics count it.
+      if (typeof event.role !== "string" || event.role.length === 0) {
+        return rejected(state, "a launch retry must name the role it retried");
+      }
+      return ok(state);
     }
 
     case "DECISION_MATCHED": {

@@ -21,7 +21,7 @@ import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOut
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
-import { computeMetrics, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
+import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -455,6 +455,9 @@ export interface RunView {
   /** Plan 05i: `env  cargo /path` for every tool the preflight resolved at
    * start, so the owner can see which toolchain the run is using. */
   envTools: string[];
+  /** Plan 05d: the `flakes` row (flakes per test, rounds saved, launch
+   * retries). Undefined when there is nothing to show. */
+  flakes?: string;
 }
 
 /** Plan 01h: what the run costs so far. `stageMinutes` excludes `needs you`,
@@ -712,6 +715,7 @@ export function buildView(
     attention,
     envBlocked,
     envTools,
+    ...(flakesLine(metrics) ? { flakes: flakesLine(metrics)! } : {}),
   };
 }
 

@@ -100,9 +100,17 @@ test("freeze-e2e: a worker that keeps writing after submit_phase is swept, kille
     assert.ok(freezeCompleted, "expected a FREEZE_COMPLETED event");
     assert.equal((freezeCompleted!.event as { tainted?: boolean }).tainted, true, "the freeze must report tainted: true");
 
-    // The survivor process is provably dead.
+    // The survivor process is provably dead. Wait for the file's CONTENT: the
+    // shell's `>` creates it before `echo` writes, so reading on existence
+    // alone can see an empty string (Number("") is 0) under load.
     const pidFile = path.join(setup.repo.dir, "survivor.pid");
-    await waitFor(() => fs.existsSync(pidFile), 15_000);
+    await waitFor(() => {
+      try {
+        return fs.readFileSync(pidFile, "utf8").trim().length > 0;
+      } catch {
+        return false;
+      }
+    }, 15_000);
     const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
     await waitFor(() => !pidAlive(pid), 30_000);
 
