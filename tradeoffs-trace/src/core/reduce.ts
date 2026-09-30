@@ -61,6 +61,9 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "CHECKS_PASSED",
   "CHECKS_FAILED",
   "CHECKS_INTERRUPTED",
+  "ENV_CHECKED",
+  "ENV_PREFLIGHT_FAILED",
+  "ENV_CHECK_FAILED",
   "PROBE_PASSED",
   "PROBE_FAILED",
   "PROBE_INTERRUPTED",
@@ -426,6 +429,14 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // second occurrence (e.g. a repair round's own check) is still just
       // `true`.
       return ok({ ...state, phase: { ...p, integrityViolated: true } });
+    }
+
+    case "ENV_CHECKED": {
+      // Plan 05i: the preflight resolved the run's tools at start. Record-only
+      // — it stores the resolved paths for the status views and moves no
+      // phase state. A later start updates them in place.
+      const e = event as Extract<Event, { type: "ENV_CHECKED" }>;
+      return ok({ ...state, phase: { ...p, env: { ...(p.env ?? {}), path: e.path, tools: e.tools } } });
     }
 
     case "SUBMIT_PHASE": {

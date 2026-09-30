@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor.ts";
+import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
 
 import { buildView, formatDuration } from "./view.ts";
@@ -324,14 +325,23 @@ function pidAlive(file: string): boolean {
  * the conductor died without a clean stop (no `stopped` marker). */
 export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "crashed" {
   let phase: string | undefined;
+  let envBlocked = false;
   try {
     const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8"));
-    phase = rebuildState(runDir, plan, { lenient: true }).phase.phase;
+    const state = rebuildState(runDir, plan, { lenient: true });
+    phase = state.phase.phase;
+    // Plan 05i: an environment block is its own node status, distinct from a
+    // code BLOCKED: it is recoverable by fixing the environment and resuming.
+    envBlocked = state.run === "ENV_BLOCKED";
   } catch {
     phase = undefined;
   }
+  // A terminal phase wins over an environment block (finding M-7): a DONE or
+  // BLOCKED run can never be re-blocked by a resume, so the program must not
+  // report a finished node as env-blocked.
   if (phase === "DONE") return "done";
   if (phase === "BLOCKED") return "blocked";
+  if (envBlocked) return "env-blocked";
   const alive = pidAlive(path.join(runDir, "conductor.pid"));
   if (phase === "AWAITING_OWNER") return "needs-you";
   // A run just launched may not have written its pid yet.
@@ -349,6 +359,9 @@ export function runWaitReason(runDir: string): string | undefined {
   try {
     const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
     const state = rebuildState(runDir, plan, { lenient: true });
+    if (state.run === "ENV_BLOCKED") {
+      return state.phase.env?.blocked ? envBlockedLine(state.phase.env.blocked) : "environment blocked";
+    }
     if (state.phase.phase === "AWAITING_OWNER" || state.phase.phase === "BLOCKED") return waitReason(state.phase);
   } catch {
     // a run whose plan or log cannot be read yet
@@ -401,7 +414,10 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       continue;
     }
     if (seen !== s.status) {
-      record({ type: "NODE_STATUS", node: n.id, status: seen, ...(seen === "needs-you" ? reasonField(runWaitReason(runDir)) : {}) });
+      // Plan 05i: an env-blocked node carries the `env blocked · …` reason,
+      // like a needs-you node, so the program buffer names the missing tool.
+      const withReason = seen === "needs-you" || seen === "blocked" || seen === "env-blocked";
+      record({ type: "NODE_STATUS", node: n.id, status: seen, ...(withReason ? reasonField(runWaitReason(runDir)) : {}) });
     }
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
@@ -558,11 +574,14 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
   try {
     const program = readProgram(dir);
     const { nodes, state } = foldProgram(dir);
-    const blocked = nodes.find((n) => state.nodes[n.id].status === "blocked");
+    // An env-blocked node is what makes the program `stuck` (findings A-8),
+    // so the notification must name its `env blocked · …` reason, not omit
+    // the tool.
+    const stuck = nodes.find((n) => state.nodes[n.id].status === "blocked" || state.nodes[n.id].status === "env-blocked");
     const reason =
       outcome === "done"
         ? "program done"
-        : `program stuck${blocked ? `: ${oneLine(state.nodes[blocked.id].reason ?? `${blocked.id} blocked`)}` : ""}`;
+        : `program stuck${stuck ? `: ${oneLine(state.nodes[stuck.id].reason ?? `${stuck.id} ${state.nodes[stuck.id].status}`)}` : ""}`;
     notify(
       { id, kind: "program", title: program.title, reason, waitKey: `program:${id}:${outcome}` },
       { root: path.dirname(path.dirname(dir)), ...(opts.reminderMs !== undefined ? { reminderMs: opts.reminderMs } : {}), onError: (message) => log(`notify: ${message}`) },
@@ -657,6 +676,7 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
     stopped: "○",
     done: "✓",
     blocked: "✗",
+    "env-blocked": "E",
   };
   const order = (id: string) => {
     const t = at[id];

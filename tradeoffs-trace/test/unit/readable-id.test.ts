@@ -15,10 +15,26 @@ import type { ProgramFile } from "../../src/core/program.ts";
 
 const CLI = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
 
-function plan(title: string): RunPlanFile {
+/** A disposable git repo for the fixture's plan. Finding v1-3: a plan with
+ * `repo: ""` makes `rebuildState` run `git -C '' rev-parse main` in the
+ * current directory, so the test passes only inside a checkout that has a
+ * local `main` branch — the conductor's detached clone does not, and
+ * `make check` failed there. A repo of the fixture's own removes that
+ * dependence. */
+function makeRepo(): string {
+  const dir = fs.mkdtempSync("/tmp/tt-readable-repo-");
+  const run = (args: string[]): string => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+  run(["init", "-q", "-b", "main"]);
+  fs.writeFileSync(path.join(dir, "README.md"), "base\n");
+  run(["add", "-A"]);
+  run(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]);
+  return dir;
+}
+
+function plan(repo: string, title: string): RunPlanFile {
   return {
     title,
-    repo: "",
+    repo,
     integrationBranch: "main",
     checks: ["true"],
     phases: [{ id: "p", goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [] }],
@@ -38,15 +54,15 @@ function stableState(line: string): string {
   return JSON.stringify(parsed);
 }
 
-function makeProgram(root: string, runIds: Record<string, string>): string {
+function makeProgram(root: string, runIds: Record<string, string>, repo: string): string {
   const dir = path.join(root, "programs", "prog0001");
   fs.mkdirSync(dir, { recursive: true });
   const program: ProgramFile = {
     title: "plan 14",
     maxParallel: 2,
     entries: [
-      { id: "a", after: [], plan: plan("14a") },
-      { id: "b", after: ["a"], plan: plan("14b") },
+      { id: "a", after: [], plan: plan(repo, "14a") },
+      { id: "b", after: ["a"], plan: plan(repo, "14b") },
     ],
     readableIds: { a: "prog0001-01", b: "prog0001-02" },
   };
@@ -61,24 +77,27 @@ function makeProgram(root: string, runIds: Record<string, string>): string {
 
 test("tt status and tt state accept <program>-NN and equal the run id's output", () => {
   const root = fs.mkdtempSync("/tmp/tt-readable-");
+  const repo = makeRepo();
   try {
-    const runA = path.basename(createRun(root, plan("14a"), "run-a"));
-    createRun(root, plan("14b"), "run-b");
-    makeProgram(root, { a: runA, b: "run-b" });
+    const runA = path.basename(createRun(root, plan(repo, "14a"), "run-a"));
+    createRun(root, plan(repo, "14b"), "run-b");
+    makeProgram(root, { a: runA, b: "run-b" }, repo);
 
     assert.equal(cli(root, "status", "prog0001-02"), cli(root, "status", "run-b"));
     assert.equal(stableState(cli(root, "state", "prog0001-02")), stableState(cli(root, "state", "run-b")));
     assert.equal(cli(root, "status", "prog0001-01"), cli(root, "status", "run-a"));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 });
 
 test("tt program state carries the id, the readable ids and the source path", () => {
   const root = fs.mkdtempSync("/tmp/tt-readable-state-");
+  const repo = makeRepo();
   try {
-    const runA = path.basename(createRun(root, plan("14a"), "run-a"));
-    const dir = makeProgram(root, { a: runA });
+    const runA = path.basename(createRun(root, plan(repo, "14a"), "run-a"));
+    const dir = makeProgram(root, { a: runA }, repo);
     fs.writeFileSync(path.join(dir, "source.json"), JSON.stringify({ path: "/home/me/orgw/work/atlas/indexps/14_program.org" }));
     const s = JSON.parse(cli(root, "program", "state", "prog0001")) as { id: string; sourcePath: string; lines: string[] };
     assert.equal(s.id, "prog0001");
@@ -91,17 +110,19 @@ test("tt program state carries the id, the readable ids and the source path", ()
     assert.match(chart, /after: prog0001-01/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 });
 
 test("a 100th node's readable id (three digits) still resolves", () => {
   const root = fs.mkdtempSync("/tmp/tt-readable-100-");
+  const repo = makeRepo();
   try {
-    const run100 = path.basename(createRun(root, plan("14a"), "run-100"));
+    const run100 = path.basename(createRun(root, plan(repo, "14a"), "run-100"));
     const dir = path.join(root, "programs", "prog0100");
     fs.mkdirSync(dir, { recursive: true });
     const phases = Array.from({ length: 100 }, (_, i) => ({ id: `p${i + 1}`, goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [] }));
-    const program: ProgramFile = { title: "100 nodes", maxParallel: 1, entries: [{ id: "e", after: [], plan: { ...plan("e"), phases } as RunPlanFile }] };
+    const program: ProgramFile = { title: "100 nodes", maxParallel: 1, entries: [{ id: "e", after: [], plan: { ...plan(repo, "e"), phases } as RunPlanFile }] };
     fs.writeFileSync(path.join(dir, "program.json"), JSON.stringify(program));
     fs.writeFileSync(
       path.join(dir, "events.jsonl"),
@@ -111,14 +132,16 @@ test("a 100th node's readable id (three digits) still resolves", () => {
     assert.equal(cli(root, "status", "prog0100-100"), cli(root, "status", run100));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 });
 
 test("tt program stop rewrites views/program.txt, so stopped nodes do not read running", () => {
   const root = fs.mkdtempSync("/tmp/tt-program-stop-");
+  const repo = makeRepo();
   try {
-    const runA = path.basename(createRun(root, plan("14a"), "run-a"));
-    const dir = makeProgram(root, { a: runA });
+    const runA = path.basename(createRun(root, plan(repo, "14a"), "run-a"));
+    const dir = makeProgram(root, { a: runA }, repo);
     cli(root, "program", "stop", "prog0001");
     const chart = fs.readFileSync(programPaths(dir).programView, "utf8");
     // The stop command is the last writer, so a node it stopped cannot keep
@@ -127,16 +150,18 @@ test("tt program stop rewrites views/program.txt, so stopped nodes do not read r
     assert.doesNotMatch(chart, /prog0001-01\s+a\s+\|\s+running/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 });
 
 test("a retried node keeps its readable id and points at the new run", () => {
   const root = fs.mkdtempSync("/tmp/tt-readable-retry-");
+  const repo = makeRepo();
   try {
-    const oldRun = path.basename(createRun(root, plan("14b"), "run-old"));
-    makeProgram(root, { b: oldRun });
+    const oldRun = path.basename(createRun(root, plan(repo, "14b"), "run-old"));
+    makeProgram(root, { b: oldRun }, repo);
     // The retry: a fresh run for the same node position.
-    const newRun = path.basename(createRun(root, plan("14b"), "run-new"));
+    const newRun = path.basename(createRun(root, plan(repo, "14b"), "run-new"));
     const dir = path.join(root, "programs", "prog0001");
     fs.appendFileSync(
       path.join(dir, "events.jsonl"),
@@ -147,5 +172,6 @@ test("a retried node keeps its readable id and points at the new run", () => {
     assert.equal(stableState(cli(root, "state", "prog0001-02")), stableState(cli(root, "state", newRun)));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
   }
 });

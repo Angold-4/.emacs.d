@@ -64,7 +64,7 @@ export interface ProgramDirective {
 /** What the scheduler knows about a node. `needs-you` and `stopped` are not
  * terminal: the owner can correct or resume the run, and it may still reach
  * DONE. Only `done` releases dependents; only `blocked` is final. */
-export type NodeStatus = "waiting" | "running" | "needs-you" | "stopped" | "done" | "blocked";
+export type NodeStatus = "waiting" | "running" | "needs-you" | "stopped" | "done" | "blocked" | "env-blocked";
 
 export interface ProgramState {
   nodes: Record<string, { status: NodeStatus; runId?: string; branch?: string; base?: string; reason?: string; resumes?: number }>;

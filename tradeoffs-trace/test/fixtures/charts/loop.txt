@@ -165,9 +165,21 @@ run states:
 > +-------------------+
   | RUN_ACTIVE        |  current
   +-------------------+
-      +- RUN_BUDGET_EXCEEDED -> RUN_PAUSED_BUDGET  [run-budget-exceeded]
+      +- ENV_PREFLIGHT_FAILED -> ENV_BLOCKED        [env-preflight-failed]
+      +- ENV_CHECK_FAILED     -> ENV_BLOCKED        [env-check-failed]
+      +- RUN_BUDGET_EXCEEDED  -> RUN_PAUSED_BUDGET  [run-budget-exceeded]
 
   +-------------------+
   | RUN_PAUSED_BUDGET |  not current
   +-------------------+
-      +- RUN_RESUMED         -> RUN_ACTIVE         [run-resumed]
+      +- ENV_PREFLIGHT_FAILED -> ENV_BLOCKED        [env-preflight-failed-from-budget]
+      +- ENV_CHECK_FAILED     -> ENV_BLOCKED        [env-check-failed-from-budget]
+      +- RUN_RESUMED          -> RUN_ACTIVE         [run-resumed]
+
+  +-------------------+
+  | ENV_BLOCKED       |  not current
+  +-------------------+
+      +- ENV_PREFLIGHT_FAILED -> ENV_BLOCKED        [env-preflight-failed-already-blocked]
+      +- ENV_CHECK_FAILED     -> ENV_BLOCKED        [env-check-failed-already-blocked]
+      +- RUN_RESUMED (resumeRunWasNotBudget) -> RUN_ACTIVE         [env-resumed]
+      +- RUN_RESUMED (resumeRunWasBudget) -> RUN_PAUSED_BUDGET  [env-resumed-to-budget]

@@ -13,7 +13,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { Ballot, Decision, Finding, Message } from "./core/types.ts";
+import type { Ballot, Decision, EnvBlockInfo, EnvTool, Finding, Message } from "./core/types.ts";
+import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { ledgerEntries } from "./core/messages.ts";
 import type { Timeline } from "./conductor.ts";
 import type { RunView } from "./view.ts";
@@ -289,6 +290,11 @@ export function renderStatusText(
     lines.push(`directive ${d.id} (${d.scope === "program" ? "whole program" : "this phase"}): ${d.text}`);
   }
   if (phase.blockedReason) lines.push(`blocked: ${phase.blockedReason}`);
+  // Plan 05i: the toolchain the run resolved at start, then the block (if
+  // any). The `env` label column matches the secret rows.
+  const env = phase.env as { tools?: EnvTool[]; blocked?: EnvBlockInfo } | undefined;
+  for (const line of envToolsLines(env?.tools)) lines.push(line);
+  if (env?.blocked) lines.push(envBlockedLine(env.blocked));
   if (phase.publishedI) lines.push(`published: ${phase.publishedI}`);
   lines.push(`pipeline: ${view.pipeline}`);
   lines.push(`gates: ${view.gates}`);
@@ -508,6 +514,9 @@ export function renderStatusView(input: StatusViewInput): string {
     ),
   );
   push(row("blocked", phase.blockedReason as string | undefined));
+  // Plan 05i: the resolved tools, then the environment block itself.
+  for (const line of view.envTools) lines.push(line);
+  if (view.envBlocked) lines.push(view.envBlocked);
   for (const nm of input.secrets?.missing ?? []) push(row("secret", `${nm} not set`));
   for (const nm of input.secrets?.tooShort ?? []) push(row("secret", `${nm} too short to mask`));
   if (name === "DONE" && (input.ownerChecklist?.length ?? 0) > 0) {

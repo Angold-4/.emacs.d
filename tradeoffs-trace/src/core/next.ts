@@ -42,8 +42,9 @@ function hasValidReview(phase: PhaseState, who: Reviewer): boolean {
 }
 
 export function next(state: State): Action[] {
-  // While the run is paused for budget, nothing dispatches for any phase.
-  if (state.run === "RUN_PAUSED_BUDGET") return [];
+  // While the run is paused for budget or blocked on its environment,
+  // nothing dispatches for any phase.
+  if (state.run !== "RUN_ACTIVE") return [];
 
   const p = state.phase;
 

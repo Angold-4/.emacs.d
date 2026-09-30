@@ -188,6 +188,64 @@ From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
   shallow clone, because candidate checkouts can't be made from one. Run
   `git fetch --unshallow` first.
 
+## Launching from launchd, cron or a script
+
+A run inherits the environment of whatever starts it: `tt start`/`tt resume`,
+`tt program start`/`resume`/`retry`, or `launchctl`, `cron`, a wrapper script
+— and, below it, the environment Emacs was started from. That environment is
+where the toolchain is found: `cargo`, `make`, `node`, `docker`, `gh` and
+every other command the phase's checks and its `:GATE:`/`:GATE_CLEANUP:`
+name. `launchctl`, `cron` and a fresh non-login shell do **not** read your
+shell profile, so their `PATH` is usually the bare system default and lacks
+`~/.cargo/bin` (the way atlas program 15 was launched: every check exited 127
+with `/bin/sh: cargo: command not found`).
+
+Before it takes the base baseline or launches any agent, the conductor
+resolves the executable of every declared command with `command -v` in **its
+own** environment. It records the resolved path of each tool it checked
+(`tt status` shows `env  cargo /Users/you/.cargo/bin/cargo`). A command whose
+executable is not on the `PATH` stops the run at once in the new
+**`ENV_BLOCKED`** state — before the baseline and before any agent — and the
+status, the status view and the program buffer say exactly what is wrong:
+
+```text
+env blocked · cargo not found on PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+```
+
+An environment failure is never the code's fault. A check, baseline, probe or
+gate command that exits **126** or **127** anywhere (`command not found` /
+`not executable`) is classified the same way: the run moves to `ENV_BLOCKED`
+with the command and the log tail, and it is never written as a baseline,
+reused by a sibling node, counted as `checks failed`, or turned into a repair
+round or a finding. A shared baseline record whose commands exited 126/127
+(from before this change) is ignored on read, so the baseline re-runs in a
+fixed environment instead of excusing a candidate against a broken base.
+
+Recovery:
+
+1. Fix the environment of the shell that launches `tt` — in a wrapper script,
+   export the toolchain `PATH` explicitly, e.g.
+   `export PATH="$HOME/.cargo/bin:$PATH"`. A `launchd`/`cron` job should carry
+   the full `PATH` itself, not rely on a login shell.
+2. `tt resume <run>` (or `tt program resume <id>`). The conductor re-runs the
+   preflight; if the tools now resolve, the run continues from exactly where
+   it stopped — a 127 during `CHECKING` leaves the phase in `CHECKING`, so the
+   checks re-run rather than losing the candidate. If a tool is still
+   missing, the run stays `ENV_BLOCKED` with the new reason.
+3. For a program, `tt program stop <id>` first if the scheduler is still up,
+   fix the environment, then `tt program resume <id>` (restarts the
+   environment-blocked nodes) or `tt program retry <id> <node>` (starts a
+   fresh run for one node). Both preflight every node they will start and
+   refuse — naming the missing tools, and creating no run — when the caller's
+   `PATH` still lacks one.
+
+`tt program start` and `tt program resume` preflight **every** node they
+would start in the caller's `PATH` before creating or launching anything, and
+`tt program retry` preflights the node it is retrying; `tt start` leaves the
+preflight to the conductor it launches. The preflight only ever checks the
+executable; a command that runs but fails to build is still an ordinary check
+failure.
+
 ## Lint a plan before it runs
 
 Every start lints the plan first — `C-c m r` (a single run, or every entry of a
@@ -735,6 +793,7 @@ the id does not revert anything.
 - **DONE:** the result is on the local `TT_BRANCH`. `tt summary <run>` writes the PR body (`<run>/views/pr.md`): the review outcome, blocking findings fixed during review, flagged decisions, **every open advisory finding** (accepted, not fixed) and tests removed from surviving files. Push and open the PR yourself. For a program, `tt program prs <id>` writes each DONE node's body and prints the `git push` and `gh pr create` commands with the stacked bases.
 - **AWAITING_OWNER ("needs you"):** repair rounds are exhausted. Read the verdict, then type a correction (it grants 3 more rounds), or `tt stop`.
 - **BLOCKED:** the run cannot continue, for example a reviewer is unavailable twice. The reason is in the status buffer. Fix the cause and start a new run.
+- **ENV_BLOCKED (environment):** a declared command's executable is not on the launching environment's `PATH`, or a check/baseline/probe/gate command exited 126/127. The status shows `env blocked · …` with the tool or command and the PRECISE `PATH`. Fix the environment and `tt resume` (or `tt program resume`/`retry`); the preflight re-runs and the phase continues where it stopped. See "Launching from launchd, cron or a script".
 
 ## Message states (contract v1)
 

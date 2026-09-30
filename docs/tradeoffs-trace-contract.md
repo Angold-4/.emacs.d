@@ -292,7 +292,74 @@ binding check rejects it.
 Front ends never infer a message's outcome from anything but these
 projections (or the `tt state` payload, which carries the same state).
 
-## 6. Version 1
+## 6. Environment preflight and `ENV_BLOCKED`
+
+The **run axis** has three states: `RUN_ACTIVE`, `RUN_PAUSED_BUDGET` (the run
+execution budget, §8.1) and `ENV_BLOCKED` (plan 05i). `ENV_BLOCKED` freezes
+dispatch exactly like a pause, while the **phase state is preserved** — a 127
+during `CHECKING` leaves the phase in `CHECKING`, so a passing resume re-runs
+the checks instead of losing the candidate.
+
+Before it takes the base baseline or launches any agent, and again on every
+`tt resume`, the conductor resolves the executable of every declared shell
+command (each effective check, the contract's `:GATE:` and `:GATE_CLEANUP:`)
+with `command -v` in its own `PATH`. It records the resolved path of each tool
+it checked (`ENV_CHECKED`, a record-only event stored in `phase.env.tools`,
+shown as `env  cargo /Users/…/.cargo/bin/cargo`). The preflight parses a
+shell command into the first word of every simple command, splitting on `&&`,
+`||`, `;`, `|` and a lone `&`, treating file-descriptor redirections
+(`2>&1`, `>&2`, `&>file`, `2>/dev/null`) as redirections rather than
+separators, and skipping shell builtins, keywords (and a `for`/`select`
+loop's variables) and variable assignments (`src/core/env-preflight.ts`).
+
+The run-axis rows (all in `TRANSITIONS`):
+
+| id | from | trigger | to |
+| --- | --- | --- | --- |
+| `env-preflight-failed` | `RUN_ACTIVE` | `ENV_PREFLIGHT_FAILED` | `ENV_BLOCKED` |
+| `env-preflight-failed-already-blocked` | `ENV_BLOCKED` | `ENV_PREFLIGHT_FAILED` | `ENV_BLOCKED` |
+| `env-preflight-failed-from-budget` | `RUN_PAUSED_BUDGET` | `ENV_PREFLIGHT_FAILED` | `ENV_BLOCKED` |
+| `env-check-failed` | `RUN_ACTIVE` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
+| `env-check-failed-already-blocked` | `ENV_BLOCKED` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
+| `env-check-failed-from-budget` | `RUN_PAUSED_BUDGET` | `ENV_CHECK_FAILED` | `ENV_BLOCKED` |
+| `env-resumed` | `ENV_BLOCKED` | `RUN_RESUMED` | `RUN_ACTIVE` |
+| `env-resumed-to-budget` | `ENV_BLOCKED` | `RUN_RESUMED` | `RUN_PAUSED_BUDGET` |
+
+A run that a conductor can start or resume is in `RUN_ACTIVE`, `RUN_PAUSED_BUDGET`
+or `ENV_BLOCKED`, and the preflight runs on every start — so the failure rows
+exist from all three.
+
+Events:
+
+- `ENV_CHECKED { path, tools: [{name, path?}] }` — record-only; stores the
+  resolved tools in `phase.env` for the status views and moves no state.
+- `ENV_PREFLIGHT_FAILED { missing, path }` — a declared command's executable
+  is not on the conductor's `PATH`. The run becomes `ENV_BLOCKED` before the
+  baseline and before any agent, with the missing names and the exact `PATH`.
+- `ENV_CHECK_FAILED { stage, command, exitCode, tail }` — a check, baseline,
+  probe or gate command exited 126/127. The run becomes `ENV_BLOCKED`
+  carrying the command and the log tail. It is **never** written as a
+  baseline, reused by a sibling, recorded as `checks failed`, or turned into
+  a repair or a finding.
+- `RUN_RESUMED` — from `ENV_BLOCKED` (and, separately, from
+  `RUN_PAUSED_BUDGET`): the preflight (or the budget) no longer blocks; the
+  frozen phase continues. A block entered from a budget pause remembers that
+  pause (`phase.env.resumeRun`) and clears back to `RUN_PAUSED_BUDGET`, so
+  clearing the environment block never silently runs past an exhausted
+  budget (`env-resumed-to-budget`).
+
+A baseline record whose commands exited 126/127 — a record written before
+this change, or a sibling's shared copy — is **ignored on read**
+(`baselineHasEnvironmentFailure`), so the baseline re-runs in a fixed
+environment instead of excusing a candidate against a broken base. The
+visible line is `env blocked · <tool> not found on PATH (<path>)`, or
+`env blocked · <command> exit <126|127> — the tool is not available here`.
+
+`tt program start`/`resume`/`retry` run the same preflight in the caller's
+`PATH` for every node they will start and refuse, naming the missing tools,
+before any run is created.
+
+## 7. Version 1
 
 This is contract version 1. A future change to the message states, the event
 names, the binding shape, the `contentHash` inputs or the carry rule bumps the
