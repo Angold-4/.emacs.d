@@ -181,14 +181,27 @@ then.  It is never part of the worker's or a reviewer's acceptance."
       (with-temp-file (expand-file-name "emacs.json" dir) (insert (json-encode `((planPath . ,plan-path))))))
     dir))
 
+(defun +tt-test--run-row (dir plan-path)
+  "A `tt list --json' row for the fake run DIR, as `+tt--run-rows' returns."
+  `((id . ,(file-name-nondirectory dir))
+    (runDir . ,dir) (dir . ,dir) (root . ,(file-name-directory dir)) (host . nil)
+    (readableId . nil) (planPath . ,plan-path) (title . ,(file-name-nondirectory dir))
+    (phase . "IMPLEMENTING") (stage . "IMPLEMENT") (stageElapsed . "0s")
+    (reviews . "") (attention . nil) (needsYou . 0) (alive . nil) (activity . 0)))
+
 (ert-deftest tradeoffs-trace-run-resolution ()
-  "Design §1.4: buffer-local run, then the plan's run, then completing-read."
+  "Design §1.4: buffer-local run, then the plan's run, then completing-read.
+With multiple roots the candidates come from one `tt list --json' per root,
+so this stubs `+tt--run-rows' with the rows those calls would return."
   (let* ((+tt-root (make-temp-file "tt-ert-root" t))
          (a (+tt-test--make-run +tt-root "run-a" "/tmp/plan-a.org"))
          (b (+tt-test--make-run +tt-root "run-b" "/tmp/plan-b.org"))
-         (b2 (+tt-test--make-run +tt-root "run-b2" "/tmp/plan-b.org")))
+         (b2 (+tt-test--make-run +tt-root "run-b2" "/tmp/plan-b.org"))
+         (rows (list (+tt-test--run-row a "/tmp/plan-a.org")
+                     (+tt-test--run-row b "/tmp/plan-b.org")
+                     (+tt-test--run-row b2 "/tmp/plan-b.org"))))
     (unwind-protect
-        (progn
+        (cl-letf (((symbol-function '+tt--run-rows) (lambda () rows)))
           ;; 1. a tradeoffs-trace buffer's own run wins
           (with-temp-buffer (setq +tt--run-dir b) (should (equal (+tt--resolve-run) b)))
           ;; 2. a plan buffer with exactly one run uses it
@@ -888,11 +901,11 @@ first, and a value shorter than the conductor's own minimum is never masked."
          (concat "[{\"id\":\"p1\",\"title\":\"plan 13\",\"waiting\":["
                  "{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\","
                  "\"duration\":\"1h12m\",\"reason\":\"the repair budget ran out\"}]}]")))
-    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) fixture)))
+    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) fixture)))
       (let ((+tt--notify-flash nil))
         (should (equal (+tt--mode-line-wait) " [⚑ 13f waiting 1h12m]"))))
     ;; No program waiting: no segment.
-    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) "[]")))
+    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) "[]")))
       (should (null (+tt--mode-line-wait))))))
 
 (ert-deftest tradeoffs-trace-notification-echo ()
@@ -972,9 +985,8 @@ first, and a value shorter than the conductor's own minimum is never masked."
 (ert-deftest tradeoffs-trace-mode-line-wait-without-live-run ()
   "Plan 01b: a waiting node whose run conductor is gone still shows its wait."
   (let ((fixture "[{\"id\":\"p1\",\"waiting\":[{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\",\"duration\":\"1h12m\"}]}]"))
-    (cl-letf (((symbol-function '+tt--cli) (lambda (&rest _) fixture))
-              ((symbol-function '+tt--runs) (lambda () (list "/nonexistent-tt-run")))
-              ((symbol-function '+tt--live-run-p) (lambda (_) nil)))
+    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) fixture))
+              ((symbol-function '+tt--run-rows) (lambda () nil)))
       (let ((+tt--notify-flash nil))
         (+tt--mode-line-update)
         (should (string-match-p "⚑ 13f waiting 1h12m" +tt--mode-line-string))))))
@@ -2598,3 +2610,292 @@ one-line notice and no error."
               (should (string-match-p "^models    worker=deepseek" text))
               (should-not (string-match-p "^chart " text)))))
       (delete-directory dir t))))
+
+;;; Several machines: one config, every root.
+
+(defun +tt-test--program-json (id title state alive source activity)
+  "One `tt program list --json' object, as `+tt--program-rows' parses it."
+  (json-encode `((id . ,id) (title . ,title) (state . ,state)
+                 (nodeCount . 1) (source . ,source) (started . 1)
+                 (activity . ,activity)
+                 (alive . ,(if alive t :false)) (waiting . []))))
+
+(ert-deftest tradeoffs-trace-roots-skip-this-machine ()
+  "A host that names this machine adds no second root."
+  (let ((+tt-root "/tmp/tt-local-root/")
+        (+tt-remote-hosts (list "mac" (system-name) "localhost")))
+    (should (equal (+tt--roots)
+                   (list "/tmp/tt-local-root/" "/ssh:mac:~/.tradeoffs-trace/"))))
+  (should (+tt--self-host-p (system-name)))
+  (should (+tt--self-host-p "localhost"))
+  (should-not (+tt--self-host-p "mac"))
+  (should (equal (+tt--host-of-root "/ssh:mac:~/.tradeoffs-trace/") "mac"))
+  (should-not (+tt--host-of-root "/tmp/tt-local-root/")))
+
+(ert-deftest tradeoffs-trace-program-picker-across-roots ()
+  "One `tt program list --json' per root; labels title · state · id · host,
+newest activity first, and choosing opens the program on its own root."
+  (let* ((root1 (make-temp-file "tt-ert-root1" t))
+         (root2 (file-name-as-directory "/ssh:host2:~/.tradeoffs-trace/"))
+         calls offered opened)
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root1 root2)))
+                  ((symbol-function '+tt--cli-on)
+                   (lambda (root &rest _)
+                     (push root calls)
+                     (concat "["
+                             (if (equal root root1)
+                                 (+tt-test--program-json "aaa" "alpha" "running" t nil 100)
+                               (+tt-test--program-json "bbb" "beta" "done" nil nil 200))
+                             "]")))
+                  ((symbol-function 'completing-read)
+                   (lambda (_p coll &rest _) (setq offered (mapcar #'car coll)) (caar coll)))
+                  ((symbol-function '+tt--program-open)
+                   (lambda (dir) (setq opened dir))))
+          (with-temp-buffer (+tt-program)))
+      (should (equal (nreverse calls) (list root1 root2)))
+      (should (equal offered
+                     (list "beta  ·  done  ·  bbb  ·  host2"
+                           "alpha  ·  running  ·  aaa")))
+      (should (equal opened (concat root2 "programs/bbb"))))))
+
+(ert-deftest tradeoffs-trace-program-picker-skips-a-dead-root ()
+  "A root whose listing call fails is skipped with one message naming it;
+the other root still lists, and nothing signals."
+  (let* ((root1 (make-temp-file "tt-ert-root1" t))
+         (root2 (make-temp-file "tt-ert-root2" t))
+         messages rows)
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root1 root2)))
+                  ((symbol-function '+tt--cli-on)
+                   (lambda (root &rest _)
+                     (if (equal root root1)
+                         (concat "[" (+tt-test--program-json "aaa" "alpha" "running" nil nil 100) "]")
+                       (error "ssh: connect timed out"))))
+                  ((symbol-function 'message)
+                   (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+          (setq rows (+tt--program-rows)))
+      (should (= (length rows) 1))
+      (should (equal (alist-get 'id (car rows)) "aaa"))
+      (should (seq-find (lambda (m) (string-match-p (regexp-quote root2) m)) messages))
+      (delete-directory root1 t)
+      (delete-directory root2 t))))
+
+(ert-deftest tradeoffs-trace-commands-use-the-buffers-root ()
+  "A run or program opened on the second root runs tt on that root, with
+`--root' naming it, never `+tt-root'."
+  (let* ((root1 (make-temp-file "tt-ert-root1" t))
+         (root2 (make-temp-file "tt-ert-root2" t))
+         (run2 (expand-file-name "run-b" root2))
+         (runner (make-temp-file "tt-ert-runner" t))
+         (captured nil)
+         (+tt-root root1))
+    (make-directory (expand-file-name "src" runner) t)
+    (write-region "" nil (expand-file-name "src/cli.ts" runner))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root1 root2)))
+                  ((symbol-function '+tt--runner-dir) (lambda (&optional _) runner))
+                  ((symbol-function 'process-file)
+                   (lambda (_program _in destination _display &rest args)
+                     (setq captured (cons default-directory args))
+                     (when (consp destination)
+                       (with-temp-file (cadr destination) (insert "")))
+                     ;; A refresh falls back to `tt state' when no view file
+                     ;; exists; answer with a parseable (if minimal) state.
+                     (when (member "state" args) (insert "{}"))
+                     0)))
+          (with-temp-buffer
+            (setq +tt--run-dir run2 +tt--run-root root2)
+            (+tt--cli "stop" run2))
+          (should (equal (car captured) (file-name-as-directory root2)))
+          (should (member "--root" captured))
+          (should (equal (cadr (member "--root" captured)) (directory-file-name root2)))
+          (setq captured nil)
+          (with-temp-buffer
+            (setq +tt--run-dir run2 +tt--run-root root2)
+            (+tt--cli "verdict" run2 "T-1" "accept"))
+          (should (equal (car captured) (file-name-as-directory root2)))
+          ;; A program buffer opened on root2 too.
+          (setq captured nil)
+          (with-temp-buffer
+            (+tt-program-mode)
+            (setq +tt--program-dir (expand-file-name "programs/p2" root2)
+                  +tt--program-root root2
+                  +tt--run-dir (expand-file-name "programs/p2" root2)
+                  +tt--run-root root2)
+            (+tt--cli "program" "stop" +tt--program-dir))
+          (should (equal (car captured) (file-name-as-directory root2)))
+          ;; `C-c m k' on a phase buffer of root2 stops it there too.
+          (setq captured nil)
+          (with-temp-buffer
+            (+tt-status-mode)
+            (setq +tt--run-dir run2 +tt--run-root root2)
+            (cl-letf (((symbol-function '+tt--confirm) (lambda (_) t))
+                      ((symbol-function '+tt--refresh-all) (lambda () nil)))
+              (+tt-stop)))
+          (should (equal (car captured) (file-name-as-directory root2)))
+          (should (equal (cadr (member "--root" captured)) (directory-file-name root2)))
+          ;; A refresh of a run buffer on root2 falls back to `tt state',
+          ;; which must run on root2 as well (finding M-5/A-7).
+          (setq captured nil)
+          (with-temp-buffer
+            (+tt-status-mode)
+            (setq +tt--run-dir run2 +tt--run-root root2)
+            (ignore-errors (+tt--render-status)))
+          (should (equal (car captured) (file-name-as-directory root2)))
+          (should (member "--root" captured))
+          (should (equal (cadr (member "--root" captured)) (directory-file-name root2))))
+      (delete-directory root1 t)
+      (delete-directory root2 t)
+      (delete-directory runner t))))
+
+(ert-deftest tradeoffs-trace-source-match-strips-tramp ()
+  "A TRAMP-prefixed buffer file matches the server's recorded plain path.
+The source-file picker and run resolution both go through this (finding M-3)."
+  (cl-letf (((symbol-function 'file-local-name)
+             (lambda (f) (if (and (stringp f) (string-prefix-p "/ssh:mac:" f))
+                             (substring f (length "/ssh:mac:"))
+                           f))))
+    (should (+tt--same-file-p "/ssh:mac:/home/me/05_program.org" "/home/me/05_program.org"))
+    (should-not (+tt--same-file-p "/home/me/a.org" "/home/me/b.org"))))
+
+(ert-deftest tradeoffs-trace-mode-line-does-not-poll-remote-roots ()
+  "The 10-second mode-line timer only touches the local root.
+A dead remote host must never block Emacs in the background (M-2/D-13)."
+  (let* ((root1 (make-temp-file "tt-ert-root1" t))
+         (root2 (file-name-as-directory "/ssh:dead:~/.tradeoffs-trace/"))
+         (called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root1 root2)))
+                  ((symbol-function '+tt--cli-on)
+                   (lambda (root &rest _) (push root called) "[]"))
+                  ((symbol-function '+tt--notify-flash) nil))
+          (let ((+tt-root root1))
+            (+tt--mode-line-update))
+          (should (member (file-name-as-directory root1) called))
+          (should-not (member root2 called)))
+      (delete-directory root1 t))))
+
+(ert-deftest tradeoffs-trace-cli-bounds-connect-before-touching-the-root ()
+  "`+tt--cli-on' binds the short connect timeout before any remote access.
+`+tt--runner-dir' checks the remote runner with `file-exists-p', which must
+not open the connection at TRAMP's long default (finding A-6)."
+  (let* ((root (file-name-as-directory "/ssh:dead:~/.tradeoffs-trace/"))
+         (runner (make-temp-file "tt-ert-runner" t))
+         (seen nil))
+    (make-directory (expand-file-name "src" runner) t)
+    (write-region "" nil (expand-file-name "src/cli.ts" runner))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--runner-dir)
+                   (lambda (&optional _) (setq seen tramp-connection-timeout) runner))
+                  ((symbol-function 'process-file)
+                   (lambda (_p _i destination _d &rest _)
+                     (when (consp destination) (with-temp-file (cadr destination) (insert "")))
+                     0)))
+          (let ((+tt-connect-timeout 7)
+                (tramp-connection-timeout 60))
+            (+tt--cli-on root "list"))
+          (should (equal seen 7)))
+      (delete-directory runner t))))
+
+(ert-deftest tradeoffs-trace-program-picker-from-source-file ()
+  "In a buffer visiting a program's Org file, the picker offers only that
+file's programs; exactly one running opens it with no prompt."
+  (let* ((root (make-temp-file "tt-ert-root" t))
+         (src (expand-file-name "05_program.org" root))
+         (opened nil) offered)
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root)))
+                  ((symbol-function '+tt--program-open) (lambda (dir) (setq opened dir))))
+          ;; Two programs from the file, none running: offer only those two.
+          (cl-letf (((symbol-function '+tt--cli-on)
+                     (lambda (_root &rest _)
+                       (concat "["
+                               (+tt-test--program-json "aaa" "alpha" "done" nil src 100)
+                               ","
+                               (+tt-test--program-json "bbb" "beta" "done" nil src 200)
+                               ","
+                               (+tt-test--program-json "ccc" "gamma" "done" nil nil 300)
+                               "]"))))
+            (with-temp-buffer
+              (setq buffer-file-name src)
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (_p coll &rest _) (setq offered (mapcar #'car coll)) (caar coll))))
+                (+tt-program))
+              (setq buffer-file-name nil)))
+          (should (= (length offered) 2))
+          (should (string-match-p "beta" (nth 0 offered)))
+          (should (string-match-p "alpha" (nth 1 offered)))
+          (should (equal opened (expand-file-name "programs/bbb" root)))
+          ;; Exactly one running: open it, no prompt.
+          (setq opened nil offered nil)
+          (cl-letf (((symbol-function '+tt--cli-on)
+                     (lambda (_root &rest _)
+                       (concat "["
+                               (+tt-test--program-json "aaa" "alpha" "done" nil src 100)
+                               ","
+                               (+tt-test--program-json "bbb" "beta" "running" t src 200)
+                               "]")))
+                    ((symbol-function 'completing-read)
+                     (lambda (&rest _) (error "should not prompt"))))
+            (with-temp-buffer
+              (setq buffer-file-name src)
+              (+tt-program)
+              (setq buffer-file-name nil)))
+          (should (equal opened (expand-file-name "programs/bbb" root)))
+          ;; Anywhere else: every program.
+          (setq offered nil)
+          (cl-letf (((symbol-function '+tt--cli-on)
+                     (lambda (_root &rest _)
+                       (concat "["
+                               (+tt-test--program-json "aaa" "alpha" "done" nil src 100)
+                               ","
+                               (+tt-test--program-json "bbb" "beta" "done" nil src 200)
+                               ","
+                               (+tt-test--program-json "ccc" "gamma" "done" nil nil 300)
+                               "]")))
+                    ((symbol-function 'completing-read)
+                     (lambda (_p coll &rest _) (setq offered (mapcar #'car coll)) (caar coll))))
+            (with-temp-buffer (+tt-program))))
+      (should (= (length offered) 3))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-mode-maps-bind-only-commands ()
+  "Every key in every mode map, and every Evil normal-state binding, is a
+command; no Evil normal-state map binds a bare `g'.
+The mirror `+tt--evil-normal-maps' is checked in batch; when Evil is loaded
+the real auxiliary maps are checked too (finding M-4)."
+  (let ((maps (list +tt-program-mode-map +tt-trace-mode-map +tt-status-mode-map
+                    +tt-tape-mode-map +tt-input-mode-map +tt-review-mode-map
+                    +tt-decisions-mode-map +tt-runs-mode-map)))
+    (dolist (map maps)
+      ;; `map-keymap' also walks a parent and Emacs's event-property bindings
+      ;; (`follow-link', whose key is a symbol): only real keys count here.
+      (map-keymap (lambda (key def)
+                    (when (and (symbolp def) (not (symbolp key)))
+                      (should (commandp def))))
+                  map)
+      ;; The real Evil normal-state map when Evil is loaded.
+      (when (fboundp 'evil-get-auxiliary-keymap)
+        (let ((real (ignore-errors (evil-get-auxiliary-keymap map 'normal))))
+          (when real
+            (let ((g (lookup-key real "g")))
+              (should (or (null g) (keymapp g))))
+            (map-keymap (lambda (key def)
+                          (when (and (symbolp def) (not (symbolp key)))
+                            (should (commandp def))))
+                        real))))
+      (let ((aux (cdr (assq map +tt--evil-normal-maps))))
+        (when aux
+          (let ((g (lookup-key aux "g")))
+            (should (or (null g) (keymapp g))))
+          (map-keymap (lambda (key def)
+                        (when (and (symbolp def) (not (symbolp key)))
+                          (should (commandp def))))
+                      aux))))
+    ;; A `kbd'-ed key must survive the mirror: `(kbd (kbd "TAB"))' parses to
+    ;; no key, so a doubled conversion would silently drop TAB and RET.
+    (should (commandp (lookup-key (cdr (assq +tt-review-mode-map +tt--evil-normal-maps)) (kbd "TAB"))))
+    (should (commandp (lookup-key (cdr (assq +tt-decisions-mode-map +tt--evil-normal-maps)) (kbd "TAB"))))
+    (should (commandp (lookup-key (cdr (assq +tt-input-mode-map +tt--evil-normal-maps)) (kbd "RET"))))
+    (should (commandp '+tt--refresh-all))))

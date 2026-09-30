@@ -114,6 +114,32 @@ test("tt program state carries the id, the readable ids and the source path", ()
   }
 });
 
+test("tt list --json names each run's readable id and plan path", () => {
+  const root = fs.mkdtempSync("/tmp/tt-list-json-");
+  const repo = makeRepo();
+  try {
+    const runA = path.basename(createRun(root, plan(repo, "14a"), "run-a"));
+    const dir = makeProgram(root, { a: runA }, repo);
+    // `createRun` leaves meta.json to the conductor; `tt list` only lists runs
+    // that have one. Write the two files a started run has.
+    fs.writeFileSync(path.join(root, runA, "meta.json"), JSON.stringify({ title: "14a" }));
+    fs.writeFileSync(path.join(root, runA, "events.jsonl"), "");
+    fs.writeFileSync(
+      path.join(root, runA, "program.json"),
+      JSON.stringify({ programId: "prog0001", node: "a", readableId: "prog0001-01" }),
+    );
+    fs.writeFileSync(path.join(root, runA, "emacs.json"), JSON.stringify({ planPath: "/home/me/05_program.org" }));
+    const rows = JSON.parse(cli(root, "list", "--json")) as Array<Record<string, unknown>>;
+    const row = rows.find((r) => r.id === runA)!;
+    assert.equal(row.readableId, "prog0001-01");
+    assert.equal(row.planPath, "/home/me/05_program.org");
+    void dir;
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("a 100th node's readable id (three digits) still resolves", () => {
   const root = fs.mkdtempSync("/tmp/tt-readable-100-");
   const repo = makeRepo();

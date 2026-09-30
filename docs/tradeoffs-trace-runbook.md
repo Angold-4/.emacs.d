@@ -930,6 +930,47 @@ a run leaves the tab bar alone and uses ordinary windows; the run's buffers
 and headers carry the identity. Set it non-nil to get one `tab-bar` tab per
 run as before.
 
+## Several machines
+
+One Emacs config, kept in git and used on every machine, can list and open
+the runs and programs of every machine reachable over SSH:
+
+```elisp
+(setq +tt-remote-hosts '("mac" "buildbox"))
+```
+
+Each host adds the root `/ssh:HOST:~/.tradeoffs-trace/` beside the local
+`+tt-root`. A host that names the machine Emacs is running on — its
+`system-name`, or `localhost` — is skipped, so the same line works unchanged
+everywhere it is deployed. On the laptop, `C-c m p` and `C-c m l` show the
+laptop's programs and runs plus mac's and buildbox's; on mac itself the
+"mac" entry is skipped and the same config shows mac's own runs beside the
+others it can reach.
+
+Each root is listed with **one call run on that host**: `tt list --json` for
+runs, `tt program list --json` for programs (id, title, state, node count,
+its Org source file and last activity). Each call has a short connect
+timeout, so a dead host costs seconds, not TRAMP's default minute; a root
+whose call fails is skipped with one echo-area line naming it while the
+others still list. Pickers label each entry `title · state · readable id ·
+host` (the host is omitted for the local root), newest activity first, and
+choosing one opens it on its own root: every later `tt` command on that
+buffer (refresh, `C-c m k`/`C-c m c`, `C-c m d`, A/D verdicts, directives)
+runs against that root, never the default one. No per-run file is read over
+TRAMP while listing. Remote roots are listed only from a picker or a visible
+buffer; the periodic mode-line refresh reads the local root alone, so a dead
+host cannot stall Emacs in the background.
+
+`C-c m p` in a buffer visiting a program's Org file (`05_program.org`) skips
+the prompt: the running program of that file opens directly when exactly one
+is running, otherwise a picker limited to that file's programs, newest first,
+each labelled with its state and start time. The program buffer's header and
+every picker label name the source file next to the title.
+
+This needs passwordless SSH (ControlMaster is recommended) and a runner
+installed on each host (`tt runner install <sha>` run there), or `+tt-runner`
+set to one runner path every host shares.
+
 ## Stop and resume
 
 ```sh
