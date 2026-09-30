@@ -1,0 +1,91 @@
+* Needs you (3)
+** Should a vendor excluded before a weekend stay excluded when its market reopens?
+   :PROPERTIES:
+   :ID:       F-M-9
+   :KIND:     brief
+   :COMMAND:  resolve
+   :OPTIONS:  accept_risk,repair
+   :ACCEPT_OPTION: accept_risk
+   :REFUSE_OPTION: repair
+   :QUESTION: Should a vendor excluded before a weekend stay excluded when its market reopens?
+   :RECORD_VERSION: 1
+   :CANDIDATE_SHA:  c0ffee15d0000000000000000000000000000000
+   :CONTRACT_VERSION: 4
+   :CONTRACT_SHA256:  a1b2c3d4
+   :RUN_ID:   05661870
+   :PHASE_ID: atlas-15d
+   :END:
+   Today: Pyth's NVDA product reopens Sunday 20:00 ET[3]. Right now the excluded vendor rejoins at the first tick at or after that reopen, even though its first quote after a long break is often stale.
+   Impact: No market stops publishing[2]. At most a vendor is missing for about 10 s after a weekend reopen, so the published price is formed from a vendor fewer for that window[2].
+   Options:
+   - Keep as is [option:accept_risk] — the vendor rejoins immediately at the first tick after the reopen[2] Cost: a stale first quote can enter the price for up to 10 s[2]
+   - Hold it out [option:repair] (recommended) — the vendor stays excluded until 10 s after the reopen, then rejoins[4] Cost: 10 s with a vendor fewer at a reopen[4]
+   Recommendation: Hold it out — IC §5's re-entry rule asks for a settled first tick, not the first tick after a break
+   Related:
+   - [[*Should the re-entry band be widened?][D-A-80 — Should the re-entry band be widened?]]
+   - [[file:messages/T-54.org][T-54 — Should every held market make no offer at all until a vendor returns?]]
+   Glossary: [[file:glossary.org::Owner glossary][window]]
+*** Evidence
+   - [1] message: F-M-9 a vendor excluded before the weekend rejoins immediately at the first tick after a reopen
+   - [2] code: src/core/blend.rs:88 the re-entry wait is 10 s after a reopen
+   - [3] config: calendars.yaml us_equity opens Sun 20:00
+   - [4] code: src/core/blend.rs:41 the band constant is 10 s
+
+** Should the re-entry band be widened?
+   :PROPERTIES:
+   :ID:       D-A-80
+   :KIND:     brief
+   :COMMAND:  resolve
+   :OPTIONS:  accept_as_implemented,reject_and_repair
+   :ACCEPT_OPTION: accept_as_implemented
+   :REFUSE_OPTION: reject_and_repair
+   :QUESTION: Should the re-entry band be widened?
+   :RECORD_VERSION: 2
+   :CANDIDATE_SHA:  c0ffee15d0000000000000000000000000000000
+   :CONTRACT_VERSION: 4
+   :CONTRACT_SHA256:  a1b2c3d4
+   :RUN_ID:   05661870
+   :PHASE_ID: atlas-15d
+   :END:
+   Today: Stork's BTCUSD product trades around the clock: its calendar runs every minute of 00:00 to 23:59[3], so it has no reopen. The band now uses 10 s[2], the value the decision chose, and the excluded vendor rejoins when a fresh tick lands inside it.
+   Impact: No market stops publishing[2]. The wider band lets another vendor back in after a quiet spell, so the price is formed from more vendors more of the time.
+   Options:
+   - Accept it as implemented [option:accept_as_implemented] (recommended) — 10 s stays the re-entry band[2] Cost: a genuinely stale vendor can rejoin after 10 s[2]
+   - Reject and repair [option:reject_and_repair] — a new attempt picks the band again, with a further allowance Cost: a further repair round
+   Recommendation: Accept it as implemented — the panel's own count of re-entries agrees with IC §5's 10 s[2]
+   Glossary: [[file:glossary.org::Owner glossary][band]]
+*** Evidence
+   - [1] message: D-A-80 widen the re-entry band to 10 s failed its vote
+   - [2] code: src/core/blend.rs:41 the band constant is 10 s
+   - [3] config: calendars.yaml crypto_24_7 rth 00:00-23:59
+
+** Should the last good price be published while a market is held?
+   :PROPERTIES:
+   :ID:       D-B-82
+   :KIND:     brief
+   :COMMAND:  resolve
+   :OPTIONS:  accept_as_implemented,reject_and_repair
+   :ACCEPT_OPTION: accept_as_implemented
+   :REFUSE_OPTION: reject_and_repair
+   :QUESTION: Should the last good price be published while a market is held?
+   :RECORD_VERSION: 1
+   :CANDIDATE_SHA:  c0ffee15d0000000000000000000000000000000
+   :CONTRACT_VERSION: 4
+   :CONTRACT_SHA256:  a1b2c3d4
+   :RUN_ID:   05661870
+   :PHASE_ID: atlas-15d
+   :END:
+   Today: Kaiko's XAUUSD product closes Friday 17:00 ET for the weekend[3]. The current candidate does not publish during that held window; when the market reopens Sunday 18:00 ET[3] the first fresh price is published.
+   Impact: No market stops publishing[2]. While XAUUSD is held there is simply no offer, which is the documented behaviour; the change only affects whether the last price is repeated[2].
+   Options:
+   - Accept it as implemented [option:accept_as_implemented] (recommended) — no offer is published while the market is held Cost: consumers see no update for the held window
+   - Reject and repair [option:reject_and_repair] — a new attempt makes the held market repeat its last good price Cost: a further repair round; a stale price can be mistaken for a live one
+   Recommendation: Accept it as implemented — IC §7 says a held market makes no offer, and a repeated price would read as live
+   Related:
+   - [[file:messages/T-54.org][T-54 — Should every held market make no offer at all until a vendor returns?]]
+   Glossary: [[file:glossary.org::Owner glossary][window]] [[file:glossary.org::Owner glossary][held]]
+*** Evidence
+   - [1] message: D-B-82 publish the last good price while the market is held failed its vote
+   - [2] code: src/core/publish.rs:120 the held branch skips the offer
+   - [3] config: calendars.yaml metal_otc opens Sun 18:00; sessions 18:00-17:00
+

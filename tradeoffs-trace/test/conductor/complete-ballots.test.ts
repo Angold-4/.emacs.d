@@ -122,25 +122,14 @@ test("complete-ballots: a submit omitting two listed records is rejected naming 
     assert.deepEqual(new Set(missing), new Set([decisions[1].id, decisions[2].id]), "the rejection names both omitted records");
     assert.ok(!records.some((r) => r.kind === "incomplete_review"), "the corrected resubmission was complete");
 
-    // The rejection the model actually saw names every missing id and the
-    // record's one-line choice.
-    const streamDir = runPaths(setup.runDir).stream;
-    const mStream = fs.readdirSync(streamDir).find((f) => f.startsWith("reviewer-M-"));
-    assert.ok(mStream, "the M reviewer's RPC stream was written");
-    const streamPath = path.join(streamDir, mStream!);
-    // The stream's tool result is written by the agent's own stdout capture, so
-    // under load it can land a moment after DONE. Read once, then wait briefly
-    // for the ids rather than race the writer (the "names the ids" flake).
-    let streamText = fs.readFileSync(streamPath, "utf8");
-    const namesBoth = () => [decisions[1], decisions[2]].every((d) => streamText.includes(d.id));
-    const deadline = Date.now() + 5_000;
-    while (!namesBoth() && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      streamText = fs.readFileSync(streamPath, "utf8");
-    }
+    // The rejection the model was refused with names every missing id and the
+    // record's one-line choice. The conductor logs that exact reason, so this
+    // assertion never races the reviewer's stream file (the "names the ids"
+    // flake).
+    const reason = (rejected[0].event as { reason?: string }).reason ?? "";
     for (const d of [decisions[1], decisions[2]]) {
-      assert.ok(streamText.includes(d.id), `the rejection message names ${d.id}`);
-      assert.ok(streamText.includes(d.choice), `the rejection message gives ${d.id}'s choice`);
+      assert.ok(reason.includes(d.id), `the rejection message names ${d.id}`);
+      assert.ok(reason.includes(d.choice), `the rejection message gives ${d.id}'s choice`);
     }
   } finally {
     await teardown(setup);

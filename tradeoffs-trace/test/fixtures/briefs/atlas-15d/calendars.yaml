@@ -1,0 +1,19 @@
+# config/index/calendars.yaml — the plan's own session catalog.
+us_equity:
+  timezone: America/New_York
+  opens: "Sun 20:00"
+  sessions:
+    pre: "04:00-09:30"
+    rth: "09:30-16:00"
+    ah: "16:00-20:00"
+    overnight: "20:00-04:00"
+crypto_24_7:
+  timezone: UTC
+  opens: "always"
+  sessions:
+    rth: "00:00-23:59"
+metal_otc:
+  timezone: America/New_York
+  opens: "Sun 18:00"
+  sessions:
+    otc_open: "18:00-17:00"

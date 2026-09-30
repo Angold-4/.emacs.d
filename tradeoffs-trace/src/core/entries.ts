@@ -35,7 +35,8 @@
 // entry carries a deterministic `≈ E-n` hint instead, and only the owner's `m`
 // merges them (as ENTRY_MERGED_BY_OWNER).
 
-import type { Message, MessageType } from "./types.ts";
+import type { Decision, DecisionBrief, Message, MessageType, Override, OwnerRequest } from "./types.ts";
+import { renderBriefOrg, renderBriefsSection } from "./briefs.ts";
 
 // ---------------------------------------------------------------------------
 // Anchors
@@ -931,6 +932,25 @@ export interface EntryReviewOptions {
   readableId?: string;
   dirId?: string;
   phaseId?: string;
+  /** Decision briefs: one per open owner item, rendered as a `* Needs you'
+   * section above every entry. Each brief's question is its heading and its
+   * evidence is folded under TAB. */
+  briefs?: readonly DecisionBrief[];
+  /** The open owner requests the briefs answer, so the rendered brief
+   * carries the resolve binding. */
+  ownerRequests?: readonly OwnerRequest[];
+  /** The ids of the briefs that are still showable: open owner requests plus
+   * live flagged reserved decisions. A recorded brief whose item is settled
+   * is never shown under `Needs you' again. */
+  briefableIds?: ReadonlySet<string>;
+  /** Live decisions, so a reserved decision's brief is showable while the
+   * decision is still on this candidate. */
+  decisions?: readonly Decision[];
+  /** Owner overrides, so a reserved decision the owner already approved or
+   * rejected stops showing (finding M-11). */
+  overrides?: readonly Override[];
+  /** The binding a resolve command from a brief needs. */
+  resolveBinding?: { runId: string; phaseId: string; candidateSha: string; recordVersion: number; contractVersion: { snapshot: number; sectionSha256: string } };
   /** The program view: entries of every phase, tagged by phase. */
   program?: {
     id: string;
@@ -941,8 +961,14 @@ export interface EntryReviewOptions {
        * the candidate that phase is at, not the program's last one (finding
        * A-30). */
       candidate?: { sha: string };
+      runId?: string;
+      contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
       messages?: readonly Message[];
       entries?: readonly Entry[];
+      decisions?: readonly Decision[];
+      overrides?: readonly Override[];
+      briefs?: readonly DecisionBrief[];
+      ownerRequests?: readonly OwnerRequest[];
     }>;
   };
   newestCandidateSha?: string;
@@ -1037,12 +1063,67 @@ function entryReviewLabel(opts: EntryReviewOptions): string {
   return readable ?? dir ?? opts.phaseId ?? "";
 }
 
+/** The entries the owner has explicitly marked: a live entry with a linked
+ * message the owner refused. Not every live entry — showing each one twice
+ * buries the real decisions (findings M-58/disc-B-18). */
+export function ownerMarkedEntryIds(views: readonly EntryView[]): string[] {
+  return views.filter((v) => v.live && v.messages.some((m) => m.state === "refused")).map((v) => v.entry.id);
+}
+
+/** The ids a `Needs you' brief may still be shown for: every open owner
+ * request, plus every live flagged reserved decision on the current
+ * candidate (a reserved decision never becomes an owner request, so it would
+ * otherwise reach the owner as an engineer note). */
+export function briefableIdsFor(
+  requests: readonly OwnerRequest[] | undefined,
+  decisions: readonly Decision[] | undefined,
+  overrides: readonly Override[] | undefined,
+  candidateSha: string | undefined,
+  entryIds: Iterable<string> = [],
+): Set<string> {
+  const ids = new Set((requests ?? []).filter((r) => r.status === "open").map((r) => r.id));
+  for (const d of decisions ?? []) {
+    if (d.class !== "reserved" || d.amendment) continue;
+    if (d.supersededBy || d.supersededByCorrection) continue;
+    if (candidateSha && d.boundCandidateSha !== candidateSha) continue;
+    // An owner override settles the decision; it no longer needs the owner.
+    if ((overrides ?? []).some((o) => o.decisionId === d.id && (!candidateSha || o.boundCandidateSha === candidateSha))) continue;
+    ids.add(d.id);
+  }
+  // Only an entry the owner has MARKED gets a brief: one whose linked message
+  // the owner refused. Showing every live entry twice buries the real
+  // decisions (findings M-58/disc-B-18).
+  for (const id of entryIds) ids.add(id);
+  return ids;
+}
+
 /** `views/review.org` for one phase: three sections (Blockers, Findings,
  * Trade-offs), one heading per live entry, and the accounting footer. */
 export function renderEntryReview(opts: EntryReviewOptions): string {
   const projected = projectEntries({ messages: opts.messages, entries: opts.entries, newestCandidateSha: opts.newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness });
   const lines = reviewHeader(opts);
   lines.push("");
+  // Decision briefs first: the owner reads the question and the choice before
+  // any entry's evidence. Only items that are still open are shown; a recorded
+  // brief whose request is settled is not resurrected (finding M-3).
+  const entryIds = ownerMarkedEntryIds(projected.views);
+  const showable = opts.briefableIds ?? briefableIdsFor(opts.ownerRequests, opts.decisions, opts.overrides, opts.newestCandidateSha, entryIds);
+  // A brief recorded for another candidate must not read as current after a
+  // repair (finding disc-M-86): hide it until the new candidate's own brief is
+  // recorded. A brief with no candidateSha is a pre-field fixture and shows.
+  const briefs = (opts.briefs ?? []).filter(
+    (b) =>
+      showable.has(b.requestId) &&
+      (b.candidateSha === undefined || opts.newestCandidateSha === undefined || b.candidateSha === opts.newestCandidateSha),
+  );
+  lines.push(
+    ...renderBriefsSection(briefs, {
+      requestFor: (id) => (opts.ownerRequests ?? []).find((r) => r.id === id),
+      binding: opts.resolveBinding,
+      recordVersionFor: (id) =>
+        (opts.ownerRequests ?? []).find((r) => r.id === id)?.version ?? (opts.decisions ?? []).find((d) => d.id === id)?.version,
+    }),
+  );
   for (const s of SECTION_ORDER) lines.push(...renderSection(projected.views, s.kind, s.label, () => undefined));
   lines.push(accountingLine(projected.accounting));
   return `${lines.join("\n")}\n`;
@@ -1067,6 +1148,43 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
     readableId: p.readableId,
     projected: projectEntries({ messages: p.messages, entries: p.entries, newestCandidateSha: p.candidate?.sha ?? opts.newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness }),
   }));
+  // Decision briefs: every phase's open owner items, one section at the top.
+  // The brief's own requestId stays the heading id (never qualified), so a
+  // resolve from the program review names the real request (findings B-9,
+  // M-2); the phase tag is shown beside the heading and in a :PHASE:
+  // property. Only items still open are shown (finding M-3).
+  const allBriefs: Array<{
+    brief: DecisionBrief;
+    tag: string;
+    requests: readonly OwnerRequest[];
+    recordVersion?: number;
+    binding?: { runId: string; phaseId: string; candidateSha: string; recordVersion: number; contractVersion: { snapshot: number; sectionSha256: string } };
+  }> = [];
+  for (const p of program.phases) {
+    const tag = p.readableId ?? p.phaseId;
+    const entryIds = ownerMarkedEntryIds(perPhase.find((ph) => ph.phaseId === p.phaseId)?.projected.views ?? []);
+    const showable = briefableIdsFor(p.ownerRequests, p.decisions, p.overrides, p.candidate?.sha ?? opts.newestCandidateSha, entryIds);
+    const requests = p.ownerRequests ?? [];
+    const binding =
+      p.contract?.contractVersion && p.candidate?.sha && p.runId && p.phaseId
+        ? { runId: p.runId, phaseId: p.phaseId, candidateSha: p.candidate.sha, recordVersion: 1, contractVersion: p.contract.contractVersion }
+        : undefined;
+    const phaseSha = p.candidate?.sha ?? opts.newestCandidateSha;
+    for (const brief of p.briefs ?? []) {
+      if (!showable.has(brief.requestId)) continue;
+      if (brief.candidateSha !== undefined && phaseSha !== undefined && brief.candidateSha !== phaseSha) continue;
+      const recordVersion = requests.find((r) => r.id === brief.requestId)?.version ?? (p.decisions ?? []).find((d) => d.id === brief.requestId)?.version;
+      allBriefs.push({ brief, tag, requests, recordVersion, binding });
+    }
+  }
+  if (allBriefs.length > 0) {
+    lines.push(`* Needs you (${allBriefs.length})`);
+    for (const b of allBriefs) {
+      const request = (b.requests ?? []).find((r) => r.id === b.brief.requestId);
+      const binding = b.binding && b.recordVersion !== undefined ? { ...b.binding, recordVersion: b.recordVersion } : (b.binding ?? opts.resolveBinding);
+      lines.push(renderBriefOrg(b.brief, { request, binding, tag: b.tag, recordVersion: b.recordVersion }), "");
+    }
+  }
   const all: Array<{ view: EntryView; phaseTag: string; phaseIndex: number }> = [];
   for (const ph of perPhase) {
     const tag = ph.readableId ?? ph.phaseId;

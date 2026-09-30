@@ -408,6 +408,66 @@ export interface OwnerRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Decision briefs (owner-facing; see src/core/briefs.ts)
+// ---------------------------------------------------------------------------
+
+/** One plain-language option of a brief, carrying the underlying owner
+ * request's own option id, so resolving from the brief sends exactly the
+ * same resolve command as resolving the request. */
+export interface BriefOption {
+  id: string;
+  label: string;
+  /** What happens under this option. */
+  effect: string;
+  /** What it costs. */
+  cost: string;
+}
+
+/** Another open item that touches the same concern as a brief, so the owner
+ * sees the bigger risk beside the narrow request. */
+export interface BriefRelated {
+  id: string;
+  question: string;
+}
+
+/** One owner-facing decision brief for one open item that needs the owner's
+ * decision. Produced once per round after evaluation by the evaluator's
+ * model; validated by `briefIssue` in src/core/briefs.ts. */
+export interface DecisionBrief {
+  /** The owner request (or entry/message id) this brief is for. */
+  requestId: string;
+  /** The owner command choosing an option sends. `resolve` (default) settles
+   * an owner request; `override` approves or rejects a flagged reserved
+   * decision; `entry` settles a live review entry (accept/refuse). A brief for
+   * a reserved decision or an entry carries the command that item needs. */
+  command?: "resolve" | "override" | "entry";
+  /** One plain line, no code identifiers. */
+  question: string;
+  /** What the system does today, with one concrete example using real market
+   * names and times from the plan's calendars. */
+  today: string;
+  /** What the owner would notice; always answers whether any market stops
+   * publishing. */
+  impact: string;
+  options: BriefOption[];
+  /** One option and why, citing the plan or an IC section. Absent only for
+   * the deterministic backstop; it never recommends an option by position
+   * without evidence. */
+  recommendation?: { option: string; why: string };
+  /** The reason the backstop has no recommendation (the writer timed out, its
+   * tools did not match, or it did not run), rendered in plain words where the
+   * recommendation would be (OD-3 / D-B-79). */
+  noRecommendationReason?: string;
+  related: BriefRelated[];
+  /** The original message/finding/file:line, folded under TAB. */
+  evidence: string[];
+  /** The candidate this brief was written for, so a later candidate's round
+   * rewrites it (the plan asks for one brief per round). Internal to the
+   * conductor: the evaluator's `submit_brief` does not supply it. */
+  candidateSha?: string;
+}
+
+// ---------------------------------------------------------------------------
 // §7.5 Corrections (revise)
 // ---------------------------------------------------------------------------
 
@@ -1019,6 +1079,16 @@ export interface PhaseState {
    * repaired candidate see them (finding A-5), and marked with that candidate
    * so a later one is not shown a stale split (finding A-9). */
   lastCheckFailures?: LastCheckFailures;
+  /** Decision briefs (one per open owner item), produced once per round after
+   * evaluation and folded from BRIEFS_RECORDED. The views render these above
+   * the evidence; the status `needs you` line shows the first one's
+   * question. */
+  briefs?: DecisionBrief[];
+  /** Plan 05k (OD-6): the `<candidateSha>::<itemId>` keys whose only brief on
+   * that candidate is a backstop and for which the brief writer has already
+   * been re-dispatched once. Folded from BRIEF_RETRY_ATTEMPTED, so the retry
+   * is once per candidate even across a restart. */
+  briefRetries?: string[];
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
@@ -1870,8 +1940,29 @@ export interface EvMessageCarried {
   sourceContentHash?: string;
 }
 
+/** Decision briefs: one per open owner item, produced once per round after
+ * evaluation. A record-only event (no phase-state-name change; handled by
+ * reduce.ts's applyRecordEvent) merged by requestId, so a conductor restart
+ * rebuilds the briefs the views render from the log alone. */
+export interface EvBriefsRecorded {
+  type: "BRIEFS_RECORDED";
+  briefs: DecisionBrief[];
+}
+
+/** Plan 05k (OD-6): the brief writer was re-dispatched once for the named
+ * items, whose only brief on `candidateSha` was a backstop. A record-only
+ * event (handled by reduce.ts's applyRecordEvent) so the once-per-candidate
+ * bound survives a conductor restart. */
+export interface EvBriefRetryAttempted {
+  type: "BRIEF_RETRY_ATTEMPTED";
+  candidateSha: string;
+  requestIds: string[];
+}
+
 export type Event =
   | EvReviewLintFailed
+  | EvBriefsRecorded
+  | EvBriefRetryAttempted
   | EvEntryCurated
   | EntryEvent
   | EvAttemptStarted

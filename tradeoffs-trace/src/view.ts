@@ -437,6 +437,10 @@ export interface RunView {
   /** Minutes since the active agent last produced an event (agent stages only). */
   idleMinutes?: number;
   attention?: string;
+  /** Decision briefs: when `attention` is `needs you`, the plain question of
+   * the first open item's brief, so the status buffer shows the question
+   * rather than a finding id. Undefined when no brief is recorded. */
+  attentionQuestion?: string;
   /** Plan 04c: the balance metrics (review share, rounds, raw/published per
    * type, merge/drop rates, A/D, owner wait, blockers, unexposed proxy) and
    * the one status line that renders them. */
@@ -653,6 +657,31 @@ export function buildView(
   else if (!alive && phase.phase !== "DONE") attention = "conductor stopped";
   else if (idleMinutes !== undefined && idleMinutes > 5) attention = `idle ${Math.round(idleMinutes)}m`;
   else if (t && t.byCategory.polling.ms > t.elapsedMs / 4) attention = "heavy polling";
+  // Decision briefs: the `needs you` line names the owner's actual question.
+  // The wait may be a flagged reserved decision or a live entry, not only an
+  // open request (finding B-38), so all three owner-item classes are walked.
+  const waitingIds = new Set(phase.ownerRequests.filter((r) => r.status === "open").map((r) => r.id));
+  for (const d of phase.decisions) {
+    if (d.class !== "reserved" || d.amendment || d.supersededBy || d.supersededByCorrection) continue;
+    if (C && d.boundCandidateSha !== C) continue;
+    if (phase.overrides.some((o) => o.decisionId === d.id && (!C || o.boundCandidateSha === C))) continue;
+    waitingIds.add(d.id);
+  }
+  // Only an entry the owner explicitly marked (a linked message the owner
+  // refused) is waiting; every live entry would bury the real decisions.
+  const refusedMessages = new Set((phase.messages ?? []).filter((m) => m.state === "refused").map((m) => m.id));
+  for (const e of phase.entries ?? []) {
+    if (e.state !== "open") continue;
+    if ((e.links ?? []).some((l) => refusedMessages.has(l.messageId))) waitingIds.add(e.id);
+  }
+  // A brief written for another candidate must not read as current after a
+  // repair (finding disc-M-86).
+  const firstBrief = (phase.briefs ?? []).find(
+    (b) => waitingIds.has(b.requestId) && (b.candidateSha === undefined || !C || b.candidateSha === C),
+  );
+  // A parked phase (needs you) AND a BLOCKED phase both wait on the owner and
+  // both get briefs, so the line names the question either way (disc-M-185).
+  const attentionQuestion = attention === "needs you" || attention === "BLOCKED" ? firstBrief?.question : undefined;
 
   const firstAt = timeline.phases[0]?.at;
   const endAt = phase.phase === "DONE" || phase.phase === "BLOCKED" ? Date.parse(timeline.phases[timeline.phases.length - 1].at) : now.getTime();
@@ -713,6 +742,7 @@ export function buildView(
     needsYou,
     idleMinutes,
     attention,
+    attentionQuestion,
     envBlocked,
     envTools,
     ...(flakesLine(metrics) ? { flakes: flakesLine(metrics)! } : {}),

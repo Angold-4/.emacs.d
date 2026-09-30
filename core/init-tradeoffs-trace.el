@@ -1471,13 +1471,19 @@ open the decision view at that record."
           (insert (format "  - %s\n" (+tt--one-line item 200))))))
     (+tt--render-owner-inputs s)
     (when attention
-      (insert "\n" (propertize (format "⚑ %s%s" attention
-                                       (cond ((equal attention "needs you")
-                                              " — type a correction in the input box (C-c m d to read the review)")
-                                             ((equal attention "conductor stopped") " — M-x +tt-resume")
-                                             (t "")))
-                               'face 'error)
-              "\n"))))
+      ;; Decision briefs: the `needs you' line names the owner's actual
+      ;; question, never a finding id.
+      (let ((label (if (and (alist-get 'attentionQuestion v)
+                            (member attention '("needs you" "BLOCKED")))
+                       (format "%s — %s" attention (alist-get 'attentionQuestion v))
+                     attention)))
+        (insert "\n" (propertize (format "⚑ %s%s" label
+                                         (cond ((equal attention "needs you")
+                                                " — type a correction in the input box (C-c m d to read the review)")
+                                               ((equal attention "conductor stopped") " — M-x +tt-resume")
+                                               (t "")))
+                                 'face 'error)
+                "\n")))))
 
 (defun +tt--status-restore-records ()
   "Restore the `+tt-record' property a rendered trade-off line carries.
@@ -2085,18 +2091,50 @@ The id text property is what RET and A/D read at point; the section heading
   "Non-nil when point is on a message heading (one carrying an `:ID:')."
   (and (org-at-heading-p) (org-entry-get nil "ID")))
 
+(defun +tt-review--brief-evidence-heading ()
+  "Position of the brief at point's `Evidence' child heading, or nil.
+The decision's paragraphs stay visible; only this child is folded (goal (3))."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((end (save-excursion (org-end-of-subtree t) (point))))
+      (when (re-search-forward "^\\*\\*\\* Evidence" end t)
+        (match-beginning 0)))))
+
 (defun +tt-review--fold-messages ()
   "Fold every message's body and property drawer, keeping every title visible.
 Plan 05c: the layout is deterministic, independent of the user's
 `org-startup-folded'.  Only a heading carrying an `:ID:' is a message, so the
 section headings and the `Minor (N)' group headings stay expanded and every
-message's one-line title is on screen."
+message's one-line title is on screen.  A decision brief keeps its question,
+today, impact, options and recommendation visible and folds only its
+`Evidence' child, so the owner can decide without a keystroke (disc-M-172)."
   (org-fold-show-all)
   (save-excursion
     (goto-char (point-max))
     (while (re-search-backward "^\\*+ " nil t)
-      (when (save-excursion (goto-char (match-beginning 0)) (org-entry-get nil "ID"))
-        (org-fold-hide-subtree)))))
+      (let* ((start (match-beginning 0))
+             (kind (save-excursion (goto-char start) (org-entry-get nil "KIND")))
+             (id (save-excursion (goto-char start) (org-entry-get nil "ID"))))
+        (cond
+         ((equal kind "brief")
+          (let ((end (save-excursion (goto-char start) (org-end-of-subtree t) (point))))
+            ;; A-47: the brief's own property drawer is folded like every other
+            ;; message's, while today/impact/options/recommendation stay visible.
+            (save-excursion
+              (goto-char start)
+              (when (re-search-forward "^[ \t]*:PROPERTIES:[ \t]*$" end t)
+                (goto-char (match-beginning 0))
+                (org-fold-hide-drawer-toggle)))
+            (save-excursion
+              (goto-char start)
+              (when (re-search-forward "^\\*\\*\\* Evidence" end t)
+                (org-fold-hide-subtree)))))
+         (id (org-fold-hide-subtree)))))))
+
+(defun +tt-review--brief-evidence-folded-p ()
+  "Non-nil when the brief at point's Evidence child is folded."
+  (let ((pos (+tt-review--brief-evidence-heading)))
+    (and pos (save-excursion (goto-char pos) (org-fold-folded-p (line-end-position))))))
 
 (defun +tt-review--body-folded-p ()
   "Non-nil when the message at point has its body hidden.
@@ -2124,13 +2162,22 @@ is read from the line after the drawer (`:END:'), not from the drawer."
 
 (defun +tt-review-toggle ()
   "Toggle the message at point: show its body, keep its property drawer folded.
-Plan 05c: `TAB' never opens the drawer; `RET' opens the message's own file."
+Plan 05c: `TAB' never opens the drawer; `RET' opens the message's own file.
+A decision brief: `TAB' unfolds the original evidence the plan keeps hidden
+behind `Evidence' (disc-M-172)."
   (interactive)
   (unless (+tt-review--message-heading-p)
     (user-error "No message on this line"))
-  (if (+tt-review--body-folded-p)
-      (org-fold-show-entry 'hide-drawers)
-    (org-fold-hide-subtree)))
+  (if (+tt-review--brief-kind)
+      (let ((pos (+tt-review--brief-evidence-heading)))
+        (unless pos (user-error "This brief has no evidence section"))
+        (goto-char pos)
+        (if (org-fold-folded-p (line-end-position))
+            (org-fold-show-subtree)
+          (org-fold-hide-subtree)))
+    (if (+tt-review--body-folded-p)
+        (org-fold-show-entry 'hide-drawers)
+      (org-fold-hide-subtree))))
 
 (defun +tt-review--setup ()
   "Put the review buffer in its read-only, file-only display state.
@@ -2165,17 +2212,20 @@ After a refresh a message may have disappeared; point then goes to the top."
 (defun +tt-review-open-message ()
   "Open the detail file for the entry or message at point (RET).
 Plan 05j: an entry heading (`E-n') opens `views/entries/<id>.org', a linked
-message line opens `views/messages/<id>.org'."
+message line opens `views/messages/<id>.org'. Decision briefs: RET chooses one
+of the brief's options and resolves the owner request."
   (interactive)
-  (let* ((entry (+tt-review--entry-id))
-         (id (cond (entry entry)
-                   ((+tt-review--bullet-message-id))
-                   (t (+tt-review--message-id))))
-         (dir (if (and id (string-prefix-p "E-" id)) "views/entries/" "views/messages/"))
-         (file (and id +tt--run-dir (expand-file-name (concat dir id ".org") +tt--run-dir))))
-    (unless id (user-error "No entry or message on this line"))
-    (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
-    (find-file file)))
+  (if (+tt-review--brief-kind)
+      (+tt-review--brief-choose)
+    (let* ((entry (+tt-review--entry-id))
+           (id (cond (entry entry)
+                     ((+tt-review--bullet-message-id))
+                     (t (+tt-review--message-id))))
+           (dir (if (and id (string-prefix-p "E-" id)) "views/entries/" "views/messages/"))
+           (file (and id +tt--run-dir (expand-file-name (concat dir id ".org") +tt--run-dir))))
+      (unless id (user-error "No entry or message on this line"))
+      (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
+      (find-file file))))
 
 (defun +tt-review--entry-id ()
   "The `E-n' id of the entry at point, or nil."
@@ -2219,6 +2269,115 @@ ENTRY_MERGED_BY_OWNER."
     (unless into (user-error "Entry %s carries no ≈ hint; nothing to merge" entry))
     (message "%s" (+tt--cli "entry" +tt--run-dir "merge" entry into))
     (+tt-review-refresh t)))
+
+(defun +tt-review--brief-kind ()
+  "Non-nil when point is on a decision brief heading (`:KIND: brief')."
+  (equal (org-entry-get nil "KIND") "brief"))
+
+(defun +tt-review--brief-options ()
+  "The brief's own option ids, in order, or nil."
+  (let ((opts (org-entry-get nil "OPTIONS")))
+    (when (and opts (not (string-empty-p opts)))
+      (split-string opts "," t))))
+
+(defun +tt-review--brief-binding ()
+  "The decision-view binding tuple a resolve from the brief needs, or nil.
+The full binding travels with the command, so choosing an option from a brief
+sends the identical resolve command choosing it on the request sends."
+  (let ((vals (mapcar (lambda (k) (org-entry-get nil k))
+                      '("RUN_ID" "PHASE_ID" "CANDIDATE_SHA" "RECORD_VERSION"
+                        "CONTRACT_VERSION" "CONTRACT_SHA256"))))
+    (when (seq-every-p (lambda (v) (and v (not (string-empty-p v)))) vals)
+      (list (cons 'runId (nth 0 vals))
+            (cons 'phaseId (nth 1 vals))
+            (cons 'recordId (+tt-review--message-id))
+            (cons 'candidateSha (nth 2 vals))
+            (cons 'recordVersion (string-to-number (nth 3 vals)))
+            (cons 'contractVersion (list (cons 'snapshot (string-to-number (nth 4 vals)))
+                                         (cons 'sectionSha256 (nth 5 vals))))))))
+
+(defun +tt-review--brief-option (key fallback)
+  "The brief's option id under property KEY, or FALLBACK."
+  (let ((v (org-entry-get nil key)))
+    (if (and v (not (string-empty-p v))) v fallback)))
+
+(defun +tt-review--brief-choices ()
+  "The brief's option lines as an alist of (plain label . option id).
+RET completes on the labels, so the engineer option ids never come back into
+the owner's face (finding B-35)."
+  (let (choices)
+    (save-excursion
+      (org-back-to-heading t)
+      (let ((end (save-excursion (org-end-of-subtree t) (point))))
+        (while (re-search-forward "^[ \t]*- \\(.*?\\) \\[option:\\([A-Za-z0-9_-]+\\)\\]" end t)
+          (push (cons (match-string 1) (match-string 2)) choices))))
+    (nreverse choices)))
+
+(defun +tt-review--brief-note (text)
+  "Queue TEXT as an owner note, so it reaches the next worker attempt.
+Used for a refusal's optional reason (OD-2 / D-B-78): the resolve/override
+command itself carries no free text, so the reason rides a note command."
+  (let ((binding (+tt-review--brief-binding)))
+    (when binding
+      (+tt--write-command
+       +tt--run-dir
+       (list (cons 'type "note")
+             (cons 'text text)
+             (cons 'binding (list (cons 'runId (alist-get 'runId binding))
+                                  (cons 'phaseId (alist-get 'phaseId binding)))))))))
+
+(defun +tt-review--brief-resolve (option)
+  "Write the command for the brief at point with OPTION.
+The brief's `:COMMAND:' says whether OPTION is a `resolve' (an owner request),
+an `override' (a flagged reserved decision) or an entry verdict (a live review
+entry); either way the same encoding the item itself uses is written. Any
+refusal asks for the optional reason (OD-2 / D-B-78), and an `accept_risk'
+option also prompts for the non-empty scope note the request requires."
+  (let* ((binding (+tt-review--brief-binding))
+         (command (or (org-entry-get nil "COMMAND") "resolve"))
+         (accept-option (org-entry-get nil "ACCEPT_OPTION"))
+         (refuse (and accept-option (not (equal option accept-option)))))
+    (cond
+     ((equal command "entry")
+      (let ((reason (when refuse (read-string "Reason (optional): "))))
+        (message "%s"
+                 (apply #'+tt--cli
+                        (append (list "entry" +tt--run-dir (if (equal option "accept") "accept" "refuse") (+tt-review--message-id))
+                                (when (and reason (not (string-empty-p reason))) (list "--reason" reason)))))))
+     (t
+      (unless binding
+        (user-error "This brief has no full binding; refresh the review (g) and try again"))
+      (cond
+       ((equal command "override")
+        (let ((reason (when refuse (read-string "Reason (optional): "))))
+          (+tt--write-command
+           +tt--run-dir
+           (list (cons 'type "override")
+                 (cons 'vote (if (equal option "approve") "approve" "reject"))
+                 (cons 'binding binding)))
+          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason))))
+       (t
+        (let* ((note (when (equal option "accept_risk")
+                       (let ((n (read-string "Scope note for accepting the risk: ")))
+                         (when (string-empty-p n)
+                           (user-error "accepting the risk needs a non-empty scope note"))
+                         n)))
+               (reason (when (and refuse (not note)) (read-string "Reason (optional): ")))
+               (carried (or note (and reason (not (string-empty-p reason)) reason))))
+          (+tt--write-command
+           +tt--run-dir
+           (append (list (cons 'type "resolve") (cons 'option option))
+                   (when carried (list (cons 'note carried)))
+                   (list (cons 'binding binding))))
+          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason)))))))))
+
+(defun +tt-review--brief-choose ()
+  "Prompt for one of the brief's options (by plain label) and send it."
+  (let ((choices (+tt-review--brief-choices)))
+    (unless choices (user-error "This brief carries no options"))
+    (let* ((choice (completing-read "Resolve with: " choices nil t))
+           (id (or (cdr (assoc choice choices)) choice)))
+      (message "%s" (+tt-review--brief-resolve id)))))
 
 (defun +tt-review--binding-at-point ()
   "The six binding property values at point, or nil when any is missing.
@@ -2280,19 +2439,32 @@ is shown in the echo area and the buffer refreshes."
       (+tt-review-refresh t))))
 
 (defun +tt-review-accept ()
-  "Accept the entry or message at point (A)."
+  "Resolve the brief at point with its accept option (A), or accept the entry
+or message at point. The brief's `:ACCEPT_OPTION:' names the option by its own
+meaning, never by its position."
   (interactive)
-  (+tt-review--verdict "accept" nil))
+  (if (+tt-review--brief-kind)
+      (let ((opts (+tt-review--brief-options)))
+        (unless opts (user-error "This brief carries no options"))
+        (message "%s" (+tt-review--brief-resolve (+tt-review--brief-option "ACCEPT_OPTION" (car opts)))))
+    (+tt-review--verdict "accept" nil)))
 
 (defun +tt-review-refuse ()
-  "Refuse the message at point (D), asking for an optional one-line reason.
-A message that cannot be settled is reported before the reason is asked for
-(A-18), so D on a raw message just says it is not yet frozen."
+  "Resolve the brief at point with its refuse option (D), or refuse the message
+at point, asking for an optional one-line reason. The brief's `:REFUSE_OPTION:'
+names the option by its own meaning, never by its position. A message that
+cannot be settled is reported before the reason is asked for (A-18)."
   (interactive)
-  (if (+tt-review--entry-id)
-      (+tt-review--verdict "refuse" (read-string "Reason (optional): "))
+  (cond
+   ((+tt-review--brief-kind)
+    (let ((opts (+tt-review--brief-options)))
+      (unless opts (user-error "This brief carries no options"))
+      (message "%s" (+tt-review--brief-resolve (+tt-review--brief-option "REFUSE_OPTION" (car (last opts)))))))
+   ((+tt-review--entry-id)
+    (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))
+   (t
     (+tt-review--settleable-id)
-    (+tt-review--verdict "refuse" (read-string "Reason (optional): "))))
+    (+tt-review--verdict "refuse" (read-string "Reason (optional): ")))))
 
 (defun +tt-review-refresh (&optional force)
   "Re-read `views/review.org' when it changed, keeping point on the same id.

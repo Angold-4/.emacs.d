@@ -1277,6 +1277,35 @@ inert as it was before the key existed — no error, and nothing opened."
   (concat "#+TITLE: tradeoffs-trace review — cebd7fcb-01 · 33c41174\n"
           "#+CONTRACT_VERSION: v1\n"
           "\n"
+          ;; Decision briefs: the owner's question is the heading, and the
+          ;; original evidence is in the folded body.
+          "* Needs you (1)\n"
+          "** Should a vendor excluded before a weekend stay excluded when its market reopens?\n"
+          "   :PROPERTIES:\n"
+          "   :ID: F-M-9\n"
+          "   :KIND: brief\n"
+          "   :COMMAND: resolve\n"
+          "   :OPTIONS: accept_risk,repair\n"
+          "   :ACCEPT_OPTION: accept_risk\n"
+          "   :REFUSE_OPTION: repair\n"
+          "   :QUESTION: Should a vendor excluded before a weekend stay excluded when its market reopens?\n"
+          "   :RECORD_VERSION: 1\n"
+          "   :CANDIDATE_SHA: C1\n"
+          "   :CONTRACT_VERSION: 4\n"
+          "   :CONTRACT_SHA256: aaaa\n"
+          "   :RUN_ID: r1\n"
+          "   :PHASE_ID: p1\n"
+          "   :END:\n"
+          "   Today: Pyth's NVDA product reopens Sunday 20:00 ET.\n"
+          "   Impact: No market stops publishing.\n"
+          "   Options:\n"
+          "   - Keep as is [option:accept_risk] — rejoins at once Cost: one stale quote\n"
+          "   - Hold it out for 10 s [option:repair] (recommended) — rejoins after 10 s Cost: 10 s with one vendor fewer\n"
+          "   Recommendation: Hold it out for 10 s — IC §5's re-entry rule\n"
+          "*** Evidence\n"
+          "   - [1] message: F-M-9 a vendor excluded before the weekend rejoins immediately\n"
+          "   - [2] config: calendars.yaml us_equity overnight starts at 20:00\n"
+          "\n"
           "* Blockers\n"
           "** B-1 the loop does not terminate\n"
           "  :PROPERTIES:\n"
@@ -1331,7 +1360,7 @@ inert as it was before the key existed — no error, and nothing opened."
           "  :PHASE_ID: p1\n"
           "  :END:\n"
           "  not frozen yet\n")
-  "A fixture `views/review.org' with a blocker, a trade-off and a raw finding.")
+  "A fixture `views/review.org' with a decision brief, a blocker, a trade-off and a raw finding.")
 
 (defun +tt-test--review-buffer (dir)
   "Open DIR's review the real way: +tt-review on a fixture run directory.
@@ -1557,6 +1586,265 @@ and point on the same one."
               (should (org-fold-folded-p (line-end-position))))
             (kill-buffer buf))
         (delete-directory dir t)))))
+
+(ert-deftest tradeoffs-trace-review-brief-evidence-and-status-question ()
+  "Decision briefs: the review buffer shows the brief with its body and evidence
+folded, TAB unfolds the original evidence, and the status `needs you' line
+shows the question, never a finding id."
+  (let ((dir (make-temp-file "tt-ert-review" t)))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir)))
+          (with-current-buffer buf
+            ;; The question and the decision's paragraphs are visible; only the
+            ;; original evidence is folded (disc-M-172).
+            (goto-char (point-min))
+            (search-forward "Should a vendor excluded")
+            (goto-char (match-beginning 0))
+            (should (not (get-char-property (line-beginning-position) 'invisible)))
+            (should-not (org-fold-folded-p (line-end-position)))
+            ;; A-47: the brief's own property drawer is folded like every other
+            ;; message's, so the owner never sees the engineer ids on open.
+            (goto-char (point-min))
+            (search-forward ":ID: F-M-9")
+            (should (org-fold-folded-p (line-end-position)))
+            (goto-char (point-min))
+            (search-forward "Today: Pyth's")
+            (should (not (org-fold-folded-p (line-beginning-position))))
+            (goto-char (point-min))
+            (search-forward "Impact: No market stops publishing")
+            (should (not (org-fold-folded-p (line-beginning-position))))
+            (goto-char (point-min))
+            (search-forward "*** Evidence")
+            (goto-char (match-beginning 0))
+            (should (org-fold-folded-p (line-end-position)))
+            ;; TAB on the brief unfolds the evidence.
+            (goto-char (point-min))
+            (search-forward "Should a vendor excluded")
+            (goto-char (match-beginning 0))
+            (+tt-review-toggle)
+            (goto-char (point-min))
+            (search-forward "message: F-M-9")
+            (should (not (org-fold-folded-p (line-beginning-position))))
+            (goto-char (point-min))
+            (search-forward "config: calendars.yaml")
+            (should (not (org-fold-folded-p (line-beginning-position))))
+            ;; TAB again folds it back.
+            (goto-char (point-min))
+            (search-forward "Should a vendor excluded")
+            (goto-char (match-beginning 0))
+            (+tt-review-toggle)
+            (goto-char (point-min))
+            (search-forward "message: F-M-9")
+            (should (org-fold-folded-p (line-beginning-position))))
+          (kill-buffer buf))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-brief-resolve-sends-the-request-command ()
+  "Decision briefs: A writes the resolve command with the brief's own accept
+option id and full binding, prompting for the scope note accept_risk needs;
+RET chooses an option and sends the same encoding."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (writes nil)
+        (written nil))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir)))
+          (with-current-buffer buf
+            (cl-letf (((symbol-function '+tt--write-command)
+                       (lambda (run-dir command) (push command writes) (setq written (list run-dir command)) "cmd-1"))
+                      ((symbol-function 'completing-read)
+                       (lambda (_prompt collection &rest _)
+                         (car (seq-find (lambda (c) (string-match-p "Hold it out" (car c))) collection))))
+                      ((symbol-function 'read-string)
+                       (lambda (prompt &rest _)
+                         (if (string-match-p "Scope note" prompt)
+                             "known race, accepted for one release"
+                           "the rejoin is still too eager"))))
+              (goto-char (point-min))
+              (search-forward "Should a vendor excluded")
+              (goto-char (match-beginning 0))
+              (+tt-review-accept)
+              (should (equal (nth 0 written) dir))
+              (should (equal (alist-get 'type (nth 1 written)) "resolve"))
+              (should (equal (alist-get 'option (nth 1 written)) "accept_risk"))
+              (should (equal (alist-get 'note (nth 1 written)) "known race, accepted for one release"))
+              (let ((binding (alist-get 'binding (nth 1 written))))
+                (should (equal (alist-get 'recordId binding) "F-M-9"))
+                (should (equal (alist-get 'candidateSha binding) "C1"))
+                (should (equal (alist-get 'recordVersion binding) 1))
+                (should (equal (alist-get 'contractVersion binding) '((snapshot . 4) (sectionSha256 . "aaaa")))))
+              ;; RET prompts on the PLAIN label (finding B-35) and a refuse
+              ;; option asks for the optional reason, which rides both the
+              ;; resolve's note and a note command so it reaches the next
+              ;; worker (OD-2 / D-B-78).
+              (setq writes nil written nil)
+              (goto-char (point-min))
+              (search-forward "Should a vendor excluded")
+              (goto-char (match-beginning 0))
+              (+tt-review-open-message)
+              (let* ((resolve (seq-find (lambda (c) (equal (alist-get 'type c) "resolve")) writes))
+                     (note (seq-find (lambda (c) (equal (alist-get 'type c) "note")) writes)))
+                (should (equal (alist-get 'option resolve) "repair"))
+                (should (equal (alist-get 'note resolve) "the rejoin is still too eager"))
+                (should (equal (alist-get 'recordId (alist-get 'binding resolve)) "F-M-9"))
+                (should (equal (alist-get 'text note) "the rejoin is still too eager"))
+                (should (equal (alist-get 'phaseId (alist-get 'binding note)) "p1")))
+              ;; The collection offered is labels, not ids.
+              (should-not (seq-some (lambda (c) (string-match-p "accept_risk" (car c))) (+tt-review--brief-choices))))
+          (kill-buffer buf))
+      (delete-directory dir t)))))
+
+(defconst +tt-test--brief-override-org
+  (concat "#+TITLE: tradeoffs-trace review\n"
+          "#+CONTRACT_VERSION: v1\n"
+          "\n"
+          "* Needs you (1)\n"
+          "** Should this choice stand? widen the re-entry band\n"
+          "   :PROPERTIES:\n"
+          "   :ID: D-A-80\n"
+          "   :KIND: brief\n"
+          "   :COMMAND: override\n"
+          "   :OPTIONS: approve,reject_and_repair\n"
+          "   :ACCEPT_OPTION: approve\n"
+          "   :REFUSE_OPTION: reject_and_repair\n"
+          "   :RECORD_VERSION: 2\n"
+          "   :CANDIDATE_SHA: C1\n"
+          "   :CONTRACT_VERSION: 4\n"
+          "   :CONTRACT_SHA256: aaaa\n"
+          "   :RUN_ID: r1\n"
+          "   :PHASE_ID: p1\n"
+          "   :END:\n"
+          "   Impact: Whether any market stops publishing is not established.\n")
+  "A fixture review with one override brief (a flagged reserved decision).")
+
+(ert-deftest tradeoffs-trace-brief-override-sends-an-override ()
+  "Decision briefs: a flagged reserved decision's brief A/D send an override
+(approve/reject) command with the decision's own binding."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (writes nil)
+        (written nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--brief-override-org))
+          (with-temp-file (expand-file-name "views/status.txt" dir) (insert "run: r1\n"))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              (cl-letf (((symbol-function '+tt--write-command)
+                         (lambda (run-dir command) (push command writes) (setq written (list run-dir command)) "cmd-2"))
+                        ((symbol-function 'read-string) (lambda (&rest _) "the band stays too wide")))
+                (goto-char (point-min))
+                (search-forward "Should this choice stand")
+                (goto-char (match-beginning 0))
+                (+tt-review-accept)
+                (should (equal (alist-get 'type (nth 1 written)) "override"))
+                (should (equal (alist-get 'vote (nth 1 written)) "approve"))
+                (should (equal (alist-get 'recordId (alist-get 'binding (nth 1 written))) "D-A-80"))
+                (should (equal (alist-get 'recordVersion (alist-get 'binding (nth 1 written))) 2))
+                ;; D (reject) asks for the optional reason and queues it as a
+                ;; note so it reaches the next worker (OD-2 / D-B-78).
+                (setq writes nil written nil)
+                (goto-char (point-min))
+                (search-forward "Should this choice stand")
+                (goto-char (match-beginning 0))
+                (+tt-review-refuse)
+                (let* ((override (seq-find (lambda (c) (equal (alist-get 'type c) "override")) writes))
+                       (note (seq-find (lambda (c) (equal (alist-get 'type c) "note")) writes)))
+                  (should (equal (alist-get 'vote override) "reject"))
+                  (should (equal (alist-get 'text note) "the band stays too wide")))))
+            (kill-buffer buf)))
+      (delete-directory dir t))))
+
+(defconst +tt-test--brief-entry-org
+  (concat "#+TITLE: tradeoffs-trace review\n"
+          "#+CONTRACT_VERSION: v1\n"
+          "\n"
+          "* Needs you (1)\n"
+          "** Should this stand? a held market makes no offer\n"
+          "   :PROPERTIES:\n"
+          "   :ID: E-1\n"
+          "   :KIND: brief\n"
+          "   :COMMAND: entry\n"
+          "   :OPTIONS: accept,refuse\n"
+          "   :ACCEPT_OPTION: accept\n"
+          "   :REFUSE_OPTION: refuse\n"
+          "   :END:\n"
+          "   Impact: Whether any market stops publishing is not established.\n"
+          "   Options:\n"
+          "   - Accept it [option:accept] — the entry is settled\n"
+          "   - Refuse it [option:refuse] — your reason reaches the worker\n")
+  "A fixture review with one live-entry brief.")
+
+(ert-deftest tradeoffs-trace-brief-entry-settles-via-the-entry-command ()
+  "Decision briefs: a live entry's brief A/D call the entry accept/refuse
+command the review view already uses."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (calls nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--brief-entry-org))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "entry accept applied")))
+                (goto-char (point-min))
+                (search-forward "Should this stand")
+                (goto-char (match-beginning 0))
+                (+tt-review-accept)
+                (should (equal calls (list "entry" dir "accept" "E-1")))
+                (setq calls nil)
+                (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "the market is held")))
+                  (goto-char (point-min))
+                  (search-forward "Should this stand")
+                  (goto-char (match-beginning 0))
+                  (+tt-review-refuse)
+                  (should (equal calls (list "entry" dir "refuse" "E-1" "--reason" "the market is held"))))))
+            (kill-buffer buf)))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-status-needs-you-shows-the-question ()
+  "Decision briefs: the status `needs you' line shows the brief's question, not
+a finding id."
+  (let ((s `((state (phase (phaseId . "p1") (phase . "AWAITING_OWNER")
+                        (attempt (n . 1)) (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
+             (conductorAlive . t)
+             (meta (title . "atlas 15d"))
+             (view (elapsed . "1m") (round . 1) (pipeline . "repair 1s…")
+                   (reviewLine . "M ✓   A ✓   B ✓")
+                   (attention . "needs you")
+                   (attentionQuestion . "Should a vendor excluded before a weekend stay excluded when its market reopens?")
+                   (cost (text . "1m"))))))
+    (with-temp-buffer
+      (+tt--render-status-from s "/tmp/does-not-matter")
+      (should (string-match-p
+               "Should a vendor excluded before a weekend stay excluded when its market reopens?"
+               (buffer-string)))
+      (should (string-match-p "needs you" (buffer-string)))
+      (should-not (string-match-p "F-M-9" (buffer-string))))))
+
+(ert-deftest tradeoffs-trace-status-blocked-shows-the-question ()
+  "Decision briefs: a BLOCKED phase that has a brief shows its question too,
+not only the word BLOCKED (disc-M-185)."
+  (let ((s `((state (phase (phaseId . "p1") (phase . "BLOCKED")
+                        (blockedReason . "reviewer unavailable")
+                        (attempt (n . 1)) (repairRoundsUsed . 0) (repairRoundsGranted . 3)))
+             (conductorAlive . t)
+             (meta (title . "atlas 15d"))
+             (view (elapsed . "1m") (round . 1) (pipeline . "review 1s…")
+                   (reviewLine . "M ✓   A ✓   B ✓")
+                   (attention . "BLOCKED")
+                   (attentionQuestion . "Should a vendor excluded before a weekend stay excluded when its market reopens?")
+                   (cost (text . "1m"))))))
+    (with-temp-buffer
+      (+tt--render-status-from s "/tmp/does-not-matter")
+      (should (string-match-p
+               "BLOCKED — Should a vendor excluded before a weekend stay excluded when its market reopens?"
+               (buffer-string))))))
 
 (defconst +tt-test--entry-review-org
   (concat "#+TITLE: tradeoffs-trace review — cebd7fcb-01 · 33c41174\n"

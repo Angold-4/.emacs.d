@@ -77,6 +77,7 @@ import type {
   ContractVersion,
   CriterionDispute,
   Decision,
+  DecisionBrief,
   DecisionDisclosure,
   EvFlakeObserved,
   DirectiveScope,
@@ -125,6 +126,7 @@ import {
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
+import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -201,6 +203,11 @@ export interface Deadlines {
    * its raw messages are published `unevaluated` and the phase moves on. The
    * plan sets it with `#+TT_EVALUATE_MINUTES` (default 10). */
   evaluateMs: number;
+  /** Decision briefs: how long the brief-writing agent may run. It is its own
+   * short deadline (default 90 s), not the evaluator's evaluateMs, so a
+   * stalled writer cannot make the owner wait out a full evaluation budget
+   * after evaluation already finished (finding disc-B-94). */
+  briefMs: number;
   /** Plan 04b: each panel seat's own deadline. A seat that times out is
    * re-dispatched once; a second loss makes that seat unavailable. The plan
    * sets it with `#+TT_PANEL_MINUTES` (default 10). */
@@ -257,6 +264,7 @@ export const DEFAULT_DEADLINES: Deadlines = {
   probeMs: 10 * 60_000,
   gateMs: 30 * 60_000,
   evaluateMs: 10 * 60_000,
+  briefMs: 90_000,
   panelMs: 10 * 60_000,
   reviewMs: 15 * 60_000,
   reproductionMs: 5 * 60_000,
@@ -421,6 +429,13 @@ export interface ConductorOptions {
    * runs) never gate at once; tests point it at a temp path so they neither
    * contend with a real run nor with each other. */
   gateLockPath?: string;
+  /** Decision briefs: when true, the conductor records a deterministic brief
+   * for every open owner item after evaluation, so the owner always has one
+   * above the evidence even when the evaluator's model did not call
+   * submit_brief. Default false so the many existing tests that reach
+   * AWAITING_OWNER keep their exact event logs; `cli.ts` enables it for a real
+   * run. */
+  briefs?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,6 +1015,12 @@ interface AgentHandle {
   /** A `submit_review` from this agent is being recorded. A second call
    * while it is (run cc1992e2: B called the tool twice) is refused. */
   reviewInFlight?: boolean;
+  /** Plan 05k: the item ids this brief agent was dispatched for, and the ones
+   * it actually submitted. The agent is done only when it submitted every id
+   * it was asked for — a retried backstop already has a brief, so existence
+   * alone must never end the pass (finding M-41). */
+  briefInFlightIds?: Set<string>;
+  briefSubmitted?: Set<string>;
 }
 
 /** `#applyReviewFindingsAndBallots` found the round over after an await. */
@@ -1013,6 +1034,14 @@ export class Conductor {
   #lastLintSignature = "";
   /** Plan 05j: re-entrancy guard while #syncEntries appends entry events. */
   #syncingEntries = false;
+  /** Decision briefs: the item ids the current brief-writing agent was asked
+   * for, so #refreshBriefs does not dispatch a second agent for them. */
+  #briefInFlight = new Set<string>();
+  /** Plan 05k (OD-6): the park episode at which each backstop was recorded,
+   * keyed `<candidateSha>::<itemId>`. The single retry fires only when a LATER
+   * park happens on the same candidate, never on the next beat of the same
+   * one. */
+  #briefBackstopEpisode = new Map<string, number>();
   /** Plan 05j: candidates whose curator agent is in flight. */
   #curatorInFlight = new Set<string>();
   #plan: RunPlanFile;
@@ -1027,6 +1056,7 @@ export class Conductor {
   #preflightEnv: NodeJS.ProcessEnv;
   #piEnvFor: ((role: Role, agentId: string) => NodeJS.ProcessEnv | undefined) | undefined;
   #stubReviews: boolean;
+  #briefsEnabled: boolean;
   #probeReuse: boolean;
   /** Plan 01b: the clock `#checkNotifications` reads (injectable). */
   #now: () => number;
@@ -1156,6 +1186,7 @@ export class Conductor {
     this.#piEnvFor = opts.piEnvFor;
     this.#providerModelFor = opts.providerModelFor;
     this.#stubReviews = opts.stubReviews ?? false;
+    this.#briefsEnabled = opts.briefs ?? false;
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
@@ -1262,6 +1293,8 @@ export class Conductor {
     this.#writeStatusViewSafe();
     // Plan 01b: seed the park-episode counter from the log, so a restarted
     // conductor keeps the same notification key for the wait it is resuming.
+    // Plan 05k (OD-7): the retry gate counts only AWAITING_OWNER entries;
+    // entering BLOCKED neither dispatches the retry nor spends it.
     this.#awaitingEpisode = rebuildTimeline(this.#runDir, this.#plan).phases.filter((p) => p.phase === "AWAITING_OWNER").length;
     if (this.#secretNames.length > 0) this.#recordSecrets();
     // design §9.3: "If the command ID is already in the log, the command is
@@ -2875,6 +2908,13 @@ export class Conductor {
     try {
       do {
         this.#redriveRequested = false;
+        // Decision briefs: once the phase is parked on the owner (after
+        // evaluation), make sure every open owner item has a brief. The
+        // evaluator's own model may have supplied one through submit_brief;
+        // this is the deterministic backstop so the owner never faces the
+        // raw finding without one. Idempotent, and a no-op while nothing is
+        // open.
+        this.#refreshBriefs();
         const actions = next(this.#state);
         // Plan 05j: the curator pass starts once per round, after the reviews
         // and before the evaluators. It is launched first, but it never BLOCKS
@@ -3230,18 +3270,20 @@ export class Conductor {
           const rejections = handle.incompleteReviewRejections ?? 0;
           if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
             handle.incompleteReviewRejections = rejections + 1;
+            // The reason is logged beside the missing ids, so the record is the
+            // same text the model is refused with (a test does not have to race
+            // the reviewer's stream file to read it).
+            const reason = `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
+              .map((m) => `${m.id} (${m.choice})`)
+              .join("; ")}`;
             this.#log.append("incomplete_review_rejected", {
               reviewer: review.reviewer,
               agentId,
               missing: missing.map((m) => m.id),
               rejection: rejections + 1,
+              reason,
             });
-            return {
-              ok: false,
-              reason: `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
-                .map((m) => `${m.id} (${m.choice})`)
-                .join("; ")}`,
-            };
+            return { ok: false, reason };
           }
           this.#log.append("incomplete_review", {
             reviewer: review.reviewer,
@@ -3417,6 +3459,53 @@ export class Conductor {
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
       this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
       handle.doneResolve();
+      return { ok: true };
+    }
+    if (msg.tool === "submit_brief") {
+      // Decision briefs: the evaluator's model writes one owner-readable brief
+      // per owner item after a round's evaluation. Validated whole via
+      // briefIssue (no code identifier in the question; a time, count or
+      // duration cites the config/code it read; the option ids map one-to-one
+      // to the item's own; the today example is checked against the plan's
+      // calendars, including its weekly reopen). A record-only event, so a
+      // restart rebuilds the briefs the views render.
+      if (handle.role !== "evaluator") {
+        return { ok: false, reason: `submit_brief is not accepted from role ${handle.role}` };
+      }
+      const brief = (msg.args ?? {}) as { requestId?: unknown };
+      const requestId = typeof brief.requestId === "string" ? brief.requestId : "";
+      const request = this.#state.phase.ownerRequests.find((r) => r.id === requestId && r.status === "open");
+      // A flagged reserved decision never becomes an owner request, and a live
+      // review entry is settled directly, so a brief for either is accepted
+      // here too (each carries its own owner command).
+      const decision = !request ? this.#liveReservedDecisions().find((d) => d.id === requestId) : undefined;
+      const entry = !request && !decision ? this.#ownerMarkedEntries().find((e) => e.id === requestId) : undefined;
+      if (!request && !decision && !entry) return { ok: false, reason: `brief ${requestId || "(no requestId)"} does not name an open owner item` };
+      const requestOptions = request
+        ? (request.options ?? []).map((o) => o.id)
+        : decision
+          ? ["approve", "reject_and_repair"]
+          : ["accept", "refuse"];
+      const issue = briefIssue(brief as never, { requestOptions, catalogs: this.#briefCatalogs() });
+      if (issue) return { ok: false, reason: `invalid brief for ${requestId}: ${issue}` };
+      const C = this.#state.phase.candidate?.sha;
+      // The item class fixes the command, never the model's own field: a
+      // reserved decision must send an override and an entry an entry verdict,
+      // or the owner's A writes a resolve that matches nothing (F-A-16).
+      const command = request ? "resolve" : decision ? "override" : "entry";
+      // The conductor merges its own same-concern items into the model's
+      // `related` (finding A-29), and stamps the candidate so the next round
+      // rewrites the brief (finding M-30).
+      const enriched = { ...enrichBriefRelated(brief as DecisionBrief, this.#briefConcerns()), candidateSha: C, command };
+      this.#applyEvent({ type: "BRIEFS_RECORDED", briefs: [enriched] });
+      this.#log.append("brief_recorded", { requestId, options: (brief as { options?: unknown }).options, candidateSha: C });
+      // The brief agent is done only once IT has submitted every item it was
+      // asked for. Existence alone is not enough: a retried backstop already
+      // has a brief for this candidate, so checking the phase's briefs would
+      // end the pass after the first submit (finding M-41).
+      handle.briefSubmitted?.add(requestId);
+      const ids = handle.briefInFlightIds ?? new Set<string>();
+      if (ids.size > 0 && [...ids].every((id) => handle.briefSubmitted?.has(id))) handle.doneResolve();
       return { ok: true };
     }
     if (msg.tool === "submit_round_panel_votes") {
@@ -5148,6 +5237,9 @@ export class Conductor {
       const ids = runIds(this.#runDir);
       const rendered = projectEntryReview({ ...phase, ...ids }, { anchorFreshness: candidateAnchorFreshness(this.#candidateDir()) });
       fs.writeFileSync(this.#paths.review, rendered.text);
+      // Goal (4): the glossary a brief links to, written beside review.org so
+      // the link resolves inside the run directory (finding M-25).
+      fs.writeFileSync(path.join(path.dirname(this.#paths.review), "glossary.org"), `* Owner glossary\n${renderGlossaryOrg()}\n`);
       this.#writeEntryViews(rendered.files);
       this.#recordReviewLint(rendered.lint);
       this.#writeMessageViews();
@@ -7275,6 +7367,409 @@ export class Conductor {
     lines.push("", "Open entries:");
     if (openEntries.length === 0) lines.push("- (none)");
     for (const e of openEntries) lines.push(`- ${e.id} [${e.type}] ${e.title} (${formatAnchor(e.anchor)}; ${e.links.length} linked)`);
+    return lines.join("\n");
+  }
+
+  /** The plan's calendars.yaml / products.yaml, or null when neither is
+   * readable. Never throws: a missing catalog makes a brief say its example
+   * is unverified, it never invents one. */
+  #briefCatalogs(): Catalogs | null {
+    const tryRead = (rel: string): string | undefined => {
+      for (const candidate of [path.join(this.#plan.repo, rel), rel]) {
+        try {
+          return fs.readFileSync(candidate, "utf8");
+        } catch {
+          // keep looking
+        }
+      }
+      return undefined;
+    };
+    const calendars = tryRead("config/index/calendars.yaml");
+    const products = tryRead("config/index/products.yaml");
+    if (!calendars && !products) return null;
+    return parseCatalogs(calendars, products);
+  }
+
+  /** Decision briefs (after evaluation): record a deterministic brief for
+   * every open owner item that has none yet, so the owner always has a brief
+   * above the evidence even when the evaluator's model did not (or could
+   * not) call submit_brief. The evaluator's own brief is never overwritten.
+   * Idempotent. */
+  #refreshBriefs(): void {
+    if (this.#closed || !this.#briefsEnabled) return;
+    const phase = this.#state.phase;
+    // The brief pass runs when the owner is actually needed (F-8), never
+    // during RESOLVING or GATING: briefing a proceeding phase costs a model
+    // run for an item the owner may never see (finding disc-B-60).
+    if (phase.phase !== "AWAITING_OWNER" && phase.phase !== "BLOCKED") return;
+    const C = phase.candidate?.sha;
+    // Per candidate, not per request id: the plan asks for one brief per
+    // round, so a new candidate's item is rewritten (finding M-30). A brief
+    // recorded for another candidate is stale.
+    const existing = new Set((phase.briefs ?? []).filter((b) => b.candidateSha === C).map((b) => b.requestId));
+    const itemIds: string[] = [
+      ...phase.ownerRequests.filter((r) => r.status === "open").map((r) => r.id),
+      ...this.#liveReservedDecisions(phase).map((d) => d.id),
+      ...this.#ownerMarkedEntries(phase).map((e) => e.id),
+    ];
+    const missing = itemIds.filter((id) => !existing.has(id));
+    // Plan 05k (OD-6/OD-7): an item whose ONLY brief on this candidate is a
+    // backstop gets the writer re-dispatched once, so the owner can still
+    // decide from a real brief; the retry is recorded so a later park never
+    // dispatches again on this candidate. A model brief (no
+    // `noRecommendationReason`) is never retried. OD-7: only an
+    // AWAITING_OWNER park counts as the later park; a BLOCKED phase writes
+    // any missing briefs but never spends the retry (it auto-stops right after
+    // dispatch, so a retry there could never submit).
+    const retried = new Set(phase.briefRetries ?? []);
+    const backstops =
+      phase.phase !== "AWAITING_OWNER"
+        ? []
+        : itemIds.filter((id) => {
+            if (!existing.has(id) || retried.has(`${C}::${id}`)) return false;
+            const brief = (phase.briefs ?? []).find((b) => b.requestId === id && b.candidateSha === C);
+            if (brief === undefined || brief.noRecommendationReason === undefined) return false;
+            // The backstop's AWAITING_OWNER episode is remembered when it is
+            // recorded; a missing entry is seeded now, so the retry waits for
+            // the next AWAITING_OWNER park.
+            const key = `${C}::${id}`;
+            const recorded = this.#briefBackstopEpisode.get(key);
+            if (recorded === undefined) {
+              this.#briefBackstopEpisode.set(key, this.#awaitingEpisode);
+              return false;
+            }
+            return this.#awaitingEpisode > recorded;
+          });
+    // Only ids no running agent already covers are dispatched, and the set is
+    // accumulated (never replaced), so a second item opening mid-pass does not
+    // double-brief the first agent's ids or wipe its bookkeeping (finding
+    // M-18).
+    const toRetry = backstops.filter((id) => !this.#briefInFlight.has(id));
+    const toDispatch = [...missing, ...toRetry].filter((id) => !this.#briefInFlight.has(id));
+    if (toDispatch.length === 0) return;
+    if (toRetry.length > 0) {
+      // Record the retry BEFORE dispatching, so a crash or a second failure
+      // cannot make it unbounded (OD-6).
+      this.#applyEvent({ type: "BRIEF_RETRY_ATTEMPTED", candidateSha: C ?? "", requestIds: toRetry });
+    }
+    const actionId = this.#log.actionId("briefs");
+    for (const id of toDispatch) this.#briefInFlight.add(id);
+    void this.#runBriefAgent(actionId, toDispatch).catch((err) => {
+      // A spawn/intent throw happens before #runBriefAgent's own finally, so
+      // clean the ids and record the backstop here too; otherwise they would
+      // stay 'in flight' and every later pass would skip them (finding A-24).
+      this.#logUnexpected("briefs", err);
+      for (const id of toDispatch) this.#briefInFlight.delete(id);
+      this.#recordFallbackBriefs(toDispatch, "the brief writer could not start");
+    });
+  }
+
+  /** The live, flagged reserved decisions of the current candidate. A
+   * reserved decision never becomes an owner request, so without a brief it
+   * reaches the owner as an engineer note. A decision the owner already
+   * overrode is settled and no longer needs one (finding M-11). */
+  #liveReservedDecisions(phase = this.#state.phase): Decision[] {
+    const C = phase.candidate?.sha;
+    return phase.decisions.filter((d) => {
+      if (d.class !== "reserved" || d.amendment || d.supersededBy || d.supersededByCorrection) return false;
+      if (!isLiveDecision(d)) return false;
+      if (C && d.boundCandidateSha !== C) return false;
+      return !phase.overrides.some((o) => o.decisionId === d.id && (!C || o.boundCandidateSha === C));
+    });
+  }
+
+  /** The review entries the owner has explicitly MARKED: a live entry with a
+   * linked message the owner refused. Briefing every live entry would show it
+   * twice and bury the real decisions (findings M-58/disc-B-18). */
+  #ownerMarkedEntries(phase = this.#state.phase): Array<{ id: string; title?: string; messages?: Array<{ id: string; title?: string; evidence?: string[] }> }> {
+    const refused = new Set((phase.messages ?? []).filter((m) => m.state === "refused").map((m) => m.id));
+    return (phase.entries ?? []).filter(
+      (e) => (e as { state?: string }).state === "open" && ((e as { links?: Array<{ messageId: string }> }).links ?? []).some((l) => refused.has(l.messageId)),
+    ) as never;
+  }
+
+  /** Every live entry, marked or not. They are NOT briefed, but they are
+   * concerns: a same-concern trade-off or finding that never became an owner
+   * item is exactly the T-54 silence `related` must surface (OD-2 / D-B-77). */
+  #liveEntriesForRelated(phase = this.#state.phase): Array<{ id: string; title?: string; messages?: Array<{ id: string; title?: string; evidence?: string[] }> }> {
+    return (phase.entries ?? []).filter((e) => (e as { state?: string }).state === "open") as never;
+  }
+
+  /** One open item's concern (the files and plan clauses it touches), from its
+   * linked finding and messages, so `related` can name a bigger silence on the
+   * same concern. */
+  #concernFor(id: string, question: string, recordIds: string[], messageIds: string[] = []): OpenItemConcern {
+    const phase = this.#state.phase;
+    const files = new Set<string>();
+    const planRefs = new Set<string>();
+    for (const f of phase.findings) {
+      if (!recordIds.includes(f.id)) continue;
+      const file = evidenceFile(f.evidence);
+      if (file) files.add(file);
+    }
+    for (const m of phase.messages ?? []) {
+      const linked = messageIds.includes(m.id) || (m.sourceRecordId !== undefined && recordIds.includes(m.sourceRecordId));
+      if (!linked) continue;
+      if (m.planRef) planRefs.add(m.planRef);
+      if (m.anchor?.path) files.add(m.anchor.path);
+      for (const ev of m.evidence ?? []) {
+        const file = evidenceFile(ev);
+        if (file) files.add(file);
+      }
+    }
+    return { id, question, files: [...files], planRefs: [...planRefs] };
+  }
+
+  /** Every open owner item of the phase as a plain concern, so a brief's
+   * `related` can list the others that touch the same file or plan clause. */
+  #briefConcerns(): OpenItemConcern[] {
+    const phase = this.#state.phase;
+    const out: OpenItemConcern[] = [];
+    for (const r of phase.ownerRequests.filter((r) => r.status === "open")) {
+      const linked = [r.linkedFindingId, r.linkedDecisionId, r.linkedMessageId, r.linkedCorrectionId].filter((v): v is string => typeof v === "string");
+      // The owner-facing `related` label must stay plain, so it uses the brief's
+      // own question when there is one and otherwise strips the request's
+      // engineer prose (finding A-36).
+      const question = (phase.briefs ?? []).find((b) => b.requestId === r.id)?.question ?? stripCounts(stripCodeTokens(r.reason)).replace(/\s+/g, " ").trim();
+      out.push(this.#concernFor(r.id, question, linked));
+    }
+    for (const d of this.#liveReservedDecisions(phase)) out.push(this.#concernFor(d.id, stripCounts(stripCodeTokens(d.choice)).replace(/\s+/g, " ").trim(), [d.id]));
+    // Every live entry, not only the marked ones: a same-concern trade-off or
+    // finding that never became an owner item is the T-54 silence the goal
+    // says `related` must surface (OD-2 / D-B-77).
+    for (const e of this.#liveEntriesForRelated(phase)) {
+      const messageIds = (e.messages ?? []).map((m) => m.id);
+      out.push(this.#concernFor(e.id, stripCounts(stripCodeTokens(e.title ?? "")).replace(/\s+/g, " ").trim(), [], messageIds));
+    }
+    return out;
+  }
+
+  /** The deterministic backstop brief for every item the evaluator's model did
+   * not cover: an owner request gets a resolve brief, a reserved decision an
+   * override brief, a live entry an entry brief. It never asserts an
+   * unchecked impact, omits a recommendation, and carries the conductor's own
+   * `related`. Idempotent for this candidate. */
+  #recordFallbackBriefs(ids: readonly string[], reason = "the brief writer did not run"): void {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha;
+    const existing = new Set((phase.briefs ?? []).filter((b) => b.candidateSha === C).map((b) => b.requestId));
+    const concerns = this.#briefConcerns();
+    const catalogs = this.#briefCatalogs();
+    const briefs: DecisionBrief[] = [];
+    for (const id of ids) {
+      if (existing.has(id)) {
+        // A retried item keeps its backstop (the model brief never replaced
+        // it); record why the retry did not help (OD-6).
+        const held = (phase.briefs ?? []).find((b) => b.requestId === id && b.candidateSha === C);
+        if (held?.noRecommendationReason !== undefined) this.#log.append("brief_retry_failed", { requestId: id, reason });
+        continue;
+      }
+      const concern = concerns.find((c) => c.id === id);
+      const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
+      const request = phase.ownerRequests.find((r) => r.id === id);
+      if (request) {
+        briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
+        continue;
+      }
+      const decision = this.#liveReservedDecisions(phase).find((d) => d.id === id);
+      if (decision) {
+        briefs.push({ ...fallbackDecisionBrief(decision, opts), candidateSha: C });
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
+        continue;
+      }
+      const entry = this.#ownerMarkedEntries(phase).find((e) => e.id === id);
+      if (entry) {
+        briefs.push({ ...fallbackEntryBrief(entry, opts), candidateSha: C });
+        this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
+      }
+    }
+    if (briefs.length > 0) this.#applyEvent({ type: "BRIEFS_RECORDED", briefs });
+  }
+
+  /** The brief-writing evaluator pass. One fresh evaluator-role agent is
+   * shown every item that still needs a brief and the plan's calendars, and
+   * writes one owner-readable brief per item through `submit_brief`. A timeout
+   * or a settle without complete coverage leaves the deterministic backstop to
+   * fill the rest, so the owner is never left without a brief. */
+  async #runBriefAgent(actionId: string, ids: readonly string[]): Promise<void> {
+    const dispatchCandidate = this.#state.phase.candidate?.sha;
+    const agentId = `briefs-${actionId}`;
+    const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
+    const candidateDir = this.#candidateDir();
+    const env: NodeJS.ProcessEnv = {
+      ...this.#extraEnv,
+      ...this.#piEnvFor?.("evaluator", agentId),
+      TT_SOCKET: this.#paths.sock,
+      TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_RUN_DIR: this.#runDir,
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+      TT_CANDIDATE_SHA: dispatchCandidate,
+      TT_BRIEF: "1",
+    };
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
+    let fallbackReason = "the brief writer did not run";
+    const evaluatorPiCommand = this.#resolvePiCommand("evaluator");
+    const providerModel = this.#providerModelFor?.("evaluator");
+    const agent = spawnPiAgent({
+      command: evaluatorPiCommand,
+      args: [
+        ...this.#resolvePiArgsPrefix("evaluator"),
+        ...launchArgs("evaluator", { noSession: evaluatorPiCommand !== undefined, provider: providerModel?.provider, model: providerModel?.model }),
+      ],
+      cwd: candidateDir,
+      env,
+      role: "evaluator",
+      agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(agentId, event);
+        this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
+    });
+    const handle: AgentHandle = {
+      agent,
+      role: "evaluator",
+      agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve: () => undefined,
+      discoveryPromise: Promise.resolve(),
+      briefInFlightIds: new Set(ids),
+      briefSubmitted: new Set(),
+    };
+    this.#agents.set(agentId, handle);
+    this.#log.intent(actionId, { agentId, pgid: agent.pgid, briefs: ids });
+    try {
+      const hello = await Promise.race([
+        raceTimeout(helloPromise, this.#deadlines.helloTimeoutMs, "hello"),
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      if (hello === "timeout" || hello === "exited") {
+        await agent.terminate();
+        fallbackReason = hello === "exited" ? "the brief writer exited before it started" : "the brief writer did not start in time";
+        this.#log.completion(actionId, { ok: false, reason: hello === "exited" ? "brief agent exited before hello" : "hello timed out" });
+        return;
+      }
+      if (!hello.ok) {
+        await agent.terminate();
+        fallbackReason = hello.mismatch ? "the brief writer's tools did not match at launch" : "the brief writer failed to start";
+        this.#log.completion(actionId, { ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
+        // A tool-set mismatch is NOT a phase launch failure here: the brief
+        // pass runs only in AWAITING_OWNER/BLOCKED, where no LAUNCH_FAILED
+        // transition exists, so applying the event would be rejected and throw
+        // (OD-2 / D-M-70). Record why and let the finally backstop cover it.
+        if (hello.mismatch) {
+          this.#log.append("brief_agent_launch_rejected", { agentId, expected: hello.mismatch.missing, extra: hello.mismatch.extra });
+        }
+        return;
+      }
+      const briefTimeout = this.#withStallWatch(
+        agentId,
+        agent,
+        cancelableTimeout(this.#deadlines.briefMs, "timeout" as const),
+        "Owner (conductor): no progress for a while. Finish now and call submit_brief for each item listed.",
+      );
+      const settled = nextSettle();
+      await agent.prompt(this.#buildBriefPrompt(ids));
+      const outcome = await Promise.race([
+        donePromise.then(() => "submitted" as const),
+        briefTimeout.promise,
+        settled,
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      briefTimeout.cancel();
+      await agent.terminate();
+      if (outcome === "timeout") fallbackReason = "the brief writer timed out";
+      else if (outcome === "exited") fallbackReason = "the brief writer exited";
+      else if (outcome === "settled") fallbackReason = "the brief writer settled without covering every item";
+      else fallbackReason = "the brief writer did not cover every item";
+      this.#log.completion(actionId, { ok: outcome === "submitted", reason: outcome === "submitted" ? undefined : outcome });
+    } finally {
+      this.#agents.delete(agentId);
+      // Remove only THIS agent's ids: a later agent may be covering others
+      // (finding M-18).
+      for (const id of ids) this.#briefInFlight.delete(id);
+      // Whatever the model did not cover, the backstop fills in with the
+      // reason the owner reads where the recommendation would be. Stale (the
+      // phase moved on): nothing to record and the next park re-runs it.
+      if (dispatchCandidate === this.#state.phase.candidate?.sha) this.#recordFallbackBriefs(ids, fallbackReason);
+    }
+  }
+
+  /** The brief-writing evaluator prompt: each item that still needs a brief,
+   * its own option ids, the underlying evidence, the other open items on the
+   * same concern, and the plan's calendars/products so `today` can name a real
+   * market and session time. */
+  #buildBriefPrompt(ids: readonly string[]): string {
+    const phase = this.#state.phase;
+    const catalogs = this.#briefCatalogs();
+    const lines: string[] = [
+      `You write the owner-facing decision briefs for phase ${phase.phaseId}, candidate ${(phase.candidate?.sha ?? "").slice(0, 9)}.`,
+      "The owner must be able to decide from each brief alone, in under a minute.",
+      "",
+      "For EACH item below call submit_brief exactly once, with:",
+      "- question: one plain line, NO code identifiers (no snake_case, no path/file.rs), e.g. \"Should a vendor excluded before a weekend stay excluded when its market reopens?\"",
+      "- today: what the system does now, with ONE concrete example naming a real product and session time from the calendars below; a weekday reopen must match the calendar's weekly reopen. If you cannot check it, write \"(example unverified)\".",
+      "- ALL owner-facing text (the question, today, impact, the options, the recommendation and the related questions) must stay PLAIN: no file paths and no code identifiers. Cite a claim by its evidence number in square brackets, e.g. '10 s after a reopen[2]'.",
+      "- evidence: the numbered list of what you read, e.g. 'message: ...' then 'config: ...' or 'code: path:line'. Every time, count or duration in today, impact or an option must carry its OWN [n] reference into this list; one reference does not cover another claim.",
+      "- impact: what the owner would notice (price flow, number of vendors, quality, duration) and ALWAYS whether any market stops publishing. The publishing answer itself must cite the config or code it was checked against, or say it is unverified.",
+      "- options: exactly the item's own option ids, each relabelled in plain words with what happens and its cost.",
+      "- recommendation: one option id and why, citing the plan or an IC section.",
+      "- related: the other item ids below that touch the same file or plan clause.",
+      "",
+      "Calendars (calendars.yaml):",
+      ...(catalogs
+        ? Object.entries(catalogs.calendars).map(
+            ([name, c]) => `- ${name}: weekly reopen ${c.opens ?? "(none declared)"}; sessions ${Object.entries(c.sessions).map(([s, t]) => `${s} ${t}`).join(", ")}`,
+          )
+        : ["(none readable)"]),
+      "Products (products.yaml):",
+      ...(catalogs ? Object.entries(catalogs.products).map(([sym, p]) => `- ${sym}: vendor ${p.vendor ?? "?"}, calendar ${p.calendar ?? "?"}`) : ["(none readable)"]),
+      "",
+      "Glossary — use these terms as-is and never explain them inline; the brief links each one:",
+      ...BRIEF_GLOSSARY.map((g) => `- ${g.term}: ${g.meaning}`),
+      "",
+      `Items needing a brief (${ids.length}):`,
+    ];
+    const concerns = this.#briefConcerns();
+    for (const id of ids) {
+      const request = phase.ownerRequests.find((r) => r.id === id);
+      const decision = !request ? this.#liveReservedDecisions(phase).find((d) => d.id === id) : undefined;
+      const entry = !request && !decision ? this.#ownerMarkedEntries(phase).find((e) => e.id === id) : undefined;
+      const others = concerns.find((c) => c.id === id);
+      if (request) {
+        lines.push(`- ${id} (owner request, origin ${request.origin}): ${request.reason}`);
+        lines.push(`    its options: ${request.options.map((o) => o.id).join(", ")}`);
+      } else if (decision) {
+        lines.push(`- ${id} (flagged reserved decision, command override): ${decision.choice}`);
+        lines.push(`    why it matters: ${decision.whyItMatters}`);
+        lines.push("    its options: approve, reject_and_repair; set command to override");
+      } else if (entry) {
+        lines.push(`- ${id} (owner-marked review entry, command entry): ${entry.title ?? ""}`);
+        lines.push("    its options: accept, refuse; set command to entry");
+      }
+      lines.push(`    same-concern items: ${(others?.planRefs ?? []).join(", ")} ${(others?.files ?? []).join(", ")}`.trim());
+    }
+    lines.push("", "Call submit_brief once per item above, then finish.");
     return lines.join("\n");
   }
 

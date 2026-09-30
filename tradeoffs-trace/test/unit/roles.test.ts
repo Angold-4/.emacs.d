@@ -12,7 +12,9 @@ test("roles: ROLE_TOOLS matches design §2.1's launch table exactly", () => {
   assert.deepEqual(ROLE_TOOLS.reviewer, ["read", "grep", "find", "ls", "submit_discovery", "submit_review"]);
   // Plan 04a: the evaluator reads the candidate and returns through
   // submit_evaluation (and may raise a trade-off it spots); no write tools.
-  assert.deepEqual(ROLE_TOOLS.evaluator, ["read", "grep", "find", "ls", "submit_evaluation"]);
+  // Decision briefs add submit_brief: the same role writes the owner-facing
+  // brief for each open owner item after evaluation.
+  assert.deepEqual(ROLE_TOOLS.evaluator, ["read", "grep", "find", "ls", "submit_evaluation", "submit_brief"]);
 });
 
 test("roles: launchArgs never uses --exclude-tools, always an explicit --tools allowlist", () => {

@@ -20,7 +20,7 @@
         "DECISION_CLASS_LOWERED", "OWNER_REQUEST_OPENED", "OWNER_REQUEST_RESOLVED", "ACCEPTED",
         "PUBLISH_INTENT", "PUBLISH_COMPLETED", "PUBLISH_STALE", "REPAIR_ATTEMPT_STARTED",
         "REPAIR_BUDGET_EXHAUSTED", "RESOLVING_INCOMPLETE", "REVISE", "AMEND",
-        "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED",
+        "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED", "BRIEFS_RECORDED", "BRIEF_RETRY_ATTEMPTED",
         "CRITERION_AMENDED", "CRITERION_REVERTED",
         "NOTE_ADDED", "OWNER_INPUT_RECORDED", "OWNER_CORRECTION", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED",
         "MESSAGE_RAISED", "MESSAGE_PUBLISHED", "MESSAGE_MERGED", "MESSAGE_DROPPED", "OWNER_VERDICT", "MESSAGE_RESOLVED", "MESSAGE_ADDRESS_REPORTED", "MESSAGE_SUPERSEDED", "MESSAGE_CARRIED"
@@ -80,6 +80,8 @@
     { "type": "object", "required": ["type"], "properties": { "type": { "const": "RUN_RESUMED" } } },
     { "type": "object", "required": ["type", "role", "expected", "missing", "extra"], "properties": { "type": { "const": "LAUNCH_FAILED" }, "role": { "enum": ["worker", "reviewer", "evaluator", "panel"] }, "reviewer": { "enum": ["M", "A", "B"] }, "expected": { "type": "array" }, "missing": { "type": "array" }, "extra": { "type": "array" } } },
     { "type": "object", "required": ["type", "stage"], "properties": { "type": { "const": "INTEGRITY_VIOLATED" }, "stage": { "type": "string", "minLength": 1 }, "evidence": { "type": "string" } } },
+    { "type": "object", "required": ["type", "briefs"], "properties": { "type": { "const": "BRIEFS_RECORDED" }, "briefs": { "type": "array", "items": { "type": "object" } } } },
+    { "type": "object", "required": ["type", "candidateSha", "requestIds"], "properties": { "type": { "const": "BRIEF_RETRY_ATTEMPTED" }, "candidateSha": { "type": "string" }, "requestIds": { "type": "array", "items": { "type": "string", "minLength": 1 } } } },
     { "type": "object", "required": ["type", "phaseId", "text"], "properties": { "type": { "const": "NOTE_ADDED" }, "phaseId": { "type": "string", "minLength": 1 }, "text": { "type": "string", "minLength": 1 } } },
     { "type": "object", "required": ["type", "input"], "properties": { "type": { "const": "OWNER_INPUT_RECORDED" }, "input": { "type": "object" } } },
     { "type": "object", "required": ["type", "correctionId", "text"], "properties": { "type": { "const": "OWNER_CORRECTION" }, "correctionId": { "type": "string", "minLength": 1 }, "text": { "type": "string", "minLength": 1 } } },

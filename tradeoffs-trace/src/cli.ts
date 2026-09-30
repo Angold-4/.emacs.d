@@ -658,7 +658,7 @@ async function runConductorProcess(runDir: string): Promise<void> {
   // the one place a run's Conductor is built. `testPiInjection` above still
   // supplies the fake-pi command for a test-launched run; the two do not
   // interact (one picks the binary, the other the model flags).
-  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan), deadlines, stubReviews });
+  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan), deadlines, stubReviews, briefs: true });
   const cleanStop = () =>
     void conductor.stop().then(() => {
       writeFileSync(stoppedMarker, new Date().toISOString());

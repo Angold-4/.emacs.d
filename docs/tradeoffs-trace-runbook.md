@@ -635,6 +635,122 @@ past run cannot display one either.
 | mode line | live runs with stage, time and reviews; the oldest owner wait (`⚑ 13f waiting 1h12m`) with a warning-face flash when a new notification arrives |
 | CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
 
+## The decision brief (what needs you, in plain words)
+
+Every item that needs your decision — an open owner request, a flagged
+trade-off, an entry marked for the owner — reaches you as a **decision
+brief**, written once per round after evaluation by the evaluator's model and
+checked against the code and the plan. You decide from the brief alone, in
+under a minute:
+
+- **question** — one plain line with no code identifiers, as the heading, e.g.
+  *Should a vendor excluded before a weekend stay excluded when its market
+  reopens?*
+- **today** — what the system does now, with one concrete example that names a
+  real market and session time from the plan's `calendars.yaml`/`products.yaml`.
+  A brief whose example cannot be checked says so instead of inventing one.
+- **impact** — what you would notice (price flow, number of vendors, quality,
+  duration), and always whether any market stops publishing.
+- **options** — each option the request already offered, relabelled in plain
+  words with what happens and its cost. The option ids are unchanged, so
+  choosing one from the brief sends exactly the same resolve command as
+  choosing it on the request.
+- **recommendation** — one option and why, citing the plan or an IC section.
+- **related** — other open items on the same file or plan clause, so a bigger
+  risk is never hidden behind a narrow request; each is an Org link the owner
+  can follow (to its message/entry detail file, or to its own brief).
+- **glossary** — when a brief uses one of the terms below, it links the term to
+  this glossary instead of explaining it inline.
+- **evidence** — the original message/finding/`file:line`, folded under `TAB`.
+
+A brief that states a time, a count or a duration must cite the config or code
+it read, and a question that names code (`within_band_active`) is refused back
+to the evaluator. An example can only excuse itself with `(example unverified)`
+when it names no market and no time; a named time is always checked against the
+calendars.
+
+Once the phase is parked on you, the conductor runs one brief-writing pass by
+the evaluator's model for every item you must decide: an open owner request, a
+flagged reserved decision (which never becomes an owner request), and an entry
+you have explicitly marked (a live entry with a linked message you refused).
+It does not brief every live entry: each one already appears in its own
+section with `A`/`D`, and duplicating them would bury the real decisions. A
+reserved decision's brief sends an override (approve / reject) and a marked
+entry's sends the entry accept/refuse, rather than a request resolve. The pass
+is per round and per candidate, so a new candidate's item is rewritten rather
+than keeping an earlier round's `today`; while a new brief is being written,
+the review and the status line do not show an earlier candidate's brief as
+current. The writer is shown each calendar's weekly reopen as well as its
+sessions, and the brief pass has its own short deadline so a stalled writer
+cannot hold the parked phase for a full evaluation budget.
+
+`A` and `D` choose the brief's accept and refuse option by the option's own
+meaning, never by its position; `RET` prompts on the option's **plain label**,
+never its engineer id. Refusing an entry from its brief asks for the optional
+reason, and the reason reaches the next worker attempt. A model brief must
+state one recommended option, with why, citing the plan or an IC section; only
+the deterministic backstop may omit it. A model brief must also state whether
+any market stops publishing; only the deterministic backstop may say the
+impact was not established. A model brief that could not check the publishing
+answer says it is unverified instead of asserting it. ALL owner-facing text —
+the question, today, impact, the options, the recommendation's why and the
+related questions — stays plain: no file paths and no code identifiers. Every
+time, count or
+duration carries its own numbered reference into the evidence list (`[2]`); one
+reference does not cover another claim, and the reference must point at a
+config or code line that actually holds the claimed value. The publishing
+answer's own sentence must cite the code path it was checked against (a
+calendar or data file cannot show whether publishing stops); a sentence that
+says the answer is unverified is exempt, but the word must refer to markets or
+publishing, and only the backstop may say 'not established'. An option that
+asserts whether a market stops publishing is held to the same rule. A
+reference must hold every time or number its claim states, not just the first.
+The path itself is rendered only under Evidence, folded behind `TAB`. The glossary terms `T_in` and `T_out`
+are allowed in a brief's question.
+
+If the model misses an item, the backstop records a brief that never invents
+an example, never asserts an unchecked impact (it says the impact was not
+established), and says in plain words where the recommendation would be that
+no recommendation was checked — `No recommendation: the brief writer was
+unavailable (<reason>); decide from the evidence.` It never recommends an
+option by position, and it lists the other items on the same file or plan
+clause. On a later park in the same candidate the writer is asked once more
+for an item whose only brief is that backstop; if it fails or times out again
+the backstop stays (with why) and is not retried again on that candidate — a
+new candidate is briefed afresh. `related`
+names both other owner items and same-concern live trade-offs or findings
+that never became owner items — the T-54 silence the goal says must not hide.
+The conductor merges its own same-concern items into a model brief's `related`
+too. A brief names a weekday reopen example only when the plan's calendar
+carries a weekly schedule to check it against; otherwise it is marked
+unverified. If the brief-writing agent's own tools do not match at launch, the
+conductor records why and uses the deterministic backstop — the brief pass
+never emits a phase launch failure from the parked phases it runs in.
+
+The same briefs appear at the top of `views/review.org` (and the program
+review) under `* Needs you (N)`. The question heading is followed by the
+today, impact, options and recommendation paragraphs and the `related` links
+as visible text, so you can decide without a keystroke; only the original
+evidence sits under the folded `Evidence` child and `TAB` unfolds it. An item
+already settled is never shown here again. The status buffer's wait line shows
+the question, not a finding id: `needs you — <question>`, or
+`BLOCKED — <question>` when a blocked phase still has a brief waiting.
+
+### Owner glossary
+
+The brief links a term here instead of explaining it inline:
+
+- **band** — a vendor drops out when its last tick is older than the band's
+  upper edge, and rejoins when a fresh tick arrives inside the band's lower
+  edge.
+- **T_in** — the staleness at which an excluded vendor is allowed back in.
+- **T_out** — the staleness at which a live vendor is excluded.
+- **window** — the recent span of ticks the calculator reads to decide a price.
+- **held** — the market is open but no vendor is publishing, so no price can be
+  formed.
+- **degraded** — a price is still published, but from fewer vendors than the
+  full set.
+
 ## Notifications when something needs you
 
 Nothing waits for the owner by default, so the system tells you when a run has

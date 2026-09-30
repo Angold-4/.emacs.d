@@ -78,3 +78,40 @@ test("reduce: INTEGRITY_VIOLATED is accepted from any phase state (a record even
     assert.equal(result.state.phase.integrityViolated, true);
   }
 });
+
+// Decision briefs: BRIEFS_RECORDED is a logged record event (no phase-state
+// change), merged by requestId so a restart rebuilds the briefs the views
+// render and the status `needs you` line shows.
+const BRIEF = {
+  requestId: "F-M-9",
+  question: "Should a vendor excluded before a weekend stay excluded when its market reopens?",
+  today: "Pyth's NVDA product reopens Sunday 20:00 ET. (example unverified)",
+  impact: "No market stops publishing.",
+  options: [{ id: "accept_risk", label: "Keep as is", effect: "rejoins at once", cost: "one stale quote" }],
+  recommendation: { option: "accept_risk", why: "IC §5" },
+  related: [],
+  evidence: ["message: F-M-9"],
+};
+
+test("reduce: BRIEF_RETRY_ATTEMPTED records the once-per-candidate retry keys", () => {
+  const state = baseState({ phase: "AWAITING_OWNER" });
+  const result = reduce(state, { type: "BRIEF_RETRY_ATTEMPTED", candidateSha: "C1", requestIds: ["F-M-9", "D-A-80"] });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.state.phase.briefRetries?.sort(), ["C1::D-A-80", "C1::F-M-9"]);
+  const again = reduce(result.state, { type: "BRIEF_RETRY_ATTEMPTED", candidateSha: "C1", requestIds: ["F-M-9"] });
+  assert.equal(again.ok, true);
+  assert.equal((again.state.phase.briefRetries ?? []).length, 2, "a repeated key is recorded once");
+});
+
+test("reduce: BRIEFS_RECORDED records and merges briefs by requestId, changing no phase state", () => {
+  const state = baseState({ phase: "AWAITING_OWNER" });
+  const first = reduce(state, { type: "BRIEFS_RECORDED", briefs: [BRIEF] });
+  assert.equal(first.ok, true);
+  assert.equal(first.state.phase.phase, "AWAITING_OWNER");
+  assert.equal(first.state.phase.briefs?.length, 1);
+  assert.equal(first.state.phase.briefs?.[0].requestId, "F-M-9");
+  const second = reduce(first.state, { type: "BRIEFS_RECORDED", briefs: [{ ...BRIEF, question: "A reworded question?" }] });
+  assert.equal(second.ok, true);
+  assert.equal(second.state.phase.briefs?.length, 1, "a later brief for the same request replaces the earlier one");
+  assert.equal(second.state.phase.briefs?.[0].question, "A reworded question?");
+});

@@ -22,6 +22,7 @@ import { buildView, formatDuration } from "./view.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 import { renderProgramChart } from "./charts.ts";
 import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
+import { renderGlossaryOrg } from "./core/briefs.ts";
 import { runReviewLint } from "./core/review-lint.ts";
 import { candidateAnchorFreshness } from "./render.ts";
 
@@ -667,7 +668,19 @@ export function writeProgramChart(dir: string): void {
 export function programReviewText(dir: string): string {
   const { nodes, state, readableIds } = foldProgram(dir);
   const root = path.dirname(path.dirname(dir));
-  const phases: Array<{ phaseId: string; readableId?: string; candidate?: { sha: string }; messages?: unknown[]; entries?: unknown[] }> = [];
+  const phases: Array<{
+    phaseId: string;
+    readableId?: string;
+    candidate?: { sha: string };
+    runId?: string;
+    contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
+    messages?: unknown[];
+    entries?: unknown[];
+    decisions?: unknown[];
+    overrides?: unknown[];
+    briefs?: unknown[];
+    ownerRequests?: unknown[];
+  }> = [];
   // The lint runs per phase, on each phase's OWN entries and message ids
   // (every phase numbers E-1/T-1 from scratch, so a single combined
   // projection would collide ids and fire one-anchor on a topic that recurs
@@ -695,6 +708,14 @@ export function programReviewText(dir: string): string {
         candidate: sha ? { sha } : undefined,
         messages: phase.messages ?? [],
         entries: phase.entries ?? [],
+        decisions: phase.decisions ?? [],
+        overrides: phase.overrides ?? [],
+        runId: phase.runId,
+        contract: phase.contract ? { contractVersion: phase.contract.contractVersion } : undefined,
+        // Decision briefs: the program review shows each node's open owner
+        // items as briefs too (renderProgramEntryReview).
+        briefs: phase.briefs ?? [],
+        ownerRequests: phase.ownerRequests ?? [],
       });
     } catch {
       // the run is not readable (yet): it contributes no entries
@@ -714,6 +735,8 @@ export function writeProgramReview(dir: string): void {
     const file = programPaths(dir).reviewView;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, programReviewText(dir));
+    // Goal (4): the glossary a brief links to, beside the program review too.
+    fs.writeFileSync(path.join(path.dirname(file), "glossary.org"), `* Owner glossary\n${renderGlossaryOrg()}\n`);
   } catch {
     // a review that cannot be written must never stop the scheduler
   }
