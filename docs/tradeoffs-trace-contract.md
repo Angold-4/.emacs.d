@@ -77,6 +77,7 @@ tradeoffs-trace message chart — generated from MESSAGE_TRANSITIONS (src/core/m
   +------------+
   | published  |
   +------------+
+      +- MESSAGE_DROPPED                -> dropped     [message-dropped-published]
       +- OWNER_VERDICT (verdictAccept)  -> accepted    [owner-verdict-accept]
       +- OWNER_VERDICT (verdictRefuse)  -> refused     [owner-verdict-refuse]
       +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-published]
@@ -129,6 +130,7 @@ Every row:
 | `message-published` | `raw` | `MESSAGE_PUBLISHED` | always | `published` |
 | `message-merged` | `raw` | `MESSAGE_MERGED` | always | `merged` |
 | `message-dropped` | `raw` | `MESSAGE_DROPPED` | always | `dropped` |
+| `message-dropped-published` | `published` | `MESSAGE_DROPPED` | always | `dropped` |
 | `owner-verdict-accept` | `published` | `OWNER_VERDICT` | `verdict === "accept"` | `accepted` |
 | `owner-verdict-refuse` | `published` | `OWNER_VERDICT` | `verdict === "refuse"` | `refused` |
 | `message-superseded-published` | `published` | `MESSAGE_SUPERSEDED` | always | `superseded` |
@@ -155,7 +157,7 @@ The events, all reduced by `reduce()`:
 - `MESSAGE_RAISED { message }` — raises the message as `raw`.
 - `MESSAGE_PUBLISHED { messageId, boundCandidateSha, boundContractVersion, boundRecordVersion }`
 - `MESSAGE_MERGED { messageId, by, reason?, …binding }`
-- `MESSAGE_DROPPED { messageId, by, reason?, …binding }`
+- `MESSAGE_DROPPED { messageId, by, reason?, …binding }` — from `raw` (an evaluator) or from `published` (the round panel's non-`keep` majority)
 - `OWNER_VERDICT { messageId, verdict: "accept" | "refuse", reason?, …binding }`
 - `MESSAGE_RESOLVED { messageId, by, reason?, …binding }`
 - `MESSAGE_SUPERSEDED { messageId, reason?, …binding }`
@@ -175,6 +177,82 @@ The events, all reduced by `reduce()`:
 - **`refuse` after `DONE`** is a **follow-up**: the message is marked
   `followUp` and no phase state changes.
 - **`accept`** settles exactly the message version the command named.
+
+### The vote rule per message type (plan 05e)
+
+Which agent validates a message, and how many, depends on its type. Nothing
+reaches the owner, and nothing blocks the worker, on one agent's word except
+an advisory finding.
+
+| Type | Validation | Votes | Effect |
+| --- | --- | --- | --- |
+| trade-off (`T-n`) | the round panel, unless the backing decision already carries valid M, A and B ballots (then no panel) | `keep` / `drop`, batched | a `keep` majority publishes it; otherwise `MESSAGE_DROPPED` from `published` (`by: panel`), with the seats' reasons on the message |
+| advisory finding (`F-n`) | the `finding` evaluator, after the conductor's 3a/3b checks | none | published with `verified` evidence, or `MESSAGE_DROPPED` + `FINDING_DISPROVED` with the evaluator's reason |
+| blocking finding (`F-n`) | the same round panel as the trade-offs, each seat seeing the 3a/3b evidence | `keep` / `drop` | blocks only with a 2-of-3 `keep`; otherwise `FINDING_SEVERITY_CHANGED` to `advisory` |
+| blocker (`B-n`) | its own panel of three, per blocker (unchanged) | `block` / `downgrade` | `block` majority escalates to the owner; `downgrade` makes it an ordinary blocking finding |
+
+One **round panel** per round: three seats, one batched
+`ROUND_PANEL_VOTE` each, dispatched only after the evaluators have published,
+inside `EVALUATING`. `ROUND_PANEL_DECIDED` stamps the outcome and every seat's
+reason on each item message (`panelOutcome`, `panelVotes`).
+
+Three deterministic checks precede any model:
+
+- **3a, facts first:** the conductor compares a finding's claim with the
+  check, probe and gate records it already holds for that candidate. A claim
+  that a named check, test or command fails while the record shows it passing
+  is rejected (`FINDING_DISPROVED` + `MESSAGE_DROPPED`, both citing the
+  record) before any agent sees it; a claim the record confirms gets
+  `verified: record (confirmed by record: …)`. Only a sentence that names the
+  command AND carries a failure word is a claim about it. This runs for a
+  blocker's finding too.
+- **3b, run what can be run:** a finding naming a runnable test or command is
+  re-run in the candidate's disposable checkout, bounded by the check
+  deadline. Exit 0, or a timeout that reproduces nothing, drops it (`run <cmd>
+  exit 0` / `run <cmd> timed out`); a non-zero exit records `verified: run
+  <cmd> exit N`. A blocker's `runnable` is checked the same way.
+- **severity against the plan (5):** a blocking finding that cites no
+  acceptance item or reserved rule is lowered by the evaluator
+  (`FINDING_SEVERITY_CHANGED`, by `evaluator`, with its reason). The GROUND
+  decides, not the kind: an `integration` finding citing an acceptance item
+  may block. A citation is the item verbatim, a phrasing-preserving
+  paraphrase, a numbered reference, a reserved rule, an owner directive id,
+  or a `criterionDispute`. A `sameAs` re-raise takes the re-raiser's severity
+  **downward only**; one reviewer cannot raise an advisory finding to
+  blocking.
+
+`FINDING_VERIFIED` records what validated a finding — `record`, `run <cmd>
+exit N`, a `file:line …` citation, or `panel keep` — and the renderer shows it
+in the property drawer (`VERIFIED`) and in `views/messages/<id>.org`.
+Validations accumulate: the 3a/3b evidence, the panel's vote and an
+evaluator-supplied citation (`evaluator: <text>`, tagged because the conductor
+did not check it) are joined rather than overwritten.
+
+### Resolution across rounds (plan 05e)
+
+Every later round's turn-2 prompt lists the earlier rounds' open findings and
+blockers; each reviewer's `Review.resolutionStatements` marks each `resolved`
+or `open` with evidence. A 2-of-3 `resolved` majority emits `MESSAGE_RESOLVED`
+(`by: vote`) and `FINDING_RESOLVED_BY_VOTE` (the finding is repaired), so the
+message leaves the owner's live view and no longer blocks. A 2-of-3 `open`
+majority, or no majority, leaves it live. A trade-off may carry
+`closes: <messageId>`; both message files render the link (`CLOSES` /
+`FIXED_BY`).
+
+### Approved code stays approved (plan 05e)
+
+When all three reviewers review a candidate, every live decision bound to it
+has settled, no owner request is open and no open blocking finding stands,
+`CANDIDATE_APPROVED` records its git tree. It is emitted when the round's
+`EVALUATING` has settled, so the round panel's severity decisions are already
+final. A later round whose candidate ships the same tree (an amendment-only
+resubmission) re-reviews only the amended criterion; a new blocking finding on
+the unchanged code is raised as advisory, unless it cites an acceptance item
+or a reserved rule. A point filed through a reviewer's `blockers` list on such
+a round is raised as an ordinary finding message (advisory when it cites no
+ground), so no blocker panel runs on unchanged approved code. A candidate
+whose ballots were rejected is never approved, so an identical resubmission is
+re-reviewed normally.
 
 ## 2. Bindings and `contentHash`
 

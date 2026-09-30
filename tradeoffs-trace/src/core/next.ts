@@ -28,6 +28,9 @@ import {
   panelSeatSettled,
   panelSeatsSettled,
   resolvedCorrectionIdsFor,
+  roundPanelItemsNeedingVote,
+  roundPanelSeatSettled,
+  roundPanelSeatsSettled,
   sameVersion,
   typesNeedingEvaluation,
 } from "./predicate.ts";
@@ -115,12 +118,33 @@ export function next(state: State): Action[] {
           if (!p.inFlight[key]) actions.push({ type: "dispatch_panel", blockerId, seat });
         }
       }
+      // Plan 05e: the round panel votes on every published trade-off that no
+      // three reviewers balloted and on every published blocking finding. It
+      // is dispatched only once the evaluators have published (its items are
+      // a fact of the published messages), batched as ONE panel per round.
+      const evaluatorsSettled = pending.length === 0;
+      const roundItems = evaluatorsSettled ? roundPanelItemsNeedingVote(p) : [];
+      if (evaluatorsSettled && roundItems.length > 0 && !p.panel?.round?.decided) {
+        for (const seat of PANEL_SEATS) {
+          if (roundPanelSeatSettled(p.panel?.round?.seats?.[String(seat)])) continue;
+          const key = `dispatch_round_panel_${seat}` as InFlightKey;
+          if (!p.inFlight[key]) actions.push({ type: "dispatch_round_panel", seat });
+        }
+      }
       if (actions.length > 0) return actions;
       // Every seat has settled; the panel's own verdict is next(), not the
       // agent's — one action per undecided blocker, computed from the votes.
       for (const blockerId of blockersNeedingPanel(p)) {
         const panel = p.panel!.blockers![blockerId];
         if (!panel.decided && panelSeatsSettled(panel)) return [{ type: "panel_decide", blockerId }];
+      }
+      if (
+        evaluatorsSettled &&
+        roundItems.length > 0 &&
+        !p.panel?.round?.decided &&
+        roundPanelSeatsSettled(p.panel?.round)
+      ) {
+        return [{ type: "round_panel_decide" }];
       }
       return evaluationSettled(p) ? [{ type: "evaluation_complete" }] : [];
     }

@@ -81,7 +81,8 @@
             "required": ["command"],
             "additionalProperties": false,
             "properties": { "command": { "type": "string", "minLength": 1 } }
-          }
+          },
+          "runnable": { "type": "string", "minLength": 1 }
         }
       }
     },
@@ -111,7 +112,22 @@
             "required": ["command"],
             "additionalProperties": false,
             "properties": { "command": { "type": "string", "minLength": 1 } }
-          }
+          },
+          "runnable": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "resolutionStatements": {
+      "type": "array",
+      "description": "Plan 05e: this reviewer's mark on every earlier-round finding/blocker the turn-2 prompt listed.",
+      "items": {
+        "type": "object",
+        "required": ["messageId", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "messageId": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["resolved", "open"] },
+          "evidence": { "type": "string" }
         }
       }
     },

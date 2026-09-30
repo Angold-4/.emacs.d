@@ -58,6 +58,7 @@ import {
   classifyCheckFailure,
   classifyRerun,
   failedNormally,
+  escapeRegExp,
   parseBaseline,
   parseTestFailures,
   rerunCommandsFor,
@@ -107,7 +108,21 @@ import {
   type ToolSetMismatch,
 } from "./core/roles.ts";
 import { rerunBudgetMs } from "./core/checks.ts";
-import { decisionStatus, isLiveDecision, panelOptionsFor, panelOutcome, panelSeatsSettled, sameVersion } from "./core/predicate.ts";
+import {
+  decisionSettled,
+  decisionStatus,
+  findingCitesAcceptanceOrReserved,
+  isLiveDecision,
+  panelOptionsFor,
+  panelOutcome,
+  panelSeatsSettled,
+  reviewsComplete,
+  roundPanelItemsNeedingVote,
+  roundPanelOutcomeFor,
+  roundPanelSeatSettled,
+  roundPanelSeatsSettled,
+  sameVersion,
+} from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
@@ -132,6 +147,7 @@ import {
   discardProbe,
   publishCAS,
   removeWorktree,
+  candidateTree,
   verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
@@ -428,6 +444,13 @@ const MESSAGE_EVENT_TYPES = new Set<string>([
   "MESSAGE_SUPERSEDED",
   "MESSAGE_CARRIED",
   "PANEL_DECIDED",
+  // Plan 05e: the round panel stamps its reasons on each item message, and a
+  // severity change alters what the review shows.
+  "ROUND_PANEL_DECIDED",
+  "FINDING_SEVERITY_CHANGED",
+  "FINDING_VERIFIED",
+  "FINDING_RESOLVED_BY_VOTE",
+  "CANDIDATE_APPROVED",
   // Plan 05j: the entry ledger and the review lint are projections too, so an
   // owner's s/m/A/D on an entry (or a curator's link) must rewrite the views
   // in the same beat (finding A-7).
@@ -1465,6 +1488,21 @@ export class Conductor {
       }
       this.#log.completion(actionId, { blockerId, seat, interrupted: true, reason: "crash-recovery" });
       this.#panelSeatUnavailable(blockerId, seat, this.#state.phase.candidate?.sha, "the conductor died while the seat voted");
+      return;
+    }
+
+    if (key.startsWith("dispatch_round_panel_")) {
+      // Plan 05e: a conductor died while a round-panel seat voted. Kill what
+      // survived and treat the seat like a timeout — retried once; a second
+      // loss makes it unavailable, and the remaining real votes decide.
+      const seat = Number(key.slice("dispatch_round_panel_".length));
+      const pgid = payload.pgid as number | undefined;
+      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
+        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
+      this.#log.completion(actionId, { seat, interrupted: true, reason: "crash-recovery" });
+      this.#roundPanelSeatUnavailable(seat, "the conductor died while the seat voted");
       return;
     }
 
@@ -2880,6 +2918,13 @@ export class Conductor {
         return;
       }
       case "evaluation_complete":
+        // Plan 05e (finding #34): the round's evaluators and panels have
+        // settled, so the candidate's final approval state is known.
+        try {
+          this.#recordCandidateApproval();
+        } catch (err) {
+          this.#log.append("error", { where: "candidate_approval", error: String((err as Error)?.message ?? err) });
+        }
         this.#applyEvent({ type: "EVALUATION_COMPLETED" });
         return;
       case "dispatch_panel": {
@@ -2908,6 +2953,17 @@ export class Conductor {
           ...(blockReasons.length > 0 ? { reason: blockReasons.join("; ") } : {}),
           ...(outcome === "escalate" ? { options: panelOptionsFor(panel) } : {}),
         });
+        return;
+      }
+      case "dispatch_round_panel": {
+        const seat = action.seat as number;
+        const actionId = this.#log.actionId(`${kind}_${seat}`);
+        this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_round_panel", actionId, seat });
+        void this.#runRoundPanelSeat(actionId, seat).catch((err) => this.#logUnexpected("dispatch_round_panel", err));
+        return;
+      }
+      case "round_panel_decide": {
+        this.#decideRoundPanel();
         return;
       }
       case "dispatch_worker": {
@@ -3239,6 +3295,15 @@ export class Conductor {
           this.#log.append("review_outcome_error", { reviewer: review.reviewer, error });
           return { ok: false, reason: error };
         }
+        // Plan 05e: once all three reviews are in, the round's resolution
+        // ballots are counted (a majority `resolved` moves a message out of
+        // the live view). Candidate approval is recorded later, when the
+        // round's EVALUATING has settled (see `evaluation_complete`).
+        try {
+          this.#applyRoundResolutions(review);
+        } catch (err) {
+          this.#log.append("error", { where: "round_resolutions", error: String((err as Error)?.message ?? err) });
+        }
         this.#applyEvent({ type: "REVIEW_SUBMITTED", review });
         try {
           this.#applyReviewFindingStatements(review);
@@ -3296,6 +3361,9 @@ export class Conductor {
       }
       const anchor = parseAnchor(args.anchor);
       if (!anchor) return { ok: false, reason: "raise_tradeoff needs anchor = {path, lines: [start, end]}" };
+      // Plan 05e: a trade-off raised for a fix may name the message it closes
+      // (`closes: F-3`); the renderer shows the link on both messages.
+      const closes = typeof args.closes === "string" && args.closes.trim().length > 0 ? args.closes.trim() : undefined;
       // Bind to the current candidate when one exists; otherwise to the
       // integration head, and let the freeze's MESSAGE_CARRIED rebind it.
       const candidateSha = this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead;
@@ -3307,9 +3375,9 @@ export class Conductor {
         undefined,
         { type: "tradeoff", title: choice, summary: why, context: alternative, evidence: [`${anchor.path}:${anchor.lines[0]}-${anchor.lines[1]}`], ...(planRef ? { planRef } : {}) },
         candidateSha,
-        { anchor },
+        { anchor, ...(closes ? { closes } : {}) },
       );
-      this.#log.append("tradeoff_raised", { role: handle.role, choice, anchor });
+      this.#log.append("tradeoff_raised", { role: handle.role, choice, anchor, ...(closes ? { closes } : {}) });
       return { ok: true };
     }
     if (msg.tool === "submit_evaluation") {
@@ -3348,6 +3416,44 @@ export class Conductor {
       }
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
       this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
+      handle.doneResolve();
+      return { ok: true };
+    }
+    if (msg.tool === "submit_round_panel_votes") {
+      // Plan 05e: one round-panel seat's batched votes on every pending
+      // trade-off and blocking finding. Validated whole, then recorded.
+      if (handle.role !== "panel" || this.#state.phase.phase !== "EVALUATING") {
+        return { ok: false, reason: `submit_round_panel_votes is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      const seat = handle.panelSeat;
+      if (seat === undefined || !handle.agentId.startsWith("round-panel-")) {
+        return { ok: false, reason: "this panel seat is not bound to the round panel" };
+      }
+      const seatState = this.#state.phase.panel?.round?.seats?.[String(seat)];
+      if (seatState?.votes !== undefined) return { ok: false, reason: `this round panel seat (${seat}) already voted` };
+      if (seatState?.unavailable === true && seatState.dispatches >= 2) {
+        return { ok: false, reason: `this round panel seat (${seat}) is unavailable` };
+      }
+      const raw = (msg.args as { votes?: unknown }).votes;
+      if (!Array.isArray(raw) || raw.length === 0) return { ok: false, reason: "submit_round_panel_votes needs a non-empty votes array" };
+      const items = new Set(roundPanelItemsNeedingVote(this.#state.phase));
+      const seen = new Set<string>();
+      const votes: Array<{ messageId: string; verdict: "keep" | "drop" | "downgrade"; reason: string }> = [];
+      for (const entry of raw as Array<{ messageId?: unknown; verdict?: unknown; reason?: unknown }>) {
+        const messageId = typeof entry?.messageId === "string" ? entry.messageId : "";
+        if (!items.has(messageId)) return { ok: false, reason: `${messageId || "(no messageId)"} is not a pending item of this round's panel` };
+        if (seen.has(messageId)) return { ok: false, reason: `${messageId} is voted on more than once` };
+        seen.add(messageId);
+        const verdict = entry?.verdict;
+        if (verdict !== "keep" && verdict !== "drop" && verdict !== "downgrade") {
+          return { ok: false, reason: `verdict for ${messageId} must be keep, drop or downgrade` };
+        }
+        const reason = typeof entry?.reason === "string" ? entry.reason.trim() : "";
+        if (!reason) return { ok: false, reason: `a reason is required for ${messageId}` };
+        votes.push({ messageId, verdict, reason });
+      }
+      for (const id of items) if (!seen.has(id)) return { ok: false, reason: `every pending item needs a vote; ${id} is missing` };
+      this.#applyEvent({ type: "ROUND_PANEL_VOTE", seat, votes });
       handle.doneResolve();
       return { ok: true };
     }
@@ -3565,12 +3671,19 @@ export class Conductor {
         }
         continue;
       }
+      const sourceFinding = message.sourceRecordId ? this.#state.phase.findings.find((f) => f.id === message.sourceRecordId) : undefined;
       if (entry.action === "merge") {
         const into = typeof entry.into === "string" && entry.into.trim().length > 0 ? entry.into.trim() : undefined;
         events.push({ type: "MESSAGE_MERGED", ...binding, by: "evaluator", reason: into ? `merged into ${into}` : "merged" });
       } else if (entry.action === "drop") {
         const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : "dropped by the evaluator";
         events.push({ type: "MESSAGE_DROPPED", ...binding, by: "evaluator", reason });
+        // Plan 05e (3c): an advisory finding the evaluator cannot confirm is
+        // dropped with its reason, and the finding itself is disproved — it
+        // never reaches the owner as an open defect.
+        if (sourceFinding && sourceFinding.status === "open") {
+          events.push({ type: "FINDING_DISPROVED", findingId: sourceFinding.id, byReviewer: sourceFinding.raisedBy as Reviewer, evidence: reason });
+        }
       } else {
         const text = (v: unknown, fallback: string) => (typeof v === "string" && v.trim().length > 0 ? v.trim() : fallback);
         const importance =
@@ -3590,6 +3703,33 @@ export class Conductor {
             ...(importance ? { importance } : {}),
           },
         });
+        if (sourceFinding) {
+          // Plan 05e: the evaluator's own citation is tagged as evaluator
+          // supplied (`evaluator: …`, round-3 review disc-A-38/M-10) and
+          // APPENDED to whatever already validated the finding (the 3a record
+          // or a 3b run), so no earlier validation evidence is lost.
+          const supplied = typeof entry.verified === "string" && entry.verified.trim().length > 0 ? entry.verified.trim() : undefined;
+          const addition = supplied ? (supplied.startsWith("evaluator:") ? supplied : `evaluator: ${supplied}`) : undefined;
+          const combined = appendVerified(sourceFinding.verified, addition);
+          if (combined && combined !== sourceFinding.verified) events.push({ type: "FINDING_VERIFIED", findingId: sourceFinding.id, verified: combined });
+          // Plan 05e (5): a blocking finding may stay blocking only when it is
+          // a defect against an acceptance item or a reserved rule; the
+          // evaluator lowers anything else, recording the reason.
+          if (
+            sourceFinding.severity === "blocking" &&
+            message.type === "finding" &&
+            !message.raisedAsBlocker &&
+            !findingCitesAcceptanceOrReserved(sourceFinding, this.#state.phase.contract, this.#directiveIds())
+          ) {
+            events.push({
+              type: "FINDING_SEVERITY_CHANGED",
+              findingId: sourceFinding.id,
+              severity: "advisory",
+              reason: "the finding cites no acceptance item or reserved rule, so it may not block",
+              by: "evaluator",
+            });
+          }
+        }
       }
     }
     return events;
@@ -3722,12 +3862,213 @@ export class Conductor {
    * live worktree or the reviewer's own read-only candidate checkout) if
    * one was given, and emits `FINDING_RAISED`. Returns an error string
    * instead of throwing, like `#applyDiscoveries`. */
+  /** Plan 05e: the ids of the owner directives in force, which a blocking
+   * finding may cite as its ground (`cite the directive id`). */
+  #directiveIds(): string[] {
+    return (this.#state.phase.ownerDirectives ?? []).map((d) => d.id).filter((id) => typeof id === "string" && id.length > 0);
+  }
+
+  /** Plan 05e (3a): the check, probe and gate records this candidate's run
+   * already holds, as `{command, exitCode, output}` per command. A log's
+   * first line is `$ <command>`, its last `exit <n> signal <s>`. Read-only;
+   * an absent directory is no records. */
+  #checkRecordsFor(candidateSha: string): Array<{ command: string; exitCode: number | null; output: string }> {
+    // The candidate's own check and gate logs, plus the probe's own records
+    // for the integration it probed onto (recorded under a probe-specific
+    // directory), so 3a compares against every record the run holds for the
+    // candidate (plan 05e, disc-A-17).
+    const dirs = [path.join(this.#paths.checks, candidateSha)];
+    const probe = this.#state.phase.probe;
+    if (probe && probe.candidateSha === candidateSha && typeof probe.probedI === "string" && probe.probedI.length > 0) {
+      dirs.push(path.join(this.#paths.checks, "probe", probe.probedI));
+    }
+    const out: Array<{ command: string; exitCode: number | null; output: string }> = [];
+    for (const dir of dirs) {
+      let names: string[];
+      try {
+        names = fs.readdirSync(dir).filter((n) => n.endsWith(".log"));
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        try {
+          const lines = fs.readFileSync(path.join(dir, name), "utf8").split("\n");
+          const first = lines[0] ?? "";
+          if (!first.startsWith("$ ")) continue;
+          const command = first.slice(2).trim();
+          const last = [...lines].reverse().find((l) => l.startsWith("exit ")) ?? "";
+          const m = last.match(/^exit (\d+)/);
+          out.push({ command, exitCode: m ? Number(m[1]) : null, output: lines.slice(1).join("\n") });
+        } catch {
+          // best effort: a corrupt record proves nothing
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Plan 05e (3a): compare a finding's own words with the candidate's check
+   * record, before any agent sees it. A claim that names a check command or
+   * a test the record lists as failing is `confirmed`; a claim that a named
+   * command fails while the record shows it passing is `rejected` with the
+   * record cited.
+   *
+   * Only a sentence that both names the command AND carries a failure word is
+   * read as a claim about it, so a finding that merely mentions a passing
+   * check ("make check passes but does not cover it") is not auto-dropped
+   * (round-2 reviews A-6, M-12, B-21). */
+  #claimAgainstCheckRecords(
+    evidence: string,
+    candidateSha: string,
+  ): { kind: "rejected"; reason: string } | { kind: "confirmed"; reason: string } | undefined {
+    const sentences = evidence
+      .split(/[.;\n]+/)
+      .map((s) => s.toLowerCase())
+      .filter((s) => s.trim().length > 0);
+    const failureWord = /(fail|fails|failed|failing|failure|error|errors|broken|crash|crashes|crashed|does not pass|doesn't pass|not pass|red|non-zero|nonzero|times out|timed out|timeout|regression|invalid)/;
+    for (const record of this.#checkRecordsFor(candidateSha)) {
+      const command = record.command.trim();
+      if (command.length >= 5) {
+        const needle = command.toLowerCase();
+        const claiming = sentences.find((s) => s.includes(needle) && failureWord.test(s));
+        if (claiming) {
+          if (record.exitCode === 0) {
+            return {
+              kind: "rejected",
+              reason: `check record for ${candidateSha.slice(0, 9)}: \`${command}\` exit 0 (passed) — the claim that it fails is contradicted by the record`,
+            };
+          }
+          if (record.exitCode !== null) {
+            return { kind: "confirmed", reason: `record (confirmed by record: \`${command}\` exit ${record.exitCode})` };
+          }
+        }
+      }
+      for (const name of parseTestFailures(record.output)) {
+        if (name.length < 4) continue;
+        const re = new RegExp(`(^|[^a-z0-9_])${escapeRegExp(name.toLowerCase())}([^a-z0-9_]|$)`);
+        if (re.test(evidence.toLowerCase())) {
+          return { kind: "confirmed", reason: `record (confirmed by record: \`${command}\` lists failing test ${name})` };
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /** Plan 05e (3b): run the finding's own runnable test or command in a fresh
+   * disposable checkout of the candidate, bounded by the check deadline. */
+  async #runRunnable(command: string, candidateSha: string): Promise<{ exitCode: number | null; timedOut: boolean; tail: string }> {
+    const checkout = disposableCheckout(this.#plan.repo, candidateSha);
+    try {
+      const running = runCommand({
+        command,
+        cwd: checkout.dir,
+        deadlineMs: this.#deadlines.checkMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+      });
+      const result = await running.result;
+      return { exitCode: result.exitCode, timedOut: result.timedOut, tail: result.output.slice(-2000) };
+    } finally {
+      checkout.dispose();
+    }
+  }
+
+  /** Plan 05e (3a/3b): record a finding whose claim the record (or its own
+   * passing run) already contradicted — as an immediately disproved finding
+   * and a dropped message, so no evaluator or panel ever sees it. */
+  #rejectFinding(
+    fd: FindingDisclosure,
+    reviewer: Reviewer,
+    candidateSha: string,
+    reason: string,
+    opts: { raisedAsBlocker?: boolean } = {},
+  ): void {
+    const id = `F-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-${reviewer}-${this.#state.phase.findings.length + 1}`;
+    const finding: Finding = {
+      id,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      kind: fd.kind,
+      severity: fd.severity,
+      evidence: fd.evidence,
+      raisedBy: reviewer,
+      status: "disproved",
+      boundCandidateSha: candidateSha,
+      disprovedEvidence: reason,
+    };
+    const result = validate(FINDING_SCHEMA, finding);
+    if (result.valid) {
+      this.#applyEvent({ type: "FINDING_RAISED", finding: { ...finding, status: "open" } });
+      this.#applyEvent({ type: "FINDING_DISPROVED", findingId: id, byReviewer: reviewer, evidence: reason });
+    }
+    const messageType: MessageType = opts.raisedAsBlocker ? "blocker" : "finding";
+    const messageId = this.#raiseMessage(messageType, id, this.#findingContent({ ...finding, status: "open" }, messageType), candidateSha, opts.raisedAsBlocker ? { raisedAsBlocker: true } : {});
+    const message = (this.#state.phase.messages ?? []).find((m) => m.id === messageId)!;
+    this.#applyEvent({
+      type: "MESSAGE_DROPPED",
+      messageId,
+      by: "evaluator",
+      reason,
+      boundCandidateSha: message.boundCandidateSha,
+      boundContractVersion: message.boundContractVersion,
+      boundRecordVersion: message.messageVersion,
+    });
+    this.#log.append("finding_rejected_by_record", { reviewer, findingId: id, reason });
+  }
+
   async #raiseFinding(
     fd: FindingDisclosure,
     reviewer: Reviewer,
     candidateSha: string,
     opts: { raisedAsBlocker?: boolean } = {},
   ): Promise<string | undefined> {
+    // Plan 05e (finding #34): a new point on bytes the reviewers already
+    // approved is an advisory finding, not a blocker, unless it violates an
+    // acceptance item or a reserved rule. That applies to a point filed
+    // through the `blockers` list too: it is raised as an ordinary finding
+    // message, so no blocker panel runs on unchanged approved code
+    // (round-4 review A-16).
+    let severity = fd.severity;
+    let asBlocker = opts.raisedAsBlocker === true;
+    const approvedSha = this.#amendmentOnlyApprovedSha(candidateSha);
+    const citesGround =
+      approvedSha !== undefined &&
+      findingCitesAcceptanceOrReserved(
+        { kind: fd.kind, evidence: fd.evidence, criterionDisputed: fd.criterionDispute?.criterion } as Finding,
+        this.#state.phase.contract,
+        this.#directiveIds(),
+      );
+    if (approvedSha && !citesGround) {
+      this.#log.append("amendment_only_downgrade", { reviewer, approvedCandidateSha: approvedSha, candidateSha, raisedAsBlocker: asBlocker });
+      if (asBlocker) asBlocker = false;
+      if (severity === "blocking") severity = "advisory";
+    }
+    // Plan 05e (3a/3b): every finding — including one raised through a
+    // reviewer's `blockers` list, which is a blocking finding too — goes
+    // through the record comparison and the runnable re-run before any agent
+    // sees it (round-3 reviews disc-A-36, M-9).
+    let verified: string | undefined;
+    {
+      const claim = this.#claimAgainstCheckRecords(fd.evidence, candidateSha);
+      if (claim?.kind === "rejected") {
+        this.#rejectFinding(fd, reviewer, candidateSha, claim.reason, { raisedAsBlocker: asBlocker });
+        return undefined;
+      }
+      if (claim?.kind === "confirmed") verified = claim.reason;
+      if (fd.runnable && fd.runnable.trim().length > 0) {
+        const run = await this.#runRunnable(fd.runnable.trim(), candidateSha);
+        this.#log.append("finding_run", { reviewer, command: fd.runnable.trim(), exitCode: run.exitCode, timedOut: run.timedOut, tail: run.tail });
+        // Plan 05e (3b): the finding is published only if the run reproduces
+        // it. Exit 0 did not reproduce it; a timeout is inconclusive and must
+        // not count as a reproduced failure either (round-2 reviews A-7,
+        // M-3, B-22).
+        if (run.timedOut || run.exitCode === 0) {
+          const why = run.timedOut ? "timed out" : "exit 0";
+          this.#rejectFinding(fd, reviewer, candidateSha, `run \`${fd.runnable.trim()}\` ${why} — the claimed failure did not reproduce`, { raisedAsBlocker: asBlocker });
+          return undefined;
+        }
+        verified = `run \`${fd.runnable.trim()}\` exit ${run.exitCode}`;
+      }
+    }
     let reproduction: Finding["reproduction"];
     if (fd.reproduction) {
       const result = await this.#runReproduction(fd.reproduction.command, candidateSha);
@@ -3738,11 +4079,12 @@ export class Conductor {
       version: 1,
       phaseId: this.#state.phase.phaseId,
       kind: fd.kind,
-      severity: fd.severity,
+      severity,
       evidence: fd.evidence,
       raisedBy: reviewer,
       status: "open",
       boundCandidateSha: candidateSha,
+      ...(verified !== undefined ? { verified } : {}),
       // Optional fields are omitted entirely rather than set to
       // `undefined` — schema.ts's minimal validator treats a PRESENT key
       // whose value is `undefined` as "wrong type", not "absent" (a real
@@ -3763,13 +4105,13 @@ export class Conductor {
     // finding keeps its pre-04b meaning — it blocks acceptance and forces a
     // repair — and stays a `finding` message, listed under Findings marked
     // `blocking', never as a Blocker (plan 05c).
-    const messageType: MessageType = opts.raisedAsBlocker ? "blocker" : "finding";
+    const messageType: MessageType = asBlocker ? "blocker" : "finding";
     this.#raiseMessage(
       messageType,
       finding.id,
       this.#findingContent(finding, messageType),
       candidateSha,
-      opts.raisedAsBlocker ? { raisedAsBlocker: true } : {},
+      asBlocker ? { raisedAsBlocker: true } : {},
     );
     // Plan 01g: a reviewer's finding may say the criterion cannot be met as
     // written. That is recorded as an amendment the reviewers vote on later;
@@ -3939,6 +4281,27 @@ export class Conductor {
           const existing = this.#state.phase.findings.find((f) => f.id === fd.sameAs && f.status === "open");
           if (existing) {
             this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer: review.reviewer });
+            // Plan 05e (5, finding #32): a `sameAs` re-raise takes the
+            // re-raiser's severity DOWNWARD — a narrower advisory re-raise of
+            // a fixed blocking finding no longer keeps it blocking. It never
+            // raises one: a single reviewer making an advisory finding
+            // blocking would block the worker on one agent's word (round-2
+            // reviews A-5, M-2).
+            if (fd.severity === "advisory" && existing.severity === "blocking") {
+              this.#applyEvent({
+                type: "FINDING_SEVERITY_CHANGED",
+                findingId: existing.id,
+                severity: "advisory",
+                reason: `re-raised by ${review.reviewer} at advisory severity`,
+                by: "reviewer",
+              });
+            } else if (fd.severity === "blocking" && existing.severity === "advisory") {
+              this.#log.append("sameas_severity_raise_refused", {
+                reviewer: review.reviewer,
+                findingId: existing.id,
+                reason: "a sameAs re-raise may lower a finding's severity, never raise it",
+              });
+            }
             continue;
           }
         }
@@ -4020,6 +4383,100 @@ export class Conductor {
         }
       }
     }
+  }
+
+  /** Plan 05e: the three reviews of the current candidate, with `review`
+   * standing in for the one being submitted (it is not recorded yet when
+   * this runs). Undefined until all three are present. */
+  #threeReviewsWith(review: Review): Review[] | undefined {
+    const list: Review[] = [];
+    for (const who of ["M", "A", "B"] as const) {
+      const r = who === review.reviewer ? review : this.#state.phase.reviews[who]?.review;
+      if (!r || r.candidateSha !== review.candidateSha) return undefined;
+      list.push(r);
+    }
+    return list;
+  }
+
+  /** Plan 05e: count the round's resolution ballots. For every earlier-round
+   * finding/blocker message any reviewer marked, a 2-of-3 `resolved` majority
+   * moves it to `resolved` (it leaves the owner's live view); a 2-of-3 `open`
+   * majority (or no majority) leaves it live. */
+  #applyRoundResolutions(review: Review): void {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha;
+    if (!C) return;
+    const reviews = this.#threeReviewsWith(review);
+    if (!reviews) return;
+    const ids = new Set<string>();
+    for (const r of reviews) for (const s of r.resolutionStatements ?? []) ids.add(s.messageId);
+    for (const id of ids) {
+      const message = (phase.messages ?? []).find((m) => m.id === id);
+      if (!message || (message.state !== "published" && message.state !== "refused")) continue;
+      let resolved = 0;
+      for (const r of reviews) {
+        const s = (r.resolutionStatements ?? []).find((x) => x.messageId === id);
+        if (s?.status === "resolved") resolved += 1;
+      }
+      if (resolved < 2) continue;
+      const evidence = reviews
+        .flatMap((r) => (r.resolutionStatements ?? []).filter((s) => s.messageId === id && s.status === "resolved"))
+        .map((s) => s.evidence)
+        .filter((e): e is string => typeof e === "string" && e.length > 0)
+        .join("; ");
+      this.#applyEvent({
+        type: "MESSAGE_RESOLVED",
+        messageId: id,
+        by: "vote",
+        reason: evidence.length > 0 ? `resolved by a reviewer majority: ${evidence}` : "resolved by a reviewer majority",
+        boundCandidateSha: message.boundCandidateSha,
+        boundContractVersion: message.boundContractVersion,
+        boundRecordVersion: message.messageVersion,
+      });
+      // The finding a resolved finding/blocker message came from is repaired
+      // on this candidate, so it no longer blocks acceptance.
+      const sourceFinding = message.sourceRecordId ? phase.findings.find((f) => f.id === message.sourceRecordId) : undefined;
+      if (sourceFinding && sourceFinding.status === "open" && C) {
+        this.#applyEvent({ type: "FINDING_RESOLVED_BY_VOTE", findingId: sourceFinding.id, candidateSha: C });
+      }
+    }
+  }
+
+  /** Plan 05e (finding #34): record the candidate as approved once all three
+   * reviewers have reviewed it, every live decision bound to it has settled,
+   * no owner request is open and no open blocking finding stands against it
+   * (round-2 reviews A-4, disc-A-19, B-23). It runs when the round's
+   * EVALUATING has settled, so the round panel's and evaluator's severity
+   * decisions are already final. The tree object id is what a later
+   * amendment-only resubmission is compared against. */
+  #recordCandidateApproval(): void {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha;
+    if (!C) return;
+    const K = phase.contract.contractVersion;
+    if (!reviewsComplete(phase, C, K)) return;
+    if ((phase.approvedCandidates ?? []).some((a) => a.candidateSha === C)) return;
+    if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open")) return;
+    if (phase.ownerRequests.some((r) => r.status === "open")) return;
+    for (const decision of phase.decisions) {
+      if (!isLiveDecision(decision)) continue;
+      if (decision.amendment) continue;
+      if (decision.boundCandidateSha !== C) continue;
+      if (!decisionSettled(decision, phase, C, K)) return;
+    }
+    const tree = candidateTree(this.#plan.repo, C);
+    if (!tree) return;
+    this.#applyEvent({ type: "CANDIDATE_APPROVED", candidateSha: C, tree });
+  }
+
+  /** Plan 05e: the approved candidate whose shipped bytes are identical to
+   * `sha`'s, if any (an amendment-only resubmission), else undefined. */
+  #amendmentOnlyApprovedSha(sha: string): string | undefined {
+    const approved = this.#state.phase.approvedCandidates ?? [];
+    if (approved.length === 0) return undefined;
+    const tree = candidateTree(this.#plan.repo, sha);
+    if (!tree) return undefined;
+    return approved.find((a) => a.tree === tree && a.candidateSha !== sha)?.candidateSha;
   }
 
   // -- work packet 2a: boundary triggers + §3.5 sampling data --------------
@@ -4950,7 +5407,7 @@ export class Conductor {
     sourceRecordId: string | undefined,
     content: MessageContent,
     candidateSha: string,
-    opts: { anchor?: Message["anchor"]; raisedAsBlocker?: boolean } = {},
+    opts: { anchor?: Message["anchor"]; raisedAsBlocker?: boolean; closes?: string } = {},
   ): string {
     const existing = this.#state.phase.messages ?? [];
     if (sourceRecordId !== undefined) {
@@ -4966,6 +5423,7 @@ export class Conductor {
       type,
       ...content,
       ...(opts.anchor ? { anchor: opts.anchor } : {}),
+      ...(opts.closes ? { closes: opts.closes } : {}),
       ...(opts.raisedAsBlocker ? { raisedAsBlocker: true } : {}),
       state: "raw",
       messageVersion: 1,
@@ -7224,6 +7682,260 @@ export class Conductor {
     ].join("\n");
   }
 
+  // -- plan 05e: the round panel (trade-offs and blocking findings) ---------
+
+  /** A late timeout/loss for a round-panel seat whose phase has moved on is
+   * logged and dropped, exactly like a blocker seat's. */
+  #roundPanelSeatUnavailable(seat: number, reason: string): void {
+    const phase = this.#state.phase;
+    const seatState = phase.panel?.round?.seats?.[String(seat)];
+    if (
+      phase.phase !== "EVALUATING" ||
+      phase.panel?.round?.decided ||
+      seatState?.votes !== undefined ||
+      (seatState?.unavailable === true && seatState.dispatches >= 2)
+    ) {
+      this.#log.append("stale_round_panel_ignored", { seat, reason, phase: phase.phase });
+      return;
+    }
+    this.#applyEvent({ type: "ROUND_PANEL_SEAT_UNAVAILABLE", seat, reason });
+  }
+
+  /** Plan 05e: one fresh round-panel seat. It reads the phase contract, the
+   * owner directives, the ledger, the candidate's diff and every pending item
+   * (with its 3a/3b evidence), and returns its batched `keep`/`drop` votes
+   * through `submit_round_panel_votes`. Three run in parallel; each has its
+   * own deadline and its own one retry. */
+  async #runRoundPanelSeat(actionId: string, seat: number): Promise<void> {
+    const dispatchCandidate = this.#state.phase.candidate?.sha;
+    const agentId = `round-panel-${seat}-${actionId}`;
+    const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
+    const candidateDir = this.#candidateDir();
+    const env: NodeJS.ProcessEnv = {
+      ...this.#extraEnv,
+      ...this.#piEnvFor?.("panel", agentId),
+      TT_SOCKET: this.#paths.sock,
+      TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_RUN_DIR: this.#runDir,
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+      TT_CANDIDATE_SHA: this.#state.phase.candidate?.sha,
+      TT_PANEL_SEAT: String(seat),
+      TT_ROUND_PANEL: "1",
+    };
+
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+
+    const panelPiCommand = this.#resolvePiCommand("panel");
+    const providerModel = this.#providerModelFor?.("panel", seat);
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
+    const agent = spawnPiAgent({
+      command: panelPiCommand,
+      args: [
+        ...this.#resolvePiArgsPrefix("panel"),
+        ...launchArgs("panel", {
+          noSession: panelPiCommand !== undefined,
+          provider: providerModel?.provider,
+          model: providerModel?.model,
+        }),
+      ],
+      cwd: candidateDir,
+      env,
+      role: "panel",
+      agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(agentId, event);
+        this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
+    });
+
+    const handle: AgentHandle = {
+      agent,
+      role: "panel",
+      agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve: () => undefined,
+      discoveryPromise: Promise.resolve(),
+      panelSeat: seat,
+    };
+    this.#agents.set(agentId, handle);
+    this.#log.intent(actionId, { agentId, pgid: agent.pgid, seat });
+
+    try {
+      const hello = await Promise.race([
+        raceTimeout(helloPromise, this.#deadlines.helloTimeoutMs, "hello"),
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      if (hello === "timeout" || hello === "exited") {
+        await agent.terminate();
+        this.#log.completion(actionId, { seat, ok: false, reason: hello === "exited" ? "round panel seat exited before hello" : "hello timed out" });
+        this.#roundPanelSeatUnavailable(seat, "the seat never started");
+        return;
+      }
+      if (!hello.ok) {
+        await agent.terminate();
+        this.#log.completion(actionId, { seat, ok: false, reason: hello.mismatch ? "tool-set mismatch" : "hello failed" });
+        if (hello.mismatch) {
+          this.#applyEvent({ type: "LAUNCH_FAILED", role: "panel", ...hello.mismatch });
+        } else {
+          this.#roundPanelSeatUnavailable(seat, "hello failed");
+        }
+        return;
+      }
+
+      const seatTimeout = this.#withStallWatch(
+        agentId,
+        agent,
+        cancelableTimeout(this.#deadlines.panelMs, "timeout" as const),
+        "Owner (conductor): no progress for a while. Finish now and call submit_round_panel_votes.",
+      );
+      const settled = nextSettle();
+      await agent.prompt(this.#buildRoundPanelPrompt(seat));
+      const outcome = await Promise.race([
+        donePromise.then(() => "submitted" as const),
+        seatTimeout.promise,
+        settled,
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      seatTimeout.cancel();
+      if (outcome === "submitted") {
+        await agent.terminate();
+        this.#log.completion(actionId, { seat, ok: true });
+        return;
+      }
+      await agent.terminate();
+      this.#log.completion(actionId, { seat, ok: false, reason: outcome });
+      this.#roundPanelSeatUnavailable(seat, `the seat did not vote (${outcome})`);
+    } finally {
+      await agent.terminate().catch(() => undefined);
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** Plan 05e: the round panel seat's prompt — every pending item once, with
+   * its 3a/3b evidence, and the panel's two questions. */
+  #buildRoundPanelPrompt(seat: number): string {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha ?? "";
+    const items = roundPanelItemsNeedingVote(phase);
+    let diff = "";
+    try {
+      diff = diffText(this.#plan.repo, phase.integrationHead, C);
+    } catch {
+      diff = "(the diff could not be read)";
+    }
+    const lines: string[] = [
+      `You are panel seat ${seat} of 3, voting on ${items.length} item(s) for phase ${phase.phaseId}, candidate ${C.slice(0, 9)} (contract snapshot ${phase.contract.contractVersion.snapshot}).`,
+      `Goal: ${phase.contract.goal}`,
+      "",
+      "Acceptance criteria:",
+      ...phase.contract.acceptance.map((a) => `- ${a}`),
+      ...secretPromptLines(this.#secretNames),
+      ...directiveLines(phase.ownerDirectives),
+      ...ledgerPromptLines(phase.messages),
+      "",
+      "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
+      "```diff",
+      redactText(diff, this.#secretMaskable),
+      "```",
+      "",
+      "For EACH item below answer two questions, then vote `keep` or `drop` once per item with a reason:",
+      "1. Is it accurate against the candidate? Cite the evidence you checked.",
+      "2. Is it a real trade-off with a credible alternative the owner could choose? A description of what the code does is NOT.",
+      "A `keep` majority publishes a trade-off to the owner; otherwise it is dropped. A `keep` majority also keeps a blocking finding blocking; otherwise the finding becomes advisory.",
+      "",
+    ];
+    for (const id of items) {
+      const m = (phase.messages ?? []).find((x) => x.id === id);
+      if (!m) continue;
+      const finding = m.sourceRecordId ? phase.findings.find((f) => f.id === m.sourceRecordId) : undefined;
+      lines.push(
+        `${m.id} [${m.type === "tradeoff" ? "trade-off" : "blocking finding"}] ${m.title}`,
+        `    why: ${m.summary}`,
+        `    context: ${m.context}`,
+        `    evidence: ${(m.evidence ?? []).join("; ")}`,
+        ...(finding?.verified ? [`    validated: ${finding.verified}`] : []),
+      );
+    }
+    lines.push(
+      "",
+      "Call submit_round_panel_votes once with `votes`: one entry {messageId, verdict: 'keep'|'drop', reason} per item above. You are one of three independent seats; vote what the evidence shows.",
+    );
+    return lines.join("\n");
+  }
+
+  /** Plan 05e: count the round panel's recorded votes, record the outcome on
+   * every item message, then apply each item's consequence: a non-keep
+   * trade-off is dropped, a non-keep blocking finding becomes advisory. */
+  #decideRoundPanel(): void {
+    const phase = this.#state.phase;
+    const round = phase.panel?.round;
+    if (!round || round.decided || !roundPanelSeatsSettled(round)) return;
+    const items = roundPanelItemsNeedingVote(phase);
+    if (items.length === 0) return;
+    const decisions = items.map((messageId) => {
+      const m = (phase.messages ?? []).find((x) => x.id === messageId)!;
+      const kind = m.type === "finding" ? "finding" : "tradeoff";
+      const outcome = roundPanelOutcomeFor(round, messageId, kind);
+      const reasons = ["1", "2", "3"]
+        .map((n) => ({ n, vote: round.seats?.[n]?.votes?.find((v) => v.messageId === messageId) }))
+        .filter((x): x is { n: string; vote: NonNullable<typeof x.vote> } => x.vote !== undefined)
+        .map((x) => `seat ${x.n}: ${x.vote.reason}`);
+      return { messageId, outcome, reason: reasons.join("; ") };
+    });
+    this.#applyEvent({ type: "ROUND_PANEL_DECIDED", decisions: decisions.map(({ messageId, outcome, reason }) => ({ messageId, outcome, ...(reason ? { reason } : {}) })) });
+    for (const { messageId, outcome, reason } of decisions) {
+      const message = (this.#state.phase.messages ?? []).find((m) => m.id === messageId);
+      if (!message) continue;
+      const binding = {
+        messageId,
+        boundCandidateSha: message.boundCandidateSha,
+        boundContractVersion: message.boundContractVersion,
+        boundRecordVersion: message.messageVersion,
+      };
+      if (message.type === "tradeoff") {
+        if (outcome !== "keep") {
+          this.#applyEvent({ type: "MESSAGE_DROPPED", ...binding, by: "panel", reason: reason || "the round panel did not keep it" });
+        }
+        continue;
+      }
+      const findingId = message.sourceRecordId;
+      if (!findingId) continue;
+      if (outcome !== "keep") {
+        this.#applyEvent({
+          type: "FINDING_SEVERITY_CHANGED",
+          findingId,
+          severity: "advisory",
+          reason: reason || "the round panel did not keep it blocking",
+          by: "panel",
+        });
+      }
+      // #34 / plan 05e: approved code stays approved — a new blocking point
+      // on bytes the reviewers already approved is advisory, not a blocker.
+      const finding = (this.#state.phase.findings ?? []).find((f) => f.id === findingId);
+      const combined = appendVerified(finding?.verified, `panel ${outcome} (${reason || "no reason"})`);
+      this.#applyEvent({ type: "FINDING_VERIFIED", findingId, verified: combined ?? `panel ${outcome}` });
+    }
+  }
+
   // -- plan 2c: discovery barrier ------------------------------------------
 
   #discoveryBarrier: { candidate: string; arrived: Set<Reviewer>; released: boolean; waiters: Array<() => void> } | undefined;
@@ -7397,6 +8109,37 @@ export class Conductor {
         ...openFindings.map((f) => `- ${f.id} [${f.severity} ${f.kind}, raised by ${f.raisedBy}]: ${f.evidence}`),
       );
     }
+    // Plan 05e (4): every earlier round's open finding/blocker message, so
+    // each reviewer marks each `resolved` or `open` with evidence; a 2-of-3
+    // `resolved` majority moves it out of the owner's live view.
+    //
+    // The message itself is REBOUND to the current candidate by
+    // MESSAGE_CARRIED at every freeze, so the filter reads the source
+    // RECORD's own binding (carried messages keep pointing at the finding,
+    // whose binding is the round it was raised on) — round-3 reviews M-8,
+    // A-11, B-14.
+    const earlierRound = (phase.messages ?? []).filter((m) => {
+      if (m.type !== "finding" && m.type !== "blocker") return false;
+      if (m.state !== "published" && m.state !== "refused") return false;
+      const record = m.sourceRecordId ? phase.findings.find((f) => f.id === m.sourceRecordId) : undefined;
+      if (record) return record.boundCandidateSha !== C;
+      return m.messageVersion > 1 || (m.carriedFrom ?? []).length > 0;
+    });
+    if (earlierRound.length > 0) {
+      lines.push(
+        "Earlier rounds' live findings and blockers (mark each resolved or open in `resolutionStatements`, with evidence):",
+        ...earlierRound.map((m) => `- ${m.id} [${m.type}, ${m.state}] ${m.title}`),
+      );
+    }
+    // Plan 05e (finding #34): an amendment-only resubmission of bytes M, A
+    // and B already approved re-reviews only the amended criterion.
+    const approvedSha = this.#amendmentOnlyApprovedSha(C);
+    if (approvedSha) {
+      lines.push(
+        "",
+        `This is an amendment-only resubmission: the shipped bytes are identical to candidate ${approvedSha.slice(0, 9)}, which M, A and B already approved. Review ONLY the amended criterion. A new point on the unchanged code is an advisory finding for the owner or the next phase, not a blocker, unless it violates an acceptance item or a reserved rule.`,
+      );
+    }
     if (openCorrections.length > 0) {
       lines.push("Open owner corrections (state honored / not_honored for each):", ...openCorrections.map((c) => `- ${c.id}: ${c.correctionText}`));
     }
@@ -7419,7 +8162,9 @@ export class Conductor {
       "",
       "Call submit_review with:",
       "- `ballots`: one ballot for EVERY record above whose class is 'delegated' or 'reserved' (approve or reject, a rationale, at least one evidence citation), except records marked carried: your previous ballot stands for those, and a new ballot replaces it. A ballot with contractObjection=true opens a contract finding and suspends that vote.",
-      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it. If the problem is that a criterion cannot be met AS WRITTEN, add `criterionDispute` = { criterion: <the acceptance item verbatim>, why, proposedWording }: the conductor records an amendment voted on like any reserved record (a passing one replaces the wording; a failed one leaves it unchanged). An unmet-but-clear criterion is an ordinary defect finding.",
+      "- `findings`: correctness problems only — defects, contract violations — with file:line or a scenario as evidence and a severity. A candidate that violates an owner directive is a blocking contract finding: cite the directive id as its evidence. If a problem is already an open finding above, set `sameAs` to its id instead of repeating it. If the problem is that a criterion cannot be met AS WRITTEN, add `criterionDispute` = { criterion: <the acceptance item verbatim>, why, proposedWording }: the conductor records an amendment voted on like any reserved record (a passing one replaces the wording; a failed one leaves it unchanged). An unmet-but-clear criterion is an ordinary defect finding. Set `runnable` when the finding is a runnable test or command: the conductor re-runs it and publishes the finding only if it fails.",
+      "- `resolutionStatements`: for EVERY earlier-round finding or blocker listed above, { messageId, status: 'resolved' | 'open', evidence }. A 2-of-3 `resolved` majority moves the message out of the owner's live view.",
+      "- A blocking finding must cite an acceptance item or a reserved rule; the evaluator lowers anything else to advisory.",
       "- `blockers`: use this ONLY to stop the work until the owner decides. Each entry is {kind, evidence} like a finding (it is raised at once as a raw blocker message and a blocking finding), and a panel of three fresh agents then votes `block` or `downgrade`. A `block` majority parks the phase for the owner, with options the panel proposes; a `downgrade` majority makes it an ordinary blocking finding for the next worker attempt. A blocker is never folded into an existing finding (no `sameAs`): state the issue's own evidence. An ordinary defect that should be fixed but need not stop the run belongs in `findings`, not here.",
       // Plan 01g: an amendment record is a reserved decision like any other;
       // it must get a ballot, and it never blocks acceptance on its own.
@@ -7477,6 +8222,19 @@ interface PanelOptionInput {
 }
 
 /** Plan 04a: one `submit_evaluation` entry, as the evaluator sends it. */
+/** Plan 05e: join validation markers without duplicating or dropping an
+ * earlier one, so `verified` accumulates (`record …; run …; evaluator: …;
+ * panel keep`). */
+function appendVerified(existing: string | undefined, addition: string | undefined): string | undefined {
+  const parts = [existing, addition]
+    .flatMap((v) => (v ?? "").split("; "))
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  const unique: string[] = [];
+  for (const part of parts) if (!unique.includes(part)) unique.push(part);
+  return unique.length > 0 ? unique.join("; ") : undefined;
+}
+
 interface EvaluationEntry {
   messageId?: unknown;
   action?: unknown;
@@ -7489,6 +8247,9 @@ interface EvaluationEntry {
   reason?: unknown;
   /** Owner-refused messages only: whether this candidate addressed it. */
   addressed?: unknown;
+  /** Plan 05e: a finding's own validation evidence (`file:line …`) — what the
+   * evaluator checked to confirm it. */
+  verified?: unknown;
 }
 
 /** Plan 04a: an anchor is `{path, lines: [start, end]}`. Anything else is

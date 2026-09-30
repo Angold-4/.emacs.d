@@ -31,6 +31,8 @@
     "acceptedScope": { "type": "string", "minLength": 1 },
     "criterionDisputed": { "type": "string", "minLength": 1 },
     "supersededBy": { "type": "string", "minLength": 1 },
-    "alsoRaisedBy": { "type": "array", "items": { "enum": ["M", "A", "B"] } }
+    "alsoRaisedBy": { "type": "array", "items": { "enum": ["M", "A", "B"] } },
+    "verified": { "type": "string", "minLength": 1 },
+    "severityReason": { "type": "string", "minLength": 1 }
   }
 }

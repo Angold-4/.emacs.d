@@ -45,6 +45,7 @@ import type {
   Message,
   OwnerRequest,
   PanelState,
+  RoundPanelState,
   PhaseState,
   PhaseStateName,
   Review,
@@ -458,12 +459,13 @@ addRow({
  * evaluator may publish the message while the panel votes, and the panel
  * must still run. A blocking *finding* raised through the ordinary
  * `findings` list is not a blocker here — it keeps its pre-04b handling. */
-function panelForMessages(messages: readonly Message[] | undefined): { blockers: Record<string, PanelState> } {
+function panelForMessages(messages: readonly Message[] | undefined): { blockers: Record<string, PanelState>; round: RoundPanelState } {
   const blockers: Record<string, PanelState> = {};
   for (const m of messages ?? []) {
     if (m.type === "blocker" && m.raisedAsBlocker === true && m.state === "raw") blockers[m.id] = {};
   }
-  return { blockers };
+  // Plan 05e: a fresh round panel, ready to record its seats' batched votes.
+  return { blockers, round: { seats: {} } };
 }
 
 function applyProbePassed(s: State, ev: Event, targetPhase: PhaseStateName): State {

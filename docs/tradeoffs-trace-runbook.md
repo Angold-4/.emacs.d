@@ -896,6 +896,7 @@ tradeoffs-trace message chart — generated from MESSAGE_TRANSITIONS (src/core/m
   +------------+
   | published  |
   +------------+
+      +- MESSAGE_DROPPED                -> dropped     [message-dropped-published]
       +- OWNER_VERDICT (verdictAccept)  -> accepted    [owner-verdict-accept]
       +- OWNER_VERDICT (verdictRefuse)  -> refused     [owner-verdict-refuse]
       +- MESSAGE_SUPERSEDED             -> superseded  [message-superseded-published]
@@ -1045,6 +1046,77 @@ type's evaluator, while the phase stays `EVALUATING` until all of them settle.
 The tape shows the `EVALUATE` step, the `views/loop.txt` chart draws the
 `EVALUATING` state, and `views/metrics.json` counts how many blockers
 escalated, downgraded or came back incomplete.
+
+## The vote rule per message type
+
+After the evaluators publish, one **round panel of three fresh agents** votes
+on every pending item at once (one panel per round, batched — three dispatch
+actions, never one panel per message). Each seat answers two questions per
+item — is it accurate against the candidate (with cited evidence), and is it
+a real trade-off with a credible alternative the owner could choose (a
+description of what the code does is not) — and votes `keep` or `drop` with a
+reason.
+
+| Message type | Who validates it | The vote | Result |
+|---|---|---|---|
+| **Trade-off** | the round panel, unless the backing decision already carries valid ballots from M, A **and** B (then no panel) | `keep` / `drop`, one vote per item | a `keep` majority publishes it to the owner; otherwise it is **dropped**, and its `views/messages/<id>.org` keeps all three seats' reasons |
+| **Advisory finding** | one validation: the `finding` evaluator, with the 3a/3b checks | none — the evaluator publishes (`verified: …`) or drops it with a reason | published with its `verified` evidence, or dropped |
+| **Blocking finding** | the same round panel as the trade-offs, each seat seeing the 3a/3b evidence | `keep` / `drop` | it blocks acceptance only with a **2-of-3 `keep`** majority; otherwise it is published as **advisory** |
+| **Blocker** (`B-n`) | unchanged: its own panel of three, per blocker | `block` / `downgrade` | `block` majority parks on the owner; `downgrade` makes it an ordinary blocking finding |
+
+Three deterministic rules run **before any model**:
+
+1. **Facts first (3a).** The conductor compares a finding's claim with the
+   check, probe and gate records it already holds for that candidate. A
+   finding that claims a check, test or command fails while the record shows
+   it passing is rejected with the record cited, and never reaches an agent;
+   a claim the record confirms is marked `confirmed by record`. Only a
+   sentence that names the command AND carries a failure word counts as a
+   claim, so merely mentioning a passing check is not a claim that it fails.
+   This runs for a blocker's finding too.
+2. **Run what can be run (3b).** A finding that names a runnable test or
+   command (`runnable`) is re-run in the candidate's disposable checkout,
+   bounded by the check deadline, and its output tail is recorded. The
+   finding is published only if the run reproduces it (a non-zero exit); a
+   passing run — or a timeout, which reproduces nothing — drops it, recording
+   the command and exit status. A blocker's `runnable` is checked the same
+   way.
+3. **Severity against the plan (5).** A blocking finding may stay blocking
+   only when it cites an acceptance item or a reserved rule — the ground, not
+   the finding's kind, decides, so an `integration` finding that cites one may
+   block too. A citation is accepted as the item verbatim, a paraphrase that
+   keeps its phrasing or most of its significant words, a numbered reference
+   (`acceptance item 3`), an owner directive id, or a `criterionDispute`; the
+   evaluator lowers anything else to advisory, recording the reason. A
+   `sameAs` re-raise takes the re-raiser's severity **downward only** — one
+   reviewer's re-raise never makes an advisory finding block.
+
+Every finding records what validated it in its property drawer and in
+`views/messages/<id>.org` (`verified: record … | run <cmd> exit N |
+file:line … | panel keep`). Validations accumulate — the 3a/3b evidence, the
+panel's vote and an evaluator-supplied citation (`evaluator: <text>`, tagged
+because the conductor did not check it) are joined, never overwritten.
+
+**Resolution across rounds.** Every later round's turn-2 prompt lists the
+earlier rounds' open findings and blockers; each reviewer marks each
+`resolved` or `open` with evidence. A 2-of-3 `resolved` majority moves the
+message to `resolved` (it leaves the owner's live view) and repairs its
+finding; a 2-of-3 `open` majority (or no majority) leaves it live. A trade-off
+raised for a fix may name the message it closes (`closes: F-3`); the renderer
+shows the link on both files (`CLOSES` / `FIXED_BY`).
+
+**Approved code stays approved.** When a round's candidate ships the same git
+tree as a candidate M, A and B already approved (an amendment-only
+resubmission), the round's prompt says so and the reviewers re-review only the
+amended criterion; a new blocking point on the unchanged code is raised as an
+advisory finding, not a blocker, unless it violates an acceptance item or a
+reserved rule — a point filed through the `blockers` list on such a round is
+raised as an ordinary finding, so no blocker panel runs on unchanged code.
+Approval is recorded once the round's `EVALUATING` has settled
+(the round panel's severity decisions are final), and only when every live
+decision bound to the candidate has settled and no owner request or blocking
+finding stands — a candidate whose ballots were rejected is not approved, so
+identical bytes are re-reviewed.
 
 ## Balance metrics
 
