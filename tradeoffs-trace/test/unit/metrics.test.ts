@@ -10,8 +10,19 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 
-import { computeMetrics, metricsForRunDir, metricsLine, projectMetrics, type MetricsTimeline } from "../../src/metrics.ts";
+import { computeMetrics, metricsForRunDir, metricsLine, metricsSummary, projectMetrics, type MetricsTimeline } from "../../src/metrics.ts";
+import { applyEntryEvent, planEntryEvents, type Entry } from "../../src/core/entries.ts";
 import { basePhase, makeMessage } from "./helpers.ts";
+
+/** The runtime's round-time pass: an entry for every message. */
+function openAll(messages: ReturnType<typeof makeMessage>[]): Entry[] {
+  let es: Entry[] = [];
+  for (const ev of planEntryEvents(messages, es)) {
+    const r = applyEntryEvent(es, ev, messages);
+    if (r.ok) es = r.entries;
+  }
+  return es;
+}
 
 /** READY 0s → implement 20s → review 20s → evaluate 10s → resolve 5s →
  * owner 5s → DONE, with the last event at 1m00s. */
@@ -102,6 +113,28 @@ test("every balance metric has its expected value from the fixture run", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("the cleanness metrics join views/metrics.json, the status line and tt summary", () => {
+  // 13 live entries (over the default budget of 12); two of them are
+  // near-duplicates without a shared anchor (an open ≈ hint each).
+  const messages = Array.from({ length: 13 }, (_, i) =>
+    makeMessage({ id: `T-${i + 1}`, title: `topic number ${i + 1}`, evidence: [`src/f${i}.rs:1 x`], summary: `s${i}`, boundCandidateSha: "C1" }),
+  );
+  messages[11] = makeMessage({ id: "T-12", title: "tolerances raised on the fill path", evidence: ["src/f11.rs:1 x"], summary: "s", boundCandidateSha: "C1" });
+  messages[12] = makeMessage({ id: "T-13", title: "tolerances raised on the fill path again", evidence: ["src/f12.rs:1 x"], summary: "s", boundCandidateSha: "C1" });
+  const phase = basePhase({ runId: "r-metrics", phaseId: "p1", messages, entries: openAll(messages) });
+  const m = computeMetrics(phase, TIMELINE, EVENTS.map((e) => ({ ...e.event, ts: e.ts })));
+  assert.equal(m.cleanness.liveEntries, 13);
+  assert.equal(m.cleanness.entryBudget, 12);
+  assert.equal(m.cleanness.entryBudgetWarning, true);
+  assert.ok(m.cleanness.openHints >= 2, `expected the ≈ hint to be counted: ${m.cleanness.openHints}`);
+  assert.ok(m.cleanness.entriesPerAnchor > 0);
+  const json = JSON.parse(projectMetrics(m));
+  assert.equal(json.cleanness.liveEntries, 13);
+  assert.ok(metricsLine(m).includes("entries 13 (over budget 12)"));
+  assert.ok(metricsLine(m).includes("lint 0"));
+  assert.ok(metricsSummary(m).some((l) => l.includes("Cleanness") && l.includes("13 live entries")));
 });
 
 test("the metrics projection is deterministic and the status line carries every number", () => {

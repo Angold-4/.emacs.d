@@ -1534,6 +1534,136 @@ and point on the same one."
             (kill-buffer buf))
         (delete-directory dir t)))))
 
+(defconst +tt-test--entry-review-org
+  (concat "#+TITLE: tradeoffs-trace review — cebd7fcb-01 · 33c41174\n"
+          "#+CONTRACT_VERSION: v1\n"
+          "#+CANDIDATE: C1\n"
+          "\n"
+          "* Blockers\n"
+          "** E-1 no priced-frame counter  [M·worker · +1 linked · src/a.rs:1-5]\n"
+          "   :PROPERTIES:\n"
+          "   :ID: E-1\n"
+          "   :TYPE: blocker\n"
+          "   :STATE: open\n"
+          "   :ANCHOR: src/a.rs:1-5\n"
+          "   :RAISED_BY: M,worker\n"
+          "   :LINKED: B-1,T-2\n"
+          "   :END:\n"
+          "  the counter is never priced\n"
+          "  * Linked messages\n"
+          "    - B-1 no priced-frame counter — summary of B-1\n"
+          "    - T-2 the fix — summary of T-2\n"
+          "\n"
+          "* Findings\n"
+          "(none)\n"
+          "\n"
+          "* Trade-offs\n"
+          "** E-2 tolerances raised on the fill path  [worker · src/b.rs:1-2 · ≈ E-3]\n"
+          "   :PROPERTIES:\n"
+          "   :ID: E-2\n"
+          "   :TYPE: tradeoff\n"
+          "   :STATE: open\n"
+          "   :ANCHOR: src/b.rs:1-2\n"
+          "   :RAISED_BY: worker\n"
+          "   :LINKED: T-3\n"
+          "   :HINT: E-3\n"
+          "   :END:\n"
+          "  tolerances raised\n"
+          "\n"
+          "** E-3 tolerances raised on the fill path again  [worker · src/c.rs:1-2 · ≈ E-2]\n"
+          "   :PROPERTIES:\n"
+          "   :ID: E-3\n"
+          "   :TYPE: tradeoff\n"
+          "   :STATE: open\n"
+          "   :ANCHOR: src/c.rs:1-2\n"
+          "   :RAISED_BY: worker\n"
+          "   :LINKED: T-4\n"
+          "   :HINT: E-2\n"
+          "   :END:\n"
+          "  tolerances raised again\n"
+          "\n"
+          "4 raw → 3 entries · 4 linked · 0 dropped · 0 unaccounted · unexposed 0\n")
+  "A fixture `views/review.org' with entry headings and a `≈' hint.")
+
+(defun +tt-test--entry-review-buffer (dir)
+  "Open DIR's review with the entry fixture (the real +tt-review path)."
+  (make-directory (expand-file-name "views/entries" dir) t)
+  (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--entry-review-org))
+  (dolist (id '("E-1" "E-2" "E-3"))
+    (with-temp-file (expand-file-name (concat "views/entries/" id ".org") dir) (insert (format "* %s\n" id))))
+  (let ((+tt--run-dir dir))
+    (+tt-review))
+  (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+  (get-file-buffer (expand-file-name "views/review.org" dir)))
+
+(ert-deftest tradeoffs-trace-review-entry-keys ()
+  "Plan 05j: RET opens an entry's own file; s sends ENTRY_SPLIT; m sends the
+owner's merge; A/D act on the entry."
+  (let ((dir (make-temp-file "tt-ert-entry-review" t)) (calls nil) (opened nil))
+    (unwind-protect
+        (let ((buf (+tt-test--entry-review-buffer dir)))
+          (with-current-buffer buf
+            (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
+              (goto-char (point-min))
+              (search-forward "E-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-open-message))
+            (should (equal opened (expand-file-name "views/entries/E-1.org" dir)))
+            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "ok"))
+                      ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
+              ;; s on the entry splits its first linked message.
+              (goto-char (point-min))
+              (search-forward "E-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-split)
+              (should (equal calls (list "entry" dir "split" "E-1" "B-1")))
+              ;; s on a linked-message bullet splits that message.
+              (goto-char (point-min))
+              (search-forward "T-2 the fix")
+              (goto-char (match-beginning 0))
+              (+tt-review-split)
+              (should (equal calls (list "entry" dir "split" "E-1" "T-2")))
+              ;; m merges into the ≈ neighbour.
+              (goto-char (point-min))
+              (search-forward "E-2 tolerances")
+              (goto-char (match-beginning 0))
+              (+tt-review-merge)
+              (should (equal calls (list "entry" dir "merge" "E-2" "E-3")))
+              ;; A and D act on the entry.
+              (goto-char (point-min))
+              (search-forward "E-1")
+              (goto-char (match-beginning 0))
+              (+tt-review-accept)
+              (should (equal calls (list "entry" dir "accept" "E-1")))
+              (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "not this round")))
+                (goto-char (point-min))
+                (search-forward "E-1")
+                (goto-char (match-beginning 0))
+                (+tt-review-refuse))
+              (should (equal (nth 2 calls) "refuse"))
+              (should (equal (member "--reason" calls) '("--reason" "not this round")))))
+          (kill-buffer buf))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-program-review-key ()
+  "Plan 05j: C-c m D opens programs/<id>/views/review.org."
+  (let* ((root (make-temp-file "tt-ert-program-review" t))
+         (dir (expand-file-name "programs/abc" root)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir) (insert +tt-test--entry-review-org))
+          (let ((+tt-root root) (+tt--program-dir dir))
+            (+tt-program-review)
+            (should (equal (file-truename (buffer-file-name))
+                           (file-truename (expand-file-name "views/review.org" dir))))
+            (should (equal +tt--run-dir dir))
+            (should (derived-mode-p '+tt-review-mode)))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b)))
+      (delete-directory root t))))
+
 (ert-deftest tradeoffs-trace-status-file-restores-records ()
   "Plan 03b (A-1/B-6): the rendered status file keeps plan 01h's RET
 binding, so a trade-off line still opens the decision view."

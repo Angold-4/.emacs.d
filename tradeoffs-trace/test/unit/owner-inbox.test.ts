@@ -7,9 +7,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { reduce } from "../../src/core/reduce.ts";
-import { normalizeDecisionViewCommand, ownerCommandToEvent } from "../../src/core/owner-inbox.ts";
+import { expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent } from "../../src/core/owner-inbox.ts";
+import type { Entry } from "../../src/core/entries.ts";
 import type { Event, State } from "../../src/core/types.ts";
-import { CV, baseState } from "./helpers.ts";
+import { CV, baseState, makeMessage } from "./helpers.ts";
 
 const K = CV();
 
@@ -260,4 +261,56 @@ test("owner-inbox: the decision view's encoding (type + binding) maps to the sam
   const unknown = normalizeDecisionViewCommand({ type: "steer", text: "x", binding: { runId: "r1", phaseId: "p1" } }, "cmd-9");
   assert.equal(unknown.ok, false);
   assert.match(!unknown.ok ? unknown.reason : "", /not a conductor-state command/);
+});
+
+// Plan 05j: the owner's entry corrections (s / m / A / D in the review view).
+test("owner-inbox: the review view's entry commands expand to ENTRY_*/OWNER_VERDICT events and reduce", () => {
+  const locate = { runId: "r1", phaseId: "p1" };
+  const a = makeMessage({ id: "F-1", type: "finding", evidence: ["src/a.rs:10 x"], state: "published" });
+  const b = makeMessage({ id: "T-2", type: "tradeoff", evidence: ["src/a.rs:11 y"], state: "published" });
+  const raw = makeMessage({ id: "F-3", type: "finding", evidence: ["src/a.rs:12 z"], state: "raw" });
+  const entries: Entry[] = [
+    { id: "E-1", phaseId: "p1", title: "one topic", type: "finding", state: "open", anchor: { kind: "file", path: "src/a.rs", lines: [1, 20] }, links: [{ messageId: "F-1", anchor: { kind: "file", path: "src/a.rs", lines: [10, 10] }, reason: "opened" }, { messageId: "T-2", anchor: { kind: "file", path: "src/a.rs", lines: [11, 11] }, reason: "linked" }, { messageId: "F-3", anchor: { kind: "file", path: "src/a.rs", lines: [12, 12] }, reason: "linked" }] },
+    { id: "E-2", phaseId: "p1", title: "another", type: "tradeoff", state: "open", anchor: { kind: "file", path: "src/b.rs", lines: [1, 2] }, links: [] },
+  ];
+  const expand = (raw: Record<string, unknown>) => expandEntryCommand({ ...locate, ...raw }, entries, [a, b, raw]);
+  const split = expand({ type: "entry-split", entryId: "E-1", messageId: "T-2" });
+  assert.ok(split.ok);
+  assert.deepEqual(split.ok ? split.events : [], [{ type: "ENTRY_SPLIT", entryId: "E-1", messageId: "T-2", by: "owner" }]);
+  const merge = expand({ type: "entry-merge", entryId: "E-1", intoEntryId: "E-2" });
+  assert.ok(merge.ok);
+  assert.deepEqual(merge.ok ? merge.events : [], [{ type: "ENTRY_MERGED_BY_OWNER", entryId: "E-1", intoEntryId: "E-2", by: "owner" }]);
+  // A verdict is one OWNER_VERDICT per linked message, carrying its binding.
+  const refuse = expand({ type: "entry-verdict", entryId: "E-1", verdict: "refuse", reason: "not this round" });
+  assert.ok(refuse.ok);
+  assert.equal(refuse.ok ? refuse.events.length : 0, 2);
+  // A raw linked message cannot be settled yet, and is REPORTED, not silently
+  // skipped (record A-72 / M-63).
+  assert.deepEqual(refuse.ok ? refuse.skipped : [], ["F-3"]);
+  assert.deepEqual(refuse.ok ? refuse.events[0] : {}, {
+    type: "OWNER_VERDICT",
+    messageId: "F-1",
+    verdict: "refuse",
+    reason: "not this round",
+    boundCandidateSha: a.boundCandidateSha,
+    boundContractVersion: a.boundContractVersion,
+    boundRecordVersion: a.messageVersion,
+  });
+  // A bad op, an unknown entry, or one missing its message is refused.
+  assert.equal(expand({ type: "entry-split", entryId: "E-1" }).ok, false);
+  assert.equal(expand({ type: "entry-frobnicate", entryId: "E-1" }).ok, false);
+  assert.equal(expand({ type: "entry-merge", entryId: "E-1", intoEntryId: "E-9" }).ok, false);
+  // The event reduces: an entry opens with a message, and ENTRY_STATE settles it.
+  const opened = step(baseState({ entries: [] }), {
+    type: "ENTRY_OPENED",
+    phaseId: "p1",
+    title: "a topic",
+    anchor: { kind: "decision", id: "D-1" },
+  });
+  const settled = step(opened, { type: "ENTRY_STATE", entryId: "E-1", state: "resolved", sha: "C1", by: "owner" });
+  assert.equal(settled.phase.entries?.[0].state, "resolved");
+  assert.equal(settled.phase.entries?.[0].stateSha, "C1");
+  // The round's curator pass is recorded, so the evaluators may start.
+  const curated = step(opened, { type: "ENTRY_CURATED", candidateSha: "C1", count: 1 });
+  assert.equal(curated.phase.curatedFor, "C1");
 });

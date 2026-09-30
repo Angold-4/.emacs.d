@@ -11,7 +11,12 @@
 // projection of the log — a wall-clock `now` never enters them.
 
 import { readLog } from "./effects/log.ts";
+import { projectEntries } from "./core/entries.ts";
 import type { Message, MessageType, PhaseState } from "./core/types.ts";
+
+/** Plan 05j: the live-entry budget. Above it the review buffer is warning the
+ * owner that the phase is carrying more topics than one review can hold. */
+export const ENTRY_BUDGET = 12;
 
 /** The slice of `Timeline` (src/conductor.ts) the metrics need. Structural,
  * so metrics.ts stays free of a conductor import cycle. */
@@ -70,6 +75,24 @@ export interface PhaseMetrics {
   /** The unexposed-decision proxy: trade-offs a reviewer raised that the
    * worker did not raise itself (a `reviewer-discovered` decision). */
   unexposedTradeoffs: number;
+  /** Plan 05j: the cleanness of the entry ledger. */
+  cleanness: {
+    /** Live entries in the phase's review. */
+    liveEntries: number;
+    /** `ENTRY_BUDGET`: a warning above it. */
+    entryBudget: number;
+    entryBudgetWarning: boolean;
+    /** Live entries per distinct anchor (a dedup ratio; 1.0 is perfect). */
+    entriesPerAnchor: number;
+    /** Live entries carrying a near-duplicate `≈` hint. */
+    openHints: number;
+    /** The owner's own `m` merges: the ground truth of curator errors. */
+    ownerMerges: number;
+    /** The owner's own `s` splits. */
+    ownerSplits: number;
+    /** `REVIEW_LINT_FAILED` events in the log. */
+    lintViolations: number;
+  };
 }
 
 const EMPTY_COUNTS = (): MessageCounts => ({
@@ -182,6 +205,20 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
     }
   }
 
+  const projected = projectEntries({ messages: phase.messages ?? [], entries: phase.entries ?? [] });
+  const liveEntries = projected.views.filter((v) => v.live).length;
+  const distinctAnchors = new Set(projected.views.filter((v) => v.live).map((v) => JSON.stringify(v.anchor))).size;
+  const cleanness = {
+    liveEntries,
+    entryBudget: ENTRY_BUDGET,
+    entryBudgetWarning: liveEntries > ENTRY_BUDGET,
+    entriesPerAnchor: ratio(liveEntries, distinctAnchors),
+    openHints: projected.views.filter((v) => v.live && v.hint).length,
+    ownerMerges: events.filter((e) => e.type === "ENTRY_MERGED_BY_OWNER").length,
+    ownerSplits: events.filter((e) => e.type === "ENTRY_SPLIT").length,
+    lintViolations: events.filter((e) => e.type === "REVIEW_LINT_FAILED").length,
+  };
+
   return {
     phaseId: phase.phaseId,
     rounds: phase.round ?? timelineRoundCount(phase),
@@ -196,6 +233,7 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
     refuseRate: ratio(refuse, accept + refuse),
     blockers,
     unexposedTradeoffs,
+    cleanness,
   };
 }
 
@@ -236,6 +274,7 @@ export function metricsLine(m: PhaseMetrics): string {
     `owner wait ${duration(m.ownerWaitMs)}`,
     `blockers ${m.blockers.escalated} escalated, ${m.blockers.downgraded} downgraded`,
     `unexposed ${m.unexposedTradeoffs}`,
+    `entries ${m.cleanness.liveEntries}${m.cleanness.entryBudgetWarning ? ` (over budget ${m.cleanness.entryBudget})` : ""} · hints ${m.cleanness.openHints} · m/s ${m.cleanness.ownerMerges}/${m.cleanness.ownerSplits} · lint ${m.cleanness.lintViolations}`,
   ];
   return `metrics   ${parts.join(" · ")}`;
 }
@@ -256,6 +295,7 @@ export function metricsSummary(m: PhaseMetrics): string[] {
     `- Owner wait: ${duration(m.ownerWaitMs)}`,
     `- Blockers: ${m.blockers.escalated} escalated, ${m.blockers.downgraded} downgraded, ${m.blockers.incomplete} incomplete`,
     `- Unexposed-decision proxy (reviewer-raised trade-offs the worker did not raise): ${m.unexposedTradeoffs}`,
+    `- Cleanness: ${m.cleanness.liveEntries} live entries (budget ${m.cleanness.entryBudget}${m.cleanness.entryBudgetWarning ? ", OVER BUDGET" : ""}) · ${m.cleanness.entriesPerAnchor} entries per distinct anchor · ${m.cleanness.openHints} open ≈ hints · owner merges/splits ${m.cleanness.ownerMerges}/${m.cleanness.ownerSplits} · lint violations ${m.cleanness.lintViolations}`,
   ];
 }
 

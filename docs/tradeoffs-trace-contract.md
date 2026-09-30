@@ -375,3 +375,96 @@ before any run is created.
 This is contract version 1. A future change to the message states, the event
 names, the binding shape, the `contentHash` inputs or the carry rule bumps the
 version and is documented here.
+
+## 7. Entries (plan 05j)
+
+The message ledger counts messages; the owner decides on TOPICS. An **entry**
+is one topic: a trade-off the implementation made where it departed from or
+filled a gap in the plan (its choice, the alternative given up, and who
+approved it), a finding that is a defect against the plan or the code, or a
+blocker that stops acceptance. The same issue raised as a blocker, a
+trade-off and a finding — 15a's `B-1 = T-14 = F-1` — is one entry.
+
+- **Type.** An entry's type is the highest type of its linked messages: a
+  blocker if a blocker vote or a blocking finding stops acceptance, otherwise
+  a finding if any linked message is a defect, otherwise a trade-off. No
+  curator may change it.
+- **Events.** `ENTRY_OPENED`, `MESSAGE_LINKED` (message, entry, shared anchor,
+  reason), `ENTRY_RETITLED`, `ENTRY_SPLIT` (owner), `ENTRY_STATE` (open,
+  resolved in `<sha>`, dropped with a reason), `ENTRY_MERGED_BY_OWNER`
+  (owner) and `ENTRY_CURATED` (one round's curator pass is done, so the
+  evaluators may start). They are appended to `events.jsonl`; the entries are
+  a pure projection of them. `REVIEW_LINT_FAILED` records a violated rule.
+- **Anchors.** Every message gets a normalised anchor from its evidence: a
+  file and line range, a decision id, or a plan clause. The runtime accepts a
+  link only when the message and the entry share an anchor (an overlapping
+  line range in the same file, the same decision id, or the same plan clause).
+  Any other link is refused and logged, and the message opens its own entry —
+  nothing is silently merged, nothing hidden. A message with NO real anchor
+  (prose evidence, no decision id, no plan clause) still gets its own entry,
+  anchored to the message itself, so two such messages never merge; the lint
+  reports that entry as having no anchor. The phase id is never treated as a
+  plan clause (`A-34`).
+- **The curator.** The runtime opens an entry for every live message as it
+  is raised (a round-time pass, so `ENTRY_OPENED`/`MESSAGE_LINKED` are in the
+  log and entry ids are stable), linking a message to an open entry it
+  shares an anchor with. Once per round, after the reviews and before the
+  evaluators, that pass also starts a curator AGENT on the evaluator's model
+  (a plan may override it with `#+TT_MODELS curator=…`; with no model
+  configured it launches on Pi's default exactly like an evaluator, never
+  skipped) and records `ENTRY_CURATED`. The agent is launched first but never
+  blocks the evaluators: the evaluator and panel still launch with their own
+  models even when the curator cannot run. The agent sees every message of every type plus
+  every open entry and returns through `curate_entries`, whose only ops are
+  `link`, `open` and `retitle` (any other op is refused before an event is
+  applied; it cannot drop, resolve, merge or change a type).
+  Reviewers' and evaluators' prompts also list the open entries, so an agent
+  sees the topic a message belongs to, and a reviewer's `sameAs E-n` links its
+  raise to that entry (refused and logged when they share no anchor). The owner's `m` is the one exception to the anchor rule:
+  it merges two near-duplicates that deliberately share no anchor, so the
+  links it moves are kept.
+- **Latest state.** Each entry's state is computed against the newest
+  candidate; the view's header names it. An entry all of whose linked
+  messages are settled — resolved, dropped, merged or superseded — leaves the
+  live view. An
+  open entry whose anchor no longer resolves in the newest code is kept and
+  tagged `stale anchor`, never hidden; when a candidate exists but its
+  checkout could not be read, the anchor could not be re-checked and is tagged
+  `anchor unverified`, never assumed fresh.
+- **Views.** `views/review.org` (phase, `C-c m d`) and
+  `programs/<id>/views/review.org` (program, `C-c m D`) have three sections —
+  Blockers, Findings, Trade-offs — one heading per live entry: title, then its
+  tags (phase id in the program view; who raised it, e.g. `M·A`; `+2 linked`;
+  its anchor). In the program view the heading id is qualified with its phase
+  tags (`prog-01:E-1`), since entry ids are numbered per phase, and a folded
+  cross-phase topic takes the highest type of its messages. `TAB` shows the entry's summary and each linked message; `RET`
+  opens `views/entries/<id>.org` with the full history; `s` on a linked
+  message splits it into its own entry, which takes that message's OWN anchor
+  (the owner has decided the two are separate topics, so the pair the split
+  produced is exempt from the one-anchor rule); `m` on a `≈` hint merges the
+  two as the owner's own action; `A`/`D` are verdicts on every linked message
+  (`OWNER_VERDICT`, so accepting a trade-off is not a code fix) — a message
+  still raw cannot be settled and is reported to the owner, never silently
+  skipped. The program view links
+  entries across phases only through shared anchors, the same rule.
+- **Accounting.** The last line reconciles every raw message:
+  `31 raw → 9 entries · 18 linked · 2 dropped · 0 unaccounted · unexposed 3`.
+  A message that is neither linked, dropped, merged nor resolved is
+  unaccounted, and the lint fails. Near-duplicates that share no anchor are
+  never merged by the curator; a deterministic similarity over normalised
+  words (threshold in `ENTRY_SIMILARITY_THRESHOLD`) gives each an `≈ E-n` hint
+  tag instead.
+- **Review lint** (`src/core/review-lint.ts`) runs on every render: one live
+  entry per anchor; only live entries rendered; every entry has a type, an
+  anchor and its validation evidence (a citation, a `verified:` marker or a
+  vote); titles non-empty, at most 80 characters, not cut mid-word; every
+  state computed against the newest candidate; the accounting reconciles to 0
+  unaccounted. A violation is never repaired silently — the projection does
+  not rewrite a title or drop a message: the view's first line names it
+  (`review lint: 2 entries share capital.rs:88-104`) and a
+  `REVIEW_LINT_FAILED` event records it, on the conductor and on every CLI
+  render (`tt contract rebuild`, a late verdict, an entry command).
+- **Cleanness metrics** (`views/metrics.json`, the status `metrics` line and
+  `tt summary`): live entries per phase (a warning above a budget, default
+  12), entries per distinct anchor, open `≈` hints, the owner's `m`/`s`
+  corrections (the ground truth of curator errors) and lint violations.

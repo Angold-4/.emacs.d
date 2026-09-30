@@ -15,6 +15,16 @@ import * as path from "node:path";
 
 import type { Ballot, Decision, EnvBlockInfo, EnvTool, Finding, Message } from "./core/types.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
+import {
+  projectEntries,
+  renderEntryFile,
+  renderEntryReview,
+  renderProgramEntryReview,
+  type AnchorFreshness,
+  type Entry,
+  type EntryAnchor,
+} from "./core/entries.ts";
+import { runReviewLint, type ReviewLintResult } from "./core/review-lint.ts";
 import { ledgerEntries } from "./core/messages.ts";
 import type { Timeline } from "./conductor.ts";
 import type { RunView } from "./view.ts";
@@ -309,6 +319,102 @@ export function projectReview(phase: ReviewPhase): string {
   ];
   for (const s of SECTIONS) lines.push(...section(phase, s.section, s.label, messages));
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Plan 05j: the entry review (one heading per topic)
+// ---------------------------------------------------------------------------
+
+/** The slice of a phase the entry review reads. `PhaseState` satisfies it; a
+ * test may build just these fields. */
+export interface EntryReviewPhase {
+  phaseId?: string;
+  readableId?: string;
+  dirId?: string;
+  candidate?: { sha: string };
+  messages?: Message[];
+  entries?: Entry[];
+  /** The program a program-level view spans. */
+  program?: {
+    id: string;
+    phases: Array<{ phaseId: string; readableId?: string; candidate?: { sha: string }; messages?: Message[]; entries?: Entry[] }>;
+  };
+}
+
+/** Plan 05j: the three-way anchor freshness the live view uses. A file
+ * anchor whose file or lines no longer exist in the candidate checkout is
+ * `stale anchor`. When no candidate exists yet there is nothing to verify, so
+ * anchors are fresh; when a candidate EXISTS but its checkout cannot be read,
+ * freshness could not be re-checked and the view says `anchor unverified`,
+ * never silently treating it as fresh (record A-68 / M-67). */
+export function candidateAnchorFreshness(candidateDir: string | undefined): (anchor: EntryAnchor) => AnchorFreshness {
+  if (!candidateDir) return () => "fresh";
+  if (!fs.existsSync(candidateDir)) return (anchor) => (anchor.kind === "file" ? "unverified" : "fresh");
+  return (anchor) => {
+    if (anchor.kind !== "file") return "fresh";
+    try {
+      const file = path.join(candidateDir, anchor.path);
+      if (!fs.existsSync(file)) return "stale";
+      const lineCount = fs.readFileSync(file, "utf8").split("\n").length;
+      // Both ends of the range must exist (finding A-10): an anchor whose
+      // END line is past EOF no longer exists either.
+      return anchor.lines[0] >= 1 && anchor.lines[1] <= lineCount ? "fresh" : "stale";
+    } catch {
+      return "unverified";
+    }
+  };
+}
+
+/** The two-way answer, kept for callers/tests that only ask whether an anchor
+ * resolves (`unverified` counts as not resolved). */
+export function candidateAnchorResolves(candidateDir: string | undefined): (anchor: EntryAnchor) => boolean {
+  const freshness = candidateAnchorFreshness(candidateDir);
+  return (anchor) => freshness(anchor) === "fresh";
+}
+
+export interface EntryReviewRender {
+  /** `views/review.org`'s bytes. */
+  text: string;
+  /** One `views/entries/<id>.org` per live entry. */
+  files: Array<{ id: string; contents: string }>;
+  lint: ReviewLintResult;
+}
+
+/** `views/review.org` as plan 05j renders it: one heading per live ENTRY in
+ * three sections (Blockers, Findings, Trade-offs), with the accounting footer
+ * and the lint's first line when a rule fails. Pure projection of
+ * `phase.entries` and `phase.messages`; no agent writes it. */
+export function projectEntryReview(
+  phase: EntryReviewPhase,
+  opts: { anchorResolves?: (anchor: EntryAnchor) => boolean; anchorFreshness?: (anchor: EntryAnchor) => AnchorFreshness; lintError?: string } = {},
+  program = false,
+): EntryReviewRender {
+  const messages = phase.messages ?? [];
+  const entries = phase.entries ?? [];
+  const newestCandidateSha = phase.candidate?.sha;
+  const projected = projectEntries({ messages, entries, newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness });
+  const lint = runReviewLint({ projected, newestCandidateSha, messages });
+  const text = program
+    ? renderProgramEntryReview({
+        program: phase.program,
+        newestCandidateSha,
+        anchorResolves: opts.anchorResolves,
+        anchorFreshness: opts.anchorFreshness,
+        lintError: opts.lintError ?? (lint.ok ? undefined : lint.firstLine),
+      })
+    : renderEntryReview({
+        messages,
+        entries,
+        phaseId: phase.phaseId,
+        readableId: phase.readableId,
+        dirId: phase.dirId,
+        newestCandidateSha,
+        anchorResolves: opts.anchorResolves,
+        anchorFreshness: opts.anchorFreshness,
+        lintError: opts.lintError ?? (lint.ok ? undefined : lint.firstLine),
+      });
+  const files = projected.views.filter((v) => v.live).map((v) => ({ id: v.entry.id, contents: renderEntryFile(v) }));
+  return { text, files, lint };
 }
 
 /** The messages an evaluator merged into TARGET, so the target's own file

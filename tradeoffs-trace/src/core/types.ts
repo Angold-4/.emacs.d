@@ -905,6 +905,14 @@ export interface PhaseState {
    * raised in this phase, in raise order. Folded from MESSAGE_* events, so a
    * conductor restart rebuilds it from the log alone. */
   messages?: Message[];
+  /** Plan 05j: the review ledger's entries — one topic each, a projection of
+   * the ENTRY_* events (core/entries.ts). Folded from the log, so a conductor
+   * restart rebuilds it, and the views are pure projections of it. */
+  entries?: Entry[];
+  /** Plan 05j: the candidate whose round the entry curator has passed. The
+   * conductor runs the curator once per round, after the reviews and before
+   * the evaluators; evaluators wait until this names their candidate. */
+  curatedFor?: string;
   /** Plan 04a: the base-baseline stage's own recovery bookkeeping. Set once
    * an interrupted `run_baseline` has been re-dispatched, so a second loss
    * takes the timed-out path instead of re-dispatching again. */
@@ -1591,6 +1599,22 @@ export interface EvMessageSuperseded {
   boundContractVersion: ContractVersion;
   boundRecordVersion: number;
 }
+/** Plan 05j: one round's curator pass is done for `candidateSha`. */
+export interface EvEntryCurated {
+  type: "ENTRY_CURATED";
+  candidateSha: string;
+  count: number;
+}
+
+/** Plan 05j: a review lint violation, recorded so the view's first line and
+ * the log agree. Record-only: the lint never repairs an entry. */
+export interface EvReviewLintFailed {
+  type: "REVIEW_LINT_FAILED";
+  rule: string;
+  detail: string;
+  at?: string;
+}
+
 /** Conductor-emitted at each FREEZE_COMPLETED, one per live message: pins the
  * version bump and whether the content (and contract) survived unchanged. */
 export interface EvMessageCarried {
@@ -1609,6 +1633,9 @@ export interface EvMessageCarried {
 }
 
 export type Event =
+  | EvReviewLintFailed
+  | EvEntryCurated
+  | EntryEvent
   | EvAttemptStarted
   | EvBaselineCompleted
   | EvBaselineTimedOut

@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
  * tests. */
 export const PI_VERSION = "0.87.0";
 
-export type Role = "worker" | "reviewer" | "evaluator" | "panel";
+export type Role = "worker" | "reviewer" | "evaluator" | "panel" | "curator";
 
 /** The reviewer seats (design §2.1): three reviewers of different model
  * families, whose disagreement is the point of having three. */
@@ -53,6 +53,10 @@ export interface PlanModels {
   panelSeats?: Partial<Record<string, RoleModel>>;
   /** `panel=reviewers` in the keyword. */
   panelFrom?: PanelFrom;
+  /** Plan 05j: the curator agent's model. Absent: the curator still runs —
+   * on the evaluator's model when that is configured, else on Pi's default,
+   * exactly like an evaluator (OD-2) — so it is never skipped. */
+  curator?: RoleModel;
 }
 
 /** The model each panel seat takes from the reviewer seats, by position. */
@@ -81,6 +85,10 @@ export function planModelSelector(
       }
       return models.reviewer;
     }
+    // Plan 05j: the curator runs on the evaluator's model by default (there
+    // is no separate #+TT_MODELS role required for it); a plan may override
+    // it with `curator=...`.
+    if (role === "curator") return models.curator ?? models.evaluator;
     if (role === "panel") {
       if (seat !== undefined) {
         const own = models.panelSeats?.[String(seat)];
@@ -110,6 +118,11 @@ export const ROLE_TOOLS: Record<Role, string[]> = {
   // no `raise_tradeoff`: the plan gives that tool to the worker, and a tool
   // the evaluator could never use would be a dead interface.
   evaluator: ["read", "grep", "find", "ls", "submit_evaluation"],
+  // Plan 05j: the round's curator. It sees every new raw message of every
+  // type plus every open entry, and may only propose link/open/retitle
+  // through `curate_entries`. It never writes code and never sees the diff as
+  // its own task; the anchor rule is the runtime's.
+  curator: ["read", "grep", "find", "ls", "curate_entries"],
   // Plan 04b: one fresh panel seat per blocker vote. It reads the phase
   // contract, the owner directives, the ledger, the blocker and its evidence,
   // and the candidate's diff, and returns a single `block`/`downgrade` vote

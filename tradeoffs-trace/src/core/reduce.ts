@@ -15,6 +15,7 @@
 // mismatch, before anything else about the event is considered.
 
 import { checkBallotBinding, checkBinding, checkTupleBinding, currentVersionsFor } from "./binding.ts";
+import { applyEntryEvent, type EntryEvent } from "./entries.ts";
 import { applyCarryWithContract, applyMessageEvent, checkMessageBinding } from "./messages.ts";
 import { next as computeNext } from "./next.ts";
 import {
@@ -119,6 +120,14 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "MESSAGE_ADDRESS_REPORTED",
   "MESSAGE_SUPERSEDED",
   "MESSAGE_CARRIED",
+  "ENTRY_OPENED",
+  "MESSAGE_LINKED",
+  "ENTRY_RETITLED",
+  "ENTRY_SPLIT",
+  "ENTRY_STATE",
+  "ENTRY_MERGED_BY_OWNER",
+  "ENTRY_CURATED",
+  "REVIEW_LINT_FAILED",
 ]);
 
 function ok(state: State): ReduceResult {
@@ -882,6 +891,32 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const result = applyCarryWithContract(p.messages ?? [], message, event, p.contract.contractVersion);
       if (!result.ok) return rejected(state, result.reason);
       return ok({ ...state, phase: { ...p, messages: result.messages } });
+    }
+
+    // Plan 05j: the entry ledger. A refused link is not an error: the message
+    // opens its own entry at projection time, and the projection logs the
+    // refusal (the event already stays in the log).
+    case "ENTRY_OPENED":
+    case "MESSAGE_LINKED":
+    case "ENTRY_RETITLED":
+    case "ENTRY_SPLIT":
+    case "ENTRY_STATE":
+    case "ENTRY_MERGED_BY_OWNER": {
+      const result = applyEntryEvent(p.entries ?? [], event as EntryEvent, p.messages ?? []);
+      if (!result.ok) return rejected(state, result.reason);
+      return ok({ ...state, phase: { ...p, entries: result.entries } });
+    }
+
+    // Plan 05j: the round's curator pass is done for this candidate, so the
+    // evaluators may start. Record-only on the entries themselves.
+    case "ENTRY_CURATED": {
+      return ok({ ...state, phase: { ...p, curatedFor: event.candidateSha } });
+    }
+
+    // Plan 05j: the review lint's own record. Record-only: nothing about the
+    // entries changes, the event is the log's copy of the view's first line.
+    case "REVIEW_LINT_FAILED": {
+      return ok(state);
     }
 
     case "OWNER_VERDICT": {

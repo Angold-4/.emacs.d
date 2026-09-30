@@ -1040,3 +1040,54 @@ Each row was observed in a real run.
 - **Publishing is local.** Pushing and PRs stay manual.
 - **Stopping during reviewer dispatch** can log `ERR_STREAM_WRITE_AFTER_END` from a late prompt write; the run is still stopped.
 - **The write guard checks paths, not git commands.** A worker's `git worktree add /tmp/...` is not refused. Clean up with `git worktree prune`.
+
+## Entries and the review view (plan 05j)
+
+`C-c m d` opens the phase review; `C-c m D` opens the program review. Both are
+pure projections of `events.jsonl`: one heading per TOPIC (entry), in three
+sections — Blockers, Findings, Trade-offs — with the candidate the view
+reflects in the header and an accounting footer that reconciles every raw
+message to zero unaccounted.
+
+Keys in the review buffer:
+
+- `TAB` shows the entry's summary and each linked message.
+- `RET` opens the entry's own file (`views/entries/<id>.org`, full history) or
+  a linked message's file (`views/messages/<id>.org`).
+- `s` on a linked message splits it into its own entry (`ENTRY_SPLIT`); the new
+  entry stands on that message's own anchor, and the split pair is exempt from
+  the one-anchor lint (the owner decided they are separate topics).
+- `m` on an entry carrying a `≈ E-n` hint merges the two as the owner's own
+  action (`ENTRY_MERGED_BY_OWNER`).
+- `A` / `D` are verdicts on every linked message (`OWNER_VERDICT`), D with an
+  optional one-line reason. Accepting a trade-off does not mark it a code
+  fix. A linked message that is still raw cannot be settled; it is reported to
+  you (and logged), never silently skipped.
+
+The runtime opens an entry for every live message as it is raised, so entry
+ids are stable and an owner command always names an entry the log records.
+The linking pass runs once per round, after the reviews and before the
+evaluators (`ENTRY_CURATED` marks it). It also starts a curator AGENT on the
+evaluator's model (override with `#+TT_MODELS curator=…`; with no model
+configured it runs on Pi's default like an evaluator, never skipped); the
+agent is launched first but never blocks the evaluators, so the evaluator and
+panel always launch with their own models. The `curate_entries` tool may only
+propose `link`, `open` and `retitle`; it can never drop, resolve or change a
+type. A link with no shared anchor is refused and logged; a reviewer's
+`sameAs E-n` follows the same rule, and the owner's `m` (which merges
+near-duplicates that share no anchor) is the one exception. If the review lint fails, the view's first
+line names the violation and a `REVIEW_LINT_FAILED` event is recorded on
+every render — the runtime never repairs a view silently.
+
+If a candidate's checkout could not be read, its file anchors are shown
+`anchor unverified` (they could not be re-checked) rather than assumed fresh.
+A message with no real anchor (prose evidence, no decision id, no plan clause)
+still gets its own entry, anchored to the message itself, so two such messages
+never merge; the lint reports that entry as having no anchor. In the program
+view the entry id is qualified with its phase tags (`prog-01:E-1`) because
+entry ids are numbered per phase.
+
+Cleanness joins the balance numbers: `views/metrics.json`, the status `metrics`
+line and `tt summary` carry live entries per phase (a warning above 12),
+entries per distinct anchor, open `≈` hints, the owner's merges/splits and
+lint violations.

@@ -20,12 +20,13 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
-import { projectReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
+import { candidateAnchorFreshness, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
-import { normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
+import { expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
 import { next } from "./core/next.ts";
 import { effectiveChecks } from "./core/checks.ts";
 // Plan 05i: the pure environment preflight — parse every declared shell
@@ -411,6 +412,17 @@ const MESSAGE_EVENT_TYPES = new Set<string>([
   "MESSAGE_SUPERSEDED",
   "MESSAGE_CARRIED",
   "PANEL_DECIDED",
+  // Plan 05j: the entry ledger and the review lint are projections too, so an
+  // owner's s/m/A/D on an entry (or a curator's link) must rewrite the views
+  // in the same beat (finding A-7).
+  "ENTRY_OPENED",
+  "MESSAGE_LINKED",
+  "ENTRY_RETITLED",
+  "ENTRY_SPLIT",
+  "ENTRY_STATE",
+  "ENTRY_MERGED_BY_OWNER",
+  "ENTRY_CURATED",
+  "REVIEW_LINT_FAILED",
 ]);
 
 export function runPaths(runDir: string) {
@@ -432,6 +444,8 @@ export function runPaths(runDir: string) {
     ledger: path.join(runDir, "ledger.jsonl"),
     review: path.join(runDir, "views", "review.org"),
     messagesView: path.join(runDir, "views", "messages"),
+    // Plan 05j: one file per live ENTRY, the RET target from the review view.
+    entriesView: path.join(runDir, "views", "entries"),
     status: path.join(runDir, "views", "status.txt"),
     // Plan 03c: the phase state machine as an ASCII chart (TRANSITIONS).
     loop: path.join(runDir, "views", "loop.txt"),
@@ -955,6 +969,13 @@ const STALE_REVIEW = "stale review";
 export class Conductor {
   #runDir: string;
   #paths: ReturnType<typeof runPaths>;
+  /** Plan 05j: the last lint violation signature written/logged, so the
+   * conductor does not append a REVIEW_LINT_FAILED on every render beat. */
+  #lastLintSignature = "";
+  /** Plan 05j: re-entrancy guard while #syncEntries appends entry events. */
+  #syncingEntries = false;
+  /** Plan 05j: candidates whose curator agent is in flight. */
+  #curatorInFlight = new Set<string>();
   #plan: RunPlanFile;
   #deadlines: Deadlines;
   #piCommand: string | undefined;
@@ -1190,9 +1211,12 @@ export class Conductor {
       await this.stop();
       return;
     }
-    // Contract v1: rebuild the projections on every start. A conductor
-    // killed between an event and its projection write leaves stale or
-    // missing files; the log is authoritative and this restores them.
+    // Plan 05j: backfill the entry ledger from any messages that predate it
+    // (an old log has messages but no ENTRY_OPENED), then rebuild the
+    // projections. A conductor killed between an event and its projection
+    // write leaves stale or missing files; the log is authoritative and this
+    // restores them.
+    this.#syncEntries();
     this.#writeContractProjections();
     // Plan 03b: the status view exists immediately; the coalesced write keeps
     // it fresh afterwards without rebuilding the view on every message event.
@@ -1723,7 +1747,13 @@ export class Conductor {
     // conductor killed before this write loses nothing; writing on every
     // event (of which there are thousands per run) slowed long runs enough to
     // matter against their test timeouts.
-    if (MESSAGE_EVENT_TYPES.has(logged.type)) this.#writeContractProjections();
+    if (MESSAGE_EVENT_TYPES.has(logged.type)) {
+      // Plan 05j: persist an entry for every message that has none yet, then
+      // render. Doing it here (not in the renderer) keeps the ids stable and
+      // makes an owner's `s`/`m`/`A`/`D` name an entry reduce() can find.
+      this.#syncEntries();
+      this.#writeContractProjections();
+    }
     // Plan 01b: a fresh park is a new notification episode; resolving some of
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
@@ -2010,6 +2040,48 @@ export class Conductor {
     this.#appliedCommandIds.add(commandId);
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 05j: apply one entry command from the review view. The whole
+   * expansion is dry-run through reduce() first, so a partial application
+   * (some OWNER_VERDICTs applied, one stale) is impossible. */
+  #processEntryCommand(file: string, commandId: string, raw: Record<string, unknown>): void {
+    const phase = this.#state.phase.phase;
+    if (phase === "DONE" || phase === "BLOCKED") {
+      this.#rejectInboxFile(file, commandId, `the phase is ${phase}; the run no longer accepts owner input`);
+      return;
+    }
+    const expanded = expandEntryCommand(raw, this.#state.phase.entries ?? [], this.#state.phase.messages ?? []);
+    if (!expanded.ok) {
+      this.#rejectInboxFile(file, commandId, expanded.reason);
+      return;
+    }
+    // A raw message cannot be settled yet; it is reported, not silently
+    // skipped (record A-72 / M-63).
+    if (expanded.skipped.length > 0) {
+      this.#log.append("entry_verdict_skipped", { commandId, entryId: raw.entryId, skipped: expanded.skipped });
+    }
+    if (expanded.runId && expanded.runId !== this.#state.phase.runId) {
+      this.#rejectInboxFile(file, commandId, `command is bound to run ${expanded.runId}, but this run is ${this.#state.phase.runId}`);
+      return;
+    }
+    if (expanded.phaseId && expanded.phaseId !== this.#state.phase.phaseId) {
+      this.#rejectInboxFile(file, commandId, `command is bound to phase ${expanded.phaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
+      return;
+    }
+    let check = this.#state;
+    for (const event of expanded.events) {
+      const result = reduce(check, event);
+      if (!result.ok) {
+        this.#rejectInboxFile(file, commandId, result.reason);
+        return;
+      }
+      check = result.state;
+    }
+    this.#appliedCommandIds.add(commandId);
+    for (const event of expanded.events) this.#applyEvent(event, commandId);
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+    this.#log.append("entries_applied", { commandId, count: expanded.events.length });
   }
 
   /** Plan 01i: `withdraw OD-n`. The directive no longer applies: every live
@@ -2340,6 +2412,14 @@ export class Conductor {
         forwardProgram: false,
         pushed: true,
       });
+      return;
+    }
+
+    // Plan 05j: the review view's entry commands. An entry-verdict expands to
+    // one OWNER_VERDICT per linked message; split/merge/retitle are one
+    // ENTRY_* event each. Handled before the conductor-state mapping.
+    if (raw !== null && typeof raw === "object" && typeof (raw as { type?: unknown }).type === "string" && (raw as { type: string }).type.startsWith("entry-")) {
+      this.#processEntryCommand(file, commandId, raw as Record<string, unknown>);
       return;
     }
 
@@ -2742,6 +2822,12 @@ export class Conductor {
       do {
         this.#redriveRequested = false;
         const actions = next(this.#state);
+        // Plan 05j: the curator pass starts once per round, after the reviews
+        // and before the evaluators. It is launched first, but it never BLOCKS
+        // the evaluators: OD-1 requires the evaluator and panel to keep
+        // launching with their models even when the curator agent cannot run.
+        const p = this.#state.phase;
+        if (p.phase === "EVALUATING" && p.candidate && p.curatedFor !== p.candidate.sha) this.#curateRound(p.candidate!.sha);
         for (const action of actions) this.#dispatch(action);
       } while (this.#redriveRequested);
     } finally {
@@ -3197,11 +3283,13 @@ export class Conductor {
       // Bind to the current candidate when one exists; otherwise to the
       // integration head, and let the freeze's MESSAGE_CARRIED rebind it.
       const candidateSha = this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead;
-      const planRef = typeof args.planRef === "string" && args.planRef.trim().length > 0 ? args.planRef.trim() : this.#state.phase.phaseId;
+      // Only a planRef the worker actually named; the phase id is not a plan
+      // clause (finding A-34).
+      const planRef = typeof args.planRef === "string" && args.planRef.trim().length > 0 ? args.planRef.trim() : undefined;
       this.#raiseMessage(
         "tradeoff",
         undefined,
-        { type: "tradeoff", title: choice, summary: why, context: alternative, evidence: [`${anchor.path}:${anchor.lines[0]}-${anchor.lines[1]}`], planRef },
+        { type: "tradeoff", title: choice, summary: why, context: alternative, evidence: [`${anchor.path}:${anchor.lines[0]}-${anchor.lines[1]}`], ...(planRef ? { planRef } : {}) },
         candidateSha,
         { anchor },
       );
@@ -3297,6 +3385,62 @@ export class Conductor {
         reason,
         ...(vote === "block" ? { options: options!.map((o) => ({ id: o.id.trim(), label: o.label.trim() })) } : {}),
       });
+      handle.doneResolve();
+      return { ok: true };
+    }
+    if (msg.tool === "curate_entries") {
+      // Plan 05j: the curator's link/open/retitle pass. The allow-list is the
+      // tool's contract: any other op is refused before an event is applied.
+      if (handle.role !== "curator") return { ok: false, reason: `curate_entries is not accepted from role ${handle.role}` };
+      const proposals = (msg.args as { proposals?: unknown }).proposals;
+      if (!Array.isArray(proposals)) return { ok: false, reason: "curate_entries needs a proposals array" };
+      const entries = this.#state.phase.entries ?? [];
+      const messages = this.#state.phase.messages ?? [];
+      const events: Array<{ type: string; [key: string]: unknown }> = [];
+      for (const proposal of proposals) {
+        const built = curatorEvent(proposal as CuratorProposal, this.#state.phase.phaseId);
+        if (!built.ok) return { ok: false, reason: built.reason };
+        const event = built.event as unknown as { type: string; [key: string]: unknown };
+        // A link is refused (and logged) when the message and entry share no
+        // anchor; the message keeps its own entry (finding A-21). Any other
+        // refusal is caught by the whole-batch dry run below, so no partial
+        // application can happen and #applyEvent never throws (finding A-19).
+        if (event.type === "MESSAGE_LINKED") {
+          const entry = entries.find((e) => e.id === (event as { entryId?: string }).entryId);
+          const message = messages.find((m) => m.id === (event as { messageId?: string }).messageId);
+          const check = entry && message ? validateLink(entry, message, (event as { anchor?: never }).anchor) : { ok: false as const, reason: "unknown entry or message" };
+          if (!check.ok) {
+            this.#log.append("entry_link_refused", { entryId: (event as { entryId?: string }).entryId, messageId: (event as { messageId?: string }).messageId, reason: check.reason });
+            continue;
+          }
+        }
+        // A curator `open` naming a message an open entry already holds is
+        // redundant (the runtime opened its entry at raise time); skip just
+        // that proposal instead of refusing the whole batch (finding M-31).
+        if (event.type === "ENTRY_OPENED") {
+          const messageId = (event as { messageId?: string }).messageId;
+          const holder = messageId ? entries.find((e) => e.state === "open" && e.links.some((l) => l.messageId === messageId)) : undefined;
+          if (holder) {
+            this.#log.append("entry_open_skipped", { messageId, entryId: holder.id, reason: "the message already belongs to an open entry" });
+            continue;
+          }
+        }
+        // A retitle of an entry that does not exist is skipped, not fatal to
+        // the batch.
+        if (event.type === "ENTRY_RETITLED" && !entries.some((e) => e.id === (event as { entryId?: string }).entryId)) {
+          this.#log.append("entry_retitle_skipped", { entryId: (event as { entryId?: string }).entryId, reason: "no such entry" });
+          continue;
+        }
+        events.push(event);
+      }
+      let check = this.#state;
+      for (const event of events) {
+        const result = reduce(check, event as never);
+        if (!result.ok) return { ok: false, reason: result.reason };
+        check = result.state;
+      }
+      for (const event of events) this.#applyEvent(event as never);
+      this.#log.append("entries_curated", { count: events.length });
       handle.doneResolve();
       return { ok: true };
     }
@@ -3783,10 +3927,19 @@ export class Conductor {
           }
         }
       }
-      const { sameAs: _sameAs, ...disclosure } = fd;
+      const { sameAs, ...disclosure } = fd;
+      const before = new Set((this.#state.phase.messages ?? []).map((m) => m.id));
       const error = await this.#raiseFinding(disclosure, review.reviewer, candidate.sha, { raisedAsBlocker: asBlocker });
       if (error) return error;
       if (!this.#reviewStillCurrent(candidate.sha)) return STALE_REVIEW;
+      // Plan 05j: a reviewer may name an entry with `sameAs E-n` to link the
+      // raise to it at raise time. The runtime accepts the link only if the
+      // message and the entry share an anchor; otherwise it is refused and
+      // logged (the message keeps the entry the round pass opened for it).
+      if (typeof sameAs === "string" && sameAs.startsWith("E-")) {
+        const newMessage = (this.#state.phase.messages ?? []).find((m) => !before.has(m.id));
+        if (newMessage) this.#linkReviewerRaise(newMessage.id, sameAs, review.reviewer);
+      }
     }
 
     for (const bd of review.ballots ?? []) {
@@ -4474,8 +4627,13 @@ export class Conductor {
       fs.writeFileSync(this.#paths.messages, projectMessages(phase));
       fs.writeFileSync(this.#paths.ledger, projectLedger(phase));
       // Plan 05c: the header names the run by its readable id and directory
-      // id, never by the internal runId.
-      fs.writeFileSync(this.#paths.review, projectReview({ ...phase, ...runIds(this.#runDir) }));
+      // id, never by the internal runId. Plan 05j: the view is the entry
+      // projection (one topic once), linted on every render.
+      const ids = runIds(this.#runDir);
+      const rendered = projectEntryReview({ ...phase, ...ids }, { anchorFreshness: candidateAnchorFreshness(this.#candidateDir()) });
+      fs.writeFileSync(this.#paths.review, rendered.text);
+      this.#writeEntryViews(rendered.files);
+      this.#recordReviewLint(rendered.lint);
       this.#writeMessageViews();
     } catch (err) {
       this.#logUnexpected("write_contract_projections", err);
@@ -4487,6 +4645,104 @@ export class Conductor {
       this.#writeStatusView();
     } catch (err) {
       this.#logUnexpected("write_status_view", err);
+    }
+  }
+
+  /** Plan 05j: one round's curator pass. It links every remaining message to
+   * a shared-anchor entry (or opens its own), records `ENTRY_CURATED` so the
+   * evaluators may start, and leaves the resulting links in the log. The
+   * curator's allow-list (link/open/retitle only) is enforced by
+   * `curate_entries`; the deterministic anchor pass is the same rule. */
+  #curateRound(candidateSha: string): void {
+    this.#syncEntries();
+    if (this.#curatorInFlight.has(candidateSha)) return;
+    this.#curatorInFlight.add(candidateSha);
+    const actionId = this.#log.actionId("dispatch_curator");
+    // The curator always runs (OD-2): with no configured model it launches
+    // on Pi's default exactly like an evaluator would, never skipped.
+    void this.#runCurator(actionId, candidateSha).catch((err) => {
+      this.#logUnexpected("dispatch_curator", err);
+      this.#finishCurator(candidateSha);
+    });
+  }
+
+  /** Plan 05j: the round is curated (the curator submitted, timed out or
+   * could not start): the evaluators may run. Idempotent. */
+  #finishCurator(candidateSha: string): void {
+    this.#curatorInFlight.delete(candidateSha);
+    const p = this.#state.phase;
+    if (p.phase !== "EVALUATING" || p.candidate?.sha !== candidateSha || p.curatedFor === candidateSha) return;
+    this.#applyEvent({ type: "ENTRY_CURATED", candidateSha, count: (p.entries ?? []).length });
+  }
+
+  /** Plan 05j: a reviewer's `sameAs E-n` link. Applied through reduce, which
+   * refuses (and logs) a link with no shared anchor. */
+  #linkReviewerRaise(messageId: string, entryId: string, reviewer: Reviewer): void {
+    const entry = (this.#state.phase.entries ?? []).find((e) => e.id === entryId);
+    if (!entry) {
+      this.#log.append("entry_link_ignored", { messageId, entryId, reviewer, reason: "no such entry" });
+      return;
+    }
+    const before = (this.#state.phase.entries ?? []).find((e) => e.id === entryId)!.links.length;
+    this.#applyEvent({ type: "MESSAGE_LINKED", messageId, entryId, anchor: entry.anchor, reason: `reviewer ${reviewer} sameAs`, by: `reviewer ${reviewer}` });
+    const after = (this.#state.phase.entries ?? []).find((e) => e.id === entryId)!.links.length;
+    if (after === before) {
+      this.#log.append("entry_link_refused", { messageId, entryId, reviewer, reason: "no shared anchor" });
+    }
+  }
+
+  /** Plan 05j: persist the entry ledger for every message that has none yet.
+   * Called on start (backfilling an old log) and on every message event, so
+   * the entries are in `events.jsonl`, not invented at render time. */
+  #syncEntries(): void {
+    if (this.#syncingEntries) return;
+    const events = planEntryEvents(this.#state.phase.messages ?? [], this.#state.phase.entries ?? []);
+    if (events.length === 0) return;
+    this.#syncingEntries = true;
+    try {
+      for (const event of events) this.#applyEvent(event as never);
+    } catch (err) {
+      this.#logUnexpected("sync_entries", err);
+    } finally {
+      this.#syncingEntries = false;
+    }
+  }
+
+  /** Plan 05j: `views/entries/<id>.org`, one per live entry, pruned of files
+   * whose entry is no longer live (a resolved or merged entry is not shown). */
+  #writeEntryViews(files: Array<{ id: string; contents: string }>): void {
+    const ids = new Set(files.map((f) => f.id));
+    fs.mkdirSync(this.#paths.entriesView, { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(this.#paths.entriesView, `${f.id}.org`), f.contents);
+    for (const name of fs.readdirSync(this.#paths.entriesView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) {
+        fs.rmSync(path.join(this.#paths.entriesView, name), { force: true });
+      }
+    }
+  }
+
+  /** Plan 05j: `REVIEW_LINT_FAILED` records a violation the view's first line
+   * already names. One event per distinct violation, so a steady violation is
+   * not logged on every render beat. */
+  #recordReviewLint(lint: { ok: boolean; violations: Array<{ rule: string; detail: string }> }): void {
+    const signature = lint.violations.map((v) => `${v.rule}:${v.detail}`).join("|");
+    if (signature === this.#lastLintSignature) return;
+    this.#lastLintSignature = signature;
+    // Dedup against the LOG, not just memory (finding M-23): after a restart
+    // the same violation would otherwise be appended again.
+    let existing = "";
+    try {
+      existing = fs.readFileSync(this.#paths.events, "utf8");
+    } catch {
+      // no log yet: every violation is new
+    }
+    for (const v of lint.violations) {
+      if (existing.includes(JSON.stringify(v.detail))) continue;
+      try {
+        this.#applyEvent({ type: "REVIEW_LINT_FAILED", rule: v.rule, detail: v.detail });
+      } catch (err) {
+        this.#logUnexpected("review_lint_event", err);
+      }
     }
   }
 
@@ -4562,7 +4818,8 @@ export class Conductor {
       summary: decision.recommendation.reason,
       context: decision.whyItMatters,
       evidence: decision.alternatives.map((a) => `${a.option}: ${a.consequence}`),
-      planRef: this.#state.phase.phaseId,
+      // No fabricated planRef: the phase id is not a plan clause, and using it
+      // as one made unrelated prose messages share an anchor (finding A-34).
     };
   }
 
@@ -4577,7 +4834,8 @@ export class Conductor {
       summary: `raised by ${finding.raisedBy} against ${finding.boundCandidateSha}`,
       context: finding.evidence,
       evidence: [finding.evidence],
-      planRef: this.#state.phase.phaseId,
+      // No fabricated planRef (finding A-34): a prose-evidence finding has no
+      // real anchor, so it gets its own entry, never merged with another.
     };
   }
 
@@ -6205,6 +6463,145 @@ export class Conductor {
     this.#applyEvent({ type: "EVALUATION_TIMED_OUT", messageType });
   }
 
+  /** Plan 05j: the round's curator agent. It reads every new raw message of
+   * every type and every open entry, and proposes link/open/retitle through
+   * `curate_entries` (the only ops its tool accepts). A submit, a timeout or
+   * a launch failure all end the pass, so the evaluators are never wedged. */
+  async #runCurator(actionId: string, candidateSha: string): Promise<void> {
+    const agentId = `curator-${actionId}`;
+    const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
+    const candidateDir = this.#candidateDir();
+    const model = this.#providerModelFor?.("curator");
+    const env: NodeJS.ProcessEnv = {
+      ...this.#extraEnv,
+      ...this.#piEnvFor?.("curator", agentId),
+      TT_SOCKET: this.#paths.sock,
+      TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_RUN_DIR: this.#runDir,
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+      TT_CANDIDATE_SHA: candidateSha,
+    };
+
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+    // A curator that settles without submitting (or with an empty pass) ends
+    // the round at once instead of waiting out evaluateMs.
+    const settleWaiters: Array<() => void> = [];
+    const nextSettle = () => new Promise<"settled">((resolve) => settleWaiters.push(() => resolve("settled")));
+    const agent = spawnPiAgent({
+      command: this.#resolvePiCommand("curator"),
+      args: [
+        ...this.#resolvePiArgsPrefix("curator"),
+        ...launchArgs("curator", { noSession: true, provider: model?.provider, model: model?.model }),
+      ],
+      cwd: candidateDir,
+      env,
+      role: "curator",
+      agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(agentId, event);
+        this.#trackRunTokens(agentId, event);
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
+    });
+    const handle: AgentHandle = {
+      agent,
+      role: "curator",
+      agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve: () => undefined,
+      discoveryPromise: Promise.resolve(),
+    };
+    this.#agents.set(agentId, handle);
+    this.#log.intent(actionId, { agentId, candidateSha });
+    try {
+      const hello = await Promise.race([
+        raceTimeout(helloPromise, this.#deadlines.helloTimeoutMs, "hello"),
+        agent.waitExit().then(() => "exited" as const),
+      ]);
+      if (hello === "timeout" || hello === "exited" || !hello.ok) {
+        await agent.terminate();
+        this.#log.completion(actionId, { candidateSha, ok: false, reason: hello === "exited" ? "curator exited before hello" : "curator did not start" });
+        return;
+      }
+      await agent.prompt(this.#buildCuratorPrompt());
+      const settled = nextSettle();
+      // A cancelable deadline (never `raceTimeout`, whose timer survives the
+      // race and keeps the process alive): the conductor's own `stop()`
+      // terminates the agent, `waitExit` then ends the wait, and the finally
+      // cancels the timer — so a spawned conductor still exits by itself.
+      const timeout = cancelableTimeout(this.#deadlines.evaluateMs, "timeout" as const);
+      let outcome: "submitted" | "settled" | "exited" | "timeout";
+      try {
+        outcome = await Promise.race([
+          donePromise.then(() => "submitted" as const),
+          settled,
+          agent.waitExit().then(() => "exited" as const),
+          timeout.promise,
+        ]);
+      } finally {
+        timeout.cancel();
+      }
+      await agent.terminate();
+      this.#log.completion(actionId, {
+        candidateSha,
+        ok: outcome === "submitted",
+        ...(outcome === "submitted" ? {} : { reason: outcome === "settled" ? "curator settled without submitting" : outcome === "exited" ? "curator exited" : "curator timed out" }),
+      });
+    } finally {
+      this.#agents.delete(agentId);
+      this.#finishCurator(candidateSha);
+    }
+  }
+
+  /** Plan 05j: what the curator sees — every message of every type this
+   * round, and every open entry, with the op allow-list. */
+  #buildCuratorPrompt(): string {
+    const phase = this.#state.phase;
+    const openEntries = (phase.entries ?? []).filter((e) => e.state === "open");
+    const lines = [
+      "You are the review curator for this round. Link each new message to the open entry it is the SAME TOPIC as, so the owner sees each topic once.",
+      "Call curate_entries with a `proposals` array. Every proposal is exactly one of:",
+      "- link: { op: \"link\", messageId, entryId, anchor, reason } — accepted only when the message and the entry share an anchor (overlapping file line ranges, the same decision id, or the same plan clause).",
+      "- open: { op: \"open\", title, messageId, anchor? } — open a new topic when no open entry matches.",
+      "- retitle: { op: \"retitle\", entryId, title } — improve a title (at most 80 characters, never cut mid-word).",
+      "You may not drop, resolve, merge or change a type. Leave a message alone rather than inventing an anchor.",
+      "",
+      `Candidate: ${phase.candidate?.sha ?? ""}`,
+    ];
+    const byType: Array<[MessageType, string]> = [
+      ["blocker", "Blockers"],
+      ["finding", "Findings"],
+      ["tradeoff", "Trade-offs"],
+    ];
+    for (const [type, label] of byType) {
+      const msgs = (phase.messages ?? []).filter((m) => m.type === type && (m.state === "raw" || m.state === "published"));
+      lines.push("", `${label}:`);
+      if (msgs.length === 0) lines.push("- (none)");
+      for (const m of msgs) lines.push(`- ${m.id} [${m.state}] ${m.title}\n    summary: ${m.summary}\n    evidence: ${(m.evidence ?? []).join(" | ")}`);
+    }
+    lines.push("", "Open entries:");
+    if (openEntries.length === 0) lines.push("- (none)");
+    for (const e of openEntries) lines.push(`- ${e.id} [${e.type}] ${e.title} (${formatAnchor(e.anchor)}; ${e.links.length} linked)`);
+    return lines.join("\n");
+  }
+
   /** Plan 04a: one fresh evaluator PER MESSAGE TYPE checks that type's raw
    * messages against the candidate's diff and a read-only checkout, then
    * returns through `submit_evaluation`. A submit settles that type; a
@@ -6366,6 +6763,10 @@ export class Conductor {
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
       ...ledgerPromptLines(phase.messages),
+      // Plan 05j: the evaluator sees the entries its messages belong to, so a
+      // topic raised as another type is visible to it (plan item 3's
+      // cross-type view of the round; finding M-18).
+      ...entryPromptLines(phase.entries),
       "",
       "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
       "```diff",
@@ -6677,6 +7078,9 @@ export class Conductor {
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
+      // Plan 05j: the open ENTRIES, so a reviewer links to an existing topic
+      // instead of re-raising it under a new id.
+      ...entryPromptLines(phase.entries),
       // Plan 01f: turn 1 is told the conductor owns the gate evidence too (a
       // reviewer that only learns it in turn 2 could demand or accept a
       // substitute first). The failed record from an earlier candidate is
@@ -6761,6 +7165,8 @@ export class Conductor {
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
+      // Plan 05j: the same open-entry list on the turn-2 prompt.
+      ...entryPromptLines(phase.entries),
       "Records:",
       ...(live.length > 0 ? live.map(record) : ["- (none)"]),
     ];
@@ -7132,6 +7538,18 @@ export function directiveLines(directives: readonly OwnerDirective[] | undefined
  * section. Exported (and used by `buildWorkerPrompt` and
  * `#buildReviewerTurn2Prompt`) so a unit test exercises exactly the words the
  * two prompts send, rather than a look-alike built somewhere else. */
+/** Plan 05j: the open entries a reviewer's prompt lists, so it can link at
+ * raise time instead of re-raising a topic under a new id. */
+export function entryPromptLines(entries: readonly Entry[] | undefined): string[] {
+  const open = (entries ?? []).filter((e) => e.state === "open");
+  if (open.length === 0) return [];
+  return [
+    "",
+    "Open entries (one topic each; raise the topic once, and do not repeat one already listed):",
+    ...open.map((e) => `- ${e.id} [${e.type}] ${e.title} (${formatAnchor(e.anchor)})`),
+  ];
+}
+
 export function baselinePromptLines(commands: readonly BaselineCommand[] | undefined): string[] {
   const failed = baselineFailedCommands(commands ?? []);
   if (failed.length === 0) return [];

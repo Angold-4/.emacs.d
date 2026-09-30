@@ -21,6 +21,9 @@ import { execFileSync } from "node:child_process";
 import { buildView, formatDuration } from "./view.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 import { renderProgramChart } from "./charts.ts";
+import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
+import { runReviewLint } from "./core/review-lint.ts";
+import { candidateAnchorFreshness } from "./render.ts";
 
 import {
   expandProgram,
@@ -57,6 +60,8 @@ export function programPaths(dir: string) {
     source: path.join(dir, "source.json"),
     /** Plan 03c: the rendered dependency graph Emacs/the owner read. */
     programView: path.join(dir, "views", "program.txt"),
+    /** Plan 05j: the program-wide entry review (`C-c m D`). */
+    reviewView: path.join(dir, "views", "review.org"),
     /** Plan 01i: the program's own owner-input inbox (a `C-u` directive from
      * a node run is forwarded here; the Emacs program buffer writes here). */
     inbox: path.join(dir, "inbox"),
@@ -649,6 +654,68 @@ export function writeProgramChart(dir: string): void {
     fs.writeFileSync(file, programChartText(dir));
   } catch {
     // a chart that cannot be written must never stop the scheduler
+  }
+  writeProgramReview(dir);
+}
+
+/** Plan 05j: `programs/<id>/views/review.org` — every node run's entries,
+ * grouped by the same three sections and tagged with the node's phase id.
+ * Cross-phase links are only through shared anchors, so the same rule as the
+ * phase view holds across the program. A node that never started or whose
+ * run is unreadable contributes nothing (and is not hidden silently: it has
+ * no entries to show). */
+export function programReviewText(dir: string): string {
+  const { nodes, state, readableIds } = foldProgram(dir);
+  const root = path.dirname(path.dirname(dir));
+  const phases: Array<{ phaseId: string; readableId?: string; candidate?: { sha: string }; messages?: unknown[]; entries?: unknown[] }> = [];
+  // The lint runs per phase, on each phase's OWN entries and message ids
+  // (every phase numbers E-1/T-1 from scratch, so a single combined
+  // projection would collide ids and fire one-anchor on a topic that recurs
+  // across phases — findings M-16/A-20). The program view itself folds those
+  // cross-phase duplicates into one row.
+  const violations: Array<{ detail: string }> = [];
+  for (const n of nodes) {
+    const s = state.nodes[n.id];
+    if (!s.runId) continue;
+    try {
+      const runDir = path.join(root, s.runId);
+      const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
+      const phase = rebuildState(runDir, plan, { lenient: true }).phase;
+      const sha = phase.candidate?.sha;
+      const projected = projectEntries({
+        messages: phase.messages ?? [],
+        entries: phase.entries ?? [],
+        newestCandidateSha: sha,
+        anchorFreshness: candidateAnchorFreshness(sha ? path.join(runDir, "candidates", sha) : undefined),
+      });
+      violations.push(...runReviewLint({ projected, newestCandidateSha: sha, messages: phase.messages ?? [] }).violations);
+      phases.push({
+        phaseId: phase.phaseId,
+        readableId: readableIds[n.id],
+        candidate: sha ? { sha } : undefined,
+        messages: phase.messages ?? [],
+        entries: phase.entries ?? [],
+      });
+    } catch {
+      // the run is not readable (yet): it contributes no entries
+    }
+  }
+  const newestCandidateSha = [...phases].reverse().map((ph) => ph.candidate?.sha).find((sha) => typeof sha === "string" && sha.length > 0);
+  return renderProgramEntryReview({
+    program: { id: path.basename(dir), phases: phases as never },
+    newestCandidateSha,
+    lintError: violations.length > 0 ? violations[0].detail : undefined,
+  });
+}
+
+/** Plan 05j: write the program review beside the program chart. */
+export function writeProgramReview(dir: string): void {
+  try {
+    const file = programPaths(dir).reviewView;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, programReviewText(dir));
+  } catch {
+    // a review that cannot be written must never stop the scheduler
   }
 }
 

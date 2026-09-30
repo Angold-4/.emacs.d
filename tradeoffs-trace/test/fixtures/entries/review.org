@@ -1,0 +1,234 @@
+#+TITLE: tradeoffs-trace review — 15a-01 · 1989d1d0
+#+CONTRACT_VERSION: v1
+#+CANDIDATE: C1
+
+* Blockers
+** E-1 no priced-frame counter  [M·worker·A · +3 linked · src/priced_frame.rs:88-104]
+   :PROPERTIES:
+   :ID: E-1
+   :TYPE: blocker
+   :STATE: open
+   :ANCHOR: src/priced_frame.rs:88-104
+   :RAISED_BY: M,worker,A
+   :LINKED: B-1,T-14,F-1,T-40
+   :END:
+  summary of B-1
+
+  * Linked messages
+    - B-1 no priced-frame counter — summary of B-1
+    - F-1 no priced-frame counter — summary of F-1
+    - T-14 no priced-frame counter — summary of T-14
+    - T-40 the counter the fix adds — summary of T-40
+
+* Findings
+** E-11 a missing test  [M · src/e.rs:1-1]
+   :PROPERTIES:
+   :ID: E-11
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/e.rs:1-1
+   :RAISED_BY: M
+   :LINKED: F-5
+   :END:
+  summary of F-5
+
+  * Linked messages
+    - F-5 a missing test — summary of F-5
+
+** E-12 a wrong error  [A · src/f.rs:1-1]
+   :PROPERTIES:
+   :ID: E-12
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/f.rs:1-1
+   :RAISED_BY: A
+   :LINKED: F-6
+   :END:
+  summary of F-6
+
+  * Linked messages
+    - F-6 a wrong error — summary of F-6
+
+** E-13 an off-by-one  [B · src/g.rs:1-1]
+   :PROPERTIES:
+   :ID: E-13
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/g.rs:1-1
+   :RAISED_BY: B
+   :LINKED: F-7
+   :END:
+  summary of F-7
+
+  * Linked messages
+    - F-7 an off-by-one — summary of F-7
+
+** E-14 a leak  [M · src/h.rs:1-1]
+   :PROPERTIES:
+   :ID: E-14
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/h.rs:1-1
+   :RAISED_BY: M
+   :LINKED: F-8
+   :END:
+  summary of F-8
+
+  * Linked messages
+    - F-8 a leak — summary of F-8
+
+** E-15 a stale cache  [A · src/i.rs:1-1]
+   :PROPERTIES:
+   :ID: E-15
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/i.rs:1-1
+   :RAISED_BY: A
+   :LINKED: F-9
+   :END:
+  summary of F-9
+
+  * Linked messages
+    - F-9 a stale cache — summary of F-9
+
+** E-2 priced CLOSED frames dropped  [worker·A · +1 linked · src/priced_frame.rs:210-224]
+   :PROPERTIES:
+   :ID: E-2
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/priced_frame.rs:210-224
+   :RAISED_BY: worker,A
+   :LINKED: T-7,F-3
+   :END:
+  summary of T-7
+
+  * Linked messages
+    - F-3 priced CLOSED frames are dropped — summary of F-3
+    - T-7 priced CLOSED frames dropped — summary of T-7
+
+** E-3 no weekday RTH fixture  [worker·B · +1 linked · src/fixtures/rth.rs:1-40]
+   :PROPERTIES:
+   :ID: E-3
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/fixtures/rth.rs:1-40
+   :RAISED_BY: worker,B
+   :LINKED: T-15,F-4
+   :END:
+  summary of T-15
+
+  * Linked messages
+    - F-4 no weekday RTH fixture — summary of F-4
+    - T-15 no weekday RTH fixture — summary of T-15
+
+** E-4 a slow path returns NaN  [M·worker · +1 linked · src/util.rs:3-3]
+   :PROPERTIES:
+   :ID: E-4
+   :TYPE: finding
+   :STATE: open
+   :ANCHOR: src/util.rs:3-3
+   :RAISED_BY: M,worker
+   :LINKED: F-2,T-27
+   :END:
+  summary of F-2
+
+  * Linked messages
+    - F-2 a slow path returns NaN — summary of F-2
+    - T-27 guarding the slow path — summary of T-27
+
+* Trade-offs
+** E-10 one lock per request  [worker · +1 linked · src/d.rs:1-1]
+   :PROPERTIES:
+   :ID: E-10
+   :TYPE: tradeoff
+   :STATE: open
+   :ANCHOR: src/d.rs:1-1
+   :RAISED_BY: worker
+   :LINKED: T-5,T-11
+   :END:
+  summary of T-5
+
+  * Linked messages
+    - T-11 one lock per request — summary of T-11
+    - T-5 one lock per request — summary of T-5
+
+** E-5 tolerances raised on the fill path  [worker · src/fills.rs:12-18 · ≈ E-6]
+   :PROPERTIES:
+   :ID: E-5
+   :TYPE: tradeoff
+   :STATE: open
+   :ANCHOR: src/fills.rs:12-18
+   :RAISED_BY: worker
+   :LINKED: T-2
+   :HINT: E-6
+   :END:
+  summary of T-2
+
+  * Linked messages
+    - T-2 tolerances raised on the fill path — summary of T-2
+
+** E-6 tolerances raised on the fill path  [worker · src/fills.rs:90-96 · ≈ E-5]
+   :PROPERTIES:
+   :ID: E-6
+   :TYPE: tradeoff
+   :STATE: open
+   :ANCHOR: src/fills.rs:90-96
+   :RAISED_BY: worker
+   :LINKED: T-41
+   :HINT: E-5
+   :END:
+  summary of T-41
+
+  * Linked messages
+    - T-41 tolerances raised on the fill path — summary of T-41
+
+** E-7 batch per tick  [worker · +3 linked · src/a.rs:1-1]
+   :PROPERTIES:
+   :ID: E-7
+   :TYPE: tradeoff
+   :STATE: open
+   :ANCHOR: src/a.rs:1-1
+   :RAISED_BY: worker
+   :LINKED: T-8,T-10,T-20,T-25
+   :END:
+  summary of T-8
+
+  * Linked messages
+    - T-10 batch per tick — summary of T-10
+    - T-20 batch per tick — summary of T-20
+    - T-25 batch per tick — summary of T-25
+    - T-8 batch per tick — summary of T-8
+
+** E-8 keep the layout  [worker · +2 linked · src/b.rs:1-1]
+   :PROPERTIES:
+   :ID: E-8
+   :TYPE: tradeoff
+   :STATE: open
+   :ANCHOR: src/b.rs:1-1
+   :RAISED_BY: worker
+   :LINKED: T-1,T-9,T-18
+   :END:
+  summary of T-1
+
+  * Linked messages
+    - T-1 keep the layout — summary of T-1
+    - T-18 keep the layout — summary of T-18
+    - T-9 keep the layout — summary of T-9
+
+** E-9 rename it  [worker · +2 linked · src/c.rs:1-1]
+   :PROPERTIES:
+   :ID: E-9
+   :TYPE: tradeoff
+   :STATE: open
+   :ANCHOR: src/c.rs:1-1
+   :RAISED_BY: worker
+   :LINKED: T-4,T-12,T-17
+   :END:
+  summary of T-4
+
+  * Linked messages
+    - T-12 rename it — summary of T-12
+    - T-17 rename it — summary of T-17
+    - T-4 rename it — summary of T-4
+
+31 raw → 15 entries · 29 linked · 2 dropped · 0 unaccounted · unexposed 0
