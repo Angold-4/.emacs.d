@@ -78,6 +78,10 @@ interface Script {
    * conductor's hello limit and the retry — with its longer limit — gets it. */
   helloDelayMs?: number;
   steps: Step[];
+  /** 06a finding #24: how this fake answers a `--print` probe (the models
+   * check's own Pi print mode). Absent: `ok` with `OK`. `hang` never exits,
+   * so the check's 60 s bound must kill it and report `unreachable`. */
+  print?: { mode: "ok" | "refused" | "hang"; text?: string };
 }
 
 let hangingForever = false;
@@ -223,6 +227,33 @@ class RunSocket {
 
 async function main(): Promise<void> {
   recordArgv();
+  // 06a finding #24: the models check runs Pi in print mode (`--print`) with
+  // no run socket. Answer that shape here so a unit test can drive `ok`,
+  // `refused` (a 403 body) and `unreachable` (never answers) without a real
+  // model.
+  if (process.argv.includes("--print")) {
+    const printScript = loadScript();
+    const p = printScript.print ?? { mode: "ok" as const };
+    if (p.mode === "refused") {
+      process.stderr.write(`${p.text ?? "403 restricted"}\n`);
+      process.exit(1);
+    }
+    if (p.mode === "hang") {
+      // Survive the stdin `end` handler below (stdio is ignored in print
+      // mode, so it fires at once) — the models check's own bound must kill
+      // this, not a clean exit.
+      hangingForever = true;
+      await new Promise(() => {
+        // An unresolved promise alone does not keep the event loop alive (the
+        // process would just exit 0), so hold a far-future interval; the
+        // models check's own bound must kill this, not a clean exit.
+        setInterval(() => undefined, 1 << 30);
+      });
+      return;
+    }
+    process.stdout.write(`${p.text ?? "OK"}\n`);
+    process.exit(0);
+  }
   const script = loadScript();
   const runSocket = new RunSocket();
   const socketPath = readEnv("TT_SOCKET");

@@ -35,6 +35,8 @@ import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { planModelSelector } from "./core/roles.ts";
+import { distinctModelGroups, modelsCheckRefused, planModelTargets, type ModelsCheck } from "./core/models-check.ts";
+import { runModelsCheck } from "./effects/models-check.ts";
 import { effectiveChecks } from "./core/checks.ts";
 // Plan 05i: the program commands preflight every node they will start, before
 // any run is created, so a missing toolchain refuses visibly instead of
@@ -74,7 +76,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--skip-models-check]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -115,10 +117,12 @@ function parseArgs(argv: string[]): {
   runId?: string;
   phaseId?: string;
   source?: string;
+  skipModelsCheck: boolean;
 } {
   const positional: string[] = [];
   let root: string | undefined;
   let json = false;
+  let skipModelsCheck = false;
   let reason: string | undefined;
   let candidateSha: string | undefined;
   let messageVersion: number | undefined;
@@ -165,11 +169,13 @@ function parseArgs(argv: string[]): {
       source = argv[++i];
     } else if (arg.startsWith("--source=")) {
       source = arg.slice("--source=".length);
+    } else if (arg === "--skip-models-check") {
+      skipModelsCheck = true;
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source };
+  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck };
 }
 
 /** Plan 03c: resolve a readable id `<program>-NN` to the node's run
@@ -338,7 +344,72 @@ function programSecrets(dir: string): string[] {
   return program.entries.filter((e) => state.nodes[e.id]?.status !== "done").flatMap((e) => e.plan.secrets ?? []);
 }
 
-async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean, source?: string): Promise<void> {
+/** 06a finding #24: the print-mode Pi command — the real `pi` binary, or the
+ * `TT_TEST_MODE=1` fake-pi injection the conductor already uses. The probe's
+ * 60 s bound is overridable only under `TT_TEST_MODE=1`, so a unit test can
+ * exercise `unreachable` without waiting a minute. */
+function modelsCheckOptions(): { command: string; argsPrefix: string[]; timeoutMs?: number } {
+  const { piCommand, piArgsPrefix } = testPiInjection();
+  let timeoutMs: number | undefined;
+  if (process.env.TT_TEST_MODE === "1") {
+    const raw = Number(process.env.TT_MODELS_CHECK_TIMEOUT_MS);
+    if (Number.isFinite(raw) && raw > 0) timeoutMs = raw;
+  }
+  return { command: piCommand ?? "pi", argsPrefix: piArgsPrefix ?? [], ...(timeoutMs !== undefined ? { timeoutMs } : {}) };
+}
+
+/** The distinct configured models of a plan (empty when it declares none). */
+async function runPlanModelsCheck(plan: RunPlanFile): Promise<ModelsCheck> {
+  return runModelsCheck(distinctModelGroups(planModelTargets(plan.models)), modelsCheckOptions());
+}
+
+/** The distinct configured models across every entry of a program. */
+async function runProgramModelsCheck(program: ProgramFile): Promise<ModelsCheck> {
+  return runModelsCheck(distinctModelGroups(program.entries.flatMap((e) => planModelTargets(e.plan.models))), modelsCheckOptions());
+}
+
+/** Write the check's record next to the run/program it belongs to. */
+function writeModelsCheck(dir: string, check: ModelsCheck): void {
+  writeFileSync(path.join(dir, "models-check.json"), `${JSON.stringify(check, null, 2)}\n`);
+}
+
+/** 06a finding #24: refuse a start when a configured model is refused, naming
+ * the gateway's own message. `--skip-models-check` bypasses this. */
+function refuseRefusedModels(check: ModelsCheck, what: string): boolean {
+  const refused = modelsCheckRefused(check);
+  if (refused.length === 0) return false;
+  const list = refused.map((p) => `${p.key}${p.message ? ` (${p.message})` : ""}`).join(", ");
+  process.stderr.write(
+    `refusing to ${what}: configured model(s) refused by the gateway: ${list}\n` +
+      `fix #+TT_MODELS, or pass --skip-models-check to start anyway\n`,
+  );
+  process.exitCode = 1;
+  return true;
+}
+
+/** 06a finding #24: `tt models check [plan-or-program]`. Prints one line per
+ * distinct configured model; exits non-zero when any is not `ok`. */
+async function cmdModels(sub: string | undefined, args: string[]): Promise<void> {
+  if (sub !== "check") usage();
+  if (args.length !== 1) usage();
+  const json = JSON.parse(readFileSync(args[0], "utf8")) as unknown;
+  const check = isProgramInput(json) ? await runProgramModelsCheck(json as ProgramFile) : await runPlanModelsCheck(json as RunPlanFile);
+  if (check.probes.length === 0) {
+    process.stdout.write("no #+TT_MODELS configured; nothing to check\n");
+    return;
+  }
+  for (const p of check.probes) {
+    const detail = p.status === "refused" && p.message ? ` (${p.message})` : "";
+    process.stdout.write(`${p.key} ${p.status}${detail}\n`);
+  }
+  // A refused or unreachable model is a failed check; `tt start` itself only
+  // refuses on `refused` (an unreachable model may be a transient network
+  // problem, not a gateway policy), but `tt models check` exits non-zero for
+  // either so a script can branch on it.
+  if (check.probes.some((p) => p.status !== "ok")) process.exitCode = 1;
+}
+
+async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean, source?: string, skipModelsCheck = false): Promise<void> {
   if (sub === "start") {
     if (args.length !== 1) usage();
     const program = JSON.parse(readFileSync(args[0], "utf8")) as ProgramFile;
@@ -358,6 +429,15 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     // Plan 03c: the Org program file the program was started from (Emacs
     // passes it), shown in the program buffer's header.
     if (source) recordProgramSource(dir, source);
+    // 06a finding #24: probe every distinct configured model, record the
+    // result in the program directory, and refuse before the scheduler starts
+    // when one is refused (unless --skip-models-check).
+    const check = await runProgramModelsCheck(program);
+    writeModelsCheck(dir, check);
+    if (!skipModelsCheck && refuseRefusedModels(check, "start the program")) return;
+    if (skipModelsCheck && modelsCheckRefused(check).length > 0) {
+      process.stderr.write("warning: --skip-models-check: starting with refused model(s)\n");
+    }
     launchProgramScheduler(dir);
     process.stdout.write(`${path.basename(dir)}\n`);
   } else if (sub === "status") {
@@ -551,7 +631,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
   }
 }
 
-async function cmdStart(planPath: string, root: string): Promise<void> {
+async function cmdStart(planPath: string, root: string, skipModelsCheck = false): Promise<void> {
   const plan = JSON.parse(readFileSync(planPath, "utf8")) as RunPlanFile;
   if (!plan.repo) usage();
   // Plan 01c: lint before any run exists. An error refuses to start (message
@@ -563,7 +643,17 @@ async function cmdStart(planPath: string, root: string): Promise<void> {
     return;
   }
   if (refuseMissingSecrets(plan.secrets, "start the run")) return;
-  launchDetached(createRun(root, plan));
+  // 06a finding #24: create the run, probe its distinct configured models,
+  // record the result in the run directory, and refuse to launch when one is
+  // refused (unless --skip-models-check).
+  const runDir = createRun(root, plan);
+  const check = await runPlanModelsCheck(plan);
+  writeModelsCheck(runDir, check);
+  if (!skipModelsCheck && refuseRefusedModels(check, "start the run")) return;
+  if (skipModelsCheck && modelsCheckRefused(check).length > 0) {
+    process.stderr.write("warning: --skip-models-check: starting with refused model(s)\n");
+  }
+  launchDetached(runDir);
 }
 
 /** Relaunch the conductor for an existing run (after a crash or reboot);
@@ -1362,11 +1452,13 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source } = parseArgs(rest);
+  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
-    await cmdStart(positional[0], runRoot);
+    await cmdStart(positional[0], runRoot, skipModelsCheck);
+  } else if (cmd === "models") {
+    await cmdModels(positional[0], positional.slice(1));
   } else if (cmd === "lint") {
     if (positional.length !== 1) usage();
     cmdLint(positional[0]);
@@ -1380,7 +1472,7 @@ async function main(): Promise<void> {
     if (refuseMissingSecrets(readPlan(runDir).secrets, "resume the run")) return;
     launchDetached(runDir);
   } else if (cmd === "program") {
-    await cmdProgram(positional[0], positional.slice(1), runRoot, json, source);
+    await cmdProgram(positional[0], positional.slice(1), runRoot, json, source, skipModelsCheck);
   } else if (cmd === "list") {
     cmdList(runRoot, json);
   } else if (cmd === "contract") {
