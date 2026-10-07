@@ -486,13 +486,13 @@ export function evidenceTestNames(evidence: string): string[] {
   return out;
 }
 
-/** A command a reviewer ran, quoted as `` `…` `` in its evidence. */
+/** A command a reviewer ran, quoted as `` `…` `` in its evidence. The
+ * backtick must start with the tool name itself (so a cited path like
+ * `git.ts` is not mistaken for a command). */
 export function evidenceCommands(evidence: string): string[] {
   const out: string[] = [];
-  for (const m of evidence.matchAll(/`([^`]+)`/g)) {
-    const cmd = m[1].trim();
-    if (/(?:^|\s)(?:node|npm|make|cargo|python|pytest|go|git|sh|bash|deno|bun|yarn|pnpm)\b/.test(cmd)) out.push(cmd);
-  }
+  const re = /`((?:node|npm|npx|make|cargo|python|pytest|go|git|sh|bash|deno|bun|yarn|pnpm)(?:\s[^`]*)?)`/g;
+  for (const m of evidence.matchAll(re)) out.push(m[1].trim());
   return out;
 }
 
@@ -518,10 +518,10 @@ export interface VerdictContext {
   /** The worker's own coverage anchors, which a met/fits verdict may not
    * lean on alone. */
   workerAnchors: readonly string[];
-  /** Plan 06b (finding B-18): for an architecture item, whether the
-   * candidate's `:WHERE:` file exists and names every symbol the item
-   * declares. A majority `deviates` contradicted by this is overturned. */
-  archSymbolsPresent?: (item: FlatItem) => boolean;
+  /** The shell commands this reviewer itself ran in this review, from its
+   * recorded tool calls. A verdict that cites a command must cite one of
+   * these (findings F-contract-12, disc-M-33). */
+  reviewerCommands: readonly string[];
 }
 
 /** True when `path` (or the `:WHERE:` text) matches one of `files`. A
@@ -578,6 +578,12 @@ export function verdictIssues(
     if (outcome !== "passed") {
       out.push(`${item.id}: the cited test "${name}" ${outcome === undefined || outcome === "missing" ? "is not in this check run" : "did not pass in this check run"}`);
     }
+  }
+  // A cited command must be one the reviewer actually ran in this review, not
+  // merely a command-shaped backtick (findings F-contract-12, disc-M-33).
+  for (const cmd of evidenceCommands(evidence)) {
+    const ran = ctx.reviewerCommands.some((r) => r.trim() === cmd || r.includes(cmd));
+    if (!ran) out.push(`${item.id}: the cited command \`${cmd}\` is not one you ran in this review`);
   }
   const isMet = value === "met" || value === "fits";
   if (isMet && anchors.length > 0) {
@@ -641,16 +647,13 @@ export function reverify(
   if (contradicted.length >= 2) {
     const tests = itemTestVerifies(item);
     const testPassed = tests.length > 0 && tests.every((t) => ctx.testOutcomes.get(t.name) === "passed");
-    // An architecture item whose :WHERE: file exists and names its declared
-    // symbol(s) is contradicted by a `deviates` too (finding B-18), so a
-    // review-only architecture item gets a real re-verification.
-    const archFits = item.kind === "architecture" && ctx.archSymbolsPresent?.(item) === true;
-    if (testPassed || archFits) {
+    if (testPassed) {
       // Every contradicted seat is overturned and counted (finding M-3): the
-      // code proves the opposite, so each `unmet`/`deviates` is flipped.
-      const reason = testPassed
-        ? `the item's own test verify passed in this check run (${tests.map((t) => `"${t.name}"`).join(", ")})`
-        : "the item's :WHERE: file exists in the candidate and names its declared symbol(s)";
+      // code proves the opposite, so each `unmet`/`deviates` is flipped. A
+      // symbol merely being present does NOT contradict a shape/ownership
+      // judgement, so only a passing test verify overturns (the reviewers
+      // vetoed the broader rule).
+      const reason = `the item's own test verify passed in this check run (${tests.map((t) => `"${t.name}"`).join(", ")})`;
       return contradicted.map((v) => ({ seat: v.seat, id: item.id, kind: item.kind, verdict: v.verdict, effect: "flip" as const, reason }));
     }
     return [];

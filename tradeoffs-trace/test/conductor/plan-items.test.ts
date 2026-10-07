@@ -408,6 +408,59 @@ test("plan-items: a met verdict citing only the worker's anchors with no file th
   }
 });
 
+test("plan-items: a verdict citing a command the reviewer did not run is refused, and a run command counts", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const cv = state.phase.contract.contractVersion;
+      const cand = state.phase.candidate?.sha;
+      const withCommand = (evidence: string) => ({
+        items: [
+          { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+          { id: "R2", verdict: "unmet", evidence },
+          { id: "C1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+        ],
+        arch: [{ id: "A1", verdict: "fits", evidence: "src/core/rounds.ts:1" }],
+      });
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          // The cited command was never run: refused.
+          { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, cand, cv, withCommand("`sh -c true` fails")) },
+          // Now run it, then cite it: accepted.
+          { kind: "call-sh", command: "sh -c true" },
+          { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, cand, cv, withCommand("`sh -c true` fails")) },
+        ],
+      };
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "incomplete_review_rejected"), 90_000, 50, setup.runDir);
+    const rejected = readEvents(setup.runDir).filter((r) => r.kind === "incomplete_review_rejected");
+    assert.ok(
+      rejected.some((r) => ((r.event as { itemIssues?: string[] }).itemIssues ?? []).some((i) => /not one you ran/.test(i))),
+      `the unrun command was refused: ${JSON.stringify(rejected[0]?.event)}`,
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("plan-items: an architecture :WHERE: file missing from the candidate is recorded deviates before review", async () => {
   const missingWhere = {
     architecture: [{ id: "A1", title: "Gone", text: "interface Gone { n: number }", tags: ["data"], where: "src/core/gone.ts" }],

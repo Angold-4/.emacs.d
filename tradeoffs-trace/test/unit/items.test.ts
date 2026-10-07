@@ -186,6 +186,7 @@ test("items: verdict validation refuses a missing file, a missing line, a stale 
     testOutcomes: new Map([["lanes: two candidates", "passed" as const]]),
     reviewerReadFiles: ["src/a.ts"],
     workerAnchors: ["src/a.ts"],
+    reviewerCommands: [],
   };
   // A line beyond the file: refused.
   assert.ok(verdictIssues(item, { id: "R1", verdict: "met", evidence: "src/a.ts:99" }, ctx).some((i) => i.includes("do not exist")));
@@ -226,7 +227,7 @@ test("items: the evaluator overturns a majority unmet verdict the item's passing
   assert.equal(overturns[0].effect, "flip");
 });
 
-test("items: a majority deviates on an architecture item whose :WHERE: symbols are present is overturned (B-18)", () => {
+test("items: a majority deviates on an architecture item is NOT overturned by symbol presence alone (D-7 withdrawn)", () => {
   const arch = structured.architecture[0];
   const item = { kind: "architecture" as const, id: arch.id, title: arch.title, text: arch.text, arch: [], verify: [], where: arch.where, tags: arch.tags };
   const verdicts: SeatItemVerdict[] = [
@@ -240,13 +241,29 @@ test("items: a majority deviates on an architecture item whose :WHERE: symbols a
     testOutcomes: new Map(),
     reviewerReadFiles: ["src/a.ts"],
     workerAnchors: [],
-    archSymbolsPresent: () => true,
+    reviewerCommands: [],
   };
-  const overturns = reverify(item, verdicts, ctx);
-  assert.equal(overturns.length, 2);
-  assert.ok(overturns.every((o) => o.effect === "flip"));
-  // The flipped tally is a majority fits.
-  assert.equal(tallyItems({ goal: "", architecture: [arch], requirements: [], constraints: [] }, [{ seat: "M", items: { items: [], arch: [{ id: arch.id, verdict: "deviates", evidence: "src/a.ts:1" }] } }, { seat: "A", items: { items: [], arch: [{ id: arch.id, verdict: "deviates", evidence: "src/a.ts:1" }] } }, { seat: "B", items: { items: [], arch: [{ id: arch.id, verdict: "fits", evidence: "src/a.ts:1" }] } }], overturns)[0].outcome, "fits");
+  // A symbol being present does not contradict a shape/ownership judgement.
+  assert.deepEqual(reverify(item, verdicts, ctx), []);
+});
+
+test("items: a cited command must be one the reviewer actually ran (F-contract-12)", () => {
+  const item = structured.requirements[0];
+  const base = {
+    lineCount: () => 10,
+    diffFiles: ["src/a.ts"],
+    testOutcomes: new Map([["lanes: two candidates", "passed" as const]]),
+    reviewerReadFiles: ["src/a.ts"],
+    workerAnchors: [],
+  };
+  // An invented command-shaped backtick is refused...
+  assert.ok(
+    verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "`make check` fails" }, { ...base, reviewerCommands: [] }).some((i) => i.includes("not one you ran")),
+  );
+  // ...and a command the reviewer ran counts.
+  assert.deepEqual(verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "`make check` fails" }, { ...base, reviewerCommands: ["make check"] }), []);
+  // A cited path that merely starts with a tool name is not a command.
+  assert.deepEqual(verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "src/a.ts:1" }, { ...base, reviewerCommands: [] }), []);
 });
 
 test("items: the matrix and the counts line show every item by seat", () => {

@@ -906,12 +906,17 @@ function applyCriterionAmended(s: State, ev: Event): State {
       ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
       : f,
   );
-  // Plan 06b: a structured phase carries the criterion in its requirement
-  // item too, so the amended wording must replace both (by position).
-  const requirements =
-    s.phase.contract.requirements && s.phase.contract.requirements.length === e.newAcceptance.length
-      ? s.phase.contract.requirements.map((r, i) => ({ ...r, title: e.newAcceptance[i], text: e.newAcceptance[i] }))
-      : s.phase.contract.requirements;
+  // Plan 06b (finding disc-B-37): a structured phase carries the criterion in
+  // its requirement item too. Match the item by its OLD wording — never by
+  // position, which could retarget the wrong requirement — and replace it with
+  // the amendment's proposed wording.
+  const requirements = s.phase.contract.requirements
+    ? s.phase.contract.requirements.map((r) =>
+        r.text === amendment.criterion || r.title === amendment.criterion
+          ? { ...r, title: amendment.proposedWording, text: amendment.proposedWording }
+          : r,
+      )
+    : s.phase.contract.requirements;
   return withPhase(s, {
     phase: "IMPLEMENTING",
     contract: { ...s.phase.contract, acceptance: e.newAcceptance, ...(requirements ? { requirements } : {}), contractVersion: e.newContractVersion },

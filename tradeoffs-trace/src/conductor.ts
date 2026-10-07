@@ -2859,6 +2859,10 @@ export class Conductor {
    * of them, never only the worker's own anchors. */
   #reviewerReads = new Map<Reviewer, Set<string>>();
 
+  /** Plan 06b: the shell commands each reviewer itself ran in this review, so
+   * a verdict that cites a command must cite one it actually ran. */
+  #reviewerCommands = new Map<Reviewer, Set<string>>();
+
   /** Plan 3b: after each worker tool call, append one `tt_file_changes`
    * record to its stream naming the files that call changed ("path +a −r",
    * from `git diff --numstat` before and after — so edits made through sh
@@ -3448,10 +3452,9 @@ export class Conductor {
         if (itemIssues.length > 0 && this.#itemsEnforced()) {
           const items = this.#planItems();
           const flat = flatItems(items);
-          const reads = this.#reviewerReadFiles(review.reviewer);
           const valid = (v: { id: string }): boolean => {
             const item = flat.find((i) => i.id === v.id);
-            return item ? verdictIssues(item, v as import("./core/items.ts").ItemVerdict, this.#verdictContext(item, reads)).length === 0 : true;
+            return item ? verdictIssues(item, v as import("./core/items.ts").ItemVerdict, this.#verdictContext(item, review.reviewer)).length === 0 : true;
           };
           review = { ...review, items: (review.items ?? []).filter(valid), arch: (review.arch ?? []).filter(valid) };
         }
@@ -5289,19 +5292,31 @@ export class Conductor {
     return [...(this.#reviewerReads.get(reviewer) ?? [])];
   }
 
-  /** The candidate's changed files (repo-relative). */
+  #reviewerRanCommands(reviewer: Reviewer): string[] {
+    return [...(this.#reviewerCommands.get(reviewer) ?? [])];
+  }
+
+  /** The candidate's changed files (repo-relative), diffed against the phase
+   * BASE (the integration head the phase started from), not the candidate's
+   * parent commit: freeze commits stack and may be empty, so a `C^..C` diff
+   * would hide an earlier attempt's change (finding disc-M-31). */
   #diffFiles(C: string): string[] {
+    const base = this.#state.phase.integrationHead;
     try {
-      return execFileSync("git", ["-C", this.#plan.repo, "diff", "--name-only", `${C}^`, C], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+      return execFileSync("git", ["-C", this.#plan.repo, "diff", "--name-only", base, C], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
     } catch {
-      return [];
+      try {
+        return execFileSync("git", ["-C", this.#plan.repo, "diff", "--name-only", `${C}^`, C], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+      } catch {
+        return [];
+      }
     }
   }
 
   /** The code facts a verdict is validated against: candidate file lines,
    * the diff, the item's `:WHERE:`, the check run's test outcomes, the files
    * this reviewer read, and the worker's own anchors. */
-  #verdictContext(item: FlatItem, reviewerReadFiles: string[]): VerdictContext {
+  #verdictContext(item: FlatItem, reviewer: Reviewer): VerdictContext {
     const dir = this.#candidateDir();
     const C = this.#state.phase.candidate?.sha ?? "";
     return {
@@ -5315,32 +5330,10 @@ export class Conductor {
       diffFiles: C ? this.#diffFiles(C) : [],
       ...(item.where ? { where: item.where } : {}),
       testOutcomes: this.#itemTestOutcomes(),
-      reviewerReadFiles,
+      reviewerReadFiles: this.#reviewerReadFiles(reviewer),
       workerAnchors: this.#workerAnchors(),
-      archSymbolsPresent: (i: FlatItem) => this.#archSymbolsPresent(i),
+      reviewerCommands: this.#reviewerRanCommands(reviewer),
     };
-  }
-
-  /** Plan 06b (finding B-18): whether the candidate's `:WHERE:` file for an
-   * architecture item exists and names every symbol the item declares. */
-  #archSymbolsPresent(item: FlatItem): boolean {
-    const arch = this.#planItems().architecture.find((a) => a.id === item.id);
-    if (!arch || !arch.where) return false;
-    const symbols = architectureSymbols(arch);
-    if (symbols.length === 0) return false;
-    const dir = this.#candidateDir();
-    let text = "";
-    let fileShaped = false;
-    for (const token of arch.where.split(/[\s,;]+/).filter(Boolean)) {
-      if (!/[/.]/.test(token)) continue;
-      fileShaped = true;
-      try {
-        text += `${fs.readFileSync(path.join(dir, token), "utf8")}\n`;
-      } catch {
-        return false;
-      }
-    }
-    return fileShaped && symbols.every((s) => symbolPresent(text, s));
   }
 
   /** Every reason a review's item section must be refused and re-asked: a
@@ -5351,14 +5344,13 @@ export class Conductor {
     const items = this.#planItems();
     const issues = reviewItemsIssues({ items: review.items ?? [], arch: review.arch ?? [] }, items);
     const flat = flatItems(items);
-    const reads = this.#reviewerReadFiles(review.reviewer);
     for (const v of review.items ?? []) {
       const item = flat.find((i) => i.id === v.id);
-      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, reads)));
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer)));
     }
     for (const v of review.arch ?? []) {
       const item = flat.find((i) => i.id === v.id);
-      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, reads)));
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer)));
     }
     return issues;
   }
@@ -5390,7 +5382,7 @@ export class Conductor {
       B: this.#reviewerReadFiles("B"),
     };
     for (const o of outcomes) {
-      const ctx = this.#verdictContext(o.item, this.#reviewerReadFiles((o.seats[0]?.seat ?? "M") as Reviewer));
+      const ctx = this.#verdictContext(o.item, (o.seats[0]?.seat ?? "M") as Reviewer);
       out.push(...reverify(o.item, o.seats, ctx, readsBySeat));
     }
     return out;
@@ -7487,6 +7479,7 @@ export class Conductor {
     // files this seat read in an earlier round no longer count as "read in
     // this review".
     this.#reviewerReads.set(reviewer, new Set());
+    this.#reviewerCommands.set(reviewer, new Set());
     const agentId = `reviewer-${reviewer}-${actionId}`;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
     const candidateDir = this.#candidateDir();
@@ -7587,6 +7580,16 @@ export class Conductor {
               const set = this.#reviewerReads.get(reviewer) ?? new Set<string>();
               set.add(file.replace(/^\.\//, ""));
               this.#reviewerReads.set(reviewer, set);
+            }
+          }
+          // A `sh` tool call is a command the reviewer ran (findings
+          // F-contract-12, disc-M-33).
+          if (e.toolName === "sh") {
+            const a = e.args as { command?: unknown } | undefined;
+            if (typeof a?.command === "string" && a.command.trim().length > 0) {
+              const set = this.#reviewerCommands.get(reviewer) ?? new Set<string>();
+              set.add(a.command.trim());
+              this.#reviewerCommands.set(reviewer, set);
             }
           }
         }
