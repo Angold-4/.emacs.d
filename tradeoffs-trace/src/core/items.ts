@@ -183,6 +183,11 @@ export type Verify = { kind: "test"; name: string; file?: string } | { kind: "re
  * the string is empty. `test "name"` and `test file::name` are both accepted;
  * a bare `test` (no name) parses to a nameless test verify, which lint
  * rejects. Several kinds may be listed (`test "…" review`). */
+/** A verify's `file::` prefix is a path: it has a `/` or a file extension. */
+function isFilePath(text: string): boolean {
+  return text.includes("/") || /\.[A-Za-z0-9]+$/.test(text);
+}
+
 export function parseVerify(raw: string | undefined): Verify[] {
   const text = (raw ?? "").trim();
   if (text.length === 0) return [{ kind: "review" }];
@@ -193,8 +198,10 @@ export function parseVerify(raw: string | undefined): Verify[] {
     if (m[1] !== undefined) {
       const rawName = m[2] ?? m[3] ?? "";
       const name = rawName.trim();
+      // `file::name` only when the left side is a file path: Rust test names
+      // are module paths (`acceptance::mark_s11_01`) and stay whole.
       const sep = name.indexOf("::");
-      if (sep > 0) out.push({ kind: "test", file: name.slice(0, sep), name: name.slice(sep + 2) });
+      if (sep > 0 && isFilePath(name.slice(0, sep))) out.push({ kind: "test", file: name.slice(0, sep), name: name.slice(sep + 2) });
       else out.push({ kind: "test", name });
     } else if (m[4] !== undefined) {
       out.push({ kind: "review" });
@@ -361,10 +368,14 @@ export function testOutcomeIn(output: string, name: string): TestOutcome {
   const nodeFail = new RegExp(`^\\s*(?:✖|✗|×)\\s+${escaped}(?:\\s*\\(.*\\))?\\s*$`);
   const tapPass = new RegExp(`^\\s*ok\\s+\\d+\\s+-\\s+${escaped}(?:\\s*#.*)?\\s*$`);
   const tapFail = new RegExp(`^\\s*not\\s+ok\\s+\\d+\\s+-\\s+${escaped}(?:\\s*#.*)?\\s*$`);
+  // Rust libtest (`cargo test`): `test <full path> ... ok|FAILED|ignored`.
+  // The path matches exactly; an ignored test did not run, so it stays missing.
+  const cargoPass = new RegExp(`^\\s*test\\s+${escaped}\\s+\\.\\.\\.\\s+ok\\s*$`);
+  const cargoFail = new RegExp(`^\\s*test\\s+${escaped}\\s+\\.\\.\\.\\s+FAILED\\s*$`);
   let passed = false;
   for (const line of output.split("\n")) {
-    if (tapFail.test(line) || nodeFail.test(line)) return "failed";
-    if (tapPass.test(line) || nodePass.test(line)) passed = true;
+    if (tapFail.test(line) || nodeFail.test(line) || cargoFail.test(line)) return "failed";
+    if (tapPass.test(line) || nodePass.test(line) || cargoPass.test(line)) passed = true;
   }
   return passed ? "passed" : "missing";
 }

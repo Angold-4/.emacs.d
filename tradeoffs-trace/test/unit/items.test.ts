@@ -341,3 +341,25 @@ test("items: evidenceFileAnchors reads a range", () => {
     { path: "src/b.ts", start: 3, end: 3 },
   ]);
 });
+
+test("items: a Rust test verify keeps its module path and resolves from cargo test output", () => {
+  // `::` splits off a file only when the left side is a path.
+  assert.deepEqual(parseVerify('test "acceptance::mark_s11_01_quiet"'), [{ kind: "test", name: "acceptance::mark_s11_01_quiet" }]);
+  assert.deepEqual(parseVerify("test basic::median_and_mean_are_exact"), [{ kind: "test", name: "basic::median_and_mean_are_exact" }]);
+  assert.deepEqual(parseVerify("test tests/mark/main.rs::acceptance::x"), [{ kind: "test", file: "tests/mark/main.rs", name: "acceptance::x" }]);
+  const output = [
+    "running 3 tests",
+    "test acceptance::mark_s11_01_quiet ... ok",
+    "test acceptance::mark_s11_02_rich ... FAILED",
+    "test acceptance::mark_s11_03_slow ... ignored",
+    "test acceptance::mark_s11_04_long_name_extended ... ok",
+    "test result: FAILED. 2 passed; 1 failed; 1 ignored",
+  ].join("\n");
+  assert.equal(testOutcomeIn(output, "acceptance::mark_s11_01_quiet"), "passed");
+  assert.equal(testOutcomeIn(output, "acceptance::mark_s11_02_rich"), "failed");
+  // An ignored test did not run.
+  assert.equal(testOutcomeIn(output, "acceptance::mark_s11_03_slow"), "missing");
+  // The full path matches exactly, never a prefix or a tail.
+  assert.equal(testOutcomeIn(output, "acceptance::mark_s11_04_long_name"), "missing");
+  assert.equal(testOutcomeIn(output, "mark_s11_01_quiet"), "missing");
+});
