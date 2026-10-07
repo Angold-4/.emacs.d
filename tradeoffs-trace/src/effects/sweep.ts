@@ -100,20 +100,23 @@ export function killGroup(pgid: number, opts: { termGraceMs?: number } = {}): Pr
   });
 }
 
-/** True when PGID's leader exists and started no later than `atMs` (plus a
- * slack): a pgid whose leader started AFTER the run recorded it has been
- * recycled by an unrelated process. Used before signalling a group read from
- * a previous conductor's log (crash recovery), so a recycled pgid is never
- * signalled. A group with no leader has nothing to signal, so a failed `ps`
- * is reported as true (the caller's own liveness check decides). */
+/** True when PGID's leader is proven to have started no later than `atMs`
+ * (plus a slack). A pgid whose leader started AFTER the run recorded it has
+ * been recycled by an unrelated process; a pgid whose leader `ps` cannot
+ * describe is not proven either. Used before signalling a group read from a
+ * previous conductor's log (crash recovery): safety wins, so an UNPROVABLE
+ * group is left running, not signalled (fail-closed). If the leader is gone
+ * and a descendant still holds the group, that descendant is not the run's
+ * proven process either, so it is left too. */
 export function groupStartedBefore(pgid: number, atMs: number, slackMs = 10_000): boolean {
   let startMs: number;
   try {
     startMs = Date.parse(execFileSync("ps", ["-o", "lstart=", "-p", String(pgid)], { encoding: "utf8" }).trim());
   } catch {
-    return true;
+    // The leader cannot be described: nothing is proven, so do not signal.
+    return false;
   }
-  if (!Number.isFinite(startMs)) return true;
+  if (!Number.isFinite(startMs) || !Number.isFinite(atMs)) return false;
   return startMs <= atMs + slackMs;
 }
 

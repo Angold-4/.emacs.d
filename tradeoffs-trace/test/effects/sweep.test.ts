@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { groupStartedBefore, killGroup, sweep } from "../../src/effects/sweep.ts";
+import { groupAlive, groupStartedBefore, killGroup, sweep } from "../../src/effects/sweep.ts";
 
 let dir: string;
 
@@ -178,6 +178,8 @@ test("plan 06e: a recorded group is signalled, a recycled pgid is not", async ()
     });
     // Recorded a minute BEFORE this process started: the pid was recycled.
     assert.equal(groupStartedBefore(own.pid!, Date.now() - 60_000), false);
+    // A pgid `ps` cannot describe is not proven either: fail-closed.
+    assert.equal(groupStartedBefore(999_999, Date.now()), false);
     // Recorded now: this is the group the run started.
     assert.equal(groupStartedBefore(own.pid!, Date.now()), true);
     const { signalsSent } = await killGroup(own.pid!, { termGraceMs: 200 });
@@ -185,6 +187,25 @@ test("plan 06e: a recorded group is signalled, a recycled pgid is not", async ()
     await waitFor(() => !processAlive(own.pid!));
   } finally {
     own.kill("SIGKILL");
+  }
+});
+
+test("plan 06e: a group whose start time cannot be proven is left running (fail-closed)", async () => {
+  // The group leader forks a child in the same group, then exits. `ps` can no
+  // longer describe the leader, so its start time is unprovable — but the
+  // group is still alive (the child). Safety says leave it, never signal it.
+  const leader = spawn(
+    "/usr/bin/perl",
+    ["-e", 'setpgrp(0,0); my $c = fork(); die "fork" unless defined $c; if ($c == 0) { sleep 100; exit 0 } exit 0;'],
+    { detached: true, stdio: "ignore" },
+  );
+  const pgid = leader.pid!;
+  try {
+    await waitFor(() => !processAlive(pgid) && groupAlive(pgid));
+    assert.equal(groupStartedBefore(pgid, Date.now()), false, "an unprovable group is not signalled");
+  } finally {
+    // Clean up the surviving child (this test owns the group it started).
+    await killGroup(pgid, { termGraceMs: 100 });
   }
 });
 
