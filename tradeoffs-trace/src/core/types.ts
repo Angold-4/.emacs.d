@@ -47,6 +47,10 @@ export interface PlanPhase {
   boundaries: string[];
   reserved: string[];
   provisional: boolean;
+  /** Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by a
+   * phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted runs
+   * it, once. Absent on a plan that declares none, which behaves as before. */
+  finalChecks?: string[];
   /** Plan 06b: the structured items of a phase subtree (ref
    * refs/06_ref_plan_format.md). Absent on an old-format plan, where
    * `acceptance`/`reserved` are the only items. */
@@ -70,6 +74,10 @@ export interface PhaseContract {
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 06c: the phase's final check, frozen into the contract. Only a
+   * candidate that has passed review with no open blocker runs it, once
+   * (core/checks.ts's `checkTier`). */
+  finalChecks?: string[];
   /** Plan 06b: the structured items of the frozen contract. The FSM,
    * prompts, checks, verdicts and acceptance all read these; absent on an
    * old-format phase, where `itemsFromPhase` synthesizes R1..Rn from
@@ -790,6 +798,7 @@ export type PhaseStateName =
   | "REVIEWING"
   | "EVALUATING"
   | "RESOLVING"
+  | "FINAL_CHECKING"
   | "GATING"
   | "ACCEPTED"
   | "PUBLISHING"
@@ -995,6 +1004,7 @@ export type InFlightKey =
   | `dispatch_panel_${string}_${number}`
   | `dispatch_round_panel_${number}`
   | "run_gate"
+  | "run_final_checks"
   | "publish_cas";
 
 /** The full state of one phase, as reduce()/next() see it. */
@@ -1152,6 +1162,10 @@ export interface PhaseState {
    * majority verdict, recorded with what it checked. A `contradicted` check
    * overturns the majority (the FINDING_VERIFIED path). */
   itemChecks?: Array<{ itemId: string; verdict: "confirmed" | "contradicted" | "unchecked"; evidence: string }>;
+  /** Plan 06c: the candidate whose `final` check run already passed, so
+   * RESOLVING accepts it without asking for the final check again. Cleared
+   * when a new candidate freezes. */
+  finalChecksPassedFor?: string;
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
@@ -1205,6 +1219,9 @@ export interface EvSubmitPhase {
 /** Plan 04a: the base baseline finished (run or reused). */
 export interface EvBaselineCompleted {
   type: "BASELINE_COMPLETED";
+  /** Plan 06c (A3): the parent candidate whose passing check record this run
+   * reused as its baseline, when it reused one. */
+  reusedFrom?: string;
 }
 /** Plan 04a: the base baseline could not be taken in time; the checks stay
  * strict and the work continues. */
@@ -1636,6 +1653,38 @@ export interface EvAccepted {
  * RESOLVING --ACCEPTED--> ACCEPTED edge). */
 export interface EvGateRequired {
   type: "GATE_REQUIRED";
+}
+
+/** Plan 06c: the candidate is acceptable and its contract declares a final
+ * check — so the final check runs first, once. Emitted by the conductor
+ * exactly when next() asks for it, never for a phase without a final check
+ * (which keeps the old RESOLVING --ACCEPTED--> ACCEPTED edge). */
+export interface EvFinalCheckRequired {
+  type: "FINAL_CHECK_REQUIRED";
+}
+
+/** Plan 06c: the final check ran and passed, so the candidate is accepted. */
+export interface EvFinalChecksPassed {
+  type: "FINAL_CHECKS_PASSED";
+  candidateSha: string;
+}
+
+/** Plan 06c: the final check failed. An ordinary check failure: the phase
+ * returns to REPAIRING (or AWAITING_OWNER when the repair budget is spent),
+ * with a blocking finding carrying `evidence` (the failing test's name and
+ * the check log's tail). */
+export interface EvFinalChecksFailed {
+  type: "FINAL_CHECKS_FAILED";
+  evidence: string;
+  /** Plan 06c: the final run's failing tests, classified like a normal check
+   * failure, so the repair prompt names them. */
+  failures?: CheckFailureClass[];
+}
+
+/** Plan 06c: the conductor died while running the final check. Like an
+ * interrupted gate, it is rerun rather than counted as passed or failed. */
+export interface EvFinalChecksInterrupted {
+  type: "FINAL_CHECKS_INTERRUPTED";
 }
 
 /** Plan 01f: the gate command failed — a non-zero exit, or a kill at the
@@ -2115,6 +2164,10 @@ export type Event =
   | EvGateRequired
   | EvGateFailed
   | EvGateInterrupted
+  | EvFinalCheckRequired
+  | EvFinalChecksPassed
+  | EvFinalChecksFailed
+  | EvFinalChecksInterrupted
   | EvPublishIntent
   | EvPublishCompleted
   | EvPublishStale

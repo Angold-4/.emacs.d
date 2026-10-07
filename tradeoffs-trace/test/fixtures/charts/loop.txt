@@ -73,6 +73,7 @@ phase states:
       +- CRITERION_AMENDED         -> IMPLEMENTING    [resolving-criterion-amended]
       +- ACCEPTED                  -> ACCEPTED        [resolving-accept-holds]
       +- GATE_REQUIRED             -> GATING          [resolving-gate-required]
+      +- FINAL_CHECK_REQUIRED      -> FINAL_CHECKING  [resolving-final-check-required]
       +- RESOLVING_INCOMPLETE (openItemsAndBudgetRemains) -> REPAIRING       [resolving-incomplete-repair]
       +- RESOLVING_INCOMPLETE (openItemsBudgetExhausted) -> AWAITING_OWNER  [resolving-incomplete-awaiting-owner]
       +- AMEND                     -> CHECKING        [amend-from-resolving]
@@ -153,16 +154,25 @@ phase states:
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-evaluating]
       +- REVISE                    -> REPAIRING       [revise-from-evaluating]
 
+  +----------------+
+  | FINAL_CHECKING |  not entered
+  +----------------+
+      +- FINAL_CHECKS_PASSED (acceptHoldsAndNoGate) -> ACCEPTED        [final-checks-passed-accepted]
+      +- FINAL_CHECKS_PASSED (acceptHoldsAndGateDeclared) -> GATING          [final-checks-passed-gated]
+      +- FINAL_CHECKS_FAILED (budgetRemains) -> REPAIRING       [final-checks-failed-to-repairing]
+      +- FINAL_CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [final-checks-failed-budget-exhausted]
+
 rare edges (crash recovery, launch failure):
-  BASELINE -- BASELINE_INTERRUPTED -> BASELINE      [baseline-interrupted]
-  IMPLEMENTING -- ATTEMPT_INTERRUPTED  -> IMPLEMENTING  [attempt-interrupted]
-  FREEZING -- FREEZE_INTERRUPTED   -> FREEZING      [freeze-interrupted]
-  CHECKING -- CHECKS_INTERRUPTED   -> CHECKING      [checks-interrupted]
-  PROBING -- PROBE_INTERRUPTED    -> PROBING       [probe-interrupted]
-  GATING -- GATE_INTERRUPTED     -> GATING        [gate-interrupted]
-  IMPLEMENTING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-implementing]
-  EVALUATING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-evaluating]
-  REVIEWING -- LAUNCH_FAILED        -> BLOCKED       [launch-failed-from-reviewing]
+  BASELINE -- BASELINE_INTERRUPTED     -> BASELINE        [baseline-interrupted]
+  IMPLEMENTING -- ATTEMPT_INTERRUPTED      -> IMPLEMENTING    [attempt-interrupted]
+  FREEZING -- FREEZE_INTERRUPTED       -> FREEZING        [freeze-interrupted]
+  CHECKING -- CHECKS_INTERRUPTED       -> CHECKING        [checks-interrupted]
+  PROBING -- PROBE_INTERRUPTED        -> PROBING         [probe-interrupted]
+  GATING -- GATE_INTERRUPTED         -> GATING          [gate-interrupted]
+  FINAL_CHECKING -- FINAL_CHECKS_INTERRUPTED -> FINAL_CHECKING  [final-checks-interrupted]
+  IMPLEMENTING -- LAUNCH_FAILED            -> BLOCKED         [launch-failed-from-implementing]
+  EVALUATING -- LAUNCH_FAILED            -> BLOCKED         [launch-failed-from-evaluating]
+  REVIEWING -- LAUNCH_FAILED            -> BLOCKED         [launch-failed-from-reviewing]
 
 run states:
 > +-------------------+

@@ -710,22 +710,42 @@ export function reverify(
     }
     return [];
   }
-  // A unanimous met/fits verdict whose every seat cites only the worker's own
-  // anchors (and read none of them) is audited: each such verdict is
-  // withdrawn, so it no longer counts toward the majority.
-  const met = verdicts.filter((v) => v.verdict === (item.kind === "architecture" ? "fits" : "met"));
-  if (met.length === verdicts.length && met.length === 3) {
-    const thinSeats = met.filter((v) => {
-      const anchors = evidenceFileAnchors(v.evidence).map((a) => a.path);
-      const own = readsBySeat[v.seat] ?? ctx.reviewerReadFiles;
-      return anchors.length <= 1 && anchors.every((p) => pathInList(p, ctx.workerAnchors)) && anchors.every((p) => !pathInList(p, own));
-    });
-    if (thinSeats.length === met.length) {
-      const reason = "unanimous met verdict with only the worker's anchors";
-      return met.map((v) => ({ seat: v.seat, id: item.id, kind: item.kind, verdict: v.verdict, effect: "drop" as const, reason }));
-    }
-  }
+  // Plan 06c (R5): a unanimous thin met/fits verdict is NOT withdrawn by
+  // code. It is sent to the evaluator as an owed item check
+  // (`thinMetItems`); only a `contradicted` check with valid anchors
+  // overturns it (the conductor's `#itemOverturns`). `readsBySeat` is kept
+  // for callers that pass it, but whether a seat read the anchor plays no
+  // part in what is audited.
+  void readsBySeat;
   return [];
+}
+
+/** True when one seat's evidence is thin: a single file anchor, or only the
+ * worker's own anchors. Whether the seat read the anchor plays no part. */
+export function isThinSeatEvidence(evidence: string, workerAnchors: readonly string[]): boolean {
+  const anchors = evidenceFileAnchors(evidence).map((a) => a.path);
+  if (anchors.length <= 1) return true;
+  return anchors.every((p) => pathInList(p, workerAnchors));
+}
+
+/** Plan 06c (R5): the items whose verdict from EVERY seat is met/fits and
+ * whose every seat's evidence is thin. They are audited by the evaluator, not
+ * withdrawn by code. Works for any seat count (no literal 3). */
+export function thinMetItems(outcomes: readonly ItemOutcome[], workerAnchors: readonly string[]): ItemOutcome[] {
+  return outcomes.filter((o) => {
+    const value = o.item.kind === "architecture" ? "fits" : "met";
+    if (o.outcome !== value || o.seats.length === 0) return false;
+    return o.seats.every((s) => s.verdict === value && isThinSeatEvidence(s.evidence, workerAnchors));
+  });
+}
+
+/** The worker's own coverage anchors (`where`), which a thin met verdict may
+ * be leaning on. */
+export function workerAnchorsOf(coverage: Coverage | undefined): string[] {
+  const out: string[] = [];
+  for (const e of coverage?.items ?? []) out.push(...e.where);
+  for (const e of coverage?.arch ?? []) out.push(...e.where);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -770,6 +790,10 @@ export function tallyItem(item: FlatItem, verdicts: readonly SeatItemVerdict[]):
 function flippedValue(v: string): string {
   if (v === "unmet") return "met";
   if (v === "deviates") return "fits";
+  // Plan 06c: an evaluator that contradicts a thin met/fits flips it the
+  // other way.
+  if (v === "met") return "unmet";
+  if (v === "fits") return "deviates";
   return v;
 }
 

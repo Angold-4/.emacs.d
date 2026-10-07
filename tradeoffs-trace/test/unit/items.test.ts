@@ -29,6 +29,8 @@ import {
   type ReviewItems,
   type SeatItemVerdict,
   architectureSymbols,
+  thinMetItems,
+  type Overturn,
 } from "../../src/core/items.ts";
 
 const structured: PlanItems = {
@@ -263,16 +265,46 @@ test("plan 06b: an audited thin met that is overturned no longer counts as met",
     workerAnchors: ["src/a.ts:1"],
     reviewerCommands: [],
   };
-  const audits = reverify(item, verdicts, ctx);
-  assert.equal(audits.length, 3, "every thin met seat is audited");
-  assert.ok(audits.every((o) => o.effect === "drop"));
-  // With the audits applied, the item no longer has a met majority.
-  const outcome = tallyItems({ goal: "", architecture: [], requirements: [item], constraints: [] }, [
-    { seat: "M", items: { items: [verdicts[0]], arch: [] } },
-    { seat: "A", items: { items: [verdicts[1]], arch: [] } },
-    { seat: "B", items: { items: [verdicts[2]], arch: [] } },
-  ], audits)[0];
+  // Plan 06c (R5): code never withdraws a thin met verdict; the evaluator is
+  // asked to re-check it.
+  assert.deepEqual(reverify(item, verdicts, ctx), [], "code never withdraws a thin met verdict");
+  const items = { goal: "", architecture: [], requirements: [item], constraints: [] };
+  const itemVerdict = (v: SeatItemVerdict) => ({ id: item.id, verdict: v.verdict, evidence: v.evidence });
+  const reviews = [
+    { seat: "M" as const, items: { items: [itemVerdict(verdicts[0])], arch: [] } },
+    { seat: "A" as const, items: { items: [itemVerdict(verdicts[1])], arch: [] } },
+    { seat: "B" as const, items: { items: [itemVerdict(verdicts[2])], arch: [] } },
+  ];
+  const met = tallyItems(items, reviews, [])[0];
+  assert.equal(met.outcome, "met", "without an evaluator contradiction the thin met counts");
+  assert.equal(thinMetItems([met], ["src/a.ts:1"]).length, 1, "the thin met is sent to the evaluator");
+  // The evaluator's `contradicted` check overturns every seat (effect flip),
+  // so the item no longer has a met majority.
+  const overturns: Overturn[] = verdicts.map((v) => ({ seat: v.seat, id: item.id, kind: "requirement", verdict: v.verdict, effect: "flip", reason: "evaluator re-check contradicted it" }));
+  const outcome = tallyItems(items, reviews, overturns)[0];
   assert.notEqual(outcome.outcome, "met", "an overturned met verdict no longer counts as met");
+});
+
+test("plan 06c: the thin-met audit selects items the same way with five seats", () => {
+  const item = structured.requirements[2];
+  const outcomeWith = (evidence: string[], outcome: "met" | "unmet" = "met") => ({
+    item,
+    outcome,
+    seats: evidence.map((e, i) => ({ seat: `S${i}` as const, verdict: "met" as const, evidence: e })),
+    evidence: [],
+  });
+  // Five seats, all thin (one anchor): selected, exactly as with three (no
+  // literal 3 in the rule).
+  assert.equal(thinMetItems([outcomeWith(Array(5).fill("src/a.ts:1"))], ["src/a.ts:1"]).length, 1, "a five-seat thin met is selected");
+  // Five seats, only the worker's anchors: still thin.
+  assert.equal(thinMetItems([outcomeWith(Array(5).fill("src/a.ts:1-9"))], ["src/a.ts:1-9"]).length, 1, "worker-only anchors are thin");
+  // Five seats, each citing two non-worker anchors: not thin.
+  const twoAnchors = Array(5).fill("src/a.ts:1 src/b.ts:2");
+  assert.equal(thinMetItems([outcomeWith(twoAnchors)], ["src/a.ts:1"]).length, 0, "two non-worker anchors are not thin");
+  // Three seats, thin, still selected.
+  assert.equal(thinMetItems([outcomeWith(Array(3).fill("src/a.ts:1"))], ["src/a.ts:1"]).length, 1);
+  // A non-met outcome is never in the thin-met audit.
+  assert.equal(thinMetItems([outcomeWith(Array(5).fill("src/a.ts:1"), "unmet")], ["src/a.ts:1"]).length, 0);
 });
 
 test("items: a cited command must be one the reviewer actually ran (F-contract-12)", () => {

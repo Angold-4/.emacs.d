@@ -537,3 +537,34 @@ test("env-preflight: tt program retry refuses a blocked node whose entry names a
     cleanupDir(repo.dir);
   }
 });
+
+test("plan 06c: the worker prompt names missing tools from the preflight", async () => {
+  const originalPath = process.env.PATH;
+  const dir = fs.mkdtempSync("/tmp/tt-06c-tools-");
+  // A PATH with git and sh but without rg/gtimeout/docker/cargo: the agent
+  // preflight reports them missing, and the worker prompt names them.
+  process.env.PATH = "/usr/bin:/bin";
+  const promptLog = path.join(dir, "worker.prompts.log");
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      checks: ["true"],
+      deadlines: FAST,
+      workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+      extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    });
+    await setup.conductor.start();
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").length > 0, 90_000, 50, setup.runDir);
+    const prompt = fs.readFileSync(promptLog, "utf8");
+    assert.match(prompt, /environment preflight did not find/, "the prompt carries the preflight's missing-tools line");
+    assert.match(prompt, /\brg\b/, "rg is named as missing");
+  } finally {
+    process.env.PATH = originalPath;
+    if (setup) {
+      await setup.conductor.stop();
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

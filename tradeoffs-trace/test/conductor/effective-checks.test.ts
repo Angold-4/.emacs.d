@@ -7,12 +7,14 @@
 // `this.#state.phase.contract.checks`, so a phase-only check never ran.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
-import { effectiveChecks, rerunBudgetMs } from "../../src/core/checks.ts";
+import { effectiveChecks, parseCheckRecord, rerunBudgetMs } from "../../src/core/checks.ts";
 import { runPaths } from "../../src/conductor.ts";
 import {
   cleanupDir,
@@ -333,4 +335,327 @@ test("a re-run's budget is what is left of the check's deadline, never negative"
   assert.equal(rerunBudgetMs(10_000, 4_000), 6_000);
   assert.equal(rerunBudgetMs(10_000, 10_000), 0, "the deadline itself leaves no time");
   assert.equal(rerunBudgetMs(10_000, 12_000), 0, "a passed deadline is not negative");
+});
+
+// ---------------------------------------------------------------------------
+// Plan 06c: the final check.
+// ---------------------------------------------------------------------------
+
+/** Run the REAL Emacs parser on an org plan and return its first phase. */
+function parseOrgPhase(orgText: string): import("../../src/conductor.ts").RunPlanPhase {
+  const dir = fs.mkdtempSync("/tmp/tt-06c-org-");
+  const orgPath = path.join(dir, "PLAN.org");
+  fs.writeFileSync(orgPath, orgText);
+  const emacsLoad = fileURLToPath(new URL("../../../test/tradeoffs-trace-test.el", import.meta.url));
+  const coreDir = fileURLToPath(new URL("../../../core", import.meta.url));
+  const testDir = fileURLToPath(new URL("../../../test", import.meta.url));
+  const out = execFileSync(
+    "emacs",
+    [
+      "--batch",
+      "-Q",
+      "-L",
+      coreDir,
+      "-L",
+      testDir,
+      "-l",
+      emacsLoad,
+      "--eval",
+      `(with-temp-buffer (insert-file-contents "${orgPath}") (org-mode) (setq buffer-file-name "${orgPath}") (princ (json-encode (plist-get (+tt-parse-plan) :plan))))`,
+    ],
+    { encoding: "utf8" },
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+  const parsed = JSON.parse(out) as { phases: Array<import("../../src/conductor.ts").RunPlanPhase> };
+  return parsed.phases[0];
+}
+
+function freezeShas(runDir: string): string[] {
+  return readEvents(runDir)
+    .filter((r) => r.kind === "event" && (r.event as { type: string }).type === "FREEZE_COMPLETED")
+    .map((r) => (r.event as { candidateSha: string }).candidateSha);
+}
+
+function checkRecord(runDir: string, sha: string) {
+  const file = path.join(runPaths(runDir).checks, sha, "record.json");
+  assert.ok(fs.existsSync(file), `expected a check record at ${file}`);
+  const raw = fs.readFileSync(file, "utf8");
+  const record = parseCheckRecord(JSON.parse(raw));
+  assert.ok(record, `the record must parse: ${raw}`);
+  return record!;
+}
+
+const FINAL_DEADLINES = { abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 10_000, workerAttemptMs: 30_000, checkMs: 20_000, probeMs: 20_000, freezeMs: 20_000, reviewMs: 20_000, evaluateMs: 10_000, panelMs: 10_000 };
+
+/** A worker that writes a fresh file each attempt, so each repair freezes a
+ * different tree. */
+function writingWorker() {
+  return (attempt: number) => ({
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh" as const, command: `printf '${attempt}\n' > attempt-${attempt}.txt` },
+      { kind: "call-submit" as const, tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  });
+}
+
+/** A real two-turn reviewer that always passes (no ballots, no findings). */
+function passingReviewer() {
+  return (reviewer: Reviewer, state: State) => ({
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit" as const, tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" as const },
+      {
+        kind: "call-submit" as const,
+        tool: "submit_review",
+        args: {
+          reviewer,
+          phaseId: state.phase.phaseId,
+          candidateSha: state.phase.candidate?.sha,
+          contractVersion: state.phase.contract.contractVersion,
+          correctionStatements: [],
+          findingStatements: [],
+          ballots: [],
+          findings: [],
+        },
+      },
+    ],
+  });
+}
+
+test("plan 06c: an org phase with TT_FINAL_CHECKS parsed by the real Emacs parser runs the final check only on the candidate about to be accepted", async () => {
+  const finalMarker = `/tmp/tt-final-${randomUUID().slice(0, 8)}`;
+  const checkMarker = `/tmp/tt-final-round-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(finalMarker, { force: true });
+  fs.rmSync(checkMarker, { force: true });
+  const finalCommand = `echo final >> ${finalMarker}`;
+  // The baseline runs n=1 (pass), the first candidate n=2 (fail, so it is
+  // repaired), the second n=3 (pass). The final command is separate.
+  const roundCheck = `n=$(cat ${checkMarker} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${checkMarker}; test $n -ne 2`;
+  const phase = parseOrgPhase(
+    [
+      "#+TITLE: 06c",
+      "#+TT_REPO: /tmp/x",
+      "#+TT_BRANCH: main",
+      `#+TT_CHECKS: ${roundCheck}`,
+      `#+TT_FINAL_CHECKS: ${finalCommand}`,
+      "",
+      "* Phase 1: p",
+      "  :PROPERTIES:",
+      "  :ID: p1",
+      `  :CHECKS: ${roundCheck}`,
+      "  :END:",
+      "  Goal: g",
+      "  Acceptance:",
+      "  - it works",
+    ].join("\n") + "\n",
+  );
+  assert.deepEqual(phase.finalChecks, [finalCommand], "the real parser wrote finalChecks into the phase");
+  const setup = await setupConductor({
+    phase,
+    stubReviews: false,
+    deadlines: FINAL_DEADLINES,
+    workerScriptForAttempt: writingWorker(),
+    reviewerScriptFor: passingReviewer(),
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const shas = freezeShas(setup.runDir);
+    assert.equal(shas.length, 2, "one repair means two candidates");
+    const [repairSha, acceptedSha] = shas;
+    const repair = checkRecord(setup.runDir, repairSha);
+    assert.equal(repair.tier, "round", "the repair candidate's record is a round run");
+    assert.deepEqual(repair.finalCommands, [], "the repair candidate ran no final command");
+    assert.ok(!repair.commands.some((c) => c.command === finalCommand), "the repair candidate did not run the final command");
+    const accepted = checkRecord(setup.runDir, acceptedSha);
+    assert.equal(accepted.tier, "final", "the accepted candidate's record is a final run");
+    assert.deepEqual(accepted.finalCommands, [finalCommand], "the final command is named on the record");
+    assert.ok(accepted.commands.some((c) => c.command === finalCommand), "the accepted candidate ran the final command");
+    // Only one final run happened across the whole phase.
+    assert.equal(fs.readFileSync(finalMarker, "utf8").trim().split("\n").length, 1, "the final command ran exactly once");
+    assert.equal(eventTypes(setup.runDir).filter((t) => t === "FINAL_CHECKS_PASSED").length, 1);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(finalMarker, { force: true });
+    fs.rmSync(checkMarker, { force: true });
+  }
+});
+
+test("plan 06c: a failing final check sends the phase to repair and the next accepted candidate runs it again", async () => {
+  const finalMarker = `/tmp/tt-final-fail-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(finalMarker, { force: true });
+  // The final command fails the first time it runs (naming a test) and passes
+  // the second; it only ever runs on the candidate about to be accepted.
+  const finalCommand = `n=$(cat ${finalMarker} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${finalMarker}; if [ $n -lt 2 ]; then echo 'not ok 1 - final gate test'; exit 1; fi; echo 'ok 1 - final gate test'`;
+  const phase = parseOrgPhase(
+    [
+      "#+TITLE: 06c",
+      "#+TT_REPO: /tmp/x",
+      "#+TT_BRANCH: main",
+      "#+TT_CHECKS: true",
+      `#+TT_FINAL_CHECKS: ${finalCommand}`,
+      "",
+      "* Phase 1: p",
+      "  :PROPERTIES:",
+      "  :ID: p1",
+      "  :CHECKS: true",
+      "  :END:",
+      "  Goal: g",
+      "  Acceptance:",
+      "  - it works",
+    ].join("\n") + "\n",
+  );
+  const promptLog = `/tmp/tt-final-prompt-${randomUUID().slice(0, 8)}.txt`;
+  const setup = await setupConductor({
+    phase,
+    stubReviews: false,
+    deadlines: FINAL_DEADLINES,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScriptForAttempt: writingWorker(),
+    // Every round's reviews pass: only the final check can send the phase back.
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit" as const, tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" as const },
+        {
+          kind: "call-submit" as const,
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings: [],
+          },
+        },
+      ],
+    }),
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    assert.equal(fs.readFileSync(finalMarker, "utf8").trim(), "2", "the final check ran again for the next accepted candidate");
+    const failed = readEvents(setup.runDir).find((r) => r.kind === "event" && (r.event as { type: string }).type === "FINAL_CHECKS_FAILED");
+    assert.ok(failed, "a failing final check was recorded");
+    assert.match((failed!.event as { evidence: string }).evidence, /final gate test/, "the failing final test is named");
+    // The repair prompt names the failing final test.
+    const prompts = fs.readFileSync(promptLog, "utf8");
+    assert.match(prompts, /REPAIR/);
+    assert.match(prompts, /final gate test/, "the repair prompt names the failing final test");
+    const shas = freezeShas(setup.runDir);
+    assert.equal(shas.length, 2);
+    assert.equal(checkRecord(setup.runDir, shas[1]).tier, "final");
+    const passed = eventTypes(setup.runDir).filter((t) => t === "FINAL_CHECKS_PASSED");
+    assert.equal(passed.length, 1, "the accepted candidate ran the final check once");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(finalMarker, { force: true });
+    fs.rmSync(promptLog, { force: true });
+  }
+});
+
+test("plan 06c: a plan without TT_FINAL_CHECKS checks every candidate exactly as before", async () => {
+  const marker = `/tmp/tt-nofinal-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(marker, { force: true });
+  const command = `echo run >> ${marker}`;
+  const setup = await setupConductor({
+    checks: [command],
+    probeReuse: false,
+    deadlines: FINAL_DEADLINES,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'x\n' > sum.js" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    }),
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    const types = eventTypes(setup.runDir);
+    assert.ok(!types.includes("FINAL_CHECK_REQUIRED") && !types.includes("FINAL_CHECKS_PASSED") && !types.includes("FINAL_CHECKS_FAILED"), "no final-check event fires");
+    // Same number of check runs as before: the base baseline, the candidate's
+    // own gate and the probe (probeReuse is off).
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split("\n").length, 3, "baseline + candidate + probe, no extra run");
+    const sha = setup.conductor.state.phase.candidate!.sha;
+    assert.equal(checkRecord(setup.runDir, sha).tier, "round", "without a final check the record is a round run");
+    assert.deepEqual(checkRecord(setup.runDir, sha).finalCommands, []);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(marker, { force: true });
+  }
+});
+
+test("plan 06c: check records carry load average and free memory", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    deadlines: FINAL_DEADLINES,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'x\n' > sum.js" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    }),
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    const record = checkRecord(setup.runDir, setup.conductor.state.phase.candidate!.sha);
+    assert.equal(typeof record.load1, "number");
+    assert.ok(record.load1 >= 0, `load1 is a load average, got ${record.load1}`);
+    assert.equal(typeof record.freeMemMB, "number");
+    assert.ok(record.freeMemMB > 0, `freeMemMB is in MiB, got ${record.freeMemMB}`);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
 });

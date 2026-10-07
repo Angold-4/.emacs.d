@@ -276,6 +276,39 @@ re-run targets that one file even though `TT_CHECKS` ran a subset.
 `check-full` is the conductor's gate command for the phases that change the
 conductor itself (06a–06e), not something a worker runs on every attempt.
 
+### `TT_CHECKS` versus `TT_FINAL_CHECKS`
+
+`#+TT_CHECKS` (and a phase's `:CHECKS:`) is the **round check**: every
+candidate runs it, before the reviews. `#+TT_FINAL_CHECKS` (or a phase's
+`:FINAL_CHECKS:`, which overrides the plan-level one) is the **final check**:
+only the candidate about to be accepted runs it, once, after the reviews pass
+with no open blocker. The final check runs the phase's round checks and then
+the final command; a failure there is an ordinary check failure, so the phase
+is repaired and the next candidate that reaches acceptance runs it again.
+
+Each candidate's check run is recorded at
+`<run>/checks/<candidateSha>/record.json`. Its `tier` field is what the run
+was:
+
+- `round` — the phase's checks only, for a candidate that has not yet passed
+  review (every candidate starts here, and a repair candidate's record stays
+  `round`); `finalCommands` is empty.
+- `final` — the phase's checks **and** the final check, for the candidate about
+  to be accepted; `finalCommands` names the final command and the record's
+  `commands` include it. A `final` run overwrites that candidate's `round`
+  record, so the accepted candidate's record is the one that ran the final
+  check.
+
+The record also carries `load1` (the machine's 1-minute load average) and
+`freeMemMB` (free memory in MiB) at the run, so a slow or flaky check can be
+read against the machine it ran on.
+
+A plan that names no `TT_FINAL_CHECKS` behaves exactly as before: every
+candidate runs only its round checks, no final check is appended, no
+`FINAL_CHECK_REQUIRED`/`FINAL_CHECKS_*` event fires, and every record's tier
+is `round`. Nothing about the check list, the number of runs or the old event
+logs changes for such a plan.
+
 ## Start a run
 
 1. Write or open an Org plan (`~/orgw/PLAN_TEMPLATE.md`). Set `#+TT_BRANCH` to the branch the result publishes to, and `#+TT_CHECKS` to a check command that finishes in a few minutes (see "Checks for this repository" above).

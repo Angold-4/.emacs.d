@@ -211,3 +211,123 @@ test("review-protocol: two-turn ordering, reviewer-discovered records, unreferen
     cleanupDir(setup.scriptsDir);
   }
 });
+
+test("plan 06c: a reviewer whose turn settles without submit_review is re-prompted once and its second-turn submission counts", async () => {
+  // First run: B's turn 2 settles silently, the conductor re-prompts once, and
+  // B's submission in that second turn counts like any other review.
+  {
+    const setup = await setupConductor({
+      checks: ["true"],
+      stubReviews: false,
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [
+          { kind: "call-sh", command: "printf 'x\n' > sum.js" },
+          { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        ],
+      }),
+      reviewerScriptFor: (reviewer, state) => {
+        const review = {
+          kind: "call-submit" as const,
+          tool: "submit_review" as const,
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings: [],
+          },
+        };
+        if (reviewer !== "B") {
+          return {
+            hello: defaultReviewerHello(),
+            steps: [{ kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } }, { kind: "wait-for-prompt" }, review],
+          };
+        }
+        return {
+          hello: defaultReviewerHello(),
+          steps: [
+            { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+            // Turn 2 settles with no submit_review...
+            { kind: "wait-for-prompt" },
+            // ...the re-prompt's turn submits it.
+            { kind: "wait-for-prompt" },
+            review,
+          ],
+        };
+      },
+    });
+    await setup.conductor.start();
+    try {
+      await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+      const records = readEvents(setup.runDir);
+      assert.ok(records.some((r) => r.kind === "review_reprompt" && (r.event as { reviewer?: string }).reviewer === "B"), "B was re-prompted once");
+      const submitted = records.filter((r) => r.kind === "event" && (r.event as { type: string }).type === "REVIEW_SUBMITTED").map((r) => (r.event as unknown as { review: { reviewer: string } }).review.reviewer);
+      assert.ok(submitted.includes("B"), "B's second-turn submission counts");
+      assert.equal(setup.conductor.state.phase.reviews.B?.review?.reviewer, "B");
+    } finally {
+      await setup.conductor.stop();
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+    }
+  }
+
+  // Second run: B settles silently twice — only then does the seat time out,
+  // exactly as before.
+  {
+    const setup = await setupConductor({
+      checks: ["true"],
+      stubReviews: false,
+      deadlines: { abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 10_000, reviewMs: 20_000 },
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [
+          { kind: "call-sh", command: "printf 'x\n' > sum.js" },
+          { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        ],
+      }),
+      reviewerScriptFor: (reviewer, state) => {
+        if (reviewer !== "B") {
+          return {
+            hello: defaultReviewerHello(),
+            steps: [
+              { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+              { kind: "wait-for-prompt" },
+              {
+                kind: "call-submit",
+                tool: "submit_review",
+                args: { reviewer, phaseId: state.phase.phaseId, candidateSha: state.phase.candidate?.sha, contractVersion: state.phase.contract.contractVersion, correctionStatements: [], findingStatements: [], ballots: [], findings: [] },
+              },
+            ],
+          };
+        }
+        return {
+          hello: defaultReviewerHello(),
+          steps: [
+            { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+            // Turn 2 and the re-prompt both settle with no submit_review.
+            { kind: "wait-for-prompt" },
+            { kind: "wait-for-prompt" },
+          ],
+        };
+      },
+    });
+    await setup.conductor.start();
+    try {
+      await waitFor(() => eventTypes(readEvents(setup.runDir)).includes("REVIEW_TIMED_OUT"), 120_000, 50, setup.runDir);
+      const records = readEvents(setup.runDir);
+      assert.ok(records.some((r) => r.kind === "review_reprompt" && (r.event as { reviewer?: string }).reviewer === "B"), "B was re-prompted once before timing out");
+      const completion = records.find(
+        (r) => r.kind === "completion" && (r.event as { reviewer?: string; reason?: string }).reviewer === "B" && (r.event as { reason?: string }).reason?.includes("re-prompt"),
+      );
+      assert.ok(completion, "the second silent settle is recorded as a timeout");
+    } finally {
+      await setup.conductor.stop();
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+    }
+  }
+});

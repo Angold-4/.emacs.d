@@ -18,6 +18,7 @@
 // exactly, and calling next() again after the matching ACTION_STARTED
 // returns [] (no double dispatch) for the dispatch-shaped ones.
 
+import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
 import {
   accept,
@@ -161,6 +162,9 @@ export function next(state: State): Action[] {
       const amendment = amendmentToApply(p, C, K);
       if (amendment) return [{ type: "apply_amendment", decisionId: amendment.id }];
       if (accept(p, C, K)) {
+        // Plan 06c: an acceptable candidate with a declared final check runs
+        // it first, once; the FINAL_CHECKING stage asks for it.
+        if (finalCheckOf(p.contract) && p.finalChecksPassedFor !== C) return [{ type: "final_check_required" }];
         // Plan 01f: an acceptable candidate with a declared gate is gated
         // first; the gate stage then asks for the gate command itself. A
         // gate-less phase accepts exactly as it did before plan 01f.
@@ -169,6 +173,12 @@ export function next(state: State): Action[] {
       }
       return [{ type: "resolving_incomplete" }];
     }
+
+    // Plan 06c: the plan's final check, run once for the candidate about to
+    // be accepted.
+    case "FINAL_CHECKING":
+      if (!p.candidate) return [];
+      return p.inFlight.run_final_checks ? [] : [{ type: "run_final_checks", candidateSha: p.candidate.sha }];
 
     // Plan 01f: the conductor's own gate command, run once for this
     // candidate (a recorded pass for an identical tree is reused instead,

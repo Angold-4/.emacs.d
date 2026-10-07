@@ -622,6 +622,11 @@ so an old plan reaches the loop as items without changing meaning."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
          (id (org-element-property :ID hl))
          (checks (org-element-property :CHECKS hl))
+         ;; Plan 06c: the final check runs once on the candidate about to be
+         ;; accepted. A phase's own :FINAL_CHECKS: overrides the plan's
+         ;; #+TT_FINAL_CHECKS; a plan that names neither behaves as before.
+         (final-checks (or (org-element-property :FINAL_CHECKS hl)
+                           (+tt--keyword "TT_FINAL_CHECKS")))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -672,6 +677,8 @@ so an old plan reaches the loop as items without changing meaning."
             (acceptance . ,(vconcat acceptance))
             (acceptanceLines . ,(vconcat acceptance-lines))
             (checks . ,(vconcat (and checks (list checks))))
+            ,@(when final-checks
+                `((finalChecks . ,(vconcat (list final-checks)))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))

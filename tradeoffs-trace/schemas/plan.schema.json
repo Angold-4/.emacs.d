@@ -84,6 +84,11 @@
         "goal": { "type": "string", "minLength": 1 },
         "acceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "finalChecks": {
+          "description": "Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by the phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted runs it, once.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
         "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "provisional": { "type": "boolean" },
