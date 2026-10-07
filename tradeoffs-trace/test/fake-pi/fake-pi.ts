@@ -314,6 +314,21 @@ async function main(): Promise<void> {
           });
           break;
         }
+        case "call-tool": {
+          // Plan 06b: a plain tool call (e.g. `read`), so a scripted reviewer
+          // can record the files it read — the conductor requires a met
+          // verdict to cite one of them.
+          const toolCallId = randomUUID();
+          writeStdout({ type: "tool_execution_start", toolCallId, toolName: step.tool, args: step.args ?? {} });
+          writeStdout({
+            type: "tool_execution_end",
+            toolCallId,
+            toolName: step.tool,
+            result: { content: [{ type: "text", text: String(step.result ?? "ok") }] },
+            isError: false,
+          });
+          break;
+        }
         case "call-sh": {
           const toolCallId = randomUUID();
           writeStdout({ type: "tool_execution_start", toolCallId, toolName: "sh", args: { command: step.command, cwd: step.cwd } });

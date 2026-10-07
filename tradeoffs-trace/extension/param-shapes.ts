@@ -76,8 +76,19 @@ export const SUBMIT_REVIEW_PARAMS: ParamShape = {
     "discoveryMatches",
     "blockers",
     "resolutionStatements",
+    "items",
+    "arch",
   ],
   required: ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
+};
+
+/** Plan 06b: `submit_coverage` — the worker's status for every requirement
+ * and constraint (done/partial/not_done, with where and tests) and its
+ * fits/deviates answer for every architecture item. Matches
+ * schemas/submission.schema.json's `$defs.submitCoverage`. */
+export const SUBMIT_COVERAGE_PARAMS: ParamShape = {
+  properties: ["items", "arch"],
+  required: ["items", "arch"],
 };
 
 /** Plan 04b: `submit_panel_vote` — one panel seat's single vote on one raw

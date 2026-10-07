@@ -128,6 +128,38 @@ import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
+import { pendingEvidenceItems } from "./core/predicate.ts";
+// Plan 06b: the pure item machinery (coverage, test-verify resolution,
+// verdict validation, per-item majority, the matrix and the status counts).
+import {
+  architectureSymbols,
+  checkResolutionLines,
+  checklistLines,
+  flatItems,
+  itemNeedsEvidence,
+  coverageComplete,
+  coverageIssues,
+  coverageLines,
+  coverageNoteLines,
+  emptyCoverage,
+  evidenceFileAnchors,
+  itemsFromPhase,
+  requirementAndConstraintItems,
+  repairItemLines,
+  resolveTestVerifies,
+  reviewItemsIssues,
+  reviewRequestLines,
+  reverify,
+  symbolPresent,
+  tallyItems,
+  testVerifyProblems,
+  verdictIssues,
+  type Coverage,
+  type ItemOutcome,
+  type PlanItems,
+  type SeatItemVerdict,
+  type VerdictContext,
+} from "./core/items.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
@@ -283,6 +315,11 @@ export interface RunPlanPhase {
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 06b: the structured items of a phase subtree (ref
+   * refs/06_ref_plan_format.md). Absent on an old-format plan. */
+  architecture?: import("./core/items.ts").ArchitectureItem[];
+  requirements?: import("./core/items.ts").RequirementItem[];
+  constraints?: import("./core/items.ts").ConstraintItem[];
   /** Plan 01c: 1-based lines in the source Org file of the `acceptance`
    * items, parallel to the array. Emacs records them so `tt lint` can point
    * at the offending line; a hand-written JSON plan has no lines and the
@@ -634,6 +671,9 @@ export function amendContractVersion(contract: PhaseContract, acceptance: string
         checks: contract.checks,
         boundaries: contract.boundaries,
         reserved: contract.reserved,
+        architecture: contract.architecture,
+        requirements: contract.requirements,
+        constraints: contract.constraints,
         gate: contract.gate,
         gateCleanup: contract.gateCleanup,
       }),
@@ -651,6 +691,9 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     checks: phase.checks,
     boundaries: phase.boundaries,
     reserved: phase.reserved,
+    ...(phase.architecture ? { architecture: phase.architecture } : {}),
+    ...(phase.requirements ? { requirements: phase.requirements } : {}),
+    ...(phase.constraints ? { constraints: phase.constraints } : {}),
     // Plan 01f: a declared gate is part of the frozen contract — the FSM
     // (next.ts/transitions.ts) reads it to decide whether the phase gates at
     // all, and every prompt that mentions the gate quotes the same text.
@@ -2433,6 +2476,43 @@ export class Conductor {
    * visibly — a `command_rejected` log record plus the file moved to
    * rejected/ with the reason beside it; (3) otherwise the event is appended
    * (the effect), the id is remembered, and only then is the file moved. */
+  /** Plan 06b: record one `evidence` item the owner recorded with
+   * `tt evidence`. When it was the last pending evidence item and the phase
+   * parked on the owner for it, the fallback request is resolved so the phase
+   * resumes to RESOLVING and acceptance. */
+  #processEvidenceCommand(file: string, commandId: string, raw: { item?: unknown; text?: unknown }): void {
+    const name = this.#state.phase.phase;
+    if (name === "DONE" || name === "BLOCKED") {
+      this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
+      return;
+    }
+    const itemId = typeof raw.item === "string" ? raw.item.trim() : "";
+    const text = typeof raw.text === "string" ? raw.text.trim() : "";
+    const evidenceItems = flatItems(this.#planItems()).filter((i) => itemNeedsEvidence(i));
+    const item = evidenceItems.find((i) => i.id === itemId);
+    if (!item) {
+      this.#rejectInboxFile(file, commandId, `${itemId || "(no item)"} is not an evidence item of this phase`);
+      return;
+    }
+    if (text.length === 0) {
+      this.#rejectInboxFile(file, commandId, "evidence needs non-empty text or an existing file");
+      return;
+    }
+    const existing = this.#state.phase.itemEvidence ?? [];
+    this.#applyEvent({
+      type: "ITEM_STATE_UPDATED",
+      itemEvidence: [...existing.filter((e) => e.id !== itemId), { id: itemId, text, at: new Date().toISOString(), commandId }],
+    });
+    this.#log.append("item_evidence_recorded", { commandId, item: itemId });
+    // Resume once nothing else stands in the way: the evidence the phase
+    // parked for is recorded, so the phase returns to RESOLVING (where
+    // accept() now holds) and the parking request closes.
+    if (this.#state.phase.phase === "AWAITING_OWNER" && pendingEvidenceItems(this.#state.phase).length === 0) {
+      this.#applyEvent({ type: "EVIDENCE_RECORDED", itemId });
+    }
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
   #processInboxFile(file: string): void {
     if (this.#closed) return;
     const name = path.basename(file);
@@ -2499,6 +2579,13 @@ export class Conductor {
         forwardProgram: false,
         pushed: true,
       });
+      return;
+    }
+
+    // Plan 06b: `tt evidence <run> <item> <file-or-text>` — the owner's
+    // recording of an `evidence` item. Handled before the input-kind map.
+    if (raw !== null && typeof raw === "object" && (raw as { type?: unknown }).type === "evidence") {
+      this.#processEvidenceCommand(file, commandId, raw as { item?: unknown; text?: unknown });
       return;
     }
 
@@ -2755,6 +2842,11 @@ export class Conductor {
    * its last tool call, and the queue that keeps the snapshots in order. */
   #fileSnapshots = new Map<string, { totals: Map<string, [number, number]>; queue: Promise<void> }>();
 
+  /** Plan 06b: the files each reviewer itself read in this review, from its
+   * recorded `read` tool calls. A `met`/`fits` verdict must cite at least one
+   * of them, never only the worker's own anchors. */
+  #reviewerReads = new Map<Reviewer, Set<string>>();
+
   /** Plan 3b: after each worker tool call, append one `tt_file_changes`
    * record to its stream naming the files that call changed ("path +a −r",
    * from `git diff --numstat` before and after — so edits made through sh
@@ -2961,6 +3053,14 @@ export class Conductor {
         // Plan 05e (finding #34): the round's evaluators and panels have
         // settled, so the candidate's final approval state is known.
         try {
+          // Plan 06b: the item loop settles here — the per-item majority, the
+          // evaluator's overturns, and a blocking finding for every item a
+          // majority did not meet (or fit).
+          this.#applyItemOutcomes();
+        } catch (err) {
+          this.#log.append("error", { where: "item_outcomes", error: String((err as Error)?.message ?? err) });
+        }
+        try {
           this.#recordCandidateApproval();
         } catch (err) {
           this.#log.append("error", { where: "candidate_approval", error: String((err as Error)?.message ?? err) });
@@ -3160,9 +3260,37 @@ export class Conductor {
   async #onSubmitChecked(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
     const handle = this.#agents.get(agentId);
     if (!handle) return { ok: false, reason: "unknown agent" };
+    if (msg.tool === "submit_coverage") {
+      // Plan 06b: the worker's per-item coverage. It is recorded even when
+      // incomplete (so the worker and the status see what is missing), but
+      // the freeze is refused until every R, C and A is covered with its
+      // required note.
+      if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
+        return { ok: false, reason: `submit_coverage is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      const args = msg.args as Coverage;
+      const issues = coverageIssues(args, this.#planItems());
+      this.#applyEvent({ type: "ITEM_STATE_UPDATED", coverage: args });
+      if (issues.length > 0) {
+        const reason = `coverage is incomplete: ${issues.join("; ")}`;
+        this.#log.append("coverage_refused", { at: "submit_coverage", issues, reason });
+        return { ok: false, reason };
+      }
+      if (this.#state.phase.candidate) this.#applyCoverageNotes(args, this.#state.phase.candidate.sha);
+      return { ok: true };
+    }
     if (msg.tool === "submit_phase") {
       if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
         return { ok: false, reason: `submit_phase is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      // Plan 06b: the freeze is refused until the coverage is complete.
+      if (this.#structured()) {
+        const issues = coverageIssues(this.#state.phase.coverage, this.#planItems());
+        if (issues.length > 0) {
+          const reason = `submit_phase refused until submit_coverage is complete: ${issues.join("; ")}`;
+          this.#log.append("coverage_refused", { at: "submit_phase", issues, reason });
+          return { ok: false, reason };
+        }
       }
       // design §6.2/§9.3 (round-of-review item 3): SUBMIT_PHASE is logged
       // with the raw disclosure *before* anything else — freeze is an
@@ -3266,20 +3394,29 @@ export class Conductor {
         // stubborn model cannot wedge the turn. The demanded set is the
         // prompt-time snapshot, so a late discovery is never demanded.
         const missing = this.#missingDemandedBallots(review, handle);
-        if (missing.length > 0) {
+        // Plan 06b: the same complete-ballot rule extended to items — every
+        // R and C needs a verdict, every A needs one, and every verdict must
+        // cite anchors the code can follow. A refusal re-asks the reviewer.
+        const itemIssues = this.#reviewItemIssues(review);
+        if (missing.length > 0 || itemIssues.length > 0) {
           const rejections = handle.incompleteReviewRejections ?? 0;
           if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
             handle.incompleteReviewRejections = rejections + 1;
             // The reason is logged beside the missing ids, so the record is the
             // same text the model is refused with (a test does not have to race
             // the reviewer's stream file to read it).
-            const reason = `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
+            const ballots = `a ballot is required for every listed record not marked carried. Missing: ${missing
               .map((m) => `${m.id} (${m.choice})`)
               .join("; ")}`;
+            const reason =
+              itemIssues.length > 0
+                ? `incomplete or unverifiable review: ${itemIssues.join("; ")}${missing.length > 0 ? `; ${ballots}` : ""}`
+                : `incomplete review: ${ballots}`;
             this.#log.append("incomplete_review_rejected", {
               reviewer: review.reviewer,
               agentId,
               missing: missing.map((m) => m.id),
+              itemIssues,
               rejection: rejections + 1,
               reason,
             });
@@ -3289,6 +3426,7 @@ export class Conductor {
             reviewer: review.reviewer,
             agentId,
             missing: missing.map((m) => m.id),
+            itemIssues,
             rejections,
           });
         }
@@ -5046,6 +5184,11 @@ export class Conductor {
     // to the NEXT attempt (round-3 review, advisory A-6), never a permanent
     // must-fix item — see ownerBlockerChoiceLines' own rule.
     blocking.push(...ownerBlockerChoiceLines(phase, C));
+    // Plan 06b: list only the items a majority did not meet (or fit), with
+    // the reviewers' evidence, so the repair addresses exactly those points.
+    if (phase.contract.architecture !== undefined || phase.contract.requirements !== undefined || phase.contract.constraints !== undefined) {
+      blocking.push(...repairItemLines(this.#itemOutcomes(), phase.overturns ?? []));
+    }
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
@@ -5073,6 +5216,266 @@ export class Conductor {
         .filter((d) => d.source === "worker" && isLiveDecision(d) && !d.amendment)
         .map((d) => ({ id: d.id, choice: d.choice })),
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Plan 06b: the item loop. Every point of a structured plan is an A, R or
+  // C item the loop carries mechanically: the worker's coverage, the check
+  // resolution, the reviewers' per-item verdicts and the acceptance decision.
+  // -------------------------------------------------------------------------
+
+  /** The phase's structured items (synthesizing the old format when the
+   * contract carries only an acceptance list). */
+  #planItems(): PlanItems {
+    return itemsFromPhase(this.#state.phase.contract);
+  }
+
+  /** True when the phase declares structured items, so the item loop applies.
+   * A plan that predates the format has none and behaves exactly as before. */
+  #structured(): boolean {
+    const c = this.#state.phase.contract;
+    return c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined;
+  }
+
+  #itemTestOutcomes(): Map<string, "passed" | "failed" | "missing"> {
+    const m = new Map<string, "passed" | "failed" | "missing">();
+    for (const r of this.#state.phase.checkResolution ?? []) m.set(r.name, r.outcome);
+    return m;
+  }
+
+  /** The worker's own anchors (its coverage `where` entries), which a
+   * `met`/`fits` verdict may not lean on alone. */
+  #workerAnchors(): string[] {
+    const out: string[] = [];
+    for (const e of this.#state.phase.coverage?.items ?? []) out.push(...e.where);
+    for (const e of this.#state.phase.coverage?.arch ?? []) out.push(...e.where);
+    return out;
+  }
+
+  #reviewerReadFiles(reviewer: Reviewer): string[] {
+    return [...(this.#reviewerReads.get(reviewer) ?? [])];
+  }
+
+  /** The candidate's changed files (repo-relative). */
+  #diffFiles(C: string): string[] {
+    try {
+      return execFileSync("git", ["-C", this.#plan.repo, "diff", "--name-only", `${C}^`, C], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /** The code facts a verdict is validated against: candidate file lines,
+   * the diff, the item's `:WHERE:`, the check run's test outcomes, the files
+   * this reviewer read, and the worker's own anchors. */
+  #verdictContext(item: { where?: string }, reviewerReadFiles: string[]): VerdictContext {
+    const dir = this.#candidateDir();
+    const C = this.#state.phase.candidate?.sha ?? "";
+    return {
+      lineCount: (p: string) => {
+        try {
+          return fs.readFileSync(path.join(dir, p), "utf8").split("\n").length;
+        } catch {
+          return undefined;
+        }
+      },
+      diffFiles: C ? this.#diffFiles(C) : [],
+      ...(item.where ? { where: item.where } : {}),
+      testOutcomes: this.#itemTestOutcomes(),
+      reviewerReadFiles,
+      workerAnchors: this.#workerAnchors(),
+    };
+  }
+
+  /** Every reason a review's item section must be refused and re-asked: a
+   * missing verdict (the complete-ballot rule extended to items), an invalid
+   * verdict value, or a verdict whose anchors the code cannot follow. */
+  #reviewItemIssues(review: Review): string[] {
+    if (!this.#structured()) return [];
+    const items = this.#planItems();
+    const issues = reviewItemsIssues({ items: review.items ?? [], arch: review.arch ?? [] }, items);
+    const flat = flatItems(items);
+    const reads = this.#reviewerReadFiles(review.reviewer);
+    for (const v of review.items ?? []) {
+      const item = flat.find((i) => i.id === v.id);
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, reads)));
+    }
+    for (const v of review.arch ?? []) {
+      const item = flat.find((i) => i.id === v.id);
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, reads)));
+    }
+    return issues;
+  }
+
+  /** The per-item majority across the three reviews. */
+  #itemOutcomes(): ItemOutcome[] {
+    const reviews = (["M", "A", "B"] as const).map((seat) => {
+      const r = this.#state.phase.reviews[seat]?.review;
+      return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
+    });
+    const outcomes = tallyItems(this.#planItems(), reviews, this.#state.phase.overturns ?? []);
+    // A symbol the conductor could not find is `deviates` regardless of the
+    // seats' own verdicts.
+    const symbolDeviations = this.#state.phase.archSymbolDeviations ?? [];
+    for (const o of outcomes) {
+      if (o.item.kind === "architecture" && symbolDeviations.includes(o.item.id) && o.outcome !== "deviates") o.outcome = "deviates";
+    }
+    return outcomes;
+  }
+
+  /** The evaluator's re-verification: a majority unmet/deviates verdict the
+   * code contradicts is overturned, and a unanimous thin-evidence met verdict
+   * is audited. Each overturn is counted against its seat. */
+  #itemOverturns(outcomes: readonly ItemOutcome[]): import("./core/items.ts").Overturn[] {
+    const out: import("./core/items.ts").Overturn[] = [];
+    const readsBySeat: Record<string, readonly string[]> = {
+      M: this.#reviewerReadFiles("M"),
+      A: this.#reviewerReadFiles("A"),
+      B: this.#reviewerReadFiles("B"),
+    };
+    for (const o of outcomes) {
+      const ctx = this.#verdictContext(o.item, this.#reviewerReadFiles((o.seats[0]?.seat ?? "M") as Reviewer));
+      const overturn = reverify(o.item, o.seats, ctx, readsBySeat);
+      if (overturn) out.push(overturn);
+    }
+    return out;
+  }
+
+  /** Plan 06b (layer 1): for an architecture item with `:WHERE:` and a named
+   * type/event/function, grep the candidate for the symbol. A missing one is
+   * recorded `deviates` (and a blocking finding) before any reviewer is
+   * asked. Runs once the candidate exists, before REVIEWING. */
+  #applyArchitectureSymbols(C: string): void {
+    if (!this.#structured()) return;
+    const dir = this.#candidateDir();
+    const deviates: string[] = [];
+    for (const arch of this.#planItems().architecture) {
+      if (!arch.where) continue;
+      const symbols = architectureSymbols(arch);
+      if (symbols.length === 0) continue;
+      let text = "";
+      for (const token of arch.where.split(/[\s,;]+/).filter(Boolean)) {
+        try {
+          text += `${fs.readFileSync(path.join(dir, token), "utf8")}\n`;
+        } catch {
+          // not a readable file at that token
+        }
+      }
+      if (text.length === 0) continue;
+      if (symbols.some((s) => !symbolPresent(text, s))) deviates.push(arch.id);
+    }
+    if (deviates.length === 0) return;
+    this.#applyEvent({ type: "ITEM_STATE_UPDATED", archSymbolDeviations: deviates });
+    for (const id of deviates) {
+      if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === id)) continue;
+      const arch = this.#planItems().architecture.find((a) => a.id === id);
+      const finding: Finding = {
+        id: `F-${this.#state.phase.phaseId}-symbol-${id}-${this.#state.phase.findings.length + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: `${id}${arch ? ` ${arch.title}` : ""} — :WHERE: ${arch?.where ?? ""} does not name the symbol(s) ${architectureSymbols(arch!).join(", ")}`,
+        raisedBy: "conductor",
+        status: "open",
+        boundCandidateSha: C,
+        itemId: id,
+      };
+      this.#applyEvent({ type: "FINDING_RAISED", finding });
+    }
+  }
+
+  /** After the reviews and evaluation settle: compute the per-item majority,
+   * record the overturns, and raise a blocking finding anchored to every item
+   * a majority did not meet (or fit). */
+  #applyItemOutcomes(): void {
+    if (!this.#structured()) return;
+    const C = this.#state.phase.candidate?.sha;
+    if (!C) return;
+    const raw = this.#itemOutcomes();
+    const overturns = this.#itemOverturns(raw);
+    this.#applyEvent({ type: "ITEM_STATE_UPDATED", overturns });
+    // Recompute with the overturns applied, so an overturned verdict neither
+    // blocks nor raises a finding.
+    const outcomes = this.#itemOutcomes();
+    const overturned = new Set(overturns.map((o) => o.id));
+    for (const o of outcomes) {
+      if (o.item.kind === "architecture") {
+        const accepted = (this.#state.phase.acceptedDeviations ?? []).includes(o.item.id);
+        if (o.outcome === "fits" || accepted) continue;
+        if (overturned.has(o.item.id)) continue;
+        this.#raiseItemFinding(o, C);
+        continue;
+      }
+      if (o.outcome === "met") continue;
+      if (overturned.has(o.item.id)) continue;
+      this.#raiseItemFinding(o, C);
+    }
+  }
+
+  /** One blocking finding, anchored to its item, with the reviewers' own
+   * evidence. A conductor-raised finding: no model is asked to confirm what
+   * the recorded votes already say. */
+  #raiseItemFinding(o: ItemOutcome, C: string): void {
+    if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === o.item.id)) return;
+    const evidence = `${o.item.id} ${o.item.title} — ${o.outcome}${o.evidence.length > 0 ? `: ${o.evidence.join(" | ")}` : ""}`;
+    const finding: Finding = {
+      id: `F-${this.#state.phase.phaseId}-item-${o.item.id}-${this.#state.phase.findings.length + 1}`,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      // A deviating architecture item is a defect against the plan's own
+      // shape, not a contract objection: the owner may accept the deviation
+      // as a trade-off (`accept_risk`) or ask for a repair.
+      kind: "defect",
+      severity: "blocking",
+      evidence,
+      raisedBy: "conductor",
+      status: "open",
+      boundCandidateSha: C,
+      itemId: o.item.id,
+    };
+    this.#applyEvent({ type: "FINDING_RAISED", finding });
+  }
+
+  /** A `test` verify that is missing from or failed in the candidate's check
+   * run is a blocking finding anchored to its item. */
+  #applyTestVerifyFindings(C: string): void {
+    if (!this.#structured()) return;
+    const resolutions = this.#state.phase.checkResolution ?? [];
+    const problems = testVerifyProblems(resolutions);
+    if (problems.length === 0) return;
+    for (const id of new Set(resolutions.filter((r) => r.outcome !== "passed").map((r) => r.id))) {
+      if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === id)) continue;
+      const item = flatItems(this.#planItems()).find((i) => i.id === id);
+      const lines = resolutions.filter((r) => r.id === id && r.outcome !== "passed").map((r) => `test "${r.name}" ${r.outcome}`);
+      const finding: Finding = {
+        id: `F-${this.#state.phase.phaseId}-test-${id}-${this.#state.phase.findings.length + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: `${id}${item ? ` ${item.title}` : ""} — ${lines.join(", ")}`,
+        raisedBy: "conductor",
+        status: "open",
+        boundCandidateSha: C,
+        itemId: id,
+      };
+      this.#applyEvent({ type: "FINDING_RAISED", finding });
+    }
+  }
+
+  /** The worker's coverage as a trade-off message per partial/not_done item
+   * and per deviating architecture item (ref doc: the note becomes a
+   * trade-off message). Deduped by the item id. */
+  #applyCoverageNotes(coverage: Coverage, C: string): void {
+    for (const { id, note } of coverageNoteLines(coverage, this.#planItems())) {
+      this.#raiseMessage(
+        "tradeoff",
+        `coverage-${id}`,
+        { type: "tradeoff", title: `${id} not fully covered`, summary: note, context: "", evidence: [note] },
+        C,
+      );
+    }
   }
 
   async #sweepAndClear(handle: AgentHandle): Promise<void> {
@@ -5216,6 +5619,10 @@ export class Conductor {
     for (const decision of outcome.decisions) {
       this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), outcome.candidateSha);
     }
+    // Plan 06b: every partial/not_done coverage entry and every deviating
+    // architecture item becomes a trade-off message, once the candidate
+    // exists for it to bind to.
+    if (this.#structured() && this.#state.phase.coverage) this.#applyCoverageNotes(this.#state.phase.coverage, outcome.candidateSha);
     // Work packet 2a: boundary triggers (design §3.3) and §3.5's sampling
     // data need a real candidate (for the diff, and for DECISION_ADDED's
     // own binding check) — only possible once FREEZE_COMPLETED above has
@@ -6291,6 +6698,9 @@ export class Conductor {
        * the owner) can see exactly what is new. Plan 05d narrows this to the
        * names that still fail when re-run alone. */
       let newFailures: string[] = [];
+      /** Plan 06b: the combined output of every check command, so each item's
+       * `test` verify is resolved against the check run by name. */
+      let combinedOutput = "";
       /** Plan 05d: every new failing test of the failing command, with its
        * `reproduces alone` / `load-only` label, for the repair prompt. */
       let checkFailures: CheckFailureClass[] = [];
@@ -6324,6 +6734,7 @@ export class Conductor {
             termGraceMs: this.#deadlines.termGraceMs,
           });
           const result = await running.result;
+          combinedOutput += `${result.output}\n`;
           // Plan 05d: the machine's load average at the failing run is part
           // of the flake evidence (findings #10, #31).
           const machineLoad = Math.round(loadavg()[0] * 100) / 100;
@@ -6444,6 +6855,14 @@ export class Conductor {
         ...(checkFailures.length > 0 ? { checkFailures } : {}),
         reason: !passed && timedOut ? "timeout" : undefined,
       });
+      // Plan 06b: resolve every item's `test` verify against this check run.
+      // A named test that is missing from or failed in the output is a
+      // blocking finding anchored to its item.
+      if (this.#structured()) {
+        const resolutions = resolveTestVerifies(this.#planItems(), combinedOutput);
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions });
+        this.#applyTestVerifyFindings(candidateSha);
+      }
       this.#applyEvent(
         passed
           ? { type: "CHECKS_PASSED" }
@@ -6573,6 +6992,9 @@ export class Conductor {
       reason: timedOutCommand !== undefined ? "timeout" : undefined,
     });
     if (passed) {
+      // Plan 06b: grep the candidate for every architecture `:WHERE:` symbol
+      // before the reviewers are asked.
+      this.#applyArchitectureSymbols(candidateSha);
       this.#applyEvent({ type: "PROBE_PASSED", probedI: result.I });
     } else if (timedOutCommand !== undefined) {
       this.#applyEvent({ type: "PROBE_FAILED", evidence: `timeout: integration probe command '${timedOutCommand}' timed out on probed integration ${result.I}` });
@@ -7072,6 +7494,20 @@ export class Conductor {
       onEvent: (event) => {
         this.#noteActivity(agentId, event);
         this.#trackRunTokens(agentId, event);
+        // Plan 06b: record the files this reviewer itself read, so a
+        // met/fits verdict can be required to cite one of them.
+        if ((event as { type?: string }).type === "tool_execution_start") {
+          const e = event as { toolName?: string; args?: unknown };
+          if (e.toolName === "read") {
+            const a = e.args as Record<string, unknown> | undefined;
+            const file = a?.path ?? a?.file ?? a?.file_path;
+            if (typeof file === "string" && file.trim().length > 0) {
+              const set = this.#reviewerReads.get(reviewer) ?? new Set<string>();
+              set.add(file.replace(/^\.\//, ""));
+              this.#reviewerReads.set(reviewer, set);
+            }
+          }
+        }
         if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
       },
     });
@@ -8590,6 +9026,16 @@ export class Conductor {
       // Plan 05d: the candidate's own failing tests, each re-run alone, so a
       // reviewer never calls a real regression a flake or a flake a defect.
       ...checkFailurePromptLines(phase),
+      // Plan 06b: the same checklist the worker saw, the worker's coverage,
+      // the check resolution, and the verdicts this review must carry.
+      ...(this.#structured()
+        ? [
+            ...checklistLines(this.#planItems()),
+            ...coverageLines(phase.coverage, this.#planItems()),
+            ...checkResolutionLines(phase.checkResolution ?? []),
+            ...reviewRequestLines(this.#planItems()),
+          ]
+        : []),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
@@ -9171,15 +9617,23 @@ export function buildWorkerPrompt(
   baselineCommands?: readonly BaselineCommand[],
   messages?: readonly Message[],
 ): string {
+  const structured = contract.architecture !== undefined || contract.requirements !== undefined || contract.constraints !== undefined;
   const lines: string[] = [
     `Goal: ${contract.goal}`,
     "",
     "Acceptance criteria:",
     ...contract.acceptance.map((a) => `- ${a}`),
+    ...(structured ? checklistLines(itemsFromPhase(contract)) : []),
     ...secretPromptLines(secrets),
     ...referenceLines(references),
     ...baselinePromptLines(baselineCommands),
   ];
+  if (structured) {
+    lines.push(
+      "",
+      "End your attempt with submit_coverage: for every requirement and constraint above, give status done, partial or not_done with where and tests; for every architecture item, give fits or deviates with where. A partial, not_done or deviates entry must carry a note, which becomes a trade-off message. The phase cannot freeze until the coverage is complete.",
+    );
+  }
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
   lines.push(...directiveLines(directives));
@@ -9242,8 +9696,18 @@ export function buildReviewerPrompt(
     // Plan 05d: name the candidate's own failing tests (each re-run alone), so
     // a reviewer never calls a real regression a flake or a flake a defect.
     ...checkFailurePromptLines(phase),
+    // Plan 06b: the same checklist the worker saw, plus the worker's coverage
+    // and the check resolution, and the verdicts this review must carry.
+    ...(phase.contract.architecture !== undefined || phase.contract.requirements !== undefined || phase.contract.constraints !== undefined
+      ? [
+          ...checklistLines(itemsFromPhase(phase.contract)),
+          ...coverageLines(phase.coverage, itemsFromPhase(phase.contract)),
+          ...checkResolutionLines(phase.checkResolution ?? []),
+          ...reviewRequestLines(itemsFromPhase(phase.contract)),
+        ]
+      : []),
     ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),
-    "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
+    "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, findingStatements, items and arch.",
   ].join("\n");
 }
 

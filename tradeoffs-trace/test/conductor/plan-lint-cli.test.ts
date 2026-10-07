@@ -67,6 +67,55 @@ async function waitForPid(dir: string, pidFile: string, ms = 5000): Promise<void
   }
 }
 
+test("plan-lint CLI: `tt plan template` prints a skeleton `tt lint` accepts, and lint reads an .org phase subtree", async () => {
+  const dir = tmpDir("tt-lint-template");
+  try {
+    const template = await runCli(["plan", "template"], {});
+    assert.equal(template.code, 0);
+    const file = path.join(dir, "PLAN.org");
+    fs.writeFileSync(file, template.stdout);
+    const lint = await runCli(["lint", file], {});
+    assert.equal(lint.code, 0, `template must lint clean: ${lint.stdout}`);
+    assert.equal(lint.stdout.trim(), "");
+    // A structured Org plan is read directly by `tt lint`: the four item rules
+    // report with the Org file and line.
+    fs.writeFileSync(
+      file,
+      [
+        "#+TITLE: bad",
+        "#+TT_REPO: /tmp/x",
+        "#+TT_BRANCH: main",
+        "",
+        "* P",
+        "  :PROPERTIES:",
+        "  :ID: p1",
+        "  :CHECKS: true",
+        "  :END:",
+        "** Requirements",
+        "*** R1 first",
+        "    :PROPERTIES:",
+        "    :ID: R1",
+        "    :ARCH: A9",
+        "    :VERIFY: test",
+        "    :END:",
+        "    one",
+        "*** R1 again",
+        "    :PROPERTIES:",
+        "    :ID: R1",
+        "    :END:",
+        "    two",
+      ].join("\n") + "\n",
+    );
+    const bad = await runCli(["lint", file], {});
+    assert.equal(bad.code, 1);
+    assert.match(bad.stdout, /PLAN\.org:15: error: \[p1\] a test verify has no name/);
+    assert.match(bad.stdout, /PLAN\.org:14: error: \[p1\] :ARCH: names A9/);
+    assert.match(bad.stdout, /PLAN\.org:18: error: \[p1\] the item id R1 is already used/);
+  } finally {
+    cleanupDir(dir);
+  }
+});
+
 test("plan-lint CLI: `tt lint` reports an error with file and line and exits non-zero", async () => {
   const dir = tmpDir("tt-lint");
   try {

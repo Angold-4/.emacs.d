@@ -480,6 +480,124 @@ Org line the owner will edit rather than at a temporary JSON copy."
             (forward-line 1)))))
     (nreverse lines)))
 
+;;; Plan 06b: the structured plan format (refs/06_ref_plan_format.md).
+;; A phase subtree names four headings — Goal, Architecture, Requirements,
+;; Constraints — and every item under the last three is a subheading with an
+;; `:ID:`. The item's own body (sub-lists and source blocks included) is its
+;; text, kept whole: the #41 failure was a parser that cut the goal at its
+;; first sub-list.
+
+(defun +tt--headline-title (hl)
+  "The plain title of headline HL, without its tags or TODO keyword."
+  (let ((title (org-element-property :title hl)))
+    (if (stringp title)
+        title
+      (string-trim (buffer-substring-no-properties
+                    (org-element-property :begin hl)
+                    (or (org-element-property :end hl) (point-max)))))))
+
+(defun +tt--child-headlines (hl)
+  "The direct child headlines of HL, in order."
+  (seq-filter (lambda (el) (eq (org-element-type el) 'headline))
+              (org-element-contents hl)))
+
+(defun +tt--property-line (hl name)
+  "1-based line of property NAME in HL's own property drawer, or nil."
+  (let ((beg (org-element-property :begin hl))
+        (end (or (org-element-property :end hl) (point-max))))
+    (save-excursion
+      (goto-char beg)
+      (when (re-search-forward "^[ \t]*:PROPERTIES:[ \t]*$" end t)
+        (let ((drawer-end (save-excursion
+                            (when (re-search-forward "^[ \t]*:END:[ \t]*$" end t)
+                              (point)))))
+          (when drawer-end
+            (goto-char beg)
+            (when (re-search-forward (concat "^[ \t]*:" (regexp-quote name) ":[ \t]*") drawer-end t)
+              (line-number-at-pos))))))))
+
+(defun +tt--parse-item (hl kind)
+  "Parse one structured item headline HL of KIND into a plan-JSON alist.
+KIND is `architecture', `requirement' or `constraint'.  The item's text is
+its whole body, so sub-lists and source blocks stay inside it; `rawText'
+keeps the same text so `tt lint' can prove nothing was lost in parsing."
+  (let* ((body (+tt--phase-body hl))
+         (text (string-trim body))
+         (verify (org-element-property :VERIFY hl))
+         (arch (org-element-property :ARCH hl))
+         (where (org-element-property :WHERE hl))
+         (title (string-trim (+tt--headline-title hl)))
+         (line (line-number-at-pos (org-element-property :begin hl))))
+    `((id . ,(org-element-property :ID hl))
+      (title . ,title)
+      (text . ,text)
+      (rawText . ,text)
+      (tags . ,(vconcat (org-element-property :tags hl)))
+      ,@(when (eq kind 'architecture)
+          `((where . ,where)
+            (whereLine . ,(+tt--property-line hl "WHERE"))))
+      ,@(when (eq kind 'requirement)
+          `((arch . ,(vconcat (and arch (split-string arch "[ \t,]+" t))))
+            (archLine . ,(+tt--property-line hl "ARCH"))))
+      ,@(when (memq kind '(requirement constraint))
+          `((verify . ,(vconcat (and verify (list verify))))
+            (verifyLine . ,(+tt--property-line hl "VERIFY"))))
+      (line . ,line))))
+
+(defun +tt--parse-structure (hl)
+  "Parse HL's Goal/Architecture/Requirements/Constraints children.
+Return a plist (:goal :architecture :requirements :constraints), or nil when
+HL has none of those headings (an old-format phase)."
+  (let ((goal nil) (architecture nil) (requirements nil) (constraints nil) (found nil))
+    (dolist (child (+tt--child-headlines hl))
+      (let ((title (string-trim (+tt--headline-title child))))
+        (cond
+         ((equal title "Goal")
+          (setq found t)
+          (setq goal (string-trim (+tt--phase-body child))))
+         ((equal title "Architecture")
+          (setq found t)
+          (setq architecture (mapcar (lambda (i) (+tt--parse-item i 'architecture))
+                                     (+tt--child-headlines child))))
+         ((equal title "Requirements")
+          (setq found t)
+          (setq requirements (mapcar (lambda (i) (+tt--parse-item i 'requirement))
+                                     (+tt--child-headlines child))))
+         ((equal title "Constraints")
+          (setq found t)
+          (setq constraints (mapcar (lambda (i) (+tt--parse-item i 'constraint))
+                                    (+tt--child-headlines child)))))))
+    (when found
+      (list :goal goal :architecture architecture :requirements requirements :constraints constraints))))
+
+(defun +tt--synthesize-items (acceptance acceptance-lines reserved)
+  "The old format as structured items: R1..Rn and C1.
+Each acceptance item is review, or evidence when it starts with the word
+evidence and a colon.  This is the same synthesis `src/core/items.ts' does,
+so an old plan reaches the loop as items without changing meaning."
+  (let ((n 0))
+    (list
+     :requirements
+     (vconcat
+      (mapcar (lambda (text)
+                (setq n (1+ n))
+                `((id . ,(format "R%d" n))
+                  (title . ,text)
+                  (text . ,text)
+                  (rawText . ,text)
+                  (arch . [])
+                  (verify . ,(if (string-match-p "\\`[ \t]*evidence[ \t]*:" text)
+                                 (vector "evidence")
+                               (vector "review")))
+                  (line . ,(nth (1- n) acceptance-lines))))
+              acceptance))
+     :constraints
+     (vconcat
+      (when (and reserved (seq-filter (lambda (r) (not (string-empty-p (string-trim r)))) reserved))
+        (let ((text (mapconcat #'string-trim (seq-filter (lambda (r) (not (string-empty-p (string-trim r)))) reserved) "; ")))
+          (list `((id . "C1") (title . ,text) (text . ,text) (rawText . ,text)
+                  (verify . ,(vector "review"))))))))))
+
 (defun +tt--parse-phase (hl)
   "Parse phase headline HL into (PHASE-ALIST . ERRORS)."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
@@ -496,7 +614,13 @@ Org line the owner will edit rather than at a temporary JSON copy."
          (reserved (org-element-property :RESERVED hl))
          (provisional (member "provisional" (org-element-property :tags hl)))
          (body (+tt--phase-body hl))
-         (goal (+tt--goal body))
+         (structure (+tt--parse-structure hl))
+         (structured (and structure
+                          (or (plist-get structure :architecture)
+                              (plist-get structure :requirements)
+                              (plist-get structure :constraints))))
+         (goal (or (and structure (plist-get structure :goal))
+                   (+tt--goal body)))
          (acceptance (+tt--list-items "Acceptance:" body))
          (acceptance-lines (+tt--list-lines hl "Acceptance:"))
          ;; Plan 01c: the owner's own checklist, next to Acceptance.  Its
@@ -504,23 +628,40 @@ Org line the owner will edit rather than at a temporary JSON copy."
          ;; acceptance; they are shown once the phase is DONE.
          (owner-checklist (+tt--list-items "Owner checklist:" body))
          (owner-checklist-lines (+tt--list-lines hl "Owner checklist:"))
+         (reserved-list (and reserved (split-string reserved ";" t "[ \t]+")))
+         ;; Plan 06b: a structured phase carries architecture/requirements/
+         ;; constraints; an old-format phase synthesizes R1..Rn and C1 so the
+         ;; loop sees items either way.
+         (synthesized (unless structured
+                        (+tt--synthesize-items acceptance acceptance-lines reserved-list)))
+         (architecture (and structure (plist-get structure :architecture)))
+         (requirements (if structured
+                           (plist-get structure :requirements)
+                         (plist-get synthesized :requirements)))
+         (constraints (if structured
+                          (plist-get structure :constraints)
+                        (plist-get synthesized :constraints)))
          (errors nil))
     (unless provisional
       (unless id (push (cons line "phase has no :ID: property") errors))
       (unless checks (push (cons line "phase has no :CHECKS: property") errors))
       (unless goal (push (cons line "phase has no \"Goal:\" line") errors))
-      (unless acceptance (push (cons line "phase has no \"Acceptance:\" list") errors)))
+      (unless (or structured acceptance)
+        (push (cons line "phase has no \"Acceptance:\" list and no Requirements heading") errors)))
     (cons `((id . ,(or id (format "line-%d" line)))
             (goal . ,(or goal ""))
             (acceptance . ,(vconcat acceptance))
             (acceptanceLines . ,(vconcat acceptance-lines))
             (checks . ,(vconcat (and checks (list checks))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
-            (reserved . ,(vconcat (and reserved (split-string reserved ";" t "[ \t]+"))))
+            (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
             ,@(when owner-checklist
                 `((ownerChecklist . ,(vconcat owner-checklist))
                   (ownerChecklistLines . ,(vconcat owner-checklist-lines))))
+            ,@(when architecture `((architecture . ,(vconcat architecture))))
+            ,@(when requirements `((requirements . ,(vconcat requirements))))
+            ,@(when constraints `((constraints . ,(vconcat constraints))))
             ,@(when gate `((gate . ,gate)))
             ,@(when gate-cleanup `((gateCleanup . ,gate-cleanup))))
           (nreverse errors))))
@@ -3458,9 +3599,23 @@ unchanged, nothing shown is ageing and the last refresh is younger than
   (unless (timerp +tt--notify-timer)
     (setq +tt--notify-timer (run-with-timer 1 3 #'+tt--notifications-poll))))
 
+;;;###autoload
+(defun +tt-evidence (item file-or-text)
+  "Record the owner's evidence for ITEM (the `C-c m e' command).
+FILE-OR-TEXT is an existing file whose contents are recorded, or the text
+itself.  A phase parked `AWAITING_OWNER' for an `evidence' item resumes once
+every evidence item is recorded (plan 06b)."
+  (interactive
+   (list (read-string "Item id: ")
+         (read-string "Evidence (file or text): ")))
+  (let* ((run (+tt--resolve-run))
+         (out (+tt--cli "evidence" run item file-or-text)))
+    (message "%s" (string-trim out))))
+
 ;;;; Keys
 
 (keymap-global-set "C-c m r" #'+tt-run)
+(keymap-global-set "C-c m e" #'+tt-evidence)
 (keymap-global-set "C-c m s" #'+tt-show)
 (keymap-global-set "C-c m d" #'+tt-review)
 (keymap-global-set "C-c m D" #'+tt-program-review)

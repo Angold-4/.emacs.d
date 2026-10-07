@@ -63,6 +63,126 @@
     (should (equal (alist-get 'reserved p1) ["public API types" "persistence format"]))
     (should (eq (alist-get 'provisional (aref (alist-get 'phases plan) 1)) t))))
 
+(defconst +tt-test--structured-plan
+  (concat "#+TITLE: structured\n"
+          "#+TT_REPO: /tmp/tt-ert-repo\n"
+          "#+TT_BRANCH: main\n"
+          "#+TT_CHECKS: make check\n\n"
+          "* Stage 1: two lanes\n"
+          "  :PROPERTIES:\n"
+          "  :ID:          stage-1\n"
+          "  :CHECKS:      make check\n"
+          "  :END:\n"
+          "** Goal\n"
+          "   The outcome and why, in the owner's words.\n"
+          "** Architecture\n"
+          "*** A1 Round                                                       :data:\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       A1\n"
+          "    :WHERE:    src/core/rounds.ts\n"
+          "    :END:\n"
+          "    #+begin_src typescript\n"
+          "    interface Round { n: number }\n"
+          "    #+end_src\n"
+          "    Who writes it, who reads it.\n"
+          "*** A2 Pick tally                                                   :rule:\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       A2\n"
+          "    :END:\n"
+          "    Strict majority of seats.\n"
+          "*** A3 Flow                                                         :flow:\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       A3\n"
+          "    :END:\n"
+          "    Plan to worker to checks.\n"
+          "** Requirements\n"
+          "*** R1 Two candidates from one base\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R1\n"
+          "    :ARCH:     A1\n"
+          "    :VERIFY:   test \"lanes: two candidates\"\n"
+          "    :END:\n"
+          "    One paragraph.\n"
+          "    - a sub-point\n"
+          "    - another sub-point\n"
+          "*** R2 Owner's live run\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R2\n"
+          "    :VERIFY:   evidence\n"
+          "    :END:\n"
+          "    The owner records it.\n"
+          "*** R3 Reviewed\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R3\n"
+          "    :VERIFY:   review\n"
+          "    :END:\n"
+          "    A reviewer judges it.\n"
+          "*** R4 Tally\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R4\n"
+          "    :ARCH:     A2\n"
+          "    :VERIFY:   test \"lanes: tally\"\n"
+          "    :END:\n"
+          "    The tally is by code.\n"
+          "** Constraints\n"
+          "*** C1 K = 1\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       C1\n"
+          "    :VERIFY:   test \"lanes: one worker\"\n"
+          "    :END:\n"
+          "    Today's loop.\n"
+          "*** C2 Public API\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       C2\n"
+          "    :VERIFY:   review\n"
+          "    :END:\n"
+          "    The public API does not change.\n")
+  "Plan 06b: the structured fixture the ERT parser tests share.")
+
+(ert-deftest tradeoffs-trace-plan-structured-parse ()
+  "Plan 06b: a structured phase parses to goal, 3 A, 4 R and 2 C items."
+  (let* ((parsed (+tt-test--parse +tt-test--structured-plan))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0))
+         (arch (alist-get 'architecture p1))
+         (reqs (alist-get 'requirements p1))
+         (cons (alist-get 'constraints p1)))
+    (should (null (plist-get parsed :errors)))
+    (should (equal (alist-get 'goal p1) "The outcome and why, in the owner's words."))
+    (should (= (length arch) 3))
+    (should (equal (mapcar (lambda (a) (alist-get 'id a)) arch) '("A1" "A2" "A3")))
+    (should (equal (alist-get 'tags (aref arch 0)) (vector "data")))
+    (should (equal (alist-get 'where (aref arch 0)) "src/core/rounds.ts"))
+    ;; The source block stays inside A1's text.
+    (should (string-match-p "interface Round" (alist-get 'text (aref arch 0))))
+    (should (= (length reqs) 4))
+    (should (equal (mapcar (lambda (r) (alist-get 'id r)) reqs) '("R1" "R2" "R3" "R4")))
+    (should (equal (alist-get 'arch (aref reqs 0)) (vector "A1")))
+    (should (equal (alist-get 'verify (aref reqs 0)) (vector "test \"lanes: two candidates\"")))
+    (should (equal (alist-get 'verify (aref reqs 1)) (vector "evidence")))
+    ;; The sub-list stays inside R1's text (#41).
+    (should (string-match-p "a sub-point" (alist-get 'text (aref reqs 0))))
+    (should (string-match-p "another sub-point" (alist-get 'text (aref reqs 0))))
+    (should (= (length cons) 2))
+    (should (equal (mapcar (lambda (c) (alist-get 'id c)) cons) '("C1" "C2")))))
+
+(ert-deftest tradeoffs-trace-plan-old-format-items ()
+  "Plan 06b: an old-format phase synthesizes R1..Rn and C1."
+  (let* ((parsed (+tt-test--parse +tt-test--valid-plan))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0))
+         (reqs (alist-get 'requirements p1))
+         (cons (alist-get 'constraints p1)))
+    (should (null (plist-get parsed :errors)))
+    (should (equal (mapcar (lambda (r) (alist-get 'id r)) reqs) '("R1" "R2")))
+    (should (equal (alist-get 'verify (aref reqs 0)) (vector "review")))
+    (should (= (length cons) 1))
+    (should (equal (alist-get 'id (aref cons 0)) "C1"))
+    ;; An `evidence:' item becomes an evidence verify.
+    (let* ((text (concat "#+TITLE: t\n#+TT_REPO: /tmp/x\n#+TT_BRANCH: main\n\n"
+                         "* Phase 1: p\n  :PROPERTIES:\n  :ID: p1\n  :CHECKS: true\n  :END:\n"
+                         "  Goal: g\n  Acceptance:\n  - evidence: the owner live run is recorded\n  - a worker check\n"))
+           (ev (aref (alist-get 'requirements (aref (alist-get 'phases (plist-get (+tt-test--parse text) :plan)) 0)) 0)))
+      (should (equal (alist-get 'verify ev) (vector "evidence"))))))
+
 (ert-deftest tradeoffs-trace-plan-rerun-keyword ()
   "Plan 05d: #+TT_RERUN becomes the plan's rerun template and its line."
   (let* ((text (concat "#+TITLE: rerun\n"
@@ -1384,6 +1504,32 @@ inert as it was before the key existed — no error, and nothing opened."
           "  :END:\n"
           "  not frozen yet\n")
   "A fixture `views/review.org' with a decision brief, a blocker, a trade-off and a raw finding.")
+
+(defconst +tt-test--review-items-org
+  (concat "* Plan items\n"
+          "  R 2/2 met · A 1/1 fit · C 1/1\n\n"
+          "  | item | worker | check | M | A | B |\n"
+          "  | R1 Two candidates | done | pass | met | met | met |\n"
+          "  | A1 Round | yes | — | fits | fits | fits |\n")
+  "Plan 06b: the item-by-seat matrix the runtime appends to `views/review.org'.")
+
+(ert-deftest tradeoffs-trace-review-item-matrix ()
+  "Plan 06b: the review buffer shows the item-by-seat matrix and the counts."
+  (let ((dir (make-temp-file "tt-ert-items" t)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert +tt-test--review-items-org))
+          (let ((+tt--run-dir dir)) (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              (should (string-match-p "Plan items" (buffer-string)))
+              (should (string-match-p "R 2/2 met · A 1/1 fit · C 1/1" (buffer-string)))
+              (should (string-match-p "R1 Two candidates | done | pass | met" (buffer-string)))
+              (should (string-match-p "A1 Round | yes" (buffer-string))))))
+      (delete-directory dir t))))
 
 (defun +tt-test--review-buffer (dir)
   "Open DIR's review the real way: +tt-review on a fixture run directory.

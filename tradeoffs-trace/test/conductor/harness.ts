@@ -192,6 +192,15 @@ export async function setupConductor(opts: {
   /** The phase's own goal text (default "do the thing"). A plan's prose is a
    * secret-value carrier too, so a test can quote one in it. */
   goal?: string;
+  /** Plan 06b: the phase's structured items (architecture/requirements/
+   * constraints). When given, the acceptance list is derived from the
+   * requirements' texts so the item loop (coverage, per-item verdicts, item
+   * acceptance) applies exactly as for an Emacs-parsed plan. */
+  items?: {
+    architecture?: import("../../src/core/items.ts").ArchitectureItem[];
+    requirements?: import("../../src/core/items.ts").RequirementItem[];
+    constraints?: import("../../src/core/items.ts").ConstraintItem[];
+  };
   /** Plan 01f: the phase's `:GATE:` command (omitted = no gate, the
    * pre-01f pipeline) and its `:GATE_CLEANUP:` companion. */
   gate?: string;
@@ -228,10 +237,11 @@ export async function setupConductor(opts: {
       {
         id: "p1",
         goal: opts.goal ?? "do the thing",
-        acceptance: ["it works", ...(opts.acceptanceFiles ?? [])],
+        acceptance: opts.items?.requirements ? opts.items.requirements.map((r) => r.text) : ["it works", ...(opts.acceptanceFiles ?? [])],
         checks: opts.phaseChecks ?? opts.checks ?? ["true"],
         boundaries: opts.boundaries ?? [],
         reserved: [],
+        ...(opts.items ?? {}),
         ...(opts.gate ? { gate: opts.gate } : {}),
         ...(opts.gateCleanup ? { gateCleanup: opts.gateCleanup } : {}),
       },

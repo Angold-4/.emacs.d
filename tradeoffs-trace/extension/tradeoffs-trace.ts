@@ -51,6 +51,7 @@ import {
   SUBMIT_BRIEF_PARAMS,
   SUBMIT_DISCOVERY_PARAMS,
   SUBMIT_EVALUATION_PARAMS,
+  SUBMIT_COVERAGE_PARAMS,
   SUBMIT_PANEL_VOTE_PARAMS,
   SUBMIT_PHASE_PARAMS,
   SUBMIT_REVIEW_PARAMS,
@@ -102,6 +103,8 @@ const BRIEF_SCHEMA = loadSchema("../schemas/decision-brief.schema.json");
 const SUBMISSION_SCHEMA_FILE = loadSchema("../schemas/submission.schema.json");
 const SUBMIT_PHASE_SCHEMA = subschema(SUBMISSION_SCHEMA_FILE, "submitPhase");
 const SUBMIT_DISCOVERY_SCHEMA = subschema(SUBMISSION_SCHEMA_FILE, "submitDiscovery");
+// Plan 06b: the worker's per-item coverage.
+const SUBMIT_COVERAGE_SCHEMA = subschema(SUBMISSION_SCHEMA_FILE, "submitCoverage");
 
 // --- typebox parameter schemas (what the model sees / what Pi enforces
 // structurally before `execute` runs). Each is built by mapping over the
@@ -268,7 +271,54 @@ const submitReviewFields: Record<string, TSchema> = {
       { description: "Plan 05e: mark every earlier-round finding/blocker resolved or open; a 2-of-3 resolved majority closes it" },
     ),
   ),
+  // Plan 06b: a verdict for every requirement and constraint, and every
+  // architecture item. A review that omits an id is incomplete.
+  items: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String({ description: "The requirement or constraint id from the checklist" }),
+        verdict: StringEnum(["met", "unmet", "partial"] as const),
+        evidence: Type.String({ description: "file:line-range in the candidate, a test name, or a command you ran" }),
+        note: Type.Optional(Type.String()),
+      }),
+      { description: "One verdict per requirement and constraint; a missing id is an incomplete review" },
+    ),
+  ),
+  arch: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String({ description: "The architecture item id from the checklist" }),
+        verdict: StringEnum(["fits", "deviates", "unclear"] as const),
+        evidence: Type.String({ description: "file:line-range in the candidate, a test name, or a command you ran" }),
+        note: Type.Optional(Type.String()),
+      }),
+      { description: "One verdict per architecture item; a missing id is an incomplete review" },
+    ),
+  ),
 };
+
+// Plan 06b: the worker's `submit_coverage` — a status for every requirement
+// and constraint, and fits/deviates for every architecture item.
+const CoverageEntryParam = Type.Object({
+  id: Type.String({ description: "The requirement or constraint id from the checklist" }),
+  status: StringEnum(["done", "partial", "not_done"] as const),
+  where: Type.Array(Type.String(), { description: "file:line locations, when known" }),
+  tests: Type.Array(Type.String(), { description: "Test names you ran" }),
+  note: Type.Optional(Type.String({ description: "Required when status is partial or not_done; becomes a trade-off message" })),
+});
+const ArchCoverageEntryParam = Type.Object({
+  id: Type.String({ description: "The architecture item id from the checklist" }),
+  fits: StringEnum(["yes", "deviates"] as const),
+  where: Type.Array(Type.String(), { description: "file:line locations, when known" }),
+  note: Type.Optional(Type.String({ description: "Required when fits is deviates; becomes a trade-off message" })),
+});
+const submitCoverageFields: Record<string, TSchema> = {
+  items: Type.Array(CoverageEntryParam),
+  arch: Type.Array(ArchCoverageEntryParam),
+};
+const SubmitCoverageParams = Type.Object(
+  Object.fromEntries(SUBMIT_COVERAGE_PARAMS.properties.map((key) => [key, submitCoverageFields[key]])),
+);
 const SubmitReviewParams = Type.Object(
   Object.fromEntries(SUBMIT_REVIEW_PARAMS.properties.map((key) => [key, submitReviewFields[key]])),
 );
@@ -469,6 +519,7 @@ class RunSocketClient {
       | "submit_phase"
       | "submit_discovery"
       | "submit_review"
+      | "submit_coverage"
       | "raise_tradeoff"
       | "submit_evaluation"
       | "submit_panel_vote"
@@ -532,7 +583,12 @@ export default function (pi: ExtensionAPI) {
    * is satisfied. Worker: submit_phase. Reviewer: submit_discovery in turn
    * 1, then submit_review in turn 2 (design §3.3 two-turn review). */
   function owedSubmission(): string | undefined {
-    if (role === "worker") return accepted.has("submit_phase") ? undefined : "submit_phase";
+    if (role === "worker") {
+      // Plan 06b: the worker ends its attempt with submit_coverage, before
+      // submit_phase — the freeze is refused until the coverage is complete.
+      if (!accepted.has("submit_coverage")) return "submit_coverage";
+      return accepted.has("submit_phase") ? undefined : "submit_phase";
+    }
     // Plan 05j: the curator owes no submission; an empty proposals list is a
     // valid pass and settling without one is allowed.
     if (role === "curator") return undefined;
@@ -556,6 +612,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   const REMINDER_TEXT: Record<string, string> = {
+    submit_coverage:
+      "You have not called submit_coverage yet. For every requirement and constraint, give status done, partial or not_done with where and tests; for every architecture item, give fits or deviates with where. A partial, not_done or deviates entry must carry a note.",
     submit_phase:
       "You have not called submit_phase yet. The phase cannot finish without it — call submit_phase with your decisions, assumptions and deviations before finishing.",
     submit_discovery:
@@ -668,6 +726,7 @@ export default function (pi: ExtensionAPI) {
       | "submit_phase"
       | "submit_discovery"
       | "submit_review"
+      | "submit_coverage"
       | "raise_tradeoff"
       | "submit_evaluation"
       | "submit_panel_vote"
@@ -719,6 +778,20 @@ export default function (pi: ExtensionAPI) {
       const error = validateOrError(SUBMIT_PHASE_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_phase", params);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_coverage",
+    label: "Submit Coverage",
+    description:
+      "Cover every requirement and constraint (done/partial/not_done, with where and tests) and every architecture item (fits/deviates, with where). The phase cannot freeze until the coverage is complete.",
+    promptSnippet: "Submit your coverage of every requirement, constraint and architecture item",
+    parameters: SubmitCoverageParams,
+    async execute(_toolCallId, params) {
+      const error = validateOrError(SUBMIT_COVERAGE_SCHEMA, params);
+      if (error) return { isError: true, content: [{ type: "text", text: error }] };
+      return submitTool("submit_coverage", params);
     },
   });
 

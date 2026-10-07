@@ -21,11 +21,23 @@
 // numbers come from the Org source: Emacs records them on `acceptanceLines`
 // when it parses the plan, and a hand-written JSON plan simply gets no line.
 
+import { parseVerify } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
 export type LintSeverity = "error" | "warning";
 
-export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no-tolerance" | "model-declaration" | "rerun-template";
+export type LintRule =
+  | "owner-actor"
+  | "human-actor"
+  | "future-dependency"
+  | "no-tolerance"
+  | "model-declaration"
+  | "rerun-template"
+  // Plan 06b: the structured-plan rules (refs/06_ref_plan_format.md).
+  | "item-id"
+  | "item-arch"
+  | "item-verify"
+  | "item-text-loss";
 
 /** The roles #+TT_MODELS may assign a model to. */
 const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
@@ -68,14 +80,44 @@ export interface LintFinding {
   fix: string;
 }
 
+/** One structured item (`:ID:` subheading) as the linter reads it. The line
+ * fields are recorded by the Emacs parser; a hand-written JSON plan may omit
+ * them and the finding simply carries no line. */
+export interface LintItemInput {
+  id?: string;
+  title?: string;
+  text?: string;
+  /** The exact Org body, when the parser recorded it. `lintItems` reports a
+   * parsed `text` that is missing a line of `rawText`. */
+  rawText?: string;
+  /** Architecture only: the module/area the item lives in. */
+  where?: string;
+  whereLine?: number;
+  tags?: string[];
+  /** Requirements only: the architecture ids the item is realised by. */
+  arch?: string[];
+  /** Requirements and constraints: the raw `:VERIFY:` strings. */
+  verify?: string[];
+  line?: number;
+  archLine?: number;
+  verifyLine?: number;
+}
+
 /** The slice of a plan the linter needs. `RunPlanFile`/`RunPlanPhase` are
  * structurally assignable to it, so the CLI can pass a parsed plan directly. */
 export interface LintPhaseInput {
   id?: string;
+  /** The phase's Goal paragraph, when the parser read it. */
+  goal?: string;
   acceptance?: string[];
   /** 1-based source lines of `acceptance`, parallel to it (Emacs records
    * these; absent for a hand-written JSON plan). */
   acceptanceLines?: number[];
+  /** Plan 06b: the structured items of the phase subtree. Absent on an
+   * old-format plan (only `acceptance`), where no item rule fires. */
+  architecture?: LintItemInput[];
+  requirements?: LintItemInput[];
+  constraints?: LintItemInput[];
 }
 
 export interface LintPlanInput {
@@ -320,12 +362,89 @@ export function lintRerun(plan: LintPlanInput): LintFinding[] {
   ];
 }
 
-/** Lint one plan (all its phases' acceptance items, its #+TT_MODELS and its
- * #+TT_RERUN). Pure. */
+/** Lines of `rawText` that the parsed `text` does not carry: the proof that a
+ * parser dropped part of an item (a sub-list or a source block cut off at the
+ * first blank line, the #41 failure). Property-drawer and blank lines are not
+ * item text and are ignored. */
+export function lostTextLines(rawText: string | undefined, text: string | undefined): string[] {
+  if (typeof rawText !== "string" || rawText.trim().length === 0) return [];
+  const parsed = text ?? "";
+  const missing: string[] = [];
+  for (const raw of rawText.split("\n")) {
+    const line = raw.trim();
+    if (line.length === 0) continue;
+    if (/^:(?:PROPERTIES|END):$/i.test(line)) continue;
+    if (/^:[A-Za-z0-9_]+:\s*/.test(line)) continue;
+    if (!parsed.includes(line)) missing.push(line);
+  }
+  return missing;
+}
+
+/** Plan 06b: lint a phase's structured items — a missing or duplicate `:ID:`,
+ * an `:ARCH:` naming no architecture item, a `test` verify without a name, and
+ * text lost in parsing (a line of `rawText` the parsed `text` does not
+ * carry). */
+export function lintItems(phase: LintPhaseInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  const phaseId = phase.id ?? "?";
+  const architecture = phase.architecture ?? [];
+  const requirements = phase.requirements ?? [];
+  const constraints = phase.constraints ?? [];
+  const all: Array<{ kind: string; item: LintItemInput }> = [
+    ...architecture.map((item) => ({ kind: "architecture", item })),
+    ...requirements.map((item) => ({ kind: "requirement", item })),
+    ...constraints.map((item) => ({ kind: "constraint", item })),
+  ];
+  const architectureIds = new Set(architecture.map((a) => a.id).filter((id): id is string => typeof id === "string" && id.length > 0));
+  const seen = new Map<string, number>();
+  const finding = (rule: LintRule, item: LintItemInput, line: number | undefined, problem: string, fix: string): LintFinding => ({
+    severity: "error",
+    rule,
+    phaseId,
+    item: (item.text ?? item.title ?? item.id ?? "(item)").split("\n")[0],
+    line,
+    sourceFile: undefined,
+    problem,
+    fix,
+  });
+  for (const { item } of all) {
+    const id = item.id;
+    if (typeof id !== "string" || id.trim().length === 0) {
+      out.push(finding("item-id", item, item.line, "the item has no :ID: property", "give the subheading an :ID: property (for example A1, R2 or C1)"));
+    } else if (seen.has(id)) {
+      out.push(finding("item-id", item, item.line, `the item id ${id} is already used at line ${seen.get(id)}`, `give each item a unique :ID: (${id} is taken)`));
+    } else {
+      seen.set(id, item.line ?? 0);
+    }
+    for (const raw of item.verify ?? []) {
+      for (const v of parseVerify(raw)) {
+        if (v.kind === "test" && v.name.trim().length === 0) {
+          out.push(finding("item-verify", item, item.verifyLine ?? item.line, `a test verify has no name: ${JSON.stringify(raw)}`, 'write test "<the test name>" (the name as the test runner prints it), or drop the test kind'));
+        }
+      }
+    }
+    const missing = lostTextLines(item.rawText, item.text);
+    if (missing.length > 0) {
+      out.push(finding("item-text-loss", item, item.line, `the parsed item text is missing ${missing.length} source line(s), starting with ${JSON.stringify(missing[0])}`, "keep the whole item body in the parsed text: a sub-list or a source block inside an item belongs to that item"));
+    }
+  }
+  for (const item of requirements) {
+    for (const arch of item.arch ?? []) {
+      if (!architectureIds.has(arch)) {
+        out.push(finding("item-arch", item, item.archLine ?? item.line, `:ARCH: names ${arch}, which is no architecture item of this phase`, "name an existing architecture item id (one of " + ([...architectureIds].join(", ") || "none") + "), or add the architecture item"));
+      }
+    }
+  }
+  return out;
+}
+
+/** Lint one plan (all its phases' acceptance items, its structured items,
+ * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
+    for (const finding of lintItems(phase)) out.push({ ...finding, sourceFile: plan.sourceFile });
     const acceptance = phase.acceptance ?? [];
     acceptance.forEach((item, i) => {
       const line = phase.acceptanceLines?.[i];

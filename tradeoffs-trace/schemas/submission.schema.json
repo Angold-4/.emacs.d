@@ -101,6 +101,38 @@
           "items": { "$ref": "#/$defs/decisionDisclosure" }
         }
       }
+    },
+    "coverageEntry": {
+      "type": "object",
+      "required": ["id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["done", "partial", "not_done"] },
+        "where": { "type": "array", "items": { "type": "string" } },
+        "tests": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
+    },
+    "archCoverageEntry": {
+      "type": "object",
+      "required": ["id", "fits"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "fits": { "enum": ["yes", "deviates"] },
+        "where": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
+    },
+    "submitCoverage": {
+      "type": "object",
+      "required": ["items", "arch"],
+      "additionalProperties": true,
+      "properties": {
+        "items": { "type": "array", "items": { "$ref": "#/$defs/coverageEntry" } },
+        "arch": { "type": "array", "items": { "$ref": "#/$defs/archCoverageEntry" } }
+      }
     }
   }
 }

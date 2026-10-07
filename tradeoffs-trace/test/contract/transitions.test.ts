@@ -313,6 +313,42 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "RESOLVING_INCOMPLETE" },
   },
+  "awaiting-owner-evidence-recorded": {
+    state: baseState({
+      phase: "AWAITING_OWNER",
+      contract: {
+        ...baseState().phase.contract,
+        acceptance: ["the owner run is recorded"],
+        requirements: [{ id: "R1", title: "owner run", text: "the owner run is recorded", arch: [], verify: ["evidence"] }],
+      },
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: {
+        M: { review: { ...approvingReview("M", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+        A: { review: { ...approvingReview("A", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+        B: { review: { ...approvingReview("B", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+      },
+      itemEvidence: [{ id: "R1", text: "recorded" }],
+      ownerRequests: [
+        {
+          id: "OR-evidence-1",
+          version: 1,
+          phaseId: "p1",
+          reason: "the owner must record evidence for R1",
+          origin: "repair_budget_exhausted",
+          boundCandidateSha: "C1",
+          boundContractVersion: K,
+          options: [
+            { id: "grant", label: "grant 3 more repair rounds" },
+            { id: "stop", label: "stop the phase" },
+          ],
+          status: "open",
+        },
+      ],
+    }),
+    event: { type: "EVIDENCE_RECORDED", itemId: "R1" },
+  },
   "accepted-publish-intent": {
     state: baseState({ phase: "ACCEPTED", candidate: C1, integrationHead: "H0", probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true } }),
     event: { type: "PUBLISH_INTENT", expectedHead: "H0", candidateI: "I1" },

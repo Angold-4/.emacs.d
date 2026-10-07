@@ -31,6 +31,7 @@ import {
   type LintPlanInput,
   type LintProgramInput,
 } from "./core/plan-lint.ts";
+import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
@@ -76,7 +77,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--skip-models-check]\n       tt lint <plan.json|program.json>   (findings; non-zero on errors)\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -99,10 +100,19 @@ function reportFindings(findings: readonly LintFinding[], file: string, out: Nod
  * exits non-zero when any is an error, so a script (and Emacs) can branch on
  * the exit status. Warnings alone exit 0. */
 function cmdLint(file: string): void {
-  const json = JSON.parse(readFileSync(file, "utf8")) as unknown;
+  // Plan 06b: `tt lint` reads a phase subtree too — an `.org` file is parsed
+  // by the lint-side Org reader, a `.json` file is read directly. Both reach
+  // the same item rules.
+  const json = file.endsWith(".org") ? parseOrgPlan(readFileSync(file, "utf8"), file) : (JSON.parse(readFileSync(file, "utf8")) as unknown);
   const findings = lintJson(json);
   reportFindings(findings, file, process.stdout);
   if (hasLintErrors(findings)) process.exitCode = 1;
+}
+
+/** Plan 06b: `tt plan template` — the Org skeleton owners and agents start
+ * from. It is lint-clean, so a new plan begins from a passing shape. */
+function cmdPlanTemplate(): void {
+  process.stdout.write(PLAN_TEMPLATE);
 }
 
 function parseArgs(argv: string[]): {
@@ -1163,6 +1173,35 @@ async function awaitInboxVerdict(
   }
 }
 
+/** Plan 06b: `tt evidence <run> <item> <file-or-text>` — the owner records an
+ * `evidence` item. A file path is read; any other argument is the text
+ * itself. Written through the inbox, so the conductor validates the item and
+ * resumes the parked phase. */
+async function cmdEvidence(positional: string[], root: string): Promise<void> {
+  const [runArg, item, ...rest] = positional;
+  const arg = rest.join(" ");
+  const runDir = resolveRunDir(runArg, root);
+  let text = arg;
+  try {
+    if (arg.length > 0 && existsSync(arg) && statSync(arg).isFile()) text = readFileSync(arg, "utf8");
+  } catch {
+    // keep the literal argument
+  }
+  const inbox = path.join(runDir, "inbox");
+  mkdirSync(inbox, { recursive: true });
+  const commandId = `evidence-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify({ type: "evidence", item, text }, null, 2));
+  const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
+  if (outcome.kind === "applied") {
+    process.stdout.write(`evidence recorded for ${item} in run ${path.basename(runDir)}\n`);
+  } else if (outcome.kind === "rejected") {
+    process.stdout.write(`evidence rejected: ${outcome.reason}\n`);
+    process.exitCode = 1;
+  } else {
+    process.stdout.write(`queued evidence ${commandId} for ${item} (queued, not yet applied)\n`);
+  }
+}
+
 async function cmdVerdict(
   positional: string[],
   root: string,
@@ -1462,6 +1501,11 @@ async function main(): Promise<void> {
   } else if (cmd === "lint") {
     if (positional.length !== 1) usage();
     cmdLint(positional[0]);
+  } else if (cmd === "plan" && positional[0] === "template") {
+    cmdPlanTemplate();
+  } else if (cmd === "evidence") {
+    if (positional.length < 3) usage();
+    await cmdEvidence(positional, runRoot);
   } else if (cmd === "status") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);

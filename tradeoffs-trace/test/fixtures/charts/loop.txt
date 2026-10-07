@@ -111,6 +111,7 @@ phase states:
   +----------------+
   | AWAITING_OWNER |  not entered
   +----------------+
+      +- EVIDENCE_RECORDED         -> RESOLVING       [awaiting-owner-evidence-recorded]
       +- AMEND                     -> CHECKING        [amend-from-awaiting_owner]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-awaiting_owner]
       +- REVISE (targetRecordBindingCurrentAndClears) -> REPAIRING       [revise-from-awaiting-owner-clears]

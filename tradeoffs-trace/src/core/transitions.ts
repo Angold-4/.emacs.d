@@ -30,8 +30,11 @@ import {
   blockerWithOutcome,
   blockersNeedingPanel,
   DEFAULT_BLOCKER_OPTIONS,
+  evidenceAllRecorded,
+  evidenceOnlyPending,
   evaluationSettled,
   isLiveDecision,
+  pendingEvidenceItems,
   resolvedCorrectionIdsFor,
   reviewsComplete,
   sameVersion,
@@ -903,9 +906,15 @@ function applyCriterionAmended(s: State, ev: Event): State {
       ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
       : f,
   );
+  // Plan 06b: a structured phase carries the criterion in its requirement
+  // item too, so the amended wording must replace both (by position).
+  const requirements =
+    s.phase.contract.requirements && s.phase.contract.requirements.length === e.newAcceptance.length
+      ? s.phase.contract.requirements.map((r, i) => ({ ...r, title: e.newAcceptance[i], text: e.newAcceptance[i] }))
+      : s.phase.contract.requirements;
   return withPhase(s, {
     phase: "IMPLEMENTING",
-    contract: { ...s.phase.contract, acceptance: e.newAcceptance, contractVersion: e.newContractVersion },
+    contract: { ...s.phase.contract, acceptance: e.newAcceptance, ...(requirements ? { requirements } : {}), contractVersion: e.newContractVersion },
     candidate: s.phase.candidate && { sha: s.phase.candidate.sha, contractVersion: e.newContractVersion },
     decisions,
     findings,
@@ -1031,7 +1040,8 @@ addRow({
   from: "RESOLVING",
   trigger: "RESOLVING_INCOMPLETE",
   guardName: "openItemsAndBudgetRemains",
-  guard: (s) => !acceptHolds(s) && budgetRemains(s),
+  // Plan 06b: an evidence-only phase parks on the owner, not a repair round.
+  guard: (s) => !acceptHolds(s) && budgetRemains(s) && !evidenceOnlyPending(s.phase),
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING" }),
@@ -1043,10 +1053,48 @@ addRow({
   from: "RESOLVING",
   trigger: "RESOLVING_INCOMPLETE",
   guardName: "openItemsBudgetExhausted",
-  guard: (s) => !acceptHolds(s) && budgetExhausted(s),
+  guard: (s) => !acceptHolds(s) && (budgetExhausted(s) || evidenceOnlyPending(s.phase)),
   to: "AWAITING_OWNER",
   actions: [],
-  apply: (s) => enterAwaitingOwner(s, "the repair budget ran out while items remained open"),
+  apply: (s) =>
+    enterAwaitingOwner(
+      s,
+      evidenceOnlyPending(s.phase)
+        ? `the owner must record evidence for ${pendingEvidenceItems(s.phase).map((i) => i.id).join(", ")}`
+        : "the repair budget ran out while items remained open",
+    ),
+});
+
+// Plan 06b: every `evidence` item is recorded, so the owner has done the
+// thing the phase parked for. The parking request closes and the phase
+// resumes to RESOLVING, where next() re-evaluates accept().
+addRow({
+  id: "awaiting-owner-evidence-recorded",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "EVIDENCE_RECORDED",
+  guardName: "evidenceAllRecorded",
+  guard: (s) => evidenceAllRecorded(s.phase),
+  to: "RESOLVING",
+  // The gate-less fixture (base contract): accept now holds, so the row's
+  // actions are exactly next(RESOLVING).
+  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  apply: (s) =>
+    withPhase(s, {
+      phase: "RESOLVING",
+      ownerRequests: s.phase.ownerRequests.map((r) =>
+        r.status === "open"
+          ? {
+              ...r,
+              status: "resolved" as const,
+              resolution: { option: "evidence_recorded" },
+              resolvedBinding: s.phase.candidate
+                ? { candidateSha: s.phase.candidate.sha, contractVersion: s.phase.contract.contractVersion }
+                : undefined,
+            }
+          : r,
+      ),
+    }),
 });
 
 // --- ACCEPTED / PUBLISHING --------------------------------------------

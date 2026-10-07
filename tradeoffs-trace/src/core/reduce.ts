@@ -108,6 +108,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "INTEGRITY_VIOLATED",
   "BRIEFS_RECORDED",
   "BRIEF_RETRY_ATTEMPTED",
+  "ITEM_STATE_UPDATED",
+  "EVIDENCE_RECORDED",
   "DECISION_ADDED",
   "NOTE_ADDED",
   "OWNER_INPUT_RECORDED",
@@ -331,6 +333,24 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, "a finding must carry evidence; got none");
       }
       return ok({ ...state, phase: { ...p, findings: [...p.findings, event.finding] } });
+    }
+
+    case "ITEM_STATE_UPDATED": {
+      // Plan 06b: the item loop's own state, merged record-only. Nothing
+      // here moves the phase; the freeze, checks, reviews and acceptance
+      // read it.
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          ...(event.coverage ? { coverage: event.coverage } : {}),
+          ...(event.checkResolution ? { checkResolution: event.checkResolution } : {}),
+          ...(event.itemEvidence ? { itemEvidence: event.itemEvidence } : {}),
+          ...(event.acceptedDeviations ? { acceptedDeviations: event.acceptedDeviations } : {}),
+          ...(event.archSymbolDeviations ? { archSymbolDeviations: event.archSymbolDeviations } : {}),
+          ...(event.overturns ? { overturns: event.overturns } : {}),
+        },
+      });
     }
 
     case "DECISION_ADDED": {

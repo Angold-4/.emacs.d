@@ -86,7 +86,57 @@
         "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "provisional": { "type": "boolean" }
+        "provisional": { "type": "boolean" },
+        "architecture": { "type": "array", "items": { "$ref": "#/$defs/ArchitectureItem" } },
+        "requirements": { "type": "array", "items": { "$ref": "#/$defs/RequirementItem" } },
+        "constraints": { "type": "array", "items": { "$ref": "#/$defs/ConstraintItem" } }
+      }
+    },
+    "ArchitectureItem": {
+      "description": "One architecture item (an :ID: subheading under Architecture).",
+      "type": "object",
+      "required": ["id", "title", "text", "tags"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "text": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "where": { "type": "string" },
+        "rawText": { "type": "string" },
+        "line": { "type": "integer" }
+      }
+    },
+    "RequirementItem": {
+      "description": "One requirement item (an :ID: subheading under Requirements).",
+      "type": "object",
+      "required": ["id", "title", "text", "arch", "verify"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "text": { "type": "string" },
+        "arch": { "type": "array", "items": { "type": "string" } },
+        "verify": { "type": "array", "items": { "type": "string" } },
+        "rawText": { "type": "string" },
+        "line": { "type": "integer" },
+        "archLine": { "type": "integer" },
+        "verifyLine": { "type": "integer" }
+      }
+    },
+    "ConstraintItem": {
+      "description": "One constraint item (an :ID: subheading under Constraints).",
+      "type": "object",
+      "required": ["id", "title", "text", "verify"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "text": { "type": "string" },
+        "verify": { "type": "array", "items": { "type": "string" } },
+        "rawText": { "type": "string" },
+        "line": { "type": "integer" },
+        "verifyLine": { "type": "integer" }
       }
     },
     "RoleModel": {

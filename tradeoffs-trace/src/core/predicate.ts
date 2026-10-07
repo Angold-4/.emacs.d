@@ -30,6 +30,10 @@
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
+// Plan 06b: the per-item acceptance half — every R and C met by majority with
+// its test verifies passed, every A fitting by majority or its deviation
+// accepted by the owner, and every evidence item recorded.
+import { flatItems, itemNeedsEvidence, itemsAccept, itemsFromPhase, tallyItems, testVerifyProblems } from "./items.ts";
 import type { RoundPanelOutcome, RoundPanelState } from "./types.ts";
 import type {
   ContractVersion,
@@ -473,6 +477,36 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
   }
 
+  // Plan 06b: a structured phase additionally requires every item point met
+  // (or fit), its `test` verifies passed, and every `evidence` item recorded.
+  if (phase.contract.requirements !== undefined || phase.contract.constraints !== undefined || phase.contract.architecture !== undefined) {
+    const items = itemsFromPhase(phase.contract);
+    const reviews = (["M", "A", "B"] as const).map((seat) => {
+      const r = phase.reviews[seat]?.review;
+      return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
+    });
+    if (testVerifyProblems(phase.checkResolution ?? []).length > 0) return false;
+    // An architecture deviation is accepted when the owner accepts the item's
+    // own blocking finding as a trade-off (`accept_risk`), or when it is
+    // recorded in `acceptedDeviations`.
+    const acceptedDeviations = new Set([
+      ...(phase.acceptedDeviations ?? []),
+      ...phase.findings.filter((f) => f.itemId && f.status === "accepted").map((f) => f.itemId!),
+    ]);
+    // A `:WHERE:` symbol the conductor could not find is a deviation the
+    // owner must accept before acceptance, whatever the seats said.
+    if ((phase.archSymbolDeviations ?? []).some((id) => !acceptedDeviations.has(id))) return false;
+    const outcomes = tallyItems(items, reviews, phase.overturns ?? []);
+    if (
+      !itemsAccept(items, outcomes, {
+        acceptedDeviations: [...acceptedDeviations],
+        evidenceRecorded: (phase.itemEvidence ?? []).map((e) => e.id),
+      })
+    ) {
+      return false;
+    }
+  }
+
   if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open")) {
     return false;
   }
@@ -502,6 +536,41 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
   }
 
   return true;
+}
+
+/** Plan 06b: true when the ONLY thing keeping the phase from acceptance is an
+ * unrecorded `evidence` item. Then the phase parks AWAITING_OWNER naming the
+ * item instead of spending a repair round the worker cannot satisfy. */
+/** The `evidence` items not yet recorded. */
+export function pendingEvidenceItems(phase: PhaseState) {
+  if (phase.contract.requirements === undefined && phase.contract.constraints === undefined && phase.contract.architecture === undefined) return [];
+  const items = itemsFromPhase(phase.contract);
+  const recorded = new Set((phase.itemEvidence ?? []).map((e) => e.id));
+  return flatItems(items).filter((i) => itemNeedsEvidence(i) && !recorded.has(i.id));
+}
+
+/** True when the phase has at least one `evidence` item and every one is
+ * recorded. */
+export function evidenceAllRecorded(phase: PhaseState): boolean {
+  const ev = flatItems(itemsFromPhase(phase.contract)).filter((i) => itemNeedsEvidence(i));
+  if (ev.length === 0) return false;
+  const recorded = new Set((phase.itemEvidence ?? []).map((e) => e.id));
+  return ev.every((i) => recorded.has(i.id));
+}
+
+export function evidenceOnlyPending(phase: PhaseState): boolean {
+  const c = phase.contract;
+  if (c.requirements === undefined && c.constraints === undefined && c.architecture === undefined) return false;
+  if (!phase.candidate) return false;
+  const pending = pendingEvidenceItems(phase);
+  if (pending.length === 0) return false;
+  // Everything else acceptable: pretend the evidence is recorded and ask
+  // accept() whether only the evidence stood in the way.
+  const withEvidence: PhaseState = {
+    ...phase,
+    itemEvidence: [...(phase.itemEvidence ?? []), ...pending.map((i) => ({ id: i.id, text: "pending" }))],
+  };
+  return accept(withEvidence, phase.candidate.sha, c.contractVersion);
 }
 
 /** done(phase) ⇔ accept(C, K) ∧ the integration branch points at the probed I. */

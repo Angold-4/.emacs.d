@@ -37,6 +37,8 @@ export interface RecordBinding {
 // §1.1 Plan and phase contract
 // ---------------------------------------------------------------------------
 
+import type { ArchitectureItem, ConstraintItem, RequirementItem } from "./items.ts";
+
 export interface PlanPhase {
   id: string;
   goal: string;
@@ -45,6 +47,12 @@ export interface PlanPhase {
   boundaries: string[];
   reserved: string[];
   provisional: boolean;
+  /** Plan 06b: the structured items of a phase subtree (ref
+   * refs/06_ref_plan_format.md). Absent on an old-format plan, where
+   * `acceptance`/`reserved` are the only items. */
+  architecture?: ArchitectureItem[];
+  requirements?: RequirementItem[];
+  constraints?: ConstraintItem[];
 }
 
 export interface Plan {
@@ -62,6 +70,13 @@ export interface PhaseContract {
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 06b: the structured items of the frozen contract. The FSM,
+   * prompts, checks, verdicts and acceptance all read these; absent on an
+   * old-format phase, where `itemsFromPhase` synthesizes R1..Rn from
+   * `acceptance` and C1 from `reserved`. */
+  architecture?: ArchitectureItem[];
+  requirements?: RequirementItem[];
+  constraints?: ConstraintItem[];
   /** Plan 01f: the phase's own expensive, live command (the plan's `:GATE:`
    * property). Declaring one inserts a GATING stage between RESOLVING and
    * ACCEPTED: the conductor runs this command itself, once per candidate the
@@ -167,6 +182,10 @@ export interface Decision {
   /** Plan 2c: reviewers who independently discovered this same choice and
    * matched their discovery to this record (design §3.3, §10). */
   alsoSeenBy?: Reviewer[];
+  /** Plan 06b: the plan item this finding is anchored to (an R, C or A id),
+   * when a per-item majority produced it. The repair prompt and the item
+   * matrix use it to point at the exact point. */
+  itemId?: string;
 }
 
 /** Plan 2c: in a repair attempt the worker states, for each of its prior
@@ -608,6 +627,12 @@ export interface Review {
    * evidence. A majority `resolved` moves the message to `resolved`; a
    * majority `open` (or no majority) leaves it live. */
   resolutionStatements?: FindingResolutionStatement[];
+  /** Plan 06b: this reviewer's verdict on every requirement and constraint
+   * (`met`/`unmet`/`partial`) and every architecture item
+   * (`fits`/`deviates`/`unclear`), each with evidence. A review that omits an
+   * id is incomplete under the existing complete-ballot rule. */
+  items?: import("./items.ts").ItemVerdict[];
+  arch?: import("./items.ts").ArchVerdict[];
 }
 
 /** Plan 05e: one reviewer's mark on an earlier round's open finding/blocker
@@ -1089,6 +1114,26 @@ export interface PhaseState {
    * been re-dispatched once. Folded from BRIEF_RETRY_ATTEMPTED, so the retry
    * is once per candidate even across a restart. */
   briefRetries?: string[];
+  /** Plan 06b: the worker's `submit_coverage` payload. The freeze is refused
+   * until it covers every R, C and A. */
+  coverage?: import("./items.ts").Coverage;
+  /** Plan 06b: every `test` verify resolved against the candidate's check
+   * run. A missing or failed one is a blocking finding anchored to its item. */
+  checkResolution?: import("./items.ts").VerifyResolution[];
+  /** Plan 06b: the items the owner recorded with `tt evidence`, and the
+   * recording. The phase parks AWAITING_OWNER until every `evidence` item is
+   * here. */
+  itemEvidence?: Array<{ id: string; text: string; at?: string; commandId?: string }>;
+  /** Plan 06b: architecture item ids whose deviation the owner accepted as a
+   * trade-off. */
+  acceptedDeviations?: string[];
+  /** Plan 06b: architecture items whose `:WHERE:` symbol the conductor
+   * grepped for and did not find in the candidate. Recorded as `deviates`
+   * before any reviewer is asked. */
+  archSymbolDeviations?: string[];
+  /** Plan 06b: verdicts the evaluator's re-verification overturned, each
+   * counted against its seat. */
+  overturns?: import("./items.ts").Overturn[];
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
@@ -1959,7 +2004,30 @@ export interface EvBriefRetryAttempted {
   requestIds: string[];
 }
 
+/** Plan 06b: the item-loop state, as one record-only event so a conductor
+ * restart rebuilds the worker's coverage, the check resolution, the owner's
+ * evidence recordings, the accepted deviations and the evaluator's overturns
+ * from the log alone. Fields are replaced when present. */
+export interface EvItemStateUpdated {
+  type: "ITEM_STATE_UPDATED";
+  coverage?: import("./items.ts").Coverage;
+  checkResolution?: import("./items.ts").VerifyResolution[];
+  itemEvidence?: Array<{ id: string; text: string; at?: string; commandId?: string }>;
+  acceptedDeviations?: string[];
+  archSymbolDeviations?: string[];
+  overturns?: import("./items.ts").Overturn[];
+}
+
+/** Plan 06b: every `evidence` item is now recorded, so the phase the owner
+ * parked resumes to RESOLVING (and acceptance, if nothing else is open). */
+export interface EvEvidenceRecorded {
+  type: "EVIDENCE_RECORDED";
+  itemId: string;
+}
+
 export type Event =
+  | EvItemStateUpdated
+  | EvEvidenceRecorded
   | EvReviewLintFailed
   | EvBriefsRecorded
   | EvBriefRetryAttempted
