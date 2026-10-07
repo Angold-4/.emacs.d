@@ -2510,6 +2510,13 @@ export class Conductor {
       this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
       return;
     }
+    // OD-2 (disc-M-91): an old-format phase has no structured items and never
+    // parks for evidence, so a recording there has no effect; refuse it
+    // rather than accept a no-op.
+    if (!this.#structured()) {
+      this.#rejectInboxFile(file, commandId, "this phase has no structured items, so it has no evidence items to record");
+      return;
+    }
     const itemId = typeof raw.item === "string" ? raw.item.trim() : "";
     const text = typeof raw.text === "string" ? raw.text.trim() : "";
     const evidenceItems = flatItems(this.#planItems()).filter((i) => itemNeedsEvidence(i));
@@ -3301,7 +3308,8 @@ export class Conductor {
       if (!this.#structured()) return { ok: true };
       const args = msg.args as Coverage;
       const issues = coverageIssues(args, this.#planItems());
-      this.#applyEvent({ type: "ITEM_STATE_UPDATED", coverage: args });
+      // OD-2 A2: bind the report to the attempt it was submitted in.
+      this.#applyEvent({ type: "ITEM_STATE_UPDATED", coverage: args, coverageAttempt: this.#state.phase.attempt.n });
       if (issues.length > 0) {
         const reason = `coverage is incomplete: ${issues.join("; ")}`;
         this.#log.append("coverage_refused", { at: "submit_coverage", issues, reason });
@@ -3314,9 +3322,11 @@ export class Conductor {
       if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
         return { ok: false, reason: `submit_phase is not accepted in phase ${this.#state.phase.phase}` };
       }
-      // Plan 06b: the freeze is refused until the coverage is complete.
+      // Plan 06b: the freeze is refused until the coverage is complete AND
+      // bound to the CURRENT attempt (OD-2 A2).
       if (this.#itemsEnforced()) {
-        const issues = coverageIssues(this.#state.phase.coverage, this.#planItems());
+        const bound = this.#state.phase.coverageAttempt === this.#state.phase.attempt.n;
+        const issues = bound ? coverageIssues(this.#state.phase.coverage, this.#planItems()) : ["no coverage was submitted for this attempt"];
         if (issues.length > 0) {
           const reason = `submit_phase refused until submit_coverage is complete: ${issues.join("; ")}`;
           this.#log.append("coverage_refused", { at: "submit_phase", issues, reason });
@@ -3642,7 +3652,7 @@ export class Conductor {
       // = { id, verdict, evidence }. For every item with a review-only
       // majority unmet/deviates the evaluator owes a check: a missing one is
       // re-prompted once, then recorded `unchecked` (visible, never silent).
-      const owed = this.#owedItemCheckIds();
+      const owed = this.#owedItemCheckIds(messageType);
       const checkEvents: Event[] = [];
       const provided = new Set<string>();
       const itemChecks = (msg.args as { itemChecks?: unknown }).itemChecks;
@@ -5441,12 +5451,18 @@ export class Conductor {
     });
   }
 
-  /** Plan 06b (OD-2 A3): the item ids the evaluator owes a check for, on a
-   * structured phase with a review-only majority unmet/deviates. */
-  #owedItemCheckIds(): string[] {
+  /** Plan 06b (OD-2 A3, ODP-2): the item ids the evaluator owes a check for.
+   * The duty sits with the FINDING pass only (disc-M-89), and covers every
+   * outcome that is not met/fits (ODP-2: never raise an item blocker without
+   * a check). An architecture deviation the owner already accepted is not a
+   * blocker and owes no check. */
+  #owedItemCheckIds(messageType: MessageType): string[] {
+    if (messageType !== "finding") return [];
     if (!this.#itemsEnforced() || !itemsNeedingEvaluatorReverify(this.#state.phase)) return [];
+    const accepted = new Set(this.#state.phase.acceptedDeviations ?? []);
     return phaseItemOutcomes(this.#state.phase)
-      .filter((o) => o.outcome === "unmet" || o.outcome === "deviates")
+      .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
+      .filter((o) => !(o.item.kind === "architecture" && accepted.has(o.item.id)))
       .map((o) => o.item.id);
   }
 
@@ -5554,13 +5570,23 @@ export class Conductor {
         const accepted = (this.#state.phase.acceptedDeviations ?? []).includes(o.item.id);
         if (o.outcome === "fits" || accepted) continue;
         if (overturned.has(o.item.id)) continue;
+        this.#ensureItemCheck(o.item.id);
         this.#raiseItemFinding(o, C);
         continue;
       }
       if (o.outcome === "met") continue;
       if (overturned.has(o.item.id)) continue;
+      this.#ensureItemCheck(o.item.id);
       this.#raiseItemFinding(o, C);
     }
+  }
+
+  /** ODP-2: an item blocker is never raised without an evaluator item check.
+   * When the evaluator gave none (even after its re-prompt), the conductor
+   * records its own `unchecked` check so the blocker is never silent. */
+  #ensureItemCheck(id: string): void {
+    if ((this.#state.phase.itemChecks ?? []).some((c) => c.itemId === id)) return;
+    this.#applyEvent({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "no evaluator item check was recorded" });
   }
 
   /** One blocking finding, anchored to its item, with the reviewers' own
@@ -5624,10 +5650,13 @@ export class Conductor {
    * trade-off message). Deduped by the item id. */
   #applyCoverageNotes(coverage: Coverage, C: string): void {
     for (const { id, note } of coverageNoteLines(coverage, this.#planItems())) {
+      // OD-2 (disc-M-92): coverage is per attempt, so the message is keyed by
+      // the candidate too — a repair's changed note is never deduplicated
+      // against an earlier candidate's.
       this.#raiseMessage(
         "tradeoff",
-        `coverage-${id}`,
-        { type: "tradeoff", title: `${id} not fully covered`, summary: note, context: "", evidence: [note] },
+        `coverage-${C.slice(0, 8)}-${id}`,
+        { type: "tradeoff", title: `${id} not fully covered`, context: "", summary: note, evidence: [note] },
         C,
       );
     }
@@ -8583,7 +8612,7 @@ export class Conductor {
     // evaluator's substantive re-check against the candidate before it
     // blocks. The check is recorded with what was checked.
     const reverifyItems = itemsNeedingEvaluatorReverify(phase)
-      ? phaseItemOutcomes(phase).filter((o) => o.outcome === "unmet" || o.outcome === "deviates")
+      ? phaseItemOutcomes(phase).filter((o) => o.outcome !== "met" && o.outcome !== "fits")
       : [];
     if (reverifyItems.length > 0) {
       lines.push(

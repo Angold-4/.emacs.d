@@ -1127,6 +1127,10 @@ export interface PhaseState {
   /** Plan 06b: the worker's `submit_coverage` payload. The freeze is refused
    * until it covers every R, C and A. */
   coverage?: import("./items.ts").Coverage;
+  /** OD-2 A2 / owner steer: the attempt number this coverage was submitted
+   * in. The freeze requires it to equal the current `attempt.n`, so an
+   * earlier attempt's report can never satisfy a later attempt's gate. */
+  coverageAttempt?: number;
   /** Plan 06b: every `test` verify resolved against the candidate's check
    * run. A missing or failed one is a blocking finding anchored to its item. */
   checkResolution?: import("./items.ts").VerifyResolution[];
@@ -2025,6 +2029,7 @@ export interface EvBriefRetryAttempted {
 export interface EvItemStateUpdated {
   type: "ITEM_STATE_UPDATED";
   coverage?: import("./items.ts").Coverage;
+  coverageAttempt?: number;
   checkResolution?: import("./items.ts").VerifyResolution[];
   itemEvidence?: Array<{ id: string; text: string; at?: string; commandId?: string }>;
   acceptedDeviations?: string[];

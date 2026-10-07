@@ -1516,6 +1516,60 @@ for (const edge of DESIGN_EDGES) {
   });
 }
 
+test("plan 06b: a criterion amendment's new attempt owes its own coverage (OD-2 A2)", () => {
+  const contract = {
+    ...baseState().phase.contract,
+    acceptance: ["first criterion", "second criterion"],
+    requirements: [
+      { id: "R1", title: "first criterion", text: "first criterion", arch: [], verify: ["review"] },
+      { id: "R2", title: "second criterion", text: "second criterion", arch: [], verify: ["review"] },
+    ],
+  };
+  const state = baseState({
+    phase: "RESOLVING",
+    contract,
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: acceptableReviews,
+    coverage: { items: [{ id: "R1", status: "done", where: [], tests: [] }], arch: [] },
+    decisions: [
+      {
+        id: "D-am",
+        version: 1,
+        phaseId: "p1",
+        source: "worker",
+        class: "reserved",
+        choice: "second criterion v2",
+        whyItMatters: "the letter cannot be met",
+        alternatives: [{ option: "second criterion", consequence: "unsatisfiable" }],
+        recommendation: { choice: "second criterion v2", reason: "satisfiable" },
+        boundCandidateSha: "C1",
+        boundContractVersion: K,
+        amendment: {
+          id: "AM-p1",
+          criterion: "second criterion",
+          itemId: "R2",
+          proposedWording: "second criterion v2",
+          why: "the letter cannot be met",
+          raisedBy: "worker",
+          status: "proposed",
+          previousContractVersion: K,
+        },
+      },
+    ],
+    ballots: [
+      { reviewer: "M", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+      { reviewer: "A", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+    ],
+  });
+  const result = reduce(state, { type: "CRITERION_AMENDED", decisionId: "D-am", newAcceptance: ["first criterion", "second criterion v2"], newContractVersion: CV(2) });
+  assert.ok(result.ok, "the amendment applies");
+  assert.equal(result.state.phase.phase, "IMPLEMENTING");
+  assert.equal(result.state.phase.coverage, undefined, "the amended contract's new attempt owes its own coverage");
+});
+
 test("plan 06b: a criterion amendment rewrites the requirement it names by id", () => {
   const contract = {
     ...baseState().phase.contract,

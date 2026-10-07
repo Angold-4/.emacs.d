@@ -136,9 +136,11 @@ test("plan-items: the freeze is refused until submit_coverage covers every item;
     assert.ok((refused[0].event as { issues: string[] }).issues.some((i) => i.includes("R1")));
     // The partial note is a trade-off message (coverage itself is reset at
     // each freeze, per OD-1 A2).
-    const coverageMessage = (setup.conductor.state.phase.messages ?? []).find((m) => m.sourceRecordId === "coverage-R2");
+    const coverageMessage = (setup.conductor.state.phase.messages ?? []).find((m) => (m.sourceRecordId ?? "").endsWith("-R2") && (m.sourceRecordId ?? "").startsWith("coverage-"));
     assert.ok(coverageMessage, "the partial note became a trade-off message");
     assert.match(coverageMessage!.summary, /only the first half/);
+    // OD-2 (disc-M-92): the note is keyed by the candidate too.
+    assert.match(coverageMessage!.sourceRecordId ?? "", new RegExp(`^coverage-${setup.conductor.state.phase.candidate!.sha.slice(0, 8)}-R2$`));
   } finally {
     await teardown(setup);
   }
@@ -608,6 +610,157 @@ test("plan 06b: an evaluator item check with an invalid anchor never overturns a
     await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), 120_000, 50, setup.runDir);
     // The contradicted check cited a file that does not exist, so the majority stands.
     assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: the criterion-amended path's new attempt owes its own coverage", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        ...(attempt === 1 ? [{ kind: "call-submit", tool: "submit_coverage", args: coverage() }] : []),
+        {
+          kind: "call-submit",
+          tool: "submit_phase",
+          args: {
+            decisions: [],
+            assumptions: [],
+            deviations: [],
+            ...(attempt === 1 ? { criterionDispute: { criterion: "R2 is judged by review", why: "no candidate can satisfy it", proposedWording: "R2 is judged by review v2" } } : {}),
+          },
+        },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const amendment = state.phase.decisions.find((d) => d.amendment && d.amendment.status === "proposed");
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              ...reviewArgs(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
+              ...(amendment ? { ballots: [{ decisionId: amendment.id, vote: "approve", rationale: "the wording is unsatisfiable", evidence: ["src/core/rounds.ts:1"] }] } : {}),
+            },
+          },
+        ],
+      };
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => readEvents(setup.runDir).some((r) => r.kind === "coverage_refused" && (r.event as { at?: string }).at === "submit_phase"),
+      150_000,
+      50,
+      setup.runDir,
+    );
+    // The amendment applied and its new attempt refused a coverage-free freeze.
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type?: string }).type === "CRITERION_AMENDED"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: an evaluator that times out still records the item blocker as unchecked", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    // The evaluator settles without ever submitting: its dispatch times out.
+    evaluatorScriptFor: () => ({ hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator }, steps: [] }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), 150_000, 50, setup.runDir);
+    const check = (setup.conductor.state.phase.itemChecks ?? []).find((c) => c.itemId === "R2");
+    assert.equal(check?.verdict, "unchecked", "the timeout path records unchecked before the blocker");
+    assert.match(setup.conductor.state.phase.findings.find((f) => f.itemId === "R2")!.evidence, /unchecked/);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: an item blocker is never raised without an evaluator item check", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    // R2 is only partial: it blocks, and ODP-2 requires a check even then.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "partial" })),
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } },
+        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), 120_000, 50, setup.runDir);
+    assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2"), "a check is recorded for the blocking item");
+    const finding = setup.conductor.state.phase.findings.find((f) => f.itemId === "R2")!;
+    assert.match(finding.evidence, /evaluator re-check:/);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: tt evidence on an old-format phase is rejected", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_review", args: { reviewer, phaseId: "p1", candidateSha: state.phase.candidate?.sha, contractVersion: state.phase.contract.contractVersion, correctionStatements: [], findingStatements: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    fs.mkdirSync(`${setup.runDir}/inbox`, { recursive: true });
+    fs.writeFileSync(`${setup.runDir}/inbox/evidence-1.json`, JSON.stringify({ type: "evidence", item: "R1", text: "x" }));
+    await waitFor(() => fs.existsSync(`${setup.runDir}/inbox/rejected/evidence-1.reason.txt`), 60_000, 50, setup.runDir);
+    const reason = fs.readFileSync(`${setup.runDir}/inbox/rejected/evidence-1.reason.txt`, "utf8");
+    assert.match(reason, /no structured items/);
   } finally {
     await teardown(setup);
   }

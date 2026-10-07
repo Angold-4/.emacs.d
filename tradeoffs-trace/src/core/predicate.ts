@@ -116,7 +116,9 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
  * it against the candidate before it can block. */
 export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
   if (!isStructured(phase.contract)) return false;
-  return phaseItemOutcomes(phase).some((o) => o.outcome === "unmet" || o.outcome === "deviates");
+  // ODP-2: an item blocker is never raised without an evaluator item check,
+  // so every outcome that is not met/fits owes one.
+  return phaseItemOutcomes(phase).some((o) => o.outcome !== "met" && o.outcome !== "fits");
 }
 
 /** Plan 04a: whether everything EVALUATING waits for has settled. In 04a
@@ -558,7 +560,7 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
  * item instead of spending a repair round the worker cannot satisfy. */
 /** The `evidence` items not yet recorded. */
 export function pendingEvidenceItems(phase: PhaseState) {
-  if (phase.contract.requirements === undefined && phase.contract.constraints === undefined && phase.contract.architecture === undefined) return [];
+  if (!isStructured(phase.contract)) return [];
   const items = itemsFromPhase(phase.contract);
   const recorded = new Set((phase.itemEvidence ?? []).map((e) => e.id));
   return flatItems(items).filter((i) => itemNeedsEvidence(i) && !recorded.has(i.id));

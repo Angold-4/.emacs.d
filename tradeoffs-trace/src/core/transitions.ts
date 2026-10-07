@@ -146,7 +146,7 @@ addRow({
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }], // next() of the resulting IMPLEMENTING state
   // OD-2 A2: coverage is per candidate/attempt; a new attempt owes its own.
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined }),
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined }),
 });
 
 addRow({
@@ -174,7 +174,7 @@ addRow({
   guard: () => true,
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined, inFlight: clearInFlight(s.phase, "run_baseline") }),
 });
 
 addRow({
@@ -186,7 +186,7 @@ addRow({
   guard: () => true,
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined, inFlight: clearInFlight(s.phase, "run_baseline") }),
 });
 
 addRow({
@@ -305,6 +305,10 @@ addRow({
     withPhase(s, {
       phase: "IMPLEMENTING",
       attempt: { ...s.phase.attempt, interrupted: true },
+      // OD-2 A2: an interrupted attempt is re-dispatched as a new attempt, so
+      // it owes its own coverage too.
+      coverage: undefined,
+      coverageAttempt: undefined,
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
     }),
 });
@@ -943,6 +947,10 @@ function applyCriterionAmended(s: State, ev: Event): State {
     decisions,
     findings,
     attempt: { n: s.phase.attempt.n + 1 },
+    // OD-2 A2: the amended contract starts a NEW attempt, so it owes its own
+    // coverage; the previous candidate's report must not satisfy its freeze.
+    coverage: undefined,
+    coverageAttempt: undefined,
     checks: undefined,
     probe: undefined,
     reviews: {},
@@ -1191,6 +1199,7 @@ addRow({
       // OD-2 A2: a repair attempt owes its own coverage; the previous
       // attempt's report never satisfies the freeze.
       coverage: undefined,
+      coverageAttempt: undefined,
     }),
 });
 

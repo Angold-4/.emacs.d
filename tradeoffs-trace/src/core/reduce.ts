@@ -355,6 +355,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         phase: {
           ...p,
           ...(event.coverage ? { coverage: event.coverage } : {}),
+          ...(event.coverageAttempt !== undefined ? { coverageAttempt: event.coverageAttempt } : {}),
           ...(event.checkResolution ? { checkResolution: event.checkResolution } : {}),
           ...(event.itemEvidence ? { itemEvidence: event.itemEvidence } : {}),
           ...(event.acceptedDeviations ? { acceptedDeviations: event.acceptedDeviations } : {}),

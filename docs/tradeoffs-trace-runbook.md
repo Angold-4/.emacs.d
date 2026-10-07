@@ -503,15 +503,20 @@ What the loop does with the items:
    evidence.
 
 The old format still parses: a `Goal:` paragraph, an `Acceptance:` list and
-`:RESERVED:`. Each acceptance item becomes `R1..Rn` with `review` (or
-`evidence` for an item that starts `evidence:`), and `:RESERVED:` becomes
-`C1`. There is no architecture. The conductor synthesizes the same items for
-any plan that declares none, so an old-format plan's points appear in the
-worker prompt, the matrix and acceptance. Their coverage and per-item verdict
-requirements apply once the worker has submitted `submit_coverage` — the
-extension makes every real worker do so, so a plan started for real is fully
-enforced; a hand-built in-process plan that never calls it keeps the old
-behaviour.
+`:RESERVED:`. The Emacs parser turns each acceptance item into `R1..Rn` with
+`review` (or `evidence` for an item that starts `evidence:`) and `:RESERVED:`
+into `C1`, and marks the phase `itemsSynthesized`. Such a phase is NOT
+structured: it owes `submit_phase` only, its prompts carry no item checklist
+and never mention `submit_coverage`, and no coverage or per-item verdict is
+required. The item loop — the checklist, `submit_coverage`, the per-item
+verdicts and the evaluator item check — applies only to a phase that declares
+**Architecture**, **Requirements** or **Constraints** (one `isStructured`
+decision owns this everywhere).
+
+Coverage is per attempt: a repair, a correction or an amended contract starts
+a new worker attempt that owes its own `submit_coverage`, and the freeze
+requires the report bound to the current attempt number — an earlier
+attempt's report never satisfies it.
 
 ## Models per role and per seat
 

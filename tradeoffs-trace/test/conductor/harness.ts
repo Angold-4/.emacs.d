@@ -305,12 +305,13 @@ export async function setupConductor(opts: {
   // with a `confirmed` check, so a test that does not script the evaluator is
   // not re-prompted. A test that wants the re-prompt/unchecked path supplies
   // its own `evaluatorScriptFor` with no itemChecks.
-  const defaultEvaluatorScript = (state: State) => {
-    const owed = itemsNeedingEvaluatorReverify(state.phase)
-      ? phaseItemOutcomes(state.phase)
-          .filter((o) => o.outcome === "unmet" || o.outcome === "deviates")
-          .map((o) => o.item.id)
-      : [];
+  const defaultEvaluatorScript = (state: State, messageType: string) => {
+    const owed =
+      messageType === "finding" && itemsNeedingEvaluatorReverify(state.phase)
+        ? phaseItemOutcomes(state.phase)
+            .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
+            .map((o) => o.item.id)
+        : [];
     return {
       hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -377,7 +378,7 @@ export async function setupConductor(opts: {
         if (!evaluatorScriptPaths.has(agentId)) {
           const script = opts.evaluatorScriptFor
             ? opts.evaluatorScriptFor(messageType, conductor.state)
-            : defaultEvaluatorScript(conductor.state);
+            : defaultEvaluatorScript(conductor.state, messageType);
           evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
         }
         return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
