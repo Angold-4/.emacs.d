@@ -153,6 +153,9 @@ export interface CriterionAmendment {
   id: string;
   criterion: string; // the replaced acceptance item, verbatim
   proposedWording: string; // the replacement
+  /** Plan 06b (OD-1 R6): on a structured phase, the requirement item id the
+   * amendment names. The rewrite targets this id, never a list position. */
+  itemId?: string;
   why: string;
   raisedBy: "worker" | Reviewer;
   status: AmendmentStatus;

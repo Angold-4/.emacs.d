@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 
 import { buildContract, type RunPlanFile, type RunPlanPhase } from "../../src/conductor.ts";
+import { validate } from "../../src/core/schema.ts";
 import { countsLine, matrixMarkdown, phaseItemCounts, tallyItems, type ItemLoopState } from "../../src/core/items.ts";
 import { prSummary } from "../../src/view.ts";
 import { projectEntryReview, renderStatusView, statusViewInput } from "../../src/render.ts";
@@ -67,18 +68,19 @@ test("plan-items view: the counts line is R x/y met · A a/b fit · C c/d", () =
   assert.equal(countsLine(phaseItemCounts(loopState)), "R 1/2 met · A 1/1 fit · C 1/1");
   const matrix = matrixMarkdown(loopState);
   assert.equal(matrix[0], "| item | worker | check | M | A | B |");
-  assert.match(matrix.find((l) => l.startsWith("| R1 "))!, /\| — \| pass \| met \| met \| met \|/);
-  assert.match(matrix.find((l) => l.startsWith("| R2 "))!, /\| unmet \| unmet \| met \|/);
+  assert.match(matrix.find((l) => l.startsWith("| [R1 "))!, /\| \[—\]\(items\/R1\.org\) \| \[pass\]\(items\/R1\.org\) \| \[met\]\(items\/R1\.org\) \| \[met\]\(items\/R1\.org\) \| \[met\]\(items\/R1\.org\) \|/);
+  assert.match(matrix.find((l) => l.startsWith("| [R2 "))!, /\[unmet\]\(items\/R2\.org\) \| \[unmet\]\(items\/R2\.org\) \| \[met\]\(items\/R2\.org\)/);
 });
 
 test("plan-items view: tt summary's PR body carries the matrix", () => {
   const runDir = fs.mkdtempSync(path.join("/tmp", "tt-items-view-"));
   try {
     const md = prSummary(runDir, plan());
-    assert.match(md, /### Plan items|\| item \| worker \| check \| M \| A \| B \|/);
-    assert.match(md, /\| R1 /);
-    assert.match(md, /\| A1 /);
-    assert.match(md, /\| C1 /);
+    assert.match(md, /\| item \| worker \| check \| M \| A \| B \|/);
+    // OD-1 R7: every matrix cell links to the item's evidence file.
+    assert.match(md, /\[R1 Two candidates\]\(items\/R1\.org\)/);
+    assert.match(md, /\[A1 Round\]\(items\/A1\.org\)/);
+    assert.match(md, /\[C1 K = 1\]\(items\/C1\.org\)/);
   } finally {
     fs.rmSync(runDir, { recursive: true, force: true });
   }
@@ -132,13 +134,33 @@ test("plan-items view: the status view shows the counts line", () => {
   assert.match(text, /items\s+R 2\/2 met · A 1\/1 fit · C 1\/1/);
 });
 
-test("plan-items view: an old-format plan's synthesized items appear in the matrix too", () => {
+test("plan 06b: a structured phase without acceptance validates against the schemas", () => {
+  const phase = {
+    id: "p1",
+    goal: "g",
+    checks: ["true"],
+    boundaries: [],
+    reserved: [],
+    provisional: false,
+    architecture: items.architecture,
+    requirements: items.requirements,
+    constraints: items.constraints,
+  };
+  const planJson = { title: "t", checks: ["true"], phases: [phase] };
+  const planSchema = JSON.parse(fs.readFileSync(new URL("../../schemas/plan.schema.json", import.meta.url), "utf8"));
+  const planResult = validate(planSchema, planJson);
+  assert.equal(planResult.valid, true, planResult.errors.join("; "));
+  const contract = buildContract(phase as unknown as RunPlanPhase);
+  const contractSchema = JSON.parse(fs.readFileSync(new URL("../../schemas/phase-contract.schema.json", import.meta.url), "utf8"));
+  const contractResult = validate(contractSchema, contract);
+  assert.equal(contractResult.valid, true, contractResult.errors.join("; "));
+});
+
+test("plan 06b: an old-format plan declares no items and adds no matrix", () => {
   const plain: RunPlanPhase = { id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false };
   const contract = buildContract(plain);
-  assert.equal(contract.itemsSynthesized, true, "the conductor synthesized the old format's items");
-  assert.deepEqual(contract.requirements!.map((r) => r.id), ["R1"]);
+  assert.equal(contract.requirements, undefined, "the old format is not made structured");
+  assert.equal(contract.itemsSynthesized, true);
   const rendered = projectEntryReview({ phaseId: "p1", contract, messages: [], entries: [] });
-  assert.match(rendered.text, /\* Plan items/);
-  assert.match(rendered.text, /\[\[items\/R1\.org\]\[R1 it works\]\]/);
-  assert.deepEqual(tallyItems({ goal: "", architecture: [], requirements: [], constraints: [] }, []), []);
+  assert.doesNotMatch(rendered.text, /Plan items/);
 });

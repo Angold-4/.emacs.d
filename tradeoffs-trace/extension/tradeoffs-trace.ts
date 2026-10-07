@@ -584,9 +584,10 @@ export default function (pi: ExtensionAPI) {
    * 1, then submit_review in turn 2 (design §3.3 two-turn review). */
   function owedSubmission(): string | undefined {
     if (role === "worker") {
-      // Plan 06b: the worker ends its attempt with submit_coverage, before
-      // submit_phase — the freeze is refused until the coverage is complete.
-      if (!accepted.has("submit_coverage")) return "submit_coverage";
+      // Plan 06b (OD-1): a STRUCTURED phase (the conductor sets TT_ITEMS=1)
+      // makes the worker end with submit_coverage before submit_phase; an
+      // old-format phase owes submit_phase only.
+      if (readEnv("TT_ITEMS") === "1" && !accepted.has("submit_coverage")) return "submit_coverage";
       return accepted.has("submit_phase") ? undefined : "submit_phase";
     }
     // Plan 05j: the curator owes no submission; an empty proposals list is a

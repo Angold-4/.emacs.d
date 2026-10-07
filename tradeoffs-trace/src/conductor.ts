@@ -685,26 +685,24 @@ export function amendContractVersion(contract: PhaseContract, acceptance: string
 }
 
 export function buildContract(phase: RunPlanPhase): PhaseContract {
-  // Plan 06b: every plan carries items. When the phase declares none (the old
-  // format, or a hand-built in-process plan), synthesize R1..Rn from
-  // `acceptance` and C1 from `reserved`, exactly as the Emacs parser does,
-  // and mark them synthesized. The items are then shown in the worker prompt,
-  // the matrix and acceptance; their coverage/verdict REQUIREMENTS apply once
-  // the worker submits coverage (which the extension makes every real worker
-  // do), so a direct in-process plan keeps its old behaviour.
+  // Plan 06b (OD-1): a STRUCTURED phase declares architecture/requirements/
+  // constraints and carries the item loop; an old-format phase (Goal +
+  // Acceptance + :RESERVED:) declares none and owes submit_phase only. The
+  // items are taken as the plan declares them — never synthesized into the
+  // contract — so `#structured()` is exactly "the plan declared items".
   const declaredItems = phase.architecture !== undefined || phase.requirements !== undefined || phase.constraints !== undefined;
-  const synthesized = itemsFromPhase(phase);
+  const acceptance = (phase.acceptance?.length ?? 0) > 0 ? phase.acceptance : (phase.requirements ?? []).map((r) => r.text);
   return {
     phaseId: phase.id,
     contractVersion: contractVersionFor(phase),
     goal: phase.goal,
-    acceptance: phase.acceptance,
+    acceptance,
     checks: phase.checks,
     boundaries: phase.boundaries,
     reserved: phase.reserved,
-    architecture: synthesized.architecture,
-    requirements: synthesized.requirements,
-    constraints: synthesized.constraints,
+    ...(phase.architecture ? { architecture: phase.architecture } : {}),
+    ...(phase.requirements ? { requirements: phase.requirements } : {}),
+    ...(phase.constraints ? { constraints: phase.constraints } : {}),
     ...(declaredItems ? {} : { itemsSynthesized: true }),
     // Plan 01f: a declared gate is part of the frozen contract — the FSM
     // (next.ts/transitions.ts) reads it to decide whether the phase gates at
@@ -1775,6 +1773,7 @@ export class Conductor {
           id: `AM-${this.#state.phase.phaseId}-${short}`,
           criterion: dispute.criterion,
           proposedWording: dispute.proposedWording,
+          ...(this.#criterionItemId(dispute.criterion) ? { itemId: this.#criterionItemId(dispute.criterion)! } : {}),
           why: dispute.why,
           raisedBy: "worker",
           status: "proposed",
@@ -3284,6 +3283,9 @@ export class Conductor {
       if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
         return { ok: false, reason: `submit_coverage is not accepted in phase ${this.#state.phase.phase}` };
       }
+      // OD-1: an old-format phase owes submit_phase only, so a stray coverage
+      // call is a harmless no-op rather than a refusal.
+      if (!this.#structured()) return { ok: true };
       const args = msg.args as Coverage;
       const issues = coverageIssues(args, this.#planItems());
       this.#applyEvent({ type: "ITEM_STATE_UPDATED", coverage: args });
@@ -4386,6 +4388,12 @@ export class Conductor {
     return undefined;
   }
 
+  /** Plan 06b (OD-1 R6): the requirement item id whose text is the disputed
+   * criterion, or undefined on an old-format phase. */
+  #criterionItemId(criterion: string): string | undefined {
+    return this.#state.phase.contract.requirements?.find((r) => r.text === criterion || r.title === criterion)?.id;
+  }
+
   /** Plan 01g: assembles a reviewer-raised `criterionDispute` into an
    * amendment record (a `reserved` decision) bound to the candidate/contract
    * being reviewed, exactly like a worker disclosure. It is votable like any
@@ -4414,6 +4422,7 @@ export class Conductor {
         id: `AM-${this.#state.phase.phaseId}-${short}-${raisedBy}-${n}`,
         criterion: dispute.criterion,
         proposedWording: dispute.proposedWording,
+        ...(this.#criterionItemId(dispute.criterion) ? { itemId: this.#criterionItemId(dispute.criterion)! } : {}),
         why: dispute.why,
         raisedBy,
         status: "proposed",
@@ -4930,6 +4939,9 @@ export class Conductor {
       TT_WORKTREE: this.#paths.worktree,
       TT_RUN_DIR: this.#runDir,
       TT_PROTECTED: protectedPaths,
+      // Plan 06b (OD-1): a structured phase makes the worker submit coverage;
+      // an old-format phase does not.
+      TT_ITEMS: this.#structured() ? "1" : "0",
       // Where find/grep/ls may search: the worktree and the plan's references.
       TT_SEARCH_ROOTS: [this.#paths.worktree, this.#paths.refs].join(path.delimiter),
       // Plan 01a: the plan's secrets — the names (so the extension guard
@@ -5214,7 +5226,7 @@ export class Conductor {
     blocking.push(...ownerBlockerChoiceLines(phase, C));
     // Plan 06b: list only the items a majority did not meet (or fit), with
     // the reviewers' evidence, so the repair addresses exactly those points.
-    if (!phase.contract.itemsSynthesized || phase.coverage !== undefined) {
+    if (this.#structured()) {
       blocking.push(...repairItemLines(this.#itemOutcomes(), phase.overturns ?? []));
     }
     const failedDecisions: string[] = [];
@@ -5258,19 +5270,17 @@ export class Conductor {
     return itemsFromPhase(this.#state.phase.contract);
   }
 
-  /** True when the phase carries structured items, so the prompt and the
-   * views render them. Always true after `buildContract`. */
+  /** True when the phase DECLARED structured items (OD-1: an old-format plan
+   * declares none and owes submit_phase only). */
   #structured(): boolean {
     const c = this.#state.phase.contract;
-    return c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined;
+    return !c.itemsSynthesized && (c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined);
   }
 
-  /** True when the item loop's coverage and per-item verdict REQUIREMENTS
-   * apply: the plan declared its items, or the worker submitted coverage (the
-   * extension makes every real worker do so). A synthesized plan whose worker
-   * never called `submit_coverage` keeps the pre-06b behaviour. */
+  /** The item loop (coverage, per-item verdicts, symbol pre-check, tally)
+   * applies exactly to a structured phase. */
   #itemsEnforced(): boolean {
-    return !this.#state.phase.contract.itemsSynthesized || this.#state.phase.coverage !== undefined;
+    return this.#structured();
   }
 
   #itemTestOutcomes(): Map<string, "passed" | "failed" | "missing"> {
@@ -5659,6 +5669,9 @@ export class Conductor {
     // happened; the completion record has not.
     crashAt("after_freeze");
     this.#log.completion(actionId, { candidateSha: outcome.candidateSha, tainted: outcome.tainted });
+    // Plan 06b (OD-1 A2): FREEZE_COMPLETED resets the per-candidate item
+    // record, so capture this candidate's coverage before applying it.
+    const coverageAtFreeze = this.#state.phase.coverage;
     this.#applyEvent({
       type: "FREEZE_COMPLETED",
       candidateSha: outcome.candidateSha,
@@ -5678,7 +5691,7 @@ export class Conductor {
     // Plan 06b: every partial/not_done coverage entry and every deviating
     // architecture item becomes a trade-off message, once the candidate
     // exists for it to bind to.
-    if (this.#structured() && this.#state.phase.coverage) this.#applyCoverageNotes(this.#state.phase.coverage, outcome.candidateSha);
+    if (this.#structured() && coverageAtFreeze) this.#applyCoverageNotes(coverageAtFreeze, outcome.candidateSha);
     // Work packet 2a: boundary triggers (design §3.3) and §3.5's sampling
     // data need a real candidate (for the diff, and for DECISION_ADDED's
     // own binding check) — only possible once FREEZE_COMPLETED above has

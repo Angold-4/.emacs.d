@@ -477,12 +477,11 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
   }
 
-  // Plan 06b: a phase additionally requires every item point met (or fit), its
-  // `test` verifies passed, and every `evidence` item recorded — once the
-  // worker engaged the item loop (submitted coverage). A synthesized plan
-  // whose worker never did keeps the pre-06b behaviour.
-  const itemsEnforced = !phase.contract.itemsSynthesized || phase.coverage !== undefined;
-  if (itemsEnforced && (phase.contract.requirements !== undefined || phase.contract.constraints !== undefined || phase.contract.architecture !== undefined)) {
+  // Plan 06b (OD-1): a STRUCTURED phase additionally requires every item point
+  // met (or fit), its `test` verifies passed, and every `evidence` item
+  // recorded. An old-format phase declares no items and keeps today's rule.
+  const itemsEnforced = phase.contract.requirements !== undefined || phase.contract.constraints !== undefined || phase.contract.architecture !== undefined;
+  if (itemsEnforced) {
     const items = itemsFromPhase(phase.contract);
     const reviews = (["M", "A", "B"] as const).map((seat) => {
       const r = phase.reviews[seat]?.review;
@@ -564,7 +563,6 @@ export function evidenceAllRecorded(phase: PhaseState): boolean {
 export function evidenceOnlyPending(phase: PhaseState): boolean {
   const c = phase.contract;
   if (c.requirements === undefined && c.constraints === undefined && c.architecture === undefined) return false;
-  if (c.itemsSynthesized && phase.coverage === undefined) return false;
   if (!phase.candidate) return false;
   const pending = pendingEvidenceItems(phase);
   if (pending.length === 0) return false;

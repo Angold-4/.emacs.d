@@ -496,10 +496,28 @@ export function evidenceCommands(evidence: string): string[] {
   return out;
 }
 
+function normCommand(s: string): string {
+  return s.trim().replace(/\s+/g, " ");
+}
+
+/** The commands an evidence string cites that the reviewer actually ran, in
+ * this review. Matching is exact (whitespace-normalised), so a cited prefix
+ * or a command merely echoed inside another does not count. */
+export function runCommandsIn(evidence: string, reviewerCommands: readonly string[]): string[] {
+  // Candidates are the tool-named backticks AND any backtick that exactly
+  // matches a recorded command (so `cd x && make check` is recognised), but a
+  // backticked path that was not run is never a command.
+  const candidates = new Set(evidenceCommands(evidence));
+  for (const m of evidence.matchAll(/`([^`]+)`/g)) candidates.add(m[1].trim());
+  return [...candidates].filter((cmd) => cmd.length > 0 && reviewerCommands.some((r) => normCommand(r) === normCommand(cmd)));
+}
+
 /** True when an evidence string carries at least one anchor a code check can
- * follow: a file:line range, a test name or a command the reviewer ran. */
-export function evidenceHasAnchor(evidence: string): boolean {
-  return evidenceFileAnchors(evidence).length > 0 || evidenceTestNames(evidence).length > 0 || evidenceCommands(evidence).length > 0;
+ * follow: a file:line range, a test name, or a command the reviewer ran (the
+ * last needs the reviewer's own recorded commands — findings F-contract-12,
+ * disc-M-33). */
+export function evidenceHasAnchor(evidence: string, reviewerCommands: readonly string[] = []): boolean {
+  return evidenceFileAnchors(evidence).length > 0 || evidenceTestNames(evidence).length > 0 || runCommandsIn(evidence, reviewerCommands).length > 0;
 }
 
 /** What the code can read about the candidate and this review's own tool
@@ -556,10 +574,21 @@ export function verdictIssues(
   const out: string[] = [];
   const evidence = verdict.evidence ?? "";
   const value = verdict.verdict;
-  if (!evidenceHasAnchor(evidence)) {
-    out.push(`${item.id}: the verdict cites no anchor (a file:line-range, a test name, or a command you ran)`);
+  // A command-shaped backtick is not an anchor on its own: it must be a
+  // command the reviewer actually ran (exact match against its recorded
+  // tool calls). Anything else is refused with that reason.
+  const citedCommands = evidenceCommands(evidence);
+  const ranCommands = runCommandsIn(evidence, ctx.reviewerCommands);
+  const unrunCommands = citedCommands.filter((c) => !ranCommands.includes(c));
+  if (!evidenceHasAnchor(evidence, ctx.reviewerCommands)) {
+    out.push(
+      unrunCommands.length > 0
+        ? `${item.id}: the cited command \`${unrunCommands[0]}\` is not one you ran in this review`
+        : `${item.id}: the verdict cites no anchor (a file:line-range, a test name, or a command you ran)`,
+    );
     return out;
   }
+  for (const cmd of unrunCommands) out.push(`${item.id}: the cited command \`${cmd}\` is not one you ran in this review`);
   // Every cited file and line range must exist in the candidate.
   const anchors = evidenceFileAnchors(evidence);
   for (const a of anchors) {
@@ -578,12 +607,6 @@ export function verdictIssues(
     if (outcome !== "passed") {
       out.push(`${item.id}: the cited test "${name}" ${outcome === undefined || outcome === "missing" ? "is not in this check run" : "did not pass in this check run"}`);
     }
-  }
-  // A cited command must be one the reviewer actually ran in this review, not
-  // merely a command-shaped backtick (findings F-contract-12, disc-M-33).
-  for (const cmd of evidenceCommands(evidence)) {
-    const ran = ctx.reviewerCommands.some((r) => r.trim() === cmd || r.includes(cmd));
-    if (!ran) out.push(`${item.id}: the cited command \`${cmd}\` is not one you ran in this review`);
   }
   const isMet = value === "met" || value === "fits";
   if (isMet && anchors.length > 0) {
@@ -815,10 +838,15 @@ export function matrixMarkdown(phase: ItemLoopState): string[] {
   if (flatItems(items).length === 0) return [];
   const outcomes = phaseItemOutcomes(phase);
   const rows = itemMatrix(items, outcomes, phase.coverage, phase.checkResolution ?? []);
+  // Plan 06b (OD-1 R7): every cell links to the item's evidence file, in
+  // `tt summary` as in the review buffer.
   return [
     "| item | worker | check | M | A | B |",
     "| --- | --- | --- | --- | --- | --- |",
-    ...rows.map((r) => `| ${r.id} ${r.title.replace(/\s+/g, " ").trim()} | ${r.cells.map((c) => c.text).join(" | ")} |`),
+    ...rows.map((r) => {
+      const cell = (t: string) => `[${t.replace(/\s+/g, " ").trim()}](items/${r.id}.org)`;
+      return `| ${[`${r.id} ${r.title}`, ...r.cells.map((c) => c.text)].map(cell).join(" | ")} |`;
+    }),
   ];
 }
 

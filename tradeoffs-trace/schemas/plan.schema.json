@@ -77,12 +77,12 @@
   "$defs": {
     "PlanPhase": {
       "type": "object",
-      "required": ["id", "goal", "acceptance", "checks", "boundaries", "reserved", "provisional"],
+      "required": ["id", "goal", "checks", "boundaries", "reserved", "provisional"],
       "additionalProperties": false,
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "goal": { "type": "string", "minLength": 1 },
-        "acceptance": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "acceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },

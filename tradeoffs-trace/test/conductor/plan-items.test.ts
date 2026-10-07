@@ -132,8 +132,8 @@ test("plan-items: the freeze is refused until submit_coverage covers every item;
     const refused = events.filter((r) => r.kind === "coverage_refused");
     assert.ok(refused.length >= 1, "the incomplete coverage refused the freeze");
     assert.ok((refused[0].event as { issues: string[] }).issues.some((i) => i.includes("R1")));
-    assert.equal(setup.conductor.state.phase.coverage?.items.find((i) => i.id === "R2")?.status, "partial");
-    // The partial note is a trade-off message.
+    // The partial note is a trade-off message (coverage itself is reset at
+    // each freeze, per OD-1 A2).
     const coverageMessage = (setup.conductor.state.phase.messages ?? []).find((m) => m.sourceRecordId === "coverage-R2");
     assert.ok(coverageMessage, "the partial note became a trade-off message");
     assert.match(coverageMessage!.summary, /only the first half/);
@@ -408,6 +408,40 @@ test("plan-items: a met verdict citing only the worker's anchors with no file th
   }
 });
 
+test("plan 06b: an old-format worker owes no submit_coverage", async () => {
+  const setup = await setupConductor({
+    // No `items`: the old format. The worker calls submit_phase only.
+    checks: [CHECK_OUTPUT],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: { reviewer, phaseId: "p1", candidateSha: state.phase.candidate?.sha, contractVersion: state.phase.contract.contractVersion, correctionStatements: [], findingStatements: [] },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "coverage_refused"), "no coverage was demanded or refused");
+    assert.equal(setup.conductor.state.phase.contract.requirements, undefined, "the old format stays unstructured");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("plan-items: a verdict citing a command the reviewer did not run is refused, and a run command counts", async () => {
   const setup = await setupConductor({
     items: ITEMS,
@@ -499,6 +533,102 @@ test("plan-items: an architecture :WHERE: file missing from the candidate is rec
     await setup.conductor.start();
     await waitFor(() => (setup.conductor.state.phase.archSymbolDeviations ?? []).includes("A1"), 90_000, 50, setup.runDir);
     assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "A1" && f.severity === "blocking"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: a met anchor on a file changed only in an earlier repair of this phase is accepted", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        // Attempt 1 adds src/core/rounds.ts; attempt 2 adds only other.ts.
+        { kind: "call-sh", command: attempt === 1 ? WRITE_ROUNDS : "mkdir -p src/core && printf 'x\\n' > src/core/other.ts" },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const open = state.phase.findings.filter((f) => f.status === "open");
+      const firstRound = (state.phase.round ?? 1) === 1;
+      const items = {
+        items: [
+          { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+          { id: "R2", verdict: firstRound ? "unmet" : "met", evidence: "src/core/rounds.ts:1" },
+          { id: "C1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+        ],
+        arch: [{ id: "A1", verdict: "fits", evidence: "src/core/rounds.ts:1" }],
+      };
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          { kind: "call-submit", tool: "submit_review", args: { ...reviewArgs(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, items), findingStatements: open.map((f) => ({ findingId: f.id, status: "confirm", evidence: "the repair fixes it" })) } },
+        ],
+      };
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    // The earlier repair's file is part of the phase diff, so its met anchor was accepted.
+    assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "incomplete_review_rejected"), "no met verdict was refused for touching an earlier repair's file");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: item state from the previous candidate never reaches the next", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        // Candidate 1 misses A1's `Round` symbol; candidate 2 has it.
+        { kind: "call-sh", command: attempt === 1 ? "mkdir -p src/core && printf 'no symbol here\\n' > src/core/rounds.ts" : WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const open = state.phase.findings.filter((f) => f.status === "open");
+      const items = {
+        items: [
+          { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+          { id: "R2", verdict: "met", evidence: "src/core/rounds.ts:1" },
+          { id: "C1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+        ],
+        arch: [{ id: "A1", verdict: "fits", evidence: "src/core/rounds.ts:1" }],
+      };
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          { kind: "call-submit", tool: "submit_review", args: { ...reviewArgs(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, items), findingStatements: open.map((f) => ({ findingId: f.id, status: "confirm", evidence: "the symbol is present now" })) } },
+        ],
+      };
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    // Candidate 1 recorded the A1 deviation; candidate 2 cleared it.
+    assert.deepEqual(setup.conductor.state.phase.archSymbolDeviations ?? [], []);
+    // The candidate-1 deviation finding is closed (superseded when the new
+    // candidate re-evaluated the item), never left open into candidate 2.
+    assert.ok(setup.conductor.state.phase.findings.every((f) => f.itemId !== "A1" || f.status !== "open"));
   } finally {
     await teardown(setup);
   }

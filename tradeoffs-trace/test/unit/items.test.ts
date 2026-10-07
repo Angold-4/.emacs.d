@@ -227,7 +227,7 @@ test("items: the evaluator overturns a majority unmet verdict the item's passing
   assert.equal(overturns[0].effect, "flip");
 });
 
-test("items: a majority deviates on an architecture item is NOT overturned by symbol presence alone (D-7 withdrawn)", () => {
+test("plan 06b: symbol presence never overturns a majority deviates", () => {
   const arch = structured.architecture[0];
   const item = { kind: "architecture" as const, id: arch.id, title: arch.title, text: arch.text, arch: [], verify: [], where: arch.where, tags: arch.tags };
   const verdicts: SeatItemVerdict[] = [
@@ -247,6 +247,33 @@ test("items: a majority deviates on an architecture item is NOT overturned by sy
   assert.deepEqual(reverify(item, verdicts, ctx), []);
 });
 
+test("plan 06b: an audited thin met that is overturned no longer counts as met", () => {
+  const item = structured.requirements[2]; // R3, review verify
+  const verdicts: SeatItemVerdict[] = [
+    { seat: "M", verdict: "met", evidence: "src/a.ts:1" },
+    { seat: "A", verdict: "met", evidence: "src/a.ts:1" },
+    { seat: "B", verdict: "met", evidence: "src/a.ts:1" },
+  ];
+  const ctx = {
+    lineCount: () => 10,
+    diffFiles: ["src/a.ts"],
+    testOutcomes: new Map(),
+    reviewerReadFiles: [],
+    workerAnchors: ["src/a.ts:1"],
+    reviewerCommands: [],
+  };
+  const audits = reverify(item, verdicts, ctx);
+  assert.equal(audits.length, 3, "every thin met seat is audited");
+  assert.ok(audits.every((o) => o.effect === "drop"));
+  // With the audits applied, the item no longer has a met majority.
+  const outcome = tallyItems({ goal: "", architecture: [], requirements: [item], constraints: [] }, [
+    { seat: "M", items: { items: [verdicts[0]], arch: [] } },
+    { seat: "A", items: { items: [verdicts[1]], arch: [] } },
+    { seat: "B", items: { items: [verdicts[2]], arch: [] } },
+  ], audits)[0];
+  assert.notEqual(outcome.outcome, "met", "an overturned met verdict no longer counts as met");
+});
+
 test("items: a cited command must be one the reviewer actually ran (F-contract-12)", () => {
   const item = structured.requirements[0];
   const base = {
@@ -264,6 +291,9 @@ test("items: a cited command must be one the reviewer actually ran (F-contract-1
   assert.deepEqual(verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "`make check` fails" }, { ...base, reviewerCommands: ["make check"] }), []);
   // A cited path that merely starts with a tool name is not a command.
   assert.deepEqual(verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "src/a.ts:1" }, { ...base, reviewerCommands: [] }), []);
+  // A cited prefix or an echoed command does not count: the match is exact.
+  assert.ok(verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "`make check` fails" }, { ...base, reviewerCommands: ["make check EXTRA=1"] }).some((i) => i.includes("not one you ran")));
+  assert.ok(verdictIssues(item, { id: "R1", verdict: "unmet", evidence: "`make check` fails" }, { ...base, reviewerCommands: ["echo 'make check'"] }).some((i) => i.includes("not one you ran")));
 });
 
 test("items: the matrix and the counts line show every item by seat", () => {

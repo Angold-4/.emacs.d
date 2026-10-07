@@ -340,6 +340,15 @@ addRow({
       // worker kept or changed them (core/rounds.ts); the rest are superseded
       // and can no longer block acceptance.
       decisions: [...carried, ...e.decisions],
+      // Plan 06b (OD-1 A2): a conductor-raised finding that was anchored to an
+      // ITEM belongs to the candidate it was raised on. A new candidate
+      // re-evaluates the item, so the old finding is superseded here; a still
+      // unmet/deviating item gets a fresh one from #applyItemOutcomes.
+      findings: s.phase.findings.map((f) =>
+        f.status === "open" && f.raisedBy === "conductor" && f.itemId
+          ? { ...f, status: "superseded" as const, supersededBy: `candidate ${e.candidateSha.slice(0, 8)} re-evaluated ${f.itemId}` }
+          : f,
+      ),
       round: (s.phase.round ?? 0) + 1,
       checks: undefined,
       // Plan 05d: this candidate is the one that repairs the previous check
@@ -353,6 +362,15 @@ addRow({
       pendingDispute: undefined,
       probe: undefined,
       reviews: {},
+      // Plan 06b / OD-1 A2: the per-candidate item record is created EMPTY at
+      // each freeze and never carried into the next candidate, exactly like
+      // checks/probe/reviews. The worker's coverage, the check resolution,
+      // the symbol deviations and the overturns all belong to the candidate
+      // that just froze.
+      coverage: undefined,
+      checkResolution: undefined,
+      archSymbolDeviations: undefined,
+      overturns: undefined,
       // Skill fix 5: kept decisions that passed keep their ballots.
       ballots: carryBallotsForward(
         s.phase.decisions,
@@ -906,13 +924,13 @@ function applyCriterionAmended(s: State, ev: Event): State {
       ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
       : f,
   );
-  // Plan 06b (finding disc-B-37): a structured phase carries the criterion in
-  // its requirement item too. Match the item by its OLD wording — never by
-  // position, which could retarget the wrong requirement — and replace it with
-  // the amendment's proposed wording.
+  // Plan 06b (OD-1 R6, finding disc-B-37): a structured phase carries the
+  // criterion in its requirement item too. Target the item the amendment NAMES
+  // by id; fall back to matching its OLD wording. Never by list position,
+  // which could retarget the wrong requirement.
   const requirements = s.phase.contract.requirements
     ? s.phase.contract.requirements.map((r) =>
-        r.text === amendment.criterion || r.title === amendment.criterion
+        (amendment.itemId ? r.id === amendment.itemId : r.text === amendment.criterion || r.title === amendment.criterion)
           ? { ...r, title: amendment.proposedWording, text: amendment.proposedWording }
           : r,
       )

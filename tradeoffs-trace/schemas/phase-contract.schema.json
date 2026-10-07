@@ -10,7 +10,7 @@
     "phaseId": { "type": "string", "minLength": 1 },
     "contractVersion": { "$ref": "#/$defs/ContractVersion" },
     "goal": { "type": "string", "minLength": 1 },
-    "acceptance": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "acceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
