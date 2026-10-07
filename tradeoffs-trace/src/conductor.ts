@@ -933,12 +933,42 @@ export interface Timeline {
   restarts?: string[];
 }
 
+/** Plan 06c (A5): the instants a new stage segment starts. A clean `tt stop`
+ * writes a `stop` record and the resume writes no event of its own, so the
+ * FIRST event after a stop is the resume; a conductor that starts on an
+ * existing run writes a `resume` record. An interrupted attempt and an
+ * environment unblock are new segments too. Pure, so the rule is unit-tested
+ * directly rather than inferred from a hand-built timeline. */
+export function restartInstants(records: readonly LogRecord[]): string[] {
+  const out: string[] = [];
+  let stopped = false;
+  for (const record of records) {
+    if (record.kind === "stop") {
+      stopped = true;
+      continue;
+    }
+    if (record.kind === "resume") {
+      out.push(record.ts);
+      stopped = false;
+      continue;
+    }
+    if (record.kind !== "event") continue;
+    if (stopped) {
+      out.push(record.ts);
+      stopped = false;
+    }
+    const type = (record.event as { type?: string }).type;
+    if (type === "ATTEMPT_INTERRUPTED" || type === "RUN_RESUMED") out.push(record.ts);
+  }
+  return out;
+}
+
 function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
   const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string } | undefined;
   let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
-  const restarts: string[] = [];
+  const restarts = restartInstants(records);
   for (const record of records) {
     if (record.kind !== "event") continue;
     const before = state;
@@ -946,9 +976,6 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
     if (!result.ok) continue;
     state = result.state;
     const type = (record.event as { type?: string }).type;
-    // Plan 06c (A5): the stage clock stops at a stop and starts a new segment
-    // at a resume — not only at an interrupted attempt.
-    if (type === "ATTEMPT_INTERRUPTED" || type === "RUN_RESUMED") restarts.push(record.ts);
     const prevC = before.phase.candidate?.sha;
     if (type === "FREEZE_COMPLETED" && prevC) {
       const reasons = notAcceptedReasons(before.phase);
@@ -1354,6 +1381,13 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
     }
     this.#state = foldEvents(this.#state, records);
+    // Plan 06c (A5): a conductor that starts on an existing, non-terminal run
+    // begins a new stage segment. The `resume` record is the segment's start;
+    // the stage clock stops at the preceding `stop` (or at the last event
+    // before the exit) and never counts the stopped interval.
+    if (initRecord && records.length > 1 && this.#state.phase.phase !== "DONE" && this.#state.phase.phase !== "BLOCKED") {
+      this.#log.append("resume", { at: new Date().toISOString(), phase: this.#state.phase.phase });
+    }
     // Plan 05i: resolve every declared command's executable before the
     // baseline and before any agent launch. A missing tool stops the run in
     // ENV_BLOCKED (visible, and recoverable with `tt resume` once the
@@ -8148,9 +8182,11 @@ export class Conductor {
         this.#log.append("review_reprompt", { reviewer, agentId, reason: "turn 2 settled without submit_review" });
         const settled3 = nextSettle();
         await agent.prompt(
-          `You ended your review turn without calling submit_review. That tool is required to finish this review. ` +
-            `Call submit_review now with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, ` +
-            `findingStatements, items and arch, then end your turn.`,
+          this.#agentPrompt(
+            `You ended your review turn without calling submit_review. That tool is required to finish this review. ` +
+              `Call submit_review now with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, ` +
+              `findingStatements, items and arch, then end your turn.`,
+          ),
         );
         turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled3]);
       }

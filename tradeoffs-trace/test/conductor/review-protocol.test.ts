@@ -18,6 +18,9 @@
 // file's happy-path run to DONE.
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor } from "./harness.ts";
@@ -209,6 +212,72 @@ test("review-protocol: two-turn ordering, reviewer-discovered records, unreferen
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 06c: the silent-review re-prompt names missing tools from the preflight", async () => {
+  const originalPath = process.env.PATH;
+  const dir = fs.mkdtempSync("/tmp/tt-06c-reprompt-");
+  // A PATH without rg: the agent-tool line names it, including on the silent
+  // reviewer's re-prompt (which goes through the shared #agentPrompt helper).
+  process.env.PATH = "/usr/bin:/bin";
+  const bLog = path.join(dir, `B-${randomUUID().slice(0, 8)}.log`);
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      checks: ["true"],
+      stubReviews: false,
+      deadlines: { abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 10_000, reviewMs: 20_000 },
+      extraReviewerEnv: (reviewer) => (reviewer === "B" ? { FAKE_PI_PROMPT_LOG: bLog } : undefined),
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [
+          { kind: "call-sh", command: "printf 'x\n' > sum.js" },
+          { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        ],
+      }),
+      reviewerScriptFor: (reviewer, state) => {
+        const review = {
+          kind: "call-submit" as const,
+          tool: "submit_review" as const,
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings: [],
+          },
+        };
+        if (reviewer !== "B") {
+          return { hello: defaultReviewerHello(), steps: [{ kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } }, { kind: "wait-for-prompt" }, review] };
+        }
+        return {
+          hello: defaultReviewerHello(),
+          steps: [
+            { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+            { kind: "wait-for-prompt" },
+            { kind: "wait-for-prompt" },
+            review,
+          ],
+        };
+      },
+    });
+    await setup.conductor.start();
+    await waitFor(() => setup!.conductor.state.phase.phase === "DONE", 120_000, 50, setup!.runDir);
+    const prompts = fs.readFileSync(bLog, "utf8");
+    assert.match(prompts, /environment preflight did not find/, "the re-prompt carries the missing-tools line");
+    assert.match(prompts, /\brg\b/, "rg is named on the re-prompt");
+  } finally {
+    process.env.PATH = originalPath;
+    if (setup) {
+      await setup.conductor.stop();
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
