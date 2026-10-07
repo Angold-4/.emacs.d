@@ -1104,7 +1104,11 @@ export function reviewRequestLines(items: PlanItems): string[] {
 // Architecture symbols (`:WHERE:` with a named symbol)
 // ---------------------------------------------------------------------------
 
-const SYMBOL_RE = /\b(?:type|interface|class|function|const|let|var|enum|struct|def|fn)\s+([A-Za-z_$][\w$]*)/g;
+// A keyword counts only when the name after it is followed by code punctuation
+// (`(`, `{`, `<`, `:`, `=`, `;`), so a declaration matches and prose does not:
+// `interface Round {` and `pub fn new(` name symbols, "a pure function with no
+// dependencies" and "class Dark." do not.
+const SYMBOL_RE = /\b(?:type|interface|class|function|const|let|var|enum|struct|def|fn)\s+([A-Za-z_$][\w$]*)(?=\s*[({<:=;])/g;
 
 /** The named types, events and functions an architecture item mentions. Used
  * to grep the candidate for a symbol before any reviewer is asked: a missing
@@ -1112,8 +1116,9 @@ const SYMBOL_RE = /\b(?:type|interface|class|function|const|let|var|enum|struct|
 export function architectureSymbols(item: ArchitectureItem): string[] {
   const out: string[] = [];
   for (const m of `${item.title} ${item.text}`.matchAll(SYMBOL_RE)) out.push(m[1]);
-  // A bare `PascalCase` name in the title or a code span also counts.
-  for (const m of item.text.matchAll(/`([A-Za-z_$][\w$]*)`/g)) out.push(m[1]);
+  // A bare `PascalCase` name in a code span also counts; a lower-case word in
+  // backticks (`review`, `dark`) is prose, not a declared symbol.
+  for (const m of item.text.matchAll(/`([A-Z][\w$]*)`/g)) out.push(m[1]);
   return [...new Set(out)];
 }
 

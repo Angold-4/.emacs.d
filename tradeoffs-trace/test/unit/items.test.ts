@@ -28,6 +28,7 @@ import {
   type PlanItems,
   type ReviewItems,
   type SeatItemVerdict,
+  architectureSymbols,
 } from "../../src/core/items.ts";
 
 const structured: PlanItems = {
@@ -362,4 +363,22 @@ test("items: a Rust test verify keeps its module path and resolves from cargo te
   // The full path matches exactly, never a prefix or a tail.
   assert.equal(testOutcomeIn(output, "acceptance::mark_s11_04_long_name"), "missing");
   assert.equal(testOutcomeIn(output, "mark_s11_01_quiet"), "missing");
+});
+
+test("items: architecture symbols come from declarations and PascalCase code spans, never from prose", () => {
+  const item = {
+    id: "A1",
+    title: "The class Dark and the slugify function",
+    text: [
+      "`slugify(text: string): string` is a pure function with no dependencies; a const factor in class Dark.",
+      "#+begin_src rust",
+      "pub struct ClusterTime(pub u64); // mirrors the type in trade-core",
+      "pub fn evaluate(state: &mut MarkState) -> Result<(), MarkError>;",
+      "#+end_src",
+      "Also see `RegimeMap`; `review` and `dark` are prose. interface Round { n: number }",
+    ].join("\n"),
+    tags: ["data"],
+    where: "src/a.rs",
+  };
+  assert.deepEqual(architectureSymbols(item as never).sort(), ["ClusterTime", "RegimeMap", "Round", "evaluate"].sort());
 });
