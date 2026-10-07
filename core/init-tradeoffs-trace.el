@@ -536,21 +536,31 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
          (arch (org-element-property :ARCH hl))
          (where (org-element-property :WHERE hl))
          (title (string-trim (+tt--headline-title hl)))
+         (item-id (org-element-property :ID hl))
+         (where-line (+tt--property-line hl "WHERE"))
+         (arch-line (+tt--property-line hl "ARCH"))
+         (verify-line (+tt--property-line hl "VERIFY"))
          (line (line-number-at-pos (org-element-property :begin hl))))
-    `((id . ,(org-element-property :ID hl))
+    ;; OD-1 R8: omit every absent optional field.  A `nil' written as JSON
+    ;; `null' violates the item schema (`where` must be a string, and
+    ;; `additionalProperties' is false), so a real parsed plan must not carry
+    ;; one.
+    `(,@(when item-id `((id . ,item-id)))
       (title . ,title)
       (text . ,text)
       (rawText . ,raw)
-      (tags . ,(vconcat (org-element-property :tags hl)))
+      ;; Tags are an architecture property only (OD-1 R8: the requirement and
+      ;; constraint schemas forbid extra fields).
       ,@(when (eq kind 'architecture)
-          `((where . ,where)
-            (whereLine . ,(+tt--property-line hl "WHERE"))))
+          `((tags . ,(vconcat (org-element-property :tags hl)))
+            ,@(when where `((where . ,where)))
+            ,@(when where-line `((whereLine . ,where-line)))))
       ,@(when (eq kind 'requirement)
           `((arch . ,(vconcat (and arch (split-string arch "[ \t,]+" t))))
-            (archLine . ,(+tt--property-line hl "ARCH"))))
+            ,@(when arch-line `((archLine . ,arch-line)))))
       ,@(when (memq kind '(requirement constraint))
           `((verify . ,(vconcat (and verify (list verify))))
-            (verifyLine . ,(+tt--property-line hl "VERIFY"))))
+            ,@(when verify-line `((verifyLine . ,verify-line)))))
       (line . ,line))))
 
 (defun +tt--parse-structure (hl)
@@ -598,7 +608,7 @@ so an old plan reaches the loop as items without changing meaning."
                   (verify . ,(if (string-match-p "\\`[ \t]*evidence[ \t]*:" text)
                                  (vector "evidence")
                                (vector "review")))
-                  (line . ,(nth (1- n) acceptance-lines))))
+                  ,@(when (nth (1- n) acceptance-lines) `((line . ,(nth (1- n) acceptance-lines))))))
               acceptance))
      :constraints
      (vconcat
@@ -668,6 +678,10 @@ so an old plan reaches the loop as items without changing meaning."
             ,@(when owner-checklist
                 `((ownerChecklist . ,(vconcat owner-checklist))
                   (ownerChecklistLines . ,(vconcat owner-checklist-lines))))
+            ;; OD-1 R9: an old-format phase's items are synthesized, not
+            ;; declared, so the conductor keeps it unstructured (it owes
+            ;; submit_phase only) while lint and the views still see R1..Rn.
+            ,@(unless structured '((itemsSynthesized . t)))
             ,@(when architecture `((architecture . ,(vconcat architecture))))
             ,@(when requirements `((requirements . ,(vconcat requirements))))
             ,@(when constraints `((constraints . ,(vconcat constraints))))

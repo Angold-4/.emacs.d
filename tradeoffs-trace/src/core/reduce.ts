@@ -110,6 +110,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "BRIEF_RETRY_ATTEMPTED",
   "ITEM_STATE_UPDATED",
   "EVIDENCE_RECORDED",
+  "ITEM_CHECK_RECORDED",
   "DECISION_ADDED",
   "NOTE_ADDED",
   "OWNER_INPUT_RECORDED",
@@ -333,6 +334,16 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, "a finding must carry evidence; got none");
       }
       return ok({ ...state, phase: { ...p, findings: [...p.findings, event.finding] } });
+    }
+
+    case "ITEM_CHECK_RECORDED": {
+      // Plan 06b (OD-1 R3b): the evaluator's re-check of an item's majority
+      // verdict, merged by item id (the latest check wins).
+      const others = (p.itemChecks ?? []).filter((c) => c.itemId !== event.itemId);
+      return ok({
+        ...state,
+        phase: { ...p, itemChecks: [...others, { itemId: event.itemId, verdict: event.verdict, evidence: event.evidence }] },
+      });
     }
 
     case "ITEM_STATE_UPDATED": {

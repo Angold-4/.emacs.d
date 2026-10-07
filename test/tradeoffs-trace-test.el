@@ -165,6 +165,21 @@
     (should (= (length cons) 2))
     (should (equal (mapcar (lambda (c) (alist-get 'id c)) cons) '("C1" "C2")))))
 
+(ert-deftest tradeoffs-trace-plan-structured-schema-clean ()
+  "Plan 06b (OD-1 R8): a parsed structured phase carries no null optional
+fields, and an old-format phase is marked synthesized so the conductor keeps
+it unstructured (R9)."
+  (let* ((parsed (+tt-test--parse +tt-test--structured-plan))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0)))
+    (should (null (plist-get parsed :errors)))
+    (dolist (item (seq-concatenate 'list (alist-get 'architecture p1)
+                                   (alist-get 'requirements p1)
+                                   (alist-get 'constraints p1)))
+      (dolist (cell item)
+        (should-not (null (cdr cell)))))
+    (let ((old (aref (alist-get 'phases (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)) 0)))
+      (should (eq (alist-get 'itemsSynthesized old) t)))))
+
 (ert-deftest tradeoffs-trace-plan-old-format-items ()
   "Plan 06b: an old-format phase synthesizes R1..Rn and C1."
   (let* ((parsed (+tt-test--parse +tt-test--valid-plan))

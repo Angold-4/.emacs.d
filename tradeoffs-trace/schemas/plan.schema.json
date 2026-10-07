@@ -103,6 +103,7 @@
         "text": { "type": "string" },
         "tags": { "type": "array", "items": { "type": "string" } },
         "where": { "type": "string" },
+        "whereLine": { "type": "integer" },
         "rawText": { "type": "string" },
         "line": { "type": "integer" }
       }

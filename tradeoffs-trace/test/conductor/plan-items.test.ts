@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor, type FakePiStep } from "./harness.ts";
 import type { Reviewer } from "../../src/core/types.ts";
+import { ROLE_TOOLS } from "../../src/core/roles.ts";
 
 type Setup = Awaited<ReturnType<typeof setupConductor>>;
 
@@ -403,6 +404,45 @@ test("plan-items: a met verdict citing only the worker's anchors with no file th
       rejected.some((r) => ((r.event as { itemIssues?: string[] }).itemIssues ?? []).some((i) => /read yourself/.test(i))),
       `the reviewer was re-asked to cite a file it read: ${JSON.stringify(rejected[0]?.event)}`,
     );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: the evaluator's substantive re-check overturns a review-only majority (R3b)", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    // R2 is review-only: all three seats judge it unmet, so only the
+    // evaluator's own re-check can contradict the majority.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: { evaluations: [], itemChecks: [{ itemId: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 implements R2" }] },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase), 120_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.phase, "DONE", "the contradicted majority did not block");
+    assert.ok(!setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), "no finding is raised for the contradicted item");
+    assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"));
   } finally {
     await teardown(setup);
   }

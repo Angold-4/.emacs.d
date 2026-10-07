@@ -919,7 +919,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- ${live.length} trade-off(s), ${flagged.length} flagged for the owner`,
     ...(() => {
       const c = phase.contract;
-      const structuredContract = c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined;
+      const structuredContract = !c.itemsSynthesized && (c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined);
       if (!structuredContract) return [];
       const itemsPhase = { contract: c, reviews: phase.reviews, coverage: phase.coverage, checkResolution: phase.checkResolution, overturns: phase.overturns };
       const matrix = matrixMarkdown(itemsPhase);

@@ -362,6 +362,16 @@ const EvaluationParam = Type.Object({
 });
 const submitEvaluationFields: Record<string, TSchema> = {
   evaluations: Type.Array(EvaluationParam, { description: "One entry per raw message you were shown" }),
+  itemChecks: Type.Optional(
+    Type.Array(
+      Type.Object({
+        itemId: Type.String({ description: "The plan item id from the re-check list" }),
+        verdict: StringEnum(["confirmed", "contradicted"] as const),
+        evidence: Type.String({ description: "What you checked in the candidate" }),
+      }),
+      { description: "Plan 06b: your re-check of each plan item whose majority verdict was unmet or deviating" },
+    ),
+  ),
 };
 const SubmitEvaluationParams = Type.Object(
   Object.fromEntries(SUBMIT_EVALUATION_PARAMS.properties.map((key) => [key, submitEvaluationFields[key]])),

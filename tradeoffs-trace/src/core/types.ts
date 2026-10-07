@@ -1144,6 +1144,10 @@ export interface PhaseState {
   /** Plan 06b: verdicts the evaluator's re-verification overturned, each
    * counted against its seat. */
   overturns?: import("./items.ts").Overturn[];
+  /** Plan 06b (OD-1 R3b): the evaluator's substantive re-check of an item's
+   * majority verdict, recorded with what it checked. A `contradicted` check
+   * overturns the majority (the FINDING_VERIFIED path). */
+  itemChecks?: Array<{ itemId: string; verdict: "confirmed" | "contradicted"; evidence: string }>;
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
@@ -2035,9 +2039,19 @@ export interface EvEvidenceRecorded {
   itemId: string;
 }
 
+/** Plan 06b (OD-1 R3b): the evaluator's substantive re-check of one item's
+ * majority verdict, with the evidence of what it checked. */
+export interface EvItemCheckRecorded {
+  type: "ITEM_CHECK_RECORDED";
+  itemId: string;
+  verdict: "confirmed" | "contradicted";
+  evidence: string;
+}
+
 export type Event =
   | EvItemStateUpdated
   | EvEvidenceRecorded
+  | EvItemCheckRecorded
   | EvReviewLintFailed
   | EvBriefsRecorded
   | EvBriefRetryAttempted

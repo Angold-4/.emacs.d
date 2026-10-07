@@ -362,15 +362,15 @@ addRow({
       pendingDispute: undefined,
       probe: undefined,
       reviews: {},
-      // Plan 06b / OD-1 A2: the per-candidate item record is created EMPTY at
-      // each freeze and never carried into the next candidate, exactly like
-      // checks/probe/reviews. The worker's coverage, the check resolution,
-      // the symbol deviations and the overturns all belong to the candidate
-      // that just froze.
-      coverage: undefined,
+      // Plan 06b / OD-1 A2: the previous candidate's item RESULTS are cleared
+      // at each freeze (the check resolution, symbol deviations and overturns
+      // belong to the candidate that just froze). The worker's COVERAGE is
+      // this new candidate's own input — the reviewer prompt and the views
+      // read it — so it is kept until the next worker attempt replaces it.
       checkResolution: undefined,
       archSymbolDeviations: undefined,
       overturns: undefined,
+      itemChecks: undefined,
       // Skill fix 5: kept decisions that passed keep their ballots.
       ballots: carryBallotsForward(
         s.phase.decisions,
@@ -1102,11 +1102,14 @@ addRow({
   // The gate-less fixture (base contract): accept now holds, so the row's
   // actions are exactly next(RESOLVING).
   actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  // OD-1 (disc-M-56): resolve ONLY the request that parked the phase for
+  // evidence — never an unrelated owner decision. The parking request is the
+  // fallback whose reason names the evidence items.
   apply: (s) =>
     withPhase(s, {
       phase: "RESOLVING",
       ownerRequests: s.phase.ownerRequests.map((r) =>
-        r.status === "open"
+        r.status === "open" && r.reason.startsWith("the owner must record evidence for")
           ? {
               ...r,
               status: "resolved" as const,

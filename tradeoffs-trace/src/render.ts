@@ -484,7 +484,7 @@ export function projectEntryReview(
     checkResolution: phase.checkResolution,
     overturns: phase.overturns,
   } as ItemLoopState;
-  const structuredContract = Boolean(phase.contract) && (phase.contract!.architecture !== undefined || phase.contract!.requirements !== undefined || phase.contract!.constraints !== undefined);
+  const structuredContract = Boolean(phase.contract) && !phase.contract!.itemsSynthesized && (phase.contract!.architecture !== undefined || phase.contract!.requirements !== undefined || phase.contract!.constraints !== undefined);
   const matrix = structuredContract ? matrixOrg(itemsPhase) : [];
   if (matrix.length > 0) {
     text += `\n* Plan items\n  ${countsLine(phaseItemCounts(itemsPhase))}\n\n${matrix.map((l) => `  ${l}`).join("\n")}\n`;
@@ -827,8 +827,8 @@ export function renderStatusView(input: StatusViewInput): string {
   push(row("pipeline", view.pipeline));
   // Plan 06b: the status line's item counts, e.g. `R 7/8 met · A 3/3 fit · C 2/2`.
   try {
-    const contract = phase.contract as { architecture?: unknown; requirements?: unknown; constraints?: unknown } | undefined;
-    const structured = contract !== undefined && (contract.architecture !== undefined || contract.requirements !== undefined || contract.constraints !== undefined);
+    const contract = phase.contract as { architecture?: unknown; requirements?: unknown; constraints?: unknown; itemsSynthesized?: boolean } | undefined;
+    const structured = contract !== undefined && !contract.itemsSynthesized && (contract.architecture !== undefined || contract.requirements !== undefined || contract.constraints !== undefined);
     if (structured) {
       const loopState = {
         contract,

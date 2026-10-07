@@ -54,7 +54,9 @@ export const RAISE_TRADEOFF_PARAMS: ParamShape = {
  * publish (clean wording), merge (into another message) or drop (with a
  * reason). One entry per raw message it was shown. */
 export const SUBMIT_EVALUATION_PARAMS: ParamShape = {
-  properties: ["evaluations"],
+  // Plan 06b (OD-1 R3b): `itemChecks` is the evaluator's substantive
+  // re-check of a plan item's majority verdict, with what it checked.
+  properties: ["evaluations", "itemChecks"],
   required: ["evaluations"],
 };
 

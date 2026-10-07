@@ -128,7 +128,7 @@ import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { isRepairForcingOption } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
-import { pendingEvidenceItems } from "./core/predicate.ts";
+import { itemsNeedingEvaluatorReverify, pendingEvidenceItems } from "./core/predicate.ts";
 // Plan 06b: the pure item machinery (coverage, test-verify resolution,
 // verdict validation, per-item majority, the matrix and the status counts).
 import {
@@ -145,6 +145,7 @@ import {
   evidenceFileAnchors,
   itemsFromPhase,
   requirementAndConstraintItems,
+  phaseItemOutcomes,
   repairItemLines,
   resolveTestVerifies,
   reviewItemsIssues,
@@ -321,6 +322,11 @@ export interface RunPlanPhase {
   architecture?: import("./core/items.ts").ArchitectureItem[];
   requirements?: import("./core/items.ts").RequirementItem[];
   constraints?: import("./core/items.ts").ConstraintItem[];
+  /** Plan 06b (OD-1 R9): true when the parser SYNTHESIZED these items from
+   * an old-format `acceptance`/`:RESERVED:` list. The items exist for the
+   * views and lint, but the phase owes submit_phase only, exactly like a
+   * hand-written old-format JSON plan. */
+  itemsSynthesized?: boolean;
   /** Plan 01c: 1-based lines in the source Org file of the `acceptance`
    * items, parallel to the array. Emacs records them so `tt lint` can point
    * at the offending line; a hand-written JSON plan has no lines and the
@@ -690,7 +696,9 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
   // Acceptance + :RESERVED:) declares none and owes submit_phase only. The
   // items are taken as the plan declares them — never synthesized into the
   // contract — so `#structured()` is exactly "the plan declared items".
-  const declaredItems = phase.architecture !== undefined || phase.requirements !== undefined || phase.constraints !== undefined;
+  // OD-1 R9: items the parser synthesized from the old format are NOT
+  // declared items — the phase stays unstructured and owes submit_phase only.
+  const declaredItems = phase.itemsSynthesized !== true && (phase.architecture !== undefined || phase.requirements !== undefined || phase.constraints !== undefined);
   const acceptance = (phase.acceptance?.length ?? 0) > 0 ? phase.acceptance : (phase.requirements ?? []).map((r) => r.text);
   return {
     phaseId: phase.id,
@@ -3625,7 +3633,19 @@ export class Conductor {
         this.#log.append("evaluation_title_accepted", { messageType, agentId, detail: titleIssue, rejections });
       }
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
-      this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
+      // Plan 06b (OD-1 R3b): the evaluator's top-level item re-checks.
+      const checkEvents: Event[] = [];
+      const itemChecks = (msg.args as { itemChecks?: unknown }).itemChecks;
+      if (Array.isArray(itemChecks)) {
+        for (const c of itemChecks as Array<{ itemId?: unknown; verdict?: unknown; evidence?: unknown }>) {
+          const itemId = typeof c?.itemId === "string" ? c.itemId.trim() : "";
+          const verdict = c?.verdict === "confirmed" || c?.verdict === "contradicted" ? c.verdict : undefined;
+          const evidence = typeof c?.evidence === "string" ? c.evidence.trim() : "";
+          if (itemId.length === 0 || !verdict || evidence.length === 0) continue;
+          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId, verdict, evidence });
+        }
+      }
+      this.#applyEvents([...events, ...checkEvents, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
       handle.doneResolve();
       return { ok: true };
     }
@@ -3907,6 +3927,19 @@ export class Conductor {
     const messages = this.#state.phase.messages ?? [];
     const byId = new Map(messages.map((m) => [m.id, m]));
     const events: Event[] = [];
+    // Plan 06b (OD-1 R3b): the evaluator's substantive re-check of an item's
+    // majority verdict, recorded with what it checked (the FINDING_VERIFIED
+    // path). A `contradicted` check overturns the majority in
+    // `#itemOverturns`; a `confirmed` one leaves it blocking.
+    for (const entry of entries) {
+      const check = (entry as { itemCheck?: { itemId?: unknown; verdict?: unknown; evidence?: unknown } }).itemCheck;
+      if (!check || typeof check.itemId !== "string") continue;
+      const itemId = check.itemId.trim();
+      const verdict = check.verdict === "confirmed" || check.verdict === "contradicted" ? check.verdict : undefined;
+      const evidence = typeof check.evidence === "string" ? check.evidence.trim() : "";
+      if (itemId.length === 0 || !verdict || evidence.length === 0) continue;
+      events.push({ type: "ITEM_CHECK_RECORDED", itemId, verdict, evidence });
+    }
     for (const entry of entries) {
       const id = typeof entry?.messageId === "string" ? entry.messageId : "";
       const message = byId.get(id);
@@ -5393,7 +5426,22 @@ export class Conductor {
     };
     for (const o of outcomes) {
       const ctx = this.#verdictContext(o.item, (o.seats[0]?.seat ?? "M") as Reviewer);
-      out.push(...reverify(o.item, o.seats, ctx, readsBySeat));
+      const testOverturns = reverify(o.item, o.seats, ctx, readsBySeat);
+      if (testOverturns.length > 0) {
+        out.push(...testOverturns);
+        continue;
+      }
+      // Plan 06b (OD-1 R3b): the evaluator's substantive re-check. A
+      // `contradicted` check overturns every seat whose verdict made the
+      // majority, recorded with what the evaluator checked.
+      if (o.outcome === "unmet" || o.outcome === "deviates") {
+        const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
+        if (check) {
+          for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
+            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted it: ${check.evidence}` });
+          }
+        }
+      }
     }
     return out;
   }
@@ -8488,6 +8536,20 @@ export class Conductor {
         "",
         `Owner-refused ${messageType} messages (report whether this candidate addressed each):`,
         ...refused.map((m) => `- ${m.id} "${m.title}" — refused: ${m.settlement?.reason ?? "no reason given"}`),
+      );
+    }
+    // Plan 06b (OD-1 R3b): a majority unmet/deviates item needs the
+    // evaluator's substantive re-check against the candidate before it
+    // blocks. The check is recorded with what was checked.
+    const reverifyItems = itemsNeedingEvaluatorReverify(phase)
+      ? phaseItemOutcomes(phase).filter((o) => o.outcome === "unmet" || o.outcome === "deviates")
+      : [];
+    if (reverifyItems.length > 0) {
+      lines.push(
+        "",
+        "Plan-item re-check: a majority of seats judged each item below unmet or deviating. Re-check it against the candidate's code and record exactly what you checked:",
+        ...reverifyItems.map((o) => `- ${o.item.id} ${o.item.title}: ${o.outcome}; seats: ${o.evidence.join(" | ")}`),
+        "Add one `itemCheck` = { itemId, verdict: confirmed|contradicted, evidence } for each item above. Use `contradicted` only when the candidate's code proves the majority wrong; otherwise `confirmed`.",
       );
     }
     lines.push(

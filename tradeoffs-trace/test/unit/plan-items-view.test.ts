@@ -135,6 +135,8 @@ test("plan-items view: the status view shows the counts line", () => {
 });
 
 test("plan 06b: a structured phase without acceptance validates against the schemas", () => {
+  // Every field the Emacs parser emits, including the line metadata, must be
+  // allowed (OD-1 R8); no null optional field.
   const phase = {
     id: "p1",
     goal: "g",
@@ -142,9 +144,9 @@ test("plan 06b: a structured phase without acceptance validates against the sche
     boundaries: [],
     reserved: [],
     provisional: false,
-    architecture: items.architecture,
-    requirements: items.requirements,
-    constraints: items.constraints,
+    architecture: [{ id: "A1", title: "A", text: "t", tags: ["data"], where: "src/a.ts", whereLine: 10, rawText: "t", line: 9 }],
+    requirements: [{ id: "R1", title: "R", text: "t", arch: ["A1"], verify: ['test "x"'], rawText: "t", line: 20, archLine: 22, verifyLine: 23 }],
+    constraints: [{ id: "C1", title: "C", text: "t", verify: ["review"], rawText: "t", line: 30, verifyLine: 32 }],
   };
   const planJson = { title: "t", checks: ["true"], phases: [phase] };
   const planSchema = JSON.parse(fs.readFileSync(new URL("../../schemas/plan.schema.json", import.meta.url), "utf8"));
@@ -154,6 +156,10 @@ test("plan 06b: a structured phase without acceptance validates against the sche
   const contractSchema = JSON.parse(fs.readFileSync(new URL("../../schemas/phase-contract.schema.json", import.meta.url), "utf8"));
   const contractResult = validate(contractSchema, contract);
   assert.equal(contractResult.valid, true, contractResult.errors.join("; "));
+  // The old format is synthesized and not declared, so the conductor keeps it
+  // unstructured (R9).
+  const oldContract = buildContract({ id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false } as unknown as RunPlanPhase);
+  assert.equal(oldContract.itemsSynthesized, true);
 });
 
 test("plan 06b: an old-format plan declares no items and adds no matrix", () => {
