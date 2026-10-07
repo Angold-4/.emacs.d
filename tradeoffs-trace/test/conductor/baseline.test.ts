@@ -564,20 +564,19 @@ test("plan 06c: a child node based on its parent's accepted candidate reuses the
       at: new Date().toISOString(),
     }),
   );
-  // The program's own events name the parent run, which is how the child
-  // finds the record without a path the scheduler did not record.
+  // The SCHEDULER makes the reuse choice and passes the accepted candidate's
+  // record path into the run; the conductor only consumes it.
   const programId = "prog-child-baseline";
-  const programDir = path.join(runRoot, "programs", programId);
-  fs.mkdirSync(programDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(programDir, "events.jsonl"),
-    `${JSON.stringify({ ts: new Date().toISOString(), event: { type: "NODE_STARTED", node: "a", runId: parentRunId } })}\n`,
-  );
 
-  const makeChild = (integrationBranch: string, node: string, scriptName: string): { runDir: string; conductor: Conductor } => {
+  const makeChild = (
+    integrationBranch: string,
+    node: string,
+    scriptName: string,
+    baselineReuse?: { fromRunId: string; fromCandidateSha: string },
+  ): { runDir: string; conductor: Conductor } => {
     const childPlan: RunPlanFile = { title: `child-${node}`, repo: repo.dir, integrationBranch, checks: [command], phases: [phase] };
     const runDir = createRun(runRoot, childPlan);
-    fs.writeFileSync(path.join(runDir, "program.json"), JSON.stringify({ programId, node }));
+    fs.writeFileSync(path.join(runDir, "program.json"), JSON.stringify({ programId, node, ...(baselineReuse ? { baselineReuse } : {}) }));
     const worker = writeScript(scriptsDir, `${scriptName}-worker`, {
       hello: defaultWorkerHello(),
       steps: [
@@ -614,7 +613,7 @@ test("plan 06c: a child node based on its parent's accepted candidate reuses the
   };
 
   // The child's base IS the parent's accepted candidate: no baseline runs.
-  const reused = makeChild("main--a", "b", "reuse");
+  const reused = makeChild("main--a", "b", "reuse", { fromRunId: parentRunId, fromCandidateSha: baseSha });
   try {
     await reused.conductor.start();
     await waitFor(

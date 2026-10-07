@@ -946,7 +946,9 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
     if (!result.ok) continue;
     state = result.state;
     const type = (record.event as { type?: string }).type;
-    if (type === "ATTEMPT_INTERRUPTED") restarts.push(record.ts);
+    // Plan 06c (A5): the stage clock stops at a stop and starts a new segment
+    // at a resume — not only at an interrupted attempt.
+    if (type === "ATTEMPT_INTERRUPTED" || type === "RUN_RESUMED") restarts.push(record.ts);
     const prevC = before.phase.candidate?.sha;
     if (type === "FREEZE_COMPLETED" && prevC) {
       const reasons = notAcceptedReasons(before.phase);
@@ -5534,19 +5536,18 @@ export class Conductor {
     if (messageType !== "finding") return [];
     if (!this.#itemsEnforced() || !itemsNeedingEvaluatorReverify(this.#state.phase)) return [];
     const accepted = new Set(this.#state.phase.acceptedDeviations ?? []);
-    return phaseItemOutcomes(this.#state.phase)
-      .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
-      .filter((o) => !(o.item.kind === "architecture" && accepted.has(o.item.id)))
-      .map((o) => o.item.id);
-  }
-
-  /** Plan 06c (R5): the ids of unanimous thin met/fits items. They are LISTED
-   * to the evaluator for audit, but a missing check is not re-prompted and the
-   * verdict is never withdrawn by code — only a `contradicted` check with
-   * valid anchors overturns it. */
-  #thinMetAuditIds(): string[] {
-    if (!this.#itemsEnforced()) return [];
-    return thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors()).map((o) => o.item.id);
+    const ids = new Set(
+      phaseItemOutcomes(this.#state.phase)
+        .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
+        .filter((o) => !(o.item.kind === "architecture" && accepted.has(o.item.id)))
+        .map((o) => o.item.id),
+    );
+    // Plan 06c (A4/R9): a unanimous thin met/fits is an OWED item check too.
+    // A missing one is re-prompted once, then recorded `unchecked`; a
+    // `contradicted` check with valid anchors overturns it, and code never
+    // withdraws the verdict on its own.
+    for (const o of thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors())) ids.add(o.item.id);
+    return [...ids];
   }
 
   #itemOverturns(outcomes: readonly ItemOutcome[]): import("./core/items.ts").Overturn[] {
@@ -6328,61 +6329,51 @@ export class Conductor {
    * own event log names every sibling run, so this never needs a path the
    * scheduler did not record. */
   #candidateRecordBaseline(commands: readonly string[], key: string): { record: Baseline; sourceDir: string } | undefined {
-    const programDir = this.#programDir();
-    if (!programDir) return undefined;
-    const baseSha = this.#baselineBaseSha();
-    if (!baseSha) return undefined;
-    let text: string;
+    // Plan 06c (A3): the SCHEDULER chose this reuse when it started this node
+    // and recorded the parent's accepted candidate and run in the node's
+    // `program.json`. The conductor only consumes the given path; it never
+    // scans sibling runs to decide a baseline itself.
+    let reuse: { fromRunId?: unknown; fromCandidateSha?: unknown } | undefined;
     try {
-      text = fs.readFileSync(path.join(programDir, "events.jsonl"), "utf8");
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as {
+        baselineReuse?: { fromRunId?: unknown; fromCandidateSha?: unknown };
+      };
+      reuse = info.baselineReuse;
     } catch {
       return undefined;
     }
-    const runIds = new Set<string>();
-    for (const line of text.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const parsed = JSON.parse(line) as { event?: { type?: string; runId?: string } };
-        if (parsed.event?.type === "NODE_STARTED" && typeof parsed.event.runId === "string") runIds.add(parsed.event.runId);
-      } catch {
-        // a torn last line
-      }
+    if (!reuse || typeof reuse.fromRunId !== "string" || typeof reuse.fromCandidateSha !== "string") return undefined;
+    const baseSha = reuse.fromCandidateSha;
+    const dir = path.join(path.dirname(this.#runDir), reuse.fromRunId, "checks", baseSha);
+    let record: CheckRecord | undefined;
+    try {
+      record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(dir, "record.json"), "utf8")));
+    } catch {
+      record = undefined;
     }
-    const root = path.dirname(this.#runDir);
-    for (const runId of runIds) {
-      if (runId === path.basename(this.#runDir)) continue;
-      const dir = path.join(root, runId, "checks", baseSha);
-      let record: CheckRecord | undefined;
-      try {
-        record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(dir, "record.json"), "utf8")));
-      } catch {
-        record = undefined;
-      }
-      if (!record || !record.passed) continue;
-      // The record's final command (if any) is not part of the child's own
-      // check list; the phase's checks are.
-      const runCommands = record.commands.filter((c) => !record.finalCommands.includes(c.command));
-      if (runCommands.length !== commands.length) continue;
-      if (!runCommands.every((c, i) => c.command === this.#baselineCommandName(commands[i]))) continue;
-      const baseline: Baseline = {
-        baseSha,
-        tree: this.#baselineTree(),
-        key,
-        at: record.at,
-        commands: runCommands.map((c) => ({
-          command: c.command,
-          exitCode: c.exitCode,
-          signal: c.signal ?? null,
-          timedOut: c.timedOut,
-          durationMs: c.durationMs,
-          failures: [],
-          ...(c.log ? { log: c.log } : {}),
-        })),
+    if (!record || !record.passed) return undefined;
+    // The record's final command (if any) is not part of the child's own
+    // check list; the phase's checks are.
+    const runCommands = record.commands.filter((c) => !record.finalCommands.includes(c.command));
+    if (runCommands.length !== commands.length) return undefined;
+    if (!runCommands.every((c, i) => c.command === this.#baselineCommandName(commands[i]))) return undefined;
+    const baseline: Baseline = {
+      baseSha,
+      tree: this.#baselineTree(),
+      key,
+      at: record.at,
+      commands: runCommands.map((c) => ({
+        command: c.command,
+        exitCode: c.exitCode,
+        signal: c.signal ?? null,
+        timedOut: c.timedOut,
+        durationMs: c.durationMs,
         failures: [],
-      };
-      return { record: baseline, sourceDir: dir };
-    }
-    return undefined;
+        ...(c.log ? { log: c.log } : {}),
+      })),
+      failures: [],
+    };
+    return { record: baseline, sourceDir: dir };
   }
 
   /** The log file name a check command's evidence gets under its gate's
@@ -6442,6 +6433,14 @@ export class Conductor {
       "",
       `Tools the environment preflight did not find on this machine (use an available alternative): ${this.#agentToolsMissing.join(", ")}.`,
     ];
+  }
+
+  /** Plan 06c (A5): every agent prompt names the tools the preflight did not
+   * find. `buildWorkerPrompt` takes them directly; every other prompt is
+   * wrapped here so no role is left uninformed. */
+  #agentPrompt(text: string): string {
+    const lines = this.#agentToolLines();
+    return lines.length > 0 ? `${text}\n${lines.join("\n")}` : text;
   }
 
   /** Resolve one executable in the conductor's own environment with
@@ -6559,7 +6558,8 @@ export class Conductor {
    * resolved), which is both what the baseline records and what the C gate
    * and the probe execute. */
   #resolvedEffectiveChecks(): string[] {
-    return effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks).map((c) => this.#withValues(c));
+    // Plan 06c (A1/C2): the round list comes from the one chooser too.
+    return checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, "round").map((c) => this.#withValues(c));
   }
 
   #baselineKey(commands: readonly string[]): string {
@@ -7324,16 +7324,22 @@ export class Conductor {
         } else {
           const failing = recordCommands.filter((c) => !c.passed).map((c) => c.command);
           const tail = combinedOutput.split("\n").filter((l) => l.trim().length > 0).slice(-20).join("\n");
-          // The failing tests, classified like a normal check failure, so the
-          // repair prompt names the failing final test.
+          // Keep the SAME rerun classification an ordinary check failure has
+          // (loadOnly, reproducesAlone, rerunExitCodes): a load-only flake is
+          // never relabelled a real regression, and the record says which
+          // reruns were actually performed. Only when the loop classified
+          // nothing (its output named no test) do we fall back to the names.
           const failingExitCode = recordCommands.find((c) => !c.passed)?.exitCode ?? null;
-          const finalFailures: CheckFailureClass[] = parseTestFailures(combinedOutput).map((name) => ({
-            name,
-            reproducesAlone: true,
-            loadOnly: false,
-            failingExitCode,
-            rerunExitCodes: [],
-          }));
+          const finalFailures: CheckFailureClass[] =
+            checkFailures.length > 0
+              ? checkFailures
+              : parseTestFailures(combinedOutput).map((name) => ({
+                  name,
+                  reproducesAlone: true,
+                  loadOnly: false,
+                  failingExitCode,
+                  rerunExitCodes: [],
+                }));
           this.#applyEvent({
             type: "FINAL_CHECKS_FAILED",
             evidence: `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${tail ? `\n${tail}` : ""}`,
@@ -7430,7 +7436,8 @@ export class Conductor {
     const sameTree = treeOf(this.#plan.repo, result.I) === treeOf(this.#plan.repo, candidateSha);
     const reuse = this.#probeReuse && sameTree && checks?.candidateSha === candidateSha && checks.passed === true;
     if (reuse) this.#log.append("probe_checks_reused", { candidateSha, I: result.I, reason: "I has the candidate's tree; checks passed on the candidate" });
-    for (const rawCommand of reuse ? [] : effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+    // Plan 06c (A1/C2): the probe re-runs the round list from the one chooser.
+    for (const rawCommand of reuse ? [] : checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, "round")) {
       const command = this.#withValues(rawCommand);
       // design §8.1: "integration probe (merge plus its checks) | as for
       // checks, per command | kill its group; discard the probe branch |
@@ -8061,7 +8068,7 @@ export class Conductor {
 
       if (this.#stubReviews) {
         await agent.prompt(
-          buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives),
+          this.#agentPrompt(buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives)),
         );
         const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
         reviewTimeout.cancel();
@@ -8085,7 +8092,7 @@ export class Conductor {
       // votable decision) accepted at all (#onSubmit's own turn-order
       // check). One shared `reviewMs` deadline covers both turns.
       const settled1 = nextSettle();
-      await agent.prompt(this.#buildReviewerTurn1Prompt(reviewer));
+      await agent.prompt(this.#agentPrompt(this.#buildReviewerTurn1Prompt(reviewer)));
       const turn1 = await Promise.race([discoveryPromise.then(() => "discovered" as const), reviewTimeout.promise, settled1]);
       if (turn1 !== "discovered") {
         reviewTimeout.cancel();
@@ -8130,7 +8137,7 @@ export class Conductor {
         return;
       }
       const settled2 = nextSettle();
-      await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer, handle));
+      await agent.prompt(this.#agentPrompt(this.#buildReviewerTurn2Prompt(reviewer, handle)));
       let turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled2]);
       // Plan 06c (A2): the review stage owns this turn's outcome. A turn that
       // settles WITHOUT submit_review is asked once more, naming the missing
@@ -8253,7 +8260,7 @@ export class Conductor {
         this.#log.completion(actionId, { candidateSha, ok: false, reason: hello === "exited" ? "curator exited before hello" : "curator did not start" });
         return;
       }
-      await agent.prompt(this.#buildCuratorPrompt());
+      await agent.prompt(this.#agentPrompt(this.#buildCuratorPrompt()));
       const settled = nextSettle();
       // A cancelable deadline (never `raceTimeout`, whose timer survives the
       // race and keeps the process alive): the conductor's own `stop()`
@@ -8634,7 +8641,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_brief for each item listed.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildBriefPrompt(ids));
+      await agent.prompt(this.#agentPrompt(this.#buildBriefPrompt(ids)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         briefTimeout.promise,
@@ -8832,7 +8839,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_evaluation.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildEvaluatorPrompt(messageType));
+      await agent.prompt(this.#agentPrompt(this.#buildEvaluatorPrompt(messageType)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         evaluatorTimeout.promise,
@@ -8904,30 +8911,19 @@ export class Conductor {
     // Plan 06b (OD-1 R3b): a majority unmet/deviates item needs the
     // evaluator's substantive re-check against the candidate before it
     // blocks. The check is recorded with what was checked.
+    const owedIds = this.#owedItemCheckIds("finding");
     const reverifyItems = itemsNeedingEvaluatorReverify(phase)
-      ? phaseItemOutcomes(phase).filter((o) => o.outcome !== "met" && o.outcome !== "fits")
+      ? phaseItemOutcomes(phase).filter((o) => owedIds.includes(o.item.id))
       : [];
     if (reverifyItems.length > 0) {
       lines.push(
         "",
-        "Plan-item re-check: a majority of seats judged each item below unmet or deviating. Re-check it against the candidate's code and record exactly what you checked:",
-        ...reverifyItems.map((o) => `- ${o.item.id} ${o.item.title}: ${o.outcome}; seats: ${o.evidence.join(" | ")}`),
-        "Add one `itemChecks[]` entry = { id, verdict: confirmed|contradicted, evidence } for each item above. `evidence` must cite a file:line in the candidate. Use `contradicted` only when the candidate's code proves the majority wrong; otherwise `confirmed`.",
-      );
-    }
-    // Plan 06c (R5): a unanimous met/fits whose evidence is thin (one anchor,
-    // or only the worker's anchors) is audited. The evaluator is asked to
-    // re-check it; a `contradicted` check with valid anchors overturns the
-    // met verdict, and a missing check simply leaves it met.
-    const thinAudit = this.#thinMetAuditIds()
-      .map((id) => phaseItemOutcomes(phase).find((o) => o.item.id === id))
-      .filter((o): o is NonNullable<typeof o> => o !== undefined);
-    if (thinAudit.length > 0) {
-      lines.push(
-        "",
-        "Plan-item audit: every seat judged each item below met/fits with thin evidence (one anchor, or only the worker's anchors). Re-check it against the candidate and record an `itemChecks[]` entry only if the code contradicts the met/fits verdict:",
-        ...thinAudit.map((o) => `- ${o.item.id} ${o.item.title}: ${o.outcome}; seats: ${o.evidence.join(" | ")}`),
-        "Add { id, verdict: 'contradicted', evidence } with a file:line in the candidate for any item above whose met/fits verdict the code proves wrong. A confirmed or missing check leaves it met.",
+        "Plan-item re-check: each item below owes an evaluator check. Re-check it against the candidate's code and record exactly what you checked:",
+        ...reverifyItems.map(
+          (o) =>
+            `- ${o.item.id} ${o.item.title}: ${o.outcome}${o.outcome === "met" || o.outcome === "fits" ? " (thin unanimous evidence — audit it)" : " (a majority judged it unmet or deviating)"}; seats: ${o.evidence.join(" | ")}`,
+        ),
+        "Add one `itemChecks[]` entry = { id, verdict: confirmed|contradicted, evidence } for each item above. `evidence` must cite a file:line in the candidate. Use `contradicted` only when the candidate's code proves the verdict wrong; otherwise `confirmed`.",
       );
     }
     lines.push(
@@ -9084,7 +9080,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_panel_vote.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildPanelPrompt(blockerId, seat));
+      await agent.prompt(this.#agentPrompt(this.#buildPanelPrompt(blockerId, seat)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         seatTimeout.promise,
@@ -9277,7 +9273,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_round_panel_votes.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildRoundPanelPrompt(seat));
+      await agent.prompt(this.#agentPrompt(this.#buildRoundPanelPrompt(seat)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         seatTimeout.promise,

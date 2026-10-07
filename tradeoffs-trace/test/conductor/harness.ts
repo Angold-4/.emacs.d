@@ -442,6 +442,7 @@ export async function setupConductor(opts: {
 function owedItemIds(state: State): string[] {
   const outcomes = phaseItemOutcomes(state.phase);
   const ids = new Set(outcomes.filter((o) => o.outcome !== "met" && o.outcome !== "fits").map((o) => o.item.id));
+  // Plan 06c (A4/R9): a unanimous thin met/fits is an owed item check too.
   for (const o of thinMetItems(outcomes, workerAnchorsOf(state.phase.coverage))) ids.add(o.item.id);
   return [...ids];
 }

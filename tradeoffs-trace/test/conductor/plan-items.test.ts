@@ -435,7 +435,15 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
         {
           kind: "call-submit",
           tool: "submit_evaluation",
-          args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 implements R2" }] },
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 implements R2" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
         },
       ],
     }),
@@ -601,7 +609,19 @@ test("plan 06b: an evaluator item check with an invalid anchor never overturns a
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
-        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "contradicted", evidence: "src/nonexistent.ts:1 proves it" }] } },
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "contradicted", evidence: "src/nonexistent.ts:1 proves it" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
+        },
       ],
     }),
   });
@@ -635,7 +655,19 @@ test("plan 06c: a confirmed evaluator item check with invalid anchors is recorde
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
-        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "confirmed", evidence: "src/nonexistent.ts:1 confirms it" }] } },
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "confirmed", evidence: "src/nonexistent.ts:1 confirms it" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
+        },
       ],
     }),
   });
@@ -1168,7 +1200,15 @@ test("plan 06c: a thin unanimous met verdict is sent to the evaluator as an item
         {
           kind: "call-submit",
           tool: "submit_evaluation",
-          args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R2" }] },
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R2" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
         },
       ],
     }),
@@ -1176,10 +1216,10 @@ test("plan 06c: a thin unanimous met verdict is sent to the evaluator as an item
   try {
     await setup.conductor.start();
     // The audit is listed in the evaluator's prompt.
-    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("Plan-item audit"), 90_000, 50, setup.runDir);
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("Plan-item re-check"), 90_000, 50, setup.runDir);
     const prompts = fs.readFileSync(promptLog, "utf8");
-    assert.match(prompts, /Plan-item audit/);
-    assert.match(prompts, /- R2 /, "the thin met R2 is listed for audit");
+    assert.match(prompts, /Plan-item re-check/);
+    assert.match(prompts, /- R2 .*thin unanimous evidence/, "the thin met R2 is an owed item check");
     // The evaluator's contradiction overturns the thin met verdict (it is the
     // evaluator's check, never the code, that withdrew it).
     await waitFor(() => (setup.conductor.state.phase.overturns ?? []).some((o) => o.id === "R2"), 90_000, 50, setup.runDir);
