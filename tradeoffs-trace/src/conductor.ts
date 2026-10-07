@@ -191,6 +191,7 @@ import {
   reverify,
   symbolPresent,
   tallyItems,
+  testResultLines,
   testVerifyProblems,
   thinMetItems,
   verdictIssues,
@@ -6489,6 +6490,7 @@ export class Conductor {
       diffFiles: C ? this.#diffFiles(C) : [],
       ...(item.where ? { where: item.where } : {}),
       testOutcomes: this.#itemTestOutcomes(),
+      checkOutput: (this.#state.phase.checkTestLines ?? []).join("\n"),
       reviewerReadFiles: this.#reviewerReadFiles(reviewer),
       workerAnchors: this.#workerAnchors(),
       reviewerCommands: this.#reviewerRanCommands(reviewer),
@@ -9537,7 +9539,7 @@ export class Conductor {
       // check's run does not re-resolve them.
       if (tier === "round" && this.#itemsEnforced()) {
         const resolutions = resolveTestVerifies(this.#planItems(), combinedOutput);
-        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions });
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions, checkTestLines: testResultLines(combinedOutput) });
         this.#applyTestVerifyFindings(candidateSha);
       }
       if (tier === "final") {

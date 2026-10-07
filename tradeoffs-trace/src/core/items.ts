@@ -192,6 +192,14 @@ function isFilePath(text: string): boolean {
   return text.includes("/") || /\.[A-Za-z0-9]+$/.test(text);
 }
 
+/** `file::name` only when the left side is a file path: Rust test names are
+ * module paths (`acceptance::mark_s11_01`) and stay whole. */
+function testRef(raw: string): { name: string; file?: string } {
+  const name = raw.trim();
+  const sep = name.indexOf("::");
+  return sep > 0 && isFilePath(name.slice(0, sep)) ? { name: name.slice(sep + 2), file: name.slice(0, sep) } : { name };
+}
+
 export function parseVerify(raw: string | undefined): Verify[] {
   const text = (raw ?? "").trim();
   if (text.length === 0) return [{ kind: "review" }];
@@ -200,13 +208,7 @@ export function parseVerify(raw: string | undefined): Verify[] {
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     if (m[1] !== undefined) {
-      const rawName = m[2] ?? m[3] ?? "";
-      const name = rawName.trim();
-      // `file::name` only when the left side is a file path: Rust test names
-      // are module paths (`acceptance::mark_s11_01`) and stay whole.
-      const sep = name.indexOf("::");
-      if (sep > 0 && isFilePath(name.slice(0, sep))) out.push({ kind: "test", file: name.slice(0, sep), name: name.slice(sep + 2) });
-      else out.push({ kind: "test", name });
+      out.push({ kind: "test", ...testRef(m[2] ?? m[3] ?? "") });
     } else if (m[4] !== undefined) {
       out.push({ kind: "review" });
     } else if (m[5] !== undefined) {
@@ -402,6 +404,18 @@ export function testOutcomeIn(output: string, name: string): TestOutcome {
   return passed ? "passed" : "missing";
 }
 
+/** The test-result lines of a check run's output, in the shapes
+ * `testOutcomeIn` reads. Kept with the run so a reviewer may cite any test it
+ * ran, not only the plan's verifies, without storing the whole output. */
+export function testResultLines(output: string): string[] {
+  const shapes = [
+    /^\s*(?:✔|✓|✖|✗|×)\s+\S/,
+    /^\s*(?:not\s+)?ok\s+\d+\s+-\s+\S/,
+    /^\s*test\s+\S.*\s+\.\.\.\s+(?:ok|FAILED|ignored)\s*$/,
+  ];
+  return output.split("\n").filter((line) => shapes.some((re) => re.test(line)));
+}
+
 /** Resolve every `test` verify of every R, C (and A) item against the check
  * run's output. An item with no test verify produces no rows. */
 export function resolveTestVerifies(items: PlanItems, checkOutput: string): VerifyResolution[] {
@@ -527,11 +541,9 @@ export function evidenceFileAnchors(evidence: string): FileAnchor[] {
 /** The `test "name"` names cited in an evidence string. */
 export function evidenceTestNames(evidence: string): string[] {
   const out: string[] = [];
-  for (const m of evidence.matchAll(/\btest\s+"([^"]+)"/g)) out.push(m[1]);
-  for (const m of evidence.matchAll(/\btest\s+([\w./:-]+::[\w.:-]+)/g)) {
-    const name = m[1];
-    out.push(name.includes("::") ? name.slice(name.indexOf("::") + 2) : name);
-  }
+  for (const m of evidence.matchAll(/\btest\s+"([^"]+)"/g)) out.push(testRef(m[1]).name);
+  // An unquoted name ends at prose punctuation: `test a::b.` cites `a::b`.
+  for (const m of evidence.matchAll(/\btest\s+([\w./:-]+::[\w.:-]+)/g)) out.push(testRef(m[1].replace(/[.:]+$/, "")).name);
   return out;
 }
 
@@ -582,6 +594,9 @@ export interface VerdictContext {
   where?: string;
   /** The check run's test resolutions, by test name. */
   testOutcomes: ReadonlyMap<string, TestOutcome>;
+  /** The check run's test-result lines (`testResultLines`), so a cited test
+   * that is not a plan verify still resolves against the run itself. */
+  checkOutput?: string;
   /** Files this reviewer itself read in this review (from its tool calls). */
   reviewerReadFiles: readonly string[];
   /** The worker's own coverage anchors, which a met/fits verdict may not
@@ -654,7 +669,7 @@ export function verdictIssues(
   }
   // A cited test must have passed in this check run.
   for (const name of evidenceTestNames(evidence)) {
-    const outcome = ctx.testOutcomes.get(name);
+    const outcome = ctx.testOutcomes.get(name) ?? (ctx.checkOutput === undefined ? undefined : testOutcomeIn(ctx.checkOutput, name));
     if (outcome !== "passed") {
       out.push(`${item.id}: the cited test "${name}" ${outcome === undefined || outcome === "missing" ? "is not in this check run" : "did not pass in this check run"}`);
     }
