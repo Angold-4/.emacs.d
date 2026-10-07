@@ -136,6 +136,7 @@ import {
   checkResolutionLines,
   checklistLines,
   flatItems,
+  isStructured,
   itemNeedsEvidence,
   coverageComplete,
   coverageIssues,
@@ -1073,6 +1074,10 @@ interface AgentHandle {
    * had rejected for a title that ends mid-word or was cut to fit the cap
    * (at most MAX_INCOMPLETE_REVIEW_REJECTIONS, then accepted as is). */
   evaluationTitleRejections?: number;
+  /** Plan 06b (OD-2 A3): how many times this evaluator has been re-prompted
+   * for a missing item check (at most once, then the item is recorded
+   * `unchecked`). */
+  itemCheckRejections?: number;
   /** A `submit_review` from this agent is being recorded. A second call
    * while it is (run cc1992e2: B called the tool twice) is refused. */
   reviewInFlight?: boolean;
@@ -3633,16 +3638,38 @@ export class Conductor {
         this.#log.append("evaluation_title_accepted", { messageType, agentId, detail: titleIssue, rejections });
       }
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
-      // Plan 06b (OD-1 R3b): the evaluator's top-level item re-checks.
+      // Plan 06b (OD-2 A3): ONE item-check form, submit_evaluation.itemChecks[]
+      // = { id, verdict, evidence }. For every item with a review-only
+      // majority unmet/deviates the evaluator owes a check: a missing one is
+      // re-prompted once, then recorded `unchecked` (visible, never silent).
+      const owed = this.#owedItemCheckIds();
       const checkEvents: Event[] = [];
+      const provided = new Set<string>();
       const itemChecks = (msg.args as { itemChecks?: unknown }).itemChecks;
       if (Array.isArray(itemChecks)) {
-        for (const c of itemChecks as Array<{ itemId?: unknown; verdict?: unknown; evidence?: unknown }>) {
-          const itemId = typeof c?.itemId === "string" ? c.itemId.trim() : "";
+        for (const c of itemChecks as Array<{ id?: unknown; verdict?: unknown; evidence?: unknown }>) {
+          const id = typeof c?.id === "string" ? c.id.trim() : "";
           const verdict = c?.verdict === "confirmed" || c?.verdict === "contradicted" ? c.verdict : undefined;
           const evidence = typeof c?.evidence === "string" ? c.evidence.trim() : "";
-          if (itemId.length === 0 || !verdict || evidence.length === 0) continue;
-          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId, verdict, evidence });
+          if (id.length === 0 || !verdict || evidence.length === 0) continue;
+          provided.add(id);
+          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict, evidence });
+        }
+      }
+      const missing = owed.filter((id) => !provided.has(id));
+      if (missing.length > 0) {
+        const rejections = handle.itemCheckRejections ?? 0;
+        if (rejections < 1) {
+          handle.itemCheckRejections = rejections + 1;
+          this.#log.append("item_check_rejected", { messageType, agentId, missing });
+          return {
+            ok: false,
+            reason: `submit_evaluation owes an itemCheck for: ${missing.join(", ")}. Re-check each against the candidate and include itemChecks[] = { id, verdict: confirmed|contradicted, evidence }`,
+          };
+        }
+        this.#log.append("item_check_unchecked", { messageType, agentId, missing });
+        for (const id of missing) {
+          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "the evaluator gave no item check after a re-prompt" });
         }
       }
       this.#applyEvents([...events, ...checkEvents, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
@@ -3927,19 +3954,6 @@ export class Conductor {
     const messages = this.#state.phase.messages ?? [];
     const byId = new Map(messages.map((m) => [m.id, m]));
     const events: Event[] = [];
-    // Plan 06b (OD-1 R3b): the evaluator's substantive re-check of an item's
-    // majority verdict, recorded with what it checked (the FINDING_VERIFIED
-    // path). A `contradicted` check overturns the majority in
-    // `#itemOverturns`; a `confirmed` one leaves it blocking.
-    for (const entry of entries) {
-      const check = (entry as { itemCheck?: { itemId?: unknown; verdict?: unknown; evidence?: unknown } }).itemCheck;
-      if (!check || typeof check.itemId !== "string") continue;
-      const itemId = check.itemId.trim();
-      const verdict = check.verdict === "confirmed" || check.verdict === "contradicted" ? check.verdict : undefined;
-      const evidence = typeof check.evidence === "string" ? check.evidence.trim() : "";
-      if (itemId.length === 0 || !verdict || evidence.length === 0) continue;
-      events.push({ type: "ITEM_CHECK_RECORDED", itemId, verdict, evidence });
-    }
     for (const entry of entries) {
       const id = typeof entry?.messageId === "string" ? entry.messageId : "";
       const message = byId.get(id);
@@ -5303,11 +5317,10 @@ export class Conductor {
     return itemsFromPhase(this.#state.phase.contract);
   }
 
-  /** True when the phase DECLARED structured items (OD-1: an old-format plan
-   * declares none and owes submit_phase only). */
+  /** OD-2 A1: the ONE structured-ness decision, shared with the prompts, the
+   * views and the extension. */
   #structured(): boolean {
-    const c = this.#state.phase.contract;
-    return !c.itemsSynthesized && (c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined);
+    return isStructured(this.#state.phase.contract);
   }
 
   /** The item loop (coverage, per-item verdicts, symbol pre-check, tally)
@@ -5417,6 +5430,26 @@ export class Conductor {
   /** The evaluator's re-verification: a majority unmet/deviates verdict the
    * code contradicts is overturned, and a unanimous thin-evidence met verdict
    * is audited. Each overturn is counted against its seat. */
+  /** OD-2 A3: an evaluator item check's evidence must cite at least one
+   * file:line that exists in the candidate, in range. */
+  #itemCheckAnchorsValid(evidence: string, ctx: VerdictContext): boolean {
+    const anchors = evidenceFileAnchors(evidence);
+    if (anchors.length === 0) return false;
+    return anchors.every((a) => {
+      const lines = ctx.lineCount(a.path);
+      return lines !== undefined && a.start >= 1 && a.end <= lines;
+    });
+  }
+
+  /** Plan 06b (OD-2 A3): the item ids the evaluator owes a check for, on a
+   * structured phase with a review-only majority unmet/deviates. */
+  #owedItemCheckIds(): string[] {
+    if (!this.#itemsEnforced() || !itemsNeedingEvaluatorReverify(this.#state.phase)) return [];
+    return phaseItemOutcomes(this.#state.phase)
+      .filter((o) => o.outcome === "unmet" || o.outcome === "deviates")
+      .map((o) => o.item.id);
+  }
+
   #itemOverturns(outcomes: readonly ItemOutcome[]): import("./core/items.ts").Overturn[] {
     const out: import("./core/items.ts").Overturn[] = [];
     const readsBySeat: Record<string, readonly string[]> = {
@@ -5436,7 +5469,10 @@ export class Conductor {
       // majority, recorded with what the evaluator checked.
       if (o.outcome === "unmet" || o.outcome === "deviates") {
         const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
-        if (check) {
+        // OD-2 A3: a contradicted check overturns only when its evidence
+        // anchors are valid (each cited file exists and its lines are in
+        // range), exactly like a reviewer verdict.
+        if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
           for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
             out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted it: ${check.evidence}` });
           }
@@ -5532,7 +5568,12 @@ export class Conductor {
    * the recorded votes already say. */
   #raiseItemFinding(o: ItemOutcome, C: string): void {
     if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === o.item.id)) return;
-    const evidence = `${o.item.id} ${o.item.title} — ${o.outcome}${o.evidence.length > 0 ? `: ${o.evidence.join(" | ")}` : ""}`;
+    // OD-2 A3: name the evaluator's own re-check, so an item that blocked
+    // without one is visible to the owner as `unchecked`, never silent.
+    const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id);
+    const checkDetail = check ? (check.verdict === "unchecked" ? " — no item check was given after a re-prompt" : ` — ${check.evidence}`) : "";
+    const checkNote = check ? ` [evaluator re-check: ${check.verdict}${checkDetail}]` : "";
+    const evidence = `${o.item.id} ${o.item.title} — ${o.outcome}${o.evidence.length > 0 ? `: ${o.evidence.join(" | ")}` : ""}${checkNote}`;
     const finding: Finding = {
       id: `F-${this.#state.phase.phaseId}-item-${o.item.id}-${this.#state.phase.findings.length + 1}`,
       version: 1,
@@ -8549,7 +8590,7 @@ export class Conductor {
         "",
         "Plan-item re-check: a majority of seats judged each item below unmet or deviating. Re-check it against the candidate's code and record exactly what you checked:",
         ...reverifyItems.map((o) => `- ${o.item.id} ${o.item.title}: ${o.outcome}; seats: ${o.evidence.join(" | ")}`),
-        "Add one `itemCheck` = { itemId, verdict: confirmed|contradicted, evidence } for each item above. Use `contradicted` only when the candidate's code proves the majority wrong; otherwise `confirmed`.",
+        "Add one `itemChecks[]` entry = { id, verdict: confirmed|contradicted, evidence } for each item above. `evidence` must cite a file:line in the candidate. Use `contradicted` only when the candidate's code proves the majority wrong; otherwise `confirmed`.",
       );
     }
     lines.push(
@@ -9777,7 +9818,7 @@ export function buildWorkerPrompt(
   baselineCommands?: readonly BaselineCommand[],
   messages?: readonly Message[],
 ): string {
-  const structured = contract.architecture !== undefined || contract.requirements !== undefined || contract.constraints !== undefined;
+  const structured = isStructured(contract);
   const lines: string[] = [
     `Goal: ${contract.goal}`,
     "",
@@ -9858,7 +9899,7 @@ export function buildReviewerPrompt(
     ...checkFailurePromptLines(phase),
     // Plan 06b: the same checklist the worker saw, plus the worker's coverage
     // and the check resolution, and the verdicts this review must carry.
-    ...(phase.contract.architecture !== undefined || phase.contract.requirements !== undefined || phase.contract.constraints !== undefined
+    ...(isStructured(phase.contract)
       ? [
           ...checklistLines(itemsFromPhase(phase.contract)),
           ...coverageLines(phase.coverage, itemsFromPhase(phase.contract)),

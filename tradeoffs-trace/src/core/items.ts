@@ -81,6 +81,22 @@ export interface PhaseItemInput {
   constraints?: ConstraintItem[];
 }
 
+/** Plan 06b (OD-2 A1): the ONE place that decides whether a phase is
+ * structured. True only when the plan declares items AND the parser did not
+ * mark them synthesized. The worker prompt, the reviewer prompt, the coverage
+ * gate, the item tallies and the views all call this; none of them looks at
+ * the item arrays directly. */
+export function isStructured(contract: {
+  architecture?: unknown;
+  requirements?: unknown;
+  constraints?: unknown;
+  itemsSynthesized?: boolean;
+} | undefined): boolean {
+  if (!contract) return false;
+  if (contract.itemsSynthesized) return false;
+  return contract.architecture !== undefined || contract.requirements !== undefined || contract.constraints !== undefined;
+}
+
 export type ItemKind = "architecture" | "requirement" | "constraint";
 
 /** One item of any kind, flattened for prompts, coverage and verdicts. */

@@ -20,7 +20,7 @@ import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baselin
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
-import { countsLine, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
+import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
@@ -919,8 +919,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- ${live.length} trade-off(s), ${flagged.length} flagged for the owner`,
     ...(() => {
       const c = phase.contract;
-      const structuredContract = !c.itemsSynthesized && (c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined);
-      if (!structuredContract) return [];
+      if (!isStructured(c)) return [];
       const itemsPhase = { contract: c, reviews: phase.reviews, coverage: phase.coverage, checkResolution: phase.checkResolution, overturns: phase.overturns };
       const matrix = matrixMarkdown(itemsPhase);
       const overturns = overturnCounts(phase.overturns ?? []);

@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -432,7 +433,7 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
         {
           kind: "call-submit",
           tool: "submit_evaluation",
-          args: { evaluations: [], itemChecks: [{ itemId: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 implements R2" }] },
+          args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 implements R2" }] },
         },
       ],
     }),
@@ -443,6 +444,170 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
     assert.equal(setup.conductor.state.phase.phase, "DONE", "the contradicted majority did not block");
     assert.ok(!setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), "no finding is raised for the contradicted item");
     assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: an old-format phase started through Emacs owes submit_phase only and its prompts never mention submit_coverage", async () => {
+  // 1. Run the REAL Emacs parser on an old-format org file.
+  const dir = fs.mkdtempSync("/tmp/tt-r1-");
+  const orgPath = path.join(dir, "PLAN.org");
+  fs.writeFileSync(
+    orgPath,
+    ["#+TITLE: old", "#+TT_REPO: /tmp/tt-r1-repo", "#+TT_BRANCH: main", "", "* Phase 1: p", "  :PROPERTIES:", "  :ID: p1", "  :CHECKS: true", "  :END:", "  Goal: g", "  Acceptance:", "  - it works"].join("\n") + "\n",
+  );
+  const emacsLoad = fileURLToPath(new URL("../../../test/tradeoffs-trace-test.el", import.meta.url));
+  const coreDir = fileURLToPath(new URL("../../../core", import.meta.url));
+  const testDir = fileURLToPath(new URL("../../../test", import.meta.url));
+  const out = execFileSync(
+    "emacs",
+    [
+      "--batch",
+      "-Q",
+      "-L",
+      coreDir,
+      "-L",
+      testDir,
+      "-l",
+      emacsLoad,
+      "--eval",
+      `(with-temp-buffer (insert-file-contents "${orgPath}") (org-mode) (setq buffer-file-name "${orgPath}") (princ (json-encode (plist-get (+tt-parse-plan) :plan))))`,
+    ],
+    { encoding: "utf8" },
+  );
+  const parsed = JSON.parse(out) as { phases: Array<{ itemsSynthesized?: boolean; requirements?: unknown[] }> };
+  const phase = parsed.phases[0] as import("../../src/conductor.ts").RunPlanPhase;
+  assert.equal(phase.itemsSynthesized, true, "the Emacs parser marks the old format synthesized");
+  assert.ok(Array.isArray(phase.requirements) && phase.requirements.length > 0, "the parser still emits R1..Rn");
+  // 2. Start a run with that exact phase and capture the worker prompt.
+  const promptLog = path.join(dir, "prompts.txt");
+  const setup = await setupConductor({
+    phase,
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: { reviewer, phaseId: "p1", candidateSha: state.phase.candidate?.sha, contractVersion: state.phase.contract.contractVersion, correctionStatements: [], findingStatements: [] },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    const prompt = fs.readFileSync(promptLog, "utf8");
+    assert.doesNotMatch(prompt, /submit_coverage/, "the worker prompt never mentions submit_coverage");
+    assert.doesNotMatch(prompt, /Architecture:|Requirements:/, "the worker prompt has no item checklist");
+  } finally {
+    await teardown(setup);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("plan 06b: a repair attempt that skips submit_coverage cannot freeze on the previous attempt's coverage", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        ...(attempt === 1 ? [{ kind: "call-submit", tool: "submit_coverage", args: coverage() }] : []),
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review((state.phase.round ?? 1) === 1 ? { R2: "unmet" } : {})),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => readEvents(setup.runDir).some((r) => r.kind === "coverage_refused" && (r.event as { at?: string }).at === "submit_phase"),
+      120_000,
+      50,
+      setup.runDir,
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: a review-only majority unmet item with no evaluator item check is re-prompted, then blocks as unchecked", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } },
+        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), 120_000, 50, setup.runDir);
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "item_check_rejected"), "the evaluator was re-prompted");
+    const check = (setup.conductor.state.phase.itemChecks ?? []).find((c) => c.itemId === "R2");
+    assert.equal(check?.verdict, "unchecked");
+    const finding = setup.conductor.state.phase.findings.find((f) => f.itemId === "R2")!;
+    assert.match(finding.evidence, /unchecked/);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06b: an evaluator item check with an invalid anchor never overturns a majority", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "contradicted", evidence: "src/nonexistent.ts:1 proves it" }] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), 120_000, 50, setup.runDir);
+    // The contradicted check cited a file that does not exist, so the majority stands.
+    assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"));
   } finally {
     await teardown(setup);
   }

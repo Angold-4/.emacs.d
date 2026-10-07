@@ -1147,7 +1147,7 @@ export interface PhaseState {
   /** Plan 06b (OD-1 R3b): the evaluator's substantive re-check of an item's
    * majority verdict, recorded with what it checked. A `contradicted` check
    * overturns the majority (the FINDING_VERIFIED path). */
-  itemChecks?: Array<{ itemId: string; verdict: "confirmed" | "contradicted"; evidence: string }>;
+  itemChecks?: Array<{ itemId: string; verdict: "confirmed" | "contradicted" | "unchecked"; evidence: string }>;
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
@@ -2044,7 +2044,9 @@ export interface EvEvidenceRecorded {
 export interface EvItemCheckRecorded {
   type: "ITEM_CHECK_RECORDED";
   itemId: string;
-  verdict: "confirmed" | "contradicted";
+  /** `unchecked` is the conductor's own record that the evaluator gave no
+   * check for a required item after one re-prompt. */
+  verdict: "confirmed" | "contradicted" | "unchecked";
   evidence: string;
 }
 

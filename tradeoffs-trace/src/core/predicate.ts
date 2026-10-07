@@ -33,7 +33,7 @@ import { currentBallot, isValidBallot, tally } from "./tally.ts";
 // Plan 06b: the per-item acceptance half — every R and C met by majority with
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
-import { flatItems, itemNeedsEvidence, itemsAccept, itemsFromPhase, phaseItemOutcomes, tallyItems, testVerifyProblems } from "./items.ts";
+import { flatItems, isStructured, itemNeedsEvidence, itemsAccept, itemsFromPhase, phaseItemOutcomes, tallyItems, testVerifyProblems } from "./items.ts";
 import type { RoundPanelOutcome, RoundPanelState } from "./types.ts";
 import type {
   ContractVersion,
@@ -115,9 +115,7 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
  * majority verdict is `unmet` or `deviates`, so the evaluator must re-check
  * it against the candidate before it can block. */
 export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
-  const c = phase.contract;
-  if (c.itemsSynthesized) return false;
-  if (c.requirements === undefined && c.constraints === undefined && c.architecture === undefined) return false;
+  if (!isStructured(phase.contract)) return false;
   return phaseItemOutcomes(phase).some((o) => o.outcome === "unmet" || o.outcome === "deviates");
 }
 
@@ -495,7 +493,7 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
   // Plan 06b (OD-1): a STRUCTURED phase additionally requires every item point
   // met (or fit), its `test` verifies passed, and every `evidence` item
   // recorded. An old-format phase declares no items and keeps today's rule.
-  const itemsEnforced = !phase.contract.itemsSynthesized && (phase.contract.requirements !== undefined || phase.contract.constraints !== undefined || phase.contract.architecture !== undefined);
+  const itemsEnforced = isStructured(phase.contract);
   if (itemsEnforced) {
     const items = itemsFromPhase(phase.contract);
     const reviews = (["M", "A", "B"] as const).map((seat) => {
@@ -569,6 +567,7 @@ export function pendingEvidenceItems(phase: PhaseState) {
 /** True when the phase has at least one `evidence` item and every one is
  * recorded. */
 export function evidenceAllRecorded(phase: PhaseState): boolean {
+  if (!isStructured(phase.contract)) return false;
   const ev = flatItems(itemsFromPhase(phase.contract)).filter((i) => itemNeedsEvidence(i));
   if (ev.length === 0) return false;
   const recorded = new Set((phase.itemEvidence ?? []).map((e) => e.id));
@@ -576,9 +575,7 @@ export function evidenceAllRecorded(phase: PhaseState): boolean {
 }
 
 export function evidenceOnlyPending(phase: PhaseState): boolean {
-  const c = phase.contract;
-  if (c.itemsSynthesized) return false;
-  if (c.requirements === undefined && c.constraints === undefined && c.architecture === undefined) return false;
+  if (!isStructured(phase.contract)) return false;
   if (!phase.candidate) return false;
   const pending = pendingEvidenceItems(phase);
   if (pending.length === 0) return false;
@@ -588,7 +585,7 @@ export function evidenceOnlyPending(phase: PhaseState): boolean {
     ...phase,
     itemEvidence: [...(phase.itemEvidence ?? []), ...pending.map((i) => ({ id: i.id, text: "pending" }))],
   };
-  return accept(withEvidence, phase.candidate.sha, c.contractVersion);
+  return accept(withEvidence, phase.candidate.sha, phase.contract.contractVersion);
 }
 
 /** done(phase) ⇔ accept(C, K) ∧ the integration branch points at the probed I. */

@@ -365,9 +365,9 @@ const submitEvaluationFields: Record<string, TSchema> = {
   itemChecks: Type.Optional(
     Type.Array(
       Type.Object({
-        itemId: Type.String({ description: "The plan item id from the re-check list" }),
+        id: Type.String({ description: "The plan item id from the re-check list" }),
         verdict: StringEnum(["confirmed", "contradicted"] as const),
-        evidence: Type.String({ description: "What you checked in the candidate" }),
+        evidence: Type.String({ description: "What you checked in the candidate, as a file:line citation" }),
       }),
       { description: "Plan 06b: your re-check of each plan item whose majority verdict was unmet or deviating" },
     ),

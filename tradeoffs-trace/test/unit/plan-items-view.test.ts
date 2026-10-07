@@ -72,7 +72,7 @@ test("plan-items view: the counts line is R x/y met · A a/b fit · C c/d", () =
   assert.match(matrix.find((l) => l.startsWith("| [R2 "))!, /\[unmet\]\(items\/R2\.org\) \| \[unmet\]\(items\/R2\.org\) \| \[met\]\(items\/R2\.org\)/);
 });
 
-test("plan-items view: tt summary's PR body carries the matrix", () => {
+test("plan 06b: tt summary matrix cells link to their evidence files", () => {
   const runDir = fs.mkdtempSync(path.join("/tmp", "tt-items-view-"));
   try {
     const md = prSummary(runDir, plan());

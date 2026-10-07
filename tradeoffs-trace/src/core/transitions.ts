@@ -145,7 +145,8 @@ addRow({
   guard: (_s, ev) => !baselineNeeded(ev),
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }], // next() of the resulting IMPLEMENTING state
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING" }),
+  // OD-2 A2: coverage is per candidate/attempt; a new attempt owes its own.
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined }),
 });
 
 addRow({
@@ -1187,6 +1188,9 @@ addRow({
       phase: "IMPLEMENTING",
       repairRoundsUsed: s.phase.repairRoundsUsed + 1,
       attempt: { n: s.phase.attempt.n + 1 },
+      // OD-2 A2: a repair attempt owes its own coverage; the previous
+      // attempt's report never satisfies the freeze.
+      coverage: undefined,
     }),
 });
 

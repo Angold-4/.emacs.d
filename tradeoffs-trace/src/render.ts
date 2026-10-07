@@ -26,7 +26,7 @@ import {
 } from "./core/entries.ts";
 import { runReviewLint, type ReviewLintResult } from "./core/review-lint.ts";
 import { ledgerEntries } from "./core/messages.ts";
-import { countsLine, itemEvidenceFiles, matrixMarkdown, matrixOrg, overturnCounts, phaseItemCounts, type ItemLoopState } from "./core/items.ts";
+import { countsLine, isStructured, itemEvidenceFiles, matrixMarkdown, matrixOrg, overturnCounts, phaseItemCounts, type ItemLoopState } from "./core/items.ts";
 import type { Timeline } from "./conductor.ts";
 import type { RunView } from "./view.ts";
 
@@ -484,7 +484,7 @@ export function projectEntryReview(
     checkResolution: phase.checkResolution,
     overturns: phase.overturns,
   } as ItemLoopState;
-  const structuredContract = Boolean(phase.contract) && !phase.contract!.itemsSynthesized && (phase.contract!.architecture !== undefined || phase.contract!.requirements !== undefined || phase.contract!.constraints !== undefined);
+  const structuredContract = isStructured(phase.contract);
   const matrix = structuredContract ? matrixOrg(itemsPhase) : [];
   if (matrix.length > 0) {
     text += `\n* Plan items\n  ${countsLine(phaseItemCounts(itemsPhase))}\n\n${matrix.map((l) => `  ${l}`).join("\n")}\n`;
@@ -828,7 +828,7 @@ export function renderStatusView(input: StatusViewInput): string {
   // Plan 06b: the status line's item counts, e.g. `R 7/8 met · A 3/3 fit · C 2/2`.
   try {
     const contract = phase.contract as { architecture?: unknown; requirements?: unknown; constraints?: unknown; itemsSynthesized?: boolean } | undefined;
-    const structured = contract !== undefined && !contract.itemsSynthesized && (contract.architecture !== undefined || contract.requirements !== undefined || contract.constraints !== undefined);
+    const structured = isStructured(contract);
     if (structured) {
       const loopState = {
         contract,
