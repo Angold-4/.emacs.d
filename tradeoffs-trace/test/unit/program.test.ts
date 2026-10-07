@@ -147,7 +147,7 @@ test("program: invalid graphs are refused with the reason", () => {
   );
 });
 
-test("plan 06d: NODE_BLOCKED after NODE_STARTED for the same run id leaves the node running and is recorded as ignored", () => {
+test("plan 06d: NODE_BLOCKED after NODE_STARTED for the same run id leaves the node running", () => {
   const nodes = expandProgram(program13);
   let s = initialProgramState(nodes);
   s = reduceProgram(s, { type: "NODE_STARTED", node: "13a", runId: "run-a" });

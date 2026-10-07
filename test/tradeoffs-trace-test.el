@@ -3211,6 +3211,13 @@ owner input from views/status.txt, so Emacs never computes the outcome."
                     "  - a refused note — refused: too late (note)\n"
                     "  - a queued steer — queued (steer)\n"))
           (should (equal (+tt--input-header-last root) "  - a queued steer — queued (steer)"))
+          ;; A note is queued for the next attempt too (A-5): a `noted' line
+          ;; after an older queued one is the latest input the header shows.
+          (with-temp-file status
+            (insert "Owner input (2)\n"
+                    "  - a queued correction — queued (correction)\n"
+                    "  - a noted note — noted (note)\n"))
+          (should (equal (+tt--input-header-last root) "  - a noted note — noted (note)"))
           ;; A status with no queued or refused input yields nil.
           (with-temp-file status (insert "run abcd1234\n"))
           (should-not (+tt--input-header-last root)))

@@ -1879,16 +1879,18 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
 Plan 06d (A4/R6): the input header states what the run actually did with the
 owner's input, so it reads the runtime's own record instead of computing an
 outcome itself.  Returns nil when the file is missing or holds no queued or
-refused input.  The status text line is `  - TEXT — queued (kind)' or
+refused input.  The status text line is `  - TEXT — queued (kind)',
+`  - TEXT — noted (kind)' (a note is queued for the next attempt) or
 `  - TEXT — refused: REASON (kind)'."
   (let ((file (and run-dir (expand-file-name "views/status.txt" run-dir))))
     (when (and file (file-exists-p file))
       (with-temp-buffer
         (insert-file-contents file)
         (goto-char (point-max))
-        ;; Each line is `  - TEXT — LABEL (kind)'; the label is `queued' or
-        ;; `refused: …'.  Match the whole line, not just up to the label.
-        (when (re-search-backward "^  - .*\\(?: — queued \\| — refused: \\)" nil t)
+        ;; Each line is `  - TEXT — LABEL (kind)'; the label is `queued',
+        ;; `noted' (a queued note) or `refused: …'.  Match the whole line, not
+        ;; just up to the label.
+        (when (re-search-backward "^  - .*\\(?: — queued \\| — noted \\| — refused: \\)" nil t)
           (buffer-substring (line-beginning-position) (line-end-position)))))))
 
 (defun +tt--render-input-header ()

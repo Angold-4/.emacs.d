@@ -2554,11 +2554,17 @@ export class Conductor {
     }
 
     const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
-    if (!worker) {
-      // Plan 06d (A1): a steer that reaches the executor with no live worker
-      // (a race with the worker exiting after acceptInput's observation) is
-      // queued, never refused: owner input is never lost. Only DONE/BLOCKED
-      // refuse, and acceptInput already handled those.
+    // Plan 06d (A1/C3): the observation may have changed since the inbox
+    // block last asked acceptInput (the worker can exit in between), so ask
+    // the one policy again rather than deciding here. A steer with no worker
+    // is queued, never refused: owner input is never lost.
+    const decision = acceptInput(this.#state, { kind: "steer", text, workerRunning: worker !== undefined });
+    if (decision.kind === "refused") {
+      this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, decision.reason);
+      this.#rejectInboxFile(file, commandId, decision.reason);
+      return;
+    }
+    if (decision.kind === "queued" || !worker) {
       const event: Event = { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text };
       const result = reduce(this.#state, event);
       if (!result.ok) {

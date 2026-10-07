@@ -20,6 +20,7 @@ import type { ReviewLintResult } from "./core/review-lint.ts";
 import { candidateAnchorFreshness, pendingOwnerInputs, projectEntryReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
+import { resolveBinding } from "./core/binding.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
   formatFindings,
@@ -1256,14 +1257,28 @@ async function cmdVerdict(
     ...(overrides.contractVersion !== undefined ? { snapshot: overrides.contractVersion } : {}),
     ...(overrides.contractSha256 !== undefined ? { sectionSha256: overrides.contractSha256 } : {}),
   };
-  const boundRunId = overrides.runId ?? state.phase.runId;
+  let boundRunId = overrides.runId ?? state.phase.runId;
   const boundPhaseId = overrides.phaseId ?? state.phase.phaseId;
-  // The heading carries the full binding. A run/phase id that names another
-  // run is refused here, never silently dropped when the daemon has exited.
-  if (overrides.runId !== undefined && overrides.runId !== "" && overrides.runId !== state.phase.runId) {
-    process.stdout.write(`verdict rejected: run id ${overrides.runId} is not this run (${state.phase.runId})\n`);
-    process.exitCode = 1;
-    return;
+  // The heading carries the full binding. Plan 06d (A2/C3): resolveBinding is
+  // the one matcher, so the run may be named by its internal id, its
+  // directory id or its readable id. An id that names nothing is refused with
+  // all three that would have bound — never silently dropped when the daemon
+  // has exited, and never accepted as a different run.
+  if (overrides.runId !== undefined && overrides.runId !== "") {
+    const resolved = resolveBinding(
+      {
+        runId: state.phase.runId,
+        dirId: path.basename(runDir),
+        ...(runReadableId(runDir) ? { readableId: runReadableId(runDir)! } : {}),
+      },
+      overrides.runId,
+    );
+    if (!resolved.ok) {
+      process.stdout.write(`verdict rejected: ${resolved.reason}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    boundRunId = resolved.runId;
   }
   if (overrides.phaseId !== undefined && overrides.phaseId !== "" && overrides.phaseId !== state.phase.phaseId) {
     process.stdout.write(`verdict rejected: phase id ${overrides.phaseId} is not this phase (${state.phase.phaseId})\n`);

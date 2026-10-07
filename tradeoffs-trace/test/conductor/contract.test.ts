@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -711,6 +712,17 @@ test("contract v1 projections pass check, rebuild identically, and record a late
     const staleLate = ttResult(["verdict", setup.runDir, other.id, "accept", "--candidate-sha", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"]);
     assert.equal(staleLate.status, 1, "a stale late verdict must exit non-zero");
     assert.match(staleLate.stdout, /verdict rejected: .*candidate/);
+
+    // Plan 06d (A2/C3): `--run-id` goes through resolveBinding, so the run
+    // directory id names this run; an unknown id is refused with the ids that
+    // would have bound (the internal run id and the directory id here).
+    const dirId = path.basename(setup.runDir);
+    assert.match(tt(["verdict", setup.runDir, other.id, "accept", "--run-id", dirId]), /recorded accept/);
+    const unknownRunId = ttResult(["verdict", setup.runDir, other.id, "accept", "--run-id", "no-such-run"]);
+    assert.equal(unknownRunId.status, 1, "an unknown --run-id must exit non-zero");
+    assert.match(unknownRunId.stdout, /no-such-run/);
+    assert.match(unknownRunId.stdout, new RegExp(dirId), "the refusal names the directory id");
+    assert.match(unknownRunId.stdout, new RegExp(setup.conductor.state.phase.runId), "the refusal names the internal run id");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
