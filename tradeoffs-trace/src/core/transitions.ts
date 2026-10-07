@@ -2068,6 +2068,24 @@ addRow({
   apply: (s) => ({ ...s, run: "RUN_ACTIVE" }),
 });
 
+// Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
+// run records RUN_RESUMED once at start-up, so the stage clock sees the resume
+// as the start of a new segment. The run was already active, so this is a
+// record-only row (the phase is preserved untouched).
+addRow({
+  id: "run-resumed-active",
+  axis: "run",
+  from: "RUN_ACTIVE",
+  trigger: "RUN_RESUMED",
+  guardName: "always",
+  guard: () => true,
+  to: "RUN_ACTIVE",
+  // The fixture resumes with the phase at READY, so next() recommends
+  // start_attempt once the resume is recorded.
+  actions: [{ type: "start_attempt" }],
+  apply: (s) => s,
+});
+
 export const TRANSITIONS: readonly TransitionRow[] = rows;
 
 /** Plan 05h: the declared main path — the states a normal round passes

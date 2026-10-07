@@ -931,6 +931,9 @@ export interface Timeline {
    * (program 14: 14g showed "over by 22m" right after a resume, counting the
    * whole time it was stopped). */
   restarts?: string[];
+  /** Plan 06c (A5): the instants a conductor stop was recorded, so the span
+   * computation can exclude a stopped interval from a stage's duration. */
+  stops?: string[];
 }
 
 /** Plan 06c (A5): the instants a new stage segment starts. A clean `tt stop`
@@ -953,12 +956,15 @@ export function restartInstants(records: readonly LogRecord[]): string[] {
       continue;
     }
     if (record.kind !== "event") continue;
+    const push = (ts: string) => {
+      if (out[out.length - 1] !== ts) out.push(ts);
+    };
     if (stopped) {
-      out.push(record.ts);
+      push(record.ts);
       stopped = false;
     }
     const type = (record.event as { type?: string }).type;
-    if (type === "ATTEMPT_INTERRUPTED" || type === "RUN_RESUMED") out.push(record.ts);
+    if (type === "ATTEMPT_INTERRUPTED" || type === "RUN_RESUMED") push(record.ts);
   }
   return out;
 }
@@ -969,6 +975,7 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
   const restarts = restartInstants(records);
+  const stops = records.filter((r) => r.kind === "stop").map((r) => r.ts);
   for (const record of records) {
     if (record.kind !== "event") continue;
     const before = state;
@@ -997,7 +1004,7 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
       phases.push({ phase: state.phase.phase, at: record.ts });
     }
   }
-  return { state, phases, rounds, restarts };
+  return { state, phases, rounds, restarts, stops };
 }
 
 export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
@@ -1381,12 +1388,25 @@ export class Conductor {
       this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
     }
     this.#state = foldEvents(this.#state, records);
-    // Plan 06c (A5): a conductor that starts on an existing, non-terminal run
-    // begins a new stage segment. The `resume` record is the segment's start;
-    // the stage clock stops at the preceding `stop` (or at the last event
-    // before the exit) and never counts the stopped interval.
-    if (initRecord && records.length > 1 && this.#state.phase.phase !== "DONE" && this.#state.phase.phase !== "BLOCKED") {
-      this.#log.append("resume", { at: new Date().toISOString(), phase: this.#state.phase.phase });
+    // Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
+    // run records a real RUN_RESUMED event once at start-up (drive-suspended,
+    // so nothing dispatches before start() is ready). The stage clock treats it
+    // as the start of a new segment, so the stopped interval never counts.
+    // ENV_BLOCKED keeps its own RUN_RESUMED in the preflight gate below, and a
+    // budget pause keeps its own resume path.
+    if (
+      initRecord &&
+      records.length > 1 &&
+      this.#state.run === "RUN_ACTIVE" &&
+      this.#state.phase.phase !== "DONE" &&
+      this.#state.phase.phase !== "BLOCKED"
+    ) {
+      this.#driveSuspended = true;
+      try {
+        this.#applyEvent({ type: "RUN_RESUMED" });
+      } finally {
+        this.#driveSuspended = false;
+      }
     }
     // Plan 05i: resolve every declared command's executable before the
     // baseline and before any agent launch. A missing tool stops the run in
@@ -1696,6 +1716,21 @@ export class Conductor {
       discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       this.#applyEvent({ type: "PROBE_INTERRUPTED" });
+      return;
+    }
+
+    if (key === "run_checks") {
+      // Plan 06c: a conductor that stopped during CHECKING leaves the check
+      // in flight. Kill the orphaned check command, then rerun the check
+      // (CHECKS_INTERRUPTED clears the in-flight entry and re-dispatches).
+      for (const rec of records) {
+        if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
+        if (!rec.actionId.startsWith(`check-sh-${actionId}-`)) continue;
+        const pgid = (rec.event as { pgid?: number }).pgid;
+        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      }
+      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#applyEvent({ type: "CHECKS_INTERRUPTED" });
       return;
     }
 
@@ -7198,6 +7233,11 @@ export class Conductor {
             env: childEnv(),
             deadlineMs: this.#deadlines.checkMs,
             termGraceMs: this.#deadlines.termGraceMs,
+            // Plan 06c: record the command's process group so a crash/stop
+            // during CHECKING can kill the orphan and re-run the check.
+            onIntent: ({ pgid }) => {
+              this.#log.intent(`check-sh-${actionId}-${pgid}`, { pgid });
+            },
           });
           const result = await running.result;
           combinedOutput += `${result.output}\n`;

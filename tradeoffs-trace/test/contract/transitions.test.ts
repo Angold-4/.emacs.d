@@ -467,6 +467,10 @@ const BUILD: Record<string, Fixture> = {
     state: baseState({ phase: "READY" }, "RUN_PAUSED_BUDGET"),
     event: { type: "RUN_RESUMED" },
   },
+  "run-resumed-active": {
+    state: baseState({ phase: "READY" }, "RUN_ACTIVE"),
+    event: { type: "RUN_RESUMED" },
+  },
   // Plan 05i: the environment preflight and environment (126/127) failures.
   "env-preflight-failed": {
     state: baseState({ phase: "READY" }),
