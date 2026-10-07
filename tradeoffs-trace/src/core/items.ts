@@ -486,13 +486,20 @@ export function evidenceTestNames(evidence: string): string[] {
   return out;
 }
 
-/** A command a reviewer ran, quoted as `` `…` `` in its evidence. The
- * backtick must start with the tool name itself (so a cited path like
- * `git.ts` is not mistaken for a command). */
+/** The commands an evidence string cites, quoted as `` `…` ``. There is no
+ * tool-name whitelist: any backticked span that is not itself a `file:line`
+ * anchor is a command candidate, and `verdictIssues` accepts it only when it
+ * exactly matches a command the reviewer actually ran (findings F-contract-12,
+ * disc-M-33). A cited path such as `` `src/a.ts:1` `` is a file anchor, not a
+ * command. */
 export function evidenceCommands(evidence: string): string[] {
   const out: string[] = [];
-  const re = /`((?:node|npm|npx|make|cargo|python|pytest|go|git|sh|bash|deno|bun|yarn|pnpm)(?:\s[^`]*)?)`/g;
-  for (const m of evidence.matchAll(re)) out.push(m[1].trim());
+  for (const m of evidence.matchAll(/`([^`]+)`/g)) {
+    const cmd = m[1].trim();
+    if (cmd.length === 0) continue;
+    if (evidenceFileAnchors(cmd).length > 0) continue;
+    out.push(cmd);
+  }
   return out;
 }
 
@@ -504,12 +511,7 @@ function normCommand(s: string): string {
  * this review. Matching is exact (whitespace-normalised), so a cited prefix
  * or a command merely echoed inside another does not count. */
 export function runCommandsIn(evidence: string, reviewerCommands: readonly string[]): string[] {
-  // Candidates are the tool-named backticks AND any backtick that exactly
-  // matches a recorded command (so `cd x && make check` is recognised), but a
-  // backticked path that was not run is never a command.
-  const candidates = new Set(evidenceCommands(evidence));
-  for (const m of evidence.matchAll(/`([^`]+)`/g)) candidates.add(m[1].trim());
-  return [...candidates].filter((cmd) => cmd.length > 0 && reviewerCommands.some((r) => normCommand(r) === normCommand(cmd)));
+  return evidenceCommands(evidence).filter((cmd) => reviewerCommands.some((r) => normCommand(r) === normCommand(cmd)));
 }
 
 /** True when an evidence string carries at least one anchor a code check can

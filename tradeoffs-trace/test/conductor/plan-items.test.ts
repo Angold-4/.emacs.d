@@ -459,6 +459,7 @@ test("plan-items: a verdict citing a command the reviewer did not run is refused
     reviewerScriptFor: (reviewer, state) => {
       const cv = state.phase.contract.contractVersion;
       const cand = state.phase.candidate?.sha;
+      const cmd = "./run-checks.sh";
       const withCommand = (evidence: string) => ({
         items: [
           { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1" },
@@ -473,11 +474,11 @@ test("plan-items: a verdict citing a command the reviewer did not run is refused
           { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
           { kind: "wait-for-prompt" },
           { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
-          // The cited command was never run: refused.
-          { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, cand, cv, withCommand("`sh -c true` fails")) },
-          // Now run it, then cite it: accepted.
-          { kind: "call-sh", command: "sh -c true" },
-          { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, cand, cv, withCommand("`sh -c true` fails")) },
+          // A command the reviewer never ran is refused.
+          { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, cand, cv, withCommand("`" + cmd + "` fails")) },
+          // Now run it (any command, no tool whitelist), then cite it: accepted.
+          { kind: "call-sh", command: cmd },
+          { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, cand, cv, withCommand("`" + cmd + "` fails")) },
         ],
       };
     },

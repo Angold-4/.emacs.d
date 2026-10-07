@@ -112,7 +112,9 @@ export function planModelSelector(
  * tools — see the negative case in role-tool-sets.test.ts). */
 export const ROLE_TOOLS: Record<Role, string[]> = {
   worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "submit_coverage", "raise_tradeoff"],
-  reviewer: ["read", "grep", "find", "ls", "submit_discovery", "submit_review"],
+  // Plan 06b: a verdict may cite a command the reviewer ran, so the reviewer
+  // has `sh` (the conductor owns and runs it, as for every role).
+  reviewer: ["read", "grep", "find", "ls", "sh", "submit_discovery", "submit_review"],
   // Plan 04a: the evaluator checks a round's raw messages against the code
   // it can read, and returns through `submit_evaluation`. Decision briefs
   // add `submit_brief`: after a round's evaluation the same role writes one

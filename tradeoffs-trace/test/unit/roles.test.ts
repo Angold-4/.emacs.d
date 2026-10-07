@@ -9,7 +9,7 @@ test("roles: PI_VERSION is the pinned version", () => {
 
 test("roles: ROLE_TOOLS matches design §2.1's launch table exactly", () => {
   assert.deepEqual(ROLE_TOOLS.worker, ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "submit_coverage", "raise_tradeoff"]);
-  assert.deepEqual(ROLE_TOOLS.reviewer, ["read", "grep", "find", "ls", "submit_discovery", "submit_review"]);
+  assert.deepEqual(ROLE_TOOLS.reviewer, ["read", "grep", "find", "ls", "sh", "submit_discovery", "submit_review"]);
   // Plan 04a: the evaluator reads the candidate and returns through
   // submit_evaluation (and may raise a trade-off it spots); no write tools.
   // Decision briefs add submit_brief: the same role writes the owner-facing
@@ -73,7 +73,7 @@ test("assertToolSet: missing tools are reported", () => {
   const result = assertToolSet("reviewer", ["read", "grep"]);
   assert.equal(result.ok, false);
   if (!result.ok) {
-    assert.deepEqual(result.missing.sort(), ["find", "ls", "submit_discovery", "submit_review"].sort());
+    assert.deepEqual(result.missing.sort(), ["find", "ls", "sh", "submit_discovery", "submit_review"].sort());
     assert.deepEqual(result.extra, []);
     assert.deepEqual(result.duplicates, []);
   }
