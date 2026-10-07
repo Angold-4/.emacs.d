@@ -3,8 +3,17 @@
 // `runCommand`/`killGroup` (shell.ts) kill everything in a command's
 // recorded process group, but a detached descendant that calls `setsid` (or
 // otherwise leaves the group) escapes that. The sweep is the fallback: list
-// every process whose current working directory or an open file lies under
-// the worktree (`lsof +D <dir>`), kill what is found, and report it.
+// every process with a file under the worktree (`lsof +D <dir>`), kill the
+// ones whose current WORKING DIRECTORY lies under it (a daemon the attempt
+// started there), and report the rest without killing them.
+//
+// Why not kill every process with an open file there: a live gate runs a
+// Docker stack that bind-mounts worktree directories, so Docker Desktop's own
+// file-sharing processes (com.docker.backend, the Virtualization XPC service)
+// hold files under the worktree. Program 14's 14i freezes killed Docker
+// Desktop that way (sweep records at 18:06:53 and 18:48:15 UTC on
+// 2026-09-26), five times in one day. A process that only holds a file is
+// reported as `held`; system and application processes are never signalled.
 //
 // IMPORTANT (documented per the brief): an empty sweep does not prove no
 // process survived. A detached process can `chdir` away, close every open
@@ -22,6 +31,11 @@ export interface SweepKilled {
 
 export interface SweepResult {
   killed: SweepKilled[];
+  /** Processes with a file open under the worktree but their working
+   * directory elsewhere (a bind mount's file server, an editor), or a
+   * protected system/application process: reported, never signalled, and
+   * not a reason to taint. */
+  held?: SweepKilled[];
   /** True iff any survivor was found — design §2.2: "A sweep that found
    * survivors marks the worktree tainted." */
   tainted: boolean;
@@ -38,28 +52,41 @@ export interface SweepOptions {
   termGraceMs?: number;
 }
 
-function lsofPidsUnder(dir: string): number[] {
+/** Executables the sweep never signals, whatever `lsof` reports: the OS and
+ * installed applications (Docker Desktop and its VM helpers live here). */
+const PROTECTED_PREFIXES = ["/System/", "/Applications/", "/Library/", "/usr/libexec/", "/usr/sbin/"];
+
+export function isProtectedCommand(command: string): boolean {
+  return PROTECTED_PREFIXES.some((p) => command.startsWith(p));
+}
+
+/** Every pid with a file under `dir`, and whether that file is its cwd. */
+function lsofUnder(dir: string): Map<number, { cwd: boolean }> {
   let out: string;
   try {
-    out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
+    out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "pf"], { encoding: "utf8" });
   } catch (err) {
     // lsof exits 1 (and prints nothing) when nothing matches. Any stdout
     // captured on the error object is still authoritative; anything else
     // is a real failure to run lsof at all.
     const stdout = (err as { stdout?: string }).stdout ?? "";
-    if (stdout.length === 0) return [];
+    if (stdout.length === 0) return new Map();
     out = stdout;
   }
-  const pids: number[] = [];
+  // `-F pf`: a `p<pid>` line starts each process, followed by one `f<fd>`
+  // line per file it has under `dir`; `fcwd` is its working directory.
+  const found = new Map<number, { cwd: boolean }>();
+  let current: { cwd: boolean } | undefined;
   for (const line of out.split("\n")) {
-    // `-F p` prefixes a pid line with the literal `p`; other lines (`f...`
-    // for each open file/fd) are not process identifiers.
     if (line.startsWith("p")) {
       const pid = Number.parseInt(line.slice(1), 10);
-      if (Number.isFinite(pid)) pids.push(pid);
+      current = Number.isFinite(pid) ? { cwd: false } : undefined;
+      if (current) found.set(pid, current);
+    } else if (line === "fcwd" && current) {
+      current.cwd = true;
     }
   }
-  return pids;
+  return found;
 }
 
 function commandFor(pid: number): string {
@@ -112,11 +139,15 @@ function delay(ms: number): Promise<void> {
 export async function sweep(dir: string, options: SweepOptions = {}): Promise<SweepResult> {
   const termGraceMs = options.termGraceMs ?? 500;
   const excluded = new Set<number>([...(options.exceptPids ?? []), ...selfAndAncestors()]);
-  const candidates = lsofPidsUnder(dir).filter((pid) => !excluded.has(pid));
-
   const killed: SweepKilled[] = [];
-  for (const pid of candidates) {
+  const held: SweepKilled[] = [];
+  for (const [pid, { cwd }] of lsofUnder(dir)) {
+    if (excluded.has(pid)) continue;
     const command = commandFor(pid);
+    if (!cwd || isProtectedCommand(command)) {
+      held.push({ pid, command });
+      continue;
+    }
     try {
       process.kill(pid, "SIGTERM");
       killed.push({ pid, command });
@@ -138,5 +169,5 @@ export async function sweep(dir: string, options: SweepOptions = {}): Promise<Sw
     }
   }
 
-  return { killed, tainted: killed.length > 0 };
+  return { killed, held, tainted: killed.length > 0 };
 }
