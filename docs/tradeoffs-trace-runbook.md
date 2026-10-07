@@ -388,6 +388,136 @@ the conductor commits the candidate. The existing plans in
 (`tradeoffs-trace/test/fixtures/atlas-plans/`): the linter finds exactly one
 error across them, `13j`'s owner-actor item.
 
+## Writing a plan
+
+This is the reference for owner sessions, workers and reviewers (ref
+`06_ref_plan_format.md`). A phase is an Org subtree whose children have fixed
+headings. Every item under **Architecture**, **Requirements** and
+**Constraints** is a subheading with an `:ID:`; the loop carries each item
+mechanically from the plan to the worker, the checks, the reviewers and the
+acceptance decision.
+
+```org
+* Stage 1: two lanes
+  :PROPERTIES:
+  :ID:          stage-1
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  tradeoffs-trace/src/**
+  :END:
+** Goal
+   One paragraph: the outcome and why, in the owner's words where possible.
+** Architecture
+*** A1 Round                                                       :data:
+    :PROPERTIES:
+    :ID:       A1
+    :WHERE:    tradeoffs-trace/src/core/rounds.ts
+    :END:
+    #+begin_src typescript
+    interface Round { n: number; base: Sha; lanes: Lane[] }
+    #+end_src
+    One or two sentences: who writes it, who reads it, its invariant.
+*** A2 Pick tally                                                  :rule:
+    :PROPERTIES:
+    :ID:       A2
+    :END:
+    Strict majority of seats; computed by code, never by a model.
+** Requirements
+*** R1 Two candidates from one base
+    :PROPERTIES:
+    :ID:       R1
+    :ARCH:     A1
+    :VERIFY:   test "lanes: two candidates from one base"
+    :END:
+    One paragraph. Sub-lists are parsed as part of the item:
+    - the first point
+    - the second point
+*** R2 Owner's live run
+    :PROPERTIES:
+    :ID:       R2
+    :VERIFY:   evidence
+    :END:
+    The owner records it with `tt evidence` or `C-c m e`.
+** Constraints
+*** C1 K = 1 is today's loop
+    :PROPERTIES:
+    :ID:       C1
+    :VERIFY:   test "lanes: one worker writes no new events"
+    :END:
+    Today's behaviour must not change.
+```
+
+`tt plan template` prints this skeleton; `tt lint` accepts it. `tt lint`
+reads an `.org` plan (`tt lint plan.org`) as well as the JSON Emacs writes,
+and rejects a missing or duplicate `:ID:`, an `:ARCH:` naming no architecture
+item, a `test` verify with no name, and any text lost in parsing — each with
+its file and line.
+
+`:VERIFY:` kinds (several may be listed, e.g. `test "…" review`):
+
+- `test "<name>"` (or `test <file>::<name>`): the test must exist and pass in
+the candidate's check run; the conductor matches it against the node test
+output. A missing or failed one is a blocking finding anchored to the item.
+- `review`: judged by the reviewers in turn 2. This is the default when
+  `:VERIFY:` is absent.
+- `evidence`: the owner records it (`tt evidence <run> <item> <file-or-text>`
+  or `C-c m e`). The phase parks `AWAITING_OWNER` naming the item until then.
+
+Architecture items are high level on purpose: data shapes, state and events,
+ownership, invariants, the module they live in (`:WHERE:`), and a tag —
+`:data:`, `:rule:`, `:flow:` or `:boundary:`. Leave out how to code them. A
+named type, event or function in the item plus a `:WHERE:` file is grepped in
+the candidate before any reviewer is asked; a missing symbol is recorded
+`deviates`.
+
+What the loop does with the items:
+
+1. **Worker prompt** renders the checklist by id; the worker ends its attempt
+   with `submit_coverage` — every requirement and constraint `done`,
+   `partial` or `not_done` with `where` and `tests`, every architecture item
+   `fits` or `deviates` with `where`. A `partial`, `not_done` or `deviates`
+   entry must carry a note, which becomes a trade-off message. The freeze is
+   refused until the coverage is complete.
+2. **Checks** resolve every `test` verify; a missing or failed one is a
+   blocking finding anchored to its item.
+3. **Reviewers** get the same checklist plus the worker's coverage and the
+   check resolution, and `submit_review` must carry a verdict for every
+   requirement and constraint (`met`/`unmet`/`partial`) and every architecture
+   item (`fits`/`deviates`/`unclear`), each with evidence. A review that omits
+   an id is incomplete and is re-asked. Every verdict cites an anchor
+   (`file:line-range`, a test name, or a command); the conductor refuses and
+   re-asks a verdict whose file or lines are not in the candidate, whose `met`
+   anchor touches neither the diff nor the item's `:WHERE:`, or whose cited
+   test did not pass — and a `met`/`fits` verdict must cite a file the
+   reviewer itself read.
+4. **Tally**: per item a strict majority of seats decides. A majority `unmet`
+   requirement or constraint, or a majority `deviates` architecture item,
+   becomes a blocking finding anchored to the item with the reviewers'
+   evidence; the evaluator re-verifies every such majority before it blocks,
+   overturns one the code contradicts (counted against its seat), and audits
+   unanimous `met` verdicts with thin evidence.
+5. **Acceptance** additionally requires every requirement and constraint met
+   by majority with its `test` verifies passed, every architecture item
+   fitting by majority (or its deviation accepted by the owner as a
+   trade-off), and every `evidence` item recorded.
+6. **The repair prompt** lists only the items not met or not fitting, with the
+   evidence.
+
+The old format still parses: a `Goal:` paragraph, an `Acceptance:` list and
+`:RESERVED:`. The Emacs parser turns each acceptance item into `R1..Rn` with
+`review` (or `evidence` for an item that starts `evidence:`) and `:RESERVED:`
+into `C1`, and marks the phase `itemsSynthesized`. Such a phase is NOT
+structured: it owes `submit_phase` only, its prompts carry no item checklist
+and never mention `submit_coverage`, and no coverage or per-item verdict is
+required. The item loop — the checklist, `submit_coverage`, the per-item
+verdicts and the evaluator item check — applies only to a phase that declares
+**Architecture**, **Requirements** or **Constraints** (one `isStructured`
+decision owns this everywhere).
+
+Coverage is per attempt: a repair, a correction or an amended contract starts
+a new worker attempt that owes its own `submit_coverage`, and the freeze
+requires the report bound to the current attempt number — an earlier
+attempt's report never satisfies it.
+
 ## Models per role and per seat
 
 By default every role — the worker, the three reviewers (M, A, B), the

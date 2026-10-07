@@ -111,7 +111,7 @@ export function planModelSelector(
  * denylist leaves gaps and, for a worker, leaks the reviewer submission
  * tools — see the negative case in role-tool-sets.test.ts). */
 export const ROLE_TOOLS: Record<Role, string[]> = {
-  worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "raise_tradeoff"],
+  worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "submit_coverage", "raise_tradeoff"],
   reviewer: ["read", "grep", "find", "ls", "submit_discovery", "submit_review"],
   // Plan 04a: the evaluator checks a round's raw messages against the code
   // it can read, and returns through `submit_evaluation`. Decision briefs

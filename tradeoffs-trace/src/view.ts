@@ -20,6 +20,7 @@ import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baselin
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
+import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
@@ -916,6 +917,15 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- Reviews on the accepted candidate ${C ? C.slice(0, 9) : "?"}: ${v.reviewLine}`,
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} trade-off(s), ${flagged.length} flagged for the owner`,
+    ...(() => {
+      const c = phase.contract;
+      if (!isStructured(c)) return [];
+      const itemsPhase = { contract: c, reviews: phase.reviews, coverage: phase.coverage, checkResolution: phase.checkResolution, overturns: phase.overturns };
+      const matrix = matrixMarkdown(itemsPhase);
+      const overturns = overturnCounts(phase.overturns ?? []);
+      const overturnLine = overturns.length > 0 ? [`- Overturned verdicts (counted against a seat): ${overturns.map((o) => `${o.seat} ${o.count}`).join(" · ")}`] : [];
+      return matrix.length > 0 ? [`- ${countsLine(phaseItemCounts(itemsPhase))}`, ...overturnLine, "", ...matrix, ""] : [];
+    })(),
     "",
     ...(models.length > 0
       ? ["### Models per role", "", ...models.map((m) => `- ${m.role}: ${m.value}`), ""]

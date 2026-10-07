@@ -26,6 +26,7 @@ import {
 } from "./core/entries.ts";
 import { runReviewLint, type ReviewLintResult } from "./core/review-lint.ts";
 import { ledgerEntries } from "./core/messages.ts";
+import { countsLine, isStructured, itemEvidenceFiles, matrixMarkdown, matrixOrg, overturnCounts, phaseItemCounts, type ItemLoopState } from "./core/items.ts";
 import type { Timeline } from "./conductor.ts";
 import type { RunView } from "./view.ts";
 
@@ -362,7 +363,19 @@ export interface EntryReviewPhase {
   ownerRequests?: OwnerRequest[];
   decisions?: Decision[];
   overrides?: Override[];
-  contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
+  contract?: {
+    contractVersion?: { snapshot: number; sectionSha256: string };
+    // Plan 06b: the structured items, so the review buffer shows the
+    // item-by-seat matrix.
+    architecture?: import("./core/items.ts").ArchitectureItem[];
+    requirements?: import("./core/items.ts").RequirementItem[];
+    constraints?: import("./core/items.ts").ConstraintItem[];
+  };
+  /** Plan 06b: the per-item state the matrix renders. */
+  reviews?: import("./core/types.ts").PhaseState["reviews"];
+  coverage?: import("./core/items.ts").Coverage;
+  checkResolution?: import("./core/items.ts").VerifyResolution[];
+  overturns?: import("./core/items.ts").Overturn[];
   messages?: Message[];
   entries?: Entry[];
   /** The program a program-level view spans. */
@@ -408,6 +421,9 @@ export interface EntryReviewRender {
   text: string;
   /** One `views/entries/<id>.org` per live entry. */
   files: Array<{ id: string; contents: string }>;
+  /** Plan 06b: one `views/items/<id>.org` per item, the evidence a matrix
+   * cell opens. */
+  itemFiles: Array<{ id: string; contents: string }>;
   lint: ReviewLintResult;
 }
 
@@ -425,7 +441,7 @@ export function projectEntryReview(
   const newestCandidateSha = phase.candidate?.sha;
   const projected = projectEntries({ messages, entries, newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness });
   const lint = runReviewLint({ projected, newestCandidateSha, messages });
-  const text = program
+  let text = program
     ? renderProgramEntryReview({
         program: phase.program,
         newestCandidateSha,
@@ -458,8 +474,24 @@ export function projectEntryReview(
         anchorFreshness: opts.anchorFreshness,
         lintError: opts.lintError ?? (lint.ok ? undefined : lint.firstLine),
       });
+  // Plan 06b: the review buffer's own item-by-seat matrix, appended to the
+  // rendered review so the owner and reviewers see every item's worker
+  // status, check result and seat verdict in one place.
+  const itemsPhase = {
+    contract: phase.contract ?? {},
+    reviews: phase.reviews,
+    coverage: phase.coverage,
+    checkResolution: phase.checkResolution,
+    overturns: phase.overturns,
+  } as ItemLoopState;
+  const structuredContract = isStructured(phase.contract);
+  const matrix = structuredContract ? matrixOrg(itemsPhase) : [];
+  if (matrix.length > 0) {
+    text += `\n* Plan items\n  ${countsLine(phaseItemCounts(itemsPhase))}\n\n${matrix.map((l) => `  ${l}`).join("\n")}\n`;
+  }
   const files = projected.views.filter((v) => v.live).map((v) => ({ id: v.entry.id, contents: renderEntryFile(v) }));
-  return { text, files, lint };
+  const itemFiles = structuredContract ? itemEvidenceFiles(itemsPhase) : [];
+  return { text, files, itemFiles, lint };
 }
 
 /** The messages an evaluator merged into TARGET, so the target's own file
@@ -793,6 +825,26 @@ export function renderStatusView(input: StatusViewInput): string {
   push(row("loop", view.loop));
   push(row("phase", `${phase.phaseId} · ${name} · round ${view.round} · attempt ${attempt?.n ?? "?"} · repairs ${phase.repairRoundsUsed ?? 0}/${phase.repairRoundsGranted ?? 0}`));
   push(row("pipeline", view.pipeline));
+  // Plan 06b: the status line's item counts, e.g. `R 7/8 met · A 3/3 fit · C 2/2`.
+  try {
+    const contract = phase.contract as { architecture?: unknown; requirements?: unknown; constraints?: unknown; itemsSynthesized?: boolean } | undefined;
+    const structured = isStructured(contract);
+    if (structured) {
+      const loopState = {
+        contract,
+        reviews: phase.reviews,
+        coverage: phase.coverage,
+        checkResolution: phase.checkResolution,
+        overturns: phase.overturns,
+      } as unknown as ItemLoopState;
+      const counts = countsLine(phaseItemCounts(loopState));
+      push(row("items", counts));
+      const overturns = overturnCounts(loopState.overturns ?? []);
+      if (overturns.length > 0) push(row("overturns", overturns.map((o) => `${o.seat} ${o.count}`).join(" · ")));
+    }
+  } catch {
+    // A view must never fail to render for a count.
+  }
   push(row("time", view.time));
   push(row("gates", view.gates));
   push(row("gate", view.gate));

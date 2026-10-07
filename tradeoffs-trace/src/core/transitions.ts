@@ -30,8 +30,11 @@ import {
   blockerWithOutcome,
   blockersNeedingPanel,
   DEFAULT_BLOCKER_OPTIONS,
+  evidenceAllRecorded,
+  evidenceOnlyPending,
   evaluationSettled,
   isLiveDecision,
+  pendingEvidenceItems,
   resolvedCorrectionIdsFor,
   reviewsComplete,
   sameVersion,
@@ -142,7 +145,8 @@ addRow({
   guard: (_s, ev) => !baselineNeeded(ev),
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }], // next() of the resulting IMPLEMENTING state
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING" }),
+  // OD-2 A2: coverage is per candidate/attempt; a new attempt owes its own.
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined }),
 });
 
 addRow({
@@ -170,7 +174,7 @@ addRow({
   guard: () => true,
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined, inFlight: clearInFlight(s.phase, "run_baseline") }),
 });
 
 addRow({
@@ -182,7 +186,7 @@ addRow({
   guard: () => true,
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined, inFlight: clearInFlight(s.phase, "run_baseline") }),
 });
 
 addRow({
@@ -301,6 +305,10 @@ addRow({
     withPhase(s, {
       phase: "IMPLEMENTING",
       attempt: { ...s.phase.attempt, interrupted: true },
+      // OD-2 A2: an interrupted attempt is re-dispatched as a new attempt, so
+      // it owes its own coverage too.
+      coverage: undefined,
+      coverageAttempt: undefined,
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
     }),
 });
@@ -337,6 +345,15 @@ addRow({
       // worker kept or changed them (core/rounds.ts); the rest are superseded
       // and can no longer block acceptance.
       decisions: [...carried, ...e.decisions],
+      // Plan 06b (OD-1 A2): a conductor-raised finding that was anchored to an
+      // ITEM belongs to the candidate it was raised on. A new candidate
+      // re-evaluates the item, so the old finding is superseded here; a still
+      // unmet/deviating item gets a fresh one from #applyItemOutcomes.
+      findings: s.phase.findings.map((f) =>
+        f.status === "open" && f.raisedBy === "conductor" && f.itemId
+          ? { ...f, status: "superseded" as const, supersededBy: `candidate ${e.candidateSha.slice(0, 8)} re-evaluated ${f.itemId}` }
+          : f,
+      ),
       round: (s.phase.round ?? 0) + 1,
       checks: undefined,
       // Plan 05d: this candidate is the one that repairs the previous check
@@ -350,6 +367,15 @@ addRow({
       pendingDispute: undefined,
       probe: undefined,
       reviews: {},
+      // Plan 06b / OD-1 A2: the previous candidate's item RESULTS are cleared
+      // at each freeze (the check resolution, symbol deviations and overturns
+      // belong to the candidate that just froze). The worker's COVERAGE is
+      // this new candidate's own input — the reviewer prompt and the views
+      // read it — so it is kept until the next worker attempt replaces it.
+      checkResolution: undefined,
+      archSymbolDeviations: undefined,
+      overturns: undefined,
+      itemChecks: undefined,
       // Skill fix 5: kept decisions that passed keep their ballots.
       ballots: carryBallotsForward(
         s.phase.decisions,
@@ -903,13 +929,28 @@ function applyCriterionAmended(s: State, ev: Event): State {
       ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
       : f,
   );
+  // Plan 06b (OD-1 R6, finding disc-B-37): a structured phase carries the
+  // criterion in its requirement item too. Target the item the amendment NAMES
+  // by id; fall back to matching its OLD wording. Never by list position,
+  // which could retarget the wrong requirement.
+  const requirements = s.phase.contract.requirements
+    ? s.phase.contract.requirements.map((r) =>
+        (amendment.itemId ? r.id === amendment.itemId : r.text === amendment.criterion || r.title === amendment.criterion)
+          ? { ...r, title: amendment.proposedWording, text: amendment.proposedWording }
+          : r,
+      )
+    : s.phase.contract.requirements;
   return withPhase(s, {
     phase: "IMPLEMENTING",
-    contract: { ...s.phase.contract, acceptance: e.newAcceptance, contractVersion: e.newContractVersion },
+    contract: { ...s.phase.contract, acceptance: e.newAcceptance, ...(requirements ? { requirements } : {}), contractVersion: e.newContractVersion },
     candidate: s.phase.candidate && { sha: s.phase.candidate.sha, contractVersion: e.newContractVersion },
     decisions,
     findings,
     attempt: { n: s.phase.attempt.n + 1 },
+    // OD-2 A2: the amended contract starts a NEW attempt, so it owes its own
+    // coverage; the previous candidate's report must not satisfy its freeze.
+    coverage: undefined,
+    coverageAttempt: undefined,
     checks: undefined,
     probe: undefined,
     reviews: {},
@@ -1031,7 +1072,8 @@ addRow({
   from: "RESOLVING",
   trigger: "RESOLVING_INCOMPLETE",
   guardName: "openItemsAndBudgetRemains",
-  guard: (s) => !acceptHolds(s) && budgetRemains(s),
+  // Plan 06b: an evidence-only phase parks on the owner, not a repair round.
+  guard: (s) => !acceptHolds(s) && budgetRemains(s) && !evidenceOnlyPending(s.phase),
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING" }),
@@ -1043,10 +1085,51 @@ addRow({
   from: "RESOLVING",
   trigger: "RESOLVING_INCOMPLETE",
   guardName: "openItemsBudgetExhausted",
-  guard: (s) => !acceptHolds(s) && budgetExhausted(s),
+  guard: (s) => !acceptHolds(s) && (budgetExhausted(s) || evidenceOnlyPending(s.phase)),
   to: "AWAITING_OWNER",
   actions: [],
-  apply: (s) => enterAwaitingOwner(s, "the repair budget ran out while items remained open"),
+  apply: (s) =>
+    enterAwaitingOwner(
+      s,
+      evidenceOnlyPending(s.phase)
+        ? `the owner must record evidence for ${pendingEvidenceItems(s.phase).map((i) => i.id).join(", ")}`
+        : "the repair budget ran out while items remained open",
+    ),
+});
+
+// Plan 06b: every `evidence` item is recorded, so the owner has done the
+// thing the phase parked for. The parking request closes and the phase
+// resumes to RESOLVING, where next() re-evaluates accept().
+addRow({
+  id: "awaiting-owner-evidence-recorded",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "EVIDENCE_RECORDED",
+  guardName: "evidenceAllRecorded",
+  guard: (s) => evidenceAllRecorded(s.phase),
+  to: "RESOLVING",
+  // The gate-less fixture (base contract): accept now holds, so the row's
+  // actions are exactly next(RESOLVING).
+  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  // OD-1 (disc-M-56): resolve ONLY the request that parked the phase for
+  // evidence — never an unrelated owner decision. The parking request is the
+  // fallback whose reason names the evidence items.
+  apply: (s) =>
+    withPhase(s, {
+      phase: "RESOLVING",
+      ownerRequests: s.phase.ownerRequests.map((r) =>
+        r.status === "open" && r.reason.startsWith("the owner must record evidence for")
+          ? {
+              ...r,
+              status: "resolved" as const,
+              resolution: { option: "evidence_recorded" },
+              resolvedBinding: s.phase.candidate
+                ? { candidateSha: s.phase.candidate.sha, contractVersion: s.phase.contract.contractVersion }
+                : undefined,
+            }
+          : r,
+      ),
+    }),
 });
 
 // --- ACCEPTED / PUBLISHING --------------------------------------------
@@ -1113,6 +1196,10 @@ addRow({
       phase: "IMPLEMENTING",
       repairRoundsUsed: s.phase.repairRoundsUsed + 1,
       attempt: { n: s.phase.attempt.n + 1 },
+      // OD-2 A2: a repair attempt owes its own coverage; the previous
+      // attempt's report never satisfies the freeze.
+      coverage: undefined,
+      coverageAttempt: undefined,
     }),
 });
 

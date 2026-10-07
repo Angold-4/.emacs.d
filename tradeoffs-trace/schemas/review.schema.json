@@ -36,6 +36,36 @@
         }
       }
     },
+    "items": {
+      "type": "array",
+      "description": "Plan 06b: a verdict for every requirement and constraint (met/unmet/partial, with evidence).",
+      "items": {
+        "type": "object",
+        "required": ["id", "verdict", "evidence"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "verdict": { "enum": ["met", "unmet", "partial"] },
+          "evidence": { "type": "string", "minLength": 1 },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "arch": {
+      "type": "array",
+      "description": "Plan 06b: a verdict for every architecture item (fits/deviates/unclear, with evidence).",
+      "items": {
+        "type": "object",
+        "required": ["id", "verdict", "evidence"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "verdict": { "enum": ["fits", "deviates", "unclear"] },
+          "evidence": { "type": "string", "minLength": 1 },
+          "note": { "type": "string" }
+        }
+      }
+    },
     "ballots": {
       "type": "array",
       "description": "Work packet 2a: turn 2 of a real review — a ballot per votable decision.",

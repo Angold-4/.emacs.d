@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 
 import { Conductor, createRun, runPaths, type ConductorOptions, type RunPlanFile } from "../../src/conductor.ts";
 import { planModelSelector, ROLE_TOOLS, type PlanModels } from "../../src/core/roles.ts";
-import { roundPanelItemsNeedingVote } from "../../src/core/predicate.ts";
+import { itemsNeedingEvaluatorReverify, roundPanelItemsNeedingVote } from "../../src/core/predicate.ts";
+import { phaseItemOutcomes } from "../../src/core/items.ts";
 
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { readLog, type LogRecord } from "../../src/effects/log.ts";
@@ -192,6 +193,18 @@ export async function setupConductor(opts: {
   /** The phase's own goal text (default "do the thing"). A plan's prose is a
    * secret-value carrier too, so a test can quote one in it. */
   goal?: string;
+  /** Plan 06b (OD-2 R1): an exact phase object (e.g. the real Emacs parser's
+   * output) to use instead of the harness's built one. */
+  phase?: import("../../src/conductor.ts").RunPlanPhase;
+  /** Plan 06b: the phase's structured items (architecture/requirements/
+   * constraints). When given, the acceptance list is derived from the
+   * requirements' texts so the item loop (coverage, per-item verdicts, item
+   * acceptance) applies exactly as for an Emacs-parsed plan. */
+  items?: {
+    architecture?: import("../../src/core/items.ts").ArchitectureItem[];
+    requirements?: import("../../src/core/items.ts").RequirementItem[];
+    constraints?: import("../../src/core/items.ts").ConstraintItem[];
+  };
   /** Plan 01f: the phase's `:GATE:` command (omitted = no gate, the
    * pre-01f pipeline) and its `:GATE_CLEANUP:` companion. */
   gate?: string;
@@ -225,13 +238,14 @@ export async function setupConductor(opts: {
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
     ...(opts.models ? { models: opts.models } : {}),
     phases: [
-      {
+      opts.phase ?? {
         id: "p1",
         goal: opts.goal ?? "do the thing",
-        acceptance: ["it works", ...(opts.acceptanceFiles ?? [])],
+        acceptance: opts.items?.requirements ? opts.items.requirements.map((r) => r.text) : ["it works", ...(opts.acceptanceFiles ?? [])],
         checks: opts.phaseChecks ?? opts.checks ?? ["true"],
         boundaries: opts.boundaries ?? [],
         reserved: [],
+        ...(opts.items ?? {}),
         ...(opts.gate ? { gate: opts.gate } : {}),
         ...(opts.gateCleanup ? { gateCleanup: opts.gateCleanup } : {}),
       },
@@ -287,10 +301,33 @@ export async function setupConductor(opts: {
     };
   };
 
-  const defaultEvaluatorScript = () => ({
-    hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
-    steps: [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } }],
-  });
+  // Plan 06b (OD-2 A3): the default evaluator answers any owed item re-check
+  // with a `confirmed` check, so a test that does not script the evaluator is
+  // not re-prompted. A test that wants the re-prompt/unchecked path supplies
+  // its own `evaluatorScriptFor` with no itemChecks.
+  const defaultEvaluatorScript = (state: State, messageType: string) => {
+    const owed =
+      messageType === "finding" && itemsNeedingEvaluatorReverify(state.phase)
+        ? phaseItemOutcomes(state.phase)
+            .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
+            .map((o) => o.item.id)
+        : [];
+    return {
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            ...(owed.length > 0
+              ? { itemChecks: owed.map((id) => ({ id, verdict: "confirmed", evidence: "evaluator: re-checked the candidate and found no contradiction" })) }
+              : {}),
+          },
+        },
+      ],
+    };
+  };
 
   const conductor = new Conductor({
     runDir,
@@ -341,7 +378,7 @@ export async function setupConductor(opts: {
         if (!evaluatorScriptPaths.has(agentId)) {
           const script = opts.evaluatorScriptFor
             ? opts.evaluatorScriptFor(messageType, conductor.state)
-            : defaultEvaluatorScript();
+            : defaultEvaluatorScript(conductor.state, messageType);
           evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
         }
         return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
