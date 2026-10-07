@@ -743,6 +743,15 @@ reads: the values live in the environment (design §7)."
   (seq-remove #'string-empty-p
               (split-string (or (+tt--keyword "TT_SECRETS") "") "[ \t,]+" t)))
 
+(defun +tt--plan-env-file ()
+  "The KEY=value file #+TT_ENV_FILE names, as an absolute path, or nil.
+Plan 06e (A1): a declared secret may come from this file when the environment
+does not set it; the lookup order is the environment first, then the file."
+  (let ((v (+tt--keyword "TT_ENV_FILE")))
+    (when (and v (not (string-empty-p (string-trim v))))
+      (expand-file-name (string-trim v)
+                        (file-name-directory (expand-file-name (or buffer-file-name default-directory)))))))
+
 (defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel" "curator")
   "Roles #+TT_MODELS may assign a model to (design §2.1).
 Plan 05j adds `curator': the round's linking agent. It runs whether or not
@@ -868,6 +877,8 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                       (and r `((references . ,(vconcat r)))))
                   ,@(let ((s (+tt--plan-secrets)))
                       (and s `((secrets . ,(vconcat s)))))
+                  ,@(let ((f (+tt--plan-env-file)))
+                      (and f `((envFile . ,f))))
                   ,@(let ((m (+tt--plan-models)))
                       (and m
                            (append `((models . ,(nth 0 m))
@@ -1119,6 +1130,9 @@ several phases runs them in order."
          ;; declaration (plan 14 declared its vendor keys once, here, and no
          ;; entry received them).
          (program-secrets (+tt--plan-secrets))
+         ;; #+TT_ENV_FILE in the program file: the default for every entry
+         ;; whose own plan does not name one.
+         (program-env-file (+tt--plan-env-file))
          ;; #+TT_MODELS in a *program* file: the per-role default for every
          ;; entry that does not set its own (an entry's own value wins).  A
          ;; plan file treated as a one-entry program is parsed by
@@ -1149,6 +1163,8 @@ several phases runs them in order."
                     (let ((own (append (alist-get 'secrets plan) nil)))
                       (setq plan (cons `(secrets . ,(vconcat (seq-uniq (append own program-secrets))))
                                        (assq-delete-all 'secrets (copy-alist plan))))))
+                  (when (and program-env-file (not (assq 'envFile plan)))
+                    (setq plan (cons `(envFile . ,program-env-file) plan)))
                   (setq plan (+tt--merge-models plan program-models))
                   (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
     (unless entries (push (cons 1 "program has no entries") errors))

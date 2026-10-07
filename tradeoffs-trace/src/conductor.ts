@@ -171,7 +171,7 @@ import { validate } from "./core/schema.ts";
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireLock, acquireWaitingLock, type Lock } from "./effects/lock.ts";
 import { killGroup, childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
-import { sweep, type SweepResult } from "./effects/sweep.ts";
+import { loggedHeld, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
   diffHunks,
@@ -390,6 +390,12 @@ export interface RunPlanFile {
    * conductor writes. A name that is unset at start is reported in the
    * status; the run starts anyway. */
   secrets?: string[];
+  /** Plan 06e (A1): a `KEY=value` file (`#+TT_ENV_FILE`, or `tt start
+   * --env-file`) that supplies a declared secret when the environment does
+   * not. The lookup order is the environment first, then this file. The path
+   * is recorded here (never a value), so a resumed run resolves the same
+   * source. Only effects/secrets.ts reads it. */
+  envFile?: string;
   /** Plan 01i: program-wide owner directives already in force when this
    * run's node was started (D5). They seed the phase's directive list, so a
    * node started after the owner's ruling still carries it in every prompt.
@@ -811,7 +817,7 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   // text — see `#withValues`, which puts the real value back for the commands
   // the plan asks for, and only for them.
   const declared = secretNames(plan.secrets);
-  const { maskable } = resolveSecrets(declared);
+  const { maskable } = resolveSecrets(declared, process.env, plan.envFile);
   fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(redactRecord(plan, maskable), null, 2));
   // Snapshot the plan's reference documents (same-named files get a numeric
   // prefix); a missing one is skipped and noted rather than failing the run.
@@ -1355,7 +1361,7 @@ export class Conductor {
     // file), and every writer below redacts them. A declared name that is
     // unset is recorded and reported — the run still starts.
     this.#secretNames = secretNames(this.#plan.secrets);
-    const resolved = resolveSecrets(this.#secretNames);
+    const resolved = resolveSecrets(this.#secretNames, process.env, this.#plan.envFile);
     this.#secretValues = resolved.values;
     this.#secretMaskable = resolved.maskable;
     this.#missingSecrets = resolved.missing;
@@ -1462,6 +1468,10 @@ export class Conductor {
       // (fake-pi) sends its `sh` messages straight to this socket.
       refuseSh: (_agentId, command) => secretUseInCommand(command, this.#secretNames),
       shDeadline: { deadlineMs: this.#deadlines.shCommandMs, termGraceMs: this.#deadlines.termGraceMs },
+      // Plan 06e (A1): a `sh` command's environment carries childEnv() plus
+      // every resolved secret value, so `$NAME` works whether the environment
+      // or the env file supplied the value.
+      shEnv: () => this.#gateEnv(),
       onNoSubmission: (agentId) => this.#onNoSubmission(agentId),
     });
 
@@ -1584,6 +1594,29 @@ export class Conductor {
       .filter((pgid) => Number.isFinite(pgid));
   }
 
+  /** Every process group THIS RUN recorded at spawn: the pgid of every intent
+   * record in the log, plus every live agent and shell group. A2 (plan 06e):
+   * the sweep may signal only these — a process in any other group is
+   * reported as HELD, never signalled. */
+  #ownPgids(): number[] {
+    const pgids = new Set<number>();
+    try {
+      for (const r of readLog(this.#paths.events).records) {
+        if (r.kind !== "intent") continue;
+        const pgid = (r.event as { pgid?: unknown }).pgid;
+        if (typeof pgid === "number" && Number.isFinite(pgid)) pgids.add(pgid);
+      }
+    } catch {
+      // an unreadable log: fall back to the live handles below
+    }
+    for (const handle of this.#agents.values()) {
+      pgids.add(handle.agent.pgid);
+      for (const g of handle.shGroups) pgids.add(g);
+    }
+    for (const g of this.#liveShGroups) pgids.add(g);
+    return [...pgids];
+  }
+
   /** design §9.3's per-effect reconciliation table, driven off
    * `phase.inFlight` (an intent recorded, with no matching completion, is
    * exactly what an in-flight entry with no live dispatcher means on a
@@ -1682,7 +1715,7 @@ export class Conductor {
       for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
         await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
       }
-      const sweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       if (typeof payload.sessionDir === "string") this.#recoveredSessionDir = payload.sessionDir;
@@ -1692,7 +1725,7 @@ export class Conductor {
 
     if (key === "freeze") {
       const found = findCommitByTrailer(this.#paths.worktree, actionId);
-      const sweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
       if (found) {
         const decisions = this.#assembleDecisions(found);
@@ -5926,7 +5959,7 @@ export class Conductor {
     // e.g. a test tearing down right after an interrupted attempt re-
     // dispatched a new one. Nothing further to record once closed.
     if (this.#closed) return;
-    const result = await sweep(this.#paths.worktree, { exceptPids: [] });
+    const result = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
     if (this.#closed) return;
     this.#log.append("sweep", result);
   }
@@ -5970,7 +6003,7 @@ export class Conductor {
       if (timedOut) return undefined;
 
       // step 2: sweep.
-      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       if (timedOut) return undefined;
       this.#log.append("sweep", sweepResult);
 
@@ -6023,7 +6056,7 @@ export class Conductor {
         await handle.agent.terminate().catch(() => undefined);
         this.#agents.delete(handle.agentId);
       }
-      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
       this.#log.completion(actionId, { timedOut: true, tainted: true, reason: outcome });
       this.#applyEvent({ type: "FREEZE_TIMED_OUT" });
@@ -6244,6 +6277,7 @@ export class Conductor {
         view,
         alive: !this.#closed,
         secrets: { missing: this.#missingSecrets, tooShort: this.#tooShortSecrets },
+        held: loggedHeld(this.#runDir),
       }),
     );
     fs.writeFileSync(this.#paths.status, redactText(text, this.#secretMaskable));

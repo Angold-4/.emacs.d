@@ -315,7 +315,9 @@ logs changes for such a plan.
 2. Make sure no checkout has `TT_BRANCH` checked out, or publishing will collide with it.
 3. In the plan buffer, press `C-c m r`. Emacs validates the plan (errors open in `*tt-plan-errors*`), starts the conductor and opens the workspace tab.
 
-From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
+From a shell: `tt start <plan.json> [--env-file <KEY=value file>]`. It takes
+the JSON plan that Emacs writes; `--env-file` supplies secrets the environment
+does not set (see "Secrets" below).
 
 - **Reference documents.** Every `*.md` file the plan names that exists
   (relative to the plan, or under `~`), plus anything in `#+TT_REFS`, is copied
@@ -748,6 +750,33 @@ A plan declares the credentials it needs **by name** and nothing else:
 #+TT_SECRETS: PYTH_ACCESS_TOKEN KAIKO_KEY
 ```
 
+A secret may also come from a `KEY=value` file the plan names with
+`#+TT_ENV_FILE`, or that `tt start`/`tt program start` takes as `--env-file`:
+
+```org
+#+TT_ENV_FILE: ~/secrets/atlas.env
+#+TT_SECRETS: PYTH_ACCESS_TOKEN KAIKO_KEY
+```
+
+**The file format.** One `KEY=value` assignment per line. Blank lines and
+lines starting with `#` are ignored, an optional `export ` prefix is accepted,
+and single or double quotes around a value are stripped:
+
+```sh
+# vendor keys, never committed
+export PYTH_ACCESS_TOKEN='…'
+KAIKO_KEY=…
+```
+
+**The lookup order is the environment first, then the env file.** A name the
+environment sets wins; a name it does not set is read from the file.
+`--env-file` overrides `#+TT_ENV_FILE` for that run, and the path (never a
+value) is recorded in the run's plan snapshot, so a resumed run resolves the
+same file. A missing variable refuses the start, naming the variable and both
+sources it checked. `effects/secrets.ts` is the only reader of either source,
+and it hands every value to the redactor before any agent starts, so no value
+from the env file can reach a file of the run directory.
+
 - The name goes into the JSON plan (`secrets`); the plan never holds a value.
 - In a program file, `#+TT_SECRETS` declares the names for **every** entry, in
   addition to any entry plan's own declaration.
@@ -844,6 +873,27 @@ not conductor output, and are left alone — check them yourself if a worker eve
 pasted a value into the code. The trace buffer masks a declared secret's value
 that a stream file still holds, using Emacs's own environment, so an unredacted
 past run cannot display one either.
+
+## Processes the run owns (what `held` means)
+
+A run signals only the processes it started. Every command it spawns is
+recorded with its process group, and when a phase is cancelled, times out, is
+frozen or recovered from a crash, the **sweep** ends the processes whose group
+is one of those recorded groups — and only those.
+
+Any other process with a file under the run's worktree is **held**: it is
+reported, never signalled. `tt status` lists each one as
+`held: <pid> <command> (cwd <dir>)`. A held process does not taint the
+worktree; only ending one of the run's own processes does. A process is held
+because the run cannot prove it owns it — a detached descendant that left its
+group, a bind mount's file server, an editor, or Docker Desktop's own helpers
+(program 14's 14i freezes killed Docker Desktop because an earlier sweep
+signalled every process with a cwd under the worktree). Safety wins over
+cleanup: never signalling a foreign process comes before cleaning up.
+
+An empty sweep is therefore not a guarantee. A process that closed every open
+file under the worktree is invisible to `lsof +D`, which only sees what is
+true at the moment it runs.
 
 ## Watch it
 

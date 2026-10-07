@@ -262,8 +262,10 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const globalFinalChecks = first("TT_FINAL_CHECKS")?.value;
   const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks));
   const rerun = first("TT_RERUN");
+  const envFile = first("TT_ENV_FILE")?.value;
   return {
     ...(sourceFile ? { sourceFile } : {}),
+    ...(envFile && envFile.trim().length > 0 ? { envFile: envFile.trim() } : {}),
     phases,
     ...parseModels(first("TT_MODELS")),
     ...(rerun ? { rerun: rerun.value, rerunLine: rerun.line } : {}),

@@ -7,7 +7,7 @@
 // `<run>/conductor.log`, so the parent (this CLI invocation) returns the
 // run id immediately rather than blocking for the whole run.
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readdirSync, statSync } from "node:fs";
 import * as os from "node:os";
@@ -35,6 +35,8 @@ import {
 import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
+import { loggedHeld } from "./effects/sweep.ts";
+import { runnerFor } from "./effects/runner.ts";
 import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { planModelSelector } from "./core/roles.ts";
 import { distinctModelGroups, modelsCheckRefused, planModelTargets, type ModelsCheck } from "./core/models-check.ts";
@@ -78,7 +80,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -129,11 +131,13 @@ function parseArgs(argv: string[]): {
   phaseId?: string;
   source?: string;
   skipModelsCheck: boolean;
+  envFile?: string;
 } {
   const positional: string[] = [];
   let root: string | undefined;
   let json = false;
   let skipModelsCheck = false;
+  let envFile: string | undefined;
   let reason: string | undefined;
   let candidateSha: string | undefined;
   let messageVersion: number | undefined;
@@ -182,11 +186,15 @@ function parseArgs(argv: string[]): {
       source = arg.slice("--source=".length);
     } else if (arg === "--skip-models-check") {
       skipModelsCheck = true;
+    } else if (arg === "--env-file") {
+      envFile = argv[++i];
+    } else if (arg.startsWith("--env-file=")) {
+      envFile = arg.slice("--env-file=".length);
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck };
+  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile };
 }
 
 /** Plan 03c: resolve a readable id `<program>-NN` to the node's run
@@ -207,6 +215,23 @@ function resolveReadableRunDir(ref: string, root: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** A4 (plan 06e): read a run with the runner that recorded it, when that
+ * runner is installed. `runnerFor` is the only chooser; this re-execs the
+ * chosen runner's own CLI with the same argv and exits with its status, so a
+ * run recorded under an older installed revision is served by that
+ * revision's code (its status text, its `state` JSON). `TT_RUNNER_SERVED=1`
+ * stops a second hop: the chosen runner answers with its own code. */
+function delegateToRecordedRunner(runDir: string, root: string): void {
+  if (process.env.TT_RUNNER_SERVED === "1") return;
+  const choice = runnerFor(runDir, root);
+  if (choice.current) return;
+  const result = spawnSync(process.execPath, [choice.cliPath, ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: { ...process.env, TT_RUNNER_SERVED: "1" },
+  });
+  process.exit(result.status ?? 1);
 }
 
 function resolveRunDir(rootOrId: string, root: string): string {
@@ -271,7 +296,8 @@ function runSummary(runDir: string): string {
  * finding, a decision or a command is never shown. */
 function secretsForRun(runDir: string): Secret[] {
   try {
-    return resolveSecrets(secretNames(readPlan(runDir).secrets)).maskable;
+    const plan = readPlan(runDir);
+    return resolveSecrets(secretNames(plan.secrets), process.env, plan.envFile).maskable;
   } catch {
     return [];
   }
@@ -282,14 +308,49 @@ function secretsForRun(runDir: string): Secret[] {
  * keyless for hours (plan 14: `tt program resume` from a shell without the
  * vendor keys; the worker could not run the live gate and deferred it). So a
  * start or resume that would launch a conductor refuses, naming what is
- * missing, unless TT_ALLOW_MISSING_SECRETS=1. Names only; never a value. */
-function refuseMissingSecrets(declared: readonly (string | undefined)[] | undefined, what: string): boolean {
+ * missing, unless TT_ALLOW_MISSING_SECRETS=1. Plan 06e (A1): a declared name
+ * is satisfied by the environment first, then by the env file, so the refusal
+ * names the variable and every source it checked. Names only; never a value. */
+function refuseMissingSecrets(
+  declared: readonly (string | undefined)[] | undefined,
+  what: string,
+  envFile?: string,
+): boolean {
   const names = [...new Set(secretNames((declared ?? []).filter((n): n is string => typeof n === "string")))];
-  const { missing } = resolveSecrets(names);
+  const { missing } = resolveSecrets(names, process.env, envFile);
   if (missing.length === 0 || process.env.TT_ALLOW_MISSING_SECRETS === "1") return false;
+  const where = envFile === undefined ? "this environment" : `this environment or the env file ${envFile}`;
   process.stderr.write(
-    `refusing to ${what}: declared secret(s) not set in this environment: ${missing.join(", ")}\n` +
-      `export them in the shell (or Emacs) that runs this command, or set TT_ALLOW_MISSING_SECRETS=1 to run without them\n`,
+    `refusing to ${what}: declared secret(s) not set in ${where}: ${missing.join(", ")}\n` +
+      `export them in the shell (or Emacs) that runs this command, add them to the env file, or set TT_ALLOW_MISSING_SECRETS=1 to run without them\n`,
+  );
+  process.exitCode = 1;
+  return true;
+}
+
+/** The plans of a program's entries whose node has not finished (a done node
+ * can never start again, so its secrets are no longer required). */
+function programActivePlans(dir: string): RunPlanFile[] {
+  const { program, state } = foldProgram(dir);
+  return program.entries.filter((e) => state.nodes[e.id]?.status !== "done").map((e) => e.plan);
+}
+
+/** Plan 06e (A1): the same refusal for a program, whose entries may each name
+ * their own env file. A name missing from every source is refused once, with
+ * the sources named. */
+function refuseMissingSecretsForPlans(plans: readonly RunPlanFile[], what: string, envFile?: string): boolean {
+  const missing = new Set<string>();
+  const sources = new Set<string>();
+  for (const plan of plans) {
+    const file = envFile ?? plan.envFile;
+    sources.add(file === undefined ? "this environment" : `the env file ${file}`);
+    const { missing: m } = resolveSecrets(secretNames(plan.secrets), process.env, file);
+    for (const name of m) missing.add(name);
+  }
+  if (missing.size === 0 || process.env.TT_ALLOW_MISSING_SECRETS === "1") return false;
+  process.stderr.write(
+    `refusing to ${what}: declared secret(s) not set in ${[...sources].join(" or ")}: ${[...missing].join(", ")}\n` +
+      `export them in the shell (or Emacs) that runs this command, add them to the env file, or set TT_ALLOW_MISSING_SECRETS=1 to run without them\n`,
   );
   process.exitCode = 1;
   return true;
@@ -347,12 +408,6 @@ function refuseMissingTools(plans: readonly RunPlanFile[], what: string): boolea
   );
   process.exitCode = 1;
   return true;
-}
-
-/** The secrets every not-yet-done entry of a program declares. */
-function programSecrets(dir: string): string[] {
-  const { program, state } = foldProgram(dir);
-  return program.entries.filter((e) => state.nodes[e.id]?.status !== "done").flatMap((e) => e.plan.secrets ?? []);
 }
 
 /** 06a finding #24: the print-mode Pi command — the real `pi` binary, or the
@@ -420,10 +475,14 @@ async function cmdModels(sub: string | undefined, args: string[]): Promise<void>
   if (check.probes.some((p) => p.status !== "ok")) process.exitCode = 1;
 }
 
-async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean, source?: string, skipModelsCheck = false): Promise<void> {
+async function cmdProgram(sub: string | undefined, args: string[], root: string, json: boolean, source?: string, skipModelsCheck = false, envFile?: string): Promise<void> {
   if (sub === "start") {
     if (args.length !== 1) usage();
     const program = JSON.parse(readFileSync(args[0], "utf8")) as ProgramFile;
+    // Plan 06e (A1): --env-file overrides every entry's own #+TT_ENV_FILE, and
+    // is recorded in each entry's plan snapshot so a resume resolves it too.
+    const resolvedEnvFile = envFile === undefined ? undefined : path.resolve(envFile);
+    if (resolvedEnvFile !== undefined) for (const e of program.entries) e.plan.envFile = resolvedEnvFile;
     // Plan 01c: every entry's plan is linted before the scheduler starts. An
     // error refuses the whole program; warnings are printed and it starts.
     const findings = lintProgram(program);
@@ -432,7 +491,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       process.exitCode = 1;
       return;
     }
-    if (refuseMissingSecrets(program.entries.flatMap((e) => e.plan.secrets ?? []), "start the program")) return;
+    if (refuseMissingSecretsForPlans(program.entries.map((e) => e.plan), "start the program", resolvedEnvFile)) return;
     // Plan 05i: every node's declared commands must resolve in THIS caller's
     // PATH before the program (or any of its runs) exists.
     if (refuseMissingTools(program.entries.map((e) => e.plan), "start the program")) return;
@@ -509,7 +568,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
   } else if (sub === "resume") {
     if (args.length !== 1) usage();
     const dir = resolveProgramDir(args[0], root);
-    if (refuseMissingSecrets(programSecrets(dir), `resume program ${path.basename(dir)}`)) return;
+    if (refuseMissingSecretsForPlans(programActivePlans(dir), `resume program ${path.basename(dir)}`)) return;
     // Plan 05i: preflight every node this resume could start — the stopped /
     // crashed runs it restarts now AND the waiting nodes the scheduler will
     // start later — before it starts any of them, so a missing tool refuses
@@ -557,7 +616,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       process.exitCode = 1;
       return;
     }
-    if (refuseMissingSecrets(programSecrets(dir), `retry ${args[1]}`)) return;
+    if (refuseMissingSecretsForPlans(programActivePlans(dir), `retry ${args[1]}`)) return;
     // Plan 05i: the retried node's declared commands must resolve now, before
     // its fresh run is created.
     const retryEntry = program.entries.find((e) => e.id === args[1] || args[1].startsWith(`${e.id}/`));
@@ -653,9 +712,13 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
   }
 }
 
-async function cmdStart(planPath: string, root: string, skipModelsCheck = false): Promise<void> {
+async function cmdStart(planPath: string, root: string, skipModelsCheck = false, envFile?: string): Promise<void> {
   const plan = JSON.parse(readFileSync(planPath, "utf8")) as RunPlanFile;
   if (!plan.repo) usage();
+  // Plan 06e (A1): --env-file overrides the plan's own #+TT_ENV_FILE. The path
+  // is absolute, so the detached conductor (which re-reads the plan snapshot)
+  // resolves the same file.
+  if (envFile !== undefined) plan.envFile = path.resolve(envFile);
   // Plan 01c: lint before any run exists. An error refuses to start (message
   // on stderr, non-zero exit); warnings are printed and the run starts.
   const findings = lintPlan(plan);
@@ -664,7 +727,7 @@ async function cmdStart(planPath: string, root: string, skipModelsCheck = false)
     process.exitCode = 1;
     return;
   }
-  if (refuseMissingSecrets(plan.secrets, "start the run")) return;
+  if (refuseMissingSecrets(plan.secrets, "start the run", plan.envFile)) return;
   // 06a finding #24: create the run, probe its distinct configured models,
   // record the result in the run directory, and refuse to launch when one is
   // refused (unless --skip-models-check).
@@ -809,9 +872,13 @@ async function runConductorProcess(runDir: string): Promise<void> {
 function renderStatus(runDir: string): string {
   const p = runPaths(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
+  // A4 (plan 06e): a finished run's projection is a pure function of its
+  // immutable log. DONE and BLOCKED are terminal, so the rebuilt phase (and
+  // the recorded `views/status.txt` the front end serves as it was written)
+  // can never change — `tt status` reads the same outcome on every call.
   const state = rebuildState(runDir, plan, { lenient: true });
   const view = buildView(runDir, plan, conductorAlive(runDir));
-  return renderStatusText(runDir, state, view, loggedSecretStatus(runDir));
+  return renderStatusText(runDir, state, view, loggedSecretStatus(runDir), loggedHeld(runDir));
 }
 
 function conductorAlive(runDir: string): boolean {
@@ -1388,6 +1455,7 @@ async function cmdVerdict(
           view: lateView,
           alive: false,
           secrets: loggedSecretStatus(runDir),
+          held: loggedHeld(runDir),
         }),
       ),
       maskable,
@@ -1530,11 +1598,11 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck } = parseArgs(rest);
+  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
-    await cmdStart(positional[0], runRoot, skipModelsCheck);
+    await cmdStart(positional[0], runRoot, skipModelsCheck, envFile);
   } else if (cmd === "models") {
     await cmdModels(positional[0], positional.slice(1));
   } else if (cmd === "lint") {
@@ -1548,14 +1616,16 @@ async function main(): Promise<void> {
   } else if (cmd === "status") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);
+    delegateToRecordedRunner(runDir, runRoot);
     process.stdout.write(redactText(renderStatus(runDir), secretsForRun(runDir)));
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);
-    if (refuseMissingSecrets(readPlan(runDir).secrets, "resume the run")) return;
+    const runPlan = readPlan(runDir);
+    if (refuseMissingSecrets(runPlan.secrets, "resume the run", runPlan.envFile)) return;
     launchDetached(runDir);
   } else if (cmd === "program") {
-    await cmdProgram(positional[0], positional.slice(1), runRoot, json, source, skipModelsCheck);
+    await cmdProgram(positional[0], positional.slice(1), runRoot, json, source, skipModelsCheck, envFile);
   } else if (cmd === "list") {
     cmdList(runRoot, json);
   } else if (cmd === "contract") {
@@ -1569,10 +1639,13 @@ async function main(): Promise<void> {
     await cmdEntry(positional, runRoot, reason);
   } else if (cmd === "summary") {
     if (positional.length !== 1) usage();
-    process.stdout.write(runSummary(resolveRunDir(positional[0], runRoot)));
+    const runDir = resolveRunDir(positional[0], runRoot);
+    delegateToRecordedRunner(runDir, runRoot);
+    process.stdout.write(runSummary(runDir));
   } else if (cmd === "timing") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);
+    delegateToRecordedRunner(runDir, runRoot);
     const secrets = secretsForRun(runDir);
     const times = timingReport(runDir);
     process.stdout.write(json ? `${JSON.stringify(redactJson(times, secrets))}\n` : `${redactText(timingText(times), secrets)}\n`);
@@ -1584,6 +1657,7 @@ async function main(): Promise<void> {
     // the state rebuilt by folding the control log (never a stored snapshot).
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);
+    delegateToRecordedRunner(runDir, runRoot);
     const p = runPaths(runDir);
     const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
     const meta = JSON.parse(readFileSync(p.meta, "utf8"));

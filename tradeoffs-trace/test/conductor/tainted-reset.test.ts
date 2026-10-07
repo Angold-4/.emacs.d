@@ -19,6 +19,7 @@
 // (run before it does anything else) found the reset worktree clean.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,14 +33,25 @@ import {
   makeRepo,
   makeRunRoot,
   readEvents,
+  setupConductor,
   waitFor,
   writeScript,
   type TestRepo,
 } from "./harness.ts";
-import { Conductor, createRun, type RunPlanFile } from "../../src/conductor.ts";
+import { Conductor, createRun, runPaths, type RunPlanFile } from "../../src/conductor.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 
 const FAKE_PI_PATH = fileURLToPath(new URL("../fake-pi/fake-pi.ts", import.meta.url));
+const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function shortTmp(prefix: string): string {
   const dir = path.join("/tmp", `${prefix}-${randomBytes(4).toString("hex")}`);
@@ -199,5 +211,86 @@ test("tainted-reset: after a tainted freeze, the next attempt's worktree is rese
     await conductor.stop();
     cleanupDir(runRoot);
     cleanupDir(scriptsDir);
+  }
+});
+
+// Plan 06e (A2/R3/C1): a process with a file under the worktree whose process
+// group the run never recorded is HELD, never signalled, and `tt status`
+// lists it. The holder leaves its group and runs with cwd `/`, exactly like a
+// bind mount's file server or an escaped detached descendant.
+test("plan 06e: a process holding a worktree file outside the run's process groups is reported held and never signalled", async () => {
+  const markerDir = fs.mkdtempSync("/tmp/tt-held-");
+  const ready = path.join(markerDir, "ready");
+  const pidFile = path.join(markerDir, "holder.pid");
+  const perl = path.join(markerDir, "holder.pl");
+  fs.writeFileSync(
+    perl,
+    [
+      "use strict; use warnings;",
+      "my ($file, $ready, $pidfile) = @ARGV;",
+      "setpgrp(0,0);",
+      "open(my $f, '<', $file) or die \"open: $!\";",
+      "chdir '/' or die \"chdir: $!\";",
+      "open(my $r, '>', $ready) or die \"ready: $!\";",
+      "open(my $p, '>', $pidfile) or die \"pid: $!\"; print $p $$; close($p); close($r);",
+      "sleep 300;",
+    ].join("\n") + "\n",
+  );
+
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        {
+          // The agent's `sh` runs in the worktree. The holder opens
+          // `holder.txt` there, then leaves its group and changes cwd, so the
+          // run cannot own it. The ready file makes the sweep timing
+          // deterministic.
+          kind: "call-sh",
+          command: `touch holder.txt; /usr/bin/perl ${perl} holder.txt ${ready} ${pidFile} & i=0; while [ ! -f ${ready} ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.05; done`,
+        },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    deadlines: { abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 5_000, workerAttemptMs: 60_000, checkMs: 10_000, freezeMs: 20_000, reviewMs: 10_000 },
+  });
+
+  let holderPid = 0;
+  try {
+    await setup.conductor.start();
+    await waitFor(() => fs.existsSync(ready), 20_000);
+    holderPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    assert.ok(holderPid > 0, "expected the holder's pid");
+
+    // The freeze's own sweep must have run and reported the holder.
+    await waitFor(() => readEvents(setup.runDir).some((e) => e.kind === "sweep"), 30_000);
+    const sweeps = readEvents(setup.runDir).filter((e) => e.kind === "sweep");
+    const held = sweeps.flatMap(
+      (e) => (e.event as { held?: Array<{ pid: number; command: string; cwd: string }> }).held ?? [],
+    );
+    assert.ok(held.some((h) => h.pid === holderPid), `expected the holder in held: ${JSON.stringify(held)}`);
+    assert.match(held.find((h) => h.pid === holderPid)!.cwd, /^\//, "held reports the process's cwd");
+    const killed = sweeps.flatMap((e) => (e.event as { killed?: Array<{ pid: number }> }).killed ?? []);
+    assert.ok(!killed.some((k) => k.pid === holderPid), "the holder is never signalled");
+    assert.ok(processAlive(holderPid), "the held process is still alive");
+
+    // `tt status` lists it under held.
+    const status = execFileSync(process.execPath, [CLI_PATH, "status", setup.runDir], { encoding: "utf8" });
+    assert.match(status, /^held: /m, `expected a held line in:\n${status}`);
+    assert.match(status, new RegExp(`held: ${holderPid} `), `expected held pid ${holderPid} in:\n${status}`);
+  } finally {
+    await setup.conductor.stop();
+    if (holderPid > 0) {
+      try {
+        process.kill(holderPid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    cleanupDir(markerDir);
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    cleanupDir(setup.repo.dir);
   }
 });

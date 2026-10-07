@@ -3,17 +3,17 @@
 // `runCommand`/`killGroup` (shell.ts) kill everything in a command's
 // recorded process group, but a detached descendant that calls `setsid` (or
 // otherwise leaves the group) escapes that. The sweep is the fallback: list
-// every process with a file under the worktree (`lsof +D <dir>`), kill the
-// ones whose current WORKING DIRECTORY lies under it (a daemon the attempt
-// started there), and report the rest without killing them.
+// every process with a file under the worktree (`lsof +D <dir>`), and end the
+// ones that belong to a process group THIS RUN recorded at spawn.
 //
-// Why not kill every process with an open file there: a live gate runs a
-// Docker stack that bind-mounts worktree directories, so Docker Desktop's own
-// file-sharing processes (com.docker.backend, the Virtualization XPC service)
-// hold files under the worktree. Program 14's 14i freezes killed Docker
-// Desktop that way (sweep records at 18:06:53 and 18:48:15 UTC on
-// 2026-09-26), five times in one day. A process that only holds a file is
-// reported as `held`; system and application processes are never signalled.
+// A2 (plan 06e): the sweep is the only code that signals a process, and it
+// signals only the run's own process groups, recorded at spawn. Any other
+// process with a file under the worktree — a process that left its group, a
+// bind mount's file server, an editor, Docker Desktop's own helpers — is
+// reported as `HELD {pid, command, cwd}` and never signalled. Safety wins
+// over cleanup: a foreign process is never killed, even when it looks like a
+// survivor. (Program 14's 14i freezes killed Docker Desktop because an
+// earlier sweep killed every process with a cwd under the worktree.)
 //
 // IMPORTANT (documented per the brief): an empty sweep does not prove no
 // process survived. A detached process can `chdir` away, close every open
@@ -23,25 +23,40 @@
 // as a one-shot guarantee.
 
 import { execFileSync } from "node:child_process";
+import * as path from "node:path";
+
+import { readLog } from "./log.ts";
 
 export interface SweepKilled {
   pid: number;
   command: string;
 }
 
+/** A process with a file under the worktree that the run does NOT own: it is
+ * reported, never signalled (A2). `cwd` is where it is running, so the owner
+ * can tell an agent's escaped daemon from an unrelated file server. */
+export interface SweepHeld extends SweepKilled {
+  cwd: string;
+}
+
 export interface SweepResult {
+  /** The run's own processes the sweep ended. */
   killed: SweepKilled[];
-  /** Processes with a file open under the worktree but their working
-   * directory elsewhere (a bind mount's file server, an editor), or a
-   * protected system/application process: reported, never signalled, and
-   * not a reason to taint. */
-  held?: SweepKilled[];
-  /** True iff any survivor was found — design §2.2: "A sweep that found
-   * survivors marks the worktree tainted." */
+  /** Foreign processes with a file under the worktree: reported, never
+   * signalled, and not a reason to taint. */
+  held?: SweepHeld[];
+  /** True iff the sweep ended one of the run's own processes — design §2.2:
+   * "A sweep that found survivors marks the worktree tainted." A `held`
+   * foreign process does NOT taint the worktree. */
   tainted: boolean;
 }
 
 export interface SweepOptions {
+  /** The process groups THIS RUN recorded at spawn (the pgids of its intent
+   * records, its live agents and its live shell commands). A2: the sweep
+   * signals a process only when its group is in this set. Omitted means the
+   * run owns nothing here, so every process found is `held` — never killed. */
+  ownPgids?: number[];
   /** Pids never to touch even if `lsof` reports them under `dir` (e.g. a
    * command the conductor is intentionally still running there). */
   exceptPids?: number[];
@@ -60,33 +75,40 @@ export function isProtectedCommand(command: string): boolean {
   return PROTECTED_PREFIXES.some((p) => command.startsWith(p));
 }
 
-/** Every pid with a file under `dir`, and whether that file is its cwd. */
-function lsofUnder(dir: string): Map<number, { cwd: boolean }> {
+/** Every pid with a file under `dir`. A2 does not care whether the file is
+ * the process's cwd: the deciding fact is its process group. */
+function lsofUnder(dir: string): Set<number> {
   let out: string;
   try {
-    out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "pf"], { encoding: "utf8" });
+    out = execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" });
   } catch (err) {
     // lsof exits 1 (and prints nothing) when nothing matches. Any stdout
     // captured on the error object is still authoritative; anything else
     // is a real failure to run lsof at all.
     const stdout = (err as { stdout?: string }).stdout ?? "";
-    if (stdout.length === 0) return new Map();
+    if (stdout.length === 0) return new Set();
     out = stdout;
   }
-  // `-F pf`: a `p<pid>` line starts each process, followed by one `f<fd>`
-  // line per file it has under `dir`; `fcwd` is its working directory.
-  const found = new Map<number, { cwd: boolean }>();
-  let current: { cwd: boolean } | undefined;
+  const found = new Set<number>();
   for (const line of out.split("\n")) {
-    if (line.startsWith("p")) {
-      const pid = Number.parseInt(line.slice(1), 10);
-      current = Number.isFinite(pid) ? { cwd: false } : undefined;
-      if (current) found.set(pid, current);
-    } else if (line === "fcwd" && current) {
-      current.cwd = true;
-    }
+    if (!line.startsWith("p")) continue;
+    const pid = Number.parseInt(line.slice(1), 10);
+    if (Number.isFinite(pid)) found.add(pid);
   }
   return found;
+}
+
+/** Where PID is running. `lsof +D` does not name a cwd outside the swept
+ * tree, so a `HELD` process's cwd is read with a second, targeted query.
+ * `<unknown>` when the process is already gone or `lsof` cannot say. */
+function cwdFor(pid: number): string {
+  try {
+    const out = execFileSync("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-F", "n"], { encoding: "utf8" });
+    const named = out.split("\n").find((line) => line.startsWith("n"));
+    return named ? named.slice(1) : "<unknown>";
+  } catch {
+    return "<unknown>";
+  }
 }
 
 function commandFor(pid: number): string {
@@ -94,6 +116,17 @@ function commandFor(pid: number): string {
     return execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
   } catch {
     return "<unknown>";
+  }
+}
+
+/** The process group PID belongs to, or undefined when `ps` cannot say (a pid
+ * that already exited between the `lsof` snapshot and now). */
+function pgidFor(pid: number): number | undefined {
+  try {
+    const pgid = Number.parseInt(execFileSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).trim(), 10);
+    return Number.isFinite(pgid) ? pgid : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -133,19 +166,25 @@ function delay(ms: number): Promise<void> {
 
 /** Lists, kills and reports every process found under `dir` by `lsof +D`,
  * excluding the conductor's own process/ancestors and `options.exceptPids`.
- * Survivors get SIGTERM, then SIGKILL after `options.termGraceMs` (default
- * 500ms) if still alive. See the module comment for what an empty result
- * does and does not prove. */
+ * A process is signalled ONLY when its process group is in
+ * `options.ownPgids` (A2); every other process is returned under `held` and
+ * left alone. The run's own survivors get SIGTERM, then SIGKILL after
+ * `options.termGraceMs` (default 500ms) if still alive. See the module
+ * comment for what an empty result does and does not prove. */
 export async function sweep(dir: string, options: SweepOptions = {}): Promise<SweepResult> {
   const termGraceMs = options.termGraceMs ?? 500;
+  const own = new Set<number>(options.ownPgids ?? []);
   const excluded = new Set<number>([...(options.exceptPids ?? []), ...selfAndAncestors()]);
   const killed: SweepKilled[] = [];
-  const held: SweepKilled[] = [];
-  for (const [pid, { cwd }] of lsofUnder(dir)) {
+  const held: SweepHeld[] = [];
+  for (const pid of lsofUnder(dir)) {
     if (excluded.has(pid)) continue;
     const command = commandFor(pid);
-    if (!cwd || isProtectedCommand(command)) {
-      held.push({ pid, command });
+    const pgid = pgidFor(pid);
+    // A2: only the run's own recorded process groups are signalled. A
+    // protected command is reported even when its group is ours.
+    if (pgid === undefined || !own.has(pgid) || isProtectedCommand(command)) {
+      held.push({ pid, command, cwd: cwdFor(pid) });
       continue;
     }
     try {
@@ -170,4 +209,30 @@ export async function sweep(dir: string, options: SweepOptions = {}): Promise<Sw
   }
 
   return { killed, held, tainted: killed.length > 0 };
+}
+
+/** The `held` processes a run last recorded (`tt status` lists them). Read
+ * from the newest `sweep` record in the control log — the sweep's own result,
+ * never re-derived. Names only; the pid, command and cwd are the process's,
+ * not a secret. */
+export function loggedHeld(runDir: string): SweepHeld[] {
+  let records: Array<{ kind: string; event: unknown }>;
+  try {
+    records = readLog(path.join(runDir, "events.jsonl")).records;
+  } catch {
+    return [];
+  }
+  let held: SweepHeld[] = [];
+  for (const record of records) {
+    if (record.kind !== "sweep") continue;
+    const raw = (record.event as { held?: unknown })?.held;
+    if (!Array.isArray(raw)) {
+      held = [];
+      continue;
+    }
+    held = raw
+      .filter((h): h is { pid: number; command?: unknown; cwd?: unknown } => !!h && typeof h === "object" && typeof (h as { pid?: unknown }).pid === "number")
+      .map((h) => ({ pid: h.pid, command: typeof h.command === "string" ? h.command : "<unknown>", cwd: typeof h.cwd === "string" ? h.cwd : "<unknown>" }));
+  }
+  return held;
 }
