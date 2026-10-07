@@ -879,7 +879,13 @@ past run cannot display one either.
 A run signals only the processes it started. Every command it spawns is
 recorded with its process group, and when a phase is cancelled, times out, is
 frozen or recovered from a crash, the **sweep** ends the processes whose group
-is one of those recorded groups — and only those.
+is one of those recorded groups — and only those. Every signal the run sends
+(a command's group on timeout, an agent on termination, a pgid recovered from
+a crashed conductor's log, the conductor or scheduler pid an owner stops) is
+sent by that one module, so there is a single place to read what the run may
+signal. Crash recovery additionally checks that a recovered pgid's leader
+started no later than the record that named it, so a pid the OS recycled after
+the crash is never signalled.
 
 Any other process with a file under the run's worktree is **held**: it is
 reported, never signalled. `tt status` lists each one as

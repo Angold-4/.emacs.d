@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { sweep } from "../../src/effects/sweep.ts";
+import { groupStartedBefore, killGroup, sweep } from "../../src/effects/sweep.ts";
 
 let dir: string;
 
@@ -156,6 +156,35 @@ test("a process that only holds a file under the worktree (a bind mount's file s
     assert.ok(processAlive(holder.pid!), "the holder is still alive");
   } finally {
     holder.kill("SIGKILL");
+  }
+});
+
+test("plan 06e: a recorded group is signalled, a recycled pgid is not", async () => {
+  // Crash recovery reads a pgid from a dead conductor's log. If the OS has
+  // recycled that pid since the crash, its leader started AFTER the record,
+  // and A2/C3 forbid signalling it.
+  const own = spawn(
+    "/usr/bin/perl",
+    ["-e", 'setpgrp(0,0); chdir $ARGV[0] or die; sleep 100;', dir],
+    { detached: true, stdio: "ignore" },
+  );
+  try {
+    await waitFor(() => {
+      try {
+        return execFileSync("/usr/sbin/lsof", ["+D", dir, "-F", "p"], { encoding: "utf8" }).includes(`p${own.pid}`);
+      } catch {
+        return false;
+      }
+    });
+    // Recorded a minute BEFORE this process started: the pid was recycled.
+    assert.equal(groupStartedBefore(own.pid!, Date.now() - 60_000), false);
+    // Recorded now: this is the group the run started.
+    assert.equal(groupStartedBefore(own.pid!, Date.now()), true);
+    const { signalsSent } = await killGroup(own.pid!, { termGraceMs: 200 });
+    assert.deepEqual(signalsSent, ["SIGTERM"]);
+    await waitFor(() => !processAlive(own.pid!));
+  } finally {
+    own.kill("SIGKILL");
   }
 });
 

@@ -1,0 +1,18 @@
+{
+  "baseSha": "c91ef46c356df2c0c3a9ec92d0c32a8fbd9e9524",
+  "tree": "cc1bdfa1894337da8480f5a64a42dbde30c80912",
+  "key": "cc1bdfa18943-7c9e9fe5",
+  "at": "2026-10-07T23:10:40.963Z",
+  "commands": [
+    {
+      "command": "true",
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "durationMs": 24,
+      "failures": [],
+      "log": "true.log"
+    }
+  ],
+  "failures": []
+}

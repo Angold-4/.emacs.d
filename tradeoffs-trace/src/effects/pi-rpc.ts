@@ -18,6 +18,9 @@ import { randomUUID } from "node:crypto";
 import { JSONLDecoder, encodeLine, type PiRpcCommand, type PiRpcEvent, type PiRpcResponse } from "../core/protocol.ts";
 import type { Role } from "../core/roles.ts";
 import { redactRecord, type Secret } from "./secrets.ts";
+// A2/C3 (plan 06e): the sweep owns the signalling decision; this module asks
+// it to signal the agent group it recorded at spawn.
+import { groupAlive, signalGroup } from "./sweep.ts";
 
 export interface PiAgentOptions {
   /** The `pi` binary, or an injected stand-in (fake-pi) for tests. Defaults
@@ -50,15 +53,6 @@ export type TerminateReason = "abort" | "sigterm" | "sigkill" | "already-exited"
 
 export interface TerminateResult {
   signalsSent: TerminateReason[];
-}
-
-function groupAlive(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** A live Pi agent process, driven over RPC. */
@@ -282,25 +276,11 @@ export class PiAgent {
     const exited = await raceExit(this.#exitPromise, abortGraceMs);
     if (exited || this.#exited) return { signalsSent };
 
-    if (groupAlive(this.pgid)) {
-      try {
-        process.kill(-this.pgid, "SIGTERM");
-        signalsSent.push("sigterm");
-      } catch {
-        // already gone
-      }
-    }
+    if (groupAlive(this.pgid) && signalGroup(this.pgid, "SIGTERM")) signalsSent.push("sigterm");
     const exitedAfterTerm = await raceExit(this.#exitPromise, termGraceMs);
     if (exitedAfterTerm || this.#exited) return { signalsSent };
 
-    if (groupAlive(this.pgid)) {
-      try {
-        process.kill(-this.pgid, "SIGKILL");
-        signalsSent.push("sigkill");
-      } catch {
-        // already gone
-      }
-    }
+    if (groupAlive(this.pgid) && signalGroup(this.pgid, "SIGKILL")) signalsSent.push("sigkill");
     await this.#exitPromise;
     return { signalsSent };
   }

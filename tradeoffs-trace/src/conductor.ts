@@ -170,8 +170,8 @@ import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
 import { acquireLock, acquireWaitingLock, type Lock } from "./effects/lock.ts";
-import { killGroup, childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
-import { loggedHeld, sweep, type SweepResult } from "./effects/sweep.ts";
+import { childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
+import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
   diffHunks,
@@ -1586,12 +1586,28 @@ export class Conductor {
    * reads every logged one regardless, since a crashed agent's shell groups
    * are exactly what design §9.3's "agent attempt" row means by "every
    * recorded shell group"). */
-  #recordedShGroups(records: readonly LogRecord[], agentId: string): number[] {
+  #recordedShGroups(records: readonly LogRecord[], agentId: string): Array<{ pgid: number; ts: number }> {
     const prefix = `sh-${agentId}-`;
     return records
       .filter((r) => r.kind === "intent" && typeof r.actionId === "string" && r.actionId.startsWith(prefix))
-      .map((r) => (r.event as { pgid: number }).pgid)
-      .filter((pgid) => Number.isFinite(pgid));
+      .map((r) => ({ pgid: (r.event as { pgid: number }).pgid, ts: Date.parse(r.ts) }))
+      .filter((g) => Number.isFinite(g.pgid));
+  }
+
+  /** Signals a process group read from a PREVIOUS conductor's log, but only
+   * when its leader started no later than the record that named it. A pgid
+   * the OS recycled after the crash belongs to a foreign process; A2/C3
+   * forbid signalling it, so it is logged and left alone. Every recovery
+   * kill goes through here — the one place crash recovery signals a group. */
+  async #killRecordedGroup(pgid: number, recordedAtMs: number): Promise<void> {
+    if (!Number.isFinite(recordedAtMs) || !groupStartedBefore(pgid, recordedAtMs)) {
+      this.#log.append("sweep_skipped", {
+        pgid,
+        reason: "pgid leader did not start at the recorded time (recycled or foreign); not signalled",
+      });
+      return;
+    }
+    await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
   }
 
   /** Every process group THIS RUN recorded at spawn: the pgid of every intent
@@ -1648,7 +1664,7 @@ export class Conductor {
       for (const rec of records) {
         if (rec.kind !== "intent" || typeof rec.actionId !== "string" || !rec.actionId.startsWith(prefix)) continue;
         const pgid = (rec.event as { pgid?: number }).pgid;
-        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+        if (typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(rec.ts));
       }
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       this.#applyEvent(
@@ -1663,9 +1679,9 @@ export class Conductor {
       // publishes that type's raw messages `unevaluated` and settles it.
       const messageType = key.slice("dispatch_evaluation_".length) as MessageType;
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
       this.#log.completion(actionId, { messageType, interrupted: true, reason: "crash-recovery" });
       this.#applyEvent(
@@ -1685,9 +1701,9 @@ export class Conductor {
       const blockerId = rest.slice(0, sep);
       const seat = Number(rest.slice(sep + 1));
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
       this.#log.completion(actionId, { blockerId, seat, interrupted: true, reason: "crash-recovery" });
       this.#panelSeatUnavailable(blockerId, seat, this.#state.phase.candidate?.sha, "the conductor died while the seat voted");
@@ -1700,9 +1716,9 @@ export class Conductor {
       // loss makes it unavailable, and the remaining real votes decide.
       const seat = Number(key.slice("dispatch_round_panel_".length));
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
       this.#log.completion(actionId, { seat, interrupted: true, reason: "crash-recovery" });
       this.#roundPanelSeatUnavailable(seat, "the conductor died while the seat voted");
@@ -1711,9 +1727,9 @@ export class Conductor {
 
     if (key === "dispatch_worker") {
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
       const sweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
@@ -1761,7 +1777,7 @@ export class Conductor {
         if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
         if (!rec.actionId.startsWith(`check-sh-${actionId}-`)) continue;
         const pgid = (rec.event as { pgid?: number }).pgid;
-        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+        if (typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(rec.ts));
       }
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       this.#applyEvent({ type: "CHECKS_INTERRUPTED" });
@@ -1783,7 +1799,7 @@ export class Conductor {
         if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
         if (!prefixes.some((p) => rec.actionId.startsWith(p))) continue;
         const pgid = (rec.event as { pgid?: number }).pgid;
-        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+        if (typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(rec.ts));
       }
       discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
@@ -1802,7 +1818,7 @@ export class Conductor {
     if (key === "review_M" || key === "review_A" || key === "review_B") {
       const reviewer = key.slice("review_".length) as Reviewer;
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
       this.#log.completion(actionId, { reviewer, interrupted: true, reason: "crash-recovery" });
       // design §9.3: "Reviewer: discard; start a new review." REVIEW_TIMED_OUT
       // is the existing core event for exactly that (discard this review
@@ -10048,12 +10064,7 @@ function sleepMs(ms: number): Promise<void> {
  * one. A recycled pid can only make a stale lock look live for one bounded
  * wait, never wedge a run. */
 function pidRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return processAlive(pid);
 }
 
 function cancelableTimeout<T>(ms: number, value: T): { promise: Promise<T>; cancel: () => void } {

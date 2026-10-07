@@ -14,8 +14,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { createRun, runPaths, type RunPlanFile } from "./conductor.ts";
+import { createRun, runPaths } from "./conductor.ts";
 import { readRunState } from "./effects/runner.ts";
+import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
 import { acquireLock, type Lock } from "./effects/lock.ts";
@@ -328,8 +329,8 @@ function pidAlive(file: string): boolean {
   try {
     const pid = Number(fs.readFileSync(file, "utf8"));
     if (!(pid > 0)) return false;
-    process.kill(pid, 0);
-    return true;
+    // A2/C3 (plan 06e): the sweep owns the signalling decision.
+    return processAlive(pid);
   } catch {
     return false;
   }
@@ -678,8 +679,10 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
  * never started, or a hand-made fixture). */
 function nodeCostLine(runDir: string): string | undefined {
   try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-    const view = buildView(runDir, plan, pidAlive(path.join(runDir, "conductor.pid")));
+    // A4 (plan 06e): the plan comes from the run's recorded runner.
+    const read = readRunState(runDir, path.dirname(runDir));
+    if (!read) return undefined;
+    const view = buildView(runDir, read.plan, pidAlive(path.join(runDir, "conductor.pid")));
     const cost = view.cost;
     if (!cost) return undefined;
     const parts = [`${cost.rounds} round${cost.rounds === 1 ? "" : "s"}`, `${cost.totalMinutes}m`];

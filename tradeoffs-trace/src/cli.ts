@@ -35,9 +35,9 @@ import {
 import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
-import { loggedHeld } from "./effects/sweep.ts";
-import { runnerFor } from "./effects/runner.ts";
-import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
+import { loggedHeld, processAlive, signalProcess } from "./effects/sweep.ts";
+import { currentChoice, installedRunnerRoot, recordedRunnerRevision, setRunnerChooser, type RunnerChoice } from "./effects/runner.ts";
+import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runnerRevision, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { planModelSelector } from "./core/roles.ts";
 import { distinctModelGroups, modelsCheckRefused, planModelTargets, type ModelsCheck } from "./core/models-check.ts";
 import { runModelsCheck } from "./effects/models-check.ts";
@@ -216,6 +216,25 @@ function resolveReadableRunDir(ref: string, root: string): string | undefined {
     return undefined;
   }
 }
+
+/** A4 (plan 06e): the ONE place that chooses a runner for a run — the
+ * recorded revision's installed copy when it differs from this checkout,
+ * otherwise this checkout. `status`, `program status`, the program review and
+ * the scheduler all read through it. Declared here, at the CLI boundary, as
+ * the architecture names; `effects/runner.ts` reads a run through the chooser
+ * this file registers. */
+export function runnerFor(runDir: string, root: string): RunnerChoice {
+  const mine = runnerRevision();
+  const recorded = recordedRunnerRevision(runDir);
+  if (recorded === undefined || recorded === mine) return currentChoice();
+  const installed = installedRunnerRoot(root, recorded);
+  if (installed === undefined) return currentChoice();
+  return { revision: recorded, packageRoot: installed, current: false, cliPath: path.join(installed, "src", "cli.ts") };
+}
+
+// program.ts reads node runs through `effects/runner.ts`, which cannot import
+// this file (it runs main() on import), so the one chooser is registered here.
+setRunnerChooser(runnerFor);
 
 /** A4 (plan 06e): read a run with the runner that recorded it, when that
  * runner is installed. `runnerFor` is the only chooser; this re-execs the
@@ -535,7 +554,8 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     const dir = resolveProgramDir(args[0], root);
     appendProgramEvent(dir, { type: "PROGRAM_STOPPED" });
     try {
-      process.kill(Number(readFileSync(programPaths(dir).pid, "utf8")), "SIGTERM");
+      // A2/C3 (plan 06e): the sweep owns the signalling decision.
+      signalProcess(Number(readFileSync(programPaths(dir).pid, "utf8")), "SIGTERM");
     } catch {
       // not running
     }
@@ -1078,12 +1098,7 @@ function cmdRedact(argv: string[], defaultRoot: string): void {
 
 function pidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return processAlive(pid);
 }
 
 /** Plan 2d: `tt stop <run>` ends a run's conductor cleanly within 15 s —
@@ -1103,11 +1118,7 @@ async function cmdStop(runIdOrDir: string, root: string): Promise<void> {
     process.stdout.write(`run ${path.basename(runDir)} has no running conductor\n`);
     return;
   }
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // raced with the conductor exiting on its own; fall through to the wait
-  }
+  signalProcess(pid, "SIGTERM");
   const deadline = Date.now() + 15_000;
   while (pidAlive(pid) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1665,10 +1676,7 @@ async function main(): Promise<void> {
     let alive = false;
     try {
       const pid = Number(readFileSync(path.join(runDir, "conductor.pid"), "utf8"));
-      if (pid > 0) {
-        process.kill(pid, 0);
-        alive = true;
-      }
+      if (pid > 0) alive = processAlive(pid);
     } catch {
       alive = false;
     }

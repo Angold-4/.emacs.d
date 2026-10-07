@@ -35,7 +35,8 @@ function currentPackageRoot(): string {
   return fileURLToPath(new URL("../../", import.meta.url));
 }
 
-function currentChoice(): RunnerChoice {
+/** The choice that reads a run with this checkout. */
+export function currentChoice(): RunnerChoice {
   const packageRoot = currentPackageRoot();
   return { revision: runnerRevision(), packageRoot, current: true, cliPath: path.join(packageRoot, "src", "cli.ts") };
 }
@@ -72,16 +73,18 @@ export function installedRunnerRoot(root: string, revision: string): string | un
   return fs.existsSync(path.join(dir, "src", "cli.ts")) ? dir : undefined;
 }
 
-/** A4: the one place that chooses a runner for a run. The recorded revision's
- * installed copy when it differs from the running checkout, otherwise the
- * current one. */
-export function runnerFor(runDir: string, root: string): RunnerChoice {
-  const mine = runnerRevision();
-  const recorded = recordedRunnerRevision(runDir);
-  if (recorded === undefined || recorded === mine) return currentChoice();
-  const installed = installedRunnerRoot(root, recorded);
-  if (installed === undefined) return currentChoice();
-  return { revision: recorded, packageRoot: installed, current: false, cliPath: path.join(installed, "src", "cli.ts") };
+// A4 (plan 06e): `runnerFor` — the one place that chooses a runner — is
+// declared in cli.ts (the architecture's :WHERE:), because the CLI is the
+// boundary that owns the choice. program.ts cannot import cli.ts (cli.ts runs
+// main() on import), so cli.ts registers its `runnerFor` here and this module
+// uses it; when program.ts is used on its own (tests), no chooser is
+// registered and `readRunState` reads locally with this checkout.
+type RunnerChooser = (runDir: string, root: string) => RunnerChoice;
+let registeredChooser: RunnerChooser | undefined;
+
+/** cli.ts registers its `runnerFor` here at load. */
+export function setRunnerChooser(chooser: RunnerChooser | undefined): void {
+  registeredChooser = chooser;
 }
 
 /** A run's plan snapshot and rebuilt state, read locally by this runner. */
@@ -100,8 +103,8 @@ function readLocally(runDir: string): { plan: RunPlanFile; state: State } | unde
  * uninstalled revision, or a frozen copy that cannot serve) is read here. The
  * fallback keeps a broken install from making a run unreadable. */
 export function readRunState(runDir: string, root: string): { plan: RunPlanFile; state: State } | undefined {
-  const choice = runnerFor(runDir, root);
-  if (choice.current) return readLocally(runDir);
+  const choice = registeredChooser?.(runDir, root);
+  if (choice === undefined || choice.current) return readLocally(runDir);
   const result = spawnSync(process.execPath, [choice.cliPath, "state", runDir, "--root", root], {
     encoding: "utf8",
     env: { ...process.env, TT_RUNNER_SERVED: "1" },

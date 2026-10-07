@@ -1,0 +1,13 @@
+#+TITLE: tradeoffs-trace review — 2667a49a
+#+CONTRACT_VERSION: v1
+
+* Blockers
+(none)
+
+* Findings
+(none)
+
+* Trade-offs
+(none)
+
+0 raw → 0 entries · 0 linked · 0 dropped · 0 unaccounted · unexposed 0

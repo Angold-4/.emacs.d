@@ -27,6 +27,96 @@ import * as path from "node:path";
 
 import { readLog } from "./log.ts";
 
+// ---------------------------------------------------------------------------
+// The one owner of the signalling decision (A2/C3)
+// ---------------------------------------------------------------------------
+//
+// Every signal the run sends — a `sh` command's group on timeout, an agent
+// group on termination, a pgid read from a dead conductor's log on crash
+// recovery, the conductor/scheduler pid an owner stops — goes through a
+// function here. No other module calls `process.kill` with a signal, so there
+// is exactly one place to read (and change) what the run is allowed to signal.
+// The sweep itself is the only code that signals a process it *discovered*,
+// and it signals one only when its group is in `ownPgids`.
+
+export type SignalName = NodeJS.Signals | 0;
+
+/** True when PID exists (signal 0). */
+export function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Sends SIGNAL to one process the caller already owns (a conductor pid, a
+ * scheduler pid, a probe child). Returns whether it was delivered. */
+export function signalProcess(pid: number, signal: SignalName): boolean {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Sends SIGNAL to a whole process group (the run's own, recorded at spawn).
+ * Returns whether it was delivered. */
+export function signalGroup(pgid: number, signal: SignalName): boolean {
+  try {
+    process.kill(-pgid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when any process in PGID's group still exists (signal 0). */
+export function groupAlive(pgid: number): boolean {
+  return signalGroup(pgid, 0);
+}
+
+/** SIGTERM to PGID's whole group, then SIGKILL after `termGraceMs` if it is
+ * still alive. The one escalation path; returns the signals actually sent. */
+export function killGroup(pgid: number, opts: { termGraceMs?: number } = {}): Promise<{ signalsSent: string[] }> {
+  const termGraceMs = opts.termGraceMs ?? 10_000;
+  return new Promise((resolve) => {
+    const signalsSent: string[] = [];
+    if (!groupAlive(pgid)) {
+      resolve({ signalsSent });
+      return;
+    }
+    if (!signalGroup(pgid, "SIGTERM")) {
+      resolve({ signalsSent });
+      return;
+    }
+    signalsSent.push("SIGTERM");
+    setTimeout(() => {
+      if (groupAlive(pgid) && signalGroup(pgid, "SIGKILL")) signalsSent.push("SIGKILL");
+      resolve({ signalsSent });
+    }, termGraceMs);
+  });
+}
+
+/** True when PGID's leader exists and started no later than `atMs` (plus a
+ * slack): a pgid whose leader started AFTER the run recorded it has been
+ * recycled by an unrelated process. Used before signalling a group read from
+ * a previous conductor's log (crash recovery), so a recycled pgid is never
+ * signalled. A group with no leader has nothing to signal, so a failed `ps`
+ * is reported as true (the caller's own liveness check decides). */
+export function groupStartedBefore(pgid: number, atMs: number, slackMs = 10_000): boolean {
+  let startMs: number;
+  try {
+    startMs = Date.parse(execFileSync("ps", ["-o", "lstart=", "-p", String(pgid)], { encoding: "utf8" }).trim());
+  } catch {
+    return true;
+  }
+  if (!Number.isFinite(startMs)) return true;
+  return startMs <= atMs + slackMs;
+}
+
 export interface SweepKilled {
   pid: number;
   command: string;
@@ -151,15 +241,6 @@ function selfAndAncestors(): Set<number> {
   return pids;
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -187,24 +268,14 @@ export async function sweep(dir: string, options: SweepOptions = {}): Promise<Sw
       held.push({ pid, command, cwd: cwdFor(pid) });
       continue;
     }
-    try {
-      process.kill(pid, "SIGTERM");
-      killed.push({ pid, command });
-    } catch {
-      // Already gone between the lsof snapshot and now — not a survivor.
-    }
+    if (signalProcess(pid, "SIGTERM")) killed.push({ pid, command });
+    // else: already gone between the lsof snapshot and now — not a survivor.
   }
 
   if (killed.length > 0) {
     await delay(termGraceMs);
     for (const { pid } of killed) {
-      if (processAlive(pid)) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Already gone.
-        }
-      }
+      if (processAlive(pid)) signalProcess(pid, "SIGKILL");
     }
   }
 
