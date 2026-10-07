@@ -25,6 +25,21 @@ macOS uses ~/orgw/; Linux and other platforms use ~/org/.")
 (unless (file-directory-p +org/root)
   (make-directory +org/root t))
 
+(defvar +org/agenda-skip-dirs
+  '(".git" "node_modules" "target" "evidence" "recordings" "worktree" "worktrees"
+    ".venv" "straight" "fixtures" "__pycache__")
+  "Directory names `+org/agenda-files' never descends into.
+They hold checkouts, captures and build output, not notes.")
+
+(defun +org/agenda-files ()
+  "Every .org file under `+org/root', skipping `+org/agenda-skip-dirs'."
+  (when (file-directory-p +org/root)
+    (directory-files-recursively
+     +org/root "\\.org\\'" nil
+     (lambda (dir)
+       (not (member (file-name-nondirectory (directory-file-name dir))
+                    +org/agenda-skip-dirs))))))
+
 (use-package org
   :straight (:type built-in)
   :defer t
@@ -57,10 +72,13 @@ macOS uses ~/orgw/; Linux and other platforms use ~/org/.")
           ("CANCELLED"   . (:foreground "#5B6268" :weight bold))))
 
   ;; ── Agenda: every .org file under +org/root (recursive) ──────────
-  (setq org-agenda-files
-        (when (file-directory-p +org/root)
-          (directory-files-recursively +org/root "\\.org\\'"))
-        org-agenda-span 'day
+  ;; Built when the agenda first loads, not here: this :config runs on the
+  ;; first Org buffer, and walking all of +org/root (19 GB, ~480k files of
+  ;; worktrees and evidence) took ~4.7 s.  See `+org/agenda-files'.
+  (with-eval-after-load 'org-agenda
+    (unless org-agenda-files
+      (setq org-agenda-files (+org/agenda-files))))
+  (setq org-agenda-span 'day
         org-agenda-start-on-weekday 1
         org-agenda-window-setup 'current-window
         org-agenda-skip-scheduled-if-done t
