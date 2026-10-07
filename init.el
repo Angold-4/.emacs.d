@@ -255,7 +255,10 @@
                        ;; No file was visited on the command line.
                        (not (seq-some #'buffer-file-name (buffer-list))))
               (when (require 'magit nil t)
-                (when (magit-toplevel)
-                  (magit-status default-directory))))))
+                ;; Open the repository root: `magit-status' on a subdirectory
+                ;; (e.g. ~/orgw/skills/tradeoffs-trace/) asks whether to
+                ;; create a second, nested repository there.
+                (when-let* ((top (magit-toplevel)))
+                  (magit-status top))))))
 
 ;;; init.el ends here
