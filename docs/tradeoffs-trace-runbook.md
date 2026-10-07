@@ -1206,6 +1206,57 @@ program buffer or the phase's own buffer (status, trace or input). `C-c m k`
 asks first: `RET` confirms, `n` cancels. The run directory and worktree stay on
 disk after a stop.
 
+## Owner input
+
+Whatever you send through the input box reaches the run in exactly one of
+three ways. `acceptInput` (`src/core/owner-inbox.ts`) is the one place that
+decides which, and the decision is recorded as an event; the status shows what
+actually happened, never what Emacs hoped for.
+
+| Outcome | When | What you see |
+|---|---|---|
+| **applied now** | a correction while the phase is `AWAITING_OWNER`; a steer while a worker attempt is live | `correction started`, or `delivered` once Pi acknowledges |
+| **queued** | a correction outside `AWAITING_OWNER`, or a steer while no worker is running | `queued`: it reaches the next worker attempt's prompt verbatim and is shown to live reviewers |
+| **refused** | only `DONE` and `BLOCKED` | `refused: <reason>`, with the same reason in `views/status.txt` and the inbox's `rejected/` note |
+
+Only `DONE` and `BLOCKED` refuse. A correction that arrives while the run is
+reviewing or checking is queued for the next worker attempt; a steer that
+arrives with no worker running is queued the same way. Nothing is dropped and
+nothing is silently re-applied. The status buffer's **Owner input** section and
+`views/status.txt` carry the latest queued or refused input with its reason,
+and the input box's header line repeats that line (read from the file), so the
+Emacs front end never computes an outcome itself.
+
+### Naming a run: the three ids
+
+A binding may name the run by any of the three ids `resolveBinding`
+(`src/core/binding.ts`) matches — it is the only matcher:
+
+- the **internal run id** (`state.phase.runId`, a uuid the log records);
+- the **run directory id** (the directory's basename, what `tt list` shows);
+- the **readable id** (`<program>-NN`), the position of a program node, which
+  survives a retry.
+
+A binding that matches nothing is refused, and the reason lists all three ids
+that would have bound. Corrections written by Emacs carry the binding it saw;
+the same three ids are accepted everywhere a run id is taken.
+
+### Pause and resume a program
+
+```sh
+tt program pause <id>    # running nodes finish; no new node starts until resume
+tt program resume <id>   # starts the next ready node (and clears a stop, too)
+```
+
+A pause is a logged `PROGRAM_PAUSED` event, not a kill: the nodes already
+running go on, the scheduler keeps watching them so their finish is recorded,
+and then it exits reporting `paused`. `tt program resume` records
+`PROGRAM_RESUMED` and starts the next ready node. Exactly one scheduler runs
+per program: it holds `programs/<id>/scheduler.lock` for its whole life, and a
+second scheduler exits at once with `scheduler already running`. A lock left by
+a dead pid is taken over, so a crashed scheduler never blocks the program
+forever.
+
 ## Time limits (defaults)
 
 | Limit | Default | When it fires |

@@ -12,7 +12,56 @@
 // work and maps to `undefined`, which the conductor rejects visibly.
 
 import { entryVerdictEvents, type Entry } from "./entries.ts";
-import type { ContractVersion, Event, Message, OwnerCommand } from "./types.ts";
+import type { ContractVersion, Event, Message, OwnerCommand, State } from "./types.ts";
+
+// ---------------------------------------------------------------------------
+// Plan 06d (A1): what an inbox input does
+// ---------------------------------------------------------------------------
+//
+// The owner's input box can reach a run in exactly three ways: it is applied
+// now, queued for the moment the run can apply it, or refused with a reason.
+// `acceptInput` is the ONE place that decides which, from the phase state and
+// whether a worker is live right now. The conductor only executes the
+// decision (steer, queue a note, or record the refusal), so no second caller
+// can invent a different outcome.
+
+export type InputKind = "steer" | "note" | "correction";
+
+export type InputOutcome =
+  | { kind: "applied"; effect: InputKind }
+  | { kind: "queued"; until: "next_attempt" | "awaiting_owner" }
+  | { kind: "refused"; reason: string };
+
+export interface InputCommand {
+  kind: InputKind;
+  text: string;
+  /** True when a worker agent of this run is live right now. The conductor
+   * observes it; it never decides the outcome itself. */
+  workerRunning: boolean;
+}
+
+/** Decide what one owner input does now. Only DONE and BLOCKED refuse: every
+ * other phase either applies the input or queues it for the next worker
+ * attempt, so owner input is never lost. */
+export function acceptInput(state: State, command: InputCommand): InputOutcome {
+  const name = state.phase.phase;
+  if (name === "DONE" || name === "BLOCKED") {
+    return { kind: "refused", reason: `the phase is ${name}; the run no longer accepts owner input` };
+  }
+  // A correction is applied now only while the phase is parked on the owner:
+  // that is the one moment resolving the open requests is what it means.
+  if (command.kind === "correction" && name === "AWAITING_OWNER") {
+    return { kind: "applied", effect: "correction" };
+  }
+  // A steer reaches the worker directly only while one is live.
+  if (command.kind === "steer" && command.workerRunning) {
+    return { kind: "applied", effect: "steer" };
+  }
+  // A note, a correction outside AWAITING_OWNER, or a steer with no worker:
+  // queued for the next worker attempt. It reaches that attempt's prompt (and
+  // the live reviewers' notes) and is marked delivered there.
+  return { kind: "queued", until: "next_attempt" };
+}
 
 /** Plan 05j: the entry commands the review view sends (`s`, `m`, a retitle,
  * and the owner's A/D). The owner's verdict is a verdict on each linked

@@ -77,7 +77,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -495,6 +495,16 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     // every node is stopped, since no scheduler is left to tick (F-A-6/M-7).
     writeProgramChart(dir);
     process.stdout.write(`stopped program ${path.basename(dir)}\n`);
+  } else if (sub === "pause") {
+    // Plan 06d (A3): a pause is a logged program event, never a kill. The
+    // running nodes finish; the scheduler (still alive, or relaunched later)
+    // starts nothing new until `resume`. The scheduler keeps watching while a
+    // node is active so its finish is observed, then exits reporting paused.
+    if (args.length !== 1) usage();
+    const dir = resolveProgramDir(args[0], root);
+    appendProgramEvent(dir, { type: "PROGRAM_PAUSED" });
+    writeProgramChart(dir);
+    process.stdout.write(`paused program ${path.basename(dir)} (running nodes finish; no new node starts until resume)\n`);
   } else if (sub === "resume") {
     if (args.length !== 1) usage();
     const dir = resolveProgramDir(args[0], root);
@@ -512,9 +522,10 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       )
       .map((e) => e.plan);
     if (refuseMissingTools(resumePlans, `resume program ${path.basename(dir)}`)) return;
-    // Undo a stop, restart every node run that is not running (stopped by
-    // the owner or crashed), then the scheduler if it is not running.
-    if (state.stopped) appendProgramEvent(dir, { type: "PROGRAM_RESUMED" });
+    // Undo a stop or pause, restart every node run that is not running
+    // (stopped by the owner or crashed), then the scheduler if it is not
+    // running.
+    if (state.stopped || state.paused) appendProgramEvent(dir, { type: "PROGRAM_RESUMED" });
     const restarted: string[] = [];
     for (const [node, s] of Object.entries(state.nodes)) {
       if (!s.runId || ["done", "blocked", "waiting"].includes(s.status)) continue;

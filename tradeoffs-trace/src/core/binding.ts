@@ -12,6 +12,50 @@ export interface BindingCheckResult {
   reason?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Plan 06d (A2): naming a run
+// ---------------------------------------------------------------------------
+//
+// A binding may name the run it was written for by any of the three ids the
+// owner can see: the internal run id the log records (`phase.runId`), the run
+// directory id (`tt list` shows it), or the readable id a program node was
+// given (`<program>-NN`). `resolveBinding` is the ONE place that decides
+// whether a binding names this run, so the conductor, the CLI and Emacs never
+// each invent their own match. A binding that names nothing is refused with
+// the ids it could have used, never silently dropped.
+
+export interface RunBinding {
+  /** The internal run id (`phase.runId`, a separate uuid in the init record). */
+  runId: string;
+  /** The run directory's own id (its basename). */
+  dirId: string;
+  /** The readable id (`<program>-NN`) when a program scheduler started the
+   * run; absent for a hand-started run. */
+  readableId?: string;
+}
+
+export type BindingResolution = { ok: true; runId: string } | { ok: false; reason: string };
+
+/** The three ids a binding could have used for RUN, in the order the reason
+ * names them. */
+export function runBindingIds(run: RunBinding): string[] {
+  return [run.runId, run.dirId, ...(run.readableId ? [run.readableId] : [])].filter((id) => id.length > 0);
+}
+
+/** Resolve a binding's run reference (a plain id, or the `binding` object a
+ * decision-view command carries) against RUN. An absent/empty reference means
+ * "this run" and resolves to its internal id. An unknown id is refused with
+ * every id that would have bound, so the owner can retry with one of them. */
+export function resolveBinding(run: RunBinding, binding: string | { runId?: string } | undefined): BindingResolution {
+  const wanted = typeof binding === "string" ? binding : binding?.runId;
+  if (wanted === undefined || wanted === "") return { ok: true, runId: run.runId };
+  if (runBindingIds(run).includes(wanted)) return { ok: true, runId: run.runId };
+  return {
+    ok: false,
+    reason: `no run matches ${wanted}; this run can be named by ${runBindingIds(run).join(", ")}`,
+  };
+}
+
 function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
   return a.snapshot === b.snapshot && a.sectionSha256 === b.sectionSha256;
 }

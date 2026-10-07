@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { reduce } from "../../src/core/reduce.ts";
-import { expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent } from "../../src/core/owner-inbox.ts";
+import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent } from "../../src/core/owner-inbox.ts";
 import type { Entry } from "../../src/core/entries.ts";
 import type { Event, State } from "../../src/core/types.ts";
 import { CV, baseState, makeMessage } from "./helpers.ts";
@@ -313,4 +313,39 @@ test("owner-inbox: the review view's entry commands expand to ENTRY_*/OWNER_VERD
   // The round's curator pass is recorded, so the evaluators may start.
   const curated = step(opened, { type: "ENTRY_CURATED", candidateSha: "C1", count: 1 });
   assert.equal(curated.phase.curatedFor, "C1");
+});
+
+test("plan 06d: acceptInput decides applied, queued or refused and only DONE/BLOCKED refuse", () => {
+  const at = (phase: string) => baseState({ phase: phase as never });
+  // A correction while AWAITING_OWNER applies now.
+  assert.deepEqual(acceptInput(at("AWAITING_OWNER"), { kind: "correction", text: "x", workerRunning: false }), {
+    kind: "applied",
+    effect: "correction",
+  });
+  // A steer with a live worker applies now.
+  assert.deepEqual(acceptInput(at("IMPLEMENTING"), { kind: "steer", text: "x", workerRunning: true }), {
+    kind: "applied",
+    effect: "steer",
+  });
+  // A correction outside AWAITING_OWNER queues for the next worker attempt.
+  assert.deepEqual(acceptInput(at("REVIEWING"), { kind: "correction", text: "x", workerRunning: false }), {
+    kind: "queued",
+    until: "next_attempt",
+  });
+  // A steer with no worker queues the same way.
+  assert.deepEqual(acceptInput(at("CHECKING"), { kind: "steer", text: "x", workerRunning: false }), {
+    kind: "queued",
+    until: "next_attempt",
+  });
+  // A note always queues.
+  assert.deepEqual(acceptInput(at("REVIEWING"), { kind: "note", text: "x", workerRunning: false }), {
+    kind: "queued",
+    until: "next_attempt",
+  });
+  // Only DONE and BLOCKED refuse.
+  for (const phase of ["DONE", "BLOCKED"]) {
+    const r = acceptInput(at(phase), { kind: "note", text: "x", workerRunning: false });
+    assert.equal(r.kind, "refused");
+    assert.match((r as { reason: string }).reason, new RegExp(phase));
+  }
 });

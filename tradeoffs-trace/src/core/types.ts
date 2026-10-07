@@ -862,6 +862,8 @@ export type OwnerInputKind = "steer" | "note" | "correction" | "directive" | "wi
 export type OwnerInputState =
   | "delivered" // steer acknowledged by Pi (deliver.done)
   | "noted" // note queued for the next worker attempt
+  | "queued" // plan 06d: a correction outside AWAITING_OWNER, or a steer with no
+  // running worker, queued for the next worker attempt (never refused)
   | "correction-started" // AWAITING_OWNER correction: requests resolved, repair started
   | "delivery-uncertain" // steer intent recorded, no acknowledgement (never resent)
   | "reverted" // plan 01g: a correction naming an amendment id restored its criterion
