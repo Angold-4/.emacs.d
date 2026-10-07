@@ -340,6 +340,15 @@ test("plan 06c: a stop during CHECKING and a resume show the resumed stage's own
       deadlines: { ...fastDeadlines, checkMs: 30_000 },
     });
     await resumed.start();
+    // OD-5: while the resumed check is still running, the CURRENT checks
+    // stage sums its running segments: its own start (never the resume) and a
+    // duration at least the pre-stop segment.
+    const liveTimeline = rebuildTimeline(setup.runDir, setup.plan);
+    const checksEntry = liveTimeline.phases.find((p) => p.phase === "CHECKING")!.at;
+    const stopTs = readEvents(setup.runDir).find((r) => r.kind === "stop")!.ts;
+    const liveChecks = stageSpans(liveTimeline, new Date()).find((s) => s.stage === "checks")!;
+    assert.equal(liveChecks.startedAt, checksEntry, "the current stage keeps its own start, never the resume");
+    assert.ok(liveChecks.ms >= Date.parse(stopTs) - Date.parse(checksEntry), "the current stage includes its pre-stop segment");
     // The resumed check is running; let it pass and the phase move on.
     fs.writeFileSync(gate, "go\n");
     await waitFor(() => resumed!.state.phase.phase === "DONE", 90_000, 50, setup.runDir);

@@ -132,13 +132,10 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
   const last = spans[spans.length - 1];
   if (last) {
     const end = lastEventAt ? Date.parse(lastEventAt) : now.getTime();
-    // The current stage counts from its last resume inside it: an interrupted
-    // attempt that was re-dispatched, or an ordinary stop/resume, has a fresh
-    // segment.
-    if (last.stage !== "DONE" && last.stage !== "BLOCKED") {
-      const restart = resumes.filter((t) => t >= Date.parse(last.startedAt)).pop();
-      if (restart) last.startedAt = new Date(restart).toISOString();
-    }
+    // Plan 06c (A5/OD-5): the current stage also SUMS its running segments —
+    // its completed segments (stage start, or a RUN_RESUMED, until the stop)
+    // plus the running segment (the last RUN_RESUMED until now). `startedAt`
+    // stays the stage's own start; it is never reset to the last resume.
     const start = Date.parse(last.startedAt);
     last.ms = Math.max(0, end - start - stoppedMs(start, end));
     if (last.stage === "DONE" || last.stage === "BLOCKED" || lastEventAt) last.current = false;

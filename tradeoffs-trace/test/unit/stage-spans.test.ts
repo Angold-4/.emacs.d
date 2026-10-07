@@ -9,22 +9,28 @@ import { pipelineLine, stageSpans } from "../../src/view.ts";
 import { restartInstants, type Timeline } from "../../src/conductor.ts";
 import type { LogRecord } from "../../src/effects/log.ts";
 
-test("stage spans: the current stage counts from the last attempt restart, not from before a stop", () => {
+test("stage spans: the current stage sums its running segments, not the stopped interval", () => {
+  // OD-5: the stage started at 11:00, the conductor stopped immediately and
+  // resumed at 11:48:24; at 11:50:24 the stage's own time is the 2 minutes it
+  // actually ran, never the 50-minute wall interval. `startedAt` is the
+  // stage's own start, not the resume.
   const timeline = {
     state: {} as Timeline["state"],
-    phases: [{ phase: "IMPLEMENTING", at: "2026-09-26T10:41:00.000Z" }],
+    phases: [{ phase: "IMPLEMENTING", at: "2026-09-26T11:00:00.000Z" }],
     rounds: [],
+    stops: ["2026-09-26T11:00:00.000Z"],
     restarts: ["2026-09-26T11:48:24.000Z"],
   } as Timeline;
   const now = new Date("2026-09-26T11:50:24.000Z");
   const spans = stageSpans(timeline, now);
   assert.equal(spans.length, 1);
-  assert.equal(spans[0].ms, 120_000, "two minutes since the restart, not 69 since the stage began");
+  assert.equal(spans[0].ms, 120_000, "two minutes of running segments, not 50 of wall time");
+  assert.equal(spans[0].startedAt, "2026-09-26T11:00:00.000Z", "startedAt is never reset to the resume");
   assert.match(pipelineLine(spans, { implement: 45 * 60_000 }), /implement 2m00s… \(43m00s left\)/);
 
-  // A restart before the current stage began is ignored.
-  const earlier = { ...timeline, restarts: ["2026-09-26T10:00:00.000Z"] } as Timeline;
-  assert.equal(stageSpans(earlier, now)[0].ms, 69 * 60_000 + 24_000);
+  // A stop before the current stage began is ignored.
+  const earlier = { ...timeline, stops: ["2026-09-26T10:00:00.000Z"] } as Timeline;
+  assert.equal(stageSpans(earlier, now)[0].ms, 50 * 60_000 + 24_000);
 });
 
 test("plan 06c: status after stop and resume shows the resumed stage's own time", () => {
@@ -56,9 +62,11 @@ test("plan 06c: status after stop and resume shows the resumed stage's own time"
   assert.equal(spans[1].stage, "probe");
   assert.equal(spans[1].ms, 60_000, "the current stage counts from its own start");
 
-  // The same stage still running after the resume counts from the resume.
+  // OD-5: the CURRENT stage also sums its running segments — 5 minutes before
+  // the stop plus 2 after the resume = 7 minutes — and its startedAt is never
+  // reset to the resume.
   const running = { ...timeline, phases: [{ phase: "CHECKING", at: "2026-10-07T16:00:00.000Z" }] } as Timeline;
   const runningSpans = stageSpans(running, now);
-  assert.equal(runningSpans[0].ms, 2 * 60_000, "two minutes since the resume, not 92 since the stage began");
-  assert.equal(runningSpans[0].startedAt, "2026-10-07T17:30:00.000Z", "the resumed stage shows its own start");
+  assert.equal(runningSpans[0].ms, 7 * 60_000, "current stage = 5 min before the stop + 2 min after the resume");
+  assert.equal(runningSpans[0].startedAt, "2026-10-07T16:00:00.000Z", "startedAt is the stage's own start, never the resume");
 });
