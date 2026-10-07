@@ -45,9 +45,30 @@
 
 (require 'json)
 (require 'subr-x)
-(require 'org)
-(require 'org-element)
 (require 'tab-bar)
+
+;; Org is loaded on first use (a plan parse or a review buffer), never at
+;; startup: `(require 'org)' here pulled in Org and its exporters, ~3 s of
+;; every Emacs start, although `init-org' defers Org until an Org file opens.
+(declare-function org-element-map "org-element")
+(declare-function org-element-parse-buffer "org-element")
+(declare-function org-element-property "org-element")
+(declare-function org-entry-get "org")
+(declare-function org-content "org")
+(declare-function org-fold-show-entry "org")
+(declare-function org-fold-show-subtree "org")
+(declare-function org-fold-folded-p "org")
+(declare-function org-fold-hide-subtree "org")
+(declare-function org-fold-hide-drawer-toggle "org")
+(declare-function org-fold-show-all "org")
+(declare-function org-end-of-subtree "org")
+(declare-function org-back-to-heading "org")
+(declare-function org-at-heading-p "org")
+
+(defun +tt--require-org ()
+  "Load Org and its element parser, the first time a plan is parsed."
+  (require 'org)
+  (require 'org-element))
 
 (defgroup +tt nil
   "tradeoffs-trace front end."
@@ -266,6 +287,67 @@ ROOT is the root the command belongs to and decides the host it runs on."
             out))
       (delete-file err-file))))
 
+(defun +tt--cli-async (root args callback)
+  "Run `tt' ARGS against the local ROOT without blocking Emacs.
+CALLBACK gets the trimmed stdout when the process exits 0, else nil.  For
+timers only: a synchronous `+tt--cli-on' costs a whole Node start plus the
+command (`tt list' folds every run's event log, over 1 s with ~100 runs), and
+on a timer that froze Emacs for that long every tick.  Interactive commands
+keep `+tt--cli', which reports failures."
+  (condition-case nil
+      (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir root)))
+             (default-directory (file-name-as-directory root))
+             (out (generate-new-buffer " *tt-async*"))
+             (err (generate-new-buffer " *tt-async-stderr*")))
+        (make-process
+         :name "tt-async" :buffer out :stderr err :noquery t :connection-type 'pipe
+         :command (append (list +tt-node cli) args (list "--root" (directory-file-name root)))
+         :sentinel
+         (lambda (proc _event)
+           (unless (process-live-p proc)
+             (let ((ok (and (eq (process-status proc) 'exit) (eq (process-exit-status proc) 0)))
+                   (text (if (buffer-live-p out) (with-current-buffer out (buffer-string)) "")))
+               (dolist (b (list out err))
+                 (when (buffer-live-p b)
+                   ;; The stderr pipe has its own process: never let killing
+                   ;; its buffer ask "buffer has a running process".
+                   (when-let* ((p (get-buffer-process b)))
+                     (set-process-query-on-exit-flag p nil)
+                     (delete-process p))
+                   (kill-buffer b)))
+               (funcall callback (and ok (string-trim text)))))))
+        t)
+    (error (funcall callback nil) nil)))
+
+(defun +tt--file-stamp (file)
+  "FILE's modification time and size, or nil when it does not exist (one stat)."
+  (when-let* ((a (file-attributes file)))
+    (cons (file-attribute-modification-time a) (file-attribute-size a))))
+
+(defcustom +tt-refresh-max-age 30
+  "Seconds after which a visible buffer re-renders even if its files are unchanged.
+The workspace timer re-renders the input header and the program buffer only
+when their run's or program's files change (each render calls Node); this
+bounds how stale a value derived from time (a conductor that died) can get."
+  :type 'integer)
+
+(defvar-local +tt--refresh-stamp nil "File stamps of this buffer's last render.")
+(defvar-local +tt--refresh-at 0 "`float-time' of this buffer's last render.")
+(defvar +tt--refresh-force nil "Non-nil: re-render even when nothing changed.")
+
+(defun +tt--needs-render-p (files)
+  "Non-nil when this buffer should re-render, and record the new stamp.
+True when FILES' stamps differ from the last render, the last render is older
+than `+tt-refresh-max-age', or `+tt--refresh-force' is set."
+  (let ((stamp (mapcar #'+tt--file-stamp files))
+        (now (float-time)))
+    (when (or +tt--refresh-force
+              (not (equal stamp +tt--refresh-stamp))
+              (> (- now +tt--refresh-at) +tt-refresh-max-age))
+      (setq +tt--refresh-stamp stamp
+            +tt--refresh-at now)
+      t)))
+
 (defvar +tt--failed-roots nil
   "Roots whose last listing call failed, so a repeated failure is not re-echoed.
 A root is removed again the next time it answers.")
@@ -329,6 +411,7 @@ Runs on DIR's host, so a plan opened over TRAMP asks the server's repo."
 
 (defun +tt--keyword (name)
   "Return the value of #+NAME in the current buffer, or nil."
+  (+tt--require-org)
   (org-element-map (org-element-parse-buffer 'element) 'keyword
     (lambda (k) (when (string= (org-element-property :key k) name)
                   (org-element-property :value k)))
@@ -340,6 +423,7 @@ The first keyword wins, as for every other plan keyword (`+tt--keyword'): a
 second declaration is ignored, not merged.  LINE is the 1-based line of the
 keyword itself, so `tt lint' can point at the Org line the owner edited (as
 `acceptanceLines' does for a list item)."
+  (+tt--require-org)
   (org-element-map (org-element-parse-buffer 'element) 'keyword
     (lambda (k) (when (string= (org-element-property :key k) name)
                   (cons (org-element-property :value k)
@@ -656,15 +740,24 @@ root whose call fails is skipped with a message naming it."
     (dolist (root (+tt--listing-roots))
       (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "list" "--json")))))
         (when json
-          (dolist (row (json-parse-string json :object-type 'alist :array-type 'list
-                                          :null-object nil :false-object :false))
-            (push (append row
-                          (list (cons 'root root)
-                                (cons 'host (+tt--host-of-root root))
-                                (cons 'dir (+tt--under-root root (alist-get 'id row)))))
-                  rows)))))
-    (sort rows (lambda (a b)
-                 (> (or (alist-get 'activity a) 0) (or (alist-get 'activity b) 0))))))
+          (setq rows (append (+tt--rows-from-json root json) rows)))))
+    (+tt--sort-rows rows)))
+
+(defun +tt--rows-from-json (root json)
+  "The run rows in ROOT's `tt list --json' output JSON, each with `root',
+`host' and the TRAMP-correct `dir' added."
+  (mapcar (lambda (row)
+            (append row
+                    (list (cons 'root root)
+                          (cons 'host (+tt--host-of-root root))
+                          (cons 'dir (+tt--under-root root (alist-get 'id row))))))
+          (json-parse-string json :object-type 'alist :array-type 'list
+                             :null-object nil :false-object :false)))
+
+(defun +tt--sort-rows (rows)
+  "ROWS, newest activity first."
+  (sort rows (lambda (a b)
+               (> (or (alist-get 'activity a) 0) (or (alist-get 'activity b) 0)))))
 
 (defun +tt--run-label (row)
   "Picker label for a run ROW: title, state, readable id and host."
@@ -1267,7 +1360,10 @@ own tab and takes the whole frame."
 Interactive, and bound to `gr' in Evil normal state (never a bare `g', which
 would swallow Evil's `g' prefix) and to `g' elsewhere."
   (interactive)
-  (let ((any nil))
+  (let ((any nil)
+        ;; An explicit refresh (`gr') always re-renders; the timer re-renders
+        ;; a Node-backed view only when its files changed (or it is old).
+        (+tt--refresh-force (or +tt--refresh-force (called-interactively-p 'any))))
     (dolist (win (window-list-1 nil 'nomini t))
       (with-current-buffer (window-buffer win)
         (when +tt--run-dir
@@ -1276,8 +1372,21 @@ would swallow Evil's `g' prefix) and to `g' elsewhere."
             (cond ((derived-mode-p '+tt-trace-mode) (+tt--render-trace win))
                   ((derived-mode-p '+tt-status-mode) (+tt--render-status))
                   ((derived-mode-p '+tt-review-mode) (+tt-review-refresh))
-                  ((derived-mode-p '+tt-input-mode) (+tt--render-input-header))
-                  ((derived-mode-p '+tt-program-mode) (+tt--render-program))
+                  ;; Each of the next two runs a synchronous `tt' (a Node
+                  ;; start, ~0.3 s): every 2 s that froze Emacs while a
+                  ;; workspace or program buffer was visible.
+                  ((derived-mode-p '+tt-input-mode)
+                   (when (+tt--needs-render-p
+                          (if +tt--input-program-dir
+                              nil
+                            (list (expand-file-name "events.jsonl" +tt--run-dir)
+                                  (expand-file-name "conductor.pid" +tt--run-dir))))
+                     (+tt--render-input-header)))
+                  ((derived-mode-p '+tt-program-mode)
+                   (when (+tt--needs-render-p
+                          (mapcar (lambda (f) (expand-file-name f +tt--program-dir))
+                                  '("events.jsonl" "program.json" "views/program.txt")))
+                     (+tt--render-program)))
                   ;; Plan 05h: the tape has its own `+tt-tape-refresh-interval'
                   ;; timer; the workspace beat only makes sure it is running
                   ;; while the buffer is visible.
@@ -1536,9 +1645,9 @@ with no agent live says so instead."
     (if (null targets)
         "(no live agent; carried in every later prompt)"
       (mapconcat
-       (lambda (t)
-         (let ((state (alist-get (intern t) deliveries)))
-           (format "%s %s" t
+       (lambda (target)
+         (let ((state (alist-get (intern target) deliveries)))
+           (format "%s %s" target
                    (cond ((equal state "delivered") "✓")
                          ((equal state "delivery-uncertain") "?")
                          (t "⧗")))))
@@ -2735,8 +2844,9 @@ and never a CLI call.  FORCE re-reads anyway (after a verdict)."
             (org-fold-show-entry 'hide-drawers)))
         (+tt-review--goto-id id)))))
 
+;; No `:parent org-mode-map': that would need Org loaded at startup.
+;; `define-derived-mode' makes `org-mode-map' the parent when the mode runs.
 (defvar-keymap +tt-review-mode-map
-  :parent org-mode-map
   "TAB" #'+tt-review-toggle
   "RET" #'+tt-review-open-message
   "A" #'+tt-review-accept
@@ -3198,39 +3308,60 @@ Emacs started are not replayed."
           ;; Truncated or replaced: start over from its current end.
           (setq +tt--notifications-offset size)))))))
 
+;; The mode-line indicator is refreshed on a 10 s timer.  It must never block:
+;; the listing it needs (`tt list' and `tt program list') is a Node start plus
+;; a fold of every run's event log, over 1 s with ~100 runs, and run
+;; synchronously on the timer it froze Emacs for that long every 10 s even
+;; with no tradeoffs-trace buffer open.  The timer therefore (1) runs both
+;; commands as asynchronous processes and renders in their sentinels, and
+;; (2) does not run them at all when no run or program file changed since the
+;; last refresh and nothing shown is ageing (no live run, no waiting node).
+;; `+tt--mode-line-update' keeps the synchronous form for tests and callers
+;; that want the answer now.
+
+(defun +tt--waiting-from-json (jsons)
+  "Waiting nodes in the `tt program list --json' outputs JSONS, oldest first."
+  (let (rows)
+    (dolist (json jsons)
+      (when json
+        (dolist (p (json-parse-string json :object-type 'alist :array-type 'list
+                                      :null-object nil :false-object :false))
+          (dolist (w (alist-get 'waiting p))
+            (push (cons (or (alist-get 'since w) "") w) rows)))))
+    (mapcar #'cdr (sort rows (lambda (a b) (string< (car a) (car b)))))))
+
 (defun +tt--waiting-nodes ()
   "Waiting nodes across every program of every root, oldest wait first.
 One `tt program list --json' call per root; nil when there is no program or
 no wait.  A root whose call fails is skipped with a message."
-  (let (rows)
-    (dolist (root (+tt--listing-roots))
-      (let ((json (+tt--root-call root (lambda () (+tt--cli-on root "program" "list" "--json")))))
-        (when json
-          (dolist (p (json-parse-string json :object-type 'alist :array-type 'list
-                                        :null-object nil :false-object :false))
-            (dolist (w (alist-get 'waiting p))
-              (push (cons (or (alist-get 'since w) "") w) rows))))))
-    (mapcar #'cdr (sort rows (lambda (a b) (string< (car a) (car b)))))))
+  (+tt--waiting-from-json
+   (mapcar (lambda (root)
+             (+tt--root-call root (lambda () (+tt--cli-on root "program" "list" "--json"))))
+           (+tt--listing-roots))))
 
-(defun +tt--mode-line-wait ()
-  "The `⚑ <node> waiting <duration>' mode-line segment, or nil."
-  (when-let* ((w (car (+tt--waiting-nodes))))
+(defun +tt--mode-line-wait-from (waiting)
+  "The `⚑ <node> waiting <duration>' segment for the first of WAITING, or nil."
+  (when-let* ((w (car waiting)))
     (propertize (format " [⚑ %s waiting %s]" (alist-get 'node w) (alist-get 'duration w))
                 'face (if (and +tt--notify-flash
                                (< (float-time (time-since +tt--notify-flash)) 10))
                           'warning 'error))))
 
-(defun +tt--mode-line-update ()
-  "Refresh the mode-line indicator from `tt list' when any run is live.
-Only the local root is listed here: this runs on a timer, and a dead remote
-host must never block Emacs in the background (findings M-2/D-13).  The
-pickers and a visible buffer list every other root on demand."
-  (let* ((+tt--roots-override (+tt--background-roots))
-         (wait (+tt--mode-line-wait))
+(defun +tt--mode-line-wait ()
+  "The `⚑ <node> waiting <duration>' mode-line segment, or nil."
+  (+tt--mode-line-wait-from (+tt--waiting-nodes)))
+
+(defvar +tt--mode-line-ageing nil
+  "Non-nil when the indicator shows something that ages by itself (a live
+run's stage time, a wait's duration), so the timer refreshes it every tick.")
+
+(defun +tt--mode-line-apply (rows waiting)
+  "Set the mode-line indicator from run ROWS and WAITING nodes."
+  (let* ((wait (+tt--mode-line-wait-from waiting))
          (flash (and +tt--notify-flash
                      (< (float-time (time-since +tt--notify-flash)) 10)))
-         (rows (ignore-errors (+tt--list)))
          (live (seq-some (lambda (r) (eq (alist-get 'alive r) t)) rows)))
+    (setq +tt--mode-line-ageing (and (or live wait) t))
     (setq +tt--mode-line-string
           (if (not live)
               ;; A waiting program whose run conductor is stopped or dead
@@ -3251,18 +3382,79 @@ pickers and a visible buffer list every other root on demand."
                           (lambda (r)
                             (propertize (format "tt:%s %s %s %s" (substring (or (alist-get 'readableId r) (alist-get 'id r)) 0 4)
                                                 (alist-get 'stage r) (alist-get 'stageElapsed r)
-                                                (replace-regexp-in-string " +" "" (alist-get 'reviews r)))
+                                                (replace-regexp-in-string " +" "" (or (alist-get 'reviews r) "")))
                                         'face (+tt--attention-face r)))
                           shown " | ")
                          "]")))))))
   (force-mode-line-update t))
+
+(defun +tt--mode-line-update ()
+  "Refresh the mode-line indicator now, synchronously, from `tt list'.
+Only the local root is listed: a dead remote host must never block Emacs
+from the mode line (findings M-2/D-13).  The timer uses
+`+tt--mode-line-tick', which never blocks."
+  (let ((+tt--roots-override (+tt--background-roots)))
+    (+tt--mode-line-apply (ignore-errors (+tt--list)) (+tt--waiting-nodes))))
+
+(defun +tt--root-stamp (root)
+  "A cheap fingerprint of the local ROOT: the stamp of every run's and
+program's event log and program state, in one directory walk (stats only,
+no Node).  Equal stamps mean no run or program changed."
+  (let (stamps)
+    (dolist (dir (directory-files root t "\\`[^.]" t))
+      (when (file-directory-p dir)
+        (push (+tt--file-stamp (expand-file-name "events.jsonl" dir)) stamps)))
+    (let ((programs (expand-file-name "programs" root)))
+      (when (file-directory-p programs)
+        (dolist (dir (directory-files programs t "\\`[^.]" t))
+          (push (+tt--file-stamp (expand-file-name "events.jsonl" dir)) stamps)
+          (push (+tt--file-stamp (expand-file-name "program.json" dir)) stamps))))
+    stamps))
+
+(defvar +tt--mode-line-inflight nil "Non-nil while an asynchronous refresh runs.")
+(defvar +tt--mode-line-stamp nil "The root stamp the indicator was last computed from.")
+(defvar +tt--mode-line-at 0 "`float-time' of the last asynchronous refresh.")
+
+(defcustom +tt-mode-line-max-age 300
+  "Seconds after which the mode-line indicator is recomputed even if nothing changed."
+  :type 'integer)
+
+(defun +tt--mode-line-tick ()
+  "Timer body: refresh the indicator asynchronously, and only when needed.
+Skipped while a refresh is running; skipped when the local root's stamp is
+unchanged, nothing shown is ageing and the last refresh is younger than
+`+tt-mode-line-max-age'."
+  (unless +tt--mode-line-inflight
+    (let* ((root (car (+tt--background-roots)))
+           (stamp (ignore-errors (+tt--root-stamp root))))
+      (when (or (not (equal stamp +tt--mode-line-stamp))
+                ;; Only durations change: once a minute is enough.
+                (and +tt--mode-line-ageing (> (- (float-time) +tt--mode-line-at) 60))
+                (> (- (float-time) +tt--mode-line-at) +tt-mode-line-max-age))
+        (setq +tt--mode-line-inflight t)
+        (+tt--cli-async
+         root '("program" "list" "--json")
+         (lambda (programs)
+           (+tt--cli-async
+            root '("list" "--json")
+            (lambda (list)
+              (unwind-protect
+                  ;; A failed call keeps the last indicator rather than
+                  ;; clearing it; the next change or max age retries.
+                  (when (and programs list)
+                    (+tt--mode-line-apply
+                     (+tt--sort-rows (ignore-errors (+tt--rows-from-json root list)))
+                     (ignore-errors (+tt--waiting-from-json (list programs))))
+                    (setq +tt--mode-line-stamp stamp
+                          +tt--mode-line-at (float-time)))
+                (setq +tt--mode-line-inflight nil))))))))))
 
 (defun +tt--ensure-mode-line ()
   "Install the display-only mode-line indicator and its timers."
   (unless (memq '+tt--mode-line-string global-mode-string)
     (setq global-mode-string (append global-mode-string '(+tt--mode-line-string))))
   (unless (timerp +tt--mode-line-timer)
-    (setq +tt--mode-line-timer (run-with-timer 1 10 #'+tt--mode-line-update)))
+    (setq +tt--mode-line-timer (run-with-timer 1 10 #'+tt--mode-line-tick)))
   (unless (timerp +tt--notify-timer)
     (setq +tt--notify-timer (run-with-timer 1 3 #'+tt--notifications-poll))))
 

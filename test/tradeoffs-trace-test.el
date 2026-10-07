@@ -2776,6 +2776,109 @@ A dead remote host must never block Emacs in the background (M-2/D-13)."
           (should-not (member root2 called)))
       (delete-directory root1 t))))
 
+;;; The mode-line timer and workspace refresh never block Emacs on Node.
+
+(defun +tt-test--fake-node (root script)
+  "A fake runner under ROOT whose `node' runs SCRIPT; return (RUNNER . NODE)."
+  (let ((runner (expand-file-name "runner" root))
+        (node (expand-file-name "fake-node" root)))
+    (make-directory (expand-file-name "src" runner) t)
+    (write-region "" nil (expand-file-name "src/cli.ts" runner))
+    (write-region script nil node)
+    (set-file-modes node #o755)
+    (cons runner node)))
+
+(defun +tt-test--wait (pred &optional seconds)
+  "Accept process output until PRED is non-nil or SECONDS (default 10) pass."
+  (let ((end (+ (float-time) (or seconds 10))))
+    (while (and (not (funcall pred)) (< (float-time) end))
+      (accept-process-output nil 0.05))
+    (funcall pred)))
+
+(ert-deftest tradeoffs-trace-cli-async-returns-stdout-or-nil ()
+  "`+tt--cli-async' calls back with stdout on exit 0 and nil on failure."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-root-" t)))
+         (fake (+tt-test--fake-node root "#!/bin/sh\nif [ \"$2\" = ok ]; then echo out; exit 0; fi\necho boom >&2; exit 1\n"))
+         (+tt-runner (car fake))
+         (+tt-node (cdr fake))
+         (got 'unset) (bad 'unset))
+    (unwind-protect
+        (progn
+          (+tt--cli-async root '("ok") (lambda (out) (setq got out)))
+          (+tt--cli-async root '("bad") (lambda (out) (setq bad out)))
+          (should (+tt-test--wait (lambda () (and (not (eq got 'unset)) (not (eq bad 'unset))))))
+          (should (equal got "out"))
+          (should (null bad))
+          ;; No helper buffer is left behind.
+          (should-not (seq-some (lambda (b) (string-prefix-p " *tt-async" (buffer-name b))) (buffer-list))))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-mode-line-tick-is-async-and-skips-when-unchanged ()
+  "The mode-line timer never calls the synchronous CLI, and calls none at all
+when no run file changed and nothing shown is ageing."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-root-" t)))
+         (log (expand-file-name "calls" root))
+         (fake (+tt-test--fake-node
+                root (format "#!/bin/sh\necho \"$2\" >> %s\necho '[]'\n" log)))
+         (+tt-runner (car fake))
+         (+tt-node (cdr fake))
+         (+tt-root root)
+         (+tt--mode-line-inflight nil)
+         (+tt--mode-line-stamp nil)
+         (+tt--mode-line-at 0)
+         (+tt--mode-line-ageing nil)
+         (+tt--mode-line-string "")
+         (+tt--notify-flash nil)
+         (calls (lambda () (if (file-exists-p log)
+                               (length (split-string (with-temp-buffer (insert-file-contents log) (buffer-string)) "\n" t))
+                             0))))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--cli-on)
+                   (lambda (&rest _) (error "the timer must not run the synchronous CLI"))))
+          (make-directory (expand-file-name "run1" root))
+          (write-region "{}\n" nil (expand-file-name "run1/events.jsonl" root))
+          (+tt--mode-line-tick)
+          (should (+tt-test--wait (lambda () (not +tt--mode-line-inflight))))
+          (should (= 2 (funcall calls)))     ; program list + list
+          ;; Nothing changed: the next tick spawns nothing.
+          (+tt--mode-line-tick)
+          (should-not +tt--mode-line-inflight)
+          (should (= 2 (funcall calls)))
+          ;; A run's event log grows: the next tick lists again.
+          (write-region "{}\n{}\n" nil (expand-file-name "run1/events.jsonl" root))
+          (+tt--mode-line-tick)
+          (should (+tt-test--wait (lambda () (not +tt--mode-line-inflight))))
+          (should (= 4 (funcall calls))))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-workspace-refresh-renders-node-views-only-on-change ()
+  "The 2 s workspace timer re-renders the input header (a `tt state' call)
+only when the run's files change; an explicit refresh always renders."
+  (let* ((run (make-temp-file "tt-run-" t))
+         (renders 0)
+         (buf (get-buffer-create "*tt-test-input-gate*")))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--render-input-header)
+                   (lambda () (setq renders (1+ renders))))
+                  ((symbol-function 'window-list-1)
+                   (lambda (&rest _) (list (selected-window))))
+                  ((symbol-function 'window-buffer) (lambda (&rest _) buf)))
+          (write-region "{}\n" nil (expand-file-name "events.jsonl" run))
+          (with-current-buffer buf
+            (+tt-input-mode)
+            (setq +tt--run-dir run))
+          (+tt--refresh-all)
+          (should (= renders 1))
+          (+tt--refresh-all)
+          (should (= renders 1))            ; unchanged: no render
+          (write-region "{}\n{}\n" nil (expand-file-name "events.jsonl" run))
+          (+tt--refresh-all)
+          (should (= renders 2))            ; the event log changed
+          (let ((+tt--refresh-force t)) (+tt--refresh-all))
+          (should (= renders 3)))           ; explicit refresh
+      (kill-buffer buf)
+      (delete-directory run t))))
+
 (ert-deftest tradeoffs-trace-cli-bounds-connect-before-touching-the-root ()
   "`+tt--cli-on' binds the short connect timeout before any remote access.
 `+tt--runner-dir' checks the remote runner with `file-exists-p', which must
