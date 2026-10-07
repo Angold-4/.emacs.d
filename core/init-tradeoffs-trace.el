@@ -523,6 +523,15 @@ its whole body, so sub-lists and source blocks stay inside it; `rawText'
 keeps the same text so `tt lint' can prove nothing was lost in parsing."
   (let* ((body (+tt--phase-body hl))
          (text (string-trim body))
+         ;; Plan 06b (finding M-2): `rawText' is the literal source body,
+         ;; captured independently of `text', so `tt lint' can see a line the
+         ;; parse dropped.  The property drawer is part of the raw text and
+         ;; `lostTextLines' ignores it.
+         (raw (let ((beg (org-element-property :contents-begin hl))
+                    (end (org-element-property :contents-end hl)))
+                (if (and beg end)
+                    (string-trim (buffer-substring-no-properties beg end))
+                  text)))
          (verify (org-element-property :VERIFY hl))
          (arch (org-element-property :ARCH hl))
          (where (org-element-property :WHERE hl))
@@ -531,7 +540,7 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
     `((id . ,(org-element-property :ID hl))
       (title . ,title)
       (text . ,text)
-      (rawText . ,text)
+      (rawText . ,raw)
       (tags . ,(vconcat (org-element-property :tags hl)))
       ,@(when (eq kind 'architecture)
           `((where . ,where)
@@ -2704,14 +2713,29 @@ After a refresh a message may have disappeared; point then goes to the top."
     (when (looking-at "^[ \t]*- \\([A-Z]-[0-9]+\\) ")
       (match-string-no-properties 1))))
 
+(defun +tt-review--item-id-at-point ()
+  "The item id of the Plan-items matrix row at point, or nil.
+Plan 06b: a row's first cell links to `views/items/<id>.org'."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^[ \t]*| *\\[\\[items/\\([^]]+\\)\\.org\\]")
+      (match-string-no-properties 1))))
+
 (defun +tt-review-open-message ()
-  "Open the detail file for the entry or message at point (RET).
+  "Open the detail file for the entry, item or message at point (RET).
 Plan 05j: an entry heading (`E-n') opens `views/entries/<id>.org', a linked
-message line opens `views/messages/<id>.org'. Decision briefs: RET chooses one
-of the brief's options and resolves the owner request."
+message line opens `views/messages/<id>.org'. Plan 06b: a Plan-items matrix
+row opens `views/items/<id>.org' (the cell's evidence). Decision briefs: RET
+chooses one of the brief's options and resolves the owner request."
   (interactive)
-  (if (+tt-review--brief-kind)
-      (+tt-review--brief-choose)
+  (cond
+   ((+tt-review--brief-kind) (+tt-review--brief-choose))
+   ((+tt-review--item-id-at-point)
+    (let* ((item (+tt-review--item-id-at-point))
+           (file (and +tt--run-dir (expand-file-name (concat "views/items/" item ".org") +tt--run-dir))))
+      (unless (and file (file-exists-p file)) (user-error "No item file for %s" item))
+      (find-file file)))
+   (t
     (let* ((entry (+tt-review--entry-id))
            (id (cond (entry entry)
                      ((+tt-review--bullet-message-id))
@@ -2720,7 +2744,7 @@ of the brief's options and resolves the owner request."
            (file (and id +tt--run-dir (expand-file-name (concat dir id ".org") +tt--run-dir))))
       (unless id (user-error "No entry or message on this line"))
       (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
-      (find-file file))))
+      (find-file file)))))
 
 (defun +tt-review--entry-id ()
   "The `E-n' id of the entry at point, or nil."

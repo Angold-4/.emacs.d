@@ -505,7 +505,13 @@ What the loop does with the items:
 The old format still parses: a `Goal:` paragraph, an `Acceptance:` list and
 `:RESERVED:`. Each acceptance item becomes `R1..Rn` with `review` (or
 `evidence` for an item that starts `evidence:`), and `:RESERVED:` becomes
-`C1`. There is no architecture.
+`C1`. There is no architecture. The conductor synthesizes the same items for
+any plan that declares none, so an old-format plan's points appear in the
+worker prompt, the matrix and acceptance. Their coverage and per-item verdict
+requirements apply once the worker has submitted `submit_coverage` — the
+extension makes every real worker do so, so a plan started for real is fully
+enforced; a hand-built in-process plan that never calls it keeps the old
+behaviour.
 
 ## Models per role and per seat
 

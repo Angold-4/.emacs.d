@@ -288,9 +288,11 @@ test("plan-items: the evaluator overturns a majority unmet verdict the passing t
     await waitFor(() => ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase), 90_000, 50, setup.runDir);
     assert.equal(setup.conductor.state.phase.phase, "DONE", "the overturned verdict does not block");
     const overturns = setup.conductor.state.phase.overturns ?? [];
-    assert.equal(overturns.length, 1);
-    assert.equal(overturns[0].id, "R1");
-    assert.ok(["A", "M"].includes(overturns[0].seat), `counted against an unmet seat: ${overturns[0].seat}`);
+    // Both contradicted seats are overturned and counted (finding M-3).
+    assert.equal(overturns.length, 2);
+    assert.deepEqual(overturns.map((o) => o.id), ["R1", "R1"]);
+    assert.deepEqual(overturns.map((o) => o.seat).sort(), ["A", "M"]);
+    assert.ok(overturns.every((o) => o.effect === "flip"));
     assert.ok(!setup.conductor.state.phase.findings.some((f) => f.itemId === "R1"), "no finding is raised for the overturned item");
     // The seat's overturn count shows in `tt summary`'s PR body.
     const { prSummary } = await import("../../src/view.ts");
@@ -406,9 +408,59 @@ test("plan-items: a met verdict citing only the worker's anchors with no file th
   }
 });
 
-test("plan-items: two of three seats judging A1 deviates block acceptance until the owner accepts the deviation as a trade-off", async () => {
+test("plan-items: an architecture :WHERE: file missing from the candidate is recorded deviates before review", async () => {
+  const missingWhere = {
+    architecture: [{ id: "A1", title: "Gone", text: "interface Gone { n: number }", tags: ["data"], where: "src/core/gone.ts" }],
+    requirements: [{ id: "R1", title: "R1 proves it", text: "R1 proves it", arch: ["A1"], verify: ['test "R1 proves it"'] }],
+    constraints: [],
+  };
   const setup = await setupConductor({
-    items: ITEMS,
+    items: missingWhere,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        // The :WHERE: file is never created.
+        { kind: "call-sh", command: "mkdir -p src/core && printf 'x\\n' > src/core/other.ts" },
+        {
+          kind: "call-submit",
+          tool: "submit_coverage",
+          args: { items: [{ id: "R1", status: "done", where: ["src/core/other.ts:1"], tests: ["R1 proves it"] }], arch: [{ id: "A1", fits: "yes", where: [] }] },
+        },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        { kind: "call-tool", tool: "read", args: { path: "src/core/other.ts" } },
+        { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, { items: [{ id: "R1", verdict: "met", evidence: "src/core/other.ts:1" }], arch: [{ id: "A1", verdict: "fits", evidence: "src/core/other.ts:1" }] }) },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => (setup.conductor.state.phase.archSymbolDeviations ?? []).includes("A1"), 90_000, 50, setup.runDir);
+    assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "A1" && f.severity === "blocking"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan-items: two of three seats judging A1 deviates block acceptance until the owner accepts the deviation as a trade-off", async () => {
+  // A1 has no :WHERE: symbol, so the code cannot contradict the deviating
+  // verdicts (the evaluator's own symbol re-verification does not apply).
+  const deviatingItems = {
+    architecture: [{ id: "A1", title: "Round", text: "the round shape", tags: ["data"] }],
+    requirements: ITEMS.requirements,
+    constraints: ITEMS.constraints,
+  };
+  const setup = await setupConductor({
+    items: deviatingItems,
     phaseChecks: [CHECK_OUTPUT],
     stubReviews: false,
     deadlines: FAST,

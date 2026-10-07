@@ -155,6 +155,7 @@ import {
   testVerifyProblems,
   verdictIssues,
   type Coverage,
+  type FlatItem,
   type ItemOutcome,
   type PlanItems,
   type SeatItemVerdict,
@@ -535,6 +536,7 @@ export function runPaths(runDir: string) {
     ledger: path.join(runDir, "ledger.jsonl"),
     review: path.join(runDir, "views", "review.org"),
     messagesView: path.join(runDir, "views", "messages"),
+    itemsView: path.join(runDir, "views", "items"),
     // Plan 05j: one file per live ENTRY, the RET target from the review view.
     entriesView: path.join(runDir, "views", "entries"),
     status: path.join(runDir, "views", "status.txt"),
@@ -683,6 +685,15 @@ export function amendContractVersion(contract: PhaseContract, acceptance: string
 }
 
 export function buildContract(phase: RunPlanPhase): PhaseContract {
+  // Plan 06b: every plan carries items. When the phase declares none (the old
+  // format, or a hand-built in-process plan), synthesize R1..Rn from
+  // `acceptance` and C1 from `reserved`, exactly as the Emacs parser does,
+  // and mark them synthesized. The items are then shown in the worker prompt,
+  // the matrix and acceptance; their coverage/verdict REQUIREMENTS apply once
+  // the worker submits coverage (which the extension makes every real worker
+  // do), so a direct in-process plan keeps its old behaviour.
+  const declaredItems = phase.architecture !== undefined || phase.requirements !== undefined || phase.constraints !== undefined;
+  const synthesized = itemsFromPhase(phase);
   return {
     phaseId: phase.id,
     contractVersion: contractVersionFor(phase),
@@ -691,9 +702,10 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     checks: phase.checks,
     boundaries: phase.boundaries,
     reserved: phase.reserved,
-    ...(phase.architecture ? { architecture: phase.architecture } : {}),
-    ...(phase.requirements ? { requirements: phase.requirements } : {}),
-    ...(phase.constraints ? { constraints: phase.constraints } : {}),
+    architecture: synthesized.architecture,
+    requirements: synthesized.requirements,
+    constraints: synthesized.constraints,
+    ...(declaredItems ? {} : { itemsSynthesized: true }),
     // Plan 01f: a declared gate is part of the frozen contract — the FSM
     // (next.ts/transitions.ts) reads it to decide whether the phase gates at
     // all, and every prompt that mentions the gate quotes the same text.
@@ -3284,7 +3296,7 @@ export class Conductor {
         return { ok: false, reason: `submit_phase is not accepted in phase ${this.#state.phase.phase}` };
       }
       // Plan 06b: the freeze is refused until the coverage is complete.
-      if (this.#structured()) {
+      if (this.#itemsEnforced()) {
         const issues = coverageIssues(this.#state.phase.coverage, this.#planItems());
         if (issues.length > 0) {
           const reason = `submit_phase refused until submit_coverage is complete: ${issues.join("; ")}`;
@@ -3345,7 +3357,7 @@ export class Conductor {
       if (handle.role !== "reviewer" || this.#state.phase.phase !== "REVIEWING") {
         return { ok: false, reason: `submit_review is not accepted in phase ${this.#state.phase.phase}` };
       }
-      const review = msg.args as Review;
+      let review = msg.args as Review;
       if (review.candidateSha !== this.#state.phase.candidate?.sha) {
         return { ok: false, reason: "submit_review candidateSha does not match the current candidate" };
       }
@@ -3429,6 +3441,19 @@ export class Conductor {
             itemIssues,
             rejections,
           });
+        }
+        // Plan 06b (finding M-16): an invalid verdict never counts, even once
+        // the rejection cap accepts the review as-is. Drop every item verdict
+        // the code refused, so it cannot enter the tally.
+        if (itemIssues.length > 0 && this.#itemsEnforced()) {
+          const items = this.#planItems();
+          const flat = flatItems(items);
+          const reads = this.#reviewerReadFiles(review.reviewer);
+          const valid = (v: { id: string }): boolean => {
+            const item = flat.find((i) => i.id === v.id);
+            return item ? verdictIssues(item, v as import("./core/items.ts").ItemVerdict, this.#verdictContext(item, reads)).length === 0 : true;
+          };
+          review = { ...review, items: (review.items ?? []).filter(valid), arch: (review.arch ?? []).filter(valid) };
         }
         // Ordering matters, and in TWO conflicting directions at once — a
         // real bug this packet's own contract-objection test caught: if
@@ -5186,7 +5211,7 @@ export class Conductor {
     blocking.push(...ownerBlockerChoiceLines(phase, C));
     // Plan 06b: list only the items a majority did not meet (or fit), with
     // the reviewers' evidence, so the repair addresses exactly those points.
-    if (phase.contract.architecture !== undefined || phase.contract.requirements !== undefined || phase.contract.constraints !== undefined) {
+    if (!phase.contract.itemsSynthesized || phase.coverage !== undefined) {
       blocking.push(...repairItemLines(this.#itemOutcomes(), phase.overturns ?? []));
     }
     const failedDecisions: string[] = [];
@@ -5230,11 +5255,19 @@ export class Conductor {
     return itemsFromPhase(this.#state.phase.contract);
   }
 
-  /** True when the phase declares structured items, so the item loop applies.
-   * A plan that predates the format has none and behaves exactly as before. */
+  /** True when the phase carries structured items, so the prompt and the
+   * views render them. Always true after `buildContract`. */
   #structured(): boolean {
     const c = this.#state.phase.contract;
     return c.architecture !== undefined || c.requirements !== undefined || c.constraints !== undefined;
+  }
+
+  /** True when the item loop's coverage and per-item verdict REQUIREMENTS
+   * apply: the plan declared its items, or the worker submitted coverage (the
+   * extension makes every real worker do so). A synthesized plan whose worker
+   * never called `submit_coverage` keeps the pre-06b behaviour. */
+  #itemsEnforced(): boolean {
+    return !this.#state.phase.contract.itemsSynthesized || this.#state.phase.coverage !== undefined;
   }
 
   #itemTestOutcomes(): Map<string, "passed" | "failed" | "missing"> {
@@ -5268,7 +5301,7 @@ export class Conductor {
   /** The code facts a verdict is validated against: candidate file lines,
    * the diff, the item's `:WHERE:`, the check run's test outcomes, the files
    * this reviewer read, and the worker's own anchors. */
-  #verdictContext(item: { where?: string }, reviewerReadFiles: string[]): VerdictContext {
+  #verdictContext(item: FlatItem, reviewerReadFiles: string[]): VerdictContext {
     const dir = this.#candidateDir();
     const C = this.#state.phase.candidate?.sha ?? "";
     return {
@@ -5284,14 +5317,37 @@ export class Conductor {
       testOutcomes: this.#itemTestOutcomes(),
       reviewerReadFiles,
       workerAnchors: this.#workerAnchors(),
+      archSymbolsPresent: (i: FlatItem) => this.#archSymbolsPresent(i),
     };
+  }
+
+  /** Plan 06b (finding B-18): whether the candidate's `:WHERE:` file for an
+   * architecture item exists and names every symbol the item declares. */
+  #archSymbolsPresent(item: FlatItem): boolean {
+    const arch = this.#planItems().architecture.find((a) => a.id === item.id);
+    if (!arch || !arch.where) return false;
+    const symbols = architectureSymbols(arch);
+    if (symbols.length === 0) return false;
+    const dir = this.#candidateDir();
+    let text = "";
+    let fileShaped = false;
+    for (const token of arch.where.split(/[\s,;]+/).filter(Boolean)) {
+      if (!/[/.]/.test(token)) continue;
+      fileShaped = true;
+      try {
+        text += `${fs.readFileSync(path.join(dir, token), "utf8")}\n`;
+      } catch {
+        return false;
+      }
+    }
+    return fileShaped && symbols.every((s) => symbolPresent(text, s));
   }
 
   /** Every reason a review's item section must be refused and re-asked: a
    * missing verdict (the complete-ballot rule extended to items), an invalid
    * verdict value, or a verdict whose anchors the code cannot follow. */
   #reviewItemIssues(review: Review): string[] {
-    if (!this.#structured()) return [];
+    if (!this.#itemsEnforced()) return [];
     const items = this.#planItems();
     const issues = reviewItemsIssues({ items: review.items ?? [], arch: review.arch ?? [] }, items);
     const flat = flatItems(items);
@@ -5335,8 +5391,7 @@ export class Conductor {
     };
     for (const o of outcomes) {
       const ctx = this.#verdictContext(o.item, this.#reviewerReadFiles((o.seats[0]?.seat ?? "M") as Reviewer));
-      const overturn = reverify(o.item, o.seats, ctx, readsBySeat);
-      if (overturn) out.push(overturn);
+      out.push(...reverify(o.item, o.seats, ctx, readsBySeat));
     }
     return out;
   }
@@ -5354,15 +5409,24 @@ export class Conductor {
       const symbols = architectureSymbols(arch);
       if (symbols.length === 0) continue;
       let text = "";
+      let missingFile = false;
+      let fileShaped = false;
       for (const token of arch.where.split(/[\s,;]+/).filter(Boolean)) {
+        // Only a file-shaped token (a path or a name with an extension) can be
+        // grepped; a bare module name is left to the reviewers.
+        if (!/[/.]/.test(token)) continue;
+        fileShaped = true;
         try {
           text += `${fs.readFileSync(path.join(dir, token), "utf8")}\n`;
         } catch {
-          // not a readable file at that token
+          // The `:WHERE:` file does not exist in the candidate. A missing
+          // module is the clearest deviation, so it is recorded as one rather
+          // than skipped (finding M-15).
+          missingFile = true;
         }
       }
-      if (text.length === 0) continue;
-      if (symbols.some((s) => !symbolPresent(text, s))) deviates.push(arch.id);
+      if (!fileShaped) continue;
+      if (missingFile || symbols.some((s) => !symbolPresent(text, s))) deviates.push(arch.id);
     }
     if (deviates.length === 0) return;
     this.#applyEvent({ type: "ITEM_STATE_UPDATED", archSymbolDeviations: deviates });
@@ -5389,7 +5453,7 @@ export class Conductor {
    * record the overturns, and raise a blocking finding anchored to every item
    * a majority did not meet (or fit). */
   #applyItemOutcomes(): void {
-    if (!this.#structured()) return;
+    if (!this.#itemsEnforced()) return;
     const C = this.#state.phase.candidate?.sha;
     if (!C) return;
     const raw = this.#itemOutcomes();
@@ -5440,7 +5504,7 @@ export class Conductor {
   /** A `test` verify that is missing from or failed in the candidate's check
    * run is a blocking finding anchored to its item. */
   #applyTestVerifyFindings(C: string): void {
-    if (!this.#structured()) return;
+    if (!this.#itemsEnforced()) return;
     const resolutions = this.#state.phase.checkResolution ?? [];
     const problems = testVerifyProblems(resolutions);
     if (problems.length === 0) return;
@@ -5648,6 +5712,7 @@ export class Conductor {
       // the link resolves inside the run directory (finding M-25).
       fs.writeFileSync(path.join(path.dirname(this.#paths.review), "glossary.org"), `* Owner glossary\n${renderGlossaryOrg()}\n`);
       this.#writeEntryViews(rendered.files);
+      this.#writeItemViews(rendered.itemFiles);
       this.#recordReviewLint(rendered.lint);
       this.#writeMessageViews();
     } catch (err) {
@@ -5732,6 +5797,19 @@ export class Conductor {
     for (const name of fs.readdirSync(this.#paths.entriesView)) {
       if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) {
         fs.rmSync(path.join(this.#paths.entriesView, name), { force: true });
+      }
+    }
+  }
+
+  /** Plan 06b: one `views/items/<id>.org` per item, the evidence a matrix
+   * cell opens. */
+  #writeItemViews(files: Array<{ id: string; contents: string }>): void {
+    const ids = new Set(files.map((f) => f.id));
+    fs.mkdirSync(this.#paths.itemsView, { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(this.#paths.itemsView, `${f.id}.org`), f.contents);
+    for (const name of fs.readdirSync(this.#paths.itemsView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) {
+        fs.rmSync(path.join(this.#paths.itemsView, name), { force: true });
       }
     }
   }
@@ -6858,7 +6936,7 @@ export class Conductor {
       // Plan 06b: resolve every item's `test` verify against this check run.
       // A named test that is missing from or failed in the output is a
       // blocking finding anchored to its item.
-      if (this.#structured()) {
+      if (this.#itemsEnforced()) {
         const resolutions = resolveTestVerifies(this.#planItems(), combinedOutput);
         this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions });
         this.#applyTestVerifyFindings(candidateSha);
@@ -7405,6 +7483,10 @@ export class Conductor {
 
   async #runReview(actionId: string, reviewer: Reviewer): Promise<void> {
     const dispatchCandidate = this.#state.phase.candidate?.sha;
+    // Plan 06b (finding M-1): a fresh dispatch is a fresh review, so the
+    // files this seat read in an earlier round no longer count as "read in
+    // this review".
+    this.#reviewerReads.set(reviewer, new Set());
     const agentId = `reviewer-${reviewer}-${actionId}`;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
     const candidateDir = this.#candidateDir();

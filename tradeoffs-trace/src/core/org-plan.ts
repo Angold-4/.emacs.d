@@ -24,8 +24,12 @@ interface OrgNode {
   /** The 1-based line of each property, when present. */
   propLines: Record<string, number>;
   /** The node's body: every line until the next headline of level <= this
-   * one, property drawer removed. */
+   * one, property drawer removed. Source blocks are kept verbatim. */
   body: string[];
+  /** The literal source body, captured without any line classification (the
+   * property drawer included). `rawText` is built from this, so `tt lint` can
+   * still see a line the parsed `text` dropped. */
+  rawBody: string[];
   children: OrgNode[];
 }
 
@@ -45,29 +49,36 @@ export function parseOrgTree(text: string): { keywords: Array<{ key: string; val
   const stack: OrgNode[] = [];
   let current: OrgNode | undefined;
   let inDrawer = false;
+  // Plan 06b (finding A-6): inside `#+begin_src … #+end_src` every line is
+  // verbatim content — a `* headline` or a `#+name: example` in an example
+  // block is not a headline or a plan keyword.
+  let inSrc = false;
 
-  const pushBody = (line: string) => {
-    if (!current) return;
-    if (inDrawer) {
-      if (/^\s*:END:\s*$/i.test(line)) inDrawer = false;
-      return;
-    }
-    if (/^\s*:PROPERTIES:\s*$/i.test(line)) {
-      inDrawer = true;
-      return;
-    }
-    current.body.push(line);
+  const pushRaw = (line: string) => {
+    if (current) current.rawBody.push(line);
   };
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineNo = i + 1;
+    if (inSrc) {
+      pushRaw(line);
+      if (current) current.body.push(line);
+      if (/^\s*#\+end_src\b/i.test(line)) inSrc = false;
+      continue;
+    }
+    if (/^\s*#\+begin_src\b/i.test(line)) {
+      pushRaw(line);
+      if (current) current.body.push(line);
+      inSrc = true;
+      continue;
+    }
     const headline = /^(\*+)\s+(.*)$/.exec(line);
     if (headline) {
       inDrawer = false;
       const level = headline[1].length;
       const { title, tags } = splitTitle(headline[2]);
-      const node: OrgNode = { level, title, tags, props: {}, line: lineNo, propLines: {}, body: [], children: [] };
+      const node: OrgNode = { level, title, tags, props: {}, line: lineNo, propLines: {}, body: [], rawBody: [], children: [] };
       while (stack.length > 0 && stack[stack.length - 1].level >= level) stack.pop();
       if (stack.length > 0) stack[stack.length - 1].children.push(node);
       else roots.push(node);
@@ -75,10 +86,13 @@ export function parseOrgTree(text: string): { keywords: Array<{ key: string; val
       current = node;
       continue;
     }
+    // The raw body keeps every non-headline line, including the property
+    // drawer and any keyword a later parse might drop.
+    pushRaw(line);
     const keyword = /^#\+([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
     if (keyword) {
       keywords.push({ key: keyword[1].toUpperCase(), value: keyword[2].trim(), line: lineNo });
-      if (current && current.level === 1) current.body.push(line);
+      if (current) current.body.push(line);
       continue;
     }
     if (current && /^\s*:PROPERTIES:\s*$/i.test(line)) {
@@ -95,7 +109,7 @@ export function parseOrgTree(text: string): { keywords: Array<{ key: string; val
       current.propLines[prop[1].toUpperCase()] = lineNo;
       continue;
     }
-    pushBody(line);
+    if (current) current.body.push(line);
   }
   return { keywords, roots };
 }
@@ -106,11 +120,14 @@ function bodyText(node: OrgNode): string {
 
 function itemInput(node: OrgNode, kind: "architecture" | "requirement" | "constraint"): LintItemInput {
   const text = bodyText(node);
+  // The raw text comes from the literal source, not from the parsed text, so
+  // `lostTextLines` can actually see a line the parse dropped (finding M-2).
+  const rawText = node.rawBody.join("\n").trim();
   const item: LintItemInput = {
     id: node.props.ID,
     title: node.title,
     text,
-    rawText: text,
+    rawText,
     line: node.line,
   };
   if (kind === "architecture") {

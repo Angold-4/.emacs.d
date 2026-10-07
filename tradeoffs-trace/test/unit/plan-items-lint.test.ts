@@ -206,6 +206,44 @@ test("plan-lint: a truncated item text is an error with file and line", () => {
   assert.deepEqual(lostTextLines("a\n- b", "a\n- b"), []);
 });
 
+test("org-plan: a source block keeps its lines verbatim, and is not read as headings or keywords", () => {
+  const org = [
+    "#+TITLE: src",
+    "#+TT_REPO: /tmp/x",
+    "#+TT_BRANCH: main",
+    "",
+    "* P",
+    "  :PROPERTIES:",
+    "  :ID: p1",
+    "  :CHECKS: true",
+    "  :END:",
+    "** Architecture",
+    "*** A1 Shape",
+    "    :PROPERTIES:",
+    "    :ID: A1",
+    "    :END:",
+    "    #+begin_src org",
+    "    * not a headline",
+    "    #+name: not-a-plan-keyword",
+    "    :PROPERTIES: not a drawer",
+    "    #+end_src",
+    "    after the block",
+    "",
+  ].join("\n");
+  const plan = parseOrgPlan(org, "/x/PLAN.org");
+  const a1 = plan.phases![0].architecture![0];
+  assert.match(a1.text!, /\* not a headline/);
+  assert.match(a1.text!, /#\+name: not-a-plan-keyword/);
+  assert.match(a1.text!, /:PROPERTIES: not a drawer/);
+  assert.match(a1.text!, /after the block/);
+  // The lines inside the block are not parsed as keywords or a new headline.
+  assert.deepEqual(plan.phases!.length, 1);
+  assert.equal(plan.phases![0].architecture!.length, 1);
+  // The raw text is the literal source, so a dropped line would be caught.
+  assert.match(a1.rawText!, /#\+name: not-a-plan-keyword/);
+  assert.deepEqual(lintPlan(plan), []);
+});
+
 test("plan-lint: the runbook's 'Writing a plan' section documents the format", () => {
   const runbook = readFileSync(new URL("../../../docs/tradeoffs-trace-runbook.md", import.meta.url), "utf8");
   assert.match(runbook, /^## Writing a plan$/m);

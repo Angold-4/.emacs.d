@@ -332,20 +332,23 @@ export interface VerifyResolution {
   outcome: TestOutcome;
 }
 
-const FAIL_LINE = /^\s*(?:not ok\b|✖|✗|×)/u;
-const PASS_LINE = /^\s*(?:ok\b|✔|✓)/u;
 
 /** Whether the check run's combined output names `name` as passing, failing or
- * not at all. Node's test reporter prints `✔ name` / `✖ name` and TAP prints
- * `ok N - name` / `not ok N - name`; both are matched. A failure anywhere wins
- * over a pass (a test that failed once did not pass this run). */
+ * not at all. The name must be the reporter's own test-name token, not a
+ * substring of a longer one (finding M-14): `✔ name (1.2ms)` and TAP's
+ * `ok N - name` both match, while `lanes: tally` never matches `lanes: tally
+ * extended`. A failure anywhere wins over a pass. */
 export function testOutcomeIn(output: string, name: string): TestOutcome {
   if (name.trim().length === 0) return "missing";
+  const escaped = name.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nodePass = new RegExp(`^\\s*(?:✔|✓)\\s+${escaped}(?:\\s*\\(.*\\))?\\s*$`);
+  const nodeFail = new RegExp(`^\\s*(?:✖|✗|×)\\s+${escaped}(?:\\s*\\(.*\\))?\\s*$`);
+  const tapPass = new RegExp(`^\\s*ok\\s+\\d+\\s+-\\s+${escaped}(?:\\s*#.*)?\\s*$`);
+  const tapFail = new RegExp(`^\\s*not\\s+ok\\s+\\d+\\s+-\\s+${escaped}(?:\\s*#.*)?\\s*$`);
   let passed = false;
   for (const line of output.split("\n")) {
-    if (!line.includes(name)) continue;
-    if (FAIL_LINE.test(line)) return "failed";
-    if (PASS_LINE.test(line)) passed = true;
+    if (tapFail.test(line) || nodeFail.test(line)) return "failed";
+    if (tapPass.test(line) || nodePass.test(line)) passed = true;
   }
   return passed ? "passed" : "missing";
 }
@@ -515,6 +518,10 @@ export interface VerdictContext {
   /** The worker's own coverage anchors, which a met/fits verdict may not
    * lean on alone. */
   workerAnchors: readonly string[];
+  /** Plan 06b (finding B-18): for an architecture item, whether the
+   * candidate's `:WHERE:` file exists and names every symbol the item
+   * declares. A majority `deviates` contradicted by this is overturned. */
+  archSymbolsPresent?: (item: FlatItem) => boolean;
 }
 
 /** True when `path` (or the `:WHERE:` text) matches one of `files`. A
@@ -600,13 +607,16 @@ export interface SeatItemVerdict {
   evidence: string;
 }
 
-/** An overturned verdict: the evaluator's re-verification contradicted it. */
+/** An overturned verdict: the evaluator's re-verification contradicted it.
+ * `flip` is a contradicted `unmet`/`deviates` (the code proves the opposite);
+ * `drop` is a thin `met`/`fits` the audit withdraws (it no longer counts). */
 export interface Overturn {
   seat: Reviewer;
   id: string;
   kind: ItemKind;
   /** The verdict the seat gave. */
   verdict: string;
+  effect: "flip" | "drop";
   reason: string;
 }
 
@@ -624,40 +634,43 @@ export function reverify(
    * is only "thin" when every seat's cited anchors are the worker's own and
    * none is a file that seat read. */
   readsBySeat: Record<string, readonly string[]> = {},
-): Overturn | undefined {
-  if (verdicts.length === 0) return undefined;
-  const unmet = verdicts.filter((v) => v.verdict === "unmet");
-  const deviates = item.kind === "architecture" ? verdicts.filter((v) => v.verdict === "deviates") : [];
-  const isMajorityUnmet = unmet.length >= 2;
-  const isMajorityDeviates = deviates.length >= 2;
-  if (isMajorityUnmet || isMajorityDeviates) {
+): Overturn[] {
+  if (verdicts.length === 0) return [];
+  const contradicted =
+    item.kind === "architecture" ? verdicts.filter((v) => v.verdict === "deviates") : verdicts.filter((v) => v.verdict === "unmet");
+  if (contradicted.length >= 2) {
     const tests = itemTestVerifies(item);
-    const passed = tests.length > 0 && tests.every((t) => ctx.testOutcomes.get(t.name) === "passed");
-    if (passed) {
-      const seat = (isMajorityUnmet ? unmet[0] : deviates[0]).seat;
-      return {
-        seat,
-        id: item.id,
-        kind: item.kind,
-        verdict: isMajorityUnmet ? "unmet" : "deviates",
-        reason: `the item's own test verify passed in this check run (${tests.map((t) => `"${t.name}"`).join(", ")})`,
-      };
+    const testPassed = tests.length > 0 && tests.every((t) => ctx.testOutcomes.get(t.name) === "passed");
+    // An architecture item whose :WHERE: file exists and names its declared
+    // symbol(s) is contradicted by a `deviates` too (finding B-18), so a
+    // review-only architecture item gets a real re-verification.
+    const archFits = item.kind === "architecture" && ctx.archSymbolsPresent?.(item) === true;
+    if (testPassed || archFits) {
+      // Every contradicted seat is overturned and counted (finding M-3): the
+      // code proves the opposite, so each `unmet`/`deviates` is flipped.
+      const reason = testPassed
+        ? `the item's own test verify passed in this check run (${tests.map((t) => `"${t.name}"`).join(", ")})`
+        : "the item's :WHERE: file exists in the candidate and names its declared symbol(s)";
+      return contradicted.map((v) => ({ seat: v.seat, id: item.id, kind: item.kind, verdict: v.verdict, effect: "flip" as const, reason }));
     }
-    return undefined;
+    return [];
   }
-  // A unanimous met/fits verdict with only the worker's anchors is audited.
+  // A unanimous met/fits verdict whose every seat cites only the worker's own
+  // anchors (and read none of them) is audited: each such verdict is
+  // withdrawn, so it no longer counts toward the majority.
   const met = verdicts.filter((v) => v.verdict === (item.kind === "architecture" ? "fits" : "met"));
   if (met.length === verdicts.length && met.length === 3) {
-    const thin = met.every((v) => {
+    const thinSeats = met.filter((v) => {
       const anchors = evidenceFileAnchors(v.evidence).map((a) => a.path);
       const own = readsBySeat[v.seat] ?? ctx.reviewerReadFiles;
       return anchors.length <= 1 && anchors.every((p) => pathInList(p, ctx.workerAnchors)) && anchors.every((p) => !pathInList(p, own));
     });
-    if (thin) {
-      return { seat: met[0].seat, id: item.id, kind: item.kind, verdict: met[0].verdict, reason: "unanimous met verdict with only the worker's anchors" };
+    if (thinSeats.length === met.length) {
+      const reason = "unanimous met verdict with only the worker's anchors";
+      return met.map((v) => ({ seat: v.seat, id: item.id, kind: item.kind, verdict: v.verdict, effect: "drop" as const, reason }));
     }
   }
-  return undefined;
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -696,25 +709,24 @@ export function tallyItem(item: FlatItem, verdicts: readonly SeatItemVerdict[]):
   return { item, outcome, seats, evidence: evidenceFor(outcome) };
 }
 
-/** The opposite of a verdict the evaluator overturned: an overturned unmet is
- * met, an overturned deviates fits (the only two the evaluator overturns —
- * see `reverify`). */
-function overturnedValue(v: string): string {
+/** The opposite of a verdict the evaluator flipped: an overturned unmet is
+ * met, an overturned deviates fits (the only two `flip` overturns — see
+ * `reverify`). */
+function flippedValue(v: string): string {
   if (v === "unmet") return "met";
   if (v === "deviates") return "fits";
   return v;
 }
 
-/** Tally every item from the three reviews' item sections. When `overturns`
- * is given, an overturned seat's verdict is counted as its opposite, so the
- * majority and acceptance reflect what the code proved, not what the seat
- * first said. */
+/** Tally every item from the three reviews' item sections. An overturned
+ * `unmet`/`deviates` counts as its opposite; an audited thin `met`/`fits` is
+ * dropped, so the majority and acceptance reflect what the code proved. */
 export function tallyItems(
   items: PlanItems,
   reviews: Array<{ seat: Reviewer; items?: ReviewItems }>,
   overturns: readonly Overturn[] = [],
 ): ItemOutcome[] {
-  const flipped = new Map(overturns.map((o) => [`${o.seat}:${o.id}`, o]));
+  const bySeat = new Map(overturns.map((o) => [`${o.seat}:${o.id}`, o]));
   return flatItems(items).map((item) => {
     const verdicts: SeatItemVerdict[] = [];
     for (const review of reviews) {
@@ -726,10 +738,16 @@ export function tallyItems(
         if (v) verdicts.push({ seat: review.seat, verdict: v.verdict, evidence: v.evidence ?? "" });
       }
     }
-    const effective = verdicts.map((v) => {
-      const o = flipped.get(`${v.seat}:${item.id}`);
-      return o && o.verdict === v.verdict ? { ...v, verdict: overturnedValue(v.verdict) as ItemVerdictValue } : v;
-    });
+    const effective: SeatItemVerdict[] = [];
+    for (const v of verdicts) {
+      const o = bySeat.get(`${v.seat}:${item.id}`);
+      if (o && o.verdict === v.verdict) {
+        if (o.effect === "drop") continue;
+        effective.push({ ...v, verdict: flippedValue(v.verdict) as ItemVerdictValue });
+      } else {
+        effective.push(v);
+      }
+    }
     return tallyItem(item, effective);
   });
 }
@@ -799,6 +817,52 @@ export function matrixMarkdown(phase: ItemLoopState): string[] {
     "| --- | --- | --- | --- | --- | --- |",
     ...rows.map((r) => `| ${r.id} ${r.title.replace(/\s+/g, " ").trim()} | ${r.cells.map((c) => c.text).join(" | ")} |`),
   ];
+}
+
+/** The item-by-seat matrix as an Org table whose first cell links to the
+ * item's evidence file (`views/items/<id>.org`), so a cell opens its
+ * evidence in the review buffer. */
+export function matrixOrg(phase: ItemLoopState): string[] {
+  const items = itemsFromPhase(phase.contract);
+  if (flatItems(items).length === 0) return [];
+  const outcomes = phaseItemOutcomes(phase);
+  const rows = itemMatrix(items, outcomes, phase.coverage, phase.checkResolution ?? []);
+  return [
+    "| item | worker | check | M | A | B |",
+    "|------+--------+-------+---+---+---|",
+    ...rows.map(
+      (r) =>
+        `| [[items/${r.id}.org][${r.id} ${r.title.replace(/\s+/g, " ").trim()}]] | ${r.cells.map((c) => c.text).join(" | ")} |`,
+    ),
+  ];
+}
+
+/** One `views/items/<id>.org` per item: its text, the worker's coverage, the
+ * check resolution and every seat's verdict with its evidence. */
+export function itemEvidenceFiles(phase: ItemLoopState): Array<{ id: string; contents: string }> {
+  const items = itemsFromPhase(phase.contract);
+  const outcomes = new Map(phaseItemOutcomes(phase).map((o) => [o.item.id, o]));
+  return flatItems(items).map((item) => {
+    const lines = [`#+TITLE: ${item.id} — ${item.title}`, "", `* ${item.id} ${item.title}`, "  :PROPERTIES:", `  :ID: ${item.id}`, "  :END:", `  ${item.text.replace(/\n/g, "\n  ")}`];
+    lines.push("", "* Worker coverage");
+    if (item.kind === "architecture") {
+      const e = phase.coverage?.arch?.find((x) => x.id === item.id);
+      lines.push(`  - ${e ? (e.fits === "yes" ? "fits" : "deviates") : "(none)"}${e?.where?.length ? ` at ${e.where.join(", ")}` : ""}${e?.note ? ` — ${e.note}` : ""}`);
+    } else {
+      const e = phase.coverage?.items?.find((x) => x.id === item.id);
+      lines.push(`  - ${e ? e.status : "(none)"}${e?.where?.length ? ` at ${e.where.join(", ")}` : ""}${e?.tests?.length ? `; tests: ${e.tests.join(", ")}` : ""}${e?.note ? ` — ${e.note}` : ""}`);
+    }
+    const tests = (phase.checkResolution ?? []).filter((r) => r.id === item.id);
+    if (tests.length > 0) {
+      lines.push("", "* Check");
+      for (const t of tests) lines.push(`  - test "${t.name}": ${t.outcome}`);
+    }
+    const o = outcomes.get(item.id);
+    lines.push("", `* Verdict: ${o?.outcome ?? "incomplete"}`);
+    if (o && o.seats.length > 0) for (const s of o.seats) lines.push(`  - ${s.seat}: ${s.verdict} — ${s.evidence}`);
+    else lines.push("  (no item verdict was submitted)");
+    return { id: item.id, contents: `${lines.join("\n")}\n` };
+  });
 }
 
 /** Per-seat overturn counts, in seat order (only seats with a count). */

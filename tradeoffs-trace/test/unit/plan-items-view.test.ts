@@ -95,7 +95,10 @@ test("plan-items view: review.org carries the matrix", () => {
   assert.match(rendered.text, /\* Plan items/);
   assert.match(rendered.text, /\| item \| worker \| check \| M \| A \| B \|/);
   assert.match(rendered.text, /R 2\/2 met · A 1\/1 fit · C 1\/1/);
-  assert.match(rendered.text, /\| R2 /);
+  // Each row's first cell links to the item's evidence file.
+  assert.match(rendered.text, /\[\[items\/R2\.org\]\[R2 Owner run\]\]/);
+  assert.deepEqual(rendered.itemFiles.map((f) => f.id), ["A1", "R1", "R2", "C1"]);
+  assert.match(rendered.itemFiles.find((f) => f.id === "R2")!.contents, /Verdict: met/);
 });
 
 test("plan-items view: the status view shows the counts line", () => {
@@ -129,11 +132,13 @@ test("plan-items view: the status view shows the counts line", () => {
   assert.match(text, /items\s+R 2\/2 met · A 1\/1 fit · C 1\/1/);
 });
 
-test("plan-items view: an unstructured plan adds no matrix section", () => {
+test("plan-items view: an old-format plan's synthesized items appear in the matrix too", () => {
   const plain: RunPlanPhase = { id: "p1", goal: "g", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false };
-  const rendered = projectEntryReview({ phaseId: "p1", contract: buildContract(plain), messages: [], entries: [] });
-  assert.doesNotMatch(rendered.text, /Plan items/);
-  // The pure renderer still synthesizes the old format's R1; the views only
-  // append the section for a structured contract.
+  const contract = buildContract(plain);
+  assert.equal(contract.itemsSynthesized, true, "the conductor synthesized the old format's items");
+  assert.deepEqual(contract.requirements!.map((r) => r.id), ["R1"]);
+  const rendered = projectEntryReview({ phaseId: "p1", contract, messages: [], entries: [] });
+  assert.match(rendered.text, /\* Plan items/);
+  assert.match(rendered.text, /\[\[items\/R1\.org\]\[R1 it works\]\]/);
   assert.deepEqual(tallyItems({ goal: "", architecture: [], requirements: [], constraints: [] }, []), []);
 });

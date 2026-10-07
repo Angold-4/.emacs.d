@@ -1104,6 +1104,13 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     for (const name of readdirSync(p.entriesView)) {
       if (name.endsWith(".org") && !entryIds.has(name.slice(0, -4))) rmSync(path.join(p.entriesView, name), { force: true });
     }
+    // Plan 06b: the item evidence files the matrix cells open.
+    mkdirSync(p.itemsView, { recursive: true });
+    const itemIds = new Set(entryReview.itemFiles.map((f) => f.id));
+    for (const f of entryReview.itemFiles) writeFileSync(path.join(p.itemsView, `${f.id}.org`), f.contents);
+    for (const name of readdirSync(p.itemsView)) {
+      if (name.endsWith(".org") && !itemIds.has(name.slice(0, -4))) rmSync(path.join(p.itemsView, name), { force: true });
+    }
     // Plan 05j: a render that named a violation records it (findings A-18,
     // B-13). `check` never mutates, only `rebuild`.
     recordLintFailures(runDir, entryReview.lint);
@@ -1474,6 +1481,12 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
   for (const f of entryReview.files) writeFileSync(path.join(p.entriesView, `${f.id}.org`), f.contents);
   for (const name of readdirSync(p.entriesView)) {
     if (name.endsWith(".org") && !entryIds.has(name.slice(0, -4))) rmSync(path.join(p.entriesView, name), { force: true });
+  }
+  mkdirSync(p.itemsView, { recursive: true });
+  const itemIds = new Set(entryReview.itemFiles.map((f) => f.id));
+  for (const f of entryReview.itemFiles) writeFileSync(path.join(p.itemsView, `${f.id}.org`), f.contents);
+  for (const name of readdirSync(p.itemsView)) {
+    if (name.endsWith(".org") && !itemIds.has(name.slice(0, -4))) rmSync(path.join(p.itemsView, name), { force: true });
   }
   process.stdout.write(`recorded entry ${op} for ${entryId} in run ${path.basename(runDir)}\n`);
 }

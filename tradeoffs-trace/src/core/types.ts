@@ -77,6 +77,13 @@ export interface PhaseContract {
   architecture?: ArchitectureItem[];
   requirements?: RequirementItem[];
   constraints?: ConstraintItem[];
+  /** Plan 06b: true when the conductor synthesized these items from an
+   * old-format `acceptance`/`:RESERVED:` list. The items are carried through
+   * the matrix and acceptance either way; the coverage and per-item verdict
+   * REQUIREMENTS apply once the worker has submitted coverage (the extension
+   * makes every real worker do so), so a hand-built in-process plan keeps its
+   * old behaviour. */
+  itemsSynthesized?: boolean;
   /** Plan 01f: the phase's own expensive, live command (the plan's `:GATE:`
    * property). Declaring one inserts a GATING stage between RESOLVING and
    * ACCEPTED: the conductor runs this command itself, once per candidate the

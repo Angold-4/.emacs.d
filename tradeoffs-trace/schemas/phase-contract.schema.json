@@ -13,7 +13,11 @@
     "acceptance": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
     "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-    "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+    "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "architecture": { "type": "array", "items": { "type": "object" } },
+    "requirements": { "type": "array", "items": { "type": "object" } },
+    "constraints": { "type": "array", "items": { "type": "object" } },
+    "itemsSynthesized": { "type": "boolean" }
   },
   "$defs": {
     "ContractVersion": {

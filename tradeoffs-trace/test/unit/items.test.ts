@@ -127,6 +127,12 @@ test("items: a test verify is resolved against the node check output by name", (
   assert.equal(testOutcomeIn(output, "lanes: two candidates"), "passed");
   assert.equal(testOutcomeIn(output, "lanes: one worker"), "failed");
   assert.equal(testOutcomeIn(output, "never ran"), "missing");
+  // The name is the reporter's own token, never a substring of a longer one
+  // (finding M-14): `lanes: tally` must not be satisfied by `lanes: tally
+  // extended`.
+  assert.equal(testOutcomeIn("✔ lanes: tally extended", "lanes: tally"), "missing");
+  assert.equal(testOutcomeIn("ok 3 - lanes: tally extended", "lanes: tally"), "missing");
+  assert.equal(testOutcomeIn("✔ lanes: tally", "lanes: tally"), "passed");
   const resolved = resolveTestVerifies(structured, output);
   assert.deepEqual(resolved, [
     { id: "R1", name: "lanes: two candidates", outcome: "passed" },
@@ -212,10 +218,35 @@ test("items: the evaluator overturns a majority unmet verdict the item's passing
     { seat: "A", verdict: "unmet", evidence: "src/a.ts:1" },
     { seat: "B", verdict: "met", evidence: "src/a.ts:1" },
   ];
-  const overturn = reverify(item, verdicts, ctx);
-  assert.ok(overturn);
-  assert.equal(overturn!.seat, "M");
-  assert.equal(overturn!.id, "R1");
+  const overturns = reverify(item, verdicts, ctx);
+  // Every contradicted seat is overturned and counted (finding M-3).
+  assert.equal(overturns.length, 2);
+  assert.deepEqual(overturns.map((o) => o.seat).sort(), ["A", "M"]);
+  assert.equal(overturns[0].id, "R1");
+  assert.equal(overturns[0].effect, "flip");
+});
+
+test("items: a majority deviates on an architecture item whose :WHERE: symbols are present is overturned (B-18)", () => {
+  const arch = structured.architecture[0];
+  const item = { kind: "architecture" as const, id: arch.id, title: arch.title, text: arch.text, arch: [], verify: [], where: arch.where, tags: arch.tags };
+  const verdicts: SeatItemVerdict[] = [
+    { seat: "M", verdict: "deviates", evidence: "src/a.ts:1" },
+    { seat: "A", verdict: "deviates", evidence: "src/a.ts:1" },
+    { seat: "B", verdict: "fits", evidence: "src/a.ts:1" },
+  ];
+  const ctx = {
+    lineCount: () => 10,
+    diffFiles: ["src/a.ts"],
+    testOutcomes: new Map(),
+    reviewerReadFiles: ["src/a.ts"],
+    workerAnchors: [],
+    archSymbolsPresent: () => true,
+  };
+  const overturns = reverify(item, verdicts, ctx);
+  assert.equal(overturns.length, 2);
+  assert.ok(overturns.every((o) => o.effect === "flip"));
+  // The flipped tally is a majority fits.
+  assert.equal(tallyItems({ goal: "", architecture: [arch], requirements: [], constraints: [] }, [{ seat: "M", items: { items: [], arch: [{ id: arch.id, verdict: "deviates", evidence: "src/a.ts:1" }] } }, { seat: "A", items: { items: [], arch: [{ id: arch.id, verdict: "deviates", evidence: "src/a.ts:1" }] } }, { seat: "B", items: { items: [], arch: [{ id: arch.id, verdict: "fits", evidence: "src/a.ts:1" }] } }], overturns)[0].outcome, "fits");
 });
 
 test("items: the matrix and the counts line show every item by seat", () => {

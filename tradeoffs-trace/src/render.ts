@@ -26,7 +26,7 @@ import {
 } from "./core/entries.ts";
 import { runReviewLint, type ReviewLintResult } from "./core/review-lint.ts";
 import { ledgerEntries } from "./core/messages.ts";
-import { countsLine, matrixMarkdown, overturnCounts, phaseItemCounts, type ItemLoopState } from "./core/items.ts";
+import { countsLine, itemEvidenceFiles, matrixMarkdown, matrixOrg, overturnCounts, phaseItemCounts, type ItemLoopState } from "./core/items.ts";
 import type { Timeline } from "./conductor.ts";
 import type { RunView } from "./view.ts";
 
@@ -421,6 +421,9 @@ export interface EntryReviewRender {
   text: string;
   /** One `views/entries/<id>.org` per live entry. */
   files: Array<{ id: string; contents: string }>;
+  /** Plan 06b: one `views/items/<id>.org` per item, the evidence a matrix
+   * cell opens. */
+  itemFiles: Array<{ id: string; contents: string }>;
   lint: ReviewLintResult;
 }
 
@@ -482,12 +485,13 @@ export function projectEntryReview(
     overturns: phase.overturns,
   } as ItemLoopState;
   const structuredContract = Boolean(phase.contract) && (phase.contract!.architecture !== undefined || phase.contract!.requirements !== undefined || phase.contract!.constraints !== undefined);
-  const matrix = structuredContract ? matrixMarkdown(itemsPhase) : [];
+  const matrix = structuredContract ? matrixOrg(itemsPhase) : [];
   if (matrix.length > 0) {
     text += `\n* Plan items\n  ${countsLine(phaseItemCounts(itemsPhase))}\n\n${matrix.map((l) => `  ${l}`).join("\n")}\n`;
   }
   const files = projected.views.filter((v) => v.live).map((v) => ({ id: v.entry.id, contents: renderEntryFile(v) }));
-  return { text, files, lint };
+  const itemFiles = structuredContract ? itemEvidenceFiles(itemsPhase) : [];
+  return { text, files, itemFiles, lint };
 }
 
 /** The messages an evaluator merged into TARGET, so the target's own file

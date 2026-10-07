@@ -1509,26 +1509,37 @@ inert as it was before the key existed — no error, and nothing opened."
   (concat "* Plan items\n"
           "  R 2/2 met · A 1/1 fit · C 1/1\n\n"
           "  | item | worker | check | M | A | B |\n"
-          "  | R1 Two candidates | done | pass | met | met | met |\n"
-          "  | A1 Round | yes | — | fits | fits | fits |\n")
+          "  |------+--------+-------+---+---+---|\n"
+          "  | [[items/R1.org][R1 Two candidates]] | done | pass | met | met | met |\n"
+          "  | [[items/A1.org][A1 Round]] | yes | — | fits | fits | fits |\n")
   "Plan 06b: the item-by-seat matrix the runtime appends to `views/review.org'.")
 
 (ert-deftest tradeoffs-trace-review-item-matrix ()
-  "Plan 06b: the review buffer shows the item-by-seat matrix and the counts."
-  (let ((dir (make-temp-file "tt-ert-items" t)))
+  "Plan 06b: the review buffer shows the item-by-seat matrix and the counts,
+and RET on a row opens the item's evidence file."
+  (let ((dir (make-temp-file "tt-ert-items" t)) (opened nil))
     (unwind-protect
         (progn
-          (make-directory (expand-file-name "views" dir) t)
+          (make-directory (expand-file-name "views/items" dir) t)
           (with-temp-file (expand-file-name "views/review.org" dir)
             (insert +tt-test--review-items-org))
+          (with-temp-file (expand-file-name "views/items/R1.org" dir)
+            (insert "* R1 Two candidates\n* Verdict: met\n  - M: met — src/core/rounds.ts:1\n"))
           (let ((+tt--run-dir dir)) (+tt-review))
           (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
           (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
             (with-current-buffer buf
               (should (string-match-p "Plan items" (buffer-string)))
               (should (string-match-p "R 2/2 met · A 1/1 fit · C 1/1" (buffer-string)))
-              (should (string-match-p "R1 Two candidates | done | pass | met" (buffer-string)))
-              (should (string-match-p "A1 Round | yes" (buffer-string))))))
+              (should (string-match-p "R1 Two candidates" (buffer-string)))
+              (should (string-match-p "A1 Round" (buffer-string)))
+              ;; RET on the R1 matrix row opens its item evidence file.
+              (goto-char (point-min))
+              (search-forward "R1 Two candidates")
+              (goto-char (match-beginning 0))
+              (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
+                (+tt-review-open-message))
+              (should (equal opened (expand-file-name "views/items/R1.org" dir))))))
       (delete-directory dir t))))
 
 (defun +tt-test--review-buffer (dir)
