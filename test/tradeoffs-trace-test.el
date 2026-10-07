@@ -7,6 +7,17 @@
 (require 'ert)
 (require 'init-tradeoffs-trace)
 
+;; ODP-1: loading the module installs its global mode-line and notification
+;; timers (+tt--ensure-mode-line's 1 s first tick, the workspace refresh
+;; timer). In a slow ERT run the real timer can fire inside a test and start
+;; its own async `tt` calls, which is a test-isolation bug, not a code bug.
+;; Cancel every load-time timer here, before any test runs; the two tests that
+;; exercise the tick call it directly.
+(dolist (timer-var '(+tt--mode-line-timer +tt--notify-timer +tt--timer))
+  (let ((timer (symbol-value timer-var)))
+    (when (timerp timer) (cancel-timer timer))
+    (set timer-var nil)))
+
 (defconst +tt-test--valid-plan "#+TITLE: sum validation
 #+TT_REPO: /tmp/tt-ert-repo
 #+TT_BRANCH: main

@@ -25,6 +25,8 @@ import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
 import { renderGlossaryOrg } from "./core/briefs.ts";
 import { runReviewLint } from "./core/review-lint.ts";
 import { candidateAnchorFreshness } from "./render.ts";
+// 06a finding #24: the program status names its models check's result.
+import { modelsCheckStatusText, parseModelsCheck } from "./core/models-check.ts";
 
 import {
   expandProgram,
@@ -754,9 +756,17 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
   const { program, nodes, state, readableIds, at } = foldProgram(dir);
   const outcome = programOutcome(nodes, state);
   const alive = pidAlive(programPaths(dir).pid);
+  // 06a finding #24: the models preflight's own line, when the program ran it.
+  let modelsCheck: string | undefined;
+  try {
+    modelsCheck = modelsCheckStatusText(parseModelsCheck(JSON.parse(fs.readFileSync(path.join(dir, "models-check.json"), "utf8"))));
+  } catch {
+    modelsCheck = undefined;
+  }
   const lines = [
     `${program.title}`,
     `program ${path.basename(dir)} · scheduler ${alive ? "running" : "stopped"} · ${outcome} · max ${program.maxParallel} in parallel`,
+    ...(modelsCheck ? [`models    ${modelsCheck}`] : []),
     "",
   ];
   const mark: Record<NodeStatus, string> = {

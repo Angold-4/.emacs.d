@@ -246,9 +246,39 @@ readlink ~/.tradeoffs-trace/runner/current
 - For the CLI, alias the installed copy:
   `alias tt=~/.tradeoffs-trace/runner/current/tradeoffs-trace/bin/tt`
 
+## Checks for this repository (`check`, `check-e2e`, `check-full`)
+
+`tradeoffs-trace/Makefile` has three targets:
+
+| Target | What it runs | Cost |
+|---|---|---|
+| `make -C tradeoffs-trace check` | the fast suite: unit, contract, effects and fake-pi tests plus ERT | under 60 s on an idle machine |
+| `make -C tradeoffs-trace check-e2e FILES="…"` | only the named conductor test files, with the full suite's own concurrency (3) and 180 s per-command timeout | the named files |
+| `make -C tradeoffs-trace check-full` | today's whole suite: every `test/**/*.test.ts` (including the real-process conductor, crash and live files) plus ERT | 7–15 min |
+
+`crash` (the full crash-boundary sweep) and `live` (the opt-in real-Pi smoke
+tests) are unchanged.
+
+A phase that changes `tradeoffs-trace` writes its `#+TT_CHECKS` as the fast
+check plus one `check-e2e` naming the conductor test files it touches:
+
+```org
+#+TT_CHECKS: make -C tradeoffs-trace check && make -C tradeoffs-trace check-e2e FILES="test/conductor/flakes.test.ts"
+```
+
+Each `#+TT_CHECKS` line is one shell command, so the `&&` runs `check-e2e`
+only when `check` passed; a phase whose two lists must run independently can
+use two `#+TT_CHECKS` lines instead. The named files are exactly the phase's
+own conductor tests; a phase whose work is all in the fast suite names none.
+The conductor still re-runs a newly failing test alone (see "Flaky tests:
+re-run before failing"): the reporter's own file line locates the test, so the
+re-run targets that one file even though `TT_CHECKS` ran a subset.
+`check-full` is the conductor's gate command for the phases that change the
+conductor itself (06a–06e), not something a worker runs on every attempt.
+
 ## Start a run
 
-1. Write or open an Org plan (`~/orgw/PLAN_TEMPLATE.md`). Set `#+TT_BRANCH` to the branch the result publishes to, and `#+TT_CHECKS` to a check command that finishes in a few minutes.
+1. Write or open an Org plan (`~/orgw/PLAN_TEMPLATE.md`). Set `#+TT_BRANCH` to the branch the result publishes to, and `#+TT_CHECKS` to a check command that finishes in a few minutes (see "Checks for this repository" above).
 2. Make sure no checkout has `TT_BRANCH` checked out, or publishing will collide with it.
 3. In the plan buffer, press `C-c m r`. Emacs validates the plan (errors open in `*tt-plan-errors*`), starts the conductor and opens the workspace tab.
 
@@ -364,12 +394,18 @@ By default every role — the worker, the three reviewers (M, A, B), the
 message evaluators and the blocker panel — runs on Pi's own `defaultModel`
 (`~/.pi/agent/settings.json`). A plan can give a role, or each of its seats, a
 stronger (or just different) model with one keyword. The owner's own
-configuration, with a different model family per reviewer seat and the panel
+configuration (design 06, 2026-10-07): the worker on `deepseek-v4.1-flash-fast`,
+a different model family per reviewer seat (M `claude-opus-5.5`, A
+`gpt-6.1-sol`, B `grok-4.6`), the evaluator on M's model and the panel
 following the reviewers:
 
 ```org
-#+TT_MODELS: worker=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers
+#+TT_MODELS: worker=vercel-ai-gateway:deepseek/deepseek-v4.1-flash-fast reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=vercel-ai-gateway:openai/gpt-6.1-sol reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers
 ```
+
+Not every model the catalog lists is reachable: the owner's 2026-10-07 probe
+found `spacexai/grok-4.7` answering **403 `restricted`** through the team's
+Vercel AI Gateway, so it is not in the line above.
 
 Space-separated declarations, one per line in the real plans:
 
@@ -405,6 +441,30 @@ What ran is visible: `views/loop.txt` names each reviewer and panel seat's
 model when the seats differ (and the compact per-role line when they do not),
 `tt status` and the status buffer print one `models` line naming `reviewer.M`,
 `panel.1`, …, and `tt summary`'s PR body lists the models per seat.
+
+### `tt models check` (the model preflight)
+
+Before a run or a program spends its first minute on a model the gateway will
+refuse, `tt start` and `tt program start` probe every distinct configured
+provider/model: one tiny prompt in Pi's print mode per distinct model, a 60 s
+bound each, in parallel. Each is reported `ok`, `refused` (with the gateway's
+own message, e.g. `403 restricted`) or `unreachable` (a timeout, a crash, a
+connection error). The record is written to the run/program directory as
+`models-check.json`, and the status `models` line shows it (`check ok`, or
+`check grok-4.7 refused (403 restricted)`).
+
+```sh
+tt models check plan.json      # the same probe on its own; non-zero when any is not ok
+tt models check program.json   # every entry's distinct models
+tt start plan.json             # refuses when a configured model is refused
+tt program start program.json  # likewise for every entry
+```
+
+A **refused** model stops the start (nothing is launched); `--skip-models-check`
+starts anyway, and the refusal is still recorded and shown. An **unreachable**
+model does not stop a start — it may be a transient network problem, not a
+gateway policy — but `tt models check` exits non-zero for it. A plan with no
+`#+TT_MODELS` probes nothing.
 
 `tt lint` rejects, at the keyword's file and line: an unknown role
 (`foo=…`), an unknown seat (`reviewer.X`, `panel.4`), a key named twice, a key

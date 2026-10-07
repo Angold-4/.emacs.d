@@ -11,6 +11,8 @@ import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFil
 import { loopTapeHead, renderLoopTape, tapeLabel, type ChartModels } from "./charts.ts";
 import { effectiveChecks } from "./core/checks.ts";
 import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
+// 06a finding #24: the `models` line also carries the models check's result.
+import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./core/models-check.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
@@ -706,12 +708,18 @@ export function buildView(
     limits: stageLimits(plan),
   };
   const tape = renderLoopTape(tapeInput);
+  // 06a finding #24: the `models` row names what the plan configured AND what
+  // the preflight found (`check ok`, or the refused model and its gateway
+  // message).
+  const modelsText = modelsLineText(plan.models);
+  const modelsCheckText = modelsCheckStatusText(readModelsCheck(runDir));
+  const models = [modelsText, modelsCheckText].filter((s): s is string => s !== undefined && s.length > 0).join(" · ") || undefined;
   return {
     timeline,
     tape,
     metrics,
     metricsLine: metricsLine(metrics),
-    models: modelsLineText(plan.models),
+    models,
     loop: loopTapeHead(tapeInput),
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
@@ -803,6 +811,17 @@ export function gateSummaryLine(record: GateRecord, acceptedAtBase?: string): st
 function readBaseline(runDir: string): Baseline | undefined {
   try {
     return parseBaseline(JSON.parse(fs.readFileSync(path.join(runPaths(runDir).checks, "base", "baseline.json"), "utf8")));
+  } catch {
+    return undefined;
+  }
+}
+
+/** 06a finding #24: the models check's record at `<run>/models-check.json`,
+ * or undefined when it has not run (an old run, or a plan with no
+ * `#+TT_MODELS`). A malformed record is no record. */
+function readModelsCheck(runDir: string): ModelsCheck | undefined {
+  try {
+    return parseModelsCheck(JSON.parse(fs.readFileSync(path.join(runDir, "models-check.json"), "utf8")));
   } catch {
     return undefined;
   }
