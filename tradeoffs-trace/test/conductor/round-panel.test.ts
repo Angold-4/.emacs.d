@@ -62,6 +62,13 @@ function workerDelegated() {
 function discoveringReviewer() {
   return (reviewer: string, state: State) => {
     const worker = state.phase.decisions.find((d) => d.source === "worker");
+    const C = state.phase.candidate?.sha;
+    // A re-dispatched seat (a timeout under load) must not discover the same
+    // choice twice: its own earlier discovery already exists on this
+    // candidate. The script is keyed by agent id, so a retry re-runs it.
+    const alreadyDiscovered = state.phase.decisions.some(
+      (d) => d.source === "reviewer-discovered" && d.boundCandidateSha === C && d.id.includes(`-disc-${reviewer}-`),
+    );
     return {
       hello: defaultReviewerHello(),
       steps: [
@@ -72,7 +79,7 @@ function discoveringReviewer() {
             // Both M and A discover one detail choice: two pending items, so
             // the same single panel (three seats) must cover both at once.
             discoveries:
-              reviewer === "B"
+              reviewer === "B" || alreadyDiscovered
                 ? []
                 : [
                     {
