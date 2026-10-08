@@ -717,10 +717,13 @@ accepts the candidate and lists the carried items in the run record and in
 `tt summary`, as input for the next phase's plan. If a blocking item is open,
 the owner sees only the blocking items.
 
-The carry waives the **open review items only**. It never waives the
-mechanical gates: the checks must have passed for the carried candidate, the
-probe must be that candidate's onto the current integration head, and the
-candidate under acceptance must be the one the carry was given for.
+The carry waives the **open review items only** — reviewer verdicts, findings,
+decisions and corrections. It never waives the mechanical gates: the checks
+must have passed for the carried candidate, the probe must be that candidate's
+onto the current integration head, the candidate under acceptance must be the
+one the carry was given for, a named `test` verify must have passed, no
+`:WHERE:` symbol deviation may stand unaccepted, and every `evidence` item
+must be recorded.
 
 The owner's disposition is the command
 

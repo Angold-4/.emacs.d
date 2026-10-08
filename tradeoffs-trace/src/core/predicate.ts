@@ -493,12 +493,41 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     return false;
   }
 
-  // Plan 06g (A6/ODP-2): the owner's "accept with carried items" decision at
-  // the end of the round budget accepts the candidate the carry was given for
-  // (`carriedCandidateSha`), waiving only the OPEN REVIEW ITEMS — the open
-  // findings, decisions and corrections that are carried. It never waives the
-  // mechanical gates just checked, the candidate binding, or a gate/probe for
-  // another candidate.
+  // Plan 06b (OD-1): a STRUCTURED phase additionally requires its `test`
+  // verifies passed, no unaccepted `:WHERE:` symbol deviation, and every
+  // `evidence` item recorded. These are MECHANICAL item gates (ODP-3): they are
+  // evaluated BEFORE the owner's carry shortcut, so a carry can never waive a
+  // missing named test verify, a symbol deviation or unrecorded evidence. The
+  // item REVIEW VERDICTS (the tally below) are review items the carry does
+  // waive. An old-format phase declares no items and keeps today's rule.
+  const itemsEnforced = isStructured(phase.contract);
+  const items = itemsEnforced ? itemsFromPhase(phase.contract) : undefined;
+  let acceptedDeviations: Set<string> | undefined;
+  let evidenceRecorded: string[] | undefined;
+  if (itemsEnforced) {
+    if (testVerifyProblems(phase.checkResolution ?? []).length > 0) return false;
+    // An architecture deviation is accepted when the owner accepts the item's
+    // own blocking finding as a trade-off (`accept_risk`), or when it is
+    // recorded in `acceptedDeviations`.
+    acceptedDeviations = new Set([
+      ...(phase.acceptedDeviations ?? []),
+      ...phase.findings.filter((f) => f.itemId && f.status === "accepted").map((f) => f.itemId!),
+    ]);
+    // A `:WHERE:` symbol the conductor could not find is a deviation the
+    // owner must accept before acceptance, whatever the seats said.
+    if ((phase.archSymbolDeviations ?? []).some((id) => !acceptedDeviations!.has(id))) return false;
+    evidenceRecorded = (phase.itemEvidence ?? []).map((e) => e.id);
+    // Every `evidence` item is owner-recorded, never waived by a carry.
+    if (flatItems(items!).some((i) => itemNeedsEvidence(i) && !evidenceRecorded!.includes(i.id))) return false;
+  }
+
+  // Plan 06g (A6/ODP-2/ODP-3): the owner's "accept with carried items" decision
+  // at the end of the round budget accepts the candidate the carry was given
+  // for (`carriedCandidateSha`), waiving only the OPEN REVIEW ITEMS — the
+  // review verdicts, open findings, decisions and corrections that are carried.
+  // It never waives the mechanical gates above (checks, probe, test verifies,
+  // symbol deviations, evidence), the candidate binding, or another
+  // candidate's gate/probe.
   if (phase.acceptedWithCarried) return phase.carriedCandidateSha === C;
 
   for (const who of ["M", "A", "B"] as const) {
@@ -507,32 +536,16 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
   }
 
-  // Plan 06b (OD-1): a STRUCTURED phase additionally requires every item point
-  // met (or fit), its `test` verifies passed, and every `evidence` item
-  // recorded. An old-format phase declares no items and keeps today's rule.
-  const itemsEnforced = isStructured(phase.contract);
   if (itemsEnforced) {
-    const items = itemsFromPhase(phase.contract);
     const reviews = (["M", "A", "B"] as const).map((seat) => {
       const r = phase.reviews[seat]?.review;
       return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
     });
-    if (testVerifyProblems(phase.checkResolution ?? []).length > 0) return false;
-    // An architecture deviation is accepted when the owner accepts the item's
-    // own blocking finding as a trade-off (`accept_risk`), or when it is
-    // recorded in `acceptedDeviations`.
-    const acceptedDeviations = new Set([
-      ...(phase.acceptedDeviations ?? []),
-      ...phase.findings.filter((f) => f.itemId && f.status === "accepted").map((f) => f.itemId!),
-    ]);
-    // A `:WHERE:` symbol the conductor could not find is a deviation the
-    // owner must accept before acceptance, whatever the seats said.
-    if ((phase.archSymbolDeviations ?? []).some((id) => !acceptedDeviations.has(id))) return false;
-    const outcomes = tallyItems(items, reviews, phase.overturns ?? []);
+    const outcomes = tallyItems(items!, reviews, phase.overturns ?? []);
     if (
-      !itemsAccept(items, outcomes, {
-        acceptedDeviations: [...acceptedDeviations],
-        evidenceRecorded: (phase.itemEvidence ?? []).map((e) => e.id),
+      !itemsAccept(items!, outcomes, {
+        acceptedDeviations: [...acceptedDeviations!],
+        evidenceRecorded: evidenceRecorded!,
       })
     ) {
       return false;

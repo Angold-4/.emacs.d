@@ -1556,13 +1556,13 @@ test("plan 06g: a phase still blocked after three rounds stops AWAITING_OWNER an
   }
 });
 
-test("plan 06g: with only advisories open at the end of the budget, tt carry accepts the candidate and tt summary lists the carried items", async () => {
-  // A structured phase whose R2 is an `evidence` item the owner never records,
-  // so acceptance cannot complete. Rounds 1 and 2 raise a GROUNDED blocking
-  // finding (withdrawn the next round); round 3 raises an advisory. With the
-  // default budget of 3 rounds the phase parks on the owner with only that
-  // advisory open. `tt carry` then accepts the candidate and the carried item
-  // reaches `tt summary`.
+test("plan 06g: tt carry accepts once no blocking item remains uncarried and lists each carried item with its target", async () => {
+  // A structured phase whose R2 is an `evidence` item, RECORDED up front so
+  // the carry never waives a mechanical gate (ODP-3). Rounds 1 and 2 raise a
+  // GROUNDED blocking finding (withdrawn the next round); round 3 raises one
+  // grounded blocking finding and one advisory. With the default budget of 3
+  // rounds the phase parks on the owner; the owner carries each open review
+  // item and the candidate is accepted, with both items reaching `tt summary`.
   const items = {
     architecture: [],
     requirements: [
@@ -1609,7 +1609,10 @@ test("plan 06g: with only advisories open at the end of the budget, tt carry acc
         reviewer === "M"
           ? round <= 2
             ? [{ kind: "defect", severity: "blocking", evidence: "R1 (R1 proves it) is unmet: src/core/rounds.ts:1 still drops the second lane" }]
-            : [{ kind: "defect", severity: "advisory", evidence: "a further edge path worth carrying into the next phase's plan" }]
+            : [
+                { kind: "defect", severity: "blocking", evidence: "R1 (R1 proves it) is unmet: src/core/rounds.ts:1 still drops the second lane" },
+                { kind: "defect", severity: "advisory", evidence: "a further edge path worth carrying into the next phase's plan" },
+              ]
           : [];
       return {
         hello: defaultReviewerHello(),
@@ -1645,35 +1648,153 @@ test("plan 06g: with only advisories open at the end of the budget, tt carry acc
   });
   await setup.conductor.start();
   try {
+    // Record the evidence item up front, so the carry never has to waive a
+    // mechanical gate (ODP-3): it accepts only once the gates hold and the
+    // remaining open items are review items.
+    await runCli(["evidence", setup.runDir, "R2", "the live run is in NOTES.md", "--root", setup.runRoot]);
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
     const parked = setup.conductor.state.phase;
     assert.equal(parked.repairRoundsUsed, 2, "two repairs (three rounds) were spent");
     assert.equal(parked.repairRoundsGranted, 2, "and the budget is spent, so no fourth round may start");
     assert.equal(parked.attempt.n, 3, "three rounds ran, and no fourth worker attempt was launched");
-    // Only advisories are open, so the owner's one decision is accept with
-    // carried items.
+    assert.deepEqual(parked.itemEvidence?.map((e) => e.id), ["R2"], "the evidence gate is satisfied, not waived");
+    // Round 3 leaves a grounded blocking finding and one advisory open.
+    const blocking = parked.findings.find((f) => f.status === "open" && f.severity === "blocking")!;
     const advisory = parked.findings.find((f) => f.status === "open" && f.severity === "advisory")!;
-    assert.ok(advisory, "the round-3 advisory is the only open finding");
+    assert.ok(blocking && advisory, "the round-3 blocking finding and advisory are open");
+    const request = parked.ownerRequests.find((r) => r.status === "open" && r.linkedFindingId === blocking.id)!;
+    assert.ok(request, "the owner is asked about the blocking finding");
+
+    // The owner carries each open review item through the real CLI. Carrying
+    // the advisory alone does not accept (the blocking finding is uncarried);
+    // carrying the blocking finding then accepts the candidate.
+    const advisoryCarry = await runCli(["carry", setup.runDir, advisory.id, "--to", "06h", "--root", setup.runRoot]);
+    assert.match(advisoryCarry.stdout, new RegExp(`carried ${advisory.id} to 06h`));
+    assert.notEqual(setup.conductor.state.phase.phase, "DONE", "one uncarried blocking item still holds acceptance");
+    const blockingCarry = await runCli(["carry", setup.runDir, blocking.id, "--to", "06h", "--root", setup.runRoot]);
+    assert.match(blockingCarry.stdout, new RegExp(`carried ${blocking.id} to 06h`));
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const done = setup.conductor.state.phase;
+    assert.equal(done.acceptedWithCarried, true);
+    assert.ok(done.carriedItems?.includes(advisory.id), "the advisory is recorded");
+    assert.ok(done.carriedItems?.includes(blocking.id), "the blocking item is recorded");
+    assert.equal(done.carriedTo?.[advisory.id], "06h", "with the target phase the owner named");
+    assert.equal(done.carriedTo?.[blocking.id], "06h", "with the target phase the owner named");
+    const summary = prSummary(setup.runDir, setup.plan);
+    assert.match(summary, /### Carried items \(2\)/);
+    assert.match(summary, new RegExp(`${advisory.id}.* → 06h`));
+    assert.match(summary, new RegExp(`${blocking.id}.* → 06h`));
+    // The status view lists them too, with the target (A5).
+    const status = fs.readFileSync(path.join(runPaths(setup.runDir).status), "utf8");
+    assert.match(status, /Carried items \(2\)/);
+    assert.match(status, new RegExp(`${advisory.id} → 06h`));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06g: tt carry never waives a missing named test verify or unrecorded evidence", async () => {
+  // ODP-3: the carry replaces only the review-verdict tally. A missing named
+  // test verify or an unrecorded `evidence` item is a mechanical gate and must
+  // keep holding, so the phase stays parked after the carry.
+  const items = {
+    architecture: [],
+    requirements: [
+      { id: "R1", title: "R1 proves it", text: "R1 proves it", arch: [], verify: ['test "R1 proves it"'] },
+      { id: "R2", title: "R2 owner run", text: "the owner live run is recorded", arch: [], verify: ["evidence"] },
+    ],
+    constraints: [],
+  };
+  const setup = await setupConductor({
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    phase: {
+      id: "p1",
+      goal: "keep the loop short",
+      acceptance: items.requirements.map((r) => r.text),
+      checks: [CHECK_OUTPUT],
+      boundaries: [],
+      reserved: [],
+      provisional: false,
+      ...items,
+    },
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `mkdir -p src/core && printf 'interface Round { n: number } // ${attempt}\\n' > src/core/rounds.ts` },
+        {
+          kind: "call-submit",
+          tool: "submit_coverage",
+          args: {
+            items: [
+              { id: "R1", status: "done", where: ["src/core/rounds.ts:1"], tests: ["R1 proves it"] },
+              { id: "R2", status: "done", where: [], tests: [] },
+            ],
+            arch: [],
+          },
+        },
+        submitPhaseStep(),
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const round = state.phase.round ?? 1;
+      const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === reviewer);
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: open
+                .filter((f) => f.boundCandidateSha !== state.phase.candidate?.sha)
+                .map((f) => ({ findingId: f.id, status: "withdraw", evidence: "withdrawn: the new candidate no longer carries it" })),
+              ballots: [],
+              items: [
+                { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+                { id: "R2", verdict: "met", evidence: "src/core/rounds.ts:1" },
+              ],
+              arch: [],
+              findings:
+                reviewer === "M"
+                  ? round <= 2
+                    ? [{ kind: "defect", severity: "blocking", evidence: "R1 (R1 proves it) is unmet: src/core/rounds.ts:1 still drops the second lane" }]
+                    : [{ kind: "defect", severity: "advisory", evidence: "a further edge path worth carrying into the next phase's plan" }]
+                  : [],
+            },
+          },
+        ],
+      };
+    },
+    deadlines: { ...FAST, inboxPollMs: 40 },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
+    const parked = setup.conductor.state.phase;
+    // R2 is unrecorded, so the park is the evidence gate; only the advisory is
+    // open, and the owner is offered accept-with-carried.
+    assert.deepEqual(parked.itemEvidence ?? [], [], "R2 is not recorded");
+    const advisory = parked.findings.find((f) => f.status === "open" && f.severity === "advisory")!;
+    assert.ok(advisory, "the advisory is open");
     assert.ok(!parked.findings.some((f) => f.status === "open" && f.severity === "blocking"), "no blocking finding is open");
     const request = parked.ownerRequests.find((r) => r.status === "open")!;
     assert.deepEqual(request.options.map((o) => o.id), ["accept_carried"], "the owner's single decision is accept with carried items");
 
-    // The owner carries the advisory through the real CLI: the candidate is
-    // accepted and the carried item is listed for the next phase.
-    const { stdout: carryOut } = await runCli(["carry", setup.runDir, advisory.id, "--to", "06h", "--root", setup.runRoot]);
-    assert.match(carryOut, new RegExp(`carried ${advisory.id} to 06h`));
-    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
-    const done = setup.conductor.state.phase;
-    assert.equal(done.acceptedWithCarried, true);
-    assert.ok(done.carriedItems?.includes(advisory.id), "the carried item is recorded");
-    assert.equal(done.carriedTo?.[advisory.id], "06h", "with the target phase the owner named");
-    const summary = prSummary(setup.runDir, setup.plan);
-    assert.match(summary, /### Carried items \(1\)/);
-    assert.match(summary, new RegExp(`${advisory.id}.* → 06h`));
-    // The status view lists them too, with the target (A5).
-    const status = fs.readFileSync(path.join(runPaths(setup.runDir).status), "utf8");
-    assert.match(status, /Carried items \(1\)/);
-    assert.match(status, new RegExp(`${advisory.id} → 06h`));
+    // The carry is recorded, but it must NOT accept: the evidence gate holds.
+    const carry = await runCli(["carry", setup.runDir, advisory.id, "--to", "06h", "--root", setup.runRoot]);
+    assert.match(carry.stdout, new RegExp(`carried ${advisory.id} to 06h`));
+    assert.notEqual(setup.conductor.state.phase.phase, "DONE", "the carry never waives an unrecorded evidence item");
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 30_000, 20, setup.runDir);
+    assert.deepEqual(setup.conductor.state.phase.itemEvidence ?? [], [], "the evidence is still unrecorded");
   } finally {
     await teardown(setup);
   }

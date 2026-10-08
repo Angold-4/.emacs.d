@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { buildContract, type RunPlanPhase } from "../../src/conductor.ts";
 import { applyItemCarried, applyOwnerRequestResolved } from "../../src/core/owner-commands.ts";
 import { openItemOwnerRequestsFor } from "../../src/core/owner-requests.ts";
 import { accept } from "../../src/core/predicate.ts";
@@ -100,6 +101,9 @@ test("plan 06g: taking accept with carried items accepts the candidate and recor
   });
   assert.equal(resolved.acceptedWithCarried, true);
   assert.deepEqual(resolved.carriedItems, ["F-adv"]);
+  // A5: each carried item is listed with its target; this request has no
+  // explicit `--to`, so the leftovers go to the next phase.
+  assert.deepEqual(resolved.carriedTo, { "F-adv": "next" });
   assert.equal(accept(resolved, "C1", K), true);
 });
 
@@ -137,6 +141,47 @@ test("plan 06g: tt carry never accepts a candidate whose checks failed", () => {
     integrationHead: "H0",
   };
   assert.equal(accept(gated, "C1", K), true, "with the mechanical gates met, the owner's carry accepts");
+});
+
+test("plan 06g: tt carry never waives a missing named test verify or unrecorded evidence", () => {
+  // ODP-3: these are mechanical gates, evaluated before the carry shortcut.
+  const contract = buildContract({
+    id: "p1",
+    goal: "g",
+    acceptance: ["it works"],
+    checks: ["true"],
+    boundaries: [],
+    reserved: [],
+    provisional: false,
+    requirements: [
+      { id: "R1", title: "R1", text: "R1 proves it", arch: [], verify: ['test "R1 proves it"'] },
+      { id: "R2", title: "R2", text: "the owner run is recorded", arch: [], verify: ["evidence"] },
+    ],
+  } as unknown as RunPlanPhase);
+  const carried = spent({
+    contract,
+    acceptedWithCarried: true,
+    carriedCandidateSha: "C1",
+    itemEvidence: [{ id: "R2", text: "the live run is in NOTES.md" }],
+  });
+  // The named test verify passed and the evidence is recorded: the carry holds.
+  assert.equal(
+    accept({ ...carried, checkResolution: [{ id: "R1", name: "R1 proves it", outcome: "passed" }] }, "C1", K),
+    true,
+    "with every mechanical gate met, the carry accepts",
+  );
+  // A missing named test verify is never waived.
+  assert.equal(
+    accept({ ...carried, checkResolution: [{ id: "R1", name: "R1 proves it", outcome: "missing" }] }, "C1", K),
+    false,
+    "a missing named test verify is not waived",
+  );
+  // An unrecorded `evidence` item is never waived.
+  assert.equal(
+    accept({ ...carried, itemEvidence: [], checkResolution: [{ id: "R1", name: "R1 proves it", outcome: "passed" }] }, "C1", K),
+    false,
+    "unrecorded evidence is not waived",
+  );
 });
 
 test("plan 06g: tt summary lists the carried items by id, with what each one says", () => {

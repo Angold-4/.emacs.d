@@ -116,13 +116,18 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
   // carried. `accept()` honours the flag, and the carried ids are recorded
   // here (the views list them, and the next phase's plan is built from them).
   if (isBudgetGateRequest(request) && event.option === "accept_carried") {
+    const carriedItems = next.findings.filter((f) => f.status === "open").map((f) => f.id);
     next = {
       ...next,
       acceptedWithCarried: true,
       // Plan 06g (ODP-2): the candidate the carry was given for. `accept()`
       // accepts only when this equals the candidate under acceptance.
       carriedCandidateSha: event.boundCandidateSha,
-      carriedItems: next.findings.filter((f) => f.status === "open").map((f) => f.id),
+      carriedItems,
+      // A5: every carried item is listed WITH its target. This request has no
+      // explicit `--to` (the owner's one decision carries the leftovers into
+      // the next phase), so the target is the next phase's plan.
+      carriedTo: Object.fromEntries(carriedItems.map((id) => [id, "next"])),
     };
   }
   if (request.origin === "open_finding" && event.option === "accept_risk" && request.linkedFindingId) {
