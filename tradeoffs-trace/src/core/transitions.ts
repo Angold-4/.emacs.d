@@ -13,7 +13,7 @@
 // state. `actions` is what `next()` of the resulting state must equal.
 
 import { carryBallotsForward, carryDecisionsForward } from "./rounds.ts";
-import { seatsOf } from "./seats.ts";
+import { leaderOf, seatsOf } from "./seats.ts";
 import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
 import {
@@ -401,6 +401,7 @@ addRow({
         carried,
         e.candidateSha,
         seatsOf(s.phase.contract),
+        leaderOf(s.phase.contract),
       ),
       overrides: [],
       // design §2.2: a clean freeze (no survivors this time) clears any

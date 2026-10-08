@@ -105,6 +105,9 @@ export function carryBallotsForward(
   carried: Decision[],
   newCandidateSha: string,
   seats: readonly string[] = DEFAULT_SEATS,
+  /** Plan 06h (A2): the named leader, so a kept decision's re-tally uses the
+   * same veto as the fresh vote. Absent means the first seat. */
+  leader?: string,
 ): Ballot[] {
   if (!prevCandidateSha) return [];
   const kept = new Set((prior ?? []).filter((p) => p.status === "kept").map((p) => p.id));
@@ -113,7 +116,7 @@ export function carryBallotsForward(
     if (!kept.has(d.id) || d.boundCandidateSha !== newCandidateSha) continue;
     const before = prevDecisions.find((x) => x.id === d.id);
     if (!before || before.boundCandidateSha !== prevCandidateSha) continue;
-    if (tally(before, prevBallots, findings, prevCandidateSha, contractVersion, seats) !== "pass") continue;
+    if (tally(before, prevBallots, findings, prevCandidateSha, contractVersion, seats, leader) !== "pass") continue;
     for (const reviewer of seats) {
       const b = currentBallot(prevBallots, d.id, reviewer, prevCandidateSha, contractVersion, before.version);
       if (!b) continue;
