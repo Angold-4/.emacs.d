@@ -690,28 +690,37 @@ recorded and the phase is the single-candidate loop it was before.
 ### The round budget and carried items
 
 A phase may spend **3 rounds** by default; `#+TT_ROUNDS` sets another number.
-The number is the phase's repair allowance, exactly as the pre-06g budget was:
-round 1 is the first candidate and each later round is one repair, so
-`#+TT_ROUNDS: 3` allows three repairs on top of the first candidate. A round
-costs one attempt of the repair budget, whatever the number of lanes.
+One round is **one candidate reviewed**, so `#+TT_ROUNDS: 3` reviews exactly
+three candidates — the first plus two repairs — matching ODP-1's "accepted
+within 3 rounds". `roundBudget()` is the single source of that number and the
+FSM's repair allowance is `roundBudget - 1`. A round costs one attempt of the
+repair budget, whatever the number of lanes.
 
 From round 2, a finding blocks acceptance only when it either
 
 - names an item of the contract (or of an owner correction) that is unmet on
   the main path, with the item id and a `file:line`; or
 - is a **regression**: a test or behaviour that passed at the round's base and
-  fails now.
+  fails now. The round's base is that round's own starting candidate — the
+  previous candidate in a repair, the phase base in round 1 — never the phase
+  baseline alone.
 
 Anything else — a further edge path, hardening, wording, style — is an
 **advisory**: recorded as a trade-off and carried, never blocking. Round 1 is
 unchanged: every blocking finding blocks.
 
 When the budget is spent the phase stops on the owner and no further round
-starts without an explicit owner grant. If the only open findings are
-advisories, the owner's single decision is **"accept with carried items"**:
-taking it accepts the candidate and lists the carried items in the run record
-and in `tt summary`, as input for the next phase's plan. If a blocking item is
-open, the owner sees only the blocking items.
+starts without an explicit owner grant of **one** round (the budget gate's
+`grant` option adds exactly one). If the only open findings are advisories,
+the owner's single decision is **"accept with carried items"**: taking it
+accepts the candidate and lists the carried items in the run record and in
+`tt summary`, as input for the next phase's plan. If a blocking item is open,
+the owner sees only the blocking items.
+
+The carry waives the **open review items only**. It never waives the
+mechanical gates: the checks must have passed for the carried candidate, the
+probe must be that candidate's onto the current integration head, and the
+candidate under acceptance must be the one the carry was given for.
 
 The owner's disposition is the command
 

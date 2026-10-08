@@ -472,12 +472,10 @@ export function decisionSettled(decision: Decision, phase: PhaseState, C: string
 
 /** accept(C, K): the only way a phase may reach ACCEPTED. */
 export function accept(phase: PhaseState, C: string, K: ContractVersion): boolean {
-  // Plan 06g (A6): the owner's "accept with carried items" decision at the
-  // end of the round budget accepts the candidate as it stands — the open
-  // items are carried to the next phase's plan (`phase.carriedItems`). This
-  // is the owner's own decision, recorded as OWNER_REQUEST_RESOLVED; no
-  // model and no conductor can set it.
-  if (phase.acceptedWithCarried) return true;
+  // Mechanical gates are facts (ODP-1, ODP-2): the checks must have passed
+  // for C, and the probe must be for C onto the CURRENT integration head. They
+  // are evaluated BEFORE the owner's accept-with-carried shortcut, so a carry
+  // can never accept a failing or stale candidate.
   if (!(phase.checks && phase.checks.candidateSha === C && phase.checks.passed === true)) {
     return false;
   }
@@ -494,6 +492,14 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
   ) {
     return false;
   }
+
+  // Plan 06g (A6/ODP-2): the owner's "accept with carried items" decision at
+  // the end of the round budget accepts the candidate the carry was given for
+  // (`carriedCandidateSha`), waiving only the OPEN REVIEW ITEMS — the open
+  // findings, decisions and corrections that are carried. It never waives the
+  // mechanical gates just checked, the candidate binding, or a gate/probe for
+  // another candidate.
+  if (phase.acceptedWithCarried) return phase.carriedCandidateSha === C;
 
   for (const who of ["M", "A", "B"] as const) {
     const review = phase.reviews[who]?.review;

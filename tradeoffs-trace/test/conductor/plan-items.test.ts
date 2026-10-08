@@ -1451,8 +1451,10 @@ test("plan 06g: with TT_WORKERS absent no lane, pick or round event is recorded 
     assert.equal(state.phase.rounds, undefined);
     assert.equal(state.phase.contract.workers, undefined);
     assert.equal(state.phase.contract.roundsAllowed, undefined);
-    // The round budget defaults to 3, exactly as the repair budget did before.
-    assert.equal(state.phase.repairRoundsGranted, 3);
+    // A4: `roundBudget` defaults to 3 ROUNDS — one candidate reviewed each,
+    // so the repair allowance is roundBudget - 1 (the first candidate plus two
+    // repairs).
+    assert.equal(state.phase.repairRoundsGranted, 2);
 
     // No round event of any kind reached the log.
     const logEvents = readEvents(setup.runDir);
@@ -1500,33 +1502,36 @@ test("plan 06g: a round-2 blocking finding that names no contract item and no re
 });
 
 test("plan 06g: a phase still blocked after three rounds stops AWAITING_OWNER and starts no fourth round until the owner grants one", async () => {
-  // Three rounds, each with a GROUNDED blocking finding (an item id and a
-  // file:line): rounds 1 and 2 force a repair, round 3's finding is still open
-  // when its budget runs out, so the phase parks on the owner and no fourth
-  // round may start by itself. `#+TT_ROUNDS: 2` is two repair rounds, i.e.
-  // exactly three rounds of review. The owner then grants one more through a
-  // real inbox file, and the fourth attempt starts.
-  const setup = await runTwoRounds("R1 (it works) is unmet: src/core/rounds.ts:12 still drops the second lane", { rounds: 2 });
+  // The checks never pass, so the phase can only repair: the default budget
+  // (3 rounds = the first candidate plus two repairs) is spent after round 3,
+  // the phase parks AWAITING_OWNER, and no fourth round starts by itself. The
+  // owner lifts the park for exactly ONE more round through a real inbox file.
+  const setup = await setupConductor({
+    checks: ["false"],
+    workerScriptForAttempt: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    deadlines: { ...FAST, inboxPollMs: 40 },
+  });
+  await setup.conductor.start();
   try {
-    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 20, setup.runDir);
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
     const parked = setup.conductor.state.phase;
     assert.equal(parked.repairRoundsUsed, 2, "two repairs (three rounds) were spent");
-    assert.equal(parked.repairRoundsGranted, 2, "and the budget is spent, so no fourth round may start");
+    assert.equal(parked.repairRoundsGranted, 2, "the default budget of 3 rounds is spent");
     assert.equal(parked.attempt.n, 3, "three rounds ran, and no fourth worker attempt was launched");
     const request = parked.ownerRequests.find((r) => r.status === "open")!;
-    assert.ok(request, "the owner is asked about the still-open item");
-    assert.equal(request.linkedFindingId, parked.findings.find((f) => f.status === "open" && f.severity === "blocking")!.id);
+    assert.ok(request, "the owner is asked to lift the park");
+    assert.ok(request.options.some((o) => o.id === "grant"), "the owner may grant one more round");
 
-    // The owner grants one more round through a real inbox file.
+    // The owner grants exactly one more round through a real inbox file.
     const runId = parked.runId;
-    const file = path.join(runPaths(setup.runDir).inbox, "cmd-resolve-repair.json");
+    const file = path.join(runPaths(setup.runDir).inbox, "cmd-resolve-grant.json");
     fs.writeFileSync(
       file,
       JSON.stringify({
-        commandId: "cmd-resolve-repair",
+        commandId: "cmd-resolve-grant",
         type: "resolve",
         recordKind: "request",
-        option: "repair",
+        option: "grant",
         binding: {
           runId,
           phaseId: parked.phaseId,
@@ -1539,13 +1544,13 @@ test("plan 06g: a phase still blocked after three rounds stops AWAITING_OWNER an
     );
     await waitFor(() => setup.conductor.state.phase.phase !== "AWAITING_OWNER", 30_000);
     await waitFor(() => setup.conductor.state.phase.attempt.n >= 4, 90_000, 20, setup.runDir);
-    assert.equal(setup.conductor.state.phase.repairRoundsGranted, 5, "the owner's grant added three rounds");
+    assert.equal(setup.conductor.state.phase.repairRoundsGranted, 3, "the grant added exactly one round");
     const resolved = readEvents(setup.runDir)
       .filter((r) => r.kind === "event")
       .map((r) => r.event as { type: string; option?: string })
       .filter((e) => e.type === "OWNER_REQUEST_RESOLVED");
     assert.equal(resolved.length, 1);
-    assert.equal(resolved[0].option, "repair");
+    assert.equal(resolved[0].option, "grant");
   } finally {
     await teardown(setup);
   }
@@ -1554,10 +1559,10 @@ test("plan 06g: a phase still blocked after three rounds stops AWAITING_OWNER an
 test("plan 06g: with only advisories open at the end of the budget, tt carry accepts the candidate and tt summary lists the carried items", async () => {
   // A structured phase whose R2 is an `evidence` item the owner never records,
   // so acceptance cannot complete. Rounds 1 and 2 raise a GROUNDED blocking
-  // finding (withdrawn the next round); round 3 raises an advisory. With
-  // `#+TT_ROUNDS: 2` (two repair rounds = three rounds of review) the phase
-  // parks on the owner with only that advisory open. `tt carry` then accepts
-  // the candidate and the carried item reaches `tt summary`.
+  // finding (withdrawn the next round); round 3 raises an advisory. With the
+  // default budget of 3 rounds the phase parks on the owner with only that
+  // advisory open. `tt carry` then accepts the candidate and the carried item
+  // reaches `tt summary`.
   const items = {
     architecture: [],
     requirements: [
@@ -1577,7 +1582,6 @@ test("plan 06g: with only advisories open at the end of the budget, tt carry acc
       boundaries: [],
       reserved: [],
       provisional: false,
-      rounds: 2,
       ...items,
     },
     workerScriptForAttempt: (attempt) => ({
@@ -1693,6 +1697,55 @@ test("plan 06g: a round-2 finding that names an unmet item (id and file:line) st
   }
 });
 
+test("plan 06g: a test that passed at round 1's candidate and fails in round 2 is a regression and blocks", async () => {
+  // R4's regression clause at the conductor level, with the round's own base
+  // (not the phase base): test T passes at the phase base and at round 1's
+  // candidate, and fails at round 2's. Comparing against the phase base would
+  // (wrongly) be the same here; the point is that the round-2 failure is judged
+  // against round 1's candidate, which passed it, so it is a regression.
+  const marker = fs.mkdtempSync("/tmp/tt-regression-");
+  const failMarker = path.join(marker, "fail");
+  const check = `sh -c 'if [ -f ${failMarker} ]; then printf "not ok 1 - T\\n"; exit 1; else printf "ok 1 - T\\n"; exit 0; fi'`;
+  const setup = await setupConductor({
+    checks: [check],
+    stubReviews: false,
+    phase: {
+      id: "p1",
+      goal: "keep the loop short",
+      acceptance: ["it works"],
+      checks: [check],
+      boundaries: [],
+      reserved: [],
+      provisional: false,
+      rounds: 2,
+    },
+    // Round 2 arms the check's failure; round 1 does not.
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        ...(attempt >= 2 ? [{ kind: "call-sh", command: `touch ${failMarker}` }] : []),
+        { kind: "call-sh", command: `printf 'round${attempt}' > candidate.txt` },
+        submitPhaseStep(),
+      ],
+    }),
+    reviewerScriptFor: reviewerRaisingOncePerRound("a blocking finding on round 1's candidate"),
+    deadlines: { ...FAST, inboxPollMs: 40 },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.equal(phase.round, 2, "round 2's candidate is the one whose check failed");
+    assert.notEqual(phase.phase, "DONE", "a regression blocks acceptance");
+    const regressions = readLog(runPaths(setup.runDir).events).records.filter((r) => r.kind === "round_regression");
+    assert.ok(regressions.length >= 1, "the regression against the round's base is recorded");
+    assert.ok((regressions[0].event as { tests?: string[] }).tests?.includes("T"), "the test that passed at round 1 and fails now is named");
+  } finally {
+    await teardown(setup);
+    cleanupDir(marker);
+  }
+});
+
 test("plan 06g: tt carry on a contract finding at the end of the budget accepts the candidate and lists the item as carried to the named phase", async () => {
   // The 06c case (2026-10-07): one contract finding on a display detail, with
   // the budget spent. A contract finding cannot be answered by a correction
@@ -1706,7 +1759,10 @@ test("plan 06g: tt carry on a contract finding at the end of the budget accepts 
   try {
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
     const parked = setup.conductor.state.phase;
-    assert.equal(parked.repairRoundsUsed, 1, "the one repair round was spent");
+    // `#+TT_ROUNDS: 1` = one round (the first candidate), so round 1's finding
+    // exhausts the budget and parks the phase.
+    assert.equal(parked.repairRoundsUsed, 0, "the single round's candidate was the only one reviewed");
+    assert.equal(parked.repairRoundsGranted, 0, "the budget of one round is spent");
     const contract = parked.findings.find((f) => f.status === "open" && f.kind === "contract")!;
     assert.ok(contract, "the open contract finding is what the owner must answer");
     // A contract finding's only offered option is repair, so the owner needs

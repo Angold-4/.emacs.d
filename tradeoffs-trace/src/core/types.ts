@@ -1158,6 +1158,15 @@ export interface PhaseState {
   acceptedWithCarried?: boolean;
   /** Plan 06g: the open items carried past this phase, by finding id. */
   carriedItems?: string[];
+  /** Plan 06g (ODP-2): the candidate sha the owner's carry was given for.
+   * `accept()` accepts only when it equals the candidate under acceptance, so
+   * a carry can never accept a stale or failing candidate. */
+  carriedCandidateSha?: string;
+  /** Plan 06g (A4): the test names that failed at THIS round's base — the
+   * phase base in round 1, the previous candidate in a repair. Recorded at
+   * the freeze, so `#regressionTests` compares against the round's base, not
+   * the phase base. Absent in round 1 (the phase baseline is the base then). */
+  roundBaseFailures?: string[];
   /** Plan 06g (A5): the target phase each carried item goes to, keyed by the
    * finding/message id (`tt carry <run> <id> --to <phase-id>`). `accept_carried`
    * carries the open items without a named target, so an id may be absent. */

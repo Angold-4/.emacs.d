@@ -779,9 +779,12 @@ BUILD["awaiting-owner-request-resolved-grant"] = {
 // the candidate as it stands and resumes to RESOLVING, where next() accepts
 // (accept() honours `acceptedWithCarried`).
 BUILD["awaiting-owner-request-resolved-accept-carried"] = {
+  // ODP-2: the carry waives the open review items only; the mechanical gates
+  // (checks passed for C, the probe for C onto the current head) must hold for
+  // acceptance, so the fixture carries them.
   state: baseState({
+    ...resolvableAwaitingOwnerBase,
     phase: "AWAITING_OWNER",
-    candidate: C1,
     findings: [
       { id: "F-adv", version: 1, phaseId: "p1", kind: "defect", severity: "advisory", evidence: "a further edge path, carried", raisedBy: "B", status: "open", boundCandidateSha: "C1" },
     ],

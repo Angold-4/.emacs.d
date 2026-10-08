@@ -19,7 +19,9 @@ function hasOpenRequestLinkedTo(phase: PhaseState, matches: (r: OwnerRequest) =>
 }
 
 export const BUDGET_GATE_OPTIONS: OwnerRequestOption[] = [
-  { id: "grant", label: "grant 3 more repair rounds" },
+  // Plan 06g (A4, owner-verified): the park is lifted for exactly ONE more
+  // round (one candidate reviewed), never a fresh three-round allowance.
+  { id: "grant", label: "grant one more round" },
   { id: "stop", label: "stop the phase" },
 ];
 

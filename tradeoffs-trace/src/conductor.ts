@@ -789,13 +789,15 @@ export function initialState(
     overrides: [],
     inFlight: {},
     repairRoundsUsed: 0,
-    // Plan 06g (A6): `roundBudget(contract)` is the only place that decides
-    // how many rounds a phase may spend — `#+TT_ROUNDS` when the plan names
-    // it, the default of 3 otherwise. The number is the phase's repair
-    // allowance, exactly as the pre-06g budget was: the first candidate is
-    // round 1, and each later round is one repair. Keeping that reading is
-    // what lets every existing test pass unchanged (C1).
-    repairRoundsGranted: roundBudget(contract),
+    // Plan 06g (A4, owner-verified): `roundBudget(contract)` is the only place
+    // that decides how many ROUNDS a phase may spend — `#+TT_ROUNDS` when the
+    // plan names it, the default of 3 otherwise. One round is one candidate
+    // reviewed, so the repair allowance the FSM compares against is
+    // `roundBudget - 1`: the first candidate is round 1 and each later round
+    // is one repair. `#+TT_ROUNDS: 3` therefore reviews exactly 3 candidates
+    // (the first plus two repairs), matching ODP-1's "accepted within 3
+    // rounds".
+    repairRoundsGranted: roundBudget(contract) - 1,
     // Plan 01i: a program-wide directive in force when this node was started
     // seeds the phase's own list (scope `program`, seeded), so it is quoted
     // in every prompt from the first attempt. The plan snapshot is on disk,
@@ -4518,12 +4520,26 @@ export class Conductor {
    * passed at the round's base — the conductor's own regression split (a
    * load-only flake is not one: it passed alone). */
   #regressionTests(): string[] {
-    const last = this.#state.phase.lastCheckFailures;
-    if (!last) return [];
+    const phase = this.#state.phase;
+    const current = phase.checks;
+    const failures = current?.failures ?? phase.lastCheckFailures?.failures ?? [];
+    if (failures.length === 0) return [];
+    // The round's base: the phase base in round 1, the previous candidate in
+    // a repair (recorded at the freeze). This is the ONLY correct base — not
+    // `#baselineFailedCommands()`, which is the phase base for every round.
+    const base = new Set(this.#roundBaseFailures());
     // A test the base already failed is not a regression; a load-only failure
     // passed when re-run alone, so it is not one either.
-    const base = new Set(this.#baselineFailedCommands().flatMap((c) => c.failures ?? []));
-    return last.failures.filter((f) => !f.loadOnly && !base.has(f.name)).map((f) => f.name);
+    return failures.filter((f) => !f.loadOnly && !base.has(f.name)).map((f) => f.name);
+  }
+
+  /** Plan 06g (A4): the tests that failed at this round's base — the phase
+   * base's failures in round 1, the previous candidate's check failures in a
+   * repair. Recorded by `freezeCompleted` (`roundBaseFailures`), so a test
+   * that PASSED at round 1's candidate and fails in round 2 is a regression,
+   * while a test the base already failed is a persisting failure. */
+  #roundBaseFailures(): string[] {
+    return this.#state.phase.roundBaseFailures ?? this.#baselineFailedCommands().flatMap((c) => c.failures ?? []);
   }
 
   #directiveIds(): string[] {
@@ -7753,12 +7769,18 @@ export class Conductor {
             ...(finalFailures.length > 0 ? { failures: finalFailures } : {}),
           });
         }
+      } else if (passed) {
+        this.#applyEvent({ type: "CHECKS_PASSED" });
       } else {
-        this.#applyEvent(
-          passed
-            ? { type: "CHECKS_PASSED" }
-            : { type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) },
-        );
+        this.#applyEvent({ type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) });
+        // Plan 06g (A4): a test that PASSED at this round's base (the previous
+        // candidate in a repair, the phase base in round 1) and fails now is a
+        // true regression — recorded so the reason is observable, and distinct
+        // from a persisting failure the base already had.
+        const regressions = this.#regressionTests();
+        if (regressions.length > 0) {
+          this.#log.append("round_regression", { candidateSha, round: this.#state.phase.round ?? 1, tests: regressions });
+        }
       }
     } finally {
       checkoutDir.dispose();

@@ -42,6 +42,10 @@ const plan = {
       checks: ["true"],
       boundaries: [],
       reserved: ["public API"],
+      // Plan 06g (A4/C1): this fixture exercises four attempt timeouts (three
+      // repairs), so it names its round budget explicitly: `#+TT_ROUNDS: 4` = 4
+      // rounds = the first candidate plus three repairs.
+      rounds: 4,
     },
   ],
 } as unknown as RunPlanFile;

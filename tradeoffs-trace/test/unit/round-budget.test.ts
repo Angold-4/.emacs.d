@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { applyOwnerRequestResolved } from "../../src/core/owner-commands.ts";
+import { applyItemCarried, applyOwnerRequestResolved } from "../../src/core/owner-commands.ts";
 import { openItemOwnerRequestsFor } from "../../src/core/owner-requests.ts";
 import { accept } from "../../src/core/predicate.ts";
 import type { Finding, PhaseState } from "../../src/core/types.ts";
@@ -103,23 +103,40 @@ test("plan 06g: taking accept with carried items accepts the candidate and recor
   assert.equal(accept(resolved, "C1", K), true);
 });
 
-test("plan 06g: accept with carried items accepts even a candidate the acceptance rule alone would refuse", () => {
-  // The phase parked because acceptance failed for a reason that is not a
-  // finding (a check record that never passed, say). The owner's own decision
-  // is what accepts it — no model and no conductor can set this flag.
-  const phase = spent({ checks: undefined, findings: [finding()] });
+test("plan 06g: tt carry never accepts a candidate whose checks failed", () => {
+  // ODP-2 (owner-verified): the carry waives only the OPEN REVIEW ITEMS. The
+  // mechanical gates — checks passed for C, the probe for C onto the current
+  // head, and C being the candidate the carry was given for — are facts and
+  // are evaluated BEFORE the carry shortcut.
+  const phase = spent({ checks: { candidateSha: "C1", passed: false }, findings: [finding()] });
   const request = openItemOwnerRequestsFor(phase, "the repair budget ran out while items remained open")[0];
   const parked: PhaseState = { ...phase, ownerRequests: [{ ...request, status: "open" as const }] };
-  assert.equal(accept(parked, "C1", K), false, "without the owner's decision the candidate is not acceptable");
-  const resolved = applyOwnerRequestResolved(parked, {
-    type: "OWNER_REQUEST_RESOLVED",
-    requestId: request.id,
-    option: "accept_carried",
+  const carried = applyItemCarried(parked, {
+    type: "ITEM_CARRIED",
+    recordId: "F-adv",
+    recordKind: "finding",
+    toPhase: "06h",
     boundCandidateSha: "C1",
     boundContractVersion: K,
-    boundRecordVersion: request.version,
+    boundRecordVersion: 1,
   });
-  assert.equal(accept(resolved, "C1", K), true, "the owner's decision is what accepts it");
+  assert.equal(carried.acceptedWithCarried, true, "the carry is recorded");
+  assert.equal(carried.carriedCandidateSha, "C1", "with the candidate it was given for");
+  assert.equal(accept(carried, "C1", K), false, "a failed check is never waived by the carry");
+
+  // A stale carry (given for another candidate) is not acceptance either.
+  const passingButStale = { ...carried, checks: { candidateSha: "C1", passed: true }, carriedCandidateSha: "C2" };
+  assert.equal(accept(passingButStale, "C1", K), false, "a carry for another candidate never accepts C1");
+
+  // With the mechanical gates met for the carried candidate, the owner's carry
+  // accepts the candidate, waiving the open advisory and owner request.
+  const gated = {
+    ...carried,
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    integrationHead: "H0",
+  };
+  assert.equal(accept(gated, "C1", K), true, "with the mechanical gates met, the owner's carry accepts");
 });
 
 test("plan 06g: tt summary lists the carried items by id, with what each one says", () => {

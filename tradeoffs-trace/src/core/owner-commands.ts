@@ -104,7 +104,10 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
   // no-op. "budget.granted by owner request <id>": the allowance is granted
   // exactly like a correction's, independent of the exhausted budget.
   if (isBudgetGateRequest(request) && event.option === "grant") {
-    next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 3 };
+    // Plan 06g (A4, owner-verified): the budget gate grants exactly ONE more
+    // round — the owner lifts the park for a single further candidate, never a
+    // fresh three-round allowance. One round is one candidate reviewed.
+    next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 1 };
   }
   if (isRepairForcingOption(request.origin, event.option)) {
     next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 3 };
@@ -116,6 +119,9 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
     next = {
       ...next,
       acceptedWithCarried: true,
+      // Plan 06g (ODP-2): the candidate the carry was given for. `accept()`
+      // accepts only when this equals the candidate under acceptance.
+      carriedCandidateSha: event.boundCandidateSha,
       carriedItems: next.findings.filter((f) => f.status === "open").map((f) => f.id),
     };
   }
@@ -321,11 +327,12 @@ export function applyItemCarried(phase: PhaseState, event: EvItemCarried): Phase
   }
 
   // Accept once no blocking item remains uncarried; advisories never block
-  // acceptance (owner directive ODP-1).
+  // acceptance (owner directive ODP-1). The candidate the carry was given for
+  // is recorded so `accept()` can refuse a stale or failing one (ODP-2).
   const blockingLeft = next.findings.some(
     (f) => f.status === "open" && f.severity === "blocking" && !carriedItems.includes(f.id),
   );
-  return blockingLeft ? next : { ...next, acceptedWithCarried: true };
+  return blockingLeft ? next : { ...next, acceptedWithCarried: true, carriedCandidateSha: event.boundCandidateSha };
 }
 
 // --- OVERRIDE_CAST -------------------------------------------------------

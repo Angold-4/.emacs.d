@@ -358,6 +358,13 @@ addRow({
           : f,
       ),
       round: (s.phase.round ?? 0) + 1,
+      // Plan 06g (A4): the round's BASE, i.e. the candidate this one repairs
+      // (round 1 keeps the phase baseline: absent here). A test that passed at
+      // this base and fails in the new round is a regression; one the base
+      // already failed is a persisting failure, not a regression.
+      ...((s.phase.round ?? 0) >= 1
+        ? { roundBaseFailures: (s.phase.checks?.failures ?? []).filter((f) => !f.loadOnly).map((f) => f.name) }
+        : {}),
       checks: undefined,
       // Plan 05d: this candidate is the one that repairs the previous check
       // failure, so mark the kept split with its sha (finding A-9): the
