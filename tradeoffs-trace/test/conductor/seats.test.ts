@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import { test } from "node:test";
 
 import { lintPlan, type LintPlanInput } from "../../src/core/plan-lint.ts";
+import { seatsOf } from "../../src/core/seats.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 
@@ -232,6 +233,35 @@ function fiveSeatReviewer() {
     };
   };
 }
+
+test("plan 06h: a phase-only seat override is recorded in the init event and replays", async () => {
+  const seats = ["M", "A", "B", "C", "D"];
+  // The seats live only on the phase, not the plan.
+  const setup = await setupConductor({
+    phase: lanePhase({ workers: 2, seats, leader: "M" }),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat, liveRound(state), "a", "the only candidate"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const { readLog } = await import("../../src/effects/log.ts");
+    const { rebuildState, runPaths } = await import("../../src/conductor.ts");
+    const init = readLog(runPaths(setup.runDir).events).records.find((r) => r.kind === "init");
+    const recorded = (init!.event as { seats?: { seats: string[] } }).seats;
+    assert.deepEqual(recorded?.seats, seats, "the init event records the phase's effective five seats");
+    const rebuilt = rebuildState(setup.runDir, setup.plan);
+    assert.deepEqual(seatsOf(rebuilt.phase.contract), seats, "a replay keeps the phase's own seats");
+  } finally {
+    await teardown(setup);
+  }
+});
 
 test("plan 06h: TT_ROUNDS 2 stops a still-blocked phase after two rounds, and tt lint refuses TT_ROUNDS 0 and 6", async () => {
   // `tt lint` refuses a round budget outside 1..5, at the keyword's line.

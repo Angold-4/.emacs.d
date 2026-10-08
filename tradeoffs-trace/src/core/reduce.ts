@@ -904,7 +904,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!panelSeatsSettled(panel, panelSeatKeys(p).size)) {
         return rejected(state, `blocker ${event.blockerId}'s panel still has undecided seats`);
       }
-      const computed = panelOutcome(panel);
+      const computed = panelOutcome(panel, panelSeatKeys(p).size);
       if (event.outcome !== computed) {
         return rejected(
           state,

@@ -305,12 +305,10 @@ test("schema: plan accepts per-seat #+TT_MODELS (reviewerSeats, panelSeats, pane
   assert.equal(result.valid, true, result.errors.join("; "));
 });
 
-test("schema: plan rejects an unknown panelFrom value, and accepts a seat key the linter checks", () => {
+test("schema: plan rejects an unknown panelFrom value and an unknown seat", () => {
   const base = fixture("plan") as Record<string, unknown>;
   const badPanelFrom = { ...base, models: { panelFrom: "reviewer" } };
   assert.equal(validate(schema("plan"), badPanelFrom).valid, false);
-  // Plan 06h: `reviewer.C` is a valid JSON key now — whether C is a
-  // configured seat is `tt lint`'s job, against `#+TT_REVIEWERS`.
-  const seat = { ...base, models: { reviewerSeats: { C: { model: "x" } } } };
-  assert.equal(validate(schema("plan"), seat).valid, true);
+  const badSeat = { ...base, models: { reviewerSeats: { C: { model: "x" } } } };
+  assert.equal(validate(schema("plan"), badSeat).valid, false);
 });

@@ -65,10 +65,14 @@ function reviewerSeatsOf(plan: LintPlanInput): string[] {
   return [...DEFAULT_REVIEWER_SEATS];
 }
 
-/** The lane numbers a plan's worker count names, 1-based. */
+/** The lane numbers a plan's worker count names, 1-based. A plan without
+ * `#+TT_REVIEWERS` is the 06g2 plan and names at most two lanes. */
 function workerLanesOf(plan: LintPlanInput): string[] {
+  const hasNewSeats = Array.isArray(plan.seats) && plan.seats.length > 0;
   const n = Number.isInteger(plan.workers) && (plan.workers as number) >= 1 ? (plan.workers as number) : 1;
-  return Array.from({ length: n }, (_, i) => String(i + 1));
+  // A 06g2 plan (no `#+TT_REVIEWERS`) names at most two lanes, whatever its
+  // worker count, so worker.1/worker.2 stay valid and worker.3 is 06h's.
+  return Array.from({ length: hasNewSeats ? n : 2 }, (_, i) => String(i + 1));
 }
 
 /** The slice of #+TT_MODELS the linter reads. `models` is what Emacs parsed
@@ -146,6 +150,14 @@ export interface LintPhaseInput {
   /** Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by
    * the phase's `:FINAL_CHECKS:`). Absent leaves the plan as before. */
   finalChecks?: string[];
+  /** Plan 06h (A4/C2): a phase's own `:REVIEWERS:` override. It must satisfy
+   * the same rule as the plan's `#+TT_REVIEWERS`. */
+  seats?: string[];
+  /** Plan 06h (A4/C2): a phase's own `:LEADER:` override. */
+  leader?: string;
+  /** Plan 06h: the 1-based line of the phase headline, used as the line for
+   * a phase-override finding when the property's own line is not recorded. */
+  line?: number;
 }
 
 export interface LintPlanInput {
@@ -365,13 +377,18 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
     const seats = reviewerSeatsOf(plan);
     const panelSeats = seats.map((_, i) => String(i + 1));
     const lanes = workerLanesOf(plan);
+    const hasNewSeats = Array.isArray(plan.seats) && plan.seats.length > 0;
     if (decl.kind === "reviewer-seat" && !seats.includes(decl.seat!)) {
       out.push(
         modelFinding(
           plan,
           decl.key,
-          `#+TT_MODELS names the reviewer seat ${decl.key}, which #+TT_REVIEWERS does not declare`,
-          `name one of the declared seats (${seats.map((s) => `reviewer.${s}`).join(", ")}), or add ${decl.seat} to #+TT_REVIEWERS`,
+          hasNewSeats
+            ? `#+TT_MODELS names the reviewer seat ${decl.key}, which #+TT_REVIEWERS does not declare`
+            : `#+TT_MODELS names the unknown reviewer seat ${decl.key}`,
+          hasNewSeats
+            ? `name one of the declared seats (${seats.map((s) => `reviewer.${s}`).join(", ")}), or add ${decl.seat} to #+TT_REVIEWERS`
+            : "use reviewer.M, reviewer.A or reviewer.B",
         ),
       );
       continue;
@@ -381,21 +398,34 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
         modelFinding(
           plan,
           decl.key,
-          `#+TT_MODELS names the panel seat ${decl.key}, which the ${seats.length} reviewers do not have`,
-          `use one of panel.${panelSeats.join(", panel.")} (one panel seat per reviewer)`,
+          hasNewSeats
+            ? `#+TT_MODELS names the panel seat ${decl.key}, which the ${seats.length} reviewers do not have`
+            : `#+TT_MODELS names the unknown panel seat ${decl.key}`,
+          hasNewSeats ? `use one of panel.${panelSeats.join(", panel.")} (one panel seat per reviewer)` : "use panel.1, panel.2 or panel.3",
         ),
       );
       continue;
     }
     if (decl.kind === "worker-seat" && !lanes.includes(decl.seat!)) {
-      out.push(
-        modelFinding(
-          plan,
-          decl.key,
-          `#+TT_MODELS names the worker lane ${decl.key}, but #+TT_WORKERS declares ${lanes.length}`,
-          `use one of worker.${lanes.join(", worker.")}`,
-        ),
-      );
+      if (Array.isArray(plan.seats) && plan.seats.length > 0) {
+        out.push(
+          modelFinding(
+            plan,
+            decl.key,
+            `#+TT_MODELS names the worker lane ${decl.key}, but #+TT_WORKERS declares ${lanes.length}`,
+            `use one of worker.${lanes.join(", worker.")}`,
+          ),
+        );
+      } else {
+        out.push(
+          modelFinding(
+            plan,
+            decl.key,
+            `#+TT_MODELS names the unknown worker lane ${decl.key}`,
+            "use worker.1 or worker.2 (this plan version runs one or two lanes; more is 06h's phase)",
+          ),
+        );
+      }
       continue;
     }
     const model = decl.model?.model;
@@ -534,12 +564,86 @@ export function lintItems(phase: LintPhaseInput): LintFinding[] {
   return out;
 }
 
+/** Plan 06h (A4/C2): lint a phase's own `:REVIEWERS:`/`:LEADER:` override
+ * with the same rule as the plan's `#+TT_REVIEWERS`/`#+TT_LEADER`. The
+ * effective worker count is the phase's own `:WORKERS:` or the plan's. */
+export function lintPhaseSeats(phase: LintPhaseInput, plan: LintPlanInput): LintFinding[] {
+  const hasSeats = Array.isArray(phase.seats) && phase.seats.length > 0;
+  const hasLeader = typeof phase.leader === "string" && phase.leader.trim().length > 0;
+  if (!hasSeats && !hasLeader) return [];
+  const out: LintFinding[] = [];
+  const phaseId = `${phase.id ?? "?"}/reviewers`;
+  const line = phase.line ?? plan.seatsLine;
+  const sourceFile = plan.sourceFile;
+  const effectiveSeats = hasSeats ? phase.seats! : plan.seats && plan.seats.length > 0 ? plan.seats : [...DEFAULT_REVIEWER_SEATS];
+  if (hasSeats) {
+    if (phase.seats!.length % 2 === 0) {
+      out.push({
+        severity: "error",
+        rule: "reviewer-seat",
+        phaseId,
+        item: `:REVIEWERS: ${phase.seats!.join(" ")}`,
+        line,
+        sourceFile,
+        problem: `the phase :REVIEWERS: names ${phase.seats!.length} seats; the count must be odd`,
+        fix: `write an odd number of seats (${phase.seats!.length + 1}, or ${Math.max(1, phase.seats!.length - 1)})`,
+      });
+    }
+    const seen = new Set<string>();
+    const dupes = new Set<string>();
+    for (const s of phase.seats!) {
+      if (seen.has(s)) dupes.add(s);
+      seen.add(s);
+    }
+    if (dupes.size > 0) {
+      out.push({
+        severity: "error",
+        rule: "reviewer-seat",
+        phaseId,
+        item: `:REVIEWERS: ${phase.seats!.join(" ")}`,
+        line,
+        sourceFile,
+        problem: `the phase :REVIEWERS: names ${[...dupes].join(", ")} more than once`,
+        fix: "give each seat a unique name",
+      });
+    }
+    const workers = Number.isInteger(phase.workers) && (phase.workers as number) >= 1 ? (phase.workers as number) : Number.isInteger(plan.workers) && (plan.workers as number) >= 1 ? (plan.workers as number) : 1;
+    const smallest = smallestReviewerCount(workers);
+    if (phase.seats!.length < smallest) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId,
+        item: `:REVIEWERS: ${phase.seats!.join(" ")}`,
+        line,
+        sourceFile,
+        problem: `${workers} worker${workers === 1 ? "" : "s"} needs at least ${smallest} reviewers; the phase :REVIEWERS: names ${phase.seats!.length}`,
+        fix: `name at least ${smallest} reviewers in the phase :REVIEWERS:`,
+      });
+    }
+  }
+  if (hasLeader && !effectiveSeats.includes(phase.leader!)) {
+    out.push({
+      severity: "error",
+      rule: "reviewer-leader",
+      phaseId: `${phase.id ?? "?"}/leader`,
+      item: `:LEADER: ${phase.leader}`,
+      line,
+      sourceFile,
+      problem: `the phase :LEADER: names ${phase.leader}, which is not one of the reviewer seats (${effectiveSeats.join(", ")})`,
+      fix: `name one of the declared seats (${effectiveSeats.join(", ")}), or add ${phase.leader} to the phase :REVIEWERS:`,
+    });
+  }
+  return out;
+}
+
 /** Lint one plan (all its phases' acceptance items, its structured items,
  * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
+    for (const finding of lintPhaseSeats(phase, plan)) out.push(finding);
     for (const finding of lintItems(phase)) out.push({ ...finding, sourceFile: plan.sourceFile });
     const acceptance = phase.acceptance ?? [];
     acceptance.forEach((item, i) => {
@@ -608,7 +712,10 @@ export function lintProgram(program: LintProgramInput): LintFinding[] {
 export function lintWorkers(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [];
   const seats = plan.seats;
-  const declaredSeats = Array.isArray(seats) && seats.length > 0 ? seats : [...DEFAULT_REVIEWER_SEATS];
+  // Plan 06h: a plan that names no `#+TT_REVIEWERS` is the 06g2 plan, so it
+  // keeps the two-lane limit; the new keywords are what opt into more lanes.
+  const hasNewSeats = Array.isArray(seats) && seats.length > 0;
+  const declaredSeats = hasNewSeats ? seats! : [...DEFAULT_REVIEWER_SEATS];
   if (plan.workers !== undefined) {
     const n = plan.workers;
     if (!Number.isInteger(n) || n < 1) {
@@ -621,6 +728,29 @@ export function lintWorkers(plan: LintPlanInput): LintFinding[] {
         sourceFile: plan.sourceFile,
         problem: `#+TT_WORKERS must be a whole number of lanes, got ${String(n)}`,
         fix: "write #+TT_WORKERS: 1 (today's loop), or any whole number of lanes from 1 on",
+      });
+    } else if (!hasNewSeats && n > 2) {
+      // The 06g2 behaviour, kept for a plan without `#+TT_REVIEWERS`.
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "workers",
+        item: `#+TT_WORKERS: ${n}`,
+        line: plan.workersLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_WORKERS names ${n} lanes; this plan version runs at most 2`,
+        fix: "write #+TT_WORKERS: 2, or wait for 06h, the phase that makes the lane count adjustable (3, 4, … lanes)",
+      });
+    } else if (!hasNewSeats && n === 2) {
+      out.push({
+        severity: "warning",
+        rule: "worker-count",
+        phaseId: "workers",
+        item: `#+TT_WORKERS: 2`,
+        line: plan.workersLine,
+        sourceFile: plan.sourceFile,
+        problem: "the two-lane round arrives in 06g2; this run uses one lane",
+        fix: "leave #+TT_WORKERS: 2 (the round lands in 06g2), or write #+TT_WORKERS: 1 for today's single-candidate loop",
       });
     }
   }
@@ -673,7 +803,7 @@ export function lintWorkers(plan: LintPlanInput): LintFinding[] {
   }
   const workers = Number.isInteger(plan.workers) && (plan.workers as number) >= 1 ? (plan.workers as number) : 1;
   const smallest = smallestReviewerCount(workers);
-  if (declaredSeats.length < smallest) {
+  if (hasNewSeats && declaredSeats.length < smallest) {
     out.push({
       severity: "error",
       rule: "worker-count",

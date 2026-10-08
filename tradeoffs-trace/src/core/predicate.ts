@@ -467,7 +467,7 @@ export function amendmentToApply(
       // meaningless — next() must agree with the row's own guard, or the
       // conductor emits an event the reducer refuses and throws.
       phase.contract.acceptance.includes(d.amendment.criterion) &&
-      tally(d, phase.ballots, phase.findings, C, K, seatsOf(phase.contract)) === "pass",
+      tally(d, phase.ballots, phase.findings, C, K, seatsOf(phase.contract), leaderOf(phase.contract)) === "pass",
   );
 }
 
@@ -477,7 +477,7 @@ export function decisionSettled(decision: Decision, phase: PhaseState, C: string
   // delegated and reserved alike: the reviewers' vote, an owner override,
   // or the owner accepting it after a failed vote. A reserved decision is
   // flagged for the owner (DecisionStatus.flagged), never held for them.
-  if (tally(decision, phase.ballots, phase.findings, C, K, seatsOf(phase.contract)) === "pass") return true;
+  if (tally(decision, phase.ballots, phase.findings, C, K, seatsOf(phase.contract), leaderOf(phase.contract)) === "pass") return true;
   const overridden = phase.overrides.some(
     (o) =>
       o.decisionId === decision.id &&
@@ -689,10 +689,10 @@ function votedStatus(decision: Decision, phase: PhaseState, C: string, K: Contra
   const seats = seatsOf(phase.contract);
   const leader = leaderOf(phase.contract);
   if (decisionSettled(decision, phase, C, K)) {
-    const t = tally(decision, phase.ballots, phase.findings, C, K, seats);
+    const t = tally(decision, phase.ballots, phase.findings, C, K, seats, leader);
     return { status: "passed", reason: t === "pass" ? "vote passed" : "settled by the owner" };
   }
-  const t = tally(decision, phase.ballots, phase.findings, C, K, seats);
+  const t = tally(decision, phase.ballots, phase.findings, C, K, seats, leader);
   if (t === "suspended") return { status: "suspended", reason: `linked finding ${decision.linkedFindingId} is open` };
   const vote = (who: string) => {
     const b = currentBallot(phase.ballots, decision.id, who, C, K, decision.version);

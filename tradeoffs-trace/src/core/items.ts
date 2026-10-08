@@ -766,14 +766,17 @@ export interface ItemOutcome {
   evidence: string[];
 }
 
-/** Tally one item across the seats: a strict majority (2 of 3) decides. An
- * R or C is met when at least two seats say met; an A fits when at least two
- * say fits. Anything else that a majority says (unmet/partial for R and C,
- * deviates/unclear for A) is that outcome. */
-export function tallyItem(item: FlatItem, verdicts: readonly SeatItemVerdict[]): ItemOutcome {
+/** Tally one item across the seats: a strict majority of the SEAT COUNT
+ * decides (2 of 3, 3 of 5, 4 of 7). An R or C is met when a strict majority
+ * say met; an A fits when a strict majority say fits. Anything else that a
+ * majority says (unmet/partial for R and C, deviates/unclear for A) is that
+ * outcome. `needed` is the strict majority of the configured seat count;
+ * absent, it falls back to a strict majority of the verdicts actually cast. */
+export function tallyItem(item: FlatItem, verdicts: readonly SeatItemVerdict[], needed?: number): ItemOutcome {
   const seats = [...verdicts].sort((a, b) => a.seat.localeCompare(b.seat));
   const count = (v: string) => seats.filter((s) => s.verdict === v).length;
-  const majority = (v: string) => count(v) >= 2;
+  const required = needed ?? Math.floor(seats.length / 2) + 1;
+  const majority = (v: string) => count(v) >= required;
   const evidenceFor = (v: string) => seats.filter((s) => s.verdict === v).map((s) => `${s.seat}: ${s.evidence}`);
   let outcome: ItemOutcome["outcome"] = "incomplete";
   if (item.kind === "architecture") {
@@ -810,6 +813,9 @@ export function tallyItems(
   overturns: readonly Overturn[] = [],
 ): ItemOutcome[] {
   const bySeat = new Map(overturns.map((o) => [`${o.seat}:${o.id}`, o]));
+  // Plan 06h (A2): a strict majority of the configured seat count, not a
+  // fixed two. `reviews` carries one entry per configured seat.
+  const needed = Math.floor(reviews.length / 2) + 1;
   return flatItems(items).map((item) => {
     const verdicts: SeatItemVerdict[] = [];
     for (const review of reviews) {
@@ -831,7 +837,7 @@ export function tallyItems(
         effective.push(v);
       }
     }
-    return tallyItem(item, effective);
+    return tallyItem(item, effective, needed);
   });
 }
 

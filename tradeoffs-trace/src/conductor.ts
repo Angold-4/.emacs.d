@@ -1538,17 +1538,18 @@ export class Conductor {
     } else {
       const head = currentHead(this.#plan.repo, this.#integrationBranch);
       const runId = randomUUID().slice(0, 8);
-      // Plan 06h (A1): the init event records the run's seats, so a later
-      // replay uses its own seats even after the plan changes. An old log
-      // with none recorded means M, A and B.
-      this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision(), seats: seatsRecordOf(this.#plan) });
-      // A plan that declares its seats only at the plan level (a hand-written
-      // JSON plan) still freezes them; a phase's own `:REVIEWERS:` wins.
-      const planSeats =
-        (this.#plan.phases[0].seats?.length ?? 0) === 0 && (this.#plan.seats?.length || this.#plan.leader)
-          ? seatsRecordOf(this.#plan)
-          : undefined;
-      this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? [], planSeats);
+      // Plan 06h (A1): the init event records the run's EFFECTIVE seats (a
+      // phase's own `:REVIEWERS:`/`:LEADER:` wins over the plan's), so a
+      // later replay uses its own seats even after the plan changes. An old
+      // log with none recorded means M, A and B.
+      const phase0 = this.#plan.phases[0];
+      const effectiveSeats = seatsRecordOf({
+        seats: phase0.seats && phase0.seats.length > 0 ? phase0.seats : this.#plan.seats,
+        leader: phase0.leader ?? this.#plan.leader,
+        workers: phase0.workers ?? this.#plan.workers,
+      });
+      this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision(), seats: effectiveSeats });
+      this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats);
     }
     this.#state = foldEvents(this.#state, records);
     // Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal

@@ -21,22 +21,36 @@
       "properties": {
         "worker": { "$ref": "#/$defs/RoleModel" },
         "workerLanes": {
-          "description": "Plan 06g2/06h: per-lane worker models (worker.1..worker.N, one per configured lane); a lane without one uses worker's.",
+          "description": "Plan 06g2: per-lane worker models (worker.1, worker.2); a lane without one uses worker's.",
           "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/RoleModel" }
+          "additionalProperties": false,
+          "properties": {
+            "1": { "$ref": "#/$defs/RoleModel" },
+            "2": { "$ref": "#/$defs/RoleModel" }
+          }
         },
         "reviewer": { "$ref": "#/$defs/RoleModel" },
         "reviewerSeats": {
-          "description": "Plan 06h: per-seat reviewer models (reviewer.<seat>, one per configured seat); a seat without one uses reviewer's.",
+          "description": "Per-seat reviewer models (reviewer.M, reviewer.A, reviewer.B); a seat without one uses reviewer's.",
           "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/RoleModel" }
+          "additionalProperties": false,
+          "properties": {
+            "M": { "$ref": "#/$defs/RoleModel" },
+            "A": { "$ref": "#/$defs/RoleModel" },
+            "B": { "$ref": "#/$defs/RoleModel" }
+          }
         },
         "evaluator": { "$ref": "#/$defs/RoleModel" },
         "panel": { "$ref": "#/$defs/RoleModel" },
         "panelSeats": {
-          "description": "Plan 06h: per-seat panel models (panel.1..panel.N, one per reviewer); a seat without one uses the reviewer of its position when panelFrom is reviewers, else panel's.",
+          "description": "Per-seat panel models (panel.1, panel.2, panel.3); a seat without one uses the reviewer of its position when panelFrom is reviewers, else panel's.",
           "type": "object",
-          "additionalProperties": { "$ref": "#/$defs/RoleModel" }
+          "additionalProperties": false,
+          "properties": {
+            "1": { "$ref": "#/$defs/RoleModel" },
+            "2": { "$ref": "#/$defs/RoleModel" },
+            "3": { "$ref": "#/$defs/RoleModel" }
+          }
         },
         "panelFrom": {
           "description": "`panel=reviewers`: each panel seat follows the reviewer model of its position.",
@@ -110,6 +124,7 @@
       "additionalProperties": false,
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "line": { "description": "The 1-based line of the phase headline, for a phase-override finding.", "type": "integer" },
         "goal": { "type": "string", "minLength": 1 },
         "acceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },

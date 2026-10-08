@@ -219,20 +219,22 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
  * same selector the launch sites use — so the line names what each seat ran
  * on, not just the role's shared default. A plan that only sets the four flat
  * roles keeps the four-entry line unchanged. */
-export function modelEntries(models: PlanModels | undefined): Array<{ role: string; value: string }> {
+export function modelEntries(models: PlanModels | undefined, seats?: readonly string[]): Array<{ role: string; value: string }> {
   if (!models) return [];
-  const select = planModelSelector({ models }, models.reviewerSeats ? Object.keys(models.reviewerSeats) : undefined);
+  // Plan 06h (A2): a plan with per-seat models names EVERY configured seat,
+  // including a seat that falls back to the shared reviewer model. `seats`
+  // is the contract's own list; absent, the declared model keys stand in.
+  const perSeat = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
+  const configured = seats && seats.length > 0 ? seats : perSeat ? Object.keys(models.reviewerSeats!) : [];
+  const select = planModelSelector({ models }, configured.length > 0 ? configured : undefined);
   const out: Array<{ role: string; value: string }> = [];
   const push = (role: string, m: RoleModel | undefined): void => {
     if (!m) return;
     out.push({ role, value: m.provider ? `${m.provider}:${m.model ?? ""}` : m.model ?? "" });
   };
   push("worker", models.worker);
-  // Plan 06h (A2): expand the seats the plan actually declares, not a fixed
-  // three, so a five-seat plan names reviewer.C/D too.
-  const reviewerSeatKeys = models.reviewerSeats ? Object.keys(models.reviewerSeats) : [];
-  if (reviewerSeatKeys.length > 0) {
-    for (const seat of reviewerSeatKeys) push(`reviewer.${seat}`, select("reviewer", seat));
+  if (perSeat) {
+    for (const seat of configured) push(`reviewer.${seat}`, select("reviewer", seat));
   } else {
     push("reviewer", models.reviewer);
   }
@@ -240,9 +242,10 @@ export function modelEntries(models: PlanModels | undefined): Array<{ role: stri
   const panelSeatKeys = models.panelSeats ? Object.keys(models.panelSeats) : [];
   if (panelSeatKeys.length > 0) {
     for (const seat of panelSeatKeys) push(`panel.${seat}`, select("panel", seat));
-  } else if (models.panelFrom === "reviewers" && reviewerSeatKeys.length > 0) {
-    // panel=reviewers: one panel seat per declared reviewer, by position.
-    reviewerSeatKeys.forEach((_, i) => push(`panel.${i + 1}`, select("panel", String(i + 1))));
+  } else if (models.panelFrom === "reviewers") {
+    // panel=reviewers: one panel seat per configured reviewer, by position.
+    const list = configured.length > 0 ? configured : ["M", "A", "B"];
+    for (let i = 1; i <= list.length; i++) push(`panel.${i}`, select("panel", String(i)));
   } else {
     push("panel", models.panel);
   }
@@ -253,27 +256,33 @@ export function modelEntries(models: PlanModels | undefined): Array<{ role: stri
  * undefined when the plan set none (a run that uses Pi's `defaultModel` needs
  * no line). The status view pads the `models` label itself, so the value
  * carries no `models:` prefix. */
-export function modelsLineText(models: PlanModels | undefined): string | undefined {
-  const entries = modelEntries(models);
+export function modelsLineText(models: PlanModels | undefined, seats?: readonly string[]): string | undefined {
+  const entries = modelEntries(models, seats);
   return entries.length > 0 ? entries.map((e) => `${e.role}=${e.value}`).join(" ") : undefined;
 }
 
 /** The plan's own models in the shape `renderLoopTape` reads. Only what the
  * plan declares enters the tape, never Pi's settings, so the live file and a
  * `tt contract rebuild` agree; a role with no declared model reads `default`. */
-export function chartModelsFromPlan(models: PlanModels | undefined): ChartModels | undefined {
+export function chartModelsFromPlan(models: PlanModels | undefined, seats?: readonly string[]): ChartModels | undefined {
   if (!models) return undefined;
-  // Plan 06h (A2): expand the seats the plan declares, not a fixed three.
-  const seatKeys = models.reviewerSeats ? Object.keys(models.reviewerSeats) : [];
-  const select = planModelSelector({ models }, seatKeys.length > 0 ? seatKeys : undefined);
+  // Plan 06h (A2): expand every configured seat, not a fixed three.
+  const perSeat = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
+  const configured = seats && seats.length > 0 ? seats : perSeat ? Object.keys(models.reviewerSeats!) : [];
+  const select = planModelSelector({ models }, configured.length > 0 ? configured : undefined);
   const name = (m: RoleModel | undefined): string | undefined => m?.model;
-  const panelKeys = models.panelSeats ? Object.keys(models.panelSeats) : seatKeys.map((_, i) => String(i + 1));
+  const panelPerSeat = models.panelSeats ? Object.keys(models.panelSeats).length > 0 : false;
+  const panelKeys = panelPerSeat
+    ? Object.keys(models.panelSeats!)
+    : models.panelFrom === "reviewers"
+      ? configured.map((_, i) => String(i + 1))
+      : [];
   return {
     worker: name(select("worker")),
     reviewer: name(select("reviewer")),
     evaluator: name(select("evaluator")),
     panel: name(select("panel")),
-    reviewerSeats: Object.fromEntries(seatKeys.map((s) => [s, name(select("reviewer", s))])),
+    reviewerSeats: perSeat ? Object.fromEntries(configured.map((s) => [s, name(select("reviewer", s))])) : {},
     panelSeats: Object.fromEntries(panelKeys.map((s) => [s, name(select("panel", s))])),
   };
 }
@@ -806,14 +815,14 @@ export function buildView(
     phase,
     run: timeline.state.run,
     endMs: timelineEndMs(timeline, events),
-    models: chartModelsFromPlan(plan.models),
+    models: chartModelsFromPlan(plan.models, seatsOf(phase.contract)),
     limits: stageLimits(plan),
   };
   const tape = renderLoopTape(tapeInput);
   // 06a finding #24: the `models` row names what the plan configured AND what
   // the preflight found (`check ok`, or the refused model and its gateway
   // message).
-  const modelsText = modelsLineText(plan.models);
+  const modelsText = modelsLineText(plan.models, seatsOf(phase.contract));
   const modelsCheckText = modelsCheckStatusText(readModelsCheck(runDir));
   const models = [modelsText, modelsCheckText].filter((s): s is string => s !== undefined && s.length > 0).join(" · ") || undefined;
   return {
@@ -997,7 +1006,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   // follow-up, not a blocker. The PR body must not hide it.
   const followUps = (phase.messages ?? []).filter((m) => m.followUp);
   // #+TT_MODELS: the models the run actually used, one line per role.
-  const models = modelEntries(plan.models);
+  const models = modelEntries(plan.models, seatsOf(phase.contract));
   const lines = [
     `## ${phase.phaseId}`,
     "",

@@ -93,6 +93,9 @@ export function tally(
   candidateSha: string,
   contractVersion: ContractVersion,
   seats: readonly string[] = DEFAULT_SEATS,
+  /** Plan 06h (A2): the named leader (`#+TT_LEADER`), whose approval a
+   * decision needs. Absent (or not a seat) means the first seat. */
+  leader?: string,
 ): TallyResult {
   if (!isVotedClass(decision)) return "not_votable";
   if (decision.linkedFindingId) {
@@ -100,9 +103,9 @@ export function tally(
     if (!finding || finding.status === "open") return "suspended";
   }
   const list = seats.length > 0 ? seats : DEFAULT_SEATS;
-  const leader = list[0];
+  const leaderSeat = typeof leader === "string" && list.includes(leader) ? leader : list[0];
   const needed = Math.floor(list.length / 2) + 1;
-  const leaderBallot = currentBallot(ballots, decision.id, leader, candidateSha, contractVersion, decision.version);
+  const leaderBallot = currentBallot(ballots, decision.id, leaderSeat, candidateSha, contractVersion, decision.version);
   if (!isValidBallot(leaderBallot) || leaderBallot.vote !== "approve") return "fail";
   const approvals = list.filter((seat) => {
     const b = currentBallot(ballots, decision.id, seat, candidateSha, contractVersion, decision.version);

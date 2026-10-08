@@ -696,6 +696,7 @@ so an old plan reaches the loop as items without changing meaning."
       (unless (or structured acceptance)
         (push (cons line "phase has no \"Acceptance:\" list and no Requirements heading") errors)))
     (cons `((id . ,(or id (format "line-%d" line)))
+            (line . ,line)
             (goal . ,(or goal ""))
             (acceptance . ,(vconcat acceptance))
             (acceptanceLines . ,(vconcat acceptance-lines))
