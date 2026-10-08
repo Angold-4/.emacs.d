@@ -356,7 +356,7 @@ export async function setupConductor(opts: {
     piArgsPrefix: [FAKE_PI_PATH, ...(opts.extraPiArgsPrefix ?? [])],
     // The same one-liner `tt start` uses, so a plan's #+TT_MODELS reaches
     // every launch in tests exactly as it does in production.
-    providerModelFor: planModelSelector(plan),
+    providerModelFor: planModelSelector(plan, plan.seats),
     extraEnv: opts.extraEnv,
     deadlines: opts.deadlines,
     stubReviews: opts.stubReviews ?? true,
@@ -376,7 +376,7 @@ export async function setupConductor(opts: {
         }
         return { FAKE_PI_SCRIPT: laneWorkerScriptPaths.get(key)!, ...(opts.extraWorkerEnv ?? {}) };
       }
-      const laneReview = agentId.match(/^lane-review-(\d+)-([a-z])-([MAB])-/);
+      const laneReview = agentId.match(/^lane-review-(\d+)-([a-z])-([A-Za-z0-9_]+)-/);
       if (role === "reviewer" && laneReview && opts.laneReviewerScriptFor) {
         const seat = laneReview[3];
         const key = `lane-review-${agentId}`;
@@ -388,7 +388,7 @@ export async function setupConductor(opts: {
         }
         return { FAKE_PI_SCRIPT: laneReviewerScriptPaths.get(key)!, ...(opts.extraReviewerEnv?.(seat as Reviewer) ?? {}) };
       }
-      const pick = agentId.match(/^pick-(\d+)-([MAB])-/);
+      const pick = agentId.match(/^(?:pick|revote)-(\d+)-([A-Za-z0-9_]+)-/);
       if (role === "picker" && pick && opts.pickScriptFor) {
         const seat = pick[2];
         const key = `pick-${agentId}`;
@@ -469,7 +469,7 @@ export async function setupConductor(opts: {
         }
         return { FAKE_PI_SCRIPT: panelScriptPaths.get(agentId)! };
       }
-      const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1] ?? "M") as Reviewer;
+      const reviewer = (agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] ?? "M") as Reviewer;
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {
         const script = opts.reviewerScriptFor(reviewer, conductor.state);
         reviewerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));

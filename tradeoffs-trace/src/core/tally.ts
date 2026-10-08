@@ -15,6 +15,7 @@
 //   reduce.ts's BALLOT_CAST case — tally() only reports `suspended` once
 //   that link exists).
 
+import { DEFAULT_SEATS } from "./seats.ts";
 import type { Ballot, ContractVersion, Decision, Finding, Reviewer } from "./types.ts";
 
 export type TallyResult = "pass" | "fail" | "suspended" | "not_votable";
@@ -81,24 +82,31 @@ export function currentBallot(
   return bound[bound.length - 1];
 }
 
+/** Plan 06h (A2): the vote rule generalises the master-veto two-of-three
+ * rule. A decision passes iff the LEADER approves and a strict majority of
+ * the seats approve (2 of 3, 3 of 5, 4 of 7). With the default `M A B` and
+ * leader `M` this is exactly the old rule, so every 06g test is unchanged. */
 export function tally(
   decision: Decision,
   ballots: Ballot[],
   findings: Finding[],
   candidateSha: string,
   contractVersion: ContractVersion,
+  seats: readonly string[] = DEFAULT_SEATS,
 ): TallyResult {
   if (!isVotedClass(decision)) return "not_votable";
   if (decision.linkedFindingId) {
     const finding = findings.find((f) => f.id === decision.linkedFindingId);
     if (!finding || finding.status === "open") return "suspended";
   }
-  const m = currentBallot(ballots, decision.id, "M", candidateSha, contractVersion, decision.version);
-  const a = currentBallot(ballots, decision.id, "A", candidateSha, contractVersion, decision.version);
-  const b = currentBallot(ballots, decision.id, "B", candidateSha, contractVersion, decision.version);
-  const mVote = isValidBallot(m) ? m.vote : "reject";
-  const aVote = isValidBallot(a) ? a.vote : "reject";
-  const bVote = isValidBallot(b) ? b.vote : "reject";
-  if (mVote !== "approve") return "fail";
-  return aVote === "approve" || bVote === "approve" ? "pass" : "fail";
+  const list = seats.length > 0 ? seats : DEFAULT_SEATS;
+  const leader = list[0];
+  const needed = Math.floor(list.length / 2) + 1;
+  const leaderBallot = currentBallot(ballots, decision.id, leader, candidateSha, contractVersion, decision.version);
+  if (!isValidBallot(leaderBallot) || leaderBallot.vote !== "approve") return "fail";
+  const approvals = list.filter((seat) => {
+    const b = currentBallot(ballots, decision.id, seat, candidateSha, contractVersion, decision.version);
+    return isValidBallot(b) && b.vote === "approve";
+  }).length;
+  return approvals >= needed ? "pass" : "fail";
 }

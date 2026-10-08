@@ -21,6 +21,7 @@
 // `isLiveDecision`).
 
 import { isLiveDecision } from "./predicate.ts";
+import { DEFAULT_SEATS } from "./seats.ts";
 import { currentBallot, tally } from "./tally.ts";
 import type {
   Ballot,
@@ -103,6 +104,7 @@ export function carryBallotsForward(
   contractVersion: ContractVersion,
   carried: Decision[],
   newCandidateSha: string,
+  seats: readonly string[] = DEFAULT_SEATS,
 ): Ballot[] {
   if (!prevCandidateSha) return [];
   const kept = new Set((prior ?? []).filter((p) => p.status === "kept").map((p) => p.id));
@@ -111,8 +113,8 @@ export function carryBallotsForward(
     if (!kept.has(d.id) || d.boundCandidateSha !== newCandidateSha) continue;
     const before = prevDecisions.find((x) => x.id === d.id);
     if (!before || before.boundCandidateSha !== prevCandidateSha) continue;
-    if (tally(before, prevBallots, findings, prevCandidateSha, contractVersion) !== "pass") continue;
-    for (const reviewer of ["M", "A", "B"] as const) {
+    if (tally(before, prevBallots, findings, prevCandidateSha, contractVersion, seats) !== "pass") continue;
+    for (const reviewer of seats) {
       const b = currentBallot(prevBallots, d.id, reviewer, prevCandidateSha, contractVersion, before.version);
       if (!b) continue;
       out.push({ ...b, boundCandidateSha: newCandidateSha, boundRecordVersion: d.version, carriedFrom: prevCandidateSha });
@@ -187,22 +189,68 @@ export interface RoundWinner {
  * - two or more: the lane with a strict majority of the seats' pick votes
  *   (2 of 3, 3 of 5, 4 of 7) wins. A round whose votes give no lane a
  *   majority has no winner. */
-export function pickWinner(round: RoundRecord, seats: number): RoundWinner | undefined {
+export function pickWinner(round: RoundRecord, seats: number | readonly string[], leader?: string): RoundWinner | undefined {
   const passing = passingCandidates(round);
   if (passing.length === 0) return undefined;
   if (passing.length === 1) return { lane: passing[0].lane, sha: passing[0].sha as string, votes: 0 };
-  const needed = Math.floor(seats / 2) + 1;
-  const counts = new Map<string, number>();
-  for (const vote of round.votes) {
-    if (!passing.some((c) => c.lane === vote.lane)) continue;
-    counts.set(vote.lane, (counts.get(vote.lane) ?? 0) + 1);
-  }
+  const seatList = typeof seats === "number" ? undefined : seats;
+  const seatCount = typeof seats === "number" ? seats : seats.length;
+  const needed = Math.floor(seatCount / 2) + 1;
+  const counts = countVotes(round.votes, passing);
   let best: RoundWinner | undefined;
   for (const c of passing) {
     const votes = counts.get(c.lane) ?? 0;
     if (votes >= needed && (!best || votes > best.votes)) best = { lane: c.lane, sha: c.sha as string, votes };
   }
-  return best;
+  if (best) return best;
+  // Plan 06h (A3): 3+ candidates with no strict majority go to one revote
+  // between the top two. A tie there is broken by the leader's vote.
+  if (passing.length < 3 || !round.revote) return undefined;
+  const pair = round.revote.lanes;
+  const inPair = passing.filter((c) => pair.includes(c.lane));
+  // The leader is the tiebreak, so the majority is over the OTHER seats; a
+  // tie among them is broken by the leader's own revote vote. Counting the
+  // leader here would make a tie impossible with an odd seat count.
+  const leaderSeat = leader ?? seatList?.[0] ?? DEFAULT_SEATS[0];
+  const nonLeader = seatList ? seatList.filter((s) => s !== leaderSeat) : undefined;
+  const revoteVotes = nonLeader ? round.revote.votes.filter((v) => nonLeader.includes(v.seat)) : round.revote.votes;
+  const revoteCounts = countVotes(revoteVotes, inPair);
+  const revoteNeeded = nonLeader ? Math.floor(nonLeader.length / 2) + 1 : needed;
+  let rBest: RoundWinner | undefined;
+  for (const c of inPair) {
+    const votes = revoteCounts.get(c.lane) ?? 0;
+    if (votes >= revoteNeeded && (!rBest || votes > rBest.votes)) rBest = { lane: c.lane, sha: c.sha as string, votes };
+  }
+  if (rBest) return rBest;
+  const leaderVote = round.revote.votes.find((v) => v.seat === leaderSeat);
+  const picked = leaderVote ? inPair.find((c) => c.lane === leaderVote.lane) : undefined;
+  if (picked) return { lane: picked.lane, sha: picked.sha as string, votes: revoteCounts.get(picked.lane) ?? 0 };
+  return undefined;
+}
+
+/** Plan 06h (A3): the two lanes a 3+-candidate round must revote between, or
+ * undefined when the first vote already gave a lane a strict majority (or
+ * there are fewer than three candidates). `runRound` uses this to decide
+ * whether to run the revote turn. */
+export function revotePair(round: RoundRecord, seats: number | readonly string[]): string[] | undefined {
+  const passing = passingCandidates(round);
+  if (passing.length < 3) return undefined;
+  const seatCount = typeof seats === "number" ? seats : seats.length;
+  const needed = Math.floor(seatCount / 2) + 1;
+  const counts = countVotes(round.votes, passing);
+  if (passing.some((c) => (counts.get(c.lane) ?? 0) >= needed)) return undefined;
+  const ranked = [...passing].sort((a, b) => (counts.get(b.lane) ?? 0) - (counts.get(a.lane) ?? 0));
+  if (ranked.length < 2) return undefined;
+  return [ranked[0].lane, ranked[1].lane];
+}
+
+function countVotes(votes: readonly PickVote[], candidates: readonly LaneCandidateRecord[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const vote of votes) {
+    if (!candidates.some((c) => c.lane === vote.lane)) continue;
+    counts.set(vote.lane, (counts.get(vote.lane) ?? 0) + 1);
+  }
+  return counts;
 }
 
 /** One lane's pick votes, in seat order. */

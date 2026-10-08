@@ -13,6 +13,7 @@
 // state. `actions` is what `next()` of the resulting state must equal.
 
 import { carryBallotsForward, carryDecisionsForward } from "./rounds.ts";
+import { seatsOf } from "./seats.ts";
 import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
 import {
@@ -104,8 +105,8 @@ function acceptHolds(s: State): boolean {
 
 function allThreeReviewsPresent(state: State, upcoming?: Review): boolean {
   const r = state.phase.reviews;
-  const has = (slot: typeof r.M, who: "M" | "A" | "B") => Boolean(slot?.review) || upcoming?.reviewer === who;
-  return has(r.M, "M") && has(r.A, "A") && has(r.B, "B");
+  const has = (who: string) => Boolean(r[who]?.review) || upcoming?.reviewer === who;
+  return seatsOf(state.phase.contract).every(has);
 }
 
 function activePhaseStates(): PhaseStateName[] {
@@ -399,6 +400,7 @@ addRow({
         s.phase.contract.contractVersion,
         carried,
         e.candidateSha,
+        seatsOf(s.phase.contract),
       ),
       overrides: [],
       // design §2.2: a clean freeze (no survivors this time) clears any

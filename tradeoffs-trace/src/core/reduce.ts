@@ -28,7 +28,8 @@ import {
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
-import { isLiveDecision, panelOutcome, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { seatsOf } from "./seats.ts";
 import { rowsFor } from "./transitions.ts";
 import type {
   BindingTuple,
@@ -121,6 +122,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "CANDIDATE_SUBMITTED",
   "CANDIDATE_CHECKED",
   "PICK_VOTE",
+  "REVOTE_STARTED",
   "CANDIDATE_PICKED",
   "ROUND_REVIEW_SUBMITTED",
   "ITEM_CARRIED",
@@ -220,8 +222,10 @@ function withoutEvaluationInFlight(p: PhaseState, type: MessageType): PhaseState
   return inFlight;
 }
 
-/** Plan 04b: the three seats a panel may have. */
-const PANEL_SEAT_KEYS = new Set(["1", "2", "3"]);
+/** Plan 04b/06h: the panel seat keys a phase may have — one per reviewer. */
+function panelSeatKeys(p: PhaseState): Set<string> {
+  return new Set(panelSeatNumbers(seatsOf(p.contract).length).map(String));
+}
 
 function withoutPanelSeatInFlight(p: PhaseState, blockerId: string, seat: string): PhaseState["inFlight"] {
   const inFlight = { ...p.inFlight };
@@ -449,6 +453,19 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
     }
 
+    case "REVOTE_STARTED": {
+      // Plan 06h (A3): the top two lanes go to one revote. Record-only.
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `REVOTE_STARTED for round ${event.round}, which has not started`);
+      if (event.lanes.length !== 2 || event.lanes.some((l) => !round.lanes.includes(l))) {
+        return rejected(state, `REVOTE_STARTED names ${event.lanes.join(", ")}, not two lanes of round ${event.round}`);
+      }
+      return ok({
+        ...state,
+        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, revote: { lanes: [...event.lanes], votes: [] } }) },
+      });
+    }
+
     case "PICK_VOTE": {
       const round = (p.rounds ?? []).find((r) => r.round === event.round);
       if (!round) return rejected(state, `PICK_VOTE for round ${event.round}, which has not started`);
@@ -457,7 +474,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       // A seat votes once: a later vote from the same seat replaces the
       // earlier one, exactly like a re-cast ballot.
-      const votes = [...round.votes.filter((v) => v.seat !== event.seat), { seat: event.seat, lane: event.lane, why: event.why }];
+      const vote = { seat: event.seat, lane: event.lane, why: event.why };
+      if (event.revote) {
+        if (!round.revote || !round.revote.lanes.includes(event.lane)) {
+          return rejected(state, `PICK_VOTE names lane ${event.lane}, not a revote lane of round ${event.round}`);
+        }
+        const votes = [...round.revote.votes.filter((v) => v.seat !== event.seat), vote];
+        return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, revote: { ...round.revote, votes } }) } });
+      }
+      const votes = [...round.votes.filter((v) => v.seat !== event.seat), vote];
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, votes }) } });
     }
 
@@ -795,7 +820,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const panel = p.panel?.blockers?.[event.blockerId];
       if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = panel.seats?.[seatKey];
       if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
       if (seat?.unavailable) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is unavailable`);
@@ -849,7 +874,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const panel = p.panel?.blockers?.[event.blockerId];
       if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = panel.seats?.[seatKey];
       if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
       if (panelSeatSettled(seat)) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is already unavailable`);
@@ -876,7 +901,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const panel = p.panel?.blockers?.[event.blockerId];
       if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
       if (panel.decided) return rejected(state, `blocker ${event.blockerId}'s panel has already decided`);
-      if (!panelSeatsSettled(panel)) {
+      if (!panelSeatsSettled(panel, panelSeatKeys(p).size)) {
         return rejected(state, `blocker ${event.blockerId}'s panel still has undecided seats`);
       }
       const computed = panelOutcome(panel);
@@ -912,7 +937,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, `ROUND_PANEL_VOTE is only valid in EVALUATING, not ${p.phase}`);
       }
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `round panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `round panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = p.panel?.round?.seats?.[seatKey];
       if (seat?.votes !== undefined) return rejected(state, `round panel seat ${seatKey} already voted`);
       if (seat?.unavailable) return rejected(state, `round panel seat ${seatKey} is unavailable`);
@@ -943,7 +968,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, `ROUND_PANEL_SEAT_UNAVAILABLE is only valid in EVALUATING, not ${p.phase}`);
       }
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `round panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `round panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = p.panel?.round?.seats?.[seatKey];
       if (seat?.votes !== undefined) return rejected(state, `round panel seat ${seatKey} already voted`);
       if (seat?.unavailable === true && (seat.dispatches ?? 0) >= 2) {

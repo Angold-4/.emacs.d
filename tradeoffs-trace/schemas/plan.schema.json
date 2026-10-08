@@ -21,36 +21,22 @@
       "properties": {
         "worker": { "$ref": "#/$defs/RoleModel" },
         "workerLanes": {
-          "description": "Plan 06g2: per-lane worker models (worker.1, worker.2); a lane without one uses worker's.",
+          "description": "Plan 06g2/06h: per-lane worker models (worker.1..worker.N, one per configured lane); a lane without one uses worker's.",
           "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "1": { "$ref": "#/$defs/RoleModel" },
-            "2": { "$ref": "#/$defs/RoleModel" }
-          }
+          "additionalProperties": { "$ref": "#/$defs/RoleModel" }
         },
         "reviewer": { "$ref": "#/$defs/RoleModel" },
         "reviewerSeats": {
-          "description": "Per-seat reviewer models (reviewer.M, reviewer.A, reviewer.B); a seat without one uses reviewer's.",
+          "description": "Plan 06h: per-seat reviewer models (reviewer.<seat>, one per configured seat); a seat without one uses reviewer's.",
           "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "M": { "$ref": "#/$defs/RoleModel" },
-            "A": { "$ref": "#/$defs/RoleModel" },
-            "B": { "$ref": "#/$defs/RoleModel" }
-          }
+          "additionalProperties": { "$ref": "#/$defs/RoleModel" }
         },
         "evaluator": { "$ref": "#/$defs/RoleModel" },
         "panel": { "$ref": "#/$defs/RoleModel" },
         "panelSeats": {
-          "description": "Per-seat panel models (panel.1, panel.2, panel.3); a seat without one uses the reviewer of its position when panelFrom is reviewers, else panel's.",
+          "description": "Plan 06h: per-seat panel models (panel.1..panel.N, one per reviewer); a seat without one uses the reviewer of its position when panelFrom is reviewers, else panel's.",
           "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "1": { "$ref": "#/$defs/RoleModel" },
-            "2": { "$ref": "#/$defs/RoleModel" },
-            "3": { "$ref": "#/$defs/RoleModel" }
-          }
+          "additionalProperties": { "$ref": "#/$defs/RoleModel" }
         },
         "panelFrom": {
           "description": "`panel=reviewers`: each panel seat follows the reviewer model of its position.",
@@ -83,7 +69,7 @@
       "type": "integer"
     },
     "workers": {
-      "description": "Plan 06g: #+TT_WORKERS — how many lanes one round runs. This plan version allows 1 and 2 (`tt lint` refuses more and names 06h). Absent is today's single-candidate loop. A value that is not a whole number is passed through as written so `tt lint` can name it.",
+      "description": "Plan 06g/06h: #+TT_WORKERS — how many lanes one round runs, any positive whole number. Absent is today's single-candidate loop. A value that is not a whole number is passed through as written so `tt lint` can name it.",
       "type": ["integer", "string"]
     },
     "workersLine": {
@@ -91,11 +77,29 @@
       "type": "integer"
     },
     "rounds": {
-      "description": "Plan 06g: #+TT_ROUNDS — how many rounds a phase may spend before it parks on the owner. Absent means the default of 3. A value that is not a whole number is passed through as written so `tt lint` can name it.",
+      "description": "Plan 06g: #+TT_ROUNDS — how many rounds a phase may spend before it parks on the owner (1 to 5). Absent means the default of 3. A value that is not a whole number is passed through as written so `tt lint` can name it.",
       "type": ["integer", "string"]
     },
     "roundsLine": {
       "description": "Lint-only: the 1-based line of #+TT_ROUNDS in the source Org file.",
+      "type": "integer"
+    },
+    "seats": {
+      "description": "Plan 06h: #+TT_REVIEWERS — the odd list of reviewer seats. Absent means M A B.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "seatsLine": {
+      "description": "Lint-only: the 1-based line of #+TT_REVIEWERS in the source Org file.",
+      "type": "integer"
+    },
+    "leader": {
+      "description": "Plan 06h: #+TT_LEADER — the leader seat. Absent means the first seat.",
+      "type": "string",
+      "minLength": 1
+    },
+    "leaderLine": {
+      "description": "Lint-only: the 1-based line of #+TT_LEADER in the source Org file.",
       "type": "integer"
     }
   },
@@ -124,6 +128,16 @@
         "rounds": {
           "description": "Plan 06g: the phase's own :ROUNDS: (overrides #+TT_ROUNDS) — how many rounds the phase may spend.",
           "type": "integer"
+        },
+        "seats": {
+          "description": "Plan 06h: the phase's own :REVIEWERS: (overrides #+TT_REVIEWERS) — the odd list of reviewer seats.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "leader": {
+          "description": "Plan 06h: the phase's own :LEADER: (overrides #+TT_LEADER).",
+          "type": "string",
+          "minLength": 1
         },
         "architecture": { "type": "array", "items": { "$ref": "#/$defs/ArchitectureItem" } },
         "requirements": { "type": "array", "items": { "$ref": "#/$defs/RequirementItem" } },

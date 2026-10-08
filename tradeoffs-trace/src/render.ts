@@ -15,6 +15,7 @@ import * as path from "node:path";
 
 import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest, RoundRecord } from "./core/types.ts";
 import { candidateLabel } from "./core/rounds.ts";
+import { seatsOf } from "./core/seats.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
   projectEntries,
@@ -690,7 +691,10 @@ export function renderStatusText(
   if (probe) lines.push(`probe: ${probe.passed ? `passed (I=${probe.probedI})` : "failed"}`);
   const reviews = phase.reviews as Record<string, { review?: unknown }> | undefined;
   if (reviews) {
-    for (const who of ["M", "A", "B"]) lines.push(`review ${who}: ${reviews[who]?.review ? "submitted" : "pending"}`);
+    // Plan 06h (A2): every configured seat, never a fixed three.
+    for (const who of seatsOf(phase.contract as { seats?: string[] } | undefined)) {
+      lines.push(`review ${who}: ${reviews[who]?.review ? "submitted" : "pending"}`);
+    }
   }
   const ownerRequests = (phase.ownerRequests as Array<{ status: string }>) ?? [];
   lines.push(`open owner requests: ${ownerRequests.filter((r) => r.status === "open").length}`);
@@ -918,7 +922,7 @@ export function renderStatusView(input: StatusViewInput): string {
       } as unknown as ItemLoopState;
       const counts = countsLine(phaseItemCounts(loopState));
       push(row("items", counts));
-      const overturns = overturnCounts(loopState.overturns ?? []);
+      const overturns = overturnCounts(loopState.overturns ?? [], seatsOf(loopState.contract));
       if (overturns.length > 0) push(row("overturns", overturns.map((o) => `${o.seat} ${o.count}`).join(" · ")));
     }
   } catch {

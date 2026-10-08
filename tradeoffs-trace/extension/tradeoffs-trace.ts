@@ -242,7 +242,8 @@ const SubmitDiscoveryParams = Type.Object(
 );
 
 const submitReviewFields: Record<string, TSchema> = {
-  reviewer: StringEnum(["M", "A", "B"] as const),
+  // Plan 06h: any seat the plan's #+TT_REVIEWERS declares (default M A B).
+  reviewer: Type.String({ description: "Your reviewer seat, as the conductor told it to you" }),
   phaseId: Type.String(),
   candidateSha: Type.String(),
   contractVersion: ContractVersionParam,
@@ -384,7 +385,7 @@ const PanelOptionParam = Type.Object({
 });
 const submitPanelVoteFields: Record<string, TSchema> = {
   blockerId: Type.String({ description: "The raw blocker message id this vote is about" }),
-  seat: Type.Integer({ description: "This seat's number (1, 2 or 3)" }),
+  seat: Type.Integer({ minimum: 1, description: "This seat's number (1..N, one per reviewer)" }),
   vote: StringEnum(["block", "downgrade"] as const, {
     description: "block: stop the work until the owner decides; downgrade: an ordinary blocking finding for the next worker attempt",
   }),

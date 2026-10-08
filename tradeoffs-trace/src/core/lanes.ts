@@ -20,7 +20,7 @@
 // conductor never calls `runRound`, and the single-candidate loop is byte for
 // byte what it was.
 
-import { candidateLabel, laneIds, passingCandidates, pickWinner, type RoundWinner } from "./rounds.ts";
+import { candidateLabel, laneIds, passingCandidates, pickWinner, revotePair, type RoundWinner } from "./rounds.ts";
 import type {
   CriterionDispute,
   DecisionDisclosure,
@@ -60,8 +60,12 @@ export interface LaneCheck {
 export interface LaneHost {
   readonly phaseId: string;
   readonly goal: string;
-  /** The seats that review and vote: M, A and B (never a model's choice). */
+  /** The seats that review and vote, from the contract's `#+TT_REVIEWERS`
+   * (never a model's choice). */
   readonly seats: readonly string[];
+  /** Plan 06h (A3): the leader, whose vote breaks a revote tie. Absent means
+   * the first seat. */
+  readonly leader?: string;
   /** The round records the log holds so far. */
   rounds(): readonly RoundRecord[];
   /** The settled ledger, one line per record (the leader's pick context). */
@@ -81,12 +85,14 @@ export interface LaneHost {
   /** One seat reviews one passing candidate. */
   reviewCandidate(round: number, lane: string, sha: string, seat: string): Promise<void>;
   /** One seat's pick turn. The host builds the prompt (`buildPickPrompt`)
-   * and records the seat's vote; it never decides the winner. */
+   * and records the seat's vote; it never decides the winner. `revote` is
+   * true for the top-two revote turn (plan 06h A3). */
   pickTurn(
     round: number,
     base: string,
     seat: string,
     passing: ReadonlyArray<{ lane: string; sha: string }>,
+    revote?: boolean,
   ): Promise<void>;
   /** Record one round event. */
   emit(event: Event): void;
@@ -228,16 +234,41 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       }
     }
   }
-  const finalRecord = host.rounds().find((r) => r.round === ctx.round);
+  let finalRecord = host.rounds().find((r) => r.round === ctx.round);
   if (!failure && finalRecord && passing.length > 1) {
     const voted = new Set(finalRecord.votes.map((v) => v.seat));
     const missing = host.seats.filter((s) => !voted.has(s));
     if (missing.length > 0) failure = `the pick turn is missing a vote from ${missing.join(", ")}`;
   }
+
+  // 4b. Plan 06h (A3): with three or more candidates and no strict majority,
+  //     the top two by votes go to ONE revote. A tie in the revote is broken
+  //     by the leader's vote (pickWinner).
+  if (!failure && finalRecord && passing.length >= 3) {
+    const pair = revotePair(finalRecord, host.seats);
+    if (pair) {
+      host.emit({ type: "REVOTE_STARTED", round: ctx.round, lanes: pair });
+      const pairCandidates = passing.filter((c) => pair.includes(c.lane)).map((c) => ({ lane: c.lane, sha: c.sha as string }));
+      for (const seat of host.seats) {
+        try {
+          await host.pickTurn(ctx.round, ctx.base, seat, pairCandidates, true);
+        } catch (err) {
+          failure = `${seat}'s revote failed: ${errorNote(err)}`;
+          break;
+        }
+      }
+      finalRecord = host.rounds().find((r) => r.round === ctx.round);
+      if (!failure && finalRecord) {
+        const voted = new Set((finalRecord.revote?.votes ?? []).map((v) => v.seat));
+        const missing = host.seats.filter((s) => !voted.has(s));
+        if (missing.length > 0) failure = `the revote is missing a vote from ${missing.join(", ")}`;
+      }
+    }
+  }
   if (failure) return { round: ctx.round, base: ctx.base, lanes, builds, failure };
 
   // 5. `pickWinner` — code, never a model — decides the round.
-  const winner = finalRecord ? pickWinner(finalRecord, host.seats.length) : undefined;
+  const winner = finalRecord ? pickWinner(finalRecord, host.seats, host.leader) : undefined;
   if (winner) {
     host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: winner.lane, sha: winner.sha, votes: winner.votes });
   }

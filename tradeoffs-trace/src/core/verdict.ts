@@ -5,9 +5,11 @@
 // open).
 
 import { decisionStatus, isLiveDecision } from "./predicate.ts";
+import { seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot } from "./tally.ts";
 import type { PhaseState, Reviewer } from "./types.ts";
 
+/** The default seats, kept for callers that predate `#+TT_REVIEWERS`. */
 export const REVIEWERS: readonly Reviewer[] = ["M", "A", "B"];
 
 export interface ReviewerOutcome {
@@ -26,7 +28,7 @@ export interface ReviewerOutcome {
 /** Each reviewer's outcome on the current candidate. */
 export function reviewerOutcomes(phase: PhaseState): ReviewerOutcome[] {
   const C = phase.candidate?.sha;
-  return REVIEWERS.map((reviewer) => {
+  return seatsOf(phase.contract).map((reviewer) => {
     const review = phase.reviews[reviewer]?.review;
     const submitted = Boolean(C && review && review.candidateSha === C);
     const ballots = phase.ballots.filter((b) => b.reviewer === reviewer && b.boundCandidateSha === C);
@@ -80,7 +82,8 @@ export function notAcceptedReasons(phase: PhaseState): string[] {
     failedBy.set(why, [...(failedBy.get(why) ?? []), shortId(d.id)]);
   }
   for (const [why, ids] of failedBy) {
-    const verb = why === "M veto" ? "vetoed by M" : `failed (${why})`;
+    const veto = /([A-Za-z0-9_]+) veto/.exec(why);
+    const verb = veto ? `vetoed by ${veto[1]}` : `failed (${why})`;
     reasons.push(ids.length <= 2 ? `${ids.join(", ")} ${verb}` : `${ids.length} trade-offs ${verb}`);
   }
   for (const f of phase.findings) {
@@ -171,14 +174,16 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
   for (const d of live) {
     const status = decisionStatus(d, phase);
     const choice = oneLine(d.choice, 70);
-    if (status.status === "failed" && (status.reason ?? "").includes("M veto")) {
-      const m = C ? currentBallot(phase.ballots, d.id, "M", C, K, d.version) : undefined;
+    const vetoMatch = /([A-Za-z0-9_]+) veto/.exec(status.reason ?? "");
+    if (status.status === "failed" && vetoMatch) {
+      const leader = vetoMatch[1];
+      const m = C ? currentBallot(phase.ballots, d.id, leader, C, K, d.version) : undefined;
       const why = m && isValidBallot(m) ? oneLine(m.rationale, 80) : "no reason recorded";
-      vetoes.push({ kind: "veto", recordId: d.id, text: `vetoed by M: ${shortId(d.id)} ${choice} — ${why}` });
+      vetoes.push({ kind: "veto", recordId: d.id, text: `vetoed by ${leader}: ${shortId(d.id)} ${choice} — ${why}` });
       continue;
     }
     const dissenters = C
-      ? (["M", "A", "B"] as const).filter((who) => {
+      ? seatsOf(phase.contract).filter((who) => {
           const b = currentBallot(phase.ballots, d.id, who, C, K, d.version);
           return isValidBallot(b) && b.vote === "reject";
         })

@@ -372,7 +372,7 @@ test("plan-lint CLI: `tt lint` reports a bad seat and a panel=reviewers conflict
     const r = await runCli(["lint", planPath], {});
     assert.notEqual(r.code, 0);
     assert.match(r.stdout, /\/tmp\/PLAN\.org:4: error: \[models\]/);
-    assert.match(r.stdout, /unknown reviewer seat reviewer\.X/);
+    assert.match(r.stdout, /reviewer\.X, which #\+TT_REVIEWERS does not declare/);
     assert.match(r.stdout, /panel=reviewers together with an explicit panel seat/);
     assert.match(r.stdout, /reviewer\.M more than once/);
   } finally {

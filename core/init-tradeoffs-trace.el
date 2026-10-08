@@ -643,6 +643,13 @@ so an old plan reaches the loop as items without changing meaning."
                       (+tt--keyword "TT_WORKERS")))
          (rounds (or (org-element-property :ROUNDS hl)
                      (+tt--keyword "TT_ROUNDS")))
+         ;; Plan 06h: the reviewer seats and their leader. A phase's own
+         ;; :REVIEWERS:/:LEADER: overrides the plan's #+TT_REVIEWERS/#+TT_LEADER;
+         ;; a plan that names neither keeps the fixed M A B, led by M.
+         (reviewers (or (org-element-property :REVIEWERS hl)
+                        (+tt--keyword "TT_REVIEWERS")))
+         (leader (or (org-element-property :LEADER hl)
+                     (+tt--keyword "TT_LEADER")))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -699,6 +706,10 @@ so an old plan reaches the loop as items without changing meaning."
                 `((workers . ,(+tt--count-value workers))))
             ,@(when rounds
                 `((rounds . ,(+tt--count-value rounds))))
+            ,@(when reviewers
+                `((seats . ,(vconcat (split-string reviewers "[ \t,]+" t)))))
+            ,@(when leader
+                `((leader . ,(string-trim leader))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
@@ -919,6 +930,14 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((r (+tt--keyword-at "TT_ROUNDS")))
                       (and r (list (cons 'rounds (+tt--count-value (car r)))
                                    (cons 'roundsLine (cdr r)))))
+                  ;; Plan 06h: the reviewer seats and their leader, for the
+                  ;; conductor's init event and `tt lint'.
+                  ,@(let ((s (+tt--keyword-at "TT_REVIEWERS")))
+                      (and s (list (cons 'seats (vconcat (split-string (car s) "[ \t,]+" t)))
+                                   (cons 'seatsLine (cdr s)))))
+                  ,@(let ((l (+tt--keyword-at "TT_LEADER")))
+                      (and l (list (cons 'leader (string-trim (car l)))
+                                   (cons 'leaderLine (cdr l)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))

@@ -8,7 +8,7 @@
   "additionalProperties": false,
   "properties": {
     "blockerId": { "type": "string", "minLength": 1, "description": "The raw blocker message id this vote is about" },
-    "seat": { "enum": [1, 2, 3], "description": "This seat's number (1, 2 or 3)" },
+    "seat": { "type": "integer", "minimum": 1, "description": "This seat's number (1..N, one per reviewer)" },
     "vote": { "enum": ["block", "downgrade"] },
     "reason": { "type": "string", "minLength": 1 },
     "options": {

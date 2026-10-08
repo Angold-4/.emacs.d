@@ -7,7 +7,7 @@
   "required": ["reviewer", "decisionId", "vote", "rationale", "evidence", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"],
   "additionalProperties": true,
   "properties": {
-    "reviewer": { "enum": ["M", "A", "B"] },
+    "reviewer": { "type": "string", "minLength": 1, "description": "Plan 06h: any seat #+TT_REVIEWERS declares (default M A B)." },
     "decisionId": { "type": "string", "minLength": 1 },
     "vote": { "enum": ["approve", "reject"] },
     "rationale": { "type": "string", "minLength": 1 },

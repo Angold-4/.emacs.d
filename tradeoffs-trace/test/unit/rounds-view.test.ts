@@ -158,6 +158,57 @@ test("plan 06g: status, loop chart, tape and tt summary show both lanes, per-can
   assert.match(section, /winner C2-b \(ddddddd, 2 votes\)/);
 });
 
+test("plan 06h: status, loop chart and tape list five seats and four lanes", () => {
+  const seats = ["M", "A", "B", "C", "D"];
+  const K5 = CV();
+  const round: RoundRecord = {
+    round: 1,
+    base: "B0",
+    lanes: ["a", "b", "c", "d"],
+    candidates: ["a", "b", "c", "d"].map((lane, i) => ({
+      lane,
+      sha: String(i + 1).repeat(40),
+      ok: true,
+      reviews: seats.map((seat) => ({
+        seat,
+        review: { reviewer: seat, phaseId: "p1", candidateSha: String(i + 1).repeat(40), contractVersion: K5, correctionStatements: [], findingStatements: [] },
+      })),
+    })),
+    votes: seats.map((seat, i) => ({ seat, lane: i < 3 ? "a" : "b", why: `${seat} picks` })),
+    picked: { lane: "a", sha: "1".repeat(40), votes: 3 },
+  };
+  const p = basePhase({ rounds: [round], contract: { ...basePhase().contract, seats: [...seats], leader: "M" } });
+
+  // Status: one line per lane (four), each naming all five seats, and the
+  // round's cost is four candidates × five seats = 20 reviews.
+  const lines = lanesView(p);
+  assert.equal(lines.length, 6, "four lanes, the cost line and the votes line");
+  assert.match(lines[0], /^a C1-a 1111111 checks ✓ — reviewed by A, B, C, D, M — picked \(3 votes\)$/);
+  assert.match(lines[3], /^d C1-d 4444444 checks ✓ — reviewed by A, B, C, D, M$/);
+  assert.match(lines[4], /round 1 from B0: 4 worker run\(s\), 20 review\(s\)/);
+  assert.match(lines[5], /votes: M→a · A→a · B→a · C→b · D→b/);
+
+  // Loop tape / chart: the same four lanes and the five seats' reviews.
+  const tape = renderLoopTape({
+    label: "06h four lanes",
+    round: 1,
+    lanes: lanesView(p),
+    phases: [{ phase: "IMPLEMENTING", at: "2026-10-08T00:00:00.000Z" }],
+    phase: { phase: "REVIEWING", attempt: { n: 1 }, repairRoundsUsed: 0, repairRoundsGranted: 3, contract: { seats } },
+    endMs: Date.parse("2026-10-08T00:02:00.000Z"),
+  });
+  assert.match(tape, /a C1-a 1111111 checks ✓ — reviewed by A, B, C, D, M/);
+  assert.match(tape, /d C1-d 4444444 checks ✓ — reviewed by A, B, C, D, M/);
+  assert.match(tape, /4 worker run\(s\), 20 review\(s\)/);
+
+  // Review buffer: each candidate shows all five seats' reviews.
+  const org = renderRoundsOrg([round]);
+  assert.match(org, /reviews: 5/);
+  assert.match(org, /- D: no findings/);
+  assert.match(org, /- M → C1-a: M picks/);
+  assert.match(org, /Winner: C1-a \(1111111, 3 votes\)/);
+});
+
 test("plan 06g: tt summary lists each round's candidates, votes and winner", () => {
   const section = roundsSection(phase()).join("\n");
   assert.match(section, /### Rounds \(2\)/);

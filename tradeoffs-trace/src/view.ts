@@ -25,6 +25,7 @@ import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCoun
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
 import { candidateLabel } from "./core/rounds.ts";
+import { seatsOf } from "./core/seats.ts";
 import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
@@ -220,23 +221,28 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
  * roles keeps the four-entry line unchanged. */
 export function modelEntries(models: PlanModels | undefined): Array<{ role: string; value: string }> {
   if (!models) return [];
-  const select = planModelSelector({ models });
+  const select = planModelSelector({ models }, models.reviewerSeats ? Object.keys(models.reviewerSeats) : undefined);
   const out: Array<{ role: string; value: string }> = [];
   const push = (role: string, m: RoleModel | undefined): void => {
     if (!m) return;
     out.push({ role, value: m.provider ? `${m.provider}:${m.model ?? ""}` : m.model ?? "" });
   };
   push("worker", models.worker);
-  const reviewerSeats = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
-  if (reviewerSeats) {
-    for (const seat of ["M", "A", "B"] as const) push(`reviewer.${seat}`, select("reviewer", seat));
+  // Plan 06h (A2): expand the seats the plan actually declares, not a fixed
+  // three, so a five-seat plan names reviewer.C/D too.
+  const reviewerSeatKeys = models.reviewerSeats ? Object.keys(models.reviewerSeats) : [];
+  if (reviewerSeatKeys.length > 0) {
+    for (const seat of reviewerSeatKeys) push(`reviewer.${seat}`, select("reviewer", seat));
   } else {
     push("reviewer", models.reviewer);
   }
   push("evaluator", models.evaluator);
-  const panelSeats = models.panelFrom === "reviewers" || (models.panelSeats ? Object.keys(models.panelSeats).length > 0 : false);
-  if (panelSeats) {
-    for (const seat of ["1", "2", "3"] as const) push(`panel.${seat}`, select("panel", seat));
+  const panelSeatKeys = models.panelSeats ? Object.keys(models.panelSeats) : [];
+  if (panelSeatKeys.length > 0) {
+    for (const seat of panelSeatKeys) push(`panel.${seat}`, select("panel", seat));
+  } else if (models.panelFrom === "reviewers" && reviewerSeatKeys.length > 0) {
+    // panel=reviewers: one panel seat per declared reviewer, by position.
+    reviewerSeatKeys.forEach((_, i) => push(`panel.${i + 1}`, select("panel", String(i + 1))));
   } else {
     push("panel", models.panel);
   }
@@ -257,15 +263,18 @@ export function modelsLineText(models: PlanModels | undefined): string | undefin
  * `tt contract rebuild` agree; a role with no declared model reads `default`. */
 export function chartModelsFromPlan(models: PlanModels | undefined): ChartModels | undefined {
   if (!models) return undefined;
-  const select = planModelSelector({ models });
+  // Plan 06h (A2): expand the seats the plan declares, not a fixed three.
+  const seatKeys = models.reviewerSeats ? Object.keys(models.reviewerSeats) : [];
+  const select = planModelSelector({ models }, seatKeys.length > 0 ? seatKeys : undefined);
   const name = (m: RoleModel | undefined): string | undefined => m?.model;
+  const panelKeys = models.panelSeats ? Object.keys(models.panelSeats) : seatKeys.map((_, i) => String(i + 1));
   return {
     worker: name(select("worker")),
     reviewer: name(select("reviewer")),
     evaluator: name(select("evaluator")),
     panel: name(select("panel")),
-    reviewerSeats: { M: name(select("reviewer", "M")), A: name(select("reviewer", "A")), B: name(select("reviewer", "B")) },
-    panelSeats: { "1": name(select("panel", 1)), "2": name(select("panel", 2)), "3": name(select("panel", 3)) },
+    reviewerSeats: Object.fromEntries(seatKeys.map((s) => [s, name(select("reviewer", s))])),
+    panelSeats: Object.fromEntries(panelKeys.map((s) => [s, name(select("panel", s))])),
   };
 }
 
@@ -1015,7 +1024,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
       if (!isStructured(c)) return [];
       const itemsPhase = { contract: c, reviews: phase.reviews, coverage: phase.coverage, checkResolution: phase.checkResolution, overturns: phase.overturns };
       const matrix = matrixMarkdown(itemsPhase);
-      const overturns = overturnCounts(phase.overturns ?? []);
+      const overturns = overturnCounts(phase.overturns ?? [], seatsOf(c));
       const overturnLine = overturns.length > 0 ? [`- Overturned verdicts (counted against a seat): ${overturns.map((o) => `${o.seat} ${o.count}`).join(" · ")}`] : [];
       return matrix.length > 0 ? [`- ${countsLine(phaseItemCounts(itemsPhase))}`, ...overturnLine, "", ...matrix, ""] : [];
     })(),
@@ -1129,7 +1138,8 @@ export function lanesView(phase: PhaseState): string[] {
     return `${lane} ${label} ${short} ${state}${reviewed}${picked}`;
   });
   const passing = round.candidates.filter((c) => c.ok === true).length;
-  const seats = 3;
+  // Plan 06h (A2): the review count is the configured seat count, never 3.
+  const seats = seatsOf(phase.contract).length;
   lines.push(
     `round ${round.round} from ${round.base.slice(0, 7)}: ${round.lanes.length} worker run(s), ${passing * seats} review(s)`,
   );
