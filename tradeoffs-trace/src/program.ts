@@ -21,7 +21,7 @@ import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
 import { acquireLock, type Lock } from "./effects/lock.ts";
 
-import { buildView, formatDuration } from "./view.ts";
+import { buildView, formatDuration, updateLiveWaiting } from "./view.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 import { renderProgramChart } from "./charts.ts";
 import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
@@ -501,7 +501,27 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
   }
   // Plan 03c: keep `views/program.txt` current after every status change.
   writeProgramChart(dir);
+  // Plan 06f (A2): the scheduler is `live.json`'s node writer, on the same
+  // beat — the nodes still waiting to start are exactly what the mode line
+  // must show while a run is not yet alive.
+  writeProgramLive(dir, nodes, state);
   return programOutcome(nodes, state);
+}
+
+/** Plan 06f (A2): republish this program's waiting nodes in `<root>/live.json`.
+ * Every other program's wait and every run row (written by the conductors) is
+ * preserved. */
+function writeProgramLive(dir: string, nodes: ProgramNode[], state: ProgramState): void {
+  try {
+    const root = path.dirname(path.dirname(dir));
+    const programId = path.basename(dir);
+    const waiting = nodes
+      .filter((n) => state.nodes[n.id]?.status === "waiting")
+      .map((n) => ({ program: programId, node: n.id }));
+    updateLiveWaiting(root, programId, waiting);
+  } catch {
+    // a live file that cannot be written must never stop the scheduler
+  }
 }
 
 /** `{ reason }` only when there is one, so an event payload stays exactly
@@ -598,6 +618,13 @@ export async function runScheduler(dir: string, opts: SchedulerOptions): Promise
     fs.writeFileSync(programPaths(dir).pid, String(process.pid));
     return await schedulerLoop(dir, opts);
   } finally {
+    // Plan 06f (A2): a scheduler that exits has no node waiting to start, so
+    // its `live.json' wait list is cleared rather than left stale.
+    try {
+      updateLiveWaiting(path.dirname(path.dirname(dir)), path.basename(dir), []);
+    } catch {
+      // best effort: a live file that cannot be written must never matter here
+    }
     await lock.release();
   }
 }

@@ -157,6 +157,33 @@ test("program.txt matches its golden file, with readable ids and a join", () => 
   assert.match(chart, /after: atlas-02, atlas-03/);
 });
 
+test("plan 06f: the program graph lists nodes in dependency order", () => {
+  // File order is deliberately b, a, d, c: every AFTER edge points backwards.
+  const program: ProgramFile = {
+    title: "out of order",
+    maxParallel: 2,
+    entries: [
+      { id: "b", after: ["a"], plan: phasePlan("b") },
+      { id: "a", after: [], plan: phasePlan("a") },
+      { id: "d", after: ["b", "c"], plan: phasePlan("d") },
+      { id: "c", after: ["a"], plan: phasePlan("c") },
+    ],
+    readableIds: { a: "ooo-01", b: "ooo-02", c: "ooo-03", d: "ooo-04" },
+  };
+  const nodes = expandProgram(program);
+  const state = initialProgramState(nodes);
+  const chart = renderProgramChart(program, nodes, state, { programId: "ooo" });
+  // Every node is drawn after the nodes it waits for. The box label is
+  // `| ooo-01  a`, so the readable id marks the node's position.
+  const at = (id: string) => chart.indexOf(id);
+  assert.ok(at("ooo-01") < at("ooo-02"), "a is drawn before b, though the file lists b first");
+  assert.ok(at("ooo-01") < at("ooo-03"), "a is drawn before c");
+  assert.ok(at("ooo-02") < at("ooo-04"), "b is drawn before d");
+  assert.ok(at("ooo-03") < at("ooo-04"), "c is drawn before d");
+  // File order still breaks ties: a's two dependents keep b before c.
+  assert.ok(at("ooo-02") < at("ooo-03"), "b (file index 0) stays before c (file index 3) among a's dependents");
+});
+
 test("the phase chart names each reviewer and panel seat's model (#+TT_MODELS)", () => {
   const stats = statsFromTimeline(TIMELINE, new Date("2026-09-27T11:05:00.000Z"));
   const perSeat = renderPhaseChart(TRANSITIONS, {

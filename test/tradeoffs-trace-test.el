@@ -1054,17 +1054,24 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (delete-directory root t))))
 
 (ert-deftest tradeoffs-trace-mode-line-wait ()
-  "Plan 01b: the mode-line segment names the oldest waiting program node."
-  (let ((fixture
-         (concat "[{\"id\":\"p1\",\"title\":\"plan 13\",\"waiting\":["
-                 "{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\","
-                 "\"duration\":\"1h12m\",\"reason\":\"the repair budget ran out\"}]}]")))
-    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) fixture)))
-      (let ((+tt--notify-flash nil))
-        (should (equal (+tt--mode-line-wait) " [⚑ 13f waiting 1h12m]"))))
-    ;; No program waiting: no segment.
-    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) "[]")))
-      (should (null (+tt--mode-line-wait))))))
+  "Plan 06f (A2): the mode-line segment names a waiting program node from
+`live.json', and no CLI call is made to get it."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-live" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
+         (+tt--notify-flash nil))
+    (unwind-protect
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"2026-09-24T05:00:00.000Z\",\"runs\":[],"
+                    "\"waitingNodes\":[{\"program\":\"p1\",\"node\":\"13f\"}]}"))
+          (cl-letf (((symbol-function '+tt--cli-on)
+                     (lambda (&rest _) (error "the mode line must not call the CLI"))))
+            (should (equal (+tt--mode-line-wait) " [⚑ 13f waiting]")))
+          ;; No program waiting: no segment.
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[],\"waitingNodes\":[]}"))
+          (should (null (+tt--mode-line-wait))))
+      (delete-directory root t))))
 
 (ert-deftest tradeoffs-trace-notification-echo ()
   "Plan 01b: each new notifications.jsonl line is shown in the echo area once."
@@ -1141,13 +1148,21 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (delete-file file))))
 
 (ert-deftest tradeoffs-trace-mode-line-wait-without-live-run ()
-  "Plan 01b: a waiting node whose run conductor is gone still shows its wait."
-  (let ((fixture "[{\"id\":\"p1\",\"waiting\":[{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\",\"duration\":\"1h12m\"}]}]"))
-    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) fixture))
-              ((symbol-function '+tt--run-rows) (lambda () nil)))
-      (let ((+tt--notify-flash nil))
-        (+tt--mode-line-update)
-        (should (string-match-p "⚑ 13f waiting 1h12m" +tt--mode-line-string))))))
+  "Plan 06f (A2): a waiting node whose run conductor is gone still shows its
+wait, read from `live.json' (a file, never the CLI)."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-live-wait" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
+         (+tt--notify-flash nil))
+    (unwind-protect
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[],"
+                    "\"waitingNodes\":[{\"program\":\"p1\",\"node\":\"13f\"}]}"))
+          (cl-letf (((symbol-function '+tt--cli-on)
+                     (lambda (&rest _) (error "the mode line must not call the CLI"))))
+            (+tt--mode-line-update)
+            (should (string-match-p "⚑ 13f waiting" +tt--mode-line-string))))
+      (delete-directory root t))))
 
 (defconst +tt-test--amended-state
   '((meta (title . "sum validation"))
@@ -1601,8 +1616,10 @@ A/D and the mtime refresh all work in a real, file-visiting buffer."
               (goto-char (match-beginning 0))
               (+tt-review-open-message))
             (should (equal opened (expand-file-name "views/messages/T-1.org" dir)))
-            ;; A calls tt verdict with the heading's run dir and full binding.
-            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "verdict applied"))
+            ;; A calls tt verdict (asynchronously) with the heading's run dir
+            ;; and full binding.
+            (cl-letf (((symbol-function '+tt--cli-async-result)
+                       (lambda (_root args callback) (setq calls args) (funcall callback 0 "verdict applied")))
                       ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
               (goto-char (point-min))
               (search-forward "B-1")
@@ -1662,7 +1679,8 @@ asks for a one-line reason; a raw message is not yet frozen."
         (let ((buf (+tt-test--review-buffer dir))
               (calls nil))
           (with-current-buffer buf
-            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "queued verdict x"))
+            (cl-letf (((symbol-function '+tt--cli-async-result)
+                       (lambda (_root args callback) (setq calls args) (funcall callback 0 "queued verdict x")))
                       ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
               ;; A on the blocker: the full binding from the heading.
               (goto-char (point-min))
@@ -1998,7 +2016,8 @@ command the review view already uses."
           (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
           (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
             (with-current-buffer buf
-              (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "entry accept applied")))
+              (cl-letf (((symbol-function '+tt--cli-async-result)
+                         (lambda (_root args callback) (setq calls args) (funcall callback 0 "entry accept applied"))))
                 (goto-char (point-min))
                 (search-forward "Should this stand")
                 (goto-char (match-beginning 0))
@@ -2129,6 +2148,8 @@ owner's merge; A/D act on the entry."
               (+tt-review-open-message))
             (should (equal opened (expand-file-name "views/entries/E-1.org" dir)))
             (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "ok"))
+                      ((symbol-function '+tt--cli-async-result)
+                       (lambda (_root args callback) (setq calls args) (funcall callback 0 "ok")))
                       ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
               ;; s on the entry splits its first linked message.
               (goto-char (point-min))
@@ -2242,8 +2263,8 @@ binding, so a trade-off line still opens the decision view."
       (unwind-protect
           (let ((buf (+tt-test--review-buffer dir)))
             (with-current-buffer buf
-              (cl-letf (((symbol-function '+tt--cli)
-                         (lambda (&rest _) (error "tt verdict failed: %s" reason)))
+              (cl-letf (((symbol-function '+tt--cli-async-result)
+                         (lambda (_root _args callback) (funcall callback 1 reason)))
                         ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil))
                         ((symbol-function 'message)
                          (lambda (fmt &rest args) (push (apply #'format fmt args) echoed))))
@@ -2955,21 +2976,23 @@ The source-file picker and run resolution both go through this (finding M-3)."
     (should-not (+tt--same-file-p "/home/me/a.org" "/home/me/b.org"))))
 
 (ert-deftest tradeoffs-trace-mode-line-does-not-poll-remote-roots ()
-  "The 10-second mode-line timer only touches the local root.
-A dead remote host must never block Emacs in the background (M-2/D-13)."
-  (let* ((root1 (make-temp-file "tt-ert-root1" t))
-         (root2 (file-name-as-directory "/ssh:dead:~/.tradeoffs-trace/"))
+  "Plan 06f (A2/C2): the mode-line update reads only the local `live.json'.
+No root — remote or local — is polled and no process is started."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-root1" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
          (called nil))
     (unwind-protect
-        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root1 root2)))
-                  ((symbol-function '+tt--cli-on)
-                   (lambda (root &rest _) (push root called) "[]"))
-                  ((symbol-function '+tt--notify-flash) nil))
-          (let ((+tt-root root1))
-            (+tt--mode-line-update))
-          (should (member (file-name-as-directory root1) called))
-          (should-not (member root2 called)))
-      (delete-directory root1 t))))
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[{\"id\":\"r1\",\"title\":\"t\",\"phase\":\"IMPLEMENTING\",\"needsOwner\":false}],\"waitingNodes\":[]}"))
+          (cl-letf (((symbol-function '+tt--roots) (lambda () (list "/ssh:dead:~/.tradeoffs-trace/")))
+                    ((symbol-function '+tt--cli-on) (lambda (r &rest _) (push r called) "[]"))
+                    ((symbol-function '+tt--cli-async) (lambda (&rest _) (error "the mode line must not start a process")))
+                    ((symbol-function '+tt--notify-flash) nil))
+            (+tt--mode-line-update)
+            (should (null called))
+            (should (string-match-p "tt:r1 IMPLEMENTING" +tt--mode-line-string))))
+      (delete-directory root t))))
 
 ;;; The mode-line timer and workspace refresh never block Emacs on Node.
 
@@ -3008,43 +3031,106 @@ A dead remote host must never block Emacs in the background (M-2/D-13)."
           (should-not (seq-some (lambda (b) (string-prefix-p " *tt-async" (buffer-name b))) (buffer-list))))
       (delete-directory root t))))
 
-(ert-deftest tradeoffs-trace-mode-line-tick-is-async-and-skips-when-unchanged ()
-  "The mode-line timer never calls the synchronous CLI, and calls none at all
-when no run file changed and nothing shown is ageing."
+(ert-deftest tradeoffs-trace-mode-line-tick-is-file-only-and-skips-when-unchanged ()
+  "Plan 06f (A2/C2): the 10 s timer re-reads `live.json' only when its stamp
+changed, and never starts a process."
   (let* ((root (file-name-as-directory (make-temp-file "tt-root-" t)))
-         (log (expand-file-name "calls" root))
-         (fake (+tt-test--fake-node
-                root (format "#!/bin/sh\necho \"$2\" >> %s\necho '[]'\n" log)))
-         (+tt-runner (car fake))
-         (+tt-node (cdr fake))
-         (+tt-root root)
-         (+tt--mode-line-inflight nil)
+         (+tt--live-file (expand-file-name "live.json" root))
          (+tt--mode-line-stamp nil)
          (+tt--mode-line-at 0)
-         (+tt--mode-line-ageing nil)
          (+tt--mode-line-string "")
-         (+tt--notify-flash nil)
-         (calls (lambda () (if (file-exists-p log)
-                               (length (split-string (with-temp-buffer (insert-file-contents log) (buffer-string)) "\n" t))
-                             0))))
+         (+tt--notify-flash nil))
     (unwind-protect
-        (cl-letf (((symbol-function '+tt--cli-on)
-                   (lambda (&rest _) (error "the timer must not run the synchronous CLI"))))
-          (make-directory (expand-file-name "run1" root))
-          (write-region "{}\n" nil (expand-file-name "run1/events.jsonl" root))
+        (cl-letf (((symbol-function 'make-process)
+                   (lambda (&rest _) (error "the timer must not start a process")))
+                  ((symbol-function 'process-file)
+                   (lambda (&rest _) (error "the timer must not run process-file"))))
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[{\"id\":\"r1\",\"title\":\"t\",\"phase\":\"IMPLEMENTING\",\"needsOwner\":false}],\"waitingNodes\":[]}"))
           (+tt--mode-line-tick)
-          (should (+tt-test--wait (lambda () (not +tt--mode-line-inflight))))
-          (should (= 2 (funcall calls)))     ; program list + list
-          ;; Nothing changed: the next tick spawns nothing.
+          (should (string-match-p "tt:r1 IMPLEMENTING" +tt--mode-line-string))
+          ;; Unchanged: the tick keeps the last indicator and starts nothing.
+          (setq +tt--mode-line-string "sentinel")
           (+tt--mode-line-tick)
-          (should-not +tt--mode-line-inflight)
-          (should (= 2 (funcall calls)))
-          ;; A run's event log grows: the next tick lists again.
-          (write-region "{}\n{}\n" nil (expand-file-name "run1/events.jsonl" root))
+          (should (equal +tt--mode-line-string "sentinel"))
+          ;; The file changes: the tick re-reads it.
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[{\"id\":\"r1\",\"title\":\"t\",\"phase\":\"DONE\",\"needsOwner\":false}],\"waitingNodes\":[]}"))
           (+tt--mode-line-tick)
-          (should (+tt-test--wait (lambda () (not +tt--mode-line-inflight))))
-          (should (= 4 (funcall calls))))
+          (should (string-match-p "tt:r1 DONE" +tt--mode-line-string)))
       (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-mode-line-from-live-json-without-cli ()
+  "Plan 06f (R4): the mode line renders a live.json fixture with the CLI
+unavailable.  Unmet if any mode-line path starts a process."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-live-ml" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
+         (+tt--mode-line-string "")
+         (+tt--mode-line-stamp nil)
+         (+tt--mode-line-at 0)
+         (+tt--notify-flash nil))
+    (unwind-protect
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"2026-10-07T00:00:00.000Z\","
+                    "\"runs\":[{\"id\":\"abc12345\",\"title\":\"running\",\"phase\":\"REVIEWING\",\"needsOwner\":false},"
+                    "{\"id\":\"def67890\",\"title\":\"parked\",\"phase\":\"AWAITING_OWNER\",\"needsOwner\":true}],"
+                    "\"waitingNodes\":[{\"program\":\"prog1\",\"node\":\"b\"}]}"))
+          ;; The CLI is unavailable: any process launch signals an error.
+          (cl-letf (((symbol-function 'process-file)
+                     (lambda (&rest _) (error "mode-line path ran process-file")))
+                    ((symbol-function 'call-process)
+                     (lambda (&rest _) (error "mode-line path ran call-process")))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest _) (error "mode-line path started a process"))))
+            (+tt--mode-line-update)
+            (should (string-match-p "tt:abc1 REVIEWING" +tt--mode-line-string))
+            (should (string-match-p "tt:def6 AWAITING_OWNER ⚑" +tt--mode-line-string))
+            (should (string-match-p "⚑ b waiting" +tt--mode-line-string))
+            ;; The timer path is a file read too.
+            (setq +tt--mode-line-stamp nil)
+            (+tt--mode-line-tick)
+            (should (string-match-p "tt:abc1 REVIEWING" +tt--mode-line-string))))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-review-a-is-async-and-pending ()
+  "Plan 06f (R5): A on a review entry returns at once, marks the entry
+pending, and the callback later shows the recorded outcome."
+  (let* ((run (file-name-as-directory (make-temp-file "tt-ert-verdict-" t)))
+         (fake (+tt-test--fake-node
+                run "#!/bin/sh\nsleep 1\necho \"entry accept applied: E-1 in run x\"\n"))
+         (+tt-runner (car fake))
+         (+tt-node (cdr fake))
+         (msgs nil)
+         (buf (get-buffer-create "*tt-test-review-async*")))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" run) t)
+          (with-temp-file (expand-file-name "views/review.org" run)
+            (insert "* E-1 a topic\n  :PROPERTIES:\n  :ID: E-1\n  :END:\n  body\n"))
+          (with-current-buffer buf
+            (+tt-review-mode)
+            (setq +tt--run-dir run +tt-review--file (expand-file-name "views/review.org" run))
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert-file-contents +tt-review--file))
+            (+tt-review--setup)
+            (goto-char (point-min))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) msgs))))
+              (let ((+tt--cli-root run)
+                    (started (float-time)))
+                (+tt-review-accept)
+                ;; Returned at once, before the slow CLI could have exited.
+                (should (< (- (float-time) started) 0.5))
+                ;; The entry shows pending at once.
+                (should (gethash "E-1" +tt-review--pending))
+                (should (string-match-p "pending" (gethash "E-1" +tt-review--pending)))
+                ;; The callback later clears it and shows the outcome.
+                (should (+tt-test--wait (lambda () (not (gethash "E-1" +tt-review--pending))) 5))
+                (should (seq-some (lambda (m) (string-match-p "applied" m)) msgs))))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (delete-directory run t))))
 
 (ert-deftest tradeoffs-trace-workspace-refresh-renders-node-views-only-on-change ()
   "The 2 s workspace timer re-renders the input header (a `tt state' call)
