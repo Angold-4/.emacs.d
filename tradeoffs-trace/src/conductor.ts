@@ -1284,6 +1284,27 @@ interface AgentHandle {
 /** `#applyReviewFindingsAndBallots` found the round over after an await. */
 const STALE_REVIEW = "stale review";
 
+/** Plan 06b: the text a `:WHERE:` token names. A file is read as it is; a
+ * directory (a crate, a package) is every source file under it, skipping
+ * build output and VCS metadata, so a symbol declared anywhere inside it is
+ * found. A missing path throws, which the caller records as a deviation. */
+export function readWhereText(target: string): string {
+  if (!fs.statSync(target).isDirectory()) return fs.readFileSync(target, "utf8");
+  const skip = new Set(["target", "node_modules", ".git"]);
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    const entries = fs.readdirSync(d, { withFileTypes: true }).sort((x, y) => x.name.localeCompare(y.name));
+    for (const e of entries) {
+      if (skip.has(e.name)) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile() && /\.(rs|ts|tsx|js|el|go|py|toml)$/.test(e.name)) out.push(fs.readFileSync(full, "utf8"));
+    }
+  };
+  walk(target);
+  return out.join("\n");
+}
+
 export class Conductor {
   #runDir: string;
   #paths: ReturnType<typeof runPaths>;
@@ -6665,7 +6686,7 @@ export class Conductor {
         if (!/[/.]/.test(token)) continue;
         fileShaped = true;
         try {
-          text += `${fs.readFileSync(path.join(dir, token), "utf8")}\n`;
+          text += `${readWhereText(path.join(dir, token))}\n`;
         } catch {
           // The `:WHERE:` file does not exist in the candidate. A missing
           // module is the clearest deviation, so it is recorded as one rather
