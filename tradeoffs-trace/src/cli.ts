@@ -132,6 +132,7 @@ function parseArgs(argv: string[]): {
   source?: string;
   skipModelsCheck: boolean;
   envFile?: string;
+  toPhase?: string;
 } {
   const positional: string[] = [];
   let root: string | undefined;
@@ -139,6 +140,7 @@ function parseArgs(argv: string[]): {
   let skipModelsCheck = false;
   let envFile: string | undefined;
   let reason: string | undefined;
+  let toPhase: string | undefined;
   let candidateSha: string | undefined;
   let messageVersion: number | undefined;
   let contractVersion: number | undefined;
@@ -190,11 +192,15 @@ function parseArgs(argv: string[]): {
       envFile = argv[++i];
     } else if (arg.startsWith("--env-file=")) {
       envFile = arg.slice("--env-file=".length);
+    } else if (arg === "--to") {
+      toPhase = argv[++i];
+    } else if (arg.startsWith("--to=")) {
+      toPhase = arg.slice("--to=".length);
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile };
+  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase };
 }
 
 /** Plan 03c: resolve a readable id `<program>-NN` to the node's run
@@ -1539,6 +1545,66 @@ async function cmdVerdict(
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
 }
 
+/** Plan 06g (A5): `tt carry <run> <id> --to <phase-id>` — the owner carries a
+ * finding or message into a later phase's plan. Through the inbox, as every
+ * owner command does: the conductor's owner-commands.ts decides what a carry
+ * does (mark the item carried with its target; once no blocking item remains
+ * uncarried, accept the candidate). The binding the heading would carry is
+ * the record's own current one, so a stale carry is refused by the same path
+ * as any other stale command. */
+async function cmdCarry(positional: string[], root: string, toPhase: string | undefined): Promise<void> {
+  const runDir = resolveRunDir(positional[0], root);
+  const recordId = positional[1];
+  if (!recordId) usage();
+  if (!toPhase || toPhase.trim().length === 0) {
+    process.stdout.write(`carry rejected: a carry needs --to <phase-id>\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const finding = state.phase.findings.find((f) => f.id === recordId);
+  const message = (state.phase.messages ?? []).find((m) => m.id === recordId);
+  if (!finding && !message) {
+    process.stdout.write(`carry rejected: no finding or message ${recordId} in run ${path.basename(runDir)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const recordKind = finding ? "finding" : "message";
+  // Like every record command, the binding is the PHASE's current candidate
+  // and contract plus the record's own version (owner-commands.ts's
+  // checkItemCarried matches it the same way).
+  const boundCandidateSha = state.phase.candidate?.sha ?? "";
+  const boundContractVersion = state.phase.contract.contractVersion;
+  const boundRecordVersion = finding ? finding.version : message!.messageVersion;
+  const inbox = path.join(runDir, "inbox");
+  mkdirSync(inbox, { recursive: true });
+  const commandId = `carry-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  const command = {
+    type: "carry",
+    recordKind,
+    toPhase: toPhase.trim(),
+    binding: {
+      runId: state.phase.runId,
+      phaseId: state.phase.phaseId,
+      candidateSha: boundCandidateSha,
+      contractVersion: boundContractVersion,
+      recordId,
+      recordVersion: boundRecordVersion,
+    },
+  };
+  writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
+  const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
+  if (outcome.kind === "applied") {
+    process.stdout.write(`carried ${recordId} to ${toPhase.trim()} in run ${path.basename(runDir)}\n`);
+  } else if (outcome.kind === "rejected") {
+    process.stdout.write(`carry rejected: ${outcome.reason}\n`);
+    process.exitCode = 1;
+  } else {
+    process.stdout.write(`queued carry ${commandId} for ${recordId} (queued, not yet applied)\n`);
+  }
+}
+
 /** Plan 05j: record a lint violation the render just named. Every render
  * (conductor, `tt contract rebuild`, a late verdict, an entry command) must
  * leave the log's copy, not just the view's red first line (findings A-18,
@@ -1672,7 +1738,7 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile } = parseArgs(rest);
+  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
@@ -1708,6 +1774,9 @@ async function main(): Promise<void> {
   } else if (cmd === "verdict") {
     if (positional.length !== 3) usage();
     await cmdVerdict(positional, runRoot, reason, { candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId });
+  } else if (cmd === "carry") {
+    if (positional.length !== 2) usage();
+    await cmdCarry(positional, runRoot, toPhase);
   } else if (cmd === "entry") {
     if (positional.length < 3) usage();
     await cmdEntry(positional, runRoot, reason);

@@ -13,7 +13,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest } from "./core/types.ts";
+import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest, RoundRecord } from "./core/types.ts";
+import { candidateLabel } from "./core/rounds.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
   projectEntries,
@@ -373,6 +374,9 @@ export interface EntryReviewPhase {
   };
   /** Plan 06b: the per-item state the matrix renders. */
   reviews?: import("./core/types.ts").PhaseState["reviews"];
+  /** Plan 06g: the phase's rounds, so the review buffer groups the candidates
+   * with the pick votes and the winner. Absent for a plan without lanes. */
+  rounds?: RoundRecord[];
   coverage?: import("./core/items.ts").Coverage;
   checkResolution?: import("./core/items.ts").VerifyResolution[];
   overturns?: import("./core/items.ts").Overturn[];
@@ -431,6 +435,38 @@ export interface EntryReviewRender {
  * three sections (Blockers, Findings, Trade-offs), with the accounting footer
  * and the lint's first line when a rule fails. Pure projection of
  * `phase.entries` and `phase.messages`; no agent writes it. */
+/** Plan 06g (A5): the review buffer's round section, as Org: one subtree per
+ * round, one child per candidate (its lane, checks result and why it
+ * produced none), then the pick votes and the winner. Pure, so the grouping
+ * is unit-tested without a run directory. */
+export function renderRoundsOrg(rounds: readonly RoundRecord[]): string {
+  const lines: string[] = ["* Rounds", ""];
+  for (const round of rounds) {
+    lines.push(`** Round ${round.round} from ${round.base.slice(0, 7)}`, "");
+    for (const lane of round.lanes) {
+      const candidate = round.candidates.find((c) => c.lane === lane);
+      const label = candidateLabel(round.round, lane);
+      if (!candidate?.sha) {
+        lines.push(`*** ${label} (lane ${lane}) — no candidate${candidate?.note ? `: ${candidate.note}` : ""}`, "");
+        continue;
+      }
+      const state = candidate.ok === undefined ? "checks pending" : candidate.ok ? "checks passed" : "checks failed";
+      const picked = round.picked?.lane === lane ? ", picked" : "";
+      lines.push(`*** ${label} (lane ${lane}) — ${state}${picked}`, "", `    ${candidate.sha}`, "");
+    }
+    if (round.votes.length > 0) {
+      lines.push("Votes:", ...round.votes.map((v) => `  - ${v.seat} → ${candidateLabel(round.round, v.lane)}: ${v.why}`), "");
+    }
+    lines.push(
+      round.picked
+        ? `Winner: ${candidateLabel(round.round, round.picked.lane)} (${round.picked.sha.slice(0, 7)}, ${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})`
+        : "Winner: none",
+      "",
+    );
+  }
+  return lines.join("\n");
+}
+
 export function projectEntryReview(
   phase: EntryReviewPhase,
   opts: { anchorResolves?: (anchor: EntryAnchor) => boolean; anchorFreshness?: (anchor: EntryAnchor) => AnchorFreshness; lintError?: string } = {},
@@ -488,6 +524,14 @@ export function projectEntryReview(
   const matrix = structuredContract ? matrixOrg(itemsPhase) : [];
   if (matrix.length > 0) {
     text += `\n* Plan items\n  ${countsLine(phaseItemCounts(itemsPhase))}\n\n${matrix.map((l) => `  ${l}`).join("\n")}\n`;
+  }
+  // Plan 06g (A5): the review buffer groups the round's candidates with the
+  // pick votes and the winner, so the owner reads both lanes and the pick
+  // rather than only the accepted candidate. Absent (and the buffer is
+  // byte-identical to before) for a plan without `#+TT_WORKERS`.
+  const rounds = phase.rounds ?? [];
+  if (rounds.length > 0) {
+    text += `\n${renderRoundsOrg(rounds)}\n`;
   }
   const files = projected.views.filter((v) => v.live).map((v) => ({ id: v.entry.id, contents: renderEntryFile(v) }));
   const itemFiles = structuredContract ? itemEvidenceFiles(itemsPhase) : [];
@@ -869,6 +913,22 @@ export function renderStatusView(input: StatusViewInput): string {
   push(row("base", view.baseline));
   push(row("amended", view.amendments));
   push(row("previous", view.previousRound));
+  // Plan 06g (A5): one line per lane of the latest round, then the round's
+  // cost — the owner sees both lanes and the pick, never only the winner.
+  if (view.lanes && view.lanes.length > 0) {
+    lines.push("", `Lanes (round ${view.round})`);
+    for (const lane of view.lanes) lines.push(`  ${lane}`);
+  }
+  // Plan 06g (A5): every item the owner carried past this phase, with the
+  // phase it is carried to, so the status and `tt summary` agree.
+  const carriedItems = phase.carriedItems ?? [];
+  if (carriedItems.length > 0) {
+    lines.push("", `Carried items (${carriedItems.length})`);
+    for (const id of carriedItems) {
+      const to = phase.carriedTo?.[id];
+      lines.push(`  - ${id}${to ? ` → ${to}` : ""}`);
+    }
+  }
   push(row("reviews", view.reviewLine));
   push(row("models", view.models));
   push(view.metricsLine);

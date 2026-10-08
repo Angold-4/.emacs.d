@@ -333,3 +333,43 @@ test("plan-lint: a full per-seat declaration passes and an empty seat model fail
   assert.match(empty[0].problem, /empty model/);
   assert.match(empty[0].problem, /reviewer\.B/);
 });
+
+test("plan 06g: tt lint refuses TT_WORKERS 3 naming 06h", () => {
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  // 1 and 2 are this plan version's lanes; absent is the same as 1.
+  assert.deepEqual(lintPlan(base).filter((f) => f.rule === "worker-count"), []);
+  assert.deepEqual(lintPlan({ ...base, workers: 1, workersLine: 3 }).filter((f) => f.rule === "worker-count"), []);
+  // Two lanes are valid but the lane round itself lands in 06g2: a warning,
+  // not an error, and the run uses one lane until then.
+  const two = lintPlan({ ...base, workers: 2, workersLine: 3 });
+  const twoFinding = two.find((f) => f.rule === "worker-count");
+  assert.ok(twoFinding, "TT_WORKERS 2 must warn that the round arrives in 06g2");
+  assert.equal(twoFinding!.severity, "warning");
+  assert.match(twoFinding!.problem, /two-lane round arrives in 06g2/);
+  assert.match(twoFinding!.problem, /uses one lane/);
+  assert.equal(hasLintErrors(two), false, "a warning is not an error");
+
+  const three = lintPlan({ ...base, workers: 3, workersLine: 3 });
+  const finding = three.find((f) => f.rule === "worker-count");
+  assert.ok(finding, "TT_WORKERS 3 must be refused");
+  assert.equal(finding!.severity, "error");
+  assert.equal(finding!.line, 3);
+  assert.match(finding!.problem, /3 lanes/);
+  // The message names 06h as the phase that allows more lanes.
+  assert.match(finding!.fix, /06h/);
+  assert.equal(hasLintErrors(three), true);
+
+  // A value that is not a whole number of lanes is refused too, naming it.
+  const text = lintPlan({ ...base, workers: "two" as unknown as number, workersLine: 4 });
+  assert.match(text.find((f) => f.rule === "worker-count")!.problem, /got two/);
+  assert.equal(lintPlan({ ...base, workers: 0, workersLine: 4 }).find((f) => f.rule === "worker-count")!.severity, "error");
+});
+
+test("plan 06g: #+TT_ROUNDS must be a positive whole number, and 3 is the default", () => {
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  assert.deepEqual(lintPlan({ ...base, rounds: 5, roundsLine: 4 }).filter((f) => f.rule === "worker-count"), []);
+  assert.deepEqual(lintPlan(base).filter((f) => f.rule === "worker-count"), []);
+  const bad = lintPlan({ ...base, rounds: 0, roundsLine: 4 }).find((f) => f.rule === "worker-count");
+  assert.ok(bad, "#+TT_ROUNDS: 0 must be refused");
+  assert.match(bad!.fix, /default/);
+});

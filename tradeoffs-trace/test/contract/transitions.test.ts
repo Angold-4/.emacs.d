@@ -774,6 +774,41 @@ BUILD["awaiting-owner-request-resolved-grant"] = {
   },
 };
 
+// Plan 06g (A6): "accept with carried items" — the budget-spent phase whose
+// only open items are advisories offers this one decision; taking it accepts
+// the candidate as it stands and resumes to RESOLVING, where next() accepts
+// (accept() honours `acceptedWithCarried`).
+BUILD["awaiting-owner-request-resolved-accept-carried"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    findings: [
+      { id: "F-adv", version: 1, phaseId: "p1", kind: "defect", severity: "advisory", evidence: "a further edge path, carried", raisedBy: "B", status: "open", boundCandidateSha: "C1" },
+    ],
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the repair budget ran out while items remained open; only advisories are open (F-adv) and they are carried",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "accept_carried", label: "accept with carried items" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "OWNER_REQUEST_RESOLVED",
+    requestId: "OR-gate",
+    option: "accept_carried",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
 BUILD["awaiting-owner-request-resolved-stop"] = {
   state: baseState({
     phase: "AWAITING_OWNER",
@@ -1103,6 +1138,122 @@ BUILD["awaiting-owner-finding-accepted-stays"] = {
     findingId: "F1",
     scope: "known limitation for this phase",
     by: "owner",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
+// Plan 06g (A5): `tt carry <run> <id> --to <phase-id>`. Carrying the only
+// blocking item resolves the request about it and accepts the candidate
+// (`acceptedWithCarried`), so the phase resumes to RESOLVING.
+BUILD["awaiting-owner-item-carried-clears-to-resolving"] = {
+  state: baseState({
+    ...resolvableAwaitingOwnerBase,
+    phase: "AWAITING_OWNER",
+    findings: [findingFixture()],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding open",
+        origin: "open_finding",
+        linkedFindingId: "F1",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "ITEM_CARRIED",
+    recordId: "F1",
+    recordKind: "finding",
+    toPhase: "06h",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
+// An open correction still needs a round even after the carried item clears
+// its request, so the phase resumes to REPAIRING.
+BUILD["awaiting-owner-item-carried-clears-to-repairing"] = {
+  state: baseState({
+    ...resolvableAwaitingOwnerBase,
+    phase: "AWAITING_OWNER",
+    findings: [findingFixture()],
+    corrections: [
+      {
+        id: "C-1",
+        version: 1,
+        phaseId: "p1",
+        targetRecordId: "D-other",
+        correctionText: "x",
+        contractChange: false,
+        status: "open",
+        boundContractVersion: K,
+        grantedRounds: 3,
+      },
+    ],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding open",
+        origin: "open_finding",
+        linkedFindingId: "F1",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "ITEM_CARRIED",
+    recordId: "F1",
+    recordKind: "finding",
+    toPhase: "06h",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
+// A second blocking item is still uncarried, so the phase stays parked.
+BUILD["awaiting-owner-item-carried-stays"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    findings: [findingFixture({ id: "F1" }), findingFixture({ id: "F2" })],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding F1 open",
+        origin: "open_finding",
+        linkedFindingId: "F1",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+      {
+        id: "OR-2",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding F2 open",
+        origin: "open_finding",
+        linkedFindingId: "F2",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "ITEM_CARRIED",
+    recordId: "F1",
+    recordKind: "finding",
+    toPhase: "06h",
     boundCandidateSha: "C1",
     boundContractVersion: K,
     boundRecordVersion: 1,

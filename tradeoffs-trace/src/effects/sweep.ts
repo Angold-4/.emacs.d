@@ -150,6 +150,13 @@ export interface SweepOptions {
    * signals a process only when its group is in this set. Omitted means the
    * run owns nothing here, so every process found is `held` — never killed. */
   ownPgids?: number[];
+  /** Plan 06g (A2): the one directory a LANE's sweep may signal in. When set,
+   * a process is signalled only when its own cwd is inside this directory —
+   * so a lane's sweep never signals a process whose cwd is in the other
+   * lane's worktree, even when that process happens to hold a file under
+   * this lane's tree. Absent (the one-lane loop, today's behaviour): the
+   * process group alone decides. */
+  cwdUnder?: string;
   /** Pids never to touch even if `lsof` reports them under `dir` (e.g. a
    * command the conductor is intentionally still running there). */
   exceptPids?: number[];
@@ -248,6 +255,60 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Plan 06g: one row of the process table the sweep decides on. The real
+ * sweep reads these from `lsof`/`ps`; a unit test hands in a fake table, so
+ * the lane rule (A2) is checked without spawning anything. */
+export interface SweepProcess {
+  pid: number;
+  /** The process group, when `ps` could say. */
+  pgid?: number;
+  command: string;
+  /** Where the process is running. */
+  cwd: string;
+}
+
+export interface SweepDecisionOptions {
+  ownPgids?: readonly number[];
+  exceptPids?: readonly number[];
+  /** Plan 06g: signal only a process whose cwd is inside this directory. */
+  cwdUnder?: string;
+}
+
+/** True when `dir` is `base` itself or lives under it. Pure path arithmetic:
+ * the sweep's lane rule must not be fooled by a sibling directory whose name
+ * merely starts with the same characters. */
+export function isUnder(dir: string, base: string): boolean {
+  const d = path.resolve(dir);
+  const b = path.resolve(base);
+  return d === b || d.startsWith(b.endsWith(path.sep) ? b : b + path.sep);
+}
+
+/** The sweep's whole signalling decision, as a pure function of the process
+ * table (A2): a process is killed only when its group is one THIS RUN
+ * recorded, its command is not protected, and — when `cwdUnder` is set — its
+ * own cwd is inside that directory. Everything else is `held`. */
+export function sweepDecision(procs: readonly SweepProcess[], options: SweepDecisionOptions = {}): SweepDecision {
+  const own = new Set<number>(options.ownPgids ?? []);
+  const excluded = new Set<number>(options.exceptPids ?? []);
+  const killed: SweepKilled[] = [];
+  const held: SweepHeld[] = [];
+  for (const proc of procs) {
+    if (excluded.has(proc.pid)) continue;
+    const inLane = options.cwdUnder === undefined || isUnder(proc.cwd, options.cwdUnder);
+    if (proc.pgid === undefined || !own.has(proc.pgid) || isProtectedCommand(proc.command) || !inLane) {
+      held.push({ pid: proc.pid, command: proc.command, cwd: proc.cwd });
+      continue;
+    }
+    killed.push({ pid: proc.pid, command: proc.command });
+  }
+  return { killed, held };
+}
+
+export interface SweepDecision {
+  killed: SweepKilled[];
+  held: SweepHeld[];
+}
+
 /** Lists, kills and reports every process found under `dir` by `lsof +D`,
  * excluding the conductor's own process/ancestors and `options.exceptPids`.
  * A process is signalled ONLY when its process group is in
@@ -257,20 +318,15 @@ function delay(ms: number): Promise<void> {
  * comment for what an empty result does and does not prove. */
 export async function sweep(dir: string, options: SweepOptions = {}): Promise<SweepResult> {
   const termGraceMs = options.termGraceMs ?? 500;
-  const own = new Set<number>(options.ownPgids ?? []);
-  const excluded = new Set<number>([...(options.exceptPids ?? []), ...selfAndAncestors()]);
-  const killed: SweepKilled[] = [];
-  const held: SweepHeld[] = [];
+  const excluded = [...(options.exceptPids ?? []), ...selfAndAncestors()];
+  const table: SweepProcess[] = [];
   for (const pid of lsofUnder(dir)) {
-    if (excluded.has(pid)) continue;
-    const command = commandFor(pid);
-    const pgid = pgidFor(pid);
-    // A2: only the run's own recorded process groups are signalled. A
-    // protected command is reported even when its group is ours.
-    if (pgid === undefined || !own.has(pgid) || isProtectedCommand(command)) {
-      held.push({ pid, command, cwd: cwdFor(pid) });
-      continue;
-    }
+    table.push({ pid, command: commandFor(pid), pgid: pgidFor(pid), cwd: cwdFor(pid) });
+  }
+  const decision = sweepDecision(table, { ownPgids: options.ownPgids, exceptPids: excluded, cwdUnder: options.cwdUnder });
+  const killed: SweepKilled[] = [];
+  const held: SweepHeld[] = decision.held;
+  for (const { pid, command } of decision.killed) {
     if (signalProcess(pid, "SIGTERM")) killed.push({ pid, command });
     // else: already gone between the lsof snapshot and now — not a survivor.
   }

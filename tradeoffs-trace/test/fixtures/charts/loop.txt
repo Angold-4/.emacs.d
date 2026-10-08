@@ -119,6 +119,7 @@ phase states:
       +- REVISE (targetRecordBindingCurrentAndStays) -> AWAITING_OWNER  [revise-from-awaiting-owner-stays]
       +- OWNER_CORRECTION          -> REPAIRING       [owner-correction-from-awaiting-owner]
       +- OWNER_REQUEST_RESOLVED (budgetGateGrant) -> REPAIRING       [awaiting-owner-request-resolved-grant]
+      +- OWNER_REQUEST_RESOLVED (budgetGateAcceptCarried) -> RESOLVING       [awaiting-owner-request-resolved-accept-carried]
       +- OWNER_REQUEST_RESOLVED (budgetGateStop) -> BLOCKED         [awaiting-owner-request-resolved-stop]
       +- OWNER_REQUEST_RESOLVED (repairForcingClears) -> REPAIRING       [awaiting-owner-request-resolved-repair-clears]
       +- OWNER_REQUEST_RESOLVED (repairForcingStays) -> AWAITING_OWNER  [awaiting-owner-request-resolved-repair-stays]
@@ -131,6 +132,9 @@ phase states:
       +- OVERRIDE_CAST (clearsToResolving) -> RESOLVING       [awaiting-owner-override-clears-to-resolving]
       +- OVERRIDE_CAST (clearsToRepairing) -> REPAIRING       [awaiting-owner-override-clears-to-repairing]
       +- OVERRIDE_CAST (staysOpen) -> AWAITING_OWNER  [awaiting-owner-override-stays]
+      +- ITEM_CARRIED (clearsToResolving) -> RESOLVING       [awaiting-owner-item-carried-clears-to-resolving]
+      +- ITEM_CARRIED (clearsToRepairing) -> REPAIRING       [awaiting-owner-item-carried-clears-to-repairing]
+      +- ITEM_CARRIED (staysOpen)  -> AWAITING_OWNER  [awaiting-owner-item-carried-stays]
 
   +----------------+
   | BLOCKED        |  not entered

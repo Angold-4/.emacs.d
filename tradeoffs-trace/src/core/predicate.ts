@@ -472,6 +472,12 @@ export function decisionSettled(decision: Decision, phase: PhaseState, C: string
 
 /** accept(C, K): the only way a phase may reach ACCEPTED. */
 export function accept(phase: PhaseState, C: string, K: ContractVersion): boolean {
+  // Plan 06g (A6): the owner's "accept with carried items" decision at the
+  // end of the round budget accepts the candidate as it stands — the open
+  // items are carried to the next phase's plan (`phase.carriedItems`). This
+  // is the owner's own decision, recorded as OWNER_REQUEST_RESOLVED; no
+  // model and no conductor can set it.
+  if (phase.acceptedWithCarried) return true;
   if (!(phase.checks && phase.checks.candidateSha === C && phase.checks.passed === true)) {
     return false;
   }

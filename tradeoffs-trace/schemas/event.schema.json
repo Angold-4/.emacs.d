@@ -23,7 +23,9 @@
         "RUN_BUDGET_EXCEEDED", "RUN_RESUMED", "LAUNCH_FAILED", "INTEGRITY_VIOLATED", "BRIEFS_RECORDED", "BRIEF_RETRY_ATTEMPTED",
         "CRITERION_AMENDED", "CRITERION_REVERTED",
         "NOTE_ADDED", "OWNER_INPUT_RECORDED", "OWNER_CORRECTION", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED",
-        "MESSAGE_RAISED", "MESSAGE_PUBLISHED", "MESSAGE_MERGED", "MESSAGE_DROPPED", "OWNER_VERDICT", "MESSAGE_RESOLVED", "MESSAGE_ADDRESS_REPORTED", "MESSAGE_SUPERSEDED", "MESSAGE_CARRIED"
+        "MESSAGE_RAISED", "MESSAGE_PUBLISHED", "MESSAGE_MERGED", "MESSAGE_DROPPED", "OWNER_VERDICT", "MESSAGE_RESOLVED", "MESSAGE_ADDRESS_REPORTED", "MESSAGE_SUPERSEDED", "MESSAGE_CARRIED",
+        "ROUND_STARTED", "CANDIDATE_SUBMITTED", "CANDIDATE_CHECKED", "PICK_VOTE", "CANDIDATE_PICKED",
+        "ITEM_CARRIED"
       ]
     }
   },
@@ -98,6 +100,12 @@
     { "type": "object", "required": ["type", "messageId", "by", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_RESOLVED" }, "messageId": { "type": "string", "minLength": 1 }, "by": { "enum": ["owner", "evaluator", "panel", "vote"] } } },
     { "type": "object", "required": ["type", "messageId", "addressed", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_ADDRESS_REPORTED" }, "messageId": { "type": "string", "minLength": 1 }, "addressed": { "type": "boolean" }, "reason": { "type": "string" }, "at": { "type": "string" } } },
     { "type": "object", "required": ["type", "messageId", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "MESSAGE_SUPERSEDED" }, "messageId": { "type": "string", "minLength": 1 } } },
-    { "type": "object", "required": ["type", "messageId", "fromCandidate", "toCandidate", "fromVersion", "toVersion", "contentHash", "unchanged"], "properties": { "type": { "const": "MESSAGE_CARRIED" }, "messageId": { "type": "string", "minLength": 1 }, "fromCandidate": { "type": "string", "minLength": 1 }, "toCandidate": { "type": "string", "minLength": 1 }, "fromVersion": { "type": "integer" }, "toVersion": { "type": "integer" }, "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "unchanged": { "type": "boolean" }, "content": { "type": "object" } } }
+    { "type": "object", "required": ["type", "messageId", "fromCandidate", "toCandidate", "fromVersion", "toVersion", "contentHash", "unchanged"], "properties": { "type": { "const": "MESSAGE_CARRIED" }, "messageId": { "type": "string", "minLength": 1 }, "fromCandidate": { "type": "string", "minLength": 1 }, "toCandidate": { "type": "string", "minLength": 1 }, "fromVersion": { "type": "integer" }, "toVersion": { "type": "integer" }, "contentHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "unchanged": { "type": "boolean" }, "content": { "type": "object" } } },
+    { "type": "object", "required": ["type", "round", "base", "lanes"], "properties": { "type": { "const": "ROUND_STARTED" }, "round": { "type": "integer", "minimum": 1 }, "base": { "type": "string", "minLength": 1 }, "lanes": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } } } },
+    { "type": "object", "required": ["type", "round", "lane", "sha"], "properties": { "type": { "const": "CANDIDATE_SUBMITTED" }, "round": { "type": "integer", "minimum": 1 }, "lane": { "type": "string", "minLength": 1 }, "sha": { "type": "string", "minLength": 1 } } },
+    { "type": "object", "required": ["type", "round", "lane", "ok"], "properties": { "type": { "const": "CANDIDATE_CHECKED" }, "round": { "type": "integer", "minimum": 1 }, "lane": { "type": "string", "minLength": 1 }, "ok": { "type": "boolean" }, "note": { "type": "string" } } },
+    { "type": "object", "required": ["type", "round", "seat", "lane", "why"], "properties": { "type": { "const": "PICK_VOTE" }, "round": { "type": "integer", "minimum": 1 }, "seat": { "type": "string", "minLength": 1 }, "lane": { "type": "string", "minLength": 1 }, "why": { "type": "string", "minLength": 1 } } },
+    { "type": "object", "required": ["type", "round", "lane", "sha", "votes"], "properties": { "type": { "const": "CANDIDATE_PICKED" }, "round": { "type": "integer", "minimum": 1 }, "lane": { "type": "string", "minLength": 1 }, "sha": { "type": "string", "minLength": 1 }, "votes": { "type": "integer", "minimum": 0 } } },
+    { "type": "object", "required": ["type", "recordId", "toPhase", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "ITEM_CARRIED" }, "recordId": { "type": "string", "minLength": 1 }, "recordKind": { "enum": ["finding", "message"] }, "toPhase": { "type": "string", "minLength": 1 } } }
   ]
 }

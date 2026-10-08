@@ -24,6 +24,7 @@ import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCoun
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
+import { candidateLabel } from "./core/rounds.ts";
 import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
@@ -487,6 +488,10 @@ export interface RunView {
    * (`base fails: N tests: …`). Undefined when the base passes or no baseline
    * was taken. */
   baseline?: string;
+  /** Plan 06g (A5): one line per lane of the current round, then the round's
+   * cost — `a C1-a ✓`, `b (no candidate: the lane crashed)`. Undefined for a
+   * plan without `#+TT_WORKERS`, which records no round at all. */
+  lanes?: string[];
   previousRound?: string;
   reviewers: ReviewerOutcome[];
   reviewLine: string;
@@ -677,6 +682,9 @@ export function buildView(
       : ` · gate ${gateRecord.passed ? `✓${gateRecord.reused ? " (reused)" : ""}` : "✗"}`;
   let gates: string;
   let previousRound: string | undefined;
+  // Plan 06g (A5): one line per lane of the phase's latest round, then the
+  // round's cost. Empty for a plan without `#+TT_WORKERS`.
+  const lanes = lanesView(phase);
   if (repairing && stage === "implement") {
     gates = `pending (round ${round + 1})`;
     previousRound = C ? `round ${round} · ${C.slice(0, 7)} · ${reasons.length > 0 ? `not accepted: ${reasons.join("; ")}` : "not accepted"}` : undefined;
@@ -784,6 +792,7 @@ export function buildView(
   const tapeInput = {
     label: tapeLabel(phase.phaseId),
     round,
+    ...(lanes.length > 0 ? { lanes } : {}),
     phases: timeline.phases,
     phase,
     run: timeline.state.run,
@@ -813,6 +822,7 @@ export function buildView(
     gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord, phase.integrationHead) : undefined,
     baseline: baselineStatusLine(baseline),
     previousRound,
+    ...(lanes.length > 0 ? { lanes } : {}),
     reviewers,
     reviewLine: reviewers.map((r) => r.label).join("   "),
     verdict,
@@ -1048,6 +1058,8 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     lines.push("", `### Open advisory findings (${advisories.length}) — accepted, not fixed`, "");
     for (const f of advisories) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 400)}`);
   }
+  lines.push(...roundsSection(phase));
+  lines.push(...carriedItemsSection(phase));
   if (followUps.length > 0) {
     lines.push("", `### Follow-ups (refused after DONE — recorded, not blocking)`, "");
     for (const m of followUps) {
@@ -1060,6 +1072,76 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     for (const t of extra.removedTests) lines.push(`- ${t}`);
   }
   return `${lines.join("\n")}\n`;
+}
+
+/** Plan 06g (A5): `tt summary` lists each round's candidates, votes and
+ * winner. Empty for a plan without `#+TT_WORKERS`, which records no round. */
+export function roundsSection(phase: PhaseState): string[] {
+  const rounds = phase.rounds ?? [];
+  if (rounds.length === 0) return [];
+  const lines = ["", `### Rounds (${rounds.length})`, ""];
+  for (const round of rounds) {
+    const candidates = round.lanes
+      .map((lane) => {
+        const c = round.candidates.find((x) => x.lane === lane);
+        const label = candidateLabel(round.round, lane);
+        if (!c?.sha) return `${label} no candidate${c?.note ? ` (${c.note})` : ""}`;
+        return `${label} ${c.sha.slice(0, 7)} ${c.ok === true ? "checks ✓" : c.ok === false ? "checks ✗" : "checking"}`;
+      })
+      .join(" · ");
+    const votes = round.votes.length > 0 ? `votes ${round.votes.map((v) => `${v.seat}→${v.lane}`).join(" ")}` : "no vote";
+    const picked = round.picked
+      ? `winner ${candidateLabel(round.round, round.picked.lane)} (${round.picked.sha.slice(0, 7)}, ${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})`
+      : "no winner";
+    lines.push(`- Round ${round.round} from ${round.base.slice(0, 7)}: ${candidates} — ${votes} — ${picked}`);
+  }
+  return lines;
+}
+
+/** Plan 06g (A6): the owner's "accept with carried items" decision at the end
+ * of the round budget. The carried items are the next phase's plan input, so
+ * `tt summary` lists them by id, with what each one says. Empty for a phase
+ * the owner did not accept that way. Exported so the summary's own words are
+ * unit-tested, not a copy of them. */
+/** Plan 06g (A5): the status view's lane lines — one per lane of the phase's
+ * LATEST round, then the round's cost. A lane that produced no candidate
+ * says why (its `note`), so a crashed lane is visible and never silent. Empty
+ * for a phase without rounds (no `#+TT_WORKERS`), which is today's view
+ * unchanged. */
+export function lanesView(phase: PhaseState): string[] {
+  const round = (phase.rounds ?? [])[Math.max(0, (phase.rounds ?? []).length - 1)];
+  if (!round) return [];
+  const lines = round.lanes.map((lane) => {
+    const candidate = round.candidates.find((c) => c.lane === lane);
+    const label = candidateLabel(round.round, lane);
+    if (!candidate?.sha) return `${lane} ${candidate?.note ? `(no candidate: ${candidate.note})` : "(no candidate yet)"}`;
+    const short = candidate.sha.slice(0, 7);
+    const state = candidate.ok === undefined ? "checking" : candidate.ok ? "checks ✓" : "checks ✗";
+    const picked = round.picked?.lane === lane ? ` — picked (${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})` : "";
+    return `${lane} ${label} ${short} ${state}${picked}`;
+  });
+  const passing = round.candidates.filter((c) => c.ok === true).length;
+  const seats = 3;
+  lines.push(
+    `round ${round.round} from ${round.base.slice(0, 7)}: ${round.lanes.length} worker run(s), ${passing * seats} review(s)`,
+  );
+  if (round.votes.length > 0) {
+    lines.push(`votes: ${round.votes.map((v) => `${v.seat}→${v.lane}`).join(" · ")}`);
+  }
+  return lines;
+}
+
+export function carriedItemsSection(phase: PhaseState): string[] {
+  if (!phase.acceptedWithCarried) return [];
+  const carried = (phase.carriedItems ?? []).map(
+    (id) => phase.findings.find((f) => f.id === id) ?? { id, raisedBy: "?", evidence: "(no longer in the record)" },
+  );
+  const lines = ["", `### Carried items (${carried.length}) — accepted with the owner's decision`, ""];
+  for (const f of carried) {
+    const to = phase.carriedTo?.[f.id];
+    lines.push(`- **${f.id}**${to ? ` → ${to}` : ""} (${f.raisedBy}): ${oneLine(f.evidence, 400)}`);
+  }
+  return lines;
 }
 
 function oneLine(text: string, max: number): string {

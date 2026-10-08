@@ -215,6 +215,17 @@ function acceptanceFromBody(node: OrgNode): { items: string[]; lines: number[] }
   return { items, lines };
 }
 
+/** Plan 06g: `#+TT_WORKERS:`/`#+TT_ROUNDS:` — a whole number, kept as
+ * written so the linter can refuse a nonsense value rather than silently
+ * defaulting. Absent leaves the plan exactly as before. */
+function parseCount(keyword: { value: string; line: number } | undefined): number | undefined {
+  if (!keyword) return undefined;
+  const value = keyword.value.trim();
+  if (value.length === 0) return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : Number.NaN;
+}
+
 function parseModels(keyword: { value: string; line: number } | undefined): Pick<LintPlanInput, "models" | "modelsLine" | "modelsRepeated"> {
   if (!keyword) return {};
   const models: LintModels = {};
@@ -263,12 +274,18 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks));
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
+  const workers = first("TT_WORKERS");
+  const rounds = first("TT_ROUNDS");
+  const workersValue = parseCount(workers);
+  const roundsValue = parseCount(rounds);
   return {
     ...(sourceFile ? { sourceFile } : {}),
     ...(envFile && envFile.trim().length > 0 ? { envFile: envFile.trim() } : {}),
     phases,
     ...parseModels(first("TT_MODELS")),
     ...(rerun ? { rerun: rerun.value, rerunLine: rerun.line } : {}),
+    ...(workersValue !== undefined ? { workers: workersValue, workersLine: workers!.line } : {}),
+    ...(roundsValue !== undefined ? { rounds: roundsValue, roundsLine: rounds!.line } : {}),
   };
 }
 

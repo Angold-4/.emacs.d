@@ -636,6 +636,101 @@ gateway policy — but `tt models check` exits non-zero for it. A plan with no
 with an empty model, and `panel=reviewers` together with an explicit
 `panel.N`.
 
+## Several lanes per round (`#+TT_WORKERS`)
+
+A plan can run more than one implementation lane per round:
+
+```org
+#+TT_WORKERS: 2
+#+TT_ROUNDS: 3
+```
+
+> **Status (06g, repair round 1).** What is implemented and tested today: the
+> keyword is parsed by the real Emacs parser and linted, the round events
+> exist and reduce into `phase.rounds`, `pickWinner` / `blocksAcceptance` /
+> `roundBudget` are the pure rules (`pickWinner` is the only place a winner is
+> decided), the lane sweep is cwd-scoped, the views render a round (status,
+> tape, review buffer, `tt summary`), the A6 round rule downgrades an ungrounded
+> round-2 blocking finding to an advisory, and the budget-spent "accept with
+> carried items" decision works end to end through a real inbox file.
+> **Not yet implemented:** the conductor's lane round itself — two worktrees,
+> two worker attempts, two freezes, the per-candidate checks and reviews, and
+> the pick turn — so a plan with `#+TT_WORKERS: 2` currently runs the one-lane
+> loop and records no round event. Everything below is the intended behaviour
+> that the remaining work must satisfy.
+
+`#+TT_WORKERS: 2` makes one round start from **one** version (round 1: the
+integration branch head) and run two lanes. Each lane gets its own worktree,
+its own worker and its own sweep, on the same prompt; a phase's own
+`:WORKERS:`/`:ROUNDS:` property overrides the plan's keyword. This plan
+version runs **1 or 2** lanes — `tt lint` refuses `#+TT_WORKERS: 3` and names
+06h, the phase that makes the lane count adjustable.
+
+What one round does, in order:
+
+1. each lane works in its own worktree at the round's base and freezes its own
+   candidate (`C2-a`, `C2-b`);
+2. the candidates are checked **one after the other** under the machine-wide
+   lock — checks never run concurrently on one machine;
+3. M, A and B review every candidate that passed its checks (two passing
+   candidates are six reviews);
+4. each seat casts one pick vote with a one-line why, and the candidate with a
+   strict majority of the seats (2 of 3) wins. A single passing candidate wins
+   without a vote; a round where no candidate passes repeats from the same
+   base, carrying both lanes' failures.
+
+The winner is decided by `pickWinner` in code (`src/core/rounds.ts`), never by
+a model. Acceptance is then the rule in force applied to the winner **alone**;
+the losing candidate is discarded. A lane that crashes or times out yields no
+candidate and does not stop the other lane — the status shows why.
+
+With `#+TT_WORKERS` absent (or 1) nothing above happens: no round event is
+recorded and the phase is the single-candidate loop it was before.
+
+### The round budget and carried items
+
+A phase may spend **3 rounds** by default; `#+TT_ROUNDS` sets another number.
+The number is the phase's repair allowance, exactly as the pre-06g budget was:
+round 1 is the first candidate and each later round is one repair, so
+`#+TT_ROUNDS: 3` allows three repairs on top of the first candidate. A round
+costs one attempt of the repair budget, whatever the number of lanes.
+
+From round 2, a finding blocks acceptance only when it either
+
+- names an item of the contract (or of an owner correction) that is unmet on
+  the main path, with the item id and a `file:line`; or
+- is a **regression**: a test or behaviour that passed at the round's base and
+  fails now.
+
+Anything else — a further edge path, hardening, wording, style — is an
+**advisory**: recorded as a trade-off and carried, never blocking. Round 1 is
+unchanged: every blocking finding blocks.
+
+When the budget is spent the phase stops on the owner and no further round
+starts without an explicit owner grant. If the only open findings are
+advisories, the owner's single decision is **"accept with carried items"**:
+taking it accepts the candidate and lists the carried items in the run record
+and in `tt summary`, as input for the next phase's plan. If a blocking item is
+open, the owner sees only the blocking items.
+
+The owner's disposition is the command
+
+```text
+tt carry <run> <finding-or-message-id> --to <phase-id>
+```
+
+It goes through the run's inbox, like every owner command. It marks the item
+carried with the target phase, answers the open request about it (a contract
+finding's only other option is a correction, which grants three rounds and
+restarts the worker), and once no blocking item remains uncarried it accepts
+the candidate. Every carried item, with its target, is listed in `tt summary`
+and `tt status`.
+
+`tt status` shows one line per lane and the round's cost (`2 worker run(s),
+6 review(s)`), `views/loop.txt` and `views/tape.txt` show both lanes and the
+pick, the review buffer groups the round's candidates with the votes and the
+winner, and `tt summary` lists each round's candidates, votes and winner.
+
 ## Owner checklist
 
 A plan may carry the owner's own to-dos next to `Acceptance:`:

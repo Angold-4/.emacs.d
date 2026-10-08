@@ -23,6 +23,12 @@ export const BUDGET_GATE_OPTIONS: OwnerRequestOption[] = [
   { id: "stop", label: "stop the phase" },
 ];
 
+/** Plan 06g (A6): the round budget is spent and only advisories are open, so
+ * the owner's single decision is "accept with carried items". Taking it
+ * accepts the candidate and carries the open items to the next phase's plan
+ * (the run record and `tt summary` list them). */
+export const CARRIED_OPTIONS: OwnerRequestOption[] = [{ id: "accept_carried", label: "accept with carried items" }];
+
 export const FAILED_VOTE_OPTIONS: OwnerRequestOption[] = [
   { id: "accept_as_implemented", label: "accept the decision as implemented" },
   { id: "reject_and_repair", label: "reject it and repair (grant 3 rounds)" },
@@ -176,15 +182,26 @@ export function openItemOwnerRequestsFor(phase: PhaseState, cause: string): Owne
   if (created.length === 0) {
     // A gate failed with no record-level item to blame (design §8.1's own
     // escape): worker attempts, freezes, checks or probes kept failing.
+    // Plan 06g (A6): when the only open findings are advisories, the one
+    // decision offered is "accept with carried items" — the phase may not
+    // spend another round on an advisory, and the owner is not asked to
+    // choose between "more rounds" and "stop" for one either. A blocking
+    // item is never carried: it gets its own request above, so the owner
+    // sees only the blocking items.
+    const advisories = phase.findings.filter((f) => f.status === "open" && f.severity === "advisory");
+    const blocking = phase.findings.some((f) => f.status === "open" && f.severity === "blocking");
+    const offerCarried = advisories.length > 0 && !blocking;
     created.push({
       id: nextId("gate"),
       version: 1,
       phaseId: phase.phaseId,
-      reason: cause,
+      reason: offerCarried
+        ? `${cause}; only advisories are open (${advisories.map((f) => f.id).join(", ")}) and they are carried`
+        : cause,
       origin: "repair_budget_exhausted",
       boundCandidateSha: C,
       boundContractVersion: K,
-      options: BUDGET_GATE_OPTIONS,
+      options: offerCarried ? CARRIED_OPTIONS : BUDGET_GATE_OPTIONS,
       status: "open",
     });
   }

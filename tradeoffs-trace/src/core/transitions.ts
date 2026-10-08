@@ -17,11 +17,13 @@ import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
 import {
   applyFindingAcceptedByOwner,
+  applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
   autoResolveLinkedRequest,
   awaitingOwnerTarget,
   checkFindingAcceptedByOwner,
+  checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
@@ -1612,6 +1614,7 @@ function checkAndApply<E extends Event>(
 const ownerRequestResolved = checkAndApply(checkOwnerRequestResolved, applyOwnerRequestResolved);
 const findingAcceptedByOwner = checkAndApply(checkFindingAcceptedByOwner, applyFindingAcceptedByOwner);
 const overrideCast = checkAndApply(checkOverrideCast, applyOverrideCast);
+const itemCarried = checkAndApply(checkItemCarried, applyItemCarried);
 
 function resolvedRequestFor(s: State, ev: Event): PhaseState["ownerRequests"][number] | undefined {
   const e = ev as Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
@@ -1637,6 +1640,31 @@ addRow({
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s, ev) => withPhase(s, { ...ownerRequestResolved.applyPhase(s, ev), phase: "REPAIRING" }),
+});
+
+// Plan 06g (A6): "accept with carried items" — the single decision a phase
+// whose budget is spent offers when only advisories are open. Taking it
+// accepts the candidate as it stands (applyOwnerRequestResolved records
+// `acceptedWithCarried` and the carried ids, and accept() honours them) and
+// the phase resumes to RESOLVING, where next() accepts.
+addRow({
+  id: "awaiting-owner-request-resolved-accept-carried",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "OWNER_REQUEST_RESOLVED",
+  guardName: "budgetGateAcceptCarried",
+  guard: (s, ev) => {
+    const request = resolvedRequestFor(s, ev);
+    const e = ev as Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
+    if (!request || !isBudgetGateRequest(request) || e.option !== "accept_carried") return false;
+    if (!ownerRequestResolved.guardValid(s, ev)) return false;
+    return awaitingOwnerTarget(ownerRequestResolved.applyPhase(s, ev)) !== "AWAITING_OWNER";
+  },
+  to: "RESOLVING",
+  // The gate-less form, exactly like the grant row's own fixture: a phase
+  // whose contract declares a gate asks for `gate_required` first.
+  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  apply: (s, ev) => withPhase(s, { ...ownerRequestResolved.applyPhase(s, ev), phase: "RESOLVING" }),
 });
 
 addRow({
@@ -1775,6 +1803,12 @@ addAwaitingOwnerRecordCommandRows(
 addAwaitingOwnerRecordCommandRows("awaiting-owner-finding-accepted", "FINDING_ACCEPTED_BY_OWNER", () => true, findingAcceptedByOwner);
 
 addAwaitingOwnerRecordCommandRows("awaiting-owner-override", "OVERRIDE_CAST", () => true, overrideCast);
+
+// Plan 06g (A5): the owner's `tt carry <run> <id> --to <phase-id>` — mark the
+// item carried with its target, answer the request about it, and (once no
+// blocking item remains uncarried) accept the candidate. It shares the same
+// clears/stays routing as the other record-level owner commands.
+addAwaitingOwnerRecordCommandRows("awaiting-owner-item-carried", "ITEM_CARRIED", () => true, itemCarried);
 
 // --- launch failure (§2.1): a tool-set mismatch is a launch failure, not a
 // warning — straight to BLOCKED, no repair round spent (phase-1b round of

@@ -51,6 +51,12 @@ export interface PlanPhase {
    * phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted runs
    * it, once. Absent on a plan that declares none, which behaves as before. */
   finalChecks?: string[];
+  /** Plan 06g: `#+TT_WORKERS:` — how many lanes one round runs. Absent (or 1)
+   * is today's single-candidate loop; 2 is the two-lane round. */
+  workers?: number;
+  /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before it
+   * parks on the owner. Absent means the default of 3. */
+  rounds?: number;
   /** Plan 06b: the structured items of a phase subtree (ref
    * refs/06_ref_plan_format.md). Absent on an old-format plan, where
    * `acceptance`/`reserved` are the only items. */
@@ -78,6 +84,12 @@ export interface PhaseContract {
    * candidate that has passed review with no open blocker runs it, once
    * (core/checks.ts's `checkTier`). */
   finalChecks?: string[];
+  /** Plan 06g: `#+TT_WORKERS:` frozen into the contract — how many lanes one
+   * round runs. Absent (or 1) is today's single-candidate loop. */
+  workers?: number;
+  /** Plan 06g: `#+TT_ROUNDS:` frozen into the contract, or undefined for the
+   * default (3). `roundBudget()` reads this; nothing else decides the budget. */
+  roundsAllowed?: number;
   /** Plan 06b: the structured items of the frozen contract. The FSM,
    * prompts, checks, verdicts and acceptance all read these; absent on an
    * old-format phase, where `itemsFromPhase` synthesizes R1..Rn from
@@ -1136,6 +1148,20 @@ export interface PhaseState {
    * been re-dispatched once. Folded from BRIEF_RETRY_ATTEMPTED, so the retry
    * is once per candidate even across a restart. */
   briefRetries?: string[];
+  /** Plan 06g: the phase's rounds, in order — each round's base, lanes,
+   * candidates, pick votes and winner. Absent for a plan without
+   * `#+TT_WORKERS`, where no round event is ever recorded. */
+  rounds?: RoundRecord[];
+  /** Plan 06g (A6): the owner's `accept_carried` decision at budget
+   * exhaustion — "accept with carried items". Set only by that owner option;
+   * `accept()` honours it, and the views list `carriedItems`. */
+  acceptedWithCarried?: boolean;
+  /** Plan 06g: the open items carried past this phase, by finding id. */
+  carriedItems?: string[];
+  /** Plan 06g (A5): the target phase each carried item goes to, keyed by the
+   * finding/message id (`tt carry <run> <id> --to <phase-id>`). `accept_carried`
+   * carries the open items without a named target, so an id may be absent. */
+  carriedTo?: Record<string, string>;
   /** Plan 06b: the worker's `submit_coverage` payload. The freeze is refused
    * until it covers every R, C and A. */
   coverage?: import("./items.ts").Coverage;
@@ -1171,6 +1197,41 @@ export interface PhaseState {
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
+// ---------------------------------------------------------------------------
+// Plan 06g: the round (K lanes, one base, one winner)
+// ---------------------------------------------------------------------------
+
+/** One lane's result inside a round. `sha` is set when the lane froze a
+ * candidate; `ok` when its checks ran (true = passed). A lane that crashed,
+ * timed out or produced no submission leaves both unset and carries `note`,
+ * so the status can say why. */
+export interface LaneCandidateRecord {
+  lane: string; // "a", "b", …
+  sha?: string;
+  ok?: boolean;
+  note?: string;
+}
+
+/** One seat's vote in a round's pick turn. `why` is the one-line reason. */
+export interface PickVote {
+  seat: string; // "M", "A", "B"
+  lane: string;
+  why: string;
+}
+
+/** One round of a phase: the base it started from, its lanes, their
+ * candidates, the pick turn's votes and the winner. Reduced from the
+ * ROUND_STARTED / CANDIDATE_SUBMITTED / CANDIDATE_CHECKED / PICK_VOTE /
+ * CANDIDATE_PICKED record events, so a restart rebuilds it from the log. */
+export interface RoundRecord {
+  round: number;
+  base: string;
+  lanes: string[];
+  candidates: LaneCandidateRecord[];
+  votes: PickVote[];
+  picked?: { lane: string; sha: string; votes: number };
+}
+
 export interface FlakeObservation {
   name: string;
   command: string;
@@ -1577,6 +1638,10 @@ export interface EvProbeInterrupted {
 export interface EvReviewSubmitted {
   type: "REVIEW_SUBMITTED";
   review: Review;
+  /** Plan 06g: the candidate this review judged, when the round reviewed more
+   * than one (K ≥ 2). Absent on the single-lane loop, where the phase's own
+   * candidate is the only one there could be. */
+  candidate?: string;
 }
 export interface EvReviewTimedOut {
   type: "REVIEW_TIMED_OUT";
@@ -2106,7 +2171,87 @@ export interface EvItemCheckRecorded {
   evidence: string;
 }
 
+/** Plan 06g (A5): the owner carries one finding or message to a later
+ * phase's plan (`tt carry <run> <id> --to <phase-id>`). Record-only unless
+ * the phase is AWAITING_OWNER: there it answers the open request about the
+ * record, and once no blocking item remains uncarried it accepts the
+ * candidate (`acceptedWithCarried`). owner-commands.ts is the only place
+ * that decides what a carry does. */
+export interface EvItemCarried {
+  type: "ITEM_CARRIED";
+  recordId: string;
+  /** Which record the id names; absent means the lookup tries a finding
+   * first, then a message. */
+  recordKind?: "finding" | "message";
+  /** The phase id the item is carried to. */
+  toPhase: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+
+// ---------------------------------------------------------------------------
+// Plan 06g: the round's record events (all absent when TT_WORKERS is absent)
+// ---------------------------------------------------------------------------
+
+/** A round began: `lanes` are its lane ids, `base` the one version every lane
+ * starts from (round 1: the integration branch head). Record-only. */
+export interface EvRoundStarted {
+  type: "ROUND_STARTED";
+  round: number;
+  base: string;
+  lanes: string[];
+}
+
+/** One lane froze a candidate. Record-only; `sha` is the lane's commit. */
+export interface EvCandidateSubmitted {
+  type: "CANDIDATE_SUBMITTED";
+  round: number;
+  lane: string;
+  sha: string;
+}
+
+/** One lane's checks ran. `ok` is false for a failure; a lane that crashed,
+ * timed out or submitted nothing records no candidate at all (the status
+ * shows its `note` instead). Record-only. */
+export interface EvCandidateChecked {
+  type: "CANDIDATE_CHECKED";
+  round: number;
+  lane: string;
+  ok: boolean;
+  note?: string;
+}
+
+/** One seat's vote in a round's pick turn, with its one-line why. A seat
+ * votes once; a later PICK_VOTE from the same seat replaces the earlier one.
+ * Record-only. */
+export interface EvPickVote {
+  type: "PICK_VOTE";
+  round: number;
+  seat: string;
+  lane: string;
+  why: string;
+}
+
+/** The round's winner, decided by core/rounds.ts's `pickWinner` (never by a
+ * model) and recorded here. `votes` is the number of pick votes the winner
+ * took (0 when it was the only passing candidate and won without a vote).
+ * Record-only. */
+export interface EvCandidatePicked {
+  type: "CANDIDATE_PICKED";
+  round: number;
+  lane: string;
+  sha: string;
+  votes: number;
+}
+
 export type Event =
+  | EvRoundStarted
+  | EvCandidateSubmitted
+  | EvCandidateChecked
+  | EvPickVote
+  | EvCandidatePicked
+  | EvItemCarried
   | EvItemStateUpdated
   | EvEvidenceRecorded
   | EvItemCheckRecorded

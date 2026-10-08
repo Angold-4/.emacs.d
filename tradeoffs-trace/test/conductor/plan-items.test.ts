@@ -4,15 +4,32 @@
 // (refs/06_ref_plan_format.md). Fake-pi end to end.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor, type FakePiStep } from "./harness.ts";
-import type { Reviewer } from "../../src/core/types.ts";
+import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor, type FakePiStep, type TestConductorSetup } from "./harness.ts";
+import { rebuildState, runPaths } from "../../src/conductor.ts";
+import type { Reviewer, State } from "../../src/core/types.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
+import { readLog } from "../../src/effects/log.ts";
+import { prSummary } from "../../src/view.ts";
+
+const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
+
+/** Runs the real CLI asynchronously: the conductor runs in THIS process, so a
+ * synchronous `execFileSync` would block the event loop and the inbox poll
+ * that applies the command. Returns the CLI's stdout and exit code. */
+function runCli(args: string[]): Promise<{ stdout: string; code: number }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI_PATH, ...args], { env: { ...process.env, TT_NOTIFY_COMMAND: ":" } });
+    let stdout = "";
+    child.stdout.on("data", (d) => (stdout += String(d)));
+    child.on("close", (code) => resolve({ stdout, code: code ?? 0 }));
+  });
+}
 
 type Setup = Awaited<ReturnType<typeof setupConductor>>;
 
@@ -1313,6 +1330,402 @@ test("plan 06c: an amendment whose text equals the current criterion is never ra
       readEvents(setup.runDir).some((r) => r.kind === "dispute_ignored" && /equals the current criterion/.test(String((r.event as { reason?: string }).reason))),
       "the no-op amendment is logged as ignored",
     );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Plan 06g (A4/A5): the round budget's convergence rule and the owner's carry.
+// These run only when a plan asks for a round budget; a plan without
+// `#+TT_WORKERS` behaves exactly as today (C1).
+// ---------------------------------------------------------------------------
+
+/** Every event type this plan adds. None may appear in a run without
+ * `#+TT_WORKERS`. */
+const ROUND_EVENT_TYPES = new Set(["ROUND_STARTED", "CANDIDATE_SUBMITTED", "CANDIDATE_CHECKED", "PICK_VOTE", "CANDIDATE_PICKED"]);
+
+function submitPhaseStep(): FakePiStep {
+  return { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } };
+}
+
+/** M raises one blocking finding per CANDIDATE (so a repair round raises a
+ * new one), and withdraws its previous open finding once a new candidate is
+ * under review — the ordinary reviewer flow the record requires before a
+ * reopened point may stop blocking. A and B approve. */
+function reviewerRaisingOncePerRound(evidence: string, kind: "defect" | "contract" = "defect") {
+  return (reviewer: Reviewer, state: State) => {
+    const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === reviewer);
+    const alreadyOnThisCandidate = open.some((f) => f.boundCandidateSha === state.phase.candidate?.sha);
+    return {
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: open
+              .filter((f) => f.boundCandidateSha !== state.phase.candidate?.sha)
+              .map((f) => ({ findingId: f.id, status: "withdraw", evidence: "withdrawn: the new candidate no longer carries it" })),
+            ballots: [],
+            findings: reviewer === "M" && !alreadyOnThisCandidate ? [{ kind, severity: "blocking", evidence }] : [],
+          },
+        },
+      ],
+    };
+  };
+}
+
+/** A run that reaches DONE after a round-1 repair, with the given finding
+ * evidence raised in each round. */
+async function runTwoRounds(
+  evidence: string,
+  phase: Partial<import("../../src/conductor.ts").RunPlanPhase> = {},
+  kind: "defect" | "contract" = "defect",
+): Promise<TestConductorSetup> {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScriptForAttempt: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: reviewerRaisingOncePerRound(evidence, kind),
+    deadlines: { ...FAST, inboxPollMs: 40 },
+    ...(Object.keys(phase).length > 0
+      ? {
+          phase: {
+            id: "p1",
+            goal: "keep the loop short",
+            acceptance: ["it works"],
+            checks: ["true"],
+            boundaries: [],
+            reserved: [],
+            provisional: false,
+            ...phase,
+          },
+        }
+      : {}),
+  });
+  await setup.conductor.start();
+  return setup;
+}
+
+test("plan 06g: with TT_WORKERS absent no lane, pick or round event is recorded and old event logs replay unchanged", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    }),
+    deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+  });
+
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000);
+    const state = setup.conductor.state;
+
+    // The plan declares no lanes, so the phase carries no round at all.
+    assert.equal(state.phase.rounds, undefined);
+    assert.equal(state.phase.contract.workers, undefined);
+    assert.equal(state.phase.contract.roundsAllowed, undefined);
+    // The round budget defaults to 3, exactly as the repair budget did before.
+    assert.equal(state.phase.repairRoundsGranted, 3);
+
+    // No round event of any kind reached the log.
+    const logEvents = readEvents(setup.runDir);
+    const offenders = logEvents.filter((r) => r.kind === "event" && ROUND_EVENT_TYPES.has((r.event as { type?: string })?.type ?? ""));
+    assert.deepEqual(offenders, [], "a run without TT_WORKERS must record no round event");
+    const reviewSubmitted = logEvents.filter((r) => r.kind === "event" && (r.event as { type: string }).type === "REVIEW_SUBMITTED");
+    assert.ok(reviewSubmitted.length >= 3, "the three reviews still run as before");
+    for (const record of reviewSubmitted) {
+      assert.equal((record.event as { candidate?: string }).candidate, undefined, "a single-lane review carries no candidate field");
+    }
+
+    // An old log replays unchanged: folding events.jsonl from scratch gives
+    // the same state the live conductor holds, with no round record.
+    const rebuilt = rebuildState(setup.runDir, setup.plan);
+    assert.deepEqual(rebuilt.phase.rounds, undefined);
+    assert.equal(rebuilt.phase.phase, state.phase.phase);
+    assert.equal(rebuilt.phase.candidate?.sha, state.phase.candidate?.sha);
+    assert.equal(rebuilt.phase.publishedI, state.phase.publishedI);
+    const before = readLog(runPaths(setup.runDir).events).records.length;
+    rebuildState(setup.runDir, setup.plan);
+    assert.equal(readLog(runPaths(setup.runDir).events).records.length, before);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06g: a round-2 blocking finding that names no contract item and no regression is carried as an advisory and the phase is accepted", async () => {
+  const setup = await runTwoRounds("a further edge path in the sweep, not named by any item");
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.equal(phase.round, 2);
+    const advisory = phase.findings.find((f) => f.severity === "advisory" && f.boundCandidateSha === phase.candidate?.sha)!;
+    assert.ok(advisory, "the round-2 finding is carried as an advisory");
+    assert.equal(advisory.status, "open");
+    assert.match(advisory.severityReason ?? "", /A6 round 2/);
+    assert.equal(phase.phase, "DONE");
+    assert.equal(phase.repairRoundsUsed, 1, "the round rule saved the extra repair round");
+    const log = readLog(runPaths(setup.runDir).events).records.filter((r) => r.kind === "round_advisory");
+    assert.ok(log.length >= 1, "the downgrade is recorded with its reason");
+    assert.match(String((log[0].event as { reason?: string }).reason ?? ""), /A6 round 2/);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06g: a phase still blocked after three rounds stops AWAITING_OWNER and starts no fourth round until the owner grants one", async () => {
+  // Three rounds, each with a GROUNDED blocking finding (an item id and a
+  // file:line): rounds 1 and 2 force a repair, round 3's finding is still open
+  // when its budget runs out, so the phase parks on the owner and no fourth
+  // round may start by itself. `#+TT_ROUNDS: 2` is two repair rounds, i.e.
+  // exactly three rounds of review. The owner then grants one more through a
+  // real inbox file, and the fourth attempt starts.
+  const setup = await runTwoRounds("R1 (it works) is unmet: src/core/rounds.ts:12 still drops the second lane", { rounds: 2 });
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 90_000, 20, setup.runDir);
+    const parked = setup.conductor.state.phase;
+    assert.equal(parked.repairRoundsUsed, 2, "two repairs (three rounds) were spent");
+    assert.equal(parked.repairRoundsGranted, 2, "and the budget is spent, so no fourth round may start");
+    assert.equal(parked.attempt.n, 3, "three rounds ran, and no fourth worker attempt was launched");
+    const request = parked.ownerRequests.find((r) => r.status === "open")!;
+    assert.ok(request, "the owner is asked about the still-open item");
+    assert.equal(request.linkedFindingId, parked.findings.find((f) => f.status === "open" && f.severity === "blocking")!.id);
+
+    // The owner grants one more round through a real inbox file.
+    const runId = parked.runId;
+    const file = path.join(runPaths(setup.runDir).inbox, "cmd-resolve-repair.json");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        commandId: "cmd-resolve-repair",
+        type: "resolve",
+        recordKind: "request",
+        option: "repair",
+        binding: {
+          runId,
+          phaseId: parked.phaseId,
+          candidateSha: parked.candidate!.sha,
+          contractVersion: parked.contract.contractVersion,
+          recordId: request.id,
+          recordVersion: request.version,
+        },
+      }),
+    );
+    await waitFor(() => setup.conductor.state.phase.phase !== "AWAITING_OWNER", 30_000);
+    await waitFor(() => setup.conductor.state.phase.attempt.n >= 4, 90_000, 20, setup.runDir);
+    assert.equal(setup.conductor.state.phase.repairRoundsGranted, 5, "the owner's grant added three rounds");
+    const resolved = readEvents(setup.runDir)
+      .filter((r) => r.kind === "event")
+      .map((r) => r.event as { type: string; option?: string })
+      .filter((e) => e.type === "OWNER_REQUEST_RESOLVED");
+    assert.equal(resolved.length, 1);
+    assert.equal(resolved[0].option, "repair");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06g: with only advisories open at the end of the budget, tt carry accepts the candidate and tt summary lists the carried items", async () => {
+  // A structured phase whose R2 is an `evidence` item the owner never records,
+  // so acceptance cannot complete. Rounds 1 and 2 raise a GROUNDED blocking
+  // finding (withdrawn the next round); round 3 raises an advisory. With
+  // `#+TT_ROUNDS: 2` (two repair rounds = three rounds of review) the phase
+  // parks on the owner with only that advisory open. `tt carry` then accepts
+  // the candidate and the carried item reaches `tt summary`.
+  const items = {
+    architecture: [],
+    requirements: [
+      { id: "R1", title: "R1 proves it", text: "R1 proves it", arch: [], verify: ['test "R1 proves it"'] },
+      { id: "R2", title: "R2 owner run", text: "the owner live run is recorded", arch: [], verify: ["evidence"] },
+    ],
+    constraints: [],
+  };
+  const setup = await setupConductor({
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    phase: {
+      id: "p1",
+      goal: "keep the loop short",
+      acceptance: items.requirements.map((r) => r.text),
+      checks: [CHECK_OUTPUT],
+      boundaries: [],
+      reserved: [],
+      provisional: false,
+      rounds: 2,
+      ...items,
+    },
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `mkdir -p src/core && printf 'interface Round { n: number } // ${attempt}\\n' > src/core/rounds.ts` },
+        {
+          kind: "call-submit",
+          tool: "submit_coverage",
+          args: {
+            items: [
+              { id: "R1", status: "done", where: ["src/core/rounds.ts:1"], tests: ["R1 proves it"] },
+              { id: "R2", status: "done", where: [], tests: [] },
+            ],
+            arch: [],
+          },
+        },
+        submitPhaseStep(),
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const round = state.phase.round ?? 1;
+      const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === reviewer);
+      const findings =
+        reviewer === "M"
+          ? round <= 2
+            ? [{ kind: "defect", severity: "blocking", evidence: "R1 (R1 proves it) is unmet: src/core/rounds.ts:1 still drops the second lane" }]
+            : [{ kind: "defect", severity: "advisory", evidence: "a further edge path worth carrying into the next phase's plan" }]
+          : [];
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: open
+                .filter((f) => f.boundCandidateSha !== state.phase.candidate?.sha)
+                .map((f) => ({ findingId: f.id, status: "withdraw", evidence: "withdrawn: the new candidate no longer carries it" })),
+              ballots: [],
+              items: [
+                { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+                { id: "R2", verdict: "met", evidence: "src/core/rounds.ts:1" },
+              ],
+              arch: [],
+              findings,
+            },
+          },
+        ],
+      };
+    },
+    deadlines: { ...FAST, inboxPollMs: 40 },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
+    const parked = setup.conductor.state.phase;
+    assert.equal(parked.repairRoundsUsed, 2, "two repairs (three rounds) were spent");
+    assert.equal(parked.repairRoundsGranted, 2, "and the budget is spent, so no fourth round may start");
+    assert.equal(parked.attempt.n, 3, "three rounds ran, and no fourth worker attempt was launched");
+    // Only advisories are open, so the owner's one decision is accept with
+    // carried items.
+    const advisory = parked.findings.find((f) => f.status === "open" && f.severity === "advisory")!;
+    assert.ok(advisory, "the round-3 advisory is the only open finding");
+    assert.ok(!parked.findings.some((f) => f.status === "open" && f.severity === "blocking"), "no blocking finding is open");
+    const request = parked.ownerRequests.find((r) => r.status === "open")!;
+    assert.deepEqual(request.options.map((o) => o.id), ["accept_carried"], "the owner's single decision is accept with carried items");
+
+    // The owner carries the advisory through the real CLI: the candidate is
+    // accepted and the carried item is listed for the next phase.
+    const { stdout: carryOut } = await runCli(["carry", setup.runDir, advisory.id, "--to", "06h", "--root", setup.runRoot]);
+    assert.match(carryOut, new RegExp(`carried ${advisory.id} to 06h`));
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const done = setup.conductor.state.phase;
+    assert.equal(done.acceptedWithCarried, true);
+    assert.ok(done.carriedItems?.includes(advisory.id), "the carried item is recorded");
+    assert.equal(done.carriedTo?.[advisory.id], "06h", "with the target phase the owner named");
+    const summary = prSummary(setup.runDir, setup.plan);
+    assert.match(summary, /### Carried items \(1\)/);
+    assert.match(summary, new RegExp(`${advisory.id}.* → 06h`));
+    // The status view lists them too, with the target (A5).
+    const status = fs.readFileSync(path.join(runPaths(setup.runDir).status), "utf8");
+    assert.match(status, /Carried items \(1\)/);
+    assert.match(status, new RegExp(`${advisory.id} → 06h`));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06g: a round-2 finding that names an unmet item (id and file:line) still blocks, so the phase repairs instead of accepting", async () => {
+  // The negative half of the convergence rule (R4): a round-2 blocking finding
+  // that DOES name an unmet item, with its id and a file:line, is not
+  // downgraded — it keeps blocking acceptance.
+  const setup = await runTwoRounds("R1 (it works) is unmet: src/core/rounds.ts:12 still drops the second lane");
+  try {
+    await waitFor(() => setup.conductor.state.phase.repairRoundsUsed >= 2, 90_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.notEqual(phase.phase, "DONE", "a grounded item finding must not be accepted away");
+    const grounded = phase.findings.find((f) => f.severity === "blocking" && f.status === "open");
+    assert.ok(grounded, "the grounded finding stays blocking and open");
+    assert.match(grounded!.evidence, /src\/core\/rounds\.ts:12/);
+    assert.equal(grounded!.severityReason, undefined, "a grounded finding is not downgraded");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06g: tt carry on a contract finding at the end of the budget accepts the candidate and lists the item as carried to the named phase", async () => {
+  // The 06c case (2026-10-07): one contract finding on a display detail, with
+  // the budget spent. A contract finding cannot be answered by a correction
+  // without granting three rounds and restarting the worker; `tt carry` is the
+  // owner's disposition that accepts the candidate and carries the item.
+  const setup = await runTwoRounds(
+    "R1 (it works) is unmet: src/core/rounds.ts:12 the stage clock is wrong on the display",
+    { rounds: 1 },
+    "contract",
+  );
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
+    const parked = setup.conductor.state.phase;
+    assert.equal(parked.repairRoundsUsed, 1, "the one repair round was spent");
+    const contract = parked.findings.find((f) => f.status === "open" && f.kind === "contract")!;
+    assert.ok(contract, "the open contract finding is what the owner must answer");
+    // A contract finding's only offered option is repair, so the owner needs
+    // the carry disposition to accept without another round.
+    const request = parked.ownerRequests.find((r) => r.status === "open" && r.linkedFindingId === contract.id)!;
+    assert.deepEqual(request.options.map((o) => o.id), ["repair"]);
+
+    // The real CLI: `tt carry <run> <id> --to <phase-id>`.
+    const { stdout: carryOut } = await runCli(["carry", setup.runDir, contract.id, "--to", "06h", "--root", setup.runRoot]);
+    assert.match(carryOut, new RegExp(`carried ${contract.id} to 06h`));
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 20, setup.runDir);
+    const done = setup.conductor.state.phase;
+    assert.equal(done.acceptedWithCarried, true, "the owner's carry accepts the candidate");
+    assert.ok(done.carriedItems?.includes(contract.id));
+    assert.equal(done.carriedTo?.[contract.id], "06h", "the item is carried to the named phase");
+    const summary = prSummary(setup.runDir, setup.plan);
+    assert.match(summary, /### Carried items \(1\)/);
+    assert.match(summary, new RegExp(`${contract.id}.* → 06h`));
+    assert.match(summary, /the stage clock is wrong on the display/);
   } finally {
     await teardown(setup);
   }
