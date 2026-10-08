@@ -3018,18 +3018,34 @@ tuple the owner saw; a missing property is refused before this runs."
 Plan 06f (A3): A/D mark the entry pending at once and the process callback
 clears the mark.  The mark is buffer-local, never written to `review.org'.")
 
+(defvar-local +tt-review--pending-overlays nil
+  "Hash of id -> the overlay showing that id's pending marker.
+Kept beside `+tt-review--pending' so a marker can be DELETED, not just
+forgotten: `erase-buffer' collapses an overlay rather than removing it, and a
+collapsed overlay still draws its `after-string'.")
+
+(defun +tt-review--clear-overlays ()
+  "Delete every pending overlay before a redraw (never stack two)."
+  (when +tt-review--pending-overlays
+    (maphash (lambda (_id ov) (when (overlayp ov) (delete-overlay ov))) +tt-review--pending-overlays)
+    (setq +tt-review--pending-overlays (make-hash-table :test 'equal))))
+
 (defun +tt-review--apply-pending ()
   "Draw the pending marker on every id in `+tt-review--pending'.
 Called after every render, so a refresh keeps the markers of commands still
-in flight (the overlay itself is destroyed by `erase-buffer')."
+in flight; any previous overlay is deleted first, so markers never stack."
+  (+tt-review--clear-overlays)
   (when +tt-review--pending
+    (unless +tt-review--pending-overlays (setq +tt-review--pending-overlays (make-hash-table :test 'equal)))
     (maphash
      (lambda (id label)
        (save-excursion
          (when (+tt-review--goto-id id)
            (let ((ov (make-overlay (line-beginning-position) (line-end-position))))
              (overlay-put ov 'after-string (propertize (format "  ⧗ %s" label) 'face 'warning))
-             (overlay-put ov '+tt-review-pending id)))))
+             (overlay-put ov '+tt-review-pending id)
+             (overlay-put ov 'evaporate t)
+             (puthash id ov +tt-review--pending-overlays)))))
      +tt-review--pending)))
 
 (defun +tt-review--mark-pending (id label)
@@ -3040,9 +3056,13 @@ in flight (the overlay itself is destroyed by `erase-buffer')."
     (+tt-review--apply-pending)))
 
 (defun +tt-review--clear-pending (id)
-  "Forget ID's pending marker (the process callback replaces it)."
+  "Delete ID's pending marker and forget it (the callback replaces it)."
   (when (and +tt-review--pending id)
-    (remhash id +tt-review--pending)))
+    (remhash id +tt-review--pending)
+    (when +tt-review--pending-overlays
+      (let ((ov (gethash id +tt-review--pending-overlays)))
+        (when (overlayp ov) (delete-overlay ov)))
+      (remhash id +tt-review--pending-overlays))))
 
 (defun +tt-review--send-async (id label args)
   "Mark ID pending, run `tt' ARGS asynchronously, and show the outcome.

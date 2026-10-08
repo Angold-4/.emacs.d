@@ -3119,15 +3119,23 @@ pending, and the callback later shows the recorded outcome."
             (cl-letf (((symbol-function 'message)
                        (lambda (fmt &rest args) (push (apply #'format fmt args) msgs))))
               (let ((+tt--cli-root run)
-                    (started (float-time)))
+                    (started (float-time))
+                    (marker (lambda ()
+                              (seq-some (lambda (ov)
+                                          (equal (overlay-get ov '+tt-review-pending) "E-1"))
+                                        (overlays-in (point-min) (point-max))))))
                 (+tt-review-accept)
                 ;; Returned at once, before the slow CLI could have exited.
                 (should (< (- (float-time) started) 0.5))
-                ;; The entry shows pending at once.
+                ;; The entry shows pending at once, visibly (an overlay), and
+                ;; no second marker is stacked.
                 (should (gethash "E-1" +tt-review--pending))
                 (should (string-match-p "pending" (gethash "E-1" +tt-review--pending)))
-                ;; The callback later clears it and shows the outcome.
+                (should (funcall marker))
+                ;; The callback later clears the VISIBLE marker and shows the
+                ;; outcome.
                 (should (+tt-test--wait (lambda () (not (gethash "E-1" +tt-review--pending))) 5))
+                (should-not (funcall marker))
                 (should (seq-some (lambda (m) (string-match-p "applied" m)) msgs))))))
       (when (buffer-live-p buf) (kill-buffer buf))
       (delete-directory run t))))

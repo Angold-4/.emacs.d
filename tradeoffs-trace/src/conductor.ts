@@ -6172,15 +6172,21 @@ export class Conductor {
   #writeLive(): void {
     try {
       const root = path.dirname(this.#runDir);
-      if (this.#closed) {
-        updateLiveRun(root, undefined);
+      const id = path.basename(this.#runDir);
+      const needsOwner = this.#state.phase.phase === "AWAITING_OWNER";
+      // A closed run is neither alive nor waiting, so its row leaves. The one
+      // exception is a run still AWAITING_OWNER: the goal counts "waiting for
+      // the owner" as live even when its conductor has been stopped, so the
+      // mode line keeps showing it until the owner acts (M's veto of
+      // D-disc-M-24). Passing `id` explicitly is what makes the removal land.
+      if (this.#closed && !needsOwner) {
+        updateLiveRun(root, id, undefined);
         return;
       }
-      updateLiveRun(root, {
-        id: path.basename(this.#runDir),
+      updateLiveRun(root, id, {
         title: redactText(this.#plan.title, this.#secretMaskable),
         phase: this.#state.phase.phase,
-        needsOwner: this.#state.phase.phase === "AWAITING_OWNER",
+        needsOwner,
       });
     } catch (err) {
       this.#logUnexpected("write_live", err);

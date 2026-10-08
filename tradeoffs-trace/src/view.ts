@@ -70,16 +70,17 @@ export function writeLive(root: string, live: Live): void {
 }
 
 /** Plan 06f (A2): replace THIS run's row in `live.json`, keeping every other
- * run and every waiting node another writer recorded. A closed conductor
- * removes its own row (a finished run is neither alive nor waiting). */
+ * run and every waiting node another writer recorded. The id is passed
+ * separately from the row so a closed conductor can remove its own row
+ * (`run` undefined) — the earlier `run?.id` form left every row in place. */
 export function updateLiveRun(
   root: string,
-  run: { id: string; title: string; phase: string; needsOwner: boolean } | undefined,
+  id: string,
+  run: { title: string; phase: string; needsOwner: boolean } | undefined,
 ): void {
   const live = readLive(root);
-  const id = run?.id;
   const runs = live.runs.filter((r) => r.id !== id);
-  if (run) runs.push(run);
+  if (run) runs.push({ id, ...run });
   writeLive(root, { updatedAt: new Date().toISOString(), runs, waitingNodes: live.waitingNodes });
 }
 
