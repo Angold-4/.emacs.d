@@ -102,6 +102,62 @@ test("plan 06g: the review buffer groups reviews by candidate, with the votes an
   assert.match(org, /Winner: none/);
 });
 
+test("plan 06g: status, loop chart, tape and tt summary show both lanes, per-candidate reviews, the votes and the winner", () => {
+  // A round whose two passing candidates each drew three reviews: the views
+  // show both lanes, each candidate's own reviews, the three votes and the
+  // winner — in the status, the tape, the review buffer and `tt summary`.
+  const withReviews = rounds();
+  withReviews[1] = {
+    ...withReviews[1],
+    candidates: withReviews[1].candidates.map((c) => ({
+      ...c,
+      reviews: ["M", "A", "B"].map((seat) => ({
+        seat,
+        review: {
+          reviewer: seat as "M",
+          phaseId: "p1",
+          candidateSha: c.sha!,
+          contractVersion: K,
+          correctionStatements: [],
+          findingStatements: [],
+        },
+      })),
+    })),
+  };
+  const p = phase({ rounds: withReviews });
+
+  // Status: one line per lane, naming the seats that reviewed it.
+  const lines = lanesView(p);
+  assert.match(lines[0], /^a C2-a ccccccc checks ✓ — reviewed by A, B, M$/);
+  assert.match(lines[1], /^b C2-b ddddddd checks ✓ — reviewed by A, B, M — picked \(2 votes\)$/);
+
+  // Loop chart / tape: the same lane lines.
+  const tape = renderLoopTape({
+    label: "06g two lanes",
+    round: 2,
+    lanes: lanesView(p),
+    phases: [{ phase: "IMPLEMENTING", at: "2026-10-07T00:00:00.000Z" }],
+    phase: { phase: "REVIEWING", attempt: { n: 2 }, repairRoundsUsed: 1, repairRoundsGranted: 3, contract: {} },
+    endMs: Date.parse("2026-10-07T00:02:00.000Z"),
+  });
+  assert.match(tape, /a C2-a ccccccc checks ✓ — reviewed by A, B, M/);
+  assert.match(tape, /b C2-b ddddddd checks ✓ — reviewed by A, B, M — picked \(2 votes\)/);
+
+  // Review buffer: grouped by candidate, with its reviews, the votes and the winner.
+  const org = renderRoundsOrg(withReviews);
+  assert.match(org, /\*\*\* C2-a \(lane a\) — checks passed/);
+  assert.match(org, /    reviews: 3/);
+  assert.match(org, /      - M: no findings/);
+  assert.match(org, /- M → C2-b: b is the smaller diff/);
+  assert.match(org, /Winner: C2-b \(ddddddd, 2 votes\)/);
+
+  // tt summary: per-candidate reviews beside the votes and the winner.
+  const section = roundsSection(p).join("\n");
+  assert.match(section, /reviews — C2-a: A\/B\/M · C2-b: A\/B\/M/);
+  assert.match(section, /votes M→b A→b B→a/);
+  assert.match(section, /winner C2-b \(ddddddd, 2 votes\)/);
+});
+
 test("plan 06g: tt summary lists each round's candidates, votes and winner", () => {
   const section = roundsSection(phase()).join("\n");
   assert.match(section, /### Rounds \(2\)/);

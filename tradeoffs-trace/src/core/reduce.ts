@@ -122,6 +122,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "CANDIDATE_CHECKED",
   "PICK_VOTE",
   "CANDIDATE_PICKED",
+  "ROUND_REVIEW_SUBMITTED",
   "ITEM_CARRIED",
   "DECISION_ADDED",
   "NOTE_ADDED",
@@ -458,6 +459,24 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // earlier one, exactly like a re-cast ballot.
       const votes = [...round.votes.filter((v) => v.seat !== event.seat), { seat: event.seat, lane: event.lane, why: event.why }];
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, votes }) } });
+    }
+
+    case "ROUND_REVIEW_SUBMITTED": {
+      // Plan 06g2: one seat's review of one lane candidate, recorded while
+      // the round runs (no review slot exists yet). Record-only; the round's
+      // per-candidate record, which the review buffer groups by candidate.
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `ROUND_REVIEW_SUBMITTED for round ${event.round}, which has not started`);
+      const candidate = round.candidates.find((c) => c.lane === event.lane);
+      if (!candidate?.sha) {
+        return rejected(state, `ROUND_REVIEW_SUBMITTED names lane ${event.lane}, which submitted no candidate of round ${event.round}`);
+      }
+      if (event.review.candidateSha !== candidate.sha) {
+        return rejected(state, `ROUND_REVIEW_SUBMITTED for ${event.lane} names candidate ${event.review.candidateSha}, not ${candidate.sha}`);
+      }
+      const reviews = [...(candidate.reviews ?? []).filter((r) => r.seat !== event.seat), { seat: event.seat, review: event.review }];
+      const candidates = upsertLane(round.candidates, event.lane, { reviews });
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
     }
 
     case "CANDIDATE_PICKED": {

@@ -636,6 +636,11 @@ gateway policy — but `tt models check` exits non-zero for it. A plan with no
 with an empty model, and `panel=reviewers` together with an explicit
 `panel.N`.
 
+With `#+TT_WORKERS`, a lane may also name its own worker model: `worker.1` is
+lane `a` and `worker.2` is lane `b`, each falling back to `worker` when it is
+not given. `tt lint` names a lane other than 1 or 2 as unknown (this plan
+version runs one or two lanes; 06h makes the count adjustable).
+
 ## Several lanes per round (`#+TT_WORKERS`)
 
 A plan can run more than one implementation lane per round:
@@ -645,19 +650,24 @@ A plan can run more than one implementation lane per round:
 #+TT_ROUNDS: 3
 ```
 
-> **Status (06g, repair round 1).** What is implemented and tested today: the
-> keyword is parsed by the real Emacs parser and linted, the round events
-> exist and reduce into `phase.rounds`, `pickWinner` / `blocksAcceptance` /
-> `roundBudget` are the pure rules (`pickWinner` is the only place a winner is
-> decided), the lane sweep is cwd-scoped, the views render a round (status,
-> tape, review buffer, `tt summary`), the A6 round rule downgrades an ungrounded
-> round-2 blocking finding to an advisory, and the budget-spent "accept with
-> carried items" decision works end to end through a real inbox file.
-> **Not yet implemented:** the conductor's lane round itself — two worktrees,
-> two worker attempts, two freezes, the per-candidate checks and reviews, and
-> the pick turn — so a plan with `#+TT_WORKERS: 2` currently runs the one-lane
-> loop and records no round event. Everything below is the intended behaviour
-> that the remaining work must satisfy.
+> **Status (06g2).** The lane round is implemented: `runRound`
+> (`src/core/lanes.ts`) orchestrates it — two lane worktrees, two worker
+> attempts on the same prompt, two freezes, the per-candidate checks one after
+> the other under `~/.tradeoffs-trace/check.lock`, today's two-turn review once
+> per candidate (each review in its own session, so a seat judging the second
+> candidate is not carrying the first's in context) and the pick turn — and the
+> winner is handed to the single-candidate pipeline with the checks and reviews
+> it already earned (they are never re-run). A review or a vote that cannot be
+> taken fails the round: it repeats, and no winner is ever handed off on fewer
+> than K × N reviews and N votes. The keyword
+> is parsed by the real Emacs parser and linted, the round events reduce into
+> `phase.rounds`, `pickWinner` / `blocksAcceptance` / `roundBudget` are the pure
+> rules (`pickWinner` is the only place a winner is decided), the lane sweep is
+> cwd-scoped, and the views render a round (status, tape, review buffer,
+> `tt summary`). A plan without `#+TT_WORKERS` is untouched.
+>
+> `#+TT_MODELS` may give each lane its own worker model: `worker.1` is lane `a`
+> and `worker.2` is lane `b`, each falling back to `worker`.
 
 `#+TT_WORKERS: 2` makes one round start from **one** version (round 1: the
 integration branch head) and run two lanes. Each lane gets its own worktree,
@@ -690,11 +700,11 @@ recorded and the phase is the single-candidate loop it was before.
 ### The round budget and carried items
 
 A phase may spend **3 rounds** by default; `#+TT_ROUNDS` sets another number.
-One round is **one candidate reviewed**, so `#+TT_ROUNDS: 3` reviews exactly
-three candidates — the first plus two repairs — matching ODP-1's "accepted
-within 3 rounds". `roundBudget()` is the single source of that number and the
-FSM's repair allowance is `roundBudget - 1`. A round costs one attempt of the
-repair budget, whatever the number of lanes.
+One round is **one pass of the repair budget**, so `#+TT_ROUNDS: 3` allows the
+first round plus two repairs — matching ODP-1's "accepted within 3 rounds" —
+and with two lanes that is up to six candidates. `roundBudget()` is the single
+source of that number and the FSM's repair allowance is `roundBudget - 1`. A
+round costs one attempt of the repair budget, whatever the number of lanes.
 
 From round 2, a finding blocks acceptance only when it either
 

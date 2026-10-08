@@ -30,7 +30,11 @@ import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCom
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, blocksAcceptance, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
+import { advisoryReason, blocksAcceptance, candidateLabel, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
+// Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
+// implements its `LaneHost` with the worktree, agent, check, review and vote
+// machinery below and calls it; it decides nothing about lanes itself.
+import { isLaneRound, laneFailureLines, lanesOfContract, runRound, type LaneBuild, type LaneCheck, type LaneHost } from "./core/lanes.ts";
 import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
 import { checkCommands, checkTier, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand } from "./core/checks.ts";
@@ -119,6 +123,7 @@ import {
   decisionStatus,
   findingCitesAcceptanceOrReserved,
   isLiveDecision,
+  reviewIngestionIssue,
   panelOptionsFor,
   panelOutcome,
   panelSeatsSettled,
@@ -504,6 +509,11 @@ export interface ConductorOptions {
    * runs) never gate at once; tests point it at a temp path so they neither
    * contend with a real run nor with each other. */
   gateLockPath?: string;
+  /** Plan 06g2 (C2): the machine-wide lock every candidate check runs
+   * under, so two lanes' checks — in one round, or in two runs on this
+   * machine — never overlap in time. Defaults to
+   * `~/.tradeoffs-trace/check.lock`. */
+  checkLockPath?: string;
   /** Decision briefs: when true, the conductor records a deterministic brief
    * for every open owner item after evaluation, so the owner always has one
    * above the evidence even when the evaluator's model did not call
@@ -1145,6 +1155,35 @@ interface AgentHandle {
    * mode or for a worker handle. */
   discoveryResolve: () => void;
   discoveryPromise: Promise<void>;
+  /** Plan 06g2: the lane this agent belongs to (a lane worker or a lane
+   * reviewer), so its submissions are recorded against the lane's candidate
+   * rather than the phase's own. Absent on the single-candidate loop. */
+  lane?: string;
+  /** Plan 06g2: the round this agent belongs to. */
+  laneRound?: number;
+  /** Plan 06g2: a lane worker's `submit_phase` payload, captured for the
+   * winner's hand-off (the round's lanes never move the phase themselves). */
+  laneSubmission?: {
+    disclosures: DecisionDisclosure[];
+    prior?: PriorDecisionStatement[];
+    dispute?: CriterionDispute;
+  };
+  /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
+   * winner's hand-off. */
+  laneCoverage?: unknown;
+  /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
+  pickSeat?: string;
+  /** Plan 06g2: the (round, lane, candidate, seat) a lane review records its
+   * `submit_review` against. */
+  laneReview?: { round: number; lane: string; sha: string; seat: string };
+  /** Plan 06g2: a lane reviewer's turn-1 discoveries, kept per lane until the
+   * winner's hand-off applies them (the phase has no candidate to bind them to
+   * while the round runs). */
+  laneDiscoveries?: DecisionDisclosure[];
+  /** Plan 06g2: waiters for this agent's next `agent_settled`, so a lane
+   * review can wait out each of its two turns (the same technique
+   * `#runReview` uses for the single-candidate path). Set for lane agents. */
+  settleWaiters?: Array<() => void>;
   /** Plan 04a: the message type this evaluator handles. */
   messageType?: MessageType;
   /** Plan 04b: the raw blocker this panel seat votes on, and its seat number.
@@ -1225,6 +1264,36 @@ export class Conductor {
    * `~/.tradeoffs-trace/gate.lock`). Held only while the gate command runs,
    * so two phases never gate at once. */
   #gateLockPath: string;
+  /** Plan 06g2 (C2): the machine-wide lock each lane candidate's checks run
+   * under (default `~/.tradeoffs-trace/check.lock`), held only while one
+   * candidate is checked. */
+  #checkLockPath: string;
+  /** Plan 06g2: the winner's hand-off — the lane build and round whose
+   * reviews are promoted into the phase's review slots once the probe has
+   * passed (the FSM's REVIEWING state is only reachable then). */
+  #pendingLaneWinner:
+    | { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> }
+    | undefined;
+  /** Plan 06g2: each lane candidate's combined check output this round, so
+   * the winner's hand-off can resolve its `test` verifies without re-running
+   * the checks. */
+  #laneCheckOutputs = new Map<string, string>();
+  /** Plan 06g2: each lane candidate's own `test`-verify resolution. */
+  #laneCheckResolutions = new Map<string, ReturnType<typeof resolveTestVerifies>>();
+  /** Plan 06g2: this round's lane builds, keyed `<round>-<lane>` — the lane
+   * review prompts need each lane's own disclosures. */
+  #laneBuilds = new Map<string, LaneBuild>();
+  /** Plan 06g2: each lane candidate's turn-1 discoveries, keyed
+   * `<round>-<lane>` then by seat. The phase has no candidate to bind them to
+   * while the round runs, so the winner's are applied at the hand-off. */
+  #laneDiscoveries = new Map<string, Map<string, DecisionDisclosure[]>>();
+  /** Plan 06g2: each lane candidate's discovery-id plan, computed ONCE — when
+   * the first of its turn-2 prompts is built — and reused at the hand-off, so
+   * the ids the seats balloted are the ids that appear even though the freeze
+   * grows the phase's decision list in between. */
+  #laneDiscoveryPlans = new Map<string, Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }>>();
+  /** Plan 06g2: the per-candidate discovery barrier, keyed `<round>-<lane>`. */
+  #laneBarriers = new Map<string, { arrived: Set<string>; waiters: Array<() => void> }>();
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -1354,6 +1423,7 @@ export class Conductor {
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
+    this.#checkLockPath = opts.checkLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "check.lock");
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -1777,6 +1847,20 @@ export class Conductor {
       }
       const sweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
+      // Plan 06g2: a crash during a lane round left up to two lane worktrees
+      // (and their own agents) behind; each is swept inside its own tree, so a
+      // lane's survivors can never be another lane's. The round itself is
+      // re-dispatched from scratch (ROUND_STARTED replaces the partial round).
+      for (const lane of this.#laneRoundEnabled() ? this.#lanes() : []) {
+        const worktree = this.#laneWorktree(lane);
+        if (!fs.existsSync(worktree)) continue;
+        const laneSweep = await sweep(worktree, {
+          ownPgids: this.#ownPgids(),
+          exceptPids: [],
+          cwdUnder: this.#laneSweepRoot(worktree),
+        });
+        this.#log.append("sweep", { ...laneSweep, lane, reason: "crash-recovery" });
+      }
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       if (typeof payload.sessionDir === "string") this.#recoveredSessionDir = payload.sessionDir;
       this.#applyEvent({ type: "ATTEMPT_INTERRUPTED" });
@@ -1906,8 +1990,14 @@ export class Conductor {
    * reconciliation: assembles+binds `phase.pendingDisclosures` into real
    * `Decision` records for `candidateSha` (design §6.2/§7.1's binding), and
    * validates each against `schemas/decision.schema.json`. */
-  #assembleDecisions(candidateSha: string): Decision[] {
-    const disclosures: DecisionDisclosure[] = this.#state.phase.pendingDisclosures ?? [];
+  #assembleDecisions(
+    candidateSha: string,
+    /** Plan 06g2: assemble a LANE's decisions from its own submission instead
+     * of the phase's pending one, with exactly the ids the winner's hand-off
+     * will produce (same disclosures, same sha, same phase). */
+    lane?: { disclosures: DecisionDisclosure[]; dispute?: CriterionDispute },
+  ): Decision[] {
+    const disclosures: DecisionDisclosure[] = lane ? lane.disclosures : (this.#state.phase.pendingDisclosures ?? []);
     const decisions: Decision[] = disclosures.map((d, i) => ({
       id: `D-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-${i + 1}`,
       version: 1,
@@ -1925,7 +2015,7 @@ export class Conductor {
     // `reserved` decision the reviewers vote on in turn 2 like any other. A
     // passing tally rewrites the accepted item (next()'s `apply_amendment`);
     // a failing one leaves it unchanged and never blocks acceptance.
-    const dispute = this.#state.phase.pendingDispute;
+    const dispute = lane ? lane.dispute : this.#state.phase.pendingDispute;
     // Plan 06c (R7): an amendment whose proposed text equals the current
     // criterion changes nothing, so it is never raised (no decision, no
     // message, no ballot, no status line).
@@ -3439,6 +3529,13 @@ export class Conductor {
       case "dispatch_worker": {
         const actionId = this.#log.actionId(kind);
         this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_worker", actionId });
+        // Plan 06g2 (A1): with `#+TT_WORKERS: 2` one dispatch is one ROUND,
+        // and `core/lanes.ts`'s `runRound` orchestrates it. The conductor
+        // decides nothing about lanes beyond calling it.
+        if (this.#laneRoundEnabled()) {
+          void this.#runLaneRound(actionId).catch((err) => this.#logUnexpected("run_round", err));
+          return;
+        }
         void this.#runWorkerAttempt(actionId).catch((err) => this.#logUnexpected("dispatch_worker", err));
         return;
       }
@@ -3609,6 +3706,21 @@ export class Conductor {
       if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
         return { ok: false, reason: `submit_coverage is not accepted in phase ${this.#state.phase.phase}` };
       }
+      // Plan 06g2: a lane worker's coverage belongs to its lane, not to the
+      // phase — the winner's is applied at the hand-off. An incomplete one is
+      // refused back to the lane worker like any other.
+      if (handle.lane !== undefined) {
+        if (!this.#structured()) return { ok: true };
+        const args = msg.args as Coverage;
+        const issues = coverageIssues(args, this.#planItems());
+        handle.laneCoverage = args;
+        if (issues.length > 0) {
+          const reason = `coverage is incomplete: ${issues.join("; ")}`;
+          this.#log.append("coverage_refused", { at: "submit_coverage", lane: handle.lane, issues, reason });
+          return { ok: false, reason };
+        }
+        return { ok: true };
+      }
       // OD-1: an old-format phase owes submit_phase only, so a stray coverage
       // call is a harmless no-op rather than a refusal.
       if (!this.#structured()) return { ok: true };
@@ -3627,6 +3739,29 @@ export class Conductor {
     if (msg.tool === "submit_phase") {
       if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
         return { ok: false, reason: `submit_phase is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      // Plan 06g2: a lane worker's submission is the lane's candidate, never
+      // the phase's own — the round freezes it, and the winner's payload is
+      // applied at the hand-off (a synthetic SUBMIT_PHASE). The coverage gate
+      // is the same one the phase's own worker owes.
+      if (handle.lane !== undefined) {
+        if (this.#itemsEnforced()) {
+          const args = handle.laneCoverage as Coverage | undefined;
+          const issues = args ? coverageIssues(args, this.#planItems()) : ["no coverage was submitted for this lane"];
+          if (issues.length > 0) {
+            const reason = `submit_phase refused until submit_coverage is complete: ${issues.join("; ")}`;
+            this.#log.append("coverage_refused", { at: "submit_phase", lane: handle.lane, issues, reason });
+            return { ok: false, reason };
+          }
+        }
+        const args = msg.args as SubmitPhaseArgs;
+        handle.laneSubmission = {
+          disclosures: args.decisions ?? [],
+          ...(args.priorDecisions ? { prior: args.priorDecisions } : {}),
+          ...(args.criterionDispute ? { dispute: args.criterionDispute } : {}),
+        };
+        handle.doneResolve();
+        return { ok: true };
       }
       // Plan 06b: the freeze is refused until the coverage is complete AND
       // bound to the CURRENT attempt (OD-2 A2).
@@ -3689,6 +3824,45 @@ export class Conductor {
       return { ok: true };
     }
     if (msg.tool === "submit_review") {
+      // Plan 06g2: a lane reviewer's review belongs to the round's candidate
+      // (the phase is still IMPLEMENTING and has no candidate of its own). It
+      // is recorded as the round's per-candidate review; the winner's is
+      // promoted into the phase's review slots at the hand-off.
+      if (handle.laneReview !== undefined) {
+        const { round, lane, sha, seat } = handle.laneReview;
+        const review = msg.args as Review;
+        if (review.candidateSha !== sha) {
+          return { ok: false, reason: `submit_review candidateSha ${review.candidateSha} does not match lane ${lane}'s candidate ${sha}` };
+        }
+        if (review.reviewer !== seat) {
+          return { ok: false, reason: `submit_review reviewer ${review.reviewer} does not match the seat this dispatch reviews as (${seat})` };
+        }
+        const issue = reviewIngestionIssue(review);
+        if (issue) return { ok: false, reason: issue };
+        const itemIssues = this.#reviewItemIssues(review);
+        // A ballot is required for every votable record the lane's turn-2
+        // prompt listed (the worker's own decisions and the seats'
+        // discoveries); an incomplete review is refused back to the model
+        // within the same turn, like the single-candidate path.
+        const missing = this.#missingDemandedBallots(review, handle);
+        if (missing.length > 0 || itemIssues.length > 0) {
+          const rejections = handle.incompleteReviewRejections ?? 0;
+          if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
+            handle.incompleteReviewRejections = rejections + 1;
+            const reason =
+              `incomplete review: a ballot is required for every record the turn-2 prompt listed. Missing: ${missing
+                .map((m) => `${m.id} (${m.choice})`)
+                .join("; ")}` + (itemIssues.length > 0 ? `; item verdicts: ${itemIssues.join("; ")}` : "");
+            this.#log.append("incomplete_review_rejected", { reviewer: seat, agentId, lane, missing: missing.map((m) => m.id), itemIssues });
+            return { ok: false, reason };
+          }
+          this.#log.append("incomplete_review", { reviewer: seat, agentId, lane, missing: missing.map((m) => m.id), itemIssues, rejections });
+        }
+        this.#applyEvent({ type: "ROUND_REVIEW_SUBMITTED", round, lane, seat, review });
+        this.#log.append("lane_review_submitted", { round, lane, seat, candidateSha: sha });
+        handle.doneResolve();
+        return { ok: true };
+      }
       if (handle.role !== "reviewer" || this.#state.phase.phase !== "REVIEWING") {
         return { ok: false, reason: `submit_review is not accepted in phase ${this.#state.phase.phase}` };
       }
@@ -3857,7 +4031,54 @@ export class Conductor {
       handle.doneResolve();
       return { ok: true };
     }
+    if (msg.tool === "submit_pick_vote") {
+      // Plan 06g2: one seat's vote in the round's pick turn. The round decides
+      // the winner in code (`pickWinner`); this only records the vote.
+      if (handle.pickSeat === undefined) {
+        return { ok: false, reason: "submit_pick_vote is only accepted from a seat's pick turn" };
+      }
+      const args = msg.args as { round?: unknown; seat?: unknown; lane?: unknown; why?: unknown };
+      const round = typeof args.round === "number" ? args.round : Number(args.round);
+      const seat = typeof args.seat === "string" ? args.seat : handle.pickSeat;
+      const lane = typeof args.lane === "string" ? args.lane : "";
+      const why = typeof args.why === "string" ? args.why.trim() : "";
+      if (!Number.isInteger(round) || round !== handle.laneRound) {
+        return { ok: false, reason: `submit_pick_vote names round ${String(args.round)}, not the pick turn's round ${String(handle.laneRound)}` };
+      }
+      if (seat !== handle.pickSeat) {
+        return { ok: false, reason: `submit_pick_vote names seat ${seat}, not this turn's seat ${handle.pickSeat}` };
+      }
+      if (why.length === 0) return { ok: false, reason: "submit_pick_vote needs a non-empty why" };
+      const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+      if (!roundRecord) return { ok: false, reason: `round ${round} has not started` };
+      const candidate = roundRecord.candidates.find((c) => c.lane === lane);
+      if (!candidate?.sha) return { ok: false, reason: `submit_pick_vote names lane ${lane}, which submitted no candidate of round ${round}` };
+      if (candidate.ok !== true) return { ok: false, reason: `submit_pick_vote names lane ${lane}, whose candidate did not pass its checks` };
+      this.#applyEvent({ type: "PICK_VOTE", round, seat, lane, why });
+      handle.doneResolve();
+      return { ok: true };
+    }
     if (msg.tool === "submit_discovery") {
+      // Plan 06g2: a lane review's turn 1. The discoveries belong to the
+      // lane's candidate, which the phase does not hold while the round runs,
+      // so they are kept per lane until the winner's hand-off applies them.
+      if (handle.laneReview !== undefined) {
+        const discoveries = (msg.args as { discoveries?: DecisionDisclosure[] }).discoveries ?? [];
+        handle.laneDiscoveries = discoveries;
+        const key = `${handle.laneReview.round}-${handle.laneReview.lane}`;
+        const bySeat = this.#laneDiscoveries.get(key) ?? new Map<string, DecisionDisclosure[]>();
+        bySeat.set(handle.laneReview.seat, discoveries);
+        this.#laneDiscoveries.set(key, bySeat);
+        this.#log.append("discovery_submitted", {
+          agentId,
+          reviewer: handle.laneReview.seat,
+          count: discoveries.length,
+          lane: handle.laneReview.lane,
+          round: handle.laneReview.round,
+        });
+        handle.discoveryResolve();
+        return { ok: true };
+      }
       if (this.#stubReviews) {
         // Phase 1's stub reviewers are not expected to call it — accepted
         // as a no-op so a scripted call does not fail a test outright.
@@ -4456,7 +4677,14 @@ export class Conductor {
    * no attach-to-existing-id matching yet. Assembles+binds each one exactly
    * like a worker's disclosure (id/version/boundCandidateSha/
    * boundContractVersion), validates it, and emits `DECISION_ADDED`. */
-  #applyDiscoveries(discoveries: DecisionDisclosure[], reviewer: Reviewer): string | undefined {
+  #applyDiscoveries(
+    discoveries: DecisionDisclosure[],
+    reviewer: Reviewer,
+    /** Plan 06g2: the number the FIRST of these discoveries takes. A lane
+     * round passes the numbers its turn-2 prompt listed, so the ballots a seat
+     * cast name exactly the records that appear here. */
+    opts: { firstIndex?: number } = {},
+  ): string | undefined {
     const candidate = this.#state.phase.candidate;
     if (!candidate) return "no candidate exists yet to bind a discovered decision to";
     if (this.#discoveryClosed()) {
@@ -4466,9 +4694,10 @@ export class Conductor {
       return undefined;
     }
     const K = this.#state.phase.contract.contractVersion;
+    let index = opts.firstIndex ?? this.#state.phase.decisions.length + 1;
     for (const d of discoveries) {
       const decision: Decision = {
-        id: `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-${this.#state.phase.decisions.length + 1}`,
+        id: `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-${index}`,
         version: 1,
         phaseId: this.#state.phase.phaseId,
         source: "reviewer-discovered",
@@ -4484,6 +4713,7 @@ export class Conductor {
       if (!result.valid) {
         return `discovered decision fails schemas/decision.schema.json: ${result.errors.join("; ")}`;
       }
+      index += 1;
       this.#applyEvent({ type: "DECISION_ADDED", decision });
       // Plan 04a item 2: a reviewer's discovered trade-off is raised as a raw
       // message too, so the evaluator checks it in EVALUATING like any other
@@ -5347,6 +5577,10 @@ export class Conductor {
   #cwdFor(agentId: string): string | undefined {
     const handle = this.#agents.get(agentId);
     if (!handle) return undefined;
+    // Plan 06g2: a lane agent's commands run in ITS OWN lane worktree (a lane
+    // worker) or in the candidate it reviews — never in another lane's tree.
+    if (handle.laneReview) return path.join(this.#paths.candidates, handle.laneReview.sha);
+    if (handle.lane !== undefined) return this.#laneWorktree(handle.lane);
     return handle.role === "worker" ? this.#paths.worktree : this.#candidateDir();
   }
 
@@ -6159,6 +6393,914 @@ export class Conductor {
    * unblock via the timeout branch's own `terminate()`, which is what makes
    * a hung `waitSettled()` resolve at all). */
   async #runFreeze(actionId: string): Promise<void> {
+    return this.#runFreezeImpl(actionId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Plan 06g2: the two-lane round (A1/A2)
+  // -------------------------------------------------------------------------
+
+  /** The lanes this phase's frozen contract runs (a, b for `#+TT_WORKERS: 2`). */
+  #lanes(): string[] {
+    return lanesOfContract(this.#state.phase.contract);
+  }
+
+  /** True when this phase runs more than one lane per round. A plan without
+   * `#+TT_WORKERS` (or with 1) keeps today's single-candidate loop exactly. */
+  #laneRoundEnabled(): boolean {
+    return isLaneRound(this.#state.phase.contract);
+  }
+
+  /** Each lane's own worktree, under the run directory (A2). The lane id is
+   * part of the path, so a sweep scoped to one lane's worktree can never
+   * reach the other's. */
+  #laneWorktree(lane: string): string {
+    return path.join(this.#runDir, "worktrees", `lane-${lane}`);
+  }
+
+  /** The lane sweep's `cwdUnder`: the SAME directory, with symlinks resolved.
+   * `lsof` reports a process's real cwd (on macOS `/tmp` is `/private/tmp`),
+   * and `sweepDecision`'s lane rule compares plain paths — so an unresolved
+   * `cwdUnder` would make every survivor look like another lane's and be held
+   * instead of killed. */
+  #laneSweepRoot(worktree: string): string {
+    try {
+      return fs.realpathSync(worktree);
+    } catch {
+      return worktree;
+    }
+  }
+
+  /** The environment one lane agent runs with: its OWN worktree (so the
+   * extension's write/`sh` guards and `TT_SEARCH_ROOTS` are lane-scoped), the
+   * same secrets and run paths as every other agent. */
+  #laneEnv(worktree: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    const contract = this.#state.phase.contract;
+    const protectedPaths = contract.acceptance.filter((a) => a.includes("/")).join(",");
+    return {
+      ...this.#extraEnv,
+      ...extra,
+      TT_SOCKET: this.#paths.sock,
+      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_WORKTREE: worktree,
+      TT_RUN_DIR: this.#runDir,
+      TT_PROTECTED: protectedPaths,
+      TT_ITEMS: this.#structured() ? "1" : "0",
+      TT_SEARCH_ROOTS: [worktree, this.#paths.refs].join(path.delimiter),
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+    };
+  }
+
+  /** Spawns one lane agent (a lane worker, a lane reviewer or a pick seat) and
+   * registers its handle, exactly like the single-lane dispatches do. */
+  #spawnLaneAgent(opts: {
+    role: Role;
+    agentId: string;
+    cwd: string;
+    sessionDir: string;
+    env: NodeJS.ProcessEnv;
+    seat?: string;
+    lane?: string;
+    laneRound?: number;
+    laneReview?: { round: number; lane: string; sha: string; seat: string };
+    pickSeat?: string;
+  }): AgentHandle {
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+    let discoveryResolve!: () => void;
+    const discoveryPromise = new Promise<void>((resolve) => {
+      discoveryResolve = resolve;
+    });
+    fs.mkdirSync(opts.sessionDir, { recursive: true });
+    const providerModel =
+      opts.role === "worker"
+        ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
+          // position, which the caller passes as `seat`.
+          this.#providerModelFor?.("worker", opts.seat ?? opts.lane)
+        : // A pick seat runs on its own reviewer seat's model.
+          this.#providerModelFor?.(opts.role === "picker" ? "reviewer" : opts.role, opts.seat);
+    const command = this.#resolvePiCommand(opts.role);
+    const streamFile = path.join(this.#paths.stream, `${opts.agentId}.jsonl`);
+    // Declared before the spawn so the event callback below can never see it
+    // in its temporal dead zone.
+    const settleWaiters: Array<() => void> = [];
+    const agent = spawnPiAgent({
+      command,
+      args: [
+        ...this.#resolvePiArgsPrefix(opts.role),
+        ...launchArgs(opts.role, {
+          sessionDir: opts.sessionDir,
+          continueSession: hasSessionFile(opts.sessionDir),
+          noSession: command !== undefined,
+          provider: providerModel?.provider,
+          model: providerModel?.model,
+        }),
+      ],
+      cwd: opts.cwd,
+      env: opts.env,
+      role: opts.role,
+      agentId: opts.agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(opts.agentId, event);
+        this.#trackRunTokens(opts.agentId, event);
+        // Plan 06g2: a lane review has two turns and must wait out each one;
+        // `waitSettled()` is one-shot, so per-turn waiters are resolved here
+        // (exactly like `#runReview`'s own `settleWaiters`).
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
+    });
+    const handle: AgentHandle = {
+      agent,
+      role: opts.role,
+      agentId: opts.agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve,
+      discoveryPromise,
+      settleWaiters,
+      ...(opts.lane !== undefined ? { lane: opts.lane } : {}),
+      ...(opts.laneRound !== undefined ? { laneRound: opts.laneRound } : {}),
+      ...(opts.laneReview ? { laneReview: opts.laneReview } : {}),
+      ...(opts.pickSeat !== undefined ? { pickSeat: opts.pickSeat } : {}),
+    };
+    this.#agents.set(opts.agentId, handle);
+    // Plan 06g2: record the lane agent's own process group, so a crashed
+    // conductor's recovery can attribute it to this run (`#ownPgids`) and the
+    // lane sweep can end it — the same intent/completion discipline every
+    // other dispatch follows.
+    this.#log.intent(`lane-agent-${opts.agentId}`, { agentId: opts.agentId, pgid: agent.pgid, cwd: opts.cwd });
+    return handle;
+  }
+
+  /** The round's worker prompt: the SAME text for every lane (A2). It is the
+   * ordinary worker prompt plus the round's own lines — which lanes exist,
+   * the one base they share, and what the previous round's lanes got wrong. */
+  #laneWorkerPrompt(round: number, base: string): string {
+    const previous = (this.#state.phase.rounds ?? []).find((r) => r.round === round - 1);
+    const failures = laneFailureLines(previous);
+    const lines: string[] = [
+      `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs ${this.#lanes().length} lanes. You are the worker of one lane; another worker builds a second candidate from the same base with this same prompt, in its own worktree. Do not touch another lane's worktree.`,
+    ];
+    if (failures.length > 0) {
+      lines.push(`The previous round's lanes (round ${previous!.round}):`, ...failures.map((f) => `- ${f}`));
+    }
+    return `${buildWorkerPrompt(
+      this.#state.phase.contract,
+      undefined,
+      undefined,
+      this.#repairContext(),
+      runReferences(this.#runDir),
+      this.#secretNames,
+      this.#state.phase.ownerDirectives,
+      this.#baselineFailedCommands(),
+      this.#state.phase.messages,
+      this.#agentToolLines(),
+    )}\n\n${lines.join("\n")}`;
+  }
+
+  /** One lane: its own worktree at the round's base, its own worker and its
+   * own sweep (A2). Returns the frozen candidate sha and the lane's
+   * disclosures, or a note saying why the lane produced none. */
+  async #buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild> {
+    const worktree = this.#laneWorktree(lane);
+    if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+    crashAt("before_create_worktree");
+    createWorktree(this.#plan.repo, worktree, base);
+    crashAt("after_create_worktree");
+    const actionId = this.#log.actionId(`lane_${round}_${lane}`);
+    this.#log.intent(actionId, { lane, round, worktree, base });
+    const agentId = `lane-${round}-${lane}-${actionId}`;
+    const sessionDir = path.join(this.#paths.sessions, `lane-worker-${lane}`);
+    const handle = this.#spawnLaneAgent({
+      role: "worker",
+      agentId,
+      cwd: worktree,
+      sessionDir,
+      env: this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}),
+      lane,
+      laneRound: round,
+      // `worker.N` names the lane by its 1-based position (a = 1, b = 2).
+      seat: String(this.#lanes().indexOf(lane) + 1),
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        const note = hello === "timeout" ? "the lane's worker did not start (hello timed out)" : "the lane's worker failed to start";
+        this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
+        return { lane, note };
+      }
+      await handle.agent.prompt(prompt);
+      const timeout = cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const);
+      const outcome = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        handle.agent.waitSettled().then(() => "settled" as const),
+        handle.agent.waitExit().then(() => "exited" as const),
+        timeout.promise,
+      ]);
+      timeout.cancel();
+      if (outcome !== "submitted") {
+        await handle.agent.terminate();
+        const note =
+          outcome === "timeout"
+            ? "the lane's worker timed out before submitting"
+            : `the lane's worker ended without submit_phase (${outcome})`;
+        this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
+        return { lane, note };
+      }
+      await handle.agent.terminate();
+      this.#agents.delete(agentId);
+      // The lane's own sweep: scoped to THIS lane's worktree (06g's
+      // `sweepDecision` with `cwdUnder`), so it can never signal a process the
+      // other lane started.
+      const sweepResult: SweepResult = await sweep(worktree, {
+        ownPgids: this.#ownPgids(),
+        exceptPids: [],
+        cwdUnder: this.#laneSweepRoot(worktree),
+      });
+      this.#log.append("sweep", { ...sweepResult, lane });
+      const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} lane ${lane} candidate`);
+      const candidateDir = path.join(this.#paths.candidates, sha);
+      if (!fs.existsSync(candidateDir)) materializeCandidate(this.#plan.repo, sha, candidateDir);
+      this.#log.completion(actionId, { lane, round, candidateSha: sha, tainted: sweepResult.tainted });
+      return {
+        lane,
+        sha,
+        // The lane's own sweep result, carried to FREEZE_COMPLETED at the
+        // hand-off (a lane that left a survivor taints the winner's tree
+        // exactly as the single-candidate freeze would).
+        tainted: sweepResult.tainted,
+        ...(handle.laneSubmission ?? { disclosures: [] }),
+        ...(handle.laneCoverage !== undefined ? { coverage: handle.laneCoverage } : {}),
+      };
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** One candidate's checks, run under the machine-wide lock (C2). */
+  async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
+    const lock = await acquireWaitingLock(this.#checkLockPath);
+    try {
+      this.#log.append("lane_check_started", { round, lane, candidateSha: sha });
+      const result = await this.#runLaneChecks(lane, sha);
+      this.#log.append("lane_check_finished", { round, lane, candidateSha: sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
+      return result;
+    } finally {
+      await lock.release();
+    }
+  }
+
+  /** Runs the effective check commands for one lane candidate in a fresh
+   * checkout of its commit and writes `checks/<sha>/record.json`. Nothing
+   * about the phase moves here: a candidate that fails its checks records
+   * CANDIDATE_CHECKED { ok: false } and the round goes on with the other
+   * lane. */
+  async #runLaneChecks(lane: string, candidateSha: string): Promise<LaneCheck> {
+    const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
+    const outDir = path.join(this.#paths.checks, candidateSha);
+    fs.mkdirSync(outDir, { recursive: true });
+    const commands = checkCommands(
+      this.#plan.checks,
+      this.#state.phase.contract.checks,
+      this.#state.phase.contract.finalChecks,
+      "round",
+    );
+    const recordCommands: CheckRecordCommand[] = [];
+    const recordLoad1 = Math.round(loadavg()[0] * 100) / 100;
+    const recordFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
+    let passed = true;
+    let combinedOutput = "";
+    let firstFailure: string | undefined;
+    try {
+      if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
+        passed = false;
+        firstFailure = "the checkout no longer matches the candidate commit";
+      }
+      for (const rawCommand of commands) {
+        if (!passed) break;
+        const command = this.#withValues(rawCommand);
+        const startedAt = Date.now();
+        const result = await runCommand({
+          command,
+          cwd: checkoutDir.dir,
+          env: childEnv(),
+          deadlineMs: this.#deadlines.checkMs,
+          termGraceMs: this.#deadlines.termGraceMs,
+          onIntent: ({ pgid }) => {
+            this.#onStageShIntent(pgid);
+            this.#log.intent(`lane-check-sh-${lane}-${pgid}`, { pgid });
+          },
+        }).result;
+        combinedOutput += `${result.output}\n`;
+        this.#recordCheck(outDir, command, result);
+        recordCommands.push({
+          command,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          durationMs: Date.now() - startedAt,
+          passed: result.exitCode === 0 && !result.timedOut,
+          log: this.#checkLogName(command),
+        });
+        if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
+          passed = false;
+          firstFailure = "the checkout no longer matches the candidate commit";
+          break;
+        }
+        if (result.exitCode === 0 && !result.timedOut) continue;
+        // Plan 01e's pre-existing rule, unchanged: a failing check whose every
+        // parsed failing test also failed on the round's base is not this
+        // candidate's failure.
+        if (failedNormally(result)) {
+          const verdict = classifyCheckFailure(result.output, this.#baseFailuresFor(command), this.#requiredTestTexts());
+          if (verdict.excused) {
+            this.#log.append("check_failures_pre_existing", { candidateSha, command, failures: verdict.parsed, lane });
+            continue;
+          }
+          if (verdict.newFailures.length > 0) firstFailure = `the check \`${command}\` failed: ${verdict.newFailures.join(", ")}`;
+        }
+        if (!firstFailure) firstFailure = `the check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}`;
+        passed = false;
+      }
+      this.#writeCheckRecord(outDir, {
+        candidateSha,
+        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
+        tier: "round",
+        passed,
+        commands: recordCommands,
+        finalCommands: [],
+        load1: recordLoad1,
+        freeMemMB: recordFreeMemMB,
+        at: new Date().toISOString(),
+      });
+      // The item test-verifies are resolved for the winner only (the hand-off
+      // applies them); a loser's output must not touch the phase's item state.
+      this.#laneCheckOutputs.set(candidateSha, combinedOutput);
+      if (this.#itemsEnforced()) {
+        this.#laneCheckResolutions.set(candidateSha, resolveTestVerifies(this.#planItems(), combinedOutput));
+      }
+      return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
+    } finally {
+      checkoutDir.dispose();
+    }
+  }
+
+  /** Plan 06g2: the ids the lane's discoveries will have, in the order the
+   * hand-off applies them. ONE plan for both sides: the lane's turn-2 prompt
+   * shows these ids, and the hand-off passes the same numbers to
+   * `#applyDiscoveries`, so a seat's ballot always names the record that
+   * appears. The numbering starts after every record the phase ALREADY holds
+   * (each survives FREEZE_COMPLETED, carried forward) and the lane's own
+   * worker decisions — which is exactly where `#applyDiscoveries` would number
+   * from — then walks M, A and B in seat order. */
+  #laneDiscoveryPlan(
+    round: number,
+    lane: string,
+    sha: string,
+  ): Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }> {
+    const key = `${round}-${lane}`;
+    const cached = this.#laneDiscoveryPlans.get(key);
+    if (cached) return cached;
+    const build = this.#laneBuilds.get(key);
+    const workerDecisions = build
+      ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
+      : [];
+    let n = this.#state.phase.decisions.length + workerDecisions.length;
+    const out: Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }> = [];
+    for (const seat of this.#laneSeats()) {
+      for (const disclosure of this.#laneDiscoveries.get(key)?.get(seat) ?? []) {
+        n += 1;
+        out.push({ seat, disclosure, id: `D-${this.#state.phase.phaseId}-${sha.slice(0, 8)}-disc-${seat}-${n}`, index: n });
+      }
+    }
+    this.#laneDiscoveryPlans.set(key, out);
+    return out;
+  }
+
+  /** The lane phase a lane review is built from: the round's candidate, the
+   * lane's own decisions (the worker's disclosures, assembled exactly as the
+   * hand-off will assemble them), its coverage and its check resolution, and
+   * the discoveries the three seats made on THIS candidate. Never the phase's
+   * own candidate/decisions, which belong to another version. */
+  #lanePhase(round: number, lane: string, sha: string, opts: { final?: boolean } = {}): PhaseState {
+    const K = this.#state.phase.contract.contractVersion;
+    const build = this.#laneBuilds.get(`${round}-${lane}`);
+    const workerDecisions = build
+      ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
+      : [];
+    // Only turn 2 (after the discovery barrier) knows every seat's
+    // discoveries, and only its plan is cached for the hand-off.
+    const plan = opts.final ? this.#laneDiscoveryPlan(round, lane, sha) : [];
+    const discovered: Decision[] = plan.map(({ seat, disclosure, id }) => ({
+      id,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      source: "reviewer-discovered",
+      class: disclosure.classProposal,
+      choice: disclosure.choice,
+      whyItMatters: disclosure.whyItMatters,
+      alternatives: disclosure.alternatives,
+      recommendation: disclosure.recommendation,
+      boundCandidateSha: sha,
+      boundContractVersion: K,
+    }));
+    return {
+      ...this.#state.phase,
+      candidate: { sha, contractVersion: K },
+      decisions: [...workerDecisions, ...discovered],
+      ...(build?.coverage !== undefined ? { coverage: build.coverage as Coverage } : {}),
+      checkResolution: this.#laneCheckResolutions.get(sha) ?? [],
+    };
+  }
+
+  /** Plan 06g2: one seat's review of one passing lane candidate — today's
+   * two-turn review, once per candidate (design §3.3): turn 1 discovers the
+   * behavioural choices before the worker's own disclosure is shown, the
+   * three seats' discoveries merge behind a per-candidate barrier, and turn 2
+   * reviews the lane's decisions, findings and item verdicts. A review that
+   * cannot be taken THROWS: the round then fails and repeats, so a winner is
+   * never handed off with fewer than K × N reviews. */
+  async #runLaneReview(round: number, lane: string, sha: string, seat: string): Promise<void> {
+    const candidateDir = path.join(this.#paths.candidates, sha);
+    const actionId = this.#log.actionId(`lane_review_${round}_${lane}_${seat}`);
+    this.#log.intent(actionId, { round, lane, seat, candidateSha: sha });
+    const agentId = `lane-review-${round}-${lane}-${seat}-${actionId}`;
+    const handle = this.#spawnLaneAgent({
+      role: "reviewer",
+      agentId,
+      cwd: candidateDir,
+      // A FRESH session per (round, lane, seat): a seat judging the second
+      // candidate must not carry the first's review in context (M's veto of
+      // the shared session), and a later round re-reviews from scratch.
+      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}`),
+      env: this.#laneEnv(candidateDir, {
+        ...(this.#piEnvFor?.("reviewer", agentId) ?? {}),
+        TT_CANDIDATE_SHA: sha,
+        TT_REVIEWER: seat,
+      }),
+      lane,
+      laneRound: round,
+      seat,
+      laneReview: { round, lane, sha, seat },
+    });
+    const lanePhase = this.#lanePhase(round, lane, sha);
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "the reviewer did not start" });
+        throw new Error("the reviewer did not start");
+      }
+      const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      const nextSettle = () =>
+        new Promise<"settled">((resolve) => handle.settleWaiters!.push(() => resolve("settled")));
+
+      // Turn 1: discover, before the worker's own disclosure is shown.
+      const settled1 = nextSettle();
+      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn1Prompt(seat as Reviewer, lanePhase, candidateDir)));
+      const raced1 = await Promise.race([
+        handle.discoveryPromise.then(() => "discovered" as const),
+        timeout.promise,
+        settled1,
+        // A crashed reviewer ends the attempt at once, never at reviewMs.
+        handle.agent.waitExit().then(() => "exited" as const),
+      ]);
+      // The discovery reply and the turn's own settle are two channels; the
+      // settle can win the race. What matters is whether the discovery was
+      // ACCEPTED, so the recorded discovery (not the race's winner) decides.
+      const turn1 = raced1 !== "discovered" && handle.laneDiscoveries !== undefined ? ("discovered" as const) : raced1;
+      if (turn1 !== "discovered") {
+        timeout.cancel();
+        await handle.agent.terminate();
+        const why =
+          turn1 === "settled"
+            ? "settled without submit_discovery (turn 1)"
+            : turn1 === "exited"
+              ? "the reviewer's process exited before submit_discovery (turn 1)"
+              : "timeout (turn 1)";
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: why });
+        throw new Error(why);
+      }
+      const turn1Settled = await Promise.race([settled1, timeout.promise]);
+      if (turn1Settled === "timeout") {
+        timeout.cancel();
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "timeout (turn 1 did not settle)" });
+        throw new Error("timeout (turn 1 did not settle)");
+      }
+      // The per-candidate discovery barrier: no seat gets turn 2 until all
+      // three have finished turn 1 on THIS candidate, so every turn-2 prompt
+      // lists the same merged records and every seat can ballot the others'.
+      this.#laneArriveAtBarrier(round, lane, seat);
+      const barrier = await Promise.race([this.#laneBarrierReleased(round, lane).then(() => "released" as const), timeout.promise]);
+      if (barrier === "timeout") {
+        timeout.cancel();
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "timeout (waiting for the other seats' discovery)" });
+        throw new Error("timeout (waiting for the other seats' discovery)");
+      }
+
+      // Turn 2: the lane's decisions (the worker's own, plus every seat's
+      // discoveries) with a ballot demanded for each votable one. The plan's
+      // ids are cached here and reused at the hand-off.
+      const merged = this.#lanePhase(round, lane, sha, { final: true });
+      const settled2 = nextSettle();
+      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn2Prompt(seat as Reviewer, handle, merged, candidateDir)));
+      const reviewRecorded = () =>
+        ((this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane)?.reviews ?? []).some(
+          (r) => r.seat === seat,
+        );
+      let turn2 = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        timeout.promise,
+        settled2,
+        handle.agent.waitExit().then(() => "exited" as const),
+      ]);
+      // Same channel race as turn 1: the recorded review, not the race's
+      // winner, says whether the submission landed.
+      if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
+      if (turn2 === "settled") {
+        this.#log.append("review_reprompt", { reviewer: seat, agentId, reason: "turn 2 settled without submit_review" });
+        const settled3 = nextSettle();
+        await handle.agent.prompt(
+          this.#agentPrompt(
+            `You ended your review turn without calling submit_review. That tool is required to finish this review. ` +
+              `Call submit_review now with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, ` +
+              `findingStatements, items and arch, then end your turn.`,
+          ),
+        );
+        turn2 = await Promise.race([handle.donePromise.then(() => "submitted" as const), timeout.promise, settled3]);
+        if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
+      }
+      timeout.cancel();
+      await handle.agent.terminate();
+      const ok = turn2 === "submitted";
+      this.#log.completion(actionId, { round, lane, seat, ok, ...(ok ? {} : { reason: turn2 }) });
+      if (!ok) {
+        throw new Error(
+          turn2 === "settled"
+            ? "settled without submit_review (turn 2, after one re-prompt)"
+            : turn2 === "exited"
+              ? "the reviewer's process exited before submit_review (turn 2)"
+              : "timeout (turn 2)",
+        );
+      }
+    } finally {
+      // A seat that died or timed out never reaches the barrier: the other
+      // seats must not wait out their own deadline for it. Marking it arrived
+      // releases them, and the round still fails on the missing review.
+      this.#laneArriveAtBarrier(round, lane, seat);
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** The per-(round, lane) discovery barrier: every seat that arrives waits
+   * until all of the round's seats have, exactly like the single-candidate
+   * path's `#discoveryBarrier` but keyed by the candidate under review. */
+  #laneArriveAtBarrier(round: number, lane: string, seat: string): void {
+    const key = `${round}-${lane}`;
+    const barrier = this.#laneBarriers.get(key) ?? { arrived: new Set<string>(), waiters: [] };
+    if (barrier.arrived.has(seat)) return;
+    barrier.arrived.add(seat);
+    this.#laneBarriers.set(key, barrier);
+    if (this.#laneSeats().every((s) => barrier.arrived.has(s))) barrier.waiters.splice(0).forEach((f) => f());
+  }
+
+  #laneBarrierReleased(round: number, lane: string): Promise<void> {
+    const key = `${round}-${lane}`;
+    const barrier = this.#laneBarriers.get(key);
+    if (barrier && this.#laneSeats().every((s) => barrier.arrived.has(s))) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const b = this.#laneBarriers.get(key) ?? { arrived: new Set<string>(), waiters: [] };
+      b.waiters.push(resolve);
+      this.#laneBarriers.set(key, b);
+    });
+  }
+
+  /** One seat's pick turn. The prompt is `buildPickPrompt` (the leader seat
+   * carries the ledger, every earlier round and the other candidates' diffs);
+   * the vote itself is recorded by `submit_pick_vote`. */
+  async #runPickTurn(
+    round: number,
+    base: string,
+    seat: string,
+    passing: ReadonlyArray<{ lane: string; sha: string }>,
+  ): Promise<void> {
+    const actionId = this.#log.actionId(`pick_${round}_${seat}`);
+    this.#log.intent(actionId, { round, seat, lanes: passing.map((c) => c.lane) });
+    const agentId = `pick-${round}-${seat}-${actionId}`;
+    const leader = seat === (this.#laneSeats()[0] ?? "M");
+    const otherDiffs: Record<string, string> = {};
+    if (leader) {
+      for (const c of passing) {
+        try {
+          otherDiffs[c.lane] = diffText(this.#plan.repo, base, c.sha);
+        } catch {
+          otherDiffs[c.lane] = "(diff unavailable)";
+        }
+      }
+    }
+    const prompt = buildPickPrompt({
+      seat,
+      leader,
+      phaseId: this.#state.phase.phaseId,
+      goal: this.#state.phase.contract.goal,
+      round,
+      base,
+      candidates: passing.map((c) => ({ lane: c.lane, sha: c.sha, label: candidateLabel(round, c.lane) })),
+      ledger: this.#laneLedgerLines(),
+      earlierRounds: this.#laneEarlierRoundLines(round),
+      otherDiffs,
+      seats: this.#laneSeats(),
+    });
+    const candidateDir = path.join(this.#paths.candidates, passing[0]?.sha ?? base);
+    const handle = this.#spawnLaneAgent({
+      role: "picker",
+      agentId,
+      cwd: fs.existsSync(candidateDir) ? candidateDir : this.#runDir,
+      sessionDir: path.join(this.#paths.sessions, `pick-${seat}`),
+      env: this.#laneEnv(this.#runDir, {
+        ...(this.#piEnvFor?.("picker", agentId) ?? {}),
+        TT_REVIEWER: seat,
+      }),
+      laneRound: round,
+      seat,
+      pickSeat: seat,
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, seat, ok: false, reason: "the seat did not start" });
+        return;
+      }
+      await handle.agent.prompt(this.#agentPrompt(prompt));
+      const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      const outcome = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        handle.agent.waitSettled().then(() => "settled" as const),
+        handle.agent.waitExit().then(() => "exited" as const),
+        timeout.promise,
+      ]);
+      timeout.cancel();
+      await handle.agent.terminate();
+      const ok = outcome === "submitted";
+      this.#log.completion(actionId, { round, seat, ok, ...(ok ? {} : { reason: outcome }) });
+      // Plan 06g2: a missing vote fails the round (it repeats); the pick is
+      // never taken with fewer than all seats' votes.
+      if (!ok) throw new Error(`the pick turn ${outcome} without a vote`);
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** The seats that review and vote: M, A and B (the fixed seats of this plan
+   * version; 06h makes them configurable). */
+  #laneSeats(): string[] {
+    return ["M", "A", "B"];
+  }
+
+  /** The settled ledger, one line per record — the leader seat's pick
+   * context. */
+  #laneLedgerLines(): string[] {
+    const messages = this.#state.phase.messages ?? [];
+    return ledgerEntries(messages).map((e) => {
+      const message = messages.find((m) => m.id === e.messageId);
+      return `${e.messageId} ${e.state}${message ? `: ${oneLine(message.title)}` : ""}`;
+    });
+  }
+
+  /** Every earlier round's candidates, votes and winner, one line each. */
+  #laneEarlierRoundLines(round: number): string[] {
+    return (this.#state.phase.rounds ?? [])
+      .filter((r) => r.round < round)
+      .map((r) => {
+        const votes = r.votes.map((v) => `${v.seat}→${v.lane}`).join(" ");
+        const picked = r.picked ? `${candidateLabel(r.round, r.picked.lane)} won (${r.picked.votes} vote(s))` : "no winner";
+        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}`;
+      });
+  }
+
+  /** The round's own orchestration: `runRound` (core/lanes.ts) is the only
+   * module that decides the sequence; this implements its host callbacks. */
+  async #runLaneRound(actionId: string): Promise<void> {
+    const lanes = this.#lanes();
+    // The round number: the next one, unless the last round is INCOMPLETE (a
+    // conductor crash left it with fewer lane records than it has lanes) —
+    // then the round is re-run under its own number, and ROUND_STARTED
+    // replaces the partial record rather than leaving it as a stale round.
+    const rounds = this.#state.phase.rounds ?? [];
+    const last = rounds[rounds.length - 1];
+    const round = last !== undefined && last.candidates.length < lanes.length ? last.round : (last?.round ?? 0) + 1;
+    const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+    this.#log.intent(actionId, { round, base, lanes });
+    const host: LaneHost = {
+      phaseId: this.#state.phase.phaseId,
+      goal: this.#state.phase.contract.goal,
+      seats: this.#laneSeats(),
+      rounds: () => this.#state.phase.rounds ?? [],
+      ledger: () => this.#laneLedgerLines(),
+      earlierRounds: () => this.#laneEarlierRoundLines(round),
+      createWorktree: (lane, at) => {
+        const worktree = this.#laneWorktree(lane);
+        if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+        createWorktree(this.#plan.repo, worktree, at);
+        return worktree;
+      },
+      lanePrompt: (r, at) => this.#laneWorkerPrompt(r, at),
+      buildLane: async (lane, r, at, prompt) => {
+        const built = await this.#buildLane(lane, r, at, prompt);
+        // Kept for the lane review prompts, which need the lane's own
+        // disclosures before the winner's hand-off assembles them.
+        this.#laneBuilds.set(`${r}-${lane}`, built);
+        return built;
+      },
+      checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
+      reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
+      pickTurn: (r, at, seat, passing) => this.#runPickTurn(r, at, seat, passing),
+      emit: (event) => this.#applyEvent(event),
+    };
+    const outcome = await runRound(host, { round, base, lanes });
+    this.#log.completion(actionId, {
+      round,
+      base,
+      lanes,
+      ...(outcome.winner ? { winner: outcome.winner } : {}),
+      ...(outcome.failure ? { failure: outcome.failure } : {}),
+      candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
+    });
+    if (!outcome.winner) {
+      // No candidate passed, OR the round could not complete (a missing
+      // review or pick vote — `runRound` refuses to pick an incomplete
+      // round). Either way the round repeats from the same base, and the
+      // repeat costs ONE repair attempt (a round is one attempt, whatever K
+      // is). ATTEMPT_NO_SUBMISSION is the ordinary "this attempt produced no
+      // acceptable candidate" event; REPAIRING then starts the next round.
+      if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
+      this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+      this.#clearLaneRound(round);
+      return;
+    }
+    const build = outcome.builds.find((b) => b.lane === outcome.winner!.lane);
+    await this.#handOffLaneWinner(round, outcome.winner, build);
+    this.#clearLaneRound(round);
+  }
+
+  /** Drops one round's per-lane scratch state (its builds, discoveries and
+   * barrier) once the round is over, so a long run does not accumulate them. */
+  #clearLaneRound(round: number): void {
+    for (const lane of this.#lanes()) {
+      this.#laneBuilds.delete(`${round}-${lane}`);
+      this.#laneDiscoveries.delete(`${round}-${lane}`);
+      this.#laneDiscoveryPlans.delete(`${round}-${lane}`);
+      this.#laneBarriers.delete(`${round}-${lane}`);
+    }
+  }
+
+  /** Hands the round's winner to the single-candidate pipeline: the winner
+   * becomes the phase's candidate, with the checks and reviews it already
+   * earned — the checks are NOT re-run and the reviews are NOT re-taken. The
+   * probe then runs for real (next()'s PROBING), and the winner's reviews are
+   * promoted into the phase's review slots as soon as the phase reaches
+   * REVIEWING. */
+  async #handOffLaneWinner(
+    round: number,
+    winner: { lane: string; sha: string; votes: number },
+    build: LaneBuild | undefined,
+  ): Promise<void> {
+    const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+    const candidate = roundRecord?.candidates.find((c) => c.lane === winner.lane);
+    const reviews = candidate?.reviews ?? [];
+    // The worktree the phase's own worker would have used is set to the
+    // winner, so every later stage that reads `paths.worktree` sees the
+    // winner's tree (a repair round's lanes are created fresh from its sha).
+    try {
+      if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
+      createWorktree(this.#plan.repo, this.#paths.worktree, winner.sha);
+    } catch (err) {
+      this.#log.append("error", { where: "lane_winner_worktree", error: String((err as Error)?.message ?? err) });
+    }
+    fs.writeFileSync(path.join(this.#runDir, "candidate-sha.txt"), winner.sha);
+    this.#pendingLaneWinner = {
+      round,
+      lane: winner.lane,
+      sha: winner.sha,
+      build: build ?? { lane: winner.lane, sha: winner.sha },
+      reviews,
+    };
+    let assembled: Decision[] = [];
+    this.#driveSuspended = true;
+    try {
+      // The winner's own submit_phase payload, replayed as the phase's own
+      // (its disclosures are the ones the winner's worker made).
+      this.#applyEvent({
+        type: "SUBMIT_PHASE",
+        disclosures: build?.disclosures ?? [],
+        ...(build?.prior ? { prior: build.prior } : {}),
+        ...(build?.dispute ? { dispute: build.dispute } : {}),
+      });
+      assembled = this.#assembleDecisions(winner.sha);
+      this.#applyEvent({
+        type: "FREEZE_COMPLETED",
+        candidateSha: winner.sha,
+        decisions: assembled,
+        // The winner's own lane sweep, never a hard-coded false.
+        tainted: build?.tainted === true,
+      });
+      // Plan 06g2: the winner lane's turn-1 discoveries become the phase's own
+      // records, bound to the winner. The reviews' ballots name the ids the
+      // lane's turn-2 prompt listed (the lane's worker decisions and these
+      // discoveries), so the ids must match exactly — and they do, because
+      // `#lanePhase` and `#applyDiscoveries` derive them the same way (worker
+      // decisions first, then M, A and B in seat order).
+      const plan = this.#laneDiscoveryPlan(round, winner.lane, winner.sha);
+      for (const seat of this.#laneSeats()) {
+        const entries = plan.filter((e) => e.seat === seat);
+        if (entries.length === 0) continue;
+        const err = this.#applyDiscoveries(
+          entries.map((e) => e.disclosure),
+          seat as Reviewer,
+          { firstIndex: entries[0].index },
+        );
+        if (err) this.#log.append("error", { where: "lane_winner_discoveries", seat, error: err });
+      }
+      // The winner's checks already ran (under the machine-wide lock); its
+      // record is applied, never re-run.
+      this.#applyEvent({ type: "CHECKS_PASSED" });
+      if (this.#itemsEnforced()) {
+        const output = this.#laneCheckOutputs.get(winner.sha) ?? "";
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolveTestVerifies(this.#planItems(), output) });
+        this.#applyTestVerifyFindings(winner.sha);
+        if (build?.coverage) {
+          this.#applyEvent({
+            type: "ITEM_STATE_UPDATED",
+            coverage: build.coverage as Coverage,
+            coverageAttempt: this.#state.phase.attempt.n,
+          });
+        }
+      }
+    } finally {
+      this.#driveSuspended = false;
+    }
+    // The same bookkeeping #runFreeze does once a candidate exists: carry the
+    // messages, raise each decision as a trade-off, note the coverage, sample
+    // the boundary data.
+    this.#carryMessages(winner.sha);
+    for (const decision of assembled) {
+      this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), winner.sha);
+    }
+    if (this.#itemsEnforced() && build?.coverage) this.#applyCoverageNotes(build.coverage as Coverage, winner.sha);
+    this.#recordBoundaryDataAndSample(winner.sha);
+    this.drive();
+  }
+
+  /** Promotes the round winner's recorded reviews into the phase's review
+   * slots, once the phase has reached REVIEWING (the only state a
+   * REVIEW_SUBMITTED row accepts). Called by `#runProbe` right after
+   * PROBE_PASSED, with `drive()` suspended, so `next()` never dispatches a
+   * second review for a seat the round already reviewed. */
+  async #promoteLaneWinnerReviews(sha: string): Promise<void> {
+    const pending = this.#pendingLaneWinner;
+    if (!pending || pending.sha !== sha) return;
+    this.#pendingLaneWinner = undefined;
+    // The caller has `drive()` suspended: the winner's findings/ballots, its
+    // three reviews and their statements all land before anything dispatches.
+    // The order is the single-candidate path's own (see `#onSubmitChecked`):
+    // findings/ballots first, then REVIEW_SUBMITTED (the third completes the
+    // round), then the finding statements.
+    for (const { review } of pending.reviews) {
+      let error: string | undefined;
+      try {
+        error = await this.#applyReviewFindingsAndBallots(review);
+      } catch (err) {
+        error = `threw: ${String((err as Error)?.message ?? err)}`;
+      }
+      if (error) this.#log.append("error", { where: "lane_winner_review", error });
+      this.#applyEvent({ type: "REVIEW_SUBMITTED", review, candidate: sha, promotedFrom: pending.round });
+      try {
+        this.#applyReviewFindingStatements(review);
+      } catch (err) {
+        this.#log.append("error", { where: "lane_winner_finding_statements", error: String((err as Error)?.message ?? err) });
+      }
+    }
+  }
+
+  async #runFreezeImpl(actionId: string): Promise<void> {
     this.#log.intent(actionId, { worktree: this.#paths.worktree });
     crashAt("before_freeze");
     const handle = this.#activeWorkerHandle;
@@ -7910,7 +9052,18 @@ export class Conductor {
       // Plan 06b: grep the candidate for every architecture `:WHERE:` symbol
       // before the reviewers are asked.
       this.#applyArchitectureSymbols(candidateSha);
-      this.#applyEvent({ type: "PROBE_PASSED", probedI: result.I });
+      // Plan 06g2: PROBE_PASSED moves the phase to REVIEWING, where `next()`
+      // would dispatch all three reviews — but a lane round's winner was
+      // already reviewed. Both the move and the promotion happen with `drive()`
+      // suspended, so the phase never sits in REVIEWING without them.
+      this.#driveSuspended = true;
+      try {
+        this.#applyEvent({ type: "PROBE_PASSED", probedI: result.I });
+        await this.#promoteLaneWinnerReviews(candidateSha);
+      } finally {
+        this.#driveSuspended = false;
+      }
+      this.drive();
     } else if (timedOutCommand !== undefined) {
       this.#applyEvent({ type: "PROBE_FAILED", evidence: `timeout: integration probe command '${timedOutCommand}' timed out on probed integration ${result.I}` });
     } else {
@@ -9898,8 +11051,9 @@ export class Conductor {
    * review EXCEPT the worker's own disclosure (`source === "worker"`) — a
    * reviewer must discover its own choices from the diff before ever seeing
    * what the worker disclosed. */
-  #buildReviewerTurn1Prompt(reviewer: Reviewer): string {
-    const phase = this.#state.phase;
+  #buildReviewerTurn1Prompt(reviewer: Reviewer, phaseOverride?: PhaseState, candidateDirOverride?: string): string {
+    const phase = phaseOverride ?? this.#state.phase;
+    const candidateDir = candidateDirOverride ?? this.#candidateDir();
     let diff = "(diff unavailable)";
     try {
       diff = diffText(this.#plan.repo, phase.integrationHead, phase.candidate!.sha);
@@ -9912,7 +11066,7 @@ export class Conductor {
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
-      `Candidate checkout (read-only): ${this.#candidateDir()}`,
+      `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
@@ -9942,8 +11096,16 @@ export class Conductor {
   /** Turn 2 (design §6.1): every live record on this candidate (the worker's
    * disclosures, all reviewers' discoveries after the discovery barrier, and
    * triggers), open findings and open corrections. */
-  #buildReviewerTurn2Prompt(reviewer: Reviewer, handle?: AgentHandle): string {
-    const phase = this.#state.phase;
+  #buildReviewerTurn2Prompt(
+    reviewer: Reviewer,
+    handle?: AgentHandle,
+    /** Plan 06g2: the lane's own phase (its candidate, its decisions, its
+     * coverage) when this is a lane review; the phase's own state otherwise. */
+    phaseOverride?: PhaseState,
+    candidateDirOverride?: string,
+  ): string {
+    const phase = phaseOverride ?? this.#state.phase;
+    const candidateDir = candidateDirOverride ?? this.#candidateDir();
     const C = phase.candidate?.sha ?? "";
     const K = phase.contract.contractVersion;
     const live = phase.decisions.filter((d) => isLiveDecision(d) && d.boundCandidateSha === C);
@@ -9989,6 +11151,7 @@ export class Conductor {
     const openCorrections = phase.corrections.filter((c) => c.status === "open");
     const lines = [
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
+      `Candidate checkout (read-only): ${candidateDir}`,
       ...secretPromptLines(this.#secretNames),
       // Plan 01f: reviewers are told the conductor produces the gate's
       // evidence and shown the record when one exists (the failed gate that

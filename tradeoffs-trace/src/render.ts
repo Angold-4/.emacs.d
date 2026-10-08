@@ -453,6 +453,23 @@ export function renderRoundsOrg(rounds: readonly RoundRecord[]): string {
       const state = candidate.ok === undefined ? "checks pending" : candidate.ok ? "checks passed" : "checks failed";
       const picked = round.picked?.lane === lane ? ", picked" : "";
       lines.push(`*** ${label} (lane ${lane}) — ${state}${picked}`, "", `    ${candidate.sha}`, "");
+      // Plan 06g2: the candidate's own reviews, grouped under it — every seat
+      // that reviewed it, with what that review raised. The round's reviews
+      // are the round's record; the winner's are also the phase's slots.
+      const reviews = candidate.reviews ?? [];
+      if (reviews.length > 0) {
+        lines.push(
+          `    reviews: ${reviews.length}`,
+          ...reviews
+            .slice()
+            .sort((a, b) => a.seat.localeCompare(b.seat))
+            .map((r) => {
+              const raised = (r.review.findings ?? []).length + (r.review.blockers ?? []).length;
+              return `      - ${r.seat}: ${raised === 0 ? "no findings" : `${raised} finding(s)`}`;
+            }),
+          "",
+        );
+      }
     }
     if (round.votes.length > 0) {
       lines.push("Votes:", ...round.votes.map((v) => `  - ${v.seat} → ${candidateLabel(round.round, v.lane)}: ${v.why}`), "");

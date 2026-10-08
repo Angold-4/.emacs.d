@@ -535,6 +535,7 @@ class RunSocketClient {
       | "submit_panel_vote"
       | "submit_round_panel_votes"
       | "submit_brief"
+      | "submit_pick_vote"
       | "curate_entries",
     args: unknown,
     timeoutMs = 60000,
@@ -581,7 +582,8 @@ export default function (pi: ExtensionAPI) {
   const client = new RunSocketClient();
   const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
-  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | "curator" | undefined) ?? "worker";
+  const role =
+    (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker" | undefined) ?? "worker";
   const accepted = new Set<string>();
   // A reviewer's turn 2 starts with the first agent_start after its
   // discovery (turn 1) was accepted; before that, turn 1 is still running.
@@ -617,6 +619,12 @@ export default function (pi: ExtensionAPI) {
       const owed = round ? "submit_round_panel_votes" : "submit_panel_vote";
       return accepted.has(owed) ? undefined : owed;
     }
+    // Plan 06g2: the round's pick turn — a picker seat votes for one
+    // candidate of the round; it owes exactly submit_pick_vote.
+    if (role === "picker") return accepted.has("submit_pick_vote") ? undefined : "submit_pick_vote";
+    // Plan 06g2: a lane candidate's review is today's two-turn review, once
+    // per candidate, so it follows the ordinary reviewer branch below —
+    // turn 1 owes submit_discovery, then turn 2 owes submit_review.
     if (!accepted.has("submit_discovery")) return "submit_discovery";
     if (reviewTurnStarted && !accepted.has("submit_review")) return "submit_review";
     return undefined;
@@ -637,6 +645,8 @@ export default function (pi: ExtensionAPI) {
       "You have not called submit_panel_vote yet. Vote block (stop the work until the owner decides — propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
     submit_round_panel_votes:
       "You have not called submit_round_panel_votes yet. Return one {messageId, verdict: 'keep'|'drop', reason} for EVERY item the prompt listed, in one call.",
+    submit_pick_vote:
+      "You have not called submit_pick_vote yet. Vote for exactly one candidate of the round, by lane, with a one-line why.",
   };
 
   pi.on("session_start", async () => {
@@ -876,6 +886,25 @@ export default function (pi: ExtensionAPI) {
     parameters: SubmitRoundPanelVotesParams,
     async execute(_toolCallId, params) {
       return submitTool("submit_round_panel_votes", params);
+    },
+  });
+
+  // Plan 06g2: one seat's pick vote in a two-lane round. The round's winner
+  // is decided in code (core/rounds.ts's pickWinner), never by a model; this
+  // tool only records one seat's vote for one lane.
+  pi.registerTool({
+    name: "submit_pick_vote",
+    label: "Submit Pick Vote",
+    description: "Cast your pick vote for one candidate of the round: { round, seat, lane, why }.",
+    promptSnippet: "Vote for one candidate of the round, by lane, with a one-line why",
+    parameters: Type.Object({
+      round: Type.Number(),
+      seat: Type.String(),
+      lane: Type.String(),
+      why: Type.String(),
+    }),
+    async execute(_toolCallId, params) {
+      return submitTool("submit_pick_vote", params);
     },
   });
 

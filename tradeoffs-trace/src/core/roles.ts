@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
  * tests. */
 export const PI_VERSION = "0.87.0";
 
-export type Role = "worker" | "reviewer" | "evaluator" | "panel" | "curator";
+export type Role = "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker";
 
 /** The reviewer seats (design §2.1): three reviewers of different model
  * families, whose disagreement is the point of having three. */
@@ -42,6 +42,10 @@ export interface RoleModel {
  * keeps Pi's `defaultModel`. */
 export interface PlanModels {
   worker?: RoleModel;
+  /** Plan 06g2: per-lane worker models (`worker.1`, `worker.2`, …), done by
+   * Emacs; a lane with no entry uses `worker`'s. The key is the lane's 1-based
+   * position, so lane `a` is `worker.1` and lane `b` is `worker.2`. */
+  workerLanes?: Record<string, RoleModel>;
   reviewer?: RoleModel;
   evaluator?: RoleModel;
   panel?: RoleModel;
@@ -85,10 +89,27 @@ export function planModelSelector(
       }
       return models.reviewer;
     }
+    // Plan 06g2: a lane's own worker model (`worker.1`, `worker.2`) first, so
+    // a two-lane round may run its two workers on different models; a lane
+    // with none keeps the role's shared `worker` model.
+    if (role === "worker" && seat !== undefined) {
+      const own = models.workerLanes?.[String(seat)];
+      if (own) return own;
+      return models.worker;
+    }
     // Plan 05j: the curator runs on the evaluator's model by default (there
     // is no separate #+TT_MODELS role required for it); a plan may override
     // it with `curator=...`.
     if (role === "curator") return models.curator ?? models.evaluator;
+    // Plan 06g2: the pick turn is a reviewer seat's turn, so it runs on that
+    // seat's own reviewer model.
+    if (role === "picker") {
+      if (seat !== undefined) {
+        const own = models.reviewerSeats?.[String(seat) as ReviewerSeat];
+        if (own) return own;
+      }
+      return models.reviewer;
+    }
     if (role === "panel") {
       if (seat !== undefined) {
         const own = models.panelSeats?.[String(seat)];
@@ -113,6 +134,11 @@ export function planModelSelector(
 export const ROLE_TOOLS: Record<Role, string[]> = {
   worker: ["read", "edit", "write", "grep", "find", "ls", "sh", "submit_phase", "submit_coverage", "raise_tradeoff"],
   reviewer: ["read", "grep", "find", "ls", "submit_discovery", "submit_review"],
+  // Plan 06g2: the pick turn is its own role, so a two-lane round's vote
+  // never widens the reviewer's own tool set (the seats of a plan without
+  // `#+TT_WORKERS` are byte for byte what they were). It reads the
+  // candidates and casts exactly one vote.
+  picker: ["read", "grep", "find", "ls", "submit_pick_vote"],
   // Plan 04a: the evaluator checks a round's raw messages against the code
   // it can read, and returns through `submit_evaluation`. Decision briefs
   // add `submit_brief`: after a round's evaluation the same role writes one

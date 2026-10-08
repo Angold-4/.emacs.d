@@ -1094,6 +1094,12 @@ export function roundsSection(phase: PhaseState): string[] {
       ? `winner ${candidateLabel(round.round, round.picked.lane)} (${round.picked.sha.slice(0, 7)}, ${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})`
       : "no winner";
     lines.push(`- Round ${round.round} from ${round.base.slice(0, 7)}: ${candidates} — ${votes} — ${picked}`);
+    // Plan 06g2: the reviews each candidate drew, so `tt summary` shows the
+    // round's own per-candidate review record beside the votes and the winner.
+    const reviewed = round.candidates
+      .filter((c) => (c.reviews ?? []).length > 0)
+      .map((c) => `${candidateLabel(round.round, c.lane)}: ${(c.reviews ?? []).map((r) => r.seat).sort().join("/")}`);
+    if (reviewed.length > 0) lines.push(`  reviews — ${reviewed.join(" · ")}`);
   }
   return lines;
 }
@@ -1118,7 +1124,9 @@ export function lanesView(phase: PhaseState): string[] {
     const short = candidate.sha.slice(0, 7);
     const state = candidate.ok === undefined ? "checking" : candidate.ok ? "checks ✓" : "checks ✗";
     const picked = round.picked?.lane === lane ? ` — picked (${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})` : "";
-    return `${lane} ${label} ${short} ${state}${picked}`;
+    const reviews = candidate.reviews ?? [];
+    const reviewed = reviews.length > 0 ? ` — reviewed by ${reviews.map((r) => r.seat).sort().join(", ")}` : "";
+    return `${lane} ${label} ${short} ${state}${reviewed}${picked}`;
   });
   const passing = round.candidates.filter((c) => c.ok === true).length;
   const seats = 3;
