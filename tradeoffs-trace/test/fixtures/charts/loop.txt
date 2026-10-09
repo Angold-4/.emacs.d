@@ -19,6 +19,8 @@ phase states:
       +- ATTEMPT_TIMED_OUT (budgetExhausted) -> AWAITING_OWNER  [attempt-timed-out-budget-exhausted]
       +- ATTEMPT_NO_SUBMISSION (budgetRemains) -> REPAIRING       [attempt-no-submission-to-repairing]
       +- ATTEMPT_NO_SUBMISSION (budgetExhausted) -> AWAITING_OWNER  [attempt-no-submission-budget-exhausted]
+      +- RECHECK_REQUESTED (recheckAvailableRound) -> CHECKING        [recheck-requested-from-implementing]
+      +- RECHECK_REQUESTED (recheckAvailableFinal) -> FINAL_CHECKING  [recheck-requested-final-from-implementing]
       +- REVISE                    -> REPAIRING       [revise-from-implementing]
 
   +----------------+

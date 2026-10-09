@@ -1809,12 +1809,12 @@ async function cmdRecheck(positional: string[], root: string, reason: string | u
     refuse("the current candidate's checks did not just fail");
     return;
   }
-  if (name === "IMPLEMENTING") {
-    refuse("a worker attempt is running");
-    return;
-  }
-  if (name !== "AWAITING_OWNER") {
-    refuse(`the phase is ${name}; only a parked phase whose checks just failed accepts a recheck`);
+  // Plan 06j (A3, owner steer 19:41Z): a check failure with budget left
+  // starts a repair attempt by itself. The owner may still recheck while it
+  // has not submitted; the conductor stops the worker and gives the round
+  // back. Any other state is refused.
+  if (name !== "AWAITING_OWNER" && name !== "IMPLEMENTING") {
+    refuse(`the phase is ${name}; only a parked or repairing phase whose checks just failed accepts a recheck`);
     return;
   }
   const tier = checks.tier === "final" ? "final" : "round";

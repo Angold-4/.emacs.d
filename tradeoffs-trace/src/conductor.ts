@@ -1467,6 +1467,11 @@ export class Conductor {
   /** Plan 06c (R6): the tools the preflight could not find, resolved once per
    * conductor and named in every agent prompt. */
   #agentToolsMissing: string[] | undefined;
+  /** Plan 06j (A3): the worker attempt a recheck stopped. `#runWorkerAttempt`
+   * reads and clears it after its race settles, so the cancellation emits no
+   * ATTEMPT_INTERRUPTED/ATTEMPT_NO_SUBMISSION (the phase is already
+   * CHECKING and the checks are re-running on the frozen candidate). */
+  #recheckCancelledAttempt: string | undefined;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -2978,11 +2983,18 @@ export class Conductor {
       return;
     }
     if (name === "IMPLEMENTING") {
-      this.#rejectInboxFile(file, commandId, "recheck refused: a worker attempt is running");
-      return;
-    }
-    if (name !== "AWAITING_OWNER") {
-      this.#rejectInboxFile(file, commandId, `recheck refused: the phase is ${name}; only a parked phase whose checks just failed accepts a recheck`);
+      // Plan 06j (A3, owner steer 19:41Z): a check failure with budget left
+      // starts a repair attempt by itself, and the owner may still recheck
+      // the frozen candidate while it has not submitted (the phase would be
+      // FREEZING otherwise). Stop the worker: nothing it wrote is kept, and
+      // the round it charged is given back by the transition.
+      const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
+      if (worker) {
+        this.#recheckCancelledAttempt = worker.agentId;
+        void worker.agent.terminate().catch(() => undefined);
+      }
+    } else if (name !== "AWAITING_OWNER") {
+      this.#rejectInboxFile(file, commandId, `recheck refused: the phase is ${name}; only a parked or repairing phase whose checks just failed accepts a recheck`);
       return;
     }
     const tier = checks.tier === "final" || raw.tier === "final" ? "final" : "round";
@@ -6209,6 +6221,15 @@ export class Conductor {
       // below has recorded it yet.
       crashAt("after_dispatch_worker");
       this.#log.completion(actionId, { outcome });
+      // Plan 06j (A3): the owner rechecked this candidate and the conductor
+      // stopped this attempt. The phase is already CHECKING and the checks
+      // are re-running on the frozen candidate, so an attempt-failure event
+      // here would undo the recheck. `#processRecheckCommand` set this before
+      // terminating the agent.
+      if (this.#recheckCancelledAttempt === agentId) {
+        this.#recheckCancelledAttempt = undefined;
+        return;
+      }
 
       if (outcome === "submitted") {
         // Freeze already kicked off from #onSubmit; nothing more to do

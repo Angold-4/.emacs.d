@@ -127,12 +127,15 @@ function recheckAvailableFinal(s: State): boolean {
 /** Plan 06j (A3): the one mutation a recheck applies, whatever tier it enters:
  * keep the failed record (and its tier) for the re-run, answer the budget-gate
  * request the failure parked with (a recheck is a check run, not a grant), and
- * clear the stage's in-flight entries. */
-function applyRecheck(s: State, ev: Event, to: "CHECKING" | "FINAL_CHECKING"): State {
+ * clear the stage's in-flight entries. `restoreRound` is true when the recheck
+ * cancelled a repair attempt that had already charged a round (from
+ * IMPLEMENTING): stopping it charges nothing, so the round is given back. */
+function applyRecheck(s: State, ev: Event, to: "CHECKING" | "FINAL_CHECKING", restoreRound = false): State {
   const e = ev as Extract<Event, { type: "RECHECK_REQUESTED" }>;
   return withPhase(s, {
     phase: to,
     checks: s.phase.checks,
+    ...(restoreRound ? { repairRoundsUsed: Math.max(0, s.phase.repairRoundsUsed - 1) } : {}),
     ownerRequests: s.phase.ownerRequests.map((r) =>
       r.status === "open" && isBudgetGateRequest(r)
         ? { ...r, status: "resolved" as const, resolution: { option: "recheck", note: e.reason } }
@@ -560,6 +563,35 @@ addRow({
   to: "FINAL_CHECKING",
   actions: [{ type: "run_final_checks", candidateSha: "C1" }],
   apply: (s, ev) => applyRecheck(s, ev, "FINAL_CHECKING"),
+});
+
+// Plan 06j (A3, owner steer 19:41Z): a check failure with budget left starts a
+// repair attempt by itself (IMPLEMENTING) before the owner can act. The owner
+// may still recheck the frozen candidate while that attempt has not submitted;
+// the conductor stops the worker (nothing it wrote is kept) and the round it
+// charged is given back, so the checks re-run on the SAME candidate.
+addRow({
+  id: "recheck-requested-from-implementing",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableRound",
+  guard: (s) => recheckAvailableRound(s),
+  to: "CHECKING",
+  actions: [{ type: "run_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "CHECKING", true),
+});
+
+addRow({
+  id: "recheck-requested-final-from-implementing",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableFinal",
+  guard: (s) => recheckAvailableFinal(s),
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "FINAL_CHECKING", true),
 });
 
 // --- PROBING --------------------------------------------------------

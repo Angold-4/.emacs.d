@@ -824,6 +824,31 @@ BUILD["recheck-requested-final"] = {
   event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "killed process", tier: "final" },
 };
 
+// Plan 06j (A3, owner steer 19:41Z): a check failure with budget left started
+// a repair attempt by itself. The owner rechecks before it submits; the worker
+// is stopped and the charged round is given back.
+BUILD["recheck-requested-from-implementing"] = {
+  state: baseState({
+    phase: "IMPLEMENTING",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "round" },
+    repairRoundsUsed: 1,
+    repairRoundsGranted: 2,
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "load-only timing", tier: "round" },
+};
+
+BUILD["recheck-requested-final-from-implementing"] = {
+  state: baseState({
+    phase: "IMPLEMENTING",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "final" },
+    repairRoundsUsed: 1,
+    repairRoundsGranted: 2,
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "killed process", tier: "final" },
+};
+
 // Plan 06g (A6): "accept with carried items" — the budget-spent phase whose
 // only open items are advisories offers this one decision; taking it accepts
 // the candidate as it stands and resumes to RESOLVING, where next() accepts

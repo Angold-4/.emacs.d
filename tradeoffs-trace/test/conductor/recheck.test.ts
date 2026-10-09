@@ -208,38 +208,25 @@ test("plan 06j: tt recheck is refused unless the current candidate's checks just
     cleanupDir(green.scriptsDir);
   }
 
-  // (2) a worker attempt is running: a two-round phase auto-repairs, and the
-  // repair worker is held so the phase stays IMPLEMENTING.
-  const counter = `/tmp/tt-recheck-busy-${randomUUID().slice(0, 8)}`;
-  fs.rmSync(counter, { force: true });
+  // (2) a worker attempt is running with no frozen candidate yet: the
+  // initial attempt is held so the phase stays IMPLEMENTING. There is
+  // nothing to recheck, so it is refused.
   const busy = await setupConductor({
-    phase: {
-      id: "p1",
-      goal: "do the thing",
-      acceptance: ["it works"],
-      checks: [failOnceCheck(counter)],
-      boundaries: [],
-      reserved: [],
-      rounds: 2,
-    },
-    workerScriptForAttempt: (attempt) =>
-      attempt === 1
-        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'TT_RECHECK_FAIL\\n' >> README.md" }, submitPhaseStep()] }
-        : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    checks: ["true"],
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] }),
     reviewerScriptFor: reviewerFor(),
     deadlines: FAST,
   });
   try {
     await busy.conductor.start();
-    await waitFor(() => eventTypes(busy.runDir).includes("REPAIR_ATTEMPT_STARTED") && busy.conductor.state.phase.phase === "IMPLEMENTING", 90_000, 50, busy.runDir);
+    await waitFor(() => busy.conductor.state.phase.phase === "IMPLEMENTING", 90_000, 50, busy.runDir);
     const out = await runCli(["recheck", busy.runDir, "--reason", "the machine was busy"]);
-    assert.match(out.stdout, /recheck refused: a worker attempt is running/, out.stdout);
+    assert.match(out.stdout, /recheck refused: the phase has no frozen candidate yet/, out.stdout);
     assert.equal(out.code, 1);
   } finally {
     await busy.conductor.stop();
     cleanupDir(busy.runRoot);
     cleanupDir(busy.scriptsDir);
-    fs.rmSync(counter, { force: true });
   }
 
   // (3) a newer candidate exists: a hand-written command naming another sha
@@ -323,6 +310,58 @@ test("plan 06j: a recheck that fails again leaves the phase where a failed check
     assert.equal(setup.conductor.state.phase.checks?.passed, false, "the failure stands");
     assert.equal(eventTypes(setup.runDir).filter((t) => t === "REPAIR_ATTEMPT_STARTED").length, 0, "the exhausted budget dispatches no repair worker");
     assert.ok(!eventTypes(setup.runDir).includes("CHECKS_PASSED"), "a failing recheck never passes the checks");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
+});
+
+test("plan 06j: tt recheck stops a running repair attempt and re-runs the checks on the frozen candidate", async () => {
+  // The case the command exists for: after CHECKS_FAILED the conductor starts
+  // a repair attempt by itself, and the owner rechecks while that attempt has
+  // not submitted. The worker is stopped, the round it charged is given back,
+  // and the checks run again on the SAME frozen candidate.
+  const counter = `/tmp/tt-recheck-impl-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "do the thing",
+      acceptance: ["it works"],
+      checks: [failOnceCheck(counter)],
+      boundaries: [],
+      reserved: [],
+      rounds: 2,
+    },
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'TT_RECHECK_FAIL\\n' >> README.md" }, submitPhaseStep()] }
+        : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => eventTypes(setup.runDir).includes("REPAIR_ATTEMPT_STARTED") && setup.conductor.state.phase.phase === "IMPLEMENTING",
+      90_000,
+      50,
+      setup.runDir,
+    );
+    const candidateSha = setup.conductor.state.phase.candidate!.sha;
+    assert.equal(setup.conductor.state.phase.repairRoundsUsed, 1, "the auto-repair charged one round");
+
+    const out = await runCli(["recheck", setup.runDir, "--reason", "the check was killed by the machine"]);
+    assert.match(out.stdout, /recheck requested/, out.stdout);
+
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.candidate?.sha, candidateSha, "the same frozen candidate is reviewed");
+    assert.equal(setup.conductor.state.phase.repairRoundsUsed, 0, "stopping the repair gives the round back");
+    assert.equal(eventTypes(setup.runDir).filter((t) => t === "REPAIR_ATTEMPT_STARTED").length, 1, "no second repair attempt");
+    assert.equal(eventsOfType(setup.runDir, "RECHECK_REQUESTED").length, 1, "the recheck is recorded");
+    assert.ok(eventTypes(setup.runDir).includes("CHECKS_PASSED"), "the recheck's pass is recorded");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
