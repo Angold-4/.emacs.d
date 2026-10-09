@@ -151,6 +151,8 @@ test("R2.F13 childEnv: strips exactly the test-runner recursion markers, preserv
     FOO: "bar",
     NODE_TEST_CONTEXT: "child-v8",
     NODE_TEST_WORKER_ID: "1",
+    FORCE_COLOR: "3",
+    CLICOLOR_FORCE: "1",
   };
   const env = childEnv(source);
   assert.equal(env.NODE_TEST_CONTEXT, undefined);
@@ -161,9 +163,15 @@ test("R2.F13 childEnv: strips exactly the test-runner recursion markers, preserv
   assert.equal(env.TT_SOCKET, "/tmp/s");
   assert.equal(env.FAKE_PI_SCRIPT, "/tmp/s.json");
   assert.equal(env.FOO, "bar");
+  // Plan 06j (A2): a conductor that inherited a coloured shell must never pass
+  // the colour on to a check; NO_COLOR=1 is forced.
+  assert.equal(env.FORCE_COLOR, undefined, "FORCE_COLOR is scrubbed from every check's environment");
+  assert.equal(env.CLICOLOR_FORCE, undefined, "CLICOLOR_FORCE is scrubbed from every check's environment");
+  assert.equal(env.NO_COLOR, "1", "NO_COLOR=1 is forced so a check never colours its output");
   // The caller's object is not mutated.
   assert.equal(source.NODE_TEST_CONTEXT, "child-v8");
-  assert.equal(JSON.stringify(Object.keys(env).sort()), JSON.stringify(["FAKE_PI_SCRIPT", "FOO", "HOME", "NODE_OPTIONS", "PATH", "TT_SOCKET"]));
+  assert.equal(source.FORCE_COLOR, "3");
+  assert.equal(JSON.stringify(Object.keys(env).sort()), JSON.stringify(["FAKE_PI_SCRIPT", "FOO", "HOME", "NODE_OPTIONS", "NO_COLOR", "PATH", "TT_SOCKET"]));
 });
 
 // The real-Node proof: with the markers inherited, a nested `node --test`

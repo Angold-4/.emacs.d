@@ -774,6 +774,56 @@ BUILD["awaiting-owner-request-resolved-grant"] = {
   },
 };
 
+// Plan 06j (A3): the owner rechecks a frozen candidate whose checks just
+// failed. The phase is parked (budget spent) with no worker running; the row
+// re-runs the same tier, keeps the failed record (with its tier) for the
+// re-run, and answers the budget gate with the recheck itself.
+BUILD["recheck-requested"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "round" },
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the checks kept failing",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "grant", label: "grant 3 more repair rounds" }, { id: "stop", label: "stop the phase" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "load-only timing", tier: "round" },
+};
+
+// A recheck of a candidate whose failed run was the final tier enters
+// FINAL_CHECKING, so the same final check runs again.
+BUILD["recheck-requested-final"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "final" },
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the final check kept failing",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "grant", label: "grant one more round" }, { id: "stop", label: "stop the phase" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "killed process", tier: "final" },
+};
+
 // Plan 06g (A6): "accept with carried items" — the budget-spent phase whose
 // only open items are advisories offers this one decision; taking it accepts
 // the candidate as it stands and resumes to RESOLVING, where next() accepts

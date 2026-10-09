@@ -59,13 +59,12 @@ test("the loop tape is written on the status beat and rebuilds identically", asy
     const live = readFileSync(p.tape, "utf8");
     // The header is the phase's readable id, short title, round, attempt and
     // elapsed time; at DONE every main-path row is drawn and the head is DONE.
-    // OWNER RULING (2026-10-09 ~10:10Z, 06i): this change from 'attempt 1/3'
-    // to '1/2' is an EXPLICIT C1 exception. The assertion is stale on the 06g
-    // phase base (its default budget already shows 1/2) and otherwise fails
-    // this phase's check-full; it changes no behaviour. 06j R6 owns verifying
-    // it. The denominator is `repairRoundsGranted` (roundBudget - 1), not the
-    // round budget.
-    assert.match(live, /^p1 · round 1 · attempt 1\/2 · /m);
+    // Plan 06j (A4): the assertion reads the attempt budget from the phase it
+    // ran, instead of hard-coding '1/2'. The denominator is
+    // `repairRoundsGranted` (roundBudget - 1), not the round budget, so the
+    // test never goes stale when the plan's budget changes.
+    const granted = setup.conductor.state.phase.repairRoundsGranted;
+    assert.match(live, new RegExp(`^p1 · round 1 · attempt 1\\/${granted} · `, "m"));
     assert.match(live, /^  ▶  DONE\b/m);
     assert.match(live, /^  ✓  IMPLEMENT\b/m);
     assert.doesNotMatch(live, /^  .  GATE\b/m);

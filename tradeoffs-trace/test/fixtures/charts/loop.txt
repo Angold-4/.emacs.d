@@ -112,6 +112,8 @@ phase states:
   +----------------+
   | AWAITING_OWNER |  not entered
   +----------------+
+      +- RECHECK_REQUESTED (recheckAvailableRound) -> CHECKING        [recheck-requested]
+      +- RECHECK_REQUESTED (recheckAvailableFinal) -> FINAL_CHECKING  [recheck-requested-final]
       +- EVIDENCE_RECORDED         -> RESOLVING       [awaiting-owner-evidence-recorded]
       +- AMEND                     -> CHECKING        [amend-from-awaiting_owner]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-awaiting_owner]
@@ -148,6 +150,14 @@ phase states:
       +- BASELINE_TIMED_OUT        -> IMPLEMENTING    [baseline-timed-out]
 
   +----------------+
+  | FINAL_CHECKING |  not entered
+  +----------------+
+      +- FINAL_CHECKS_PASSED (acceptHoldsAndNoGate) -> ACCEPTED        [final-checks-passed-accepted]
+      +- FINAL_CHECKS_PASSED (acceptHoldsAndGateDeclared) -> GATING          [final-checks-passed-gated]
+      +- FINAL_CHECKS_FAILED (budgetRemains) -> REPAIRING       [final-checks-failed-to-repairing]
+      +- FINAL_CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [final-checks-failed-budget-exhausted]
+
+  +----------------+
   | EVALUATING     |  not entered  -  evaluator, panel - model default
   +----------------+
       +- EVALUATION_COMPLETED (evaluationSettledAndPanelEscalated) -> AWAITING_OWNER  [panel-escalate]
@@ -158,14 +168,6 @@ phase states:
       +- AMEND                     -> CHECKING        [amend-from-evaluating]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-evaluating]
       +- REVISE                    -> REPAIRING       [revise-from-evaluating]
-
-  +----------------+
-  | FINAL_CHECKING |  not entered
-  +----------------+
-      +- FINAL_CHECKS_PASSED (acceptHoldsAndNoGate) -> ACCEPTED        [final-checks-passed-accepted]
-      +- FINAL_CHECKS_PASSED (acceptHoldsAndGateDeclared) -> GATING          [final-checks-passed-gated]
-      +- FINAL_CHECKS_FAILED (budgetRemains) -> REPAIRING       [final-checks-failed-to-repairing]
-      +- FINAL_CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [final-checks-failed-budget-exhausted]
 
 rare edges (crash recovery, launch failure):
   BASELINE -- BASELINE_INTERRUPTED     -> BASELINE        [baseline-interrupted]

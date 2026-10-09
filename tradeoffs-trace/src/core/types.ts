@@ -1011,6 +1011,10 @@ export interface ChecksResult {
   candidateSha: string;
   passed?: boolean;
   interrupted?: boolean;
+  /** Plan 06j (A3): which tier the last run used, so a recheck from
+   * AWAITING_OWNER re-runs the SAME tier (`round` or `final`). Absent on an
+   * old log means `round`. */
+  tier?: "round" | "final";
   /** Plan 05d: every new failing test of the candidate's last check (each
    * re-run alone), so the worker's repair prompt labels a real failure and a
    * flake apart (finding #35). Cleared when the next candidate freezes. */
@@ -1635,6 +1639,21 @@ export interface EvChecksFailed {
 }
 export interface EvChecksInterrupted {
   type: "CHECKS_INTERRUPTED";
+}
+
+/** Plan 06j (A3): the owner asks the conductor to re-run the frozen
+ * candidate's own checks, because the failure looks like the machine (a
+ * killed process, load-only timing, an inherited environment) rather than
+ * the code. It dispatches no worker and spends no repair round; the earlier
+ * failure stays in the log with `reason`. Accepted only after
+ * CHECKS_FAILED/FINAL_CHECKS_FAILED on the current candidate and before a
+ * newer candidate exists. */
+export interface EvRecheckRequested {
+  type: "RECHECK_REQUESTED";
+  candidateSha: string;
+  reason: string;
+  /** The tier the failed run used, so the recheck re-runs the same one. */
+  tier?: "round" | "final";
 }
 
 /** Plan 05d: one new failing test that passed when re-run alone — a flake,
@@ -2460,6 +2479,7 @@ export type Event =
   | EvChecksPassed
   | EvChecksFailed
   | EvChecksInterrupted
+  | EvRecheckRequested
   | EvEnvChecked
   | EvEnvPreflightFailed
   | EvEnvCheckFailed

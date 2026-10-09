@@ -2935,6 +2935,68 @@ export class Conductor {
     this.#moveInboxFile(file, this.#paths.inboxApplied);
   }
 
+  /** Plan 06j (A3): apply one `tt recheck`. Refused with a reason unless the
+   * current candidate's checks just failed and the phase is parked with no
+   * worker running; the event re-runs the same tier, dispatches no worker and
+   * spends no repair round. A hand-written inbox file is checked exactly like
+   * the CLI's own path. */
+  #processRecheckCommand(file: string, commandId: string, raw: Record<string, unknown>): void {
+    const name = this.#state.phase.phase;
+    if (name === "DONE" || name === "BLOCKED") {
+      this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
+      return;
+    }
+    const reason = typeof raw.reason === "string" ? raw.reason.trim() : "";
+    if (reason.length === 0) {
+      this.#rejectInboxFile(file, commandId, 'a recheck needs a non-empty --reason "<why the failure is the machine>"');
+      return;
+    }
+    const candidate = this.#state.phase.candidate;
+    const checks = this.#state.phase.checks;
+    if (!candidate) {
+      this.#rejectInboxFile(file, commandId, "recheck refused: the phase has no frozen candidate yet");
+      return;
+    }
+    // The command names the candidate the owner saw. A command for any other
+    // candidate (an older one, while a newer candidate exists) is refused.
+    const binding = raw.binding && typeof raw.binding === "object" ? (raw.binding as Record<string, unknown>) : {};
+    const namedSha = typeof binding.candidateSha === "string" ? binding.candidateSha : "";
+    if (namedSha !== "" && namedSha !== candidate.sha) {
+      this.#rejectInboxFile(file, commandId, `recheck refused: a newer candidate exists (${candidate.sha.slice(0, 9)}); recheck only the candidate whose checks just failed`);
+      return;
+    }
+    if (checks?.passed === true) {
+      this.#rejectInboxFile(file, commandId, "recheck refused: the current candidate's checks passed");
+      return;
+    }
+    if (checks && checks.candidateSha !== candidate.sha) {
+      this.#rejectInboxFile(file, commandId, `recheck refused: a newer candidate exists (${candidate.sha.slice(0, 9)}); recheck only the candidate whose checks just failed`);
+      return;
+    }
+    if (!checks || checks.passed !== false || checks.interrupted === true) {
+      this.#rejectInboxFile(file, commandId, "recheck refused: the current candidate's checks did not just fail");
+      return;
+    }
+    if (name === "IMPLEMENTING") {
+      this.#rejectInboxFile(file, commandId, "recheck refused: a worker attempt is running");
+      return;
+    }
+    if (name !== "AWAITING_OWNER") {
+      this.#rejectInboxFile(file, commandId, `recheck refused: the phase is ${name}; only a parked phase whose checks just failed accepts a recheck`);
+      return;
+    }
+    const tier = checks.tier === "final" || raw.tier === "final" ? "final" : "round";
+    try {
+      this.#applyEvent({ type: "RECHECK_REQUESTED", candidateSha: candidate.sha, reason, tier }, commandId);
+    } catch (err) {
+      this.#rejectInboxFile(file, commandId, `recheck refused: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    this.#appliedCommandIds.add(commandId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
   #processInboxFile(file: string): void {
     if (this.#closed) return;
     const name = path.basename(file);
@@ -3001,6 +3063,15 @@ export class Conductor {
         forwardProgram: false,
         pushed: true,
       });
+      return;
+    }
+
+    // Plan 06j (A3): `tt recheck <run> --reason "…"` — the owner asks for the
+    // frozen candidate's checks to run again after an environmental failure.
+    // Handled before the input-kind map so a hand-written file cannot bypass
+    // the same conditions the CLI checks.
+    if (raw !== null && typeof raw === "object" && (raw as { type?: unknown }).type === "recheck") {
+      this.#processRecheckCommand(file, commandId, raw as Record<string, unknown>);
       return;
     }
 
@@ -9145,9 +9216,11 @@ export class Conductor {
     // CHECKING the candidate has not been reviewed yet, so the tier is
     // `round`; from FINAL_CHECKING it has passed review with no open blocker,
     // so the tier is `final` and the phase's final check is appended.
+    // Plan 06j (A3): a recheck re-runs the SAME tier the failed run used,
+    // which the kept `checks.tier` records.
     const tier = checkTier(this.#state.phase.contract, {
       sha: candidateSha,
-      reviewed: this.#state.phase.phase === "FINAL_CHECKING",
+      reviewed: this.#state.phase.phase === "FINAL_CHECKING" || this.#state.phase.checks?.tier === "final",
       openBlocker: false,
     });
     const finalCommands = tier === "final" ? (this.#state.phase.contract.finalChecks ?? []).map((c) => this.#withValues(c)) : [];

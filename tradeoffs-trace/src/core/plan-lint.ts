@@ -21,6 +21,7 @@
 // numbers come from the Org source: Emacs records them on `acceptanceLines`
 // when it parses the plan, and a hand-written JSON plan simply gets no line.
 
+import { matchesGlob } from "./boundaries.ts";
 import { parseVerify } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
@@ -33,6 +34,9 @@ export type LintRule =
   | "no-tolerance"
   | "model-declaration"
   | "rerun-template"
+  // Plan 06j (A1): a phase's checks cannot see what its :BOUNDARIES: let it
+  // change, or the repository's CI runs something the plan never does.
+  | "coverage"
   // Plan 06g: `#+TT_WORKERS`/`#+TT_ROUNDS` and, from 06h, the reviewer count
   // and seat list.
   | "worker-count"
@@ -138,6 +142,11 @@ export interface LintPhaseInput {
   id?: string;
   /** The phase's Goal paragraph, when the parser read it. */
   goal?: string;
+  /** Plan 06j (A1): the phase's ordinary checks (`:CHECKS:`), as the
+   * coverage rule reads them. */
+  checks?: string[];
+  /** Plan 06j (A1): the phase's `:BOUNDARIES:` globs. */
+  boundaries?: string[];
   acceptance?: string[];
   /** 1-based source lines of `acceptance`, parallel to it (Emacs records
    * these; absent for a hand-written JSON plan). */
@@ -163,6 +172,10 @@ export interface LintPhaseInput {
 export interface LintPlanInput {
   /** The Org file this JSON came from, when known. */
   sourceFile?: string;
+  /** Plan 06j (A1): the absolute path of the git repository the plan runs
+   * on (`#+TT_REPO:`). The coverage rule reads it; absent means no coverage
+   * facts and no coverage warnings. */
+  repo?: string;
   phases?: LintPhaseInput[];
   models?: LintModels;
   modelsLine?: number;
@@ -842,6 +855,121 @@ export function lintWorkers(plan: LintPlanInput): LintFinding[] {
         fix: "write #+TT_ROUNDS: 3 (the default), or a whole number from 1 to 5",
       });
     }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Plan 06j (A1): coverage warnings
+// ---------------------------------------------------------------------------
+
+/** One package/crate the repository defines. `dir` is repo-relative, with
+ * POSIX separators (`.` for a package at the repository root). */
+export interface RepoPackage {
+  name: string;
+  dir: string;
+}
+
+/** What `checkCoverageWarnings` reads about the repository. Built by
+ * `readRepoFacts` (I/O) and passed in, so this module stays pure. */
+export interface RepoFacts {
+  /** Every package/crate the repository defines. */
+  packages: RepoPackage[];
+  /** Every command line the repository's CI workflows run. */
+  ciCommands: string[];
+  /** True for a cargo repository, whose packages are named by `-p`/
+   * `--package`; a non-cargo package is named as a plain token. */
+  cargo: boolean;
+}
+
+/** An empty fact set: a plan with no repository, or one whose path does not
+ * exist, warns about nothing. */
+export function emptyRepoFacts(): RepoFacts {
+  return { packages: [], ciCommands: [], cargo: false };
+}
+
+/** The literal directory prefix of a glob, up to its first wildcard. */
+function globPrefix(glob: string): string {
+  const i = glob.search(/[*?[\]]/);
+  return (i === -1 ? glob : glob.slice(0, i)).replace(/\/+$/, "");
+}
+
+/** True when a `:BOUNDARIES:` glob covers a package directory: the glob
+ * matches the directory itself, or the glob's literal prefix and the
+ * directory contain one another (so `crates/**` covers `crates/a`, and
+ * `crates/a/src/**` covers `crates/a`). */
+export function globCoversDir(glob: string, dir: string): boolean {
+  const g = glob.trim().replace(/\/+$/, "");
+  const d = dir.trim().replace(/\/+$/, "") || ".";
+  if (g.length === 0) return false;
+  if (matchesGlob(g, d) || matchesGlob(g, `${d}/`)) return true;
+  const prefix = globPrefix(g);
+  if (prefix.length === 0) return true; // `**`, `*` — everything
+  if (d === ".") return prefix === ".";
+  if (prefix === ".") return false;
+  return d === prefix || d.startsWith(`${prefix}/`) || prefix.startsWith(`${d}/`);
+}
+
+/** True when a command names `name` the way the repository's package manager
+ * does: cargo uses `-p`/`--package`; any other package is named as a plain
+ * token (e.g. `--workspace a`). */
+export function commandNamesPackage(command: string, name: string, cargo: boolean): boolean {
+  const tokens = command.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if ((t === "-p" || t === "--package") && tokens[i + 1] === name) return true;
+    if (t === `-p=${name}` || t === `--package=${name}`) return true;
+    if (cargo && t.startsWith("-p") && t.length > 2 && t.slice(2) === name) return true;
+  }
+  return !cargo && tokens.includes(name);
+}
+
+/** True when a command runs `cargo fmt --all` (with or without `--check`). */
+export function runsCargoFmtAll(command: string): boolean {
+  return /(^|[\s;&|])cargo\s+fmt(\s|$)/.test(command) && /(^|\s)--all(\s|$)/.test(command);
+}
+
+/** Plan 06j (A1): the ONE place coverage is judged. Warnings only, never
+ * errors. For a cargo repository a phase warns when a crate whose directory
+ * its `:BOUNDARIES:` cover is named by no `-p` in its checks or final checks;
+ * for any repository a covered package the checks never name warns; and a
+ * repository whose CI runs `cargo fmt --all` while no phase check or final
+ * check does warns once. */
+export function checkCoverageWarnings(plan: LintPlanInput, repo: RepoFacts): LintFinding[] {
+  const out: LintFinding[] = [];
+  const phases = plan.phases ?? [];
+  const commandsOf = (phase: LintPhaseInput): string[] => [...(phase.checks ?? []), ...(phase.finalChecks ?? [])];
+  for (const phase of phases) {
+    const commands = commandsOf(phase);
+    const boundaries = phase.boundaries ?? [];
+    for (const pkg of repo.packages) {
+      if (!boundaries.some((g) => globCoversDir(g, pkg.dir))) continue;
+      if (commands.some((c) => commandNamesPackage(c, pkg.name, repo.cargo))) continue;
+      out.push({
+        severity: "warning",
+        rule: "coverage",
+        phaseId: phase.id ?? "?",
+        item: `${pkg.name} (${pkg.dir})`,
+        line: phase.line,
+        sourceFile: plan.sourceFile,
+        problem: `the phase's :BOUNDARIES: cover ${pkg.dir}, but no check or final check names the package ${pkg.name}`,
+        fix: repo.cargo
+          ? `add -p ${pkg.name} to the phase's :CHECKS: or :FINAL_CHECKS:, or narrow :BOUNDARIES:`
+          : `name ${pkg.name} in the phase's :CHECKS: or :FINAL_CHECKS:, or narrow :BOUNDARIES:`,
+      });
+    }
+  }
+  const ciFmt = repo.ciCommands.find(runsCargoFmtAll);
+  if (ciFmt !== undefined && !phases.some((p) => commandsOf(p).some(runsCargoFmtAll))) {
+    out.push({
+      severity: "warning",
+      rule: "coverage",
+      phaseId: "coverage",
+      item: ciFmt,
+      sourceFile: plan.sourceFile,
+      problem: "the repository's CI runs `cargo fmt --all`, but no phase check or final check does",
+      fix: "add `cargo fmt --all --check` to the phase's :FINAL_CHECKS:, or a plan-wide #+TT_FINAL_CHECKS:",
+    });
   }
   return out;
 }

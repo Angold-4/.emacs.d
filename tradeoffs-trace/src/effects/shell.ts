@@ -46,7 +46,15 @@ const STOP_POLL_TIMEOUT_MS = 5_000;
  * `node:test run() is being called recursively within a test file. skipping
  * running files.` and exit 0 — a real failing test is reported as a pass.
  *
- * `childEnv` removes exactly those two markers and nothing else: PATH, HOME,
+ * Plan 06j (A2): a conductor started from a shell that exported
+ * `FORCE_COLOR`/`CLICOLOR_FORCE` (the 06g2 round-4 incident: the owner's own
+ * shell had `FORCE_COLOR=3`) inherited it, so every check line was coloured
+ * and the item resolver read every named test as missing. The check
+ * environment is forced uncoloured: `FORCE_COLOR` and `CLICOLOR_FORCE` are
+ * removed and `NO_COLOR=1` is set. A coloured shell can never change what a
+ * check prints.
+ *
+ * `childEnv` removes exactly those four markers and nothing else: PATH, HOME,
  * NODE_OPTIONS, provider/credential variables and `TT_*` all survive, so
  * ordinary child configuration is untouched. One shared helper is used for
  * every command the conductor spawns (checks, probe and the worker `sh`
@@ -55,6 +63,9 @@ export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
   const copy: NodeJS.ProcessEnv = { ...env };
   delete copy.NODE_TEST_CONTEXT;
   delete copy.NODE_TEST_WORKER_ID;
+  delete copy.FORCE_COLOR;
+  delete copy.CLICOLOR_FORCE;
+  copy.NO_COLOR = "1";
   return copy;
 }
 

@@ -356,11 +356,41 @@ test("owner-inbox: a queued note is delivered in the next worker attempt (and, a
       binding: { runId, phaseId: "p1", candidateSha, contractVersion, recordId: request.id, recordVersion: request.version },
     });
 
-    // Let every granted repair attempt run (checks keep failing), so if the
-    // note were re-sent it would show up again.
+    // The budget-gate `grant` lifts the park for exactly ONE more round. To
+    // prove the note's own queue entry is sent once while every LATER prompt
+    // carries it as a directive, run a second granted round: wait for the
+    // first to fail and park again, then grant the next.
     await waitFor(
-      () => (eventsOfType(setup, "REPAIR_ATTEMPT_STARTED").length >= 5) && setup.conductor.state.phase.phase === "AWAITING_OWNER",
+      () => eventsOfType(setup, "REPAIR_ATTEMPT_STARTED").length >= 3 && setup.conductor.state.phase.phase === "AWAITING_OWNER",
       90_000,
+      50,
+      setup.runDir,
+    );
+    const secondRequest = openRequests(setup.conductor.state)[0];
+    assert.ok(secondRequest, "the second park opens another request");
+    // The repair froze a NEW candidate, so the second grant binds to the
+    // current candidate, not the one the note was first queued under.
+    writeCommand(setup, "cmd-ccc-grant", {
+      commandId: "cmd-ccc-grant",
+      type: "resolve",
+      recordKind: "request",
+      option: "grant",
+      binding: {
+        runId,
+        phaseId: "p1",
+        candidateSha: setup.conductor.state.phase.candidate!.sha,
+        contractVersion: setup.conductor.state.phase.contract.contractVersion,
+        recordId: secondRequest.id,
+        recordVersion: secondRequest.version,
+      },
+    });
+    // Let the second granted repair attempt run (checks keep failing), so a
+    // re-sent note would show up again in its prompt.
+    await waitFor(
+      () => eventsOfType(setup, "REPAIR_ATTEMPT_STARTED").length >= 4 && setup.conductor.state.phase.phase === "AWAITING_OWNER",
+      90_000,
+      50,
+      setup.runDir,
     );
     assert.ok(fs.existsSync(promptLog), "expected worker prompts to be captured");
     const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n").filter((p) => p.trim().length > 0);

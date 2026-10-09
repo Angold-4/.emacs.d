@@ -192,6 +192,51 @@ test("plan-items: a requirement whose test verify is missing from the check outp
   }
 });
 
+test("plan 06j: a named test in coloured spec-reporter output resolves as passed", async () => {
+  // Plan 06j (A2): the conductor inherited FORCE_COLOR=3 from the owner's
+  // shell, so node's spec reporter coloured every line. The check prints the
+  // exact 06g2 round-4 shape; the resolver must still read R1's named test as
+  // passed, and the check's own environment must carry NO_COLOR=1 and no
+  // FORCE_COLOR.
+  const markerDir = fs.mkdtempSync("/tmp/tt-06j-colour-");
+  const envFile = path.join(markerDir, "check-env.txt");
+  const coloured =
+    "printf '\\033[32m\u2714 R1 proves it\\033[39m \\033[90m(6499ms)\\033[39m\\n'; env > " + envFile;
+  const previousForce = process.env.FORCE_COLOR;
+  process.env.FORCE_COLOR = "3";
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [coloured],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    const r1 = (setup.conductor.state.phase.checkResolution ?? []).find((r) => r.id === "R1");
+    assert.equal(r1?.outcome, "passed", `R1 resolved against the coloured output: ${JSON.stringify(r1)}`);
+    assert.ok(fs.existsSync(envFile), "the check recorded its own environment");
+    const envText = fs.readFileSync(envFile, "utf8");
+    assert.match(envText, /^NO_COLOR=1$/m, "the check sees NO_COLOR=1");
+    assert.doesNotMatch(envText, /^FORCE_COLOR=/m, "FORCE_COLOR is scrubbed from the check's environment");
+    assert.doesNotMatch(envText, /^CLICOLOR_FORCE=/m, "CLICOLOR_FORCE is scrubbed from the check's environment");
+  } finally {
+    if (previousForce === undefined) delete process.env.FORCE_COLOR;
+    else process.env.FORCE_COLOR = previousForce;
+    await teardown(setup);
+    fs.rmSync(markerDir, { recursive: true, force: true });
+  }
+});
+
 test("plan-items: a review omitting one item's verdict is incomplete and re-asked", async () => {
   const setup = await setupConductor({
     items: ITEMS,
