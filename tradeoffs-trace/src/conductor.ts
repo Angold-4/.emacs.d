@@ -1467,11 +1467,16 @@ export class Conductor {
   /** Plan 06c (R6): the tools the preflight could not find, resolved once per
    * conductor and named in every agent prompt. */
   #agentToolsMissing: string[] | undefined;
-  /** Plan 06j (A3): the worker attempt a recheck stopped. `#runWorkerAttempt`
-   * reads and clears it after its race settles, so the cancellation emits no
-   * ATTEMPT_INTERRUPTED/ATTEMPT_NO_SUBMISSION (the phase is already
-   * CHECKING and the checks are re-running on the frozen candidate). */
-  #recheckCancelledAttempt: string | undefined;
+  /** Plan 06j (A3): the worker attempts a recheck stopped. `#runWorkerAttempt`
+   * reads and clears its own id after its race settles, so the cancellation
+   * emits no ATTEMPT_INTERRUPTED/ATTEMPT_NO_SUBMISSION (the phase is already
+   * CHECKING and the checks are re-running on the frozen candidate). A set so
+   * every lane worker of a multi-lane round is covered (OD-5(3)). */
+  #recheckCancelledAttempts = new Set<string>();
+  /** Plan 06j (A3/OD-5(3)): a recheck stopped a multi-lane round. Its
+   * `#runLaneRound` reads and clears this before emitting any attempt-failure
+   * event, so the stopped round never fights the recheck. */
+  #recheckCancelledLaneRound = false;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -2983,37 +2988,55 @@ export class Conductor {
       return;
     }
     if (name === "IMPLEMENTING") {
-      // Plan 06j (A3, owner steer 19:41Z/20:10Z): a check failure with budget
-      // left starts a repair attempt by itself, and the owner may still
-      // recheck the frozen candidate while it has not submitted (the phase
-      // would be FREEZING otherwise). Stop the worker, AWAIT its termination,
-      // and discard every write it made (tracked and untracked) by recreating
-      // the worktree at the frozen candidate before the checks re-run. The
-      // round it charged is given back by the transition.
-      const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
-      if (worker) {
-        // The await below yields to the event loop; mark the command in
-        // flight so the next inbox scan leaves the file alone.
-        this.#steerInFlight.add(commandId);
-        try {
-          this.#recheckCancelledAttempt = worker.agentId;
+      // Plan 06j (A3, OD-5): a check failure with budget left starts a repair
+      // attempt by itself, and the owner may still recheck the frozen
+      // candidate while it has not submitted (the phase would be FREEZING
+      // otherwise). Stop EVERY live lane worker (not just the first), kill
+      // the shell groups it left, then reset EVERY worker worktree to the
+      // frozen candidate UNCONDITIONALLY (an agent that already exited may
+      // have left writes) before the checks re-run. A reset that throws
+      // refuses the recheck: the run stays as it was and the reason is
+      // owner-visible. The round it charged is given back by the transition.
+      //
+      // The awaits below yield to the event loop; mark the command in flight
+      // so the next inbox scan leaves the file alone.
+      this.#steerInFlight.add(commandId);
+      try {
+        // Every worker handle still present, live or already exited: an
+        // exited agent may have left writes, and marking it keeps
+        // `#runWorkerAttempt` from emitting an attempt-failure event.
+        const workers = [...this.#agents.values()].filter((h) => h.role === "worker");
+        for (const worker of workers) {
+          this.#recheckCancelledAttempts.add(worker.agentId);
           await worker.agent.terminate().catch(() => undefined);
-          try {
-            if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
-            createWorktree(this.#plan.repo, this.#paths.worktree, candidate.sha);
-          } catch (err) {
-            this.#log.append("error", { where: "recheck_worktree_reset", error: String((err as Error)?.message ?? err) });
-          }
-          // The cancelled attempt has no attempt-failure event of its own, so
-          // record why the round was refunded (M-39).
-          this.#log.append("recheck_cancelled_repair", {
-            candidateSha: candidate.sha,
-            agentId: worker.agentId,
-            refundedRound: this.#state.phase.repairRoundsUsed,
-          });
-        } finally {
-          this.#steerInFlight.delete(commandId);
+          // Kill the shell groups Pi left behind, so a detached command
+          // cannot rewrite the worktree after the reset.
+          for (const pgid of worker.shGroups) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs });
         }
+        if (this.#laneRoundEnabled()) this.#recheckCancelledLaneRound = true;
+        // Reset every worker worktree to the frozen candidate, whether or not
+        // a live handle was found (OD-5(1)/(3)).
+        const worktrees = [this.#paths.worktree, ...(this.#laneRoundEnabled() ? this.#lanes().map((lane) => this.#laneWorktree(lane)) : [])];
+        try {
+          for (const worktree of worktrees) {
+            if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+            createWorktree(this.#plan.repo, worktree, candidate.sha);
+          }
+        } catch (err) {
+          const reason = `recheck refused: could not reset the worker worktree to the frozen candidate (${String((err as Error)?.message ?? err)})`;
+          this.#log.append("recheck_reset_failed", { candidateSha: candidate.sha, error: String((err as Error)?.message ?? err) });
+          this.#rejectInboxFile(file, commandId, reason);
+          return;
+        }
+        // The cancelled attempt has no attempt-failure event of its own, so
+        // record why the round was refunded (M-39).
+        this.#log.append("recheck_cancelled_repair", {
+          candidateSha: candidate.sha,
+          agents: workers.map((w) => w.agentId),
+          refundedRound: this.#state.phase.repairRoundsUsed,
+        });
+      } finally {
+        this.#steerInFlight.delete(commandId);
       }
     } else if (name !== "AWAITING_OWNER") {
       this.#rejectInboxFile(file, commandId, `recheck refused: the phase is ${name}; only a parked or repairing phase whose checks just failed accepts a recheck`);
@@ -6251,8 +6274,8 @@ export class Conductor {
       // are re-running on the frozen candidate, so an attempt-failure event
       // here would undo the recheck. `#processRecheckCommand` set this before
       // terminating the agent.
-      if (this.#recheckCancelledAttempt === agentId) {
-        this.#recheckCancelledAttempt = undefined;
+      if (this.#recheckCancelledAttempts.has(agentId)) {
+        this.#recheckCancelledAttempts.delete(agentId);
         return;
       }
 
@@ -7751,6 +7774,14 @@ export class Conductor {
       candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
     });
     if (!outcome.winner) {
+      // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
+      // the phase is already CHECKING and the checks are re-running, so this
+      // stopped round must not emit an attempt-failure event.
+      if (this.#recheckCancelledLaneRound) {
+        this.#recheckCancelledLaneRound = false;
+        this.#clearLaneRound(round);
+        return;
+      }
       // No candidate passed, OR the round could not complete (a missing
       // review or pick vote — `runRound` refuses to pick an incomplete
       // round). Either way the round repeats from the same base, and the
@@ -7759,6 +7790,13 @@ export class Conductor {
       // acceptable candidate" event; REPAIRING then starts the next round.
       if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
       this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+      this.#clearLaneRound(round);
+      return;
+    }
+    if (this.#recheckCancelledLaneRound) {
+      // Defensive: the recheck stopped the round but a winner still emerged
+      // (a lane submitted just before termination). Do not hand it off.
+      this.#recheckCancelledLaneRound = false;
       this.#clearLaneRound(round);
       return;
     }

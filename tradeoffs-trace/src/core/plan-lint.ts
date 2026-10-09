@@ -888,16 +888,34 @@ export function emptyRepoFacts(): RepoFacts {
   return { packages: [], ciCommands: [], cargo: false };
 }
 
-/** The literal directory prefix of a glob, up to its first wildcard. */
-function globPrefix(glob: string): string {
-  const i = glob.search(/[*?[\]]/);
-  return (i === -1 ? glob : glob.slice(0, i)).replace(/\/+$/, "");
+/** True when `globSeg` matches one path segment (`*` matches within one
+ * segment, exactly as core/boundaries.ts's `matchesGlob`). */
+function segmentMatches(globSeg: string, dirSeg: string): boolean {
+  return globSeg === "**" || matchesGlob(globSeg, dirSeg);
 }
 
-/** True when a `:BOUNDARIES:` glob covers a package directory: the glob
- * matches the directory itself, or the glob's literal prefix and the
- * directory contain one another (so `crates/**` covers `crates/a`, and
- * `crates/a/src/**` covers `crates/a`). */
+/** Can the glob match a path that starts with `dirSegs`? `**` consumes any
+ * number of segments; every other segment matches exactly one. This is the
+ * one place the "does a boundary reach this package" question is decided: a
+ * glob whose first segment is `*` followed by `src/**` reaches package `a`
+ * (it matches `a/src/...`), while `*.md` does not reach a nested package
+ * (its first segment cannot match two). */
+function globCanReachDir(globSegs: readonly string[], dirSegs: readonly string[]): boolean {
+  const rec = (gi: number, di: number): boolean => {
+    if (di === dirSegs.length) return true;
+    if (gi === globSegs.length) return false;
+    const seg = globSegs[gi];
+    if (seg === "**") return rec(gi + 1, di) || rec(gi, di + 1);
+    return segmentMatches(seg, dirSegs[di]) && rec(gi + 1, di + 1);
+  };
+  return rec(0, 0);
+}
+
+/** True when a `:BOUNDARIES:` glob covers a package directory: the glob can
+ * match a path inside (or at) the directory, with `*` limited to one path
+ * segment (`crates/**` covers `crates/a`; `crates/a/src/**` covers `crates/a`;
+ * a `*` followed by `src/**` covers `a`; `*.md` does not cover
+ * `packages/b`). */
 export function globCoversDir(glob: string, dir: string): boolean {
   const g = glob.trim().replace(/\/+$/, "");
   const d = dir.trim().replace(/\/+$/, "") || ".";
@@ -905,16 +923,9 @@ export function globCoversDir(glob: string, dir: string): boolean {
   // A root package is the whole repository, so any repo-relative glob covers
   // it: a `src/**` boundary lets the phase change the single root crate.
   if (d === ".") return !g.startsWith("/") && !g.startsWith("..");
-  if (matchesGlob(g, d) || matchesGlob(g, `${d}/`)) return true;
-  const prefix = globPrefix(g);
-  if (prefix.length === 0) {
-    // A glob whose first segment is a wildcard: `**` is recursive and covers
-    // everything; `*`/`*.md` matches only root-level entries, so it cannot
-    // cover a nested package (boundaries.ts:42-62 gives `*` one segment).
-    return g.startsWith("**");
-  }
-  if (prefix === ".") return false;
-  return d === prefix || d.startsWith(`${prefix}/`) || prefix.startsWith(`${d}/`);
+  const globSegs = g.split("/").filter((s) => s.length > 0);
+  const dirSegs = d.split("/").filter((s) => s.length > 0);
+  return globCanReachDir(globSegs, dirSegs);
 }
 
 /** True when a command names `name` the way the repository's package manager

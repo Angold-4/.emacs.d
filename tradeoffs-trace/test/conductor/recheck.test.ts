@@ -491,3 +491,131 @@ test("plan 06j: a recheck discards the stopped repair worker's tracked and untra
     fs.rmSync(counter, { force: true });
   }
 });
+
+/** Plan 06j (OD-5(3)): the lane helpers the two-lane recheck test needs. */
+function laneWorker(lane: string, round: number): { hello: unknown; steps: Array<{ kind: string; [key: string]: unknown }> } {
+  if (round >= 2) {
+    return {
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf 'DIRTY-${lane}\\n' > dirty-${lane}.txt; printf 'DIRTY-TRACKED-${lane}\\n' >> README.md` },
+        { kind: "hang-until-abort" },
+      ],
+    };
+  }
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `printf 'lane ${lane}\\n' > lane-${lane}.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+function laneReview(seat: Reviewer, contractVersion: unknown): { hello: unknown; steps: Array<{ kind: string; [key: string]: unknown }> } {
+  return {
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" },
+      {
+        kind: "call-submit",
+        tool: "submit_review",
+        args: { reviewer: seat, phaseId: "p1", candidateSha: "$TT_CANDIDATE_SHA", contractVersion, correctionStatements: [], findingStatements: [] },
+      },
+    ],
+  };
+}
+
+function pickVote(seat: Reviewer, round: number, lane: string, why: string): { hello: unknown; steps: Array<{ kind: string; [key: string]: unknown }> } {
+  return { hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round, seat, lane, why } }] };
+}
+
+function liveRound(state: State): number {
+  return state.phase.rounds?.length ?? 1;
+}
+
+test("plan 06j: a recheck whose worktree reset throws is refused, with the reason reported", async () => {
+  // OD-5(2): a recheck verdict never rests on an unknown worktree.
+  const counter = `/tmp/tt-recheck-refuse-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  const failOnMarker = "if grep -q TT_RECHECK_FAIL README.md; then exit 1; fi; exit 0";
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "do the thing", acceptance: ["it works"], checks: [failOnMarker], boundaries: [], reserved: [], rounds: 3 },
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'TT_RECHECK_FAIL\\n' >> README.md" }, submitPhaseStep()] }
+        : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  const worktree = runPaths(setup.runDir).worktree;
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => eventTypes(setup.runDir).includes("REPAIR_ATTEMPT_STARTED") && setup.conductor.state.phase.phase === "IMPLEMENTING",
+      90_000,
+      50,
+      setup.runDir,
+    );
+    // Make the worktree unremovable: a file inside a directory with no write
+    // permission defeats both `git worktree remove` and the rmSync fallback.
+    fs.writeFileSync(path.join(worktree, "blocker.txt"), "x");
+    fs.chmodSync(worktree, 0o500);
+    const out = await runCli(["recheck", setup.runDir, "--reason", "the machine was busy"]);
+    assert.match(out.stdout, /recheck refused: could not reset the worker worktree/, out.stdout);
+    assert.equal(out.code, 1, "a refusal is a non-zero exit");
+    assert.equal(eventsOfType(setup.runDir, "RECHECK_REQUESTED").length, 0, "no RECHECK_REQUESTED is recorded");
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "recheck_reset_failed"), "the refusal is owner-visible in the log");
+    assert.equal(setup.conductor.state.phase.phase, "IMPLEMENTING", "the run stays as it was");
+  } finally {
+    try {
+      fs.chmodSync(worktree, 0o700);
+    } catch {
+      // best effort
+    }
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
+});
+
+test("plan 06j: a recheck stops every lane worker and resets every lane worktree", async () => {
+  // OD-5(3): with workers > 1, all live lane workers stop and all lane
+  // worktrees reset before the checks re-run. The round checks pass and a
+  // winner is handed off; the FINAL check then fails and starts a two-lane
+  // repair round (the lane checks run only the round tier, so the final check
+  // is what makes the phase repair). Both repair lane workers write dirty
+  // files and hang.
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], finalChecks: ["false"], boundaries: [], reserved: [], workers: 2 },
+    workerScript: () => laneWorker("a", 1),
+    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} prefers`),
+    deadlines: FAST,
+  });
+  const laneA = path.join(setup.runDir, "worktrees", "lane-a");
+  const laneB = path.join(setup.runDir, "worktrees", "lane-b");
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => setup.conductor.state.phase.phase === "IMPLEMENTING" && fs.existsSync(path.join(laneA, "dirty-a.txt")) && fs.existsSync(path.join(laneB, "dirty-b.txt")),
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const out = await runCli(["recheck", setup.runDir, "--reason", "the final check was killed by the machine"]);
+    assert.match(out.stdout, /recheck requested/, out.stdout);
+    await waitFor(() => !fs.existsSync(path.join(laneA, "dirty-a.txt")) && !fs.existsSync(path.join(laneB, "dirty-b.txt")), 90_000, 50, setup.runDir);
+    assert.ok(!fs.existsSync(path.join(laneA, "dirty-a.txt")), "lane a's untracked write is gone");
+    assert.ok(!fs.existsSync(path.join(laneB, "dirty-b.txt")), "lane b's untracked write is gone");
+    assert.ok(!fs.readFileSync(path.join(laneA, "README.md"), "utf8").includes("DIRTY-TRACKED-a"), "lane a's tracked write is gone");
+    assert.ok(!fs.readFileSync(path.join(laneB, "README.md"), "utf8").includes("DIRTY-TRACKED-b"), "lane b's tracked write is gone");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});

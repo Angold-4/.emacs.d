@@ -104,6 +104,12 @@ test("plan 06j: a root crate covered by src/** is warned, and '*.md' does not co
     mdPlan.phases![0].boundaries = ["**"];
     const all = checkCoverageWarnings(mdPlan, readRepoFacts(root)).filter((f) => f.rule === "coverage");
     assert.ok(all.some((f) => f.item.includes("b")) && all.some((f) => f.item.includes("c")), JSON.stringify(all));
+    // (c) a wildcard first segment still reaches a nested package:
+    // `*/src/**` matches `a/src/...`, so it covers crate a.
+    mdPlan.phases![0].boundaries = ["*/src/**"];
+    mdPlan.phases![0].checks = ["true"];
+    const nested = checkCoverageWarnings(mdPlan, readRepoFacts(root)).filter((f) => f.rule === "coverage");
+    assert.ok(nested.some((f) => f.item.includes("a")), JSON.stringify(nested));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
