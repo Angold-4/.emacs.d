@@ -765,6 +765,57 @@ test("plan 04a: a submit_evaluation naming one message twice is refused, never p
   }
 });
 
+test("plan 06i: an evaluator merge with no target or a missing target is refused, never applied", async () => {
+  // OD-21(B): #evaluationIssue refuses a merge that does not name another raw
+  // message of the same type, before any event applies. The fallback in
+  // #evaluationEvents is defensive only.
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-submit", tool: "raise_tradeoff", args: { choice: "One choice", alternative: "the other", why: "matters", anchor: { path: "src/a.ts", lines: [1, 2] } } },
+        submitPhaseStep(),
+      ],
+    }),
+    reviewerScriptFor: stubReviewer(),
+    evaluatorScriptFor: (messageType) => ({
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps:
+        messageType === "tradeoff"
+          ? [
+              { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [{ messageId: "T-1", action: "merge" }] } },
+              { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [{ messageId: "T-1", action: "merge", into: "T-999" }] } },
+            ]
+          : [],
+    }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 60_000, 20, setup.runDir);
+    const streamDir = runPaths(setup.runDir).stream;
+    const text = fs
+      .readdirSync(streamDir)
+      .filter((f) => f.startsWith("evaluator-tradeoff-"))
+      .map((f) => fs.readFileSync(path.join(streamDir, f), "utf8"))
+      .join("\n");
+    assert.match(text, /must name another raw/, "the absent target was refused with the reason");
+    assert.ok(
+      !readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type: string }).type === "MESSAGE_MERGED"),
+      "no merge event was applied for either bad merge",
+    );
+    assert.ok(
+      !readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type: string }).type === "FINDING_MERGED"),
+      "no finding-merge event was applied either",
+    );
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
 test("plan 04a: a later round's new raw messages are evaluated afresh (no stale settled flag)", async () => {
   const setup = await setupConductor({
     checks: ["true"],

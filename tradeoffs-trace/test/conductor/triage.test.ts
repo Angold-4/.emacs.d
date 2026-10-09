@@ -606,6 +606,62 @@ test("plan 06i: a carried item goes only to the phase named by --to, not to ever
   }
 });
 
+test("plan 06i: a carry and a deferral on different ids both import into the child", async () => {
+  // OD-21(A): a carry and a deferral are different owner acts; when they name
+  // DIFFERENT ids, both reach the child's contract.
+  const repo = makeRepo();
+  const runRoot = makeRunRoot();
+  const phase = (goal: string) => ({ id: "p1", goal, acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [] });
+  const plan = (goal: string) => ({ title: goal, repo: repo.dir, integrationBranch: "main", checks: ["true"], phases: [phase(goal)] });
+  const program: ProgramFile = {
+    title: "carry-and-defer",
+    maxParallel: 2,
+    branches: "shared",
+    entries: [
+      { id: "a", after: [], plan: plan("a") },
+      { id: "c", after: ["a"], plan: plan("c") },
+    ],
+  };
+  const programDir = createProgram(runRoot, program, "bothprog");
+  try {
+    const runDirA = createRun(runRoot, plan("a"));
+    const f1 = { id: "F-1", version: 1, phaseId: "p1", kind: "defect", severity: "blocking", evidence: "src/a.ts:1 wrong", raisedBy: "M", status: "open", boundCandidateSha: "" };
+    const f2 = { id: "F-2", version: 1, phaseId: "p1", kind: "defect", severity: "blocking", evidence: "src/a.ts:2 wrong", raisedBy: "M", status: "open", boundCandidateSha: "" };
+    const events = [
+      { type: "FINDING_RAISED", finding: f1 },
+      { type: "TRIAGE_RECORDED", record: { itemId: "F-1", source: "finding", impact: "wrong-output", disposition: { kind: "fix", reason: "wrong" } } },
+      { type: "ITEM_CARRIED", recordId: "F-1", recordKind: "finding", toPhase: "c", boundCandidateSha: "", boundContractVersion: contractVersionFor(phase("a")), boundRecordVersion: 1 },
+      { type: "FINDING_RAISED", finding: f2 },
+      { type: "TRIAGE_RECORDED", record: { itemId: "F-2", source: "finding", impact: "wrong-output", disposition: { kind: "fix", reason: "wrong" } } },
+      { type: "DEFERRAL_RECORDED", deferral: { id: "DEF-2", itemId: "F-2", text: "deferred", test: "the cost test", toPhase: "c", status: "open" } },
+    ];
+    fs.writeFileSync(
+      runPaths(runDirA).events,
+      events.map((event, i) => JSON.stringify({ seq: i + 1, ts: new Date().toISOString(), kind: "event", event })).join("\n") + "\n",
+    );
+    fs.writeFileSync(
+      path.join(programDir, "events.jsonl"),
+      [
+        { type: "NODE_STARTED", node: "a", runId: path.basename(runDirA), branch: "main", base: "main" },
+        { type: "NODE_STATUS", node: "a", status: "done" },
+      ]
+        .map((event) => JSON.stringify({ ts: new Date().toISOString(), event }))
+        .join("\n") + "\n",
+    );
+    schedulerTick(programDir, { runRoot, launch: () => undefined, maxTicks: 1 });
+    const { state } = foldProgram(programDir);
+    const planC = JSON.parse(fs.readFileSync(path.join(runPaths(path.join(runRoot, state.nodes["c"]!.runId!)).plan, "v1.json"), "utf8")) as {
+      phases: Array<{ requirements?: Array<{ id: string; verify: string[] }> }>;
+    };
+    const ids = (planC.phases[0].requirements ?? []).map((r) => r.id);
+    assert.ok(ids.includes("CARRY-F-1"), "the carried id imported");
+    assert.ok(ids.includes("DEFER-F-2"), "the deferred id imported too");
+  } finally {
+    cleanupDir(runRoot);
+    cleanupDir(repo.dir);
+  }
+});
+
 test("plan 06i: a deferred wrong-output item's next-node VERIFY is the fix test, not the cost test", async () => {
   const repo = makeRepo();
   const runRoot = makeRunRoot();

@@ -1176,14 +1176,28 @@ export function triageSection(phase: PhaseState): string[] {
     if (d) return `${id}: ${oneLine(d.choice, 300)}`;
     return id;
   };
+  // A repaired finding's fix record is history, not an open blocker (finding
+  // M-77/B-82): list it separately so a DONE summary never reads as if a
+  // repaired item still blocks. `blockingTriageRecords` already omits it from
+  // accept(), so the summary now agrees with the gate.
+  const isRepaired = (id: string) => phase.findings.some((f) => f.id === id && f.status === "repaired");
+  const openFixes = fixes.filter((r) => !isRepaired(r.itemId));
+  const repairedFixes = fixes.filter((r) => isRepaired(r.itemId));
   const lines = ["", `### Triage (${records.length} item(s))`, ""];
-  lines.push(`#### Fixes (${fixes.length}) — blocking until repaired`, "");
-  if (fixes.length === 0) lines.push("- none", "");
-  for (const r of fixes) {
+  lines.push(`#### Fixes (${openFixes.length}) — blocking until repaired`, "");
+  if (openFixes.length === 0) lines.push("- none", "");
+  for (const r of openFixes) {
     const d = r.disposition;
     lines.push(`- ${label(r.itemId)} — ${d?.kind === "fix" ? d.reason : ""}`);
   }
-  if (fixes.length > 0) lines.push("");
+  if (openFixes.length > 0) lines.push("");
+  lines.push(`#### Repaired (${repairedFixes.length})`, "");
+  if (repairedFixes.length === 0) lines.push("- none", "");
+  for (const r of repairedFixes) {
+    const d = r.disposition;
+    lines.push(`- ${label(r.itemId)} — ${d?.kind === "fix" ? d.reason : ""}`);
+  }
+  if (repairedFixes.length > 0) lines.push("");
   lines.push(`#### Trade-offs (${tradeoffs.length}) — accepted`, "");
   if (tradeoffs.length === 0) lines.push("- none", "");
   for (const r of tradeoffs) {
