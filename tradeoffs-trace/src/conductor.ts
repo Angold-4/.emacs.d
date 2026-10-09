@@ -43,6 +43,7 @@ import {
   blockingTriageRecords,
   discoveredDecisions,
   disposition,
+  escalationRequestId,
   evidenceForDecision,
   evidenceForFinding,
   goldenCited,
@@ -4378,6 +4379,12 @@ export class Conductor {
         if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
           handle.evaluationTitleRejections = rejections + 1;
           this.#log.append("evaluation_title_rejected", { messageType, agentId, detail: titleIssue, rejection: rejections + 1 });
+          // Plan 06i (A3, F-A-100): a title is independent of an item check,
+          // so a valid classification survives the title-only re-prompt —
+          // exactly like the message-shape refusal above. Without this a
+          // format nit would erase a confirmed wrong-output and change its
+          // disposition from fix to escalate.
+          if (checkEvents.length > 0) this.#applyEvents(checkEvents);
           return {
             ok: false,
             reason: `invalid title: ${titleIssue}. Give one complete line of at most 80 characters — rewrite it shorter rather than cutting it.`,
@@ -4392,6 +4399,12 @@ export class Conductor {
         if (rejections < 1) {
           handle.itemCheckRejections = rejections + 1;
           this.#log.append("item_check_rejected", { messageType, agentId, missing });
+          // Plan 06i (A3, F-A-99): the checks that ARE valid are persisted
+          // before the re-prompt, so a valid classification survives it and
+          // the retry owes only the missing ids (owed is recomputed from the
+          // retained checks). Otherwise a valid wrong-output confirmation
+          // would be discarded and its disposition could change to escalate.
+          if (checkEvents.length > 0) this.#applyEvents(checkEvents);
           return {
             ok: false,
             reason: `submit_evaluation owes an itemCheck for: ${missing.join(", ")}. For a plan item give { id, verdict: confirmed|contradicted, evidence }. For a finding or discovered decision give { id, verdict: confirmed, impact: wrong-output|contract|judgement, evidence } and, when the impact is judgement, also chosen, alternative and why — without all three the record escalates to the owner.`,
@@ -4888,9 +4901,21 @@ export class Conductor {
       // still reaches DONE. It is not added to `decisions` (it could never
       // get the other seats' ballots).
       const K = this.#state.phase.contract.contractVersion;
+      // Plan 06i (A3, F-A-98): a late discovery never joins `decisions`, so
+      // numbering from `decisions.length + 1` restarts at the same value on
+      // every late call — a second late batch from one reviewer would reuse
+      // an itemId and reduce() would overwrite the first TRIAGE_RECORDED
+      // (C3). Allocate past any id already recorded for this reviewer.
+      const latePrefix = `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-late-`;
+      const taken = new Set((this.#state.phase.triage ?? []).map((r) => r.itemId));
       let n = this.#state.phase.decisions.length + 1;
       for (const d of discoveries) {
-        const itemId = `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-late-${n}`;
+        let itemId = `${latePrefix}${n}`;
+        while (taken.has(itemId)) {
+          n += 1;
+          itemId = `${latePrefix}${n}`;
+        }
+        taken.add(itemId);
         n += 1;
         const ownerRequestId = `OR-${this.#state.phase.phaseId}-triage-${itemId}`;
         // Plan 06i (C2): the disposition is computed by disposition() (the
@@ -6547,7 +6572,13 @@ export class Conductor {
       if (!stillOpen) this.#applyEvent({ type: "DEFERRAL_RESOLVED", deferralId: d.id });
     }
     const dispositionFor = (source: "finding" | "decision", id: string): Disposition => {
-      const ownerRequestId = `OR-${phase.phaseId}-triage-${id}`;
+      // Plan 06i (A3, F-A-97): an escalation must name a request that EXISTS.
+      // If an open request already links the item (an open_finding park
+      // request, a blocker_panel request), the disposition reuses THAT id;
+      // only when the item has no open request is the triage request opened
+      // under the deterministic triage id. Otherwise the record would cite a
+      // request that was never opened and the owner could not answer it.
+      const ownerRequestId = escalationRequestId(phase, id);
       const fresh = this.#state.phase;
       if (source === "finding") {
         const finding = fresh.findings.find((f) => f.id === id)!;

@@ -1107,3 +1107,190 @@ test("plan 06i: a discovered decision justified only by a drafting decision that
     await teardown(setup);
   }
 });
+
+test("plan 06i: a valid classification survives an item-check re-prompt (F-A-99)", async () => {
+  // A3: the first submission confirms X wrong-output with a valid anchor and
+  // leaves Y unclassified. Persisting X before the re-prompt means the retry
+  // owes only Y, and X keeps its fix disposition — it is not discarded and
+  // escalated because the submission was incomplete.
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    phase: { id: "p1", goal: "keep a valid check", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false, rounds: 1 },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: WRITE_SRC }, submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        discoveryStep([]),
+        { kind: "wait-for-prompt" },
+        { kind: "call-tool", tool: "read", args: { path: "src/a.ts" } },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: reviewArgs(reviewer, state, {
+            findings:
+              reviewer === "M"
+                ? [
+                    { kind: "defect", severity: "blocking", evidence: "it works: src/a.ts:1 defect one" },
+                    { kind: "defect", severity: "blocking", evidence: "it works: src/a.ts:1 defect two" },
+                  ]
+                : [],
+          }),
+        },
+      ],
+    }),
+    evaluatorScriptFor: (messageType, state) => {
+      const raw = (state.phase.messages ?? []).filter((m) => m.type === messageType && m.state === "raw");
+      const evals = raw.map((m) => ({ messageId: m.id, action: "publish", title: "reviewed item", summary: m.summary, context: m.context, evidence: m.evidence }));
+      const findings = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.severity === "blocking");
+      const [x, y] = findings;
+      const check = (id: string, impact?: string) => ({ id, verdict: "confirmed", evidence: "src/a.ts:1 the evaluator re-checked the candidate", ...(impact ? { impact } : {}) });
+      const step1 = {
+        kind: "call-submit",
+        tool: "submit_evaluation",
+        args: { evaluations: evals, ...(messageType === "finding" && x && y ? { itemChecks: [check(x.id, "wrong-output"), check(y.id)] } : {}) },
+      };
+      const step2 = {
+        kind: "call-submit",
+        tool: "submit_evaluation",
+        args: { evaluations: evals, ...(messageType === "finding" && x && y ? { itemChecks: [check(x.id), check(y.id, "judgement")] } : {}) },
+      };
+      return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [step1, step2] };
+    },
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const findings = phase.findings.filter((f) => f.raisedBy === "M");
+    assert.equal(findings.length, 2, "two blocking findings are open");
+    const record = (phase.triage ?? []).find((r) => findings.some((f) => f.id === r.itemId) && r.disposition?.kind === "fix");
+    assert.ok(record, "the first finding's confirmed wrong output survived the re-prompt as a fix");
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "item_check_rejected"), "the missing classification was re-prompted once");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06i: a title refusal keeps a validated item check (F-A-100)", async () => {
+  // A3: the evaluator confirms X wrong-output with a valid anchor but
+  // publishes an overlong title. The title-only retry must not erase the
+  // classification: X keeps its fix disposition instead of escalating.
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    phase: { id: "p1", goal: "keep a check across a title refusal", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false, rounds: 1 },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: WRITE_SRC }, submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        discoveryStep([]),
+        { kind: "wait-for-prompt" },
+        { kind: "call-tool", tool: "read", args: { path: "src/a.ts" } },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: reviewArgs(reviewer, state, {
+            findings: reviewer === "M" ? [{ kind: "defect", severity: "blocking", evidence: "it works: src/a.ts:1 a defect" }] : [],
+          }),
+        },
+      ],
+    }),
+    evaluatorScriptFor: (messageType, state) => {
+      const raw = (state.phase.messages ?? []).filter((m) => m.type === messageType && m.state === "raw");
+      const evals = (title: string) => raw.map((m) => ({ messageId: m.id, action: "publish", title, summary: m.summary, context: m.context, evidence: m.evidence }));
+      const finding = (state.phase.findings ?? []).find((f) => f.status === "open");
+      const check = (impact?: string) => ({ id: finding!.id, verdict: "confirmed", evidence: "src/a.ts:1 the evaluator re-checked the candidate", ...(impact ? { impact } : {}) });
+      const overlong = "x".repeat(200);
+      const step1 = {
+        kind: "call-submit",
+        tool: "submit_evaluation",
+        args: { evaluations: evals(overlong), ...(messageType === "finding" && finding ? { itemChecks: [check("wrong-output")] } : {}) },
+      };
+      const step2 = {
+        kind: "call-submit",
+        tool: "submit_evaluation",
+        args: { evaluations: evals("reviewed item"), ...(messageType === "finding" && finding ? { itemChecks: [check()] } : {}) },
+      };
+      return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [step1, step2, step2] };
+    },
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const finding = phase.findings.find((f) => f.raisedBy === "M")!;
+    const record = (phase.triage ?? []).find((r) => r.itemId === finding.id);
+    assert.equal(record?.disposition?.kind, "fix", "the confirmed wrong output survived the title-only re-prompt");
+    assert.ok(readEvents(setup.runDir).some((r) => r.kind === "evaluation_title_rejected"), "the overlong title was refused once");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06i: two late discoveries from one reviewer get distinct ids and both stay visible (F-A-98)", async () => {
+  // A3: late discoveries never join `decisions`, so numbering from the
+  // decision count reused an id and the second TRIAGE_RECORDED overwrote the
+  // first (C3). Two late batches in one REVIEWING window must be two records.
+  let bDispatches = 0;
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    deadlines: { ...FAST, reviewMs: 30_000 },
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'x\\n' > sum.js" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [disclosure("the only known choice")], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => {
+      const d = state.phase.decisions.find((x) => x.source === "worker")!;
+      if (reviewer === "B" && ++bDispatches === 1) {
+        return {
+          hello: defaultReviewerHello(),
+          steps: [
+            { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+            { kind: "wait-for-prompt" },
+          ],
+        };
+      }
+      const late = (choice: string) => ({ ...disclosure(choice), classProposal: "delegated" });
+      const first = reviewer === "B" ? [late("LATE-ONE: validates both arguments before adding")] : [];
+      const second = reviewer === "B" ? [late("LATE-TWO: rejects a negative operand")] : [];
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: first } },
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: second } },
+          { kind: "wait-for-prompt" },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: reviewArgs(reviewer, state, {
+              ballots: [{ decisionId: d.id, vote: "approve", rationale: "consistent with the goal", evidence: ["src/sum.js:1"] }],
+              findings: [],
+            }),
+          },
+        ],
+      };
+    },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const lateRecords = (phase.triage ?? []).filter((r) => r.disposition?.kind === "escalate" && /LATE-(ONE|TWO)/.test(r.disposition.reason));
+    assert.equal(lateRecords.length, 2, "both late discoveries have their own triage record");
+    assert.notEqual(lateRecords[0].itemId, lateRecords[1].itemId, "the two late ids are distinct");
+    const requests = phase.ownerRequests.filter((r) => r.status === "open" && r.blocking === false && /LATE-(ONE|TWO)/.test(r.reason));
+    assert.equal(requests.length, 2, "each late discovery has its own visible, non-blocking owner request");
+    const summary = prSummary(setup.runDir, setup.plan);
+    assert.match(summary, /LATE-ONE/);
+    assert.match(summary, /LATE-TWO/);
+  } finally {
+    await teardown(setup);
+  }
+});

@@ -29,6 +29,19 @@
 
 import type { Decision, Finding, PhaseState } from "./types.ts";
 
+/** Plan 06i (A3/F-A-97): the owner request an escalation names. An
+ * escalation must point at a request the owner can actually answer, so if an
+ * OPEN request already links the item (an `open_finding` park request, a
+ * `blocker_panel` request) that request's id is reused; only when the item
+ * has no open request does the deterministic triage request id apply. Pure:
+ * the conductor opens the request this id names when it does not exist. */
+export function escalationRequestId(phase: PhaseState, itemId: string): string {
+  const existing = (phase.ownerRequests ?? []).find(
+    (r) => r.status === "open" && (r.linkedFindingId === itemId || r.linkedDecisionId === itemId),
+  );
+  return existing?.id ?? `OR-${phase.phaseId}-triage-${itemId}`;
+}
+
 /** What a record's impact on the work is. `wrong-output` covers a wrong
  * value, offer or output on a reachable path; `contract` covers a record
  * that contradicts the current golden source or the plan; `judgement`

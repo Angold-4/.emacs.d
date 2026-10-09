@@ -11,6 +11,7 @@ import { test } from "node:test";
 import {
   disposition,
   dispositionReason,
+  escalationRequestId,
   evidenceForFinding,
   ledgerRecords,
   type TriageRecord,
@@ -43,6 +44,38 @@ test("plan 06i: disposition gives a judgement call a trade-off only when chosen,
 
   const unclassified: TriageRecord = { itemId: "F-3", source: "finding", impact: undefined as never };
   assert.equal(disposition(unclassified, {}).kind, "escalate", "an unclassified record escalates");
+});
+
+test("plan 06i: an escalation reuses an open request that already links the item, else names the triage request", () => {
+  // A3/F-A-97: an escalation must name a request the owner can answer. If an
+  // open request already links the item (an open_finding park request), the
+  // escalation names THAT id; otherwise it names the deterministic triage id
+  // the conductor then opens.
+  const parked = baseState({
+    ownerRequests: [
+      {
+        id: "OR-p1-finding-7",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding F-1 is still open",
+        origin: "open_finding",
+        linkedFindingId: "F-1",
+        status: "open",
+        options: [{ id: "repair", label: "repair" }],
+      },
+    ],
+  }).phase;
+  assert.equal(escalationRequestId(parked, "F-1"), "OR-p1-finding-7", "the open request's own id is reused");
+  assert.equal(escalationRequestId(parked, "F-2"), "OR-p1-triage-F-2", "an item with no open request names the triage request");
+
+  const resolved = baseState({
+    ownerRequests: [{ ...parked.ownerRequests[0], status: "resolved" as const, resolution: { option: "repair" } }],
+  }).phase;
+  assert.equal(
+    escalationRequestId(resolved, "F-1"),
+    "OR-p1-triage-F-1",
+    "a resolved request is not reused: the escalation names the triage request it will open",
+  );
 });
 
 test("plan 06i: a wrong value always wins over a judgement trade-off, whatever the reviewer's label", () => {
