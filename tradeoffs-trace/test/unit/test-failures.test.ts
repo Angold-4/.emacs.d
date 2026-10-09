@@ -92,6 +92,10 @@ test("test-failures: ERT `FAILED <name>` lines are parsed once, with or without 
 test("test-failures: ansi color codes do not hide a failing name", () => {
   const colored = "test exchange_state_machine::tests::cancels_order ... \u001b[31mFAILED\u001b[0m\n";
   assert.deepEqual(parseTestFailures(colored), ["exchange_state_machine::tests::cancels_order"]);
+  // Plan 06j (A2/A-8): a cursor-control prefix is not a numeric SGR code; the
+  // parser must strip it too, or the whole cargo failure line is lost.
+  const cursor = "\u001b[?25ltest a::b ... FAILED\n";
+  assert.deepEqual(parseTestFailures(cursor), ["a::b"]);
 });
 
 test("test-failures: output that names no test yields none", () => {

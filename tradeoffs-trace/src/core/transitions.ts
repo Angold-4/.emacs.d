@@ -135,13 +135,18 @@ function applyRecheck(s: State, ev: Event, to: "CHECKING" | "FINAL_CHECKING", re
   return withPhase(s, {
     phase: to,
     checks: s.phase.checks,
-    ...(restoreRound ? { repairRoundsUsed: Math.max(0, s.phase.repairRoundsUsed - 1) } : {}),
+    ...(restoreRound ? { repairRoundsUsed: Math.max(0, s.phase.repairRoundsUsed - 1), worktreeTainted: true } : {}),
     ownerRequests: s.phase.ownerRequests.map((r) =>
       r.status === "open" && isBudgetGateRequest(r)
         ? { ...r, status: "resolved" as const, resolution: { option: "recheck", note: e.reason } }
         : r,
     ),
-    inFlight: clearInFlight(s.phase, "run_checks", "run_final_checks"),
+    // Clear the stopped attempt's own in-flight entries: the cancelled worker
+    // returns without the attempt-failure events that normally clear
+    // `dispatch_worker`, and a later `REPAIR_ATTEMPT_STARTED -> IMPLEMENTING`
+    // must dispatch a fresh worker (M-3). `dispatch_worker` is the round's
+    // single entry, so it covers both lanes when workers > 1.
+    inFlight: clearInFlight(s.phase, "dispatch_worker", "run_checks", "run_final_checks"),
   });
 }
 

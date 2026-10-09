@@ -834,6 +834,9 @@ BUILD["recheck-requested-from-implementing"] = {
     checks: { candidateSha: "C1", passed: false, tier: "round" },
     repairRoundsUsed: 1,
     repairRoundsGranted: 2,
+    // The stopped attempt's own dispatch is still in flight when the recheck
+    // arrives; the row must clear it or the next repair stalls.
+    inFlight: { dispatch_worker: { actionId: "w1" } },
   }),
   event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "load-only timing", tier: "round" },
 };
@@ -1618,6 +1621,16 @@ BUILD["panel-incomplete"] = {
   }),
   event: { type: "EVALUATION_COMPLETED" },
 };
+
+test("plan 06j: a recheck from IMPLEMENTING clears the stopped attempt's dispatch_worker and refunds its round", () => {
+  const fixture = BUILD["recheck-requested-from-implementing"];
+  const result = reduce(fixture.state, fixture.event);
+  assert.equal(result.ok, true, !result.ok ? result.reason : "");
+  assert.equal(result.state.phase.phase, "CHECKING");
+  assert.equal(result.state.phase.inFlight.dispatch_worker, undefined, "the stopped attempt's dispatch must not survive");
+  assert.equal(result.state.phase.repairRoundsUsed, 0, "the charged round is given back");
+  assert.deepEqual(next(result.state), [{ type: "run_checks", candidateSha: "C1" }]);
+});
 
 test("transition table: every row in transitions.ts has a covering fixture", () => {
   const missing = TRANSITIONS.filter((r) => !BUILD[r.id]).map((r) => r.id);

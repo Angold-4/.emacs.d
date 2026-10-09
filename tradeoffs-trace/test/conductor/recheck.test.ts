@@ -12,6 +12,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor } from "./harness.ts";
+import { runPaths } from "../../src/conductor.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 
@@ -362,6 +363,127 @@ test("plan 06j: tt recheck stops a running repair attempt and re-runs the checks
     assert.equal(eventTypes(setup.runDir).filter((t) => t === "REPAIR_ATTEMPT_STARTED").length, 1, "no second repair attempt");
     assert.equal(eventsOfType(setup.runDir, "RECHECK_REQUESTED").length, 1, "the recheck is recorded");
     assert.ok(eventTypes(setup.runDir).includes("CHECKS_PASSED"), "the recheck's pass is recorded");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
+});
+
+test("plan 06j: a failed recheck from IMPLEMENTING still dispatches the next repair worker", async () => {
+  // M-3: the stopped attempt's inFlight.dispatch_worker must not survive the
+  // recheck, or the next repair's IMPLEMENTING state dispatches nothing.
+  const counter = `/tmp/tt-recheck-stall-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  const alwaysFail = `if grep -q TT_RECHECK_FAIL README.md; then n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${counter}; exit 1; fi; exit 0`;
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "do the thing",
+      acceptance: ["it works"],
+      checks: [alwaysFail],
+      boundaries: [],
+      reserved: [],
+      rounds: 3,
+    },
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'TT_RECHECK_FAIL\\n' >> README.md" }, submitPhaseStep()] }
+        : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => eventTypes(setup.runDir).includes("REPAIR_ATTEMPT_STARTED") && setup.conductor.state.phase.phase === "IMPLEMENTING",
+      90_000,
+      50,
+      setup.runDir,
+    );
+    const before = eventsOfType(setup.runDir, "ACTION_STARTED").filter((e) => e.action === "dispatch_worker").length;
+    const out = await runCli(["recheck", setup.runDir, "--reason", "the machine was busy"]);
+    assert.match(out.stdout, /recheck requested/, out.stdout);
+    // The recheck fails again and the budget remains, so a fresh worker must
+    // actually be dispatched; without the inFlight fix the phase stalls here.
+    await waitFor(
+      () =>
+        setup.conductor.state.phase.phase === "IMPLEMENTING" &&
+        eventsOfType(setup.runDir, "ACTION_STARTED").filter((e) => e.action === "dispatch_worker").length > before,
+      90_000,
+      50,
+      setup.runDir,
+    );
+    assert.ok(eventTypes(setup.runDir).filter((t) => t === "REPAIR_ATTEMPT_STARTED").length >= 2, "the failed recheck leads to another repair");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
+  }
+});
+
+test("plan 06j: a recheck discards the stopped repair worker's tracked and untracked writes", async () => {
+  // A-9: after the recheck stops the worker, the worktree is reset to the
+  // frozen candidate, so the next repair never inherits cancelled writes.
+  const counter = `/tmp/tt-recheck-clean-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  const failOnMarker = "if grep -q TT_RECHECK_FAIL README.md; then exit 1; fi; exit 0";
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "do the thing",
+      acceptance: ["it works"],
+      checks: [failOnMarker],
+      boundaries: [],
+      reserved: [],
+      rounds: 3,
+    },
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'TT_RECHECK_FAIL\\n' >> README.md" }, submitPhaseStep()] }
+        : attempt === 2
+          ? {
+              hello: defaultWorkerHello(),
+              steps: [
+                { kind: "call-sh", command: "printf 'CANCELLED-WRITE\\n' >> README.md; printf 'x\\n' > untracked.txt" },
+                { kind: "hang-until-abort" },
+              ],
+            }
+          : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  const worktree = runPaths(setup.runDir).worktree;
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => eventTypes(setup.runDir).includes("REPAIR_ATTEMPT_STARTED") && setup.conductor.state.phase.phase === "IMPLEMENTING",
+      90_000,
+      50,
+      setup.runDir,
+    );
+    await waitFor(() => fs.existsSync(path.join(worktree, "untracked.txt")), 90_000, 50, setup.runDir);
+    const out = await runCli(["recheck", setup.runDir, "--reason", "the check was killed by the machine"]);
+    assert.match(out.stdout, /recheck requested/, out.stdout);
+    // The worktree is reset to the frozen candidate: neither write survives.
+    await waitFor(
+      () => !fs.existsSync(path.join(worktree, "untracked.txt")) && !fs.readFileSync(path.join(worktree, "README.md"), "utf8").includes("CANCELLED-WRITE"),
+      90_000,
+      50,
+      setup.runDir,
+    );
+    // The recheck fails again (the marker is still present), so the next
+    // repair starts from the clean frozen candidate.
+    await waitFor(
+      () => setup.conductor.state.phase.phase === "IMPLEMENTING" && eventTypes(setup.runDir).filter((t) => t === "REPAIR_ATTEMPT_STARTED").length >= 2,
+      90_000,
+      50,
+      setup.runDir,
+    );
+    assert.ok(!fs.existsSync(path.join(worktree, "untracked.txt")), "the untracked write is gone");
+    assert.ok(!fs.readFileSync(path.join(worktree, "README.md"), "utf8").includes("CANCELLED-WRITE"), "the tracked write is gone");
   } finally {
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);

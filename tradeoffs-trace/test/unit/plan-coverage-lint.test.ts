@@ -77,6 +77,87 @@ test("plan 06j: a repo whose CI runs cargo fmt --all warns a plan that never doe
   }
 });
 
+test("plan 06j: a root crate covered by src/** is warned, and '*.md' does not cover nested packages", () => {
+  // (a) a single-package repository: the crate's dir is '.', so any boundary
+  // glob inside the repo covers it (A1's covered-crate guarantee).
+  const single = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-single-"));
+  fs.mkdirSync(path.join(single, "src"), { recursive: true });
+  fs.writeFileSync(path.join(single, "Cargo.toml"), '[package]\nname = "root"\nversion = "0.1.0"\n');
+  try {
+    const rootPlan: LintPlanInput = { repo: single, phases: [{ id: "p1", boundaries: ["src/**"], checks: ["true"] }] };
+    const warnings = checkCoverageWarnings(rootPlan, readRepoFacts(single));
+    assert.equal(warnings.filter((f) => f.rule === "coverage" && f.item.includes("root")).length, 1, JSON.stringify(warnings));
+  } finally {
+    fs.rmSync(single, { recursive: true, force: true });
+  }
+
+  // (b) a prefix-less glob is one path segment (`*.md` is root-only), so it
+  // cannot cover a nested crate; `**` can.
+  const root = cargoFixture();
+  try {
+    const mdPlan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: ["*.md"], checks: ["cargo test -p a"] }] };
+    assert.deepEqual(
+      checkCoverageWarnings(mdPlan, readRepoFacts(root)).filter((f) => f.rule === "coverage"),
+      [],
+      "*.md must not cover nested crates",
+    );
+    mdPlan.phases![0].boundaries = ["**"];
+    const all = checkCoverageWarnings(mdPlan, readRepoFacts(root)).filter((f) => f.rule === "coverage");
+    assert.ok(all.some((f) => f.item.includes("b")) && all.some((f) => f.item.includes("c")), JSON.stringify(all));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("plan 06j: a plain cargo fmt --all or --all in another segment never mirrors CI's fmt --all --check", () => {
+  const root = cargoFixture("run: cargo fmt --all --check");
+  try {
+    const plan: LintPlanInput = {
+      repo: root,
+      phases: [{ id: "p1", boundaries: [], checks: ["cargo fmt -p a --check && cargo clippy --all"] }],
+    };
+    assert.equal(
+      checkCoverageWarnings(plan, readRepoFacts(root)).filter((f) => /cargo fmt --all/.test(f.problem)).length,
+      1,
+      "--all in a different segment is not the same invocation",
+    );
+    plan.phases![0].checks = ["cargo fmt --all"];
+    assert.equal(
+      checkCoverageWarnings(plan, readRepoFacts(root)).filter((f) => /cargo fmt --all/.test(f.problem)).length,
+      1,
+      "a plain cargo fmt --all reformats and exits 0, so it never catches drift",
+    );
+    plan.phases![0].checks = ["cargo fmt --all --check"];
+    assert.deepEqual(checkCoverageWarnings(plan, readRepoFacts(root)).filter((f) => /cargo fmt --all/.test(f.problem)), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("plan 06j: a CI run block's separate lines are not one cargo fmt invocation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-ciblock-"));
+  fs.writeFileSync(path.join(root, "Cargo.toml"), '[workspace]\nmembers = ["a"]\n');
+  fs.mkdirSync(path.join(root, "a"), { recursive: true });
+  fs.writeFileSync(path.join(root, "a", "Cargo.toml"), '[package]\nname = "a"\nversion = "0.1.0"\n');
+  fs.mkdirSync(path.join(root, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, ".github", "workflows", "ci.yml"),
+    "name: CI\non: [push]\njobs:\n  t:\n    steps:\n      - run: |\n          cargo fmt --check\n          cargo test --all\n",
+  );
+  try {
+    const facts = readRepoFacts(root);
+    assert.ok(facts.ciCommands.some((c) => c.includes("cargo fmt --check\ncargo test --all")), JSON.stringify(facts.ciCommands));
+    const plan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: [], checks: ["cargo test -p a"] }] };
+    assert.deepEqual(
+      checkCoverageWarnings(plan, facts).filter((f) => /cargo fmt --all/.test(f.problem)),
+      [],
+      "fmt --check and test --all are separate lines, not one fmt --all --check",
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("plan 06j: coverage facts read a workspace's crates and its workflow commands", () => {
   const root = cargoFixture("run: cargo fmt --all --check");
   try {

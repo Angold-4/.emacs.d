@@ -902,10 +902,17 @@ export function globCoversDir(glob: string, dir: string): boolean {
   const g = glob.trim().replace(/\/+$/, "");
   const d = dir.trim().replace(/\/+$/, "") || ".";
   if (g.length === 0) return false;
+  // A root package is the whole repository, so any repo-relative glob covers
+  // it: a `src/**` boundary lets the phase change the single root crate.
+  if (d === ".") return !g.startsWith("/") && !g.startsWith("..");
   if (matchesGlob(g, d) || matchesGlob(g, `${d}/`)) return true;
   const prefix = globPrefix(g);
-  if (prefix.length === 0) return true; // `**`, `*` — everything
-  if (d === ".") return prefix === ".";
+  if (prefix.length === 0) {
+    // A glob whose first segment is a wildcard: `**` is recursive and covers
+    // everything; `*`/`*.md` matches only root-level entries, so it cannot
+    // cover a nested package (boundaries.ts:42-62 gives `*` one segment).
+    return g.startsWith("**");
+  }
   if (prefix === ".") return false;
   return d === prefix || d.startsWith(`${prefix}/`) || prefix.startsWith(`${d}/`);
 }
@@ -924,9 +931,18 @@ export function commandNamesPackage(command: string, name: string, cargo: boolea
   return !cargo && tokens.includes(name);
 }
 
-/** True when a command runs `cargo fmt --all` (with or without `--check`). */
+/** True when a command runs `cargo fmt --all --check` in one invocation. A
+ * plain `cargo fmt --all` reformats and exits 0, so it never catches the
+ * rustfmt drift CI rejects; `--all` in another segment (`cargo fmt -p a
+ * --check && cargo clippy --all`) is not the same invocation either. */
 export function runsCargoFmtAll(command: string): boolean {
-  return /(^|[\s;&|])cargo\s+fmt(\s|$)/.test(command) && /(^|\s)--all(\s|$)/.test(command);
+  for (const segment of command.split(/[;&|\n]+/)) {
+    if (!/(^|\s)cargo\s+fmt(\s|$)/.test(segment)) continue;
+    if (!/(^|\s)--all(\s|$)/.test(segment)) continue;
+    if (!/(^|\s)--check(\s|$)/.test(segment)) continue;
+    return true;
+  }
+  return false;
 }
 
 /** Plan 06j (A1): the ONE place coverage is judged. Warnings only, never

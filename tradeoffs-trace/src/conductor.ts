@@ -2945,7 +2945,7 @@ export class Conductor {
    * worker running; the event re-runs the same tier, dispatches no worker and
    * spends no repair round. A hand-written inbox file is checked exactly like
    * the CLI's own path. */
-  #processRecheckCommand(file: string, commandId: string, raw: Record<string, unknown>): void {
+  async #processRecheckCommand(file: string, commandId: string, raw: Record<string, unknown>): Promise<void> {
     const name = this.#state.phase.phase;
     if (name === "DONE" || name === "BLOCKED") {
       this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
@@ -2983,15 +2983,37 @@ export class Conductor {
       return;
     }
     if (name === "IMPLEMENTING") {
-      // Plan 06j (A3, owner steer 19:41Z): a check failure with budget left
-      // starts a repair attempt by itself, and the owner may still recheck
-      // the frozen candidate while it has not submitted (the phase would be
-      // FREEZING otherwise). Stop the worker: nothing it wrote is kept, and
-      // the round it charged is given back by the transition.
+      // Plan 06j (A3, owner steer 19:41Z/20:10Z): a check failure with budget
+      // left starts a repair attempt by itself, and the owner may still
+      // recheck the frozen candidate while it has not submitted (the phase
+      // would be FREEZING otherwise). Stop the worker, AWAIT its termination,
+      // and discard every write it made (tracked and untracked) by recreating
+      // the worktree at the frozen candidate before the checks re-run. The
+      // round it charged is given back by the transition.
       const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
       if (worker) {
-        this.#recheckCancelledAttempt = worker.agentId;
-        void worker.agent.terminate().catch(() => undefined);
+        // The await below yields to the event loop; mark the command in
+        // flight so the next inbox scan leaves the file alone.
+        this.#steerInFlight.add(commandId);
+        try {
+          this.#recheckCancelledAttempt = worker.agentId;
+          await worker.agent.terminate().catch(() => undefined);
+          try {
+            if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
+            createWorktree(this.#plan.repo, this.#paths.worktree, candidate.sha);
+          } catch (err) {
+            this.#log.append("error", { where: "recheck_worktree_reset", error: String((err as Error)?.message ?? err) });
+          }
+          // The cancelled attempt has no attempt-failure event of its own, so
+          // record why the round was refunded (M-39).
+          this.#log.append("recheck_cancelled_repair", {
+            candidateSha: candidate.sha,
+            agentId: worker.agentId,
+            refundedRound: this.#state.phase.repairRoundsUsed,
+          });
+        } finally {
+          this.#steerInFlight.delete(commandId);
+        }
       }
     } else if (name !== "AWAITING_OWNER") {
       this.#rejectInboxFile(file, commandId, `recheck refused: the phase is ${name}; only a parked or repairing phase whose checks just failed accepts a recheck`);
@@ -3083,7 +3105,10 @@ export class Conductor {
     // Handled before the input-kind map so a hand-written file cannot bypass
     // the same conditions the CLI checks.
     if (raw !== null && typeof raw === "object" && (raw as { type?: unknown }).type === "recheck") {
-      this.#processRecheckCommand(file, commandId, raw as Record<string, unknown>);
+      // Async because stopping an IMPLEMENTING worker awaits its termination
+      // and the worktree reset; `#steerInFlight` keeps a second scan off the
+      // file until it finishes.
+      void this.#processRecheckCommand(file, commandId, raw as Record<string, unknown>);
       return;
     }
 
