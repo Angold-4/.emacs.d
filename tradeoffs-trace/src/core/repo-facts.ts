@@ -79,27 +79,23 @@ function expandMember(root: string, member: string): string[] {
   return entries.map((name) => (parent ? `${parent}/${name}` : name));
 }
 
-/** Every package/crate the repository defines: the workspace members, or the
- * root package when there is no `[workspace]`. A NON-VIRTUAL workspace (a
- * root Cargo.toml that is both `[package]` and `[workspace]`) also defines a
- * root crate beside its members, so it is inventoried too; a virtual manifest
- * (no `[package]`) contributes no root package (E-76). */
+/** Every package/crate the repository defines: the root package when the root
+ * Cargo.toml has a `[package]` table, plus its workspace members. There is NO
+ * basename fallback: without a `[package]` header the root is never a package
+ * (OD-11/OD-12), so a virtual manifest (even with empty members) yields no
+ * root package, and a member with no package name is skipped. */
 function readPackages(root: string): RepoPackage[] {
   const rootToml = readFileOrUndefined(path.join(root, "Cargo.toml"));
   if (rootToml === undefined) return [];
-  const members = cargoMembers(rootToml);
-  const dirs = members.length > 0 ? members.flatMap((m) => expandMember(root, m)) : [""];
   const out: RepoPackage[] = [];
-  if (members.length > 0) {
-    const rootName = cargoPackageName(rootToml);
-    if (rootName !== undefined && rootName.length > 0) out.push({ name: rootName, dir: "." });
-  }
-  for (const dir of dirs) {
-    const toml = dir === "" ? rootToml : readFileOrUndefined(path.join(root, dir, "Cargo.toml"));
+  const rootName = cargoPackageName(rootToml);
+  if (rootName !== undefined && rootName.length > 0) out.push({ name: rootName, dir: "." });
+  for (const dir of cargoMembers(rootToml).flatMap((m) => expandMember(root, m))) {
+    const toml = readFileOrUndefined(path.join(root, dir, "Cargo.toml"));
     if (toml === undefined) continue;
-    const name = cargoPackageName(toml) ?? (dir === "" ? path.basename(root) : path.basename(dir));
-    if (name.length === 0) continue;
-    out.push({ name, dir: dir === "" ? "." : dir });
+    const name = cargoPackageName(toml);
+    if (name === undefined || name.length === 0) continue;
+    out.push({ name, dir });
   }
   return out;
 }

@@ -203,6 +203,22 @@ test("plan 06j: a non-virtual workspace's root [package] is inventoried too", ()
   }
 });
 
+test("plan 06j: a virtual root with empty members yields no packages", () => {
+  // OD-12: without a [package] header the root is never a package, even when
+  // `members` is empty — no basename fallback.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-emptyws-"));
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Cargo.toml"), "[workspace]\nmembers = []\n");
+  try {
+    const facts = readRepoFacts(root);
+    assert.deepEqual(facts.packages, [], JSON.stringify(facts.packages));
+    const plan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: ["src/**"], checks: ["true"] }] };
+    assert.deepEqual(checkCoverageWarnings(plan, facts).filter((f) => f.rule === "coverage"), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("plan 06j: a plan with no repository lints as before", () => {
   const plan: LintPlanInput = { phases: [{ id: "p1", boundaries: ["a/**"], checks: ["cargo test -p a"] }] };
   assert.deepEqual(checkCoverageWarnings(plan, { packages: [], ciCommands: [], cargo: false }), []);
