@@ -80,7 +80,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -133,6 +133,9 @@ function parseArgs(argv: string[]): {
   skipModelsCheck: boolean;
   envFile?: string;
   toPhase?: string;
+  /** Plan 06i: `tt defer --test <name>` / `--owner-ruling <id>`, the guard. */
+  deferTest?: string;
+  deferOwnerRuling?: string;
 } {
   const positional: string[] = [];
   let root: string | undefined;
@@ -148,6 +151,8 @@ function parseArgs(argv: string[]): {
   let runId: string | undefined;
   let phaseId: string | undefined;
   let source: string | undefined;
+  let deferTest: string | undefined;
+  let deferOwnerRuling: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--root") {
@@ -196,11 +201,19 @@ function parseArgs(argv: string[]): {
       toPhase = argv[++i];
     } else if (arg.startsWith("--to=")) {
       toPhase = arg.slice("--to=".length);
+    } else if (arg === "--test") {
+      deferTest = argv[++i];
+    } else if (arg.startsWith("--test=")) {
+      deferTest = arg.slice("--test=".length);
+    } else if (arg === "--owner-ruling") {
+      deferOwnerRuling = argv[++i];
+    } else if (arg.startsWith("--owner-ruling=")) {
+      deferOwnerRuling = arg.slice("--owner-ruling=".length);
     } else {
       positional.push(argv[i]);
     }
   }
-  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase };
+  return { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase, deferTest, deferOwnerRuling };
 }
 
 /** Plan 03c: resolve a readable id `<program>-NN` to the node's run
@@ -1605,6 +1618,105 @@ async function cmdCarry(positional: string[], root: string, toPhase: string | un
   }
 }
 
+/** Plan 06i: `tt defer <run> <id> [--test <name>] [--owner-ruling <id>]
+ * [--to <phase>]` — the owner puts off an item's fix. A deferral needs a
+ * guard: a test that shows the item's current cost, or a recorded owner
+ * ruling. Neither given: refused with the reason (never written to the
+ * inbox). Either given: queued like every owner command; the conductor
+ * records it and `tt summary` lists it under "Open deferrals" until
+ * resolved. */
+async function cmdDefer(
+  positional: string[],
+  root: string,
+  guard: { test?: string; ownerRuling?: string; toPhase?: string },
+): Promise<void> {
+  const runDir = resolveRunDir(positional[0], root);
+  const recordId = positional[1];
+  if (!recordId) usage();
+  const test = guard.test?.trim();
+  const ownerRuling = guard.ownerRuling?.trim();
+  if (!test && !ownerRuling) {
+    process.stdout.write(
+      "defer rejected: a deferral needs a guard — --test <test that shows its current cost> or --owner-ruling <ruling id>\n",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const finding = state.phase.findings.find((f) => f.id === recordId);
+  const decision = state.phase.decisions.find((d) => d.id === recordId);
+  if (!finding && !decision) {
+    process.stdout.write(`defer rejected: no finding or decision ${recordId} in run ${path.basename(runDir)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  // Plan 06i (A4/R7): the guard must be SUBSTANTIVE, not just spelled. A
+  // `--test` must be a test the item resolver already resolved against this
+  // phase's check run (or one the repo's own test files contain); an
+  // `--owner-ruling` must name a recorded owner input/directive/request.
+  if (test && !deferralTestExists(runDir, plan.repo, state, test)) {
+    process.stdout.write(`defer rejected: no resolved or existing test named "${test}" shows the item's current cost\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (ownerRuling && !recordedOwnerRuling(state, ownerRuling)) {
+    process.stdout.write(`defer rejected: ${ownerRuling} is not a recorded owner input, directive or request\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const boundRecordVersion = finding ? finding.version : decision!.version;
+  const inbox = path.join(runDir, "inbox");
+  mkdirSync(inbox, { recursive: true });
+  const commandId = `defer-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  const command = {
+    type: "defer",
+    text: finding ? finding.evidence : decision!.choice,
+    ...(test ? { test } : {}),
+    ...(ownerRuling ? { ownerRuling } : {}),
+    ...(guard.toPhase ? { toPhase: guard.toPhase.trim() } : {}),
+    binding: {
+      runId: state.phase.runId,
+      phaseId: state.phase.phaseId,
+      candidateSha: state.phase.candidate?.sha ?? "",
+      contractVersion: state.phase.contract.contractVersion,
+      recordId,
+      recordVersion: boundRecordVersion,
+    },
+  };
+  writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
+  const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
+  if (outcome.kind === "applied") {
+    process.stdout.write(`deferred ${recordId}${guard.toPhase ? ` to ${guard.toPhase.trim()}` : ""} in run ${path.basename(runDir)}\n`);
+  } else if (outcome.kind === "rejected") {
+    process.stdout.write(`defer rejected: ${outcome.reason}\n`);
+    process.exitCode = 1;
+  } else {
+    process.stdout.write(`queued defer ${commandId} for ${recordId} (queued, not yet applied)\n`);
+  }
+}
+
+/** Plan 06i (A4/R7): a deferral's `--test` guard is substantive only when
+ * the item resolver already resolved that test against the phase's check run,
+ * or the repo's own test files contain it. */
+function deferralTestExists(runDir: string, repo: string, state: ReturnType<typeof rebuildState>, test: string): boolean {
+  // The item resolver must have RESOLVED the test against this phase's check
+  // run. A mere mention of the name in the repo (a comment, a doc, a string
+  // literal) is not a test that shows the item's current cost, so there is no
+  // substring fallback.
+  void runDir;
+  void repo;
+  return (state.phase.checkResolution ?? []).some((r) => r.name === test && r.outcome === "passed");
+}
+
+/** Plan 06i (A4/R7): an `--owner-ruling` guard is substantive only when it
+ * names a RECORDED OWNER INPUT (an inbox command id). An auto-opened triage
+ * owner request is a question, not a ruling, and an owner directive is not a
+ * ruling on this item either. */
+function recordedOwnerRuling(state: ReturnType<typeof rebuildState>, id: string): boolean {
+  return (state.phase.ownerInputs ?? []).some((i) => i.id === id);
+}
+
 /** Plan 05j: record a lint violation the render just named. Every render
  * (conductor, `tt contract rebuild`, a late verdict, an entry command) must
  * leave the log's copy, not just the view's red first line (findings A-18,
@@ -1738,7 +1850,7 @@ async function main(): Promise<void> {
     await runConductorProcess(rest[0]);
     return;
   }
-  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase } = parseArgs(rest);
+  const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase, deferTest, deferOwnerRuling } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
   if (cmd === "start") {
     if (positional.length !== 1) usage();
@@ -1777,6 +1889,9 @@ async function main(): Promise<void> {
   } else if (cmd === "carry") {
     if (positional.length !== 2) usage();
     await cmdCarry(positional, runRoot, toPhase);
+  } else if (cmd === "defer") {
+    if (positional.length !== 2) usage();
+    await cmdDefer(positional, runRoot, { test: deferTest, ownerRuling: deferOwnerRuling, toPhase });
   } else if (cmd === "entry") {
     if (positional.length < 3) usage();
     await cmdEntry(positional, runRoot, reason);

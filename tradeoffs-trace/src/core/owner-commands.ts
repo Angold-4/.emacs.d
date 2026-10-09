@@ -383,7 +383,9 @@ export function applyOverrideCast(phase: PhaseState, event: EvOverrideCast): Pha
 export type AwaitingOwnerTarget = "AWAITING_OWNER" | "REPAIRING" | "RESOLVING";
 
 export function awaitingOwnerTarget(phase: PhaseState): AwaitingOwnerTarget {
-  if (phase.ownerRequests.some((r) => r.status === "open")) return "AWAITING_OWNER";
+  // Plan 06i: a non-blocking request (a late discovery's escalation) does not
+  // park the phase.
+  if (phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false)) return "AWAITING_OWNER";
   if (phase.corrections.some((c) => c.status === "open")) return "REPAIRING";
   if (phase.candidate) return "RESOLVING";
   return "AWAITING_OWNER";

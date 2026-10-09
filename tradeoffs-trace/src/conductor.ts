@@ -38,6 +38,26 @@ import { isLaneRound, laneFailureLines, lanesOfContract, runRound, type LaneBuil
 // Plan 06h (A1/A2): the seat list, its leader and the lane count are the
 // plan's, read from one place (`seatsOf`/`leaderOf`).
 import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
+// Plan 06i: triage — the only place fix / trade-off / escalate is decided.
+import {
+  blockingTriageRecords,
+  discoveredDecisions,
+  disposition,
+  evidenceForDecision,
+  evidenceForFinding,
+  goldenCited,
+  hasBlockingFix,
+  impactOverride,
+  isClassified,
+  ledgerRecords,
+  openFindings,
+  ownerRequestIsStale,
+  recordClassified,
+  recordImpact,
+  undispositionedBlockingFinding,
+  type Disposition,
+  type TriageRecord,
+} from "./core/triage.ts";
 import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
 import { checkCommands, checkTier, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand } from "./core/checks.ts";
@@ -141,7 +161,7 @@ import {
   sameVersion,
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
-import { isRepairForcingOption } from "./core/owner-requests.ts";
+import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
 import { itemsNeedingEvaluatorReverify, pendingEvidenceItems } from "./core/predicate.ts";
@@ -382,6 +402,11 @@ export interface RunPlanPhase {
    * the phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted
    * runs it, once. */
   finalChecks?: string[];
+  /** Plan 06i (A3): the phase's golden note (`#+TT_GOLDEN:`, overridden by
+   * the phase's `:GOLDEN:`). A choice justified only by an earlier drafting
+   * decision is re-checked against it; a `contract` classification must cite
+   * it. */
+  golden?: string;
 }
 
 /** The on-disk plan file `tt start` reads. Only phase 0 (index 0) is run by
@@ -779,6 +804,7 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     ...(phase.gateCleanup ? { gateCleanup: phase.gateCleanup } : {}),
     // Plan 06c: a declared final check is part of the frozen contract.
     ...(finalCheckOf(phase) ? { finalChecks: phase.finalChecks } : {}),
+    ...(typeof phase.golden === "string" && phase.golden.trim().length > 0 ? { golden: phase.golden } : {}),
     // Plan 06g: the lane count and the round budget are frozen into the
     // contract, so the FSM, the prompts and the views all read one value.
     ...(workersOf(phase) > 1 ? { workers: workersOf(phase) } : {}),
@@ -3168,6 +3194,19 @@ export class Conductor {
       this.#rejectInboxFile(file, commandId, `command is bound to phase ${boundPhaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
       return;
     }
+    // Plan 06i (A4/R7): a deferral's guard must be substantive, so a
+    // hand-written inbox file cannot bypass the CLI's own check.
+    if (event.type === "DEFERRAL_RECORDED") {
+      const d = event.deferral;
+      if (d.test && !this.#deferralTestExists(d.test)) {
+        this.#rejectInboxFile(file, commandId, `no resolved or existing test named "${d.test}" shows the item's current cost`);
+        return;
+      }
+      if (d.ownerRuling && !this.#recordedOwnerRuling(d.ownerRuling)) {
+        this.#rejectInboxFile(file, commandId, `${d.ownerRuling} is not a recorded owner input, directive or request`);
+        return;
+      }
+    }
     const result = reduce(this.#state, event);
     if (!result.ok) {
       this.#rejectInboxFile(file, commandId, result.reason);
@@ -3177,6 +3216,21 @@ export class Conductor {
     this.#applyEvent(event, commandId);
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 06i (A4/R7): a deferral's `--test` guard is substantive only when
+   * the item resolver resolved that test against this phase's check run, or
+   * the repo's own test files contain it. */
+  #deferralTestExists(test: string): boolean {
+    // The item resolver must have RESOLVED the test against this phase's check
+    // run; a mere mention in the repo is not a test that shows the cost.
+    return (this.#state.phase.checkResolution ?? []).some((r) => r.name === test && r.outcome === "passed");
+  }
+
+  /** Plan 06i (A4/R7): an `--owner-ruling` guard is substantive only when it
+   * names a RECORDED OWNER INPUT (an inbox command id). */
+  #recordedOwnerRuling(id: string): boolean {
+    return (this.#state.phase.ownerInputs ?? []).some((i) => i.id === id);
   }
 
   /** Moves an inbox file into `destDir`. A missing source is a no-op (it was
@@ -3519,12 +3573,27 @@ export class Conductor {
         // Plan 05e (finding #34): the round's evaluators and panels have
         // settled, so the candidate's final approval state is known.
         try {
-          // Plan 06b: the item loop settles here — the per-item majority, the
+          // Plan 06b: the item loop settles FIRST — the per-item majority, the
           // evaluator's overturns, and a blocking finding for every item a
-          // majority did not meet (or fit).
+          // majority did not meet (or fit). Its conductor-raised findings must
+          // exist before triage so every one of them gets a disposition.
           this.#applyItemOutcomes();
         } catch (err) {
           this.#log.append("error", { where: "item_outcomes", error: String((err as Error)?.message ?? err) });
+        }
+        try {
+          // Plan 06i: triage every finding and discovered decision — including
+          // the item findings just raised — so nothing disappears and
+          // acceptance waits on a fix or an owner request.
+          this.#applyTriage();
+        } catch (err) {
+          // A1: a record without a disposition is a defect of the loop, never
+          // a pass. The failure is recorded and the phase parks on the owner;
+          // it never continues to acceptance as if triage had passed.
+          const reason = String((err as Error)?.message ?? err);
+          this.#log.append("triage_failed", { error: reason });
+          this.#applyEvent({ type: "TRIAGE_FAILED", reason });
+          return;
         }
         try {
           this.#recordCandidateApproval();
@@ -4199,11 +4268,100 @@ export class Conductor {
       if (!Array.isArray(entries)) {
         return { ok: false, reason: "submit_evaluation needs an evaluations array" };
       }
+      // Plan 06b (OD-2 A3): ONE item-check form, submit_evaluation.itemChecks[]
+      // = { id, verdict, evidence }. For every item with a review-only
+      // majority unmet/deviates the evaluator owes a check: a missing one is
+      // re-prompted once, then recorded `unchecked` (visible, never silent).
+      // Plan 06i: the same form carries a finding's/discovered decision's
+      // impact class. Parsed BEFORE the B-16 whole-submission check, because a
+      // triage classification is independent of the message evaluations: a
+      // submission whose evaluations are incomplete still classifies its
+      // records (they are recorded), while the messages themselves stay
+      // unevaluated exactly as before.
+      const owed = this.#owedItemCheckIds(messageType);
+      const checkEvents: Event[] = [];
+      const provided = new Set<string>();
+      const itemChecks = (msg.args as { itemChecks?: unknown }).itemChecks;
+      if (Array.isArray(itemChecks)) {
+        for (const c of itemChecks as Array<{ id?: unknown; verdict?: unknown; evidence?: unknown; impact?: unknown; chosen?: unknown; alternative?: unknown; why?: unknown }>) {
+          const id = typeof c?.id === "string" ? c.id.trim() : "";
+          const verdict = c?.verdict === "confirmed" || c?.verdict === "contradicted" ? c.verdict : undefined;
+          const evidence = typeof c?.evidence === "string" ? c.evidence.trim() : "";
+          // Plan 06i: the same item-check form carries the evaluator's impact
+          // class for a finding or discovered decision. An unknown value is
+          // ignored, which leaves the record unclassified and escalates.
+          const impact =
+            c?.impact === "wrong-output" || c?.impact === "contract" || c?.impact === "judgement" ? c.impact : undefined;
+          // Plan 06i: a judgement call's own chosen/alternative/why, from the
+          // evaluator. The conductor never supplies stock text.
+          const chosen = typeof c?.chosen === "string" && c.chosen.trim().length > 0 ? c.chosen.trim() : undefined;
+          const alternative = typeof c?.alternative === "string" && c.alternative.trim().length > 0 ? c.alternative.trim() : undefined;
+          const why = typeof c?.why === "string" && c.why.trim().length > 0 ? c.why.trim() : undefined;
+          const isTriage = openFindings(this.#state.phase).some((f) => f.id === id) || discoveredDecisions(this.#state.phase).some((d) => d.id === id);
+          if (id.length === 0 || !verdict || evidence.length === 0) continue;
+          if (isTriage && impact === undefined) continue;
+          // OD-15(2): for a finding/decision, only a CONFIRMED check with an
+          // impact is a supplied classification. A `contradicted` verdict does
+          // not classify (triage.ts only reads confirmed), so it must be
+          // re-prompted once like a missing one, then escalated. A plan item's
+          // contradicted check is still a supplied check (it overturns).
+          if (!isTriage || verdict === "confirmed") provided.add(id);
+          // OD-2 A3 (carried here): a `confirmed` check has its anchors
+          // validated exactly like a `contradicted` one. A confirmed check
+          // whose anchors do not exist in the candidate is recorded as
+          // `unchecked by evaluator`, never as a confirmation.
+          if (verdict === "confirmed") {
+            const item = flatItems(this.#planItems()).find((i) => i.id === id);
+            const ctx = item ? this.#verdictContext(item, "M") : undefined;
+            // Plan 06i: a finding or discovered decision is not a plan item, so
+            // its confirmed anchors are validated directly against the
+            // candidate (the same 06c rule).
+            // A finding or discovered decision is not a plan item: its
+            // confirmed anchors are a candidate file:line. A golden note may
+            // substitute ONLY for a `contract` classification — a wrong-output
+            // claim still needs a reachable-path anchor (A3's 06c rule).
+            const goldenOk = impact === "contract" && goldenCited(this.#state.phase, evidence);
+            const valid = item
+              ? Boolean(ctx) && this.#itemCheckAnchorsValid(evidence, ctx!)
+              : this.#candidateAnchorsValid(evidence) || goldenOk;
+            if (!valid) {
+              this.#log.append("item_check_anchor_invalid", { messageType, agentId, itemId: id, evidence });
+              checkEvents.push({
+                type: "ITEM_CHECK_RECORDED",
+                itemId: id,
+                verdict: "unchecked",
+                evidence: `unchecked by evaluator: the confirmed check's anchors do not exist in the candidate (${evidence})`,
+              });
+              continue;
+            }
+          }
+          checkEvents.push({
+            type: "ITEM_CHECK_RECORDED",
+            itemId: id,
+            verdict,
+            evidence,
+            ...(impact ? { impact } : {}),
+            ...(chosen ? { chosen } : {}),
+            ...(alternative ? { alternative } : {}),
+            ...(why ? { why } : {}),
+          });
+        }
+      }
       // B-16 / owner directive 1: validate the WHOLE submission before
-      // applying anything. An invalid one is refused back to the evaluator
-      // (like an incomplete review), never partly applied.
+      // applying the message evaluations. An invalid one is refused back to
+      // the evaluator (like an incomplete review), never partly applied —
+      // except that the independent triage classifications above are kept,
+      // so a record is never left unclassified merely because the evaluator's
+      // message entries were incomplete.
       const issue = this.#evaluationIssue(messageType, entries as EvaluationEntry[]);
-      if (issue) return { ok: false, reason: `invalid evaluation: ${issue}` };
+      if (issue) {
+        // Plan 06i: the item checks are independent of the message
+        // evaluations, so they are recorded even when the submission is
+        // refused for its message entries (B-16 governs the evaluations, not
+        // the classification).
+        if (checkEvents.length > 0) this.#applyEvents(checkEvents);
+        return { ok: false, reason: `invalid evaluation: ${issue}` };
+      }
       // Plan 05c: a published title must be one complete line, not a
       // truncation at the 80-character cap. Refused back to the model, at
       // most MAX_INCOMPLETE_REVIEW_REJECTIONS times, then accepted as is —
@@ -4222,42 +4380,6 @@ export class Conductor {
         this.#log.append("evaluation_title_accepted", { messageType, agentId, detail: titleIssue, rejections });
       }
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
-      // Plan 06b (OD-2 A3): ONE item-check form, submit_evaluation.itemChecks[]
-      // = { id, verdict, evidence }. For every item with a review-only
-      // majority unmet/deviates the evaluator owes a check: a missing one is
-      // re-prompted once, then recorded `unchecked` (visible, never silent).
-      const owed = this.#owedItemCheckIds(messageType);
-      const checkEvents: Event[] = [];
-      const provided = new Set<string>();
-      const itemChecks = (msg.args as { itemChecks?: unknown }).itemChecks;
-      if (Array.isArray(itemChecks)) {
-        for (const c of itemChecks as Array<{ id?: unknown; verdict?: unknown; evidence?: unknown }>) {
-          const id = typeof c?.id === "string" ? c.id.trim() : "";
-          const verdict = c?.verdict === "confirmed" || c?.verdict === "contradicted" ? c.verdict : undefined;
-          const evidence = typeof c?.evidence === "string" ? c.evidence.trim() : "";
-          if (id.length === 0 || !verdict || evidence.length === 0) continue;
-          provided.add(id);
-          // OD-2 A3 (carried here): a `confirmed` check has its anchors
-          // validated exactly like a `contradicted` one. A confirmed check
-          // whose anchors do not exist in the candidate is recorded as
-          // `unchecked by evaluator`, never as a confirmation.
-          if (verdict === "confirmed") {
-            const item = flatItems(this.#planItems()).find((i) => i.id === id);
-            const ctx = item ? this.#verdictContext(item, "M") : undefined;
-            if (!ctx || !this.#itemCheckAnchorsValid(evidence, ctx)) {
-              this.#log.append("item_check_anchor_invalid", { messageType, agentId, itemId: id, evidence });
-              checkEvents.push({
-                type: "ITEM_CHECK_RECORDED",
-                itemId: id,
-                verdict: "unchecked",
-                evidence: `unchecked by evaluator: the confirmed check's anchors do not exist in the candidate (${evidence})`,
-              });
-              continue;
-            }
-          }
-          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict, evidence });
-        }
-      }
       const missing = owed.filter((id) => !provided.has(id));
       if (missing.length > 0) {
         const rejections = handle.itemCheckRejections ?? 0;
@@ -4266,12 +4388,12 @@ export class Conductor {
           this.#log.append("item_check_rejected", { messageType, agentId, missing });
           return {
             ok: false,
-            reason: `submit_evaluation owes an itemCheck for: ${missing.join(", ")}. Re-check each against the candidate and include itemChecks[] = { id, verdict: confirmed|contradicted, evidence }`,
+            reason: `submit_evaluation owes an itemCheck for: ${missing.join(", ")}. For a plan item give { id, verdict: confirmed|contradicted, evidence }. For a finding or discovered decision give { id, verdict: confirmed, impact: wrong-output|contract|judgement, evidence } and, when the impact is judgement, also chosen, alternative and why — without all three the record escalates to the owner.`,
           };
         }
         this.#log.append("item_check_unchecked", { messageType, agentId, missing });
         for (const id of missing) {
-          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "the evaluator gave no item check after a re-prompt" });
+          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "the evaluator gave no item check after a re-prompt; the record escalates" });
         }
       }
       this.#applyEvents([...events, ...checkEvents, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
@@ -4560,6 +4682,11 @@ export class Conductor {
       const id = typeof entry?.messageId === "string" ? entry.messageId : "";
       const message = byId.get(id);
       if (!message || message.type !== messageType) continue;
+      // Plan 06i: an evaluator entry for a message that is neither raw nor
+      // refused is a no-op — the message was already settled (e.g. a later
+      // round's classification pass re-publishes nothing). Ignoring it keeps
+      // the item-check half of the submission applicable.
+      if (message.state !== "raw" && message.state !== "refused") continue;
       const binding = {
         messageId: id,
         boundCandidateSha: message.boundCandidateSha,
@@ -4581,6 +4708,13 @@ export class Conductor {
       if (entry.action === "merge") {
         const into = typeof entry.into === "string" && entry.into.trim().length > 0 ? entry.into.trim() : undefined;
         events.push({ type: "MESSAGE_MERGED", ...binding, by: "evaluator", reason: into ? `merged into ${into}` : "merged" });
+        // Plan 06i (C3): the finding behind a merged message is MERGED, not
+        // disproved, and linked to the record it duplicates. Its triage
+        // disposition is the original's, so nothing leaves the ledger
+        // without one.
+        if (sourceFinding && sourceFinding.status === "open" && into) {
+          events.push({ type: "FINDING_MERGED", findingId: sourceFinding.id, into, byReviewer: sourceFinding.raisedBy as Reviewer });
+        }
       } else if (entry.action === "drop") {
         const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : "dropped by the evaluator";
         events.push({ type: "MESSAGE_DROPPED", ...binding, by: "evaluator", reason });
@@ -4738,6 +4872,52 @@ export class Conductor {
       // Plan 2c no-unshown-ballots: the other reviewers are already voting on
       // the merged list, so a record added now could never get their ballots.
       this.#log.append("late_discovery", { reviewer, candidateSha: candidate.sha, discoveries });
+      // Plan 06i (owner ruling): a late discovery must not be DROPPED (C3),
+      // but it must not stall the phase either. It is recorded with an
+      // `escalate` disposition and an open, NON-blocking owner request naming
+      // it, so it is visible in the status and `tt summary` and the phase
+      // still reaches DONE. It is not added to `decisions` (it could never
+      // get the other seats' ballots).
+      const K = this.#state.phase.contract.contractVersion;
+      let n = this.#state.phase.decisions.length + 1;
+      for (const d of discoveries) {
+        const itemId = `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-late-${n}`;
+        n += 1;
+        const ownerRequestId = `OR-${this.#state.phase.phaseId}-triage-${itemId}`;
+        // Plan 06i (C2): the disposition is computed by disposition() (the
+        // sole decider); the conductor only records it and opens the request
+        // it names.
+        const record: TriageRecord = {
+          itemId,
+          source: "decision",
+          impact: "judgement",
+          disposition: disposition(
+            { itemId, source: "decision", impact: "judgement" },
+            {
+              lateDiscovery: true,
+              ownerRequestId,
+              reason: `the discovery "${d.choice}" arrived after the review window; it is recorded and offered to the owner, never dropped`,
+            },
+          ),
+        };
+        this.#applyEvent({ type: "TRIAGE_RECORDED", record });
+        this.#applyEvent({
+          type: "OWNER_REQUEST_OPENED",
+          request: {
+            id: ownerRequestId,
+            version: 1,
+            phaseId: this.#state.phase.phaseId,
+            reason: `a discovered decision arrived after the review window: ${d.choice}`,
+            origin: "failed_vote",
+            linkedDecisionId: itemId,
+            boundCandidateSha: candidate.sha,
+            boundContractVersion: K,
+            options: FAILED_VOTE_OPTIONS,
+            status: "open",
+            blocking: false,
+          },
+        });
+      }
       return undefined;
     }
     const K = this.#state.phase.contract.contractVersion;
@@ -4790,7 +4970,7 @@ export class Conductor {
       ...this.#directiveIds(),
       ...this.#state.phase.corrections.map((c) => c.id),
     ].filter((id) => typeof id === "string" && id.length > 0);
-    return { itemIds, regressions: this.#regressionTests() };
+    return { itemIds, regressions: this.#regressionTests(), triage: blockingTriageRecords(this.#state.phase) };
   }
 
   /** Plan 06g (A6b): the tests that failed in this candidate's checks and
@@ -5461,8 +5641,11 @@ export class Conductor {
     const K = phase.contract.contractVersion;
     if (!reviewsComplete(phase, C, K)) return;
     if ((phase.approvedCandidates ?? []).some((a) => a.candidateSha === C)) return;
-    if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open")) return;
-    if (phase.ownerRequests.some((r) => r.status === "open")) return;
+    // Plan 06i (A2): approval follows the item's disposition, like accept().
+    // A fix disposition blocks; a trade-off does not; an untriaged blocking
+    // finding still blocks (fail safe).
+    if (hasBlockingFix(phase) || undispositionedBlockingFinding(phase)) return;
+    if (phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) return;
     for (const decision of phase.decisions) {
       if (!isLiveDecision(decision)) continue;
       if (decision.amendment) continue;
@@ -6165,6 +6348,23 @@ export class Conductor {
   /** The evaluator's re-verification: a majority unmet/deviates verdict the
    * code contradicts is overturned, and a unanimous thin-evidence met verdict
    * is audited. Each overturn is counted against its seat. */
+  /** Plan 06i: a finding's or discovered decision's confirmed anchors must
+   * cite at least one file:line that exists in the candidate, in range — the
+   * same rule as a plan item's check. */
+  #candidateAnchorsValid(evidence: string): boolean {
+    const anchors = evidenceFileAnchors(evidence);
+    if (anchors.length === 0) return false;
+    const dir = this.#candidateDir();
+    return anchors.every((a) => {
+      try {
+        const lines = fs.readFileSync(path.join(dir, a.path), "utf8").split("\n").length;
+        return a.start >= 1 && a.end <= lines;
+      } catch {
+        return false;
+      }
+    });
+  }
+
   /** OD-2 A3: an evaluator item check's evidence must cite at least one
    * file:line that exists in the candidate, in range. */
   #itemCheckAnchorsValid(evidence: string, ctx: VerdictContext): boolean {
@@ -6182,20 +6382,36 @@ export class Conductor {
    * a check). An architecture deviation the owner already accepted is not a
    * blocker and owes no check. */
   #owedItemCheckIds(messageType: MessageType): string[] {
+    const ids = new Set<string>();
+    // Plan 06i (A3): a discovered decision is published as a `tradeoff`
+    // message, so its impact classification is owed on that pass; a finding's
+    // on the `finding` pass. A missing one is re-prompted ONCE and then
+    // escalated, never defaulted.
+    if (messageType === "tradeoff") {
+      for (const d of discoveredDecisions(this.#state.phase)) {
+        if (!recordClassified(this.#state.phase, "decision", d.id)) ids.add(d.id);
+      }
+      return [...ids];
+    }
     if (messageType !== "finding") return [];
-    if (!this.#itemsEnforced() || !itemsNeedingEvaluatorReverify(this.#state.phase)) return [];
-    const accepted = new Set(this.#state.phase.acceptedDeviations ?? []);
-    const ids = new Set(
-      phaseItemOutcomes(this.#state.phase)
-        .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
-        .filter((o) => !(o.item.kind === "architecture" && accepted.has(o.item.id)))
-        .map((o) => o.item.id),
-    );
-    // Plan 06c (A4/R9): a unanimous thin met/fits is an OWED item check too.
-    // A missing one is re-prompted once, then recorded `unchecked`; a
-    // `contradicted` check with valid anchors overturns it, and code never
-    // withdraws the verdict on its own.
-    for (const o of thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors())) ids.add(o.item.id);
+    if (this.#itemsEnforced() && itemsNeedingEvaluatorReverify(this.#state.phase)) {
+      const accepted = new Set(this.#state.phase.acceptedDeviations ?? []);
+      for (const o of phaseItemOutcomes(this.#state.phase)) {
+        if (o.outcome === "met" || o.outcome === "fits") continue;
+        if (o.item.kind === "architecture" && accepted.has(o.item.id)) continue;
+        ids.add(o.item.id);
+      }
+      // Plan 06c (A4/R9): a unanimous thin met/fits is an OWED item check too.
+      // A missing one is re-prompted once, then recorded `unchecked`; a
+      // `contradicted` check with valid anchors overturns it, and code never
+      // withdraws the verdict on its own.
+      for (const o of thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors())) ids.add(o.item.id);
+    }
+    // Plan 06i (A3): every open finding owes its impact classification
+    // through the same form.
+    for (const f of openFindings(this.#state.phase)) {
+      if (!recordClassified(this.#state.phase, "finding", f.id)) ids.add(f.id);
+    }
     return [...ids];
   }
 
@@ -6292,6 +6508,180 @@ export class Conductor {
       };
       this.#applyEvent({ type: "FINDING_RAISED", finding });
     }
+  }
+
+  /** Plan 06i: the triage pass — after the reviews and the evaluator's
+   * item checks, before the item tally. EVERY finding and EVERY discovered
+   * decision of the ledger gets exactly one disposition from `disposition()`
+   * (the only place that decides); a duplicate copies its original's record.
+   * An escalation opens an owner request naming the item, so acceptance
+   * waits for it and nothing disappears.
+   *
+   * The evaluator's impact classification arrives through its item-check
+   * form (`itemChecks[] = { id, verdict, impact, evidence, chosen,
+   * alternative, why }`). A record the evaluator did not classify (or
+   * explicitly left `unchecked` after its one re-prompt) is UNCLASSIFIED and
+   * escalates — the conductor never guesses an impact. */
+  #applyTriage(): void {
+    const phase = this.#state.phase;
+    if (!phase.candidate) return;
+    const C = phase.candidate.sha;
+    const K = phase.contract.contractVersion;
+    // Plan 06i (A4): a deferral whose item is no longer open (repaired or
+    // superseded) is resolved here, so "until resolved" is reachable and the
+    // status stops listing it.
+    for (const d of phase.deferrals ?? []) {
+      if (d.status !== "open") continue;
+      const finding = phase.findings.find((f) => f.id === d.itemId);
+      const decision = phase.decisions.find((x) => x.id === d.itemId);
+      const stillOpen = finding ? finding.status === "open" : decision ? !(decision.supersededBy || decision.supersededByCorrection) : false;
+      if (!stillOpen) this.#applyEvent({ type: "DEFERRAL_RESOLVED", deferralId: d.id });
+    }
+    const dispositionFor = (source: "finding" | "decision", id: string): Disposition => {
+      const ownerRequestId = `OR-${phase.phaseId}-triage-${id}`;
+      const fresh = this.#state.phase;
+      if (source === "finding") {
+        const finding = fresh.findings.find((f) => f.id === id)!;
+        const evidence = evidenceForFinding(finding, fresh);
+        return disposition({ itemId: id, source, impact: recordImpact(fresh, id) }, { ...evidence, ownerRequestId });
+      }
+      const decision = fresh.decisions.find((d) => d.id === id)!;
+      // The vote outcome is computed here (triage.ts must not import the
+      // predicate's tally): a delegated/reserved decision that was balloted
+      // and did not settle failed its vote, and its outcome would change the
+      // output, so it escalates rather than reading as an accepted trade-off.
+      const balloted = (fresh.ballots ?? []).some((b) => b.decisionId === id);
+      const voteFailed = decision.class !== "detail" && balloted && !decisionSettled(decision, fresh, C, K);
+      const evidence = evidenceForDecision(decision, fresh, voteFailed);
+      return disposition({ itemId: id, source, impact: recordImpact(fresh, id) }, { ...evidence, ownerRequestId });
+    };
+
+    const entries = ledgerRecords(phase);
+    const openRequests = new Set(
+      phase.ownerRequests
+        .filter((r) => r.status === "open")
+        .flatMap((r) => [r.linkedFindingId, r.linkedDecisionId])
+        .filter((id): id is string => typeof id === "string"),
+    );
+    // Pass 1: every record that is not a duplicate of another.
+    const duplicates: Array<{ source: "finding" | "decision"; id: string; into: string }> = [];
+    for (const { source, id } of entries) {
+      const finding = source === "finding" ? phase.findings.find((f) => f.id === id) : undefined;
+      const mergedInto = finding?.status === "merged" ? finding.mergedInto : undefined;
+      if (mergedInto) {
+        duplicates.push({ source, id, into: mergedInto });
+        continue;
+      }
+      const record: TriageRecord = { itemId: id, source, impact: recordImpact(phase, id), disposition: dispositionFor(source, id) };
+      this.#applyEvent({ type: "TRIAGE_RECORDED", record });
+      if (record.disposition?.kind === "escalate" && !openRequests.has(id)) {
+        this.#openTriageRequest(record, record.disposition);
+        openRequests.add(id);
+      }
+    }
+    // Pass 2: duplicates, each linked to its ORIGINAL's disposition (C3). A
+    // chain of duplicates is followed transitively to the first record that is
+    // not itself a duplicate, so a chain never fabricates an escalation.
+    for (const dup of duplicates) {
+      const originalId = this.#ultimateOriginal(dup.id, dup.into);
+      const original = (this.#state.phase.triage ?? []).find((r) => r.itemId === originalId);
+      const ownerRequestId = `OR-${phase.phaseId}-triage-${dup.id}`;
+      const record: TriageRecord = {
+        itemId: dup.id,
+        source: dup.source,
+        impact: original?.impact ?? "judgement",
+        // Plan 06i (C2): even the orphan-duplicate fallback goes through
+        // disposition() — the sole decider — rather than building a
+        // disposition by hand.
+        disposition:
+          original?.disposition ??
+          disposition(
+            { itemId: dup.id, source: dup.source, impact: original?.impact ?? "judgement" },
+            {
+              orphanDuplicate: true,
+              ownerRequestId,
+              reason: `the original ${originalId} of duplicate ${dup.id} has no disposition`,
+            },
+          ),
+        duplicateOf: originalId,
+      };
+      this.#applyEvent({ type: "TRIAGE_RECORDED", record });
+      // M-30: an escalation must name a request that actually exists, so the
+      // owner can answer it and acceptance waits for it.
+      if (!original && record.disposition?.kind === "escalate" && !openRequests.has(dup.id)) {
+        this.#openTriageRequest(record, record.disposition);
+        openRequests.add(dup.id);
+      }
+    }
+  }
+
+  /** The finding behind a message id, if the message was raised from one. */
+  #findingBehind(id: string): string | undefined {
+    const message = (this.#state.phase.messages ?? []).find((m) => m.id === id);
+    return message?.sourceRecordId ?? (this.#state.phase.findings.some((f) => f.id === id) ? id : undefined);
+  }
+
+  /** Plan 06i (C3): the first record in a duplicate chain that is not itself
+   * a duplicate — the original whose disposition a duplicate copies. */
+  #ultimateOriginal(dupId: string, into: string): string {
+    const seen = new Set<string>([dupId]);
+    let cur = this.#findingBehind(into) ?? into;
+    while (!seen.has(cur)) {
+      seen.add(cur);
+      const finding = this.#state.phase.findings.find((f) => f.id === cur);
+      if (!finding?.mergedInto) return cur;
+      cur = this.#findingBehind(finding.mergedInto) ?? finding.mergedInto;
+    }
+    return cur;
+  }
+
+  /** Plan 06i: open the owner request an escalation names. The request's id
+   * is the one the disposition recorded, so the triage record and the request
+   * always name each other. It is the same request the phase's own park would
+   * open (open_finding / failed_vote), so the owner has the ordinary options
+   * and no duplicate request is raised later. */
+  #openTriageRequest(record: TriageRecord, esc: Extract<import("./core/triage.ts").Disposition, { kind: "escalate" }>): void {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha;
+    const K = phase.contract.contractVersion;
+    if (record.source === "finding") {
+      const finding = phase.findings.find((f) => f.id === record.itemId);
+      if (!finding) return;
+      this.#applyEvent({
+        type: "OWNER_REQUEST_OPENED",
+        request: {
+          id: esc.ownerRequestId,
+          version: 1,
+          phaseId: phase.phaseId,
+          reason: esc.reason,
+          origin: "open_finding",
+          linkedFindingId: finding.id,
+          boundCandidateSha: C,
+          boundContractVersion: K,
+          options: openFindingOptions(finding.kind),
+          status: "open",
+        },
+      });
+      return;
+    }
+    const decision = phase.decisions.find((d) => d.id === record.itemId);
+    if (!decision) return;
+    this.#applyEvent({
+      type: "OWNER_REQUEST_OPENED",
+      request: {
+        id: esc.ownerRequestId,
+        version: 1,
+        phaseId: phase.phaseId,
+        reason: esc.reason,
+        origin: "failed_vote",
+        linkedDecisionId: decision.id,
+        relatedBallots: phase.ballots.filter((b) => b.decisionId === decision.id),
+        boundCandidateSha: C,
+        boundContractVersion: K,
+        options: FAILED_VOTE_OPTIONS,
+        status: "open",
+      },
+    });
   }
 
   /** After the reviews and evaluation settle: compute the per-item majority,
@@ -10540,6 +10930,8 @@ export class Conductor {
       "",
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
+      // Plan 06i (A3): the golden note a `contract` classification must cite.
+      ...(phase.contract.golden ? ["", "Golden note (the current source a choice must be re-checked against; a `contract` classification must cite it):", phase.contract.golden] : []),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
       ...ledgerPromptLines(phase.messages),
@@ -10582,6 +10974,32 @@ export class Conductor {
         ),
         "Add one `itemChecks[]` entry = { id, verdict: confirmed|contradicted, evidence } for each item above. `evidence` must cite a file:line in the candidate. Use `contradicted` only when the candidate's code proves the verdict wrong; otherwise `confirmed`.",
       );
+    }
+    // Plan 06i: every finding and discovered decision gets an impact class
+    // through the SAME item-check form. `wrong-output` is a wrong value,
+    // offer or output on a reachable path; `contract` contradicts the golden
+    // source or the plan; `judgement` is style, hardening or ergonomics.
+    // A finding is classified on the `finding` pass; a discovered decision is
+    // published as a `tradeoff` message, so it is classified on that pass
+    // (finding M-7: the prompt must run for decisions too).
+    {
+      const rows =
+        messageType === "finding"
+          ? openFindings(phase).map((f) => `- ${f.id} (finding, raised ${f.raisedBy}, severity ${f.severity}): ${f.evidence}`)
+          : messageType === "tradeoff"
+            ? discoveredDecisions(phase).map((d) => `- ${d.id} (discovered decision): ${d.choice} — ${d.whyItMatters}`)
+            : [];
+      if (rows.length > 0) {
+        lines.push(
+          "",
+          "Plan 06i triage: classify each finding and discovered decision below. Add one `itemChecks[]` entry = { id, verdict: confirmed, impact, evidence } for each. `impact` is one of:",
+          "- wrong-output: a wrong value, offer or output on a reachable path (it MUST be fixed);",
+          "- contract: it contradicts the current golden source or the plan (a drafting decision is no exemption);",
+          "- judgement: style, hardening or ergonomics only (a trade-off).",
+          "For a `judgement` impact also give `chosen`, `alternative` and `why`; without all three the record escalates to the owner. Do not omit the impact: a record you leave unclassified escalates.",
+          ...rows,
+        );
+      }
     }
     lines.push(
       "",

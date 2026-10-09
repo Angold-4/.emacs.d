@@ -19,6 +19,7 @@ import { test } from "node:test";
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor, type FakePiStep } from "./harness.ts";
 import { runPaths } from "../../src/conductor.ts";
 import type { Decision, Reviewer, State } from "../../src/core/types.ts";
+import { prSummary } from "../../src/view.ts";
 
 type Setup = Awaited<ReturnType<typeof setupConductor>>;
 
@@ -318,6 +319,20 @@ test("complete-ballots: a discovery that arrives after the reviewer's turn-2 pro
     const late = records.filter((r) => r.kind === "late_discovery");
     assert.equal(late.length, 1, "B's re-dispatched discovery is logged as a late observation");
     assert.ok(!setup.conductor.state.phase.decisions.some((x) => x.choice.startsWith("LATE-ONLY")), "a late discovery is never a votable record");
+    // Plan 06i (owner ruling): the late discovery is not dropped — it is
+    // recorded with an `escalate` disposition and a visible, NON-blocking
+    // owner request, so it reaches DONE without stalling.
+    const lateRecord = (setup.conductor.state.phase.triage ?? []).find(
+      (r) => r.disposition?.kind === "escalate" && r.disposition.reason.includes("LATE-ONLY"),
+    );
+    assert.ok(lateRecord, "the late discovery's escalation is recorded");
+    const lateRequest = setup.conductor.state.phase.ownerRequests.find(
+      (r) => r.status === "open" && r.blocking === false && r.reason.includes("LATE-ONLY"),
+    );
+    assert.ok(lateRequest, "a visible, non-blocking owner request names the late discovery");
+    const lateSummary = prSummary(setup.runDir, setup.plan);
+    assert.match(lateSummary, /#### Escalations \(\d+\)/);
+    assert.match(lateSummary, /LATE-ONLY/);
     // The prompt-time demand snapshot for B's re-dispatch is the only place a
     // ballot could be demanded from, and it holds just the one live record —
     // the late discovery is not in it.

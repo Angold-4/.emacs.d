@@ -21,6 +21,7 @@
 // `isLiveDecision`).
 
 import { isLiveDecision } from "./predicate.ts";
+import { findingDispositionIsTradeoff, triageFixFor } from "./triage.ts";
 import { DEFAULT_SEATS } from "./seats.ts";
 import { currentBallot, tally } from "./tally.ts";
 import type {
@@ -271,6 +272,10 @@ export interface AcceptanceGate {
   /** Tests (or named behaviours) that failed in this candidate's checks but
    * passed at the round's base — the regressions. */
   regressions: string[];
+  /** Plan 06i: the phase's triage records, keyed by item id. A record the
+   * triage dispositioned `fix` blocks in ANY round, so 06g's round-2
+   * downgrade never applies to a wrong-output record. */
+  triage?: import("./triage.ts").TriageRecord[];
 }
 
 /** A `file:line` citation: `src/core/rounds.ts:12` or `foo.ts:12:3`. */
@@ -313,6 +318,8 @@ function namesRegression(text: string, regressions: readonly string[]): boolean 
 /** The part of a finding `blocksAcceptance` reads. A `Finding` is assignable
  * to it, so a raised-but-not-yet-recorded disclosure can be judged too. */
 export interface FindingGround {
+  /** Plan 06i: the finding's own id, so its triage record can be consulted. */
+  id?: string;
   severity: FindingSeverity;
   evidence: string;
   itemId?: string;
@@ -320,6 +327,13 @@ export interface FindingGround {
 }
 
 export function blocksAcceptance(finding: FindingGround, round: number, gate: AcceptanceGate): boolean {
+  // Plan 06i (A2): acceptance follows the item's disposition, never the
+  // reviewer's label. A `fix` disposition blocks whatever round it was raised
+  // in; a `trade-off` disposition does not, not even in round 1. A
+  // wrong-output finding is item-linked by definition, so 06g's round-2
+  // downgrade never applies to it.
+  if (finding.id && findingDispositionIsTradeoff(gate.triage, finding.id)) return false;
+  if (finding.id && triageFixFor(gate.triage, finding.id)) return true;
   if (finding.severity !== "blocking") return false;
   if (round <= 1) return true;
   const text = [finding.evidence, finding.criterionDisputed ?? ""].filter(Boolean).join("\n");

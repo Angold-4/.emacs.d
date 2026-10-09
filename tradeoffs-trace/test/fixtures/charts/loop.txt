@@ -154,6 +154,7 @@ phase states:
       +- EVALUATION_COMPLETED (evaluationSettledAndPanelDowngraded) -> REPAIRING       [panel-downgrade]
       +- EVALUATION_COMPLETED (evaluationSettledAndPanelIncomplete) -> RESOLVING       [panel-incomplete]
       +- EVALUATION_COMPLETED (evaluationSettledNoPanel) -> RESOLVING       [evaluation-completed]
+      +- TRIAGE_FAILED             -> AWAITING_OWNER  [triage-failed]
       +- AMEND                     -> CHECKING        [amend-from-evaluating]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-evaluating]
       +- REVISE                    -> REPAIRING       [revise-from-evaluating]

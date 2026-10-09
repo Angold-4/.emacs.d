@@ -387,6 +387,12 @@ addRow({
       archSymbolDeviations: undefined,
       overturns: undefined,
       itemChecks: undefined,
+      // Plan 06i: the triage records belong to the candidate that just froze.
+      // A disposition of `fix` for a finding the new candidate repaired must
+      // not block acceptance for ever; the new candidate is triaged afresh.
+      // (A deferral is an owner's recorded decision, not a candidate fact, so
+      // it is kept.)
+      triage: undefined,
       // Plan 06c: the final check's pass belongs to the candidate that just
       // froze, so a new candidate runs it again.
       finalChecksPassedFor: undefined,
@@ -840,6 +846,26 @@ addRow({
   // Fixture is acceptable with nothing open, so next() of RESOLVING accepts.
   actions: [{ type: "accept", resolvedCorrectionIds: [] }],
   apply: (s) => withPhase(s, { phase: "RESOLVING", inFlight: clearedAtEvaluationExit(s.phase) }),
+});
+
+// Plan 06i (A1): the triage pass itself failed. A record without a
+// disposition at the end of evaluation is a defect of the loop, never a pass,
+// so the phase parks on the owner with the reason — it never continues to
+// item outcomes or acceptance as if triage had passed.
+addRow({
+  id: "triage-failed",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "TRIAGE_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "TRIAGE_FAILED" }>;
+    const base = withPhase(s, { inFlight: clearedAtEvaluationExit(s.phase) });
+    return enterAwaitingOwner(base, `the triage pass failed: ${e.reason}`);
+  },
 });
 
 // --- RESOLVING --------------------------------------------------------

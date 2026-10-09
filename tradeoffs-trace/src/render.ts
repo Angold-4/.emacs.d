@@ -950,6 +950,16 @@ export function renderStatusView(input: StatusViewInput): string {
       lines.push(`  - ${id}${to ? ` → ${to}` : ""}`);
     }
   }
+  // Plan 06i (A4): the status lists open deferrals too, with their guard, so
+  // a deferred item is visible here and not only in `tt summary`.
+  const openDeferrals = (phase.deferrals ?? []).filter((d) => d.status === "open");
+  if (openDeferrals.length > 0) {
+    lines.push("", `Open deferrals (${openDeferrals.length})`);
+    for (const d of openDeferrals) {
+      const guard = d.test ? `test ${d.test}` : d.ownerRuling ? `owner ruling ${d.ownerRuling}` : "no guard";
+      lines.push(`  - ${d.itemId}${d.toPhase ? ` → ${d.toPhase}` : ""} (${guard})`);
+    }
+  }
   push(row("reviews", view.reviewLine));
   push(row("models", view.models));
   push(view.metricsLine);
