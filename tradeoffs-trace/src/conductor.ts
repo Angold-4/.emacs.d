@@ -3005,14 +3005,17 @@ export class Conductor {
         // Stop every worker handle (live or exited), killing the shell groups
         // Pi left behind. `#recheckCancelledAttempts` keeps the stopped
         // attempts from emitting their own attempt-failure events, so the
-        // phase stays IMPLEMENTING until the recheck event moves it.
+        // phase stays IMPLEMENTING until the recheck event moves it. The lane
+        // flag is set BEFORE the awaits (M-28), so a lane round that settles
+        // inside that window is still suppressed rather than dropping the
+        // next round's winner.
+        if (this.#laneRoundEnabled()) this.#recheckCancelledLaneRound = true;
         const workers = [...this.#agents.values()].filter((h) => h.role === "worker");
         for (const worker of workers) {
           this.#recheckCancelledAttempts.add(worker.agentId);
           await worker.agent.terminate().catch(() => undefined);
           for (const pgid of worker.shGroups) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs });
         }
-        if (this.#laneRoundEnabled()) this.#recheckCancelledLaneRound = true;
         // Reset every worker worktree to the frozen candidate, whether or not
         // a live handle was found (OD-5(1)/(3)).
         try {
@@ -3029,6 +3032,9 @@ export class Conductor {
           // worker resets it to the frozen candidate first.
           const reason = `recheck refused: could not reset the worker worktree to the frozen candidate (${String((err as Error)?.message ?? err)})`;
           this.#log.append("recheck_reset_failed", { candidateSha: candidate.sha, error: String((err as Error)?.message ?? err) });
+          // The recheck is refused, so the lane suppression must not survive
+          // to drop the next round's winner (M-28).
+          if (this.#laneRoundEnabled()) this.#recheckCancelledLaneRound = false;
           this.#rejectInboxFile(file, commandId, reason);
           this.#applyEvent({ type: "ATTEMPT_INTERRUPTED", taint: true });
           return;

@@ -11,17 +11,24 @@ import * as path from "node:path";
 
 import { emptyRepoFacts, type RepoFacts, type RepoPackage } from "./plan-lint.ts";
 
-/** One `key = value` line of a Cargo.toml, trimmed. Only the shapes the
- * coverage rule needs: `members = [...]` and `name = "..."`. */
-function cargoValue(text: string, key: string): string | undefined {
-  const re = new RegExp(`^\\s*${key}\\s*=\\s*(.+)$`, "m");
-  const m = text.match(re);
-  return m ? m[1].trim() : undefined;
+/** The body of a Cargo.toml table (`[name]`), up to the next table header. A
+ * line whose first non-space character is `[` starts a new table. */
+function tomlTable(text: string, name: string): string | undefined {
+  const header = new RegExp(`^\\s*\\[${name}\\]\\s*(?:#.*)?$`, "m");
+  const m = header.exec(text);
+  if (!m) return undefined;
+  const rest = text.slice(m.index + m[0].length);
+  const next = rest.search(/^\s*\[/m);
+  return next === -1 ? rest : rest.slice(0, next);
 }
 
-/** A Cargo.toml `name`, unquoted. */
+/** The package name from a Cargo.toml's `[package]` table, unquoted. A
+ * `name =` under any other table (`[workspace.package]`, `[workspace.metadata]`,
+ * a dependency table) is not a package (E-76/M-27). */
 function cargoPackageName(text: string): string | undefined {
-  const raw = cargoValue(text, "name");
+  const body = tomlTable(text, "package");
+  if (body === undefined) return undefined;
+  const raw = body.match(/^\s*name\s*=\s*(.+)$/m)?.[1]?.trim();
   if (!raw) return undefined;
   const m = raw.match(/^"([^"]+)"|^'([^']+)'/);
   return m ? (m[1] ?? m[2]) : raw.replace(/[",]/g, "").trim() || undefined;

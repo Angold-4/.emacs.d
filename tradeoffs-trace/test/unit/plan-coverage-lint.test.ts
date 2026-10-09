@@ -193,8 +193,9 @@ test("plan 06j: a non-virtual workspace's root [package] is inventoried too", ()
     const plan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: ["src/**"], checks: ["true"] }] };
     const warned = checkCoverageWarnings(plan, facts).filter((f) => f.rule === "coverage");
     assert.ok(warned.some((f) => f.item.includes("root")), `the root crate is warned: ${JSON.stringify(warned)}`);
-    // A virtual manifest (no [package]) keeps today's members-only behaviour.
-    fs.writeFileSync(path.join(root, "Cargo.toml"), '[workspace]\nmembers = ["a"]\n');
+    // A virtual manifest (no [package]) keeps today's members-only behaviour,
+    // even when another table carries a `name` key.
+    fs.writeFileSync(path.join(root, "Cargo.toml"), '[workspace]\nmembers = ["a"]\n\n[workspace.package]\nname = "x"\n');
     const virtual = readRepoFacts(root);
     assert.deepEqual(virtual.packages.map((p) => p.name).sort(), ["a"], JSON.stringify(virtual.packages));
   } finally {
