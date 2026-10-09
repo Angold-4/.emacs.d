@@ -352,7 +352,7 @@ addRow({
   // §9.3: interrupted clears the intent but leaves the obligation, so
   // next() re-emits dispatch_worker ("new attempt on the same session").
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) =>
+  apply: (s, ev) =>
     withPhase(s, {
       phase: "IMPLEMENTING",
       attempt: { ...s.phase.attempt, interrupted: true },
@@ -360,6 +360,10 @@ addRow({
       // it owes its own coverage too.
       coverage: undefined,
       coverageAttempt: undefined,
+      // Plan 06j (A3/OD-5): a recheck that stopped this attempt and then
+      // failed to reset its worktree marks the tree tainted, so the
+      // re-dispatched attempt resets it to the frozen candidate first.
+      ...((ev as Extract<Event, { type: "ATTEMPT_INTERRUPTED" }>).taint ? { worktreeTainted: true } : {}),
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
     }),
 });

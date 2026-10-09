@@ -3002,30 +3002,35 @@ export class Conductor {
       // so the next inbox scan leaves the file alone.
       this.#steerInFlight.add(commandId);
       try {
-        // Every worker handle still present, live or already exited: an
-        // exited agent may have left writes, and marking it keeps
-        // `#runWorkerAttempt` from emitting an attempt-failure event.
+        // Stop every worker handle (live or exited), killing the shell groups
+        // Pi left behind. `#recheckCancelledAttempts` keeps the stopped
+        // attempts from emitting their own attempt-failure events, so the
+        // phase stays IMPLEMENTING until the recheck event moves it.
         const workers = [...this.#agents.values()].filter((h) => h.role === "worker");
         for (const worker of workers) {
           this.#recheckCancelledAttempts.add(worker.agentId);
           await worker.agent.terminate().catch(() => undefined);
-          // Kill the shell groups Pi left behind, so a detached command
-          // cannot rewrite the worktree after the reset.
           for (const pgid of worker.shGroups) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs });
         }
         if (this.#laneRoundEnabled()) this.#recheckCancelledLaneRound = true;
         // Reset every worker worktree to the frozen candidate, whether or not
         // a live handle was found (OD-5(1)/(3)).
-        const worktrees = [this.#paths.worktree, ...(this.#laneRoundEnabled() ? this.#lanes().map((lane) => this.#laneWorktree(lane)) : [])];
         try {
-          for (const worktree of worktrees) {
+          for (const worktree of [this.#paths.worktree, ...(this.#laneRoundEnabled() ? this.#lanes().map((lane) => this.#laneWorktree(lane)) : [])]) {
             if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
             createWorktree(this.#plan.repo, worktree, candidate.sha);
           }
         } catch (err) {
+          // The reset can only run after the worker is stopped, so the
+          // attempt is already gone. Refuse the recheck (OD-5(2)), then
+          // record the stopped attempt exactly like a crashed one — the
+          // ordinary attempt-failure transition re-dispatches a repair
+          // worker and charges no round — and taint the worktree so that
+          // worker resets it to the frozen candidate first.
           const reason = `recheck refused: could not reset the worker worktree to the frozen candidate (${String((err as Error)?.message ?? err)})`;
           this.#log.append("recheck_reset_failed", { candidateSha: candidate.sha, error: String((err as Error)?.message ?? err) });
           this.#rejectInboxFile(file, commandId, reason);
+          this.#applyEvent({ type: "ATTEMPT_INTERRUPTED", taint: true });
           return;
         }
         // The cancelled attempt has no attempt-failure event of its own, so

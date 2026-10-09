@@ -535,8 +535,9 @@ function liveRound(state: State): number {
   return state.phase.rounds?.length ?? 1;
 }
 
-test("plan 06j: a recheck whose worktree reset throws is refused, with the reason reported", async () => {
-  // OD-5(2): a recheck verdict never rests on an unknown worktree.
+test("plan 06j: a recheck whose worktree reset throws is refused and the stopped attempt continues the repair", async () => {
+  // OD-5(2): a recheck verdict never rests on an unknown worktree, and the
+  // stopped attempt is never left dead.
   const counter = `/tmp/tt-recheck-refuse-${randomUUID().slice(0, 8)}`;
   fs.rmSync(counter, { force: true });
   const failOnMarker = "if grep -q TT_RECHECK_FAIL README.md; then exit 1; fi; exit 0";
@@ -562,12 +563,25 @@ test("plan 06j: a recheck whose worktree reset throws is refused, with the reaso
     // permission defeats both `git worktree remove` and the rmSync fallback.
     fs.writeFileSync(path.join(worktree, "blocker.txt"), "x");
     fs.chmodSync(worktree, 0o500);
+    const usedBefore = setup.conductor.state.phase.repairRoundsUsed;
+    const dispatchesBefore = eventsOfType(setup.runDir, "ACTION_STARTED").filter((e) => e.action === "dispatch_worker").length;
     const out = await runCli(["recheck", setup.runDir, "--reason", "the machine was busy"]);
     assert.match(out.stdout, /recheck refused: could not reset the worker worktree/, out.stdout);
     assert.equal(out.code, 1, "a refusal is a non-zero exit");
     assert.equal(eventsOfType(setup.runDir, "RECHECK_REQUESTED").length, 0, "no RECHECK_REQUESTED is recorded");
     assert.ok(readEvents(setup.runDir).some((r) => r.kind === "recheck_reset_failed"), "the refusal is owner-visible in the log");
-    assert.equal(setup.conductor.state.phase.phase, "IMPLEMENTING", "the run stays as it was");
+    // The stopped attempt is recorded exactly like a crashed one (OD-5(2)):
+    // an attempt-failure event, no round charged, the worktree tainted so the
+    // re-dispatched attempt resets it, and a new repair worker dispatched.
+    assert.ok(eventTypes(setup.runDir).includes("ATTEMPT_INTERRUPTED"), "the stopped attempt is recorded as interrupted");
+    assert.equal(setup.conductor.state.phase.repairRoundsUsed, usedBefore, "the refusal charges no round");
+    assert.equal(setup.conductor.state.phase.worktreeTainted, true, "the worktree is tainted for the next attempt");
+    await waitFor(
+      () => eventsOfType(setup.runDir, "ACTION_STARTED").filter((e) => e.action === "dispatch_worker").length > dispatchesBefore,
+      90_000,
+      50,
+      setup.runDir,
+    );
   } finally {
     try {
       fs.chmodSync(worktree, 0o700);
@@ -617,5 +631,43 @@ test("plan 06j: a recheck stops every lane worker and resets every lane worktree
     await setup.conductor.stop();
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 06j: a recheck resets a dirty worktree left by an exited worker", async () => {
+  // OD-5(a): the agent already exited (its handle is gone), so no live worker
+  // is found, but its tracked edit and untracked file are still in the
+  // worktree. The reset is unconditional, so both are discarded.
+  const counter = `/tmp/tt-recheck-exited-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(counter, { force: true });
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "do the thing", acceptance: ["it works"], checks: [failOnceCheck(counter)], boundaries: [], reserved: [], rounds: 4 },
+    workerScriptForAttempt: (attempt) =>
+      attempt === 1
+        ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'TT_RECHECK_FAIL\\n' >> README.md" }, submitPhaseStep()] }
+        : attempt === 2
+          ? { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'EXITED-TRACKED\\n' >> README.md; printf 'x\\n' > exited-untracked.txt" }] }
+          : { hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] },
+    reviewerScriptFor: reviewerFor(),
+    deadlines: FAST,
+  });
+  const worktree = runPaths(setup.runDir).worktree;
+  try {
+    await setup.conductor.start();
+    // Attempt 2 writes and exits without submitting; the conductor
+    // re-dispatches a later attempt. The dirty files are still there.
+    await waitFor(() => fs.existsSync(path.join(worktree, "exited-untracked.txt")) && setup.conductor.state.phase.phase === "IMPLEMENTING", 90_000, 50, setup.runDir);
+    const out = await runCli(["recheck", setup.runDir, "--reason", "the check was killed by the machine"]);
+    assert.match(out.stdout, /recheck requested/, out.stdout);
+    await waitFor(() => !fs.existsSync(path.join(worktree, "exited-untracked.txt")), 90_000, 50, setup.runDir);
+    assert.ok(!fs.existsSync(path.join(worktree, "exited-untracked.txt")), "the exited worker's untracked file is gone");
+    assert.ok(!fs.readFileSync(path.join(worktree, "README.md"), "utf8").includes("EXITED-TRACKED"), "the exited worker's tracked edit is gone");
+    // The recheck ran the checks on the frozen candidate and passed.
+    await waitFor(() => eventTypes(setup.runDir).includes("CHECKS_PASSED") || setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(counter, { force: true });
   }
 });

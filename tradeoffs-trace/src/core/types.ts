@@ -1607,6 +1607,9 @@ export interface EvAttemptNoSubmission {
 }
 export interface EvAttemptInterrupted {
   type: "ATTEMPT_INTERRUPTED";
+  /** Plan 06j (A3/OD-5): the stopped attempt left a worktree the next one
+   * must reset before it starts (a recheck whose worktree reset failed). */
+  taint?: boolean;
 }
 /** Phase 1b addition (pure, additive): `decisions` are the fully assembled,
  * bound Decision records the conductor built from `phase.pendingDisclosures`
