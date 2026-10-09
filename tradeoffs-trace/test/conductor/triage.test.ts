@@ -808,7 +808,9 @@ test("plan 06i: a sameAs advisory downgrade with no evaluator impact is re-promp
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    phase: { id: "p1", goal: "sameAs no impact", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false, rounds: 1 },
+    // rounds: 2 so the round-2 sameAs re-raise actually runs (it needs a
+    // repair round to exist); the downgrade path is what OD-15(1) requires.
+    phase: { id: "p1", goal: "sameAs no impact", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false, rounds: 2 },
     workerScriptForAttempt: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: WRITE_SRC }, submitPhaseStep()] }),
     reviewerScriptFor: (reviewer, state) => {
       const round = state.phase.round ?? 1;
@@ -869,9 +871,17 @@ test("plan 06i: a sameAs advisory downgrade with no evaluator impact is re-promp
     await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
     const phase = setup.conductor.state.phase;
     const finding = phase.findings.find((f) => f.raisedBy === "M")!;
+    // The downgrade must have actually happened (the test fails if the
+    // round-2 sameAs path was not exercised).
+    assert.equal(finding.severity, "advisory", "the sameAs re-raise lowered it to advisory");
+    assert.equal(finding.severityChangedBy, "reviewer", "the reviewer's sameAs is what lowered it");
     const record = (phase.triage ?? []).find((r) => r.itemId === finding.id);
     assert.equal(record?.disposition?.kind, "escalate", "an unclassified finding escalates, never a stock trade-off");
     assert.ok(readEvents(setup.runDir).some((r) => r.kind === "item_check_rejected"), "the missing impact was re-prompted once");
+    assert.ok(
+      phase.ownerRequests.some((r) => r.status === "open" && r.linkedFindingId === finding.id),
+      "the escalation is an open owner request naming the finding",
+    );
   } finally {
     await teardown(setup);
   }
