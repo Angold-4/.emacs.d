@@ -73,13 +73,20 @@ function expandMember(root: string, member: string): string[] {
 }
 
 /** Every package/crate the repository defines: the workspace members, or the
- * root package when there is no `[workspace]`. */
+ * root package when there is no `[workspace]`. A NON-VIRTUAL workspace (a
+ * root Cargo.toml that is both `[package]` and `[workspace]`) also defines a
+ * root crate beside its members, so it is inventoried too; a virtual manifest
+ * (no `[package]`) contributes no root package (E-76). */
 function readPackages(root: string): RepoPackage[] {
   const rootToml = readFileOrUndefined(path.join(root, "Cargo.toml"));
   if (rootToml === undefined) return [];
   const members = cargoMembers(rootToml);
   const dirs = members.length > 0 ? members.flatMap((m) => expandMember(root, m)) : [""];
   const out: RepoPackage[] = [];
+  if (members.length > 0) {
+    const rootName = cargoPackageName(rootToml);
+    if (rootName !== undefined && rootName.length > 0) out.push({ name: rootName, dir: "." });
+  }
   for (const dir of dirs) {
     const toml = dir === "" ? rootToml : readFileOrUndefined(path.join(root, dir, "Cargo.toml"));
     if (toml === undefined) continue;

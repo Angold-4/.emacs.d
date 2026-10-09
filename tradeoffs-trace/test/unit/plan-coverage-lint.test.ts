@@ -179,6 +179,29 @@ test("plan 06j: coverage facts read a workspace's crates and its workflow comman
   }
 });
 
+test("plan 06j: a non-virtual workspace's root [package] is inventoried too", () => {
+  // E-76: a root Cargo.toml that is both [package] and [workspace] defines a
+  // root crate beside its members; a virtual manifest (no [package]) does not.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-rootpkg-"));
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.mkdirSync(path.join(root, "a"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Cargo.toml"), '[package]\nname = "root"\nversion = "0.1.0"\n\n[workspace]\nmembers = ["a"]\n');
+  fs.writeFileSync(path.join(root, "a", "Cargo.toml"), '[package]\nname = "a"\nversion = "0.1.0"\n');
+  try {
+    const facts = readRepoFacts(root);
+    assert.deepEqual(facts.packages.map((p) => p.name).sort(), ["a", "root"], JSON.stringify(facts.packages));
+    const plan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: ["src/**"], checks: ["true"] }] };
+    const warned = checkCoverageWarnings(plan, facts).filter((f) => f.rule === "coverage");
+    assert.ok(warned.some((f) => f.item.includes("root")), `the root crate is warned: ${JSON.stringify(warned)}`);
+    // A virtual manifest (no [package]) keeps today's members-only behaviour.
+    fs.writeFileSync(path.join(root, "Cargo.toml"), '[workspace]\nmembers = ["a"]\n');
+    const virtual = readRepoFacts(root);
+    assert.deepEqual(virtual.packages.map((p) => p.name).sort(), ["a"], JSON.stringify(virtual.packages));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("plan 06j: a plan with no repository lints as before", () => {
   const plan: LintPlanInput = { phases: [{ id: "p1", boundaries: ["a/**"], checks: ["cargo test -p a"] }] };
   assert.deepEqual(checkCoverageWarnings(plan, { packages: [], ciCommands: [], cargo: false }), []);
