@@ -269,6 +269,13 @@ export function checkItemCarried(phase: PhaseState, event: EvItemCarried): Comma
   if ((phase.carriedItems ?? []).includes(event.recordId)) {
     return { ok: false, reason: `${event.recordId} is already carried` };
   }
+  // OD addendum A: a second owner act on the same id is refused, naming the
+  // existing act. A deferral already put this item's fix off; carrying it too
+  // would silently drop one act.
+  const existingDefer = (phase.deferrals ?? []).find((d) => d.itemId === event.recordId && d.status === "open");
+  if (existingDefer) {
+    return { ok: false, reason: `${event.recordId} is already deferred (${existingDefer.id}); resolve or drop that deferral first` };
+  }
   return checkBinding(
     { candidateSha: event.boundCandidateSha, contractVersion: event.boundContractVersion, recordVersion: event.boundRecordVersion },
     { candidateSha: record.candidateSha, contractVersion: record.contractVersion, recordVersion: record.recordVersion },

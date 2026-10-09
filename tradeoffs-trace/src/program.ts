@@ -334,7 +334,12 @@ export function withdrawProgramDirective(root: string, dir: string, directiveId:
  * wrong-output, `review` otherwise. */
 export function carriedRequirementsFor(program: ProgramFile, node: ProgramNode, state: ProgramState, runRoot: string): RequirementItem[] {
   const out: RequirementItem[] = [];
-  const seen = new Set<string>();
+  // Separate dedup sets: a carry and a deferral are different owner acts, so
+  // neither may silently drop the other (OD addendum A). The command level
+  // refuses a second act on the same id, so both being present is defensive
+  // only — and if it happened, both are imported rather than one dropped.
+  const seenCarried = new Set<string>();
+  const seenDefer = new Set<string>();
   // Plan 06i (A4): a carried item/deferral goes ONLY to the phase its
   // `--to` target names (`carriedTo[id]` / `d.toPhase`) — the runbook's
   // carry rule. A node is addressed by its node id or its phase id; an
@@ -358,9 +363,9 @@ export function carriedRequirementsFor(program: ProgramFile, node: ProgramNode, 
     if (!read) continue;
     const phase = read.state.phase;
     for (const id of phase.carriedItems ?? []) {
-      if (seen.has(id)) continue;
+      if (seenCarried.has(id)) continue;
       if (!targetedHere(phase.carriedTo?.[id])) continue;
-      seen.add(id);
+      seenCarried.add(id);
       const record = triageRecordFor(phase.triage, id);
       const finding = phase.findings.find((f) => f.id === id);
       const decision = phase.decisions.find((d) => d.id === id);
@@ -378,9 +383,9 @@ export function carriedRequirementsFor(program: ProgramFile, node: ProgramNode, 
     // with its guard as the VERIFY (a `test` for a cost test, `review` for an
     // owner ruling). A deferral never disappears between phases.
     for (const d of phase.deferrals ?? []) {
-      if (d.status !== "open" || seen.has(d.itemId)) continue;
+      if (d.status !== "open" || seenDefer.has(d.itemId)) continue;
       if (!targetedHere(d.toPhase)) continue;
-      seen.add(d.itemId);
+      seenDefer.add(d.itemId);
       const record = triageRecordFor(phase.triage, d.itemId);
       const wrongOutput = record?.impact === "wrong-output";
       // Plan 06i (A4): a WRONG-OUTPUT item's next-node VERIFY is the FIX

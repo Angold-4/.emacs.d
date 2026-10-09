@@ -438,6 +438,12 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // cost, or a recorded owner ruling. Without either it is refused with
       // the reason, never recorded silently. Recorded once per item id.
       const d = event.deferral;
+      // OD addendum A: a second owner act on the same id is refused, naming
+      // the existing act. A carry already put this item into the next phase's
+      // contract; deferring it too would silently drop one act.
+      if ((p.carriedItems ?? []).includes(d.itemId)) {
+        return rejected(state, `${d.itemId} is already carried (to ${p.carriedTo?.[d.itemId] ?? "next"}); resolve that carry first`);
+      }
       if (!(d.test && d.test.trim().length > 0) && !(d.ownerRuling && d.ownerRuling.trim().length > 0)) {
         return rejected(state, `deferring ${d.itemId} needs a guard: a test that shows its current cost, or a recorded owner ruling`);
       }

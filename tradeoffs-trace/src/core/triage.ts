@@ -175,17 +175,13 @@ export function disposition(record: TriageRecord, evidence: TriageEvidence = {})
   if (evidence.fate === "repaired") {
     return { kind: "fix", reason: isNonEmpty(evidence.fateReason) ? evidence.fateReason : "repaired at a later candidate" };
   }
-  // The round panel's recorded verdict (it did not keep the finding blocking)
-  // is a trade-off, with the panel's own reason. Checked AFTER the fix rules
-  // so a panel drop can never downgrade a confirmed wrong value.
-  if (evidence.panelDropped === true) {
-    return {
-      kind: "tradeoff",
-      chosen: "the round panel did not keep it blocking",
-      alternative: "repair it or raise it again",
-      why: isNonEmpty(evidence.panelReason) ? evidence.panelReason : "the round panel dropped it",
-    };
-  }
+  // Plan 06i (OD-20): a panel drop is NOT by itself a trade-off. The panel's
+  // severity vote is neither the evaluator's classification nor a source of
+  // chosen/alternative/why, so a panel-lowered finding goes through the same
+  // judgement path as any other: a real evaluator classification with all
+  // three fields is a trade-off; a missing field escalates. The panel's
+  // severityReason stays visible as context in the summary, but it never
+  // fills a trade-off field.
   // A closed record whose fate was not a repair is a recorded trade-off: the
   // ledger keeps it and the summary lists it, so nothing disappears. This is
   // checked BEFORE the contract branch so a superseded/disproved contract

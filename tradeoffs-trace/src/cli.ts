@@ -1583,6 +1583,16 @@ async function cmdCarry(positional: string[], root: string, toPhase: string | un
     process.exitCode = 1;
     return;
   }
+  // OD addendum A: a second owner act on the same id is refused, naming the
+  // existing act. A deferral already put this item's fix off; carrying it too
+  // would silently drop one act, so it is refused here (and by the conductor
+  // for a hand-written inbox file).
+  const existingDefer = (state.phase.deferrals ?? []).find((d) => d.itemId === recordId && d.status === "open");
+  if (existingDefer) {
+    process.stdout.write(`carry rejected: ${recordId} is already deferred (${existingDefer.id}); resolve or drop that deferral first\n`);
+    process.exitCode = 1;
+    return;
+  }
   const recordKind = finding ? "finding" : "message";
   // Like every record command, the binding is the PHASE's current candidate
   // and contract plus the record's own version (owner-commands.ts's
@@ -1648,6 +1658,13 @@ async function cmdDefer(
   const decision = state.phase.decisions.find((d) => d.id === recordId);
   if (!finding && !decision) {
     process.stdout.write(`defer rejected: no finding or decision ${recordId} in run ${path.basename(runDir)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  // OD addendum A: a second owner act on the same id is refused, naming the
+  // existing act.
+  if ((state.phase.carriedItems ?? []).includes(recordId)) {
+    process.stdout.write(`defer rejected: ${recordId} is already carried (to ${state.phase.carriedTo?.[recordId] ?? "next"}); resolve that carry first\n`);
     process.exitCode = 1;
     return;
   }

@@ -3198,6 +3198,12 @@ export class Conductor {
     // hand-written inbox file cannot bypass the CLI's own check.
     if (event.type === "DEFERRAL_RECORDED") {
       const d = event.deferral;
+      // OD addendum A: a second owner act on the same id is refused, naming
+      // the existing act (a hand-written inbox file cannot bypass the CLI).
+      if ((this.#state.phase.carriedItems ?? []).includes(d.itemId)) {
+        this.#rejectInboxFile(file, commandId, `${d.itemId} is already carried (to ${this.#state.phase.carriedTo?.[d.itemId] ?? "next"}); resolve that carry first`);
+        return;
+      }
       if (d.test && !this.#deferralTestExists(d.test)) {
         this.#rejectInboxFile(file, commandId, `no resolved or existing test named "${d.test}" shows the item's current cost`);
         return;
@@ -4706,6 +4712,9 @@ export class Conductor {
       }
       const sourceFinding = message.sourceRecordId ? this.#state.phase.findings.find((f) => f.id === message.sourceRecordId) : undefined;
       if (entry.action === "merge") {
+        // `#evaluationIssue` (above) refuses a merge that does not name
+        // another raw message of the same type, so `into` is always set here;
+        // the undefined fallback below is defensive only (OD addendum B).
         const into = typeof entry.into === "string" && entry.into.trim().length > 0 ? entry.into.trim() : undefined;
         events.push({ type: "MESSAGE_MERGED", ...binding, by: "evaluator", reason: into ? `merged into ${into}` : "merged" });
         // Plan 06i (C3): the finding behind a merged message is MERGED, not

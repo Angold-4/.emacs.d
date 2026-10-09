@@ -16,6 +16,7 @@ import {
   type TriageRecord,
 } from "../../src/core/triage.ts";
 import { reduce } from "../../src/core/reduce.ts";
+import { checkItemCarried } from "../../src/core/owner-commands.ts";
 import { baseState } from "./helpers.ts";
 import type { Decision, Finding, PhaseState } from "../../src/core/types.ts";
 
@@ -55,6 +56,47 @@ test("plan 06i: a wrong value always wins over a judgement trade-off, whatever t
   });
   assert.equal(d.kind, "fix");
   assert.match(dispositionReason(d), /wrong output/);
+});
+
+test("plan 06i: a panel drop is not by itself a trade-off; the finding needs real chosen/alternative/why", () => {
+  // OD-20: the panel's severity vote supplies neither the evaluator's
+  // classification nor the three trade-off fields. A panel-lowered finding
+  // goes through the same judgement path: real three fields -> trade-off;
+  // a missing one -> escalate. The panel's reason is context only.
+  const finding: Finding = {
+    id: "F-panel",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "advisory",
+    severityChangedBy: "panel",
+    severityReason: "panel did not keep it blocking",
+    evidence: "src/a.ts:1 a style point",
+    raisedBy: "M",
+    status: "open",
+    boundCandidateSha: "C1",
+  };
+  const base = {
+    phaseId: "p1",
+    candidate: { sha: "C1" },
+    contract: { contractVersion: { snapshot: 1, sectionSha256: "x" } },
+    findings: [finding],
+    decisions: [],
+    ballots: [],
+  };
+  const missingWhy = {
+    ...base,
+    itemChecks: [{ itemId: "F-panel", verdict: "confirmed", impact: "judgement", evidence: "README.md:1", chosen: "accept it", alternative: "repair it" }],
+  } as unknown as PhaseState;
+  const d1 = disposition({ itemId: "F-panel", source: "finding", impact: "judgement" }, evidenceForFinding(finding, missingWhy));
+  assert.equal(d1.kind, "escalate", "a panel drop with a missing why escalates, not a stock trade-off");
+
+  const withWhy = {
+    ...base,
+    itemChecks: [{ itemId: "F-panel", verdict: "confirmed", impact: "judgement", evidence: "README.md:1", chosen: "accept it", alternative: "repair it", why: "it is a style point" }],
+  } as unknown as PhaseState;
+  const d2 = disposition({ itemId: "F-panel", source: "finding", impact: "judgement" }, evidenceForFinding(finding, withWhy));
+  assert.deepEqual(d2, { kind: "tradeoff", chosen: "accept it", alternative: "repair it", why: "it is a style point" });
 });
 
 test("plan 06i: a discovered decision with no ballots escalates to the owner, never a silent trade-off", () => {
@@ -120,6 +162,31 @@ test("plan 06i: a triage failure parks the phase on the owner, never a pass", ()
     result.state.phase.ownerRequests.some((r) => r.status === "open" && r.reason.includes("triage blew up")),
     "the owner is asked, with the reason",
   );
+});
+
+test("plan 06i: a carry and a defer on the same id are refused, each naming the existing act", () => {
+  // OD addendum A: a second owner act on the same id is refused; neither is
+  // silently dropped.
+  const finding: Finding = { id: "F-1", version: 1, phaseId: "p1", kind: "defect", severity: "blocking", evidence: "e", raisedBy: "M", status: "open", boundCandidateSha: "" };
+  const phase = { ...baseState({ findings: [finding] }).phase, deferrals: [{ id: "DEF-1", itemId: "F-1", text: "t", test: "x", status: "open" as const }] };
+  const carried = checkItemCarried(phase, {
+    type: "ITEM_CARRIED",
+    recordId: "F-1",
+    toPhase: "c",
+    boundCandidateSha: phase.candidate?.sha ?? "",
+    boundContractVersion: phase.contract.contractVersion,
+    boundRecordVersion: 1,
+  });
+  assert.equal(carried.ok, false, "a carry on a deferred id is refused");
+  assert.match(carried.reason ?? "", /DEF-1/, "the refusal names the existing deferral");
+
+  const phase2 = { ...baseState({ findings: [finding] }).phase, carriedItems: ["F-1"] };
+  const r = reduce(
+    { ...baseState(), phase: phase2 },
+    { type: "DEFERRAL_RECORDED", deferral: { id: "DEF-2", itemId: "F-1", text: "t", test: "x", status: "open" } },
+  );
+  assert.equal(r.ok, false, "a defer on a carried id is refused");
+  assert.match(r.ok ? "" : r.reason, /carried/, "the refusal names the existing carry");
 });
 
 test("plan 06i: ledgerRecords covers every finding and every discovered decision of the ledger", () => {

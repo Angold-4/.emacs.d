@@ -854,8 +854,15 @@ then escalated.
 A discovered decision that receives **no ballots**, a failed vote whose
 outcome would change the output, and any unclassifiable item all escalate to
 the owner: they are never quietly kept as a trade-off and never quietly
-dropped. A `detail` decision is settled by its class and is never balloted, so
-it is an ordinary trade-off.
+dropped. A `detail` decision is **never balloted**, but it still needs the
+evaluator's impact class and a real `chosen`/`alternative`/`why` to be a
+trade-off; without them it escalates like any other unclassified record.
+
+A trade-off needs the evaluator's classification **and** real
+`chosen`/`alternative`/`why` from its check. Neither a reviewer's severity
+label nor a round-panel drop is by itself a trade-off: a panel-lowered finding
+goes through the same judgement path (real three fields → trade-off; a missing
+field → escalate), and the panel's own reason is shown only as context.
 
 ### Carry and defer
 
@@ -872,6 +879,11 @@ its current cost, or a recorded owner ruling. Without either it is refused
 with the reason (`tt defer <run> <id> --test <name>` or
 `--owner-ruling <id>`); with either it is recorded and listed under
 `### Open deferrals` in `tt summary` until it is resolved.
+
+A second owner act on the **same id** is refused with the reason, naming the
+existing act: `tt carry` on an id that already has an open deferral, and
+`tt defer` on an id that is already carried, are both rejected. The two acts
+are not merged and neither is silently dropped.
 
 ### A worked example: valuation 01's settled-halt decision
 
