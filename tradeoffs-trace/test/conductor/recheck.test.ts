@@ -13,6 +13,8 @@ import { fileURLToPath } from "node:url";
 
 import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor } from "./harness.ts";
 import { runPaths } from "../../src/conductor.ts";
+import { materializeCandidate } from "../../src/effects/git.ts";
+import { EventLog } from "../../src/effects/log.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 
@@ -596,33 +598,48 @@ test("plan 06j: a recheck whose worktree reset throws is refused and the stopped
 });
 
 test("plan 06j: a recheck stops every lane worker and resets every lane worktree", async () => {
-  // OD-5(3): with workers > 1, all live lane workers stop and all lane
-  // worktrees reset before the checks re-run. The round checks pass and a
-  // winner is handed off; the FINAL check then fails and starts a two-lane
-  // repair round (the lane checks run only the round tier, so the final check
-  // is what makes the phase repair). Both repair lane workers write dirty
-  // files and hang.
+  // OD-9: reach the state under test directly by seeding the run's log with
+  // a candidate whose checks failed and REPAIR_ATTEMPT_STARTED. `start()`
+  // folds them and dispatches the two-lane repair round immediately, so no
+  // review, pick or final check runs. Both lane workers write dirty files
+  // and hang; the recheck must stop them and reset both lane worktrees.
   const setup = await setupConductor({
-    phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], finalChecks: ["false"], boundaries: [], reserved: [], workers: 2 },
-    workerScript: () => laneWorker("a", 1),
-    laneWorkerScriptFor: (lane, round) => laneWorker(lane, round),
-    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
-    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} prefers`),
+    phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], workers: 2 },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "hang-until-abort" }] }),
+    laneWorkerScriptFor: (lane) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf 'DIRTY-${lane}\\n' > dirty-${lane}.txt; printf 'DIRTY-TRACKED-${lane}\\n' >> README.md` },
+        { kind: "hang-until-abort" },
+      ],
+    }),
+    reviewerScriptFor: reviewerFor(),
     deadlines: FAST,
   });
+  const log = new EventLog(runPaths(setup.runDir).events, []);
+  log.append("event", { type: "ATTEMPT_STARTED", baselineNeeded: false });
+  log.append("event", { type: "SUBMIT_PHASE", disclosures: [], prior: [] });
+  log.append("event", { type: "FREEZE_COMPLETED", candidateSha: setup.repo.head, decisions: [], tainted: false });
+  log.append("event", { type: "CHECKS_FAILED" });
+  log.append("event", { type: "REPAIR_ATTEMPT_STARTED" });
+  log.close();
+  // The seeded freeze skipped the physical materialization, so the candidate
+  // dir the reviewers and probe run in must exist.
+  const candidateDir = path.join(runPaths(setup.runDir).candidates, setup.repo.head);
+  if (!fs.existsSync(candidateDir)) materializeCandidate(setup.repo.dir, setup.repo.head, candidateDir);
   const laneA = path.join(setup.runDir, "worktrees", "lane-a");
   const laneB = path.join(setup.runDir, "worktrees", "lane-b");
   try {
     await setup.conductor.start();
     await waitFor(
       () => setup.conductor.state.phase.phase === "IMPLEMENTING" && fs.existsSync(path.join(laneA, "dirty-a.txt")) && fs.existsSync(path.join(laneB, "dirty-b.txt")),
-      120_000,
+      30_000,
       50,
       setup.runDir,
     );
-    const out = await runCli(["recheck", setup.runDir, "--reason", "the final check was killed by the machine"]);
+    const out = await runCli(["recheck", setup.runDir, "--reason", "the machine was busy"]);
     assert.match(out.stdout, /recheck requested/, out.stdout);
-    await waitFor(() => !fs.existsSync(path.join(laneA, "dirty-a.txt")) && !fs.existsSync(path.join(laneB, "dirty-b.txt")), 90_000, 50, setup.runDir);
+    await waitFor(() => !fs.existsSync(path.join(laneA, "dirty-a.txt")) && !fs.existsSync(path.join(laneB, "dirty-b.txt")), 30_000, 50, setup.runDir);
     assert.ok(!fs.existsSync(path.join(laneA, "dirty-a.txt")), "lane a's untracked write is gone");
     assert.ok(!fs.existsSync(path.join(laneB, "dirty-b.txt")), "lane b's untracked write is gone");
     assert.ok(!fs.readFileSync(path.join(laneA, "README.md"), "utf8").includes("DIRTY-TRACKED-a"), "lane a's tracked write is gone");
