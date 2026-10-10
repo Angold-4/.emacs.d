@@ -12,6 +12,11 @@
     "goal": { "type": "string", "minLength": 1 },
     "acceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "finalChecks": {
+      "description": "Plan 06c: the phase's final check, frozen into the contract. Only a candidate that has passed review with no open blocker runs it, once.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "architecture": { "type": "array", "items": { "type": "object" } },

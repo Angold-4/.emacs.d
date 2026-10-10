@@ -21,6 +21,7 @@ import {
   buildContract,
   buildWorkerPrompt,
   Conductor,
+  contractVersionFor,
   createRun,
   runPaths,
   type RunPlanFile,
@@ -32,6 +33,8 @@ import {
   defaultReviewerHello,
   defaultWorkerHello,
   FAKE_PI_PATH,
+  makeRepo,
+  makeRunRoot,
   readEvents,
   setupConductor,
   waitFor,
@@ -521,4 +524,136 @@ test("baseline: runs once per base tree — a second program node with the same 
   cleanupDir(setup.runRoot);
   cleanupDir(setup.scriptsDir);
   fs.rmSync(marker, { force: true });
+});
+
+test("plan 06c: a child node based on its parent's accepted candidate reuses the parent's check record as baseline", async () => {
+  const repo = makeRepo();
+  const runRoot = makeRunRoot();
+  const scriptsDir = fs.mkdtempSync("/tmp/tt-baseline-child-");
+  const marker = `/tmp/tt-child-baseline-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(marker, { force: true });
+  const command = `echo run >> ${marker}`;
+  const phase = { id: "p1", goal: "g", acceptance: ["a"], checks: [command], boundaries: [], reserved: [] };
+
+  // A commit the parent "accepted" and published to main--a; main is reset
+  // back so a control node can start from a different base.
+  fs.writeFileSync(path.join(repo.dir, "published.txt"), "x\n");
+  git(repo.dir, ["add", "-A"]);
+  git(repo.dir, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "published"]);
+  const baseSha = git(repo.dir, ["rev-parse", "HEAD"]);
+  git(repo.dir, ["branch", "main--a", baseSha]);
+  git(repo.dir, ["reset", "--hard", "HEAD~1"]);
+
+  // The parent's run holds the passing check record for its accepted candidate.
+  const parentPlan: RunPlanFile = { title: "parent", repo: repo.dir, integrationBranch: "main--a", checks: [command], phases: [phase] };
+  const parentRunDir = createRun(runRoot, parentPlan);
+  const parentRunId = path.basename(parentRunDir);
+  const recordDir = path.join(runPaths(parentRunDir).checks, baseSha);
+  fs.mkdirSync(recordDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(recordDir, "record.json"),
+    JSON.stringify({
+      candidateSha: baseSha,
+      baseSha,
+      tier: "round",
+      passed: true,
+      commands: [{ command, exitCode: 0, signal: null, timedOut: false, durationMs: 1, passed: true, log: "log" }],
+      finalCommands: [],
+      load1: 0,
+      freeMemMB: 1,
+      at: new Date().toISOString(),
+    }),
+  );
+  // The SCHEDULER makes the reuse choice and passes the accepted candidate's
+  // record path into the run; the conductor only consumes it.
+  const programId = "prog-child-baseline";
+
+  const makeChild = (
+    integrationBranch: string,
+    node: string,
+    scriptName: string,
+    baselineReuse?: { fromRunId: string; fromCandidateSha: string },
+  ): { runDir: string; conductor: Conductor } => {
+    const childPlan: RunPlanFile = { title: `child-${node}`, repo: repo.dir, integrationBranch, checks: [command], phases: [phase] };
+    const runDir = createRun(runRoot, childPlan);
+    fs.writeFileSync(path.join(runDir, "program.json"), JSON.stringify({ programId, node, ...(baselineReuse ? { baselineReuse } : {}) }));
+    const worker = writeScript(scriptsDir, `${scriptName}-worker`, {
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${node}\\n' > child-${node}.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    });
+    const reviewer = writeScript(scriptsDir, `${scriptName}-reviewer`, {
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer: "$TT_REVIEWER",
+            phaseId: "p1",
+            candidateSha: "$TT_CANDIDATE_SHA",
+            contractVersion: contractVersionFor(phase),
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    });
+    const conductor = new Conductor({
+      runDir,
+      plan: childPlan,
+      piCommand: process.execPath,
+      piArgsPrefix: [FAKE_PI_PATH],
+      piEnvFor: (role) => (role === "worker" ? { FAKE_PI_SCRIPT: worker } : role === "reviewer" ? { FAKE_PI_SCRIPT: reviewer } : undefined),
+      deadlines: FAST,
+    });
+    return { runDir, conductor };
+  };
+
+  // The child's base IS the parent's accepted candidate: no baseline runs.
+  const reused = makeChild("main--a", "b", "reuse", { fromRunId: parentRunId, fromCandidateSha: baseSha });
+  try {
+    await reused.conductor.start();
+    await waitFor(
+      () => readEvents(reused.runDir).some((r) => r.kind === "event" && (r.event as { type: string }).type === "CHECKS_PASSED"),
+      90_000,
+      50,
+      reused.runDir,
+    );
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split("\n").length, 1, "no baseline check command ran for the child");
+    const baselineEvents = readEvents(reused.runDir).filter((r) => r.kind === "baseline").map((r) => r.event as Record<string, unknown>);
+    const adopted = baselineEvents.find((e) => e.reused === true);
+    assert.ok(adopted, "the child logged a reused baseline");
+    assert.equal(adopted!.reusedFrom, baseSha, "the reuse names the parent's accepted candidate");
+    const completed = readEvents(reused.runDir).find((r) => r.kind === "event" && (r.event as { type: string }).type === "BASELINE_COMPLETED");
+    assert.equal((completed!.event as { reusedFrom?: string }).reusedFrom, baseSha, "BASELINE_COMPLETED carries reusedFrom");
+  } finally {
+    await reused.conductor.stop();
+  }
+
+  // Control: a node whose base is NOT the parent's candidate runs a baseline.
+  fs.rmSync(marker, { force: true });
+  const other = makeChild("main", "c", "other");
+  try {
+    await other.conductor.start();
+    await waitFor(
+      () => readEvents(other.runDir).some((r) => r.kind === "event" && (r.event as { type: string }).type === "CHECKS_PASSED"),
+      90_000,
+      50,
+      other.runDir,
+    );
+    assert.equal(fs.readFileSync(marker, "utf8").trim().split("\n").length, 2, "a node with any other base runs one baseline");
+    assert.ok(
+      !readEvents(other.runDir).some((r) => r.kind === "baseline" && (r.event as { reused?: boolean }).reused === true),
+      "the control did not reuse a record",
+    );
+  } finally {
+    await other.conductor.stop();
+    cleanupDir(runRoot);
+    cleanupDir(scriptsDir);
+    cleanupDir(repo.dir);
+    fs.rmSync(marker, { force: true });
+  }
 });

@@ -118,6 +118,9 @@ export interface LintPhaseInput {
   architecture?: LintItemInput[];
   requirements?: LintItemInput[];
   constraints?: LintItemInput[];
+  /** Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by
+   * the phase's `:FINAL_CHECKS:`). Absent leaves the plan as before. */
+  finalChecks?: string[];
 }
 
 export interface LintPlanInput {

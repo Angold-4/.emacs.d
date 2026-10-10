@@ -54,6 +54,12 @@ function gatedContract(gate = "deploy/atlas.sh --clean --build", gateCleanup?: s
   return { ...baseState().phase.contract, gate, ...(gateCleanup ? { gateCleanup } : {}) };
 }
 
+/** Plan 06c: the same contract with a final check declared, which inserts the
+ * FINAL_CHECKING stage between RESOLVING and ACCEPTED. */
+function finalContract(finalChecks = ["make check-final"], gate?: string) {
+  return { ...baseState().phase.contract, finalChecks, ...(gate ? { gate } : {}) };
+}
+
 interface Fixture {
   state: State;
   event: Event;
@@ -241,6 +247,84 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "GATE_INTERRUPTED" },
   },
+  // Plan 06c: an acceptable candidate whose contract declares a final check
+  // enters FINAL_CHECKING instead; the final check is the next action.
+  "resolving-final-check-required": {
+    state: baseState({
+      phase: "RESOLVING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECK_REQUIRED" },
+  },
+  "final-checks-passed-accepted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
+  "final-checks-passed-gated": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(["make check-final"], "deploy/atlas.sh --clean --build"),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
+  "final-checks-failed-to-repairing": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_FAILED", evidence: "the final check failed: test 'final check'" },
+  },
+  "final-checks-failed-budget-exhausted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      repairRoundsUsed: 3,
+      repairRoundsGranted: 3,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_FAILED", evidence: "the final check failed: test 'final check'" },
+  },
+  "final-checks-interrupted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_INTERRUPTED" },
+  },
   // Plan 01g: a passing amendment (M and A approve it) replaces one
   // acceptance item, bumps the contract version and starts a fresh attempt
   // so the next candidate is judged against the new wording. The resulting
@@ -381,6 +465,10 @@ const BUILD: Record<string, Fixture> = {
   },
   "run-resumed": {
     state: baseState({ phase: "READY" }, "RUN_PAUSED_BUDGET"),
+    event: { type: "RUN_RESUMED" },
+  },
+  "run-resumed-active": {
+    state: baseState({ phase: "READY" }, "RUN_ACTIVE"),
     event: { type: "RUN_RESUMED" },
   },
   // Plan 05i: the environment preflight and environment (126/127) failures.

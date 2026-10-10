@@ -13,6 +13,7 @@
 // state. `actions` is what `next()` of the resulting state must equal.
 
 import { carryBallotsForward, carryDecisionsForward } from "./rounds.ts";
+import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
 import {
   applyFindingAcceptedByOwner,
@@ -376,6 +377,9 @@ addRow({
       archSymbolDeviations: undefined,
       overturns: undefined,
       itemChecks: undefined,
+      // Plan 06c: the final check's pass belongs to the candidate that just
+      // froze, so a new candidate runs it again.
+      finalChecksPassedFor: undefined,
       // Skill fix 5: kept decisions that passed keep their ballots.
       ballots: carryBallotsForward(
         s.phase.decisions,
@@ -1064,6 +1068,107 @@ addRow({
   to: "GATING",
   actions: [{ type: "run_gate", candidateSha: "C1" }],
   apply: (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "run_gate") }),
+});
+
+// --- FINAL_CHECKING (plan 06c): the plan's final check ---------------------
+// A phase whose contract declares a final check runs it once for the candidate
+// about to be accepted, after the reviews have passed. A failure is an
+// ordinary check failure: back to REPAIRING (or AWAITING_OWNER when the budget
+// is spent), with the failing test named in a blocking finding.
+function finalDeclared(s: State): boolean {
+  return finalCheckOf(s.phase.contract) !== undefined;
+}
+
+function finalCheckAlreadyPassed(s: State): boolean {
+  return s.phase.finalChecksPassedFor !== undefined && s.phase.finalChecksPassedFor === s.phase.candidate?.sha;
+}
+
+addRow({
+  id: "resolving-final-check-required",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "FINAL_CHECK_REQUIRED",
+  guardName: "acceptHoldsAndFinalDeclared",
+  guard: (s) => acceptHolds(s) && finalDeclared(s) && !finalCheckAlreadyPassed(s),
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { phase: "FINAL_CHECKING" }),
+});
+
+addRow({
+  id: "final-checks-passed-accepted",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "acceptHoldsAndNoGate",
+  guard: (s) => acceptHolds(s) && !gateDeclared(s),
+  to: "ACCEPTED",
+  actions: [{ type: "publish_intent", expectedHead: "H0", candidateI: "I1" }],
+  apply: (s) => {
+    const C = s.phase.candidate!.sha;
+    const K = s.phase.contract.contractVersion;
+    const resolved = resolvedCorrectionIdsFor(s.phase, C, K);
+    const corrections = s.phase.corrections.map((c: Correction) =>
+      resolved.includes(c.id) ? { ...c, status: "resolved" as const } : c,
+    );
+    return withPhase(s, {
+      phase: "ACCEPTED",
+      corrections,
+      finalChecksPassedFor: C,
+      inFlight: clearInFlight(s.phase, "run_final_checks"),
+    });
+  },
+});
+
+addRow({
+  id: "final-checks-passed-gated",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "acceptHoldsAndGateDeclared",
+  guard: (s) => acceptHolds(s) && gateDeclared(s),
+  to: "GATING",
+  actions: [{ type: "run_gate", candidateSha: "C1" }],
+  apply: (s) =>
+    withPhase(s, {
+      phase: "GATING",
+      finalChecksPassedFor: s.phase.candidate?.sha ?? "",
+      inFlight: clearInFlight(s.phase, "run_final_checks"),
+    }),
+});
+
+failureRows(
+  "final-checks-failed",
+  "FINAL_CHECKING",
+  "FINAL_CHECKS_FAILED",
+  REPAIR_ATTEMPT_ACTIONS,
+  "the final check kept failing",
+  (s, ev) => {
+    const e = ev as Extract<Event, { type: "FINAL_CHECKS_FAILED" }>;
+    // An ordinary check failure: the failing tests are kept on `checks` (so
+    // the repair prompt names them) and no finding is raised — a finding
+    // would stay open and block the next candidate's acceptance.
+    return withPhase(s, {
+      checks: {
+        candidateSha: s.phase.candidate!.sha,
+        passed: false,
+        ...(e.failures && e.failures.length > 0 ? { failures: e.failures } : {}),
+      },
+      inFlight: clearInFlight(s.phase, "run_final_checks"),
+    });
+  },
+);
+
+addRow({
+  id: "final-checks-interrupted",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_INTERRUPTED",
+  guardName: "always",
+  guard: () => true,
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "run_final_checks") }),
 });
 
 addRow({
@@ -1961,6 +2066,24 @@ addRow({
   // start_attempt again once the run is unpaused.
   actions: [{ type: "start_attempt" }],
   apply: (s) => ({ ...s, run: "RUN_ACTIVE" }),
+});
+
+// Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
+// run records RUN_RESUMED once at start-up, so the stage clock sees the resume
+// as the start of a new segment. The run was already active, so this is a
+// record-only row (the phase is preserved untouched).
+addRow({
+  id: "run-resumed-active",
+  axis: "run",
+  from: "RUN_ACTIVE",
+  trigger: "RUN_RESUMED",
+  guardName: "always",
+  guard: () => true,
+  to: "RUN_ACTIVE",
+  // The fixture resumes with the phase at READY, so next() recommends
+  // start_attempt once the resume is recorded.
+  actions: [{ type: "start_attempt" }],
+  apply: (s) => s,
 });
 
 export const TRANSITIONS: readonly TransitionRow[] = rows;

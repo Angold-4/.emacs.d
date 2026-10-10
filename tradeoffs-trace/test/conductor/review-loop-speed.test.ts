@@ -17,7 +17,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
 
-import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor } from "./harness.ts";
+import { cleanupDir, defaultReviewerHello, defaultWorkerHello, FAKE_PI_PATH, readEvents, setupConductor, sleep, waitFor, writeScript } from "./harness.ts";
+import { Conductor, contractVersionFor, rebuildTimeline } from "../../src/conductor.ts";
+import { stageSpans } from "../../src/view.ts";
 import type { State } from "../../src/core/types.ts";
 
 type Setup = Awaited<ReturnType<typeof setupConductor>>;
@@ -281,6 +283,93 @@ test("repair-context: the repair prompt carries findings, the failed vote and pr
     assert.equal(finding.status, "repaired", "B confirmed the repair (not a withdrawal)");
   } finally {
     await teardown(setup, logs);
+  }
+});
+
+test("plan 06c: a stop during CHECKING and a resume show the resumed stage's own time and exclude the stopped gap", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-06c-clock-");
+  const gate = path.join(dir, "gate");
+  fs.rmSync(gate, { force: true });
+  // The base has no sum.js, so the baseline passes at once; the candidate
+  // (which writes sum.js) blocks in CHECKING until the gate file exists.
+  const check = `if [ -f sum.js ]; then while [ ! -f ${gate} ]; do sleep 0.2; done; fi`;
+  const setup = await setupConductor({
+    checks: [check],
+    deadlines: { ...fastDeadlines, checkMs: 30_000 },
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'x\n' > sum.js" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  let resumed: Conductor | undefined;
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "CHECKING", 60_000, 50, setup.runDir);
+    // Stop while the check is running, leave a stopped gap, then resume with a
+    // fresh conductor (the stopped one is closed).
+    await setup.conductor.stop();
+    const stoppedAt = Date.now();
+    await sleep(2_000);
+    const reviewerScript = writeScript(setup.scriptsDir, "reviewer-resume", {
+      hello: defaultReviewerHello(),
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer: "$TT_REVIEWER",
+            phaseId: "p1",
+            candidateSha: "$TT_CANDIDATE_SHA",
+            contractVersion: contractVersionFor(setup.plan.phases[0]),
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    });
+    resumed = new Conductor({
+      runDir: setup.runDir,
+      plan: setup.plan,
+      piCommand: process.execPath,
+      piArgsPrefix: [FAKE_PI_PATH],
+      piEnvFor: (role) => (role === "worker" ? { FAKE_PI_SCRIPT: path.join(setup.scriptsDir, "worker.json") } : role === "reviewer" ? { FAKE_PI_SCRIPT: reviewerScript } : undefined),
+      stubReviews: true,
+      deadlines: { ...fastDeadlines, checkMs: 30_000 },
+    });
+    await resumed.start();
+    // OD-5: while the resumed check is still running, the CURRENT checks
+    // stage sums its running segments: its own start (never the resume) and a
+    // duration at least the pre-stop segment.
+    const liveTimeline = rebuildTimeline(setup.runDir, setup.plan);
+    const checksEntry = liveTimeline.phases.find((p) => p.phase === "CHECKING")!.at;
+    const stopTs = readEvents(setup.runDir).find((r) => r.kind === "stop")!.ts;
+    const liveChecks = stageSpans(liveTimeline, new Date()).find((s) => s.stage === "checks")!;
+    assert.equal(liveChecks.startedAt, checksEntry, "the current stage keeps its own start, never the resume");
+    assert.ok(liveChecks.ms >= Date.parse(stopTs) - Date.parse(checksEntry), "the current stage includes its pre-stop segment");
+    // The resumed check is running; let it pass and the phase move on.
+    fs.writeFileSync(gate, "go\n");
+    await waitFor(() => resumed!.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    const spans = stageSpans(rebuildTimeline(setup.runDir, setup.plan), new Date());
+    const checks = spans.find((s) => s.stage === "checks")!;
+    assert.ok(checks, "the checks span is present");
+    // The stopped gap (about 2 s) never counts: the checks span is the sum of
+    // its running segments, not the wall interval across the stop.
+    assert.ok(checks.ms < 1_500, `checks span is ${checks.ms}ms, excluding the stopped gap`);
+    assert.ok(Date.now() - stoppedAt >= 2_000);
+    // The run recorded a real RUN_RESUMED event at start-up.
+    assert.ok(
+      readEvents(setup.runDir).some((r) => r.kind === "event" && (r.event as { type: string }).type === "RUN_RESUMED"),
+      "the resume is a RUN_RESUMED event",
+    );
+  } finally {
+    if (resumed) await resumed.stop();
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    cleanupDir(dir);
   }
 });
 

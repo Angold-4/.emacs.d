@@ -147,18 +147,22 @@ function itemInput(node: OrgNode, kind: "architecture" | "requirement" | "constr
 }
 
 /** Parse one level-1 phase subtree. */
-function parsePhaseNode(node: OrgNode, acceptanceLines: number[] = []): LintPhaseInput {
+function parsePhaseNode(node: OrgNode, acceptanceLines: number[] = [], globalFinalChecks?: string): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
   const architecture = byTitle("Architecture");
   const requirements = byTitle("Requirements");
   const constraints = byTitle("Constraints");
   const structured = Boolean(architecture || requirements || constraints);
+  // Plan 06c: a phase's own :FINAL_CHECKS: overrides the plan's
+  // #+TT_FINAL_CHECKS; neither leaves the plan behaving as before.
+  const finalChecks = node.props.FINAL_CHECKS ?? globalFinalChecks;
   const phase: LintPhaseInput = {
     id: node.props.ID,
     ...(goalNode ? { goal: bodyText(goalNode) } : {}),
     acceptance: [],
     acceptanceLines,
+    ...(finalChecks ? { finalChecks: [finalChecks] } : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -255,7 +259,8 @@ function parseModels(keyword: { value: string; line: number } | undefined): Pick
 export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const { keywords, roots } = parseOrgTree(text);
   const first = (key: string) => keywords.find((k) => k.key === key);
-  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r));
+  const globalFinalChecks = first("TT_FINAL_CHECKS")?.value;
+  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks));
   const rerun = first("TT_RERUN");
   return {
     ...(sourceFile ? { sourceFile } : {}),

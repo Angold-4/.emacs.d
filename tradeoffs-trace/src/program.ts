@@ -377,6 +377,45 @@ export function runWaitReason(runDir: string): string | undefined {
   return undefined;
 }
 
+/** Plan 06c (A3): the baseline-reuse decision, owned by the scheduler. When
+ * a node has exactly one dependency, that dependency's run is DONE, and its
+ * ACCEPTED candidate is exactly this node's base commit, the node reuses the
+ * accepted candidate's passing check record instead of running a baseline.
+ * The choice and its provenance are passed into the run; the conductor never
+ * scans sibling runs itself. */
+function acceptedCandidateBaseline(
+  program: ProgramFile,
+  nodes: ProgramNode[],
+  node: ProgramNode,
+  state: ProgramState,
+  runRoot: string,
+): { fromRunId: string; fromCandidateSha: string } | undefined {
+  if (node.deps.length !== 1) return undefined;
+  const dep = node.deps[0];
+  const depState = state.nodes[dep];
+  if (!depState?.runId || depState.status !== "done") return undefined;
+  const depRunDir = path.join(runRoot, depState.runId);
+  let accepted: string | undefined;
+  try {
+    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(depRunDir).plan, "v1.json"), "utf8")) as RunPlanFile;
+    const st = rebuildState(depRunDir, plan, { lenient: true });
+    if (st.phase.phase !== "DONE") return undefined;
+    accepted = st.phase.candidate?.sha;
+  } catch {
+    return undefined;
+  }
+  if (!accepted) return undefined;
+  const base = nodeBases(program, nodes, node)[0];
+  let baseSha: string;
+  try {
+    baseSha = git(program.entries.find((e) => e.id === node.entry)!.plan.repo, ["rev-parse", "--verify", `${base}^{commit}`]);
+  } catch {
+    return undefined;
+  }
+  if (baseSha !== accepted) return undefined;
+  return { fromRunId: depState.runId, fromCandidateSha: accepted };
+}
+
 /** How often the scheduler restarts a node whose conductor crashed. */
 export const MAX_CRASH_RESUMES = 3;
 
@@ -444,9 +483,14 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });
       continue;
     }
+    // Plan 06c (A3): the scheduler is the only owner of the baseline-reuse
+    // choice. A node with exactly one dependency whose accepted candidate IS
+    // this node's base reuses that candidate's check record; the path is
+    // passed into the run, and the conductor only consumes it.
+    const baselineReuse = acceptedCandidateBaseline(program, nodes, node, state, opts.runRoot);
     fs.writeFileSync(
       path.join(runDir, "program.json"),
-      JSON.stringify({ programId: path.basename(dir), node: id, readableId: readableIds[id] }),
+      JSON.stringify({ programId: path.basename(dir), node: id, readableId: readableIds[id], ...(baselineReuse ? { baselineReuse } : {}) }),
     );
     record({
       type: "NODE_STARTED",

@@ -96,13 +96,32 @@ export interface StageSpan {
 /** `lastEventAt`: when the conductor is not running, the current stage
  * stops counting at the last logged event instead of running on. */
 export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string): StageSpan[] {
+  // Plan 06c (A5): a stage's duration is the sum of its RUNNING segments. A
+  // segment runs from the stage start, or a resume (RUN_RESUMED / an
+  // interrupted attempt), to the next stop record or the stage end. A stopped
+  // interval never counts — for the current stage and for completed stages
+  // alike. This is the ONE place durations are computed.
+  const stops = (timeline.stops ?? []).map((t) => Date.parse(t)).sort((a, b) => a - b);
+  const resumes = (timeline.restarts ?? []).map((t) => Date.parse(t)).sort((a, b) => a - b);
+  const stoppedMs = (start: number, end: number): number => {
+    let total = 0;
+    for (const s of stops) {
+      if (s < start || s >= end) continue;
+      const r = resumes.find((t) => t > s);
+      const until = Math.min(r ?? end, end);
+      if (until > s) total += until - s;
+    }
+    return total;
+  };
   const spans: StageSpan[] = [];
   for (const p of timeline.phases) {
     const stage = STAGE_OF[p.phase] ?? p.phase.toLowerCase();
     const last = spans[spans.length - 1];
     if (last && last.stage === stage) continue;
     if (last) {
-      last.ms = Date.parse(p.at) - Date.parse(last.startedAt);
+      const start = Date.parse(last.startedAt);
+      const end = Date.parse(p.at);
+      last.ms = Math.max(0, end - start - stoppedMs(start, end));
       last.current = false;
       // A gate or review that hands the phase back to implement failed. A
       // baseline -> implement step is the normal path, not a failure.
@@ -111,16 +130,15 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
     spans.push({ stage, startedAt: p.at, ms: 0, failed: false, current: true });
   }
   const last = spans[spans.length - 1];
-  // The current stage counts from the last restart inside it: an interrupted
-  // attempt that was re-dispatched has a fresh deadline.
-  const restart = (timeline.restarts ?? []).filter((t) => last && Date.parse(t) >= Date.parse(last.startedAt)).pop();
-  if (last && restart) last.startedAt = restart;
   if (last) {
-    if (last.stage === "DONE" || last.stage === "BLOCKED") last.current = false;
-    else {
-      last.ms = (lastEventAt ? Date.parse(lastEventAt) : now.getTime()) - Date.parse(last.startedAt);
-      if (lastEventAt) last.current = false;
-    }
+    const end = lastEventAt ? Date.parse(lastEventAt) : now.getTime();
+    // Plan 06c (A5/OD-5): the current stage also SUMS its running segments —
+    // its completed segments (stage start, or a RUN_RESUMED, until the stop)
+    // plus the running segment (the last RUN_RESUMED until now). `startedAt`
+    // stays the stage's own start; it is never reset to the last resume.
+    const start = Date.parse(last.startedAt);
+    last.ms = Math.max(0, end - start - stoppedMs(start, end));
+    if (last.stage === "DONE" || last.stage === "BLOCKED" || lastEventAt) last.current = false;
   }
   return spans;
 }

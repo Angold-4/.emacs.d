@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { Conductor, createRun, runPaths, type ConductorOptions, type RunPlanFile } from "../../src/conductor.ts";
 import { planModelSelector, ROLE_TOOLS, type PlanModels } from "../../src/core/roles.ts";
 import { itemsNeedingEvaluatorReverify, roundPanelItemsNeedingVote } from "../../src/core/predicate.ts";
-import { phaseItemOutcomes } from "../../src/core/items.ts";
+import { phaseItemOutcomes, thinMetItems, workerAnchorsOf } from "../../src/core/items.ts";
 
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { readLog, type LogRecord } from "../../src/effects/log.ts";
@@ -306,12 +306,11 @@ export async function setupConductor(opts: {
   // not re-prompted. A test that wants the re-prompt/unchecked path supplies
   // its own `evaluatorScriptFor` with no itemChecks.
   const defaultEvaluatorScript = (state: State, messageType: string) => {
-    const owed =
-      messageType === "finding" && itemsNeedingEvaluatorReverify(state.phase)
-        ? phaseItemOutcomes(state.phase)
-            .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
-            .map((o) => o.item.id)
-        : [];
+    // Plan 06c (R9): the default evaluator cites a real file of the candidate
+    // (every harness repo has README.md) so a `confirmed` check's anchors
+    // validate; a confirmed check with anchors that do not exist is recorded
+    // `unchecked by evaluator`.
+    const owed = messageType === "finding" && itemsNeedingEvaluatorReverify(state.phase) ? owedItemIds(state) : [];
     return {
       hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -321,7 +320,7 @@ export async function setupConductor(opts: {
           args: {
             evaluations: [],
             ...(owed.length > 0
-              ? { itemChecks: owed.map((id) => ({ id, verdict: "confirmed", evidence: "evaluator: re-checked the candidate and found no contradiction" })) }
+              ? { itemChecks: owed.map((id) => ({ id, verdict: "confirmed", evidence: "README.md:1 evaluator: re-checked the candidate and found no contradiction" })) }
               : {}),
           },
         },
@@ -434,6 +433,18 @@ export async function setupConductor(opts: {
   });
 
   return { repo, runRoot, scriptsDir, plan, runDir, conductor };
+}
+
+/** Plan 06c: the item ids the finding-pass evaluator owes a check for — every
+ * outcome that is not met/fits, plus every unanimous thin met/fits. Shared
+ * with the conductor's `#owedItemCheckIds` so the harness's default evaluator
+ * answers exactly what is owed. */
+function owedItemIds(state: State): string[] {
+  const outcomes = phaseItemOutcomes(state.phase);
+  const ids = new Set(outcomes.filter((o) => o.outcome !== "met" && o.outcome !== "fits").map((o) => o.item.id));
+  // Plan 06c (A4/R9): a unanimous thin met/fits is an owed item check too.
+  for (const o of thinMetItems(outcomes, workerAnchorsOf(state.phase.coverage))) ids.add(o.item.id);
+  return [...ids];
 }
 
 export function readEvents(runDir: string): LogRecord[] {

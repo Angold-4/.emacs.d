@@ -435,7 +435,15 @@ test("plan 06b: the evaluator's substantive re-check overturns a review-only maj
         {
           kind: "call-submit",
           tool: "submit_evaluation",
-          args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 implements R2" }] },
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 implements R2" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
         },
       ],
     }),
@@ -601,7 +609,19 @@ test("plan 06b: an evaluator item check with an invalid anchor never overturns a
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
-        { kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "contradicted", evidence: "src/nonexistent.ts:1 proves it" }] } },
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "contradicted", evidence: "src/nonexistent.ts:1 proves it" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
+        },
       ],
     }),
   });
@@ -610,6 +630,53 @@ test("plan 06b: an evaluator item check with an invalid anchor never overturns a
     await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"), 120_000, 50, setup.runDir);
     // The contradicted check cited a file that does not exist, so the majority stands.
     assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "R2"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06c: a confirmed evaluator item check with invalid anchors is recorded as unchecked by evaluator", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
+    // A `confirmed` check whose only anchor does not exist in the candidate is
+    // recorded `unchecked by evaluator`, never as a confirmation.
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "confirmed", evidence: "src/nonexistent.ts:1 confirms it" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => (setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2"), 120_000, 50, setup.runDir);
+    const check = (setup.conductor.state.phase.itemChecks ?? []).find((c) => c.itemId === "R2");
+    assert.equal(check?.verdict, "unchecked", "a confirmed check with invalid anchors is unchecked");
+    assert.match(check?.evidence ?? "", /unchecked by evaluator/);
   } finally {
     await teardown(setup);
   }
@@ -1101,6 +1168,151 @@ test("plan-items: a met verdict citing a line that does not exist is refused; an
     // The missing :WHERE: symbol was recorded deviates before the reviewers.
     await waitFor(() => (setup.conductor.state.phase.archSymbolDeviations ?? []).includes("A1"), 60_000, 50, setup.runDir);
     assert.ok(setup.conductor.state.phase.findings.some((f) => f.itemId === "A1" && f.severity === "blocking"));
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06c: a thin unanimous met verdict is sent to the evaluator as an item check and never withdrawn by code", async () => {
+  const promptLog = `/tmp/tt-06c-thin-${process.pid}-${Date.now()}.txt`;
+  // Every seat judges every item met/fits with a single anchor (the review()
+  // default), so each item is a thin unanimous met/fits.
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    extraEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
+    // The evaluator is asked to audit the thin met items; it contradicts R2
+    // with valid anchors, which overturns the met verdict.
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks: [
+              { id: "R2", verdict: "contradicted", evidence: "src/core/rounds.ts:1 does not implement R2" },
+              { id: "R1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "C1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+              { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
+            ],
+          },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    // The audit is listed in the evaluator's prompt.
+    await waitFor(() => fs.existsSync(promptLog) && fs.readFileSync(promptLog, "utf8").includes("Plan-item re-check"), 90_000, 50, setup.runDir);
+    const prompts = fs.readFileSync(promptLog, "utf8");
+    assert.match(prompts, /Plan-item re-check/);
+    assert.match(prompts, /- R2 .*thin unanimous evidence/, "the thin met R2 is an owed item check");
+    // The evaluator's contradiction overturns the thin met verdict (it is the
+    // evaluator's check, never the code, that withdrew it).
+    await waitFor(() => (setup.conductor.state.phase.overturns ?? []).some((o) => o.id === "R2"), 90_000, 50, setup.runDir);
+    const overturn = (setup.conductor.state.phase.overturns ?? []).find((o) => o.id === "R2")!;
+    assert.equal(overturn.effect, "flip");
+    assert.match(overturn.reason, /thin met verdict/);
+    assert.ok((setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R2" && c.verdict === "contradicted"));
+  } finally {
+    await teardown(setup);
+    fs.rmSync(promptLog, { force: true });
+  }
+
+  // Control: with no contradiction the thin met verdict is never withdrawn by
+  // code — the phase reaches DONE with R2 still met.
+  const control = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
+  });
+  try {
+    await control.conductor.start();
+    await waitFor(() => control.conductor.state.phase.phase === "DONE", 120_000, 50, control.runDir);
+    assert.deepEqual(control.conductor.state.phase.overturns ?? [], [], "code never withdraws a thin met verdict");
+  } finally {
+    await teardown(control);
+  }
+});
+
+test("plan 06c: an amendment whose text equals the current criterion is never raised", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'x\n' > sum.js" },
+        {
+          kind: "call-submit",
+          tool: "submit_phase",
+          args: {
+            decisions: [],
+            assumptions: [],
+            deviations: [],
+            // The proposed wording IS the current criterion: a no-op.
+            criterionDispute: { criterion: "it works", why: "no reason to change it", proposedWording: "it works" },
+          },
+        },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: state.phase.phaseId,
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings: [],
+          },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000, 50, setup.runDir);
+    // No amendment record, no message, no ballot for the no-op proposal.
+    assert.ok(!setup.conductor.state.phase.decisions.some((d) => d.amendment), "no amendment decision was raised");
+    assert.ok(!(setup.conductor.state.phase.messages ?? []).some((m) => (m.sourceRecordId ?? "").includes("amendment")), "no message was raised");
+    assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "ballot_demanded" && JSON.stringify(r.event).includes("amendment")), "no ballot was demanded for it");
+    assert.ok(
+      readEvents(setup.runDir).some((r) => r.kind === "dispute_ignored" && /equals the current criterion/.test(String((r.event as { reason?: string }).reason))),
+      "the no-op amendment is logged as ignored",
+    );
   } finally {
     await teardown(setup);
   }

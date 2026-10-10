@@ -33,7 +33,7 @@ import { currentBallot, isValidBallot, tally } from "./tally.ts";
 // Plan 06b: the per-item acceptance half — every R and C met by majority with
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
-import { flatItems, isStructured, itemNeedsEvidence, itemsAccept, itemsFromPhase, phaseItemOutcomes, tallyItems, testVerifyProblems } from "./items.ts";
+import { flatItems, isStructured, itemNeedsEvidence, itemsAccept, itemsFromPhase, phaseItemOutcomes, tallyItems, testVerifyProblems, thinMetItems, workerAnchorsOf } from "./items.ts";
 import type { RoundPanelOutcome, RoundPanelState } from "./types.ts";
 import type {
   ContractVersion,
@@ -118,7 +118,10 @@ export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
   if (!isStructured(phase.contract)) return false;
   // ODP-2: an item blocker is never raised without an evaluator item check,
   // so every outcome that is not met/fits owes one.
-  return phaseItemOutcomes(phase).some((o) => o.outcome !== "met" && o.outcome !== "fits");
+  const outcomes = phaseItemOutcomes(phase);
+  if (outcomes.some((o) => o.outcome !== "met" && o.outcome !== "fits")) return true;
+  // Plan 06c (R5): a unanimous thin met/fits is audited by the evaluator.
+  return thinMetItems(outcomes, workerAnchorsOf(phase.coverage)).length > 0;
 }
 
 /** Plan 04a: whether everything EVALUATING waits for has settled. In 04a

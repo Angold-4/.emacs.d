@@ -36,6 +36,7 @@
 // merges them (as ENTRY_MERGED_BY_OWNER).
 
 import type { Decision, DecisionBrief, Message, MessageType, Override, OwnerRequest } from "./types.ts";
+import { clampMessageTitle } from "./messages.ts";
 import { renderBriefOrg, renderBriefsSection } from "./briefs.ts";
 
 // ---------------------------------------------------------------------------
@@ -329,7 +330,9 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
         id,
         phaseId: event.phaseId,
         ...(event.programId ? { programId: event.programId } : {}),
-        title: event.title.trim(),
+        // Plan 06c (R6): an entry title built from a raw message is at most
+        // 80 characters and ends at a word boundary.
+        title: clampMessageTitle(event.title),
         type,
         state: "open",
         anchor,
@@ -388,7 +391,7 @@ export function applyEntryEvent(entries: readonly Entry[], event: EntryEvent, me
         id,
         phaseId: entry.phaseId,
         ...(entry.programId ? { programId: entry.programId } : {}),
-        title: (event.title ?? (message ? message.title : entry.title)).trim(),
+        title: clampMessageTitle(event.title ?? (message ? message.title : entry.title)),
         type: message ? entryTypeOf([message]) : entry.type,
         state: "open",
         anchor,
@@ -735,14 +738,14 @@ export function planEntryEvents(messages: readonly Message[], entries: readonly 
     working.push({
       id,
       phaseId: m.phaseId,
-      title: m.title,
+      title: clampMessageTitle(m.title),
       type: entryTypeOf([m]),
       state: "open",
       anchor,
       links: [{ messageId: m.id, anchor, reason: "opened" }],
     });
     linked.add(m.id);
-    events.push({ type: "ENTRY_OPENED", phaseId: m.phaseId, title: m.title, entryType: entryTypeOf([m]), anchor, messageId: m.id, by: "runtime" });
+    events.push({ type: "ENTRY_OPENED", phaseId: m.phaseId, title: clampMessageTitle(m.title), entryType: entryTypeOf([m]), anchor, messageId: m.id, by: "runtime" });
   }
   return events;
 }
