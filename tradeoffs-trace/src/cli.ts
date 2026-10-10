@@ -24,6 +24,7 @@ import { resolveBinding } from "./core/binding.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
   checkCoverageWarnings,
+  checkVerifyReach,
   formatFindings,
   hasLintErrors,
   isProgramInput,
@@ -33,7 +34,7 @@ import {
   type LintPlanInput,
   type LintProgramInput,
 } from "./core/plan-lint.ts";
-import { readRepoFacts } from "./core/repo-facts.ts";
+import { readRepoFacts, readVerifyReachFacts } from "./core/repo-facts.ts";
 import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
@@ -120,7 +121,26 @@ function coverageFindings(json: unknown): LintFinding[] {
  * repository coverage. `tt lint` and both start commands use this one
  * function, so the warnings they show are the same. */
 function allFindings(json: unknown): LintFinding[] {
-  return [...lintJson(json), ...coverageFindings(json)];
+  return [...lintJson(json), ...coverageFindings(json), ...verifyReachFindings(json)];
+}
+
+/** 06k1's lesson: a named test the phase's checks never run (an error). Read
+ * per plan like coverage, and prefixed per program entry the same way. */
+function verifyReachFindings(json: unknown): LintFinding[] {
+  if (isProgramInput(json)) {
+    const out: LintFinding[] = [];
+    for (const entry of (json as LintProgramInput).entries ?? []) {
+      const plan = entry.plan;
+      if (!plan?.repo) continue;
+      for (const f of checkVerifyReach(plan, readVerifyReachFacts(plan))) {
+        out.push({ ...f, phaseId: entry.id ? `${entry.id}/${f.phaseId}` : f.phaseId });
+      }
+    }
+    return out;
+  }
+  const plan = json as LintPlanInput;
+  if (!plan?.repo) return [];
+  return checkVerifyReach(plan, readVerifyReachFacts(plan));
 }
 
 /** Plan 01c: print findings to OUT (stderr for a start that is about to be

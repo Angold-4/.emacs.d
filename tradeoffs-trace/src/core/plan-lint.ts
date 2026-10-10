@@ -47,7 +47,10 @@ export type LintRule =
   | "item-id"
   | "item-arch"
   | "item-verify"
-  | "item-text-loss";
+  | "item-text-loss"
+  // A `test` verify defined only where the phase's checks never run: tt
+  // reports it missing on every candidate, a gate no owner command waives.
+  | "verify-reach";
 
 /** The roles #+TT_MODELS may assign a model to. */
 const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
@@ -1060,6 +1063,87 @@ export function checkCoverageWarnings(plan: LintPlanInput, repo: RepoFacts): Lin
       problem: "the repository's CI runs `cargo fmt --all`, but no phase check or final check does",
       fix: "add `cargo fmt --all --check` to the phase's :FINAL_CHECKS:, or a plan-wide #+TT_FINAL_CHECKS:",
     });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Verify reach: a named test the phase's checks never run
+// ---------------------------------------------------------------------------
+
+/** Where one named test is defined: a repo-relative file, and for a Rust test
+ * the cargo package that owns it. */
+export interface VerifySite {
+  file: string;
+  kind: "node" | "cargo";
+  pkg?: string;
+}
+
+/** What one phase's `:CHECKS:` run, as far as the lint can resolve it.
+ * `nodeFiles` are repo-relative globs of node test files; `cargo` is the
+ * packages `cargo test` runs ("all" for a workspace run). An `…Unknown` flag
+ * means a check runs tests the lint could not resolve, and the rule stays
+ * quiet for that kind rather than guess. */
+export interface TestSelection {
+  nodeFiles: string[];
+  nodeUnknown: boolean;
+  cargo: string[] | "all";
+  cargoUnknown: boolean;
+}
+
+/** What `checkVerifyReach` reads, built by `readVerifyReachFacts` (I/O). */
+export interface VerifyReachFacts {
+  /** Named test → where it is defined. A name with no site is not written
+   * yet (the worker will add it) and is not judged. */
+  sites: Record<string, VerifySite[]>;
+  /** Phase id → what its checks run. */
+  selections: Record<string, TestSelection>;
+}
+
+/** True when the selection runs a test defined at `site`. */
+export function selectionRuns(selection: TestSelection, site: VerifySite): boolean {
+  if (site.kind === "node") return selection.nodeUnknown || selection.nodeFiles.some((g) => matchesGlob(g, site.file));
+  if (selection.cargoUnknown || selection.cargo === "all") return true;
+  return site.pkg !== undefined && selection.cargo.includes(site.pkg);
+}
+
+/** 06k1's lesson (C1, 2026-10-10): `:VERIFY: test "plan 06g: …"` lived in
+ * test/conductor/lanes.test.ts while the phase ran `check-e2e FILES="…"`
+ * without it. The probe reported the test missing on every candidate, and a
+ * missing named test is a mechanical gate no owner command waives, so an
+ * all-met candidate could never be accepted. An error, so the plan cannot
+ * start: a test that already exists only where the checks never look. */
+export function checkVerifyReach(plan: LintPlanInput, facts: VerifyReachFacts): LintFinding[] {
+  const out: LintFinding[] = [];
+  for (const phase of plan.phases ?? []) {
+    const selection = facts.selections[phase.id ?? ""];
+    if (!selection) continue;
+    const items = [...(phase.requirements ?? []), ...(phase.constraints ?? [])];
+    for (const item of items) {
+      for (const raw of item.verify ?? []) {
+        for (const v of parseVerify(raw)) {
+          if (v.kind !== "test" || v.name.length === 0) continue;
+          const sites = v.file ? [{ file: v.file, kind: /\.rs$/.test(v.file) ? ("cargo" as const) : ("node" as const) }] : (facts.sites[v.name] ?? []);
+          if (sites.length === 0) continue;
+          if (sites.some((s) => selectionRuns(selection, s))) continue;
+          const where = sites.map((s) => (s.pkg ? `${s.file} (${s.pkg})` : s.file)).join(", ");
+          const first = sites[0];
+          out.push({
+            severity: "error",
+            rule: "verify-reach",
+            phaseId: phase.id ?? "?",
+            item: v.name,
+            line: item.verifyLine ?? item.line,
+            sourceFile: plan.sourceFile,
+            problem: `${item.id ?? "?"}'s test "${v.name}" is defined only in ${where}, which the phase's :CHECKS: never run — tt would report it missing on every candidate, and no owner command waives that gate`,
+            fix:
+              first.kind === "cargo" && first.pkg
+                ? `add -p ${first.pkg} to the phase's cargo test check, or name a test the checks run`
+                : `add ${first.file} to the phase's check list (e.g. check-e2e FILES="…"), or name a test the checks run`,
+          });
+        }
+      }
+    }
   }
   return out;
 }
