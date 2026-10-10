@@ -65,8 +65,10 @@ function isDirectory(p: string): boolean {
 
 /** Expand one workspace member pattern. A pattern without a wildcard is the
  * directory itself (even when it is missing, so `readPackages` can warn); a
- * trailing `/*` lists the parent's subdirectories. */
-function expandMember(root: string, member: string): string[] {
+ * trailing `/*` lists the parent's subdirectories. A parent that cannot be
+ * read is surfaced (OD-18/M-97): an enumeration failure is not an empty
+ * workspace. */
+function expandMember(root: string, member: string, issues: string[]): string[] {
   const clean = member.replace(/\/+$/, "");
   if (!clean.includes("*")) return [clean];
   const parent = clean.slice(0, clean.lastIndexOf("/"));
@@ -75,6 +77,7 @@ function expandMember(root: string, member: string): string[] {
   try {
     entries = fs.readdirSync(parentDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
   } catch {
+    issues.push(`cannot read ${parent.length > 0 ? parent : "."} to expand ${member}`);
     return [];
   }
   return entries.map((name) => (parent ? `${parent}/${name}` : name));
@@ -92,7 +95,7 @@ function readPackages(root: string): { packages: RepoPackage[]; issues: string[]
   const issues: string[] = [];
   const rootName = cargoPackageName(rootToml);
   if (rootName !== undefined && rootName.length > 0) packages.push({ name: rootName, dir: "." });
-  for (const dir of cargoMembers(rootToml).flatMap((m) => expandMember(root, m))) {
+  for (const dir of cargoMembers(rootToml).flatMap((m) => expandMember(root, m, issues))) {
     const toml = readFileOrUndefined(path.join(root, dir, "Cargo.toml"));
     if (toml === undefined) {
       // M-93: a listed member with no readable manifest is surfaced, never
@@ -100,10 +103,14 @@ function readPackages(root: string): { packages: RepoPackage[]; issues: string[]
       issues.push(`the workspace member ${dir} has no readable Cargo.toml`);
       continue;
     }
+    // A nested virtual manifest (no [package] table) is not a crate: the ONLY
+    // branch skipped silently (OD-16/OD-18).
+    if (tomlTable(toml, "package") === undefined) continue;
     const name = cargoPackageName(toml);
-    // A nested virtual manifest (no [package] table) is not a crate: skip it
-    // without noise (A/B).
-    if (name === undefined || name.length === 0) continue;
+    if (name === undefined || name.length === 0) {
+      issues.push(`the workspace member ${dir} manifest has [package] but no readable name`);
+      continue;
+    }
     packages.push({ name, dir });
   }
   return { packages, issues };

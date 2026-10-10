@@ -259,6 +259,25 @@ test("plan 06j: a member with a missing manifest is warned, a nested virtual man
   }
 });
 
+test("plan 06j: a [package] with no readable name and an unreadable wildcard parent both warn", () => {
+  // OD-18: the only silent skip is a member whose manifest has no [package]
+  // table; a [package] without a name and an unreadable wildcard parent warn.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-memberbranches-"));
+  fs.mkdirSync(path.join(root, "badname"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Cargo.toml"), '[workspace]\nmembers = ["badname", "wild/*"]\n');
+  fs.writeFileSync(path.join(root, "badname", "Cargo.toml"), "[package]\nname =\n");
+  try {
+    const facts = readRepoFacts(root);
+    assert.deepEqual(facts.packages, []);
+    assert.ok(facts.memberIssues?.some((i) => i.includes("badname") && i.includes("no readable name")), JSON.stringify(facts.memberIssues));
+    assert.ok(facts.memberIssues?.some((i) => i.includes("wild") && i.includes("cannot read")), JSON.stringify(facts.memberIssues));
+    const plan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: [], checks: ["true"] }] };
+    assert.equal(checkCoverageWarnings(plan, facts).filter((f) => f.rule === "coverage").length, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("plan 06j: coverage facts read a workspace's crates and its workflow commands", () => {
   const root = cargoFixture("run: cargo fmt --all --check");
   try {
