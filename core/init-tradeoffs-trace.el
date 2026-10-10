@@ -805,15 +805,18 @@ suffix (`openai/gpt-6-sol:high'), so `openai/gpt-6-sol:high' is all model.
 MODELS is an alist for the plan JSON: plain roles as
 (ROLE . ((provider . P)? (model . M))), the reviewer seats as
 (reviewerSeats . ((M . ...) (A . ...) ...)), the panel seats as
-(panelSeats . ((1 . ...) ...)), and (panelFrom . \"reviewers\") for the
-`panel=reviewers' value that makes every panel seat follow the reviewer of
-its position.  A key is `role' or `role.SEAT' (e.g. `reviewer.M', `panel.2').
+(panelSeats . ((1 . ...) ...)), the worker lanes as
+(workerLanes . ((1 . ...) (2 . ...))), and (panelFrom . \"reviewers\") for
+the `panel=reviewers' value that makes every panel seat follow the reviewer
+of its position.  A key is `role' or `role.SEAT' (e.g. `reviewer.M',
+`panel.2', `worker.1').
 LINE is the 1-based line of the keyword.  REPEATED lists the keys the keyword
 named more than once (the later declaration wins): a JSON object cannot carry
 a duplicate key, so the parser records them for `tt lint' to report."
   (when-let* ((at (+tt--keyword-at "TT_MODELS")))
     (let ((seen nil) (repeated nil)
-          (models nil) (reviewer-seats nil) (panel-seats nil) (panel-from nil))
+          (models nil) (reviewer-seats nil) (panel-seats nil) (worker-lanes nil)
+          (panel-from nil))
       (dolist (tok (split-string (car at) "[ \t,]+" t))
         (let* ((eq (string-match "=" tok))
                (key (if eq (substring tok 0 eq) tok))
@@ -836,18 +839,26 @@ a duplicate key, so the parser records them for `tt lint' to report."
             (let ((sym (intern seat)))
               (setq panel-seats (cons (cons sym entry)
                                       (assq-delete-all sym panel-seats)))))
+           ;; Plan 06g2: `worker.N' — a lane's own worker model, so a
+           ;; two-lane round may run its two workers on different models.
+           ((and dot (equal role "worker"))
+            (let ((sym (intern seat)))
+              (setq worker-lanes (cons (cons sym entry)
+                                       (assq-delete-all sym worker-lanes)))))
            (t
             ;; A key named twice keeps only its LAST declaration (the run is
             ;; blocked by lint anyway); one entry per key keeps the JSON object
             ;; valid and the winner unambiguous.
             (let ((sym (intern key)))
               (setq models (cons (cons sym entry) (assq-delete-all sym models))))))))
-      (when (or models reviewer-seats panel-seats panel-from)
+      (when (or models reviewer-seats panel-seats worker-lanes panel-from)
         (let ((out (nreverse models)))
           (when reviewer-seats
             (setq out (append out (list (cons 'reviewerSeats (nreverse reviewer-seats))))))
           (when panel-seats
             (setq out (append out (list (cons 'panelSeats (nreverse panel-seats))))))
+          (when worker-lanes
+            (setq out (append out (list (cons 'workerLanes (nreverse worker-lanes))))))
           (when panel-from
             (setq out (append out (list (cons 'panelFrom panel-from)))))
           (list out (cdr at) (delete-dups (nreverse repeated))))))))

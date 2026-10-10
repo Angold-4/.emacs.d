@@ -172,6 +172,13 @@ The events, all reduced by `reduce()`:
 - `CANDIDATE_PICKED { round, lane, sha, votes }` — the round's winner, decided
   by `pickWinner` in code (never by a model), with the votes it took (`0` when
   it was the only passing candidate and won without a vote).
+- `ROUND_REVIEW_SUBMITTED { round, lane, seat, review }` — plan 06g2: one
+  seat's review of one lane candidate, recorded while the round runs (the phase
+  is still IMPLEMENTING, so it has no review slot to hold it). Record-only, like
+  the five above; it is the round's own per-candidate review record, which the
+  review buffer groups by candidate. The winner's reviews are promoted into the
+  phase's review slots at hand-off (`REVIEW_SUBMITTED` with `promotedFrom`), so
+  acceptance reads the winner's reviews and nothing else.
 - `ITEM_CARRIED { recordId, recordKind?, toPhase, …binding }` — plan 06g
   (A5): the owner carried one finding (or message) to a later phase's plan
   (`tt carry <run> <id> --to <phase-id>`). It marks the item carried (with its
@@ -180,11 +187,13 @@ The events, all reduced by `reduce()`:
   (`acceptedWithCarried`). `owner-commands.ts` is the only place that decides
   what a carry does.
 
-All five round events are **record-only**: they are reduced into
+All six round events are **record-only**: they are reduced into
 `phase.rounds` (the views and `tt summary` read them) and move no phase state.
-All five are absent from a run without `#+TT_WORKERS`, whose log is
+All six are absent from a run without `#+TT_WORKERS`, whose log is
 byte-identical to before this plan. `REVIEW_SUBMITTED` carries an extra
-optional `candidate` field when a round reviewed more than one candidate.
+optional `candidate` field when a round reviewed more than one candidate, and
+an optional `promotedFrom` naming the round whose winner's review it promotes
+into the phase's slots (so a view counting a round's reviews counts it once).
 - `MESSAGE_CARRIED { messageId, fromCandidate, toCandidate, fromVersion, toVersion, contentHash, unchanged, content? }`
   — `content` is present exactly when the reviewable content changed, so the
   stored fields and `contentHash` can never disagree.

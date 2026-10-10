@@ -1219,6 +1219,11 @@ export interface LaneCandidateRecord {
   sha?: string;
   ok?: boolean;
   note?: string;
+  /** Plan 06g2 (A3): the reviews this candidate drew, one per seat — the
+   * round's own per-candidate record, so the review buffer groups them by
+   * candidate. Set only once a review arrives; absent on a candidate whose
+   * reviews have not been recorded (or on a plan without lanes). */
+  reviews?: Array<{ seat: string; review: Review }>;
 }
 
 /** One seat's vote in a round's pick turn. `why` is the one-line reason. */
@@ -1651,6 +1656,12 @@ export interface EvReviewSubmitted {
    * than one (K ≥ 2). Absent on the single-lane loop, where the phase's own
    * candidate is the only one there could be. */
   candidate?: string;
+  /** Plan 06g2: the round whose winner this review is promoted into the
+   * phase's review slots for. The round already recorded it as a
+   * ROUND_REVIEW_SUBMITTED when it was submitted, so a view that counts the
+   * round's reviews must not count this promotion a second time. Absent on
+   * the single-lane loop. */
+  promotedFrom?: number;
 }
 export interface EvReviewTimedOut {
   type: "REVIEW_TIMED_OUT";
@@ -2254,12 +2265,27 @@ export interface EvCandidatePicked {
   votes: number;
 }
 
+/** Plan 06g2: one seat's review of one lane candidate, recorded while the
+ * round runs (the phase is still IMPLEMENTING, so no review slot exists to
+ * hold it). Record-only: the round's own per-candidate review record. The
+ * winner's reviews are promoted into the phase's review slots at hand-off
+ * (a REVIEW_SUBMITTED carrying `promotedFrom`), so the acceptance rule reads
+ * the winner's reviews and nothing else. */
+export interface EvRoundReviewSubmitted {
+  type: "ROUND_REVIEW_SUBMITTED";
+  round: number;
+  lane: string;
+  seat: string;
+  review: Review;
+}
+
 export type Event =
   | EvRoundStarted
   | EvCandidateSubmitted
   | EvCandidateChecked
   | EvPickVote
   | EvCandidatePicked
+  | EvRoundReviewSubmitted
   | EvItemCarried
   | EvItemStateUpdated
   | EvEvidenceRecorded

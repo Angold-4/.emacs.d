@@ -20,6 +20,15 @@
       "additionalProperties": false,
       "properties": {
         "worker": { "$ref": "#/$defs/RoleModel" },
+        "workerLanes": {
+          "description": "Plan 06g2: per-lane worker models (worker.1, worker.2); a lane without one uses worker's.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "1": { "$ref": "#/$defs/RoleModel" },
+            "2": { "$ref": "#/$defs/RoleModel" }
+          }
+        },
         "reviewer": { "$ref": "#/$defs/RoleModel" },
         "reviewerSeats": {
           "description": "Per-seat reviewer models (reviewer.M, reviewer.A, reviewer.B); a seat without one uses reviewer's.",

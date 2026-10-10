@@ -48,6 +48,9 @@ const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curato
 /** The seat names `reviewer.N` and `panel.N` accept (design §2.1). */
 const REVIEWER_SEATS = new Set(["M", "A", "B"]);
 const PANEL_SEATS = new Set(["1", "2", "3"]);
+/** Plan 06g2: the lane names `worker.N` accepts — this plan version runs one
+ * or two lanes (more is 06h's). */
+const WORKER_LANES = new Set(["1", "2"]);
 
 /** The slice of #+TT_MODELS the linter reads. `models` is what Emacs parsed
  * (`{ worker?: { provider?, model }, reviewerSeats?: { M?: … }, … }`), with
@@ -276,7 +279,7 @@ function modelFinding(plan: LintPlanInput, item: string, problem: string, fix: s
 interface ModelDecl {
   key: string;
   model: LintRoleModel | undefined;
-  kind: "role" | "reviewer-seat" | "panel-seat";
+  kind: "role" | "reviewer-seat" | "panel-seat" | "worker-seat";
   seat?: string;
 }
 
@@ -296,11 +299,13 @@ function modelDeclarations(models: LintModels | undefined): ModelDecl[] {
   if (!models) return [];
   const out: ModelDecl[] = [];
   for (const [key, raw] of Object.entries(models)) {
-    if (key === "reviewerSeats" || key === "panelSeats" || key === "panelFrom") continue;
+    if (key === "reviewerSeats" || key === "panelSeats" || key === "panelFrom" || key === "workerLanes") continue;
     out.push({ key, model: asRoleModel(raw), kind: "role" });
   }
   for (const [seat, model] of seatEntries(models.reviewerSeats)) out.push({ key: `reviewer.${seat}`, model, kind: "reviewer-seat", seat });
   for (const [seat, model] of seatEntries(models.panelSeats)) out.push({ key: `panel.${seat}`, model, kind: "panel-seat", seat });
+  // Plan 06g2: a lane's own worker model (`worker.1`, `worker.2`).
+  for (const [seat, model] of seatEntries(models.workerLanes)) out.push({ key: `worker.${seat}`, model, kind: "worker-seat", seat });
   return out;
 }
 
@@ -327,6 +332,17 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
     }
     if (decl.kind === "panel-seat" && !PANEL_SEATS.has(decl.seat!)) {
       out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown panel seat ${decl.key}`, "use panel.1, panel.2 or panel.3"));
+      continue;
+    }
+    if (decl.kind === "worker-seat" && !WORKER_LANES.has(decl.seat!)) {
+      out.push(
+        modelFinding(
+          plan,
+          decl.key,
+          `#+TT_MODELS names the unknown worker lane ${decl.key}`,
+          "use worker.1 or worker.2 (this plan version runs one or two lanes; more is 06h's phase)",
+        ),
+      );
       continue;
     }
     const model = decl.model?.model;

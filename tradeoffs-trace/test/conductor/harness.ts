@@ -123,6 +123,15 @@ export async function setupConductor(opts: {
    * contract-objection.test.ts, so the repair does not re-disclose a
    * duplicate decision). Takes precedence over `workerScript` when given. */
   workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 06g2: one script per lane worker (`lane-<round>-<lane>-…`). Absent:
+   * `workerScript`/`workerScriptForAttempt` is used for every lane. */
+  laneWorkerScriptFor?: (lane: string, round: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 06g2: one script per lane review (`lane-review-<round>-<lane>-<seat>-…`).
+   * The script's `submit_review` names its candidate with the
+   * `$TT_CANDIDATE_SHA` token, which fake-pi substitutes at dispatch time. */
+  laneReviewerScriptFor?: (seat: string, candidate: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 06g2: one script per pick seat (`pick-<round>-<seat>-…`). */
+  pickScriptFor?: (seat: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04a: the EVALUATING stage's fresh evaluator, ONE PER MESSAGE TYPE.
    * The default script returns an empty `submit_evaluation`, which the
@@ -262,6 +271,9 @@ export async function setupConductor(opts: {
   const workerScriptPaths = new Map<number, string>();
 
   const reviewerScriptPaths = new Map<string, string>();
+  const laneWorkerScriptPaths = new Map<string, string>();
+  const laneReviewerScriptPaths = new Map<string, string>();
+  const pickScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
   const briefScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
@@ -353,6 +365,36 @@ export async function setupConductor(opts: {
     ...(opts.now ? { now: opts.now } : {}),
     gateLockPath: opts.gateLockPath,
     piEnvFor: (role, agentId) => {
+      // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
+      const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);
+      if (role === "worker" && laneWorker && opts.laneWorkerScriptFor) {
+        const round = Number(laneWorker[1]);
+        const lane = laneWorker[2];
+        const key = `${round}-${lane}-${agentId}`;
+        if (!laneWorkerScriptPaths.has(key)) {
+          laneWorkerScriptPaths.set(key, writeScript(scriptsDir, key, opts.laneWorkerScriptFor(lane, round, conductor.state)));
+        }
+        return { FAKE_PI_SCRIPT: laneWorkerScriptPaths.get(key)!, ...(opts.extraWorkerEnv ?? {}) };
+      }
+      const laneReview = agentId.match(/^lane-review-(\d+)-([a-z])-([MAB])-/);
+      if (role === "reviewer" && laneReview && opts.laneReviewerScriptFor) {
+        const seat = laneReview[3];
+        const key = `lane-review-${agentId}`;
+        if (!laneReviewerScriptPaths.has(key)) {
+          laneReviewerScriptPaths.set(
+            key,
+            writeScript(scriptsDir, key, opts.laneReviewerScriptFor(seat, "$TT_CANDIDATE_SHA", conductor.state)),
+          );
+        }
+        return { FAKE_PI_SCRIPT: laneReviewerScriptPaths.get(key)!, ...(opts.extraReviewerEnv?.(seat as Reviewer) ?? {}) };
+      }
+      const pick = agentId.match(/^pick-(\d+)-([MAB])-/);
+      if (role === "picker" && pick && opts.pickScriptFor) {
+        const seat = pick[2];
+        const key = `pick-${agentId}`;
+        if (!pickScriptPaths.has(key)) pickScriptPaths.set(key, writeScript(scriptsDir, key, opts.pickScriptFor(seat, conductor.state)));
+        return { FAKE_PI_SCRIPT: pickScriptPaths.get(key)!, ...(opts.extraReviewerEnv?.(seat as Reviewer) ?? {}) };
+      }
       if (role === "worker") {
         if (opts.workerScriptForAttempt) {
           const attempt = Number(agentId.match(/^worker-(\d+)-/)?.[1] ?? "1");

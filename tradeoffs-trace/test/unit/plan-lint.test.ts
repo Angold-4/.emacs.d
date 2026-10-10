@@ -365,6 +365,30 @@ test("plan 06g: tt lint refuses TT_WORKERS 3 naming 06h", () => {
   assert.equal(lintPlan({ ...base, workers: 0, workersLine: 4 }).find((f) => f.rule === "worker-count")!.severity, "error");
 });
 
+test("plan 06g: tt lint reads worker.1/worker.2 as lane models and names any other lane", () => {
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  // The two lanes this plan version runs are accepted, with or without a model.
+  assert.deepEqual(
+    lintPlan({ ...base, models: { workerLanes: { "1": { model: "one" }, "2": { model: "two" } } }, modelsLine: 3 }).filter(
+      (f) => f.rule === "model-declaration",
+    ),
+    [],
+  );
+  // A third lane is 06h's, named as such.
+  const third = lintPlan({ ...base, models: { workerLanes: { "3": { model: "three" } } }, modelsLine: 3 }).find(
+    (f) => f.rule === "model-declaration",
+  );
+  assert.ok(third, "worker.3 must be refused");
+  assert.match(third!.problem, /unknown worker lane worker\.3/);
+  assert.match(third!.fix, /worker\.1 or worker\.2/);
+  // A lane with an empty model is the same error as any other key's.
+  const empty = lintPlan({ ...base, models: { workerLanes: { "1": {} } }, modelsLine: 3 }).find(
+    (f) => f.rule === "model-declaration",
+  );
+  assert.match(empty!.problem, /worker\.1/);
+  assert.match(empty!.problem, /empty model/);
+});
+
 test("plan 06g: #+TT_ROUNDS must be a positive whole number, and 3 is the default", () => {
   const base = plan([{ id: "p", acceptance: ["it works"] }]);
   assert.deepEqual(lintPlan({ ...base, rounds: 5, roundsLine: 4 }).filter((f) => f.rule === "worker-count"), []);

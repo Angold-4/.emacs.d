@@ -3432,3 +3432,74 @@ heading for a votable message."
       (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
       (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
       (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-plan-worker-lane-models ()
+  "Plan 06g2: #+TT_MODELS worker.1/worker.2 reach the plan JSON as
+workerLanes, so each lane of a two-lane round may run its own model."
+  (let* ((text (concat "#+TT_WORKERS: 2\n#+TT_MODELS: worker=gateway:shared worker.1=gateway:one worker.2=gateway:two\n"
+                       +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan))
+         (models (alist-get 'models plan)))
+    (should (equal (alist-get 'model (alist-get 'worker models)) "shared"))
+    (should (equal (alist-get 'model (alist-get (intern "1") (alist-get 'workerLanes models))) "one"))
+    (should (equal (alist-get 'model (alist-get (intern "2") (alist-get 'workerLanes models))) "two"))
+    ;; A plan without worker.N carries no workerLanes at all.
+    (let* ((plain (plist-get (+tt-test--parse (concat "#+TT_MODELS: worker=gateway:shared\n" +tt-test--valid-plan)) :plan)))
+      (should-not (assq 'workerLanes (alist-get 'models plain))))))
+
+(ert-deftest tradeoffs-trace-review-buffer-round-reviews ()
+  "Plan 06g2 (A3): the review buffer groups each candidate's OWN reviews
+under it — every seat that reviewed it — so the owner reads the round's six
+reviews (M/A/B on both lanes), not only the winner's."
+  (let* ((dir (make-temp-file "tt-ert-review-round-reviews" t))
+         (rounds (concat "* Rounds\n"
+                         "\n"
+                         "** Round 2 from bbbbbbb\n"
+                         "\n"
+                         "*** C2-a (lane a) — checks passed\n"
+                         "\n"
+                         "    cccccccccccccccccccccccccccccccccccccccc\n"
+                         "\n"
+                         "    reviews: 3\n"
+                         "      - A: no findings\n"
+                         "      - B: 1 finding(s)\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "*** C2-b (lane b) — checks passed, picked\n"
+                         "\n"
+                         "    dddddddddddddddddddddddddddddddddddddddd\n"
+                         "\n"
+                         "    reviews: 3\n"
+                         "      - A: no findings\n"
+                         "      - B: no findings\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "Votes:\n"
+                         "  - M → C2-b: b is the smaller diff\n"
+                         "  - A → C2-b: b keeps the lock short\n"
+                         "  - B → C2-a: a names the edge path\n"
+                         "\n"
+                         "Winner: C2-b (ddddddd, 2 votes)\n")))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views/messages" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert (concat +tt-test--review-org "\n" rounds)))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              ;; Each candidate's own reviews are grouped under it.
+              (should (string-search "*** C2-a (lane a) — checks passed" (buffer-string)))
+              (should (string-search "*** C2-b (lane b) — checks passed, picked" (buffer-string)))
+              (should (= 2 (how-many "    reviews: 3")))
+              (should (string-search "- B: 1 finding(s)" (buffer-string)))
+              ;; A review line is not a votable message heading either.
+              (goto-char (point-min))
+              (search-forward "reviews: 3")
+              (goto-char (match-beginning 0))
+              (should-not (+tt-review--message-heading-p)))))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
+      (delete-directory dir t))))

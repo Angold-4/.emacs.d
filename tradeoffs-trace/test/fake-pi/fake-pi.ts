@@ -43,7 +43,7 @@ import { randomUUID } from "node:crypto";
 import { JSONLDecoder, encodeLine, type RunSocketMessage } from "../../src/core/protocol.ts";
 
 interface HelloSpec {
-  role: "worker" | "reviewer" | "evaluator";
+  role: "worker" | "reviewer" | "evaluator" | "picker";
   tools: string[];
   agentId?: string;
   piVersion?: string;
@@ -51,7 +51,7 @@ interface HelloSpec {
 
 type Step =
   | { kind: "emit"; event: Record<string, unknown> }
-  | { kind: "call-submit"; tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief"; args: unknown }
+  | { kind: "call-submit"; tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief" | "submit_coverage" | "submit_pick_vote"; args: unknown }
   | { kind: "call-sh"; command: string; cwd?: string }
   // Plan 01a: report one environment variable of THIS agent process as a tool
   // result, so a test can assert what the conductor put in an agent's
@@ -113,23 +113,30 @@ function recordArgv(): void {
  * JSON script, but a `tt start`-launched (as opposed to in-process-test)
  * reviewer script has no other way to learn a value the conductor only
  * knows at dispatch time, such as the live candidate sha — a real reviewer
- * is simply told this directly. Any string value that is *exactly* one of
- * these tokens is substituted with the named env var at the moment the
- * step runs (recursing into objects and arrays; every other value, and a
- * token naming an unset env var, passes through unchanged). Keeps this to
- * a small, explicit allowlist rather than a general `$VAR` syntax, so a
- * script's own literal string content is never at risk of accidental
- * substitution. */
+ * is simply told this directly. Any occurrence of one of these tokens inside
+ * a string value (or of `$TT_CANDIDATE_SHA8`, the first eight characters of
+ * the sha) is substituted with the named env var at the moment the step runs
+ * (recursing into objects and arrays; a token naming an unset env var passes
+ * through unchanged). Keeps this to a small, explicit allowlist rather than a
+ * general `$VAR` syntax. */
 const ENV_TOKENS = ["$TT_CANDIDATE_SHA", "$TT_REVIEWER"] as const;
 
 function substituteEnvTokens(value: unknown): unknown {
   if (typeof value === "string") {
-    if ((ENV_TOKENS as readonly string[]).includes(value)) {
-      const name = value.slice(1);
-      const v = process.env[name];
-      return v !== undefined && v.length > 0 ? v : value;
+    let out = value;
+    // Plan 06g2: a script may need a record id the conductor derives from the
+    // candidate's first eight characters (`D-<phase>-<sha8>-…`). Handled
+    // BEFORE the full token, whose text it starts with.
+    if (out.includes("$TT_CANDIDATE_SHA8")) {
+      const v = process.env.TT_CANDIDATE_SHA;
+      if (v !== undefined && v.length > 0) out = out.split("$TT_CANDIDATE_SHA8").join(v.slice(0, 8));
     }
-    return value;
+    for (const token of ENV_TOKENS) {
+      if (!out.includes(token)) continue;
+      const v = process.env[token.slice(1)];
+      if (v !== undefined && v.length > 0) out = out.split(token).join(v);
+    }
+    return out;
   }
   if (Array.isArray(value)) return value.map(substituteEnvTokens);
   if (value && typeof value === "object") {
@@ -202,7 +209,15 @@ class RunSocket {
   }
 
   async submit(
-    tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief",
+    tool:
+      | "submit_phase"
+      | "submit_discovery"
+      | "submit_review"
+      | "raise_tradeoff"
+      | "submit_evaluation"
+      | "submit_brief"
+      | "submit_coverage"
+      | "submit_pick_vote",
     args: unknown,
   ): Promise<RunSocketMessage> {
     const id = randomUUID();
