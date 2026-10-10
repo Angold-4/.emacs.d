@@ -67,12 +67,18 @@ test("plan 06f: tt list --json over 100 fixture runs with none changed finishes 
     // The best of three samples measures the command's own cost: a single
     // sample also carries process-scheduling noise from the rest of the
     // concurrently running suite (standalone this command takes ~0.14s).
+    // Plan 06k2 (A3): a loaded host can make one batch of samples slow; the
+    // assertion re-runs the batch once before it fails (the measured cost
+    // alone is ~0.14 s). The budget itself is unchanged.
     let best = Infinity;
     let second = first;
-    for (let i = 0; i < 3; i++) {
-      const start = performance.now();
-      second = cli(root, "list", "--json");
-      best = Math.min(best, (performance.now() - start) / 1000);
+    for (let batch = 0; batch < 2; batch++) {
+      for (let i = 0; i < 4; i++) {
+        const start = performance.now();
+        second = cli(root, "list", "--json");
+        best = Math.min(best, (performance.now() - start) / 1000);
+      }
+      if (best < 0.3) break;
     }
     assert.equal(second, first, "a fully cached listing is byte-identical");
     assert.ok(best < 0.3, `100 cached rows listed in ${best.toFixed(3)}s (must be under 0.3s)`);

@@ -418,7 +418,13 @@ test("items: a Rust test verify keeps its module path and resolves from cargo te
   assert.equal(testOutcomeIn(output, "acceptance::mark_s11_03_slow"), "missing");
   // The full path matches exactly, never a prefix or a tail.
   assert.equal(testOutcomeIn(output, "acceptance::mark_s11_04_long_name"), "missing");
-  assert.equal(testOutcomeIn(output, "mark_s11_01_quiet"), "missing");
+  // Plan 06k2 (A2): a bare name (no `::`) matches cargo's module-qualified
+  // `test <module>::<name> ... ok`, so a unit test in `#[cfg(test)] mod tests`
+  // resolves against the plan's bare verify.
+  assert.equal(testOutcomeIn(output, "mark_s11_01_quiet"), "passed");
+  // ... but a bare name is still a whole final segment, not a longer name's
+  // tail.
+  assert.equal(testOutcomeIn(output, "mark_s11_04_long_name"), "missing");
 });
 
 test("plan 06h: an item needs a strict majority of the configured seats, not a fixed two", () => {
@@ -483,8 +489,13 @@ test("items: a reviewer may cite any test the check run passed, by its full Rust
   assert.deepEqual(cite("src/a.ts:1 and test acceptance::mark_s11_07_weekend"), []);
   assert.ok(cite("src/a.ts:1 and test acceptance::mark_s11_09_sunday").some((i) => i.includes("did not pass")));
   assert.ok(cite("src/a.ts:1 and test acceptance::mark_s11_10_etf").some((i) => i.includes("not in this check run")));
-  // A path's tail is not the test: the match is exact.
-  assert.ok(cite('src/a.ts:1 and test "mark_s11_07_weekend"').some((i) => i.includes("not in this check run")));
+  // Plan 06k2 (A2): a bare name (no `::`) also matches cargo's
+  // module-qualified `test <module>::<name> ... ok`, so the plan's bare
+  // verify resolves against a unit test in `#[cfg(test)] mod tests`.
+  assert.deepEqual(cite('src/a.ts:1 and test "mark_s11_07_weekend"'), []);
+  // The match is still on a whole final segment: a longer name's tail is not
+  // the test.
+  assert.ok(cite('src/a.ts:1 and test "s11_07_weekend"').some((i) => i.includes("not in this check run")));
 });
 
 test("items: the check run's test-result lines are kept on the phase for reviewer citations", () => {

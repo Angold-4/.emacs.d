@@ -361,3 +361,38 @@ test("plan 06k1: a reviewer's no-change dispute creates no amendment record and 
     cleanupDir(setup.scriptsDir);
   }
 });
+
+test("plan 06k2: a negated ruling restores the decision's ballots", () => {
+  const decision = makeDecision({ id: "D-1", choice: "keep the cache warm", class: "delegated" });
+  const ruled = [{ id: "D-1", choice: "keep the cache warm", by: "C-1" }];
+
+  // Plan 06k2 (A8): a later owner correction that negates the ruling clears
+  // it, so the decision needs ballots again (finding D-B-79).
+  const before = baseState({ phase: "AWAITING_OWNER", candidate: C1, decisions: [decision], ruledDecisions: ruled });
+  const negated = reduce(before, { type: "OWNER_CORRECTION", correctionId: "C-2", text: "D-1 is not ruled; reviewers must vote on it." });
+  assert.ok(negated.ok, !negated.ok ? negated.reason : "");
+  assert.deepEqual(negated.state.phase.ruledDecisions, [], "the negated ruling is cleared");
+  const after = settledPhase({ decisions: [decision], ballots: [], ruledDecisions: negated.state.phase.ruledDecisions });
+  assert.equal(decisionSettled(decision, after, "C1", K), false, "the negated ruling no longer settles it without ballots");
+
+  // A withdrawn directive clears the ruling it carried.
+  const added = reduce(baseState({ phase: "IMPLEMENTING", decisions: [decision] }), {
+    type: "DIRECTIVE_ADDED",
+    directive: {
+      id: "OD-1",
+      seq: 1,
+      text: "D-1 is ruled: keep the cache warm",
+      scope: "phase",
+      status: "in-force",
+      commandId: "cmd-od-1",
+      at: "2026-10-10T00:00:00.000Z",
+      targets: [],
+      deliveries: {},
+    },
+  });
+  assert.ok(added.ok, !added.ok ? added.reason : "");
+  assert.deepEqual(added.state.phase.ruledDecisions, [{ id: "D-1", choice: "keep the cache warm", by: "OD-1" }]);
+  const withdrawn = reduce(added.state, { type: "DIRECTIVE_WITHDRAWN", directiveId: "OD-1", at: "2026-10-10T00:01:00.000Z" });
+  assert.ok(withdrawn.ok, !withdrawn.ok ? withdrawn.reason : "");
+  assert.deepEqual(withdrawn.state.phase.ruledDecisions, [], "a withdrawn directive's ruling is cleared");
+});

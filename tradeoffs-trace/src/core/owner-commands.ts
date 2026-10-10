@@ -53,6 +53,85 @@ export function ruledDecisionIds(text: string, decisions: readonly Decision[]): 
   return out;
 }
 
+/** Plan 06k2 (A8): the decision ids a text NEGATES a ruling on — `D-1 is not
+ * ruled`, `D-1 is unruled`, `D-1 remains undecided`. A later owner word that
+ * negates a ruling clears it, restoring the decision's ballots (finding
+ * D-B-79: a ruling must not survive a negation). Pure. */
+export function negatedRulingIds(text: string, decisions: readonly Decision[]): string[] {
+  if (!text) return [];
+  const clauses = rulingClauses(text);
+  const out: string[] = [];
+  for (const d of decisions) {
+    if (d.id.length === 0) continue;
+    const escaped = d.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mentions = new RegExp(`(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)`);
+    for (const clause of clauses) {
+      if (!mentions.test(clause)) continue;
+      if (!RULING_NEGATION.test(clause)) continue;
+      if (!out.includes(d.id)) out.push(d.id);
+      break;
+    }
+  }
+  return out;
+}
+
+/** Plan 06k2 (A8): clear the rulings a text negates (and the rulings carried
+ * by a withdrawn directive, `by` the directive's own id). Returns the
+ * surviving list, or undefined when none remain. */
+export function clearRulings(
+  existing: readonly RuledDecision[] | undefined,
+  text: string,
+  decisions: readonly Decision[],
+  by?: string,
+): RuledDecision[] | undefined {
+  if (!existing || existing.length === 0) return undefined;
+  const negated = new Set(negatedRulingIds(text, decisions));
+  const out = existing.filter((r) => !negated.has(r.id) && (by === undefined || r.by !== by));
+  return out.length > 0 ? out : undefined;
+}
+
+/** Plan 06k2 (A6, finding A-3/D-B-17): true when an owner text ASKS for an
+ * unchanged resubmission. A negated clause (`do not resubmit unchanged`,
+ * `don't resubmit unchanged`, `never submit it unchanged`) asks for nothing.
+ * Pure. */
+export function asksForUnchangedResubmission(text: string): boolean {
+  if (!text) return false;
+  const clauses = text
+    .split(/[;\n]+|(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  for (const clause of clauses) {
+    const asks =
+      /\b(?:re-?submit|submit|resend|send)\b[^.]{0,40}\bunchanged\b/i.test(clause) ||
+      /\bunchanged\s+(?:re)?submission\b/i.test(clause) ||
+      /\bresubmit\s+(?:it\s+)?as[- ]is\b/i.test(clause);
+    if (!asks) continue;
+    // A negation in the same clause asks for the opposite, not permission.
+    if (/\b(?:not|never|don'?t|doesn'?t|isn'?t|no|mustn'?t|shouldn'?t)\b/i.test(clause)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Plan 06k2 (A6, finding A-3/D-B-17): the keys of the owner steers that ask
+ * for an unchanged resubmission. Only an in-force directive counts — a
+ * withdrawn one no longer asks for anything. Keys are `note:<i>` (the
+ * ownerNotes index) or `directive:<id>`, so a caller can consume one steer's
+ * permission for exactly the next submission. Pure. */
+export function unchangedResubmissionRequesters(
+  ownerNotes: readonly string[],
+  ownerDirectives: readonly { id: string; text: string; status: string }[],
+): string[] {
+  const out: string[] = [];
+  ownerNotes.forEach((text, i) => {
+    if (asksForUnchangedResubmission(text)) out.push(`note:${i}`);
+  });
+  for (const d of ownerDirectives) {
+    if (d.status === "in-force" && asksForUnchangedResubmission(d.text)) out.push(`directive:${d.id}`);
+  }
+  return out;
+}
+
 /** Plan 06k1 (A2): record the rulings a correction/directive text carries,
  * keyed by id and pinned to the decision's current choice. A second ruling
  * on the same id replaces the first, so a re-ruled choice is what counts. */

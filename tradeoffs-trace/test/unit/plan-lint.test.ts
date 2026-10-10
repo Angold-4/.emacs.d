@@ -339,15 +339,12 @@ test("plan 06g: tt lint refuses TT_WORKERS 3 naming 06h", () => {
   // 1 and 2 are this plan version's lanes; absent is the same as 1.
   assert.deepEqual(lintPlan(base).filter((f) => f.rule === "worker-count"), []);
   assert.deepEqual(lintPlan({ ...base, workers: 1, workersLine: 3 }).filter((f) => f.rule === "worker-count"), []);
-  // Two lanes are valid but the lane round itself lands in 06g2: a warning,
-  // not an error, and the run uses one lane until then.
+  // Plan 06k2 (A5): two lanes are valid with no warning — the stale
+  // "the two-lane round arrives in 06g2" warning was dropped (the conductor
+  // runs lanes whenever workers > 1).
   const two = lintPlan({ ...base, workers: 2, workersLine: 3 });
-  const twoFinding = two.find((f) => f.rule === "worker-count");
-  assert.ok(twoFinding, "TT_WORKERS 2 must warn that the round arrives in 06g2");
-  assert.equal(twoFinding!.severity, "warning");
-  assert.match(twoFinding!.problem, /two-lane round arrives in 06g2/);
-  assert.match(twoFinding!.problem, /uses one lane/);
-  assert.equal(hasLintErrors(two), false, "a warning is not an error");
+  assert.deepEqual(two.filter((f) => f.rule === "worker-count"), [], "TT_WORKERS 2 is accepted with no warning");
+  assert.equal(hasLintErrors(two), false);
 
   const three = lintPlan({ ...base, workers: 3, workersLine: 3 });
   const finding = three.find((f) => f.rule === "worker-count");

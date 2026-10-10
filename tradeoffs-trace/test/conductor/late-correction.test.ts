@@ -13,6 +13,7 @@ import { accept } from "../../src/core/predicate.ts";
 import { acceptInput } from "../../src/core/owner-inbox.ts";
 import { runPaths } from "../../src/conductor.ts";
 import { basePhase, baseState, CV } from "../unit/helpers.ts";
+import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import {
   cleanupDir,
   defaultReviewerHello,
@@ -386,4 +387,98 @@ test("plan 06k1: a correction queued with the budget spent grants its own round"
   assert.ok(result.ok, "the queued correction applies");
   assert.equal(result.state.phase.repairRoundsGranted, 6, "the correction grants its round");
   assert.deepEqual(result.state.phase.ownerNotes, ["keep the fix"], "its text is queued for the next attempt");
+});
+
+test("plan 06k2: a note queued after the lane prompt is built stays queued", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-06k2-lane-late-");
+  const promptLog = path.join(dir, "prompts.log");
+  const before = "CORRECTION-BEFORE-LANE-PROMPT: keep the marker file";
+  const late = "CORRECTION-AFTER-LANE-PROMPT: cap the retry loop at 64";
+  const laneWorker = (lane: string): { hello: unknown; steps: FakePiStep[] } => ({
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `mkdir -p src && printf 'lane ${lane}\n' > src/lane-${lane}.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  });
+  const laneReview = (seat: Reviewer, state: State): { hello: unknown; steps: FakePiStep[] } => ({
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" },
+      {
+        kind: "call-submit",
+        tool: "submit_review",
+        args: {
+          reviewer: seat,
+          phaseId: "p1",
+          candidateSha: "$TT_CANDIDATE_SHA",
+          contractVersion: state.phase.contract.contractVersion,
+          correctionStatements: [],
+          findingStatements: [],
+          ballots: [],
+          findings: [],
+        },
+      },
+    ],
+  });
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "build two candidates from one base", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], workers: 2, rounds: 10 },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    deadlines: { ...FAST, helloTimeoutMs: 10_000 },
+    workerScript: () => laneWorker("a"),
+    // Both lanes take a while to answer hello, so the test can queue the
+    // second correction AFTER the round's prompt was built.
+    laneWorkerScriptFor: (lane) => ({ ...laneWorker(lane), helloDelayMs: 3_000 } as { hello: unknown; steps: FakePiStep[]; helloDelayMs: number }),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state),
+    pickScriptFor: (seat, state) => ({
+      hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_pick_vote",
+          args: { round: state.phase.rounds?.length ?? 1, seat, lane: seat === "B" ? "a" : "b", why: `${seat} picks`, loserHad: { yes: false, anchors: [] } },
+        },
+      ],
+    }),
+  });
+  // The first correction is queued BEFORE the run: round 1's lane prompt
+  // carries it. The second is queued during the hello wait, after that prompt
+  // was built, so it must stay queued for the next attempt.
+  writeCommand(setup.runDir, "cmd-lane-before", {
+    type: "correction",
+    text: before,
+    binding: { runId: path.basename(setup.runDir), phaseId: "p1" },
+  });
+  await setup.conductor.start();
+  // Wait until the round's lane agents are dispatched: that proves the shared
+  // lane prompt was already built, so the late correction is not in it.
+  await waitFor(
+    () => readEvents(setup.runDir).some((r) => r.kind === "intent" && typeof r.actionId === "string" && r.actionId.startsWith("lane-agent-")),
+    60_000,
+    20,
+    setup.runDir,
+  );
+  writeCommand(setup.runDir, "cmd-lane-late", {
+    type: "correction",
+    text: late,
+    binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
+  });
+  try {
+    await waitFor(() => (setup.conductor.state.phase.ownerNotes ?? []).some((n) => n.includes(late)), 60_000, 20, setup.runDir);
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 180_000, 50, setup.runDir);
+    // The first NOTES_DELIVERED delivered only the pre-prompt correction; the
+    // late one stayed queued until a later attempt's prompt.
+    const delivered = readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "NOTES_DELIVERED");
+    assert.ok(delivered.length >= 2, `both corrections were delivered in turn (${delivered.length} NOTES_DELIVERED)`);
+    assert.equal((delivered[0].event as { count?: number }).count, 1, "the round-1 lane prompt delivered only the note it carried");
+    assert.match(fs.readFileSync(promptLog, "utf8"), new RegExp(late), "the late correction reached a later attempt's prompt");
+    assert.equal(setup.conductor.state.phase.phase, "DONE");
+  } finally {
+    await teardown(setup);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -709,3 +709,120 @@ test("plan 06g: both candidates failing checks repeats the round from the same b
     cleanupDir(promptLog);
   }
 });
+
+// Plan 06k2 (A7): a lane candidate's boundary triggers are computed BEFORE
+// its lane reviews, so the lane reviewers ballot them and those ballots carry
+// to the winner; and citations count every decision and finding of the phase
+// (superseded ones included), so a path an earlier round's decision cited is
+// not re-triggered.
+
+test("plan 06k2: a two-lane winner's boundary-trigger decisions are balloted by its lane reviews and settle", async () => {
+  // Scenario 1: the winner touches an uncited boundary path.
+  const setup = await setupConductor({
+    phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], boundaries: ["src/**"], reserved: [], workers: 2, rounds: 10 },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `mkdir -p src && printf 'lane ${lane}\n' > src/lane-${lane}.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    laneReviewerScriptFor: (seat, _candidate, state) =>
+      laneReview(seat as Reviewer, state.phase.contract.contractVersion, {
+        ballots: [
+          {
+            decisionId: "D-p1-$TT_CANDIDATE_SHA8-trigger-1",
+            vote: "approve",
+            rationale: "the boundary path is covered",
+            evidence: ["README.md:1"],
+          },
+        ],
+      }),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} picks`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const winner = phase.rounds![0].picked!;
+    const trigger = phase.decisions.find((d) => d.source === "trigger" && d.boundCandidateSha === winner.sha);
+    assert.ok(trigger, "the winner's boundary trigger was created");
+    const ballots = phase.ballots.filter((b) => b.decisionId === trigger!.id && b.boundCandidateSha === winner.sha);
+    assert.equal(ballots.length, 3, "the winner's lane reviews balloted the trigger");
+    assert.ok(ballots.every((b) => b.vote === "approve"));
+    assert.equal(phase.phase, "DONE", "the balloted trigger settles and the phase reaches DONE");
+  } finally {
+    await teardown(setup);
+  }
+
+  // Scenario 2: a repair round whose own disclosure cites only its new path
+  // raises no trigger for the paths an earlier round's decision cited.
+  const setup2 = await setupConductor({
+    phase: { id: "p1", goal: "build two candidates", acceptance: ["it works"], checks: ["true"], boundaries: ["src/**"], reserved: [], workers: 2, rounds: 10 },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane, round) => {
+      const decision = (choice: string) => ({
+        classProposal: "delegated",
+        choice,
+        whyItMatters: "a boundary path must be reviewed",
+        alternatives: [{ option: "leave it uncited", consequence: "an unreviewed boundary change" }],
+        recommendation: { choice: "cite the path", reason: "the boundary rule requires a disposition" },
+      });
+      return round === 1
+        ? {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "mkdir -p src && printf 'a\\n' > src/a.txt && printf 'b\\n' > src/b.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [decision("Files changed: src/a.txt and src/b.txt")], assumptions: [], deviations: [] } },
+            ],
+          }
+        : {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "mkdir -p src && printf 'c\\n' > src/c.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [decision("Files changed: src/c.txt")], assumptions: [], deviations: [] } },
+            ],
+          };
+    },
+    laneReviewerScriptFor: (seat, _candidate, state) => {
+      const round = liveRound(state);
+      const open = (state.phase.findings ?? []).filter((f) => f.status === "open");
+      return laneReview(seat as Reviewer, state.phase.contract.contractVersion, {
+        ballots: [
+          {
+            decisionId: "D-p1-$TT_CANDIDATE_SHA8-1",
+            vote: "approve",
+            rationale: "the path list is adequate",
+            evidence: ["README.md:1"],
+          },
+        ],
+        ...(round === 1 && seat === "M"
+          ? { findings: [{ kind: "defect", severity: "blocking", evidence: "src/a.txt:1 the earlier change is wrong" }] }
+          : {}),
+        ...(round >= 2 ? { findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed" })) } : {}),
+      });
+    },
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} picks`),
+  });
+  try {
+    await setup2.conductor.start();
+    await waitFor(() => setup2.conductor.state.phase.phase === "DONE", 180_000, 50, setup2.runDir);
+    const phase = setup2.conductor.state.phase;
+    assert.ok((phase.rounds?.length ?? 0) >= 2, "the phase ran a repair round");
+    const winner = phase.rounds![phase.rounds!.length - 1].picked!;
+    const triggers = phase.decisions.filter((d) => d.source === "trigger" && d.boundCandidateSha === winner.sha);
+    assert.deepEqual(triggers, [], "an earlier round's cited paths are not re-triggered");
+    assert.equal(phase.phase, "DONE");
+  } finally {
+    await teardown(setup2);
+  }
+});

@@ -170,6 +170,14 @@ function parsePhaseNode(node: OrgNode, acceptanceLines: number[] = [], globalFin
     acceptance: [],
     acceptanceLines,
     ...(finalChecks ? { finalChecks: [finalChecks] } : {}),
+    // Plan 06k2 (A5): the phase's own :GOLDEN: overrides the plan's
+    // #+TT_GOLDEN:.
+    ...(node.props.GOLDEN ? { golden: node.props.GOLDEN } : {}),
+    // Plan 06k2 (A8, finding A-4): the phase's own :VARIANT_LIMIT: override,
+    // with its line, so lint refuses a value below 2 for the phase too.
+    ...(node.props.VARIANT_LIMIT
+      ? { variantLimit: parseCount({ value: node.props.VARIANT_LIMIT, line: node.propLines.VARIANT_LIMIT ?? node.line }), variantLimitLine: node.propLines.VARIANT_LIMIT ?? node.line }
+      : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -296,6 +304,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const workers = first("TT_WORKERS");
   const rounds = first("TT_ROUNDS");
   const variantLimit = first("TT_VARIANT_LIMIT");
+  const golden = first("TT_GOLDEN");
   const leader = first("TT_LEADER");
   const workersValue = parseCount(workers);
   const roundsValue = parseCount(rounds);
@@ -312,6 +321,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(workersValue !== undefined ? { workers: workersValue, workersLine: workers!.line } : {}),
     ...(roundsValue !== undefined ? { rounds: roundsValue, roundsLine: rounds!.line } : {}),
     ...(variantLimitValue !== undefined ? { variantLimit: variantLimitValue, variantLimitLine: variantLimit!.line } : {}),
+    ...(golden && golden.value.trim().length > 0 ? { golden: golden.value.trim(), goldenLine: golden.line } : {}),
     ...(leader ? { leader: leader.value.trim(), leaderLine: leader.line } : {}),
   };
 }

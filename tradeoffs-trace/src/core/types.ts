@@ -1148,7 +1148,10 @@ export interface PhaseState {
    * worker attempt's prompt and are an acceptance obligation until that
    * prompt has been sent (cleared by NOTES_DELIVERED), so a correction is
    * never lost to timing and `accept()` refuses until it is delivered. */
-  queuedCorrections?: Array<{ id: string; text: string }>;
+  queuedCorrections?: Array<{ id: string; text: string; /** Plan 06k2 (A8): the position this note occupies in `ownerNotes`, so
+   * NOTES_DELIVERED clears exactly the corrections a prompt carried (finding
+   * F-M-14) and never one queued after it. */
+    index?: number }>;
   /** §3.5/§10.4 `s`: record ids the owner marked "should have been
    * surfaced" — the observed miss sample, recorded as a pilot metric. */
   misses?: string[];
