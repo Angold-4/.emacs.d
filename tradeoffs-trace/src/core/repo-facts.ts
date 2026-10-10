@@ -64,10 +64,11 @@ function isDirectory(p: string): boolean {
 }
 
 /** Expand one workspace member pattern. A pattern without a wildcard is the
- * directory itself; a trailing `/*` lists the parent's subdirectories. */
+ * directory itself (even when it is missing, so `readPackages` can warn); a
+ * trailing `/*` lists the parent's subdirectories. */
 function expandMember(root: string, member: string): string[] {
   const clean = member.replace(/\/+$/, "");
-  if (!clean.includes("*")) return isDirectory(path.join(root, clean)) ? [clean] : [];
+  if (!clean.includes("*")) return [clean];
   const parent = clean.slice(0, clean.lastIndexOf("/"));
   const parentDir = path.join(root, parent);
   let entries: string[] = [];
@@ -84,20 +85,28 @@ function expandMember(root: string, member: string): string[] {
  * basename fallback: without a `[package]` header the root is never a package
  * (OD-11/OD-12), so a virtual manifest (even with empty members) yields no
  * root package, and a member with no package name is skipped. */
-function readPackages(root: string): RepoPackage[] {
+function readPackages(root: string): { packages: RepoPackage[]; issues: string[] } {
   const rootToml = readFileOrUndefined(path.join(root, "Cargo.toml"));
-  if (rootToml === undefined) return [];
-  const out: RepoPackage[] = [];
+  if (rootToml === undefined) return { packages: [], issues: [] };
+  const packages: RepoPackage[] = [];
+  const issues: string[] = [];
   const rootName = cargoPackageName(rootToml);
-  if (rootName !== undefined && rootName.length > 0) out.push({ name: rootName, dir: "." });
+  if (rootName !== undefined && rootName.length > 0) packages.push({ name: rootName, dir: "." });
   for (const dir of cargoMembers(rootToml).flatMap((m) => expandMember(root, m))) {
     const toml = readFileOrUndefined(path.join(root, dir, "Cargo.toml"));
-    if (toml === undefined) continue;
+    if (toml === undefined) {
+      // M-93: a listed member with no readable manifest is surfaced, never
+      // skipped — a crate the lint cannot judge must not be a quiet green.
+      issues.push(`the workspace member ${dir} has no readable Cargo.toml`);
+      continue;
+    }
     const name = cargoPackageName(toml);
+    // A nested virtual manifest (no [package] table) is not a crate: skip it
+    // without noise (A/B).
     if (name === undefined || name.length === 0) continue;
-    out.push({ name, dir });
+    packages.push({ name, dir });
   }
-  return out;
+  return { packages, issues };
 }
 
 /** Decode a YAML double-quoted scalar body: `\"`/`\n`/`\t`/`\\` escapes. */
@@ -188,7 +197,8 @@ export function readRepoFacts(root: string): RepoFacts {
   try {
     if (!isDirectory(root)) return emptyRepoFacts();
     const cargo = fs.existsSync(path.join(root, "Cargo.toml"));
-    return { packages: readPackages(root), ciCommands: readCiCommands(root), cargo };
+    const { packages, issues } = readPackages(root);
+    return { packages, ciCommands: readCiCommands(root), cargo, ...(issues.length > 0 ? { memberIssues: issues } : {}) };
   } catch {
     return emptyRepoFacts();
   }

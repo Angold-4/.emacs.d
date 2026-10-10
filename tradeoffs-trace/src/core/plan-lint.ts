@@ -880,6 +880,10 @@ export interface RepoFacts {
   /** True for a cargo repository, whose packages are named by `-p`/
    * `--package`; a non-cargo package is named as a plain token. */
   cargo: boolean;
+  /** Plan 06j (M-93): workspace members whose manifest cannot be read or has
+   * no `[package]` name. They are surfaced as warnings rather than skipped,
+   * so a crate the lint cannot judge is never a quiet false green. */
+  memberIssues?: string[];
 }
 
 /** An empty fact set: a plan with no repository, or one whose path does not
@@ -1028,6 +1032,17 @@ export function checkCoverageWarnings(plan: LintPlanInput, repo: RepoFacts): Lin
   }
   // OD-13: CI triggers on any `cargo fmt --all`; the plan only clears it with
   // `cargo fmt --all --check` in one invocation.
+  for (const issue of repo.memberIssues ?? []) {
+    out.push({
+      severity: "warning",
+      rule: "coverage",
+      phaseId: "coverage",
+      item: issue,
+      sourceFile: plan.sourceFile,
+      problem: issue,
+      fix: "give the member a readable Cargo.toml with a [package] name, or remove it from the workspace members",
+    });
+  }
   const ciFmt = repo.ciCommands.find(ciRunsCargoFmtAll);
   if (ciFmt !== undefined && !phases.some((p) => commandsOf(p).some(runsCargoFmtAll))) {
     out.push({

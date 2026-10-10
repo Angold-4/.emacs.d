@@ -236,6 +236,29 @@ test("plan 06j: every YAML run scalar form is decoded before the fmt trigger", (
   }
 });
 
+test("plan 06j: a member with a missing manifest is warned, a nested virtual manifest is skipped", () => {
+  // M-93: a listed member whose manifest cannot be read is surfaced; a
+  // member whose manifest exists but has no [package] table is not a crate.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-members-"));
+  fs.mkdirSync(path.join(root, "a"), { recursive: true });
+  fs.mkdirSync(path.join(root, "nested"), { recursive: true });
+  fs.writeFileSync(path.join(root, "Cargo.toml"), '[workspace]\nmembers = ["a", "missing", "nested"]\n');
+  fs.writeFileSync(path.join(root, "a", "Cargo.toml"), '[package]\nname = "a"\nversion = "0.1.0"\n');
+  fs.writeFileSync(path.join(root, "nested", "Cargo.toml"), "[workspace]\nmembers = []\n");
+  try {
+    const facts = readRepoFacts(root);
+    assert.deepEqual(facts.packages.map((p) => p.name), ["a"]);
+    assert.ok(facts.memberIssues?.some((i) => i.includes("missing")), JSON.stringify(facts.memberIssues));
+    assert.ok(!facts.memberIssues?.some((i) => i.includes("nested")), "a nested virtual manifest is not warned");
+    const plan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: [], checks: ["true"] }] };
+    const warnings = checkCoverageWarnings(plan, facts).filter((f) => f.rule === "coverage");
+    assert.ok(warnings.some((f) => f.item.includes("missing")), JSON.stringify(warnings));
+    assert.ok(!warnings.some((f) => f.item.includes("nested")), JSON.stringify(warnings));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("plan 06j: coverage facts read a workspace's crates and its workflow commands", () => {
   const root = cargoFixture("run: cargo fmt --all --check");
   try {
