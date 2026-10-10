@@ -776,7 +776,7 @@ and an unknown id is refused by that command."
 
 (ert-deftest tradeoffs-trace-plan-deadlines ()
   "Per-plan time limits reach the JSON plan in ms; none means no field."
-  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n#+TT_GATE_MINUTES: 45\n"
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n#+TT_GATE_MINUTES: 45\n#+TT_REVIEW_MINUTES: 30\n"
                                                    +tt-test--valid-plan))
                           :plan))
          (d (alist-get 'deadlines plan)))
@@ -786,6 +786,8 @@ and an unknown id is refused by that command."
     (should (= (alist-get 'workerAttemptMs d) 5400000))
     ;; Plan 01f: the gate's own limit, defaulting to 30 minutes when unwritten.
     (should (= (alist-get 'gateMs d) 2700000))
+    ;; 02k: the review (and pick) turn limit, for large candidates.
+    (should (= (alist-get 'reviewMs d) 1800000))
     (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
 
 (ert-deftest tradeoffs-trace-plan-gate ()

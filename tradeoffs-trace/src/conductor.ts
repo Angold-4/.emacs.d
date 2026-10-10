@@ -35,7 +35,7 @@ import { advisoryReason, blocksAcceptance, candidateLabel, losingLanes, loserAnc
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
-import { isLaneRound, laneFailureLines, lanesOfContract, runRound, type LaneBuild, type LaneCheck, type LaneHost } from "./core/lanes.ts";
+import { isLaneRound, laneFailureLines, lanesOfContract, repeatLaneBases, runRound, type LaneBuild, type LaneCheck, type LaneHost } from "./core/lanes.ts";
 // Plan 06h (A1/A2): the seat list, its leader and the lane count are the
 // plan's, read from one place (`seatsOf`/`leaderOf`).
 import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
@@ -7570,6 +7570,17 @@ export class Conductor {
     if (failures.length > 0) {
       lines.push(`The previous round's lanes (round ${previous!.round}):`, ...failures.map((f) => `- ${f}`));
     }
+    // 02k: a lane whose candidate passed in a round that could not complete
+    // restarts from that candidate (repeatLaneBases); say so, so the worker
+    // continues from its own work instead of rebuilding it.
+    const restarted = repeatLaneBases(previous);
+    if (restarted) {
+      lines.push(
+        `Round ${previous!.round} could not complete (a review or pick vote was missing), not because of your code. A lane whose candidate passed its checks (${Object.entries(restarted)
+          .map(([l, sha]) => `lane ${l}: ${sha.slice(0, 7)}`)
+          .join(", ")}) starts this round from that candidate, so your worktree already holds your previous work: continue from it and fix what the reviews found.`,
+      );
+    }
     // Plan 06k1 (A1): when a majority of the previous round's seats said the
     // losing lane had something the winner lacked, the losing lane's anchors
     // are carried into this round's prompt, so both lanes can take them on.
@@ -8017,7 +8028,12 @@ export class Conductor {
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "the reviewer did not start" });
         throw new Error("the reviewer did not start");
       }
-      const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      // 02k (2026-10-10): each stage of a lane review has its own reviewMs —
+      // turn 1, the wait for the other seats' discovery, and turn 2 with its
+      // re-prompt. One timer across all three let a slow seat's barrier wait
+      // and its turn-2 re-prompts run it out of time, and the missing review
+      // discarded the whole two-lane round (02k rounds 1 and 2).
+      let timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
       const nextSettle = () =>
         new Promise<"settled">((resolve) => handle.settleWaiters!.push(() => resolve("settled")));
 
@@ -8058,6 +8074,8 @@ export class Conductor {
       // three have finished turn 1 on THIS candidate, so every turn-2 prompt
       // lists the same merged records and every seat can ballot the others'.
       this.#laneArriveAtBarrier(round, lane, seat);
+      timeout.cancel();
+      timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
       const barrier = await Promise.race([this.#laneBarrierReleased(round, lane).then(() => "released" as const), timeout.promise]);
       if (barrier === "timeout") {
         timeout.cancel();
@@ -8069,6 +8087,8 @@ export class Conductor {
       // Turn 2: the lane's decisions (the worker's own, plus every seat's
       // discoveries) with a ballot demanded for each votable one. The plan's
       // ids are cached here and reused at the hand-off.
+      timeout.cancel();
+      timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
       const merged = this.#lanePhase(round, lane, sha, { final: true });
       const settled2 = nextSettle();
       await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn2Prompt(seat as Reviewer, handle, merged, candidateDir)));
@@ -8292,7 +8312,10 @@ export class Conductor {
     const last = rounds[rounds.length - 1];
     const round = last !== undefined && last.candidates.length < lanes.length ? last.round : (last?.round ?? 0) + 1;
     const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
-    this.#log.intent(actionId, { round, base, lanes });
+    // 02k: a repeat of a round that failed only for a missing review or vote
+    // restarts each lane that passed its checks from its own candidate.
+    const laneBases = last && last.round === round - 1 ? repeatLaneBases(last) : undefined;
+    this.#log.intent(actionId, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
     const host: LaneHost = {
       phaseId: this.#state.phase.phaseId,
       goal: this.#state.phase.contract.goal,
@@ -8320,15 +8343,17 @@ export class Conductor {
       pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
       emit: (event) => this.#applyEvent(event),
     };
-    const outcome = await runRound(host, { round, base, lanes });
+    const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
     this.#log.completion(actionId, {
       round,
       base,
       lanes,
       ...(outcome.winner ? { winner: outcome.winner } : {}),
       ...(outcome.failure ? { failure: outcome.failure } : {}),
+      ...(outcome.missingVotes ? { missingVotes: outcome.missingVotes } : {}),
       candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
     });
+    if (outcome.missingVotes) this.#log.append("pick_votes_missing", { round, seats: outcome.missingVotes, winner: outcome.winner?.lane });
     if (!outcome.winner) {
       // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
       // the phase is already CHECKING and the checks are re-running, so this

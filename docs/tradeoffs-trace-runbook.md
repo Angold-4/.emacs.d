@@ -1091,8 +1091,10 @@ and runs independent phases in parallel.
 
 **Time limits per plan.** A repository whose builds and suites take longer than
 the defaults sets its own limits: `#+TT_SH_MINUTES` (one agent command),
-`#+TT_CHECK_MINUTES` (checks and the probe) and `#+TT_ATTEMPT_MINUTES` (one worker
-attempt). Put them in a plan file, or in the program file, where they apply
+`#+TT_CHECK_MINUTES` (checks and the probe), `#+TT_ATTEMPT_MINUTES` (one worker
+attempt) and `#+TT_REVIEW_MINUTES` (one review turn or pick turn; default 15 —
+a lane review's turn 1, its wait for the other seats, and turn 2 each get
+this much, and a large candidate in a slow seat needs more: 02k used 30). Put them in a plan file, or in the program file, where they apply
 to every entry that doesn't set its own. For Rust, also share one cargo target
 directory across worktrees and checkouts. Otherwise every fresh checkout
 rebuilds from scratch:
