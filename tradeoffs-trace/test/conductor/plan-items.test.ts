@@ -1952,3 +1952,38 @@ test("plan 06g: tt carry on a contract finding at the end of the budget accepts 
     await teardown(setup);
   }
 });
+test("plan-items: a reviewer may cite a passing Rust test the plan does not name, by its unquoted module path", async () => {
+  // The check run passes R1's verify and one more libtest test no item names.
+  const checks = "printf 'ok 1 - R1 proves it\\ntest acceptance::extra_case ... ok\\n'";
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [checks],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) =>
+      reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, {
+        ...review({}),
+        items: [
+          { id: "R1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+          { id: "R2", verdict: "met", evidence: "src/core/rounds.ts:1 and test acceptance::extra_case." },
+          { id: "C1", verdict: "met", evidence: "src/core/rounds.ts:1" },
+        ],
+      }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const rejected = readEvents(setup.runDir).filter((r) => r.kind === "incomplete_review_rejected");
+    assert.deepEqual(rejected, [], `no review was refused: ${JSON.stringify(rejected[0]?.event)}`);
+  } finally {
+    await teardown(setup);
+  }
+});

@@ -1226,6 +1226,9 @@ export interface PhaseState {
   /** Plan 06b: every `test` verify resolved against the candidate's check
    * run. A missing or failed one is a blocking finding anchored to its item. */
   checkResolution?: import("./items.ts").VerifyResolution[];
+  /** The candidate's check-run test-result lines, so a reviewer's cited test
+   * resolves even when it is not a plan verify. */
+  checkTestLines?: string[];
   /** Plan 06b: the items the owner recorded with `tt evidence`, and the
    * recording. The phase parks AWAITING_OWNER until every `evidence` item is
    * here. */
@@ -2260,6 +2263,7 @@ export interface EvItemStateUpdated {
   coverage?: import("./items.ts").Coverage;
   coverageAttempt?: number;
   checkResolution?: import("./items.ts").VerifyResolution[];
+  checkTestLines?: string[];
   itemEvidence?: Array<{ id: string; text: string; at?: string; commandId?: string }>;
   acceptedDeviations?: string[];
   archSymbolDeviations?: string[];

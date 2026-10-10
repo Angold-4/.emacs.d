@@ -473,6 +473,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           ...(event.coverage ? { coverage: event.coverage } : {}),
           ...(event.coverageAttempt !== undefined ? { coverageAttempt: event.coverageAttempt } : {}),
           ...(event.checkResolution ? { checkResolution: event.checkResolution } : {}),
+          ...(event.checkTestLines ? { checkTestLines: event.checkTestLines } : {}),
           ...(event.itemEvidence ? { itemEvidence: event.itemEvidence } : {}),
           ...(event.acceptedDeviations ? { acceptedDeviations: event.acceptedDeviations } : {}),
           ...(event.archSymbolDeviations ? { archSymbolDeviations: event.archSymbolDeviations } : {}),

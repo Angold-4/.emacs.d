@@ -5,6 +5,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { reduce } from "../../src/core/reduce.ts";
+import { baseState } from "./helpers.ts";
 
 import {
   checklistLines,
@@ -12,6 +14,7 @@ import {
   coverageIssues,
   coverageNoteLines,
   evidenceFileAnchors,
+  evidenceTestNames,
   itemsAccept,
   itemsFromPhase,
   itemCounts,
@@ -24,6 +27,7 @@ import {
   tallyItem,
   tallyItems,
   testOutcomeIn,
+  testResultLines,
   verdictIssues,
   type Coverage,
   type PlanItems,
@@ -444,4 +448,48 @@ test("items: architecture symbols come from declarations and PascalCase code spa
     where: "src/a.rs",
   };
   assert.deepEqual(architectureSymbols(item as never).sort(), ["ClusterTime", "RegimeMap", "Round", "evaluate"].sort());
+});
+
+test("items: a reviewer may cite any test the check run passed, by its full Rust path", () => {
+  // A cited Rust path stays whole, quoted or not; a file prefix is split off.
+  assert.deepEqual(evidenceTestNames("see test acceptance::mark_s11_07_weekend."), ["acceptance::mark_s11_07_weekend"]);
+  assert.deepEqual(evidenceTestNames('test "acceptance::mark_s11_08_cage"'), ["acceptance::mark_s11_08_cage"]);
+  assert.deepEqual(evidenceTestNames("test tests/mark/main.rs::acceptance::x"), ["acceptance::x"]);
+  const output = [
+    "   Compiling valuation-calc v0.1.0",
+    "running 3 tests",
+    "test acceptance::mark_s11_07_weekend ... ok",
+    "test acceptance::mark_s11_09_sunday ... FAILED",
+    "test acceptance::mark_s11_10_etf ... ignored",
+    "test result: FAILED. 1 passed; 1 failed; 1 ignored",
+  ].join("\n");
+  assert.deepEqual(testResultLines(output), [
+    "test acceptance::mark_s11_07_weekend ... ok",
+    "test acceptance::mark_s11_09_sunday ... FAILED",
+    "test acceptance::mark_s11_10_etf ... ignored",
+  ]);
+  // None of these tests is a plan verify: the lookup reads the run itself.
+  const item = structured.requirements[2];
+  const ctx = {
+    lineCount: () => 10,
+    diffFiles: ["src/a.ts"],
+    testOutcomes: new Map<string, "passed" | "failed" | "missing">(),
+    checkOutput: testResultLines(output).join("\n"),
+    reviewerReadFiles: ["src/a.ts"],
+    workerAnchors: [],
+    reviewerCommands: [],
+  };
+  const cite = (evidence: string) => verdictIssues(item, { id: item.id, verdict: "met", evidence }, ctx);
+  assert.deepEqual(cite("src/a.ts:1 and test acceptance::mark_s11_07_weekend"), []);
+  assert.ok(cite("src/a.ts:1 and test acceptance::mark_s11_09_sunday").some((i) => i.includes("did not pass")));
+  assert.ok(cite("src/a.ts:1 and test acceptance::mark_s11_10_etf").some((i) => i.includes("not in this check run")));
+  // A path's tail is not the test: the match is exact.
+  assert.ok(cite('src/a.ts:1 and test "mark_s11_07_weekend"').some((i) => i.includes("not in this check run")));
+});
+
+test("items: the check run's test-result lines are kept on the phase for reviewer citations", () => {
+  const lines = ["test acceptance::mark_s11_07_weekend ... ok"];
+  const result = reduce(baseState(), { type: "ITEM_STATE_UPDATED", checkResolution: [], checkTestLines: lines });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.ok ? result.state.phase.checkTestLines : undefined, lines);
 });

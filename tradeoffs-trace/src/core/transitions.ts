@@ -435,6 +435,7 @@ addRow({
       // this new candidate's own input — the reviewer prompt and the views
       // read it — so it is kept until the next worker attempt replaces it.
       checkResolution: undefined,
+      checkTestLines: undefined,
       archSymbolDeviations: undefined,
       overturns: undefined,
       itemChecks: undefined,
