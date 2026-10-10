@@ -51,8 +51,10 @@ function cli(root: string, ...args: string[]): string {
 test("tt program list --json prints id, title, state, node count, source and activity", () => {
   const root = fs.mkdtempSync("/tmp/tt-program-list-");
   try {
+    // Plan 06d (A3/R5): a NODE_BLOCKED for a node that already carries a run
+    // id is ignored, so this fixture blocks `a` before it ever started — the
+    // case that still leaves the dependants waiting and the program stuck.
     makeProgram(root, "prog0001", "plan 14", "/home/me/orgw/05_program.org", [
-      JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", event: { type: "NODE_STARTED", node: "a", runId: "run-a" } }),
       JSON.stringify({ ts: "2026-01-01T01:00:00.000Z", event: { type: "NODE_BLOCKED", node: "a", reason: "broke" } }),
     ]);
     const rows = JSON.parse(cli(root, "program", "list", "--json")) as Array<Record<string, unknown>>;

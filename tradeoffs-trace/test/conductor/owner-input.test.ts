@@ -30,7 +30,7 @@ import {
   waitFor,
   type TestConductorSetup,
 } from "./harness.ts";
-import { Conductor, runPaths, type Deadlines, type RunPlanFile } from "../../src/conductor.ts";
+import { Conductor, rebuildState, runPaths, type Deadlines, type RunPlanFile } from "../../src/conductor.ts";
 import { readLog } from "../../src/effects/log.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { OwnerRequest, Reviewer, State } from "../../src/core/types.ts";
@@ -417,5 +417,246 @@ test("owner-input: tt stop ends a run's conductor cleanly within 15s and tt resu
     await new Promise((resolve) => setTimeout(resolve, 50));
     cleanupDir(root);
     cleanupDir(scriptsDir);
+  }
+});
+
+test("plan 06d: a correction written as an inbox file during REVIEWING and a steer written during CHECKING are queued and reach the next worker attempt's prompt", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-06d-queue-");
+  const promptLog = path.join(dir, "worker-prompts.log");
+  const correctionText = "CORRECTION-QUEUED-06D: the retry loop must cap at 64";
+  const steerText = "STEER-QUEUED-06D: keep the lock hold under 50us";
+  // Round 1 and round 2 each raise a blocking finding, so round 3 is a real
+  // worker attempt. The correction is written during round 1's REVIEWING and
+  // the steer during round 2's CHECKING; both are queued, and round 3's prompt
+  // must carry them.
+  const setup = await setupConductor({
+    checks: ["true"],
+    // The real two-turn review protocol, like the other repair-driving tests:
+    // a blocking finding raised in round 1 and round 2 forces a round 3 worker
+    // attempt, which is where the queued correction and steer must arrive.
+    stubReviews: false,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer, state) => {
+      const round = state.phase.round ?? 1;
+      const open = state.phase.findings.filter((f) => f.status === "open");
+      const findings =
+        round <= 2 && reviewer === "M"
+          ? [{ kind: "defect", severity: "blocking", evidence: "README.md:1 the thing is not done" }]
+          : [];
+      const findingStatements = round >= 3 ? open.map((f) => ({ findingId: f.id, status: "confirm" })) : [];
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements,
+              findings,
+            },
+          },
+        ],
+      };
+    },
+    // Generous stage limits: the gate runs this file beside five other
+    // conductor files, and the two-turn review needs both turns per round.
+    deadlines: { ...FAST, workerAttemptMs: 60_000, reviewMs: 60_000, freezeMs: 30_000, checkMs: 30_000, probeMs: 30_000 },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "REVIEWING", 60_000);
+    writeCommand(setup.runDir, "cmd-06d-correction", {
+      type: "correction",
+      text: correctionText,
+      binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
+    });
+    await waitFor(
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-06d-correction" && i.state === "queued"),
+      30_000,
+      50,
+      setup.runDir,
+    );
+
+    // The repair attempt after round 1 carries the queued correction.
+    await waitFor(() => setup.conductor.state.phase.phase === "CHECKING" && (setup.conductor.state.phase.round ?? 0) >= 2, 90_000, 50, setup.runDir);
+    writeCommand(setup.runDir, "cmd-06d-steer", {
+      type: "steer",
+      text: steerText,
+      binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
+    });
+    await waitFor(
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-06d-steer" && i.state === "queued"),
+      30_000,
+    );
+
+    // Both are shown queued in views/status.txt (Emacs reads this, not state).
+    // The view is refreshed on its own beat, so wait for the file to catch up.
+    await waitFor(
+      () => {
+        const file = runPaths(setup.runDir).status;
+        const status = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+        return status.includes(correctionText) && status.includes(steerText) && (status.match(/ — queued /g) ?? []).length >= 2;
+      },
+      30_000,
+      100,
+      setup.runDir,
+    );
+
+    // The next worker attempt (round 3) carries both texts verbatim.
+    await waitFor(() => {
+      if (!fs.existsSync(promptLog)) return false;
+      const prompts = fs.readFileSync(promptLog, "utf8");
+      return prompts.includes(correctionText) && prompts.includes(steerText);
+    }, 90_000);
+    assert.ok(
+      (setup.conductor.state.phase.ownerInputs ?? []).every((i) => i.state !== "refused"),
+      "a queued correction or steer is never refused",
+    );
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("plan 06d: corrections bound with the run directory id and with the readable id are accepted", async () => {
+  const setup = await setupAwaitingOwner(["false"]);
+  try {
+    const runId = setup.conductor.state.phase.runId;
+    const dirId = path.basename(setup.runDir);
+    const readableId = "prog06d-01";
+    // A program node's readable id, recorded where the scheduler records it.
+    fs.writeFileSync(
+      path.join(setup.runDir, "program.json"),
+      JSON.stringify({ programId: "prog06d", node: "a", readableId }),
+    );
+
+    writeCommand(setup.runDir, "cmd-aaa-dir", {
+      type: "correction",
+      text: "DIR-ID-CORRECTION: applied now",
+      binding: { runId: dirId, phaseId: "p1" },
+    });
+    writeCommand(setup.runDir, "cmd-bbb-readable", {
+      type: "correction",
+      text: "READABLE-ID-CORRECTION: accepted",
+      binding: { runId: readableId, phaseId: "p1" },
+    });
+    writeCommand(setup.runDir, "cmd-ccc-unknown", {
+      type: "correction",
+      text: "UNKNOWN-ID-CORRECTION: refused",
+      binding: { runId: "no-such-run", phaseId: "p1" },
+    });
+
+    await waitFor(
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-aaa-dir" && i.state === "correction-started"),
+      30_000,
+    );
+    await waitFor(
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-bbb-readable" && i.state === "queued"),
+      30_000,
+    );
+    await waitFor(
+      () => readEvents(setup.runDir).some((r) => r.kind === "command_rejected" && (r.event as { commandId?: string }).commandId === "cmd-ccc-unknown"),
+      30_000,
+    );
+
+    assert.equal(
+      (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-aaa-dir")!.state,
+      "correction-started",
+      "the run directory id bound the correction and it applied",
+    );
+    assert.equal(
+      (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-bbb-readable")!.state,
+      "queued",
+      "the readable id bound the correction and it was accepted (queued)",
+    );
+    const refused = (setup.conductor.state.phase.ownerInputs ?? []).find((i) => i.id === "cmd-ccc-unknown")!;
+    assert.equal(refused.state, "refused");
+    // The reason lists all three ids that would have bound.
+    assert.match(refused.reason ?? "", new RegExp(runId));
+    assert.match(refused.reason ?? "", new RegExp(dirId));
+    assert.match(refused.reason ?? "", new RegExp(readableId));
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 1, "only the unknown id is refused");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 06d: every inbox command ends applied, queued or refused with a recorded event", async () => {
+  const setup = await setupAwaitingOwner(["false"]);
+  try {
+    const runId = setup.conductor.state.phase.runId;
+    // Name-sorted so the steer (no worker, still AWAITING_OWNER) queues before
+    // the correction applies now (AWAITING_OWNER); the mis-addressed note is
+    // refused. One of each outcome.
+    writeCommand(setup.runDir, "cmd-aaa-steer", { type: "steer", text: "queued steer", binding: { runId, phaseId: "p1" } });
+    writeCommand(setup.runDir, "cmd-bbb-correction", { type: "correction", text: "applied now", binding: { runId, phaseId: "p1" } });
+    writeCommand(setup.runDir, "cmd-ccc-unknown", { type: "note", text: "unknown id", binding: { runId: "no-such-run", phaseId: "p1" } });
+
+    await waitFor(() => fs.readdirSync(inboxDir(setup.runDir)).filter((n) => n.endsWith(".json")).length === 0, 30_000);
+    const inputs = setup.conductor.state.phase.ownerInputs ?? [];
+    assert.equal(inputs.find((i) => i.id === "cmd-aaa-steer")!.state, "queued", "queued");
+    assert.equal(inputs.find((i) => i.id === "cmd-bbb-correction")!.state, "correction-started", "applied");
+    assert.equal(inputs.find((i) => i.id === "cmd-ccc-unknown")!.state, "refused", "refused");
+    // Every outcome is an OWNER_INPUT_RECORDED event; the refusal additionally
+    // has its command_rejected record.
+    const recorded = eventsOfType(setup.runDir, "OWNER_INPUT_RECORDED") as Array<{ input?: { id?: string; state?: string } }>;
+    for (const id of ["cmd-aaa-steer", "cmd-bbb-correction", "cmd-ccc-unknown"]) {
+      assert.ok(recorded.some((r) => r.input?.id === id), `${id} has a recorded outcome event`);
+    }
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 1);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("plan 06d: an event log recorded before queued input replays to its recorded phase", async () => {
+  // A log that recorded a refusal (input after DONE) must replay to DONE with
+  // the refusal intact: a refusal is never turned into a queued input after
+  // the fact.
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [submitReviewStep(reviewer, state)],
+    }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  await waitFor(() => setup.conductor.state.phase.phase === "DONE", 60_000);
+  await setup.conductor.stop();
+  try {
+    writeCommand(setup.runDir, "cmd-after-done", { type: "note", text: "too late", binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" } });
+    const restarted = await restart(setup);
+    try {
+      await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "command_rejected"), 15_000);
+      const recorded = readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "OWNER_INPUT_RECORDED").map((r) => r.event as { input?: { id?: string; state?: string } });
+      assert.equal(recorded.find((e) => e.input?.id === "cmd-after-done")!.input!.state, "refused");
+      assert.equal(eventsOfType(setup.runDir, "NOTE_ADDED").length, 0, "a refusal is never turned into a queued note");
+      assert.equal(restarted.state.phase.phase, "DONE");
+      // Rebuilding the same log again gives the same recorded phase and refusal.
+      const rebuilt = rebuildState(setup.runDir, setup.plan, { lenient: true });
+      assert.equal(rebuilt.phase.phase, "DONE");
+      assert.equal((rebuilt.phase.ownerInputs ?? []).find((i) => i.id === "cmd-after-done")!.state, "refused");
+    } finally {
+      await restarted.stop();
+    }
+  } finally {
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
   }
 });

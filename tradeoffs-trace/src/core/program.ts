@@ -69,6 +69,13 @@ export type NodeStatus = "waiting" | "running" | "needs-you" | "stopped" | "done
 export interface ProgramState {
   nodes: Record<string, { status: NodeStatus; runId?: string; branch?: string; base?: string; reason?: string; resumes?: number }>;
   stopped: boolean;
+  /** Plan 06d (A3): the owner paused the program. Running nodes go on; no new
+   * node starts until `tt program resume`. */
+  paused?: boolean;
+  /** Plan 06d (A3/R5): stray NODE_BLOCKED events ignored because the node had
+   * already started (its NODE_STARTED carries a run id). Recorded here so the
+   * ignore is visible, never silent. */
+  ignoredBlocked?: Array<{ node: string; reason: string }>;
   /** Plan 01i: program-wide owner directives in force, in the order the owner
    * sent them. Rebuilt by folding the program's own event log. */
   directives?: ProgramDirective[];
@@ -78,6 +85,7 @@ export type ProgramEvent =
   | { type: "NODE_STARTED"; node: string; runId: string; branch?: string; base?: string }
   | { type: "NODE_BLOCKED"; node: string; reason: string }
   | { type: "NODE_RESUMED"; node: string; reason: "crashed" | "owner" }
+  | { type: "PROGRAM_PAUSED" }
   | { type: "PROGRAM_RESUMED" }
   /** `tt program retry`: a blocked (or stopped) node goes back to waiting and
    * runs again as a fresh run; its branch is kept. */
@@ -186,8 +194,20 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
         ...state,
         nodes: { ...state.nodes, [event.node]: { status: "running", runId: event.runId, branch: event.branch, base: event.base } },
       };
-    case "NODE_BLOCKED":
-      return { ...state, nodes: { ...state.nodes, [event.node]: { ...state.nodes[event.node], status: "blocked", reason: event.reason } } };
+    case "NODE_BLOCKED": {
+      // Plan 06d (A3/R5): a NODE_BLOCKED must never override a node whose
+      // NODE_STARTED already carries a run id. A stray block (a stale event,
+      // or one racing the start) is recorded as ignored and the node keeps
+      // running; a genuinely not-yet-started node still blocks.
+      const prev = state.nodes[event.node];
+      if (prev?.runId) {
+        return {
+          ...state,
+          ignoredBlocked: [...(state.ignoredBlocked ?? []), { node: event.node, reason: event.reason }],
+        };
+      }
+      return { ...state, nodes: { ...state.nodes, [event.node]: { ...prev, status: "blocked", reason: event.reason } } };
+    }
     case "NODE_STATUS": {
       const prev = state.nodes[event.node];
       if (!prev) return state;
@@ -202,8 +222,11 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
     }
     case "PROGRAM_STOPPED":
       return { ...state, stopped: true };
+    case "PROGRAM_PAUSED":
+      // A pause never touches the nodes already running: they go on.
+      return { ...state, paused: true };
     case "PROGRAM_RESUMED":
-      return { ...state, stopped: false };
+      return { ...state, stopped: false, paused: false };
     case "NODE_RETRY": {
       const prev = state.nodes[event.node];
       if (!prev || prev.status === "done" || prev.status === "running") return state;
@@ -235,7 +258,7 @@ const ACTIVE: NodeStatus[] = ["running", "needs-you", "stopped"];
  * dependencies are all DONE, while fewer than `maxParallel` runs are active.
  * A run that needs the owner or was stopped still holds its slot. */
 export function nextStarts(nodes: ProgramNode[], state: ProgramState, maxParallel: number): string[] {
-  if (state.stopped) return [];
+  if (state.stopped || state.paused) return [];
   const active = Object.values(state.nodes).filter((n) => ACTIVE.includes(n.status)).length;
   const room = Math.max(0, maxParallel - active);
   const ready = nodes.filter(
@@ -244,15 +267,20 @@ export function nextStarts(nodes: ProgramNode[], state: ProgramState, maxParalle
   return ready.slice(0, room).map((n) => n.id);
 }
 
-export type ProgramOutcome = "running" | "done" | "stuck" | "stopped";
+export type ProgramOutcome = "running" | "done" | "stuck" | "stopped" | "paused";
 
 /** `done`: every node is DONE. `stuck`: nothing is running or startable and
- * some node can never start (a dependency is BLOCKED). */
+ * some node can never start (a dependency is BLOCKED). `paused`: the owner
+ * paused the program and no node is running any more — the scheduler can exit
+ * without starting another node, and `tt program resume` starts the next. */
 export function programOutcome(nodes: ProgramNode[], state: ProgramState): ProgramOutcome {
   if (nodes.every((n) => state.nodes[n.id].status === "done")) return "done";
   if (state.stopped) return "stopped";
   const anyActive = nodes.some((n) => ACTIVE.includes(state.nodes[n.id].status));
+  // A pause keeps the scheduler watching while a node still runs (so its
+  // finish is observed), then reports `paused` once nothing is active.
   if (anyActive) return "running";
+  if (state.paused) return "paused";
   const startable = nextStarts(nodes, state, Number.MAX_SAFE_INTEGER).length > 0;
   return startable ? "running" : "stuck";
 }

@@ -760,6 +760,7 @@ function ownerInputStateLabel(state: string | undefined, reason: string | undefi
   switch (state) {
     case "delivered": return "delivered";
     case "noted": return "noted";
+    case "queued": return "queued";
     case "correction-started": return "correction started";
     case "reverted": return "reverted an amendment";
     case "delivery-uncertain": return `delivery uncertain${reason ? ` (${reason})` : ""}`;

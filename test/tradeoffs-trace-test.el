@@ -3185,3 +3185,65 @@ the real auxiliary maps are checked too (finding M-4)."
     (should (commandp (lookup-key (cdr (assq +tt-decisions-mode-map +tt--evil-normal-maps)) (kbd "TAB"))))
     (should (commandp (lookup-key (cdr (assq +tt-input-mode-map +tt--evil-normal-maps)) (kbd "RET"))))
     (should (commandp '+tt--refresh-all))))
+
+(ert-deftest tradeoffs-trace-input-header-last-owner-input ()
+  "Plan 06d (A4/R6): the input header reads the latest queued or refused
+owner input from views/status.txt, so Emacs never computes the outcome."
+  (let* ((root (make-temp-file "tt-ert-run" t))
+         (views (expand-file-name "views" root))
+         (status (expand-file-name "status.txt" views)))
+    (unwind-protect
+        (progn
+          (make-directory views t)
+          (with-temp-file status
+            (insert "sum validation\n"
+                    "run abcd1234 · conductor running · 1m\n\n"
+                    "Owner input (3)\n"
+                    "  - a delivered steer — delivered (steer)\n"
+                    "  - a queued correction — queued (correction)\n"
+                    "  - a refused note — refused: the phase is DONE (note)\n"))
+          ;; The latest queued or refused line is the refused one.
+          (should (equal (+tt--input-header-last root)
+                         "  - a refused note — refused: the phase is DONE (note)"))
+          ;; The latest queued line wins when it comes after a refused one.
+          (with-temp-file status
+            (insert "Owner input (2)\n"
+                    "  - a refused note — refused: too late (note)\n"
+                    "  - a queued steer — queued (steer)\n"))
+          (should (equal (+tt--input-header-last root) "  - a queued steer — queued (steer)"))
+          ;; A note is queued for the next attempt too (A-5): a `noted' line
+          ;; after an older queued one is the latest input the header shows.
+          (with-temp-file status
+            (insert "Owner input (2)\n"
+                    "  - a queued correction — queued (correction)\n"
+                    "  - a noted note — noted (note)\n"))
+          (should (equal (+tt--input-header-last root) "  - a noted note — noted (note)"))
+          ;; A status with no queued or refused input yields nil.
+          (with-temp-file status (insert "run abcd1234\n"))
+          (should-not (+tt--input-header-last root)))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-input-header-shows-last-owner-input ()
+  "Plan 06d (A4/R6): the input header line carries the latest queued or
+refused input read from views/status.txt."
+  (let* ((root (make-temp-file "tt-ert-run" t))
+         (views (expand-file-name "views" root))
+         (status (expand-file-name "status.txt" views))
+         (saved header-line-format))
+    (unwind-protect
+        (progn
+          (make-directory views t)
+          (with-temp-file status
+            (insert "Owner input (1)\n  - queued text — queued (correction)\n"))
+          (let ((+tt--run-dir root)
+                (+tt--input-program-dir nil))
+            (cl-letf (((symbol-function '+tt--state) (lambda (_) '((state (phase (phase . "REVIEWING"))))))
+                      ((symbol-function '+tt--input-header)
+                       (lambda (&optional _ program)
+                         (if program "P" "sending notes the next worker attempt"))))
+              (+tt--render-input-header)
+              (should (string-match-p "sending notes the next worker attempt" header-line-format))
+              (should (string-match-p "last owner input" header-line-format))
+              (should (string-match-p "queued text — queued (correction)" header-line-format)))))
+      (setq header-line-format saved)
+      (delete-directory root t))))

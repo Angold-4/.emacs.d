@@ -26,7 +26,8 @@ import { candidateAnchorFreshness, projectEntryReview, renderStatusView, reviewM
 import { buildView } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
-import { expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
+import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent, type InputKind } from "./core/owner-inbox.ts";
+import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
 import { checkCommands, checkTier, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand } from "./core/checks.ts";
 // Plan 05i: the pure environment preflight — parse every declared shell
@@ -2147,7 +2148,7 @@ export class Conductor {
 
   /** Plan 2d: the three input-box kinds (design §7.4), detected by shape in
    * either the flat `kind` form or the decision view's `type` form. */
-  #ownerInputKindOf(raw: unknown): OwnerInputKind | undefined {
+  #ownerInputKindOf(raw: unknown): InputKind | undefined {
     if (!raw || typeof raw !== "object") return undefined;
     const r = raw as Record<string, unknown>;
     const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
@@ -2320,9 +2321,13 @@ export class Conductor {
     if (expanded.skipped.length > 0) {
       this.#log.append("entry_verdict_skipped", { commandId, entryId: raw.entryId, skipped: expanded.skipped });
     }
-    if (expanded.runId && expanded.runId !== this.#state.phase.runId) {
-      this.#rejectInboxFile(file, commandId, `command is bound to run ${expanded.runId}, but this run is ${this.#state.phase.runId}`);
-      return;
+    if (expanded.runId) {
+      // Plan 06d (A2/C3): resolveBinding is the only place that matches a run.
+      const resolved = resolveBinding(this.#runBinding(), expanded.runId);
+      if (!resolved.ok) {
+        this.#rejectInboxFile(file, commandId, resolved.reason);
+        return;
+      }
     }
     if (expanded.phaseId && expanded.phaseId !== this.#state.phase.phaseId) {
       this.#rejectInboxFile(file, commandId, `command is bound to phase ${expanded.phaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
@@ -2549,10 +2554,30 @@ export class Conductor {
     }
 
     const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
-    if (!worker) {
-      const reason = "no worker attempt is running; the conductor refused the steer (it was not delivered)";
-      this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, reason);
-      this.#rejectInboxFile(file, commandId, reason);
+    // Plan 06d (A1/C3): the observation may have changed since the inbox
+    // block last asked acceptInput (the worker can exit in between), so ask
+    // the one policy again rather than deciding here. A steer with no worker
+    // is queued, never refused: owner input is never lost.
+    const decision = acceptInput(this.#state, { kind: "steer", text, workerRunning: worker !== undefined });
+    if (decision.kind === "refused") {
+      this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, decision.reason);
+      this.#rejectInboxFile(file, commandId, decision.reason);
+      return;
+    }
+    if (decision.kind === "queued" || !worker) {
+      const event: Event = { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text };
+      const result = reduce(this.#state, event);
+      if (!result.ok) {
+        this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, result.reason);
+        this.#rejectInboxFile(file, commandId, result.reason);
+        return;
+      }
+      this.#appliedCommandIds.add(commandId);
+      this.#applyEvent(event, commandId);
+      this.#addDirective(text, scope, commandId);
+      this.#recordOwnerInput(commandId, "steer", text, "queued");
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
       return;
     }
     const attemptId = boundAttemptId ?? worker.agentId;
@@ -2741,25 +2766,34 @@ export class Conductor {
     // is also an owner directive, phase-scoped unless the sender asked for
     // `scope: "program"` (`C-u` in a run's input box, D5).
     const inputKind = this.#ownerInputKindOf(raw);
-    let noteKindText: { text: string; scope: DirectiveScope; programWide: boolean } | undefined;
     if (inputKind) {
       const inputText = (raw as { text?: unknown }).text;
       if (typeof inputText !== "string" || inputText.trim().length === 0) {
         this.#rejectInboxFile(file, commandId, "an owner input must carry non-empty text");
         return;
       }
-      if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
-        const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
-        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, reason);
-        this.#rejectInboxFile(file, commandId, reason);
-        return;
+      // Plan 06d (A2/C3): a binding's run id may be the internal runId, the
+      // run directory id or the readable id; resolveBinding is the only
+      // matcher. An unknown id is refused with all three it could have used,
+      // so a mis-addressed input is never silently applied to this run.
+      const rawBinding = (raw as { binding?: unknown }).binding;
+      const bindingRunId = rawBinding && typeof rawBinding === "object" ? (rawBinding as { runId?: unknown }).runId : undefined;
+      if (typeof bindingRunId === "string" && bindingRunId.length > 0) {
+        const resolved = resolveBinding(this.#runBinding(), bindingRunId);
+        if (!resolved.ok) {
+          this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, resolved.reason);
+          this.#rejectInboxFile(file, commandId, resolved.reason);
+          return;
+        }
       }
       const scope: DirectiveScope = (raw as { scope?: unknown }).scope === "program" ? "program" : "phase";
       // Plan 01i: `withdraw OD-n` (or `withdraw ODP-n`) in the input box
       // withdraws one directive — whatever kind the phase would otherwise
       // have made of the text. A withdrawal that names no valid id is
       // refused visibly: it must never be recorded as a *new* binding ruling,
-      // which would leave the intended one in force.
+      // which would leave the intended one in force. A withdrawal is not one
+      // of the three input outcomes `acceptInput` decides, so it keeps its own
+      // terminal check (the same refusal text).
       const parsedWithdraw = parseWithdrawInput(inputText);
       if (parsedWithdraw?.kind === "malformed") {
         this.#recordOwnerInput(commandId, "withdraw", inputText, "refused", undefined, parsedWithdraw.reason);
@@ -2767,6 +2801,12 @@ export class Conductor {
         return;
       }
       if (parsedWithdraw?.kind === "withdraw") {
+        if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+          const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
+          this.#recordOwnerInput(commandId, "withdraw", inputText, "refused", undefined, reason);
+          this.#rejectInboxFile(file, commandId, reason);
+          return;
+        }
         this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
         return;
       }
@@ -2790,7 +2830,21 @@ export class Conductor {
           return;
         }
       }
+      // Plan 06d (A1/C3): acceptInput is the only place that decides an
+      // input's outcome. The conductor observes whether a worker is live and
+      // then only executes that decision — never decides it here.
+      const workerRunning = this.#liveAgents().some((l) => l.target === "worker");
+      const outcome = acceptInput(this.#state, { kind: inputKind, text: inputText, workerRunning });
+      if (outcome.kind === "refused") {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, outcome.reason);
+        this.#rejectInboxFile(file, commandId, outcome.reason);
+        return;
+      }
       if (inputKind === "steer") {
+        // A steer always goes through #processSteerCommand: it first recovers
+        // a recorded intent (a crash between the RPC send and its ack), then
+        // steers the live worker or queues for the next attempt — the same
+        // at-most-once delivery discipline as before.
         if (programWide) {
           this.#processProgramWideInput(file, commandId, "steer", inputText);
           return;
@@ -2798,7 +2852,39 @@ export class Conductor {
         this.#processSteerCommand(file, commandId, raw, inputText, effectiveScope);
         return;
       }
-      noteKindText = { text: inputText, scope: effectiveScope, programWide };
+      // A queued note or correction is carried as a note so it reaches the
+      // next worker attempt's prompt verbatim; an applied correction at
+      // AWAITING_OWNER resolves the open requests and starts a repair.
+      const queueAsNote = outcome.kind === "queued";
+      const event: Event = queueAsNote
+        ? { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
+        : { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: inputText };
+      const result = reduce(this.#state, event);
+      if (!result.ok) {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, result.reason);
+        this.#rejectInboxFile(file, commandId, result.reason);
+        return;
+      }
+      this.#appliedCommandIds.add(commandId);
+      this.#applyEvent(event, commandId);
+      // Plan 01i: every input is also an owner directive — recorded here, on
+      // top of the event above, so it is steered to every live agent now and
+      // quoted in every later prompt.
+      if (programWide) this.#forwardProgramDirective(commandId, inputText);
+      else this.#addDirective(inputText, effectiveScope, commandId);
+      // The recorded effect the status view reads, never an inference: a
+      // queued correction or steer is `queued`; a note is `noted`; a
+      // correction applied at AWAITING_OWNER started a repair.
+      if (queueAsNote && inputKind === "note") {
+        this.#recordOwnerInput(commandId, "note", inputText, "noted");
+      } else if (queueAsNote) {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "queued");
+      } else {
+        this.#recordOwnerInput(commandId, "correction", inputText, "correction-started");
+      }
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+      return;
     }
 
     // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
@@ -2834,10 +2920,15 @@ export class Conductor {
       boundPhaseId = normalized.phaseId;
     }
     // The decision view's binding carries run/phase ids too (design §7.1); a
-    // command for another run or phase is stale by the same rule.
-    if (boundRunId && boundRunId !== this.#state.phase.runId) {
-      this.#rejectInboxFile(file, commandId, `command is bound to run ${boundRunId}, but this run is ${this.#state.phase.runId}`);
-      return;
+    // command for another run or phase is stale by the same rule. Plan 06d
+    // (A2/C3): resolveBinding is the only place that matches a run, and it
+    // accepts the internal id, the run directory id and the readable id.
+    if (boundRunId) {
+      const resolved = resolveBinding(this.#runBinding(), boundRunId);
+      if (!resolved.ok) {
+        this.#rejectInboxFile(file, commandId, resolved.reason);
+        return;
+      }
     }
     if (boundPhaseId && boundPhaseId !== this.#state.phase.phaseId) {
       this.#rejectInboxFile(file, commandId, `command is bound to phase ${boundPhaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
@@ -2850,26 +2941,6 @@ export class Conductor {
     }
     this.#appliedCommandIds.add(commandId);
     this.#applyEvent(event, commandId);
-    // Plan 01i: a note or a correction is a directive too — recorded here,
-    // on top of the event above, so it is steered to every live agent now
-    // and quoted in every later prompt (a correction still resolves the open
-    // requests and grants its 3 rounds first: today's behaviour, unchanged).
-    if (noteKindText) {
-      if (noteKindText.programWide) {
-        this.#forwardProgramDirective(commandId, noteKindText.text);
-      } else {
-        this.#addDirective(noteKindText.text, noteKindText.scope, commandId);
-      }
-    }
-    // The recorded effect for the input box's status view: a note is queued
-    // for the next attempt the moment it is applied; a correction has just
-    // resolved the open requests and started a repair.
-    const recordedText = (raw as { text?: unknown }).text;
-    if (event.type === "NOTE_ADDED" && typeof recordedText === "string") {
-      this.#recordOwnerInput(commandId, "note", recordedText, "noted");
-    } else if (event.type === "OWNER_CORRECTION" && typeof recordedText === "string") {
-      this.#recordOwnerInput(commandId, "correction", recordedText, "correction-started");
-    }
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
   }
@@ -2961,6 +3032,27 @@ export class Conductor {
     } catch {
       return undefined;
     }
+  }
+
+  /** Plan 06d (A2): the readable id (`<program>-NN`) the scheduler recorded in
+   * this run's `program.json`, or undefined for a hand-started run. */
+  #readableId(): string | undefined {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { readableId?: unknown };
+      return typeof raw.readableId === "string" && raw.readableId.length > 0 ? raw.readableId : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 06d (A2): the three ids a binding may use to name this run, resolved
+   * by the one `resolveBinding`. The conductor never compares ids itself. */
+  #runBinding(): { runId: string; dirId: string; readableId?: string } {
+    return {
+      runId: this.#state.phase.runId,
+      dirId: path.basename(this.#runDir),
+      ...(this.#readableId() ? { readableId: this.#readableId()! } : {}),
+    };
   }
 
   /** design §8.1's "run execution budget ... tokens" and "per-attempt token

@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
+import { acquireLock, type Lock } from "./effects/lock.ts";
 
 import { buildView, formatDuration } from "./view.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
@@ -58,6 +59,10 @@ export function programPaths(dir: string) {
     program: path.join(dir, "program.json"),
     events: path.join(dir, "events.jsonl"),
     pid: path.join(dir, "scheduler.pid"),
+    /** Plan 06d (A3): the exclusive scheduler lock. One scheduler per
+     * program; a second exits at once, and a lock left by a dead pid is
+     * taken over because the OS releases the flock when its holder dies. */
+    lock: path.join(dir, "scheduler.lock"),
     log: path.join(dir, "scheduler.log"),
     /** Plan 03c: the Org program file this program was started from. */
     source: path.join(dir, "source.json"),
@@ -571,9 +576,40 @@ export function prepareBranch(
   }
 }
 
-/** The scheduler process: tick until the program is done, stuck or stopped. */
+/** Plan 06d (A3): take the program's exclusive scheduler lock. A second
+ * scheduler fails fast with "scheduler already running"; a lock whose pid is
+ * dead is taken over, because the previous holder's flock died with it. The
+ * returned Lock is released by `runScheduler` when it exits. */
+export async function acquireSchedulerLock(dir: string): Promise<Lock> {
+  return acquireLock(programPaths(dir).lock);
+}
+
+/** The scheduler process: tick until the program is done, stuck, stopped or
+ * paused. Holds `programs/<id>/scheduler.lock` for its whole life. */
 export async function runScheduler(dir: string, opts: SchedulerOptions): Promise<ProgramOutcome> {
-  fs.writeFileSync(programPaths(dir).pid, String(process.pid));
+  let lock: Lock;
+  try {
+    lock = await acquireSchedulerLock(dir);
+  } catch (err) {
+    const message = `scheduler already running for program ${path.basename(dir)}`;
+    fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} ${message}\n`);
+    process.stderr.write(`${message}\n`);
+    // Another scheduler holds the program; this process must not start any
+    // node, so it exits at once. `running` reports what the program is doing.
+    return "running";
+  }
+  try {
+    // The lock file names THIS scheduler, not the perl helper that holds the
+    // flock, so a second scheduler's refusal can name the real pid.
+    fs.writeFileSync(programPaths(dir).lock, String(process.pid));
+    fs.writeFileSync(programPaths(dir).pid, String(process.pid));
+    return await schedulerLoop(dir, opts);
+  } finally {
+    await lock.release();
+  }
+}
+
+async function schedulerLoop(dir: string, opts: SchedulerOptions): Promise<ProgramOutcome> {
   const reminderMs = opts.notifyReminderMs ?? NOTIFY_REMINDER_MS;
   let ticks = 0;
   let stuckNotifiedAt: number | undefined;

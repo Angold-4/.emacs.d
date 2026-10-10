@@ -1795,6 +1795,7 @@ the longer one behind — the same order secrets.ts's byLengthDesc uses."
   (pcase state
     ("delivered" "delivered")
     ("noted" "noted")
+    ("queued" "queued")
     ("correction-started" "correction started")
     ("reverted" "reverted an amendment")
     ("delivery-uncertain" (format "delivery uncertain%s" (if reason (format " (%s)" reason) "")))
@@ -1873,13 +1874,37 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
                           (if kind (format " (%s)" kind) ""))))))
     (+tt--render-directives s)))
 
+(defun +tt--input-header-last (run-dir)
+  "The latest queued or refused owner input, read from views/status.txt.
+Plan 06d (A4/R6): the input header states what the run actually did with the
+owner's input, so it reads the runtime's own record instead of computing an
+outcome itself.  Returns nil when the file is missing or holds no queued or
+refused input.  The status text line is `  - TEXT — queued (kind)',
+`  - TEXT — noted (kind)' (a note is queued for the next attempt) or
+`  - TEXT — refused: REASON (kind)'."
+  (let ((file (and run-dir (expand-file-name "views/status.txt" run-dir))))
+    (when (and file (file-exists-p file))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-max))
+        ;; Each line is `  - TEXT — LABEL (kind)'; the label is `queued',
+        ;; `noted' (a queued note) or `refused: …'.  Match the whole line, not
+        ;; just up to the label.
+        (when (re-search-backward "^  - .*\\(?: — queued \\| — noted \\| — refused: \\)" nil t)
+          (buffer-substring (line-beginning-position) (line-end-position)))))))
+
 (defun +tt--render-input-header ()
-  "Recompute the *tt-input* header line from the current run state."
+  "Recompute the *tt-input* header line from the current run state.
+Plan 06d (A4/R6): the latest queued or refused input is read from
+views/status.txt, never inferred here."
   (setq header-line-format
         (condition-case err
-            (if +tt--input-program-dir
-                (+tt--input-header nil t)
-              (+tt--input-header (+tt--state +tt--run-dir)))
+            (let* ((base (if +tt--input-program-dir
+                             (+tt--input-header nil t)
+                           (+tt--input-header (+tt--state +tt--run-dir))))
+                   (last (and (not +tt--input-program-dir)
+                              (+tt--input-header-last +tt--run-dir))))
+              (if last (format "%s  ·  last owner input: %s" base last) base))
           (error (format "Cannot deliver input: %s" (error-message-string err))))))
 
 (defun +tt--status-row (label value &optional face)

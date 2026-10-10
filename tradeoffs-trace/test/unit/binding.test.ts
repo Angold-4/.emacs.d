@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { checkBallotBinding, checkTupleBinding } from "../../src/core/binding.ts";
+import { checkBallotBinding, checkTupleBinding, resolveBinding } from "../../src/core/binding.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import type { BindingTuple, Finding } from "../../src/core/types.ts";
 import { CV, baseState, basePhase, makeBallot, makeDecision } from "./helpers.ts";
@@ -205,4 +205,23 @@ test("stale-binding via reduce(): a stale AMEND is rejected, naming the contract
   });
   assert.equal(result.ok, false);
   assert.match((result as { reason: string }).reason, /contract changed v1 → v2 since you viewed it/);
+});
+
+test("plan 06d: resolveBinding accepts the internal runId, the run directory id and the readable id, and refuses an unknown id with all three", () => {
+  const run = { runId: "internal-1", dirId: "dir-2", readableId: "prog-01" };
+  for (const id of ["internal-1", "dir-2", "prog-01"]) {
+    const r = resolveBinding(run, id);
+    assert.equal(r.ok, true, id);
+    assert.equal((r as { runId: string }).runId, "internal-1", "every id resolves to the internal runId");
+  }
+  // An absent binding means this run, and a hand-started run without a
+  // readable id still matches its two other ids.
+  assert.equal(resolveBinding(run, "").ok, true);
+  assert.equal(resolveBinding(run, undefined).ok, true);
+  assert.equal(resolveBinding({ runId: "r", dirId: "d" }, "d").ok, true);
+  // A binding that names nothing is refused with every id it could have used.
+  const bad = resolveBinding(run, "no-such-run");
+  assert.equal(bad.ok, false);
+  const reason = (bad as { reason: string }).reason;
+  for (const id of ["internal-1", "dir-2", "prog-01"]) assert.match(reason, new RegExp(id));
 });
