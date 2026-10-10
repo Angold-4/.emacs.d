@@ -27,6 +27,7 @@ import {
   checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  clearRulings,
   recordRulings,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
@@ -1773,13 +1774,15 @@ function applyOwnerCorrection(s: State, ev: Event): State {
   // Plan 06k1 (A2): an owner correction that names a decision id as ruled
   // settles that decision with no ballots on every later candidate whose
   // decision keeps the same id and choice.
-  const ruledDecisions = recordRulings(s.phase.ruledDecisions, e.text, s.phase.decisions, e.correctionId);
+  // Plan 06k2 (A8): a negation in the correction clears the ruling it
+  // negates (finding D-B-79).
+  const ruledDecisions = clearRulings(recordRulings(s.phase.ruledDecisions, e.text, s.phase.decisions, e.correctionId), e.text, s.phase.decisions);
   return withPhase(s, {
     phase: "REPAIRING",
     ownerRequests,
     repairRoundsGranted: s.phase.repairRoundsGranted + 3,
     ownerNotes: [...(s.phase.ownerNotes ?? []), e.text],
-    ...(ruledDecisions ? { ruledDecisions } : {}),
+    ruledDecisions: ruledDecisions ?? [],
     inFlight: {},
   });
 }

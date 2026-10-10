@@ -29,6 +29,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { guardedSearchPath, guardedShCommand, guardedWritePath, readGuardConfigFromEnv, readSearchRootsFromEnv } from "./guards.ts";
+import { capToolResult } from "../src/effects/rpc.ts";
 
 import { validate, type JSONSchema } from "../src/core/schema.ts";
 import { validateCuratorProposal } from "../src/core/entries.ts";
@@ -1005,7 +1006,9 @@ export default function (pi: ExtensionAPI) {
         const exit = await client.runShell(params.command, params.cwd, (msg) => chunks.push(msg.chunk), waitMs);
         return {
           isError: exit.code !== 0,
-          content: [{ type: "text" as const, text: chunks.join("") || `(no output, exit ${exit.code})` }],
+          // Plan 06k2 (A6): cap the whole result (bytes, single line included)
+          // before it reaches the model's context.
+          content: [{ type: "text" as const, text: capToolResult(chunks.join("") || `(no output, exit ${exit.code})`) }],
           details: { exitCode: exit.code, signal: exit.signal },
         };
       } catch (err) {

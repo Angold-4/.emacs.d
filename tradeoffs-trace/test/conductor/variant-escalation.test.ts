@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { parseOrgPlan } from "../../src/core/org-plan.ts";
+import { lintPlan } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { variantEscalation, variantLimitOf } from "../../src/core/triage.ts";
 import { basePhase, baseState, CV } from "../unit/helpers.ts";
@@ -48,6 +49,66 @@ function resolvingPhase(findings: Finding[], round: number, variantLimit?: numbe
     contract: { ...basePhase().contract, ...(variantLimit ? { variantLimit } : {}) },
   });
 }
+
+test("plan 06k2: a variant limit of 1 is a lint error", () => {
+  const planText = (limit: string) =>
+    [
+      "#+TITLE: t",
+      "#+TT_REPO: /tmp/r",
+      "#+TT_BRANCH: main",
+      "#+TT_CHECKS: true",
+      `#+TT_VARIANT_LIMIT: ${limit}`,
+      "* Phase 1: p1",
+      "  :PROPERTIES:",
+      "  :ID: p1",
+      "  :CHECKS: true",
+      "  :END:",
+      "  Goal: g",
+      "  Acceptance:",
+      "  - it works",
+    ].join("\n") + "\n";
+  const one = lintPlan(parseOrgPlan(planText("1"), "/tmp/PLAN.org")).filter((f) => /VARIANT_LIMIT/.test(f.problem));
+  assert.equal(one.length, 1, "a variant limit of 1 is refused");
+  assert.equal(one[0].severity, "error");
+  assert.equal(one[0].line, 5, "the error names the keyword's line");
+  assert.match(one[0].problem, /2 or more/);
+  // A limit of 2 is fine.
+  const two = lintPlan(parseOrgPlan(planText("2"), "/tmp/PLAN.org")).filter((f) => /VARIANT_LIMIT/.test(f.problem));
+  assert.deepEqual(two, []);
+});
+
+test("plan 06k2: a phase-level variant limit of 1 is a lint error", () => {
+  const org =
+    [
+      "#+TITLE: t",
+      "#+TT_REPO: /tmp/r",
+      "#+TT_BRANCH: main",
+      "#+TT_CHECKS: true",
+      "* Phase 1: p1",
+      "  :PROPERTIES:",
+      "  :ID: p1",
+      "  :CHECKS: true",
+      "  :VARIANT_LIMIT: 1",
+      "  :END:",
+      "  Goal: g",
+      "  Acceptance:",
+      "  - it works",
+    ].join("\n") + "\n";
+  const parsed = parseOrgPlan(org, "/tmp/PLAN.org");
+  assert.equal(parsed.phases?.[0]?.variantLimit, 1, "the phase override is parsed");
+  const findings = lintPlan(parsed).filter((f) => /VARIANT_LIMIT/.test(f.problem));
+  assert.equal(findings.length, 1, "a phase-level limit of 1 is refused");
+  assert.equal(findings[0].severity, "error");
+  assert.equal(findings[0].phaseId, "p1");
+  assert.equal(findings[0].line, 9, "the error names the phase property's line");
+  // A hand-written phase JSON (the Emacs path) is refused too.
+  const jsonFindings = lintPlan({
+    sourceFile: "/tmp/PLAN.org",
+    phases: [{ id: "p1", variantLimit: 1, variantLimitLine: 9 }],
+  }).filter((f) => /VARIANT_LIMIT/.test(f.problem));
+  assert.equal(jsonFindings.length, 1);
+  assert.equal(jsonFindings[0].severity, "error");
+});
 
 test("plan 06k1: a third consecutive round with a new blocking finding of the same kind on one requirement parks it for the owner", () => {
   // Rounds 1 and 2 repaired a blocking defect on R1; round 3 raises a third.

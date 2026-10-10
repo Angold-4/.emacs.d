@@ -649,6 +649,12 @@ so an old plan reaches the loop as items without changing meaning."
          ;; #+TT_VARIANT_LIMIT; neither keeps the default of 3.
          (variant-limit (or (org-element-property :VARIANT_LIMIT hl)
                             (+tt--keyword "TT_VARIANT_LIMIT")))
+         ;; Plan 06k2 (A5): the current source a choice must be re-checked
+         ;; against. A phase's own :GOLDEN: overrides the plan's
+         ;; #+TT_GOLDEN; the contract carries it into the worker, reviewer
+         ;; and evaluator prompts.
+         (golden (or (org-element-property :GOLDEN hl)
+                     (+tt--keyword "TT_GOLDEN")))
          ;; Plan 06h: the reviewer seats and their leader. A phase's own
          ;; :REVIEWERS:/:LEADER: overrides the plan's #+TT_REVIEWERS/#+TT_LEADER;
          ;; a plan that names neither keeps the fixed M A B, led by M.
@@ -715,6 +721,8 @@ so an old plan reaches the loop as items without changing meaning."
                 `((rounds . ,(+tt--count-value rounds))))
             ,@(when variant-limit
                 `((variantLimit . ,(+tt--count-value variant-limit))))
+            ,@(when golden
+                `((golden . ,(string-trim golden))))
             ,@(when reviewers
                 `((seats . ,(vconcat (split-string reviewers "[ \t,]+" t)))))
             ,@(when leader
@@ -942,6 +950,11 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((v (+tt--keyword-at "TT_VARIANT_LIMIT")))
                       (and v (list (cons 'variantLimit (+tt--count-value (car v)))
                                    (cons 'variantLimitLine (cdr v)))))
+                  ;; Plan 06k2 (A5): the plan's golden source; a phase's own
+                  ;; :GOLDEN: overrides it in +tt--parse-phase.
+                  ,@(let ((g (+tt--keyword-at "TT_GOLDEN")))
+                      (and g (list (cons 'golden (string-trim (car g)))
+                                   (cons 'goldenLine (cdr g)))))
                   ;; Plan 06h: the reviewer seats and their leader, for the
                   ;; conductor's init event and `tt lint'.
                   ,@(let ((s (+tt--keyword-at "TT_REVIEWERS")))

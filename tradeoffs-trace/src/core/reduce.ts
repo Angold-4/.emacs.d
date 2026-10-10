@@ -27,6 +27,7 @@ import {
   checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  clearRulings,
   recordRulings,
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
@@ -1174,10 +1175,13 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // Plan 06k1 (A2, T-2): a queued correction is still an owner ruling —
       // record it exactly like an applied one, so a lost owner input never
       // drops the ruling it carries.
-      const ruledDecisions = recordRulings(p.ruledDecisions, event.text, p.decisions, event.correctionId);
+      // Plan 06k2 (A8): a negation in the same text clears the ruling.
+      const ruledDecisions = clearRulings(recordRulings(p.ruledDecisions, event.text, p.decisions, event.correctionId), event.text, p.decisions);
       // Plan 06k1 (A5, finding A-8): the queued correction is an acceptance
       // obligation until its text reaches a worker prompt (NOTES_DELIVERED).
-      const queuedCorrections = [...(p.queuedCorrections ?? []), { id: event.correctionId, text: event.text }];
+      // Plan 06k2 (A8): the correction's position in `ownerNotes`, so
+      // NOTES_DELIVERED can clear exactly the corrections a prompt carried.
+      const queuedCorrections = [...(p.queuedCorrections ?? []), { id: event.correctionId, text: event.text, index: p.ownerNotes?.length ?? 0 }];
       return ok({
         ...state,
         phase: {
@@ -1217,9 +1221,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // oldest → newest. `seq` is the number in the id (`OD-n` or `ODP-n`).
       const ownerDirectives = [...existing, added].sort((a, b) => a.seq - b.seq);
       // Plan 06k1 (A2): a directive that names a decision id as ruled settles
-      // it, exactly like a correction.
-      const ruledDecisions = recordRulings(p.ruledDecisions, directive.text, p.decisions, directive.id);
-      return ok({ ...state, phase: { ...p, ownerDirectives, ...(ruledDecisions ? { ruledDecisions } : {}) } });
+      // it, exactly like a correction. Plan 06k2 (A8): a negation in the same
+      // text clears it instead.
+      const ruledDecisions = clearRulings(recordRulings(p.ruledDecisions, directive.text, p.decisions, directive.id), directive.text, p.decisions);
+      return ok({ ...state, phase: { ...p, ownerDirectives, ruledDecisions: ruledDecisions ?? [] } });
     }
 
     case "DIRECTIVE_WITHDRAWN": {
@@ -1233,7 +1238,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const ownerDirectives = (p.ownerDirectives ?? []).map((d) =>
         d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at } : d,
       );
-      return ok({ ...state, phase: { ...p, ownerDirectives } });
+      // Plan 06k2 (A8): a ruling the withdrawn directive carried is cleared
+      // (finding D-B-79: it must not survive the directive's withdrawal).
+      const ruledDecisions = clearRulings(p.ruledDecisions, "", p.decisions, event.directiveId);
+      return ok({ ...state, phase: { ...p, ownerDirectives, ruledDecisions: ruledDecisions ?? [] } });
     }
 
     case "DIRECTIVE_DELIVERED": {
@@ -1306,11 +1314,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, "a notes-delivered event must carry a positive integer count");
       }
       // Plan 06k1 (A5, finding A-8): the prompt that just went out carried
-      // every undelivered note, so every queued correction has now reached a
-      // worker prompt and is no longer an acceptance obligation.
+      // every note up to the new delivered count. Plan 06k2 (A8, finding
+      // F-M-14): only the queued corrections that prompt actually carried are
+      // cleared — a correction queued AFTER the prompt was built stays an
+      // acceptance obligation for the next attempt.
+      const deliveredNoteCount = (p.deliveredNoteCount ?? 0) + event.count;
+      const queuedCorrections = (p.queuedCorrections ?? []).filter((c) => (c.index ?? 0) >= deliveredNoteCount);
       return ok({
         ...state,
-        phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count, queuedCorrections: [] },
+        phase: { ...p, deliveredNoteCount, queuedCorrections },
       });
     }
 

@@ -16,6 +16,9 @@ import type { Reviewer, State } from "../../src/core/types.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import { readLog } from "../../src/effects/log.ts";
 import { prSummary } from "../../src/view.ts";
+import { resolveAnchorPath, resolveTestVerifies } from "../../src/core/items.ts";
+import { lintPlan } from "../../src/core/plan-lint.ts";
+import { parseOrgPlan } from "../../src/core/org-plan.ts";
 
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
 
@@ -712,8 +715,10 @@ test("plan 06c: a confirmed evaluator item check with invalid anchors is recorde
       ],
     }),
     reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({ R2: "unmet" })),
-    // A `confirmed` check whose only anchor does not exist in the candidate is
-    // recorded `unchecked by evaluator`, never as a confirmation.
+    // Plan 06k2 (A2): a `confirmed` check whose anchor does not resolve is
+    // re-asked ONCE for a repo-relative path; only after that is it recorded
+    // `unchecked by evaluator`, never as a confirmation. The script supplies
+    // the same bad anchor twice.
     evaluatorScriptFor: () => ({
       hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -729,6 +734,11 @@ test("plan 06c: a confirmed evaluator item check with invalid anchors is recorde
               { id: "A1", verdict: "confirmed", evidence: "src/core/rounds.ts:1 re-checked" },
             ],
           },
+        },
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: { evaluations: [], itemChecks: [{ id: "R2", verdict: "confirmed", evidence: "src/nonexistent.ts:1 confirms it" }] },
         },
       ],
     }),
@@ -1441,7 +1451,13 @@ async function runTwoRounds(
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    workerScriptForAttempt: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    // Plan 06k2 (A6): a repair attempt must change the tree, or the unchanged
+    // resubmission is refused before freeze. Attempt 1 may be empty (no prior
+    // candidate); later attempts write a marker.
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [...(attempt > 1 ? [{ kind: "call-sh", command: `printf 'round ${attempt}\n' > round-${attempt}.txt` } as FakePiStep] : []), submitPhaseStep()],
+    }),
     reviewerScriptFor: reviewerRaisingOncePerRound(evidence, kind),
     deadlines: { ...FAST, inboxPollMs: 40 },
     ...(Object.keys(phase).length > 0
@@ -2052,5 +2068,310 @@ test("plan-items: a lane review's anchors resolve against the lane's own candida
     assert.deepEqual(refused, [], "a lane review citing a file of its own candidate is never refused as missing");
   } finally {
     await teardown(setup);
+  }
+});
+
+// Plan 06k2 (A2): an evaluator anchor that is a bare or crate-relative path
+// resolves when exactly one tracked file matches it; an ambiguous one is
+// re-asked once for a repo-relative path, and only then is the item unchecked.
+
+/** The minimal structured phase the anchor tests use: one review item. */
+const ANCHOR_ITEMS = {
+  architecture: [],
+  requirements: [{ id: "R1", title: "R1 reviewed", text: "R1 is judged by review", arch: [], verify: ["review"] }],
+  constraints: [],
+};
+
+function anchorCoverage() {
+  return { items: [{ id: "R1", status: "done", where: [], tests: [] }], arch: [] };
+}
+
+/** One conductor run: the candidate writes the given tracked files, the
+ * reviewers mark R1 unmet (so the evaluator owes an item check), and the
+ * evaluator's check cites `tests/config_files.rs:312`. */
+async function runAnchorScenario(fileCount: 1 | 2): Promise<{ check: { verdict?: string; evidence?: string } | undefined; events: ReturnType<typeof readEvents> }> {
+  const write =
+    fileCount === 2
+      ? "mkdir -p crates/foo/tests crates/bar/tests && seq 1 320 > crates/foo/tests/config_files.rs && seq 1 320 > crates/bar/tests/config_files.rs"
+      : "mkdir -p crates/foo/tests && seq 1 320 > crates/foo/tests/config_files.rs";
+  const setup = await setupConductor({
+    items: ANCHOR_ITEMS,
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: write },
+        { kind: "call-submit", tool: "submit_coverage", args: anchorCoverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: "p1",
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            items: [{ id: "R1", verdict: "unmet", evidence: "crates/foo/tests/config_files.rs:1 the review item is unmet" }],
+            arch: [],
+          },
+        },
+      ],
+    }),
+    evaluatorScriptFor: () => ({
+      hello: { role: "evaluator", tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: { evaluations: [], itemChecks: [{ id: "R1", verdict: "confirmed", evidence: "tests/config_files.rs:312 re-checked" }] },
+        },
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: { evaluations: [], itemChecks: [{ id: "R1", verdict: "confirmed", evidence: "tests/config_files.rs:312 re-checked" }] },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => (setup.conductor.state.phase.itemChecks ?? []).some((c) => c.itemId === "R1"),
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const check = (setup.conductor.state.phase.itemChecks ?? []).find((c) => c.itemId === "R1");
+    return { check: check ? { verdict: check.verdict, evidence: check.evidence } : undefined, events: readEvents(setup.runDir) };
+  } finally {
+    await teardown(setup);
+  }
+}
+
+test("plan 06k2: a crate-relative evaluator anchor resolves to the one tracked file it names, and an ambiguous one is re-asked", async () => {
+  // Pure resolution.
+  const one = ["crates/foo/tests/config_files.rs"];
+  assert.deepEqual(resolveAnchorPath("tests/config_files.rs", one), { kind: "ok", path: "crates/foo/tests/config_files.rs" });
+  assert.deepEqual(resolveAnchorPath("crates/foo/tests/config_files.rs", one), { kind: "ok", path: "crates/foo/tests/config_files.rs" });
+  assert.deepEqual(resolveAnchorPath("nope.rs", one), { kind: "missing" });
+  const two = ["crates/foo/tests/config_files.rs", "crates/bar/tests/config_files.rs"];
+  assert.deepEqual(resolveAnchorPath("tests/config_files.rs", two), { kind: "ambiguous" });
+
+  // One tracked file ends with the anchor: the check is confirmed.
+  const single = await runAnchorScenario(1);
+  assert.equal(single.check?.verdict, "confirmed", "a unique suffix match resolves the anchor");
+  assert.equal(single.events.filter((r) => r.kind === "item_check_anchor_invalid").length, 0);
+
+  // Two tracked files match: the evaluator is re-asked once, and only then is
+  // the item unchecked.
+  const ambiguous = await runAnchorScenario(2);
+  assert.ok(
+    ambiguous.events.some((r) => r.kind === "item_check_anchor_invalid" && (r.event as { ambiguous?: boolean }).ambiguous === true),
+    "the ambiguous anchor is logged",
+  );
+  assert.ok(ambiguous.events.some((r) => r.kind === "item_check_rejected"), "the evaluator is re-asked once");
+  assert.equal(ambiguous.check?.verdict, "unchecked", "after the one re-ask the item is unchecked");
+  assert.match(ambiguous.check?.evidence ?? "", /unchecked by evaluator/);
+});
+
+test("plan 06k2: tt lint rejects an unknown VERIFY kind and no longer warns about 06g2", () => {
+  const org = [
+    "#+TITLE: t",
+    "#+TT_REPO: /tmp/r",
+    "#+TT_BRANCH: main",
+    "#+TT_WORKERS: 2",
+    "* Phase 1: p1",
+    "  :PROPERTIES:",
+    "  :ID: p1",
+    "  :CHECKS: true",
+    "  :END:",
+    "  Goal: g",
+    "** Requirements",
+    "*** R1 the thing",
+    "    :PROPERTIES:",
+    "    :ID: R1",
+    "    :VERIFY: grep \"x\"",
+    "    :END:",
+    "    The thing holds.",
+  ].join("\n") + "\n";
+  const findings = lintPlan(parseOrgPlan(org, "/tmp/PLAN.org"));
+  const unknown = findings.find((f) => f.rule === "item-verify");
+  assert.ok(unknown, "an unknown :VERIFY: kind is an error");
+  assert.equal(unknown!.severity, "error");
+  assert.match(unknown!.problem, /unknown kind/);
+  assert.match(unknown!.problem, /grep/);
+  assert.equal(unknown!.sourceFile, "/tmp/PLAN.org", "the error names the file");
+  assert.ok(typeof unknown!.line === "number" && unknown!.line > 0, "the error names the line");
+  // Plan 06k2 (A5): the stale "two-lane round arrives in 06g2" warning is gone.
+  assert.deepEqual(
+    findings.filter((f) => f.rule === "worker-count" && /06g2|two-lane/.test(f.problem)),
+    [],
+    "a two-lane plan gets no 06g2 warning",
+  );
+});
+
+test("plan 06k2: a test verify without module path matches cargo's module-qualified ok line", () => {
+  const items = {
+    goal: "",
+    architecture: [],
+    requirements: [
+      {
+        id: "R1",
+        title: "R1",
+        text: "R1",
+        arch: [],
+        verify: ['test "settled_funding_is_accepted_only_for_the_session_just_closed"'],
+      },
+    ],
+    constraints: [],
+  };
+  const output = "test tests::settled_funding_is_accepted_only_for_the_session_just_closed ... ok";
+  assert.deepEqual(resolveTestVerifies(items, output), [
+    { id: "R1", name: "settled_funding_is_accepted_only_for_the_session_just_closed", outcome: "passed" },
+  ]);
+});
+
+test("plan 06k2: #+TT_GOLDEN is exported and listed in worker, reviewer and evaluator prompts", async () => {
+  // 1. The REAL Emacs parser exports #+TT_GOLDEN into plan.json.
+  const dir = fs.mkdtempSync("/tmp/tt-06k2-golden-");
+  const orgPath = path.join(dir, "PLAN.org");
+  fs.writeFileSync(
+    orgPath,
+    [
+      "#+TITLE: golden",
+      "#+TT_REPO: /tmp/tt-06k2-golden-repo",
+      "#+TT_BRANCH: main",
+      "#+TT_GOLDEN: docs/a.md; docs/b.md",
+      "",
+      "* Phase 1: p1",
+      "  :PROPERTIES:",
+      "  :ID: p1",
+      "  :CHECKS: true",
+      "  :END:",
+      "  Goal: g",
+      "  Acceptance:",
+      "  - it works",
+    ].join("\n") + "\n",
+  );
+  const emacsLoad = fileURLToPath(new URL("../../../test/tradeoffs-trace-test.el", import.meta.url));
+  const coreDir = fileURLToPath(new URL("../../../core", import.meta.url));
+  const testDir = fileURLToPath(new URL("../../../test", import.meta.url));
+  const out = execFileSync(
+    "emacs",
+    [
+      "--batch",
+      "-Q",
+      "-L",
+      coreDir,
+      "-L",
+      testDir,
+      "-l",
+      emacsLoad,
+      "--eval",
+      `(with-temp-buffer (insert-file-contents "${orgPath}") (org-mode) (setq buffer-file-name "${orgPath}") (princ (json-encode (plist-get (+tt-parse-plan) :plan))))`,
+    ],
+    { encoding: "utf8" },
+  );
+  const parsed = JSON.parse(out) as { golden?: string; phases: Array<{ golden?: string }> };
+  assert.equal(parsed.golden, "docs/a.md; docs/b.md", "the plan-level golden is exported");
+  assert.equal(parsed.phases[0].golden, "docs/a.md; docs/b.md", "the phase carries the plan's golden");
+  const phase = parsed.phases[0] as import("../../src/conductor.ts").RunPlanPhase;
+
+  // 2. Run it and capture every prompt; each role names both paths.
+  const promptLog = path.join(dir, "prompts.txt");
+  const setup = await setupConductor({
+    phase,
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    extraEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: "printf 'work\n' > work.txt" },
+        {
+          kind: "call-submit",
+          tool: "submit_phase",
+          args: {
+            // One disclosed decision raises a tradeoff message, so the
+            // evaluator is actually dispatched and its prompt captured.
+            decisions: [
+              {
+                classProposal: "delegated",
+                choice: "the worker keeps the marker file",
+                whyItMatters: "a stray file changes what the candidate ships",
+                alternatives: [{ option: "drop it", consequence: "a file nobody asked for" }],
+                recommendation: { choice: "keep it", reason: "the goal names it" },
+              },
+            ],
+            assumptions: [],
+            deviations: [],
+          },
+        },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: "p1",
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            findings: [],
+            ballots: [
+              {
+                decisionId: "D-p1-$TT_CANDIDATE_SHA8-1",
+                vote: "approve",
+                rationale: "the choice is sound",
+                evidence: ["work.txt:1"],
+              },
+            ],
+          },
+        },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const log = fs.readFileSync(promptLog, "utf8");
+    const prompts = log.split("\n=====\n");
+    const worker = prompts.find((p) => p.includes("When finished, call submit_phase"));
+    const reviewer = prompts.find((p) => p.includes("Turn 1 of 2"));
+    const evaluator = prompts.find((p) => p.includes("evaluator for phase"));
+    assert.ok(worker, "the worker was prompted");
+    assert.ok(reviewer, "the reviewer was prompted");
+    assert.ok(evaluator, "the evaluator was prompted");
+    for (const [name, prompt] of [["worker", worker!], ["reviewer", reviewer!], ["evaluator", evaluator!]] as const) {
+      assert.match(prompt, /docs\/a\.md/, `the ${name} prompt names docs/a.md`);
+      assert.match(prompt, /docs\/b\.md/, `the ${name} prompt names docs/b.md`);
+    }
+    assert.match(worker!, /Golden source/, "the worker prompt carries the golden-source section");
+    assert.match(reviewer!, /Golden source/, "the reviewer prompt carries the golden-source section");
+    assert.match(evaluator!, /Golden note|Golden source/, "the evaluator prompt carries the golden section");
+  } finally {
+    await teardown(setup);
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

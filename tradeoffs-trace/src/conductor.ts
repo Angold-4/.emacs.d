@@ -27,6 +27,7 @@ import { buildView, lanesView, updateLiveRun } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent, type InputKind } from "./core/owner-inbox.ts";
+import { unchangedResubmissionRequesters } from "./core/owner-commands.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
@@ -191,6 +192,7 @@ import {
   resolveTestVerifies,
   reviewItemsIssues,
   reviewRequestLines,
+  resolveAnchorPath,
   reverify,
   symbolPresent,
   tallyItems,
@@ -1400,6 +1402,22 @@ export class Conductor {
   #laneDiscoveryPlans = new Map<string, Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }>>();
   /** Plan 06g2: the per-candidate discovery barrier, keyed `<round>-<lane>`. */
   #laneBarriers = new Map<string, { arrived: Set<string>; waiters: Array<() => void> }>();
+  /** Plan 06k2 (A7): each lane candidate's boundary-trigger decisions,
+   * computed BEFORE its lane reviews so the seats ballot them with the rest;
+   * reused at the hand-off so the ids that were balloted are the ids that
+   * appear. Keyed `<round>-<lane>`. */
+  #laneTriggers = new Map<string, Decision[]>();
+  /** Plan 06k2 (A7): the boundary paths each lane's triggers cover, for the
+   * sampling log at the hand-off. Keyed `<round>-<lane>`. */
+  #laneTriggerPaths = new Map<string, string[]>();
+  /** Plan 06k2 (A8): the absolute number of owner notes the round's lane
+   * prompt actually carried, recorded when the prompt is built. A note
+   * queued AFTER that build is not marked delivered by it. Keyed by round. */
+  #lanePromptDeliveredNoteCount = new Map<number, number>();
+  /** Plan 06k2 (A6, finding A-3/D-B-17): the owner steers whose unchanged-
+   * resubmission permission has already been used. A permission lifts exactly
+   * the next unchanged submission, never the rest of the phase. */
+  #consumedUnchangedPermissions = new Set<string>();
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -1826,6 +1844,61 @@ export class Conductor {
     } catch {
       return false;
     }
+  }
+
+  /** Plan 06k2 (A6): true when `worktree`'s tree is identical to the phase's
+   * last frozen candidate — a worker that changed nothing. Only a phase with
+   * a candidate (a repair round) can have an unchanged resubmission. */
+  #submissionTreeUnchanged(worktree: string): boolean {
+    const C = this.#state.phase.candidate?.sha;
+    if (!C) return false;
+    try {
+      const candidateTree = execFileSync("git", ["-C", this.#plan.repo, "rev-parse", `${C}^{tree}`], { encoding: "utf8" }).trim();
+      // Plan 06k2 (A6, finding A-2): compare the tree the freeze would commit,
+      // not the porcelain status. A staged-then-reverted tracked file reads as
+      // `M ` (dirty) but `git add -A` restores the candidate's bytes, so the
+      // frozen tree is identical. Mirror the freeze on a TEMP index, so the
+      // real index is never touched.
+      const tmpIndex = path.join(os.tmpdir(), `tt-tree-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const gitEnv = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+      try {
+        execFileSync("git", ["-C", worktree, "read-tree", "HEAD"], { encoding: "utf8", env: gitEnv });
+        execFileSync("git", ["-C", worktree, "add", "-A"], { encoding: "utf8", env: gitEnv });
+        const frozenTree = execFileSync("git", ["-C", worktree, "write-tree"], { encoding: "utf8", env: gitEnv }).trim();
+        return frozenTree === candidateTree;
+      } finally {
+        fs.rmSync(tmpIndex, { force: true });
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  /** Plan 06k2 (A6, finding A-3/D-B-17): the owner asked for an unchanged
+   * resubmission. Only an ASKING, in-force steer counts (a negated text or a
+   * withdrawn directive asks for nothing), and each permission lifts exactly
+   * one submission — the next one. */
+  #ownerAskedForUnchangedResubmission(): boolean {
+    const keys = unchangedResubmissionRequesters(
+      this.#state.phase.ownerNotes ?? [],
+      this.#state.phase.ownerDirectives ?? [],
+    );
+    const key = keys.find((k) => !this.#consumedUnchangedPermissions.has(k));
+    if (key === undefined) return false;
+    this.#consumedUnchangedPermissions.add(key);
+    return true;
+  }
+
+  /** Plan 06k2 (A6): refuse a submission whose tree equals the last reviewed
+   * candidate's before freeze. Returns the reason, or undefined when the
+   * submission may proceed. */
+  #unchangedResubmissionReason(worktree: string): string | undefined {
+    const C = this.#state.phase.candidate?.sha;
+    if (!C) return undefined;
+    // Consume the owner's permission only when it actually lifts a refusal.
+    if (!this.#submissionTreeUnchanged(worktree)) return undefined;
+    if (this.#ownerAskedForUnchangedResubmission()) return undefined;
+    return `this submission's tree is identical to the last reviewed candidate ${C.slice(0, 7)}; make a change, or have the owner ask for an unchanged resubmission`;
   }
 
   /** Every recorded `sh` group pgid for `agentId` (from `#onShIntent`'s own
@@ -4141,6 +4214,14 @@ export class Conductor {
             return { ok: false, reason };
           }
         }
+        // Plan 06k2 (A6): a lane whose tree equals the phase's last reviewed
+        // candidate is refused before its freeze, unless the owner asked for
+        // an unchanged resubmission.
+        const laneUnchanged = this.#unchangedResubmissionReason(this.#laneWorktree(handle.lane));
+        if (laneUnchanged) {
+          this.#log.append("resubmission_refused", { at: "submit_phase", lane: handle.lane, candidateSha: this.#state.phase.candidate?.sha, reason: laneUnchanged });
+          return { ok: false, reason: laneUnchanged };
+        }
         const args = msg.args as SubmitPhaseArgs;
         handle.laneSubmission = {
           disclosures: args.decisions ?? [],
@@ -4160,6 +4241,14 @@ export class Conductor {
           this.#log.append("coverage_refused", { at: "submit_phase", issues, reason });
           return { ok: false, reason };
         }
+      }
+      // Plan 06k2 (A6): a worker that resubmits a candidate byte-identical
+      // to the last reviewed one is refused before the freeze, unless the
+      // owner's steer asked for an unchanged resubmission.
+      const unchanged = this.#unchangedResubmissionReason(this.#paths.worktree);
+      if (unchanged) {
+        this.#log.append("resubmission_refused", { at: "submit_phase", candidateSha: this.#state.phase.candidate?.sha, reason: unchanged });
+        return { ok: false, reason: unchanged };
       }
       // design §6.2/§9.3 (round-of-review item 3): SUBMIT_PHASE is logged
       // with the raw disclosure *before* anything else — freeze is an
@@ -4618,13 +4707,26 @@ export class Conductor {
               ? Boolean(ctx) && this.#itemCheckAnchorsValid(evidence, ctx!)
               : this.#candidateAnchorsValid(evidence) || goldenOk;
             if (!valid) {
-              this.#log.append("item_check_anchor_invalid", { messageType, agentId, itemId: id, evidence });
-              checkEvents.push({
-                type: "ITEM_CHECK_RECORDED",
-                itemId: id,
-                verdict: "unchecked",
-                evidence: `unchecked by evaluator: the confirmed check's anchors do not exist in the candidate (${evidence})`,
-              });
+              // Plan 06k2 (A2): an anchor that does not resolve (missing, or
+              // ambiguous because two tracked files match a bare path) is
+              // re-asked ONCE for a repo-relative path before the item is
+              // `unchecked`. The re-ask is the existing missing-check
+              // re-prompt: not counting the check as supplied makes the id
+              // owed again. Only after that one re-prompt is it unchecked.
+              const rejections = handle.itemCheckRejections ?? 0;
+              const resolved = evidenceFileAnchors(evidence).map((a) => this.#resolveCandidatePath(a.path));
+              const ambiguous = resolved.some((r) => r.kind === "ambiguous");
+              this.#log.append("item_check_anchor_invalid", { messageType, agentId, itemId: id, evidence, ambiguous });
+              if (rejections < 1) {
+                provided.delete(id);
+              } else {
+                checkEvents.push({
+                  type: "ITEM_CHECK_RECORDED",
+                  itemId: id,
+                  verdict: "unchecked",
+                  evidence: `unchecked by evaluator: the confirmed check's anchors do not exist in the candidate (${evidence})`,
+                });
+              }
               continue;
             }
           }
@@ -6039,7 +6141,7 @@ export class Conductor {
    * is only the imperative shell (git diff, assembling+binding trigger
    * Decision records, logging the sample). Never throws on a bad diff —
    * best-effort, since a run should not fail over sampling data. */
-  #recordBoundaryDataAndSample(candidateSha: string): void {
+  #recordBoundaryDataAndSample(candidateSha: string, opts: { lane?: { round: number; lane: string } } = {}): void {
     let paths: string[];
     let hunks: ReturnType<typeof diffHunks>;
     try {
@@ -6053,13 +6155,26 @@ export class Conductor {
     const contract = this.#state.phase.contract;
     const acceptanceFiles = contract.acceptance.filter((a) => a.includes("/"));
     const citationTexts = [
+      // Plan 06k2 (A7): every decision and finding of the phase counts as a
+      // citation, superseded ones included, so a path an earlier round's
+      // decision cited is not re-triggered.
       ...this.#state.phase.decisions.flatMap((d) => [d.choice, d.whyItMatters, ...d.alternatives.map((a) => `${a.option} ${a.consequence}`)]),
       ...this.#state.phase.findings.map((f) => f.evidence),
     ];
 
-    const triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
+    let triggerPaths: string[];
+    if (opts.lane) {
+      // Plan 06k2 (A7): the winner's triggers were computed before its lane
+      // reviews and balloted there; apply exactly those records (never
+      // create a second set nobody ever saw).
+      const cached = this.#laneTriggers.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+      for (const decision of cached) this.#applyEvent({ type: "DECISION_ADDED", decision });
+      triggerPaths = this.#laneTriggerPaths.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+    } else {
+      triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
+    }
     const K = contract.contractVersion;
-    for (const p of triggerPaths) {
+    for (const p of opts.lane ? [] : triggerPaths) {
       const decision: Decision = {
         id: `D-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-trigger-${this.#state.phase.decisions.length + 1}`,
         version: 1,
@@ -6229,8 +6344,19 @@ export class Conductor {
     if (this.#state.phase.worktreeTainted && this.#state.phase.candidate) {
       const sha = this.#state.phase.candidate.sha;
       this.#log.append("worktree_reset", { candidateSha: sha, reason: "worktree tainted by a sweep that found survivors" });
-      removeWorktree(this.#plan.repo, this.#paths.worktree);
-      createWorktree(this.#plan.repo, this.#paths.worktree, sha);
+      // Plan 06k2 (A4): a worktree create/remove that throws while starting a
+      // worker attempt is recorded as THIS attempt's failure, never left as
+      // an in-flight dispatch. `ATTEMPT_NO_SUBMISSION` clears `dispatch_worker`
+      // and moves the phase to REPAIRING, so the next attempt starts.
+      try {
+        removeWorktree(this.#plan.repo, this.#paths.worktree);
+        createWorktree(this.#plan.repo, this.#paths.worktree, sha);
+      } catch (err) {
+        const error = String((err as Error)?.message ?? err);
+        this.#log.append("worktree_reset_failed", { candidateSha: sha, error });
+        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+        return;
+      }
     }
 
     // Plan 04a: the base baseline now runs entirely in its own BASELINE
@@ -6767,13 +6893,40 @@ export class Conductor {
     if (anchors.length === 0) return false;
     const dir = this.#candidateDir();
     return anchors.every((a) => {
+      const resolved = this.#resolveCandidatePath(a.path);
+      if (resolved.kind !== "ok") return false;
       try {
-        const lines = fs.readFileSync(path.join(dir, a.path), "utf8").split("\n").length;
+        const lines = fs.readFileSync(path.join(dir, resolved.path), "utf8").split("\n").length;
         return a.start >= 1 && a.end <= lines;
       } catch {
         return false;
       }
     });
+  }
+
+  /** Plan 06k2 (A2): the tracked files of the current candidate, for
+   * resolving a bare or crate-relative evaluator anchor. Best-effort (empty
+   * when there is no candidate or git cannot read it). */
+  #candidateTrackedFiles(): string[] {
+    const C = this.#state.phase.candidate?.sha ?? "";
+    if (!C) return [];
+    try {
+      return execFileSync("git", ["-C", this.#plan.repo, "ls-tree", "-r", "--name-only", C], { encoding: "utf8" })
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Plan 06k2 (A2): resolve a bare or crate-relative anchor path to the one
+   * candidate file it names. An exact candidate-relative path wins; otherwise
+   * exactly one tracked file whose path ends with `/<anchor>` resolves; two
+   * or more matches are `ambiguous` (the evaluator is re-asked once for a
+   * repo-relative path); none is `missing`. */
+  #resolveCandidatePath(anchorPath: string): { kind: "ok"; path: string } | { kind: "ambiguous" } | { kind: "missing" } {
+    return resolveAnchorPath(anchorPath, this.#candidateTrackedFiles());
   }
 
   /** OD-2 A3: an evaluator item check's evidence must cite at least one
@@ -6782,7 +6935,9 @@ export class Conductor {
     const anchors = evidenceFileAnchors(evidence);
     if (anchors.length === 0) return false;
     return anchors.every((a) => {
-      const lines = ctx.lineCount(a.path);
+      const resolved = this.#resolveCandidatePath(a.path);
+      if (resolved.kind !== "ok") return false;
+      const lines = ctx.lineCount(resolved.path);
       return lines !== undefined && a.start >= 1 && a.end <= lines;
     });
   }
@@ -7431,6 +7586,10 @@ export class Conductor {
     const allNotes = this.#state.phase.ownerNotes ?? [];
     const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
     const queuedNotes = allNotes.slice(deliveredCount).join("\n");
+    // Plan 06k2 (A8): record the absolute note count this prompt carries, so
+    // `#buildLane` marks delivered only these and never a note queued after
+    // the prompt was built (finding F-M-14).
+    this.#lanePromptDeliveredNoteCount.set(round, allNotes.length);
     const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
     return `${buildWorkerPrompt(
       this.#state.phase.contract,
@@ -7451,27 +7610,62 @@ export class Conductor {
    * disclosures, or a note saying why the lane produced none. */
   async #buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild> {
     const worktree = this.#laneWorktree(lane);
-    if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
-    crashAt("before_create_worktree");
-    createWorktree(this.#plan.repo, worktree, base);
-    crashAt("after_create_worktree");
+    // Plan 06k2 (A4, finding M-1): a lane worktree create/remove that throws
+    // is recorded as THIS lane attempt's failure, exactly like the
+    // single-worker reset — never a bare throw the round swallows without a
+    // lane-specific reason.
+    try {
+      if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+      crashAt("before_create_worktree");
+      createWorktree(this.#plan.repo, worktree, base);
+      crashAt("after_create_worktree");
+    } catch (err) {
+      const error = String((err as Error)?.message ?? err);
+      this.#log.append("lane_worktree_failed", { lane, round, base, error });
+      return { lane, note: `the lane's worktree could not be created: ${error}` };
+    }
     const actionId = this.#log.actionId(`lane_${round}_${lane}`);
     this.#log.intent(actionId, { lane, round, worktree, base });
-    const agentId = `lane-${round}-${lane}-${actionId}`;
+    let agentId = `lane-${round}-${lane}-${actionId}`;
     const sessionDir = path.join(this.#paths.sessions, `lane-worker-${lane}`);
-    const handle = this.#spawnLaneAgent({
-      role: "worker",
-      agentId,
-      cwd: worktree,
-      sessionDir,
-      env: this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}),
-      lane,
-      laneRound: round,
-      // `worker.N` names the lane by its 1-based position (a = 1, b = 2).
-      seat: String(this.#lanes().indexOf(lane) + 1),
-    });
+    const spawnLane = (): AgentHandle =>
+      this.#spawnLaneAgent({
+        role: "worker",
+        agentId,
+        cwd: worktree,
+        sessionDir,
+        env: this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}),
+        lane,
+        laneRound: round,
+        // `worker.N` names the lane by its 1-based position (a = 1, b = 2).
+        seat: String(this.#lanes().indexOf(lane) + 1),
+      });
+    let handle = spawnLane();
     try {
-      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      let hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout") {
+        // Plan 06k2 (A1): a lane worker that fails to launch is retried once
+        // before the round continues with one lane. The retry is logged, and
+        // a retry that also misses hello leaves the lane with no candidate,
+        // exactly as before. The retry gets a fresh agent id, so a test can
+        // script the first launch to fail and the retry to start.
+        const failedAgentId = handle.agentId;
+        await handle.agent.terminate();
+        this.#agents.delete(failedAgentId);
+        const bytes = sessionBytes(sessionDir);
+        const retryMs = helloRetryTimeoutMs(this.#deadlines.helloTimeoutMs, bytes);
+        this.#applyEvent({
+          type: "LAUNCH_RETRIED",
+          role: "worker",
+          timeoutMs: this.#deadlines.helloTimeoutMs,
+          retryTimeoutMs: retryMs,
+          sessionBytes: bytes,
+        });
+        this.#log.append("lane_launch_retried", { lane, round, agentId: failedAgentId, retryTimeoutMs: retryMs });
+        agentId = `lane-${round}-${lane}-${actionId}-retry`;
+        handle = spawnLane();
+        hello = await raceTimeout(handle.helloPromise, retryMs, "hello");
+      }
       if (hello === "timeout" || !hello.ok) {
         await handle.agent.terminate();
         const note = hello === "timeout" ? "the lane's worker did not start (hello timed out)" : "the lane's worker failed to start";
@@ -7484,12 +7678,14 @@ export class Conductor {
       // prompt carrying it. Both lanes send the same prompt; the first to get
       // here records the delivery, and the second sees nothing left to
       // deliver. If both lanes fail before this point, the obligation stays.
+      // Plan 06k2 (A8, finding F-M-14): only the notes the prompt ACTUALLY
+      // carried (recorded when it was built) are marked delivered — a note
+      // queued after the build stays queued for the next attempt.
       {
-        const allNotes = this.#state.phase.ownerNotes ?? [];
         const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
-        const undelivered = allNotes.slice(deliveredCount);
-        if (undelivered.length > 0) {
-          this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: undelivered.length });
+        const carried = this.#lanePromptDeliveredNoteCount.get(round) ?? deliveredCount;
+        if (carried > deliveredCount) {
+          this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: carried - deliveredCount });
         }
       }
       const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
@@ -7693,11 +7889,63 @@ export class Conductor {
     return out;
   }
 
+  /** Plan 06k2 (A7): one lane candidate's boundary-trigger decisions,
+   * computed BEFORE its lane reviews (bound to that candidate) so the lane
+   * reviewers ballot them with the candidate's other records. Citations
+   * count every decision and finding of the phase (superseded ones
+   * included), plus the lane's own worker decisions, so a path an earlier
+   * round's decision cited is not re-triggered. Cached by `<round>-<lane>`,
+   * so the hand-off applies exactly the ids the seats balloted. */
+  #laneTriggerDecisions(round: number, lane: string, sha: string): Decision[] {
+    const key = `${round}-${lane}`;
+    const cached = this.#laneTriggers.get(key);
+    if (cached) return cached;
+    let out: Decision[] = [];
+    try {
+      const contract = this.#state.phase.contract;
+      const build = this.#laneBuilds.get(key);
+      const workerDecisions = build
+        ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
+        : [];
+      const citationTexts = [
+        ...this.#state.phase.decisions.flatMap((d) => [d.choice, d.whyItMatters, ...d.alternatives.map((a) => `${a.option} ${a.consequence}`)]),
+        ...this.#state.phase.findings.map((f) => f.evidence),
+        ...workerDecisions.flatMap((d) => [d.choice, d.whyItMatters, ...d.alternatives.map((a) => `${a.option} ${a.consequence}`)]),
+      ];
+      const paths = diffNameOnly(this.#plan.repo, this.#state.phase.integrationHead, sha);
+      const acceptanceFiles = contract.acceptance.filter((a) => a.includes("/"));
+      const triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
+      const K = contract.contractVersion;
+      out = triggerPaths.map((p, i) => ({
+        id: `D-${this.#state.phase.phaseId}-${sha.slice(0, 8)}-trigger-${i + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        source: "trigger" as const,
+        class: "delegated" as const,
+        choice: `Diff touches boundary/dependency/acceptance-relevant path '${p}' with no decision or finding citing it`,
+        whyItMatters: "Boundary-relevant paths need an explicit review disposition (design §3.3/§3.4) — silence here is not the same as approval.",
+        alternatives: [
+          { option: "treat it as already covered", consequence: "a boundary or dependency change could go unreviewed" },
+          { option: "classify and review it explicitly", consequence: "costs one more decision to settle before acceptance" },
+        ],
+        recommendation: { choice: "classify and review this trigger explicitly", reason: `'${p}' matched a boundary/dependency/acceptance rule with no citing record` },
+        boundCandidateSha: sha,
+        boundContractVersion: K,
+      }));
+    } catch (err) {
+      this.#log.append("sampling_error", { candidateSha: sha, lane, error: String((err as Error)?.message ?? err) });
+    }
+    this.#laneTriggers.set(key, out);
+    this.#laneTriggerPaths.set(key, out.map((d) => /'([^']+)'/.exec(d.choice)?.[1] ?? ""));
+    return out;
+  }
+
   /** The lane phase a lane review is built from: the round's candidate, the
    * lane's own decisions (the worker's disclosures, assembled exactly as the
-   * hand-off will assemble them), its coverage and its check resolution, and
-   * the discoveries the three seats made on THIS candidate. Never the phase's
-   * own candidate/decisions, which belong to another version. */
+   * hand-off will assemble them), its coverage and its check resolution, the
+   * discoveries the three seats made on THIS candidate, and the candidate's
+   * boundary triggers. Never the phase's own candidate/decisions, which
+   * belong to another version. */
   #lanePhase(round: number, lane: string, sha: string, opts: { final?: boolean } = {}): PhaseState {
     const K = this.#state.phase.contract.contractVersion;
     const build = this.#laneBuilds.get(`${round}-${lane}`);
@@ -7723,7 +7971,7 @@ export class Conductor {
     return {
       ...this.#state.phase,
       candidate: { sha, contractVersion: K },
-      decisions: [...workerDecisions, ...discovered],
+      decisions: [...workerDecisions, ...discovered, ...this.#laneTriggerDecisions(round, lane, sha)],
       ...(build?.coverage !== undefined ? { coverage: build.coverage as Coverage } : {}),
       checkResolution: this.#laneCheckResolutions.get(sha) ?? [],
     };
@@ -8121,7 +8369,10 @@ export class Conductor {
       this.#laneDiscoveries.delete(`${round}-${lane}`);
       this.#laneDiscoveryPlans.delete(`${round}-${lane}`);
       this.#laneBarriers.delete(`${round}-${lane}`);
+      this.#laneTriggers.delete(`${round}-${lane}`);
+      this.#laneTriggerPaths.delete(`${round}-${lane}`);
     }
+    this.#lanePromptDeliveredNoteCount.delete(round);
   }
 
   /** Hands the round's winner to the single-candidate pipeline: the winner
@@ -8217,7 +8468,7 @@ export class Conductor {
       this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), winner.sha);
     }
     if (this.#itemsEnforced() && build?.coverage) this.#applyCoverageNotes(build.coverage as Coverage, winner.sha);
-    this.#recordBoundaryDataAndSample(winner.sha);
+    this.#recordBoundaryDataAndSample(winner.sha, { lane: { round, lane: winner.lane } });
     this.drive();
   }
 
@@ -12111,6 +12362,7 @@ export class Conductor {
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
+      ...goldenPromptLines(phase.contract.golden),
       `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
@@ -12202,6 +12454,7 @@ export class Conductor {
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
       `Candidate checkout (read-only): ${candidateDir}`,
       ...secretPromptLines(this.#secretNames),
+      ...goldenPromptLines(phase.contract.golden),
       // Plan 01f: reviewers are told the conductor produces the gate's
       // evidence and shown the record when one exists (the failed gate that
       // sent the phase into this repair round, or a record reused for this
@@ -12783,6 +13036,19 @@ export function referenceLines(references: string[]): string[] {
   ];
 }
 
+/** Plan 06k2 (A5): the golden-source section every worker, reviewer and
+ * evaluator prompt carries, so a choice is re-checked against the current
+ * source rather than an earlier drafting decision. Empty when the contract
+ * declares none. */
+export function goldenPromptLines(golden: string | undefined): string[] {
+  if (typeof golden !== "string" || golden.trim().length === 0) return [];
+  return [
+    "",
+    "Golden source (the current source a choice must be re-checked against; a `contract` classification must cite it):",
+    golden.trim(),
+  ];
+}
+
 export function buildWorkerPrompt(
   contract: PhaseContract,
   ownerNotes?: string,
@@ -12805,6 +13071,7 @@ export function buildWorkerPrompt(
     ...contract.acceptance.map((a) => `- ${a}`),
     ...(structured ? checklistLines(itemsFromPhase(contract)) : []),
     ...secretPromptLines(secrets),
+    ...goldenPromptLines(contract.golden),
     ...referenceLines(references),
     ...baselinePromptLines(baselineCommands),
     ...toolLines,
@@ -12869,6 +13136,7 @@ export function buildReviewerPrompt(
     `Goal: ${phase.contract.goal}`,
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
     ...secretPromptLines(secrets),
+    ...goldenPromptLines(phase.contract.golden),
     ...directiveLines(directives),
     // Plan 01f: the same rule every reviewer prompt carries — the conductor
     // owns the gate evidence, and no agent may run the command or substitute

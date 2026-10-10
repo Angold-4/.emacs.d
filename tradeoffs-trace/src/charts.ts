@@ -313,6 +313,10 @@ export interface LoopTapeInput {
   models?: ChartModels;
   /** Per-stage deadlines (`view.stageLimits`); the current row shows `x of y`. */
   limits?: Record<string, number>;
+  /** Plan 06k2 (A1): the two-lane round's own sub-phase (`LANE REVIEW` or
+   * `PICK`), so the tape head names it and the attempt clock stops instead
+   * of counting the review/pick time against the implement limit. */
+  lanePhase?: "LANE REVIEW" | "PICK";
 }
 
 /** One drawn tape row. */
@@ -510,6 +514,18 @@ export function buildLoopTape(input: LoopTapeInput): { header: string; rows: Loo
       arrow: k === ci ? arrow : undefined,
     };
   });
+  // Plan 06k2 (A1): the lane round's own sub-phase replaces the IMPLEMENT
+  // head, and its time is shown WITHOUT the implement limit — the attempt
+  // clock stopped when both lanes submitted, so it can never read "over by"
+  // while the lane reviews or the pick run.
+  if (input.lanePhase && ci >= 0 && currentStep === "IMPLEMENT" && rows[ci]) {
+    rows[ci] = {
+      ...rows[ci],
+      name: input.lanePhase,
+      time: times["IMPLEMENT"] === undefined ? "" : formatTapeMs(times["IMPLEMENT"]),
+      annotation: input.lanePhase === "LANE REVIEW" ? tapeWorking("REVIEW", input.models, input.phase.contract.seats) : "pick turn",
+    };
+  }
 
   const firstAt = phases[0]?.at;
   const elapsed = firstAt ? formatTapeMs(Math.max(0, input.endMs - Date.parse(firstAt))) : "0s";

@@ -218,6 +218,41 @@ export function parseVerify(raw: string | undefined): Verify[] {
   return out.length > 0 ? out : [{ kind: "review" }];
 }
 
+/** Plan 06k2 (A5/A8): the first token of a `:VERIFY:` string that is not one
+ * of the three known kinds (`test`, `review`, `evidence`). `undefined` when
+ * every token is known (or the string is empty). `tt lint` refuses a kind it
+ * cannot use — e.g. `:VERIFY: grep "x"` — with the file and line, rather
+ * than silently reading it as `review` (the 2026-10-09 02g/02h gap). */
+export function verifyKindIssue(raw: string): string | undefined {
+  const text = (raw ?? "").trim();
+  if (text.length === 0) return undefined;
+  const re = /(\btest\b)(?:\s+(?:"([^"]*)"|(\S+)))?|(\breview\b)|(\bevidence\b)|(\S+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m[1] !== undefined || m[4] !== undefined || m[5] !== undefined) continue;
+    if (m[6] !== undefined) return m[6];
+  }
+  return undefined;
+}
+
+/** Plan 06k2 (A2): resolve an evaluator/reviewer anchor path against the
+ * candidate's tracked files. An exact candidate-relative path resolves; a
+ * bare or crate-relative path resolves when exactly one tracked file ends
+ * with `/<path>`; two or more matches are `ambiguous` (the agent is re-asked
+ * once for a repo-relative path); none is `missing`. Pure. */
+export function resolveAnchorPath(
+  anchorPath: string,
+  trackedFiles: readonly string[],
+): { kind: "ok"; path: string } | { kind: "ambiguous" } | { kind: "missing" } {
+  const norm = anchorPath.replace(/^(\.\/)+/, "");
+  const exact = trackedFiles.find((f) => f === norm);
+  if (exact !== undefined) return { kind: "ok", path: exact };
+  const matches = trackedFiles.filter((f) => f.endsWith(`/${norm}`));
+  if (matches.length === 1) return { kind: "ok", path: matches[0] };
+  if (matches.length > 1) return { kind: "ambiguous" };
+  return { kind: "missing" };
+}
+
 /** Every verify of one item's raw strings. */
 export function itemVerifies(item: FlatItem): Verify[] {
   const raw = item.verify.length > 0 ? item.verify : ["review"];
@@ -396,10 +431,17 @@ export function testOutcomeIn(output: string, name: string): TestOutcome {
   // The path matches exactly; an ignored test did not run, so it stays missing.
   const cargoPass = new RegExp(`^\\s*test\\s+${escaped}\\s+\\.\\.\\.\\s+ok\\s*$`);
   const cargoFail = new RegExp(`^\\s*test\\s+${escaped}\\s+\\.\\.\\.\\s+FAILED\\s*$`);
+  // Plan 06k2 (A2): a unit test in `#[cfg(test)] mod tests` prints
+  // `test tests::<name> ... ok`, so a plan's bare `test "<name>"` must also
+  // match a cargo module-qualified line. Only for a name with no `::` of its
+  // own (a module path is exact): the module segments are `word::` runs.
+  const qualified = name.trim().includes("::") ? undefined : `(?:[A-Za-z0-9_]+::)+`;
+  const cargoPassQ = qualified ? new RegExp(`^\\s*test\\s+${qualified}${escaped}\\s+\\.\\.\\.\\s+ok\\s*$`) : undefined;
+  const cargoFailQ = qualified ? new RegExp(`^\\s*test\\s+${qualified}${escaped}\\s+\\.\\.\\.\\s+FAILED\\s*$`) : undefined;
   let passed = false;
   for (const line of clean.split("\n")) {
-    if (tapFail.test(line) || nodeFail.test(line) || cargoFail.test(line)) return "failed";
-    if (tapPass.test(line) || nodePass.test(line) || cargoPass.test(line)) passed = true;
+    if (tapFail.test(line) || nodeFail.test(line) || cargoFail.test(line) || cargoFailQ?.test(line)) return "failed";
+    if (tapPass.test(line) || nodePass.test(line) || cargoPass.test(line) || cargoPassQ?.test(line)) passed = true;
   }
   return passed ? "passed" : "missing";
 }

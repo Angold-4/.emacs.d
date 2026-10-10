@@ -86,10 +86,14 @@ test("cancel() kills the whole group, including grandchildren", async () => {
 });
 
 test("deadline escalation: a TERM-ignoring command ends in SIGKILL", async () => {
+  // Plan 06k2 (A3): a loaded host can delay the shell past the old 100 ms
+  // deadline, so the trap may not be installed when SIGTERM arrives and the
+  // command dies without escalating. A load-tolerant budget keeps the
+  // assertion (SIGTERM then SIGKILL) honest.
   const { result } = runCommand({
     command: "trap '' TERM; sleep 100",
-    deadlineMs: 100,
-    termGraceMs: 300,
+    deadlineMs: 400,
+    termGraceMs: 800,
   });
   const outcome = await result;
   assert.equal(outcome.timedOut, true);
@@ -98,10 +102,13 @@ test("deadline escalation: a TERM-ignoring command ends in SIGKILL", async () =>
 });
 
 test("a command that honors SIGTERM does not escalate to SIGKILL", async () => {
+  // Plan 06k2 (A3): a loaded host can delay the trap's own handling; a
+  // larger term grace keeps this from flaking (it was the 06i load-only
+  // failure).
   const { result } = runCommand({
     command: "trap 'exit 7' TERM; sleep 100",
-    deadlineMs: 100,
-    termGraceMs: 2000,
+    deadlineMs: 400,
+    termGraceMs: 8000,
   });
   const outcome = await result;
   assert.equal(outcome.timedOut, true);

@@ -9,6 +9,7 @@ import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { loopTapeHead, renderLoopTape, tapeLabel, type ChartModels } from "./charts.ts";
+import { laneRoundPhase } from "./core/loop-view.ts";
 import { effectiveChecks } from "./core/checks.ts";
 import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
 // 06a finding #24: the `models` line also carries the models check's result.
@@ -297,7 +298,7 @@ export function formatDuration(ms: number): string {
 
 /** "implement 30s → freeze 1s → checks ✗ 10m00s → implement 26m → … →
  * review 12s… (14m48s left)". Attempts after the first are numbered. */
-export function pipelineLine(spans: StageSpan[], limits: Record<string, number> = stageDeadlineMs()): string {
+export function pipelineLine(spans: StageSpan[], limits: Record<string, number | undefined> = stageDeadlineMs()): string {
   let attempt = 0;
   const parts = spans.map((s) => {
     let name = s.stage;
@@ -807,6 +808,9 @@ export function buildView(
   // Plan 05h: the loop tape is a projection of the same log read as the
   // metrics — its durations end at `endMs`, the last logged timestamp, never a
   // wall clock, so `tt contract rebuild` reproduces the live file.
+  // Plan 06k2 (A1): the lane round's own sub-phase, so the loop view shows
+  // LANE REVIEW / PICK and the attempt clock stops when both lanes submit.
+  const lanePhase = laneRoundPhase(phase);
   const tapeInput = {
     label: tapeLabel(phase.phaseId),
     round,
@@ -817,6 +821,7 @@ export function buildView(
     endMs: timelineEndMs(timeline, events),
     models: chartModelsFromPlan(plan.models, seatsOf(phase.contract)),
     limits: stageLimits(plan),
+    ...(lanePhase ? { lanePhase } : {}),
   };
   const tape = renderLoopTape(tapeInput);
   // 06a finding #24: the `models` row names what the plan configured AND what
@@ -835,7 +840,7 @@ export function buildView(
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
-    pipeline: pipelineLine(spans, stageLimits(plan)),
+    pipeline: pipelineLine(spans, lanePhase ? { ...stageLimits(plan), implement: undefined } : stageLimits(plan)),
     gates,
     gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord, phase.integrationHead) : undefined,
     baseline: baselineStatusLine(baseline),

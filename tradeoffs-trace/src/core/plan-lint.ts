@@ -22,7 +22,7 @@
 // when it parses the plan, and a hand-written JSON plan simply gets no line.
 
 import { matchesGlob } from "./boundaries.ts";
-import { parseVerify } from "./items.ts";
+import { parseVerify, verifyKindIssue } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
 export type LintSeverity = "error" | "warning";
@@ -170,6 +170,15 @@ export interface LintPhaseInput {
   /** Plan 06h: the 1-based line of the phase headline, used as the line for
    * a phase-override finding when the property's own line is not recorded. */
   line?: number;
+  /** Plan 06k2 (A5): the phase's own `:GOLDEN:` note, overriding the plan's
+   * `#+TT_GOLDEN:`; the contract's golden source. */
+  golden?: string;
+  /** Plan 06k2 (A8): the phase's own `:VARIANT_LIMIT:`, overriding the
+   * plan's `#+TT_VARIANT_LIMIT:`. Lint refuses a value below 2 exactly as it
+   * does the plan-level one. */
+  variantLimit?: number;
+  /** Lint-only: the 1-based line of the phase's `:VARIANT_LIMIT:`. */
+  variantLimitLine?: number;
 }
 
 export interface LintPlanInput {
@@ -207,6 +216,12 @@ export interface LintPlanInput {
   rounds?: number;
   /** Lint-only: the 1-based line of `#+TT_ROUNDS:` in the source Org file. */
   roundsLine?: number;
+  /** Plan 06k2 (A5): the plan's `#+TT_GOLDEN:` — the current source a choice
+   * must be re-checked against. Exported into plan.json and carried into the
+   * contract so the worker, reviewer and evaluator prompts can name it. */
+  golden?: string;
+  /** Lint-only: the 1-based line of `#+TT_GOLDEN:`. */
+  goldenLine?: number;
   /** Plan 06k1 (A3): the plan's `#+TT_VARIANT_LIMIT:` — how many consecutive
    * rounds may each raise a new blocking finding of the same kind on one
    * requirement before the owner is asked. Absent means the default of 3. */
@@ -565,6 +580,22 @@ export function lintItems(phase: LintPhaseInput): LintFinding[] {
       seen.set(id, item.line ?? 0);
     }
     for (const raw of item.verify ?? []) {
+      // Plan 06k2 (A5): a `:VERIFY:` kind the runtime cannot use (e.g.
+      // `grep "x"`) is an error with the file and line, never silently read
+      // as `review`.
+      const unknown = verifyKindIssue(raw);
+      if (unknown !== undefined) {
+        out.push(
+          finding(
+            "item-verify",
+            item,
+            item.verifyLine ?? item.line,
+            `:VERIFY: names an unknown kind ${JSON.stringify(unknown)}: ${JSON.stringify(raw)}`,
+            'use one of the three kinds: test "<the test name>", review or evidence',
+          ),
+        );
+        continue;
+      }
       for (const v of parseVerify(raw)) {
         if (v.kind === "test" && v.name.trim().length === 0) {
           out.push(finding("item-verify", item, item.verifyLine ?? item.line, `a test verify has no name: ${JSON.stringify(raw)}`, 'write test "<the test name>" (the name as the test runner prints it), or drop the test kind'));
@@ -665,6 +696,24 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
   const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
+    // Plan 06k2 (A8, finding A-4): a phase-level :VARIANT_LIMIT: below 2 is
+    // refused exactly like the plan-level one; otherwise a phase override of
+    // 1 reaches variantLimitOf and silently disables escalation.
+    if (phase.variantLimit !== undefined) {
+      const n = phase.variantLimit;
+      if (!Number.isInteger(n) || n < 2) {
+        out.push({
+          severity: "error",
+          rule: "worker-count",
+          phaseId,
+          item: `:VARIANT_LIMIT: ${String(n)}`,
+          line: phase.variantLimitLine ?? phase.line,
+          sourceFile: plan.sourceFile,
+          problem: `:VARIANT_LIMIT must be a whole number of 2 or more, got ${String(n)} (a limit below 2 escalates on the first round and silently disables escalation)`,
+          fix: "write :VARIANT_LIMIT: 2 or more, or drop the phase override",
+        });
+      }
+    }
     for (const finding of lintPhaseSeats(phase, plan)) out.push(finding);
     for (const finding of lintItems(phase)) out.push({ ...finding, sourceFile: plan.sourceFile });
     const acceptance = phase.acceptance ?? [];
@@ -763,16 +812,25 @@ export function lintWorkers(plan: LintPlanInput): LintFinding[] {
         problem: `#+TT_WORKERS names ${n} lanes; this plan version runs at most 2`,
         fix: "write #+TT_WORKERS: 2, or wait for 06h, the phase that makes the lane count adjustable (3, 4, … lanes)",
       });
-    } else if (!hasNewSeats && n === 2) {
+    }
+    // Plan 06k2 (A5): the stale "the two-lane round arrives in 06g2" warning
+    // is dropped — the conductor runs lanes whenever workers > 1, so it only
+    // misled a plan author.
+  }
+  // Plan 06k2 (A8): a variant limit below 2 would escalate on the first
+  // round, silently disabling escalation's purpose; it is a lint error.
+  if (plan.variantLimit !== undefined) {
+    const n = plan.variantLimit;
+    if (!Number.isInteger(n) || n < 2) {
       out.push({
-        severity: "warning",
+        severity: "error",
         rule: "worker-count",
-        phaseId: "workers",
-        item: `#+TT_WORKERS: 2`,
-        line: plan.workersLine,
+        phaseId: "variant-limit",
+        item: `#+TT_VARIANT_LIMIT: ${String(n)}`,
+        line: plan.variantLimitLine,
         sourceFile: plan.sourceFile,
-        problem: "the two-lane round arrives in 06g2; this run uses one lane",
-        fix: "leave #+TT_WORKERS: 2 (the round lands in 06g2), or write #+TT_WORKERS: 1 for today's single-candidate loop",
+        problem: `#+TT_VARIANT_LIMIT must be a whole number of 2 or more, got ${String(n)} (a limit below 2 escalates on the first round and silently disables escalation)`,
+        fix: "write #+TT_VARIANT_LIMIT: 3 (the default), or a whole number of 2 or more",
       });
     }
   }
