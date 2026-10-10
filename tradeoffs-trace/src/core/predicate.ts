@@ -482,12 +482,24 @@ export function amendmentToApply(
   );
 }
 
+/** Plan 06k1 (A2): true when the owner ruled this decision — the recorded
+ * ruling matches its id and its (unchanged) choice. Exported so the live
+ * ballot demand reads the same fact `decisionSettled` does, and never asks a
+ * reviewer for a ballot the owner's ruling already settled. */
+export function ownerRuledDecision(phase: PhaseState, decision: Decision): boolean {
+  return (phase.ruledDecisions ?? []).some((r) => r.id === decision.id && r.choice === decision.choice);
+}
+
 export function decisionSettled(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): boolean {
   if (decision.class === "detail") return true;
 
   // delegated and reserved alike: the reviewers' vote, an owner override,
   // or the owner accepting it after a failed vote. A reserved decision is
   // flagged for the owner (DecisionStatus.flagged), never held for them.
+  // Plan 06k1 (A2): a decision the owner ruled on is settled with no
+  // ballots, on every later candidate whose decision has the same id and
+  // choice. Checked before the tally so the ruling is never re-tallied.
+  if (ownerRuledDecision(phase, decision)) return true;
   if (tally(decision, phase.ballots, phase.findings, C, K, seatsOf(phase.contract), leaderOf(phase.contract)) === "pass") return true;
   const overridden = phase.overrides.some(
     (o) =>
@@ -625,6 +637,13 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     if (correction.status !== "open") continue; // resolved/superseded already settled
     if (!addressed(correction, phase, C, K)) return false;
   }
+
+  // Plan 06k1 (A5, finding A-8): a correction queued while the phase was
+  // reviewing, evaluating or final-checking has not reached a worker prompt
+  // yet. It is an acceptance obligation: the phase repairs (granting the
+  // correction's own round) until NOTES_DELIVERED clears it, so a correction
+  // is never lost to timing and never accepted around.
+  if ((phase.queuedCorrections ?? []).length > 0) return false;
 
   return true;
 }

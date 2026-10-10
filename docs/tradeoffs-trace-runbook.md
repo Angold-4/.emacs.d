@@ -803,6 +803,18 @@ a model. Acceptance is then the rule in force applied to the winner **alone**;
 the losing candidate is discarded. A lane that crashes or times out yields no
 candidate and does not stop the other lane — the status shows why.
 
+**Every pick vote says what the loser had.** Each seat's `submit_pick_vote`
+carries `loserHad: { yes, anchors, note? }` — whether the lane it did *not*
+pick had something the picked lane lacks, with the anchors (`file:line` or a
+test name). A vote without the field is refused and re-asked once, like an
+incomplete review. When a majority of the votes say yes, the losing lane's
+anchors are carried into the next round's repair prompt, so the next round's
+lanes can take the winner's strengths without losing what the loser had. A
+vote whose `loserHad` is absent (a log written before this field) is shown as
+**not recorded**, never guessed. `tt summary` and the status view report, per
+phase, the rounds, split versus unanimous picks and the rounds where the loser
+had something (`views/metrics.json`'s `picks`).
+
 With `#+TT_WORKERS` absent (or 1) nothing above happens: no round event is
 recorded and the phase is the single-candidate loop it was before.
 
@@ -862,6 +874,36 @@ and `tt status`.
 6 review(s)`), `views/loop.txt` and `views/tape.txt` show both lanes and the
 pick, the review buffer groups the round's candidates with the votes and the
 winner, and `tt summary` lists each round's candidates, votes and winner.
+
+### The variant limit (`#+TT_VARIANT_LIMIT`)
+
+Some requirements attract a *new* blocking finding of the same kind every
+round: fix one variant, the next round finds another. The loop does not spend
+a third round on it. When the same requirement takes a new blocking finding of
+the same kind in **N consecutive rounds** (default **3**, `#+TT_VARIANT_LIMIT:
+2` for a stricter plan), the Nth opens an **owner request** — "carry the
+remaining variants, or fix?" — and **no repair attempt starts**. A gap in the
+rounds, a different kind or a different requirement does not count.
+`variantEscalation` (`src/core/triage.ts`) is the only place the streak is
+counted; the transition table parks the phase on the owner from the finding's
+own request. `#+TT_VARIANT_LIMIT` is frozen into the contract like
+`#+TT_ROUNDS`, and a phase's own `:VARIANT_LIMIT:` overrides the plan's.
+
+### The host check window
+
+Every check run on a host — any program, any run, phase or final tier — holds
+the machine-wide check lock for its duration, and while that window is open the
+**worker processes of every other run on the host are paused** (`SIGSTOP`,
+resumed with `SIGCONT` when the window closes). A paused worker's attempt clock
+does not run, so a check that holds the machine for minutes cannot time another
+run's worker out. The window is a file per holder under `${checkLockPath}.window.d`
+(`~/.tradeoffs-trace/check.lock.window.d` for the default lock) plus a
+process-global set, so two conductors in one process and two conductors in
+separate processes both see each other's windows; a marker older than six
+hours (a crashed holder) is ignored. Because the window is scoped to the lock
+path, a run whose checks use a different lock (tests use a per-run lock) never
+pauses another run's workers. The pause and resume are recorded in the run's
+log (`worker_paused` / `worker_resumed`).
 
 ## Triage
 
@@ -1459,6 +1501,16 @@ sent). `tt summary <run>` lists the directives in force in the PR body, and
 
 `RET` sends in Evil normal state; `C-c C-c` sends from any state.
 
+**Steering a state transition.** When a steer widens a state transition — for
+example "recheck from `IMPLEMENTING`" — write it as the **outcome plus the
+cleanup it implies**: name the in-flight dispatch that must be cancelled (the
+running worker attempt, its shell groups, its review) and the worktree cleanup
+that must follow (reset to the frozen candidate, or left tainted). The 06j
+`recheck from IMPLEMENTING` steer did neither and introduced two bugs: a stale
+`inFlight.dispatch_worker` that stalled the next repair, and the stopped
+worker's writes surviving the recheck. A steer that names the cleanup leaves
+nothing for the reviewer to infer.
+
 ## Keys
 
 Every global action lives under `C-c m`; single letters are used only in the
@@ -1602,10 +1654,23 @@ actually happened, never what Emacs hoped for.
 Only `DONE` and `BLOCKED` refuse. A correction that arrives while the run is
 reviewing or checking is queued for the next worker attempt; a steer that
 arrives with no worker running is queued the same way. Nothing is dropped and
-nothing is silently re-applied. The status buffer's **Owner input** section and
-`views/status.txt` carry the latest queued or refused input with its reason,
-and the input box's header line repeats that line (read from the file), so the
-Emacs front end never computes an outcome itself.
+nothing is silently re-applied. A queued correction also **grants its own
+round** (three rounds, like a correction applied at `AWAITING_OWNER`), so a
+spent budget cannot drop an owner input. The status buffer's **Owner input**
+section and `views/status.txt` carry the latest queued or refused input with
+its reason, and the input box's header line repeats that line (read from the
+file), so the Emacs front end never computes an outcome itself.
+
+**Ruling a decision so it needs no ballots.** A delegated or reserved decision
+is normally settled by the reviewers' vote. To settle one by ruling, type a
+correction (or directive) that names the decision id and the word "ruled" (or
+"settled" / "decided"), for example `D-p1-7c1e0a4a-1 is ruled: keep the cache
+warm`. The conductor records the ruling pinned to that decision's **id and
+choice**; on every later candidate whose decision keeps the same id and the
+same choice it is settled with **no ballots and no re-tally**. A later
+candidate that changes the choice is not settled by the old ruling and is
+voted normally. A passing mention of an id without a ruling word settles
+nothing.
 
 ### Naming a run: the three ids
 

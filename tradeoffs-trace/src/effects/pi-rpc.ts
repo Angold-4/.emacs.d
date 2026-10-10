@@ -64,6 +64,11 @@ export class PiAgent {
   #onEvent: ((event: PiRpcEvent) => void) | undefined;
   #settled: Promise<void>;
   #resolveSettled!: () => void;
+  /** Plan 06k1 (A6): resolves when a compaction fails (a context overflow
+   * whose recovery was refused), so a worker that will never submit can end
+   * its attempt at once instead of waiting out the attempt deadline. */
+  #compactionFailed: Promise<void>;
+  #resolveCompactionFailed!: () => void;
   #exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   #exited = false;
   #exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
@@ -104,6 +109,9 @@ export class PiAgent {
 
     this.#settled = new Promise((resolve) => {
       this.#resolveSettled = resolve;
+    });
+    this.#compactionFailed = new Promise((resolve) => {
+      this.#resolveCompactionFailed = resolve;
     });
 
     child.stdout.on("data", (chunk: Buffer) => {
@@ -158,6 +166,14 @@ export class PiAgent {
     }
     this.#onEvent?.(event);
     if (event.type === "agent_settled") this.#resolveSettled();
+    // Plan 06k1 (A6): pi reports a failed compaction as `compaction_end` with
+    // `willRetry: false` and an error message (the 2026-10-08 incident).
+    // A worker in that state never submits, so the attempt ends at once.
+    if (event.type === "compaction_end") {
+      const e = event as { aborted?: unknown; willRetry?: unknown; errorMessage?: unknown };
+      const failed = e.willRetry === false && (typeof e.errorMessage === "string" ? e.errorMessage.length > 0 : e.aborted === true);
+      if (failed) this.#resolveCompactionFailed();
+    }
   }
 
   get exited(): boolean {
@@ -177,6 +193,11 @@ export class PiAgent {
    * process has already exited (nothing further will ever settle). */
   waitSettled(): Promise<void> {
     return this.#settled;
+  }
+
+  /** Plan 06k1 (A6): resolves once a failed compaction is reported. */
+  waitCompactionFailed(): Promise<void> {
+    return this.#compactionFailed;
   }
 
   #send(command: PiRpcCommand): Promise<PiRpcResponse> {

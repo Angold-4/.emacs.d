@@ -225,6 +225,11 @@ export async function setupConductor(opts: {
   /** Plan 01f: the machine-wide gate lock's path. Two conductors in one test
    * share it to prove their gates never overlap. */
   gateLockPath?: string;
+  /** Plan 06k1 (A4): the machine-wide check lock's path. Defaults to a path
+   * under this setup's own run root, so parallel test files never contend on
+   * the real machine-wide lock (which would pause each other's workers). A
+   * test that wants the machine-wide behavior passes one shared path. */
+  checkLockPath?: string;
   /** The plan's title (default "test plan") — plan prose like any other. */
   title?: string;
   /** #+TT_MODELS: per-role provider/model for the plan (design §2.1). The
@@ -389,6 +394,9 @@ export async function setupConductor(opts: {
     probeReuse: opts.probeReuse,
     ...(opts.now ? { now: opts.now } : {}),
     gateLockPath: opts.gateLockPath,
+    // Plan 06k1 (A4): default the check lock to a per-run path so parallel
+    // test files never contend on the real machine-wide lock.
+    checkLockPath: opts.checkLockPath ?? path.join(runRoot, "check.lock"),
     piEnvFor: (role, agentId) => {
       // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
       const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);

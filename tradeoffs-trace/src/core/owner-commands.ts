@@ -9,7 +9,72 @@ import { checkBinding, checkTupleBinding } from "./binding.ts";
 import { applyMessageEvent } from "./messages.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "./owner-requests.ts";
 import { findOwnerRequest, ownerRequestIsStale } from "./triage.ts";
-import type { BindingTuple, ContractVersion, Event, Message, PhaseState } from "./types.ts";
+import type { BindingTuple, ContractVersion, Decision, Event, Message, PhaseState, RuledDecision } from "./types.ts";
+
+/** Plan 06k1 (A2): the words an owner uses to rule a decision, as opposed to
+ * merely mentioning it. A correction or directive that names a decision id
+ * AND one of these words rules it; the ruling carries forward by id+choice. */
+const RULING_WORDS = /\b(ruled|rule|settled|settle|decided|decide|final|no ballots|no vote|without a vote)\b/i;
+
+/** Plan 06k1 (A2, finding A-4): a negation attached to the ruling word, so
+ * "D-1 is not ruled" rules nothing. Kept narrow (not a bare "no") so a
+ * phrase like "D-1 has no open findings and is ruled" still rules. */
+const RULING_NEGATION =
+  /\b(not|never|isn't|isnt|aren't|arent)\s+(?:owner[- ])?(ruled|rule|settled|settle|decided|decide)\b|\bunruled\b|\bundecided\b/i;
+
+/** The clauses a text splits into, so a ruling word attaches only to the ids
+ * in its own clause: `D-1 is ruled; D-2 remains undecided` rules D-1 alone. */
+function rulingClauses(text: string): string[] {
+  return text
+    .split(/[;\n]+|(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** Plan 06k1 (A2, finding A-4): the decision ids an owner correction or
+ * directive text names as ruled, PER ID. A ruling attaches to the id(s) in
+ * its own clause; a negated ruling rules nothing. Pure. */
+export function ruledDecisionIds(text: string, decisions: readonly Decision[]): string[] {
+  if (!text) return [];
+  const clauses = rulingClauses(text);
+  const out: string[] = [];
+  for (const d of decisions) {
+    if (d.id.length === 0) continue;
+    const escaped = d.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mentions = new RegExp(`(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)`);
+    for (const clause of clauses) {
+      if (!mentions.test(clause)) continue;
+      if (!RULING_WORDS.test(clause)) continue;
+      if (RULING_NEGATION.test(clause)) continue;
+      if (!out.includes(d.id)) out.push(d.id);
+      break;
+    }
+  }
+  return out;
+}
+
+/** Plan 06k1 (A2): record the rulings a correction/directive text carries,
+ * keyed by id and pinned to the decision's current choice. A second ruling
+ * on the same id replaces the first, so a re-ruled choice is what counts. */
+export function recordRulings(
+  existing: readonly RuledDecision[] | undefined,
+  text: string,
+  decisions: readonly Decision[],
+  by: string,
+): RuledDecision[] | undefined {
+  const ids = ruledDecisionIds(text, decisions);
+  if (ids.length === 0) return existing ? [...existing] : undefined;
+  const out = [...(existing ?? [])];
+  for (const id of ids) {
+    const decision = decisions.find((d) => d.id === id);
+    if (!decision) continue;
+    const at = out.findIndex((r) => r.id === id);
+    const ruling: RuledDecision = { id, choice: decision.choice, by };
+    if (at >= 0) out[at] = ruling;
+    else out.push(ruling);
+  }
+  return out;
+}
 
 export interface CommandCheck {
   ok: boolean;
@@ -170,8 +235,24 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
     }
   }
   // "accept_as_implemented" (failed_vote) and "approve" (reserved_decision)
-  // need no further mutation here: decisionSettled (predicate.ts) reads the
-  // resolved request's own `resolution.option` directly.
+  // settle the decision on THIS candidate through the resolved request's own
+  // `resolution.option` (predicate.ts). Plan 06k1 (A2, finding A-5): the
+  // settlement must CARRY FORWARD to later candidates by id and unchanged
+  // choice, so it is recorded as an owner ruling too — otherwise a later
+  // candidate whose D-1 has no ballots would no longer be settled.
+  const rulingTarget =
+    request.linkedDecisionId !== undefined &&
+    ((request.origin === "failed_vote" && event.option === "accept_as_implemented") ||
+      (request.origin === "reserved_decision" && event.option === "approve"))
+      ? request.linkedDecisionId
+      : undefined;
+  if (rulingTarget !== undefined) {
+    const decision = next.decisions.find((d) => d.id === rulingTarget);
+    if (decision) {
+      const kept = (next.ruledDecisions ?? []).filter((r) => r.id !== rulingTarget);
+      next = { ...next, ruledDecisions: [...kept, { id: rulingTarget, choice: decision.choice, by: "owner" }] };
+    }
+  }
   return next;
 }
 

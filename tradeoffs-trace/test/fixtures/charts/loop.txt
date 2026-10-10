@@ -77,6 +77,7 @@ phase states:
       +- GATE_REQUIRED             -> GATING          [resolving-gate-required]
       +- FINAL_CHECK_REQUIRED      -> FINAL_CHECKING  [resolving-final-check-required]
       +- RESOLVING_INCOMPLETE (openItemsAndBudgetRemains) -> REPAIRING       [resolving-incomplete-repair]
+      +- RESOLVING_INCOMPLETE (variantLimitReached) -> AWAITING_OWNER  [resolving-incomplete-variant-limit]
       +- RESOLVING_INCOMPLETE (openItemsBudgetExhausted) -> AWAITING_OWNER  [resolving-incomplete-awaiting-owner]
       +- AMEND                     -> CHECKING        [amend-from-resolving]
       +- CRITERION_REVERTED        -> CHECKING        [criterion-reverted-from-resolving]
@@ -156,6 +157,7 @@ phase states:
   +----------------+
       +- FINAL_CHECKS_PASSED (acceptHoldsAndNoGate) -> ACCEPTED        [final-checks-passed-accepted]
       +- FINAL_CHECKS_PASSED (acceptHoldsAndGateDeclared) -> GATING          [final-checks-passed-gated]
+      +- FINAL_CHECKS_PASSED (queuedCorrectionBlocksAcceptance) -> REPAIRING       [final-checks-passed-correction-queued]
       +- FINAL_CHECKS_FAILED (budgetRemains) -> REPAIRING       [final-checks-failed-to-repairing]
       +- FINAL_CHECKS_FAILED (budgetExhausted) -> AWAITING_OWNER  [final-checks-failed-budget-exhausted]
 

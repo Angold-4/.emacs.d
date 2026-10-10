@@ -25,6 +25,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const PERL_BIN = "/usr/bin/perl";
@@ -63,6 +64,137 @@ exit 0;
  * lock the same way (its stdin hits EOF), so a crashed gate cannot wedge
  * every later one. */
 const WAITING_HELPER_SCRIPT = HELPER_SCRIPT.replace("flock($fh, LOCK_EX | LOCK_NB)", "flock($fh, LOCK_EX)");
+
+// ---------------------------------------------------------------------------
+// Plan 06k1 (A4): the host-wide check window.
+//
+// A check run of ANY run on the host pauses the worker processes of every
+// OTHER run while it holds the machine. The window is a process-global set
+// plus one marker file per holder under `~/.tradeoffs-trace/check-window/`,
+// so two conductors in one process (a test) and two conductors in separate
+// processes (a host) both see each other's windows. The marker file holds
+// the holder's pid; a crashed holder leaves a stale file, so a marker older
+// than `CHECK_WINDOW_STALE_MS` is ignored.
+// ---------------------------------------------------------------------------
+
+export interface CheckWindow {
+  release: () => void;
+}
+
+const activeCheckWindows = new Set<string>();
+const CHECK_WINDOW_STALE_MS = 6 * 60 * 60 * 1000;
+
+/** The window directory for a check lock: beside the lock, so a machine-wide
+ * lock (`~/.tradeoffs-trace/check.lock`) gives a machine-wide window and a
+ * per-run lock (tests) gives a per-run one. */
+export function checkWindowDir(checkLockPath: string): string {
+  return `${checkLockPath}.window.d`;
+}
+
+/** True while any check window for this check lock is open. */
+export function anyCheckWindowOpen(checkLockPath: string): boolean {
+  const dir = checkWindowDir(checkLockPath);
+  if (activeCheckWindows.has(dir)) return true;
+  try {
+    if (!fs.existsSync(dir)) return false;
+    const now = Date.now();
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try {
+        if (now - fs.statSync(file).mtimeMs > CHECK_WINDOW_STALE_MS) {
+          fs.rmSync(file, { force: true });
+          continue;
+        }
+      } catch {
+        // a vanished file is not a window
+      }
+      return true;
+    }
+  } catch {
+    // an unreadable dir is not a window
+  }
+  return false;
+}
+
+/** Opens a check window for its caller's check run. The returned `release`
+ * closes it; call it in a `finally`. */
+export function openCheckWindow(checkLockPath: string): CheckWindow {
+  const dir = checkWindowDir(checkLockPath);
+  activeCheckWindows.add(dir);
+  const file = path.join(dir, `${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
+  } catch {
+    // A read-only home must not stop the check; the in-process set still
+    // pauses this process's own other runs.
+  }
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      activeCheckWindows.delete(dir);
+      try {
+        fs.rmSync(file, { force: true });
+      } catch {
+        // best effort
+      }
+    },
+  };
+}
+
+/** Plan 06k1 (A4): a timer whose clock stops while it is paused. Used for a
+ * worker attempt's deadline: while another run's check window is open the
+ * worker is SIGSTOPped and its attempt clock must not run, so a check that
+ * takes minutes does not time the worker out. */
+export class PausableTimer<T> {
+  readonly promise: Promise<T>;
+  #resolve!: (value: T) => void;
+  #remaining: number;
+  #timer: NodeJS.Timeout | undefined;
+  #startedAt: number;
+  #paused = false;
+  #done = false;
+  #value: T;
+
+  constructor(ms: number, value: T) {
+    this.#remaining = ms;
+    this.#value = value;
+    this.#startedAt = Date.now();
+    this.promise = new Promise<T>((resolve) => {
+      this.#resolve = resolve;
+    });
+    this.#timer = setTimeout(() => this.#fire(), ms);
+  }
+
+  #fire(): void {
+    if (this.#done) return;
+    this.#done = true;
+    this.#resolve(this.#value);
+  }
+
+  pause(): void {
+    if (this.#paused || this.#done) return;
+    this.#paused = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#remaining = Math.max(0, this.#remaining - (Date.now() - this.#startedAt));
+  }
+
+  resume(): void {
+    if (!this.#paused || this.#done) return;
+    this.#paused = false;
+    this.#startedAt = Date.now();
+    this.#timer = setTimeout(() => this.#fire(), this.#remaining);
+  }
+
+  cancel(): void {
+    this.#done = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+}
 
 export class LockError extends Error {
   lockPath: string;

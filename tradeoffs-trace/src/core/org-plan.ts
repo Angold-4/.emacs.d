@@ -295,9 +295,11 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const envFile = first("TT_ENV_FILE")?.value;
   const workers = first("TT_WORKERS");
   const rounds = first("TT_ROUNDS");
+  const variantLimit = first("TT_VARIANT_LIMIT");
   const leader = first("TT_LEADER");
   const workersValue = parseCount(workers);
   const roundsValue = parseCount(rounds);
+  const variantLimitValue = parseCount(variantLimit);
   const repo = first("TT_REPO")?.value;
   return {
     ...(sourceFile ? { sourceFile } : {}),
@@ -309,6 +311,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(rerun ? { rerun: rerun.value, rerunLine: rerun.line } : {}),
     ...(workersValue !== undefined ? { workers: workersValue, workersLine: workers!.line } : {}),
     ...(roundsValue !== undefined ? { rounds: roundsValue, roundsLine: rounds!.line } : {}),
+    ...(variantLimitValue !== undefined ? { variantLimit: variantLimitValue, variantLimitLine: variantLimit!.line } : {}),
     ...(leader ? { leader: leader.value.trim(), leaderLine: leader.line } : {}),
   };
 }

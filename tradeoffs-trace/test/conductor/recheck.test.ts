@@ -530,7 +530,7 @@ function laneReview(seat: Reviewer, contractVersion: unknown): { hello: unknown;
 }
 
 function pickVote(seat: Reviewer, round: number, lane: string, why: string): { hello: unknown; steps: Array<{ kind: string; [key: string]: unknown }> } {
-  return { hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round, seat, lane, why } }] };
+  return { hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round, seat, lane, why, loserHad: { yes: false, anchors: [] } } }] };
 }
 
 function liveRound(state: State): number {

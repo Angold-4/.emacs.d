@@ -287,6 +287,24 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
   },
+  // Plan 06k1 (A5, finding A-8): a correction queued during FINAL_CHECKING is
+  // an acceptance obligation; a passing final check repairs, not accepts.
+  "final-checks-passed-correction-queued": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      queuedCorrections: [{ id: "C-1", text: "use UTC everywhere" }],
+      repairRoundsUsed: 0,
+      repairRoundsGranted: 1,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
   "final-checks-failed-to-repairing": {
     state: baseState({
       phase: "FINAL_CHECKING",
@@ -394,6 +412,24 @@ const BUILD: Record<string, Fixture> = {
       findings: [openBlockingFinding()],
       repairRoundsUsed: 3,
       repairRoundsGranted: 3,
+    }),
+    event: { type: "RESOLVING_INCOMPLETE" },
+  },
+  // Plan 06k1 (A3): the same requirement took a blocking finding of the same
+  // kind in rounds 1, 2 and 3 (the current round); the variant row parks it.
+  "resolving-incomplete-variant-limit": {
+    state: baseState({
+      phase: "RESOLVING",
+      candidate: C1,
+      round: 3,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      findings: [
+        openBlockingFinding({ id: "F-v1", itemId: "R1", roundRaised: 1, status: "repaired" }),
+        openBlockingFinding({ id: "F-v2", itemId: "R1", roundRaised: 2, status: "repaired" }),
+        openBlockingFinding({ id: "F-v3", itemId: "R1", roundRaised: 3 }),
+      ],
     }),
     event: { type: "RESOLVING_INCOMPLETE" },
   },
