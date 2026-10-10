@@ -582,11 +582,53 @@ test("plan 06g: a missing lane review fails the round, so no winner is picked on
     assert.equal(phase.repairRoundsUsed, 1);
     for (const c of phase.rounds![1].candidates) assert.equal((c.reviews ?? []).length, 3);
     assert.equal(phase.phase, "DONE");
+    // 02k: each lane restarted from its own round-1 candidate, not the base.
+    for (const c of phase.rounds![1].candidates) {
+      const own = phase.rounds![0].candidates.find((r) => r.lane === c.lane)!.sha as string;
+      assert.doesNotThrow(
+        () => execFileSync("git", ["merge-base", "--is-ancestor", own, c.sha as string], { cwd: setup.repo.dir }),
+        `lane ${c.lane}'s round-2 candidate builds on its round-1 candidate`,
+      );
+    }
     // Only the completed round's six reviews are complete sets; the incomplete
     // round's candidate a holds at most the two seats that finished (B died).
     const events = readEvents(setup.runDir).filter((r) => r.kind === "event");
     assert.ok(events.filter((r) => ROUND_EVENT(r) === "ROUND_REVIEW_SUBMITTED").length >= 6);
     assert.equal(events.filter((r) => ROUND_EVENT(r) === "CANDIDATE_PICKED").length, 1, "only the completed round picked a winner");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("02k: a slow seat's discovery and another seat's slow turn 2 each get their own review deadline, so the round completes", async () => {
+  // reviewMs is 10 s. Seat M takes 7 s to discover, so A and B wait 7 s at
+  // the discovery barrier; seat A then takes 6 s on turn 2. Under one timer
+  // across the whole review A ran out at 10 s (02k rounds 1 and 2, seat A
+  // "timeout (turn 2)") and the missing review discarded the round.
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => {
+      const review = laneReview(seat as Reviewer, state.phase.contract.contractVersion);
+      if (seat === "M") review.steps.unshift({ kind: "sleep", ms: 7_000 });
+      if (seat === "A") review.steps.splice(2, 0, { kind: "sleep", ms: 6_000 });
+      return review;
+    },
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", "the only candidate"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.equal(phase.rounds?.length, 1, "the round completed on its first run");
+    assert.ok(phase.rounds![0].picked, "a winner was picked");
+    for (const c of phase.rounds![0].candidates) assert.equal((c.reviews ?? []).length, 3);
+    assert.equal(phase.repairRoundsUsed ?? 0, 0, "no repair attempt was spent");
   } finally {
     await teardown(setup);
   }
@@ -604,10 +646,14 @@ test("plan 06g: a missing pick vote fails the round, so a majority is never inve
     laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
     pickScriptFor: (seat, state) => {
       // Seat B dies before voting in the first round; from round 2 on it votes.
+      // Round 1's two votes are split (M a, A b), so no lane has a majority
+      // of all three seats and none may be invented (02k: a majority the
+      // missing vote cannot change is picked instead).
       if (seat === "B" && liveRound(state) === 1) {
         return { hello: { role: "picker" as const, tools: ROLE_TOOLS.picker }, steps: [{ kind: "crash", code: 9 }] };
       }
-      return pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} picks`);
+      const lane = liveRound(state) === 1 ? (seat === "M" ? "a" : "b") : seat === "B" ? "a" : "b";
+      return pickVote(seat as Reviewer, liveRound(state), lane, `${seat} picks`);
     },
   });
   try {

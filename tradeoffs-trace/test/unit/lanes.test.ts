@@ -9,7 +9,7 @@ import { test } from "node:test";
 
 import { reduce } from "../../src/core/reduce.ts";
 import { planModelSelector } from "../../src/core/roles.ts";
-import { isLaneRound, laneFailureLines, lanesOfContract, runRound, type LaneHost } from "../../src/core/lanes.ts";
+import { isLaneRound, laneFailureLines, lanesOfContract, repeatLaneBases, runRound, type LaneHost } from "../../src/core/lanes.ts";
 import type { Event, RoundRecord } from "../../src/core/types.ts";
 import { baseState, CV } from "./helpers.ts";
 
@@ -153,13 +153,28 @@ test("plan 06g: runRound refuses to pick when a seat's review is missing, and th
   assert.equal(types(host).filter((t) => t === "CANDIDATE_PICKED").length, 0);
 });
 
-test("plan 06g: runRound refuses to pick when a seat's vote is missing, and the round fails", async () => {
+test("plan 06g: runRound refuses to pick when a seat's vote is missing and the votes cast are split, and the round fails", async () => {
+  // M is silent; A votes b and B votes a: no lane has a majority of all
+  // three seats, so a majority would have to be invented.
+  const host = new FakeHost({ a: "C1a", b: "C1b" });
+  host.silentVoteSeat = "M";
+  const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.equal(outcome.winner, undefined);
+  assert.match(outcome.failure ?? "", /missing a vote from M/);
+  assert.equal(types(host).filter((t) => t === "CANDIDATE_PICKED").length, 0);
+});
+
+test("02k: a missing pick vote that cannot change the result does not discard the round", async () => {
+  // B is silent; M and A both vote b — two of three seats, a majority no
+  // missing vote could overturn. The round picks b and names B as missing.
   const host = new FakeHost({ a: "C1a", b: "C1b" });
   host.silentVoteSeat = "B";
   const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
-  assert.equal(outcome.winner, undefined);
-  assert.match(outcome.failure ?? "", /missing a vote from B/);
-  assert.equal(types(host).filter((t) => t === "CANDIDATE_PICKED").length, 0);
+  assert.equal(outcome.failure, undefined);
+  assert.equal(outcome.winner?.lane, "b");
+  assert.equal(outcome.winner?.votes, 2);
+  assert.deepEqual(outcome.missingVotes, ["B"]);
+  assert.equal(types(host).filter((t) => t === "CANDIDATE_PICKED").length, 1);
 });
 
 test("plan 06g: runRound reports a review that throws as the round's failure", async () => {
@@ -214,4 +229,38 @@ test("plan 06g: laneFailureLines names every lane's own failure, so a repeated r
   assert.match(lines[0], /C1-a \(lane a\) failed its checks: the check/);
   assert.match(lines[1], /C1-b \(lane b\) produced no candidate: the lane's worker ended/);
   assert.deepEqual(laneFailureLines(undefined), []);
+});
+
+// 02k (2026-10-10): rounds 1 and 2 were discarded because one seat's lane
+// review timed out, and both lanes then restarted from the phase base,
+// rebuilding 50 minutes of work. A lane whose candidate passed now restarts
+// from it.
+test("02k: a round that could not complete restarts each passing lane from its own candidate", async () => {
+  const first = new FakeHost({ a: "C1a", b: "C1b" });
+  first.silentReviewSeat = "A";
+  const failed = await runRound(first, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.ok(failed.failure, "a missing review fails the round");
+  assert.deepEqual(repeatLaneBases(first.rounds()[0]), { a: "C1a", b: "C1b" });
+
+  // runRound builds each lane from its own base when the context names one.
+  const bases: Record<string, string> = {};
+  const second = new FakeHost({ a: "C1a", b: "C1b" });
+  second.buildLane = async (lane: string, _round: number, base: string) => {
+    bases[lane] = base;
+    return { lane, sha: lane === "a" ? "C1a" : "C1b", disclosures: [] };
+  };
+  await runRound(second, { round: 2, base: "B0", lanes: ["a", "b"], laneBases: { a: "C1a" } });
+  assert.deepEqual(bases, { a: "C1a", b: "B0" }, "a lane without a passing candidate keeps the round's base");
+});
+
+test("02k: a round with a winner, or with no passing candidate, keeps the round's base for every lane", async () => {
+  const picked = new FakeHost({ a: "C1a", b: "C1b" });
+  await runRound(picked, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.ok(picked.rounds()[0].picked, "a complete round picks");
+  assert.equal(repeatLaneBases(picked.rounds()[0]), undefined);
+
+  const nonePassed = new FakeHost({ a: "Xa", b: { note: "no candidate" } });
+  await runRound(nonePassed, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.equal(repeatLaneBases(nonePassed.rounds()[0]), undefined, "failed checks repeat from the same base (plan 06g)");
+  assert.equal(repeatLaneBases(undefined), undefined);
 });

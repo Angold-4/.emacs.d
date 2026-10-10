@@ -770,9 +770,9 @@ so no agent searches the file system for them."
 
 (defun +tt--plan-deadlines ()
   "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES,
-#+TT_ATTEMPT_MINUTES and #+TT_GATE_MINUTES, as the conductor's deadline
-fields in ms (or nil).  For repositories whose builds and suites outlast the
-defaults (3, 5, 45, 30)."
+#+TT_ATTEMPT_MINUTES, #+TT_GATE_MINUTES and #+TT_REVIEW_MINUTES, as the
+conductor's deadline fields in ms (or nil).  For repositories whose builds,
+suites and candidates outlast the defaults (3, 5, 45, 30, 15)."
   (let ((ms (lambda (kw) (let ((v (+tt--keyword kw)))
                            (and v (string-match-p "\\`[0-9]+\\'" v) (* 60000 (string-to-number v))))))
         (out nil))
@@ -782,6 +782,9 @@ defaults (3, 5, 45, 30)."
     ;; Plan 01f: a gate defaults to 30 minutes — a 15-minute --clean --build
     ;; fits, the old 8-minute sh limit did not (runtime doc §6).
     (when-let* ((v (funcall ms "TT_GATE_MINUTES"))) (push (cons 'gateMs v) out))
+    ;; 02k (2026-10-10): one review turn (and one pick turn) on a large
+    ;; candidate outlasted the fixed 15 minutes and discarded a two-lane round.
+    (when-let* ((v (funcall ms "TT_REVIEW_MINUTES"))) (push (cons 'reviewMs v) out))
     (nreverse out)))
 
 (defun +tt--plan-secrets ()

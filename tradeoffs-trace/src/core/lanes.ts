@@ -104,6 +104,10 @@ export interface RoundContext {
    * a later round: the previous winner's commit). */
   base: string;
   lanes: readonly string[];
+  /** 02k (2026-10-10): a lane whose candidate passed its checks in a round
+   * that then failed for a missing review or vote starts the repeat from
+   * that candidate, not from `base`, so its work is not thrown away. */
+  laneBases?: Readonly<Record<string, string>>;
 }
 
 export interface RoundOutcome {
@@ -119,10 +123,27 @@ export interface RoundOutcome {
    * so the round repeats; a round never hands off on fewer than K × N reviews
    * and N votes. */
   failure?: string;
+  /** 02k: seats whose pick vote is missing from a round that still picked,
+   * because the votes cast already gave the winner a majority of all seats. */
+  missingVotes?: readonly string[];
 }
 
 function errorNote(err: unknown): string {
   return String((err as Error)?.message ?? err);
+}
+
+/** The per-lane starting points for a repeat of `last`. A round with a
+ * passing candidate and no winner could not complete (a missing review or
+ * pick vote; `runRound` picks whenever the set is complete), so each lane
+ * whose candidate passed its checks restarts from that candidate. A round in
+ * which no candidate passed keeps `base` for every lane (the repeat sees the
+ * failures; plan 06g). Derived from the round record, so it survives a
+ * conductor restart. */
+export function repeatLaneBases(last: RoundRecord | undefined): Record<string, string> | undefined {
+  if (!last || last.picked) return undefined;
+  const out: Record<string, string> = {};
+  for (const c of passingCandidates(last)) if (typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** One round: K lanes from one base, one winner. See the module comment. */
@@ -137,7 +158,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   const builds = await Promise.all(
     lanes.map(async (lane): Promise<LaneBuild> => {
       try {
-        return await host.buildLane(lane, ctx.round, ctx.base, prompt);
+        return await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
       } catch (err) {
         return { lane, note: `the lane failed: ${errorNote(err)}` };
       }
@@ -219,7 +240,12 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   // 4. The pick turn: each seat votes for one candidate. With a single
   //    passing candidate the vote is skipped — it wins without one. Every
   //    seat must vote before a winner is picked.
+  let missingVotes: string[] | undefined;
   if (!failure && passing.length > 1) {
+    // Every seat gets its pick turn; one seat's failure no longer stops the
+    // others (02k: a pick that failed discarded the round before the
+    // remaining seats voted).
+    const pickFailures: string[] = [];
     for (const seat of host.seats) {
       try {
         await host.pickTurn(
@@ -229,17 +255,25 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
           passing.map((c) => ({ lane: c.lane, sha: c.sha as string })),
         );
       } catch (err) {
-        failure = `${seat}'s pick vote failed: ${errorNote(err)}`;
-        break;
+        pickFailures.push(`${seat}'s pick vote failed: ${errorNote(err)}`);
       }
+    }
+    const afterPick = host.rounds().find((r) => r.round === ctx.round);
+    const voted = new Set((afterPick?.votes ?? []).map((v) => v.seat));
+    const missing = host.seats.filter((s) => !voted.has(s));
+    if (missing.length > 0) {
+      // 02k/06k2 (2026-10-10, owner): a missing vote that cannot change the
+      // result does not discard the round. When the votes cast already give
+      // one lane a strict majority of ALL seats (pickWinner's own rule),
+      // no missing vote could make another lane win, so the round picks and
+      // records which seats did not vote. Otherwise the round fails as before:
+      // a majority is never invented.
+      const decided = afterPick && passing.length === 2 ? pickWinner(afterPick, host.seats, host.leader) : undefined;
+      if (decided) missingVotes = missing;
+      else failure = pickFailures[0] ?? `the pick turn is missing a vote from ${missing.join(", ")}`;
     }
   }
   let finalRecord = host.rounds().find((r) => r.round === ctx.round);
-  if (!failure && finalRecord && passing.length > 1) {
-    const voted = new Set(finalRecord.votes.map((v) => v.seat));
-    const missing = host.seats.filter((s) => !voted.has(s));
-    if (missing.length > 0) failure = `the pick turn is missing a vote from ${missing.join(", ")}`;
-  }
 
   // 4b. Plan 06h (A3): with three or more candidates and no strict majority,
   //     the top two by votes go to ONE revote. A tie in the revote is broken
@@ -272,7 +306,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   if (winner) {
     host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: winner.lane, sha: winner.sha, votes: winner.votes });
   }
-  return { round: ctx.round, base: ctx.base, lanes, winner, builds };
+  return { round: ctx.round, base: ctx.base, lanes, winner, builds, ...(missingVotes ? { missingVotes } : {}) };
 }
 
 /** The lanes a plan's frozen contract runs. A plan without `#+TT_WORKERS`
