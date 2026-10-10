@@ -1990,3 +1990,67 @@ test("plan-items: a reviewer may cite a passing Rust test the plan does not name
     await teardown(setup);
   }
 });
+
+test("plan-items: a lane review's anchors resolve against the lane's own candidate, also in round 1 before any candidate is frozen", async () => {
+  // 06k1 (2026-10-10): every lane review was refused with "the cited file …
+  // does not exist in the candidate" because anchors were checked against the
+  // phase's frozen candidate, which a two-lane round 1 does not have yet.
+  const setup = await setupConductor({
+    phase: {
+      id: "p1",
+      goal: "two lanes with structured items",
+      acceptance: ITEMS.requirements.map((r) => r.text),
+      checks: [CHECK_OUTPUT],
+      boundaries: [],
+      reserved: [],
+      workers: 2,
+      ...ITEMS,
+    },
+    checks: ["true"],
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [] }),
+    laneWorkerScriptFor: (lane) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `${WRITE_ROUNDS} && printf 'lane ${lane}\\n' > lane-${lane}.txt` },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    laneReviewerScriptFor: (seat, _candidate, state) => {
+      const cv = state.phase.contract.contractVersion;
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/core/rounds.ts" } },
+          { kind: "call-submit", tool: "submit_review", args: reviewArgs(seat as Reviewer, "$TT_CANDIDATE_SHA", cv, review({})) },
+        ],
+      };
+    },
+    pickScriptFor: (seat, state) => ({
+      hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
+      steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round: state.phase.rounds?.length ?? 1, seat, lane: "a", why: "first", loserHad: { yes: false, anchors: [] } } }],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "ROUND_REVIEW_SUBMITTED").length >= 6,
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const refused = readEvents(setup.runDir).filter(
+      (r) =>
+        (r.kind === "incomplete_review_rejected" || r.kind === "incomplete_review") &&
+        ((r.event as { itemIssues?: string[] }).itemIssues ?? []).some((i) => /does not exist in the candidate/.test(i)),
+    );
+    assert.deepEqual(refused, [], "a lane review citing a file of its own candidate is never refused as missing");
+  } finally {
+    await teardown(setup);
+  }
+});

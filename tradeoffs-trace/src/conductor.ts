@@ -3535,6 +3535,10 @@ export class Conductor {
    * recorded `read` tool calls. A `met`/`fits` verdict must cite at least one
    * of them, never only the worker's own anchors. */
   #reviewerReads = new Map<Reviewer, Set<string>>();
+  /** A lane review's own reads and commands, keyed `${seat}@${candidateSha}`:
+   * one seat reviews both lanes at once, so the two must not mix. */
+  #laneReviewerReads = new Map<string, Set<string>>();
+  #laneReviewerCommands = new Map<string, Set<string>>();
 
   /** Plan 06b: the shell commands each reviewer itself ran in this review, so
    * a verdict that cites a command must cite one it actually ran. */
@@ -4128,7 +4132,10 @@ export class Conductor {
         }
         const issue = reviewIngestionIssue(review);
         if (issue) return { ok: false, reason: issue };
-        const itemIssues = this.#reviewItemIssues(review);
+        // A lane review judges the lane's own candidate, not the phase's
+        // frozen one (which does not exist yet in round 1, and is another
+        // tree after it): its anchors resolve against that candidate.
+        const itemIssues = this.#reviewItemIssues(review, sha);
         // A ballot is required for every votable record the lane's turn-2
         // prompt listed (the worker's own decisions and the seats'
         // discoveries); an incomplete review is refused back to the model
@@ -6471,6 +6478,34 @@ export class Conductor {
     return out;
   }
 
+  /** A lane reviewer's `read` and `sh` calls, as `#runReview` records a
+   * single-candidate reviewer's; a read path inside the candidate directory
+   * is kept repo-relative. */
+  #trackLaneReviewerTool(lr: { seat: string; sha: string }, candidateDir: string, event: unknown): void {
+    if ((event as { type?: string }).type !== "tool_execution_start") return;
+    const e = event as { toolName?: string; args?: unknown };
+    const key = `${lr.seat}@${lr.sha}`;
+    if (e.toolName === "read") {
+      const a = e.args as Record<string, unknown> | undefined;
+      const file = a?.path ?? a?.file ?? a?.file_path;
+      if (typeof file === "string" && file.trim().length > 0) {
+        const prefix = `${candidateDir}/`;
+        const rel = file.startsWith(prefix) ? file.slice(prefix.length) : file.replace(/^\.\//, "");
+        const set = this.#laneReviewerReads.get(key) ?? new Set<string>();
+        set.add(rel);
+        this.#laneReviewerReads.set(key, set);
+      }
+    }
+    if (e.toolName === "sh") {
+      const a = e.args as { command?: unknown } | undefined;
+      if (typeof a?.command === "string" && a.command.trim().length > 0) {
+        const set = this.#laneReviewerCommands.get(key) ?? new Set<string>();
+        set.add(a.command.trim());
+        this.#laneReviewerCommands.set(key, set);
+      }
+    }
+  }
+
   #reviewerReadFiles(reviewer: Reviewer): string[] {
     return [...(this.#reviewerReads.get(reviewer) ?? [])];
   }
@@ -6499,9 +6534,9 @@ export class Conductor {
   /** The code facts a verdict is validated against: candidate file lines,
    * the diff, the item's `:WHERE:`, the check run's test outcomes, the files
    * this reviewer read, and the worker's own anchors. */
-  #verdictContext(item: FlatItem, reviewer: Reviewer): VerdictContext {
-    const dir = this.#candidateDir();
-    const C = this.#state.phase.candidate?.sha ?? "";
+  #verdictContext(item: FlatItem, reviewer: Reviewer, candidateSha?: string): VerdictContext {
+    const dir = candidateSha ? path.join(this.#paths.candidates, candidateSha) : this.#candidateDir();
+    const C = candidateSha ?? this.#state.phase.candidate?.sha ?? "";
     return {
       lineCount: (p: string) => {
         try {
@@ -6514,27 +6549,27 @@ export class Conductor {
       ...(item.where ? { where: item.where } : {}),
       testOutcomes: this.#itemTestOutcomes(),
       checkOutput: (this.#state.phase.checkTestLines ?? []).join("\n"),
-      reviewerReadFiles: this.#reviewerReadFiles(reviewer),
+      reviewerReadFiles: candidateSha ? [...(this.#laneReviewerReads.get(`${reviewer}@${candidateSha}`) ?? [])] : this.#reviewerReadFiles(reviewer),
       workerAnchors: this.#workerAnchors(),
-      reviewerCommands: this.#reviewerRanCommands(reviewer),
+      reviewerCommands: candidateSha ? [...(this.#laneReviewerCommands.get(`${reviewer}@${candidateSha}`) ?? [])] : this.#reviewerRanCommands(reviewer),
     };
   }
 
   /** Every reason a review's item section must be refused and re-asked: a
    * missing verdict (the complete-ballot rule extended to items), an invalid
    * verdict value, or a verdict whose anchors the code cannot follow. */
-  #reviewItemIssues(review: Review): string[] {
+  #reviewItemIssues(review: Review, candidateSha?: string): string[] {
     if (!this.#itemsEnforced()) return [];
     const items = this.#planItems();
     const issues = reviewItemsIssues({ items: review.items ?? [], arch: review.arch ?? [] }, items);
     const flat = flatItems(items);
     for (const v of review.items ?? []) {
       const item = flat.find((i) => i.id === v.id);
-      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer)));
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
     }
     for (const v of review.arch ?? []) {
       const item = flat.find((i) => i.id === v.id);
-      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer)));
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
     }
     return issues;
   }
@@ -7168,6 +7203,7 @@ export class Conductor {
       onEvent: (event) => {
         this.#noteActivity(opts.agentId, event);
         this.#trackRunTokens(opts.agentId, event);
+        if (opts.laneReview) this.#trackLaneReviewerTool(opts.laneReview, opts.cwd, event);
         // Plan 06g2: a lane review has two turns and must wait out each one;
         // `waitSettled()` is one-shot, so per-turn waiters are resolved here
         // (exactly like `#runReview`'s own `settleWaiters`).
@@ -7495,6 +7531,8 @@ export class Conductor {
     const actionId = this.#log.actionId(`lane_review_${round}_${lane}_${seat}`);
     this.#log.intent(actionId, { round, lane, seat, candidateSha: sha });
     const agentId = `lane-review-${round}-${lane}-${seat}-${actionId}`;
+    this.#laneReviewerReads.set(`${seat}@${sha}`, new Set());
+    this.#laneReviewerCommands.set(`${seat}@${sha}`, new Set());
     const handle = this.#spawnLaneAgent({
       role: "reviewer",
       agentId,
