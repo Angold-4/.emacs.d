@@ -5,6 +5,7 @@
 // with a human-readable reason naming what changed, e.g. "decision D-7
 // changed v2 → v3 since you viewed it" (design §7.1's own example).
 
+import { findOwnerRequest } from "./triage.ts";
 import type { Ballot, BindingTuple, ContractVersion, PhaseState } from "./types.ts";
 
 export interface BindingCheckResult {
@@ -132,7 +133,7 @@ export function currentVersionsFor(
   if (finding) {
     return { candidateSha, contractVersion, recordVersion: finding.version, label: `finding ${finding.id}` };
   }
-  const request = phase.ownerRequests.find((r) => r.id === recordId);
+  const request = findOwnerRequest(phase, recordId);
   if (request) {
     return { candidateSha, contractVersion, recordVersion: request.version, label: `owner request ${request.id}` };
   }

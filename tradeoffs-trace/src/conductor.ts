@@ -52,10 +52,12 @@ import {
   isClassified,
   ledgerRecords,
   openFindings,
+  findOwnerRequest,
   ownerRequestIsStale,
   recordClassified,
   recordImpact,
   undispositionedBlockingFinding,
+  uniqueOwnerRequestId,
   type Disposition,
   type TriageRecord,
 } from "./core/triage.ts";
@@ -5081,7 +5083,7 @@ export class Conductor {
         }
         taken.add(itemId);
         n += 1;
-        const ownerRequestId = `OR-${this.#state.phase.phaseId}-triage-${itemId}`;
+        const ownerRequestId = uniqueOwnerRequestId(this.#state.phase, `OR-${this.#state.phase.phaseId}-triage-${itemId}`);
         // Plan 06i (C2): the disposition is computed by disposition() (the
         // sole decider); the conductor only records it and opens the request
         // it names.
@@ -6799,7 +6801,7 @@ export class Conductor {
     for (const dup of duplicates) {
       const originalId = this.#ultimateOriginal(dup.id, dup.into);
       const original = (this.#state.phase.triage ?? []).find((r) => r.itemId === originalId);
-      const ownerRequestId = `OR-${phase.phaseId}-triage-${dup.id}`;
+      const ownerRequestId = uniqueOwnerRequestId(phase, `OR-${phase.phaseId}-triage-${dup.id}`);
       const record: TriageRecord = {
         itemId: dup.id,
         source: dup.source,
@@ -10796,7 +10798,7 @@ export class Conductor {
       }
       const concern = concerns.find((c) => c.id === id);
       const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
-      const request = phase.ownerRequests.find((r) => r.id === id);
+      const request = findOwnerRequest(phase, id);
       if (request) {
         briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
         this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
@@ -10982,7 +10984,7 @@ export class Conductor {
     ];
     const concerns = this.#briefConcerns();
     for (const id of ids) {
-      const request = phase.ownerRequests.find((r) => r.id === id);
+      const request = findOwnerRequest(phase, id);
       const decision = !request ? this.#liveReservedDecisions(phase).find((d) => d.id === id) : undefined;
       const entry = !request && !decision ? this.#ownerMarkedEntries(phase).find((e) => e.id === id) : undefined;
       const others = concerns.find((c) => c.id === id);
