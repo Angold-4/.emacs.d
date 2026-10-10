@@ -32,6 +32,16 @@
       "description": "Plan 06g: #+TT_ROUNDS frozen into the contract — how many rounds the phase may spend. Absent means the default of 3 (core/rounds.ts's roundBudget).",
       "type": "integer",
       "minimum": 1
+    },
+    "seats": {
+      "description": "Plan 06h: #+TT_REVIEWERS frozen into the contract. Absent means M A B.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "leader": {
+      "description": "Plan 06h: #+TT_LEADER frozen into the contract. Absent means the first seat.",
+      "type": "string",
+      "minLength": 1
     }
   },
   "$defs": {

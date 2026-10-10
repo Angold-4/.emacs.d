@@ -29,6 +29,7 @@
 // itself, or directly) rather than re-deriving the same facts — round-1
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
+import { leaderOf, seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
 // Plan 06b: the per-item acceptance half — every R and C met by majority with
 // its test verifies passed, every A fitting by majority or its deviation
@@ -83,7 +84,7 @@ export function reviewIngestionIssue(review: Review): string | undefined {
  * status that is not exactly `"honored"` all make it false. */
 export function addressed(correction: Correction, phase: PhaseState, C: string, K: ContractVersion): boolean {
   if (!sameVersion(correction.boundContractVersion, K)) return false;
-  for (const who of ["M", "A", "B"] as const) {
+  for (const who of seatsOf(phase.contract)) {
     const review = phase.reviews[who]?.review;
     if (!review) return false;
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
@@ -132,8 +133,22 @@ export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
 // Plan 04b: the blocker panel
 // ---------------------------------------------------------------------------
 
-/** The three seats every panel has. */
+/** The default number of seats every panel has, kept for callers that
+ * predate `#+TT_REVIEWERS`. From 06h a panel has as many seats as there are
+ * reviewers, so every function below takes the count. */
 export const PANEL_SEATS = [1, 2, 3] as const;
+
+/** Plan 06h (A2): the panel seat numbers for `count` reviewers, 1-based. */
+export function panelSeatNumbers(count: number): number[] {
+  const n = Number.isInteger(count) && count >= 1 ? count : 3;
+  return Array.from({ length: n }, (_, i) => i + 1);
+}
+
+/** The strict majority of `count` seats: 2 of 3, 3 of 5, 4 of 7. */
+export function panelMajority(count: number): number {
+  const n = Number.isInteger(count) && count >= 1 ? count : 3;
+  return Math.floor(n / 2) + 1;
+}
 
 /** The fallback pair of owner options: what an ordinary open-finding request
  * for the blocker offers, worded exactly as `applyOwnerRequestResolved` and
@@ -156,22 +171,23 @@ export function panelSeatSettled(seat: PanelSeatState | undefined): boolean {
   return seat.unavailable === true && seat.dispatches >= 2;
 }
 
-export function panelSeatsSettled(panel: PanelState | undefined): boolean {
-  return PANEL_SEATS.every((n) => panelSeatSettled(panel?.seats?.[String(n)]));
+export function panelSeatsSettled(panel: PanelState | undefined, count = 3): boolean {
+  return panelSeatNumbers(count).every((n) => panelSeatSettled(panel?.seats?.[String(n)]));
 }
 
 /** The panel's verdict from its recorded votes: a majority `block` escalates,
  * a majority `downgrade` downgrades, anything else (including a split or two
  * unavailable seats) is incomplete. Only the core computes this; the
  * conductor may not invent an outcome. */
-export function panelOutcome(panel: PanelState): PanelOutcome {
+export function panelOutcome(panel: PanelState, count = 3): PanelOutcome {
   const votes = Object.values(panel.seats ?? {})
     .map((s) => s.vote)
     .filter((v): v is "block" | "downgrade" => v === "block" || v === "downgrade");
+  const needed = panelMajority(count);
   const blocks = votes.filter((v) => v === "block").length;
   const downgrades = votes.filter((v) => v === "downgrade").length;
-  if (blocks >= 2) return "escalate";
-  if (downgrades >= 2) return "downgrade";
+  if (blocks >= needed) return "escalate";
+  if (downgrades >= needed) return "downgrade";
   return "incomplete";
 }
 
@@ -179,9 +195,9 @@ export function panelOutcome(panel: PanelState): PanelOutcome {
  * options, in seat order, deduped by id and capped at three (a `block` vote
  * proposes two or three). Falls back to DEFAULT_BLOCKER_OPTIONS so an
  * escalation always has options. */
-export function panelOptionsFor(panel: PanelState): PanelOption[] {
+export function panelOptionsFor(panel: PanelState, count = 3): PanelOption[] {
   const out: PanelOption[] = [];
-  for (const n of PANEL_SEATS) {
+  for (const n of panelSeatNumbers(count)) {
     const seat = panel.seats?.[String(n)];
     if (seat?.vote !== "block") continue;
     for (const option of seat.options ?? []) {
@@ -231,8 +247,8 @@ export function roundPanelSeatSettled(seat: import("./types.ts").RoundPanelSeatS
   return seat.unavailable === true && seat.dispatches >= 2;
 }
 
-export function roundPanelSeatsSettled(round: RoundPanelState | undefined): boolean {
-  return PANEL_SEATS.every((n) => roundPanelSeatSettled(round?.seats?.[String(n)]));
+export function roundPanelSeatsSettled(round: RoundPanelState | undefined, count = 3): boolean {
+  return panelSeatNumbers(count).every((n) => roundPanelSeatSettled(round?.seats?.[String(n)]));
 }
 
 /** The items this round's panel votes on: every published trade-off message
@@ -250,7 +266,7 @@ export function roundPanelItemsNeedingVote(phase: PhaseState): string[] {
     if (m.type === "tradeoff") {
       const decision = m.sourceRecordId ? phase.decisions.find((d) => d.id === m.sourceRecordId) : undefined;
       if (decision) {
-        const all = (["M", "A", "B"] as const).every((who) =>
+        const all = seatsOf(phase.contract).every((who) =>
           isValidBallot(currentBallot(phase.ballots, decision.id, who, C, K, decision.version)),
         );
         if (all) continue;
@@ -271,14 +287,20 @@ export function roundPanelItemsNeedingVote(phase: PhaseState): string[] {
  * keeps it (a trade-off is published to the owner; a blocking finding keeps
  * blocking). Otherwise a trade-off is dropped and a finding becomes
  * advisory — a 2-of-3 majority is the only way a finding blocks. */
-export function roundPanelOutcomeFor(round: RoundPanelState | undefined, messageId: string, kind: "tradeoff" | "finding"): RoundPanelOutcome {
-  const votes = PANEL_SEATS.map((n) => round?.seats?.[String(n)]?.votes?.find((v) => v.messageId === messageId)).filter(
-    (v): v is NonNullable<typeof v> => v !== undefined,
-  );
-  const count = (verdict: string) => votes.filter((v) => v.verdict === verdict).length;
-  if (count("keep") >= 2) return "keep";
-  if (count("drop") >= 2) return "drop";
-  if (count("downgrade") >= 2) return "downgrade";
+export function roundPanelOutcomeFor(
+  round: RoundPanelState | undefined,
+  messageId: string,
+  kind: "tradeoff" | "finding",
+  count = 3,
+): RoundPanelOutcome {
+  const votes = panelSeatNumbers(count)
+    .map((n) => round?.seats?.[String(n)]?.votes?.find((v) => v.messageId === messageId))
+    .filter((v): v is NonNullable<typeof v> => v !== undefined);
+  const needed = panelMajority(count);
+  const tally = (verdict: string) => votes.filter((v) => v.verdict === verdict).length;
+  if (tally("keep") >= needed) return "keep";
+  if (tally("drop") >= needed) return "drop";
+  if (tally("downgrade") >= needed) return "downgrade";
   return kind === "finding" ? "downgrade" : "drop";
 }
 
@@ -362,7 +384,7 @@ export function findingCitesAcceptanceOrReserved(
  * SAME candidate against a new head), whether REVIEWING needs to dispatch
  * anything at all or the phase can go straight to RESOLVING. */
 export function reviewsComplete(phase: PhaseState, C: string, K: ContractVersion): boolean {
-  return (["M", "A", "B"] as const).every((who) => {
+  return seatsOf(phase.contract).every((who) => {
     const review = phase.reviews[who]?.review;
     return Boolean(review) && review!.candidateSha === C && sameVersion(review!.contractVersion, K);
   });
@@ -445,7 +467,7 @@ export function amendmentToApply(
       // meaningless — next() must agree with the row's own guard, or the
       // conductor emits an event the reducer refuses and throws.
       phase.contract.acceptance.includes(d.amendment.criterion) &&
-      tally(d, phase.ballots, phase.findings, C, K) === "pass",
+      tally(d, phase.ballots, phase.findings, C, K, seatsOf(phase.contract), leaderOf(phase.contract)) === "pass",
   );
 }
 
@@ -455,7 +477,7 @@ export function decisionSettled(decision: Decision, phase: PhaseState, C: string
   // delegated and reserved alike: the reviewers' vote, an owner override,
   // or the owner accepting it after a failed vote. A reserved decision is
   // flagged for the owner (DecisionStatus.flagged), never held for them.
-  if (tally(decision, phase.ballots, phase.findings, C, K) === "pass") return true;
+  if (tally(decision, phase.ballots, phase.findings, C, K, seatsOf(phase.contract), leaderOf(phase.contract)) === "pass") return true;
   const overridden = phase.overrides.some(
     (o) =>
       o.decisionId === decision.id &&
@@ -530,14 +552,14 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
   // candidate's gate/probe.
   if (phase.acceptedWithCarried) return phase.carriedCandidateSha === C;
 
-  for (const who of ["M", "A", "B"] as const) {
+  for (const who of seatsOf(phase.contract)) {
     const review = phase.reviews[who]?.review;
     if (!review) return false;
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
   }
 
   if (itemsEnforced) {
-    const reviews = (["M", "A", "B"] as const).map((seat) => {
+    const reviews = seatsOf(phase.contract).map((seat) => {
       const r = phase.reviews[seat]?.review;
       return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
     });
@@ -664,26 +686,38 @@ export function decisionStatus(decision: Decision, phase: PhaseState): DecisionS
 }
 
 function votedStatus(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): DecisionStatus {
+  const seats = seatsOf(phase.contract);
+  const leader = leaderOf(phase.contract);
   if (decisionSettled(decision, phase, C, K)) {
-    const t = tally(decision, phase.ballots, phase.findings, C, K);
+    const t = tally(decision, phase.ballots, phase.findings, C, K, seats, leader);
     return { status: "passed", reason: t === "pass" ? "vote passed" : "settled by the owner" };
   }
-  const t = tally(decision, phase.ballots, phase.findings, C, K);
+  const t = tally(decision, phase.ballots, phase.findings, C, K, seats, leader);
   if (t === "suspended") return { status: "suspended", reason: `linked finding ${decision.linkedFindingId} is open` };
-  const vote = (who: "M" | "A" | "B") => {
+  const vote = (who: string) => {
     const b = currentBallot(phase.ballots, decision.id, who, C, K, decision.version);
     return isValidBallot(b) ? b.vote : undefined;
   };
-  const reviewsDone = (["M", "A", "B"] as const).every((w) => phase.reviews[w]?.review?.candidateSha === C);
-  const m = vote("M");
-  const a = vote("A");
-  const b = vote("B");
-  if (!reviewsDone && (m === undefined || (a === undefined && b === undefined))) return { status: "pending", reason: "votes not cast yet" };
+  const reviewsDone = seats.every((w) => phase.reviews[w]?.review?.candidateSha === C);
+  const leaderVote = vote(leader);
+  const others = seats.filter((s) => s !== leader);
+  const missingOthers = others.filter((s) => vote(s) === undefined);
+  if (!reviewsDone && (leaderVote === undefined || missingOthers.length === others.length)) return { status: "pending", reason: "votes not cast yet" };
   const reasons: string[] = [];
-  if (m === undefined) reasons.push("missing ballot from M");
-  else if (m === "reject") reasons.push("M veto");
-  if (a !== "approve" && b !== "approve") {
-    reasons.push(a === undefined && b === undefined ? "no ballot from A or B" : "neither A nor B approved");
+  if (leaderVote === undefined) reasons.push(`missing ballot from ${leader}`);
+  else if (leaderVote === "reject") reasons.push(`${leader} veto`);
+  const otherApprovals = others.filter((s) => vote(s) === "approve").length;
+  if (seats.length === 3 && others.length === 2) {
+    // The default `M A B` keeps the exact 06g wording.
+    const a = vote(others[0]);
+    const b = vote(others[1]);
+    if (a !== "approve" && b !== "approve") {
+      reasons.push(a === undefined && b === undefined ? `no ballot from ${others[0]} or ${others[1]}` : `neither ${others[0]} nor ${others[1]} approved`);
+    }
+  } else {
+    const needed = Math.floor(seats.length / 2) + 1;
+    const approvals = (leaderVote === "approve" ? 1 : 0) + otherApprovals;
+    if (approvals < needed) reasons.push(`only ${approvals} of ${seats.length} seats approved`);
   }
   return { status: "failed", reason: reasons.join("; ") || "vote failed" };
 }

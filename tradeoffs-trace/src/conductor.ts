@@ -35,6 +35,9 @@ import { advisoryReason, blocksAcceptance, candidateLabel, roundBudget, type Acc
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
 import { isLaneRound, laneFailureLines, lanesOfContract, runRound, type LaneBuild, type LaneCheck, type LaneHost } from "./core/lanes.ts";
+// Plan 06h (A1/A2): the seat list, its leader and the lane count are the
+// plan's, read from one place (`seatsOf`/`leaderOf`).
+import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
 import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
 import { checkCommands, checkTier, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand } from "./core/checks.ts";
@@ -105,6 +108,7 @@ import type {
   PhaseState,
   Review,
   Reviewer,
+  Seats,
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
@@ -124,8 +128,10 @@ import {
   findingCitesAcceptanceOrReserved,
   isLiveDecision,
   reviewIngestionIssue,
+  panelMajority,
   panelOptionsFor,
   panelOutcome,
+  panelSeatNumbers,
   panelSeatsSettled,
   reviewsComplete,
   roundPanelItemsNeedingVote,
@@ -359,6 +365,12 @@ export interface RunPlanPhase {
   /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before
    * it parks on the owner. Absent means the default of 3. */
   rounds?: number;
+  /** Plan 06h (A1): `#+TT_REVIEWERS:` (or the phase's own `:REVIEWERS:`).
+   * Absent means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A1): `#+TT_LEADER:` (or the phase's own `:LEADER:`). Absent
+   * means the first seat. */
+  leader?: string;
   /** Plan 01f: the phase's `:GATE:` command — the expensive, live proof the
    * conductor runs itself after checks, probe and reviews pass, and before
    * acceptance. Undeclared on every phase that predates plan 01f. */
@@ -383,6 +395,10 @@ export interface RunPlanFile {
   /** Plan 06g: the plan's `#+TT_ROUNDS:` — how many rounds one phase may
    * spend. Absent means the default of 3. */
   rounds?: number;
+  /** Plan 06h (A1): the plan's `#+TT_REVIEWERS:`. Absent means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A1): the plan's `#+TT_LEADER:`. Absent means the first seat. */
+  leader?: string;
   /** Plan 01c: the Org file this JSON plan was parsed from, recorded by Emacs
    * so `tt lint` can name the file the owner edited rather than its temporary
    * JSON copy. Never read by the conductor. */
@@ -726,6 +742,8 @@ export function amendContractVersion(contract: PhaseContract, acceptance: string
         gate: contract.gate,
         gateCleanup: contract.gateCleanup,
         finalChecks: contract.finalChecks,
+        seats: contract.seats,
+        leader: contract.leader,
       }),
     )
     .digest("hex");
@@ -765,15 +783,18 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     // contract, so the FSM, the prompts and the views all read one value.
     ...(workersOf(phase) > 1 ? { workers: workersOf(phase) } : {}),
     ...(typeof phase.rounds === "number" && phase.rounds > 0 ? { roundsAllowed: Math.floor(phase.rounds) } : {}),
+    // Plan 06h (A2): the seats and the leader are frozen too, so every
+    // reader has ONE source of the seat list (`seatsOf`).
+    ...(phase.seats && phase.seats.length > 0 ? { seats: [...phase.seats] } : {}),
+    ...(typeof phase.leader === "string" && phase.leader.length > 0 ? { leader: phase.leader } : {}),
   };
 }
 
-/** Plan 06g: the number of lanes one round runs. `#+TT_WORKERS` when the plan
- * declares it, 1 otherwise — and 1 is today's single-candidate loop, which
- * records no round event at all. */
+/** Plan 06g/06h: the number of lanes one round runs. `#+TT_WORKERS` when the
+ * plan declares it, 1 otherwise — and 1 is today's single-candidate loop,
+ * which records no round event at all. */
 export function workersOf(phase: Pick<RunPlanPhase, "workers">): number {
-  const n = phase.workers;
-  return typeof n === "number" && Number.isFinite(n) && n >= 2 ? Math.floor(n) : 1;
+  return workerCountOf(phase);
 }
 
 export function initialState(
@@ -781,8 +802,19 @@ export function initialState(
   phase: RunPlanPhase,
   integrationHead: string,
   programDirectives: RunPlanDirectiveSeed[] = [],
+  /** Plan 06h (A1): the seats the init event recorded, so a run replays with
+   * its own seats even if the plan changed. Absent (an old log) means the
+   * plan's own seats, and `M A B` when it declares none. */
+  initSeats?: Seats,
 ): State {
-  const contract = buildContract(phase);
+  const built = buildContract(phase);
+  const contract: PhaseContract = initSeats
+    ? {
+        ...built,
+        ...(initSeats.seats.length > 0 ? { seats: [...initSeats.seats] } : {}),
+        ...(initSeats.leader.length > 0 ? { leader: initSeats.leader } : {}),
+      }
+    : built;
   const phaseState: PhaseState = {
     runId,
     phaseId: phase.id,
@@ -958,16 +990,18 @@ export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?
   const initRecord = records.find((r) => r.kind === "init");
   let runId: string;
   let integrationHead: string;
+  let initSeats: Seats | undefined;
   if (initRecord) {
-    const init = initRecord.event as { runId: string; integrationHead: string };
+    const init = initRecord.event as { runId: string; integrationHead: string; seats?: Seats };
     runId = init.runId;
     integrationHead = init.integrationHead;
+    initSeats = init.seats;
   } else {
     runId = randomUUID().slice(0, 8);
     integrationHead = currentHead(plan.repo, plan.integrationBranch);
   }
   return foldEvents(
-    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? []),
+    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? [], initSeats),
     records,
     opts.lenient === true,
   );
@@ -1025,8 +1059,8 @@ export function restartInstants(records: readonly LogRecord[]): string[] {
 }
 
 function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
-  const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string } | undefined;
-  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
+  const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string; seats?: Seats } | undefined;
+  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
   const restarts = restartInstants(records);
@@ -1173,6 +1207,8 @@ interface AgentHandle {
   laneCoverage?: unknown;
   /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
   pickSeat?: string;
+  /** Plan 06h (A3): true when this pick turn is the top-two revote. */
+  pickRevote?: boolean;
   /** Plan 06g2: the (round, lane, candidate, seat) a lane review records its
    * `submit_review` against. */
   laneReview?: { round: number; lane: string; sha: string; seat: string };
@@ -1491,19 +1527,29 @@ export class Conductor {
     const { records } = readLog(this.#paths.events);
     const initRecord = records.find((r) => r.kind === "init");
     if (initRecord) {
-      const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string };
+      const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string; seats?: Seats };
       const mine = runnerRevision();
       if (init.runnerRevision && init.runnerRevision !== mine && process.env.TT_ALLOW_RUNNER_MISMATCH !== "1") {
         throw new RunnerMismatchError(
           `run was started under runner ${init.runnerRevision}; this conductor is ${mine} — refusing to resume (reinstall that runner, or start a new run)`,
         );
       }
-      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? []);
+      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? [], init.seats);
     } else {
       const head = currentHead(this.#plan.repo, this.#integrationBranch);
       const runId = randomUUID().slice(0, 8);
-      this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision() });
-      this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
+      // Plan 06h (A1): the init event records the run's EFFECTIVE seats (a
+      // phase's own `:REVIEWERS:`/`:LEADER:` wins over the plan's), so a
+      // later replay uses its own seats even after the plan changes. An old
+      // log with none recorded means M, A and B.
+      const phase0 = this.#plan.phases[0];
+      const effectiveSeats = seatsRecordOf({
+        seats: phase0.seats && phase0.seats.length > 0 ? phase0.seats : this.#plan.seats,
+        leader: phase0.leader ?? this.#plan.leader,
+        workers: phase0.workers ?? this.#plan.workers,
+      });
+      this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision(), seats: effectiveSeats });
+      this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats);
     }
     this.#state = foldEvents(this.#state, records);
     // Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
@@ -1937,7 +1983,7 @@ export class Conductor {
       return;
     }
 
-    if (key === "review_M" || key === "review_A" || key === "review_B") {
+    if (key.startsWith("review_")) {
       const reviewer = key.slice("review_".length) as Reviewer;
       const pgid = payload.pgid as number | undefined;
       if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
@@ -2385,7 +2431,7 @@ export class Conductor {
     const out: Array<{ target: string; agentId: string; agent: PiAgent }> = [];
     for (const h of this.#agents.values()) {
       if (h.agent.exited) continue;
-      const target = h.role === "worker" ? "worker" : (h.agentId.match(/^reviewer-([MAB])-/)?.[1] ?? h.agentId);
+      const target = h.role === "worker" ? "worker" : (h.agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] ?? h.agentId);
       out.push({ target, agentId: h.agentId, agent: h.agent });
     }
     return out;
@@ -3501,8 +3547,9 @@ export class Conductor {
         // not invent one.
         const blockerId = action.blockerId as string;
         const panel = this.#state.phase.panel?.blockers?.[blockerId];
-        if (!panel || panel.decided || !panelSeatsSettled(panel)) return;
-        const outcome = panelOutcome(panel);
+        const panelCount = this.#laneSeats().length;
+        if (!panel || panel.decided || !panelSeatsSettled(panel, panelCount)) return;
+        const outcome = panelOutcome(panel, panelCount);
         const blockReasons = Object.values(panel.seats ?? {})
           .filter((s) => s.vote === "block" && s.reason)
           .map((s) => s.reason as string);
@@ -3511,7 +3558,7 @@ export class Conductor {
           blockerId,
           outcome,
           ...(blockReasons.length > 0 ? { reason: blockReasons.join("; ") } : {}),
-          ...(outcome === "escalate" ? { options: panelOptionsFor(panel) } : {}),
+          ...(outcome === "escalate" ? { options: panelOptionsFor(panel, panelCount) } : {}),
         });
         return;
       }
@@ -4054,7 +4101,7 @@ export class Conductor {
       const candidate = roundRecord.candidates.find((c) => c.lane === lane);
       if (!candidate?.sha) return { ok: false, reason: `submit_pick_vote names lane ${lane}, which submitted no candidate of round ${round}` };
       if (candidate.ok !== true) return { ok: false, reason: `submit_pick_vote names lane ${lane}, whose candidate did not pass its checks` };
-      this.#applyEvent({ type: "PICK_VOTE", round, seat, lane, why });
+      this.#applyEvent({ type: "PICK_VOTE", round, seat, lane, why, ...(handle.pickRevote ? { revote: true } : {}) });
       handle.doneResolve();
       return { ok: true };
     }
@@ -4667,7 +4714,7 @@ export class Conductor {
   // -- work packet 2a: real reviewer discovery/ballots/findings -----------
 
   #reviewerFromAgentId(agentId: string): Reviewer {
-    return (agentId.match(/^reviewer-([MAB])-/)?.[1] as Reviewer | undefined) ?? "M";
+    return (agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] as Reviewer | undefined) ?? this.#laneSeats()[0] ?? "M";
   }
 
   /** design §3.3's second decision source: a reviewer's turn-1
@@ -5348,7 +5395,7 @@ export class Conductor {
    * this runs). Undefined until all three are present. */
   #threeReviewsWith(review: Review): Review[] | undefined {
     const list: Review[] = [];
-    for (const who of ["M", "A", "B"] as const) {
+    for (const who of seatsOf(this.#state.phase.contract)) {
       const r = who === review.reviewer ? review : this.#state.phase.reviews[who]?.review;
       if (!r || r.candidateSha !== review.candidateSha) return undefined;
       list.push(r);
@@ -5376,7 +5423,7 @@ export class Conductor {
         const s = (r.resolutionStatements ?? []).find((x) => x.messageId === id);
         if (s?.status === "resolved") resolved += 1;
       }
-      if (resolved < 2) continue;
+      if (resolved < panelMajority(reviews.length)) continue;
       const evidence = reviews
         .flatMap((r) => (r.resolutionStatements ?? []).filter((s) => s.messageId === id && s.status === "resolved"))
         .map((s) => s.evidence)
@@ -5925,7 +5972,7 @@ export class Conductor {
     const phase = this.#state.phase;
     const C = phase.candidate?.sha;
     if (!C) return undefined;
-    const reviewed = (["M", "A", "B"] as const).some((w) => phase.reviews[w]?.review?.candidateSha === C);
+    const reviewed = seatsOf(phase.contract).some((w) => phase.reviews[w]?.review?.candidateSha === C);
     const checksFailed = phase.checks?.candidateSha === C && phase.checks.passed === false;
     const probeFailed = phase.probe?.candidateSha === C && phase.probe.passed === false;
     if (!reviewed && !checksFailed && !probeFailed) return undefined;
@@ -6101,7 +6148,7 @@ export class Conductor {
 
   /** The per-item majority across the three reviews. */
   #itemOutcomes(): ItemOutcome[] {
-    const reviews = (["M", "A", "B"] as const).map((seat) => {
+    const reviews = seatsOf(this.#state.phase.contract).map((seat) => {
       const r = this.#state.phase.reviews[seat]?.review;
       return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
     });
@@ -6465,6 +6512,7 @@ export class Conductor {
     laneRound?: number;
     laneReview?: { round: number; lane: string; sha: string; seat: string };
     pickSeat?: string;
+    pickRevote?: boolean;
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -6536,6 +6584,7 @@ export class Conductor {
       ...(opts.laneRound !== undefined ? { laneRound: opts.laneRound } : {}),
       ...(opts.laneReview ? { laneReview: opts.laneReview } : {}),
       ...(opts.pickSeat !== undefined ? { pickSeat: opts.pickSeat } : {}),
+      ...(opts.pickRevote ? { pickRevote: true } : {}),
     };
     this.#agents.set(opts.agentId, handle);
     // Plan 06g2: record the lane agent's own process group, so a crashed
@@ -7000,11 +7049,12 @@ export class Conductor {
     base: string,
     seat: string,
     passing: ReadonlyArray<{ lane: string; sha: string }>,
+    revote = false,
   ): Promise<void> {
-    const actionId = this.#log.actionId(`pick_${round}_${seat}`);
-    this.#log.intent(actionId, { round, seat, lanes: passing.map((c) => c.lane) });
-    const agentId = `pick-${round}-${seat}-${actionId}`;
-    const leader = seat === (this.#laneSeats()[0] ?? "M");
+    const actionId = this.#log.actionId(`${revote ? "revote" : "pick"}_${round}_${seat}`);
+    this.#log.intent(actionId, { round, seat, lanes: passing.map((c) => c.lane), ...(revote ? { revote: true } : {}) });
+    const agentId = `${revote ? "revote" : "pick"}-${round}-${seat}-${actionId}`;
+    const leader = seat === this.#laneLeader();
     const otherDiffs: Record<string, string> = {};
     if (leader) {
       for (const c of passing) {
@@ -7027,6 +7077,7 @@ export class Conductor {
       earlierRounds: this.#laneEarlierRoundLines(round),
       otherDiffs,
       seats: this.#laneSeats(),
+      ...(revote ? { revote: true } : {}),
     });
     const candidateDir = path.join(this.#paths.candidates, passing[0]?.sha ?? base);
     const handle = this.#spawnLaneAgent({
@@ -7041,6 +7092,7 @@ export class Conductor {
       laneRound: round,
       seat,
       pickSeat: seat,
+      ...(revote ? { pickRevote: true } : {}),
     });
     try {
       const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
@@ -7069,10 +7121,16 @@ export class Conductor {
     }
   }
 
-  /** The seats that review and vote: M, A and B (the fixed seats of this plan
-   * version; 06h makes them configurable). */
+  /** Plan 06h (A2): the seats that review and vote, from the frozen
+   * contract's `#+TT_REVIEWERS` (default `M A B`). */
   #laneSeats(): string[] {
-    return ["M", "A", "B"];
+    return seatsOf(this.#state.phase.contract);
+  }
+
+  /** Plan 06h (A2): the leader seat, from the frozen contract's
+   * `#+TT_LEADER` (default the first seat). */
+  #laneLeader(): string {
+    return leaderOf(this.#state.phase.contract);
   }
 
   /** The settled ledger, one line per record — the leader seat's pick
@@ -7113,6 +7171,7 @@ export class Conductor {
       phaseId: this.#state.phase.phaseId,
       goal: this.#state.phase.contract.goal,
       seats: this.#laneSeats(),
+      leader: this.#laneLeader(),
       rounds: () => this.#state.phase.rounds ?? [],
       ledger: () => this.#laneLedgerLines(),
       earlierRounds: () => this.#laneEarlierRoundLines(round),
@@ -7132,7 +7191,7 @@ export class Conductor {
       },
       checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
       reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
-      pickTurn: (r, at, seat, passing) => this.#runPickTurn(r, at, seat, passing),
+      pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
       emit: (event) => this.#applyEvent(event),
     };
     const outcome = await runRound(host, { round, base, lanes });
@@ -7656,7 +7715,7 @@ export class Conductor {
     const roundLines = lanesView(this.#state.phase);
     fs.writeFileSync(
       this.#paths.loop,
-      redactText(renderPhaseChart(undefined, { stats, models, ...(roundLines.length > 0 ? { roundLines } : {}) }), this.#secretMaskable),
+      redactText(renderPhaseChart(undefined, { stats, models, seats: this.#laneSeats(), ...(roundLines.length > 0 ? { roundLines } : {}) }), this.#secretMaskable),
     );
     // Plan 05h: the same beat keeps the loop tape (`views/tape.txt`) current.
     // `buildView` already built it from this beat's one log snapshot, so it
@@ -10951,15 +11010,16 @@ export class Conductor {
   #decideRoundPanel(): void {
     const phase = this.#state.phase;
     const round = phase.panel?.round;
-    if (!round || round.decided || !roundPanelSeatsSettled(round)) return;
+    const panelCount = this.#laneSeats().length;
+    if (!round || round.decided || !roundPanelSeatsSettled(round, panelCount)) return;
     const items = roundPanelItemsNeedingVote(phase);
     if (items.length === 0) return;
     const decisions = items.map((messageId) => {
       const m = (phase.messages ?? []).find((x) => x.id === messageId)!;
       const kind = m.type === "finding" ? "finding" : "tradeoff";
-      const outcome = roundPanelOutcomeFor(round, messageId, kind);
-      const reasons = ["1", "2", "3"]
-        .map((n) => ({ n, vote: round.seats?.[n]?.votes?.find((v) => v.messageId === messageId) }))
+      const outcome = roundPanelOutcomeFor(round, messageId, kind, panelCount);
+      const reasons = panelSeatNumbers(panelCount)
+        .map((n) => ({ n: String(n), vote: round.seats?.[String(n)]?.votes?.find((v) => v.messageId === messageId) }))
         .filter((x): x is { n: string; vote: NonNullable<typeof x.vote> } => x.vote !== undefined)
         .map((x) => `seat ${x.n}: ${x.vote.reason}`);
       return { messageId, outcome, reason: reasons.join("; ") };
@@ -11016,7 +11076,7 @@ export class Conductor {
   #barrierComplete(candidate: string): boolean {
     const b = this.#barrierFor(candidate);
     const phase = this.#state.phase;
-    return (["M", "A", "B"] as const).every((w) => b.arrived.has(w) || phase.reviews[w]?.review?.candidateSha === candidate);
+    return seatsOf(phase.contract).every((w) => b.arrived.has(w) || phase.reviews[w]?.review?.candidateSha === candidate);
   }
 
   #arriveAtDiscoveryBarrier(reviewer: Reviewer, candidate: string): void {
@@ -11871,6 +11931,9 @@ export interface PickPromptInput {
   otherDiffs?: Readonly<Record<string, string>>;
   /** The seats that vote (the configured reviewer seats). */
   seats: readonly string[];
+  /** Plan 06h (A3): true for the top-two revote turn, where the leader's
+   * vote breaks a tie. */
+  revote?: boolean;
 }
 
 /** Plan 06g (A4): the pick turn's prompt. Each seat votes for one candidate
@@ -11908,7 +11971,9 @@ export function buildPickPrompt(input: PickPromptInput): string {
   lines.push(
     "",
     `Vote for exactly one candidate of round ${input.round}, by lane, with a one-line why. The candidates are checked one after the other and only a passing candidate can win.`,
-    `Seats voting: ${input.seats.join(", ")}. A candidate needs a strict majority (${Math.floor(input.seats.length / 2) + 1} of ${input.seats.length}); with a single passing candidate the vote is skipped and it wins.`,
+    input.revote
+      ? `This is the REVOTE between the top two. Seats voting: ${input.seats.join(", ")}. The seats other than the leader need a strict majority; a tie among them is broken by the leader's vote.`
+      : `Seats voting: ${input.seats.join(", ")}. A candidate needs a strict majority (${Math.floor(input.seats.length / 2) + 1} of ${input.seats.length}); with a single passing candidate the vote is skipped and it wins.`,
     "Your vote counts once, exactly like every other seat's.",
     "Cast it with submit_pick_vote: { round, seat, lane, why }.",
   );

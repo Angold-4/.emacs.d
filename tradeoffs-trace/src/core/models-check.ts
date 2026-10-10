@@ -27,18 +27,19 @@ export interface ModelTarget {
  * order. A role or seat with no model is omitted, exactly as the status
  * `models` line omits it. The seat expansion mirrors `view.ts`'s
  * `modelEntries`: per-seat maps when present, else the shared role. */
-export function planModelTargets(models: PlanModels | undefined): ModelTarget[] {
+export function planModelTargets(models: PlanModels | undefined, seats?: readonly string[]): ModelTarget[] {
   if (!models) return [];
-  const select = planModelSelector({ models });
+  const perSeat = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
+  const configured = seats && seats.length > 0 ? seats : perSeat ? Object.keys(models.reviewerSeats!) : [];
+  const select = planModelSelector({ models }, configured.length > 0 ? configured : undefined);
   const out: ModelTarget[] = [];
   const push = (role: string, m: RoleModel | undefined): void => {
     if (!m?.model) return;
     out.push({ role, ...(m.provider ? { provider: m.provider } : {}), model: m.model });
   };
   push("worker", models.worker);
-  const reviewerSeats = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
-  if (reviewerSeats) {
-    for (const seat of ["M", "A", "B"] as const) push(`reviewer.${seat}`, select("reviewer", seat));
+  if (perSeat) {
+    for (const seat of configured) push(`reviewer.${seat}`, select("reviewer", seat));
   } else {
     push("reviewer", models.reviewer);
   }
@@ -46,9 +47,12 @@ export function planModelTargets(models: PlanModels | undefined): ModelTarget[] 
   // Plan 05j: the curator runs on the evaluator's model unless the plan names
   // its own; either way it is a model this run will use.
   if (models.curator) push("curator", models.curator);
-  const panelSeats = models.panelFrom === "reviewers" || (models.panelSeats ? Object.keys(models.panelSeats).length > 0 : false);
-  if (panelSeats) {
-    for (const seat of ["1", "2", "3"] as const) push(`panel.${seat}`, select("panel", seat));
+  const panelSeatKeys = models.panelSeats ? Object.keys(models.panelSeats) : [];
+  if (panelSeatKeys.length > 0) {
+    for (const seat of panelSeatKeys) push(`panel.${seat}`, select("panel", seat));
+  } else if (models.panelFrom === "reviewers") {
+    const list = configured.length > 0 ? configured : ["M", "A", "B"];
+    for (let i = 1; i <= list.length; i++) push(`panel.${i}`, select("panel", String(i)));
   } else {
     push("panel", models.panel);
   }

@@ -21,6 +21,7 @@ import {
   resolveTestVerifies,
   reviewItemsIssues,
   reverify,
+  tallyItem,
   tallyItems,
   testOutcomeIn,
   verdictIssues,
@@ -395,6 +396,17 @@ test("items: a Rust test verify keeps its module path and resolves from cargo te
   // The full path matches exactly, never a prefix or a tail.
   assert.equal(testOutcomeIn(output, "acceptance::mark_s11_04_long_name"), "missing");
   assert.equal(testOutcomeIn(output, "mark_s11_01_quiet"), "missing");
+});
+
+test("plan 06h: an item needs a strict majority of the configured seats, not a fixed two", () => {
+  const item = { id: "R1", kind: "requirement" as const, title: "R1", text: "R1", verify: [] };
+  const v = (seat: string, verdict: "met" | "unmet"): SeatItemVerdict => ({ seat, verdict, evidence: "src/a.ts:1" });
+  // Two of five is not a majority: the three unmet verdicts decide.
+  assert.equal(tallyItem(item, [v("M", "met"), v("A", "met"), v("B", "unmet"), v("C", "unmet"), v("D", "unmet")], 3).outcome, "unmet");
+  // Three of five is.
+  assert.equal(tallyItem(item, [v("M", "met"), v("A", "met"), v("B", "met"), v("C", "unmet"), v("D", "unmet")], 3).outcome, "met");
+  // The default (3 verdicts) keeps the 06g two-of-three rule.
+  assert.equal(tallyItem(item, [v("M", "met"), v("A", "met"), v("B", "unmet")]).outcome, "met");
 });
 
 test("items: architecture symbols come from declarations and PascalCase code spans, never from prose", () => {

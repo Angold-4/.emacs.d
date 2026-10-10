@@ -226,6 +226,18 @@ function parseCount(keyword: { value: string; line: number } | undefined): numbe
   return Number.isFinite(n) ? n : Number.NaN;
 }
 
+/** Plan 06h (A1): `#+TT_REVIEWERS:` — the whitespace/comma separated seat
+ * list, kept exactly as written (the linter refuses an even or duplicate
+ * list). */
+function parseSeats(keyword: { value: string; line: number } | undefined): Pick<LintPlanInput, "seats" | "seatsLine"> {
+  if (!keyword) return {};
+  const seats = keyword.value
+    .split(/[ \t,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return { seats, seatsLine: keyword.line };
+}
+
 function parseModels(keyword: { value: string; line: number } | undefined): Pick<LintPlanInput, "models" | "modelsLine" | "modelsRepeated"> {
   if (!keyword) return {};
   const models: LintModels = {};
@@ -276,6 +288,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const envFile = first("TT_ENV_FILE")?.value;
   const workers = first("TT_WORKERS");
   const rounds = first("TT_ROUNDS");
+  const leader = first("TT_LEADER");
   const workersValue = parseCount(workers);
   const roundsValue = parseCount(rounds);
   return {
@@ -283,9 +296,11 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(envFile && envFile.trim().length > 0 ? { envFile: envFile.trim() } : {}),
     phases,
     ...parseModels(first("TT_MODELS")),
+    ...parseSeats(first("TT_REVIEWERS")),
     ...(rerun ? { rerun: rerun.value, rerunLine: rerun.line } : {}),
     ...(workersValue !== undefined ? { workers: workersValue, workersLine: workers!.line } : {}),
     ...(roundsValue !== undefined ? { rounds: roundsValue, roundsLine: rounds!.line } : {}),
+    ...(leader ? { leader: leader.value.trim(), leaderLine: leader.line } : {}),
   };
 }
 

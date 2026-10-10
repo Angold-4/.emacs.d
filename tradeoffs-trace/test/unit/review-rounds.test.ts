@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 import { accept, decisionStatus, isLiveDecision } from "../../src/core/predicate.ts";
 import { reduce } from "../../src/core/reduce.ts";
-import { carryDecisionsForward } from "../../src/core/rounds.ts";
+import { carryBallotsForward, carryDecisionsForward } from "../../src/core/rounds.ts";
 import { launchArgs } from "../../src/core/roles.ts";
 import type { Decision, Event, PriorDecisionStatement, State } from "../../src/core/types.ts";
 import { approvingReview, baseState, CV, makeBallot, makeDecision } from "./helpers.ts";
@@ -208,4 +208,25 @@ test("carried ballots: a kept decision that passed keeps its ballots in the next
   const reviews = { M: { review: approvingReview("M", "C2", K) }, A: { review: approvingReview("A", "C2", K) }, B: { review: approvingReview("B", "C2", K) } };
   assert.equal(decisionStatus(byId.get("D-pass")!, { ...s.phase, reviews }).status, "passed", "carried ballots pass it with no new vote");
   assert.equal(decisionStatus(byId.get("D-pass")!, { ...phase, reviews }).reason, "M veto", "M's fresh reject overrides its carried approve");
+});
+
+test("plan 06h: a carried-forward re-tally uses the configured leader's veto", () => {
+  const seats = ["M", "A", "B", "C", "D"];
+  const decision = makeDecision({ id: "D-pass", source: "worker" });
+  // M, A, C and D approve; the named leader B rejects. Under `#+TT_LEADER: B`
+  // the vote fails, so the kept decision's ballots must NOT carry forward.
+  const ballots = [
+    makeBallot({ decisionId: "D-pass", reviewer: "M", vote: "approve" }),
+    makeBallot({ decisionId: "D-pass", reviewer: "A", vote: "approve" }),
+    makeBallot({ decisionId: "D-pass", reviewer: "B", vote: "reject" }),
+    makeBallot({ decisionId: "D-pass", reviewer: "C", vote: "approve" }),
+    makeBallot({ decisionId: "D-pass", reviewer: "D", vote: "approve" }),
+  ];
+  const prior: PriorDecisionStatement[] = [{ id: "D-pass", status: "kept" }];
+  const carried = carryDecisionsForward([decision], prior, "C2");
+  const carry = (leader: string) =>
+    carryBallotsForward([decision], ballots, [], prior, "C1", K, carried, "C2", seats, leader);
+  assert.deepEqual(carry("B"), [], "the named leader's reject fails the re-tally, so no ballots carry");
+  // The first seat as leader would pass it: the leader is what decides.
+  assert.equal(carry("M").length, 5, "under leader M the same ballots pass and all five carry");
 });

@@ -78,8 +78,12 @@ const PANEL_SEAT_REVIEWER: Record<string, ReviewerSeat> = { "1": "M", "2": "A", 
  * and Pi uses its `defaultModel`. */
 export function planModelSelector(
   plan: { models?: PlanModels },
+  /** Plan 06h: the configured reviewer seats, so `panel=reviewers` maps panel
+   * seat i to reviewer i for any N (default `M A B`). */
+  reviewerSeats?: readonly string[],
 ): (role: Role, seat?: ReviewerSeat | PanelSeat | string | number) => RoleModel | undefined {
   const models = plan.models;
+  const seats = reviewerSeats && reviewerSeats.length > 0 ? reviewerSeats : ["M", "A", "B"];
   const select = (role: Role, seat?: ReviewerSeat | PanelSeat | string | number): RoleModel | undefined => {
     if (!models) return undefined;
     if (role === "reviewer") {
@@ -115,7 +119,7 @@ export function planModelSelector(
         const own = models.panelSeats?.[String(seat)];
         if (own) return own;
         if (models.panelFrom === "reviewers") {
-          const from = PANEL_SEAT_REVIEWER[String(seat)];
+          const from = seats[Number(seat) - 1] ?? PANEL_SEAT_REVIEWER[String(seat)];
           const inherited = from ? select("reviewer", from) : undefined;
           if (inherited) return inherited;
         }

@@ -632,14 +632,71 @@ gateway policy — but `tt models check` exits non-zero for it. A plan with no
 `#+TT_MODELS` probes nothing.
 
 `tt lint` rejects, at the keyword's file and line: an unknown role
-(`foo=…`), an unknown seat (`reviewer.X`, `panel.4`), a key named twice, a key
-with an empty model, and `panel=reviewers` together with an explicit
-`panel.N`.
+(`foo=…`), a key named twice, a key with an empty model, and
+`panel=reviewers` together with an explicit `panel.N`. A seat or lane key
+must name a configured seat or lane: `reviewer.<seat>` must be one of the
+seats `#+TT_REVIEWERS` declares, `panel.<i>` must be one of the reviewers'
+positions (there is one panel seat per reviewer), and `worker.<i>` must be one
+of the `#+TT_WORKERS` lanes.
 
 With `#+TT_WORKERS`, a lane may also name its own worker model: `worker.1` is
-lane `a` and `worker.2` is lane `b`, each falling back to `worker` when it is
-not given. `tt lint` names a lane other than 1 or 2 as unknown (this plan
-version runs one or two lanes; 06h makes the count adjustable).
+lane `a`, `worker.2` is lane `b`, and so on, each falling back to `worker`
+when it is not given. `tt lint` names a lane the plan does not declare as
+unknown, and lists the lanes it does declare.
+
+## Seats, the leader and the lane count (`#+TT_REVIEWERS`, `#+TT_LEADER`)
+
+06h removes the fixed `M`, `A`, `B` and the two-lane limit. A plan declares
+its own seats and its leader:
+
+```org
+#+TT_REVIEWERS: M A B C D
+#+TT_LEADER: B
+#+TT_WORKERS: 5
+#+TT_ROUNDS: 3
+```
+
+- `#+TT_REVIEWERS` is an **odd** list of seat names (default `M A B`). Each
+  seat reviews and votes; the count is the number of reviews per candidate
+  and the number of pick votes in a round.
+- `#+TT_LEADER` names the seat whose approval a decision needs and whose vote
+  breaks a revote tie (default: the first seat).
+- `#+TT_WORKERS` is any positive whole number of lanes (default 1).
+- `#+TT_ROUNDS` is the round budget, a whole number from 1 to 5 (default 3).
+
+**The reviewers must outnumber the lanes.** The seat count must be odd and
+greater than the worker count: 1 or 2 workers need at least 3 reviewers, 3 or
+4 need at least 5, and 5 or 6 need at least 7. `tt lint` refuses a plan that
+breaks the rule and names the smallest valid reviewer count. It also refuses
+an even or empty seat list, a duplicate seat, an unknown leader, a
+non-positive lane count, a `#+TT_ROUNDS` outside 1–5, and a model key that
+names no configured seat or lane — each with the keyword's file and line.
+
+A plan that names neither `#+TT_REVIEWERS` nor `#+TT_LEADER` keeps the fixed
+`M`, `A`, `B` led by `M`, and every 06g test is unchanged.
+
+### A three-lane, five-seat example (3 × 5)
+
+```org
+#+TT_REVIEWERS: M A B C D
+#+TT_LEADER: M
+#+TT_WORKERS: 3
+```
+
+One round runs three lanes (`C1-a`, `C1-b`, `C1-c`). Each of the five seats
+reviews every passing candidate — 3 × 5 = 15 reviews — then each seat casts
+one pick vote (five votes). A candidate needs a strict majority of the five
+seats: **three** votes. If the first vote splits 2-2-1 with no strict
+majority, the top two go to **one revote**; the four non-leader seats vote
+again, and a tie among them is broken by the leader's vote. A single passing
+candidate still wins without a vote. `pickWinner` in `src/core/rounds.ts` is
+the only place the winner is decided, and the leader's tiebreak is code, not a
+model.
+
+The **owner's 06 configuration** is exactly this: `#+TT_REVIEWERS: M A B C D`,
+`#+TT_LEADER: M`, `#+TT_WORKERS: 3`, `#+TT_ROUNDS: 3`. The blocker and round
+panels have as many seats as there are reviewers, and `panel=reviewers` maps
+panel seat *i* to reviewer *i*.
 
 ## Several lanes per round (`#+TT_WORKERS`)
 
@@ -669,12 +726,12 @@ A plan can run more than one implementation lane per round:
 > `#+TT_MODELS` may give each lane its own worker model: `worker.1` is lane `a`
 > and `worker.2` is lane `b`, each falling back to `worker`.
 
-`#+TT_WORKERS: 2` makes one round start from **one** version (round 1: the
-integration branch head) and run two lanes. Each lane gets its own worktree,
+`#+TT_WORKERS: K` makes one round start from **one** version (round 1: the
+integration branch head) and run K lanes. Each lane gets its own worktree,
 its own worker and its own sweep, on the same prompt; a phase's own
-`:WORKERS:`/`:ROUNDS:` property overrides the plan's keyword. This plan
-version runs **1 or 2** lanes — `tt lint` refuses `#+TT_WORKERS: 3` and names
-06h, the phase that makes the lane count adjustable.
+`:WORKERS:`/`:ROUNDS:` property overrides the plan's keyword. Any positive
+whole number of lanes is allowed (06h removed the two-lane limit), provided
+the reviewer count is odd and greater than K (see above).
 
 What one round does, in order:
 
@@ -682,12 +739,14 @@ What one round does, in order:
    candidate (`C2-a`, `C2-b`);
 2. the candidates are checked **one after the other** under the machine-wide
    lock — checks never run concurrently on one machine;
-3. M, A and B review every candidate that passed its checks (two passing
-   candidates are six reviews);
+3. every configured seat reviews every candidate that passed its checks (K
+   passing candidates are N × K reviews, N the seat count);
 4. each seat casts one pick vote with a one-line why, and the candidate with a
-   strict majority of the seats (2 of 3) wins. A single passing candidate wins
-   without a vote; a round where no candidate passes repeats from the same
-   base, carrying both lanes' failures.
+   strict majority of the seats (3 of 5, 4 of 7, …) wins. With three or more
+   candidates and no strict majority, the top two by votes go to **one
+   revote**, and the leader's vote breaks a tie in the revote. A single
+   passing candidate wins without a vote; a round where no candidate passes
+   repeats from the same base, carrying every lane's failures.
 
 The winner is decided by `pickWinner` in code (`src/core/rounds.ts`), never by
 a model. Acceptance is then the rule in force applied to the winner **alone**;
@@ -699,12 +758,13 @@ recorded and the phase is the single-candidate loop it was before.
 
 ### The round budget and carried items
 
-A phase may spend **3 rounds** by default; `#+TT_ROUNDS` sets another number.
-One round is **one pass of the repair budget**, so `#+TT_ROUNDS: 3` allows the
-first round plus two repairs — matching ODP-1's "accepted within 3 rounds" —
-and with two lanes that is up to six candidates. `roundBudget()` is the single
-source of that number and the FSM's repair allowance is `roundBudget - 1`. A
-round costs one attempt of the repair budget, whatever the number of lanes.
+A phase may spend **3 rounds** by default; `#+TT_ROUNDS` sets another number
+from 1 to 5. One round is **one pass of the repair budget**, so
+`#+TT_ROUNDS: 3` allows the first round plus two repairs — matching ODP-1's
+"accepted within 3 rounds" — and with K lanes that is up to 3 × K candidates.
+`roundBudget()` is the single source of that number and the FSM's repair
+allowance is `roundBudget - 1`. A round costs one attempt of the repair
+budget, whatever the number of lanes.
 
 From round 2, a finding blocks acceptance only when it either
 

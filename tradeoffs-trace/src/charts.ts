@@ -77,7 +77,8 @@ export interface ChartModels {
   reviewer?: string;
   evaluator?: string;
   panel?: string;
-  reviewerSeats?: Partial<Record<"M" | "A" | "B", string>>;
+  /** Plan 06h: keyed by seat name, so any `#+TT_REVIEWERS` list works. */
+  reviewerSeats?: Record<string, string | undefined>;
   panelSeats?: Partial<Record<string, string>>;
 }
 type ModelRole = "worker" | "reviewer" | "evaluator" | "panel";
@@ -138,7 +139,7 @@ function edgeLine(row: TransitionRow, triggerWidth: number, toWidth: number, gua
  * readable; the run-axis rows get their own small section. */
 export function renderPhaseChart(
   rows: readonly TransitionRow[] = TRANSITIONS,
-  opts: { stats?: ChartStats; model?: string; models?: ChartModels; now?: Date; roundLines?: readonly string[] } = {},
+  opts: { stats?: ChartStats; model?: string; models?: ChartModels; now?: Date; roundLines?: readonly string[]; seats?: readonly string[] } = {},
 ): string {
   const stats = opts.stats ?? { entries: {}, timeMs: {} };
   const fallback = opts.model && opts.model.length > 0 ? opts.model : "default";
@@ -200,13 +201,14 @@ export function renderPhaseChart(
         // the point of three seats. When every seat resolves to the same
         // model (a plan that only sets the four flat roles), the box keeps
         // its single per-role line, exactly as before per-seat models.
-        const reviewerSeat = (seat: "M" | "A" | "B") => opts.models?.reviewerSeats?.[seat] ?? modelFor("reviewer");
+        const reviewerSeat = (seat: string) => opts.models?.reviewerSeats?.[seat] ?? modelFor("reviewer");
         const panelSeat = (seat: string) => opts.models?.panelSeats?.[seat] ?? modelFor("panel");
         if (state === "REVIEWING") {
-          const seats = (["M", "A", "B"] as const).map((s) => [s, reviewerSeat(s)] as const);
+          // Plan 06h (A2): every configured seat, never a fixed three.
+          const seats = (opts.seats ?? ["M", "A", "B"]).map((s) => [s, reviewerSeat(s)] as const);
           bits.push(
             seats.every(([, m]) => m === seats[0][1])
-              ? `${dispatch.roles} - model ${seats[0][1]}`
+              ? `${seats.map(([s]) => s).join(", ")} - model ${seats[0][1]}`
               : seats.map(([s, m]) => `${s} ${m}`).join(" · "),
           );
         } else if (state === "EVALUATING") {
@@ -284,7 +286,8 @@ export interface LoopTapePhase {
   attempt: { n: number; interrupted?: boolean };
   repairRoundsUsed: number;
   repairRoundsGranted: number;
-  contract: { gate?: string };
+  /** Plan 06h (A2): the frozen seats, so the tape names every one. */
+  contract: { gate?: string; seats?: readonly string[] };
   blockedReason?: string;
   ownerRequests?: Array<{ origin?: string; status?: string; linkedMessageId?: string }>;
 }
@@ -412,12 +415,12 @@ function tapeSeat(models: ChartModels | undefined, role: "reviewer" | "panel", s
 
 /** Who is on the current step, and on which model, matching the chart's own
  * per-seat resolution. Only the three dispatching steps name anyone. */
-function tapeWorking(step: string, models: ChartModels | undefined): string | undefined {
+function tapeWorking(step: string, models: ChartModels | undefined, seatsOfRound: readonly string[] = ["M", "A", "B"]): string | undefined {
   if (step === "IMPLEMENT") return `worker · ${tapeModel(models, "worker")}`;
   if (step === "REVIEW") {
-    const seats = (["M", "A", "B"] as const).map((s) => [s, tapeSeat(models, "reviewer", s)] as const);
+    const seats = seatsOfRound.map((s) => [s, tapeSeat(models, "reviewer", s)] as const);
     return seats.every(([, m]) => m === seats[0][1])
-      ? `M·A·B · ${seats[0][1]}`
+      ? `${seats.map(([s]) => s).join("·")} · ${seats[0][1]}`
       : seats.map(([s, m]) => `${s} ${m}`).join(" · ");
   }
   if (step === "EVALUATE") {
@@ -503,7 +506,7 @@ export function buildLoopTape(input: LoopTapeInput): { header: string; rows: Loo
       time,
       // Off the path nobody is on the step any more: the arrow names the
       // reason instead of a model.
-      annotation: mark === "▶" && !offPath ? tapeWorking(s.name, input.models) : undefined,
+      annotation: mark === "▶" && !offPath ? tapeWorking(s.name, input.models, input.phase.contract.seats) : undefined,
       arrow: k === ci ? arrow : undefined,
     };
   });

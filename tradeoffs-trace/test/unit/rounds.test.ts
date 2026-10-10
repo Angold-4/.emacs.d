@@ -20,6 +20,7 @@ import {
   openAdvisories,
   passingCandidates,
   pickWinner,
+  revotePair,
   roundBudget,
 } from "../../src/core/rounds.ts";
 import type { Finding, RoundRecord } from "../../src/core/types.ts";
@@ -254,6 +255,93 @@ test("plan 06g: a round event for a round that never started is rejected, so a s
   const badLane = reduce(started.state, { type: "CANDIDATE_SUBMITTED", round: 1, lane: "c", sha: "C1" });
   assert.equal(badLane.ok, false);
   assert.match(badLane.ok ? "" : badLane.reason, /not a lane of round 1/);
+});
+
+test("plan 06h: three lanes with five seats splitting 2-2-1 go to one revote between the top two", () => {
+  const seats = ["M", "A", "B", "C", "D"];
+  const split = round({
+    lanes: ["a", "b", "c"],
+    candidates: [
+      { lane: "a", sha: "C1a", ok: true },
+      { lane: "b", sha: "C1b", ok: true },
+      { lane: "c", sha: "C1c", ok: true },
+    ],
+    votes: [
+      { seat: "M", lane: "a", why: "x" },
+      { seat: "A", lane: "a", why: "x" },
+      { seat: "B", lane: "b", why: "y" },
+      { seat: "C", lane: "b", why: "y" },
+      { seat: "D", lane: "c", why: "z" },
+    ],
+  });
+  // 2-2-1: no lane has a strict majority (3 of 5), so the top two revote.
+  assert.equal(pickWinner(split, seats, "M"), undefined, "no first-round winner");
+  assert.deepEqual(revotePair(split, seats), ["a", "b"]);
+
+  // The revote: the four non-leader seats split 2-2; the leader's vote breaks
+  // the tie for lane b.
+  const revoted: RoundRecord = {
+    ...split,
+    revote: {
+      lanes: ["a", "b"],
+      votes: [
+        { seat: "M", lane: "b", why: "b is simpler" },
+        { seat: "A", lane: "a", why: "a is smaller" },
+        { seat: "B", lane: "b", why: "b keeps the lock short" },
+        { seat: "C", lane: "a", why: "a names the edge path" },
+        { seat: "D", lane: "b", why: "b is simpler" },
+      ],
+    },
+  };
+  assert.deepEqual(pickWinner(revoted, seats, "M"), { lane: "b", sha: "C1b", votes: 2 });
+
+  // A revote with a strict majority among the non-leader seats needs no
+  // tiebreak: 3-1 for lane a wins even though the leader voted b.
+  const majority: RoundRecord = {
+    ...split,
+    revote: {
+      lanes: ["a", "b"],
+      votes: [
+        { seat: "M", lane: "b", why: "b" },
+        { seat: "A", lane: "a", why: "a" },
+        { seat: "B", lane: "a", why: "a" },
+        { seat: "C", lane: "a", why: "a" },
+        { seat: "D", lane: "b", why: "b" },
+      ],
+    },
+  };
+  assert.deepEqual(pickWinner(majority, seats, "M"), { lane: "a", sha: "C1a", votes: 3 });
+});
+
+test("plan 06h: a five-seat strict majority is three, and two is not enough", () => {
+  const seats = ["M", "A", "B", "C", "D"];
+  const r = round({
+    lanes: ["a", "b"],
+    candidates: [
+      { lane: "a", sha: "C1a", ok: true },
+      { lane: "b", sha: "C1b", ok: true },
+    ],
+    votes: [
+      { seat: "M", lane: "a", why: "x" },
+      { seat: "A", lane: "a", why: "x" },
+      { seat: "B", lane: "b", why: "y" },
+      { seat: "C", lane: "b", why: "y" },
+      { seat: "D", lane: "a", why: "x" },
+    ],
+  });
+  assert.deepEqual(pickWinner(r, seats, "M"), { lane: "a", sha: "C1a", votes: 3 });
+
+  const two = round({
+    ...r,
+    votes: [
+      { seat: "M", lane: "a", why: "x" },
+      { seat: "A", lane: "a", why: "x" },
+      { seat: "B", lane: "b", why: "y" },
+      { seat: "C", lane: "b", why: "y" },
+      { seat: "D", lane: "b", why: "y" },
+    ],
+  });
+  assert.deepEqual(pickWinner(two, seats, "M"), { lane: "b", sha: "C1b", votes: 3 }, "b took three");
 });
 
 test("plan 06g: openAdvisories lists exactly the carried items — open, advisory findings", () => {

@@ -451,12 +451,12 @@ function modelsCheckOptions(): { command: string; argsPrefix: string[]; timeoutM
 
 /** The distinct configured models of a plan (empty when it declares none). */
 async function runPlanModelsCheck(plan: RunPlanFile): Promise<ModelsCheck> {
-  return runModelsCheck(distinctModelGroups(planModelTargets(plan.models)), modelsCheckOptions());
+  return runModelsCheck(distinctModelGroups(planModelTargets(plan.models, plan.seats)), modelsCheckOptions());
 }
 
 /** The distinct configured models across every entry of a program. */
 async function runProgramModelsCheck(program: ProgramFile): Promise<ModelsCheck> {
-  return runModelsCheck(distinctModelGroups(program.entries.flatMap((e) => planModelTargets(e.plan.models))), modelsCheckOptions());
+  return runModelsCheck(distinctModelGroups(program.entries.flatMap((e) => planModelTargets(e.plan.models, e.plan.seats))), modelsCheckOptions());
 }
 
 /** Write the check's record next to the run/program it belongs to. */
@@ -878,7 +878,7 @@ async function runConductorProcess(runDir: string): Promise<void> {
   // the one place a run's Conductor is built. `testPiInjection` above still
   // supplies the fake-pi command for a test-launched run; the two do not
   // interact (one picks the binary, the other the model flags).
-  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan), deadlines, stubReviews, briefs: true });
+  const conductor = new Conductor({ runDir, plan, piCommand, piArgsPrefix, providerModelFor: planModelSelector(plan, plan.seats), deadlines, stubReviews, briefs: true });
   const cleanStop = () =>
     void conductor.stop().then(() => {
       writeFileSync(stoppedMarker, new Date().toISOString());

@@ -17,6 +17,7 @@
 // acceptance list (each `review`, or `evidence` for an item that starts
 // `evidence:`) and `C1` from `:RESERVED:`. No existing plan changes meaning.
 
+import { seatsOf } from "./seats.ts";
 import type { Reviewer } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -79,6 +80,9 @@ export interface PhaseItemInput {
   architecture?: ArchitectureItem[];
   requirements?: RequirementItem[];
   constraints?: ConstraintItem[];
+  /** Plan 06h (A2): the reviewer seats, so the per-item tally and the matrix
+   * show every configured seat. Absent means `M A B`. */
+  seats?: string[];
 }
 
 /** Plan 06b (OD-2 A1): the ONE place that decides whether a phase is
@@ -762,14 +766,17 @@ export interface ItemOutcome {
   evidence: string[];
 }
 
-/** Tally one item across the seats: a strict majority (2 of 3) decides. An
- * R or C is met when at least two seats say met; an A fits when at least two
- * say fits. Anything else that a majority says (unmet/partial for R and C,
- * deviates/unclear for A) is that outcome. */
-export function tallyItem(item: FlatItem, verdicts: readonly SeatItemVerdict[]): ItemOutcome {
+/** Tally one item across the seats: a strict majority of the SEAT COUNT
+ * decides (2 of 3, 3 of 5, 4 of 7). An R or C is met when a strict majority
+ * say met; an A fits when a strict majority say fits. Anything else that a
+ * majority says (unmet/partial for R and C, deviates/unclear for A) is that
+ * outcome. `needed` is the strict majority of the configured seat count;
+ * absent, it falls back to a strict majority of the verdicts actually cast. */
+export function tallyItem(item: FlatItem, verdicts: readonly SeatItemVerdict[], needed?: number): ItemOutcome {
   const seats = [...verdicts].sort((a, b) => a.seat.localeCompare(b.seat));
   const count = (v: string) => seats.filter((s) => s.verdict === v).length;
-  const majority = (v: string) => count(v) >= 2;
+  const required = needed ?? Math.floor(seats.length / 2) + 1;
+  const majority = (v: string) => count(v) >= required;
   const evidenceFor = (v: string) => seats.filter((s) => s.verdict === v).map((s) => `${s.seat}: ${s.evidence}`);
   let outcome: ItemOutcome["outcome"] = "incomplete";
   if (item.kind === "architecture") {
@@ -806,6 +813,9 @@ export function tallyItems(
   overturns: readonly Overturn[] = [],
 ): ItemOutcome[] {
   const bySeat = new Map(overturns.map((o) => [`${o.seat}:${o.id}`, o]));
+  // Plan 06h (A2): a strict majority of the configured seat count, not a
+  // fixed two. `reviews` carries one entry per configured seat.
+  const needed = Math.floor(reviews.length / 2) + 1;
   return flatItems(items).map((item) => {
     const verdicts: SeatItemVerdict[] = [];
     for (const review of reviews) {
@@ -827,7 +837,7 @@ export function tallyItems(
         effective.push(v);
       }
     }
-    return tallyItem(item, effective);
+    return tallyItem(item, effective, needed);
   });
 }
 
@@ -871,7 +881,7 @@ export interface ItemLoopState {
 /** Tally every item of a phase from its recorded reviews, with the
  * evaluator's overturns applied. */
 export function phaseItemOutcomes(phase: ItemLoopState): ItemOutcome[] {
-  const reviews = (["M", "A", "B"] as const).map((seat) => {
+  const reviews = seatsOf(phase.contract).map((seat) => {
     const r = phase.reviews?.[seat]?.review;
     return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
   });
@@ -890,12 +900,13 @@ export function matrixMarkdown(phase: ItemLoopState): string[] {
   const items = itemsFromPhase(phase.contract);
   if (flatItems(items).length === 0) return [];
   const outcomes = phaseItemOutcomes(phase);
-  const rows = itemMatrix(items, outcomes, phase.coverage, phase.checkResolution ?? []);
+  const seats = seatsOf(phase.contract);
+  const rows = itemMatrix(items, outcomes, phase.coverage, phase.checkResolution ?? [], seats);
   // Plan 06b (OD-1 R7): every cell links to the item's evidence file, in
   // `tt summary` as in the review buffer.
   return [
-    "| item | worker | check | M | A | B |",
-    "| --- | --- | --- | --- | --- | --- |",
+    `| item | worker | check | ${seats.join(" | ")} |`,
+    `| --- | --- | --- | ${seats.map(() => "---").join(" | ")} |`,
     ...rows.map((r) => {
       const cell = (t: string) => `[${t.replace(/\s+/g, " ").trim()}](items/${r.id}.org)`;
       return `| ${[`${r.id} ${r.title}`, ...r.cells.map((c) => c.text)].map(cell).join(" | ")} |`;
@@ -910,10 +921,11 @@ export function matrixOrg(phase: ItemLoopState): string[] {
   const items = itemsFromPhase(phase.contract);
   if (flatItems(items).length === 0) return [];
   const outcomes = phaseItemOutcomes(phase);
-  const rows = itemMatrix(items, outcomes, phase.coverage, phase.checkResolution ?? []);
+  const seats = seatsOf(phase.contract);
+  const rows = itemMatrix(items, outcomes, phase.coverage, phase.checkResolution ?? [], seats);
   return [
-    "| item | worker | check | M | A | B |",
-    "|------+--------+-------+---+---+---|",
+    `| item | worker | check | ${seats.join(" | ")} |`,
+    `|------+--------+-------+${seats.map(() => "---").join("+")}|`,
     ...rows.map(
       (r) =>
         `| [[items/${r.id}.org][${r.id} ${r.title.replace(/\s+/g, " ").trim()}]] | ${r.cells.map((c) => c.text).join(" | ")} |`,
@@ -950,9 +962,9 @@ export function itemEvidenceFiles(phase: ItemLoopState): Array<{ id: string; con
 }
 
 /** Per-seat overturn counts, in seat order (only seats with a count). */
-export function overturnCounts(overturns: readonly Overturn[]): Array<{ seat: Reviewer; count: number }> {
+export function overturnCounts(overturns: readonly Overturn[], seats: readonly string[] = ["M", "A", "B"]): Array<{ seat: Reviewer; count: number }> {
   const out: Array<{ seat: Reviewer; count: number }> = [];
-  for (const seat of ["M", "A", "B"] as const) {
+  for (const seat of seats) {
     const count = overturns.filter((o) => o.seat === seat).length;
     if (count > 0) out.push({ seat, count });
   }
@@ -993,6 +1005,7 @@ export function itemMatrix(
   outcomes: readonly ItemOutcome[],
   coverage: Coverage | undefined,
   resolutions: readonly VerifyResolution[],
+  seats: readonly string[] = ["M", "A", "B"],
 ): MatrixRow[] {
   const byId = new Map(outcomes.map((o) => [o.item.id, o]));
   return flatItems(items).map((item) => {
@@ -1010,7 +1023,7 @@ export function itemMatrix(
       by: "check",
       text: tests.length === 0 ? "—" : tests.every((t) => t.outcome === "passed") ? "pass" : tests.map((t) => `${t.name}: ${t.outcome}`).join("; "),
     });
-    for (const seat of ["M", "A", "B"] as const) {
+    for (const seat of seats) {
       const v = outcome?.seats.find((s) => s.seat === seat);
       cells.push({ by: seat, text: v ? v.verdict : "—", ...(v ? { evidence: v.evidence } : {}) });
     }

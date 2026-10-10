@@ -53,6 +53,41 @@ test("panel rules: a majority block escalates, a majority downgrade downgrades, 
   );
 });
 
+test("plan 06h: a five-seat panel needs three votes, and the reducer validates against the configured count", () => {
+  const seat = (vote: "block" | "downgrade") => ({ dispatches: 1, vote, reason: "because" });
+  // Three downgrades of five decide; two do not.
+  assert.equal(
+    panelOutcome({ seats: { "1": seat("downgrade"), "2": seat("downgrade"), "3": seat("downgrade"), "4": seat("block"), "5": seat("block") } }, 5),
+    "downgrade",
+  );
+  assert.equal(
+    panelOutcome({ seats: { "1": seat("block"), "2": seat("block"), "3": seat("downgrade"), "4": seat("downgrade"), "5": { dispatches: 2, unavailable: true } } }, 5),
+    "incomplete",
+  );
+  // The reducer's PANEL_DECIDED check uses the configured count, so a 2-2-1
+  // five-seat panel is 'incomplete' — not a 2-of-3 'escalate'.
+  const contract = { ...basePhase().contract, seats: ["M", "A", "B", "C", "D"], leader: "M" };
+  const state = baseState({
+    phase: "EVALUATING",
+    contract,
+    panel: {
+      blockers: {
+        "B-1": {
+          seats: {
+            "1": seat("block"),
+            "2": seat("block"),
+            "3": seat("downgrade"),
+            "4": seat("downgrade"),
+            "5": { dispatches: 2, unavailable: true },
+          },
+        },
+      },
+    },
+  });
+  const result = reduce(state, { type: "PANEL_DECIDED", blockerId: "B-1", outcome: "escalate" });
+  assert.equal(result.ok, false, "the reducer refuses an outcome the configured count does not imply");
+});
+
 test("panel rules: a seat is settled by a vote, or unavailable after its one retry", () => {
   assert.equal(panelSeatSettled({ dispatches: 1 }), false, "dispatched but silent is not settled");
   assert.equal(panelSeatSettled({ dispatches: 1, unavailable: true }), false, "a first loss is still re-dispatchable");

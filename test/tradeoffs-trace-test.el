@@ -3378,6 +3378,33 @@ own :WORKERS:/:ROUNDS: property overrides the plan's keyword."
     (should (= (alist-get 'workers (aref (alist-get 'phases plan) 0)) 2))
     (should (= (alist-get 'rounds (aref (alist-get 'phases plan) 0)) 4))))
 
+(ert-deftest tradeoffs-trace-plan-seats ()
+  "Plan 06h (A1): #+TT_REVIEWERS and #+TT_LEADER reach the plan JSON, a
+ phase's own :REVIEWERS:/:LEADER: overrides them, and the plan-level seats
+ and their line are recorded for `tt lint'."
+  (let* ((text (concat "#+TT_REVIEWERS: M A B C D\n#+TT_LEADER: B\n" +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (append (alist-get 'seats plan) nil) '("M" "A" "B" "C" "D")))
+    (should (= (alist-get 'seatsLine plan) 1))
+    (should (equal (alist-get 'leader plan) "B"))
+    (should (= (alist-get 'leaderLine plan) 2))
+    ;; Every phase inherits the plan's seats and leader.
+    (should (equal (append (alist-get 'seats (aref (alist-get 'phases plan) 0)) nil) '("M" "A" "B" "C" "D")))
+    (should (equal (alist-get 'leader (aref (alist-get 'phases plan) 0)) "B")))
+  ;; A plan that names neither carries no seats/leader, so the runtime keeps
+  ;; the fixed M A B led by M.
+  (let* ((plan (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+    (should-not (assq 'seats plan))
+    (should-not (assq 'leader plan))
+    (should-not (assq 'seats (aref (alist-get 'phases plan) 0))))
+  ;; A phase's own properties win over the plan's keywords.
+  (let* ((text (replace-regexp-in-string
+                ":END:" "  :REVIEWERS: M A B C D E\n  :LEADER:    C\n  :END:"
+                +tt-test--valid-plan :fixedcase))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (append (alist-get 'seats (aref (alist-get 'phases plan) 0)) nil) '("M" "A" "B" "C" "D" "E")))
+    (should (equal (alist-get 'leader (aref (alist-get 'phases plan) 0)) "C"))))
+
 (ert-deftest tradeoffs-trace-review-buffer-rounds ()
   "Plan 06g (A5): the review buffer groups the round's candidates, with the
 pick votes and the winner — both lanes, not only the accepted one. The
@@ -3429,6 +3456,68 @@ heading for a votable message."
               (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
                 (should-error (+tt-review-open-message)))
               (should-not opened))))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-review-buffer-five-seats ()
+  "Plan 06h (R6): the review buffer shows every configured seat's review and
+ every lane of a four-lane, five-seat round — not only M, A and B, and not
+ only the accepted candidate."
+  (let* ((dir (make-temp-file "tt-ert-review-five-seats" t))
+         (rounds (concat "* Rounds\n"
+                         "\n"
+                         "** Round 1 from bbbbbbb\n"
+                         "\n"
+                         "*** C1-a (lane a) — checks passed, picked\n"
+                         "\n"
+                         "    1111111111111111111111111111111111111111\n"
+                         "\n"
+                         "    reviews: 5\n"
+                         "      - A: no findings\n"
+                         "      - B: no findings\n"
+                         "      - C: no findings\n"
+                         "      - D: no findings\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "*** C1-d (lane d) — checks passed\n"
+                         "\n"
+                         "    4444444444444444444444444444444444444444\n"
+                         "\n"
+                         "    reviews: 5\n"
+                         "      - A: no findings\n"
+                         "      - B: no findings\n"
+                         "      - C: no findings\n"
+                         "      - D: no findings\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "Votes:\n"
+                         "  - M → C1-a: M picks\n"
+                         "  - A → C1-a: A picks\n"
+                         "  - B → C1-a: B picks\n"
+                         "  - C → C1-d: C picks\n"
+                         "  - D → C1-d: D picks\n"
+                         "\n"
+                         "Winner: C1-a (1111111, 3 votes)\n")))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views/messages" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert (concat +tt-test--review-org "\n" rounds)))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              ;; Four lanes, each candidate with all five seats' reviews.
+              (should (string-search "*** C1-a (lane a) — checks passed, picked" (buffer-string)))
+              (should (string-search "*** C1-d (lane d) — checks passed" (buffer-string)))
+              (should (= 2 (how-many "    reviews: 5")))
+              (should (string-search "- D: no findings" (buffer-string)))
+              ;; The five seats' votes and the winner are shown.
+              (should (string-search "- C → C1-d: C picks" (buffer-string)))
+              (should (string-search "- D → C1-d: D picks" (buffer-string)))
+              (should (string-search "Winner: C1-a (1111111, 3 votes)" (buffer-string))))))
       (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
       (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
       (delete-directory dir t))))

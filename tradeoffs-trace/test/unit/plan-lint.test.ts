@@ -389,6 +389,21 @@ test("plan 06g: tt lint reads worker.1/worker.2 as lane models and names any oth
   assert.match(empty!.problem, /empty model/);
 });
 
+test("plan 06h: tt lint refuses an invalid phase :REVIEWERS:/:LEADER: override with a line", () => {
+  // An even phase seat list, a duplicate and an unknown phase leader.
+  const even = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B", "C"], line: 12 }]));
+  assert.ok(even.some((f) => f.rule === "reviewer-seat" && /phase :REVIEWERS:/.test(f.problem) && f.line === 12));
+  const dupe = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B", "A"], line: 13 }]));
+  assert.ok(dupe.some((f) => f.rule === "reviewer-seat" && /more than once/.test(f.problem) && f.line === 13));
+  const leader = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B"], leader: "X", line: 14 }]));
+  assert.ok(leader.some((f) => f.rule === "reviewer-leader" && /not one of the reviewer seats/.test(f.problem) && f.line === 14));
+  // Too few phase reviewers for the effective worker count, naming the smallest.
+  const few = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B"], line: 15 }], "/x/PLAN.org") );
+  assert.deepEqual(few.filter((f) => f.rule === "worker-count"), [], "3 reviewers with the default 1 worker is fine");
+  const fewWorkers = lintPlan({ ...plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B"], line: 15 }]), workers: 3, workersLine: 2 });
+  assert.ok(fewWorkers.some((f) => f.rule === "worker-count" && /at least 5 reviewers/.test(f.problem)));
+});
+
 test("plan 06g: #+TT_ROUNDS must be a positive whole number, and 3 is the default", () => {
   const base = plan([{ id: "p", acceptance: ["it works"] }]);
   assert.deepEqual(lintPlan({ ...base, rounds: 5, roundsLine: 4 }).filter((f) => f.rule === "worker-count"), []);

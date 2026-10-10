@@ -57,6 +57,12 @@ export interface PlanPhase {
   /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before it
    * parks on the owner. Absent means the default of 3. */
   rounds?: number;
+  /** Plan 06h (A1): `#+TT_REVIEWERS:` — the odd list of reviewer seats.
+   * Absent means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A1): `#+TT_LEADER:` — the seat whose approval and tie-break
+   * vote decide. Absent means the first seat. */
+  leader?: string;
   /** Plan 06b: the structured items of a phase subtree (ref
    * refs/06_ref_plan_format.md). Absent on an old-format plan, where
    * `acceptance`/`reserved` are the only items. */
@@ -69,6 +75,15 @@ export interface Plan {
   title: string;
   checks: string[]; // TT_CHECKS
   phases: PlanPhase[];
+}
+
+/** Plan 06h (A1): the run's seat configuration, recorded in the init event so
+ * a run replays with its own seats even after the plan changes. An old log
+ * that records none means `M`, `A` and `B`, led by `M`. */
+export interface Seats {
+  seats: string[];
+  leader: string;
+  workers: number;
 }
 
 /** The frozen contract a phase is evaluated against: one phase of one plan snapshot. */
@@ -90,6 +105,12 @@ export interface PhaseContract {
   /** Plan 06g: `#+TT_ROUNDS:` frozen into the contract, or undefined for the
    * default (3). `roundBudget()` reads this; nothing else decides the budget. */
   roundsAllowed?: number;
+  /** Plan 06h (A1/A2): the frozen reviewer seats. `seatsOf(contract)` is the
+   * only source of the seat list; every place that used to hard-code M, A and
+   * B reads it. Absent on an old contract means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A2): the frozen leader. Absent means the first seat. */
+  leader?: string;
   /** Plan 06b: the structured items of the frozen contract. The FSM,
    * prompts, checks, verdicts and acceptance all read these; absent on an
    * old-format phase, where `itemsFromPhase` synthesizes R1..Rn from
@@ -240,7 +261,9 @@ export interface PriorDecisionStatement {
 export type FindingKind = "defect" | "contract" | "integration";
 export type FindingSeverity = "blocking" | "advisory";
 export type FindingStatus = "open" | "repaired" | "disproved" | "accepted" | "superseded";
-export type Reviewer = "M" | "A" | "B";
+/** Plan 06h: a seat is any name `#+TT_REVIEWERS` declares. The default is
+ * still `M`, `A` and `B`, but nothing in the code may assume that set. */
+export type Reviewer = string;
 
 export interface Finding {
   id: string;
@@ -1009,9 +1032,7 @@ export type InFlightKey =
   | "freeze"
   | "run_checks"
   | "dispatch_probe"
-  | "review_M"
-  | "review_A"
-  | "review_B"
+  | `review_${string}`
   | "dispatch_evaluation_tradeoff"
   | "dispatch_evaluation_finding"
   | "dispatch_evaluation_blocker"
@@ -1033,7 +1054,9 @@ export interface PhaseState {
   candidate?: CandidateRef; // set once FREEZING completes
   checks?: ChecksResult;
   probe?: ProbeResult;
-  reviews: { M?: ReviewSlot; A?: ReviewSlot; B?: ReviewSlot };
+  /** Plan 06h: keyed by seat name, so any `#+TT_REVIEWERS` list works. An
+   * old state/fixture with `M`/`A`/`B` keeps working unchanged. */
+  reviews: Record<string, ReviewSlot>;
   decisions: Decision[];
   findings: Finding[];
   ownerRequests: OwnerRequest[];
@@ -1233,6 +1256,13 @@ export interface PickVote {
   why: string;
 }
 
+/** Plan 06h (A3): the one revote a 3+-candidate round runs when no lane has
+ * a strict majority. `lanes` are the top two by first-round votes. */
+export interface RoundRevote {
+  lanes: string[];
+  votes: PickVote[];
+}
+
 /** One round of a phase: the base it started from, its lanes, their
  * candidates, the pick turn's votes and the winner. Reduced from the
  * ROUND_STARTED / CANDIDATE_SUBMITTED / CANDIDATE_CHECKED / PICK_VOTE /
@@ -1243,6 +1273,9 @@ export interface RoundRecord {
   lanes: string[];
   candidates: LaneCandidateRecord[];
   votes: PickVote[];
+  /** Plan 06h (A3): present only when 3+ candidates split with no strict
+   * majority and the top two went to a revote. */
+  revote?: RoundRevote;
   picked?: { lane: string; sha: string; votes: number };
 }
 
@@ -2251,6 +2284,16 @@ export interface EvPickVote {
   seat: string;
   lane: string;
   why: string;
+  /** Plan 06h (A3): true when this vote is in the top-two revote rather than
+   * the first pick turn. Absent means the first turn (old logs unchanged). */
+  revote?: boolean;
+}
+
+/** Plan 06h (A3): the top two lanes go to one revote. Record-only. */
+export interface EvRevoteStarted {
+  type: "REVOTE_STARTED";
+  round: number;
+  lanes: string[];
 }
 
 /** The round's winner, decided by core/rounds.ts's `pickWinner` (never by a
@@ -2284,6 +2327,7 @@ export type Event =
   | EvCandidateSubmitted
   | EvCandidateChecked
   | EvPickVote
+  | EvRevoteStarted
   | EvCandidatePicked
   | EvRoundReviewSubmitted
   | EvItemCarried
