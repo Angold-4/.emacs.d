@@ -30,6 +30,7 @@ import {
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { seatsOf } from "./seats.ts";
+import { findOwnerRequest } from "./triage.ts";
 import { rowsFor } from "./transitions.ts";
 import type {
   BindingTuple,
@@ -1243,7 +1244,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // unstick it — the blocking finding on this candidate. The metric
       // lives in `unneededRequestIds`, so the owner can still grant/stop/
       // repair the request afterwards.
-      const request = p.ownerRequests.find((r) => r.id === event.requestId);
+      const request = findOwnerRequest(p, event.requestId);
       if (!request) return rejected(state, `unknown owner request ${event.requestId}`);
       if (request.status !== "open") {
         return rejected(state, `owner request ${event.requestId} is already ${request.status}, not open`);

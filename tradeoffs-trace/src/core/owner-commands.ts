@@ -8,6 +8,7 @@
 import { checkBinding, checkTupleBinding } from "./binding.ts";
 import { applyMessageEvent } from "./messages.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "./owner-requests.ts";
+import { findOwnerRequest, ownerRequestIsStale } from "./triage.ts";
 import type { BindingTuple, ContractVersion, Event, Message, PhaseState } from "./types.ts";
 
 export interface CommandCheck {
@@ -62,7 +63,7 @@ export function autoResolveLinkedRequest(
 type EvOwnerRequestResolved = Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
 
 export function checkOwnerRequestResolved(phase: PhaseState, event: EvOwnerRequestResolved): CommandCheck {
-  const request = phase.ownerRequests.find((r) => r.id === event.requestId);
+  const request = findOwnerRequest(phase, event.requestId);
   if (!request) return { ok: false, reason: `unknown owner request ${event.requestId}` };
   if (request.status !== "open") {
     return { ok: false, reason: `owner request ${event.requestId} is already ${request.status}, not open` };
@@ -87,9 +88,9 @@ export function checkOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
 }
 
 export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerRequestResolved): PhaseState {
-  const request = phase.ownerRequests.find((r) => r.id === event.requestId)!;
+  const request = findOwnerRequest(phase, event.requestId)!;
   const ownerRequests = phase.ownerRequests.map((r) =>
-    r.id === event.requestId
+    r === request
       ? {
           ...r,
           status: "resolved" as const,
@@ -390,9 +391,13 @@ export function applyOverrideCast(phase: PhaseState, event: EvOverrideCast): Pha
 export type AwaitingOwnerTarget = "AWAITING_OWNER" | "REPAIRING" | "RESOLVING";
 
 export function awaitingOwnerTarget(phase: PhaseState): AwaitingOwnerTarget {
+  // The owner's "accept with carried items" for this candidate answers every
+  // open request, as accept() does; an open correction still needs its round.
+  const carried = Boolean(phase.acceptedWithCarried && phase.candidate && phase.carriedCandidateSha === phase.candidate.sha);
   // Plan 06i: a non-blocking request (a late discovery's escalation) does not
-  // park the phase.
-  if (phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false)) return "AWAITING_OWNER";
+  // park the phase, and neither does a stale one (its item is closed or
+  // superseded): the park agrees with accept(), which ignores both.
+  if (!carried && phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) return "AWAITING_OWNER";
   if (phase.corrections.some((c) => c.status === "open")) return "REPAIRING";
   if (phase.candidate) return "RESOLVING";
   return "AWAITING_OWNER";

@@ -39,7 +39,28 @@ export function escalationRequestId(phase: PhaseState, itemId: string): string {
   const existing = (phase.ownerRequests ?? []).find(
     (r) => r.status === "open" && (r.linkedFindingId === itemId || r.linkedDecisionId === itemId),
   );
-  return existing?.id ?? `OR-${phase.phaseId}-triage-${itemId}`;
+  return existing?.id ?? uniqueOwnerRequestId(phase, `OR-${phase.phaseId}-triage-${itemId}`);
+}
+
+/** An owner request id no request in the phase has used yet: `base`, or
+ * `base-2`, `base-3`, ... A record escalated again in a later round (its first
+ * request already resolved) gets a NEW id, so a command naming an id always
+ * names exactly one request (valuation 02g: three requests shared one id, the
+ * resolve found the resolved copy and the open copy parked the phase for good). */
+export function uniqueOwnerRequestId(phase: PhaseState, base: string): string {
+  const taken = new Set((phase.ownerRequests ?? []).map((r) => r.id));
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${base}-${n}`)) n += 1;
+  return `${base}-${n}`;
+}
+
+/** The request a command or event names. Logs written before ids were unique
+ * can hold several requests with one id; the open one is the one the owner can
+ * still answer, so it wins, then the latest. */
+export function findOwnerRequest<R extends { id: string; status: string }>(phase: { ownerRequests: R[] }, id: string): R | undefined {
+  const same = (phase.ownerRequests ?? []).filter((r) => r.id === id);
+  return same.find((r) => r.status === "open") ?? same[same.length - 1];
 }
 
 /** What a record's impact on the work is. `wrong-output` covers a wrong

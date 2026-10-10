@@ -29,6 +29,7 @@ import {
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
+import { findOwnerRequest } from "./triage.ts";
 import {
   accept,
   blockerWithOutcome,
@@ -1769,7 +1770,7 @@ const itemCarried = checkAndApply(checkItemCarried, applyItemCarried);
 
 function resolvedRequestFor(s: State, ev: Event): PhaseState["ownerRequests"][number] | undefined {
   const e = ev as Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
-  return s.phase.ownerRequests.find((r) => r.id === e.requestId);
+  return findOwnerRequest(s.phase, e.requestId);
 }
 
 // OWNER_REQUEST_RESOLVED: the plain repair-budget gate request routes on
