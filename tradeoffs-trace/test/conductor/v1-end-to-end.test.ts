@@ -40,7 +40,9 @@ const FAST = {
   helloTimeoutMs: 30_000,
   checkMs: 60_000,
   freezeMs: 60_000,
-  workerAttemptMs: 120_000,
+  // Above the round-two hold below (up to 300 s), so the held repair attempt
+  // cannot time out while the test's own steps are slow.
+  workerAttemptMs: 400_000,
   reviewMs: 120_000,
   probeMs: 60_000,
   evaluateMs: 120_000,
@@ -219,7 +221,9 @@ test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, 
             steps: [
               {
                 kind: "call-sh",
-                command: `i=0; while [ $i -lt 600 ]; do if [ -f '${releaseFile}' ]; then exit 0; fi; i=$((i+1)); sleep 0.1; done; exit 1`,
+                // Held for as long as the test itself may run: a hold that gave up after
+                // 60 s let round two finish before the owner's D on a slow CI suite.
+                command: `i=0; while [ $i -lt 3000 ]; do if [ -f '${releaseFile}' ]; then exit 0; fi; i=$((i+1)); sleep 0.1; done; exit 1`,
               },
               {
                 kind: "call-submit",
@@ -248,7 +252,14 @@ test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, 
     await assertProjections(setup);
 
     // --- state: EVALUATING, raw messages become published ---------------
-    await waitFor(() => setup.conductor.state.phase.phase === "EVALUATING", 90_000, 10, setup.runDir);
+    // EVALUATING can last well under a second on a fast host and be over while
+    // the projection check above runs; its recorded completion stays.
+    await waitFor(
+      () => setup.conductor.state.phase.phase === "EVALUATING" || eventTypes(setup).includes("EVALUATION_COMPLETED"),
+      90_000,
+      50,
+      setup.runDir,
+    );
     await waitFor(
       () => (setup.conductor.state.phase.messages ?? []).some((m) => m.type === "tradeoff" && m.state === "published"),
       60_000,

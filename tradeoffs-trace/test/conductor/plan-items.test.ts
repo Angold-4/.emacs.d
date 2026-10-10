@@ -884,9 +884,12 @@ test("plan 06b: tt evidence on an old-format phase is rejected", async () => {
     }),
   });
   try {
-    await setup.conductor.start();
+    // Queued before start, which reads the inbox once before driving: written
+    // after start, the phase could finish and the conductor stop before its
+    // first inbox poll (a fast CI runner did).
     fs.mkdirSync(`${setup.runDir}/inbox`, { recursive: true });
     fs.writeFileSync(`${setup.runDir}/inbox/evidence-1.json`, JSON.stringify({ type: "evidence", item: "R1", text: "x" }));
+    await setup.conductor.start();
     await waitFor(() => fs.existsSync(`${setup.runDir}/inbox/rejected/evidence-1.reason.txt`), 60_000, 50, setup.runDir);
     const reason = fs.readFileSync(`${setup.runDir}/inbox/rejected/evidence-1.reason.txt`, "utf8");
     assert.match(reason, /no structured items/);
