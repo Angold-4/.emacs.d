@@ -136,3 +136,10 @@ test("SIGKILLing the holder process releases the lock", async () => {
   assert.ok(lock, `lock should be acquirable again after the holder was SIGKILLed: ${lastErr}`);
   await lock!.release();
 });
+
+test("a machine-wide lock under a directory that does not exist yet creates it (a fresh CI runner's ~/.tradeoffs-trace)", async () => {
+  const lockPath = path.join(dir, "home", ".tradeoffs-trace", "check.lock");
+  const lock = await acquireWaitingLock(lockPath);
+  assert.ok(fs.existsSync(lockPath));
+  await lock.release();
+});

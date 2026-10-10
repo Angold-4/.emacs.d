@@ -25,6 +25,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 
 const PERL_BIN = "/usr/bin/perl";
 
@@ -136,6 +137,13 @@ export function acquireWaitingLock(lockPath: string): Promise<Lock> {
 }
 
 function spawnLockHelper(helperScript: string, lockPath: string): Promise<Lock> {
+  // A machine-wide lock lives under `~/.tradeoffs-trace/`, which a fresh
+  // machine (a CI runner) does not have yet; perl's open does not create it.
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  } catch {
+    // The helper's open reports the real failure.
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(PERL_BIN, ["-e", helperScript, lockPath], {
       stdio: ["pipe", "pipe", "pipe"],
