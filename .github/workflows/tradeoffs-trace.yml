@@ -2,6 +2,9 @@
 # and end-to-end tests drive the scripted fake pi (tradeoffs-trace/test/fake-pi), and
 # test/live/*.test.ts skip themselves without TT_LIVE=1. A clean runner is also the quiet
 # host the wall-clock tests need (they flake on a laptop that is building Rust).
+# macOS, because tradeoffs-trace targets macOS hosts: the process sweep uses `lsof +D`, macOS
+# process-group semantics and macOS-protected paths, and the role-tool-sets contract test spawns
+# the real pinned Pi (0.87.0, docs/tradeoffs-trace-runbook.md) without calling a model.
 name: tradeoffs-trace
 
 on:
@@ -16,30 +19,36 @@ concurrency:
 jobs:
   check:
     name: check (unit + ERT)
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "25"
-      - name: Install Emacs
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends emacs-nox
+      - name: Install Emacs and the pinned Pi
+        run: |
+          brew install emacs
+          npm install -g @earendil-works/pi-coding-agent@0.87.0
+          pi --version
       - name: Git identity for tests that commit
         run: git config --global user.name "tt-ci" && git config --global user.email "tt-ci@users.noreply.github.com"
       - run: make -C tradeoffs-trace check
 
   check-full:
     name: check-full (whole suite, conductor e2e with fake pi)
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "25"
-      - name: Install Emacs
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends emacs-nox
+      - name: Install Emacs and the pinned Pi
+        run: |
+          brew install emacs
+          npm install -g @earendil-works/pi-coding-agent@0.87.0
+          pi --version
       - name: Git identity for tests that commit
         run: git config --global user.name "tt-ci" && git config --global user.email "tt-ci@users.noreply.github.com"
       - run: make -C tradeoffs-trace check-full
