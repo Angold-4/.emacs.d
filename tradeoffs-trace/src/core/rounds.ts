@@ -262,6 +262,72 @@ export function votesFor(round: RoundRecord, lane: string): PickVote[] {
   return round.votes.filter((v) => v.lane === lane);
 }
 
+/** Plan 06k1 (A1): the votes that DECIDE the round: the revote's votes when
+ * one ran, else the first-turn votes. `pickWinner` decides on the same set, so
+ * the pick shape and the losing lane's anchors describe the deciding votes,
+ * never a superseded first turn (finding D-B-54). */
+export function decidingVotes(round: RoundRecord): PickVote[] {
+  return round.revote && round.revote.votes.length > 0 ? round.revote.votes : round.votes;
+}
+
+/** Plan 06k1 (A1): the round's pick shape, for `tt summary` and the status
+ * view. `split` is true when the seats did not all pick one lane (a round
+ * with a single passing candidate is neither split nor unanimous: it won
+ * without a vote). `loserHadSomething` is true when a MAJORITY of the seats
+ * that picked the WINNING lane said the lane they did not pick had something
+ * (finding A-9: a seat that picked a losing lane is talking about the winner,
+ * never the loser, so its yes must not count). `recorded` is false when any
+ * deciding vote predates `loserHad` — the views then show "not recorded". */
+export function pickStats(round: RoundRecord, seats: number | readonly string[]): {
+  split: boolean;
+  unanimous: boolean;
+  loserHadSomething: boolean;
+  recorded: boolean;
+  votes: number;
+} {
+  const votes = round.votes;
+  const deciding = decidingVotes(round);
+  const winner = round.picked?.lane;
+  const seatCount = typeof seats === "number" ? seats : seats.length;
+  const recorded = deciding.length > 0 && deciding.every((v) => v.loserHad !== undefined);
+  // Finding A-11: the shape describes the DECIDING votes — a three-way split
+  // whose revote is unanimous for one lane is unanimous, not split.
+  const byLane = new Map<string, number>();
+  for (const v of deciding) byLane.set(v.lane, (byLane.get(v.lane) ?? 0) + 1);
+  const distinct = byLane.size;
+  const split = distinct > 1;
+  const unanimous = deciding.length > 0 && distinct === 1;
+  const yes = deciding.filter((v) => v.lane === winner && v.loserHad?.yes === true).length;
+  const needed = Math.floor(seatCount / 2) + 1;
+  return { split, unanimous, loserHadSomething: yes >= needed, recorded, votes: votes.length };
+}
+
+/** Plan 06k1 (A1): the losing lane's anchors a majority of the WINNER-picking
+ * seats named. The next round's repair prompt carries them so both lanes can
+ * take the winner's strengths without losing what the loser had. Empty when
+ * no majority said the loser had something (or the vote predates `loserHad`). */
+export function loserAnchors(round: RoundRecord | undefined, seats: number | readonly string[]): string[] {
+  if (!round) return [];
+  const stats = pickStats(round, seats);
+  if (!stats.recorded || !stats.loserHadSomething) return [];
+  const winner = round.picked?.lane;
+  const out: string[] = [];
+  for (const v of decidingVotes(round)) {
+    if (v.lane !== winner || v.loserHad?.yes !== true) continue;
+    for (const anchor of v.loserHad.anchors) if (!out.includes(anchor)) out.push(anchor);
+  }
+  return out;
+}
+
+/** Plan 06k1 (A1): the losing lanes of a round (every passing lane that was
+ * not picked), in lane order. */
+export function losingLanes(round: RoundRecord): string[] {
+  const picked = round.picked?.lane;
+  return passingCandidates(round)
+    .filter((c) => c.lane !== picked)
+    .map((c) => c.lane);
+}
+
 /** What `blocksAcceptance` may look at besides the finding itself. The
  * conductor builds it from the contract and the round's own check records;
  * nothing here is model-supplied. */

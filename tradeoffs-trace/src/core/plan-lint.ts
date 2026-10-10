@@ -204,6 +204,12 @@ export interface LintPlanInput {
   rounds?: number;
   /** Lint-only: the 1-based line of `#+TT_ROUNDS:` in the source Org file. */
   roundsLine?: number;
+  /** Plan 06k1 (A3): the plan's `#+TT_VARIANT_LIMIT:` — how many consecutive
+   * rounds may each raise a new blocking finding of the same kind on one
+   * requirement before the owner is asked. Absent means the default of 3. */
+  variantLimit?: number;
+  /** Lint-only: the 1-based line of `#+TT_VARIANT_LIMIT:`. */
+  variantLimitLine?: number;
   /** Plan 06h (A1/A4): the plan's `#+TT_REVIEWERS:` — the odd list of
    * reviewer seats. Absent means `M A B`. The JSON field is `seats`, the
    * same one the conductor freezes into the contract. */

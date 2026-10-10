@@ -273,6 +273,69 @@ export function isEscalate(d: Disposition | undefined): d is Extract<Disposition
   return d?.kind === "escalate";
 }
 
+/** Plan 06k1 (A3): the default number of consecutive rounds the same
+ * requirement may take a new blocking finding of the same kind before the
+ * owner is asked instead of another repair. `#+TT_VARIANT_LIMIT` overrides
+ * it. */
+export const DEFAULT_VARIANT_LIMIT = 3;
+
+/** Plan 06k1 (A3): the frozen `#+TT_VARIANT_LIMIT`, or the default of 3. */
+export function variantLimitOf(contract: { variantLimit?: number } | undefined): number {
+  const n = contract?.variantLimit;
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 1) return DEFAULT_VARIANT_LIMIT;
+  return Math.floor(n);
+}
+
+/** Plan 06k1 (A3): the requirement+kind whose blocking findings reached the
+ * variant limit in the last N consecutive rounds, or undefined. A finding
+ * counts once per round it was raised in (`roundRaised`); the phase's own
+ * round budget is not consulted — this is a separate escalation. */
+export function variantEscalation(
+  phase: PhaseState,
+  limit = variantLimitOf(phase.contract),
+): { itemId: string; kind: Finding["kind"]; rounds: number[] } | undefined {
+  const current = phase.round ?? 0;
+  if (limit < 2 || current < limit) return undefined;
+  const byKey = new Map<string, { itemId: string; kind: Finding["kind"]; rounds: Set<number> }>();
+  for (const f of phase.findings) {
+    if (f.severity !== "blocking" || !f.itemId || typeof f.roundRaised !== "number") continue;
+    // Finding D-M-60: only a REVIEWER's finding that is still open or was
+    // repaired is a real variant. A conductor-raised finding is re-raised on
+    // every freeze (one per candidate, not a new variant), and a withdrawn,
+    // panel-dropped, superseded or disproved finding never establishes a
+    // streak. (A panel drop lowers severity to advisory, so the check above
+    // already excludes it.)
+    if (f.raisedBy === "conductor" || f.raisedBy === "owner") continue;
+    if (f.status !== "open" && f.status !== "repaired") continue;
+    const key = `${f.itemId}\u0000${f.kind}`;
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = { itemId: f.itemId, kind: f.kind, rounds: new Set() };
+      byKey.set(key, entry);
+    }
+    entry.rounds.add(f.roundRaised);
+  }
+  for (const entry of byKey.values()) {
+    const window: number[] = [];
+    let all = true;
+    for (let r = current - limit + 1; r <= current; r += 1) {
+      if (!entry.rounds.has(r)) {
+        all = false;
+        break;
+      }
+      window.push(r);
+    }
+    if (all) return { itemId: entry.itemId, kind: entry.kind, rounds: window };
+  }
+  return undefined;
+}
+
+/** Plan 06k1 (A3): true when a requirement reached the variant limit and the
+ * owner must be asked instead of another repair round. */
+export function variantLimitReached(phase: PhaseState): boolean {
+  return variantEscalation(phase) !== undefined;
+}
+
 /** The triage record for one item, if any. */
 export function triageRecordFor(records: readonly TriageRecord[] | undefined, itemId: string): TriageRecord | undefined {
   return (records ?? []).find((r) => r.itemId === itemId);

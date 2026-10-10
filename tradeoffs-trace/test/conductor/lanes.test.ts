@@ -139,7 +139,7 @@ function laneWorkerWithDecision(lane: string): { hello: unknown; steps: FakePiSt
 function pickVote(seat: Reviewer, round: number, lane: string, why: string): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
-    steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round, seat, lane, why } }],
+    steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round, seat, lane, why, loserHad: { yes: false, anchors: [] } } }],
   };
 }
 

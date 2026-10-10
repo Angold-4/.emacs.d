@@ -27,6 +27,7 @@ import {
   checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  recordRulings,
 } from "./owner-commands.ts";
 import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
 import { seatsOf } from "./seats.ts";
@@ -135,6 +136,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ITEM_CARRIED",
   "DECISION_ADDED",
   "NOTE_ADDED",
+  "OWNER_CORRECTION_QUEUED",
   "OWNER_INPUT_RECORDED",
   "DIRECTIVE_ADDED",
   "DIRECTIVE_WITHDRAWN",
@@ -546,7 +548,12 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       // A seat votes once: a later vote from the same seat replaces the
       // earlier one, exactly like a re-cast ballot.
-      const vote = { seat: event.seat, lane: event.lane, why: event.why };
+      const vote: import("./types.ts").PickVote = {
+        seat: event.seat,
+        lane: event.lane,
+        why: event.why,
+        ...(event.loserHad ? { loserHad: event.loserHad } : {}),
+      };
       if (event.revote) {
         if (!round.revote || !round.revote.lanes.includes(event.lane)) {
           return rejected(state, `PICK_VOTE names lane ${event.lane}, not a revote lane of round ${event.round}`);
@@ -1155,6 +1162,34 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: { ...p, ownerNotes: [...(p.ownerNotes ?? []), event.text] } });
     }
 
+    case "OWNER_CORRECTION_QUEUED": {
+      // Plan 06k1 (A5): a correction that could not be applied now is queued
+      // for the next attempt's prompt AND grants its own round, so a spent
+      // budget never drops an owner input. Record-only: the phase-state name
+      // does not move.
+      if (typeof event.text !== "string" || event.text.trim().length === 0) {
+        return rejected(state, "a queued correction must carry non-empty text");
+      }
+      const granted = Number.isFinite(event.grantedRounds) && event.grantedRounds > 0 ? Math.floor(event.grantedRounds) : 3;
+      // Plan 06k1 (A2, T-2): a queued correction is still an owner ruling —
+      // record it exactly like an applied one, so a lost owner input never
+      // drops the ruling it carries.
+      const ruledDecisions = recordRulings(p.ruledDecisions, event.text, p.decisions, event.correctionId);
+      // Plan 06k1 (A5, finding A-8): the queued correction is an acceptance
+      // obligation until its text reaches a worker prompt (NOTES_DELIVERED).
+      const queuedCorrections = [...(p.queuedCorrections ?? []), { id: event.correctionId, text: event.text }];
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          ownerNotes: [...(p.ownerNotes ?? []), event.text],
+          repairRoundsGranted: p.repairRoundsGranted + granted,
+          ruledDecisions,
+          queuedCorrections,
+        },
+      });
+    }
+
     case "DIRECTIVE_ADDED": {
       // Plan 01i: a numbered owner directive. Record-only (moves no phase
       // state name) but binding: every later prompt quotes it verbatim
@@ -1181,7 +1216,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // before `cmd-prog-ODP-2`, and prompts and the status must still read
       // oldest → newest. `seq` is the number in the id (`OD-n` or `ODP-n`).
       const ownerDirectives = [...existing, added].sort((a, b) => a.seq - b.seq);
-      return ok({ ...state, phase: { ...p, ownerDirectives } });
+      // Plan 06k1 (A2): a directive that names a decision id as ruled settles
+      // it, exactly like a correction.
+      const ruledDecisions = recordRulings(p.ruledDecisions, directive.text, p.decisions, directive.id);
+      return ok({ ...state, phase: { ...p, ownerDirectives, ...(ruledDecisions ? { ruledDecisions } : {}) } });
     }
 
     case "DIRECTIVE_WITHDRAWN": {
@@ -1267,7 +1305,13 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!Number.isInteger(event.count) || event.count <= 0) {
         return rejected(state, "a notes-delivered event must carry a positive integer count");
       }
-      return ok({ ...state, phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count } });
+      // Plan 06k1 (A5, finding A-8): the prompt that just went out carried
+      // every undelivered note, so every queued correction has now reached a
+      // worker prompt and is no longer an acceptance obligation.
+      return ok({
+        ...state,
+        phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count, queuedCorrections: [] },
+      });
     }
 
     case "FLAKE_OBSERVED": {

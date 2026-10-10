@@ -58,6 +58,10 @@ export interface PlanPhase {
   /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before it
    * parks on the owner. Absent means the default of 3. */
   rounds?: number;
+  /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` — how many consecutive rounds may
+   * each raise a new blocking finding of the same kind on one requirement
+   * before the owner is asked. Absent means 3. */
+  variantLimit?: number;
   /** Plan 06h (A1): `#+TT_REVIEWERS:` — the odd list of reviewer seats.
    * Absent means `M A B`. */
   seats?: string[];
@@ -110,6 +114,9 @@ export interface PhaseContract {
   /** Plan 06g: `#+TT_ROUNDS:` frozen into the contract, or undefined for the
    * default (3). `roundBudget()` reads this; nothing else decides the budget. */
   roundsAllowed?: number;
+  /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` frozen into the contract, or
+   * undefined for the default (3). `variantLimitOf()` reads this. */
+  variantLimit?: number;
   /** Plan 06h (A1/A2): the frozen reviewer seats. `seatsOf(contract)` is the
    * only source of the seat list; every place that used to hard-code M, A and
    * B reads it. Absent on an old contract means `M A B`. */
@@ -314,6 +321,10 @@ export interface Finding {
    * round panel's vote, or a reviewer's `sameAs` re-raise. The triage reads
    * it: a panel drop is a recorded review outcome (a trade-off). */
   severityChangedBy?: "evaluator" | "panel" | "reviewer";
+  /** Plan 06k1 (A3): the phase round this finding was raised in, so the
+   * variant limit can count the same requirement's blocking findings across
+   * consecutive rounds. Set by the conductor when the finding is raised. */
+  roundRaised?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +573,16 @@ export interface DecisionBrief {
 // ---------------------------------------------------------------------------
 
 export type CorrectionStatus = "open" | "addressed" | "resolved" | "withdrawn";
+
+/** Plan 06k1 (A2): an owner ruling on one decision. `choice` pins the
+ * ruling to the exact choice the owner ruled on: a later candidate that
+ * changes the decision's choice is NOT settled by this ruling. */
+export interface RuledDecision {
+  id: string;
+  choice: string;
+  /** The correction or directive id that ruled it. */
+  by: string;
+}
 
 export interface Correction {
   id: string;
@@ -1083,6 +1104,11 @@ export interface PhaseState {
   findings: Finding[];
   ownerRequests: OwnerRequest[];
   corrections: Correction[];
+  /** Plan 06k1 (A2): decisions the owner ruled on by an owner correction or
+   * directive that names the id as ruled. A ruling settles the decision on
+   * every later candidate whose decision has the same id and choice, with no
+   * ballots and no re-tally. */
+  ruledDecisions?: RuledDecision[];
   ballots: Ballot[];
   overrides: Override[];
   /** Outstanding dispatches next() must not re-emit (design §9.3's intent
@@ -1117,6 +1143,12 @@ export interface PhaseState {
    * and then logs NOTES_DELIVERED, so a note reaches the *next* attempt
    * (§7.4) instead of every later one. Optional/absent = none delivered. */
   deliveredNoteCount?: number;
+  /** Plan 06k1 (A5, finding A-8): corrections that arrived while the phase
+   * was reviewing, evaluating or final-checking. They are queued for the next
+   * worker attempt's prompt and are an acceptance obligation until that
+   * prompt has been sent (cleared by NOTES_DELIVERED), so a correction is
+   * never lost to timing and `accept()` refuses until it is delivered. */
+  queuedCorrections?: Array<{ id: string; text: string }>;
   /** §3.5/§10.4 `s`: record ids the owner marked "should have been
    * surfaced" — the observed miss sample, recorded as a pilot metric. */
   misses?: string[];
@@ -1294,11 +1326,26 @@ export interface LaneCandidateRecord {
   reviews?: Array<{ seat: string; review: Review }>;
 }
 
-/** One seat's vote in a round's pick turn. `why` is the one-line reason. */
+/** Plan 06k1 (A1): what the losing lane had that the seat's pick did not.
+ * `yes` false with no anchors is an explicit "nothing"; a vote whose
+ * `loserHad` is absent was not recorded (an old log). */
+export interface LoserHad {
+  yes: boolean;
+  anchors: string[];
+  note?: string;
+}
+
+/** One seat's vote in a round's pick turn. `why` is the one-line reason;
+ * `loserHad` says whether the losing lane had something the picked lane
+ * lacked. A vote without `loserHad` is re-asked once, like an incomplete
+ * review, and only reaches the log if the re-ask also failed. */
 export interface PickVote {
   seat: string; // "M", "A", "B"
   lane: string;
   why: string;
+  /** Plan 06k1 (A1): required on every new vote; absent only in a log
+   * written before this phase (the views show "not recorded"). */
+  loserHad?: LoserHad;
 }
 
 /** Plan 06h (A3): the one revote a 3+-candidate round runs when no lane has
@@ -1983,6 +2030,20 @@ export interface EvNoteAdded {
   text: string;
 }
 
+/** Plan 06k1 (A5): an owner correction that arrived while the phase was
+ * reviewing, evaluating, final-checking or parked but not yet able to apply
+ * it. It is queued as a note for the next attempt's prompt AND grants its
+ * own round (so a spent budget cannot drop it). Record-only: it moves no
+ * phase-state name; `repairRoundsGranted` is raised so the next repair can
+ * run. */
+export interface EvOwnerCorrectionQueued {
+  type: "OWNER_CORRECTION_QUEUED";
+  phaseId: string;
+  correctionId: string;
+  text: string;
+  grantedRounds: number;
+}
+
 /** Plan 2d (§7.4/§9.3): records — or updates, keyed by `input.id` — one
  * owner input and the effect the conductor actually observed for it. A
  * record-only event (no phase-state-name change): the status buffer shows
@@ -2398,6 +2459,9 @@ export interface EvPickVote {
   seat: string;
   lane: string;
   why: string;
+  /** Plan 06k1 (A1): what the losing lane had that this seat's pick lacked.
+   * Absent only on a log written before this phase. */
+  loserHad?: LoserHad;
   /** Plan 06h (A3): true when this vote is in the top-two revote rather than
    * the first pick turn. Absent means the first turn (old logs unchanged). */
   revote?: boolean;
@@ -2530,6 +2594,7 @@ export type Event =
   | EvIntegrityViolated
   | EvDecisionAdded
   | EvNoteAdded
+  | EvOwnerCorrectionQueued
   | EvOwnerInputRecorded
   | EvDirectiveAdded
   | EvDirectiveWithdrawn

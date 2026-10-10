@@ -643,6 +643,12 @@ so an old plan reaches the loop as items without changing meaning."
                       (+tt--keyword "TT_WORKERS")))
          (rounds (or (org-element-property :ROUNDS hl)
                      (+tt--keyword "TT_ROUNDS")))
+         ;; Plan 06k1 (A3): how many consecutive rounds may each raise a new
+         ;; blocking finding of the same kind on one requirement before the
+         ;; owner is asked. A phase's own :VARIANT_LIMIT: overrides the plan's
+         ;; #+TT_VARIANT_LIMIT; neither keeps the default of 3.
+         (variant-limit (or (org-element-property :VARIANT_LIMIT hl)
+                            (+tt--keyword "TT_VARIANT_LIMIT")))
          ;; Plan 06h: the reviewer seats and their leader. A phase's own
          ;; :REVIEWERS:/:LEADER: overrides the plan's #+TT_REVIEWERS/#+TT_LEADER;
          ;; a plan that names neither keeps the fixed M A B, led by M.
@@ -707,6 +713,8 @@ so an old plan reaches the loop as items without changing meaning."
                 `((workers . ,(+tt--count-value workers))))
             ,@(when rounds
                 `((rounds . ,(+tt--count-value rounds))))
+            ,@(when variant-limit
+                `((variantLimit . ,(+tt--count-value variant-limit))))
             ,@(when reviewers
                 `((seats . ,(vconcat (split-string reviewers "[ \t,]+" t)))))
             ,@(when leader
@@ -931,6 +939,9 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((r (+tt--keyword-at "TT_ROUNDS")))
                       (and r (list (cons 'rounds (+tt--count-value (car r)))
                                    (cons 'roundsLine (cdr r)))))
+                  ,@(let ((v (+tt--keyword-at "TT_VARIANT_LIMIT")))
+                      (and v (list (cons 'variantLimit (+tt--count-value (car v)))
+                                   (cons 'variantLimitLine (cdr v)))))
                   ;; Plan 06h: the reviewer seats and their leader, for the
                   ;; conductor's init event and `tt lint'.
                   ,@(let ((s (+tt--keyword-at "TT_REVIEWERS")))

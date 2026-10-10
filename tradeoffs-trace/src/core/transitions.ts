@@ -27,9 +27,10 @@ import {
   checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  recordRulings,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
-import { findOwnerRequest } from "./triage.ts";
+import { findOwnerRequest, variantEscalation } from "./triage.ts";
 import {
   accept,
   blockerWithOutcome,
@@ -1290,6 +1291,22 @@ addRow({
     }),
 });
 
+// Plan 06k1 (A5, finding A-8): a correction arrived while the final check ran.
+// It is queued for the next attempt and granted its own round, so a passing
+// final check sends the phase to REPAIRING instead of accepting the candidate
+// without it.
+addRow({
+  id: "final-checks-passed-correction-queued",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "queuedCorrectionBlocksAcceptance",
+  guard: (s) => !acceptHolds(s) && (s.phase.queuedCorrections ?? []).length > 0,
+  to: "REPAIRING",
+  actions: REPAIR_ATTEMPT_ACTIONS,
+  apply: (s) => withPhase(s, { phase: "REPAIRING", inFlight: clearInFlight(s.phase, "run_final_checks") }),
+});
+
 failureRows(
   "final-checks-failed",
   "FINAL_CHECKING",
@@ -1332,10 +1349,36 @@ addRow({
   trigger: "RESOLVING_INCOMPLETE",
   guardName: "openItemsAndBudgetRemains",
   // Plan 06b: an evidence-only phase parks on the owner, not a repair round.
-  guard: (s) => !acceptHolds(s) && budgetRemains(s) && !evidenceOnlyPending(s.phase),
+  // Plan 06k1 (A3): a requirement that reached the variant limit is NOT
+  // repaired again; the variant row below parks it for the owner instead.
+  guard: (s) => !acceptHolds(s) && budgetRemains(s) && !evidenceOnlyPending(s.phase) && !variantEscalation(s.phase),
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING" }),
+});
+
+// Plan 06k1 (A3): the same requirement took a new blocking finding of the
+// same kind in N consecutive rounds (default 3, `#+TT_VARIANT_LIMIT`).
+// Another repair would be the loop spinning on variants; the owner is asked
+// whether to carry the remaining variants or fix, and no repair attempt
+// starts. `openItemOwnerRequestsFor` gives the open blocking finding its own
+// request; `enterAwaitingOwner` supplies the budget gate when there is none.
+addRow({
+  id: "resolving-incomplete-variant-limit",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "RESOLVING_INCOMPLETE",
+  guardName: "variantLimitReached",
+  guard: (s) => !acceptHolds(s) && budgetRemains(s) && !evidenceOnlyPending(s.phase) && variantEscalation(s.phase) !== undefined,
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s) => {
+    const escalation = variantEscalation(s.phase)!;
+    return enterAwaitingOwner(
+      s,
+      `${escalation.itemId} took a new blocking ${escalation.kind} finding in ${escalation.rounds.length} consecutive rounds (rounds ${escalation.rounds.join(", ")}); carry the remaining variants, or fix?`,
+    );
+  },
 });
 
 addRow({
@@ -1727,11 +1770,16 @@ function applyOwnerCorrection(s: State, ev: Event): State {
         }
       : r,
   );
+  // Plan 06k1 (A2): an owner correction that names a decision id as ruled
+  // settles that decision with no ballots on every later candidate whose
+  // decision keeps the same id and choice.
+  const ruledDecisions = recordRulings(s.phase.ruledDecisions, e.text, s.phase.decisions, e.correctionId);
   return withPhase(s, {
     phase: "REPAIRING",
     ownerRequests,
     repairRoundsGranted: s.phase.repairRoundsGranted + 3,
     ownerNotes: [...(s.phase.ownerNotes ?? []), e.text],
+    ...(ruledDecisions ? { ruledDecisions } : {}),
     inFlight: {},
   });
 }

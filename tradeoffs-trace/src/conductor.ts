@@ -30,7 +30,7 @@ import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCom
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, blocksAcceptance, candidateLabel, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
+import { advisoryReason, blocksAcceptance, candidateLabel, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
@@ -152,6 +152,7 @@ import {
   isLiveDecision,
   reviewIngestionIssue,
   panelMajority,
+  ownerRuledDecision,
   panelOptionsFor,
   panelOutcome,
   panelSeatNumbers,
@@ -208,7 +209,7 @@ import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
-import { acquireLock, acquireWaitingLock, type Lock } from "./effects/lock.ts";
+import { acquireLock, acquireWaitingLock, anyCheckWindowOpen, openCheckWindow, PausableTimer, type Lock } from "./effects/lock.ts";
 import { childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
 import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
@@ -395,6 +396,11 @@ export interface RunPlanPhase {
   /** Plan 06h (A1): `#+TT_LEADER:` (or the phase's own `:LEADER:`). Absent
    * means the first seat. */
   leader?: string;
+  /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` (or the phase's own
+   * `:VARIANT_LIMIT:`). How many consecutive rounds may each raise a new
+   * blocking finding of the same kind on one requirement before the owner is
+   * asked instead. Absent means 3. */
+  variantLimit?: number;
   /** Plan 01f: the phase's `:GATE:` command — the expensive, live proof the
    * conductor runs itself after checks, probe and reviews pass, and before
    * acceptance. Undeclared on every phase that predates plan 01f. */
@@ -417,6 +423,10 @@ export interface RunPlanPhase {
  * this packet's single-phase conductor. */
 export interface RunPlanFile {
   title: string;
+  /** Plan 06k1 (A6): environment variable names the plan declares its checks
+   * need, recorded at start alongside PATH and re-used by every check and
+   * resume. Absent on every plan that predates this field. */
+  envVars?: string[];
   /** Plan 06g: the plan's `#+TT_WORKERS:` — how many lanes one round runs.
    * Emacs records the whole number (or the raw text, which `tt lint`
    * refuses). Absent (or 1) is today's single-candidate loop. */
@@ -813,6 +823,7 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     // contract, so the FSM, the prompts and the views all read one value.
     ...(workersOf(phase) > 1 ? { workers: workersOf(phase) } : {}),
     ...(typeof phase.rounds === "number" && phase.rounds > 0 ? { roundsAllowed: Math.floor(phase.rounds) } : {}),
+    ...(typeof phase.variantLimit === "number" && phase.variantLimit > 0 ? { variantLimit: Math.floor(phase.variantLimit) } : {}),
     // Plan 06h (A2): the seats and the leader are frozen too, so every
     // reader has ONE source of the seat list (`seatsOf`).
     ...(phase.seats && phase.seats.length > 0 ? { seats: [...phase.seats] } : {}),
@@ -1355,6 +1366,14 @@ export class Conductor {
    * under (default `~/.tradeoffs-trace/check.lock`), held only while one
    * candidate is checked. */
   #checkLockPath: string;
+  /** Plan 06k1 (A6): the environment this run's checks need, recorded once at
+   * start (PATH plus every variable the plan or the starter declares) and
+   * re-used by every check and every resume, so a resume from a shell without
+   * JAVA_HOME or the original PATH still checks with them. */
+  /** Plan 06k1 (A6): the environment recorded at start. `null` records a
+   * DECLARED variable that was unset at start, so a resume shell that
+   * supplies it does not change the check environment (finding A-12). */
+  #recordedEnv: Record<string, string | null> = {};
   /** Plan 06g2: the winner's hand-off — the lane build and round whose
    * reviews are promoted into the phase's review slots once the probe has
    * passed (the FSM's REVIEWING state is only reachable then). */
@@ -1575,6 +1594,9 @@ export class Conductor {
     this.#missingSecrets = resolved.missing;
     this.#tooShortSecrets = resolved.tooShort;
     this.#log = new EventLog(this.#paths.events, this.#secretMaskable);
+    // Plan 06k1 (A6): record the check environment once, before any check or
+    // resume can need it.
+    this.#recordCheckEnv();
 
     // design §2.1: assert the Pi version before ever launching it — but
     // only when the real `pi` binary is actually going to be used for at
@@ -1764,12 +1786,18 @@ export class Conductor {
    * nothing to disambiguate. */
   #reconcileWorktree(): void {
     const ACTION_ID = "create-worktree";
+    // Plan 06k1 (A6): a run that already froze a candidate resumes at the
+    // LAST FROZEN CANDIDATE, not the phase base. Restarting a repair from the
+    // base would silently throw away the candidate the phase is repairing
+    // (the 2026-10-09 incident: `program resume` after `program stop` brought
+    // the worktree back at the 02e base). A run with no candidate yet starts
+    // from the integration head, exactly as before.
+    const baseSha = this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead;
     const { records } = readLog(this.#paths.events);
     const intentRecord = records.find((r) => r.kind === "intent" && r.actionId === ACTION_ID);
     const completed = records.some((r) => r.kind === "completion" && r.actionId === ACTION_ID);
 
     if (intentRecord && !completed) {
-      const { baseSha } = intentRecord.event as { worktree: string; baseSha: string };
       if (this.#worktreeMatches(baseSha)) {
         this.#log.completion(ACTION_ID, { reused: true, baseSha });
       } else {
@@ -1782,9 +1810,8 @@ export class Conductor {
       return;
     }
 
-    if (this.#worktreeMatches(this.#state.phase.integrationHead)) return; // already created and completed
+    if (this.#worktreeMatches(baseSha)) return; // already created and completed
     if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
-    const baseSha = this.#state.phase.integrationHead;
     this.#log.intent(ACTION_ID, { worktree: this.#paths.worktree, baseSha });
     crashAt("before_create_worktree");
     createWorktree(this.#plan.repo, this.#paths.worktree, baseSha);
@@ -2281,7 +2308,15 @@ export class Conductor {
     // here, before reduce(), and the log's own copy is redacted from the same
     // event (`EventLog` keeps its own pass as a backstop for its other
     // callers: intents, completions, sweeps).
-    const logged = redactRecord(raw, this.#secretMaskable) as Event;
+    // Plan 06k1 (A3): stamp every raised finding with the round it was
+    // raised in, so the variant limit can count a requirement's blocking
+    // findings across consecutive rounds. Set once, at the single point an
+    // event enters the state, so every raise site gets it.
+    const withRound: Event =
+      raw.type === "FINDING_RAISED" && raw.finding.roundRaised === undefined
+        ? ({ ...raw, finding: { ...raw.finding, roundRaised: this.#state.phase.round ?? 0 } } as Event)
+        : raw;
+    const logged = redactRecord(withRound, this.#secretMaskable) as Event;
     const before = this.#state.phase.phase;
     const result = reduce(this.#state, logged);
     if (!result.ok) {
@@ -3283,8 +3318,14 @@ export class Conductor {
       // next worker attempt's prompt verbatim; an applied correction at
       // AWAITING_OWNER resolves the open requests and starts a repair.
       const queueAsNote = outcome.kind === "queued";
+      // Plan 06k1 (A5): a correction that arrives while the phase is
+      // reviewing, evaluating, final-checking or parked is queued as a note
+      // for the next attempt AND grants its own round, so a spent budget
+      // cannot drop it. A plain note just queues.
       const event: Event = queueAsNote
-        ? { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
+        ? inputKind === "correction"
+          ? { type: "OWNER_CORRECTION_QUEUED", phaseId: this.#state.phase.phaseId, correctionId: `C-${commandId}`, text: inputText, grantedRounds: 3 }
+          : { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
         : { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: inputText };
       const result = reduce(this.#state, event);
       if (!result.ok) {
@@ -3598,6 +3639,59 @@ export class Conductor {
   /** Races `deadline` against the stall watchdog: resolves "timeout" early
    * when the agent stalls twice (see `Deadlines.stallMs`). Watching starts
    * now, just after the agent was prompted. */
+  /** Plan 06k1 (A4): while another run's check window is open, pause this
+   * worker's process group (SIGSTOP) and its attempt clock, so a check that
+   * holds the machine for minutes does not time the worker out. Resumes
+   * (SIGCONT) the moment the window closes. Returns a stop function. */
+  #watchCheckWindow(agentId: string, agent: PiAgent, timer: PausableTimer<"timeout">): () => void {
+    let paused = false;
+    const pause = () => {
+      paused = true;
+      timer.pause();
+      const a = this.#activity.get(agentId);
+      if (a) a.busy = false;
+      try {
+        process.kill(-agent.pgid, "SIGSTOP");
+      } catch {
+        // the agent may have exited; the attempt race handles that
+      }
+      this.#log.append("worker_paused", { agentId, reason: "another run's check window is open" });
+    };
+    const resume = () => {
+      paused = false;
+      timer.resume();
+      const a = this.#activity.get(agentId);
+      if (a) {
+        a.busy = true;
+        a.lastAt = Date.now();
+      }
+      try {
+        process.kill(-agent.pgid, "SIGCONT");
+      } catch {
+        // best effort
+      }
+      this.#log.append("worker_resumed", { agentId, reason: "the check window closed" });
+    };
+    const iv = setInterval(() => {
+      if (this.#closed) return;
+      const open = anyCheckWindowOpen(this.#checkLockPath);
+      if (open && !paused) pause();
+      else if (!open && paused) resume();
+    }, 100);
+    iv.unref?.();
+    return () => {
+      clearInterval(iv);
+      if (paused) {
+        paused = false;
+        try {
+          process.kill(-agent.pgid, "SIGCONT");
+        } catch {
+          // best effort
+        }
+      }
+    };
+  }
+
   #withStallWatch(
     agentId: string,
     agent: PiAgent,
@@ -4333,7 +4427,7 @@ export class Conductor {
       if (handle.pickSeat === undefined) {
         return { ok: false, reason: "submit_pick_vote is only accepted from a seat's pick turn" };
       }
-      const args = msg.args as { round?: unknown; seat?: unknown; lane?: unknown; why?: unknown };
+      const args = msg.args as { round?: unknown; seat?: unknown; lane?: unknown; why?: unknown; loserHad?: unknown };
       const round = typeof args.round === "number" ? args.round : Number(args.round);
       const seat = typeof args.seat === "string" ? args.seat : handle.pickSeat;
       const lane = typeof args.lane === "string" ? args.lane : "";
@@ -4345,12 +4439,31 @@ export class Conductor {
         return { ok: false, reason: `submit_pick_vote names seat ${seat}, not this turn's seat ${handle.pickSeat}` };
       }
       if (why.length === 0) return { ok: false, reason: "submit_pick_vote needs a non-empty why" };
+      // Plan 06k1 (A1): every pick vote carries loserHad — whether the losing
+      // lane had something the picked lane lacked. A vote without it is
+      // refused back to the model (re-asked once, like an incomplete review),
+      // so the round's record always says what the seats saw.
+      const loserHadIssue = checkLoserHad(args.loserHad);
+      if (loserHadIssue) return { ok: false, reason: loserHadIssue };
       const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
       if (!roundRecord) return { ok: false, reason: `round ${round} has not started` };
       const candidate = roundRecord.candidates.find((c) => c.lane === lane);
       if (!candidate?.sha) return { ok: false, reason: `submit_pick_vote names lane ${lane}, which submitted no candidate of round ${round}` };
       if (candidate.ok !== true) return { ok: false, reason: `submit_pick_vote names lane ${lane}, whose candidate did not pass its checks` };
-      this.#applyEvent({ type: "PICK_VOTE", round, seat, lane, why, ...(handle.pickRevote ? { revote: true } : {}) });
+      const loserHad = args.loserHad as { yes: boolean; anchors?: unknown; note?: unknown };
+      this.#applyEvent({
+        type: "PICK_VOTE",
+        round,
+        seat,
+        lane,
+        why,
+        loserHad: {
+          yes: loserHad.yes === true,
+          anchors: Array.isArray(loserHad.anchors) ? loserHad.anchors.map((a) => String(a)) : [],
+          ...(typeof loserHad.note === "string" && loserHad.note.trim().length > 0 ? { note: loserHad.note.trim() } : {}),
+        },
+        ...(handle.pickRevote ? { revote: true } : {}),
+      });
       handle.doneResolve();
       return { ok: true };
     }
@@ -5519,13 +5632,28 @@ export class Conductor {
    * raises one in turn 2, after this round's ballot demand was captured, so
    * it is voted in a later round (carryDecisionsForward keeps amendments). */
   #addAmendmentDecision(dispute: CriterionDispute, raisedBy: Reviewer, candidateSha: string): void {
-    // Plan 06c (R7): an amendment whose proposed text equals the current
-    // criterion changes nothing and is never raised or shown.
-    if (dispute.proposedWording.trim() === dispute.criterion.trim()) {
+    // Finding D-B-66: an empty (or whitespace-only) proposed wording states
+    // no position. Ignore it entirely — no amendment and no reject vote.
+    if (dispute.proposedWording.trim().length === 0) {
       this.#log.append("dispute_ignored", {
         reviewer: raisedBy,
         criterion: dispute.criterion,
-        reason: "the proposed wording equals the current criterion",
+        reason: "the proposed wording is empty; ignored",
+      });
+      return;
+    }
+    // Plan 06c (R7) / 06k1 (A2): an amendment whose proposed text changes
+    // nothing — the criterion's own text, or a "retain the criterion
+    // unchanged" phrase — is never raised or shown as an amendment. Plan
+    // 06k1: it is recorded as a vote AGAINST any worker amendment for the
+    // same criterion, so the worker's proposal is voted down rather than
+    // silently joined.
+    if (isNoChangeAmendmentWording(dispute.proposedWording, dispute.criterion)) {
+      this.#castAgainstAmendment(dispute.criterion, raisedBy, candidateSha);
+      this.#log.append("dispute_ignored", {
+        reviewer: raisedBy,
+        criterion: dispute.criterion,
+        reason: "the proposed wording retains the criterion unchanged; recorded as a vote against any amendment for it",
       });
       return;
     }
@@ -5582,6 +5710,34 @@ export class Conductor {
       return;
     }
     this.#applyEvent({ type: "DECISION_ADDED", decision });
+  }
+
+  /** Plan 06k1 (A2): a reviewer's "retain the criterion unchanged" is a vote
+   * against the worker's amendment for the same criterion, not an amendment
+   * of its own. Bound to the amendment decision's own version, so
+   * `currentBallot` counts it as the reviewer's latest vote. */
+  #castAgainstAmendment(criterion: string, reviewer: Reviewer, candidateSha: string): void {
+    const K = this.#state.phase.contract.contractVersion;
+    const target = this.#state.phase.decisions.find(
+      (d) =>
+        d.amendment !== undefined &&
+        d.amendment.status === "proposed" &&
+        d.amendment.criterion === criterion &&
+        d.boundCandidateSha === candidateSha &&
+        sameVersion(d.boundContractVersion, K),
+    );
+    if (!target) return;
+    const ballot: Ballot = {
+      reviewer,
+      decisionId: target.id,
+      vote: "reject",
+      rationale: "retain the criterion unchanged; the proposed amendment should not pass",
+      evidence: [`amendment-${target.amendment!.id}`],
+      boundCandidateSha: candidateSha,
+      boundContractVersion: K,
+      boundRecordVersion: target.version,
+    };
+    this.#applyEvent({ type: "BALLOT_CAST", ballot });
   }
 
   /** design §8.1's reproduction-command deadline: runs `command` in a fresh
@@ -6286,16 +6442,23 @@ export class Conductor {
         this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: undelivered.length });
       }
 
+      const attemptTimer = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
       const workerTimeout = this.#withStallWatch(
         agentId,
         agent,
-        cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const),
+        attemptTimer,
         "Owner (conductor): no progress for a while. Continue the work now, or call submit_phase with what you have and disclose what is unfinished.",
       );
-      const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap">> = [
+      // Plan 06k1 (A4): pause this worker while another run's check window is
+      // open.
+      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, agent, attemptTimer);
+      const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap" | "compactionFailed">> = [
         donePromise.then(() => "submitted" as const),
         agent.waitSettled().then(() => "settled" as const),
         agent.waitExit().then(() => "exited" as const),
+        // Plan 06k1 (A6): a failed compaction means this worker will never
+        // submit; end the attempt now instead of waiting out its deadline.
+        agent.waitCompactionFailed().then(() => "compactionFailed" as const),
         workerTimeout.promise,
       ];
       // design §8.1: "per-attempt token cap from Pi usage events" — treated
@@ -6305,6 +6468,7 @@ export class Conductor {
       if (tokenCap) races.push(tokenCap.promise.then(() => "tokenCap" as const));
       const outcome = await Promise.race(races);
       workerTimeout.cancel();
+      stopCheckWindowWatch();
       tokenCap?.cancel();
       // design §9.3's "after the effect but before its completion event"
       // boundary: the race has resolved (the effect happened) but nothing
@@ -6343,11 +6507,13 @@ export class Conductor {
         this.#applyEvent({ type: "ATTEMPT_TIMED_OUT" });
         return;
       }
-      if (outcome === "settled") {
+      if (outcome === "settled" || outcome === "compactionFailed") {
         // agent_settled with no submission: either the extension's
         // no_submission signal already resolved donePromise (handled
         // above) or the agent settled without ever reaching that guard
         // (e.g. a scripted fake-pi with no hello/tool-call plumbing).
+        // Plan 06k1 (A6): a failed compaction is the same end — the worker
+        // can never submit.
         await agent.terminate();
         this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
         return;
@@ -7249,9 +7415,26 @@ export class Conductor {
     if (failures.length > 0) {
       lines.push(`The previous round's lanes (round ${previous!.round}):`, ...failures.map((f) => `- ${f}`));
     }
+    // Plan 06k1 (A1): when a majority of the previous round's seats said the
+    // losing lane had something the winner lacked, the losing lane's anchors
+    // are carried into this round's prompt, so both lanes can take them on.
+    const anchors = loserAnchors(previous, this.#laneSeats());
+    if (anchors.length > 0) {
+      const losers = previous ? losingLanes(previous).join(", ") : "the losing lane";
+      lines.push(
+        `The losing lane (${losers}) had something the winner lacked — carry these anchors into your candidate:`,
+        ...anchors.map((a) => `- ${a}`),
+      );
+    }
+    // Plan 06k1 (A5, finding A-8): a queued correction must reach the next
+    // LANE attempt's prompt too, exactly like the single-candidate worker.
+    const allNotes = this.#state.phase.ownerNotes ?? [];
+    const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
+    const queuedNotes = allNotes.slice(deliveredCount).join("\n");
+    const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
     return `${buildWorkerPrompt(
       this.#state.phase.contract,
-      undefined,
+      ownerNotes.length > 0 ? ownerNotes : undefined,
       undefined,
       this.#repairContext(),
       runReferences(this.#runDir),
@@ -7296,20 +7479,43 @@ export class Conductor {
         return { lane, note };
       }
       await handle.agent.prompt(prompt);
-      const timeout = cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const);
+      // Plan 06k1 (A5, finding D-M-63): a queued correction counts as
+      // delivered only now that a lane worker that STARTED received the
+      // prompt carrying it. Both lanes send the same prompt; the first to get
+      // here records the delivery, and the second sees nothing left to
+      // deliver. If both lanes fail before this point, the obligation stays.
+      {
+        const allNotes = this.#state.phase.ownerNotes ?? [];
+        const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
+        const undelivered = allNotes.slice(deliveredCount);
+        if (undelivered.length > 0) {
+          this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: undelivered.length });
+        }
+      }
+      const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
+      // Plan 06k1 (A4): a lane worker pauses while another run's check window
+      // is open, exactly like the single-candidate worker.
+      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, handle.agent, timeout);
       const outcome = await Promise.race([
         handle.donePromise.then(() => "submitted" as const),
         handle.agent.waitSettled().then(() => "settled" as const),
         handle.agent.waitExit().then(() => "exited" as const),
+        // Plan 06k1 (A6, D-M-47): a failed compaction means this lane worker
+        // can never submit; end its attempt at once, exactly like the
+        // single-candidate worker, instead of waiting out the deadline.
+        handle.agent.waitCompactionFailed().then(() => "compactionFailed" as const),
         timeout.promise,
       ]);
       timeout.cancel();
+      stopCheckWindowWatch();
       if (outcome !== "submitted") {
         await handle.agent.terminate();
         const note =
           outcome === "timeout"
             ? "the lane's worker timed out before submitting"
-            : `the lane's worker ended without submit_phase (${outcome})`;
+            : outcome === "compactionFailed"
+              ? "the lane's worker ended after a failed compaction without submitting"
+              : `the lane's worker ended without submit_phase (${outcome})`;
         this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
         return { lane, note };
       }
@@ -7346,12 +7552,16 @@ export class Conductor {
   /** One candidate's checks, run under the machine-wide lock (C2). */
   async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
     const lock = await acquireWaitingLock(this.#checkLockPath);
+    // Plan 06k1 (A4): the check holds the host-wide window for its duration,
+    // so every other run's workers are paused while it runs.
+    const window = openCheckWindow(this.#checkLockPath);
     try {
       this.#log.append("lane_check_started", { round, lane, candidateSha: sha });
       const result = await this.#runLaneChecks(lane, sha);
       this.#log.append("lane_check_finished", { round, lane, candidateSha: sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
       return result;
     } finally {
+      window.release();
       await lock.release();
     }
   }
@@ -7389,7 +7599,7 @@ export class Conductor {
         const result = await runCommand({
           command,
           cwd: checkoutDir.dir,
-          env: childEnv(),
+          env: this.#checkEnv(),
           deadlineMs: this.#deadlines.checkMs,
           termGraceMs: this.#deadlines.termGraceMs,
           onIntent: ({ pgid }) => {
@@ -7747,15 +7957,31 @@ export class Conductor {
       }
       await handle.agent.prompt(this.#agentPrompt(prompt));
       const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
-      const outcome = await Promise.race([
+      let outcome = await Promise.race([
         handle.donePromise.then(() => "submitted" as const),
         handle.agent.waitSettled().then(() => "settled" as const),
         handle.agent.waitExit().then(() => "exited" as const),
         timeout.promise,
       ]);
+      // Plan 06k1 (A1): a pick turn that settles without a vote is re-asked
+      // ONCE (like an incomplete review), so a missing `loserHad` or a
+      // dropped vote gets one more chance before it fails the round.
+      if (outcome === "settled" && !this.#pickVoteRecorded(round, seat, revote)) {
+        this.#log.append("pick_reprompt", { round, seat, reason: "the pick turn settled without submit_pick_vote" });
+        // A settle waiter registered BEFORE the prompt, so it fires on the
+        // NEW turn's settle, not the one that just happened.
+        const settled2 = new Promise<"settled">((resolve) => handle.settleWaiters!.push(() => resolve("settled")));
+        await handle.agent.prompt(
+          this.#agentPrompt(
+            `You ended your pick turn without recording a vote. Call submit_pick_vote now with round, seat, lane, why, ` +
+              `and loserHad (whether the losing lane had something your pick lacked: { yes, anchors, note? }), then end your turn.`,
+          ),
+        );
+        outcome = await Promise.race([handle.donePromise.then(() => "submitted" as const), timeout.promise, settled2]);
+      }
       timeout.cancel();
       await handle.agent.terminate();
-      const ok = outcome === "submitted";
+      const ok = outcome === "submitted" || this.#pickVoteRecorded(round, seat, revote);
       this.#log.completion(actionId, { round, seat, ok, ...(ok ? {} : { reason: outcome }) });
       // Plan 06g2: a missing vote fails the round (it repeats); the pick is
       // never taken with fewer than all seats' votes.
@@ -7763,6 +7989,14 @@ export class Conductor {
     } finally {
       this.#agents.delete(agentId);
     }
+  }
+
+  /** Plan 06k1 (A1): whether this seat's pick vote (or revote) is already
+   * recorded for the round. */
+  #pickVoteRecorded(round: number, seat: string, revote: boolean): boolean {
+    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+    if (!record) return false;
+    return revote ? (record.revote?.votes ?? []).some((v) => v.seat === seat) : record.votes.some((v) => v.seat === seat);
   }
 
   /** Plan 06h (A2): the seats that review and vote, from the frozen
@@ -9224,7 +9458,7 @@ export class Conductor {
         const running = runCommand({
           command,
           cwd: checkout.dir,
-          env: childEnv(),
+          env: this.#checkEnv(),
           deadlineMs: this.#deadlines.checkMs,
           termGraceMs: this.#deadlines.termGraceMs,
           // Plan 04a / advisory A-15: record the command's own process group
@@ -9365,6 +9599,12 @@ export class Conductor {
   }
 
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
+    // Plan 06k1 (A4): every check run on the host — phase or final tier —
+    // holds the machine-wide check lock and the host-wide check window, so
+    // two runs' checks never overlap and every other run's workers pause
+    // while this one runs.
+    const lock = await acquireWaitingLock(this.#checkLockPath);
+    const window = openCheckWindow(this.#checkLockPath);
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
@@ -9436,7 +9676,7 @@ export class Conductor {
             // F13: isolate the child from the Node test runner's own
             // recursion markers so a check that runs `node --test` actually
             // runs (and can fail) instead of silently skipping.
-            env: childEnv(),
+            env: this.#checkEnv(),
             deadlineMs: this.#deadlines.checkMs,
             termGraceMs: this.#deadlines.termGraceMs,
             // Plan 06c: record the command's process group so a crash/stop
@@ -9646,6 +9886,8 @@ export class Conductor {
       }
     } finally {
       checkoutDir.dispose();
+      window.release();
+      await lock.release();
     }
   }
 
@@ -9675,7 +9917,7 @@ export class Conductor {
           const running = runCommand({
             command: plan.command,
             cwd: params.cwd,
-            env: childEnv(),
+            env: this.#checkEnv(),
             deadlineMs: budget,
             termGraceMs: this.#deadlines.termGraceMs,
           });
@@ -9739,7 +9981,7 @@ export class Conductor {
         command,
         cwd: result.checkoutDir,
         // F13: same test-runner-marker isolation as the C gate (see childEnv).
-        env: childEnv(),
+        env: this.#checkEnv(),
         deadlineMs: this.#deadlines.probeMs,
         termGraceMs: this.#deadlines.termGraceMs,
       });
@@ -9872,7 +10114,61 @@ export class Conductor {
    * values, so a gate command that needs a vendor key gets it from the
    * environment rather than from its own text (plan 01a's rule). */
   #gateEnv(): NodeJS.ProcessEnv {
-    return { ...childEnv(), ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])) };
+    return { ...this.#checkEnv(), ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])) };
+  }
+
+  /** Plan 06k1 (A6): the environment a check runs with — `childEnv()` plus the
+   * environment this run recorded at start. The recorded values win, so a
+   * resume from a shell that lost JAVA_HOME or PATH still checks with them. */
+  #checkEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...childEnv() };
+    for (const [name, value] of Object.entries(this.#recordedEnv)) {
+      if (value === null) delete env[name];
+      else env[name] = value;
+    }
+    return env;
+  }
+
+  /** Plan 06k1 (A6): record, once, the environment this run's checks need —
+   * `PATH` plus every variable the plan declares (`envVars`) or a check
+   * command references (`$NAME`/`${NAME}`). On a resume the recorded file is
+   * read back, so the resuming shell's own environment never changes a check.
+   * Written at start, before any check runs. */
+  #recordCheckEnv(): void {
+    const file = path.join(this.#runDir, "check-env.json");
+    if (fs.existsSync(file)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, string | null>;
+        if (parsed && typeof parsed === "object") {
+          this.#recordedEnv = parsed;
+          return;
+        }
+      } catch {
+        // fall through and re-record from this process's environment
+      }
+    }
+    const names = new Set<string>(["PATH", ...(this.#plan.envVars ?? [])]);
+    const commands = [
+      ...this.#plan.checks,
+      ...this.#plan.phases.flatMap((p) => [...p.checks, ...(p.finalChecks ?? []), ...(p.gate ? [p.gate] : [])]),
+    ];
+    for (const command of commands) {
+      for (const m of command.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) names.add(m[1]);
+    }
+    // Finding A-12: record a DECLARED name even when it was unset, as an
+    // explicit null, so a resume shell supplying it cannot change the check
+    // environment.
+    const env: Record<string, string | null> = {};
+    for (const name of names) {
+      env[name] = process.env[name] ?? null;
+    }
+    this.#recordedEnv = env;
+    try {
+      fs.writeFileSync(file, `${JSON.stringify(env, null, 2)}\n`);
+    } catch {
+      // A read-only run dir must not stop the run; the in-memory copy still
+      // serves this process, and the next start re-records.
+    }
   }
 
   /** Plan 01f: the conductor's own gate. Takes the machine-wide gate lock
@@ -11875,6 +12171,10 @@ export class Conductor {
             (d) =>
               (d.class === "delegated" || d.class === "reserved") &&
               !carriedIds.has(d.id) &&
+              // Plan 06k1 (A2, finding A-3): a decision the owner ruled is
+              // settled without ballots, so the live demand must not ask for
+              // one — the same fact `decisionSettled` reads.
+              !ownerRuledDecision(phase, d) &&
               (!d.amendment || d.amendment.status === "proposed"),
           )
           .map((d) => [d.id, d.choice]),
@@ -12664,9 +12964,46 @@ export function buildPickPrompt(input: PickPromptInput): string {
       ? `This is the REVOTE between the top two. Seats voting: ${input.seats.join(", ")}. The seats other than the leader need a strict majority; a tie among them is broken by the leader's vote.`
       : `Seats voting: ${input.seats.join(", ")}. A candidate needs a strict majority (${Math.floor(input.seats.length / 2) + 1} of ${input.seats.length}); with a single passing candidate the vote is skipped and it wins.`,
     "Your vote counts once, exactly like every other seat's.",
-    "Cast it with submit_pick_vote: { round, seat, lane, why }.",
+    "Say whether the LOSING lane had something your pick lacks. Cast it with submit_pick_vote:",
+    '  { round, seat, lane, why, loserHad: { yes: true|false, anchors: ["file:line" or "test name"], note?: "one line" } }',
+    "`loserHad.yes` true means the lane you did NOT pick has something the picked lane lacks; name what it is in `anchors`. `false` with no anchors is an explicit \"nothing\". The field is required; a vote without it is refused and asked once more.",
   );
   return lines.join("\n");
+}
+
+/** Plan 06k1 (A2): whether an amendment's proposed wording keeps the
+ * criterion unchanged. The criterion's own text is the obvious case; a
+ * reviewer may also say "retain the criterion unchanged" (or "keep as
+ * written"). Such a proposal is a vote against the amendment, never an
+ * amendment of its own. */
+export function isNoChangeAmendmentWording(proposed: string, criterion: string): boolean {
+  const p = proposed.trim();
+  // Finding D-B-66: empty (or whitespace-only) wording expresses no position
+  // at all — it is neither a retain proposal nor an amendment, so it must not
+  // synthesize a reject vote. The caller ignores it.
+  if (p.length === 0) return false;
+  if (p === criterion.trim()) return true;
+  if (/^\s*no\s+change\b/i.test(p)) return true;
+  return /^\s*(retain|keep|leave|preserve)\b[\s\S]*\b(unchanged|as[- ]is|as written|the same|no change)\b/i.test(p);
+}
+
+/** Plan 06k1 (A1): validate a `loserHad` argument. Returns a refusal reason
+ * (so the model re-asks once) or undefined when it is well-formed. */
+export function checkLoserHad(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return "submit_pick_vote needs loserHad: whether the losing lane had something the picked lane lacks ({ yes, anchors, note? })";
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return "submit_pick_vote's loserHad must be an object { yes, anchors, note? }";
+  }
+  const lh = value as { yes?: unknown; anchors?: unknown };
+  if (typeof lh.yes !== "boolean") return "submit_pick_vote's loserHad needs a boolean yes";
+  if (lh.anchors !== undefined && !Array.isArray(lh.anchors)) return "submit_pick_vote's loserHad.anchors must be an array";
+  const anchors = Array.isArray(lh.anchors) ? lh.anchors : [];
+  if (lh.yes === true && anchors.length === 0) {
+    return "submit_pick_vote's loserHad says yes but names no anchor; name what the losing lane had (file:line or a test name)";
+  }
+  return undefined;
 }
 
 /** The tree object id of `rev` in `repo`, or undefined if it cannot be read. */
