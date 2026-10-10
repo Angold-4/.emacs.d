@@ -1758,12 +1758,6 @@ export class Conductor {
       return;
     }
 
-    if (key === "run_checks") {
-      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
-      this.#applyEvent({ type: "CHECKS_INTERRUPTED" });
-      return;
-    }
-
     if (key === "dispatch_probe") {
       const candidateSha = payload.candidateSha as string;
       discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
