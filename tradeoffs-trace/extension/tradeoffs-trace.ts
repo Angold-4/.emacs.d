@@ -31,7 +31,7 @@ import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-codin
 import { guardedSearchPath, guardedShCommand, guardedWritePath, readGuardConfigFromEnv, readSearchRootsFromEnv } from "./guards.ts";
 import { capToolResult } from "../src/effects/rpc.ts";
 
-import { validate, type JSONSchema } from "../src/core/schema.ts";
+import { dropEmptyStrings, validate, type JSONSchema } from "../src/core/schema.ts";
 import { validateCuratorProposal } from "../src/core/entries.ts";
 import { briefIssue } from "../src/core/briefs.ts";
 import { reviewIngestionIssue } from "../src/core/predicate.ts";
@@ -807,6 +807,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Submit the phase's decisions, assumptions and deviations",
     parameters: SubmitPhaseParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(SUBMIT_PHASE_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_phase", params);
@@ -821,6 +822,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Submit your coverage of every requirement, constraint and architecture item",
     parameters: SubmitCoverageParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(SUBMIT_COVERAGE_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_coverage", params);
@@ -835,6 +837,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Submit the decisions you discovered in the diff",
     parameters: SubmitDiscoveryParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(SUBMIT_DISCOVERY_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_discovery", params);
@@ -848,6 +851,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Submit your review of the candidate",
     parameters: SubmitReviewParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(REVIEW_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       // The same shared ingestion rule reduce() applies for
@@ -882,6 +886,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Vote block or downgrade on the raw blocker",
     parameters: SubmitPanelVoteParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(PANEL_VOTE_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_panel_vote", params);
@@ -896,6 +901,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Vote keep or drop on every pending item",
     parameters: SubmitRoundPanelVotesParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       return submitTool("submit_round_panel_votes", params);
     },
   });
@@ -923,6 +929,7 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       return submitTool("submit_pick_vote", params);
     },
   });
@@ -935,6 +942,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Return one publish/merge/drop entry per raw message",
     parameters: SubmitEvaluationParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       return submitTool("submit_evaluation", params);
     },
   });
@@ -947,6 +955,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Write the owner-facing brief for each open owner item",
     parameters: SubmitBriefParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(BRIEF_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text" as const, text: error }] };
       const issue = briefIssue(params as never);
