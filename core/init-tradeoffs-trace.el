@@ -635,6 +635,14 @@ so an old plan reaches the loop as items without changing meaning."
          ;; #+TT_FINAL_CHECKS; a plan that names neither behaves as before.
          (final-checks (or (org-element-property :FINAL_CHECKS hl)
                            (+tt--keyword "TT_FINAL_CHECKS")))
+         ;; Plan 06g: how many lanes one round runs, and how many rounds the
+         ;; phase may spend. A phase's own :WORKERS:/:ROUNDS: overrides the
+         ;; plan's #+TT_WORKERS/#+TT_ROUNDS; a plan that names neither keeps
+         ;; today's one-lane loop and the default three rounds.
+         (workers (or (org-element-property :WORKERS hl)
+                      (+tt--keyword "TT_WORKERS")))
+         (rounds (or (org-element-property :ROUNDS hl)
+                     (+tt--keyword "TT_ROUNDS")))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -687,6 +695,10 @@ so an old plan reaches the loop as items without changing meaning."
             (checks . ,(vconcat (and checks (list checks))))
             ,@(when final-checks
                 `((finalChecks . ,(vconcat (list final-checks)))))
+            ,@(when workers
+                `((workers . ,(+tt--count-value workers))))
+            ,@(when rounds
+                `((rounds . ,(+tt--count-value rounds))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
@@ -840,6 +852,14 @@ a duplicate key, so the parser records them for `tt lint' to report."
             (setq out (append out (list (cons 'panelFrom panel-from)))))
           (list out (cdr at) (delete-dups (nreverse repeated))))))))
 
+(defun +tt--count-value (raw)
+  "RAW as a whole number, or RAW itself when it is not one.
+Plan 06g: `#+TT_WORKERS' and `#+TT_ROUNDS' are counts.  A value that is not
+all digits is passed through as written, so `tt lint' can name the bad value
+instead of the plan silently taking a default."
+  (let ((s (string-trim raw)))
+    (if (string-match-p "\\`[0-9]+\\'" s) (string-to-number s) s)))
+
 (defun +tt-parse-plan ()
   "Parse the current Org plan buffer.
 Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
@@ -879,6 +899,15 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(when rerun
                       `((rerun . ,(car rerun))
                         (rerunLine . ,(cdr rerun))))
+                  ;; Plan 06g: #+TT_WORKERS and #+TT_ROUNDS. A value that is
+                  ;; not a whole number is passed through as written, so
+                  ;; `tt lint' can name it rather than silently defaulting.
+                  ,@(let ((w (+tt--keyword-at "TT_WORKERS")))
+                      (and w (list (cons 'workers (+tt--count-value (car w)))
+                                   (cons 'workersLine (cdr w)))))
+                  ,@(let ((r (+tt--keyword-at "TT_ROUNDS")))
+                      (and r (list (cons 'rounds (+tt--count-value (car r)))
+                                   (cons 'roundsLine (cdr r)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))

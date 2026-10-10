@@ -3353,3 +3353,82 @@ refused input read from views/status.txt."
               (should (string-match-p "queued text — queued (correction)" header-line-format)))))
       (setq header-line-format saved)
       (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-plan-workers ()
+  "Plan 06g: #+TT_WORKERS and #+TT_ROUNDS reach the plan JSON, and a phase's
+own :WORKERS:/:ROUNDS: property overrides the plan's keyword."
+  ;; The plan-level keywords are recorded with their line, as whole numbers.
+  (let* ((text (concat "#+TT_WORKERS: 2\n#+TT_ROUNDS: 5\n" +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (= (alist-get 'workers plan) 2))
+    (should (= (alist-get 'workersLine plan) 1))
+    (should (= (alist-get 'rounds plan) 5))
+    (should (= (alist-get 'roundsLine plan) 2))
+    ;; Every phase inherits the plan's own count.
+    (should (= (alist-get 'workers (aref (alist-get 'phases plan) 0)) 2)))
+  ;; A value that is not a whole number is passed through as written, so
+  ;; `tt lint' names it rather than the plan silently defaulting.
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_WORKERS: two\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'workers plan) "two")))
+  ;; A phase's own property wins over the plan's keyword.
+  (let* ((plan (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+    (should-not (assq 'workers (aref (alist-get 'phases plan) 0))))
+  (let* ((text (replace-regexp-in-string ":END:" "  :WORKERS:   2\n  :ROUNDS:    4\n  :END:" +tt-test--valid-plan :fixedcase))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (= (alist-get 'workers (aref (alist-get 'phases plan) 0)) 2))
+    (should (= (alist-get 'rounds (aref (alist-get 'phases plan) 0)) 4))))
+
+(ert-deftest tradeoffs-trace-review-buffer-rounds ()
+  "Plan 06g (A5): the review buffer groups the round's candidates, with the
+pick votes and the winner — both lanes, not only the accepted one. The
+section is rendered by the runtime (renderRoundsOrg); this checks the buffer
+shows it, folds it like any other section, and never mistakes a candidate
+heading for a votable message."
+  (let* ((dir (make-temp-file "tt-ert-review-rounds" t))
+         (rounds (concat "* Rounds\n"
+                         "\n"
+                         "** Round 2 from bbbbbbb\n"
+                         "\n"
+                         "*** C2-a (lane a) — checks passed\n"
+                         "\n"
+                         "    cccccccccccccccccccccccccccccccccccccccc\n"
+                         "\n"
+                         "*** C2-b (lane b) — checks passed, picked\n"
+                         "\n"
+                         "    dddddddddddddddddddddddddddddddddddddddd\n"
+                         "\n"
+                         "Votes:\n"
+                         "  - M → C2-b: b is the smaller diff\n"
+                         "  - A → C2-b: b keeps the lock short\n"
+                         "  - B → C2-a: a names the edge path\n"
+                         "\n"
+                         "Winner: C2-b (ddddddd, 2 votes)\n"))
+         (opened nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views/messages" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert (concat +tt-test--review-org "\n" rounds)))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              ;; Both lanes are visible, each under its own candidate heading.
+              (should (string-search "*** C2-a (lane a) — checks passed" (buffer-string)))
+              (should (string-search "*** C2-b (lane b) — checks passed, picked" (buffer-string)))
+              ;; The votes and the winner are visible with them.
+              (should (string-search "M → C2-b: b is the smaller diff" (buffer-string)))
+              (should (string-search "Winner: C2-b (ddddddd, 2 votes)" (buffer-string)))
+              ;; A candidate heading carries no :ID:, so RET/A/D stay inert on
+              ;; it — the grouping never looks like a votable message.
+              (goto-char (point-min))
+              (search-forward "*** C2-a")
+              (goto-char (match-beginning 0))
+              (should-not (+tt-review--message-heading-p))
+              (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
+                (should-error (+tt-review-open-message)))
+              (should-not opened))))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
+      (delete-directory dir t))))

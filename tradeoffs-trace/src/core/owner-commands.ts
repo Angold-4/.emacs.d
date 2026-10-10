@@ -104,10 +104,31 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
   // no-op. "budget.granted by owner request <id>": the allowance is granted
   // exactly like a correction's, independent of the exhausted budget.
   if (isBudgetGateRequest(request) && event.option === "grant") {
-    next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 3 };
+    // Plan 06g (A4, owner-verified): the budget gate grants exactly ONE more
+    // round — the owner lifts the park for a single further candidate, never a
+    // fresh three-round allowance. One round is one candidate reviewed.
+    next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 1 };
   }
   if (isRepairForcingOption(request.origin, event.option)) {
     next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 3 };
+  }
+  // Plan 06g (A6): the owner accepts the candidate with the open items
+  // carried. `accept()` honours the flag, and the carried ids are recorded
+  // here (the views list them, and the next phase's plan is built from them).
+  if (isBudgetGateRequest(request) && event.option === "accept_carried") {
+    const carriedItems = next.findings.filter((f) => f.status === "open").map((f) => f.id);
+    next = {
+      ...next,
+      acceptedWithCarried: true,
+      // Plan 06g (ODP-2): the candidate the carry was given for. `accept()`
+      // accepts only when this equals the candidate under acceptance.
+      carriedCandidateSha: event.boundCandidateSha,
+      carriedItems,
+      // A5: every carried item is listed WITH its target. This request has no
+      // explicit `--to` (the owner's one decision carries the leftovers into
+      // the next phase), so the target is the next phase's plan.
+      carriedTo: Object.fromEntries(carriedItems.map((id) => [id, "next"])),
+    };
   }
   if (request.origin === "open_finding" && event.option === "accept_risk" && request.linkedFindingId) {
     // design §4.2: equivalent to accept-finding, with the required scope note.
@@ -186,6 +207,137 @@ export function applyFindingAcceptedByOwner(phase: PhaseState, event: EvFindingA
   );
   const withFinding = { ...phase, findings };
   return autoResolveLinkedRequest(withFinding, event.findingId, "accepted", event.boundCandidateSha, event.boundContractVersion);
+}
+
+// --- ITEM_CARRIED --------------------------------------------------------
+//
+// Plan 06g (A5): the owner's `tt carry <run> <id> --to <phase-id>`. It takes
+// a finding or a message id. Through the inbox it (1) marks the item carried,
+// with the target phase, (2) resolves the open owner request about that item
+// (and the plain budget gate, whose "accept with carried items" decision the
+// carry is), and (3) once no blocking item remains uncarried, accepts the
+// candidate as it stands (`acceptedWithCarried`, honoured by `accept()`).
+// This function is the ONLY place that decides what a carry does.
+
+type EvItemCarried = Extract<Event, { type: "ITEM_CARRIED" }>;
+
+/** The finding or message `recordId` names, with the version its binding
+ * must match. A finding is looked up first unless `recordKind` says
+ * otherwise; a message needs its own lookup because `currentVersionsFor`
+ * (binding.ts) knows decisions, findings and owner requests, not messages. */
+function carriedRecord(
+  phase: PhaseState,
+  recordId: string,
+  recordKind: EvItemCarried["recordKind"],
+): { kind: "finding" | "message"; candidateSha: string; contractVersion: ContractVersion; recordVersion: number; label: string } | undefined {
+  if (recordKind !== "message") {
+    const finding = phase.findings.find((f) => f.id === recordId);
+    if (finding) {
+      return {
+        kind: "finding",
+        candidateSha: phase.candidate?.sha ?? "",
+        contractVersion: phase.contract.contractVersion,
+        recordVersion: finding.version,
+        label: `finding ${finding.id}`,
+      };
+    }
+  }
+  if (recordKind !== "finding") {
+    const message = (phase.messages ?? []).find((m) => m.id === recordId);
+    if (message) {
+      // Like a finding, a message is checked against the PHASE's current
+      // candidate and contract (binding.ts's currentVersionsFor does the same
+      // for decisions and findings); only its record version is its own.
+      return {
+        kind: "message",
+        candidateSha: phase.candidate?.sha ?? "",
+        contractVersion: phase.contract.contractVersion,
+        recordVersion: message.messageVersion,
+        label: `message ${message.id}`,
+      };
+    }
+  }
+  return undefined;
+}
+
+export function checkItemCarried(phase: PhaseState, event: EvItemCarried): CommandCheck {
+  if (!event.toPhase || event.toPhase.trim().length === 0) {
+    return { ok: false, reason: `carrying ${event.recordId} needs a target phase (--to <phase-id>)` };
+  }
+  const record = carriedRecord(phase, event.recordId, event.recordKind);
+  if (!record) return { ok: false, reason: `unknown finding or message ${event.recordId}` };
+  if ((phase.carriedItems ?? []).includes(event.recordId)) {
+    return { ok: false, reason: `${event.recordId} is already carried` };
+  }
+  return checkBinding(
+    { candidateSha: event.boundCandidateSha, contractVersion: event.boundContractVersion, recordVersion: event.boundRecordVersion },
+    { candidateSha: record.candidateSha, contractVersion: record.contractVersion, recordVersion: record.recordVersion },
+    record.label,
+  );
+}
+
+export function applyItemCarried(phase: PhaseState, event: EvItemCarried): PhaseState {
+  const carriedItems = [...(phase.carriedItems ?? [])];
+  const carriedTo = { ...(phase.carriedTo ?? {}) };
+  const mark = (id: string) => {
+    if (!carriedItems.includes(id)) carriedItems.push(id);
+    carriedTo[id] = event.toPhase;
+  };
+  mark(event.recordId);
+  // A message carry also carries the finding it was raised from (its
+  // `sourceRecordId`), so the blocking item behind a blocker message is
+  // answered too.
+  const message = (phase.messages ?? []).find((m) => m.id === event.recordId);
+  if (message?.sourceRecordId && phase.findings.some((f) => f.id === message.sourceRecordId)) mark(message.sourceRecordId);
+
+  // The record-level action answers the open request about it — including a
+  // request linked to it as a MESSAGE (a blocker's own request carries
+  // `linkedMessageId`, which `autoResolveLinkedRequest` does not match).
+  let next = autoResolveLinkedRequest({ ...phase, carriedItems, carriedTo }, event.recordId, "carried", event.boundCandidateSha, event.boundContractVersion);
+  next = {
+    ...next,
+    ownerRequests: next.ownerRequests.map((r) =>
+      r.status === "open" && r.linkedMessageId === event.recordId
+        ? {
+            ...r,
+            status: "resolved" as const,
+            resolution: { option: "carried" },
+            resolvedBinding: { candidateSha: event.boundCandidateSha, contractVersion: event.boundContractVersion },
+          }
+        : r,
+    ),
+  };
+
+  // The plain budget gate (the phase parked with only advisories open) is the
+  // owner's ONE "accept with carried items" decision: carrying any item
+  // carries every open advisory at once and resolves the gate.
+  const gate = next.ownerRequests.find((r) => r.status === "open" && isBudgetGateRequest(r));
+  if (gate) {
+    for (const f of next.findings.filter((f) => f.status === "open" && f.severity === "advisory")) mark(f.id);
+    next = {
+      ...next,
+      carriedItems,
+      carriedTo,
+      ownerRequests: next.ownerRequests.map((r) =>
+        r.id === gate.id
+          ? {
+              ...r,
+              status: "resolved" as const,
+              resolution: { option: "accept_carried" },
+              resolvedBinding: { candidateSha: event.boundCandidateSha, contractVersion: event.boundContractVersion },
+            }
+          : r,
+      ),
+    };
+  }
+
+  // Accept once no blocking item remains uncarried; advisories never block
+  // acceptance (owner directive ODP-1). The candidate the carry was given for
+  // is recorded so `accept()` can refuse a stale or failing one (ODP-2).
+  const blockingLeft = next.findings.some(
+    (f) => f.status === "open" && f.severity === "blocking" && !carriedItems.includes(f.id),
+  );
+  return blockingLeft ? next : { ...next, acceptedWithCarried: true, carriedCandidateSha: event.boundCandidateSha };
 }
 
 // --- OVERRIDE_CAST -------------------------------------------------------

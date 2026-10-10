@@ -33,6 +33,9 @@ export type LintRule =
   | "no-tolerance"
   | "model-declaration"
   | "rerun-template"
+  // Plan 06g: `#+TT_WORKERS` may only be 1 or 2 in this plan version; more
+  // lanes are 06h's.
+  | "worker-count"
   // Plan 06b: the structured-plan rules (refs/06_ref_plan_format.md).
   | "item-id"
   | "item-arch"
@@ -143,6 +146,17 @@ export interface LintPlanInput {
    * already checked once at the program level; rechecking them per entry
    * would report the program's line against the entry's own file. */
   modelsFromProgram?: string[];
+  /** Plan 06g: the plan's `#+TT_WORKERS:` — how many lanes one round runs.
+   * This plan version allows 1 and 2; 3 or more is 06h's. Absent (or 1) is
+   * today's single-candidate loop. */
+  workers?: number;
+  /** Lint-only: the 1-based line of `#+TT_WORKERS:` in the source Org file. */
+  workersLine?: number;
+  /** Plan 06g: the plan's `#+TT_ROUNDS:` — how many rounds one phase may
+   * spend before it parks on the owner. Absent means the default of 3. */
+  rounds?: number;
+  /** Lint-only: the 1-based line of `#+TT_ROUNDS:` in the source Org file. */
+  roundsLine?: number;
 }
 
 export interface LintProgramInput {
@@ -155,6 +169,12 @@ export interface LintProgramInput {
   models?: LintModels;
   modelsLine?: number;
   modelsRepeated?: string[];
+  /** Plan 06g: a program file may also declare `#+TT_WORKERS:` and
+   * `#+TT_ROUNDS:`; the same rules apply. */
+  workers?: number;
+  workersLine?: number;
+  rounds?: number;
+  roundsLine?: number;
 }
 
 /** True for the JSON shape `tt program start` reads (a list of plan entries
@@ -448,7 +468,7 @@ export function lintItems(phase: LintPhaseInput): LintFinding[] {
 /** Lint one plan (all its phases' acceptance items, its structured items,
  * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan)];
+  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
     for (const finding of lintItems(phase)) out.push({ ...finding, sourceFile: plan.sourceFile });
@@ -499,10 +519,76 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
 /** Lint every entry's plan in a program file; phase ids are prefixed with the
  * entry id so two entries with the same phase id stay tellable apart. */
 export function lintProgram(program: LintProgramInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(program)];
+  const out: LintFinding[] = [...lintModels(program), ...lintWorkers(program)];
   for (const entry of program.entries ?? []) {
     for (const finding of lintPlan(entry.plan ?? { phases: [] })) {
       out.push({ ...finding, phaseId: entry.id ? `${entry.id}/${finding.phaseId}` : finding.phaseId });
+    }
+  }
+  return out;
+}
+
+/** Plan 06g: lint `#+TT_WORKERS:` — this plan version runs one or two lanes;
+ * three or more lanes is 06h's phase (`#+TT_WORKERS` made adjustable), so the
+ * message names 06h rather than inventing a rule the runtime does not have. A
+ * value that is not a whole number is an error too: it would reach the
+ * conductor as `NaN` lanes. `#+TT_ROUNDS` only needs to be a positive whole
+ * number. */
+export function lintWorkers(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  if (plan.workers !== undefined) {
+    const n = plan.workers;
+    if (!Number.isInteger(n) || n < 1) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "workers",
+        item: `#+TT_WORKERS: ${String(n)}`,
+        line: plan.workersLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_WORKERS must be a whole number of lanes, got ${String(n)}`,
+        fix: "write #+TT_WORKERS: 1 (today's loop) or #+TT_WORKERS: 2 (two lanes)",
+      });
+    } else if (n > 2) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "workers",
+        item: `#+TT_WORKERS: ${n}`,
+        line: plan.workersLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_WORKERS names ${n} lanes; this plan version runs at most 2`,
+        fix: "write #+TT_WORKERS: 2, or wait for 06h, the phase that makes the lane count adjustable (3, 4, … lanes)",
+      });
+    } else if (n === 2) {
+      // Plan 06g (C2): two lanes are valid, but the lane round itself lands in
+      // 06g2 — until then a `#+TT_WORKERS: 2` plan runs one lane, and the
+      // owner is told rather than silently getting half of what they asked.
+      out.push({
+        severity: "warning",
+        rule: "worker-count",
+        phaseId: "workers",
+        item: `#+TT_WORKERS: 2`,
+        line: plan.workersLine,
+        sourceFile: plan.sourceFile,
+        problem: "the two-lane round arrives in 06g2; this run uses one lane",
+        fix: "leave #+TT_WORKERS: 2 (the round lands in 06g2), or write #+TT_WORKERS: 1 for today's single-candidate loop",
+      });
+    }
+  }
+  if (plan.rounds !== undefined) {
+    const n = plan.rounds;
+    if (!Number.isInteger(n) || n < 1) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "rounds",
+        item: `#+TT_ROUNDS: ${String(n)}`,
+        line: plan.roundsLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_ROUNDS must be a positive whole number of rounds, got ${String(n)}`,
+        fix: "write #+TT_ROUNDS: 3 (the default) or the number of rounds this phase may spend",
+      });
     }
   }
   return out;

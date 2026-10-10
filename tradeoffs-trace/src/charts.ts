@@ -138,7 +138,7 @@ function edgeLine(row: TransitionRow, triggerWidth: number, toWidth: number, gua
  * readable; the run-axis rows get their own small section. */
 export function renderPhaseChart(
   rows: readonly TransitionRow[] = TRANSITIONS,
-  opts: { stats?: ChartStats; model?: string; models?: ChartModels; now?: Date } = {},
+  opts: { stats?: ChartStats; model?: string; models?: ChartModels; now?: Date; roundLines?: readonly string[] } = {},
 ): string {
   const stats = opts.stats ?? { entries: {}, timeMs: {} };
   const fallback = opts.model && opts.model.length > 0 ? opts.model : "default";
@@ -149,6 +149,12 @@ export function renderPhaseChart(
   lines.push("tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions.ts); do not edit");
   lines.push(`current state: ${stats.current ?? "?"}${stats.current ? `   (entered ${stats.entries[stats.current] ?? 0}x - ${formatMs(stats.timeMs[stats.current])})` : ""}`);
   if (stats.currentRun) lines.push(`current run: ${stats.currentRun}`);
+  // Plan 06g (A5): with `#+TT_WORKERS` the chart names the round's lanes and
+  // its pick, so the drawn state machine and the run agree about what a round
+  // is. Absent for a plan without lanes.
+  if (opts.roundLines && opts.roundLines.length > 0) {
+    for (const line of opts.roundLines) lines.push(`round: ${line}`);
+  }
   // Plan 05d: CHECKING's own re-run step (a newly failing test is re-run
   // alone before the check may fail; a load-only flake passes it).
   lines.push("note: a check that names new failures re-runs each alone before it may fail; a load-only flake passes it (FLAKE_OBSERVED)");
@@ -290,6 +296,10 @@ export interface LoopTapePhase {
 export interface LoopTapeInput {
   /** The phase's readable id and short title (`tapeLabel`), e.g. `05g seat models`. */
   label: string;
+  /** Plan 06g (A5): the round's lanes and pick, one line each — the tape
+   * shows both lanes and the pick beside the step rows. Absent for a plan
+   * without `#+TT_WORKERS`. */
+  lanes?: readonly string[];
   /** The phase's current round (`view.round`). */
   round: number;
   phases: ReadonlyArray<{ phase: string; at: string }>;
@@ -517,6 +527,12 @@ export function renderLoopTape(input: LoopTapeInput): string {
     if (r.annotation) line += `   ${r.annotation}`;
     if (r.arrow) line += `  → ${r.arrow}`;
     lines.push(line.replace(/ +$/, ""));
+  }
+  // Plan 06g (A5): the round's lanes and its pick, under the step rows, so
+  // the tape shows both lanes and the pick rather than only the winner.
+  if (input.lanes && input.lanes.length > 0) {
+    lines.push("");
+    for (const lane of input.lanes) lines.push(`  lanes        ${lane}`.replace(/ +$/, ""));
   }
   return `${lines.join("\n")}\n`;
 }

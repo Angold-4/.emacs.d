@@ -308,6 +308,30 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
         event: { type: "FINDING_ACCEPTED_BY_OWNER", findingId: b.recordId, scope: r.scope, by: "owner", ...w },
       };
     }
+    case "carry": {
+      // Plan 06g (A5): the owner carries a finding or message to a later
+      // phase's plan. The binding names the record and its version, so a
+      // stale carry (the record changed, or the phase moved to a new
+      // candidate) is rejected like any other owner command.
+      const w = bound();
+      if ("error" in w) return { ok: false, reason: w.error };
+      if (typeof r.toPhase !== "string" || r.toPhase.trim().length === 0) {
+        return { ok: false, reason: "a carry command needs a non-empty 'toPhase'" };
+      }
+      const recordKind = r.recordKind === "finding" || r.recordKind === "message" ? r.recordKind : undefined;
+      return {
+        ok: true,
+        runId: b.runId,
+        phaseId: b.phaseId,
+        event: {
+          type: "ITEM_CARRIED",
+          recordId: b.recordId,
+          ...(recordKind ? { recordKind } : {}),
+          toPhase: r.toPhase.trim(),
+          ...w,
+        },
+      };
+    }
     case "revise": {
       const w = bound();
       if ("error" in w) return { ok: false, reason: w.error };

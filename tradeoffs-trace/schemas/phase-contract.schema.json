@@ -22,7 +22,17 @@
     "architecture": { "type": "array", "items": { "type": "object" } },
     "requirements": { "type": "array", "items": { "type": "object" } },
     "constraints": { "type": "array", "items": { "type": "object" } },
-    "itemsSynthesized": { "type": "boolean" }
+    "itemsSynthesized": { "type": "boolean" },
+    "workers": {
+      "description": "Plan 06g: #+TT_WORKERS frozen into the contract — how many lanes one round runs. Present only when the plan asks for more than one; absent is today's single-candidate loop.",
+      "type": "integer",
+      "minimum": 2
+    },
+    "roundsAllowed": {
+      "description": "Plan 06g: #+TT_ROUNDS frozen into the contract — how many rounds the phase may spend. Absent means the default of 3 (core/rounds.ts's roundBudget).",
+      "type": "integer",
+      "minimum": 1
+    }
   },
   "$defs": {
     "ContractVersion": {

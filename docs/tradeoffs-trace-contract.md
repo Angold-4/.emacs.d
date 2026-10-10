@@ -161,6 +161,30 @@ The events, all reduced by `reduce()`:
 - `OWNER_VERDICT { messageId, verdict: "accept" | "refuse", reason?, …binding }`
 - `MESSAGE_RESOLVED { messageId, by, reason?, …binding }`
 - `MESSAGE_SUPERSEDED { messageId, reason?, …binding }`
+- `ROUND_STARTED { round, base, lanes }` — plan 06g: a round of a phase with
+  `#+TT_WORKERS` began, from one base, with its lane ids (`a`, `b`).
+- `CANDIDATE_SUBMITTED { round, lane, sha }` — one lane froze a candidate;
+  views name it `C<round>-<lane>`.
+- `CANDIDATE_CHECKED { round, lane, ok }` — one lane's checks ran. A lane that
+  crashed, timed out or submitted nothing records no candidate at all.
+- `PICK_VOTE { round, seat, lane, why }` — one seat's vote in the round's pick
+  turn, with its one-line reason. A later vote from the same seat replaces it.
+- `CANDIDATE_PICKED { round, lane, sha, votes }` — the round's winner, decided
+  by `pickWinner` in code (never by a model), with the votes it took (`0` when
+  it was the only passing candidate and won without a vote).
+- `ITEM_CARRIED { recordId, recordKind?, toPhase, …binding }` — plan 06g
+  (A5): the owner carried one finding (or message) to a later phase's plan
+  (`tt carry <run> <id> --to <phase-id>`). It marks the item carried (with its
+  target), answers the open owner request about it (and the plain budget gate),
+  and once no blocking item remains uncarried accepts the candidate
+  (`acceptedWithCarried`). `owner-commands.ts` is the only place that decides
+  what a carry does.
+
+All five round events are **record-only**: they are reduced into
+`phase.rounds` (the views and `tt summary` read them) and move no phase state.
+All five are absent from a run without `#+TT_WORKERS`, whose log is
+byte-identical to before this plan. `REVIEW_SUBMITTED` carries an extra
+optional `candidate` field when a round reviewed more than one candidate.
 - `MESSAGE_CARRIED { messageId, fromCandidate, toCandidate, fromVersion, toVersion, contentHash, unchanged, content? }`
   — `content` is present exactly when the reviewable content changed, so the
   stored fields and `contentHash` can never disagree.

@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { groupAlive, groupStartedBefore, killGroup, sweep } from "../../src/effects/sweep.ts";
+import { groupAlive, groupStartedBefore, isUnder, killGroup, sweep, sweepDecision } from "../../src/effects/sweep.ts";
 
 let dir: string;
 
@@ -257,4 +257,43 @@ test("plan 06e: the sweep never signals a process outside the run's process grou
     cwdHolder.kill("SIGKILL");
     fileHolder.kill("SIGKILL");
   }
+});
+
+test("plan 06g: a lane's sweep never signals a process whose cwd is in the other lane's worktree", () => {
+  // A fake process table: no process is spawned, so the lane rule (A2) is
+  // decided on the table alone. Both processes belong to groups this run
+  // recorded; only their cwd tells the lanes apart.
+  const laneA = "/tmp/tt-lanes/worktrees/lane-a";
+  const laneB = "/tmp/tt-lanes/worktrees/lane-b";
+  const table = [
+    { pid: 101, pgid: 11, command: "node", cwd: `${laneA}/src` },
+    { pid: 102, pgid: 12, command: "node", cwd: `${laneB}/src` },
+    // A process whose cwd is neither lane (the shared repo, say): held too.
+    { pid: 103, pgid: 13, command: "node", cwd: "/tmp/tt-lanes/repo" },
+    // A sibling whose path merely starts with lane-a's characters.
+    { pid: 104, pgid: 14, command: "node", cwd: `${laneA}-other/src` },
+    // The lane's own process, running in the lane's worktree root.
+    { pid: 105, pgid: 15, command: "node", cwd: laneA },
+  ];
+  const own = [11, 12, 13, 14, 15];
+
+  const a = sweepDecision(table, { ownPgids: own, cwdUnder: laneA });
+  assert.deepEqual(a.killed.map((k) => k.pid), [101, 105], "lane a's sweep kills only lane a's own processes");
+  assert.deepEqual(a.held.map((h) => h.pid).sort(), [102, 103, 104]);
+
+  const b = sweepDecision(table, { ownPgids: own, cwdUnder: laneB });
+  assert.deepEqual(b.killed.map((k) => k.pid), [102]);
+  assert.deepEqual(b.held.map((h) => h.pid).sort(), [101, 103, 104, 105]);
+
+  // Without a lane (today's one-lane sweep) the process group alone decides:
+  // every own-group process is killed, exactly as before this plan.
+  const plain = sweepDecision(table, { ownPgids: own });
+  assert.deepEqual(plain.killed.map((k) => k.pid).sort(), [101, 102, 103, 104, 105]);
+  assert.deepEqual(plain.held, []);
+
+  // The path arithmetic is not fooled by a sibling directory.
+  assert.equal(isUnder(`${laneA}-other/src`, laneA), false);
+  assert.equal(isUnder(`${laneA}/src`, laneA), true);
+  assert.equal(isUnder(laneA, laneA), true);
+  assert.equal(isUnder("/tmp/tt-lanes/worktrees/lane-a/deep/dir", laneA), true);
 });

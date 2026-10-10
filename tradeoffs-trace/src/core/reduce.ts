@@ -20,9 +20,11 @@ import { applyCarryWithContract, applyMessageEvent, checkMessageBinding } from "
 import { next as computeNext } from "./next.ts";
 import {
   applyFindingAcceptedByOwner,
+  applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
   checkFindingAcceptedByOwner,
+  checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
 } from "./owner-commands.ts";
@@ -115,6 +117,12 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ITEM_STATE_UPDATED",
   "EVIDENCE_RECORDED",
   "ITEM_CHECK_RECORDED",
+  "ROUND_STARTED",
+  "CANDIDATE_SUBMITTED",
+  "CANDIDATE_CHECKED",
+  "PICK_VOTE",
+  "CANDIDATE_PICKED",
+  "ITEM_CARRIED",
   "DECISION_ADDED",
   "NOTE_ADDED",
   "OWNER_INPUT_RECORDED",
@@ -239,6 +247,26 @@ function withoutRoundPanelSeatInFlight(p: PhaseState, seat: string): PhaseState[
  * only ever append or amend a record without moving the phase's own FSM
  * state, so they have no row in transitions.ts (which is scoped to
  * phase-state-changing edges, per the plan's phase-0 brief). */
+/** Plan 06g: replace (or insert) one lane's candidate record, preserving
+ * every other lane's. */
+function upsertLane(
+  candidates: import("./types.ts").LaneCandidateRecord[],
+  lane: string,
+  patch: Partial<import("./types.ts").LaneCandidateRecord>,
+): import("./types.ts").LaneCandidateRecord[] {
+  const existing = candidates.find((c) => c.lane === lane);
+  if (!existing) return [...candidates, { lane, ...patch }];
+  return candidates.map((c) => (c.lane === lane ? { ...c, ...patch } : c));
+}
+
+/** Plan 06g: replace one round record in order. */
+function replaceRound(
+  rounds: import("./types.ts").RoundRecord[] | undefined,
+  record: import("./types.ts").RoundRecord,
+): import("./types.ts").RoundRecord[] {
+  return (rounds ?? []).map((r) => (r.round === record.round ? record : r));
+}
+
 function applyRecordEvent(state: State, event: Event): ReduceResult | undefined {
   const p = state.phase;
   switch (event.type) {
@@ -332,6 +360,15 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: applyOverrideCast(p, event) });
     }
 
+    case "ITEM_CARRIED": {
+      // Plan 06g (A5): the owner's carry. The AWAITING_OWNER rows route it;
+      // every other phase records it (mark carried, answer the request, and
+      // accept once nothing blocking is uncarried) without moving the phase.
+      const check = checkItemCarried(p, event);
+      if (!check.ok) return rejected(state, check.reason!);
+      return ok({ ...state, phase: applyItemCarried(p, event) });
+    }
+
     case "FINDING_RAISED": {
       // design §4.1: "a finding needs evidence" — reject one with none.
       if (!event.finding.evidence || event.finding.evidence.trim().length === 0) {
@@ -366,6 +403,73 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           ...(event.archSymbolDeviations ? { archSymbolDeviations: event.archSymbolDeviations } : {}),
           ...(event.overturns ? { overturns: event.overturns } : {}),
         },
+      });
+    }
+
+    // Plan 06g: the round's record events. None of them moves the phase —
+    // the conductor's own orchestration does that — but they are the log a
+    // restart folds to know each round's base, lanes, candidates, votes and
+    // winner, and the views render. Every one of them is rejected when its
+    // round has not started, so a stray event cannot invent a round.
+    case "ROUND_STARTED": {
+      if (event.round < 1 || event.lanes.length === 0) {
+        return rejected(state, "ROUND_STARTED needs a round number and at least one lane");
+      }
+      const others = (p.rounds ?? []).filter((r) => r.round !== event.round);
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          rounds: [
+            ...others,
+            { round: event.round, base: event.base, lanes: [...event.lanes], candidates: [], votes: [] },
+          ].sort((a, b) => a.round - b.round),
+        },
+      });
+    }
+
+    case "CANDIDATE_SUBMITTED": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `CANDIDATE_SUBMITTED for round ${event.round}, which has not started`);
+      if (!round.lanes.includes(event.lane)) {
+        return rejected(state, `CANDIDATE_SUBMITTED names lane ${event.lane}, not a lane of round ${event.round}`);
+      }
+      const candidates = upsertLane(round.candidates, event.lane, { sha: event.sha });
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
+    }
+
+    case "CANDIDATE_CHECKED": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `CANDIDATE_CHECKED for round ${event.round}, which has not started`);
+      if (!round.lanes.includes(event.lane)) {
+        return rejected(state, `CANDIDATE_CHECKED names lane ${event.lane}, not a lane of round ${event.round}`);
+      }
+      const candidates = upsertLane(round.candidates, event.lane, { ok: event.ok, ...(event.note ? { note: event.note } : {}) });
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
+    }
+
+    case "PICK_VOTE": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `PICK_VOTE for round ${event.round}, which has not started`);
+      if (!round.lanes.includes(event.lane)) {
+        return rejected(state, `PICK_VOTE names lane ${event.lane}, not a lane of round ${event.round}`);
+      }
+      // A seat votes once: a later vote from the same seat replaces the
+      // earlier one, exactly like a re-cast ballot.
+      const votes = [...round.votes.filter((v) => v.seat !== event.seat), { seat: event.seat, lane: event.lane, why: event.why }];
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, votes }) } });
+    }
+
+    case "CANDIDATE_PICKED": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `CANDIDATE_PICKED for round ${event.round}, which has not started`);
+      const candidate = round.candidates.find((c) => c.lane === event.lane);
+      if (!candidate || candidate.sha !== event.sha) {
+        return rejected(state, `CANDIDATE_PICKED names ${event.sha} in lane ${event.lane}, which that lane did not submit`);
+      }
+      return ok({
+        ...state,
+        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, picked: { lane: event.lane, sha: event.sha, votes: event.votes } }) },
       });
     }
 

@@ -23,10 +23,14 @@ import { reduce } from "./core/reduce.ts";
 import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { candidateAnchorFreshness, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
-import { buildView, updateLiveRun } from "./view.ts";
+import { buildView, lanesView, updateLiveRun } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent, type InputKind } from "./core/owner-inbox.ts";
+// Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
+// and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
+// winner or whether a finding blocks by itself.
+import { advisoryReason, blocksAcceptance, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
 import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
 import { checkCommands, checkTier, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand } from "./core/checks.ts";
@@ -343,6 +347,13 @@ export interface RunPlanPhase {
   /** Plan 01c: 1-based lines of `ownerChecklist` in the source Org file. */
   ownerChecklistLines?: number[];
   provisional?: boolean;
+  /** Plan 06g: `#+TT_WORKERS:` — how many lanes one round runs (1 or 2 in
+   * this plan version; more is 06h's). Absent (or 1) is today's
+   * single-candidate loop. */
+  workers?: number;
+  /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before
+   * it parks on the owner. Absent means the default of 3. */
+  rounds?: number;
   /** Plan 01f: the phase's `:GATE:` command — the expensive, live proof the
    * conductor runs itself after checks, probe and reviews pass, and before
    * acceptance. Undeclared on every phase that predates plan 01f. */
@@ -360,6 +371,13 @@ export interface RunPlanPhase {
  * this packet's single-phase conductor. */
 export interface RunPlanFile {
   title: string;
+  /** Plan 06g: the plan's `#+TT_WORKERS:` — how many lanes one round runs.
+   * Emacs records the whole number (or the raw text, which `tt lint`
+   * refuses). Absent (or 1) is today's single-candidate loop. */
+  workers?: number;
+  /** Plan 06g: the plan's `#+TT_ROUNDS:` — how many rounds one phase may
+   * spend. Absent means the default of 3. */
+  rounds?: number;
   /** Plan 01c: the Org file this JSON plan was parsed from, recorded by Emacs
    * so `tt lint` can name the file the owner edited rather than its temporary
    * JSON copy. Never read by the conductor. */
@@ -733,7 +751,19 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     ...(phase.gateCleanup ? { gateCleanup: phase.gateCleanup } : {}),
     // Plan 06c: a declared final check is part of the frozen contract.
     ...(finalCheckOf(phase) ? { finalChecks: phase.finalChecks } : {}),
+    // Plan 06g: the lane count and the round budget are frozen into the
+    // contract, so the FSM, the prompts and the views all read one value.
+    ...(workersOf(phase) > 1 ? { workers: workersOf(phase) } : {}),
+    ...(typeof phase.rounds === "number" && phase.rounds > 0 ? { roundsAllowed: Math.floor(phase.rounds) } : {}),
   };
+}
+
+/** Plan 06g: the number of lanes one round runs. `#+TT_WORKERS` when the plan
+ * declares it, 1 otherwise — and 1 is today's single-candidate loop, which
+ * records no round event at all. */
+export function workersOf(phase: Pick<RunPlanPhase, "workers">): number {
+  const n = phase.workers;
+  return typeof n === "number" && Number.isFinite(n) && n >= 2 ? Math.floor(n) : 1;
 }
 
 export function initialState(
@@ -759,7 +789,15 @@ export function initialState(
     overrides: [],
     inFlight: {},
     repairRoundsUsed: 0,
-    repairRoundsGranted: 3,
+    // Plan 06g (A4, owner-verified): `roundBudget(contract)` is the only place
+    // that decides how many ROUNDS a phase may spend — `#+TT_ROUNDS` when the
+    // plan names it, the default of 3 otherwise. One round is one candidate
+    // reviewed, so the repair allowance the FSM compares against is
+    // `roundBudget - 1`: the first candidate is round 1 and each later round
+    // is one repair. `#+TT_ROUNDS: 3` therefore reviews exactly 3 candidates
+    // (the first plus two repairs), matching ODP-1's "accepted within 3
+    // rounds".
+    repairRoundsGranted: roundBudget(contract) - 1,
     // Plan 01i: a program-wide directive in force when this node was started
     // seeds the phase's own list (scope `program`, seeded), so it is quoted
     // in every prompt from the first attempt. The plan snapshot is on disk,
@@ -1258,6 +1296,9 @@ export class Conductor {
    * ever signals groups this conductor knows are live, never a recycled pgid
    * from an old log record. */
   #liveShGroups = new Set<number>();
+  /** ODP-3: the run's own STAGE command groups (a check, the baseline, the
+   * gate) that are still running, each with the time it was recorded. */
+  #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
@@ -1987,6 +2028,10 @@ export class Conductor {
       // the log may already be closed (a second stop call); never fatal.
     }
     await this.#killLiveShGroups();
+    // ODP-3: a check, the baseline or the gate still running when the
+    // conductor stops is signalled here, like any other stage's group — and
+    // only when its leader is proven to be this run's own.
+    await this.#killLiveStageGroups();
     for (const handle of this.#agents.values()) {
       // Plan 2d: a clean stop uses the short stopAbortGraceMs, not the
       // 30 s cancellation grace — `tt stop` must finish within 15 s.
@@ -2005,6 +2050,7 @@ export class Conductor {
     // A group whose agent handle was already dropped (a force-killed
     // worker's orphaned command), or one that started while stopping.
     await this.#killLiveShGroups();
+    await this.#killLiveStageGroups();
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
@@ -4456,6 +4502,46 @@ export class Conductor {
    * instead of throwing, like `#applyDiscoveries`. */
   /** Plan 05e: the ids of the owner directives in force, which a blocking
    * finding may cite as its ground (`cite the directive id`). */
+  /** Plan 06g (A6): what `blocksAcceptance` may look at — the contract's item
+   * ids (R, C and A; for an old-format phase the synthesized R1..Rn), every
+   * owner directive in force and every correction's id, plus the tests that
+   * passed at the round's base and fail now. Nothing here is model-supplied. */
+  #acceptanceGate(): AcceptanceGate {
+    const contract = this.#state.phase.contract;
+    const itemIds = [
+      ...flatItems(itemsFromPhase(contract)).map((i) => i.id),
+      ...this.#directiveIds(),
+      ...this.#state.phase.corrections.map((c) => c.id),
+    ].filter((id) => typeof id === "string" && id.length > 0);
+    return { itemIds, regressions: this.#regressionTests() };
+  }
+
+  /** Plan 06g (A6b): the tests that failed in this candidate's checks and
+   * passed at the round's base — the conductor's own regression split (a
+   * load-only flake is not one: it passed alone). */
+  #regressionTests(): string[] {
+    const phase = this.#state.phase;
+    const current = phase.checks;
+    const failures = current?.failures ?? phase.lastCheckFailures?.failures ?? [];
+    if (failures.length === 0) return [];
+    // The round's base: the phase base in round 1, the previous candidate in
+    // a repair (recorded at the freeze). This is the ONLY correct base — not
+    // `#baselineFailedCommands()`, which is the phase base for every round.
+    const base = new Set(this.#roundBaseFailures());
+    // A test the base already failed is not a regression; a load-only failure
+    // passed when re-run alone, so it is not one either.
+    return failures.filter((f) => !f.loadOnly && !base.has(f.name)).map((f) => f.name);
+  }
+
+  /** Plan 06g (A4): the tests that failed at this round's base — the phase
+   * base's failures in round 1, the previous candidate's check failures in a
+   * repair. Recorded by `freezeCompleted` (`roundBaseFailures`), so a test
+   * that PASSED at round 1's candidate and fails in round 2 is a regression,
+   * while a test the base already failed is a persisting failure. */
+  #roundBaseFailures(): string[] {
+    return this.#state.phase.roundBaseFailures ?? this.#baselineFailedCommands().flatMap((c) => c.failures ?? []);
+  }
+
   #directiveIds(): string[] {
     return (this.#state.phase.ownerDirectives ?? []).map((d) => d.id).filter((id) => typeof id === "string" && id.length > 0);
   }
@@ -4634,6 +4720,35 @@ export class Conductor {
       if (asBlocker) asBlocker = false;
       if (severity === "blocking") severity = "advisory";
     }
+    // Plan 06g (A6, owner directive ODP-1): from round 2 a blocking finding
+    // blocks only when it names an unmet item of the contract (or of an owner
+    // correction) with its id and a file:line, or is a regression — a test or
+    // behaviour that passed at the round's base and fails now. Anything else
+    // (a further edge path, hardening, wording, style) is an advisory:
+    // recorded as a carried item, never blocking. `blocksAcceptance` is the
+    // only place that decides this, for one lane or two.
+    const round = this.#state.phase.round ?? 1;
+    let roundDowngrade: string | undefined;
+    if (severity === "blocking" && round >= 2) {
+      const ground: FindingGround = {
+        severity,
+        evidence: fd.evidence,
+        ...(fd.criterionDispute?.criterion ? { criterionDisputed: fd.criterionDispute.criterion } : {}),
+      };
+      const gate = this.#acceptanceGate();
+      if (!blocksAcceptance(ground, round, gate)) {
+        roundDowngrade = `A6 round ${round}: ${advisoryReason(ground, round, gate)}`;
+        this.#log.append("round_advisory", {
+          reviewer,
+          candidateSha,
+          round,
+          reason: roundDowngrade,
+          raisedAsBlocker: asBlocker,
+        });
+        if (asBlocker) asBlocker = false;
+        severity = "advisory";
+      }
+    }
     // Plan 05e (3a/3b): every finding — including one raised through a
     // reviewer's `blockers` list, which is a blocking finding too — goes
     // through the record comparison and the runnable re-run before any agent
@@ -4687,6 +4802,10 @@ export class Conductor {
         ? { criterionDisputed: fd.criterionDispute.criterion }
         : {}),
       ...(reproduction !== undefined ? { reproduction } : {}),
+      // Plan 06g (A6): why this finding is advisory although it was raised
+      // blocking — the round rule's own sentence, so the record and the views
+      // never disagree about it.
+      ...(roundDowngrade !== undefined ? { severityReason: roundDowngrade } : {}),
     };
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
@@ -5180,6 +5299,42 @@ export class Conductor {
     this.#liveShGroups.add(pgid);
     this.#agents.get(agentId)?.shGroups.add(pgid);
     this.#log.append("intent", { agentId, pgid }, `sh-${agentId}-${pgid}`);
+  }
+
+  /** ODP-3 (carried from 06c, owner-confirmed): a STAGE command's own process
+   * group — a check, the baseline, the gate — is tracked like an agent's `sh`
+   * command, so `stop()` signals it too. A check that is still running when
+   * the conductor stops must not outlive the run.
+   *
+   * It is tracked with the time it was recorded, and killed through
+   * `#killRecordedGroup` (fail-closed): a pgid the OS recycled after the
+   * command's own group ended belongs to some other process, and A2/C3 forbid
+   * signalling it. That is not theoretical — without the check, a stop could
+   * signal an unrelated process whose pgid had been reused (caught by
+   * test/effects/shell.test.ts's TERM-ignoring escalation test under a
+   * parallel `make check`). */
+  #onStageShIntent(pgid: number): void {
+    if (this.#stopRequested) {
+      // runCommand resumes the group (SIGCONT) right after this returns;
+      // killing it first would make that resume fail. Kill it just after.
+      setImmediate(() => void killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined));
+      return;
+    }
+    this.#liveStageGroups.set(pgid, Date.now());
+  }
+
+  /** The stage command in PGID finished (or was killed): stop tracking it, so
+   * `stop()` does not signal a group that is already gone. */
+  #onStageShExit(pgid: number): void {
+    this.#liveStageGroups.delete(pgid);
+  }
+
+  /** Signal every stage command group this run is still running, each only
+   * when its leader is proven to be the run's own (`#killRecordedGroup`). */
+  async #killLiveStageGroups(): Promise<void> {
+    const groups = [...this.#liveStageGroups.entries()];
+    this.#liveStageGroups.clear();
+    await Promise.all(groups.map(([pgid, at]) => this.#killRecordedGroup(pgid, at)));
   }
 
   #onNoSubmission(agentId: string): void {
@@ -6353,7 +6508,14 @@ export class Conductor {
       reviewerSeats: { M: modelFor("reviewer", "M"), A: modelFor("reviewer", "A"), B: modelFor("reviewer", "B") },
       panelSeats: { "1": modelFor("panel", 1), "2": modelFor("panel", 2), "3": modelFor("panel", 3) },
     };
-    fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
+    // Plan 06g (A5): the chart names the round's lanes and its pick when the
+    // phase has any (a plan without `#+TT_WORKERS` passes none, and the
+    // chart is byte-identical to before).
+    const roundLines = lanesView(this.#state.phase);
+    fs.writeFileSync(
+      this.#paths.loop,
+      redactText(renderPhaseChart(undefined, { stats, models, ...(roundLines.length > 0 ? { roundLines } : {}) }), this.#secretMaskable),
+    );
     // Plan 05h: the same beat keeps the loop tape (`views/tape.txt`) current.
     // `buildView` already built it from this beat's one log snapshot, so it
     // is written here rather than rebuilt; its durations end at the log's own
@@ -7197,6 +7359,8 @@ export class Conductor {
         // command's deadline, exactly as a candidate's does.
         const deadlineAt = startedAt + this.#deadlines.checkMs;
         // Same isolation and per-command deadline as the C gate (F13).
+        // ODP-3: tracked live, so `stop()` signals the baseline's group too.
+        let baselinePgid: number | undefined;
         const running = runCommand({
           command,
           cwd: checkout.dir,
@@ -7207,10 +7371,13 @@ export class Conductor {
           // so a crash-recovery restart can kill the orphaned baseline run
           // instead of starting a second copy of the same heavy suite.
           onIntent: ({ pgid }) => {
+            baselinePgid = pgid;
+            this.#onStageShIntent(pgid);
             this.#log.intent(`baseline-sh-${this.#baselineActionId ?? "?"}-${pgid}`, { pgid });
           },
         });
         const result = await running.result;
+        if (baselinePgid !== undefined) this.#onStageShExit(baselinePgid);
         this.#recordCheck(outDir, command, result);
         // Plan 05i: 126/127 means the shell could not execute this command.
         // Abort the whole baseline (no record is written) rather than
@@ -7398,6 +7565,9 @@ export class Conductor {
           // Plan 05d: a re-run alone must finish inside this same per-command
           // deadline (design §8.1). `deadlineAt` is that deadline's wall time.
           const deadlineAt = startedAt + this.#deadlines.checkMs;
+          // ODP-3: the check's own process group, tracked live so `stop()`
+          // signals it like every other stage's.
+          let checkPgid: number | undefined;
           const running = runCommand({
             command,
             cwd: checkoutDir.dir,
@@ -7409,11 +7579,16 @@ export class Conductor {
             termGraceMs: this.#deadlines.termGraceMs,
             // Plan 06c: record the command's process group so a crash/stop
             // during CHECKING can kill the orphan and re-run the check.
+            // ODP-3: it is also tracked live, so `stop()` signals it like any
+            // other stage's group.
             onIntent: ({ pgid }) => {
+              checkPgid = pgid;
+              this.#onStageShIntent(pgid);
               this.#log.intent(`check-sh-${actionId}-${pgid}`, { pgid });
             },
           });
           const result = await running.result;
+          if (checkPgid !== undefined) this.#onStageShExit(checkPgid);
           combinedOutput += `${result.output}\n`;
           // Plan 05d: the machine's load average at the failing run is part
           // of the flake evidence (findings #10, #31).
@@ -7594,12 +7769,18 @@ export class Conductor {
             ...(finalFailures.length > 0 ? { failures: finalFailures } : {}),
           });
         }
+      } else if (passed) {
+        this.#applyEvent({ type: "CHECKS_PASSED" });
       } else {
-        this.#applyEvent(
-          passed
-            ? { type: "CHECKS_PASSED" }
-            : { type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) },
-        );
+        this.#applyEvent({ type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) });
+        // Plan 06g (A4): a test that PASSED at this round's base (the previous
+        // candidate in a repair, the phase base in round 1) and fails now is a
+        // true regression — recorded so the reason is observable, and distinct
+        // from a persisting failure the base already had.
+        const regressions = this.#regressionTests();
+        if (regressions.length > 0) {
+          this.#log.append("round_regression", { candidateSha, round: this.#state.phase.round ?? 1, tests: regressions });
+        }
       }
     } finally {
       checkoutDir.dispose();
@@ -7977,6 +8158,8 @@ export class Conductor {
         } else {
           const startedAt = new Date().toISOString();
           const startedMs = Date.now();
+          // ODP-3: tracked live, so `stop()` signals the gate's group too.
+          let gatePgid: number | undefined;
           const running = runCommand({
             command,
             cwd: probed.checkoutDir,
@@ -7985,9 +8168,14 @@ export class Conductor {
             termGraceMs: this.#deadlines.termGraceMs,
             // Design §2.2: the command's process group is recorded before it
             // runs, so a crashed gate is recoverable (see `#reconcileOne`).
-            onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
+            onIntent: ({ pgid }) => {
+              gatePgid = pgid;
+              this.#onStageShIntent(pgid);
+              this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid });
+            },
           });
           const gateResult = await running.result;
+          if (gatePgid !== undefined) this.#onStageShExit(gatePgid);
           // Plan 05i: 126/127 is the shell failing to execute the command, not
           // the gate failing. Record it (the record carries the exit, and a
           // non-passing record is never reused) but block on the environment
@@ -8008,15 +8196,22 @@ export class Conductor {
           if (cleanupCommand) {
             cleanupStartedAt = new Date().toISOString();
             const cleanupStartedMs = Date.now();
+            // ODP-3: tracked live, so `stop()` signals the cleanup's group too.
+            let cleanupPgid: number | undefined;
             const cleanup = runCommand({
               command: cleanupCommand,
               cwd: probed.checkoutDir,
               env: this.#gateEnv(),
               deadlineMs: this.#deadlines.gateMs,
               termGraceMs: this.#deadlines.termGraceMs,
-              onIntent: ({ pgid }) => this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid }),
+              onIntent: ({ pgid }) => {
+                cleanupPgid = pgid;
+                this.#onStageShIntent(pgid);
+                this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid });
+              },
             });
             cleanupResult = await cleanup.result;
+            if (cleanupPgid !== undefined) this.#onStageShExit(cleanupPgid);
             cleanupMs = Date.now() - cleanupStartedMs;
           }
           const passed = !gateResult.timedOut && gateResult.exitCode === 0;
@@ -10483,6 +10678,78 @@ export function buildReviewerPrompt(
     ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),
     "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, findingStatements, items and arch.",
   ].join("\n");
+}
+
+/** Plan 06g: one candidate as a pick prompt names it. */
+export interface PickPromptCandidate {
+  lane: string;
+  sha: string;
+  /** `C<round>-<lane>`. */
+  label: string;
+}
+
+export interface PickPromptInput {
+  /** The seat voting: M, A or B. */
+  seat: string;
+  /** True for the leader seat (M), the only one that carries the full
+   * context (plan 06g, A4). */
+  leader: boolean;
+  phaseId: string;
+  goal: string;
+  round: number;
+  base: string;
+  candidates: PickPromptCandidate[];
+  /** Leader only: the settled ledger, one line per record. */
+  ledger?: readonly string[];
+  /** Leader only: every earlier round's reviews and votes, one line each. */
+  earlierRounds?: readonly string[];
+  /** Leader only: the other candidates' diffs, by lane. The candidate the
+   * leader is voting on is in `candidates`, not here. */
+  otherDiffs?: Readonly<Record<string, string>>;
+  /** The seats that vote (the configured reviewer seats). */
+  seats: readonly string[];
+}
+
+/** Plan 06g (A4): the pick turn's prompt. Each seat votes for one candidate
+ * with a one-line why. The leader (M) carries the full context — the settled
+ * ledger, every earlier round's reviews and votes, and the other candidate's
+ * diff — and its vote counts once, exactly like the others'. A and B carry
+ * none of it: they see the round's candidates and vote.
+ *
+ * Pure and exported so a unit test exercises exactly the words the conductor
+ * sends. */
+export function buildPickPrompt(input: PickPromptInput): string {
+  const lines: string[] = [
+    `You are reviewer ${input.seat}${input.leader ? " (the leader seat)" : ""}. Cast your pick vote for phase ${input.phaseId}, round ${input.round}.`,
+    `Goal: ${input.goal}`,
+    `Round ${input.round} started from ${input.base}.`,
+    "",
+    `Candidates of round ${input.round}:`,
+    ...input.candidates.map((c) => `- ${c.label} ${c.sha.slice(0, 7)} (lane ${c.lane})`),
+  ];
+  if (input.leader) {
+    lines.push(
+      "",
+      "The settled ledger:",
+      ...(input.ledger && input.ledger.length > 0 ? input.ledger.map((l) => `- ${l}`) : ["- (nothing settled yet)"]),
+      "",
+      "Earlier rounds' reviews and votes:",
+      ...(input.earlierRounds && input.earlierRounds.length > 0 ? input.earlierRounds.map((l) => `- ${l}`) : ["- (this is round 1)"]),
+    );
+    for (const c of input.candidates) {
+      const diff = input.otherDiffs?.[c.lane];
+      if (diff === undefined) continue;
+      lines.push("", `Candidate ${c.label}'s diff:`, diff.trim().length > 0 ? diff : "(no diff)");
+    }
+  }
+  lines.push(
+    "",
+    `Vote for exactly one candidate of round ${input.round}, by lane, with a one-line why. The candidates are checked one after the other and only a passing candidate can win.`,
+    `Seats voting: ${input.seats.join(", ")}. A candidate needs a strict majority (${Math.floor(input.seats.length / 2) + 1} of ${input.seats.length}); with a single passing candidate the vote is skipped and it wins.`,
+    "Your vote counts once, exactly like every other seat's.",
+    "Cast it with submit_pick_vote: { round, seat, lane, why }.",
+  );
+  return lines.join("\n");
 }
 
 /** The tree object id of `rev` in `repo`, or undefined if it cannot be read. */
