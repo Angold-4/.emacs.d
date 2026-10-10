@@ -8,7 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 
-import { checkCoverageWarnings, type LintPlanInput } from "../../src/core/plan-lint.ts";
+import { checkCoverageWarnings, ciRunsCargoFmtAll, runsCargoFmtAll, type LintPlanInput } from "../../src/core/plan-lint.ts";
 import { readRepoFacts } from "../../src/core/repo-facts.ts";
 
 /** A cargo workspace with crates a, b and c, plus the CI workflow. */
@@ -184,6 +184,23 @@ test("plan 06j: a CI that gates on cargo fmt --all is matched by a plan running 
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(root2, { recursive: true, force: true });
   }
+});
+
+test("plan 06j: cargo-fmt detection is token-based (toolchain, env prefix, cargo-fmt binary)", () => {
+  // M-86/contract-39/OD-14: recognise the invocation, not the literal string.
+  const ciTriggers = [
+    "cargo +nightly fmt --all --check",
+    "RUSTFLAGS=x cargo fmt --all -- --check",
+    "cargo-fmt --all --check",
+    "cargo fmt --all && git diff --exit-code",
+  ];
+  for (const command of ciTriggers) assert.equal(ciRunsCargoFmtAll(command), true, `CI trigger: ${command}`);
+  for (const command of ["cargo +stable fmt -p a --check", "cargo clippy --all"]) {
+    assert.equal(ciRunsCargoFmtAll(command), false, `not a CI trigger: ${command}`);
+  }
+  assert.equal(runsCargoFmtAll("cargo +stable fmt -p a --check"), false, "a per-package fmt never qualifies");
+  assert.equal(runsCargoFmtAll("cargo +stable fmt --all --check"), true, "a toolchain fmt --all --check qualifies");
+  assert.equal(runsCargoFmtAll("cargo fmt --all"), false, "a plain fmt --all never qualifies");
 });
 
 test("plan 06j: coverage facts read a workspace's crates and its workflow commands", () => {

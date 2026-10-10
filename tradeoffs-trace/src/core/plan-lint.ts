@@ -942,6 +942,35 @@ export function commandNamesPackage(command: string, name: string, cargo: boolea
   return !cargo && tokens.includes(name);
 }
 
+/** One command segment's words, with leading `VAR=value` environment
+ * assignments dropped (`RUSTFLAGS=x cargo fmt …` still starts at `cargo`). */
+function segmentWords(segment: string): string[] {
+  const tokens = segment.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+  return tokens.slice(i);
+}
+
+/** The argument tokens of a cargo-fmt invocation in a segment, or undefined
+ * when the segment is not one. Recognises `cargo [+toolchain] fmt …` and the
+ * `cargo-fmt …` binary, so a toolchain selector, an env prefix or the
+ * standalone binary all count (M-86/contract-39). */
+function cargoFmtArgs(segment: string): string[] | undefined {
+  const words = segmentWords(segment);
+  let i = 0;
+  if (words[i] === "cargo") {
+    i += 1;
+    if (words[i] !== undefined && /^\+\S+$/.test(words[i])) i += 1;
+    if (words[i] !== "fmt") return undefined;
+    i += 1;
+  } else if (words[i] === "cargo-fmt") {
+    i += 1;
+  } else {
+    return undefined;
+  }
+  return words.slice(i);
+}
+
 /** True when a command runs `cargo fmt --all --check` in one invocation. A
  * plain `cargo fmt --all` reformats and exits 0, so it never catches the
  * rustfmt drift CI rejects; `--all` in another segment (`cargo fmt -p a
@@ -949,10 +978,8 @@ export function commandNamesPackage(command: string, name: string, cargo: boolea
  * the PLAN QUALIFIER side (OD-13): only this form clears the CI warning. */
 export function runsCargoFmtAll(command: string): boolean {
   for (const segment of command.split(/[;&|\n]+/)) {
-    if (!/(^|\s)cargo\s+fmt(\s|$)/.test(segment)) continue;
-    if (!/(^|\s)--all(\s|$)/.test(segment)) continue;
-    if (!/(^|\s)--check(\s|$)/.test(segment)) continue;
-    return true;
+    const args = cargoFmtArgs(segment);
+    if (args && args.includes("--all") && args.includes("--check")) return true;
   }
   return false;
 }
@@ -963,9 +990,8 @@ export function runsCargoFmtAll(command: string): boolean {
  * it must raise the coverage warning when the plan never does. */
 export function ciRunsCargoFmtAll(command: string): boolean {
   for (const segment of command.split(/[;&|\n]+/)) {
-    if (!/(^|\s)cargo\s+fmt(\s|$)/.test(segment)) continue;
-    if (!/(^|\s)--all(\s|$)/.test(segment)) continue;
-    return true;
+    const args = cargoFmtArgs(segment);
+    if (args && args.includes("--all")) return true;
   }
   return false;
 }

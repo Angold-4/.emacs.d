@@ -238,10 +238,18 @@ recheck continues as if the checks had passed (the probe, then the reviews);
 the earlier failure stays in the log with the reason. A recheck that fails
 again follows the ordinary check-failure path — it never waives a failure.
 
+When the checks fail with budget left, the conductor has already started a
+repair attempt by itself. A recheck is still accepted then: it stops that
+attempt (awaiting its termination and killing its shell groups), resets every
+worker worktree to the frozen candidate (tracked and untracked writes are
+discarded), gives the round back, and re-runs the same tier. A recheck whose
+worktree reset fails is refused instead, with the stopped attempt recorded as
+an interrupted attempt so the ordinary repair path continues.
+
 Use it **only** for a failure shown to be the machine, never to retry a
 failure the candidate caused: a real failure rechecked is a real failure again,
-and the reason is recorded. A refused recheck names why (the checks passed, a
-newer candidate exists, or a worker attempt is running).
+and the reason is recorded. A refused recheck names why: the checks passed, a
+newer candidate exists, or the worktree reset failed.
 
 ## Prerequisites
 
