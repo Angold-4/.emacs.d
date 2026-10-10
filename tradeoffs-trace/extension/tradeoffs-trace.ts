@@ -906,13 +906,21 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "submit_pick_vote",
     label: "Submit Pick Vote",
-    description: "Cast your pick vote for one candidate of the round: { round, seat, lane, why }.",
-    promptSnippet: "Vote for one candidate of the round, by lane, with a one-line why",
+    description:
+      "Cast your pick vote for one candidate of the round: { round, seat, lane, why, loserHad: { yes, anchors, note? } }.",
+    promptSnippet: "Vote for one candidate of the round, by lane, with a one-line why and what the losing lane had",
     parameters: Type.Object({
       round: Type.Number(),
       seat: Type.String(),
       lane: Type.String(),
       why: Type.String(),
+      // Plan 06k1 (A1): the conductor requires it; without it in the schema a
+      // model cannot send it as an object and every vote is refused.
+      loserHad: Type.Object({
+        yes: Type.Boolean(),
+        anchors: Type.Array(Type.String()),
+        note: Type.Optional(Type.String()),
+      }),
     }),
     async execute(_toolCallId, params) {
       return submitTool("submit_pick_vote", params);
