@@ -164,6 +164,28 @@ test("plan 06j: a CI run block's separate lines are not one cargo fmt invocation
   }
 });
 
+test("plan 06j: a CI that gates on cargo fmt --all is matched by a plan running cargo fmt --all --check", () => {
+  // OD-13: the CI trigger is any `cargo fmt --all` (a following `git diff
+  // --exit-code` is the same gate); the plan only clears it with `--check`.
+  const root = cargoFixture("run: cargo fmt --all && git diff --exit-code");
+  const root2 = cargoFixture("run: cargo fmt --all --check");
+  try {
+    const plan: LintPlanInput = { repo: root, phases: [{ id: "p1", boundaries: [], checks: ["cargo fmt -p a --check"] }] };
+    assert.equal(
+      checkCoverageWarnings(plan, readRepoFacts(root)).filter((f) => /cargo fmt --all/.test(f.problem)).length,
+      1,
+      "CI gates on fmt --all, the plan does not",
+    );
+    plan.phases![0].checks = ["cargo fmt --all -- --check"];
+    assert.deepEqual(checkCoverageWarnings(plan, readRepoFacts(root)).filter((f) => /cargo fmt --all/.test(f.problem)), []);
+    const plan2: LintPlanInput = { repo: root2, phases: [{ id: "p1", boundaries: [], checks: ["cargo fmt --all --check"] }] };
+    assert.deepEqual(checkCoverageWarnings(plan2, readRepoFacts(root2)).filter((f) => /cargo fmt --all/.test(f.problem)), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root2, { recursive: true, force: true });
+  }
+});
+
 test("plan 06j: coverage facts read a workspace's crates and its workflow commands", () => {
   const root = cargoFixture("run: cargo fmt --all --check");
   try {

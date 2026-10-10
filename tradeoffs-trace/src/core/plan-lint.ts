@@ -945,12 +945,26 @@ export function commandNamesPackage(command: string, name: string, cargo: boolea
 /** True when a command runs `cargo fmt --all --check` in one invocation. A
  * plain `cargo fmt --all` reformats and exits 0, so it never catches the
  * rustfmt drift CI rejects; `--all` in another segment (`cargo fmt -p a
- * --check && cargo clippy --all`) is not the same invocation either. */
+ * --check && cargo clippy --all`) is not the same invocation either. This is
+ * the PLAN QUALIFIER side (OD-13): only this form clears the CI warning. */
 export function runsCargoFmtAll(command: string): boolean {
   for (const segment of command.split(/[;&|\n]+/)) {
     if (!/(^|\s)cargo\s+fmt(\s|$)/.test(segment)) continue;
     if (!/(^|\s)--all(\s|$)/.test(segment)) continue;
     if (!/(^|\s)--check(\s|$)/.test(segment)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** True when a command runs `cargo fmt --all` in one segment, with or without
+ * `--check`. This is the CI TRIGGER side (OD-13): a CI that runs `cargo fmt
+ * --all` and then `git diff --exit-code` gates on formatting just the same, so
+ * it must raise the coverage warning when the plan never does. */
+export function ciRunsCargoFmtAll(command: string): boolean {
+  for (const segment of command.split(/[;&|\n]+/)) {
+    if (!/(^|\s)cargo\s+fmt(\s|$)/.test(segment)) continue;
+    if (!/(^|\s)--all(\s|$)/.test(segment)) continue;
     return true;
   }
   return false;
@@ -986,7 +1000,9 @@ export function checkCoverageWarnings(plan: LintPlanInput, repo: RepoFacts): Lin
       });
     }
   }
-  const ciFmt = repo.ciCommands.find(runsCargoFmtAll);
+  // OD-13: CI triggers on any `cargo fmt --all`; the plan only clears it with
+  // `cargo fmt --all --check` in one invocation.
+  const ciFmt = repo.ciCommands.find(ciRunsCargoFmtAll);
   if (ciFmt !== undefined && !phases.some((p) => commandsOf(p).some(runsCargoFmtAll))) {
     out.push({
       severity: "warning",
