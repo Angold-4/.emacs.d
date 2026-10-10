@@ -23,7 +23,7 @@ import { reduce } from "./core/reduce.ts";
 import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { candidateAnchorFreshness, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
-import { buildView } from "./view.ts";
+import { buildView, updateLiveRun } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
 import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent, type InputKind } from "./core/owner-inbox.ts";
@@ -1434,6 +1434,9 @@ export class Conductor {
     // Plan 03b: the status view exists immediately; the coalesced write keeps
     // it fresh afterwards without rebuilding the view on every message event.
     this.#writeStatusViewSafe();
+    // Plan 06f (A2): a conductor starting on an existing run republishes its
+    // row so a stale `live.json` (from a crash) reflects the resumed run.
+    this.#writeLive();
     // Plan 01b: seed the park-episode counter from the log, so a restarted
     // conductor keeps the same notification key for the wait it is resuming.
     // Plan 05k (OD-7): the retry gate counts only AWAITING_OWNER entries;
@@ -1978,6 +1981,9 @@ export class Conductor {
     }
     // Plan 03b: flush the status view once before the log closes.
     this.#writeStatusViewSafe();
+    // Plan 06f (A2): a stopped conductor is neither alive nor waiting, so its
+    // row leaves `live.json` here.
+    this.#writeLive();
     // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
@@ -2067,6 +2073,9 @@ export class Conductor {
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
     if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") this.#awaitingEpisode += 1;
+    // Plan 06f (A2): the Emacs mode line reads `live.json`; every phase change
+    // rewrites this run's row (and only this run's row) there.
+    if (before !== this.#state.phase.phase) this.#writeLive();
     this.#syncBudgetTimer();
     if (!this.#driveSuspended) this.drive();
     // Plan 01b: before `#maybeAutoStop` can tear the log down for BLOCKED.
@@ -6152,6 +6161,35 @@ export class Conductor {
       this.#writeStatusView();
     } catch (err) {
       this.#logUnexpected("write_status_view", err);
+    }
+  }
+
+  /** Plan 06f (A2): keep this run's row in `<root>/live.json` current. The
+   * conductor is one of the file's two writers (the scheduler is the other);
+   * every write is atomic, and every other run's row and every waiting node
+   * another writer recorded is preserved. A stopped conductor removes its own
+   * row rather than leaving a stale `alive` entry behind. */
+  #writeLive(): void {
+    try {
+      const root = path.dirname(this.#runDir);
+      const id = path.basename(this.#runDir);
+      const needsOwner = this.#state.phase.phase === "AWAITING_OWNER";
+      // A closed run is neither alive nor waiting, so its row leaves. The one
+      // exception is a run still AWAITING_OWNER: the goal counts "waiting for
+      // the owner" as live even when its conductor has been stopped, so the
+      // mode line keeps showing it until the owner acts (M's veto of
+      // D-disc-M-24). Passing `id` explicitly is what makes the removal land.
+      if (this.#closed && !needsOwner) {
+        updateLiveRun(root, id, undefined);
+        return;
+      }
+      updateLiveRun(root, id, {
+        title: redactText(this.#plan.title, this.#secretMaskable),
+        phase: this.#state.phase.phase,
+        needsOwner,
+      });
+    } catch (err) {
+      this.#logUnexpected("write_live", err);
     }
   }
 

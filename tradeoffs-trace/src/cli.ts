@@ -9,7 +9,7 @@
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -946,8 +946,98 @@ function runPlanPath(runDir: string): string | undefined {
   }
 }
 
+/** Plan 06f (A1): one run's row, exactly as `tt list` emits it. */
+interface ListRow {
+  id: string;
+  runDir: string;
+  readableId: string | null;
+  planPath: string | null;
+  title: string;
+  phase: string;
+  stage: string;
+  stageElapsed: string;
+  elapsed: string;
+  reviews: string;
+  attention: string | null;
+  needsYou: number;
+  alive: boolean;
+  activity: number;
+}
+
+/** The expensive part of a list row: read `meta.json`, fold the run's log
+ * (`buildView`) and redact what it carries. Only called on a cache miss. */
+function buildListRow(runDir: string, id: string, activity: number): ListRow {
+  const alive = conductorAlive(runDir);
+  const meta = JSON.parse(readFileSync(runPaths(runDir).meta, "utf8")) as { title?: string };
+  const v = buildView(runDir, readPlan(runDir), alive);
+  // Plan 01a: a title or an attention line can quote a value.
+  const secrets = secretsForRun(runDir);
+  return {
+    id,
+    runDir,
+    readableId: runReadableId(runDir) ?? null,
+    planPath: runPlanPath(runDir) ?? null,
+    title: redactText(meta.title ?? "", secrets),
+    phase: v.timeline.state.phase.phase,
+    stage: v.stage,
+    stageElapsed: v.stageElapsed,
+    elapsed: v.elapsed,
+    reviews: v.reviewLine,
+    attention: v.attention ? redactText(v.attention, secrets) : null,
+    needsYou: v.needsYou,
+    alive,
+    activity,
+  };
+}
+
+/** Plan 06f (A1): the ONE reader and writer of `<run>/views/row.json`.
+ * `row.json` holds `{ key: { size, mtimeMs }, row }`, keyed by the size and
+ * mtime of the run's `events.jsonl`. The row is rebuilt (and the file
+ * rewritten) only when that key differs from the log's current stat, so a
+ * listing with nothing changed pays one stat and one small file read per
+ * run instead of folding every log. Returns undefined for a run with no
+ * `events.jsonl`, exactly as the pre-cache listing skipped it. */
+function listRow(runDir: string, id: string): ListRow | undefined {
+  const events = runPaths(runDir).events;
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const st = statSync(events);
+    size = st.size;
+    mtimeMs = st.mtimeMs;
+  } catch {
+    return undefined;
+  }
+  const rowFile = path.join(runPaths(runDir).views, "row.json");
+  try {
+    const cached = JSON.parse(readFileSync(rowFile, "utf8")) as {
+      key?: { size?: number; mtimeMs?: number };
+      row?: ListRow;
+    };
+    if (cached.key?.size === size && cached.key?.mtimeMs === mtimeMs && cached.row) return cached.row;
+  } catch {
+    // no readable cache: rebuild below
+  }
+  let row: ListRow;
+  try {
+    row = buildListRow(runDir, id, mtimeMs);
+  } catch {
+    return undefined;
+  }
+  try {
+    mkdirSync(path.dirname(rowFile), { recursive: true });
+    const tmp = `${rowFile}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ key: { size, mtimeMs }, row }));
+    renameSync(tmp, rowFile);
+  } catch {
+    // a cache that cannot be written must never stop the listing
+  }
+  return row;
+}
+
 /** Plan 3b: `tt list` — one line per run (newest activity first), the
- * summary the Emacs runs list and mode-line indicator render. */
+ * summary the Emacs runs list renders. Plan 06f (A1): each row comes from
+ * `listRow`, cached by its `events.jsonl` size and mtime. */
 function cmdList(root: string, json: boolean): void {
   let names: string[] = [];
   try {
@@ -956,35 +1046,8 @@ function cmdList(root: string, json: boolean): void {
     names = [];
   }
   const rows = names
-    .map((n) => {
-      const runDir = path.join(root, n);
-      try {
-        const alive = conductorAlive(runDir);
-        const meta = JSON.parse(readFileSync(runPaths(runDir).meta, "utf8")) as { title?: string };
-        const v = buildView(runDir, readPlan(runDir), alive);
-        // Plan 01a: a title or an attention line can quote a value.
-        const secrets = secretsForRun(runDir);
-        return {
-          id: n,
-          runDir,
-          readableId: runReadableId(runDir) ?? null,
-          planPath: runPlanPath(runDir) ?? null,
-          title: redactText(meta.title ?? "", secrets),
-          phase: v.timeline.state.phase.phase,
-          stage: v.stage,
-          stageElapsed: v.stageElapsed,
-          elapsed: v.elapsed,
-          reviews: v.reviewLine,
-          attention: v.attention ? redactText(v.attention, secrets) : null,
-          needsYou: v.needsYou,
-          alive,
-          activity: statSync(runPaths(runDir).events).mtimeMs,
-        };
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((r): r is NonNullable<typeof r> => r !== undefined)
+    .map((n) => listRow(path.join(root, n), n))
+    .filter((r): r is ListRow => r !== undefined)
     .sort((a, b) => b.activity - a.activity);
   if (json) {
     process.stdout.write(`${JSON.stringify(rows)}\n`);

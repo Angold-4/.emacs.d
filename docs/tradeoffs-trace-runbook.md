@@ -912,8 +912,8 @@ true at the moment it runs.
 | trace buffer | one line per tool call (time, command, ✓/✗ exit, duration, last output line), plus `path +a −r` for each file the call changed; the running call in the header. `a` pins another agent. |
 | decision view (`C-c m d`) | the owner directives in force (so `RET` from a directive trade-off line lands on the ruling), then the current round's decisions in the same order as the Trade-offs panel (amendments, flagged, M vetoes, dissent, the rest), each labelled by the tally, with the options, recommendation and each reviewer's ballot; a passed amendment reads `⚑ AMENDED` and shows the old → new wording; the open advisories folded under one `Advisories (N)` heading; other findings grouped by file; earlier rounds one line each. Read-only. |
 | runs list (`C-c m l`) | every run: `RET` opens; stop and continue with `C-c m k` / `C-c m c` in the run's own buffer |
-| mode line | live runs with stage, time and reviews; the oldest owner wait (`⚑ 13f waiting 1h12m`) with a warning-face flash when a new notification arrives |
-| CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
+| mode line | the runs alive or waiting for the owner and the program nodes waiting to start, read from `<root>/live.json` — a file the conductor and the scheduler keep current — so the mode line is a file read and never starts a process; a warning-face flash when a new notification arrives |
+| CLI | `tt list` (each run's row is cached in `<run>/views/row.json`, keyed by the size and mtime of its `events.jsonl`, so a listing with nothing changed rebuilds no row), `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
 
 ## The decision brief (what needs you, in plain words)
 
@@ -1238,8 +1238,8 @@ choosing one opens it on its own root: every later `tt` command on that
 buffer (refresh, `C-c m k`/`C-c m c`, `C-c m d`, A/D verdicts, directives)
 runs against that root, never the default one. No per-run file is read over
 TRAMP while listing. Remote roots are listed only from a picker or a visible
-buffer; the periodic mode-line refresh reads the local root alone, so a dead
-host cannot stall Emacs in the background.
+buffer; the periodic mode-line refresh reads the local root's `live.json`
+alone, so a dead host cannot stall Emacs in the background.
 
 `C-c m p` in a buffer visiting a program's Org file (`05_program.org`) skips
 the prompt: the running program of that file opens directly when exactly one
@@ -1478,15 +1478,18 @@ a refresh keeps the expanded messages and point on the same one.
 |---|---|---|
 | `TAB` | on a message heading | shows the description and context in place; the property drawer stays folded |
 | `RET` | on a message heading | opens the message's own `views/messages/<id>.org`: its evidence (path and lines), the plan excerpt it concerns, what was merged into it, every version's history, its ledger entry and its votes |
-| `A` | normal state | accepts the message: writes a `verdict` command with `verdict: "accept"` |
-| `D` | normal state | refuses it: asks for a one-line reason, then writes `verdict: "refuse"` with that reason |
+| `A` | normal state | accepts the message: sends a `verdict` command with `verdict: "accept"` |
+| `D` | normal state | refuses it: asks for a one-line reason, then sends `verdict: "refuse"` with that reason |
 
 The status buffer's `review` row counts the same messages in trade-off
 vocabulary: `T 6 (6 raw) · F 0 · B 0 · C-c m d` — the titled entries plus the
 raw ones, with the raw and dropped counts broken out, matching `review.org`.
 
 `A`/`D` are accepted and refused in the buffer; `A` and `D` override Evil's
-append and delete-to-end-of-line, which is safe in a read-only view. On a
+append and delete-to-end-of-line, which is safe in a read-only view. The
+command runs **asynchronously**: `A`/`D` return at once, the entry shows
+`⧗ A pending` / `⧗ D pending` until the process exits, and the callback
+replaces it with the recorded outcome (or the error) in the echo area. On a
 **live** run the command goes through `<run>/inbox/` and the conductor
 validates its binding; on a run whose conductor has exited it is a **late
 verdict**, dry-run through `reduce()` and appended to `events.jsonl` only if

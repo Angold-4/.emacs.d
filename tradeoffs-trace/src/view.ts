@@ -28,6 +28,71 @@ import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs,
 import type { PhaseState } from "./core/types.ts";
 
 // ---------------------------------------------------------------------------
+// The live file (plan 06f, A2)
+// ---------------------------------------------------------------------------
+
+/** Plan 06f (A2): the one file the Emacs mode line reads. The conductor and
+ * the scheduler keep it current — atomically (write a temporary file, then
+ * rename), on every phase change and node change. Emacs only reads it. */
+export interface Live {
+  updatedAt: string;
+  runs: { id: string; title: string; phase: string; needsOwner: boolean }[];
+  waitingNodes: { program: string; node: string }[];
+}
+
+/** The `live.json` path for a run root. */
+export function livePath(root: string): string {
+  return path.join(root, "live.json");
+}
+
+/** The current `live.json`, or an empty one when it is missing or malformed.
+ * A reader never fails: an old or half-written file simply lists nothing. */
+export function readLive(root: string): Live {
+  try {
+    const raw = JSON.parse(fs.readFileSync(livePath(root), "utf8")) as Partial<Live>;
+    return {
+      updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : "",
+      runs: Array.isArray(raw.runs) ? raw.runs : [],
+      waitingNodes: Array.isArray(raw.waitingNodes) ? raw.waitingNodes : [],
+    };
+  } catch {
+    return { updatedAt: "", runs: [], waitingNodes: [] };
+  }
+}
+
+/** Plan 06f (A2): write `live.json` atomically. Only the conductor and the
+ * scheduler call this; a reader can therefore never see a torn file. */
+export function writeLive(root: string, live: Live): void {
+  const file = livePath(root);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(live)}\n`);
+  fs.renameSync(tmp, file);
+}
+
+/** Plan 06f (A2): replace THIS run's row in `live.json`, keeping every other
+ * run and every waiting node another writer recorded. The id is passed
+ * separately from the row so a closed conductor can remove its own row
+ * (`run` undefined) — the earlier `run?.id` form left every row in place. */
+export function updateLiveRun(
+  root: string,
+  id: string,
+  run: { title: string; phase: string; needsOwner: boolean } | undefined,
+): void {
+  const live = readLive(root);
+  const runs = live.runs.filter((r) => r.id !== id);
+  if (run) runs.push({ id, ...run });
+  writeLive(root, { updatedAt: new Date().toISOString(), runs, waitingNodes: live.waitingNodes });
+}
+
+/** Plan 06f (A2): replace THIS program's waiting nodes in `live.json`,
+ * keeping every other program's wait and every run row. */
+export function updateLiveWaiting(root: string, program: string, waitingNodes: { program: string; node: string }[]): void {
+  const live = readLive(root);
+  const others = live.waitingNodes.filter((w) => w.program !== program);
+  writeLive(root, { updatedAt: new Date().toISOString(), runs: live.runs, waitingNodes: [...others, ...waitingNodes] });
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
 

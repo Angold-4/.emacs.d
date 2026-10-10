@@ -543,28 +543,73 @@ const NODE_MARK: Record<string, string> = {
   "env-blocked": "E",
 };
 
+/** Plan 06f (A4): the program graph lists nodes in topological order of
+ * AFTER, with file order breaking ties. Pure and stable: a node whose
+ * dependencies are already placed keeps its file position relative to its
+ * peers, so a program already in dependency order is unchanged. A cycle (a
+ * hand-made `program.json`; lint refuses one) keeps the remaining nodes in
+ * file order rather than dropping them. */
+export function topologicalNodes(nodes: readonly ProgramNode[]): ProgramNode[] {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const order = new Map(nodes.map((n, i) => [n.id, i]));
+  const rank = (id: string) => order.get(id) ?? 0;
+  const remaining = new Map(nodes.map((n) => [n.id, n.deps.filter((d) => byId.has(d))]));
+  const dependents = new Map<string, string[]>();
+  for (const n of nodes) {
+    for (const d of remaining.get(n.id)!) {
+      const list = dependents.get(d);
+      if (list) list.push(n.id);
+      else dependents.set(d, [n.id]);
+    }
+  }
+  const ready = nodes.filter((n) => remaining.get(n.id)!.length === 0).map((n) => n.id);
+  ready.sort((a, b) => rank(a) - rank(b));
+  const out: ProgramNode[] = [];
+  while (ready.length > 0) {
+    const id = ready.shift()!;
+    out.push(byId.get(id)!);
+    for (const dependent of dependents.get(id) ?? []) {
+      const left = remaining.get(dependent)!.filter((d) => d !== id);
+      remaining.set(dependent, left);
+      if (left.length === 0) {
+        ready.push(dependent);
+        ready.sort((a, b) => rank(a) - rank(b));
+      }
+    }
+  }
+  for (const n of nodes) if (!out.includes(n)) out.push(n);
+  return out;
+}
+
 /** The program dependency graph as an ASCII chart: one box per node, carrying
  * its readable id (`<program>-NN`), its entry, its node state and, while it
  * runs, the phase state of its run. Under each box, the `after` edges name
- * the nodes it waits for — a join lists several. */
+ * the nodes it waits for — a join lists several. Plan 06f (A4): the boxes are
+ * in topological order of AFTER (file order breaks ties), so a node is always
+ * drawn after the nodes it waits for. */
 export function renderProgramChart(
   program: { title: string; maxParallel?: number; readableIds?: Record<string, string> },
   nodes: readonly ProgramNode[],
   state: ProgramState,
   opts: { programId: string; phaseOf?: Record<string, string> } = { programId: "" },
 ): string {
+  // The readable id's positional fallback uses the node's ORIGINAL file
+  // position, never its topological position, so reordering the chart never
+  // renumbers a node that has no recorded id.
+  const originalIndex = new Map(nodes.map((n, i) => [n.id, i]));
   const readable = (n: ProgramNode, i: number) =>
     program.readableIds?.[n.id] ?? `${opts.programId}-${String(i + 1).padStart(2, "0")}`;
+  const ordered = topologicalNodes(nodes);
   const lines: string[] = [];
   lines.push(`program ${opts.programId} — ${program.title}`);
   lines.push(`${nodes.length} node${nodes.length === 1 ? "" : "s"} · max ${program.maxParallel ?? 1} in parallel`);
   lines.push("");
-  const inner = Math.max(...nodes.map((n, i) => `${readable(n, i)}  ${n.id}`.length), 16) + 2;
+  const labelOf = (n: ProgramNode) => `${readable(n, originalIndex.get(n.id) ?? 0)}  ${n.id}`;
+  const inner = Math.max(...nodes.map((n) => labelOf(n).length), 16) + 2;
   const bar = `+${"-".repeat(inner)}+`;
-  for (let i = 0; i < nodes.length; i++) {
-    const n = nodes[i];
+  for (const n of ordered) {
     const s = state.nodes[n.id] ?? { status: "waiting" as const };
-    const label = `${readable(n, i)}  ${n.id}`;
+    const label = labelOf(n);
     const bits = [s.status];
     const phase = s.status === "running" ? opts.phaseOf?.[n.id] : undefined;
     if (phase) bits.push(phase);
@@ -572,7 +617,9 @@ export function renderProgramChart(
     lines.push(`${marker}${bar}`);
     lines.push(`  | ${label.padEnd(inner - 1)}|  ${bits.join(" - ")}`);
     lines.push(`  ${bar}`);
-    lines.push(`      after: ${n.deps.length > 0 ? n.deps.map((d) => readable(nodes.find((x) => x.id === d)!, nodes.findIndex((x) => x.id === d))).join(", ") : "(none)"}`);
+    lines.push(
+      `      after: ${n.deps.length > 0 ? n.deps.map((d) => readable(nodes.find((x) => x.id === d)!, originalIndex.get(d) ?? 0)).join(", ") : "(none)"}`,
+    );
     if (s.reason) lines.push(`      ${s.reason}`);
     if (s.runId) lines.push(`      run: ${s.runId}`);
     lines.push("");
