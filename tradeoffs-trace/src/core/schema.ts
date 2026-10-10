@@ -138,3 +138,26 @@ export function validate(schema: JSONSchema, data: unknown): ValidationResult {
   }
   return { valid: errors.length === 0, errors };
 }
+
+/**
+ * Drop empty-string fields, and objects left empty by that, before a tool's
+ * arguments are validated. Models routinely send `""` for an optional field
+ * (gpt-6.1-sol in seat A, 186 refusals over 2026-10-08/10): the schema's
+ * `minLength: 1` then refused the whole review, the seat retried the same
+ * shape until its deadline, and five two-lane rounds were dropped. An empty
+ * string carries no content, so it is treated as "absent": a required field
+ * that was empty is still refused, now as missing.
+ */
+export function dropEmptyStrings(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(dropEmptyStrings);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (child === "") continue;
+    const kept = dropEmptyStrings(child);
+    const wasObject = child !== null && typeof child === "object" && !Array.isArray(child);
+    if (wasObject && Object.keys(kept as Record<string, unknown>).length === 0) continue;
+    out[key] = kept;
+  }
+  return out;
+}
