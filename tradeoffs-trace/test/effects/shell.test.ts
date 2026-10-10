@@ -4,7 +4,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { childEnv, killGroup, runCommand } from "../../src/effects/shell.ts";
+import { childEnv, runCommand } from "../../src/effects/shell.ts";
+// A2/C3 (plan 06e): the sweep owns the signalling decision, so the recovery
+// path's killGroup lives there now.
+import { killGroup } from "../../src/effects/sweep.ts";
 
 let dir: string;
 

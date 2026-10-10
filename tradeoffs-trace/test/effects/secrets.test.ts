@@ -18,6 +18,7 @@ import {
   redactRecord,
   redactRunDir,
   redactText,
+  loadEnvFile,
   resolveSecrets,
   secretNames,
   secretPromptLines,
@@ -25,6 +26,36 @@ import {
 } from "../../src/effects/secrets.ts";
 
 const VALUE = "tt-fake-4f8a2b1c9d3e";
+
+test("secrets: an env file supplies a value the environment does not, and the environment wins (A1)", () => {
+  const dir = fs.mkdtempSync("/tmp/tt-envfile-unit-");
+  const file = path.join(dir, "secrets.env");
+  try {
+    fs.writeFileSync(
+      file,
+      [
+        "# a comment",
+        "",
+        "export FROM_FILE='file value'",
+        "BOTH=from-file",
+        'QUOTED="quoted"',
+        "not an assignment",
+      ].join("\n"),
+    );
+    const parsed = loadEnvFile(file);
+    assert.deepEqual(parsed?.values, { FROM_FILE: "file value", BOTH: "from-file", QUOTED: "quoted" });
+
+    // The environment is checked first; the file fills the rest.
+    const resolved = resolveSecrets(["FROM_FILE", "BOTH", "MISSING"], { BOTH: "from-env" }, file);
+    assert.equal(resolved.values.find((s) => s.name === "FROM_FILE")?.value, "file value");
+    assert.equal(resolved.values.find((s) => s.name === "BOTH")?.value, "from-env", "the environment wins");
+    assert.deepEqual(resolved.missing, ["MISSING"]);
+    assert.deepEqual(resolved.sources, ["environment", "env-file"]);
+    assert.equal(resolved.envFile, file);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("secrets: names are parsed, deduped and validated; values come from the environment", () => {
   assert.deepEqual(secretNames(["FAKE_KEY"]), ["FAKE_KEY"]);

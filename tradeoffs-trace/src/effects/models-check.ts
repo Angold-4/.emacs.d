@@ -6,6 +6,8 @@
 
 import { spawn } from "node:child_process";
 
+import { signalProcess } from "./sweep.ts";
+
 import {
   classifyModelProbe,
   MODELS_CHECK_TIMEOUT_MS,
@@ -54,11 +56,8 @@ export function probeModel(group: ModelGroup, opts: ModelsCheckOptions): Promise
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env: opts.env ?? process.env });
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // already gone
-      }
+      // A2/C3 (plan 06e): the sweep owns the signalling decision.
+      if (child.pid !== undefined) signalProcess(child.pid, "SIGKILL");
     }, timeoutMs);
     child.stdout?.on("data", (chunk: Buffer) => {
       output += chunk.toString();

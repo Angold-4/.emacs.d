@@ -1,0 +1,22 @@
+{
+  "title": "test plan",
+  "repo": "/tmp/tt-repo-hm6ax1",
+  "integrationBranch": "main",
+  "checks": [
+    "true"
+  ],
+  "phases": [
+    {
+      "id": "p1",
+      "goal": "do the thing",
+      "acceptance": [
+        "it works"
+      ],
+      "checks": [
+        "true"
+      ],
+      "boundaries": [],
+      "reserved": []
+    }
+  ]
+}

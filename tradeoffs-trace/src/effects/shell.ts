@@ -28,6 +28,11 @@
 
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
 
+// A2/C3 (plan 06e): the sweep owns the signalling decision. This module asks
+// it to signal the groups it recorded at spawn; it never calls `process.kill`
+// with a signal itself.
+import { groupAlive, signalGroup } from "./sweep.ts";
+
 const DEFAULT_TERM_GRACE_MS = 10_000;
 const STOP_POLL_INTERVAL_MS = 5;
 const STOP_POLL_TIMEOUT_MS = 5_000;
@@ -55,6 +60,55 @@ export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
 
 export type EndReason = "exit" | "timeout" | "cancelled";
 
+/** A3 (plan 06e): what a killed command's note reports — how much memory it
+ * used (its peak resident set, in MiB) and how much the machine had left
+ * (free memory in MiB) when it was killed. */
+export interface ResourceSample {
+  peakRssMB: number;
+  freeMemMB: number;
+}
+
+/** A3: the sampler a kill note takes its numbers from. It is a plain function
+ * of the command's process-group id, so a test replaces it with one that
+ * returns fixed values. */
+export type ResourceSampler = (pgid: number) => { rssMB: number; freeMemMB: number };
+
+/** The real sampler: the WHOLE process group's resident set right now (summed
+ * over every member — the `/bin/sh` wrapper is the leader, so sampling it
+ * alone would under-report a compound command badly), and the machine's free
+ * pages (`vm_stat`). `pgid` is the group's id. A failure on either side is 0
+ * rather than a thrown error — a kill note must never be what fails. */
+export function realSampler(pgid: number): { rssMB: number; freeMemMB: number } {
+  let rssMB = 0;
+  try {
+    const out = execFileSync("ps", ["-A", "-o", "rss=,pgid="], { encoding: "utf8" });
+    let rssKB = 0;
+    for (const line of out.split("\n")) {
+      const [rss, group] = line.trim().split(/\s+/);
+      if (Number(group) === pgid) rssKB += Number(rss) || 0;
+    }
+    rssMB = Math.round(rssKB / 1024);
+  } catch {
+    rssMB = 0;
+  }
+  let freeMemMB = 0;
+  try {
+    const out = execFileSync("vm_stat", { encoding: "utf8" });
+    const pages = out.match(/Pages free:\s+(\d+)/);
+    const pageSize = Number((out.match(/page size of (\d+) bytes/) ?? [])[1] ?? 4096);
+    if (pages) freeMemMB = Math.round((Number(pages[1]) * pageSize) / (1024 * 1024));
+  } catch {
+    freeMemMB = 0;
+  }
+  return { rssMB, freeMemMB };
+}
+
+/** How often the running command's memory is sampled while it runs. A peak
+ * needs more than one reading; 1 s is cheap (one `ps`/`vm_stat` pair) and
+ * still catches a command that grows over a multi-minute limit. The first
+ * sample is taken at spawn, so a short deadline always has a reading. */
+const SAMPLE_INTERVAL_MS = 1000;
+
 export interface RunCommandOptions {
   command: string;
   cwd?: string;
@@ -70,6 +124,9 @@ export interface RunCommandOptions {
    * caller writes the intent event (design §2.2). */
   onIntent?: (info: { pgid: number }) => void | Promise<void>;
   onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
+  /** A3: the memory sampler. Defaults to `realSampler`; a test passes fixed
+   * values so a kill note is deterministic. */
+  sampler?: ResourceSampler;
 }
 
 export interface RunCommandResult {
@@ -79,6 +136,10 @@ export interface RunCommandResult {
   cancelled: boolean;
   output: string;
   signalsSent: string[];
+  /** A3: the command's peak resident set and the machine's free memory, from
+   * the sampler, when at least one sample was taken. Present on every
+   * outcome; a kill note uses it when the command was killed at its limit. */
+  resourceSample?: ResourceSample;
 }
 
 export interface RunningCommand {
@@ -126,52 +187,6 @@ function waitUntilStopped(pid: number): Promise<void> {
   });
 }
 
-function groupAlive(pgid: number): boolean {
-  try {
-    // Signal 0 sent to -pgid: any process in the group receiving it is
-    // enough to prove the group is non-empty; ESRCH means it is gone.
-    process.kill(-pgid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Sends SIGTERM to the whole group, then SIGKILL after `termGraceMs` if
- * any member is still alive. Returns the signals actually sent. Exported
- * standalone for recovery: killing a pgid recorded in a previous
- * conductor's intent event, when there is no live `ChildProcess` handle
- * for it any more. */
-export function killGroup(pgid: number, opts: { termGraceMs?: number } = {}): Promise<{ signalsSent: string[] }> {
-  const termGraceMs = opts.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
-  return new Promise((resolve) => {
-    const signalsSent: string[] = [];
-    if (!groupAlive(pgid)) {
-      resolve({ signalsSent });
-      return;
-    }
-    try {
-      process.kill(-pgid, "SIGTERM");
-      signalsSent.push("SIGTERM");
-    } catch {
-      // Already gone.
-      resolve({ signalsSent });
-      return;
-    }
-    setTimeout(() => {
-      if (groupAlive(pgid)) {
-        try {
-          process.kill(-pgid, "SIGKILL");
-          signalsSent.push("SIGKILL");
-        } catch {
-          // Already gone.
-        }
-      }
-      resolve({ signalsSent });
-    }, termGraceMs);
-  });
-}
-
 /** Spawns `options.command` in a fresh process group and drives it through
  * the stop/intent/continue handshake described at the top of this file.
  * See `RunCommandOptions`/`RunCommandResult`/`RunningCommand`. */
@@ -192,25 +207,37 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
   let output = "";
   let child: ChildProcessWithoutNullStreams | undefined;
   let resolvedPgid: number | undefined;
+  const sampler = options.sampler ?? realSampler;
+  let peakRssMB = 0;
+  let freeMemMB = 0;
+  let sampled = false;
+  let sampleTimer: NodeJS.Timeout | undefined;
+
+  function takeSample(): void {
+    if (resolvedPgid === undefined) return;
+    const s = sampler(resolvedPgid);
+    if (!s) return;
+    peakRssMB = Math.max(peakRssMB, s.rssMB);
+    freeMemMB = s.freeMemMB;
+    sampled = true;
+  }
+
+  function stopSampling(): void {
+    if (sampleTimer !== undefined) {
+      clearInterval(sampleTimer);
+      sampleTimer = undefined;
+    }
+  }
 
   function terminate(reason: EndReason): void {
     if (reason === "timeout") timedOut = true;
     if (reason === "cancelled") cancelRequested = true;
     if (resolvedPgid === undefined || !groupAlive(resolvedPgid)) return;
-    try {
-      process.kill(-resolvedPgid, "SIGTERM");
-      signalsSent.push("SIGTERM");
-    } catch {
-      return;
-    }
+    if (!signalGroup(resolvedPgid, "SIGTERM")) return;
+    signalsSent.push("SIGTERM");
     termTimer = setTimeout(() => {
-      if (resolvedPgid !== undefined && groupAlive(resolvedPgid)) {
-        try {
-          process.kill(-resolvedPgid, "SIGKILL");
-          signalsSent.push("SIGKILL");
-        } catch {
-          // Already gone.
-        }
+      if (resolvedPgid !== undefined && groupAlive(resolvedPgid) && signalGroup(resolvedPgid, "SIGKILL")) {
+        signalsSent.push("SIGKILL");
       }
     }, termGraceMs);
   }
@@ -237,6 +264,12 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
     // so `stop()` could leave it running (found when the force-kill-shell
     // SIGKILLed-worker test waited out its own `sleep 300`).
     if (c.pid !== undefined) resolvedPgid = c.pid;
+    // A3: sample immediately (a short deadline may expire before the first
+    // interval tick) and then while the command runs, so the note reports a
+    // peak rather than a single reading.
+    takeSample();
+    sampleTimer = setInterval(takeSample, SAMPLE_INTERVAL_MS);
+    sampleTimer.unref?.();
     const intentRecorded =
       c.pid !== undefined ? Promise.resolve(options.onIntent?.({ pgid: c.pid })) : Promise.resolve();
 
@@ -274,10 +307,8 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         if (options.deadlineMs !== undefined) {
           deadlineTimer = setTimeout(() => terminate("timeout"), options.deadlineMs);
         }
-        try {
-          process.kill(-resolvedPgid, "SIGCONT");
-        } catch (err) {
-          rejectResult(err as Error);
+        if (!signalGroup(resolvedPgid, "SIGCONT")) {
+          rejectResult(new Error(`failed to continue command group ${resolvedPgid}`));
         }
       })
       .catch((err) => {
@@ -287,6 +318,7 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
     c.once("exit", (code, signal) => {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       if (termTimer) clearTimeout(termTimer);
+      stopSampling();
       resolveResult({
         exitCode: code,
         signal: signal as NodeJS.Signals | null,
@@ -294,6 +326,7 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         cancelled: cancelRequested,
         output,
         signalsSent,
+        ...(sampled ? { resourceSample: { peakRssMB, freeMemMB } } : {}),
       });
     });
   });

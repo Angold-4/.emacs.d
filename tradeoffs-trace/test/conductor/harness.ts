@@ -190,6 +190,10 @@ export async function setupConductor(opts: {
    * the JSON plan. The values are read from the harness process's own
    * environment (set them with `process.env.NAME = …` before calling). */
   secrets?: string[];
+  /** Plan 06e (A1): the plan's `#+TT_ENV_FILE` path, as Emacs would put it in
+   * the JSON plan. A declared secret the harness process does not export is
+   * resolved from this KEY=value file instead. */
+  envFile?: string;
   /** The phase's own goal text (default "do the thing"). A plan's prose is a
    * secret-value carrier too, so a test can quote one in it. */
   goal?: string;
@@ -236,6 +240,7 @@ export async function setupConductor(opts: {
     integrationBranch: "main",
     checks: opts.globalChecks ?? opts.checks ?? ["true"],
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
+    ...(opts.envFile ? { envFile: opts.envFile } : {}),
     ...(opts.models ? { models: opts.models } : {}),
     phases: [
       opts.phase ?? {

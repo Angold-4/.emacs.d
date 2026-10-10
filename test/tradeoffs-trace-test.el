@@ -834,6 +834,18 @@ and an unknown id is refused by that command."
   ;; An empty #+TT_SECRETS declares nothing.
   (should-not (assq 'secrets (plist-get (+tt-test--parse (concat "#+TT_SECRETS:\n" +tt-test--valid-plan)) :plan))))
 
+(ert-deftest tradeoffs-trace-plan-env-file ()
+  "Plan 06e: #+TT_ENV_FILE becomes the plan's envFile, as an absolute path.
+The lookup order is the environment first, then this file."
+  ;; A relative name resolves against the plan's own directory (/tmp here).
+  (let ((plan (plist-get (+tt-test--parse (concat "#+TT_ENV_FILE: secrets.env\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'envFile plan) "/tmp/secrets.env")))
+  (let ((plan (plist-get (+tt-test--parse (concat "#+TT_ENV_FILE: /abs/keys.env\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'envFile plan) "/abs/keys.env")))
+  ;; No keyword (or an empty one) declares no env file.
+  (should-not (assq 'envFile (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+  (should-not (assq 'envFile (plist-get (+tt-test--parse (concat "#+TT_ENV_FILE:\n" +tt-test--valid-plan)) :plan))))
+
 (ert-deftest tradeoffs-trace-plan-models ()
   "#+TT_MODELS becomes the plan's models map: provider optional, model may
 contain a slash, and a role named twice is recorded for `tt lint'."

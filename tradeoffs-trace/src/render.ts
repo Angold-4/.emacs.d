@@ -591,6 +591,14 @@ export interface StatusSecretStatus {
   tooShort: string[];
 }
 
+/** A2 (plan 06e): a process with a file under the worktree that the run does
+ * not own. `tt status` lists it under `held` — reported, never signalled. */
+export interface StatusHeldProcess {
+  pid: number;
+  command: string;
+  cwd: string;
+}
+
 /** `views/status.txt`: the same readable status `tt status` prints, from a
  * rebuilt (or live) state and the view computed from the run directory. The
  * Emacs status buffer reads it instead of calling `tt state' every poll. */
@@ -599,6 +607,7 @@ export function renderStatusText(
   state: { run: string; phase: unknown },
   view: RunView & { timeline: Timeline },
   secretStatus: StatusSecretStatus = { missing: [], tooShort: [] },
+  held: readonly StatusHeldProcess[] = [],
 ): string {
   const phase = state.phase as Record<string, unknown>;
   const lines: string[] = [];
@@ -606,6 +615,9 @@ export function renderStatusText(
   lines.push(`run status: ${state.run}`);
   for (const name of secretStatus.missing) lines.push(`secret ${name} not set`);
   for (const name of secretStatus.tooShort) lines.push(`secret ${name} too short to mask (value under 4 characters)`);
+  // A2 (plan 06e): a foreign process holding a worktree file, reported under
+  // `held` and never signalled. One line each, with its pid, command and cwd.
+  for (const h of held) lines.push(`held: ${h.pid} ${h.command} (cwd ${h.cwd})`);
   lines.push(`phase: ${phase.phaseId} — ${phase.phase}`);
   const attempt = phase.attempt as { n: number; interrupted?: boolean } | undefined;
   if (attempt) lines.push(`attempt: ${attempt.n}${attempt.interrupted ? " (interrupted)" : ""}`);
@@ -717,6 +729,9 @@ export interface StatusViewInput {
   pendingOwnerInputs?: OwnerInputLike[];
   ownerDirectives?: OwnerDirectiveLike[];
   ownerChecklist?: string[];
+  /** A2 (plan 06e): foreign processes holding a worktree file, listed under
+   * `held`; reported, never signalled. */
+  held?: StatusHeldProcess[];
 }
 
 /** Assemble a `StatusViewInput` from the pieces a caller already has, so the
@@ -728,6 +743,7 @@ export function statusViewInput(opts: {
   view: RunView & { timeline: Timeline };
   alive: boolean;
   secrets?: { missing: string[]; tooShort: string[] };
+  held?: StatusHeldProcess[];
 }): StatusViewInput {
   const phase = opts.state.phase as Record<string, unknown>;
   return {
@@ -741,6 +757,7 @@ export function statusViewInput(opts: {
     pendingOwnerInputs: pendingOwnerInputs(opts.runDir),
     ownerDirectives: (phase.ownerDirectives as OwnerDirectiveLike[] | undefined) ?? [],
     ownerChecklist: opts.plan.phases?.[0]?.ownerChecklist,
+    ...(opts.held ? { held: opts.held } : {}),
   };
 }
 
@@ -881,6 +898,8 @@ export function renderStatusView(input: StatusViewInput): string {
   if (view.envBlocked) lines.push(view.envBlocked);
   for (const nm of input.secrets?.missing ?? []) push(row("secret", `${nm} not set`));
   for (const nm of input.secrets?.tooShort ?? []) push(row("secret", `${nm} too short to mask`));
+  // A2 (plan 06e): foreign processes holding a worktree file, never signalled.
+  for (const h of input.held ?? []) push(row("held", `${h.pid} ${h.command} (cwd ${h.cwd})`));
   if (name === "DONE" && (input.ownerChecklist?.length ?? 0) > 0) {
     lines.push("", `Owner checklist (${input.ownerChecklist!.length}) — yours, not the worker's`);
     for (const item of input.ownerChecklist!) lines.push(`  - ${truncate(item, 200)}`);

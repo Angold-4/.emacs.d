@@ -14,7 +14,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor.ts";
+import { createRun, runPaths } from "./conductor.ts";
+import { readRunState } from "./effects/runner.ts";
+import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
 import { acquireLock, type Lock } from "./effects/lock.ts";
@@ -327,8 +329,8 @@ function pidAlive(file: string): boolean {
   try {
     const pid = Number(fs.readFileSync(file, "utf8"));
     if (!(pid > 0)) return false;
-    process.kill(pid, 0);
-    return true;
+    // A2/C3 (plan 06e): the sweep owns the signalling decision.
+    return processAlive(pid);
   } catch {
     return false;
   }
@@ -336,18 +338,17 @@ function pidAlive(file: string): boolean {
 
 /** A launched node's status, observed from its run directory. "crashed":
  * the conductor died without a clean stop (no `stopped` marker). */
-export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "crashed" {
+export function observeRun(runDir: string, root: string = path.dirname(runDir)): Exclude<NodeStatus, "waiting"> | "crashed" {
   let phase: string | undefined;
   let envBlocked = false;
-  try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8"));
-    const state = rebuildState(runDir, plan, { lenient: true });
-    phase = state.phase.phase;
+  // A4 (plan 06e): the scheduler reads a node's run through `runnerFor`, so a
+  // run recorded under an installed older runner is read by that runner.
+  const read = readRunState(runDir, root);
+  if (read) {
+    phase = read.state.phase.phase;
     // Plan 05i: an environment block is its own node status, distinct from a
     // code BLOCKED: it is recoverable by fixing the environment and resuming.
-    envBlocked = state.run === "ENV_BLOCKED";
-  } catch {
-    phase = undefined;
+    envBlocked = read.state.run === "ENV_BLOCKED";
   }
   // A terminal phase wins over an environment block (finding M-7): a DONE or
   // BLOCKED run can never be re-blocked by a resume, so the program must not
@@ -368,17 +369,14 @@ export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "cr
  * itself (its plan snapshot is redacted, and its owner-request reasons were
  * redacted when the conductor logged them). `undefined` when the run is not
  * (yet) parked or cannot be read. */
-export function runWaitReason(runDir: string): string | undefined {
-  try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-    const state = rebuildState(runDir, plan, { lenient: true });
-    if (state.run === "ENV_BLOCKED") {
-      return state.phase.env?.blocked ? envBlockedLine(state.phase.env.blocked) : "environment blocked";
-    }
-    if (state.phase.phase === "AWAITING_OWNER" || state.phase.phase === "BLOCKED") return waitReason(state.phase);
-  } catch {
-    // a run whose plan or log cannot be read yet
+export function runWaitReason(runDir: string, root: string = path.dirname(runDir)): string | undefined {
+  const read = readRunState(runDir, root);
+  if (!read) return undefined;
+  const { state } = read;
+  if (state.run === "ENV_BLOCKED") {
+    return state.phase.env?.blocked ? envBlockedLine(state.phase.env.blocked) : "environment blocked";
   }
+  if (state.phase.phase === "AWAITING_OWNER" || state.phase.phase === "BLOCKED") return waitReason(state.phase);
   return undefined;
 }
 
@@ -401,14 +399,9 @@ function acceptedCandidateBaseline(
   if (!depState?.runId || depState.status !== "done") return undefined;
   const depRunDir = path.join(runRoot, depState.runId);
   let accepted: string | undefined;
-  try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(depRunDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-    const st = rebuildState(depRunDir, plan, { lenient: true });
-    if (st.phase.phase !== "DONE") return undefined;
-    accepted = st.phase.candidate?.sha;
-  } catch {
-    return undefined;
-  }
+  const read = readRunState(depRunDir, runRoot);
+  if (!read || read.state.phase.phase !== "DONE") return undefined;
+  accepted = read.state.phase.candidate?.sha;
   if (!accepted) return undefined;
   const base = nodeBases(program, nodes, node)[0];
   let baseSha: string;
@@ -686,8 +679,10 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
  * never started, or a hand-made fixture). */
 function nodeCostLine(runDir: string): string | undefined {
   try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-    const view = buildView(runDir, plan, pidAlive(path.join(runDir, "conductor.pid")));
+    // A4 (plan 06e): the plan comes from the run's recorded runner.
+    const read = readRunState(runDir, path.dirname(runDir));
+    if (!read) return undefined;
+    const view = buildView(runDir, read.plan, pidAlive(path.join(runDir, "conductor.pid")));
     const cost = view.cost;
     if (!cost) return undefined;
     const parts = [`${cost.rounds} round${cost.rounds === 1 ? "" : "s"}`, `${cost.totalMinutes}m`];
@@ -718,13 +713,9 @@ export function programChartText(dir: string): string {
   for (const n of nodes) {
     const s = state.nodes[n.id];
     if (!s.runId || s.status !== "running") continue;
-    try {
-      const runDir = path.join(root, s.runId);
-      const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-      phaseOf[n.id] = rebuildState(runDir, plan, { lenient: true }).phase.phase;
-    } catch {
-      // the run is not readable (yet); the node still shows its node state
-    }
+    const read = readRunState(path.join(root, s.runId), root);
+    if (read) phaseOf[n.id] = read.state.phase.phase;
+    // else: the run is not readable (yet); the node still shows its node state
   }
   return renderProgramChart({ ...program, readableIds }, nodes, state, { programId: path.basename(dir), phaseOf });
 }
@@ -774,8 +765,9 @@ export function programReviewText(dir: string): string {
     if (!s.runId) continue;
     try {
       const runDir = path.join(root, s.runId);
-      const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-      const phase = rebuildState(runDir, plan, { lenient: true }).phase;
+      const read = readRunState(runDir, root);
+      if (!read) continue;
+      const phase = read.state.phase;
       const sha = phase.candidate?.sha;
       const projected = projectEntries({
         messages: phase.messages ?? [],

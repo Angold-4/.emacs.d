@@ -135,6 +135,10 @@ export interface LintPlanInput {
   /** Lint-only: the 1-based line of `#+TT_RERUN:` in the source Org file. */
   rerunLine?: number;
   modelsRepeated?: string[];
+  /** Plan 06e (A1): the `#+TT_ENV_FILE:` KEY=value file, resolved to an
+   * absolute path by Emacs. A declared secret the environment does not set is
+   * looked up here second. */
+  envFile?: string;
   /** Roles this entry inherited from a program-level #+TT_MODELS. They are
    * already checked once at the program level; rechecking them per entry
    * would report the program's line against the entry's own file. */
