@@ -219,7 +219,9 @@ test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, 
             steps: [
               {
                 kind: "call-sh",
-                command: `i=0; while [ $i -lt 600 ]; do if [ -f '${releaseFile}' ]; then exit 0; fi; i=$((i+1)); sleep 0.1; done; exit 1`,
+                // Held for as long as the test itself may run: a hold that gave up after
+                // 60 s let round two finish before the owner's D on a slow CI suite.
+                command: `i=0; while [ $i -lt 3000 ]; do if [ -f '${releaseFile}' ]; then exit 0; fi; i=$((i+1)); sleep 0.1; done; exit 1`,
               },
               {
                 kind: "call-submit",
