@@ -446,7 +446,13 @@ Two kinds of finding:
   reviewer can satisfy it. Move it to the plan's `Owner checklist:` list, or
   rewrite it as an observable result a worker produces. An invalid
   `#+TT_MODELS` declaration (see "Models per role and per seat") is an error
-  too. Emacs
+  too. So is a `:VERIFY: test "<name>"` that already exists only in a file or
+  crate the phase's `:CHECKS:` never run (`verify-reach`): the linter finds the
+  test with `git grep` and expands the checks (`make` targets with their
+  `FILES`, `node --test` globs, `cargo test -p`). tt would report such a test
+  missing on every candidate, and no owner command waives that gate (06k1's
+  C1). A check the linter cannot resolve (a script, `npm test`) judges
+  nothing. Emacs
   shows errors in `*tt-plan-errors*` (jump-to-line to the Org file) and starts
   nothing.
 - **Warning — shown, and the start continues.** An item that depends on a
