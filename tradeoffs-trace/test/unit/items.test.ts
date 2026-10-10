@@ -144,6 +144,25 @@ test("items: a test verify is resolved against the node check output by name", (
   ]);
 });
 
+test("plan 06j: a named test in coloured spec-reporter output resolves as passed", () => {
+  // The exact 06g2 round-4 shape: a conductor that inherited FORCE_COLOR=3
+  // made node's spec reporter colour every line. Before A2 the resolver read
+  // every R-item as "missing" although all had passed.
+  const coloured =
+    "\u001b[32m✔ plan 06g: the two-lane round\u001b[39m \u001b[90m(6499ms)\u001b[39m\n" +
+    "\u001b[32m✔ lanes: two candidates\u001b[39m \u001b[90m(1.2ms)\u001b[39m\n" +
+    "\u001b[31m✖ lanes: one worker\u001b[39m \u001b[90m(0.4ms)\u001b[39m\n";
+  assert.equal(testOutcomeIn(coloured, "plan 06g: the two-lane round"), "passed");
+  assert.equal(testOutcomeIn(coloured, "lanes: two candidates"), "passed");
+  assert.equal(testOutcomeIn(coloured, "lanes: one worker"), "failed");
+  assert.equal(testOutcomeIn(coloured, "never ran"), "missing");
+  const resolved = resolveTestVerifies(structured, coloured);
+  assert.deepEqual(resolved, [
+    { id: "R1", name: "lanes: two candidates", outcome: "passed" },
+    { id: "C1", name: "lanes: one worker", outcome: "failed" },
+  ]);
+});
+
 test("items: a review that omits an id is incomplete", () => {
   const review: ReviewItems = {
     items: [

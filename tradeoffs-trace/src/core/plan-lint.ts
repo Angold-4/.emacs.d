@@ -21,6 +21,7 @@
 // numbers come from the Org source: Emacs records them on `acceptanceLines`
 // when it parses the plan, and a hand-written JSON plan simply gets no line.
 
+import { matchesGlob } from "./boundaries.ts";
 import { parseVerify } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
@@ -33,6 +34,9 @@ export type LintRule =
   | "no-tolerance"
   | "model-declaration"
   | "rerun-template"
+  // Plan 06j (A1): a phase's checks cannot see what its :BOUNDARIES: let it
+  // change, or the repository's CI runs something the plan never does.
+  | "coverage"
   // Plan 06g: `#+TT_WORKERS`/`#+TT_ROUNDS` and, from 06h, the reviewer count
   // and seat list.
   | "worker-count"
@@ -138,6 +142,11 @@ export interface LintPhaseInput {
   id?: string;
   /** The phase's Goal paragraph, when the parser read it. */
   goal?: string;
+  /** Plan 06j (A1): the phase's ordinary checks (`:CHECKS:`), as the
+   * coverage rule reads them. */
+  checks?: string[];
+  /** Plan 06j (A1): the phase's `:BOUNDARIES:` globs. */
+  boundaries?: string[];
   acceptance?: string[];
   /** 1-based source lines of `acceptance`, parallel to it (Emacs records
    * these; absent for a hand-written JSON plan). */
@@ -163,6 +172,10 @@ export interface LintPhaseInput {
 export interface LintPlanInput {
   /** The Org file this JSON came from, when known. */
   sourceFile?: string;
+  /** Plan 06j (A1): the absolute path of the git repository the plan runs
+   * on (`#+TT_REPO:`). The coverage rule reads it; absent means no coverage
+   * facts and no coverage warnings. */
+  repo?: string;
   phases?: LintPhaseInput[];
   models?: LintModels;
   modelsLine?: number;
@@ -842,6 +855,205 @@ export function lintWorkers(plan: LintPlanInput): LintFinding[] {
         fix: "write #+TT_ROUNDS: 3 (the default), or a whole number from 1 to 5",
       });
     }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Plan 06j (A1): coverage warnings
+// ---------------------------------------------------------------------------
+
+/** One package/crate the repository defines. `dir` is repo-relative, with
+ * POSIX separators (`.` for a package at the repository root). */
+export interface RepoPackage {
+  name: string;
+  dir: string;
+}
+
+/** What `checkCoverageWarnings` reads about the repository. Built by
+ * `readRepoFacts` (I/O) and passed in, so this module stays pure. */
+export interface RepoFacts {
+  /** Every package/crate the repository defines. */
+  packages: RepoPackage[];
+  /** Every command line the repository's CI workflows run. */
+  ciCommands: string[];
+  /** True for a cargo repository, whose packages are named by `-p`/
+   * `--package`; a non-cargo package is named as a plain token. */
+  cargo: boolean;
+  /** Plan 06j (M-93): workspace members whose manifest cannot be read or has
+   * no `[package]` name. They are surfaced as warnings rather than skipped,
+   * so a crate the lint cannot judge is never a quiet false green. */
+  memberIssues?: string[];
+}
+
+/** An empty fact set: a plan with no repository, or one whose path does not
+ * exist, warns about nothing. */
+export function emptyRepoFacts(): RepoFacts {
+  return { packages: [], ciCommands: [], cargo: false };
+}
+
+/** True when `globSeg` matches one path segment (`*` matches within one
+ * segment, exactly as core/boundaries.ts's `matchesGlob`). */
+function segmentMatches(globSeg: string, dirSeg: string): boolean {
+  return globSeg === "**" || matchesGlob(globSeg, dirSeg);
+}
+
+/** Can the glob match a path that starts with `dirSegs`? `**` consumes any
+ * number of segments; every other segment matches exactly one. This is the
+ * one place the "does a boundary reach this package" question is decided: a
+ * glob whose first segment is `*` followed by `src/**` reaches package `a`
+ * (it matches `a/src/...`), while `*.md` does not reach a nested package
+ * (its first segment cannot match two). */
+function globCanReachDir(globSegs: readonly string[], dirSegs: readonly string[]): boolean {
+  const rec = (gi: number, di: number): boolean => {
+    if (di === dirSegs.length) return true;
+    if (gi === globSegs.length) return false;
+    const seg = globSegs[gi];
+    if (seg === "**") return rec(gi + 1, di) || rec(gi, di + 1);
+    return segmentMatches(seg, dirSegs[di]) && rec(gi + 1, di + 1);
+  };
+  return rec(0, 0);
+}
+
+/** True when a `:BOUNDARIES:` glob covers a package directory: the glob can
+ * match a path inside (or at) the directory, with `*` limited to one path
+ * segment (`crates/**` covers `crates/a`; `crates/a/src/**` covers `crates/a`;
+ * a `*` followed by `src/**` covers `a`; `*.md` does not cover
+ * `packages/b`). */
+export function globCoversDir(glob: string, dir: string): boolean {
+  const g = glob.trim().replace(/\/+$/, "");
+  const d = dir.trim().replace(/\/+$/, "") || ".";
+  if (g.length === 0) return false;
+  // A root package is the whole repository, so any repo-relative glob covers
+  // it: a `src/**` boundary lets the phase change the single root crate.
+  if (d === ".") return !g.startsWith("/") && !g.startsWith("..");
+  const globSegs = g.split("/").filter((s) => s.length > 0);
+  const dirSegs = d.split("/").filter((s) => s.length > 0);
+  return globCanReachDir(globSegs, dirSegs);
+}
+
+/** True when a command names `name` the way the repository's package manager
+ * does: cargo uses `-p`/`--package`; any other package is named as a plain
+ * token (e.g. `--workspace a`). */
+export function commandNamesPackage(command: string, name: string, cargo: boolean): boolean {
+  const tokens = command.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if ((t === "-p" || t === "--package") && tokens[i + 1] === name) return true;
+    if (t === `-p=${name}` || t === `--package=${name}`) return true;
+    if (cargo && t.startsWith("-p") && t.length > 2 && t.slice(2) === name) return true;
+  }
+  return !cargo && tokens.includes(name);
+}
+
+/** One command segment's words, with leading `VAR=value` environment
+ * assignments dropped (`RUSTFLAGS=x cargo fmt …` still starts at `cargo`). */
+function segmentWords(segment: string): string[] {
+  const tokens = segment.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+  return tokens.slice(i);
+}
+
+/** The argument tokens of a cargo-fmt invocation in a segment, or undefined
+ * when the segment is not one. Recognises `cargo [+toolchain] fmt …` and the
+ * `cargo-fmt …` binary, so a toolchain selector, an env prefix or the
+ * standalone binary all count (M-86/contract-39). */
+function cargoFmtArgs(segment: string): string[] | undefined {
+  const words = segmentWords(segment);
+  let i = 0;
+  if (words[i] === "cargo") {
+    i += 1;
+    if (words[i] !== undefined && /^\+\S+$/.test(words[i])) i += 1;
+    if (words[i] !== "fmt") return undefined;
+    i += 1;
+  } else if (words[i] === "cargo-fmt") {
+    i += 1;
+  } else {
+    return undefined;
+  }
+  return words.slice(i);
+}
+
+/** True when a command runs `cargo fmt --all --check` in one invocation. A
+ * plain `cargo fmt --all` reformats and exits 0, so it never catches the
+ * rustfmt drift CI rejects; `--all` in another segment (`cargo fmt -p a
+ * --check && cargo clippy --all`) is not the same invocation either. This is
+ * the PLAN QUALIFIER side (OD-13): only this form clears the CI warning. */
+export function runsCargoFmtAll(command: string): boolean {
+  for (const segment of command.split(/[;&|\n]+/)) {
+    const args = cargoFmtArgs(segment);
+    if (args && args.includes("--all") && args.includes("--check")) return true;
+  }
+  return false;
+}
+
+/** True when a command runs `cargo fmt --all` in one segment, with or without
+ * `--check`. This is the CI TRIGGER side (OD-13): a CI that runs `cargo fmt
+ * --all` and then `git diff --exit-code` gates on formatting just the same, so
+ * it must raise the coverage warning when the plan never does. */
+export function ciRunsCargoFmtAll(command: string): boolean {
+  for (const segment of command.split(/[;&|\n]+/)) {
+    const args = cargoFmtArgs(segment);
+    if (args && args.includes("--all")) return true;
+  }
+  return false;
+}
+
+/** Plan 06j (A1): the ONE place coverage is judged. Warnings only, never
+ * errors. For a cargo repository a phase warns when a crate whose directory
+ * its `:BOUNDARIES:` cover is named by no `-p` in its checks or final checks;
+ * for any repository a covered package the checks never name warns; and a
+ * repository whose CI runs `cargo fmt --all` while no phase check or final
+ * check does warns once. */
+export function checkCoverageWarnings(plan: LintPlanInput, repo: RepoFacts): LintFinding[] {
+  const out: LintFinding[] = [];
+  const phases = plan.phases ?? [];
+  const commandsOf = (phase: LintPhaseInput): string[] => [...(phase.checks ?? []), ...(phase.finalChecks ?? [])];
+  for (const phase of phases) {
+    const commands = commandsOf(phase);
+    const boundaries = phase.boundaries ?? [];
+    for (const pkg of repo.packages) {
+      if (!boundaries.some((g) => globCoversDir(g, pkg.dir))) continue;
+      if (commands.some((c) => commandNamesPackage(c, pkg.name, repo.cargo))) continue;
+      out.push({
+        severity: "warning",
+        rule: "coverage",
+        phaseId: phase.id ?? "?",
+        item: `${pkg.name} (${pkg.dir})`,
+        line: phase.line,
+        sourceFile: plan.sourceFile,
+        problem: `the phase's :BOUNDARIES: cover ${pkg.dir}, but no check or final check names the package ${pkg.name}`,
+        fix: repo.cargo
+          ? `add -p ${pkg.name} to the phase's :CHECKS: or :FINAL_CHECKS:, or narrow :BOUNDARIES:`
+          : `name ${pkg.name} in the phase's :CHECKS: or :FINAL_CHECKS:, or narrow :BOUNDARIES:`,
+      });
+    }
+  }
+  // OD-13: CI triggers on any `cargo fmt --all`; the plan only clears it with
+  // `cargo fmt --all --check` in one invocation.
+  for (const issue of repo.memberIssues ?? []) {
+    out.push({
+      severity: "warning",
+      rule: "coverage",
+      phaseId: "coverage",
+      item: issue,
+      sourceFile: plan.sourceFile,
+      problem: issue,
+      fix: "give the member a readable Cargo.toml with a [package] name, or remove it from the workspace members",
+    });
+  }
+  const ciFmt = repo.ciCommands.find(ciRunsCargoFmtAll);
+  if (ciFmt !== undefined && !phases.some((p) => commandsOf(p).some(runsCargoFmtAll))) {
+    out.push({
+      severity: "warning",
+      rule: "coverage",
+      phaseId: "coverage",
+      item: ciFmt,
+      sourceFile: plan.sourceFile,
+      problem: "the repository's CI runs `cargo fmt --all`, but no phase check or final check does",
+      fix: "add `cargo fmt --all --check` to the phase's :FINAL_CHECKS:, or a plan-wide #+TT_FINAL_CHECKS:",
+    });
   }
   return out;
 }

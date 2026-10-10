@@ -103,6 +103,53 @@ function acceptHolds(s: State): boolean {
   return Boolean(s.phase.candidate) && accept(s.phase, s.phase.candidate!.sha, s.phase.contract.contractVersion);
 }
 
+/** Plan 06j (A3): a recheck is available only for the current candidate whose
+ * own checks just failed. A passed check, an interrupted run or a newer
+ * candidate (the recorded check sha no longer matches) refuses it. */
+function recheckAvailable(s: State): boolean {
+  const candidate = s.phase.candidate;
+  const checks = s.phase.checks;
+  return Boolean(candidate && checks && checks.passed === false && checks.interrupted !== true && checks.candidateSha === candidate.sha);
+}
+
+/** Plan 06j (A3): a round recheck and a final recheck re-run the SAME tier the
+ * failed run used. The two rows differ only in the state they enter, so the
+ * conductor re-runs the phase's checks (`round`) or the phase's checks plus
+ * the final check (`final`). */
+function recheckAvailableRound(s: State): boolean {
+  return recheckAvailable(s) && s.phase.checks?.tier !== "final";
+}
+
+function recheckAvailableFinal(s: State): boolean {
+  return recheckAvailable(s) && s.phase.checks?.tier === "final";
+}
+
+/** Plan 06j (A3): the one mutation a recheck applies, whatever tier it enters:
+ * keep the failed record (and its tier) for the re-run, answer the budget-gate
+ * request the failure parked with (a recheck is a check run, not a grant), and
+ * clear the stage's in-flight entries. `restoreRound` is true when the recheck
+ * cancelled a repair attempt that had already charged a round (from
+ * IMPLEMENTING): stopping it charges nothing, so the round is given back. */
+function applyRecheck(s: State, ev: Event, to: "CHECKING" | "FINAL_CHECKING", restoreRound = false): State {
+  const e = ev as Extract<Event, { type: "RECHECK_REQUESTED" }>;
+  return withPhase(s, {
+    phase: to,
+    checks: s.phase.checks,
+    ...(restoreRound ? { repairRoundsUsed: Math.max(0, s.phase.repairRoundsUsed - 1), worktreeTainted: true } : {}),
+    ownerRequests: s.phase.ownerRequests.map((r) =>
+      r.status === "open" && isBudgetGateRequest(r)
+        ? { ...r, status: "resolved" as const, resolution: { option: "recheck", note: e.reason } }
+        : r,
+    ),
+    // Clear the stopped attempt's own in-flight entries: the cancelled worker
+    // returns without the attempt-failure events that normally clear
+    // `dispatch_worker`, and a later `REPAIR_ATTEMPT_STARTED -> IMPLEMENTING`
+    // must dispatch a fresh worker (M-3). `dispatch_worker` is the round's
+    // single entry, so it covers both lanes when workers > 1.
+    inFlight: clearInFlight(s.phase, "dispatch_worker", "run_checks", "run_final_checks"),
+  });
+}
+
 function allThreeReviewsPresent(state: State, upcoming?: Review): boolean {
   const r = state.phase.reviews;
   const has = (who: string) => Boolean(r[who]?.review) || upcoming?.reviewer === who;
@@ -305,7 +352,7 @@ addRow({
   // §9.3: interrupted clears the intent but leaves the obligation, so
   // next() re-emits dispatch_worker ("new attempt on the same session").
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) =>
+  apply: (s, ev) =>
     withPhase(s, {
       phase: "IMPLEMENTING",
       attempt: { ...s.phase.attempt, interrupted: true },
@@ -313,6 +360,10 @@ addRow({
       // it owes its own coverage too.
       coverage: undefined,
       coverageAttempt: undefined,
+      // Plan 06j (A3/OD-5): a recheck that stopped this attempt and then
+      // failed to reset its worktree marks the tree tainted, so the
+      // re-dispatched attempt resets it to the frozen candidate first.
+      ...((ev as Extract<Event, { type: "ATTEMPT_INTERRUPTED" }>).taint ? { worktreeTainted: true } : {}),
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
     }),
 });
@@ -454,7 +505,7 @@ addRow({
   apply: (s) =>
     withPhase(s, {
       phase: "PROBING",
-      checks: { candidateSha: s.phase.candidate!.sha, passed: true },
+      checks: { candidateSha: s.phase.candidate!.sha, passed: true, tier: "round" },
       inFlight: clearInFlight(s.phase, "run_checks"),
     }),
 });
@@ -466,7 +517,7 @@ failureRows("checks-failed", "CHECKING", "CHECKS_FAILED", REPAIR_ATTEMPT_ACTIONS
   const failures = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failures;
   const candidateSha = s.phase.candidate!.sha;
   return withPhase(s, {
-    checks: { candidateSha, passed: false, ...(failures && failures.length > 0 ? { failures } : {}) },
+    checks: { candidateSha, passed: false, tier: "round", ...(failures && failures.length > 0 ? { failures } : {}) },
     // Plan 05d: keep the split across the repair freeze too, so the reviewers
     // of the repaired candidate see which tests failed and how each was
     // classified (finding A-5).
@@ -489,6 +540,67 @@ addRow({
       checks: { candidateSha: s.phase.candidate!.sha, interrupted: true },
       inFlight: clearInFlight(s.phase, "run_checks"),
     }),
+});
+
+// Plan 06j (A3): the owner re-runs the frozen candidate's checks because the
+// failure looks like the machine. Accepted only when the current candidate's
+// checks just failed (never a passed check, never a newer candidate) and the
+// phase is parked with no worker running; it re-runs the SAME tier, answers
+// the budget-gate request the failure parked with, and spends no round.
+addRow({
+  id: "recheck-requested",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableRound",
+  guard: (s) => recheckAvailableRound(s),
+  to: "CHECKING",
+  actions: [{ type: "run_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "CHECKING"),
+});
+
+// The same, for a candidate whose failed run was the final tier: the recheck
+// enters FINAL_CHECKING so `#runChecks` runs the phase's checks plus the final
+// check again.
+addRow({
+  id: "recheck-requested-final",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableFinal",
+  guard: (s) => recheckAvailableFinal(s),
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "FINAL_CHECKING"),
+});
+
+// Plan 06j (A3, owner steer 19:41Z): a check failure with budget left starts a
+// repair attempt by itself (IMPLEMENTING) before the owner can act. The owner
+// may still recheck the frozen candidate while that attempt has not submitted;
+// the conductor stops the worker (nothing it wrote is kept) and the round it
+// charged is given back, so the checks re-run on the SAME candidate.
+addRow({
+  id: "recheck-requested-from-implementing",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableRound",
+  guard: (s) => recheckAvailableRound(s),
+  to: "CHECKING",
+  actions: [{ type: "run_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "CHECKING", true),
+});
+
+addRow({
+  id: "recheck-requested-final-from-implementing",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableFinal",
+  guard: (s) => recheckAvailableFinal(s),
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "FINAL_CHECKING", true),
 });
 
 // --- PROBING --------------------------------------------------------
@@ -1171,6 +1283,7 @@ addRow({
     withPhase(s, {
       phase: "GATING",
       finalChecksPassedFor: s.phase.candidate?.sha ?? "",
+      checks: { candidateSha: s.phase.candidate!.sha, passed: true, tier: "final" },
       inFlight: clearInFlight(s.phase, "run_final_checks"),
     }),
 });
@@ -1190,6 +1303,7 @@ failureRows(
       checks: {
         candidateSha: s.phase.candidate!.sha,
         passed: false,
+        tier: "final",
         ...(e.failures && e.failures.length > 0 ? { failures: e.failures } : {}),
       },
       inFlight: clearInFlight(s.phase, "run_final_checks"),

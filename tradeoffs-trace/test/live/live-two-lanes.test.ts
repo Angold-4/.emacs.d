@@ -188,24 +188,37 @@ function runLiveTwoLanes(): void {
       const records = readLog(eventsPath).records;
       const events = records.filter((r) => r.kind === "event").map((r) => r.event as { type: string });
       const count = (type: string) => events.filter((e) => e.type === type).length;
-      const round = (state.phase.rounds ?? [])[0];
-      // The record the owner reads: both candidates checked, six reviews,
-      // three pick votes, the winner named.
-      assert.equal(count("ROUND_STARTED"), 1, `one round; outcome ${outcome} ${notes ?? ""}`);
-      assert.equal(count("CANDIDATE_SUBMITTED"), 2, "both lanes froze a candidate");
-      assert.equal(count("CANDIDATE_CHECKED"), 2, "both candidates were checked");
-      assert.equal(count("ROUND_REVIEW_SUBMITTED"), 6, "M, A and B reviewed both passing candidates");
-      assert.equal(count("PICK_VOTE"), 3, "three pick votes");
-      assert.equal(count("CANDIDATE_PICKED"), 1, "the winner was recorded");
-      assert.ok(round?.picked, "the round names its winner");
+      const rounds = state.phase.rounds ?? [];
+      const round = rounds[rounds.length - 1];
+      // Plan 06j (A4): the round assertion accepts one OR MORE rounds, because
+      // a phase may repair after a failed candidate. Every round must still
+      // show the record the owner reads: both candidates checked, six reviews
+      // and three pick votes; the totals are per-round counts, not one lucky
+      // round's.
+      assert.ok(rounds.length >= 1, `at least one round; outcome ${outcome} ${notes ?? ""}`);
+      assert.equal(count("ROUND_STARTED"), rounds.length, "one ROUND_STARTED per recorded round");
+      assert.equal(count("CANDIDATE_SUBMITTED"), 2 * rounds.length, "both lanes froze a candidate every round");
+      assert.equal(count("CANDIDATE_CHECKED"), 2 * rounds.length, "both candidates were checked every round");
+      assert.equal(count("ROUND_REVIEW_SUBMITTED"), 6 * rounds.length, "M, A and B reviewed both passing candidates every round");
+      assert.equal(count("PICK_VOTE"), 3 * rounds.length, "three pick votes every round");
+      assert.equal(count("CANDIDATE_PICKED"), rounds.length, "every round names a winner");
+      for (const r of rounds) {
+        assert.equal(r.candidates.length, 2, `round ${r.round} froze both lanes`);
+        assert.ok(r.candidates.every((c) => c.sha), `round ${r.round} names both candidates`);
+        assert.ok(r.candidates.every((c) => c.ok === true), `round ${r.round} checked both candidates`);
+        assert.equal(r.candidates.reduce((n, c) => n + (c.reviews?.length ?? 0), 0), 6, `round ${r.round} drew six reviews`);
+        assert.equal(r.votes.length, 3, `round ${r.round} cast three pick votes`);
+        assert.ok(r.picked, `round ${r.round} names its winner`);
+      }
+      assert.ok(round?.picked, "the last round names its winner");
       assert.equal(outcome, "DONE", `the phase reached DONE (got ${outcome} ${notes ?? ""})`);
-      assert.equal(state.phase.candidate?.sha, round!.picked!.sha, "the phase's candidate is the winner");
+      assert.equal(state.phase.candidate?.sha, round!.picked!.sha, "the phase's candidate is the last round's winner");
       // The winner is named in `tt summary`'s own rounds section.
       const summary = roundsSection(state.phase).join("\n");
       assert.match(summary, /winner C1-|winner C2-/, `tt summary names the winner:\n${summary}`);
       assert.match(summary, new RegExp(`winner C${round!.round}-${round!.picked!.lane}`));
       assert.ok(
-        (state.phase.rounds ?? []).length === 1 || state.phase.repairRoundsUsed >= 1,
+        rounds.length === 1 || state.phase.repairRoundsUsed >= 1,
         "a second round costs a repair attempt",
       );
       // The checks never overlapped: the started/finished pairs are disjoint.

@@ -219,6 +219,38 @@ names the failing test.
 `tt summary` and the status buffer's `flakes` row show flakes per test (count,
 last seen), the repair rounds saved, and launch retries.
 
+### Environment failures: `tt recheck`
+
+A check failure the machine caused must never cost a repair round. When the
+failure is **shown to be the machine** — a killed process (SIGKILL/SIGSEGV,
+exit 137), load-only timing, or an environment the conductor inherited (a
+coloured shell, a stale `FORCE_COLOR`) — the owner can re-run the frozen
+candidate's own checks without dispatching a worker or spending a round:
+
+```sh
+tt recheck <run> --reason "the check was killed by the OOM killer at load 12"
+```
+
+It is accepted only after the current candidate's checks just failed and before
+a newer candidate exists; it records `RECHECK_REQUESTED {candidateSha, reason}`
+and re-runs the **same tier** (`round` or `final`) on the same sha. A passing
+recheck continues as if the checks had passed (the probe, then the reviews);
+the earlier failure stays in the log with the reason. A recheck that fails
+again follows the ordinary check-failure path — it never waives a failure.
+
+When the checks fail with budget left, the conductor has already started a
+repair attempt by itself. A recheck is still accepted then: it stops that
+attempt (awaiting its termination and killing its shell groups), resets every
+worker worktree to the frozen candidate (tracked and untracked writes are
+discarded), gives the round back, and re-runs the same tier. A recheck whose
+worktree reset fails is refused instead, with the stopped attempt recorded as
+an interrupted attempt so the ordinary repair path continues.
+
+Use it **only** for a failure shown to be the machine, never to retry a
+failure the candidate caused: a real failure rechecked is a real failure again,
+and the reason is recorded. A refused recheck names why: the checks passed, a
+newer candidate exists, or the worktree reset failed.
+
 ## Prerequisites
 
 | What | Where / how |
@@ -285,6 +317,15 @@ only the candidate about to be accepted runs it, once, after the reviews pass
 with no open blocker. The final check runs the phase's round checks and then
 the final command; a failure there is an ordinary check failure, so the phase
 is repaired and the next candidate that reaches acceptance runs it again.
+
+Write the final check to **mirror the repository's CI**, not just the phase's
+own crates: `cargo fmt --all --check` and the CI workflow's own crate list. A
+phase whose `-p` list is narrower than CI can pass every gate and still fail
+the pull request — on 2026-10-08 the valuation 02a–02c phases were accepted
+green while CI failed rustfmt and clippy outside their `-p` lists. The
+coverage lint above warns when the boundaries or the CI `fmt --all` command are
+not mirrored; the warning is the signal to widen the final check before the
+run starts.
 
 Each candidate's check run is recorded at
 `<run>/checks/<candidateSha>/record.json`. Its `tier` field is what the run
@@ -414,6 +455,15 @@ Two kinds of finding:
   comparison against a contracted limit with no stated tolerance
   (`p99 ≤ its contracted interval`). State a fact that is true when the run
   finishes, or the allowed margin (or the recorded gap a miss becomes).
+- **Warning — coverage (plan 06j).** When the plan names a `#+TT_REPO:`, the
+  linter reads the repository and warns when a phase's `:BOUNDARIES:` cover a
+  crate/package whose checks never name it, or when the repository's CI runs
+  `cargo fmt --all` and no phase check or final check does. **Read these
+  warnings at start**: they are the difference between a phase whose checks
+  can see what its boundaries let it change and one that passes every gate
+  while the pull request's CI fails. A warning clears when the check or final
+  check names the crate (`-p b`) or runs the CI command (`cargo fmt --all
+  --check`).
 
 The measured run is the reason (runtime doc §4): `13j`'s "the owner records a
 live run" parked a phase, and `13i`'s "the recorded live-run SHA is the current

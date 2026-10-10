@@ -160,6 +160,13 @@ function parsePhaseNode(node: OrgNode, acceptanceLines: number[] = [], globalFin
   const phase: LintPhaseInput = {
     id: node.props.ID,
     ...(goalNode ? { goal: bodyText(goalNode) } : {}),
+    // Plan 06j (A1): the coverage rule reads the phase's own :CHECKS: and
+    // :BOUNDARIES:. A missing :CHECKS: means no phase check (the plan's
+    // global #+TT_CHECKS still applies); a missing :BOUNDARIES: means none.
+    ...(node.props.CHECKS ? { checks: [node.props.CHECKS] } : {}),
+    ...(node.props.BOUNDARIES
+      ? { boundaries: node.props.BOUNDARIES.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean) }
+      : {}),
     acceptance: [],
     acceptanceLines,
     ...(finalChecks ? { finalChecks: [finalChecks] } : {}),
@@ -291,8 +298,10 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const leader = first("TT_LEADER");
   const workersValue = parseCount(workers);
   const roundsValue = parseCount(rounds);
+  const repo = first("TT_REPO")?.value;
   return {
     ...(sourceFile ? { sourceFile } : {}),
+    ...(repo && repo.trim().length > 0 ? { repo: repo.trim() } : {}),
     ...(envFile && envFile.trim().length > 0 ? { envFile: envFile.trim() } : {}),
     phases,
     ...parseModels(first("TT_MODELS")),

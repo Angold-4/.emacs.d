@@ -23,6 +23,7 @@ import { reduce } from "./core/reduce.ts";
 import { resolveBinding } from "./core/binding.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
+  checkCoverageWarnings,
   formatFindings,
   hasLintErrors,
   isProgramInput,
@@ -32,6 +33,7 @@ import {
   type LintPlanInput,
   type LintProgramInput,
 } from "./core/plan-lint.ts";
+import { readRepoFacts } from "./core/repo-facts.ts";
 import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
 import { EventLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
@@ -80,7 +82,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt recheck <run-dir-or-id> --reason <why the failure is the machine>   (re-run a failed candidate's checks; no worker, no round)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -90,6 +92,35 @@ function usage(): never {
  * one call. */
 function lintJson(json: unknown): LintFinding[] {
   return isProgramInput(json) ? lintProgram(json as LintProgramInput) : lintPlan(json as LintPlanInput);
+}
+
+/** Plan 06j (A1): the coverage warnings a plan's repository yields. The
+ * repository is read once per plan (a program's entries may name different
+ * repos), and a program prefixes each entry's phase id exactly as
+ * `lintProgram` does. No repository, or one that does not exist, yields
+ * nothing. */
+function coverageFindings(json: unknown): LintFinding[] {
+  if (isProgramInput(json)) {
+    const out: LintFinding[] = [];
+    for (const entry of (json as LintProgramInput).entries ?? []) {
+      const plan = entry.plan;
+      if (!plan?.repo) continue;
+      for (const f of checkCoverageWarnings(plan, readRepoFacts(plan.repo))) {
+        out.push({ ...f, phaseId: entry.id ? `${entry.id}/${f.phaseId}` : f.phaseId });
+      }
+    }
+    return out;
+  }
+  const plan = json as LintPlanInput;
+  if (!plan?.repo) return [];
+  return checkCoverageWarnings(plan, readRepoFacts(plan.repo));
+}
+
+/** Plan 06j (A1): every finding a plan (or program) yields, lint rules plus
+ * repository coverage. `tt lint` and both start commands use this one
+ * function, so the warnings they show are the same. */
+function allFindings(json: unknown): LintFinding[] {
+  return [...lintJson(json), ...coverageFindings(json)];
 }
 
 /** Plan 01c: print findings to OUT (stderr for a start that is about to be
@@ -107,7 +138,7 @@ function cmdLint(file: string): void {
   // by the lint-side Org reader, a `.json` file is read directly. Both reach
   // the same item rules.
   const json = file.endsWith(".org") ? parseOrgPlan(readFileSync(file, "utf8"), file) : (JSON.parse(readFileSync(file, "utf8")) as unknown);
-  const findings = lintJson(json);
+  const findings = allFindings(json);
   reportFindings(findings, file, process.stdout);
   if (hasLintErrors(findings)) process.exitCode = 1;
 }
@@ -522,8 +553,9 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
     const resolvedEnvFile = envFile === undefined ? undefined : path.resolve(envFile);
     if (resolvedEnvFile !== undefined) for (const e of program.entries) e.plan.envFile = resolvedEnvFile;
     // Plan 01c: every entry's plan is linted before the scheduler starts. An
-    // error refuses the whole program; warnings are printed and it starts.
-    const findings = lintProgram(program);
+    // error refuses the whole program; warnings (including plan 06j's
+    // coverage warnings) are printed and it starts.
+    const findings = allFindings(program);
     reportFindings(findings, args[0], process.stderr);
     if (hasLintErrors(findings)) {
       process.exitCode = 1;
@@ -759,8 +791,9 @@ async function cmdStart(planPath: string, root: string, skipModelsCheck = false,
   // resolves the same file.
   if (envFile !== undefined) plan.envFile = path.resolve(envFile);
   // Plan 01c: lint before any run exists. An error refuses to start (message
-  // on stderr, non-zero exit); warnings are printed and the run starts.
-  const findings = lintPlan(plan);
+  // on stderr, non-zero exit); warnings (including plan 06j's coverage
+  // warnings) are printed and the run starts.
+  const findings = allFindings(plan);
   reportFindings(findings, planPath, process.stderr);
   if (hasLintErrors(findings)) {
     process.exitCode = 1;
@@ -1734,6 +1767,82 @@ function recordedOwnerRuling(state: ReturnType<typeof rebuildState>, id: string)
   return (state.phase.ownerInputs ?? []).some((i) => i.id === id);
 }
 
+/** Plan 06j (A3): `tt recheck <run> --reason "<text>"`. The owner asks the
+ * conductor to re-run the frozen candidate's own checks because the failure
+ * looks like the machine. It is accepted only after the current candidate's
+ * checks just failed and before a newer candidate exists; it dispatches no
+ * worker and spends no round. Written through the inbox, so the conductor
+ * validates the same conditions a hand-written file cannot bypass. */
+async function cmdRecheck(positional: string[], root: string, reason: string | undefined): Promise<void> {
+  const runDir = resolveRunDir(positional[0], root);
+  const text = reason?.trim() ?? "";
+  const refuse = (why: string): void => {
+    process.stdout.write(`recheck refused: ${why}\n`);
+    process.exitCode = 1;
+  };
+  if (text.length === 0) {
+    refuse('a recheck needs --reason "<why this failure is the machine>"');
+    return;
+  }
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const name = state.phase.phase;
+  if (name === "DONE" || name === "BLOCKED") {
+    refuse(`the phase is ${name}; the run no longer accepts owner input`);
+    return;
+  }
+  const candidate = state.phase.candidate;
+  const checks = state.phase.checks;
+  if (!candidate) {
+    refuse("the phase has no frozen candidate yet");
+    return;
+  }
+  if (checks?.passed === true) {
+    refuse("the current candidate's checks passed");
+    return;
+  }
+  if (checks && checks.candidateSha !== candidate.sha) {
+    refuse(`a newer candidate exists (${candidate.sha.slice(0, 9)}); recheck only the candidate whose checks just failed`);
+    return;
+  }
+  if (!checks || checks.passed !== false || checks.interrupted === true) {
+    refuse("the current candidate's checks did not just fail");
+    return;
+  }
+  // Plan 06j (A3, owner steer 19:41Z): a check failure with budget left
+  // starts a repair attempt by itself. The owner may still recheck while it
+  // has not submitted; the conductor stops the worker and gives the round
+  // back. Any other state is refused.
+  if (name !== "AWAITING_OWNER" && name !== "IMPLEMENTING") {
+    refuse(`the phase is ${name}; only a parked or repairing phase whose checks just failed accepts a recheck`);
+    return;
+  }
+  const tier = checks.tier === "final" ? "final" : "round";
+  const inbox = path.join(runDir, "inbox");
+  mkdirSync(inbox, { recursive: true });
+  const commandId = `recheck-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  const command = {
+    type: "recheck",
+    reason: text,
+    tier,
+    binding: {
+      runId: state.phase.runId,
+      phaseId: state.phase.phaseId,
+      candidateSha: candidate.sha,
+      contractVersion: state.phase.contract.contractVersion,
+    },
+  };
+  writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify(command, null, 2));
+  const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
+  if (outcome.kind === "applied") {
+    process.stdout.write(`recheck requested for ${candidate.sha.slice(0, 9)} in run ${path.basename(runDir)}: ${text}\n`);
+  } else if (outcome.kind === "rejected") {
+    refuse(outcome.reason ?? "the conductor rejected it");
+  } else {
+    process.stdout.write(`queued recheck ${commandId} for ${candidate.sha.slice(0, 9)} (queued, not yet applied)\n`);
+  }
+}
+
 /** Plan 05j: record a lint violation the render just named. Every render
  * (conductor, `tt contract rebuild`, a late verdict, an entry command) must
  * leave the log's copy, not just the view's red first line (findings A-18,
@@ -1909,6 +2018,9 @@ async function main(): Promise<void> {
   } else if (cmd === "defer") {
     if (positional.length !== 2) usage();
     await cmdDefer(positional, runRoot, { test: deferTest, ownerRuling: deferOwnerRuling, toPhase });
+  } else if (cmd === "recheck") {
+    if (positional.length !== 1) usage();
+    await cmdRecheck(positional, runRoot, reason);
   } else if (cmd === "entry") {
     if (positional.length < 3) usage();
     await cmdEntry(positional, runRoot, reason);

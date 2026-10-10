@@ -360,13 +360,31 @@ export interface VerifyResolution {
 }
 
 
+/** Plan 06j (A2): strip ANSI SGR escape sequences (`ESC[32m` … `ESC[39m`) and
+ * the other CSI/OSC escapes a coloured reporter writes, so a conductor that
+ * inherited FORCE_COLOR still resolves test names. The 06g2 round-4 incident:
+ * `ESC[32m✔ plan 06g: … ESC[90m(6499ms)ESC[39m` reported every named test
+ * "missing" although all passed. Every parser of check output goes through
+ * this before matching. */
+export function stripAnsi(text: string): string {
+  // CSI sequences (including SGR colours), OSC sequences terminated by BEL or
+  // ST, and the two-character Fe escapes. A single pass is enough for the
+  // reporters the runners write.
+  return text
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b[@-Z\\-_]/g, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
 /** Whether the check run's combined output names `name` as passing, failing or
  * not at all. The name must be the reporter's own test-name token, not a
  * substring of a longer one (finding M-14): `✔ name (1.2ms)` and TAP's
  * `ok N - name` both match, while `lanes: tally` never matches `lanes: tally
- * extended`. A failure anywhere wins over a pass. */
+ * extended`. A failure anywhere wins over a pass. Plan 06j (A2): ANSI escapes
+ * are stripped first, so a coloured reporter cannot hide a name. */
 export function testOutcomeIn(output: string, name: string): TestOutcome {
   if (name.trim().length === 0) return "missing";
+  const clean = stripAnsi(output);
   const escaped = name.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const nodePass = new RegExp(`^\\s*(?:✔|✓)\\s+${escaped}(?:\\s*\\(.*\\))?\\s*$`);
   const nodeFail = new RegExp(`^\\s*(?:✖|✗|×)\\s+${escaped}(?:\\s*\\(.*\\))?\\s*$`);
@@ -377,7 +395,7 @@ export function testOutcomeIn(output: string, name: string): TestOutcome {
   const cargoPass = new RegExp(`^\\s*test\\s+${escaped}\\s+\\.\\.\\.\\s+ok\\s*$`);
   const cargoFail = new RegExp(`^\\s*test\\s+${escaped}\\s+\\.\\.\\.\\s+FAILED\\s*$`);
   let passed = false;
-  for (const line of output.split("\n")) {
+  for (const line of clean.split("\n")) {
     if (tapFail.test(line) || nodeFail.test(line) || cargoFail.test(line)) return "failed";
     if (tapPass.test(line) || nodePass.test(line) || cargoPass.test(line)) passed = true;
   }

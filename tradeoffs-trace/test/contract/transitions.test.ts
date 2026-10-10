@@ -774,6 +774,84 @@ BUILD["awaiting-owner-request-resolved-grant"] = {
   },
 };
 
+// Plan 06j (A3): the owner rechecks a frozen candidate whose checks just
+// failed. The phase is parked (budget spent) with no worker running; the row
+// re-runs the same tier, keeps the failed record (with its tier) for the
+// re-run, and answers the budget gate with the recheck itself.
+BUILD["recheck-requested"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "round" },
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the checks kept failing",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "grant", label: "grant 3 more repair rounds" }, { id: "stop", label: "stop the phase" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "load-only timing", tier: "round" },
+};
+
+// A recheck of a candidate whose failed run was the final tier enters
+// FINAL_CHECKING, so the same final check runs again.
+BUILD["recheck-requested-final"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "final" },
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the final check kept failing",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "grant", label: "grant one more round" }, { id: "stop", label: "stop the phase" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "killed process", tier: "final" },
+};
+
+// Plan 06j (A3, owner steer 19:41Z): a check failure with budget left started
+// a repair attempt by itself. The owner rechecks before it submits; the worker
+// is stopped and the charged round is given back.
+BUILD["recheck-requested-from-implementing"] = {
+  state: baseState({
+    phase: "IMPLEMENTING",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "round" },
+    repairRoundsUsed: 1,
+    repairRoundsGranted: 2,
+    // The stopped attempt's own dispatch is still in flight when the recheck
+    // arrives; the row must clear it or the next repair stalls.
+    inFlight: { dispatch_worker: { actionId: "w1" } },
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "load-only timing", tier: "round" },
+};
+
+BUILD["recheck-requested-final-from-implementing"] = {
+  state: baseState({
+    phase: "IMPLEMENTING",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "final" },
+    repairRoundsUsed: 1,
+    repairRoundsGranted: 2,
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "killed process", tier: "final" },
+};
+
 // Plan 06g (A6): "accept with carried items" — the budget-spent phase whose
 // only open items are advisories offers this one decision; taking it accepts
 // the candidate as it stands and resumes to RESOLVING, where next() accepts
@@ -1543,6 +1621,16 @@ BUILD["panel-incomplete"] = {
   }),
   event: { type: "EVALUATION_COMPLETED" },
 };
+
+test("plan 06j: a recheck from IMPLEMENTING clears the stopped attempt's dispatch_worker and refunds its round", () => {
+  const fixture = BUILD["recheck-requested-from-implementing"];
+  const result = reduce(fixture.state, fixture.event);
+  assert.equal(result.ok, true, !result.ok ? result.reason : "");
+  assert.equal(result.state.phase.phase, "CHECKING");
+  assert.equal(result.state.phase.inFlight.dispatch_worker, undefined, "the stopped attempt's dispatch must not survive");
+  assert.equal(result.state.phase.repairRoundsUsed, 0, "the charged round is given back");
+  assert.deepEqual(next(result.state), [{ type: "run_checks", candidateSha: "C1" }]);
+});
 
 test("transition table: every row in transitions.ts has a covering fixture", () => {
   const missing = TRANSITIONS.filter((r) => !BUILD[r.id]).map((r) => r.id);
