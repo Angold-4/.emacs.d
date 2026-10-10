@@ -203,6 +203,39 @@ test("plan 06j: cargo-fmt detection is token-based (toolchain, env prefix, cargo
   assert.equal(runsCargoFmtAll("cargo fmt --all"), false, "a plain fmt --all never qualifies");
 });
 
+test("plan 06j: every YAML run scalar form is decoded before the fmt trigger", () => {
+  // OD-15: plain, quoted and block scalars all decode to the command text.
+  const forms: Array<{ name: string; run: string }> = [
+    { name: "plain", run: "      - run: cargo fmt --all --check" },
+    { name: "single-quoted", run: "      - run: 'cargo fmt --all --check'" },
+    { name: "double-quoted", run: '      - run: "cargo fmt --all --check"' },
+    { name: "literal", run: "      - run: |\n          cargo fmt --all --check" },
+    { name: "literal-strip", run: "      - run: |-\n          cargo fmt --all --check" },
+    { name: "folded", run: "      - run: >\n          cargo fmt --all --check" },
+    { name: "folded-strip", run: "      - run: >-\n          cargo fmt --all --check" },
+  ];
+  for (const form of forms) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-yaml-"));
+    fs.mkdirSync(path.join(root, ".github", "workflows"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".github", "workflows", "ci.yml"), `name: CI\non: [push]\njobs:\n  t:\n    steps:\n${form.run}\n`);
+    try {
+      const facts = readRepoFacts(root);
+      assert.ok(ciRunsCargoFmtAll(facts.ciCommands.join("\n")), `${form.name}: ${JSON.stringify(facts.ciCommands)}`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+  // A `name:` key that merely looks like a command is not a run: value.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-06j-yaml-neg-"));
+  fs.mkdirSync(path.join(root, ".github", "workflows"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".github", "workflows", "ci.yml"), 'name: "cargo fmt --all"\non: [push]\n');
+  try {
+    assert.deepEqual(readRepoFacts(root).ciCommands, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("plan 06j: coverage facts read a workspace's crates and its workflow commands", () => {
   const root = cargoFixture("run: cargo fmt --all --check");
   try {

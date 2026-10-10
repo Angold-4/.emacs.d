@@ -100,8 +100,48 @@ function readPackages(root: string): RepoPackage[] {
   return out;
 }
 
-/** Every command a GitHub Actions workflow runs. A `run:` scalar is the
- * command; a `run: |`/`run: >` block collects the more-indented lines. */
+/** Decode a YAML double-quoted scalar body: `\"`/`\n`/`\t`/`\\` escapes. */
+function decodeDoubleQuoted(body: string): string {
+  let out = "";
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "\\" && i + 1 < body.length) {
+      const n = body[i + 1];
+      out += n === "n" ? "\n" : n === "t" ? "\t" : n === '"' ? '"' : n === "\\" ? "\\" : n;
+      i += 1;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+/** Decode one YAML scalar the way GitHub's `run:` values use it: plain,
+ * single-quoted (`''` is an escaped `'`) or double-quoted. */
+function decodeYamlScalar(raw: string): string {
+  const value = raw.trim();
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1).replace(/''/g, "'");
+  }
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    return decodeDoubleQuoted(value.slice(1, -1));
+  }
+  return value;
+}
+
+/** Decode a YAML block scalar (`|`/`>` with optional `-`/`+` chomping): strip
+ * the block's common indentation; literal keeps line breaks, folded joins
+ * lines with spaces. */
+function decodeBlock(lines: readonly string[], folded: boolean): string {
+  const nonEmpty = lines.filter((l) => l.trim().length > 0);
+  const minIndent = nonEmpty.length > 0 ? Math.min(...nonEmpty.map((l) => l.match(/^(\s*)/)![1].length)) : 0;
+  const stripped = lines.map((l) => l.slice(Math.min(minIndent, l.length)));
+  return (folded ? stripped.join(" ") : stripped.join("\n")).trim();
+}
+
+/** Every command a GitHub Actions workflow runs. A `run:` value is decoded
+ * the way YAML does for the forms workflows use: a plain scalar, a single- or
+ * double-quoted scalar, or a `|`/`>` block (OD-15). */
 function readCiCommands(root: string): string[] {
   const dir = path.join(root, ".github", "workflows");
   let files: string[] = [];
@@ -120,21 +160,22 @@ function readCiCommands(root: string): string[] {
       if (!m) continue;
       const indent = m[1].length;
       const value = m[2].trim();
-      if (/^[|>]/.test(value)) {
-        const block: string[] = [];
+      const block = /^([|>])([-+]?)\s*$/.exec(value);
+      if (block) {
+        const collected: string[] = [];
         for (let j = i + 1; j < lines.length; j++) {
           const line = lines[j];
           if (line.trim().length === 0) {
-            block.push("");
+            collected.push("");
             continue;
           }
           if (line.match(/^(\s*)/)![1].length <= indent) break;
-          block.push(line.trim());
+          collected.push(line);
         }
-        const command = block.join("\n").trim();
+        const command = decodeBlock(collected, block[1] === ">");
         if (command.length > 0) out.push(command);
       } else if (value.length > 0) {
-        out.push(value);
+        out.push(decodeYamlScalar(value));
       }
     }
   }
