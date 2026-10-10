@@ -118,6 +118,11 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ITEM_STATE_UPDATED",
   "EVIDENCE_RECORDED",
   "ITEM_CHECK_RECORDED",
+  "FINDING_MERGED",
+  "TRIAGE_RECORDED",
+  "TRIAGE_FAILED",
+  "DEFERRAL_RECORDED",
+  "DEFERRAL_RESOLVED",
   "ROUND_STARTED",
   "CANDIDATE_SUBMITTED",
   "CANDIDATE_CHECKED",
@@ -384,11 +389,75 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
 
     case "ITEM_CHECK_RECORDED": {
       // Plan 06b (OD-1 R3b): the evaluator's re-check of an item's majority
-      // verdict, merged by item id (the latest check wins).
+      // verdict, merged by item id (the latest check wins). Plan 06i: the same
+      // form carries the evaluator's impact class for a finding or discovered
+      // decision, so one check is both the re-check and the classification.
       const others = (p.itemChecks ?? []).filter((c) => c.itemId !== event.itemId);
       return ok({
         ...state,
-        phase: { ...p, itemChecks: [...others, { itemId: event.itemId, verdict: event.verdict, evidence: event.evidence }] },
+        phase: {
+          ...p,
+          itemChecks: [
+            ...others,
+            {
+              itemId: event.itemId,
+              verdict: event.verdict,
+              evidence: event.evidence,
+              ...(event.impact ? { impact: event.impact } : {}),
+              ...(event.chosen ? { chosen: event.chosen } : {}),
+              ...(event.alternative ? { alternative: event.alternative } : {}),
+              ...(event.why ? { why: event.why } : {}),
+            },
+          ],
+        },
+      });
+    }
+
+    case "FINDING_MERGED": {
+      // Plan 06i (C3): a duplicate finding is merged, not disproved, and
+      // linked to the record it duplicates. Its own triage record copies the
+      // original's disposition, so nothing leaves the ledger without one.
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      const findings = p.findings.map((f) =>
+        f.id === event.findingId ? { ...f, status: "merged" as const, mergedInto: event.into, version: f.version + 1 } : f,
+      );
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "TRIAGE_RECORDED": {
+      // Plan 06i: one record per finding/discovered decision, merged by id
+      // (the latest disposition wins). Record-only: the phase's own FSM state
+      // never moves here; `accept()` and the views read the records.
+      const others = (p.triage ?? []).filter((r) => r.itemId !== event.record.itemId);
+      return ok({ ...state, phase: { ...p, triage: [...others, event.record] } });
+    }
+
+    case "DEFERRAL_RECORDED": {
+      // Plan 06i: a deferral needs a guard — a test that shows its current
+      // cost, or a recorded owner ruling. Without either it is refused with
+      // the reason, never recorded silently. Recorded once per item id.
+      const d = event.deferral;
+      // OD addendum A: a second owner act on the same id is refused, naming
+      // the existing act. A carry already put this item into the next phase's
+      // contract; deferring it too would silently drop one act.
+      if ((p.carriedItems ?? []).includes(d.itemId)) {
+        return rejected(state, `${d.itemId} is already carried (to ${p.carriedTo?.[d.itemId] ?? "next"}); resolve that carry first`);
+      }
+      if (!(d.test && d.test.trim().length > 0) && !(d.ownerRuling && d.ownerRuling.trim().length > 0)) {
+        return rejected(state, `deferring ${d.itemId} needs a guard: a test that shows its current cost, or a recorded owner ruling`);
+      }
+      const others = (p.deferrals ?? []).filter((x) => x.itemId !== d.itemId);
+      return ok({ ...state, phase: { ...p, deferrals: [...others, d] } });
+    }
+
+    case "DEFERRAL_RESOLVED": {
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          deferrals: (p.deferrals ?? []).map((d) => (d.id === event.deferralId ? { ...d, status: "resolved" as const } : d)),
+        },
       });
     }
 
@@ -636,7 +705,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const finding = p.findings.find((f) => f.id === event.findingId);
       if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
       const findings = p.findings.map((f) =>
-        f.id === event.findingId ? { ...f, severity: event.severity, severityReason: event.reason.trim() } : f,
+        f.id === event.findingId ? { ...f, severity: event.severity, severityReason: event.reason.trim(), severityChangedBy: event.by } : f,
       );
       return ok({ ...state, phase: { ...p, findings } });
     }

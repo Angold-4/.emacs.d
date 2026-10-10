@@ -332,6 +332,38 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
         },
       };
     }
+    case "defer": {
+      // Plan 06i: a deferral puts off an item's fix. It needs a guard — a test
+      // that shows its current cost, or a recorded owner ruling — or it is
+      // refused with the reason (reduce() refuses it too, so a hand-written
+      // inbox file cannot bypass this).
+      const w = bound();
+      if ("error" in w) return { ok: false, reason: w.error };
+      const test = typeof r.test === "string" && r.test.trim().length > 0 ? r.test.trim() : undefined;
+      const ownerRuling =
+        typeof r.ownerRuling === "string" && r.ownerRuling.trim().length > 0 ? r.ownerRuling.trim() : undefined;
+      if (!test && !ownerRuling) {
+        return { ok: false, reason: "a defer command needs a guard: --test <test that shows its current cost> or --owner-ruling <ruling id>" };
+      }
+      const toPhase = typeof r.toPhase === "string" && r.toPhase.trim().length > 0 ? r.toPhase.trim() : undefined;
+      return {
+        ok: true,
+        runId: b.runId,
+        phaseId: b.phaseId,
+        event: {
+          type: "DEFERRAL_RECORDED",
+          deferral: {
+            id: `DEF-${commandId}`,
+            itemId: b.recordId,
+            text: typeof r.text === "string" && r.text.trim().length > 0 ? r.text.trim() : `deferred ${b.recordId}`,
+            ...(test ? { test } : {}),
+            ...(ownerRuling ? { ownerRuling } : {}),
+            ...(toPhase ? { toPhase } : {}),
+            status: "open",
+          },
+        },
+      };
+    }
     case "revise": {
       const w = bound();
       if ("error" in w) return { ok: false, reason: w.error };

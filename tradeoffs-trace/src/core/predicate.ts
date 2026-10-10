@@ -35,6 +35,7 @@ import { currentBallot, isValidBallot, tally } from "./tally.ts";
 // its test verifies passed, every A fitting by majority or its deviation
 // accepted by the owner, and every evidence item recorded.
 import { flatItems, isStructured, itemNeedsEvidence, itemsAccept, itemsFromPhase, phaseItemOutcomes, tallyItems, testVerifyProblems, thinMetItems, workerAnchorsOf } from "./items.ts";
+import { discoveredDecisions, hasBlockingFix, openFindings, ownerRequestIsStale, recordClassified, undispositionedBlockingFinding } from "./triage.ts";
 import type { RoundPanelOutcome, RoundPanelState } from "./types.ts";
 import type {
   ContractVersion,
@@ -109,6 +110,16 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
   // substantive re-check against the candidate before it blocks. Force one
   // `finding` evaluator pass for it when no finding message already asks.
   if (itemsNeedingEvaluatorReverify(phase) && !types.includes("finding")) types.push("finding");
+  // Plan 06i (A3): a finding or discovered decision that still owes its impact
+  // classification needs its evaluator pass even with no raw message of that
+  // type this round — otherwise the classification is owed but never asked
+  // and the record escalates.
+  if (openFindings(phase).some((f) => !recordClassified(phase, "finding", f.id)) && !types.includes("finding")) {
+    types.push("finding");
+  }
+  if (discoveredDecisions(phase).some((d) => !recordClassified(phase, "decision", d.id)) && !types.includes("tradeoff")) {
+    types.push("tradeoff");
+  }
   return types;
 }
 
@@ -552,6 +563,18 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
   // candidate's gate/probe.
   if (phase.acceptedWithCarried) return phase.carriedCandidateSha === C;
 
+  // Plan 06i: a record the triage dispositioned `fix` blocks acceptance,
+  // whatever the reviewer's severity label and whatever round it was raised
+  // in (06g's round-2 downgrade never applies to a wrong-output record). A
+  // wrong-output finding is item-linked by definition, so it is never
+  // downgraded. An explicit owner carry above is the one owner decision that
+  // accepts with the item, exactly as it does for any open review item.
+  // Plan 06i (A2): acceptance follows the item's disposition, never the
+  // reviewer's label. A fix disposition blocks; a trade-off does not; an
+  // in-window escalation blocks through its open owner request below. A
+  // blocking finding that has not been triaged yet still blocks (fail safe).
+  if (hasBlockingFix(phase) || undispositionedBlockingFinding(phase)) return false;
+
   for (const who of seatsOf(phase.contract)) {
     const review = phase.reviews[who]?.review;
     if (!review) return false;
@@ -574,9 +597,7 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     }
   }
 
-  if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open")) {
-    return false;
-  }
+
 
   for (const decision of phase.decisions) {
     // A decision superseded by a correction (design §7.5 step 1) is
@@ -593,7 +614,10 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     if (!decisionSettled(decision, phase, C, K)) return false;
   }
 
-  if (phase.ownerRequests.some((r) => r.status === "open")) {
+  // Plan 06i: a non-blocking owner request (a late discovery's escalation)
+  // is visible but does not gate acceptance; an open request whose linked
+  // item is already closed is moot and does not gate it either.
+  if (phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) {
     return false;
   }
 

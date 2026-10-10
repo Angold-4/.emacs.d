@@ -38,6 +38,7 @@ export interface RecordBinding {
 // ---------------------------------------------------------------------------
 
 import type { ArchitectureItem, ConstraintItem, RequirementItem } from "./items.ts";
+import type { Deferral, TriageRecord } from "./triage.ts";
 
 export interface PlanPhase {
   id: string;
@@ -91,6 +92,10 @@ export interface PhaseContract {
   phaseId: string;
   contractVersion: ContractVersion;
   goal: string;
+  /** Plan 06i (A3): the phase's golden note — the current source a choice
+   * that matches an earlier drafting decision is re-checked against. A
+   * `contract` classification must cite it. */
+  golden?: string;
   acceptance: string[];
   checks: string[];
   boundaries: string[];
@@ -260,7 +265,7 @@ export interface PriorDecisionStatement {
 
 export type FindingKind = "defect" | "contract" | "integration";
 export type FindingSeverity = "blocking" | "advisory";
-export type FindingStatus = "open" | "repaired" | "disproved" | "accepted" | "superseded";
+export type FindingStatus = "open" | "repaired" | "disproved" | "accepted" | "superseded" | "merged";
 /** Plan 06h: a seat is any name `#+TT_REVIEWERS` declares. The default is
  * still `M`, `A` and `B`, but nothing in the code may assume that set. */
 export type Reviewer = string;
@@ -281,6 +286,10 @@ export interface Finding {
   reproduction?: { command: string; result: "reproduced" | "not_reproduced" | "inconclusive" };
   repairedByCandidateSha?: string;
   disprovedEvidence?: string;
+  /** Plan 06i (C3): the record this finding was merged into as a duplicate
+   * (06c B4: "merged", never "disproved"). Its triage disposition is the
+   * original's. */
+  mergedInto?: string;
   acceptedScope?: string; // required scope note (§4.2, §10.4 `x`)
   /** Plan 01g: the acceptance item this `contract` finding disputes verbatim
    * (set when it was raised with a `criterionDispute`). A later amendment of
@@ -301,6 +310,10 @@ export interface Finding {
   /** Plan 05e: why the finding's severity changed from the raised one (the
    * evaluator's plan check, or the round panel's vote). */
   severityReason?: string;
+  /** Plan 06i: WHO changed the severity — the evaluator's plan check, the
+   * round panel's vote, or a reviewer's `sameAs` re-raise. The triage reads
+   * it: a panel drop is a recorded review outcome (a trade-off). */
+  severityChangedBy?: "evaluator" | "panel" | "reviewer";
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +485,11 @@ export interface OwnerRequest {
    * no-op. See owner-requests.ts for what each origin offers. */
   options: OwnerRequestOption[];
   status: OwnerRequestStatus;
+  /** Plan 06i: `false` for an escalation of an item OUTSIDE the round's
+   * ballot/evaluation window (a discovery that arrived after the prompts). It
+   * is recorded and visible, but it does not gate acceptance, so a late
+   * discovery never stalls the phase. Absent means blocking. */
+  blocking?: boolean;
   /** `option` is the chosen option's *id* (never its label). */
   resolution?: { option: string; note?: string };
   /** The (candidate, contract) the *resolution* was bound to — design §6.3's
@@ -1221,7 +1239,27 @@ export interface PhaseState {
   /** Plan 06b (OD-1 R3b): the evaluator's substantive re-check of an item's
    * majority verdict, recorded with what it checked. A `contradicted` check
    * overturns the majority (the FINDING_VERIFIED path). */
-  itemChecks?: Array<{ itemId: string; verdict: "confirmed" | "contradicted" | "unchecked"; evidence: string }>;
+  itemChecks?: Array<{
+    itemId: string;
+    verdict: "confirmed" | "contradicted" | "unchecked";
+    evidence: string;
+    /** Plan 06i: the evaluator's impact class for a finding or discovered decision (through the same item-check form). */
+    impact?: import("./triage.ts").Impact;
+    /** Plan 06i: a judgement call's own chosen/alternative/why, given by the
+     * evaluator. A judgement record without all three escalates; the
+     * conductor never supplies stock text. */
+    chosen?: string;
+    alternative?: string;
+    why?: string;
+  }>;
+  /** Plan 06i: one triage record per finding and per discovered decision of
+   * the current candidate, keyed by id. A record without a disposition at the
+   * end of evaluation is a defect of the loop, never a pass. */
+  triage?: TriageRecord[];
+  /** Plan 06i: deferrals whose fix is put off. Each needs a guard — a test
+   * that shows its current cost, or a recorded owner ruling — and is listed
+   * under "Open deferrals" in `tt summary` until resolved. */
+  deferrals?: Deferral[];
   /** Plan 06c: the candidate whose `final` check run already passed, so
    * RESOLVING accepts it without asking for the final check again. Cleared
    * when a new candidate freezes. */
@@ -2222,6 +2260,56 @@ export interface EvItemCheckRecorded {
    * check for a required item after one re-prompt. */
   verdict: "confirmed" | "contradicted" | "unchecked";
   evidence: string;
+  /** Plan 06i: the evaluator's impact class for a finding or discovered
+   * decision, given through the same item-check form. Absent for a contract
+   * item (its impact is implicit). */
+  impact?: import("./triage.ts").Impact;
+  /** Plan 06i: a judgement call's own chosen/alternative/why, from the same
+   * form. All three, or the record escalates. */
+  chosen?: string;
+  alternative?: string;
+  why?: string;
+}
+
+/** Plan 06i (C3): a finding the evaluator merged into another record as a
+ * duplicate. It keeps its own triage record, linked to the original's
+ * disposition (06c B4: "merged", never "disproved"). */
+export interface EvFindingMerged {
+  type: "FINDING_MERGED";
+  findingId: string;
+  /** The record (message or finding id) it was merged into. */
+  into: string;
+  byReviewer: Reviewer;
+}
+
+/** Plan 06i: one finding's or discovered decision's triage record, with its
+ * impact class and (once the loop has decided) exactly one disposition. A
+ * record-only event, so a restart rebuilds the triage from the log. */
+export interface EvTriageRecorded {
+  type: "TRIAGE_RECORDED";
+  record: TriageRecord;
+}
+
+/** Plan 06i: a deferral — an item whose fix is put off with a guard (a test
+ * that shows its current cost, or a recorded owner ruling). Record-only. */
+export interface EvDeferralRecorded {
+  type: "DEFERRAL_RECORDED";
+  deferral: Deferral;
+}
+
+/** Plan 06i: a deferral was resolved (its fix landed). Record-only. */
+export interface EvDeferralResolved {
+  type: "DEFERRAL_RESOLVED";
+  deferralId: string;
+}
+
+/** Plan 06i (A1): the triage pass itself failed. A record without a
+ * disposition at the end of evaluation is a defect of the loop, never a pass,
+ * so this stops acceptance and parks the phase on the owner with the reason.
+ */
+export interface EvTriageFailed {
+  type: "TRIAGE_FAILED";
+  reason: string;
 }
 
 /** Plan 06g (A5): the owner carries one finding or message to a later
@@ -2334,6 +2422,11 @@ export type Event =
   | EvItemStateUpdated
   | EvEvidenceRecorded
   | EvItemCheckRecorded
+  | EvTriageRecorded
+  | EvDeferralRecorded
+  | EvDeferralResolved
+  | EvFindingMerged
+  | EvTriageFailed
   | EvReviewLintFailed
   | EvBriefsRecorded
   | EvBriefRetryAttempted

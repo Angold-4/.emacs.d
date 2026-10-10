@@ -14,6 +14,7 @@
 // previous one, and the first after the plan's own dependencies.
 
 import type { RunPlanFile } from "../conductor.ts";
+import type { RequirementItem } from "./items.ts";
 
 export interface ProgramPlanEntry {
   /** Unique id of the entry in the program (e.g. "13c"). */
@@ -67,7 +68,10 @@ export interface ProgramDirective {
 export type NodeStatus = "waiting" | "running" | "needs-you" | "stopped" | "done" | "blocked" | "env-blocked";
 
 export interface ProgramState {
-  nodes: Record<string, { status: NodeStatus; runId?: string; branch?: string; base?: string; reason?: string; resumes?: number }>;
+  nodes: Record<
+    string,
+    { status: NodeStatus; runId?: string; branch?: string; base?: string; reason?: string; resumes?: number; carriedItems?: string[] }
+  >;
   stopped: boolean;
   /** Plan 06d (A3): the owner paused the program. Running nodes go on; no new
    * node starts until `tt program resume`. */
@@ -93,6 +97,9 @@ export type ProgramEvent =
   | { type: "NODE_STATUS"; node: string; status: Exclude<NodeStatus, "waiting">; reason?: string }
   | { type: "DIRECTIVE_ADDED"; directive: ProgramDirective }
   | { type: "DIRECTIVE_WITHDRAWN"; directiveId: string }
+  /** Plan 06i: the carried items a dependency's accepted run wrote into this
+   * node's contract (visible, never silent). */
+  | { type: "NODE_CARRIED_ITEMS"; node: string; items: string[] }
   | { type: "PROGRAM_STOPPED" };
 
 /** Expands entries into phase nodes and validates the graph: unique ids,
@@ -249,6 +256,13 @@ export function reduceProgram(state: ProgramState, event: ProgramEvent): Program
         directives: (state.directives ?? []).map((d) => (d.id === event.directiveId ? { ...d, withdrawn: true } : d)),
       };
     }
+    case "NODE_CARRIED_ITEMS": {
+      // Plan 06i: record-only; the carried requirement ids are visible on the
+      // node so the status can name what a dependency passed on.
+      const prev = state.nodes[event.node];
+      if (!prev) return state;
+      return { ...state, nodes: { ...state.nodes, [event.node]: { ...prev, carriedItems: event.items } } };
+    }
   }
 }
 
@@ -306,10 +320,21 @@ export function nodeBases(program: ProgramFile, nodes: ProgramNode[], node: Prog
 /** The plan a node's run receives: the entry's plan narrowed to its phase,
  * publishing to the node's branch. Plan 01i: the in-force program-wide
  * directives are seeded into it, so a node started after the owner ruled
- * still carries the ruling in every prompt. */
-export function nodePlan(program: ProgramFile, node: ProgramNode, directives: ProgramDirective[] = []): RunPlanFile {
+ * still carries the ruling in every prompt. Plan 06i: the items a dependency
+ * carried into this node become REAL requirements of its contract — with an
+ * id, their text and a VERIFY — never directive text alone. */
+export function nodePlan(
+  program: ProgramFile,
+  node: ProgramNode,
+  directives: ProgramDirective[] = [],
+  carried: RequirementItem[] = [],
+): RunPlanFile {
   const entry = program.entries.find((e) => e.id === node.entry)!;
-  const phase = entry.plan.phases[node.phaseIndex];
+  const base = entry.plan.phases[node.phaseIndex];
+  const phase: typeof base =
+    carried.length > 0
+      ? { ...base, requirements: [...(base.requirements ?? []), ...carried] }
+      : base;
   return {
     ...entry.plan,
     title: `${entry.plan.title} [${node.id}]`,

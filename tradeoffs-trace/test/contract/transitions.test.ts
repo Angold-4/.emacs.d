@@ -1434,6 +1434,21 @@ BUILD["evaluation-completed"] = {
   event: { type: "EVALUATION_COMPLETED" },
 };
 
+// Plan 06i (A1): the triage pass itself failed, so the phase parks on the
+// owner instead of continuing to item outcomes and acceptance.
+BUILD["triage-failed"] = {
+  state: baseState({
+    phase: "EVALUATING",
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    messages: [rawMessage()],
+    evaluation: { types: { tradeoff: { settled: true } } },
+  }),
+  event: { type: "TRIAGE_FAILED", reason: "the triage pass threw" },
+};
+
 // Plan 04b: the blocker panel. A raised blocker is a raw `blocker` message
 // AND an open blocking finding; each panel's verdict picks the exit from
 // EVALUATING (the message itself is published by the blocker evaluator before
@@ -1472,6 +1487,9 @@ const PANEL_BASE = {
   reviews: acceptableReviews,
   findings: [blockerFinding()],
   messages: [blockerMessage()],
+  // Plan 06i: the open blocking finding owes its impact classification, so its
+  // `finding` evaluator pass must be settled for EVALUATION_COMPLETED to hold.
+  evaluation: { types: { finding: { settled: true } } },
 } as const;
 
 BUILD["panel-escalate"] = {

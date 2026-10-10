@@ -366,11 +366,20 @@ const submitEvaluationFields: Record<string, TSchema> = {
   itemChecks: Type.Optional(
     Type.Array(
       Type.Object({
-        id: Type.String({ description: "The plan item id from the re-check list" }),
+        id: Type.String({ description: "The plan item, finding or discovered-decision id from the re-check list" }),
         verdict: StringEnum(["confirmed", "contradicted"] as const),
         evidence: Type.String({ description: "What you checked in the candidate, as a file:line citation" }),
+        impact: Type.Optional(
+          StringEnum(["wrong-output", "contract", "judgement"] as const, {
+            description:
+              "Plan 06i, a finding or discovered decision only: wrong-output (a wrong value, offer or output on a reachable path), contract (it contradicts the golden source or the plan), or judgement (style, hardening, ergonomics)",
+          }),
+        ),
+        chosen: Type.Optional(Type.String({ description: "Plan 06i, judgement only: what is accepted (with alternative and why, or the record escalates)" })),
+        alternative: Type.Optional(Type.String({ description: "Plan 06i, judgement only: the alternative given up" })),
+        why: Type.Optional(Type.String({ description: "Plan 06i, judgement only: why the judgement call is acceptable" })),
       }),
-      { description: "Plan 06b: your re-check of each plan item whose majority verdict was unmet or deviating" },
+      { description: "Plan 06b/06i: your re-check of each plan item, finding or discovered decision that owes one, with its impact class" },
     ),
   ),
 };

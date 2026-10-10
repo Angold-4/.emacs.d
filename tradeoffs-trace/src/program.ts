@@ -15,6 +15,8 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { createRun, runPaths } from "./conductor.ts";
+import { triageRecordFor } from "./core/triage.ts";
+import type { RequirementItem } from "./core/items.ts";
 import { readRunState } from "./effects/runner.ts";
 import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
@@ -325,6 +327,84 @@ export function withdrawProgramDirective(root: string, dir: string, directiveId:
   return true;
 }
 
+/** Plan 06i: the carried requirements a node's dependencies write into its
+ * contract. Read from each dependency's accepted run: every `carriedItems`
+ * id becomes a requirement named `CARRY-<id>` with the item's own text and a
+ * VERIFY — `test "carried <id> is fixed"` when the item's triage impact is
+ * wrong-output, `review` otherwise. */
+export function carriedRequirementsFor(program: ProgramFile, node: ProgramNode, state: ProgramState, runRoot: string): RequirementItem[] {
+  const out: RequirementItem[] = [];
+  // Separate dedup sets: a carry and a deferral are different owner acts, so
+  // neither may silently drop the other (OD addendum A). The command level
+  // refuses a second act on the same id, so both being present is defensive
+  // only — and if it happened, both are imported rather than one dropped.
+  const seenCarried = new Set<string>();
+  const seenDefer = new Set<string>();
+  // Plan 06i (A4): a carried item/deferral goes ONLY to the phase its
+  // `--to` target names (`carriedTo[id]` / `d.toPhase`) — the runbook's
+  // carry rule. A node is addressed by its node id or its phase id; an
+  // absent target (the `accept_carried` fallback records `"next"`) reaches
+  // the direct dependents, exactly as before.
+  const phaseId = program.entries.find((e) => e.id === node.entry)!.plan.phases[node.phaseIndex].id;
+  // A phase id is only an unambiguous target when it is unique across the
+  // program's nodes; repeated phase ids (every entry using `p1`) must not let
+  // one `--to p1` reach every child. The node id is always unique.
+  const phaseIdCounts = new Map<string, number>();
+  for (const e of program.entries) {
+    for (const ph of e.plan.phases) phaseIdCounts.set(ph.id, (phaseIdCounts.get(ph.id) ?? 0) + 1);
+  }
+  const phaseIdIsUnique = (phaseIdCounts.get(phaseId) ?? 0) === 1;
+  const targetedHere = (to: string | undefined): boolean =>
+    to === undefined || to === "next" || to === node.id || (phaseIdIsUnique && to === phaseId);
+  for (const dep of node.deps) {
+    const s = state.nodes[dep];
+    if (!s?.runId) continue;
+    const read = readRunState(path.join(runRoot, s.runId), runRoot);
+    if (!read) continue;
+    const phase = read.state.phase;
+    for (const id of phase.carriedItems ?? []) {
+      if (seenCarried.has(id)) continue;
+      if (!targetedHere(phase.carriedTo?.[id])) continue;
+      seenCarried.add(id);
+      const record = triageRecordFor(phase.triage, id);
+      const finding = phase.findings.find((f) => f.id === id);
+      const decision = phase.decisions.find((d) => d.id === id);
+      const text = finding?.evidence ?? decision?.choice ?? `carried item ${id}`;
+      const wrongOutput = record?.impact === "wrong-output";
+      out.push({
+        id: `CARRY-${id}`,
+        title: `carried from ${dep}: ${id}`,
+        text: `Carried from ${dep}: ${text}`,
+        arch: [],
+        verify: [wrongOutput ? `test "carried ${id} is fixed"` : "review"],
+      });
+    }
+    // Plan 06i (A4): an open deferral is a requirement of the next node too,
+    // with its guard as the VERIFY (a `test` for a cost test, `review` for an
+    // owner ruling). A deferral never disappears between phases.
+    for (const d of phase.deferrals ?? []) {
+      if (d.status !== "open" || seenDefer.has(d.itemId)) continue;
+      if (!targetedHere(d.toPhase)) continue;
+      seenDefer.add(d.itemId);
+      const record = triageRecordFor(phase.triage, d.itemId);
+      const wrongOutput = record?.impact === "wrong-output";
+      // Plan 06i (A4): a WRONG-OUTPUT item's next-node VERIFY is the FIX
+      // verification, never the cost guard (which already passes today). The
+      // cost test stays attached as context only. A judgement deferral is
+      // judged by its guard (test or review).
+      const costContext = d.test ? ` [cost guard: ${d.test}]` : "";
+      out.push({
+        id: `DEFER-${d.itemId}`,
+        title: `deferred from ${dep}: ${d.itemId}`,
+        text: `Deferred from ${dep}: ${d.text}${costContext}${d.ownerRuling ? ` (owner ruling ${d.ownerRuling})` : ""}`,
+        arch: [],
+        verify: [wrongOutput ? `test "carried ${d.itemId} is fixed"` : d.test ? `test "${d.test}"` : "review"],
+      });
+    }
+  }
+  return out;
+}
+
 function pidAlive(file: string): boolean {
   try {
     const pid = Number(fs.readFileSync(file, "utf8"));
@@ -467,7 +547,15 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
     const node = nodes.find((n) => n.id === id)!;
-    const plan = nodePlan(program, node, programDirectivesInForce(state));
+    // Plan 06i: a dependency's carried items become real requirements of this
+    // node's contract (an id, the item's text and a VERIFY). A wrong-output
+    // item carries a `test` verify; every other carried item is judged by
+    // review. Directive text alone never carries an item.
+    const carried = carriedRequirementsFor(program, node, state, opts.runRoot);
+    const plan = nodePlan(program, node, programDirectivesInForce(state), carried);
+    if (carried.length > 0) {
+      appendProgramEvent(dir, { type: "NODE_CARRIED_ITEMS", node: id, items: carried.map((c) => c.id) } as ProgramEvent);
+    }
     const prepared = prepareBranch(plan.repo, plan.integrationBranch, nodeBases(program, nodes, node), id);
     if (!prepared.ok) {
       record({ type: "NODE_BLOCKED", node: id, reason: prepared.reason });

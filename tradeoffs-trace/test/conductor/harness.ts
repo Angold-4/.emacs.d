@@ -328,6 +328,33 @@ export async function setupConductor(opts: {
     // validate; a confirmed check with anchors that do not exist is recorded
     // `unchecked by evaluator`.
     const owed = messageType === "finding" && itemsNeedingEvaluatorReverify(state.phase) ? owedItemIds(state) : [];
+    // Plan 06i: the default evaluator also classifies every open finding and
+    // discovered decision (a missing classification is re-prompted once and
+    // then escalates, so an unscripted test must still answer it). A finding
+    // is classified on the finding pass, a discovered decision (a `tradeoff`
+    // message) on the tradeoff pass.
+    const triageIds =
+      messageType === "finding"
+        ? (state.phase.findings ?? []).filter((f) => f.status === "open").map((f) => f.id)
+        : messageType === "tradeoff"
+          ? (state.phase.decisions ?? []).filter((d) => d.source === "reviewer-discovered").map((d) => d.id)
+          : [];
+    const itemChecks = [
+      ...owed.map((id) => ({ id, verdict: "confirmed", evidence: "README.md:1 evaluator: re-checked the candidate and found no contradiction" })),
+      ...triageIds.map((id) =>
+        (state.phase.findings ?? []).some((f) => f.id === id && f.severity === "blocking")
+          ? { id, verdict: "confirmed", impact: "wrong-output", evidence: "README.md:1 evaluator: re-checked the candidate" }
+          : {
+              id,
+              verdict: "confirmed",
+              impact: "judgement",
+              chosen: "accept it as recorded",
+              alternative: "repair it now",
+              why: "the evaluator re-checked the candidate and judged it a style or hardening call",
+              evidence: "README.md:1 evaluator: re-checked the candidate",
+            },
+      ),
+    ];
     return {
       hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
       steps: [
@@ -336,9 +363,7 @@ export async function setupConductor(opts: {
           tool: "submit_evaluation",
           args: {
             evaluations: [],
-            ...(owed.length > 0
-              ? { itemChecks: owed.map((id) => ({ id, verdict: "confirmed", evidence: "README.md:1 evaluator: re-checked the candidate and found no contradiction" })) }
-              : {}),
+            ...(itemChecks.length > 0 ? { itemChecks } : {}),
           },
         },
       ],
@@ -425,7 +450,7 @@ export async function setupConductor(opts: {
           const script = opts.evaluatorScriptFor
             ? opts.evaluatorScriptFor(messageType, conductor.state)
             : defaultEvaluatorScript(conductor.state, messageType);
-          evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+          evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, withTriageChecks(script, conductor.state, messageType)));
         }
         return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
       }
@@ -480,6 +505,61 @@ export async function setupConductor(opts: {
   });
 
   return { repo, runRoot, scriptsDir, plan, runDir, conductor };
+}
+
+/** Plan 06i: a test's own evaluator script may predate triage. Inject a
+ * `judgement` classification for every open finding (finding pass) or
+ * discovered decision (tradeoff pass) the script does not already classify,
+ * so an existing test that never knew about triage still answers the
+ * conductor's re-prompt. A test that wants a specific impact supplies its own
+ * entry for the id, which wins. */
+function withTriageChecks(
+  script: { hello?: unknown; steps: Array<{ kind: string; tool?: string; args?: unknown }> },
+  state: State,
+  messageType: string,
+): { hello?: unknown; steps: Array<{ kind: string; tool?: string; args?: unknown }> } {
+  // A BLOCKING finding is a defect: classify it `wrong-output` so it keeps
+  // blocking (fix). An advisory is a judgement call (trade-off). A decision is
+  // a judgement call unless the test classifies it otherwise.
+  const blockingIds = new Set((state.phase.findings ?? []).filter((f) => f.status === "open" && f.severity === "blocking").map((f) => f.id));
+  const ids =
+    messageType === "finding"
+      ? (state.phase.findings ?? []).filter((f) => f.status === "open").map((f) => f.id)
+      : messageType === "tradeoff"
+        ? (state.phase.decisions ?? []).filter((d) => d.source === "reviewer-discovered").map((d) => d.id)
+        : [];
+  if (ids.length === 0) return script;
+  const additions = ids.map((id) =>
+    blockingIds.has(id)
+      ? { id, verdict: "confirmed", impact: "wrong-output", evidence: "README.md:1 evaluator: re-checked the candidate" }
+      : {
+          id,
+          verdict: "confirmed",
+          impact: "judgement",
+          chosen: "accept it as recorded",
+          alternative: "repair it now",
+          why: "the evaluator re-checked the candidate and judged it a style or hardening call",
+          evidence: "README.md:1 evaluator: re-checked the candidate",
+        },
+  );
+  let sawSubmit = false;
+  const steps = script.steps.map((step) => {
+    if (step.kind !== "call-submit" || step.tool !== "submit_evaluation") return step;
+    sawSubmit = true;
+    const args = (step.args && typeof step.args === "object" ? { ...(step.args as Record<string, unknown>) } : {}) as Record<string, unknown>;
+    const existing = Array.isArray(args.itemChecks) ? (args.itemChecks as Array<{ id?: string }>) : [];
+    const covered = new Set(existing.map((c) => c?.id));
+    const missing = additions.filter((a) => !covered.has(a.id));
+    if (missing.length > 0) args.itemChecks = [...existing, ...missing];
+    return { ...step, args };
+  });
+  // A test script that handles only its own message type has no
+  // submit_evaluation step here; add one so the classification is still
+  // recorded (otherwise the finding pass times out and the record escalates).
+  if (!sawSubmit) {
+    steps.push({ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [], itemChecks: additions } });
+  }
+  return { ...script, steps };
 }
 
 /** Plan 06c: the item ids the finding-pass evaluator owes a check for — every

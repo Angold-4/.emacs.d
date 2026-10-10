@@ -813,6 +813,102 @@ and `tt status`.
 pick, the review buffer groups the round's candidates with the votes and the
 winner, and `tt summary` lists each round's candidates, votes and winner.
 
+## Triage
+
+Every finding and every discovered decision of the candidate ends in exactly
+**one disposition**, and `disposition(record, evidence)` in
+`src/core/triage.ts` is the only place that decides it. Nothing may silently
+disappear: a record without a disposition at the end of evaluation is a defect
+of the loop, never a pass.
+
+The three dispositions are:
+
+- **fix** — it blocks acceptance until repaired. A record dispositioned `fix`
+  makes `accept()` false whatever its severity label and whatever round it was
+  raised in, so 06g's round-2 downgrade never applies to one.
+- **trade-off** — accepted, recorded with what was chosen, the alternative
+  given up and why. It is listed under `tt summary`'s `#### Trade-offs` and
+  does not block.
+- **escalate** — an owner request is open, naming the record. Acceptance waits
+  for the owner, and `tt summary` lists it under `#### Escalations`.
+
+### The fix rule
+
+One rule separates fix from trade-off:
+
+- anything that gives a **wrong value, offer or output on a reachable path**,
+  or **contradicts the current golden source or the plan**, must be fixed;
+- only **judgement calls** (style, hardening, ergonomics) may be trade-offs;
+- matching an earlier **drafting decision is no exemption** — the choice is
+  re-checked against the current golden source, and a contradiction is a fix.
+
+Severity follows **impact, not the reviewer's label**. A finding filed at
+`advisory` severity whose evaluator re-check confirms a wrong value has impact
+`wrong-output`; its disposition is `fix` and it blocks. The evaluator gives
+every finding and every discovered decision an impact class
+(`wrong-output` | `contract` | `judgement`) through its item-check form, and a
+wrong-output claim is re-checked against the candidate with valid anchors
+before it can be classified. A missing classification is re-prompted once and
+then escalated.
+
+A discovered decision that receives **no ballots**, a failed vote whose
+outcome would change the output, and any unclassifiable item all escalate to
+the owner: they are never quietly kept as a trade-off and never quietly
+dropped. A `detail` decision is **never balloted**, but it still needs the
+evaluator's impact class and a real `chosen`/`alternative`/`why` to be a
+trade-off; without them it escalates like any other unclassified record.
+
+A trade-off needs the evaluator's classification **and** real
+`chosen`/`alternative`/`why` from its check. Neither a reviewer's severity
+label nor a round-panel drop is by itself a trade-off: a panel-lowered finding
+goes through the same judgement path (real three fields → trade-off; a missing
+field → escalate), and the panel's own reason is shown only as context.
+
+### Carry and defer
+
+A **carried** item becomes a real requirement of the phase it is carried to:
+when the next program node starts, the scheduler writes each carried finding
+or decision into its contract as a requirement with an id, the item's text and
+a `VERIFY` — `test "carried <id> is fixed"` for a wrong-output item, `review`
+otherwise. Directive text alone never carries an item. The next node's
+reviewers must give every requirement a verdict, so a carried item cannot be
+forgotten between phases.
+
+A **deferral** puts off an item's fix and needs a **guard**: a test that shows
+its current cost, or a recorded owner ruling. Without either it is refused
+with the reason (`tt defer <run> <id> --test <name>` or
+`--owner-ruling <id>`); with either it is recorded and listed under
+`### Open deferrals` in `tt summary` until it is resolved.
+
+A second owner act on the **same id** is refused with the reason, naming the
+existing act: `tt carry` on an id that already has an open deferral, and
+`tt defer` on an id that is already carried, are both rejected. The two acts
+are not merged and neither is silently dropped.
+
+### A worked example: valuation 01's settled-halt decision
+
+Valuation 01's PR review found six funding issues. One of them, **#5 (a
+settled offer can carry halt)**, had been raised in the loop as drafting
+decision **D9** and approved **3–0** because it matched the plan's drafting
+decision — but it was never re-checked against the **golden note**, which said
+a settled offer must never carry halt. Under 06i this is decided at
+evaluation:
+
+- the evaluator re-checks the choice against the current golden source, not
+  against the drafting decision;
+- the choice contradicts the golden note, so its impact is `contract` and its
+  disposition is `fix` — a 3–0 approve vote is no exemption;
+- it blocks acceptance, and the worker repairs it in the same phase.
+
+The same trace's **#2 (late prediction in the last minute)** is the
+escalation case: reviewer B discovered the decision in 01c but it received
+**no ballots**, so under the old loop it vanished. Under 06i a discovered
+decision with no ballots gets an `escalate` disposition and an open owner
+request naming it, so the owner sees it and acceptance waits. The third case,
+01e's **three confirmed wrong values** raised as blocking by one seat and
+outvoted 2–1, is the severity rule: a confirmed wrong-output record is a `fix`
+whatever the seat count, so the majority vote cannot accept it away.
+
 ## Owner checklist
 
 A plan may carry the owner's own to-dos next to `Acceptance:`:

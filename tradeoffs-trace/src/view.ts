@@ -1077,6 +1077,8 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     for (const f of advisories) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 400)}`);
   }
   lines.push(...roundsSection(phase));
+  lines.push(...triageSection(phase));
+  lines.push(...openDeferralsSection(phase));
   lines.push(...carriedItemsSection(phase));
   if (followUps.length > 0) {
     lines.push("", `### Follow-ups (refused after DONE — recorded, not blocking)`, "");
@@ -1154,6 +1156,76 @@ export function lanesView(phase: PhaseState): string[] {
   );
   if (round.votes.length > 0) {
     lines.push(`votes: ${round.votes.map((v) => `${v.seat}→${v.lane}`).join(" · ")}`);
+  }
+  return lines;
+}
+
+/** Plan 06i: `tt summary` lists every dispositioned item in its own
+ * section — fixes, trade-offs and escalations — so nothing the loop found
+ * disappears. Empty for a phase with no triage records. */
+export function triageSection(phase: PhaseState): string[] {
+  const records = phase.triage ?? [];
+  if (records.length === 0) return [];
+  const fixes = records.filter((r) => r.disposition?.kind === "fix");
+  const tradeoffs = records.filter((r) => r.disposition?.kind === "tradeoff");
+  const escalations = records.filter((r) => r.disposition?.kind === "escalate");
+  const label = (id: string) => {
+    const f = phase.findings.find((x) => x.id === id);
+    if (f) return `${id} (${f.raisedBy}): ${oneLine(f.evidence, 300)}`;
+    const d = phase.decisions.find((x) => x.id === id);
+    if (d) return `${id}: ${oneLine(d.choice, 300)}`;
+    return id;
+  };
+  // A repaired finding's fix record is history, not an open blocker (finding
+  // M-77/B-82): list it separately so a DONE summary never reads as if a
+  // repaired item still blocks. `blockingTriageRecords` already omits it from
+  // accept(), so the summary now agrees with the gate.
+  const isRepaired = (id: string) => phase.findings.some((f) => f.id === id && f.status === "repaired");
+  const openFixes = fixes.filter((r) => !isRepaired(r.itemId));
+  const repairedFixes = fixes.filter((r) => isRepaired(r.itemId));
+  const lines = ["", `### Triage (${records.length} item(s))`, ""];
+  lines.push(`#### Fixes (${openFixes.length}) — blocking until repaired`, "");
+  if (openFixes.length === 0) lines.push("- none", "");
+  for (const r of openFixes) {
+    const d = r.disposition;
+    lines.push(`- ${label(r.itemId)} — ${d?.kind === "fix" ? d.reason : ""}`);
+  }
+  if (openFixes.length > 0) lines.push("");
+  lines.push(`#### Repaired (${repairedFixes.length})`, "");
+  if (repairedFixes.length === 0) lines.push("- none", "");
+  for (const r of repairedFixes) {
+    const d = r.disposition;
+    lines.push(`- ${label(r.itemId)} — ${d?.kind === "fix" ? d.reason : ""}`);
+  }
+  if (repairedFixes.length > 0) lines.push("");
+  lines.push(`#### Trade-offs (${tradeoffs.length}) — accepted`, "");
+  if (tradeoffs.length === 0) lines.push("- none", "");
+  for (const r of tradeoffs) {
+    const d = r.disposition;
+    if (d?.kind !== "tradeoff") continue;
+    lines.push(`- ${label(r.itemId)} — chosen: ${oneLine(d.chosen, 200)}; alternative: ${oneLine(d.alternative, 200)}; why: ${oneLine(d.why, 300)}`);
+  }
+  if (tradeoffs.length > 0) lines.push("");
+  lines.push(`#### Escalations (${escalations.length}) — owner request open`, "");
+  if (escalations.length === 0) lines.push("- none", "");
+  for (const r of escalations) {
+    const d = r.disposition;
+    if (d?.kind !== "escalate") continue;
+    lines.push(`- ${label(r.itemId)} — ${oneLine(d.reason, 300)} (owner request ${d.ownerRequestId})`);
+  }
+  return lines;
+}
+
+/** Plan 06i: `tt summary`'s "Open deferrals" — every deferral whose fix is
+ * still put off, with the guard that admitted it (a test that shows its
+ * current cost, or a recorded owner ruling). Empty when there are none. */
+export function openDeferralsSection(phase: PhaseState): string[] {
+  const open = (phase.deferrals ?? []).filter((d) => d.status === "open");
+  if (open.length === 0) return [];
+  const lines = ["", `### Open deferrals (${open.length})`, ""];
+  for (const d of open) {
+    const guard = d.test ? `test: ${d.test}` : d.ownerRuling ? `owner ruling: ${d.ownerRuling}` : "no guard";
+    lines.push(`- ${d.itemId}${d.toPhase ? ` → ${d.toPhase}` : ""} (${guard}): ${oneLine(d.text, 400)}`);
   }
   return lines;
 }
