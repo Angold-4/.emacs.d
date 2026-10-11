@@ -2049,7 +2049,7 @@ test("plan-items: a lane review's anchors resolve against the lane's own candida
     },
     pickScriptFor: (seat, state) => ({
       hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
-      steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round: state.phase.rounds?.length ?? 1, seat, lane: "a", why: "first", loserHad: { yes: false, anchors: [] } } }],
+      steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { inspected: ["a", "b", "c", "d"], round: state.phase.rounds?.length ?? 1, seat, lane: "a", why: "first", loserHad: { yes: false, anchors: [] } } }],
     }),
   });
   try {

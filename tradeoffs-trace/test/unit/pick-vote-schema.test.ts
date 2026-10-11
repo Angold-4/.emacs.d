@@ -20,7 +20,7 @@ function toolParameters(name: string): string {
 
 test("submit_pick_vote's schema declares every field the conductor requires of a pick vote, loserHad as an object", () => {
   const params = toolParameters("submit_pick_vote");
-  for (const field of ["round", "seat", "lane", "why"]) {
+  for (const field of ["round", "seat", "lane", "why", "inspected"]) {
     assert.match(params, new RegExp(`\\b${field}:`), `the schema declares ${field}`);
   }
   assert.match(params, /loserHad:\s*Type\.Object\(/, "loserHad is declared as an object");

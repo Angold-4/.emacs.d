@@ -168,7 +168,7 @@ test("plan 06k1: a lane worker that fails compaction ends its attempt at once, n
     laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state),
     pickScriptFor: (seat, state) => ({
       hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
-      steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round: state.phase.rounds?.length ?? 1, seat, lane: "b", why: "only b passed", loserHad: { yes: false, anchors: [] } } }],
+      steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { inspected: ["a", "b", "c", "d"], round: state.phase.rounds?.length ?? 1, seat, lane: "b", why: "only b passed", loserHad: { yes: false, anchors: [] } } }],
     }),
   });
   try {

@@ -927,13 +927,16 @@ export default function (pi: ExtensionAPI) {
     name: "submit_pick_vote",
     label: "Submit Pick Vote",
     description:
-      "Cast your pick vote for one candidate of the round: { round, seat, lane, why, loserHad: { yes, anchors, note? } }.",
+      "Cast your pick vote for one candidate of the round: { round, seat, lane, why, inspected: [every lane you compared], loserHad: { yes, anchors, note? } }.",
     promptSnippet: "Vote for one candidate of the round, by lane, with a one-line why and what the losing lane had",
     parameters: Type.Object({
       round: Type.Number(),
       seat: Type.String(),
       lane: Type.String(),
       why: Type.String(),
+      // The lanes this seat compared; the conductor refuses a vote that does
+      // not name every passing candidate.
+      inspected: Type.Array(Type.String()),
       // Plan 06k1 (A1): the conductor requires it; without it in the schema a
       // model cannot send it as an object and every vote is refused.
       loserHad: Type.Object({

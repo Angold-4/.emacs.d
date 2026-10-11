@@ -4892,6 +4892,13 @@ export class Conductor {
       if (loserHadIssue) return { ok: false, reason: loserHadIssue };
       const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
       if (!roundRecord) return { ok: false, reason: `round ${round} has not started` };
+      // A vote must say it inspected every passing candidate; a seat that
+      // compared nothing is refused and re-asked, never counted.
+      const inspectedIssue = checkInspected(
+        (args as { inspected?: unknown }).inspected,
+        roundRecord.candidates.filter((c) => c.ok === true && c.sha).map((c) => c.lane),
+      );
+      if (inspectedIssue) return { ok: false, reason: inspectedIssue };
       const candidate = roundRecord.candidates.find((c) => c.lane === lane);
       if (!candidate?.sha) return { ok: false, reason: `submit_pick_vote names lane ${lane}, which submitted no candidate of round ${round}` };
       if (candidate.ok !== true) return { ok: false, reason: `submit_pick_vote names lane ${lane}, whose candidate did not pass its checks` };
@@ -8910,15 +8917,20 @@ export class Conductor {
     this.#log.intent(actionId, { round, seat, lanes: passing.map((c) => c.lane), ...(revote ? { revote: true } : {}), ...(retry ? { retry: true } : {}) });
     const agentId = `${revote ? "revote" : "pick"}-${round}-${seat}-${actionId}`;
     const leader = seat === this.#laneLeader();
+    // Every seat gets every passing candidate's diff and checkout, not only
+    // the leader: a seat that can see one lane votes for that lane by default
+    // (settlement 01b: seat B voted "I only had access to lane a's checkout",
+    // twice, and once picked the candidate with a stale fixture).
     const otherDiffs: Record<string, string> = {};
-    if (leader) {
-      for (const c of passing) {
-        try {
-          otherDiffs[c.lane] = diffText(this.#plan.repo, base, c.sha);
-        } catch {
-          otherDiffs[c.lane] = "(diff unavailable)";
-        }
+    const checkouts: Record<string, string> = {};
+    for (const c of passing) {
+      try {
+        otherDiffs[c.lane] = diffText(this.#plan.repo, base, c.sha);
+      } catch {
+        otherDiffs[c.lane] = "(diff unavailable)";
       }
+      const dir = path.join(this.#paths.candidates, c.sha);
+      if (fs.existsSync(dir)) checkouts[c.lane] = dir;
     }
     const prompt = buildPickPrompt({
       seat,
@@ -8931,14 +8943,16 @@ export class Conductor {
       ledger: this.#laneLedgerLines(),
       earlierRounds: this.#laneEarlierRoundLines(round),
       otherDiffs,
+      checkouts,
       seats: this.#laneSeats(),
       ...(revote ? { revote: true } : {}),
     });
-    const candidateDir = path.join(this.#paths.candidates, passing[0]?.sha ?? base);
+    // The picker starts in the candidates root, so no lane's checkout is the
+    // default one; the prompt names each lane's directory.
     const handle = this.#spawnLaneAgent({
       role: "picker",
       agentId,
-      cwd: fs.existsSync(candidateDir) ? candidateDir : this.#runDir,
+      cwd: fs.existsSync(this.#paths.candidates) ? this.#paths.candidates : this.#runDir,
       // Plan 06k3 (A1, finding D-M-37): the retry gets its own session dir.
       sessionDir: path.join(this.#paths.sessions, `pick-${seat}${retry ? "-retry" : ""}`),
       env: this.#laneEnv(this.#runDir, {
@@ -8979,7 +8993,7 @@ export class Conductor {
         await handle.agent.prompt(
           this.#agentPrompt(
             `You ended your pick turn without recording a vote. Call submit_pick_vote now with round, seat, lane, why, ` +
-              `and loserHad (whether the losing lane had something your pick lacked: { yes, anchors, note? }), then end your turn.`,
+              `inspected (every lane you compared) and loserHad (whether the losing lane had something your pick lacked: { yes, anchors, note? }), then end your turn.`,
           ),
         );
         outcome = await Promise.race([handle.donePromise.then(() => "submitted" as const), timeout.promise, settled2]);
@@ -14051,9 +14065,10 @@ export interface PickPromptInput {
   ledger?: readonly string[];
   /** Leader only: every earlier round's reviews and votes, one line each. */
   earlierRounds?: readonly string[];
-  /** Leader only: the other candidates' diffs, by lane. The candidate the
-   * leader is voting on is in `candidates`, not here. */
+  /** Every seat: each passing candidate's diff from the round's base, by lane. */
   otherDiffs?: Readonly<Record<string, string>>;
+  /** Every seat: each passing candidate's checked-out tree, by lane. */
+  checkouts?: Readonly<Record<string, string>>;
   /** The seats that vote (the configured reviewer seats). */
   seats: readonly string[];
   /** Plan 06h (A3): true for the top-two revote turn, where the leader's
@@ -14062,10 +14077,10 @@ export interface PickPromptInput {
 }
 
 /** Plan 06g (A4): the pick turn's prompt. Each seat votes for one candidate
- * with a one-line why. The leader (M) carries the full context — the settled
- * ledger, every earlier round's reviews and votes, and the other candidate's
- * diff — and its vote counts once, exactly like the others'. A and B carry
- * none of it: they see the round's candidates and vote.
+ * with a one-line why. Every seat gets every candidate's diff and checkout
+ * path, and must say it inspected each one. The leader (M) also carries the
+ * settled ledger and every earlier round's reviews and votes; its vote counts
+ * once, exactly like the others'.
  *
  * Pure and exported so a unit test exercises exactly the words the conductor
  * sends. */
@@ -14087,21 +14102,31 @@ export function buildPickPrompt(input: PickPromptInput): string {
       "Earlier rounds' reviews and votes:",
       ...(input.earlierRounds && input.earlierRounds.length > 0 ? input.earlierRounds.map((l) => `- ${l}`) : ["- (this is round 1)"]),
     );
-    for (const c of input.candidates) {
-      const diff = input.otherDiffs?.[c.lane];
-      if (diff === undefined) continue;
-      lines.push("", `Candidate ${c.label}'s diff:`, diff.trim().length > 0 ? diff : "(no diff)");
-    }
+  }
+  const checkouts = input.candidates.filter((c) => input.checkouts?.[c.lane] !== undefined);
+  if (checkouts.length > 0) {
+    lines.push(
+      "",
+      "Each candidate's full tree, checked out (read them with read, grep, find and ls):",
+      ...checkouts.map((c) => `- lane ${c.lane}: ${input.checkouts![c.lane]}`),
+    );
+  }
+  for (const c of input.candidates) {
+    const diff = input.otherDiffs?.[c.lane];
+    if (diff === undefined) continue;
+    lines.push("", `Candidate ${c.label}'s diff (lane ${c.lane}):`, diff.trim().length > 0 ? diff : "(no diff)");
   }
   lines.push(
     "",
+    `Compare EVERY candidate before you vote: read each lane's diff and, where it matters, its checked-out tree. A vote for a lane you did not compare against the others is not a vote.`,
     `Vote for exactly one candidate of round ${input.round}, by lane, with a one-line why. The candidates are checked one after the other and only a passing candidate can win.`,
     input.revote
       ? `This is the REVOTE between the top two. Seats voting: ${input.seats.join(", ")}. The seats other than the leader need a strict majority; a tie among them is broken by the leader's vote.`
       : `Seats voting: ${input.seats.join(", ")}. A candidate needs a strict majority (${Math.floor(input.seats.length / 2) + 1} of ${input.seats.length}); with a single passing candidate the vote is skipped and it wins.`,
     "Your vote counts once, exactly like every other seat's.",
     "Say whether the LOSING lane had something your pick lacks. Cast it with submit_pick_vote:",
-    '  { round, seat, lane, why, loserHad: { yes: true|false, anchors: ["file:line" or "test name"], note?: "one line" } }',
+    '  { round, seat, lane, why, inspected: ["a", "b"], loserHad: { yes: true|false, anchors: ["file:line" or "test name"], note?: "one line" } }',
+    "`inspected` lists every lane whose candidate you compared; it must name every candidate above, or the vote is refused.",
     "`loserHad.yes` true means the lane you did NOT pick has something the picked lane lacks; name what it is in `anchors`. `false` with no anchors is an explicit \"nothing\". The field is required; a vote without it is refused and asked once more.",
   );
   return lines.join("\n");
@@ -14138,6 +14163,22 @@ export function checkLoserHad(value: unknown): string | undefined {
   const anchors = Array.isArray(lh.anchors) ? lh.anchors : [];
   if (lh.yes === true && anchors.length === 0) {
     return "submit_pick_vote's loserHad says yes but names no anchor; name what the losing lane had (file:line or a test name)";
+  }
+  return undefined;
+}
+
+/** A pick vote's `inspected`: the lanes the seat says it compared. Every
+ * passing candidate must be named, so a seat that saw one lane cannot vote.
+ * Returns a refusal reason (the model is re-asked once) or undefined. */
+export function checkInspected(value: unknown, passingLanes: readonly string[]): string | undefined {
+  if (passingLanes.length < 2) return undefined;
+  if (!Array.isArray(value)) {
+    return `submit_pick_vote needs inspected: the lanes you compared, which must be every candidate (${passingLanes.join(", ")})`;
+  }
+  const named = new Set(value.map((v) => String(v)));
+  const missing = passingLanes.filter((lane) => !named.has(lane));
+  if (missing.length > 0) {
+    return `submit_pick_vote's inspected misses lane ${missing.join(", ")}: compare every candidate (its diff in the prompt, its tree at the path given) before you vote`;
   }
   return undefined;
 }
