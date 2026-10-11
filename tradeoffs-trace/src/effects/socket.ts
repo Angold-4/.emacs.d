@@ -74,8 +74,10 @@ export interface RunSocketHandlers {
    * cancel), so the caller stops tracking the pgid. */
   onShExit?: (agentId: string, commandId: string, pgid: number) => void;
   /** Per-command deadline (design §8.1's "each `sh` command the worker
-   * runs"). Defaults live here so tests can override with ms-scale values. */
-  shDeadline?: ShDeadlineOptions;
+   * runs"). Defaults live here so tests can override with ms-scale values.
+   * Plan 06l (A2): a function form lets the conductor give the narrow
+   * `tt test --changed` loop its own, longer budget than the shell cap. */
+  shDeadline?: ShDeadlineOptions | ((command: string) => ShDeadlineOptions);
   /** Plan 06e (A1): the environment a `sh` command runs with. The conductor
    * supplies `childEnv()` plus every resolved secret value, so a command can
    * reference `$NAME` whatever source (environment or env file) supplied it.
@@ -203,7 +205,8 @@ export class RunSocketServer {
       return;
     }
     const cwd = this.#handlers.cwdFor(agentId);
-    const deadline = this.#handlers.shDeadline ?? {};
+    const declared = this.#handlers.shDeadline;
+    const deadline = typeof declared === "function" ? declared(msg.command) : (declared ?? {});
     let groupId: number | undefined;
     const running = runCommand({
       command: msg.command,

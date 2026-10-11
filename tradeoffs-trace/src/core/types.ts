@@ -1687,12 +1687,19 @@ export interface EvCandidateApproved {
 }
 export interface EvAttemptNoSubmission {
   type: "ATTEMPT_NO_SUBMISSION";
+  /** Plan 06l (A3/R5): the cause when the attempt ended because the agent
+   * process exited, settled, or failed its model call terminally (a 404, a
+   * context overflow) without submitting. Absent for a plain silent settle. */
+  note?: string;
 }
 export interface EvAttemptInterrupted {
   type: "ATTEMPT_INTERRUPTED";
   /** Plan 06j (A3/OD-5): the stopped attempt left a worktree the next one
    * must reset before it starts (a recheck whose worktree reset failed). */
   taint?: boolean;
+  /** Plan 06l (R5): why the attempt ended, e.g. the worker's exit code or
+   * signal, so a dead agent's cause is on the event. */
+  note?: string;
 }
 /** Phase 1b addition (pure, additive): `decisions` are the fully assembled,
  * bound Decision records the conductor built from `phase.pendingDisclosures`

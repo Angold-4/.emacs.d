@@ -609,10 +609,12 @@ test("plan 06g: a missing lane review fails the round, so no winner is picked on
 });
 
 test("02k: a slow seat's discovery and another seat's slow turn 2 each get their own review deadline, so the round completes", async () => {
-  // reviewMs is 10 s. Seat M takes 7 s to discover, so A and B wait 7 s at
-  // the discovery barrier; seat A then takes 6 s on turn 2. Under one timer
-  // across the whole review A ran out at 10 s (02k rounds 1 and 2, seat A
-  // "timeout (turn 2)") and the missing review discarded the round.
+  // reviewMs is 10 s; plan 06l (A3) gives turn 1 its OWN shorter deadline
+  // (reviewMs/3 ≈ 3.3 s). Seat M takes 2 s to discover (within that), so A and
+  // B wait 2 s at the discovery barrier; seat A then takes 6 s on turn 2.
+  // Under one timer across the whole review A ran out at 10 s (02k rounds 1
+  // and 2, seat A "timeout (turn 2)") and the missing review discarded the
+  // round.
   const setup = await setupConductor({
     phase: lanePhase(),
     checks: ["true"],
@@ -623,7 +625,7 @@ test("02k: a slow seat's discovery and another seat's slow turn 2 each get their
     laneWorkerScriptFor: (lane) => laneWorker(lane),
     laneReviewerScriptFor: (seat, _candidate, state) => {
       const review = laneReview(seat as Reviewer, state.phase.contract.contractVersion);
-      if (seat === "M") review.steps.unshift({ kind: "sleep", ms: 7_000 });
+      if (seat === "M") review.steps.unshift({ kind: "sleep", ms: 2_000 });
       if (seat === "A") review.steps.splice(2, 0, { kind: "sleep", ms: 6_000 });
       return review;
     },
@@ -888,5 +890,138 @@ test("plan 06k2: a two-lane winner's boundary-trigger decisions are balloted by 
     assert.equal(phase.phase, "DONE");
   } finally {
     await teardown(setup2);
+  }
+});
+
+// Plan 06l (A1): a lane's checks start when THAT lane submits, not after both
+// have; and both lanes' reviews run at the same time, so the round's review
+// span is the longer lane's, not their sum, while the pick still waits for
+// every lane review.
+
+/** One lane's worker: `sleepMs` before it writes its file and submits. */
+function laneWorkerAfter(lane: string, sleepMs: number): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "sleep", ms: sleepMs },
+      { kind: "call-sh", command: `printf 'lane ${lane}\n' > lane-${lane}.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+/** A lane review whose turn 2 sleeps `sleepMs` before submit_review, so the
+ * test can measure review concurrency. */
+function laneReviewAfter(
+  seat: Reviewer,
+  contractVersion: unknown,
+  sleepMs: number,
+): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultReviewerHello(),
+    steps: [
+      { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+      { kind: "wait-for-prompt" },
+      { kind: "sleep", ms: sleepMs },
+      {
+        kind: "call-submit",
+        tool: "submit_review",
+        args: {
+          reviewer: seat,
+          phaseId: "p1",
+          candidateSha: "$TT_CANDIDATE_SHA",
+          contractVersion,
+          correctionStatements: [],
+          findingStatements: [],
+          ballots: [],
+          findings: [],
+        },
+      },
+    ],
+  };
+}
+
+test("plan 06l: a lane's checks start when it submits, while the other lane is still working", async () => {
+  // Lane a submits at once; lane b sleeps 6 s. Without A1, lane a's check
+  // waited for lane b's build, so its `lane_check_started` came after lane b's
+  // CANDIDATE_SUBMITTED.
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => (lane === "b" ? laneWorkerAfter("b", 6_000) : laneWorker("a")),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", "the only pick"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const records = readLog(runPaths(setup.runDir).events).records;
+    const checkStartA = records.find((r) => r.kind === "lane_check_started" && (r.event as { lane?: string }).lane === "a");
+    assert.ok(checkStartA, "lane a's check started");
+    const submittedB = records.find(
+      (r) => r.kind === "event" && (r.event as { type?: string; lane?: string }).type === "CANDIDATE_SUBMITTED" && (r.event as { lane?: string }).lane === "b",
+    );
+    assert.ok(submittedB, "lane b submitted a candidate");
+    assert.ok(
+      Date.parse(checkStartA!.ts) < Date.parse(submittedB!.ts),
+      `lane a's check (${checkStartA!.ts}) must start before lane b submits (${submittedB!.ts})`,
+    );
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 06l: both lanes' reviews run concurrently and the pick still waits for all of them", async () => {
+  // Every lane review sleeps 6 s on turn 2. Sequentially the round's six
+  // reviews take ~12 s; concurrently ~6 s. The pick must still wait for all.
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReviewAfter(seat as Reviewer, state.phase.contract.contractVersion, 6_000),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} picks`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 180_000, 50, setup.runDir);
+    const records = readLog(runPaths(setup.runDir).events).records;
+    // Six reviews, three seats on each of the two candidates.
+    const submitted = records.filter((r) => r.kind === "lane_review_submitted");
+    assert.equal(submitted.length, 6, "all six lane reviews completed");
+    // The review span: the earliest review start to the latest review finish.
+    const intents = records.filter((r) => r.kind === "intent" && typeof (r.event as { candidateSha?: string }).candidateSha === "string" && typeof (r.event as { seat?: string }).seat === "string");
+    assert.equal(intents.length, 6, "one review start per seat and candidate");
+    const firstStart = Math.min(...intents.map((r) => Date.parse(r.ts)));
+    const lastFinish = Math.max(...submitted.map((r) => Date.parse(r.ts)));
+    const span = lastFinish - firstStart;
+    // Concurrent: ~6 s (the longer lane). Sequential: ~12 s (their sum). A
+    // loose 16 s bound rides out host load while still failing a serial sum.
+    assert.ok(span < 16_000, `the review span must be the longer lane's (~6 s), not their sum (~12 s): ${span}ms`);
+    // The two lanes' review spans OVERLAP — the direct concurrency evidence.
+    const spanOf = (lane: string) => {
+      const starts = intents.filter((r) => (r.event as { lane?: string }).lane === lane).map((r) => Date.parse(r.ts));
+      const ends = submitted.filter((r) => (r.event as { lane?: string }).lane === lane).map((r) => Date.parse(r.ts));
+      return { start: Math.min(...starts), end: Math.max(...ends) };
+    };
+    const a = spanOf("a");
+    const b = spanOf("b");
+    assert.ok(Math.max(a.start, b.start) < Math.min(a.end, b.end), `lane a [${a.start},${a.end}] and lane b [${b.start},${b.end}] must overlap`);
+    // The pick starts only after every lane review.
+    const picks = records.filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "PICK_VOTE");
+    assert.equal(picks.length, 3, "three pick votes");
+    const firstPick = Math.min(...picks.map((r) => Date.parse(r.ts)));
+    assert.ok(firstPick >= lastFinish, `the pick (${firstPick}) must start after the last review (${lastFinish})`);
+    const phase = setup.conductor.state.phase;
+    for (const c of phase.rounds![0].candidates) assert.equal((c.reviews ?? []).length, 3);
+  } finally {
+    await teardown(setup);
   }
 });

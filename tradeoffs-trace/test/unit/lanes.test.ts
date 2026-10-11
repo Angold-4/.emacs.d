@@ -90,7 +90,7 @@ class FakeHost implements LaneHost {
 
 const types = (host: FakeHost): string[] => host.events.map((e) => e.type);
 
-test("plan 06g: runRound builds each lane from one base, checks the candidates one after the other, reviews each passing candidate, and picks the winner", async () => {
+test("plan 06l: runRound starts each lane's check as that lane submits and reviews both lanes at once, then picks the winner", async () => {
   const host = new FakeHost({ a: "C1a", b: "C1b" });
   const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
 
@@ -110,8 +110,11 @@ test("plan 06g: runRound builds each lane from one base, checks the candidates o
   // needs all three in flight), so only the SET of reviews is ordered.
   assert.deepEqual(host.reviews.slice().sort(), ["a:A", "a:B", "a:M", "b:A", "b:B", "b:M"]);
 
-  // The checks never overlap: the second starts only after the first ends.
-  assert.deepEqual(host.checkLog, ["start-a", "end-a", "start-b", "end-b"]);
+  // Plan 06l (A1): each lane's check starts the moment that lane submits, so
+  // both checks are in flight before either ends. The conductor's
+  // `checkCandidate` takes the machine-wide lock, which is what keeps the two
+  // actual commands from overlapping (the e2e checkIntervals test).
+  assert.deepEqual(host.checkLog, ["start-a", "start-b", "end-a", "end-b"]);
 
   // pickWinner (code, never a model) decided lane b with 2 of 3 votes.
   assert.deepEqual(outcome.winner, { lane: "b", sha: "C1b", votes: 2 });

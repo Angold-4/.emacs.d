@@ -159,51 +159,46 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   //    The lanes run in parallel; one lane's failure never stops the other
   //    (A2), so each is caught into a note.
   const prompt = host.lanePrompt(ctx.round, ctx.base);
+  // Plan 06l (A1): a lane's checks start the moment THAT lane submits, while
+  // the other lane is still working — not after both have. `checkCandidate`
+  // takes the machine-wide lock, so the two checks still never overlap; only
+  // the wait for a slow sibling is removed. A lane that produced no candidate
+  // records no candidate at all: its note is what the status shows.
   const builds = await Promise.all(
     lanes.map(async (lane): Promise<LaneBuild> => {
+      let build: LaneBuild;
       try {
-        return await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
+        build = await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
       } catch (err) {
-        return { lane, note: `the lane failed: ${errorNote(err)}` };
+        build = { lane, note: `the lane failed: ${errorNote(err)}` };
       }
+      if (typeof build.sha === "string" && build.sha.length > 0) {
+        host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
+        let check: LaneCheck;
+        try {
+          check = await host.checkCandidate(ctx.round, build.lane, build.sha);
+        } catch (err) {
+          check = { ok: false, note: `the check could not run: ${errorNote(err)}` };
+        }
+        host.emit({
+          type: "CANDIDATE_CHECKED",
+          round: ctx.round,
+          lane: build.lane,
+          ok: check.ok,
+          ...(check.note ? { note: check.note } : {}),
+        });
+      } else {
+        host.emit({
+          type: "CANDIDATE_CHECKED",
+          round: ctx.round,
+          lane: build.lane,
+          ok: false,
+          note: build.note ?? "the lane produced no candidate",
+        });
+      }
+      return build;
     }),
   );
-  for (const build of builds) {
-    if (typeof build.sha === "string" && build.sha.length > 0) {
-      host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
-    }
-  }
-
-  // 2. Each lane's candidate is checked — one after the other, never two at
-  //    once (the host takes the machine-wide lock around each).
-  for (const build of builds) {
-    if (typeof build.sha !== "string" || build.sha.length === 0) continue;
-    let check: LaneCheck;
-    try {
-      check = await host.checkCandidate(ctx.round, build.lane, build.sha);
-    } catch (err) {
-      check = { ok: false, note: `the check could not run: ${errorNote(err)}` };
-    }
-    host.emit({
-      type: "CANDIDATE_CHECKED",
-      round: ctx.round,
-      lane: build.lane,
-      ok: check.ok,
-      ...(check.note ? { note: check.note } : {}),
-    });
-  }
-  // A lane that produced no candidate records no candidate at all: its note
-  // is what the status shows.
-  for (const build of builds) {
-    if (typeof build.sha === "string" && build.sha.length > 0) continue;
-    host.emit({
-      type: "CANDIDATE_CHECKED",
-      round: ctx.round,
-      lane: build.lane,
-      ok: false,
-      note: build.note ?? "the lane produced no candidate",
-    });
-  }
 
   const record = host.rounds().find((r) => r.round === ctx.round);
   const passing = record ? passingCandidates(record) : [];
@@ -213,23 +208,30 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   //    round fails and repeats, so no winner is ever handed off with an
   //    incomplete set.
   let failure: string | undefined;
-  for (const candidate of passing) {
-    // The three seats review a candidate IN PARALLEL (today's REVIEWING
-    // dispatches all three at once, and the discovery barrier needs all three
-    // in flight); candidates are reviewed one after the other.
-    const results = await Promise.all(
-      host.seats.map(async (seat) => {
-        try {
-          await host.reviewCandidate(ctx.round, candidate.lane, candidate.sha as string, seat);
-          return undefined;
-        } catch (err) {
-          return `${seat}'s review of ${candidateLabel(ctx.round, candidate.lane)} failed: ${errorNote(err)}`;
-        }
-      }),
-    );
-    failure = results.find((r): r is string => r !== undefined);
-    if (failure) break;
-  }
+  // Plan 06l (A1): every passing candidate's reviews run AT THE SAME TIME —
+  // each seat reviews the two lanes as two separate turns (distinct agents,
+  // distinct per-candidate discovery barriers). The round's review span is
+  // the longer lane's span, not their sum, and the pick still waits for all
+  // of them.
+  const reviewFailures = await Promise.all(
+    passing.map(async (candidate) => {
+      // The three seats review a candidate IN PARALLEL (today's REVIEWING
+      // dispatches all three at once, and the discovery barrier needs all
+      // three in flight).
+      const results = await Promise.all(
+        host.seats.map(async (seat) => {
+          try {
+            await host.reviewCandidate(ctx.round, candidate.lane, candidate.sha as string, seat);
+            return undefined;
+          } catch (err) {
+            return `${seat}'s review of ${candidateLabel(ctx.round, candidate.lane)} failed: ${errorNote(err)}`;
+          }
+        }),
+      );
+      return results.find((r): r is string => r !== undefined);
+    }),
+  );
+  failure = reviewFailures.find((r): r is string => r !== undefined);
   if (!failure) {
     const reviewed = host.rounds().find((r) => r.round === ctx.round);
     for (const candidate of reviewed ? passingCandidates(reviewed) : []) {

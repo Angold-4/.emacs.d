@@ -8,8 +8,8 @@
 // run id immediately rather than blocking for the whole run.
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, statSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,20 +36,22 @@ import {
 } from "./core/plan-lint.ts";
 import { readRepoFacts, readVerifyReachFacts } from "./core/repo-facts.ts";
 import { PLAN_TEMPLATE, parseOrgPlan } from "./core/org-plan.ts";
-import { EventLog } from "./effects/log.ts";
+import { EventLog, readLog } from "./effects/log.ts";
 import { acquireLock } from "./effects/lock.ts";
 import { loggedHeld, processAlive, signalProcess } from "./effects/sweep.ts";
 import { currentChoice, installedRunnerRoot, recordedRunnerRevision, setRunnerChooser, type RunnerChoice } from "./effects/runner.ts";
 import { Conductor, createRun, rebuildState, rebuildTimelineWithEvents, runnerRevision, runPaths, type Deadlines, type RunPlanFile } from "./conductor.ts";
 import { planModelSelector } from "./core/roles.ts";
+import { DEFAULT_SEATS, seatsOf } from "./core/seats.ts";
+import { computeSeatTable, mergeSeatTables, renderSeatTable } from "./core/seat-table.ts";
 import { distinctModelGroups, modelsCheckRefused, planModelTargets, type ModelsCheck } from "./core/models-check.ts";
 import { runModelsCheck } from "./effects/models-check.ts";
-import { effectiveChecks } from "./core/checks.ts";
+import { CHANGED_TEST_BUDGET_MS, checkTestFiles, effectiveChecks, testFilesImporting } from "./core/checks.ts";
 // Plan 05i: the program commands preflight every node they will start, before
 // any run is created, so a missing toolchain refuses visibly instead of
 // creating runs that are immediately environment-blocked.
 import { envPreflight } from "./core/env-preflight.ts";
-import { buildView, prSummary, timingReport, timingText } from "./view.ts";
+import { buildView, chartModelsFromPlan, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
 import {
   loggedSecretStatus,
@@ -83,7 +85,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt recheck <run-dir-or-id> --reason <why the failure is the machine>   (re-run a failed candidate's checks; no worker, no round)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt seats <run-dir-or-id|program-id> [--root <dir>]   (per-seat cost and findings table)\n       tt test --changed [--run <run-dir>|--plan <plan.json>] [--base <sha>] [--budget <minutes>] [--repo <dir>]   (the narrow test loop)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt recheck <run-dir-or-id> --reason <why the failure is the machine>   (re-run a failed candidate's checks; no worker, no round)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -377,6 +379,197 @@ function runSummary(runDir: string): string {
     // views/ may be missing on a very old run; printing is what matters
   }
   return redacted;
+}
+
+/** Plan 06l (A2): `tt test --changed` — the worker's narrow test loop. It
+ * runs only the plan's check test files that import a changed file, reuses a
+ * recorded pass for an unchanged tree hash, prints failures only, and has its
+ * own time budget (never the conductor's shell cap). */
+/** Plan 06l (A2): the test files a plan's checks name, made relative to the
+ * worker's cwd. A `make -C <dir> check-e2e FILES="test/x.test.ts"` names a
+ * file relative to `<dir>`, while `git diff`/`git status` name one relative to
+ * the repository root; prefixing each file with its command's own `-C <dir>`
+ * puts them in one namespace. */
+function checkTestFilesRelative(commands: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const command of commands) {
+    const dir = /(?:^|\s)-C\s+(\S+)/.exec(command)?.[1];
+    for (const file of checkTestFiles([command])) {
+      if (path.isAbsolute(file)) continue;
+      const joined = dir ? `${dir}/${file}` : file;
+      const normalized = path.posix.normalize(joined);
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      out.push(normalized);
+    }
+  }
+  return out;
+}
+
+function cmdTestChanged(args: string[], runRoot: string): void {
+  const flag = (name: string): string | undefined => {
+    const i = args.indexOf(name);
+    return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  };
+  const repo = path.resolve(flag("--repo") ?? process.cwd());
+  const budgetMinutes = flag("--budget") ? Number(flag("--budget")) : undefined;
+  const budgetMs = budgetMinutes !== undefined && Number.isFinite(budgetMinutes) && budgetMinutes > 0 ? budgetMinutes * 60_000 : CHANGED_TEST_BUDGET_MS;
+  const base = flag("--base") ?? "HEAD";
+
+  // The plan's checks: from a run's snapshot, a plan file, or TT_RUN_DIR.
+  let checks: string[] = [];
+  const runDirArg = flag("--run") ?? process.env.TT_RUN_DIR;
+  const planArg = flag("--plan");
+  try {
+    if (runDirArg) {
+      const planPath = path.join(resolveRunDir(runDirArg, runRoot), "plan", "v1.json");
+      const plan = JSON.parse(readFileSync(planPath, "utf8")) as { checks?: string[]; phases?: Array<{ checks?: string[] }> };
+      checks = [...(plan.checks ?? []), ...(plan.phases ?? []).flatMap((p) => p.checks ?? [])];
+    } else if (planArg) {
+      const plan = JSON.parse(readFileSync(planArg, "utf8")) as { checks?: string[]; phases?: Array<{ checks?: string[] }> };
+      checks = [...(plan.checks ?? []), ...(plan.phases ?? []).flatMap((p) => p.checks ?? [])];
+    } else {
+      process.stderr.write("tt test --changed needs --run <run-dir> or --plan <plan.json> (the plan's checks name the test files)\n");
+      process.exit(2);
+    }
+  } catch (err) {
+    process.stderr.write(`tt test --changed could not read the plan: ${String((err as Error)?.message ?? err)}\n`);
+    process.exit(2);
+  }
+
+  const git = (argv: string[]): string => execFileSync("git", ["-C", repo, ...argv], { encoding: "utf8" });
+  // Git reports paths relative to the REPOSITORY ROOT, but the check commands
+  // and this loop resolve files relative to `repo` (the worker's cwd). Convert
+  // every changed path to a `repo`-relative one, and prefix each check test
+  // file with its command's own `-C <dir>` (this repo runs `make -C
+  // tradeoffs-trace check-e2e FILES="test/…"`), so both sides share one
+  // namespace. `-uall` expands an untracked directory to its files (a bare
+  // `?? src/new/` would otherwise hide the source a test imports).
+  // `realpathSync` so macOS's `/tmp -> /private/tmp` symlink does not make the
+  // root-relative and cwd-relative paths disagree.
+  const repoRoot = realpathSync(path.resolve(repo, git(["rev-parse", "--show-toplevel"]).trim()));
+  const repoBase = realpathSync(repo);
+  const toRepoRelative = (p: string): string => {
+    const abs = path.isAbsolute(p) ? p : path.join(repoRoot, p);
+    return path.relative(repoBase, abs);
+  };
+  const changed = new Set<string>();
+  for (const line of git(["diff", "--name-only", base]).split("\n")) if (line.trim()) changed.add(toRepoRelative(line.trim()));
+  const status = git(["status", "--porcelain=v1", "-uall"]);
+  for (const line of status.split("\n")) {
+    if (line.trim().length === 0) continue;
+    const rest = line.slice(3);
+    const arrow = rest.indexOf(" -> ");
+    changed.add(toRepoRelative((arrow >= 0 ? rest.slice(arrow + 4) : rest).trim()));
+  }
+
+  // The tree hash: HEAD plus the diff and the status, so two calls on the
+  // same working tree agree. Untracked files' contents are part of it too.
+  const hash = createHash("sha256");
+  hash.update(git(["rev-parse", "HEAD"]));
+  hash.update(git(["diff", base]));
+  hash.update(status);
+  for (const line of status.split("\n")) {
+    if (!line.startsWith("?? ")) continue;
+    const file = toRepoRelative(line.slice(3).trim());
+    try {
+      hash.update(readFileSync(path.join(repo, file)));
+    } catch {
+      // best effort: a file that vanished is simply not part of the hash
+    }
+  }
+  const treeHash = hash.digest("hex").slice(0, 16);
+  const gitDir = path.resolve(repo, git(["rev-parse", "--git-dir"]).trim());
+  const recordDir = path.join(gitDir, "tt-test-changed");
+  const recordPath = path.join(recordDir, `${treeHash}.json`);
+  if (existsSync(recordPath)) {
+    process.stderr.write(`tt test --changed: reused a recorded pass for tree ${treeHash}\n`);
+    return;
+  }
+
+  const testFiles = checkTestFilesRelative(checks);
+  const read = (file: string): string | undefined => {
+    try {
+      return readFileSync(path.join(repo, file), "utf8");
+    } catch {
+      return undefined;
+    }
+  };
+  const exists = (file: string): boolean => existsSync(path.join(repo, file));
+  const affected = testFilesImporting([...changed], testFiles, read, exists);
+  if (affected.length === 0) {
+    // Nothing to run: report it and record NOTHING, so a later call re-checks
+    // rather than reusing a "pass" that ran no tests.
+    process.stderr.write(`tt test --changed: no test file imports the changed files (${[...changed].join(", ") || "none"})\n`);
+    return;
+  }
+  const started = Date.now();
+  // The runner must actually run: a `tt test --changed` invoked from inside
+  // another `node --test` (a test, or a worker whose parent is one) inherits
+  // NODE_TEST_CONTEXT, which makes node skip running the files. The narrow
+  // loop is its own process, so scrub that marker.
+  const childEnv = { ...process.env };
+  delete childEnv.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, ["--test", "--test-force-exit", ...affected], {
+    cwd: repo,
+    env: childEnv,
+    encoding: "utf8",
+    timeout: budgetMs,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const passed = result.status === 0 && !result.error;
+  if (!passed) {
+    // Failures only: the runner's own output, then the list of files run.
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    process.stderr.write(`tt test --changed failed (${affected.length} file(s), ${Math.round((Date.now() - started) / 1000)}s): ${affected.join(", ")}\n`);
+    process.exit(1);
+  }
+  mkdirSync(recordDir, { recursive: true });
+  writeFileSync(recordPath, JSON.stringify({ treeHash, files: affected, at: new Date().toISOString() }));
+}
+
+/** Plan 06l (A5): `tt seats <run|program>` — the per-seat cost and findings
+ * table. For a run it is computed from the same control log the conductor
+ * writes `views/seats.txt` from, so the two are byte-identical; for a program
+ * every node run's records are pooled, which sums the counts and recomputes
+ * the minutes per turn across the whole program. */
+function cmdSeats(idOrDir: string, root: string): void {
+  const runDir = resolveRunDir(idOrDir, root);
+  if (existsSync(path.join(runDir, "meta.json"))) {
+    const plan = readPlan(runDir);
+    const seats = seatsOf(plan.seats);
+    const table = computeSeatTable(readLog(runPaths(runDir).events).records, seats, chartModelsFromPlan(plan.models, seats)?.reviewerSeats);
+    process.stdout.write(redactText(renderSeatTable(table), secretsForRun(runDir)));
+    return;
+  }
+  const programDir = resolveProgramDir(idOrDir, root);
+  if (!existsSync(programPaths(programDir).program)) {
+    process.stderr.write(`no run or program named ${idOrDir}\n`);
+    process.exit(1);
+  }
+  const { state } = foldProgram(programDir);
+  // Per node: a table with that node's own seat models, then merged by
+  // (seat, model). Pooling the raw records into one row would credit every
+  // node's findings and minutes to whichever model happened to come first.
+  const tables = [];
+  const seats: string[] = [];
+  for (const node of Object.values(state.nodes)) {
+    if (!node.runId) continue;
+    const nodeDir = path.join(root, node.runId);
+    try {
+      const plan = readPlan(nodeDir);
+      const nodeSeats = seatsOf(plan.seats);
+      for (const s of nodeSeats) if (!seats.includes(s)) seats.push(s);
+      const seatModels = chartModelsFromPlan(plan.models, nodeSeats)?.reviewerSeats;
+      tables.push(computeSeatTable(readLog(runPaths(nodeDir).events).records, nodeSeats, seatModels));
+    } catch {
+      // A node that never started a run has no log; it contributes nothing.
+    }
+  }
+  const table = tables.length > 0 ? mergeSeatTables(tables) : computeSeatTable([], seats.length > 0 ? seats : [...DEFAULT_SEATS]);
+  process.stdout.write(renderSeatTable(table));
 }
 
 /** Plan 01a: the values this run's plan declares, resolved from this
@@ -1308,12 +1501,15 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   // expected bytes are redacted the same way before the comparison.
   const view = buildView(runDir, plan, false);
   const tape = redactText(view.tape, secretsForRun(runDir));
+  // Plan 06l (A5): `views/seats.txt` is a projection of the log too.
+  const seatsText = redactText(view.seatsTable, secretsForRun(runDir));
   if (sub === "rebuild") {
     writeFileSync(p.messages, messages);
     writeFileSync(p.ledger, ledger);
     writeFileSync(p.review, review);
     writeFileSync(p.metrics, metrics);
     writeFileSync(p.tape, tape);
+    writeFileSync(p.seats, seatsText);
     mkdirSync(p.messagesView, { recursive: true });
     const ids = new Set(messageFiles.map((f) => f.id));
     for (const f of messageFiles) writeFileSync(path.join(p.messagesView, `${f.id}.org`), f.contents);
@@ -1339,7 +1535,7 @@ function cmdContract(sub: string | undefined, runDir: string): void {
     // Plan 05j: a render that named a violation records it (findings A-18,
     // B-13). `check` never mutates, only `rebuild`.
     recordLintFailures(runDir, entryReview.lint);
-    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/entries/, views/messages/, views/metrics.json, views/tape.txt\n`);
+    process.stdout.write(`rebuilt ${path.basename(runDir)}: messages.jsonl, ledger.jsonl, views/review.org, views/entries/, views/messages/, views/metrics.json, views/tape.txt, views/seats.txt\n`);
     return;
   }
   if (sub !== "check") usage();
@@ -1348,12 +1544,14 @@ function cmdContract(sub: string | undefined, runDir: string): void {
   const actualReview = existsSync(p.review) ? readFileSync(p.review, "utf8") : "";
   const actualMetrics = existsSync(p.metrics) ? readFileSync(p.metrics, "utf8") : "";
   const actualTape = existsSync(p.tape) ? readFileSync(p.tape, "utf8") : "";
+  const actualSeats = existsSync(p.seats) ? readFileSync(p.seats, "utf8") : "";
   const mismatches: string[] = [];
   if (actualMessages !== messages) mismatches.push("messages.jsonl");
   if (actualLedger !== ledger) mismatches.push("ledger.jsonl");
   if (actualReview !== review) mismatches.push("views/review.org");
   if (actualMetrics !== metrics) mismatches.push("views/metrics.json");
   if (actualTape !== tape) mismatches.push("views/tape.txt");
+  if (actualSeats !== seatsText) mismatches.push("views/seats.txt");
   for (const f of messageFiles) {
     const file = path.join(p.messagesView, `${f.id}.org`);
     const actual = existsSync(file) ? readFileSync(file, "utf8") : "";
@@ -1998,7 +2196,12 @@ async function main(): Promise<void> {
   }
   const { positional, root, json, reason, candidateSha, messageVersion, contractVersion, contractSha256, runId, phaseId, source, skipModelsCheck, envFile, toPhase, deferTest, deferOwnerRuling } = parseArgs(rest);
   const runRoot = root ?? DEFAULT_ROOT;
-  if (cmd === "start") {
+  if (cmd === "test") {
+    // Plan 06l (A2): the narrow worker test loop. Its own flags (`--changed`,
+    // `--run`, `--plan`, `--base`, `--budget`) are parsed by the handler, not
+    // by `parseArgs`.
+    cmdTestChanged(rest, runRoot);
+  } else if (cmd === "start") {
     if (positional.length !== 1) usage();
     await cmdStart(positional[0], runRoot, skipModelsCheck, envFile);
   } else if (cmd === "models") {
@@ -2049,6 +2252,9 @@ async function main(): Promise<void> {
     const runDir = resolveRunDir(positional[0], runRoot);
     delegateToRecordedRunner(runDir, runRoot);
     process.stdout.write(runSummary(runDir));
+  } else if (cmd === "seats") {
+    if (positional.length !== 1) usage();
+    cmdSeats(positional[0], runRoot);
   } else if (cmd === "timing") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);
