@@ -440,7 +440,7 @@ test("plan 06k2: a note queued after the lane prompt is built stays queued", asy
         {
           kind: "call-submit",
           tool: "submit_pick_vote",
-          args: { round: state.phase.rounds?.length ?? 1, seat, lane: seat === "B" ? "a" : "b", why: `${seat} picks`, loserHad: { yes: false, anchors: [] } },
+          args: { inspected: ["a", "b", "c", "d"], round: state.phase.rounds?.length ?? 1, seat, lane: seat === "B" ? "a" : "b", why: `${seat} picks`, loserHad: { yes: false, anchors: [] } },
         },
       ],
     }),

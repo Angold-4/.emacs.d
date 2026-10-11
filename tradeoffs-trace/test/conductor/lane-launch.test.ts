@@ -99,7 +99,7 @@ function pickVote(seat: Reviewer, round: number, lane: string, sleepMs = 0): { h
     hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
     steps: [
       ...(sleepMs > 0 ? [{ kind: "sleep", ms: sleepMs } as FakePiStep] : []),
-      { kind: "call-submit", tool: "submit_pick_vote", args: { round, seat, lane, why: `${seat} picks ${lane}`, loserHad: { yes: false, anchors: [] } } },
+      { kind: "call-submit", tool: "submit_pick_vote", args: { inspected: ["a", "b", "c", "d"], round, seat, lane, why: `${seat} picks ${lane}`, loserHad: { yes: false, anchors: [] } } },
     ],
   };
 }

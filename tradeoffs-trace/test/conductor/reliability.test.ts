@@ -124,7 +124,7 @@ function laneReview(seat: Reviewer, contractVersion: unknown, never = false): { 
 function pickVote(seat: Reviewer, round: number, lane: string): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
-    steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { round, seat, lane, why: `${seat} picks ${lane}`, loserHad: { yes: false, anchors: [] } } }],
+    steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { inspected: ["a", "b", "c", "d"], round, seat, lane, why: `${seat} picks ${lane}`, loserHad: { yes: false, anchors: [] } } }],
   };
 }
 

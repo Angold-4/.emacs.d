@@ -110,7 +110,7 @@ function pickVote(
   loserHad: { yes: boolean; anchors: string[]; note?: string } | undefined,
   askAgain = false,
 ): { hello: unknown; steps: FakePiStep[] } {
-  const args: Record<string, unknown> = { round, seat, lane, why: `${seat} picks ${lane}` };
+  const args: Record<string, unknown> = { round, seat, lane, why: `${seat} picks ${lane}`, inspected: ["a", "b", "c", "d"] };
   if (loserHad) args.loserHad = loserHad;
   const steps: FakePiStep[] = [{ kind: "call-submit", tool: "submit_pick_vote", args }];
   if (askAgain) {
@@ -120,7 +120,7 @@ function pickVote(
     steps.push({
       kind: "call-submit",
       tool: "submit_pick_vote",
-      args: { round, seat, lane, why: `${seat} picks ${lane} after the re-ask`, loserHad: loserHad ?? { yes: false, anchors: [] } },
+      args: { round, seat, lane, inspected: ["a", "b", "c", "d"], why: `${seat} picks ${lane} after the re-ask`, loserHad: loserHad ?? { yes: false, anchors: [] } },
     });
   }
   return { hello: { role: "picker" as const, tools: ROLE_TOOLS.picker }, steps };
@@ -204,6 +204,47 @@ test("plan 06k1: a pick vote without loserHad is re-asked, and a majority yes ca
   } finally {
     await teardown(setup);
     cleanupDir(promptLog);
+  }
+});
+
+test("a pick vote whose inspected misses a passing lane is refused and re-asked; only the full vote counts", async () => {
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => {
+      const round = liveRound(state);
+      if (seat !== "B") return pickVote(seat as Reviewer, round, "b", { yes: false, anchors: [] });
+      // B first votes having looked at lane a only (settlement 01b's blind
+      // seat); the conductor refuses it, and B's second vote names both.
+      const blind = { round, seat, lane: "a", why: "B only saw lane a", inspected: ["a"], loserHad: { yes: false, anchors: [] } };
+      const full = { round, seat, lane: "b", why: "B compared both", inspected: ["a", "b", "c", "d"], loserHad: { yes: false, anchors: [] } };
+      return {
+        hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
+        steps: [
+          { kind: "call-submit", tool: "submit_pick_vote", args: blind },
+          { kind: "wait-for-prompt" },
+          { kind: "call-submit", tool: "submit_pick_vote", args: full },
+        ] as FakePiStep[],
+      };
+    },
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const first = setup.conductor.state.phase.rounds![0];
+    const b = first.votes.find((v) => v.seat === "B");
+    assert.equal(b?.lane, "b", "only B's vote after comparing both lanes is recorded");
+    assert.equal(b?.why, "B compared both");
+    assert.equal(first.votes.filter((v) => v.seat === "B").length, 1, "the blind vote was never counted");
+    assert.equal(first.picked?.lane, "b");
+  } finally {
+    await teardown(setup);
   }
 });
 

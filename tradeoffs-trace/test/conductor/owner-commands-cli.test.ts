@@ -119,7 +119,7 @@ test("plan 06m: tt steer binds the run and phase, and prints each lane's deliver
     workerScript: () => ({ hello: defaultWorkerHello(), steps: [] }),
     laneWorkerScriptFor: (lane) => laneWorker(lane),
     laneReviewerScriptFor: (seat, candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
-    pickScriptFor: (seat) => ({ hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { seat, round: 1, winner: "a", loserHad: { lane: "b", what: "nothing" }, reason: "lane a" } }] }),
+    pickScriptFor: (seat) => ({ hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { inspected: ["a", "b", "c", "d"], seat, round: 1, winner: "a", loserHad: { lane: "b", what: "nothing" }, reason: "lane a" } }] }),
     deadlines: FAST,
   });
   try {
@@ -149,7 +149,7 @@ test("plan 06m: a steer during a two-lane attempt is delivered to worker-a and w
     workerScript: () => ({ hello: defaultWorkerHello(), steps: [] }),
     laneWorkerScriptFor: (lane) => laneWorker(lane),
     laneReviewerScriptFor: (seat, candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
-    pickScriptFor: (seat) => ({ hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { seat, round: 1, winner: "a", loserHad: { lane: "b", what: "nothing" }, reason: "lane a" } }] }),
+    pickScriptFor: (seat) => ({ hello: { role: "picker", tools: ROLE_TOOLS.picker }, steps: [{ kind: "call-submit", tool: "submit_pick_vote", args: { inspected: ["a", "b", "c", "d"], seat, round: 1, winner: "a", loserHad: { lane: "b", what: "nothing" }, reason: "lane a" } }] }),
     deadlines: FAST,
   });
   try {
