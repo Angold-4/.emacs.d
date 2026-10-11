@@ -230,6 +230,21 @@
   :mode (("\\.md\\'" . markdown-mode)
          ("\\.markdown\\'" . markdown-mode)))
 
+;; Pipe tables render as an aligned, word-wrapped box view that re-wraps
+;; on resize.  Display only: the buffer keeps the raw table, so diffs and
+;; GitHub see what was written.  Editing a table reveals its source;
+;; C-c C-x C-k toggles the table at point (or every table, off a table).
+(use-package markdown-table-wrap
+  :straight (markdown-table-wrap :type git :host github :repo "dnouri/markdown-table-wrap"
+                                 :files ("markdown-table-wrap.el" "markdown-table-wrap-pretty.el")))
+
+(use-package markdown-table-wrap-pretty
+  :straight nil
+  :after markdown-mode
+  :hook ((markdown-mode gfm-mode) . markdown-table-wrap-pretty-mode)
+  :custom (markdown-table-wrap-pretty-default-on-major-modes '(markdown-mode gfm-mode))
+  :bind (:map markdown-mode-map ("C-c C-x C-k" . markdown-table-wrap-pretty-toggle)))
+
 ;; =============================================================================
 ;; Other Languages
 ;; =============================================================================
