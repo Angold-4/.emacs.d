@@ -72,7 +72,7 @@ function laneWorker(lane: string): { hello: unknown; steps: FakePiStep[] } {
 function laneReview(
   seat: Reviewer,
   contractVersion: unknown,
-  opts: { findings?: unknown[]; findingStatements?: unknown[] } = {},
+  opts: { findings?: unknown[]; findingStatements?: unknown[]; ballots?: unknown[] } = {},
 ): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: defaultReviewerHello(),
@@ -89,7 +89,7 @@ function laneReview(
           contractVersion,
           correctionStatements: [],
           findingStatements: opts.findingStatements ?? [],
-          ballots: [],
+          ballots: opts.ballots ?? [],
           findings: opts.findings ?? [],
         },
       },
@@ -243,6 +243,79 @@ test("a pick vote whose inspected misses a passing lane is refused and re-asked;
     assert.equal(b?.why, "B compared both");
     assert.equal(first.votes.filter((v) => v.seat === "B").length, 1, "the blind vote was never counted");
     assert.equal(first.picked?.lane, "b");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a worker decision the next round marks `changed` is on the lane review and its ballot is demanded there", async () => {
+  // Settlement 01c: a round-1 worker decision, changed by the round-2 worker
+  // through priorDecisions, reached the phase only at the hand-off, after
+  // every lane review. No seat was ever asked to ballot it, and the gate
+  // failed it ("missing ballot") in every later round.
+  const disclosure = {
+    choice: "R7 trusts per-install tests instead of a full differential",
+    whyItMatters: "it decides how much the differential proves",
+    alternatives: [{ option: "extend the differential", consequence: "more setup" }],
+    recommendation: { choice: "trust per-install tests", reason: "smaller" },
+    classProposal: "delegated",
+  };
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane, round, state) => {
+      const worker = laneWorker(lane);
+      const submit = worker.steps[worker.steps.length - 1] as { args: Record<string, unknown> };
+      if (round === 1) {
+        submit.args = { ...submit.args, decisions: [disclosure] };
+      } else {
+        worker.steps[0] = { kind: "call-sh", command: `printf 'lane ${lane} round ${round}\n' > lane-${lane}.txt` };
+        const prior = state.phase.decisions.find((d) => d.source === "worker" && d.choice === disclosure.choice);
+        submit.args = {
+          ...submit.args,
+          priorDecisions: prior
+            ? [{ id: prior.id, status: "changed", choice: "R7 extends the differential to every listed input", whyItMatters: disclosure.whyItMatters, alternatives: disclosure.alternatives, recommendation: { choice: "extend", reason: "the plan lists them" } }]
+            : [],
+        };
+      }
+      return worker;
+    },
+    laneReviewerScriptFor: (seat, _candidate, state) => {
+      const K = state.phase.contract.contractVersion;
+      // Ballot each lane's own worker decision and every worker decision
+      // already on the phase (the carried one, round 2); an extra ballot for
+      // the other lane's record is ignored.
+      const shas = (state.phase.rounds?.[state.phase.rounds.length - 1]?.candidates ?? []).map((c) => c.sha ?? "");
+      const ids = new Set([
+        ...shas.filter(Boolean).map((sha) => `D-p1-${sha.slice(0, 8)}-1`),
+        ...state.phase.decisions.filter((d) => d.source === "worker").map((d) => d.id),
+      ]);
+      const ballots = [...ids].map((decisionId) => ({ decisionId, vote: "approve", rationale: "fine", evidence: [`lane-${seat === "B" ? "b" : "a"}.txt:1`] }));
+      return liveRound(state) === 1 && seat === "M"
+        ? laneReview("M", K, { ballots, findings: [{ kind: "defect", severity: "blocking", evidence: "it works is unmet: lane-a.txt:1 incomplete" }] })
+        : laneReview(seat as Reviewer, K, { ballots });
+    },
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", { yes: false, anchors: [] }),
+  });
+  try {
+    await setup.conductor.start();
+    const priorId = () =>
+      setup.conductor.state.phase.decisions.find((d) => d.source === "worker" && d.choice.startsWith("R7 "))?.id;
+    const demandedInRound2 = () =>
+      readEvents(setup.runDir).some((r) => {
+        if (r.kind !== "ballot_demanded") return false;
+        const e = r.event as { agentId?: string; records?: Array<{ id: string; choice: string }> };
+        return (
+          (e.agentId ?? "").startsWith("lane-review-2-") &&
+          (e.records ?? []).some((rec) => rec.id === priorId() && rec.choice.startsWith("R7 extends"))
+        );
+      });
+    await waitFor(demandedInRound2, 150_000, 50, setup.runDir);
+    assert.ok(priorId(), "round 1's worker decision exists");
   } finally {
     await teardown(setup);
   }
