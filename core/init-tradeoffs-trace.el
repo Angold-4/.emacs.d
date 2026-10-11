@@ -6,7 +6,7 @@
 ;;
 ;; Emacs front end for tradeoffs-trace (docs/tradeoffs-trace.md).  The
 ;; conductor is a detached Node daemon; Emacs only starts runs, renders the
-;; run directory, and writes owner commands into the run's inbox.  Everything
+;; run directory, and sends owner commands through the `tt' CLI writer.  Everything
 ;; shown here is rebuilt from `~/.tradeoffs-trace/<run>/' (`tt state'), so it
 ;; survives closing buffers or restarting Emacs.
 ;;
@@ -2497,20 +2497,53 @@ the program buffer.  `f' toggles to the full phase chart and back."
 
 ;;;;; Input
 
+(defun +tt--command-temp-file (run-dir contents)
+  "Write CONTENTS to a fresh temporary file beside RUN-DIR; return its name.
+The file lives on the host that runs `tt' (RUN-DIR may be remote), outside
+the run's inbox: it is only the argument the CLI writer reads."
+  (make-temp-file (expand-file-name "tt-owner-" run-dir) nil ".txt" contents))
+
+(defun +tt--cli-outcome (&rest args)
+  "Run the `tt' owner-command writer with ARGS; return its printed outcome.
+A refused command exits non-zero: its printed reason is signalled as a
+`user-error', so the owner sees why and the input is not lost."
+  (condition-case err
+      (string-trim (apply #'+tt--cli args))
+    (error
+     (let ((msg (error-message-string err)))
+       (user-error "%s" (if (string-match "\\`tt [^\n]*? failed: " msg)
+                            (substring msg (match-end 0))
+                          msg))))))
+
 (defun +tt--write-command (run-dir command)
-  "Write owner COMMAND (an alist) into RUN-DIR's inbox; return its id.
-The document is written to a temporary name and renamed into place, so a
-conductor poll can never observe a truncated or half-written file (which it
-would otherwise reject permanently as malformed)."
-  (let* ((id (format "cmd-%s-%04x" (format-time-string "%Y%m%dT%H%M%S") (random 65536)))
-         (inbox (expand-file-name "inbox" run-dir))
-         (final (expand-file-name (concat id ".json") inbox))
-         (tmp (expand-file-name (concat id ".json.tmp") inbox))
-         (payload (json-encode (cons (cons 'commandId id) command))))
-    (make-directory inbox t)
-    (write-region payload nil tmp nil 'silent)
-    (rename-file tmp final t)
-    id))
+  "Send owner COMMAND (an alist) through the CLI writer; return its outcome.
+Plan 06m (A1/C2, OD-3(2)): Emacs keeps no inbox-file writer of its own and
+sends every owner command through the ONE waiting writer the CLI uses, which
+waits for the conductor's recorded outcome and prints it — each lane's
+delivery for a steer, the recorded state otherwise.  A steer/note/correction
+goes through `tt steer|note|correct' (text in a file, so no text is ever
+parsed as a flag; `--program-wide' for a whole-program directive), with the
+binding the owner saw passed as `--run-id'/`--phase-id'; a decision command
+(resolve/override) goes through `tt input', which keeps its full binding as
+given.  Either way a foreign or stale binding is refused by the conductor,
+never rebound.  Returns the printed outcome; a refusal signals a `user-error'
+with its reason."
+  (let* ((type (alist-get 'type command))
+         (sub (pcase type ("steer" "steer") ("note" "note") ("correction" "correct")))
+         (binding (alist-get 'binding command)))
+    (if sub
+        (let ((tmp (+tt--command-temp-file run-dir (or (alist-get 'text command) ""))))
+          (unwind-protect
+              (apply #'+tt--cli-outcome
+                     (append (list sub run-dir (concat "@" (+tt--local-arg tmp)))
+                             (when (equal (alist-get 'scope command) "program") (list "--program-wide"))
+                             (when (alist-get 'runId binding) (list "--run-id" (alist-get 'runId binding)))
+                             (when (alist-get 'phaseId binding) (list "--phase-id" (alist-get 'phaseId binding)))))
+            (ignore-errors (delete-file tmp))))
+      (let ((tmp (+tt--command-temp-file run-dir (json-encode command))))
+        (unwind-protect
+            (+tt--cli-outcome "input" run-dir tmp)
+          (ignore-errors (delete-file tmp)))))))
 
 (defun +tt--input-scope-note (&optional program-wide not-in-program)
   "The scope sentence the input header shows before sending.
@@ -2647,17 +2680,21 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
              ;; own directive, and the confirmation must say what the header
              ;; and the recorded record say.
              (effective (if (and program-wide (alist-get 'program s)) "program" "phase"))
-             (id (+tt--write-command
-                  run-dir
-                  `((type . ,kind) (text . ,text)
-                    (scope . ,effective)
-                    (binding . ,binding)))))
+             ;; Plan 06m (OD-3(2)): sent through the CLI's waiting writer;
+             ;; what it printed — each lane's delivery, or the recorded
+             ;; state — is what the owner is shown.  A refusal signals with
+             ;; its reason and leaves the text in the buffer.
+             (outcome (+tt--write-command
+                       run-dir
+                       `((type . ,kind) (text . ,text)
+                         (scope . ,effective)
+                         (binding . ,binding)))))
         (erase-buffer)
         (if revert-id
-            (message "tradeoffs-trace: correction %s queued in the inbox (%s) — it reverts %s; see Owner input in the status buffer"
-                     kind id revert-id)
-          (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
-                   kind id (if (equal effective "program") "the whole program" "this phase"))))))))
+            (message "tradeoffs-trace: correction (reverts %s): %s" revert-id outcome)
+          (message "tradeoffs-trace: %s, an owner directive for %s: %s"
+                   kind (if (equal effective "program") "the whole program" "this phase") outcome))
+        outcome)))))
 
 (defun +tt-program-input ()
   "Open this program's input box: text sent there is a program-wide directive."
@@ -3045,12 +3082,13 @@ option also prompts for the non-empty scope note the request requires."
       (cond
        ((equal command "override")
         (let ((reason (when refuse (read-string "Reason (optional): "))))
-          (+tt--write-command
-           +tt--run-dir
-           (list (cons 'type "override")
-                 (cons 'vote (if (equal option "approve") "approve" "reject"))
-                 (cons 'binding binding)))
-          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason))))
+          ;; The override's own printed outcome is what the owner is shown.
+          (prog1 (+tt--write-command
+                  +tt--run-dir
+                  (list (cons 'type "override")
+                        (cons 'vote (if (equal option "approve") "approve" "reject"))
+                        (cons 'binding binding)))
+            (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason)))))
        (t
         (let* ((note (when (equal option "accept_risk")
                        (let ((n (read-string "Scope note for accepting the risk: ")))
@@ -3059,12 +3097,12 @@ option also prompts for the non-empty scope note the request requires."
                          n)))
                (reason (when (and refuse (not note)) (read-string "Reason (optional): ")))
                (carried (or note (and reason (not (string-empty-p reason)) reason))))
-          (+tt--write-command
-           +tt--run-dir
-           (append (list (cons 'type "resolve") (cons 'option option))
-                   (when carried (list (cons 'note carried)))
-                   (list (cons 'binding binding))))
-          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason)))))))))
+          (prog1 (+tt--write-command
+                  +tt--run-dir
+                  (append (list (cons 'type "resolve") (cons 'option option))
+                          (when carried (list (cons 'note carried)))
+                          (list (cons 'binding binding))))
+            (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason))))))))))
 
 (defun +tt-review--brief-choose ()
   "Prompt for one of the brief's options (by plain label) and send it."
@@ -3834,8 +3872,8 @@ every evidence item is recorded (plan 06b)."
    (list (read-string "Item id: ")
          (read-string "Evidence (file or text): ")))
   (let* ((run (+tt--resolve-run))
-         (out (+tt--cli "evidence" run item file-or-text)))
-    (message "%s" (string-trim out))))
+         (out (+tt--cli-outcome "evidence" run item file-or-text)))
+    (message "%s" out)))
 
 ;;;; Keys
 

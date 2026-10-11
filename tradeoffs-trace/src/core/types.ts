@@ -965,6 +965,10 @@ export interface OwnerInputRecord {
   state: OwnerInputState;
   attemptId?: string; // steer: the worker attempt id it was bound to
   reason?: string; // refused / delivery-uncertain detail
+  /** Plan 06m (A2): per-target outcome for a steer delivered to every live
+   * lane worker, keyed by its label (`worker-a`, `worker-b`). Absent for a
+   * single-candidate steer (whose `attemptId` names the one worker). */
+  deliveries?: Record<string, OwnerInputState>;
   at: string; // ISO timestamp the conductor recorded
 }
 
@@ -1880,7 +1884,10 @@ export interface EvFindingConfirmedRepaired {
 export interface EvFindingDisproved {
   type: "FINDING_DISPROVED";
   findingId: string;
-  byReviewer: Reviewer;
+  /** Plan 06m (A1/R2): the owner may refuse a finding directly; it is
+   * settled as disproved with the refusal reason on the record, and creates
+   * nothing that must be answered. */
+  byReviewer: Reviewer | "owner";
   evidence: string;
 }
 export interface EvFindingAcceptedByOwner extends RecordBinding {

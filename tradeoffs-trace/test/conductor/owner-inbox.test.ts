@@ -102,7 +102,13 @@ test("owner-inbox: an id already in the log is only moved, never applied twice (
   const noteText = "keep the lock hold under 50us";
   try {
     const commandId = "cmd-note-1";
-    const inboxFile = writeCommand(setup, commandId, { kind: "note", phaseId: "p1", text: noteText });
+    const inboxFile = writeCommand(setup, commandId, {
+      kind: "note",
+      phaseId: "p1",
+      text: noteText,
+      // Plan 06m (R2): an owner input carries its run/phase binding.
+      binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
+    });
 
     // The conductor applies the note (the log append is the effect) and
     // moves the file to applied/.
@@ -333,7 +339,8 @@ test("owner-inbox: an empty (still-being-written) file is retried, never rejecte
     assert.ok(fs.existsSync(file), "the empty file must be left for the next poll");
 
     // The writer finishes; the same file now applies normally.
-    fs.writeFileSync(file, JSON.stringify({ kind: "note", phaseId: "p1", text: "late write" }));
+    // Plan 06m (R2): an owner input carries its run/phase binding.
+    fs.writeFileSync(file, JSON.stringify({ kind: "note", phaseId: "p1", text: "late write", binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" } }));
     await waitFor(() => eventsOfType(setup, "NOTE_ADDED").length === 1, 15_000);
     assert.equal(eventsOfType(setup, "NOTE_ADDED").length, 1);
   } finally {

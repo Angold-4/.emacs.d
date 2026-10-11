@@ -27,7 +27,7 @@ import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCoun
 import { reviewSummary } from "./render.ts";
 import { candidateLabel } from "./core/rounds.ts";
 import { seatsOf } from "./core/seats.ts";
-import { computeSeatTable, renderSeatTable, type SeatTable } from "./core/seat-table.ts";
+import { computeSeatTable, renderSeatTable, seatRoundStates, type SeatRound, type SeatTable } from "./core/seat-table.ts";
 import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
@@ -311,8 +311,10 @@ export function pipelineLine(spans: StageSpan[], limits: Record<string, number |
     const d = formatDuration(s.ms);
     if (s.current) {
       const limit = limits[s.stage];
-      const left =
-        limit === undefined ? "" : limit >= s.ms ? ` (${formatDuration(limit - s.ms)} left)` : ` (over by ${formatDuration(s.ms - limit)})`;
+      // Plan 06m (R4/disc-M-11): the top block shows time used and left in
+      // THIS attempt; a stage past its limit reads `limit reached`, never a
+      // cumulative "over by".
+      const left = limit === undefined ? "" : limit < s.ms ? " (limit reached)" : ` (${formatDuration(limit - s.ms)} left)`;
       return `${name} ${d}…${left}`;
     }
     return `${name}${s.failed ? " ✗" : ""} ${d}`;
@@ -512,6 +514,13 @@ export interface RunView {
    * cost — `a C1-a ✓`, `b (no candidate: the lane crashed)`. Undefined for a
    * plan without `#+TT_WORKERS`, which records no round at all. */
   lanes?: string[];
+  /** Plan 06m (contract-71): each lane's own elapsed time, from the round
+   * start to its candidate submission (or now while it is still coding). */
+  laneElapsed?: Record<string, string>;
+  /** Plan 06m (OD-1/A3): each seat's lifecycle state in the current review
+   * round (reading, discovery submitted, review submitted, re-prompted,
+   * timed out, retried), from the seat's own log records this round. */
+  seatRound?: SeatRound[];
   previousRound?: string;
   reviewers: ReviewerOutcome[];
   reviewLine: string;
@@ -835,11 +844,37 @@ export function buildView(
   // timeline and metrics were, so `views/seats.txt`, `tt seats` and the phase
   // summary can never disagree with each other.
   const seatTable = computeSeatTable(records, seatsOf(phase.contract), chartModelsFromPlan(plan.models, seatsOf(phase.contract))?.reviewerSeats);
+  // Plan 06m (contract-71): each lane's own elapsed time, from the round's
+  // start to its candidate submission (or now while it is still coding).
+  const laneElapsed: Record<string, string> = {};
+  {
+    const lastRound = phase.rounds?.[phase.rounds.length - 1];
+    const started = [...records]
+      .reverse()
+      .find((r) => r.kind === "event" && (r.event as { type?: string }).type === "ROUND_STARTED" && (!lastRound || (r.event as { round?: number }).round === lastRound.round));
+    const startMs = started ? Date.parse(started.ts) : undefined;
+    if (startMs !== undefined && lastRound) {
+      for (const lane of lastRound.lanes) {
+        const submitted = [...records]
+          .reverse()
+          .find(
+            (r) =>
+              r.kind === "event" &&
+              (r.event as { type?: string }).type === "CANDIDATE_SUBMITTED" &&
+              (r.event as { lane?: string }).lane === lane &&
+              (r.event as { round?: number }).round === lastRound.round,
+          );
+        const end = submitted ? Date.parse(submitted.ts) : now.getTime();
+        laneElapsed[lane] = formatDuration(Math.max(0, end - startMs));
+      }
+    }
+  }
   return {
     timeline,
     tape,
     seatsTable: renderSeatTable(seatTable),
     seatTable,
+    seatRound: seatRoundStates(records, seatsOf(phase.contract)),
     metrics,
     metricsLine: metricsLine(metrics),
     models,
@@ -853,6 +888,7 @@ export function buildView(
     baseline: baselineStatusLine(baseline),
     previousRound,
     ...(lanes.length > 0 ? { lanes } : {}),
+    ...(Object.keys(laneElapsed).length > 0 ? { laneElapsed } : {}),
     reviewers,
     reviewLine: reviewers.map((r) => r.label).join("   "),
     verdict,

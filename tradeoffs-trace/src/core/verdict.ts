@@ -107,6 +107,13 @@ export interface TradeoffEntry {
   kind: TradeoffKind;
   text: string;
   recordId?: string;
+  /** Plan 06m (A3/R4): a human title for the record the line is about (a
+   * decision's choice, a finding's claim), so the status never shows a bare
+   * id. */
+  title?: string;
+  /** Plan 06m (A3/R4): the seats and ballot state behind the line, e.g.
+   * `M veto · A,B rejected` — shown beside the title. */
+  seats?: string;
 }
 
 /** The most lines the panel may show (design 01h: at most 6, most important
@@ -145,6 +152,8 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
     directives.push({
       kind: "directive",
       recordId: d.id,
+      title: oneLine(d.text, 80),
+      seats: `not delivered to ${pending.join(", ")}`,
       text: `directive ${d.id} not yet delivered to ${pending.join(", ")}: ${oneLine(d.text, 80)}`,
     });
   }
@@ -165,7 +174,7 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
           : status === "failed"
             ? "⚑ AMENDMENT REJECTED"
             : "⚑ AMENDMENT (pending)";
-    amendments.push({ kind: "amendment", recordId: d.id, text: `${label} ${a.id}: ${oneLine(arrow, 140)}` });
+    amendments.push({ kind: "amendment", recordId: d.id, title: oneLine(a.proposedWording || a.criterion, 80), seats: status, text: `${label} ${a.id}: ${oneLine(arrow, 140)}` });
   }
 
   // (2)-(4) the current candidate's live decisions, each under exactly one
@@ -179,7 +188,7 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
       const leader = vetoMatch[1];
       const m = C ? currentBallot(phase.ballots, d.id, leader, C, K, d.version) : undefined;
       const why = m && isValidBallot(m) ? oneLine(m.rationale, 80) : "no reason recorded";
-      vetoes.push({ kind: "veto", recordId: d.id, text: `vetoed by ${leader}: ${shortId(d.id)} ${choice} — ${why}` });
+      vetoes.push({ kind: "veto", recordId: d.id, title: choice, seats: `vetoed by ${leader}`, text: `vetoed by ${leader}: ${shortId(d.id)} ${choice} — ${why}` });
       continue;
     }
     const dissenters = C
@@ -190,11 +199,11 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
       : [];
     if (d.class === "reserved") {
       const who = dissenters.length > 0 ? `; ${dissenters.join(", ")} rejected` : "";
-      flagged.push({ kind: "flagged", recordId: d.id, text: `⚑ flagged: ${shortId(d.id)} ${choice} — ${status.status}${who}` });
+      flagged.push({ kind: "flagged", recordId: d.id, title: choice, seats: `${status.status}${who}`, text: `⚑ flagged: ${shortId(d.id)} ${choice} — ${status.status}${who}` });
       continue;
     }
     if (status.status === "passed" && dissenters.length > 0) {
-      dissents.push({ kind: "dissent", recordId: d.id, text: `passed with dissent (${dissenters.join(", ")} rejected): ${shortId(d.id)} ${choice}` });
+      dissents.push({ kind: "dissent", recordId: d.id, title: choice, seats: `${dissenters.join(", ")} rejected`, text: `passed with dissent (${dissenters.join(", ")} rejected): ${shortId(d.id)} ${choice}` });
     }
   }
 
@@ -202,9 +211,12 @@ export function tradeoffEntries(phase: PhaseState, max = MAX_TRADEOFFS): Tradeof
   const openAdvisories = phase.findings.filter((f) => f.severity === "advisory" && f.status === "open");
   if (openAdvisories.length > 0) {
     const fresh = C ? openAdvisories.filter((f) => f.boundCandidateSha === C) : [];
+    const firstAdvisory = fresh[0] ?? openAdvisories[0];
     advisories.push({
       kind: "advisories",
-      recordId: (fresh[0] ?? openAdvisories[0]).id,
+      recordId: firstAdvisory.id,
+      title: oneLine(firstAdvisory.evidence, 80),
+      seats: `${fresh.length} new`,
       text: `${openAdvisories.length} advisories (${fresh.length} new) — C-c m d`,
     });
   }

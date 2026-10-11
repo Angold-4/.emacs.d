@@ -690,7 +690,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       const finding = p.findings.find((f) => f.id === event.findingId);
       if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
-      if (finding.raisedBy !== event.byReviewer) {
+      // Plan 06m (A1/R2): the owner's refusal settles the finding (with the
+      // reason on the record) and creates nothing to answer; a reviewer may
+      // still only withdraw its own finding.
+      if (finding.raisedBy !== event.byReviewer && event.byReviewer !== "owner") {
         return rejected(
           state,
           `only the raising reviewer (${finding.raisedBy}) may withdraw finding ${event.findingId}, not ${event.byReviewer}`,

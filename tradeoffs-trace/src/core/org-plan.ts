@@ -147,7 +147,13 @@ function itemInput(node: OrgNode, kind: "architecture" | "requirement" | "constr
 }
 
 /** Parse one level-1 phase subtree. */
-function parsePhaseNode(node: OrgNode, acceptanceLines: number[] = [], globalFinalChecks?: string): LintPhaseInput {
+function parsePhaseNode(
+  node: OrgNode,
+  acceptanceLines: number[] = [],
+  globalFinalChecks?: string,
+  globalGenerated?: string[],
+  globalRegen?: string[],
+): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
   const architecture = byTitle("Architecture");
@@ -178,6 +184,18 @@ function parsePhaseNode(node: OrgNode, acceptanceLines: number[] = [], globalFin
     ...(node.props.VARIANT_LIMIT
       ? { variantLimit: parseCount({ value: node.props.VARIANT_LIMIT, line: node.propLines.VARIANT_LIMIT ?? node.line }), variantLimitLine: node.propLines.VARIANT_LIMIT ?? node.line }
       : {}),
+    // Plan 06m (A6): the phase's own :GENERATED:/:REGEN: override the plan's
+    // #+TT_GENERATED:/#+TT_REGEN:.
+    ...(node.props.GENERATED
+      ? { generated: splitList(node.props.GENERATED) }
+      : globalGenerated && globalGenerated.length > 0
+        ? { generated: globalGenerated }
+        : {}),
+    ...(node.props.REGEN
+      ? { regen: splitCommands(node.props.REGEN) }
+      : globalRegen && globalRegen.length > 0
+        ? { regen: globalRegen }
+        : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -233,6 +251,16 @@ function acceptanceFromBody(node: OrgNode): { items: string[]; lines: number[] }
 /** Plan 06g: `#+TT_WORKERS:`/`#+TT_ROUNDS:` — a whole number, kept as
  * written so the linter can refuse a nonsense value rather than silently
  * defaulting. Absent leaves the plan exactly as before. */
+/** Plan 06m (A6): a whitespace/comma-separated list (globs, labels). */
+function splitList(value: string): string[] {
+  return value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+}
+
+/** Plan 06m (A6): a `;`-separated command list. */
+function splitCommands(value: string): string[] {
+  return value.split(";").map((s) => s.trim()).filter(Boolean);
+}
+
 function parseCount(keyword: { value: string; line: number } | undefined): number | undefined {
   if (!keyword) return undefined;
   const value = keyword.value.trim();
@@ -298,7 +326,9 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const { keywords, roots } = parseOrgTree(text);
   const first = (key: string) => keywords.find((k) => k.key === key);
   const globalFinalChecks = first("TT_FINAL_CHECKS")?.value;
-  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks));
+  const globalGenerated = first("TT_GENERATED") ? splitList(first("TT_GENERATED")!.value) : undefined;
+  const globalRegen = first("TT_REGEN") ? splitCommands(first("TT_REGEN")!.value) : undefined;
+  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen));
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
   const workers = first("TT_WORKERS");
@@ -310,10 +340,14 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const roundsValue = parseCount(rounds);
   const variantLimitValue = parseCount(variantLimit);
   const repo = first("TT_REPO")?.value;
+  const labels = first("TT_LABELS");
   return {
     ...(sourceFile ? { sourceFile } : {}),
     ...(repo && repo.trim().length > 0 ? { repo: repo.trim() } : {}),
     ...(envFile && envFile.trim().length > 0 ? { envFile: envFile.trim() } : {}),
+    ...(labels ? { labels: splitList(labels.value) } : {}),
+    ...(globalGenerated ? { generated: globalGenerated } : {}),
+    ...(globalRegen ? { regen: globalRegen } : {}),
     phases,
     ...parseModels(first("TT_MODELS")),
     ...parseSeats(first("TT_REVIEWERS")),

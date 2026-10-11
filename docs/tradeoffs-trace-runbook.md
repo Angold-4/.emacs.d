@@ -369,6 +369,60 @@ does not set (see "Secrets" below).
   shallow clone, because candidate checkouts can't be made from one. Run
   `git fetch --unshallow` first.
 
+## Owner commands through `tt` (plan 06m)
+
+The owner works a run through `tt`, not by hand-writing inbox files. Every
+command resolves the run (directory id, internal run id or readable id) to
+the internal `runId` and the current `phaseId`, writes the inbox command with
+that binding, and waits for the recorded outcome.
+
+- `tt steer <run> "<text|@file>"` — deliver to every live lane worker
+  (`worker-a`, `worker-b`, …) and print one delivered line per lane.
+- `tt note <run> "<text|@file>"` — queue a note for the next worker attempt.
+- `tt correct <run> "<text|@file>"` — correct the phase (a repair when it is
+  parked on the owner).
+- `tt withdraw <run> OD-n` — retract a run directive; later prompts omit it.
+- `tt evidence <run> <item> <file-or-text>` — record an evidence item, bound
+  the same way.
+- `tt verdict <run> <finding> refuse` — settle a finding as refused, with the
+  reason on the record; nothing new is created to answer it.
+
+`--program-wide` makes a steer/note/correction a whole-program directive;
+`--run-id`/`--phase-id` send the binding the caller saw instead of the run's
+current one. `tt input <run> [<command.json>]` sends a structured command (a
+decision view's resolve/override) through the same waiting writer, keeping its
+binding as given.
+
+An input whose binding is missing, null, or names another run or phase is
+rejected into `inbox/rejected/` with the reason, printed, and never applied —
+no writer rebinds it. Emacs writes no inbox file: its input buffer calls
+`tt steer|note|correct` and its decision views `tt input`, and show what the
+writer printed (each lane's delivery, or the refusal's reason).
+
+## Delivering a stack (`tt deliver`, `tt restack`)
+
+`tt deliver <program|run> [--apply]` takes the accepted (DONE) phases in
+dependency order. For each layer it makes one commit with the accepted tree
+on its parent layer's delivered commit, pushes it with `--force-with-lease`
+pinned to the SHA recorded in `programs/<id>/delivery.json` (never a local
+branch ref), opens or updates the PR (base = parent layer, body = the phase
+summary with the whole-stack graph and the trade-offs table, no generated-by
+footer), applies `#+TT_LABELS`, and links the stack with
+`gh stack link --base <root>`. Without `--apply` it prints the plan and
+changes nothing; a rerun is idempotent.
+
+`tt restack <program> --onto <ref> [--apply]` replays the delivered layers
+onto a new base. A conflict whose every hunk lies in a path the plan declares
+generated (`#+TT_GENERATED:`) takes the base side for those hunks only,
+keeping every non-conflicting change; the plan's regenerate commands
+(`#+TT_REGEN:`) then run, the layer is amended and its check runs. Any other
+conflict, or a failing layer check, stops with the layer and paths named.
+Each layer's old parent comes from the ledger (the root's is the old base),
+nothing is pushed until every layer has replayed and passed, and the pushes
+use the same ledger leases. `--onto <branch>` records the new root base in the
+ledger; the next `tt deliver --apply` moves the root PR onto it and refreshes
+every PR body whose stack graph changed, without recommitting any layer.
+
 ## Launching from launchd, cron or a script
 
 A run inherits the environment of whatever starts it: `tt start`/`tt resume`,

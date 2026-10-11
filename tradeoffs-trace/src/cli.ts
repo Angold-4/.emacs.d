@@ -53,6 +53,7 @@ import { CHANGED_TEST_BUDGET_MS, checkTestFiles, effectiveChecks, testFilesImpor
 import { envPreflight } from "./core/env-preflight.ts";
 import { buildView, chartModelsFromPlan, prSummary, timingReport, timingText } from "./view.ts";
 import { removedTestsBetween } from "./effects/git.ts";
+import { deliver, restack } from "./effects/deliver.ts";
 import {
   loggedSecretStatus,
   planSecretNames,
@@ -85,7 +86,7 @@ const DEFAULT_ROOT = path.join(os.homedir(), ".tradeoffs-trace");
 
 function usage(): never {
   process.stderr.write(
-    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt seats <run-dir-or-id|program-id> [--root <dir>]   (per-seat cost and findings table)\n       tt test --changed [--run <run-dir>|--plan <plan.json>] [--base <sha>] [--budget <minutes>] [--repo <dir>]   (the narrow test loop)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt recheck <run-dir-or-id> --reason <why the failure is the machine>   (re-run a failed candidate's checks; no worker, no round)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
+    "usage: tt start <plan.json> [--root <dir>] [--env-file <KEY=value file>] [--skip-models-check]\n       tt lint <plan.json|program.json|plan.org>   (findings; non-zero on errors)\n       tt plan template                  (print the plan skeleton)\n       tt steer <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]   (deliver to every live lane worker)\n       tt note <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]\n       tt correct <run-dir-or-id> <text|@file> [--program-wide] [--run-id <id> --phase-id <id>]\n       tt input <run-dir-or-id> [<command.json>]   (a structured owner command; waits and prints its outcome)\n       tt withdraw <run-dir-or-id> OD-n\n       tt evidence <run-dir-or-id> <item> <file-or-text>\n       tt deliver <program|run> [--apply]\n       tt restack <program> --onto <ref> [--apply]\n       tt stop <run-dir-or-id> [--root <dir>]\n       tt list [--json] [--root <dir>]\n       tt summary <run-dir-or-id> [--root <dir>]   (PR body, Markdown)\n       tt seats <run-dir-or-id|program-id> [--root <dir>]   (per-seat cost and findings table)\n       tt test --changed [--run <run-dir>|--plan <plan.json>] [--base <sha>] [--budget <minutes>] [--repo <dir>]   (the narrow test loop)\n       tt program start <program.json> [--source <org-file>] [--skip-models-check] | status <id> | state <id> | stop <id> | pause <id> | resume <id> | retry <id> <node> | list | prs <id>  [--root <dir>]\n       tt program directive <id> <text> | withdraw <id> <ODP-n>  [--root <dir>]\n       tt models check <plan.json|program.json>   (probe each configured model)\n       tt timing <run-dir-or-id> [--json] [--root <dir>]\n       tt status <run-dir-or-id> [--root <dir>]\n       tt state <run-dir-or-id> [--root <dir>]   (JSON)\n       tt redact <run-dir-or-id> | --all  [--secrets NAME…] [--force] [--root <dir>]\n       tt runner install <sha> [--root <dir>]\n       tt resume <run-dir-or-id> [--root <dir>]\n       tt defer <run-dir-or-id> <finding-or-decision-id> [--test <name>] [--owner-ruling <id>] [--to <phase>]   (a deferral needs a guard)\n       tt recheck <run-dir-or-id> --reason <why the failure is the machine>   (re-run a failed candidate's checks; no worker, no round)\n       tt verdict <run-dir-or-id> <messageId> <accept|refuse> [--reason <text>] [--candidate-sha <sha>] [--message-version <n>] [--contract-version <n>] [--contract-sha256 <sha>] [--run-id <id>] [--phase-id <id>] [--root <dir>]\n       tt contract rebuild <run-dir-or-id> [--root <dir>]\n       tt contract check <run-dir-or-id> [--root <dir>]\n",
   );
   process.exit(2);
 }
@@ -1166,6 +1167,31 @@ function renderStatus(runDir: string): string {
   return renderStatusText(runDir, state, view, loggedSecretStatus(runDir), loggedHeld(runDir));
 }
 
+/** Plan 06m (A3/C2/R4): `tt status` and `views/status.txt` are the SAME text.
+ * When the conductor (or a late-verdict path) has written the view, `tt
+ * status` prints those exact bytes; a run that has no view yet (a fixture
+ * created without a conductor) falls back to the one renderer. */
+function statusTextForRun(runDir: string): string {
+  // Plan 06m (A3/D-4): render LIVE from the rebuilt state with the ONE
+  // renderer the conductor writes views/status.txt with, so the two can never
+  // disagree and a crashed conductor's cached file is never shown as current.
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const alive = conductorAlive(runDir);
+  const view = buildView(runDir, plan, alive);
+  return renderStatusView(
+    statusViewInput({
+      runDir,
+      plan,
+      state,
+      view,
+      alive,
+      secrets: loggedSecretStatus(runDir),
+      held: loggedHeld(runDir),
+    }),
+  );
+}
+
 function conductorAlive(runDir: string): boolean {
   try {
     return pidAlive(Number(readFileSync(path.join(runDir, "conductor.pid"), "utf8")));
@@ -1603,6 +1629,59 @@ async function awaitInboxVerdict(
   }
 }
 
+/** Plan 06m (A1/C2): THE writer for every owner command — `tt steer|note|
+ * correct|withdraw|evidence|input`, and through them Emacs. It writes the
+ * command into the run's inbox atomically (a temporary name renamed into
+ * place, so the conductor never reads a half-written file), waits for the
+ * conductor's recorded outcome and prints it: a steer prints one delivered
+ * line per lane, any other command its recorded state, a refusal its reason
+ * (exit 1). The caller's binding is written as given — this writer never
+ * rebinds a command; the conductor refuses a missing or foreign one. */
+async function sendOwnerCommand(
+  runDir: string,
+  label: string,
+  commandId: string,
+  command: Record<string, unknown>,
+  describe: (record: { state?: string; deliveries?: Record<string, string> } | undefined) => string[],
+  opts: { timeoutMs?: number; subject?: string } = {},
+): Promise<void> {
+  const inbox = path.join(runDir, "inbox");
+  mkdirSync(inbox, { recursive: true });
+  const final = path.join(inbox, `${commandId}.json`);
+  const tmp = `${final}.tmp`;
+  writeFileSync(tmp, JSON.stringify(command, null, 2));
+  renameSync(tmp, final);
+  const outcome = await awaitInboxVerdict(runDir, commandId, opts.timeoutMs ?? 20000);
+  if (outcome.kind === "rejected") {
+    process.stdout.write(`${label} rejected: ${outcome.reason}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (outcome.kind === "pending") {
+    process.stdout.write(`queued ${label} ${commandId}${opts.subject ? ` for ${opts.subject}` : ""} (queued, not yet applied)\n`);
+    return;
+  }
+  const after = rebuildState(runDir, readPlan(runDir), { lenient: true });
+  const record = (after.phase.ownerInputs ?? []).find((i) => i.id === commandId) as
+    | { state?: string; deliveries?: Record<string, string> }
+    | undefined;
+  for (const line of describe(record)) process.stdout.write(`${line}\n`);
+}
+
+/** The printed outcome of an applied steer/note/correction: a steer names
+ * each lane it reached; a note or correction its recorded state. */
+function ownerInputOutcome(kind: string, runDir: string): (record: { state?: string; deliveries?: Record<string, string> } | undefined) => string[] {
+  return (record) => {
+    if (kind === "steer") {
+      const deliveries = record?.deliveries ?? {};
+      const targets = Object.keys(deliveries).sort();
+      if (targets.length === 0) return [`steer queued for the next worker attempt (${record?.state ?? "queued"})`];
+      return targets.map((t) => `delivered to ${t}: ${deliveries[t]}`);
+    }
+    return [`${kind} ${record?.state ?? "applied"} in run ${path.basename(runDir)}`];
+  };
+}
+
 /** Plan 06b: `tt evidence <run> <item> <file-or-text>` — the owner records an
  * `evidence` item. A file path is read; any other argument is the text
  * itself. Written through the inbox, so the conductor validates the item and
@@ -1617,19 +1696,88 @@ async function cmdEvidence(positional: string[], root: string): Promise<void> {
   } catch {
     // keep the literal argument
   }
-  const inbox = path.join(runDir, "inbox");
-  mkdirSync(inbox, { recursive: true });
   const commandId = `evidence-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
-  writeFileSync(path.join(inbox, `${commandId}.json`), JSON.stringify({ type: "evidence", item, text }, null, 2));
-  const outcome = await awaitInboxVerdict(runDir, commandId, 20000);
-  if (outcome.kind === "applied") {
-    process.stdout.write(`evidence recorded for ${item} in run ${path.basename(runDir)}\n`);
-  } else if (outcome.kind === "rejected") {
-    process.stdout.write(`evidence rejected: ${outcome.reason}\n`);
-    process.exitCode = 1;
-  } else {
-    process.stdout.write(`queued evidence ${commandId} for ${item} (queued, not yet applied)\n`);
+  // Plan 06m (A1): evidence is bound the same way as a steer — the internal
+  // runId and the current phaseId — so a mis-addressed recording is refused.
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  await sendOwnerCommand(
+    runDir,
+    "evidence",
+    commandId,
+    { type: "evidence", item, text, binding: { runId: state.phase.runId, phaseId: state.phase.phaseId } },
+    () => [`evidence recorded for ${item} in run ${path.basename(runDir)}`],
+    { subject: item },
+  );
+}
+
+/** Plan 06m (A1): `tt steer|note|correct <run> <text|@file>`. The ONE writer
+ * for an owner input: it resolves the run to its internal id and current
+ * phase, writes the inbox command with that binding, and waits for the
+ * recorded outcome. A steer prints one delivered line per live lane (A2); a
+ * note/correction prints its recorded state. A refused command prints the
+ * reason and exits non-zero. */
+async function cmdOwnerInput(
+  kind: "steer" | "note" | "correction",
+  positional: string[],
+  root: string,
+  binding: { runId?: string; phaseId?: string } = {},
+): Promise<void> {
+  // `--program-wide`: the text also becomes a whole-program owner directive
+  // (Emacs's C-u C-c C-c), recorded through this same writer.
+  const programWide = positional.includes("--program-wide");
+  const [runArg, ...rest] = positional.filter((a) => a !== "--program-wide");
+  if (!runArg) usage();
+  const runDir = resolveRunDir(runArg, root);
+  const arg = rest.join(" ");
+  // Plan 06m (A1/disc-M-40): only a leading `@` means a file. A bare
+  // argument is literal text, even when it happens to name a file.
+  let text = arg;
+  try {
+    if (arg.startsWith("@")) {
+      const fileArg = arg.slice(1);
+      if (fileArg.length > 0 && existsSync(fileArg) && statSync(fileArg).isFile()) text = readFileSync(fileArg, "utf8").trim();
+    }
+  } catch {
+    // keep the literal argument
   }
+  if (text.trim().length === 0) usage();
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const commandId = `${kind}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  const command = {
+    type: kind,
+    text,
+    ...(programWide ? { scope: "program" } : {}),
+    // `--run-id`/`--phase-id` (Emacs sends the binding the owner saw) are
+    // kept as given — the conductor refuses a foreign one; without them the
+    // command is bound to the run it was sent to and its current phase.
+    binding: { runId: binding.runId ?? state.phase.runId, phaseId: binding.phaseId ?? state.phase.phaseId },
+  };
+  await sendOwnerCommand(runDir, kind, commandId, command, ownerInputOutcome(kind, runDir));
+}
+
+/** Plan 06m (A1/R2): `tt withdraw <run> OD-1` — a run directive is withdrawn
+ * the way a program directive (ODP-n) already can be. The command is written
+ * through the same inbox writer as a steer; the conductor's withdrawal path
+ * refuses an unknown or already-withdrawn id with the reason. */
+async function cmdWithdraw(positional: string[], root: string): Promise<void> {
+  const [runArg, directiveId] = positional;
+  if (!/^OD-\d+$/i.test(directiveId ?? "")) {
+    process.stdout.write(`withdraw rejected: name a run directive id, e.g. OD-1\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const runDir = resolveRunDir(runArg, root);
+  const plan = readPlan(runDir);
+  const state = rebuildState(runDir, plan, { lenient: true });
+  const commandId = `withdraw-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  const command = {
+    type: "steer",
+    text: `withdraw ${directiveId.toUpperCase()}`,
+    binding: { runId: state.phase.runId, phaseId: state.phase.phaseId },
+  };
+  await sendOwnerCommand(runDir, "withdraw", commandId, command, () => [`withdrawn ${directiveId.toUpperCase()} in run ${path.basename(runDir)}`]);
 }
 
 async function cmdVerdict(
@@ -1653,6 +1801,33 @@ async function cmdVerdict(
   const state = rebuildState(runDir, plan, { lenient: true });
   const message = (state.phase.messages ?? []).find((m) => m.id === messageId);
   if (!message) {
+    // Plan 06m (A1/R2): `tt verdict <run> <finding> refuse` settles a finding
+    // as refused (disproved) with the reason on the record; it creates no new
+    // blocking finding to answer.
+    const finding = (state.phase.findings ?? []).find((f) => f.id === messageId);
+    if (finding && verdict === "refuse") {
+      // Plan 06m (R2-82/disc-M-55/disc-M-57): a refusal needs a real reason,
+      // and it is always queued through the ONE writer (the conductor),
+      // never appended by the CLI. A stopped run applies it on its next start.
+      if (!reason || reason.trim().length === 0) {
+        process.stdout.write(`verdict rejected: refusing finding ${messageId} needs a non-empty --reason\n`);
+        process.exitCode = 1;
+        return;
+      }
+      const commandId = `finding-verdict-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+      const command = {
+        type: "finding-verdict",
+        findingId: messageId,
+        verdict,
+        reason,
+        binding: { runId: state.phase.runId, phaseId: state.phase.phaseId },
+      };
+      await sendOwnerCommand(runDir, "verdict", commandId, command, () => [`verdict applied: refused finding ${messageId} in run ${path.basename(runDir)}`], {
+        timeoutMs: conductorAlive(runDir) ? 20000 : 1000,
+        subject: messageId,
+      });
+      return;
+    }
     process.stdout.write(`verdict rejected: no message ${messageId} in run ${path.basename(runDir)}\n`);
     process.exitCode = 1;
     return;
@@ -1807,6 +1982,116 @@ async function cmdVerdict(
   );
   writeFileSync(p.tape, redactText(lateView.tape, maskable));
   process.stdout.write(`recorded ${verdict} for ${messageId} in run ${path.basename(runDir)}\n`);
+}
+
+/** Plan 06m (C2): `tt input <run> [file]` sends a structured owner command
+ * (a decision view's resolve/override/note, read as JSON from the file or
+ * stdin) through the ONE writer, `sendOwnerCommand`: it waits for the
+ * recorded outcome and prints it, exactly as `tt steer` does. The caller's
+ * binding is kept as given (R2/A1: a command bound to another run or phase is
+ * refused by the conductor, never silently rebound); only a command that
+ * carries no binding at all is bound here to the run it was sent to and its
+ * current phase. */
+async function cmdInput(runArg: string, root: string, file?: string): Promise<void> {
+  const runDir = resolveRunDir(runArg, root);
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(file ? readFileSync(file, "utf8") : readFileSync(0, "utf8")) as Record<string, unknown>;
+  } catch (err) {
+    process.stdout.write(`input rejected: could not read the command JSON: ${String((err as Error)?.message ?? err)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    process.stdout.write("input rejected: the command must be a JSON object\n");
+    process.exitCode = 1;
+    return;
+  }
+  const kind = typeof raw.type === "string" ? raw.type : typeof raw.kind === "string" ? raw.kind : "input";
+  const commandId = `input-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  let command = raw;
+  if (!("binding" in raw)) {
+    const state = rebuildState(runDir, readPlan(runDir), { lenient: true });
+    command = { ...raw, binding: { runId: state.phase.runId, phaseId: state.phase.phaseId } };
+  }
+  const describe =
+    kind === "steer" || kind === "note" || kind === "correction"
+      ? ownerInputOutcome(kind, runDir)
+      : () => [`${kind} applied in run ${path.basename(runDir)}`];
+  await sendOwnerCommand(runDir, kind, commandId, command, describe);
+}
+
+/** Plan 06m (A5): resolve `tt deliver <program|run>` to the program directory.
+ * A run that is a program node names its program through `program.json`. */
+function resolveDeliveryProgram(arg: string, root: string): string | undefined {
+  const programDir = resolveProgramDir(arg, root);
+  if (existsSync(path.join(programDir, "program.json"))) return programDir;
+  const runDir = resolveRunDir(arg, root);
+  try {
+    const info = JSON.parse(readFileSync(path.join(runDir, "program.json"), "utf8")) as { programId?: string };
+    if (info.programId) return path.join(programsRoot(root), info.programId);
+  } catch {
+    // not a program node
+  }
+  return undefined;
+}
+
+/** Parse `[--apply] [--onto <ref>] <target>`. */
+function parseDeliverArgs(rest: string[]): { positional: string[]; apply: boolean; onto?: string } {
+  const positional: string[] = [];
+  let apply = false;
+  let onto: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--apply") {
+      apply = true;
+      continue;
+    }
+    if (rest[i] === "--onto") {
+      onto = rest[++i];
+      continue;
+    }
+    // The global `--root <dir>` flag is parsed by `main`; it is not a target.
+    if (rest[i] === "--root") {
+      i += 1;
+      continue;
+    }
+    if (rest[i].startsWith("--root=")) continue;
+    positional.push(rest[i]);
+  }
+  return { positional, apply, ...(onto ? { onto } : {}) };
+}
+
+/** Plan 06m (A5): `tt deliver <program|run> [--apply]` — one commit per
+ * accepted layer, pushed with ledger leases, a stacked PR per layer and
+ * `gh stack link --base <root>`. Without `--apply` it prints the plan and
+ * changes nothing (C1). */
+async function cmdDeliver(rest: string[], root: string): Promise<void> {
+  const { positional, apply } = parseDeliverArgs(rest);
+  if (positional.length !== 1) usage();
+  const programDir = resolveDeliveryProgram(positional[0], root);
+  if (!programDir) {
+    process.stdout.write(`deliver: ${positional[0]} is not a program or a program node\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const result = deliver({ programDir, runRoot: root, apply });
+  for (const m of result.messages) process.stdout.write(`${m}\n`);
+  if (!result.ok) process.exitCode = 1;
+}
+
+/** Plan 06m (A6): `tt restack <program> --onto <ref> [--apply]`. */
+async function cmdRestack(rest: string[], root: string): Promise<void> {
+  const { positional, apply, onto } = parseDeliverArgs(rest);
+  if (!onto || positional.length !== 1) usage();
+  const programDir = resolveDeliveryProgram(positional[0], root);
+  if (!programDir) {
+    process.stdout.write(`restack: ${positional[0]} is not a program or a program node\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const result = restack({ programDir, runRoot: root, onto, apply });
+  for (const m of result.messages) process.stdout.write(`${m}\n`);
+  if (!result.ok) process.exitCode = 1;
 }
 
 /** Plan 06g (A5): `tt carry <run> <id> --to <phase-id>` — the owner carries a
@@ -2211,6 +2496,27 @@ async function main(): Promise<void> {
     cmdLint(positional[0]);
   } else if (cmd === "plan" && positional[0] === "template") {
     cmdPlanTemplate();
+  } else if (cmd === "steer" || cmd === "note" || cmd === "correct") {
+    if (positional.length < 2) usage();
+    // The conductor's input kind is `correction`; the CLI command is `correct`.
+    await cmdOwnerInput(cmd === "correct" ? "correction" : cmd, positional, runRoot, {
+      ...(runId !== undefined ? { runId } : {}),
+      ...(phaseId !== undefined ? { phaseId } : {}),
+    });
+  } else if (cmd === "withdraw") {
+    if (positional.length !== 2) usage();
+    await cmdWithdraw(positional, runRoot);
+  } else if (cmd === "input") {
+    // Plan 06m (C2): the ONE writer Emacs calls for an owner input. The
+    // command JSON arrives on stdin (or as a file); the run and phase are
+    // resolved here and stamped into the binding, so Emacs never builds the
+    // binding itself.
+    if (positional.length < 1 || positional.length > 2) usage();
+    await cmdInput(positional[0], runRoot, positional[1]);
+  } else if (cmd === "deliver") {
+    await cmdDeliver(rest, runRoot);
+  } else if (cmd === "restack") {
+    await cmdRestack(rest, runRoot);
   } else if (cmd === "evidence") {
     if (positional.length < 3) usage();
     await cmdEvidence(positional, runRoot);
@@ -2218,7 +2524,16 @@ async function main(): Promise<void> {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);
     delegateToRecordedRunner(runDir, runRoot);
-    process.stdout.write(redactText(renderStatus(runDir), secretsForRun(runDir)));
+    // Plan 06m (A-29): refresh the projection with the SAME bytes it prints,
+    // so `tt status` and views/status.txt can never diverge (freshness and
+    // parity together).
+    const statusText = redactText(statusTextForRun(runDir), secretsForRun(runDir));
+    try {
+      writeFileSync(path.join(runPaths(runDir).views, "status.txt"), statusText);
+    } catch {
+      // a run whose views directory is missing still prints the text
+    }
+    process.stdout.write(statusText);
   } else if (cmd === "resume") {
     if (positional.length !== 1) usage();
     const runDir = resolveRunDir(positional[0], runRoot);

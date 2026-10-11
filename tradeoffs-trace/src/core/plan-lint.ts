@@ -179,6 +179,12 @@ export interface LintPhaseInput {
   variantLimit?: number;
   /** Lint-only: the 1-based line of the phase's `:VARIANT_LIMIT:`. */
   variantLimitLine?: number;
+  /** Plan 06m (A6): the phase's own `:GENERATED:` globs, overriding the
+   * plan's `#+TT_GENERATED:`. */
+  generated?: string[];
+  /** Plan 06m (A6): the phase's own `:REGEN:` commands, overriding the
+   * plan's `#+TT_REGEN:`. */
+  regen?: string[];
 }
 
 export interface LintPlanInput {
@@ -216,6 +222,13 @@ export interface LintPlanInput {
   rounds?: number;
   /** Lint-only: the 1-based line of `#+TT_ROUNDS:` in the source Org file. */
   roundsLine?: number;
+  /** Plan 06m (A5): the labels `tt deliver` applies to each PR
+   * (`#+TT_LABELS:`). */
+  labels?: string[];
+  /** Plan 06m (A6): the plan's `#+TT_GENERATED:` globs. */
+  generated?: string[];
+  /** Plan 06m (A6): the plan's `#+TT_REGEN:` commands. */
+  regen?: string[];
   /** Plan 06k2 (A5): the plan's `#+TT_GOLDEN:` — the current source a choice
    * must be re-checked against. Exported into plan.json and carried into the
    * contract so the worker, reviewer and evaluator prompts can name it. */

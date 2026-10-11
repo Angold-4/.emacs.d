@@ -286,6 +286,76 @@ export function computeSeatTable(records: readonly LogRecord[], seats: readonly 
   return { seats: out };
 }
 
+/** Plan 06m (OD-1/A3): one seat's lifecycle in the CURRENT review round. */
+export type SeatRoundState =
+  | "not started"
+  | "reading"
+  | "discovery submitted"
+  | "review submitted"
+  | "re-prompted"
+  | "timed out"
+  | "retried";
+
+export interface SeatRound {
+  seat: string;
+  /** The seat's latest lifecycle state this round. */
+  state: SeatRoundState;
+  /** What happened to the seat this round besides its latest state, e.g. a
+   * review submitted after a re-prompt. Only this round — never cumulative. */
+  incidents: Array<"re-prompted" | "timed out" | "retried">;
+}
+
+/** The event types that start a review round: a lane round, or (for a
+ * single-candidate phase) the probe passing into REVIEWING. */
+const ROUND_START_EVENTS = new Set(["ROUND_STARTED", "PROBE_PASSED"]);
+
+/** Plan 06m (OD-1/A3): each seat's state in the current round, derived from
+ * the seat's own lifecycle records since the round started — the review agent
+ * launched (reading), `discovery_submitted`, REVIEW_SUBMITTED /
+ * ROUND_REVIEW_SUBMITTED, `review_reprompt`, REVIEW_TIMED_OUT and
+ * `lane_review_retried` — never from the review's verdict, and never from an
+ * earlier round's incidents. Pure over the control log. */
+export function seatRoundStates(records: readonly LogRecord[], seats: readonly string[]): SeatRound[] {
+  let start = -1;
+  for (let i = records.length - 1; i >= 0; i--) {
+    const r = records[i];
+    if (r.kind !== "event") continue;
+    const type = (r.event as { type?: unknown } | undefined)?.type;
+    if (typeof type === "string" && ROUND_START_EVENTS.has(type)) {
+      start = i;
+      break;
+    }
+  }
+  const out = new Map<string, SeatRound>(seats.map((seat) => [seat, { seat, state: "not started", incidents: [] }]));
+  const set = (seat: string | undefined, state: SeatRoundState): void => {
+    const row = seat ? out.get(seat) : undefined;
+    if (!row) return;
+    row.state = state;
+    if ((state === "re-prompted" || state === "timed out" || state === "retried") && !row.incidents.includes(state)) row.incidents.push(state);
+  };
+  for (let i = start + 1; i < records.length; i++) {
+    const record = records[i];
+    const e = record.event && typeof record.event === "object" ? (record.event as Record<string, unknown>) : {};
+    const seat = seatFromEvent(record.event);
+    if (record.kind === "intent") {
+      // A review agent launched for this seat (a lane review names its seat
+      // and candidate; the single-candidate review its reviewer).
+      if (seat && (e.candidateSha !== undefined || e.reviewer !== undefined)) set(seat, "reading");
+      continue;
+    }
+    if (record.kind === "event") {
+      const type = typeof e.type === "string" ? e.type : "";
+      if (type === "REVIEW_SUBMITTED" || type === "ROUND_REVIEW_SUBMITTED") set(seat, "review submitted");
+      else if (type === "REVIEW_TIMED_OUT") set(seat, "timed out");
+      continue;
+    }
+    if (record.kind === "discovery_submitted") set(seat, "discovery submitted");
+    else if (record.kind === "review_reprompt") set(seat, "re-prompted");
+    else if (record.kind === "lane_review_retried") set(seat, "retried");
+  }
+  return [...out.values()];
+}
+
 /** Merge per-run tables into a program table. Rows are keyed by (seat,
  * model), so a seat that ran on two models keeps two rows; counts add and the
  * per-turn minutes are pooled from the raw durations. */

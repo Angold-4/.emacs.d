@@ -240,7 +240,7 @@ import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, sec
 // same refusal at the socket, where a scripted agent's commands arrive).
 import { secretUseInCommand } from "../extension/guards.ts";
 // Plan 01b: owner-wait notifications (see notify.ts's own header for the rule).
-import { notify, oneLine, waitReason } from "./notify.ts";
+import { answeringCommand, notify, oneLine, waitReason } from "./notify.ts";
 import { crashAt, CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
 import { loadavg } from "node:os";
 
@@ -428,12 +428,23 @@ export interface RunPlanPhase {
    * decision is re-checked against it; a `contract` classification must cite
    * it. */
   golden?: string;
+  /** Plan 06m (A6): the plan's declared generated paths (`#+TT_GENERATED:`,
+   * overridden by the phase's `:GENERATED:`). A restack conflict whose every
+   * hunk lies in one of these takes the base side for those hunks only. */
+  generated?: string[];
+  /** Plan 06m (A6): the plan's regenerate commands (`#+TT_REGEN:`, overridden
+   * by the phase's `:REGEN:`), run after a restack resolution and before the
+   * layer's check. */
+  regen?: string[];
 }
 
 /** The on-disk plan file `tt start` reads. Only phase 0 (index 0) is run by
  * this packet's single-phase conductor. */
 export interface RunPlanFile {
   title: string;
+  /** Plan 06m (A5): the labels `tt deliver` applies to each PR
+   * (`#+TT_LABELS:`). Absent means none. */
+  labels?: string[];
   /** Plan 06k1 (A6): environment variable names the plan declares its checks
    * need, recorded at start alongside PATH and re-used by every check and
    * resume. Absent on every plan that predates this field. */
@@ -616,6 +627,10 @@ const MESSAGE_EVENT_TYPES = new Set<string>([
   "FINDING_SEVERITY_CHANGED",
   "FINDING_VERIFIED",
   "FINDING_RESOLVED_BY_VOTE",
+  // Plan 06m (R2-49): an owner's refusal of a finding changes the review's
+  // blocker projection, so it must rewrite the views in the same beat.
+  "FINDING_DISPROVED",
+  "FINDING_ACCEPTED_BY_OWNER",
   "CANDIDATE_APPROVED",
   // Plan 05j: the entry ledger and the review lint are projections too, so an
   // owner's s/m/A/D on an entry (or a curator's link) must rewrite the views
@@ -2661,6 +2676,27 @@ export class Conductor {
     return kind === "steer" || kind === "note" || kind === "correction" ? kind : undefined;
   }
 
+  /** Plan 06m (A1/R2): validate an owner input's binding. Returns the refusal
+   * reason, or undefined when it names this run and this phase. The ONE place
+   * that decides it, so a steer, note, correction and evidence are all bound
+   * the same way. */
+  #inputBindingError(raw: Record<string, unknown>): string | undefined {
+    const binding = raw.binding;
+    if (!binding || typeof binding !== "object") {
+      return "an owner input needs a 'binding' naming the run and phase it was sent to";
+    }
+    const runId = (binding as { runId?: unknown }).runId;
+    if (typeof runId !== "string" || runId.length === 0) return "the binding is missing 'runId'";
+    const phaseId = (binding as { phaseId?: unknown }).phaseId;
+    if (typeof phaseId !== "string" || phaseId.length === 0) return "the binding is missing 'phaseId'";
+    const resolved = resolveBinding(this.#runBinding(), runId);
+    if (!resolved.ok) return resolved.reason;
+    if (phaseId !== this.#state.phase.phaseId) {
+      return `command is bound to phase ${phaseId}, but this run is on phase ${this.#state.phase.phaseId}`;
+    }
+    return undefined;
+  }
+
   /** Plan 2d: records one owner input's actually-observed effect. Record-
    * only; keyed by the inbox command id so a later, more definitive record
    * (e.g. a recovered steer's `delivered`) updates rather than duplicates. */
@@ -2671,6 +2707,7 @@ export class Conductor {
     state: OwnerInputState,
     attemptId?: string,
     reason?: string,
+    deliveries?: Record<string, OwnerInputState>,
   ): void {
     // `id` is the inbox command id, so the logged event carries it: recovery
     // then knows a replayed file was already applied (design §9.3) instead of
@@ -2685,6 +2722,7 @@ export class Conductor {
           state,
           ...(attemptId ? { attemptId } : {}),
           ...(reason ? { reason } : {}),
+          ...(deliveries && Object.keys(deliveries).length > 0 ? { deliveries } : {}),
           at: new Date().toISOString(),
         },
       },
@@ -2703,10 +2741,17 @@ export class Conductor {
     const out: Array<{ target: string; agentId: string; agent: PiAgent }> = [];
     for (const h of this.#agents.values()) {
       if (h.agent.exited) continue;
-      const target = h.role === "worker" ? "worker" : (h.agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] ?? h.agentId);
-      out.push({ target, agentId: h.agentId, agent: h.agent });
+      out.push({ target: workerTarget(h.role, h.agentId), agentId: h.agentId, agent: h.agent });
     }
     return out;
+  }
+
+  /** Plan 06m (A2): the live lane workers of this run, each under its lane
+   * label (`worker-a`, `worker-b`, …). A single-candidate worker keeps the
+   * historical `worker` label; a lane worker's label comes from its own
+   * agent id (`lane-<round>-<lane>-…`). */
+  #liveWorkers(): Array<{ target: string; agentId: string; agent: PiAgent }> {
+    return this.#liveAgents().filter((l) => l.target === "worker" || l.target.startsWith("worker-"));
   }
 
   /** Plan 01i: records one directive, then steers it at once to every live
@@ -3036,22 +3081,34 @@ export class Conductor {
       // own event and the intent, add it now (idempotent by command id) so
       // the recovered input is still a directive in every later prompt.
       const directive = this.#addDirective(text, scope, commandId, []);
-      const recovered: "delivered" | "delivery-uncertain" = completion ? "delivered" : "delivery-uncertain";
-      if (!recorded) {
-        if (completion) {
-          const outcome = completion.event as { agentId?: string; attemptId?: string };
-          this.#recordOwnerInput(commandId, "steer", text, "delivered", outcome.attemptId ?? boundAttemptId);
-        } else {
-          this.#recordOwnerInput(
-            commandId,
-            "steer",
-            text,
-            "delivery-uncertain",
-            boundAttemptId,
-            "the conductor restarted between sending the steer and Pi acknowledging it; it is never resent automatically",
-          );
+      // Plan 06m (A2/R3): recover the per-lane outcomes from the aggregate
+      // completion's `targets` map, so a crash after two lanes acknowledged
+      // does not lose them or turn a failed lane into `delivered`.
+      const targetMap = completion ? (completion.event as { targets?: Record<string, string> }).targets : undefined;
+      const deliveries: Record<string, OwnerInputState> = {};
+      if (targetMap && typeof targetMap === "object") {
+        for (const [target, value] of Object.entries(targetMap)) {
+          const state: OwnerInputState = value === "delivered" ? "delivered" : "delivery-uncertain";
+          deliveries[target] = state;
+          this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state });
         }
-        this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state: recovered });
+      }
+      const hasTargets = Object.keys(deliveries).length > 0;
+      const allDelivered = hasTargets && Object.values(deliveries).every((s) => s === "delivered");
+      if (!recorded) {
+        this.#recordOwnerInput(
+          commandId,
+          "steer",
+          text,
+          allDelivered ? "delivered" : "delivery-uncertain",
+          boundAttemptId,
+          allDelivered || !hasTargets
+            ? hasTargets
+              ? undefined
+              : "the conductor restarted between sending the steer and Pi acknowledging it; it is never resent automatically"
+            : "Pi could not accept the steer for every lane",
+          hasTargets ? deliveries : undefined,
+        );
       }
       this.#appliedCommandIds.add(commandId);
       crashAt("before_inbox_move");
@@ -3059,18 +3116,21 @@ export class Conductor {
       return;
     }
 
-    const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
+    // Plan 06m (A2): a steer reaches every live lane worker, each under its
+    // lane label (`worker-a`, `worker-b`), through the same per-worker path a
+    // single-candidate steer uses.
+    const workers = this.#liveWorkers();
     // Plan 06d (A1/C3): the observation may have changed since the inbox
     // block last asked acceptInput (the worker can exit in between), so ask
     // the one policy again rather than deciding here. A steer with no worker
     // is queued, never refused: owner input is never lost.
-    const decision = acceptInput(this.#state, { kind: "steer", text, workerRunning: worker !== undefined });
+    const decision = acceptInput(this.#state, { kind: "steer", text, workerRunning: workers.length > 0 });
     if (decision.kind === "refused") {
       this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, decision.reason);
       this.#rejectInboxFile(file, commandId, decision.reason);
       return;
     }
-    if (decision.kind === "queued" || !worker) {
+    if (decision.kind === "queued" || workers.length === 0) {
       const event: Event = { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text };
       const result = reduce(this.#state, event);
       if (!result.ok) {
@@ -3086,46 +3146,65 @@ export class Conductor {
       this.#moveInboxFile(file, this.#paths.inboxApplied);
       return;
     }
-    const attemptId = boundAttemptId ?? worker.agentId;
+    const attemptId = boundAttemptId ?? workers[0].agentId;
     // Plan 01i: every input is also an owner directive. It is recorded before
     // the steer is sent (so a crash between the two still leaves the ruling in
     // every later prompt), and the worker's own steer below is that
     // directive's delivery — never a second, duplicate steer. The exemption
-    // is that worker's *agent id* (`worker-<n>-<actionId>`), not its label.
-    const directive = this.#addDirective(text, scope, commandId, [worker.agentId]);
+    // is each worker's *agent id*, not its label.
+    const directive = this.#addDirective(text, scope, commandId, workers.map((w) => w.agentId));
     // Mark in flight (NOT applied): the file must stay in the inbox until the
     // acknowledgement decides its fate, so a crash here can still recover it.
     this.#steerInFlight.add(commandId);
-    this.#log.intent(actionId, { commandId, agentId: worker.agentId, attemptId, text });
-    const ack = worker.agent.steer(text);
+    this.#log.intent(actionId, { commandId, targets: workers.map((w) => w.target), text });
     // design §9.3: the boundary between sending the steer and its
     // acknowledgement — a crash here leaves the outcome unknown.
     crashAt("before_steer_ack");
-    const finish = (state: "delivered" | "delivery-uncertain", reason?: string): void => {
+    const deliveries: Record<string, "delivered" | "delivery-uncertain"> = {};
+    let settled = 0;
+    const finishOne = (target: string, state: "delivered" | "delivery-uncertain"): void => {
+      deliveries[target] = state;
+      this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state });
+      settled += 1;
+      if (settled < workers.length) return;
+      const allDelivered = workers.every((w) => deliveries[w.target] === "delivered");
+      const overall: "delivered" | "delivery-uncertain" = allDelivered ? "delivered" : "delivery-uncertain";
+      this.#log.completion(actionId, { outcome: allDelivered ? "steer-acknowledged" : "steer-failed", targets: deliveries });
       this.#steerInFlight.delete(commandId);
       this.#appliedCommandIds.add(commandId);
-      this.#recordOwnerInput(commandId, "steer", text, state, attemptId, reason);
-      this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state });
+      this.#recordOwnerInput(
+        commandId,
+        "steer",
+        text,
+        overall,
+        attemptId,
+        allDelivered ? undefined : "Pi could not accept the steer for every lane",
+        deliveries,
+      );
       crashAt("before_inbox_move");
       this.#moveInboxFile(file, this.#paths.inboxApplied);
     };
-    void ack.then(
-      () => {
-        if (this.#closed) return;
-        this.#log.completion(actionId, { outcome: "steer-acknowledged", agentId: worker.agentId, attemptId });
-        finish("delivered");
-      },
-      (err) => {
-        if (this.#closed) return;
-        this.#log.completion(actionId, {
-          outcome: "steer-failed",
-          agentId: worker.agentId,
-          attemptId,
-          error: String((err as Error)?.message ?? err),
-        });
-        finish("delivery-uncertain", "Pi could not accept the steer");
-      },
-    );
+    for (const w of workers) {
+      const target = w.target;
+      const targetAction = `deliver-${commandId}-${target}-${w.agentId}`;
+      void w.agent.steer(text).then(
+        () => {
+          if (this.#closed) return;
+          this.#log.completion(targetAction, { outcome: "steer-acknowledged", target, agentId: w.agentId });
+          finishOne(target, "delivered");
+        },
+        (err) => {
+          if (this.#closed) return;
+          this.#log.completion(targetAction, {
+            outcome: "steer-failed",
+            target,
+            agentId: w.agentId,
+            error: String((err as Error)?.message ?? err),
+          });
+          finishOne(target, "delivery-uncertain");
+        },
+      );
+    }
   }
 
   /** One inbox file. The command id is the filename's basename (design §9.1
@@ -3153,6 +3232,13 @@ export class Conductor {
       this.#rejectInboxFile(file, commandId, "this phase has no structured items, so it has no evidence items to record");
       return;
     }
+    // Plan 06m (A1/R2): evidence is bound to the run and phase like any owner
+    // input; a missing/foreign binding is refused with the reason.
+    const bindingError = this.#inputBindingError(raw as Record<string, unknown>);
+    if (bindingError) {
+      this.#rejectInboxFile(file, commandId, bindingError);
+      return;
+    }
     const itemId = typeof raw.item === "string" ? raw.item.trim() : "";
     const text = typeof raw.text === "string" ? raw.text.trim() : "";
     const evidenceItems = flatItems(this.#planItems()).filter((i) => itemNeedsEvidence(i));
@@ -3178,6 +3264,92 @@ export class Conductor {
       this.#applyEvent({ type: "EVIDENCE_RECORDED", itemId });
     }
     this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 06m (A1/R2): `tt verdict <run> <finding> refuse`. The finding is
+   * settled as disproved with the refusal reason on the record; nothing new
+   * is created to answer. A binding that does not name this run/phase is
+   * refused with the reason. */
+  #processFindingVerdictCommand(file: string, commandId: string, raw: Record<string, unknown>): void {
+    const name = this.#state.phase.phase;
+    if (name === "DONE" || name === "BLOCKED") {
+      this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
+      return;
+    }
+    const bindingError = this.#inputBindingError(raw);
+    if (bindingError) {
+      this.#rejectInboxFile(file, commandId, bindingError);
+      return;
+    }
+    const findingId = typeof raw.findingId === "string" ? raw.findingId.trim() : "";
+    const finding = this.#state.phase.findings.find((f) => f.id === findingId);
+    if (!finding) {
+      this.#rejectInboxFile(file, commandId, `no finding ${findingId || "(none named)"} in phase ${this.#state.phase.phaseId}`);
+      return;
+    }
+    if (raw.verdict !== "refuse") {
+      this.#rejectInboxFile(file, commandId, "a finding verdict is refuse (an owner refusal settles the finding)");
+      return;
+    }
+    // Plan 06m (R2-82/disc-M-57): a refusal carries a real reason on the
+    // record, and it settles the blocker message it was raised from so the
+    // review.org entry does not stay live.
+    const reason = typeof raw.reason === "string" ? raw.reason.trim() : "";
+    if (reason.length === 0) {
+      this.#rejectInboxFile(file, commandId, `refusing finding ${findingId} needs a non-empty --reason`);
+      return;
+    }
+    const result = reduce(this.#state, { type: "FINDING_DISPROVED", findingId, byReviewer: "owner", evidence: reason });
+    if (!result.ok) {
+      this.#rejectInboxFile(file, commandId, result.reason);
+      return;
+    }
+    // Plan 06m (R2, M-94): every message raised from the refused finding is
+    // settled, bound to the version it is at (a MESSAGE_* event without the
+    // binding is refused by checkMessageBinding): a published or refused one
+    // is resolved by the owner, a raw (not yet evaluated) one is dropped, so
+    // review.org and the status list exactly the blockers that remain. The
+    // settlements are applied BEFORE the finding is disproved and with the
+    // drive suspended: disproving the last blocker can accept the candidate,
+    // publish and auto-stop the run synchronously, after which no event would
+    // be recorded. A settlement that cannot be applied is logged, never
+    // silently skipped.
+    const settlements: Event[] = [];
+    for (const message of this.#state.phase.messages ?? []) {
+      if (message.sourceRecordId !== findingId) continue;
+      const binding = {
+        messageId: message.id,
+        boundCandidateSha: message.boundCandidateSha,
+        boundContractVersion: message.boundContractVersion,
+        boundRecordVersion: message.messageVersion,
+      };
+      const settledReason = `refused by the owner: ${reason}`;
+      const event: Event | undefined =
+        message.state === "published" || message.state === "refused"
+          ? { type: "MESSAGE_RESOLVED", ...binding, by: "owner", reason: settledReason }
+          : message.state === "raw"
+            ? { type: "MESSAGE_DROPPED", ...binding, by: "owner", reason: settledReason }
+            : undefined;
+      if (!event) continue;
+      const settled = reduce(this.#state, event);
+      if (!settled.ok) {
+        this.#log.append("error", { where: "finding_refusal_message", findingId, messageId: message.id, error: settled.reason });
+        continue;
+      }
+      settlements.push(event);
+    }
+    const wasSuspended = this.#driveSuspended;
+    this.#driveSuspended = true;
+    try {
+      for (const event of settlements) this.#applyEvent(event, commandId);
+      this.#applyEvent({ type: "FINDING_DISPROVED", findingId, byReviewer: "owner", evidence: reason }, commandId);
+    } finally {
+      this.#driveSuspended = wasSuspended;
+    }
+    this.#appliedCommandIds.add(commandId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+    if (!wasSuspended) this.drive();
   }
 
   /** Plan 06j (A3): apply one `tt recheck`. Refused with a reason unless the
@@ -3388,6 +3560,14 @@ export class Conductor {
       return;
     }
 
+    // Plan 06m (A1/R2): `tt verdict <run> <finding> refuse` — the owner
+    // settles a finding as refused (disproved) with the reason on the record,
+    // creating nothing that must be answered.
+    if (raw !== null && typeof raw === "object" && (raw as { type?: unknown }).type === "finding-verdict") {
+      this.#processFindingVerdictCommand(file, commandId, raw as Record<string, unknown>);
+      return;
+    }
+
     // Plan 05j: the review view's entry commands. An entry-verdict expands to
     // one OWNER_VERDICT per linked message; split/merge/retitle are one
     // ENTRY_* event each. Handled before the conductor-state mapping.
@@ -3410,19 +3590,15 @@ export class Conductor {
         this.#rejectInboxFile(file, commandId, "an owner input must carry non-empty text");
         return;
       }
-      // Plan 06d (A2/C3): a binding's run id may be the internal runId, the
-      // run directory id or the readable id; resolveBinding is the only
-      // matcher. An unknown id is refused with all three it could have used,
-      // so a mis-addressed input is never silently applied to this run.
-      const rawBinding = (raw as { binding?: unknown }).binding;
-      const bindingRunId = rawBinding && typeof rawBinding === "object" ? (rawBinding as { runId?: unknown }).runId : undefined;
-      if (typeof bindingRunId === "string" && bindingRunId.length > 0) {
-        const resolved = resolveBinding(this.#runBinding(), bindingRunId);
-        if (!resolved.ok) {
-          this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, resolved.reason);
-          this.#rejectInboxFile(file, commandId, resolved.reason);
-          return;
-        }
+      // Plan 06m (A1/R2): every owner input carries a full binding. A
+      // missing binding, a null/empty run id, an unknown run id or another
+      // phase's id is refused with the reason and lands in inbox/rejected —
+      // never applied.
+      const bindingError = this.#inputBindingError(raw as Record<string, unknown>);
+      if (bindingError) {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, bindingError);
+        this.#rejectInboxFile(file, commandId, bindingError);
+        return;
       }
       const scope: DirectiveScope = (raw as { scope?: unknown }).scope === "program" ? "program" : "phase";
       // Plan 01i: `withdraw OD-n` (or `withdraw ODP-n`) in the input box
@@ -3689,7 +3865,9 @@ export class Conductor {
         kind: "run",
         title: redactText(this.#plan.title, this.#secretMaskable),
         ...(node ? { node } : {}),
+        phase: phase.phaseId,
         reason: redactText(waitReason(phase), this.#secretMaskable),
+        ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
         waitKey: `${runId}:${wait}`,
       },
       {
@@ -13448,6 +13626,19 @@ export function allocateDirectiveId(
 export type WithdrawInput =
   | { kind: "withdraw"; id: string }
   | { kind: "malformed"; reason: string };
+
+/** Plan 06m (A2): the target label a live agent is steered under. A lane
+ * worker is named by its lane (`worker-a`, `worker-b`, …); a single-candidate
+ * worker keeps the historical `worker` label; a reviewer is its seat letter.
+ * The ONE place that decides a label, so the conductor's deliveries, the
+ * recorded OWNER_INPUT_RECORDED and the status view never disagree. */
+export function workerTarget(role: string, agentId: string): string {
+  if (role === "worker") {
+    const lane = agentId.match(/^lane-\d+-([a-z])-/)?.[1];
+    return lane ? `worker-${lane}` : "worker";
+  }
+  return agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] ?? agentId;
+}
 
 export function parseWithdrawInput(text: string): WithdrawInput | undefined {
   const t = text.trim();

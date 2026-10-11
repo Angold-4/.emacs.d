@@ -195,7 +195,12 @@ test("plan 06k1: a ruled decision is not demanded in the live ballot review, exe
     const decision = setup.conductor.state.phase.decisions.find((d) => d.source === "worker")!;
     fs.writeFileSync(
       path.join(runPaths(setup.runDir).inbox, "cmd-rule.json"),
-      JSON.stringify({ type: "note", text: `${decision.id} is ruled: keep the cache warm.` }),
+      JSON.stringify({
+        type: "note",
+        text: `${decision.id} is ruled: keep the cache warm.`,
+        // Plan 06m (R2): an owner input carries its run/phase binding.
+        binding: { runId: setup.conductor.state.phase.runId, phaseId: setup.conductor.state.phase.phaseId },
+      }),
     );
     await waitFor(() => (setup.conductor.state.phase.ruledDecisions ?? []).some((r) => r.id === decision.id), 60_000, 20, setup.runDir);
     await waitFor(() => ["DONE", "BLOCKED", "AWAITING_OWNER"].includes(setup.conductor.state.phase.phase), 120_000, 50, setup.runDir);

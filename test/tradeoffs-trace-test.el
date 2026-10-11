@@ -673,6 +673,84 @@ run that is not part of a program can only apply it to its phase."
         (+tt-input-send '(4))
         (should (equal (alist-get 'scope written) "phase"))))))
 
+;; Plan 06m (A1/C2, OD-3(2)): Emacs sends every owner command through the
+;; CLI's ONE waiting writer and shows what it printed; it writes no inbox file.
+(ert-deftest tradeoffs-trace-owner-commands-use-the-cli-writer ()
+  "Plan 06m (A1/C2, OD-3(2)): a steer/note/correction goes through `tt
+steer|note|correct' (text in a file, the binding the owner saw as
+`--run-id'/`--phase-id', `--program-wide' for a whole-program directive) and
+a decision command through `tt input' with its full binding; the printed
+outcome is returned and shown, a refusal is signalled with its reason, and
+no inbox file is ever written by Emacs."
+  (let ((dir (make-temp-file "tt-ert-run" t))
+        (calls nil)
+        (texts nil)
+        (reply "delivered to worker-a: delivered\ndelivered to worker-b: delivered"))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--cli)
+                   (lambda (&rest args)
+                     (push args calls)
+                     ;; The writer reads its argument file at call time.
+                     (let ((arg (nth 2 args)))
+                       (push (with-temp-buffer
+                               (insert-file-contents (if (string-prefix-p "@" arg) (substring arg 1) arg))
+                               (buffer-string))
+                             texts))
+                     reply)))
+          (let ((binding '((runId . "r1") (phaseId . "p1"))))
+            ;; A phase steer: `tt steer', the binding kept, the outcome returned.
+            (should (equal (+tt--write-command dir `((type . "steer") (text . "cap at 64") (scope . "phase") (binding . ,binding)))
+                           reply))
+            (let ((args (car calls)))
+              (should (equal (nth 0 args) "steer"))
+              (should (equal (nth 1 args) dir))
+              (should (string-prefix-p "@" (nth 2 args)))
+              (should (equal (nthcdr 3 args) '("--run-id" "r1" "--phase-id" "p1"))))
+            (should (equal (car texts) "cap at 64"))
+            ;; A program-wide note: the same writer, `--program-wide'.
+            (+tt--write-command dir `((type . "note") (text . "--json is not a flag here") (scope . "program") (binding . ,binding)))
+            (should (equal (nth 0 (car calls)) "note"))
+            (should (member "--program-wide" (car calls)))
+            (should (equal (car texts) "--json is not a flag here"))
+            ;; A correction is `tt correct'.
+            (+tt--write-command dir `((type . "correction") (text . "revert AM-1") (binding . ,binding)))
+            (should (equal (nth 0 (car calls)) "correct"))
+            ;; A decision command goes through `tt input' with its FULL binding.
+            (+tt--write-command dir '((type . "resolve") (option . "repair")
+                                      (binding (runId . "r1") (phaseId . "p1") (recordId . "F-M-9") (recordVersion . 2))))
+            (should (equal (nth 0 (car calls)) "input"))
+            (let ((sent (json-read-from-string (car texts))))
+              (should (equal (alist-get 'type sent) "resolve"))
+              (should (equal (alist-get 'recordId (alist-get 'binding sent)) "F-M-9"))
+              (should (equal (alist-get 'phaseId (alist-get 'binding sent)) "p1"))))
+          ;; Emacs wrote no inbox file and left no argument file behind.
+          (should-not (file-exists-p (expand-file-name "inbox" dir)))
+          (should-not (directory-files dir nil "\\`tt-owner-")))
+      (delete-directory dir t))
+    ;; A refusal: the CLI exits non-zero; the reason is signalled, not "queued".
+    (cl-letf (((symbol-function '+tt--cli)
+               (lambda (&rest args)
+                 (error "tt %s failed: %s" (string-join args " ")
+                        "note rejected: command is bound to phase p2, but this run is on phase p1"))))
+      (let* ((dir (make-temp-file "tt-ert-run" t))
+             (err (unwind-protect
+                      (should-error (+tt--write-command dir '((type . "note") (text . "x") (binding (runId . "r1") (phaseId . "p2"))))
+                                    :type 'user-error)
+                    (delete-directory dir t))))
+        (should (equal (cadr err) "note rejected: command is bound to phase p2, but this run is on phase p1"))))
+    ;; The input box shows the writer's printed outcome, never "queued in the inbox".
+    (let ((shown nil))
+      (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t)))
+                ((symbol-function '+tt--cli) (lambda (&rest _) "delivered to worker-a: delivered"))
+                ((symbol-function '+tt--command-temp-file) (lambda (&rest _) "/tmp/tt-ert-owner.txt"))
+                ((symbol-function 'message) (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+        (with-temp-buffer
+          (insert "cap the retry loop at 64")
+          (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+          (+tt-input-send)
+          (should (string-match-p "delivered to worker-a: delivered" shown))
+          (should-not (string-match-p "inbox" shown)))))))
+
 (ert-deftest tradeoffs-trace-program-input-writes-a-program-directive ()
   "Plan 01i: the program buffer's input box records a program-wide directive
 through the CLI, which appends the event and steers every running node now."

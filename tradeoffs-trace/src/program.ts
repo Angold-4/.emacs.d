@@ -24,6 +24,7 @@ import { execFileSync } from "node:child_process";
 import { acquireLock, type Lock } from "./effects/lock.ts";
 
 import { buildView, formatDuration, updateLiveWaiting } from "./view.ts";
+import { renderStatusView, statusViewInput } from "./render.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 import { renderProgramChart } from "./charts.ts";
 import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
@@ -998,6 +999,41 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
     for (const d of directives) {
       lines.push(`  - ${d.id}${d.withdrawn ? " [withdrawn]" : " [in force]"}: ${d.text}`);
     }
+  }
+  // Plan 06m (OD-1/A3): every running/needs-you node's master panel and
+  // status panel, from the ONE renderer, so `tt program status` shows the
+  // same dashboard `tt status` does. Skipped for the compact list view.
+  if (opts.nodeDetail !== false) {
+    const panels: Array<{ header: string; master: string[]; status: string[] }> = [];
+    for (const n of nodes) {
+      const s = state.nodes[n.id];
+      if (!s.runId || (s.status !== "running" && s.status !== "needs-you")) continue;
+      try {
+        const runDir = path.join(path.dirname(path.dirname(dir)), s.runId);
+        const read = readRunState(runDir, path.dirname(path.dirname(dir)));
+        if (!read) continue;
+        const alive = pidAlive(path.join(runDir, "conductor.pid"));
+        const view = buildView(runDir, read.plan, alive);
+        const rendered = renderStatusView(statusViewInput({ runDir, plan: read.plan, state: read.state, view, alive })).trimEnd().split("\n");
+        // The master panel is the header plus its gauge block: the FIRST blank
+        // line is the one under the run line, so the master ends at the SECOND
+        // blank (before panel 2), never after the run line (OD-2).
+        const firstBlank = rendered.findIndex((l, i) => i > 0 && l.trim() === "");
+        const secondBlank = firstBlank >= 0 ? rendered.findIndex((l, i) => i > firstBlank + 1 && l.trim() === "") : -1;
+        const splitAt = secondBlank > 0 ? secondBlank : rendered.length;
+        panels.push({
+          header: `── ${n.id} (${readableIds[n.id] ?? s.runId}) ──`,
+          master: rendered.slice(0, splitAt),
+          status: rendered.slice(splitAt),
+        });
+      } catch {
+        // a node whose run cannot be read contributes no panel
+      }
+    }
+    // Plan 06m (OD-2/contract-39): every master panel first, then the status
+    // panels, so several running nodes read master-first.
+    for (const p of panels) lines.push("", p.header, ...p.master);
+    for (const p of panels) lines.push("", `── ${p.header.slice(3)}`, ...p.status);
   }
   return lines;
 }

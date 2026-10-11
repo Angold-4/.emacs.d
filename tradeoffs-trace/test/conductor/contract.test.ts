@@ -787,7 +787,9 @@ test("a run writes views/review.org and views/status.txt, and a new message upda
     assert.match(reviewBefore, /raw → \d+ entries/);
     const statusBefore = readFileSync(p.status, "utf8");
     assert.match(statusBefore, /^run /m);
-    assert.match(statusBefore, /^phase /m);
+    // Plan 06m (C2): one renderer for `tt status` and views/status.txt; the
+    // phase line is the CLI's `phase: <id> — <STATE>`.
+    assert.match(statusBefore, /^phase: \S+ — [A-Z_]+$/m);
 
     // A finding message is added; both views are rewritten from the new state
     // (the status view is coalesced, so it is waited for).
