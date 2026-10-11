@@ -3,7 +3,10 @@
 // sub-phase is visible in the loop view with the attempt clock stopped.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
 
 import { runPaths } from "../../src/conductor.ts";
@@ -192,5 +195,81 @@ test("plan 06k2: during lane reviews the loop shows LANE REVIEW and the attempt 
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
   } finally {
     await teardown(setup);
+  }
+});
+
+test("plan lane-prompt: only lane a's worker is launched with --append-system-prompt, once per file in order; the init record keeps each file's sha", async () => {
+  const promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-lane-prompt-"));
+  const argvDir = path.join(promptDir, "argv");
+  // A Claude skill's YAML front matter is passed as-is, never stripped.
+  const skill = path.join(promptDir, "SKILL.md");
+  fs.writeFileSync(skill, "---\nname: ponytail\ndescription: a disposition\n---\n\nBe brief.\n");
+  const shim = path.join(promptDir, "ponytail-tt-shim.md");
+  fs.writeFileSync(shim, "Submit through submit_phase.\n");
+  const sha = (f: string) => createHash("sha256").update(fs.readFileSync(f)).digest("hex");
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerPrompt: { a: [skill, shim] },
+    extraEnv: { FAKE_PI_ARGV_LOG: argvDir },
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+
+    // The init record names each lane's files: source, the run's copy, sha256.
+    const init = readEvents(setup.runDir).find((r) => r.kind === "init")!.event as {
+      workerPrompts?: Record<string, Array<{ source: string; path: string; name: string; sha256: string }>>;
+    };
+    const recorded = init.workerPrompts?.a ?? [];
+    assert.deepEqual(recorded.map((f) => f.source), [skill, shim]);
+    assert.deepEqual(recorded.map((f) => f.name), ["SKILL.md", "ponytail-tt-shim.md"]);
+    assert.deepEqual(recorded.map((f) => f.sha256), [sha(skill), sha(shim)]);
+    assert.equal(init.workerPrompts?.b, undefined, "lane b has no prompt");
+    // The copy is byte for byte the source, front matter included.
+    for (const f of recorded) {
+      assert.ok(f.path.startsWith(setup.runDir), "the worker reads the run's own copy");
+      assert.equal(sha(f.path), f.sha256);
+    }
+
+    // The recorded argv: lane a's worker has both files, in order; lane b's
+    // worker and every other role have none.
+    const argvOf = (role: string) => {
+      const file = path.join(argvDir, `${role}.jsonl`);
+      if (!fs.existsSync(file)) return [] as Array<{ agentId: string; argv: string[] }>;
+      return fs
+        .readFileSync(file, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as { agentId: string; argv: string[] });
+    };
+    const appended = (argv: string[]) => argv.flatMap((a, i) => (a === "--append-system-prompt" ? [argv[i + 1]] : []));
+    const workers = argvOf("worker");
+    const laneA = workers.filter((w) => w.agentId.startsWith("lane-1-a-"));
+    const laneB = workers.filter((w) => w.agentId.startsWith("lane-1-b-"));
+    assert.ok(laneA.length > 0 && laneB.length > 0, "both lane workers launched");
+    for (const w of laneA) assert.deepEqual(appended(w.argv), recorded.map((f) => f.path));
+    for (const w of laneB) assert.deepEqual(appended(w.argv), [], "lane b's worker gets no prompt file");
+    const others = fs.readdirSync(argvDir).filter((f) => f !== "worker.jsonl");
+    assert.ok(others.includes("reviewer.jsonl"), "the reviewers' argv was recorded");
+    for (const f of others) {
+      for (const line of argvOf(f.replace(/\.jsonl$/, ""))) {
+        assert.deepEqual(appended(line.argv), [], `${f} ${line.agentId} gets no worker prompt`);
+      }
+    }
+
+    // The status view's details block names each lane's files.
+    const status = fs.readFileSync(runPaths(setup.runDir).status, "utf8");
+    assert.match(status, new RegExp(`prompts\\s+a=SKILL\\.md@${sha(skill).slice(0, 8)},ponytail-tt-shim\\.md@${sha(shim).slice(0, 8)}`));
+  } finally {
+    await teardown(setup);
+    fs.rmSync(promptDir, { recursive: true, force: true });
   }
 });

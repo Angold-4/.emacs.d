@@ -13,6 +13,7 @@ import { laneRoundPhase } from "./core/loop-view.ts";
 import { effectiveChecks } from "./core/checks.ts";
 import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
 // 06a finding #24: the `models` line also carries the models check's result.
+import { parseWorkerPromptRecord, workerPromptLineText } from "./core/worker-prompt.ts";
 import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./core/models-check.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
@@ -570,6 +571,10 @@ export interface RunView {
    * role/seat), only when the plan set models (otherwise undefined — Pi's
    * defaultModel needs no line). */
   models?: string;
+  /** `#+TT_WORKER_PROMPT`: which lane's worker had which prompt files
+   * (`a=SKILL.md@1a2b3c4d,shim.md@9f8e7d6c  b=none`), from the `init`
+   * record. Undefined when the run appended none. */
+  workerPrompts?: string;
   /** Plan 05h: the tape's current-row cell (`▶ REVIEW 4m12s of 15m`), the
    * status buffer's one `loop` row. Undefined before the first step. */
   loop?: string;
@@ -878,6 +883,9 @@ export function buildView(
     metrics,
     metricsLine: metricsLine(metrics),
     models,
+    workerPrompts: workerPromptLineText(
+      parseWorkerPromptRecord((records.find((r) => r.kind === "init")?.event as { workerPrompts?: unknown } | undefined)?.workerPrompts),
+    ),
     loop: loopTapeHead(tapeInput),
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),

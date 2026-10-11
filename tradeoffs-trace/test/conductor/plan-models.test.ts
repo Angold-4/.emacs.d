@@ -320,3 +320,53 @@ test("plan-models: the owner's per-seat #+TT_MODELS reaches every reviewer and p
     fs.rmSync(argvDir, { recursive: true, force: true });
   }
 });
+
+test("plan lane-prompt: launchArgs appends one --append-system-prompt per file, in order, before the session flags", () => {
+  const argv = launchArgs("worker", { sessionDir: "/s", appendSystemPrompt: ["/p/SKILL.md", "/p/shim.md"] });
+  const at = argv.indexOf("--append-system-prompt");
+  assert.deepEqual(argv.slice(at, at + 4), ["--append-system-prompt", "/p/SKILL.md", "--append-system-prompt", "/p/shim.md"]);
+  assert.ok(at < argv.indexOf("--session-dir"));
+  for (const role of Object.keys(ROLE_TOOLS) as Role[]) {
+    assert.ok(!launchArgs(role).includes("--append-system-prompt"), `${role} gets no prompt file by default`);
+  }
+});
+
+test("plan lane-prompt: a single worker takes lane a's prompt files; reviewers, evaluator and panel get none", async () => {
+  const argvDir = fs.mkdtempSync("/tmp/tt-plan-lane-prompt-");
+  const promptA = path.join(argvDir, "a.md");
+  const promptB = path.join(argvDir, "b.md");
+  fs.writeFileSync(promptA, "lane a disposition\n");
+  fs.writeFileSync(promptB, "lane b disposition\n");
+  const logDir = path.join(argvDir, "argv");
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerPrompt: { a: [promptA], b: [promptB] },
+    extraEnv: { FAKE_PI_ARGV_LOG: logDir },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: blockerReviewer(),
+    evaluatorScriptFor: blockerEvaluator(),
+    deadlines: FAST,
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () => (["worker", "reviewer", "evaluator", "panel"] as Role[]).every((r) => argvFor(setup, r, logDir).length > 0),
+      90_000,
+      25,
+      setup.runDir,
+    );
+    const appended = (argv: string[]) => argv.flatMap((a, i) => (a === "--append-system-prompt" ? [argv[i + 1]] : []));
+    const copyA = path.join(setup.runDir, "worker-prompts", "a-1-a.md");
+    for (const argv of argvFor(setup, "worker", logDir)) assert.deepEqual(appended(argv), [copyA]);
+    assert.equal(fs.readFileSync(copyA, "utf8"), "lane a disposition\n");
+    for (const role of ["reviewer", "evaluator", "panel", "curator"] as Role[]) {
+      for (const argv of argvFor(setup, role, logDir)) assert.deepEqual(appended(argv), [], `${role} gets no worker prompt`);
+    }
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(argvDir, { recursive: true, force: true });
+  }
+});

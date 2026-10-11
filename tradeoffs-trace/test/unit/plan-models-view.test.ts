@@ -149,3 +149,45 @@ test("the status line and tt summary name every seat's model", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("plan lane-prompt: the status details block and tt state's view name each lane's prompt files by basename and short sha", () => {
+  const dir = fs.mkdtempSync("/tmp/tt-plan-lane-prompt-view-");
+  try {
+    const sha1 = "1a2b3c4d".padEnd(64, "0");
+    const sha2 = "9f8e7d6c".padEnd(64, "1");
+    const init = {
+      seq: 1,
+      ts: new Date().toISOString(),
+      kind: "init",
+      event: {
+        runId: "r1",
+        integrationHead: "0".repeat(40),
+        workerPrompts: {
+          a: [
+            { source: "/p/SKILL.md", path: `${dir}/worker-prompts/a-1-SKILL.md`, name: "SKILL.md", sha256: sha1 },
+            { source: "/p/shim.md", path: `${dir}/worker-prompts/a-2-shim.md`, name: "shim.md", sha256: sha2 },
+          ],
+          b: [],
+        },
+      },
+    };
+    fs.writeFileSync(path.join(dir, "events.jsonl"), `${JSON.stringify(init)}\n`);
+    const p = plan();
+    const view = buildView(dir, p, false);
+    assert.equal(view.workerPrompts, "a=SKILL.md@1a2b3c4d,shim.md@9f8e7d6c  b=none");
+    const text = renderStatusView(statusViewInput({ runDir: dir, plan: p, state: { phase: view.timeline.state.phase }, view, alive: false }));
+    const details = text.slice(text.indexOf("\nDetails\n"));
+    assert.match(details, /^prompts   a=SKILL\.md@1a2b3c4d,shim\.md@9f8e7d6c  b=none$/m);
+
+    // A run with no prompt files shows no row.
+    fs.writeFileSync(path.join(dir, "events.jsonl"), `${JSON.stringify({ ...init, event: { runId: "r1", integrationHead: "0".repeat(40) } })}\n`);
+    const bare = buildView(dir, p, false);
+    assert.equal(bare.workerPrompts, undefined);
+    assert.doesNotMatch(
+      renderStatusView(statusViewInput({ runDir: dir, plan: p, state: { phase: bare.timeline.state.phase }, view: bare, alive: false })),
+      /^prompts\b/m,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

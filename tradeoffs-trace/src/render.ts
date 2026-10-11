@@ -718,6 +718,7 @@ export function renderStatusText(
   if (view.metricsLine) lines.push(view.metricsLine);
   if (view.loop) lines.push(row("loop", view.loop)!);
   if (view.models) lines.push(row("models", view.models)!);
+  if (view.workerPrompts) lines.push(row("prompts", view.workerPrompts)!);
   if (view.amendments) lines.push(`amendments: ${view.amendments}`);
   if (view.verdict) lines.push(`verdict: ${view.verdict}`);
   for (const t of view.tradeoffs ?? []) lines.push(`trade-off: ${t.text}`);
@@ -1038,6 +1039,8 @@ export function renderStatusView(input: StatusViewInput): string {
   if (typeof phase.publishedI === "string") details.push(`published: ${phase.publishedI.slice(0, 12)}`);
   dpush(view.metricsLine);
   dpush(row("cost", view.cost?.text));
+  // `#+TT_WORKER_PROMPT`: which lane's worker ran with which prompt files.
+  dpush(row("prompts", view.workerPrompts));
   // Plan 05c: the `records' row said `decisions' and disagreed with the
   // review; the `review' row counts in trade-off vocabulary, matching the
   // entries, the raw count and the dropped count `review.org' shows.

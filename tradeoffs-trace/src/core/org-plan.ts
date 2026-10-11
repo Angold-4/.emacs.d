@@ -12,6 +12,9 @@
 // construct the plan format uses is handled, and anything else is left in the
 // item text.
 
+import * as path from "node:path";
+
+import { expandPromptPath } from "./worker-prompt.ts";
 import type { LintItemInput, LintModels, LintPhaseInput, LintPlanInput } from "./plan-lint.ts";
 
 interface OrgNode {
@@ -320,6 +323,31 @@ function parseModels(keyword: { value: string; line: number } | undefined): Pick
   };
 }
 
+/** `#+TT_WORKER_PROMPT: a=<file>[,<file>…] [b=…]`, read as Emacs does:
+ * per lane, the files in order; `none` is an empty list; a relative path
+ * resolves against the plan's directory and `~` against the home directory;
+ * an empty path stays "" so lint names it. A lane named twice keeps its later
+ * value. */
+function parseWorkerPrompt(
+  keyword: { value: string; line: number } | undefined,
+  sourceFile: string | undefined,
+): { workerPrompt?: Record<string, string[]>; workerPromptLine?: number } {
+  if (!keyword) return {};
+  const dir = sourceFile ? path.dirname(path.resolve(sourceFile)) : process.cwd();
+  const map: Record<string, string[]> = {};
+  for (const tok of keyword.value.split(/[ \t]+/).filter(Boolean)) {
+    const eq = tok.indexOf("=");
+    const lane = eq >= 0 ? tok.slice(0, eq) : tok;
+    const value = eq >= 0 ? tok.slice(eq + 1) : "";
+    map[lane] =
+      value === "none"
+        ? []
+        : value.split(",").map((f) => (f.length === 0 ? f : f.startsWith("~") ? expandPromptPath(f) : path.resolve(dir, f)));
+  }
+  if (Object.keys(map).length === 0) return {};
+  return { workerPrompt: map, workerPromptLine: keyword.line };
+}
+
 /** Parse an Org plan into the linter's input shape. `sourceFile` is recorded
  * so a finding names the Org file the owner edited. */
 export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
@@ -350,6 +378,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(globalRegen ? { regen: globalRegen } : {}),
     phases,
     ...parseModels(first("TT_MODELS")),
+    ...parseWorkerPrompt(first("TT_WORKER_PROMPT"), sourceFile),
     ...parseSeats(first("TT_REVIEWERS")),
     ...(rerun ? { rerun: rerun.value, rerunLine: rerun.line } : {}),
     ...(workersValue !== undefined ? { workers: workersValue, workersLine: workers!.line } : {}),

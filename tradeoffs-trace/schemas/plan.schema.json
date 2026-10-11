@@ -115,6 +115,20 @@
     "leaderLine": {
       "description": "Lint-only: the 1-based line of #+TT_LEADER in the source Org file.",
       "type": "integer"
+    },
+    "workerPrompt": {
+      "description": "#+TT_WORKER_PROMPT: per lane (a, b, ...), the absolute paths appended to that lane's worker system prompt (--append-system-prompt), in order. An empty list is `none`. A single worker uses lane a's.",
+      "type": "object",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "workerPromptLine": {
+      "description": "Lint-only: the 1-based line of #+TT_WORKER_PROMPT in the source Org file.",
+      "type": "integer"
+    },
+    "workerPromptFromProgram": {
+      "description": "Lint-only: the lanes this entry inherited from the program's #+TT_WORKER_PROMPT.",
+      "type": "array",
+      "items": { "type": "string" }
     }
   },
   "$defs": {
