@@ -271,11 +271,23 @@ addRow({
   guard: () => true,
   to: "FREEZING",
   actions: [{ type: "freeze" }],
-  apply: (s) =>
-    withPhase(s, {
+  apply: (s, ev) => {
+    // Plan 06k3 (A3): the submission's answers are recorded on the findings
+    // they answer, so the reviewer prompt's table can pair each finding with
+    // the worker's answer. The freeze path has already refused a submission
+    // that left an open blocking finding unanswered.
+    const e = ev as Extract<Event, { type: "SUBMIT_PHASE" }>;
+    const answers = new Map((e.findingAnswers ?? []).map((a) => [a.findingId, a]));
+    const findings =
+      answers.size === 0
+        ? s.phase.findings
+        : s.phase.findings.map((f) => (answers.has(f.id) ? { ...f, answer: answers.get(f.id) } : f));
+    return withPhase(s, {
       phase: "FREEZING",
+      findings,
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
-    }),
+    });
+  },
 });
 
 /** design §4.2/§5.2/§8.1: every entry into AWAITING_OWNER records the owner

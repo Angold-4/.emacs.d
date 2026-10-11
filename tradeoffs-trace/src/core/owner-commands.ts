@@ -123,11 +123,22 @@ export function unchangedResubmissionRequesters(
   ownerDirectives: readonly { id: string; text: string; status: string }[],
 ): string[] {
   const out: string[] = [];
-  ownerNotes.forEach((text, i) => {
-    if (asksForUnchangedResubmission(text)) out.push(`note:${i}`);
-  });
+  // Plan 06k3 (A4, findings D-M-37/F-15): the SAME ask written as a note and
+  // an in-force directive is ONE permission, not two. Without this the first
+  // submission consumes the note and the directive lifts a SECOND unchanged
+  // submission — including after a restart, where the directive key is still
+  // unconsumed.
+  const seen = new Set<string>();
+  const push = (text: string, key: string): void => {
+    if (!asksForUnchangedResubmission(text)) return;
+    const t = text.trim();
+    if (seen.has(t)) return;
+    seen.add(t);
+    out.push(key);
+  };
+  ownerNotes.forEach((text, i) => push(text, `note:${i}`));
   for (const d of ownerDirectives) {
-    if (d.status === "in-force" && asksForUnchangedResubmission(d.text)) out.push(`directive:${d.id}`);
+    if (d.status === "in-force") push(d.text, `directive:${d.id}`);
   }
   return out;
 }

@@ -119,6 +119,7 @@ import type {
   DirectiveScope,
   Event,
   Finding,
+  FindingAnswer,
   PriorDecisionStatement,
   FindingDisclosure,
   InFlightKey,
@@ -229,6 +230,7 @@ import {
   publishCAS,
   removeWorktree,
   candidateTree,
+  saveUnsubmittedWork as gitSaveUnsubmittedWork,
   verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
@@ -261,6 +263,13 @@ const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
  * second and third chance within the same turn, and one that never does
  * cannot wedge the turn. */
 export const MAX_INCOMPLETE_REVIEW_REJECTIONS = 2;
+
+/** Plan 06k3 (A1): how many times a two-lane round that fails only because a
+ * lane review or pick vote is still missing (after its seat retry) is
+ * repeated without spending a repair attempt. Two: a transient seat loss does
+ * not cost a round, but a round that keeps losing seats still counts after
+ * that. */
+export const MAX_ROUND_REPEATS = 2;
 
 // ---------------------------------------------------------------------------
 // Config — design §8.1 defaults, overridable per run.
@@ -1244,6 +1253,8 @@ interface AgentHandle {
     disclosures: DecisionDisclosure[];
     prior?: PriorDecisionStatement[];
     dispute?: CriterionDispute;
+    /** Plan 06k3 (A3): the lane's answers to the open blocking findings. */
+    answers?: FindingAnswer[];
   };
   /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
    * winner's hand-off. */
@@ -1414,10 +1425,21 @@ export class Conductor {
    * prompt actually carried, recorded when the prompt is built. A note
    * queued AFTER that build is not marked delivered by it. Keyed by round. */
   #lanePromptDeliveredNoteCount = new Map<number, number>();
-  /** Plan 06k2 (A6, finding A-3/D-B-17): the owner steers whose unchanged-
-   * resubmission permission has already been used. A permission lifts exactly
-   * the next unchanged submission, never the rest of the phase. */
-  #consumedUnchangedPermissions = new Set<string>();
+  /** Plan 06k3 (A2): the saved unsubmitted-work refs the current round's
+   * lanes start from, for the shared lane prompt. Set before the round's
+   * prompt is built. */
+  #laneSavedWorkForRound: Array<{ lane: string; ref: string; sha: string }> = [];
+  /** Plan 06k3 (A2, findings A-13/T-29): lanes whose unsubmitted-work ref
+   * could not be written. Their dirty worktree is retained (never removed)
+   * so the work is not lost, and the next attempt continues in it. */
+  #unsavedLaneWorktrees = new Set<string>();
+  /** Plan 06k3 (A3): the re-run result of each open finding's reproduction
+   * command, per candidate, for the reviewer prompt table. Computed once per
+   * candidate (after the checks) and reused by every reviewer prompt. */
+  #reproductionTableLines = new Map<string, string[]>();
+  /** Plan 06k3 (A3, finding M-9): one in-flight reproduction-table computation
+   * per candidate, so three parallel reviewer dispatches share it. */
+  #reproductionTablePending = new Map<string, Promise<void>>();
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -1809,8 +1831,10 @@ export class Conductor {
     // base would silently throw away the candidate the phase is repairing
     // (the 2026-10-09 incident: `program resume` after `program stop` brought
     // the worktree back at the 02e base). A run with no candidate yet starts
-    // from the integration head, exactly as before.
-    const baseSha = this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead;
+    // from the integration head, exactly as before. Plan 06k3 (A2, finding
+    // A-3): a saved unsubmitted work commit that descends from that candidate
+    // is the real base, so a restart keeps the work the worker did not submit.
+    const baseSha = this.#singleWorkerBase();
     const { records } = readLog(this.#paths.events);
     const intentRecord = records.find((r) => r.kind === "intent" && r.actionId === ACTION_ID);
     const completed = records.some((r) => r.kind === "completion" && r.actionId === ACTION_ID);
@@ -1837,6 +1861,25 @@ export class Conductor {
     this.#log.completion(ACTION_ID, { created: true, baseSha });
   }
 
+  /** Plan 06k3 (A2, finding A-3): the base a resumed single worker's worktree
+   * starts from — the saved unsubmitted work when it descends from the frozen
+   * candidate (so a restart after a timeout keeps that work), else the
+   * candidate, else the integration head. */
+  #singleWorkerBase(): string {
+    const candidate = this.#state.phase.candidate?.sha;
+    const saved = this.#savedLaneWork().get("a");
+    if (saved) {
+      if (!candidate) return saved.sha;
+      try {
+        execFileSync("git", ["-C", this.#plan.repo, "merge-base", "--is-ancestor", candidate, saved.sha], { encoding: "utf8" });
+        return saved.sha;
+      } catch {
+        // The saved work predates the current candidate: it is stale.
+      }
+    }
+    return candidate ?? this.#state.phase.integrationHead;
+  }
+
   #worktreeMatches(baseSha: string): boolean {
     if (!fs.existsSync(this.#paths.worktree)) return false;
     try {
@@ -1846,11 +1889,11 @@ export class Conductor {
     }
   }
 
-  /** Plan 06k2 (A6): true when `worktree`'s tree is identical to the phase's
-   * last frozen candidate — a worker that changed nothing. Only a phase with
-   * a candidate (a repair round) can have an unchanged resubmission. */
-  #submissionTreeUnchanged(worktree: string): boolean {
-    const C = this.#state.phase.candidate?.sha;
+  /** Plan 06k2 (A6) / plan 06k3 (A4): true when `worktree`'s tree is
+   * identical to `againstSha` (the candidate the submission started from) — a
+   * worker that changed nothing. */
+  #submissionTreeUnchanged(worktree: string, againstSha: string): boolean {
+    const C = againstSha;
     if (!C) return false;
     try {
       const candidateTree = execFileSync("git", ["-C", this.#plan.repo, "rev-parse", `${C}^{tree}`], { encoding: "utf8" }).trim();
@@ -1874,29 +1917,59 @@ export class Conductor {
     }
   }
 
-  /** Plan 06k2 (A6, finding A-3/D-B-17): the owner asked for an unchanged
-   * resubmission. Only an ASKING, in-force steer counts (a negated text or a
-   * withdrawn directive asks for nothing), and each permission lifts exactly
-   * one submission — the next one. */
+  /** Plan 06k2 (A6, finding A-3/D-B-17) / plan 06k3 (A4): the owner asked for
+   * an unchanged resubmission. Only an ASKING, in-force steer counts (a
+   * negated text or a withdrawn directive asks for nothing), and each
+   * permission lifts exactly one submission — the next one. The permission's
+   * use is an EVENT (`UNCHANGED_PERMISSION_USED`), not process memory, so a
+   * conductor restart cannot reopen it. */
   #ownerAskedForUnchangedResubmission(): boolean {
     const keys = unchangedResubmissionRequesters(
       this.#state.phase.ownerNotes ?? [],
       this.#state.phase.ownerDirectives ?? [],
     );
-    const key = keys.find((k) => !this.#consumedUnchangedPermissions.has(k));
+    const used = new Set(this.#state.phase.consumedUnchangedPermissions ?? []);
+    const key = keys.find((k) => !used.has(k));
     if (key === undefined) return false;
-    this.#consumedUnchangedPermissions.add(key);
+    this.#applyEvent({ type: "UNCHANGED_PERMISSION_USED", key });
     return true;
   }
 
-  /** Plan 06k2 (A6): refuse a submission whose tree equals the last reviewed
-   * candidate's before freeze. Returns the reason, or undefined when the
-   * submission may proceed. */
-  #unchangedResubmissionReason(worktree: string): string | undefined {
-    const C = this.#state.phase.candidate?.sha;
+  /** Plan 06k3 (A3): the open blocking findings this submission must answer,
+   * and the reason it is refused when one is unanswered or malformed. */
+  #findingAnswerIssue(answers: FindingAnswer[] | undefined): string | undefined {
+    const open = this.#state.phase.findings.filter((f) => f.status === "open" && f.severity === "blocking");
+    if (open.length === 0) return undefined;
+    const byId = new Map((answers ?? []).map((a) => [a.findingId, a]));
+    const missing = open.filter((f) => !byId.has(f.id)).map((f) => f.id);
+    if (missing.length > 0) {
+      return `submit_phase refused: these open blocking findings are unanswered: ${missing.join(", ")}. Answer each in findingAnswers: fixed (with the test that now covers it) or disputed (with the reason)`;
+    }
+    for (const f of open) {
+      const a = byId.get(f.id)!;
+      if (a.status === "fixed") {
+        if (!a.test || a.test.trim().length === 0) return `submit_phase refused: finding ${f.id} is answered 'fixed' but gives no test`;
+      } else if (a.status === "disputed") {
+        if (!a.reason || a.reason.trim().length === 0) return `submit_phase refused: finding ${f.id} is answered 'disputed' but gives no reason`;
+      } else {
+        return `submit_phase refused: finding ${f.id} has an unknown answer status ${JSON.stringify((a as { status?: unknown }).status)}`;
+      }
+    }
+    return undefined;
+  }
+
+  /** Plan 06k2 (A6) / plan 06k3 (A4): refuse a submission whose tree equals
+   * the candidate it started from before freeze. For the phase's own worker
+   * that is the last reviewed candidate; for a lane it is the candidate that
+   * LANE started from (its per-lane base), so a lane restarted from its own
+   * losing candidate that resubmits it unchanged is refused naming that
+   * candidate. Returns the reason, or undefined when the submission may
+   * proceed. */
+  #unchangedResubmissionReason(worktree: string, baseSha?: string): string | undefined {
+    const C = baseSha ?? this.#state.phase.candidate?.sha;
     if (!C) return undefined;
     // Consume the owner's permission only when it actually lifts a refusal.
-    if (!this.#submissionTreeUnchanged(worktree)) return undefined;
+    if (!this.#submissionTreeUnchanged(worktree, C)) return undefined;
     if (this.#ownerAskedForUnchangedResubmission()) return undefined;
     return `this submission's tree is identical to the last reviewed candidate ${C.slice(0, 7)}; make a change, or have the owner ask for an unchanged resubmission`;
   }
@@ -3716,11 +3789,11 @@ export class Conductor {
    * worker's process group (SIGSTOP) and its attempt clock, so a check that
    * holds the machine for minutes does not time the worker out. Resumes
    * (SIGCONT) the moment the window closes. Returns a stop function. */
-  #watchCheckWindow(agentId: string, agent: PiAgent, timer: PausableTimer<"timeout">): () => void {
+  #watchCheckWindow(agentId: string, agent: PiAgent, ...timers: Array<PausableTimer<"timeout" | "steer">>): () => void {
     let paused = false;
     const pause = () => {
       paused = true;
-      timer.pause();
+      for (const timer of timers) timer.pause();
       const a = this.#activity.get(agentId);
       if (a) a.busy = false;
       try {
@@ -3732,7 +3805,7 @@ export class Conductor {
     };
     const resume = () => {
       paused = false;
-      timer.resume();
+      for (const timer of timers) timer.resume();
       const a = this.#activity.get(agentId);
       if (a) {
         a.busy = true;
@@ -3763,6 +3836,29 @@ export class Conductor {
         }
       }
     };
+  }
+
+  /** Plan 06k3 (A2): at 75% of the attempt the worker (single or lane) is
+   * told how many minutes remain and to submit. The steer is a PausableTimer,
+   * so `#watchCheckWindow` pauses it with the attempt clock: a paused attempt
+   * is not steered early, and the minutes named are the active minutes left.
+   * Returns the timer (to hand to `#watchCheckWindow`) and a cancel function. */
+  #scheduleClockSteer(agentId: string, agent: PiAgent, attemptMs: number): { timer: PausableTimer<"steer">; cancel: () => void } {
+    const at = Math.max(1, Math.floor(attemptMs * 0.75));
+    const remainingMs = Math.max(0, attemptMs - at);
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+    const timer = new PausableTimer<"steer">(at, "steer");
+    void timer.promise.then(() => {
+      if (this.#closed) return;
+      this.#log.append("clock_steer", { agentId, minutesLeft: minutes });
+      const coverage = this.#structured() ? " Call submit_coverage first, then submit_phase." : "";
+      void agent
+        .steer(
+          `You have about ${minutes} minute${minutes === 1 ? "" : "s"} left in this attempt. Wrap up and call submit_phase now with what you have.${coverage}`,
+        )
+        .catch(() => undefined);
+    });
+    return { timer, cancel: () => timer.cancel() };
   }
 
   #withStallWatch(
@@ -4214,19 +4310,28 @@ export class Conductor {
             return { ok: false, reason };
           }
         }
-        // Plan 06k2 (A6): a lane whose tree equals the phase's last reviewed
-        // candidate is refused before its freeze, unless the owner asked for
-        // an unchanged resubmission.
-        const laneUnchanged = this.#unchangedResubmissionReason(this.#laneWorktree(handle.lane));
+        const args = msg.args as SubmitPhaseArgs;
+        // Plan 06k3 (A3): every open blocking finding must be answered before
+        // the lane's submission is taken.
+        const laneAnswerIssue = this.#findingAnswerIssue(args.findingAnswers);
+        if (laneAnswerIssue) {
+          this.#log.append("finding_answer_refused", { at: "submit_phase", lane: handle.lane, reason: laneAnswerIssue });
+          return { ok: false, reason: laneAnswerIssue };
+        }
+        // Plan 06k2 (A6): a lane whose tree equals the candidate that lane
+        // started from is refused before its freeze, unless the owner asked
+        // for an unchanged resubmission.
+        const laneStart = this.#laneStartSha(handle.lane, handle.laneRound);
+        const laneUnchanged = this.#unchangedResubmissionReason(this.#laneWorktree(handle.lane), laneStart);
         if (laneUnchanged) {
-          this.#log.append("resubmission_refused", { at: "submit_phase", lane: handle.lane, candidateSha: this.#state.phase.candidate?.sha, reason: laneUnchanged });
+          this.#log.append("resubmission_refused", { at: "submit_phase", lane: handle.lane, candidateSha: laneStart, reason: laneUnchanged });
           return { ok: false, reason: laneUnchanged };
         }
-        const args = msg.args as SubmitPhaseArgs;
         handle.laneSubmission = {
           disclosures: args.decisions ?? [],
           ...(args.priorDecisions ? { prior: args.priorDecisions } : {}),
           ...(args.criterionDispute ? { dispute: args.criterionDispute } : {}),
+          ...(args.findingAnswers ? { answers: args.findingAnswers } : {}),
         };
         handle.doneResolve();
         return { ok: true };
@@ -4241,6 +4346,13 @@ export class Conductor {
           this.#log.append("coverage_refused", { at: "submit_phase", issues, reason });
           return { ok: false, reason };
         }
+      }
+      // Plan 06k3 (A3): every open blocking finding must be answered before
+      // the submission is taken; the refusal names the missing ids.
+      const answerIssue = this.#findingAnswerIssue((msg.args as SubmitPhaseArgs).findingAnswers);
+      if (answerIssue) {
+        this.#log.append("finding_answer_refused", { at: "submit_phase", reason: answerIssue });
+        return { ok: false, reason: answerIssue };
       }
       // Plan 06k2 (A6): a worker that resubmits a candidate byte-identical
       // to the last reviewed one is refused before the freeze, unless the
@@ -4290,6 +4402,7 @@ export class Conductor {
       this.#applyEvent({
         type: "SUBMIT_PHASE",
         disclosures: args.decisions ?? [],
+        ...(args.findingAnswers ? { findingAnswers: args.findingAnswers } : {}),
         ...(prior.length > 0 ? { prior } : {}),
         ...(dispute ? { dispute } : {}),
       });
@@ -5866,6 +5979,92 @@ export class Conductor {
     }
   }
 
+  /** Plan 06k3 (A3): run one finding's reproduction command in the candidate
+   * and return its exit, timeout and last output lines. */
+  async #rerunReproduction(
+    command: string,
+    candidateSha: string,
+  ): Promise<{ exitCode: number | null; timedOut: boolean; tail: string }> {
+    const checkout = disposableCheckout(this.#plan.repo, candidateSha);
+    try {
+      const running = runCommand({
+        command,
+        cwd: checkout.dir,
+        deadlineMs: this.#deadlines.reproductionMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+      });
+      const result = await running.result;
+      return { exitCode: result.exitCode, timedOut: result.timedOut, tail: result.output.slice(-2000) };
+    } finally {
+      checkout.dispose();
+    }
+  }
+
+  /** Plan 06k3 (A3): the reviewer prompt's finding table — one row per open
+   * finding whose record carries a reproduction command: the finding, the
+   * worker's answer, and the re-run's result on this candidate (passes now /
+   * still fails, with its last output lines). Computed once per candidate,
+   * after the checks. Reviewers judge the table; nothing is bounced or
+   * accepted automatically. */
+  async #ensureReproductionTable(phase: PhaseState, candidateSha: string): Promise<void> {
+    if (this.#reproductionTableLines.has(candidateSha)) return;
+    // Plan 06k3 (A3, finding M-9): the three seats review in parallel, so a
+    // second seat must await the FIRST seat's in-flight computation rather
+    // than start its own. Without this every seat re-ran every reproduction.
+    const pending = this.#reproductionTablePending.get(candidateSha);
+    if (pending) {
+      await pending;
+      return;
+    }
+    const run = this.#computeReproductionTable(phase, candidateSha);
+    this.#reproductionTablePending.set(candidateSha, run);
+    try {
+      await run;
+    } finally {
+      this.#reproductionTablePending.delete(candidateSha);
+    }
+  }
+
+  async #computeReproductionTable(phase: PhaseState, candidateSha: string): Promise<void> {
+    // A3 says every OPEN finding with a reproduction command, blocking or
+    // advisory: the worker's answer is required only for the blocking ones,
+    // but the re-run is a fact for any of them.
+    const open = phase.findings.filter((f) => f.status === "open" && f.reproduction?.command);
+    if (open.length === 0) {
+      this.#reproductionTableLines.set(candidateSha, []);
+      return;
+    }
+    const lines = [
+      "Open findings whose reproduction command the conductor re-ran on this candidate (judge these; the conductor neither bounces nor accepts them automatically):",
+    ];
+    for (const f of open) {
+      const run = await this.#rerunReproduction(f.reproduction!.command, candidateSha);
+      this.#log.append("finding_reproduction_rerun", {
+        findingId: f.id,
+        candidateSha,
+        command: f.reproduction!.command,
+        exitCode: run.exitCode,
+        timedOut: run.timedOut,
+      });
+      const answer = f.answer
+        ? f.answer.status === "fixed"
+          ? `fixed (test: ${f.answer.test ?? "?"})`
+          : `disputed (${f.answer.reason ?? "?"})`
+        : "unanswered";
+      const verdict = run.timedOut ? "inconclusive (timed out)" : run.exitCode === 0 ? "passes now" : `still fails (exit ${run.exitCode})`;
+      const tailLines = run.tail
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .slice(-5)
+        .map((l) => `      ${redactText(l, this.#secretMaskable)}`);
+      lines.push(
+        `- ${f.id} "${oneLine(f.evidence)}": worker answer: ${answer}; re-run \`${f.reproduction!.command}\`: ${verdict}`,
+        ...(run.exitCode !== 0 || run.timedOut ? ["    last output lines:", ...tailLines] : []),
+      );
+    }
+    this.#reproductionTableLines.set(candidateSha, lines);
+  }
+
   /** design §5/§6.1's real turn-2 review outcome: a ballot per votable
    * decision plus any newly raised findings, replacing phase 1's
    * `#castStubBallots`. Findings are raised before ballots are cast so a
@@ -6546,6 +6745,15 @@ export class Conductor {
       const undelivered = allNotes.slice(deliveredCount);
       const queuedNotes = undelivered.join("\n");
       const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
+      // Plan 06k3 (A2, finding A-3): name the ref this attempt's unsubmitted
+      // work was saved on, and claim the worktree holds it ONLY when it does
+      // (the worktree may have been reset to the candidate).
+      const savedWork = this.#savedLaneWork().get("a");
+      const savedWorkNote = savedWork
+        ? `Your previous attempt's unsubmitted work is saved on ${savedWork.ref} (${savedWork.sha.slice(0, 7)}).${
+            this.#worktreeMatches(savedWork.sha) ? " Your worktree already holds it; continue from it and submit." : ""
+          }`
+        : undefined;
       await agent.prompt(
         buildWorkerPrompt(
           contract,
@@ -6558,6 +6766,7 @@ export class Conductor {
           this.#baselineFailedCommands(),
           this.#state.phase.messages,
           this.#agentToolLines(),
+          savedWorkNote,
         ),
       );
       // Record delivery only after the prompt was sent; a crash between the
@@ -6575,9 +6784,13 @@ export class Conductor {
         attemptTimer,
         "Owner (conductor): no progress for a while. Continue the work now, or call submit_phase with what you have and disclose what is unfinished.",
       );
+      // Plan 06k3 (A2): at 75% of the attempt the worker is told how many
+      // minutes remain and to submit. The steer timer is paused with the
+      // attempt clock, so a paused attempt is not steered early.
+      const clockSteer = this.#scheduleClockSteer(agentId, agent, this.#deadlines.workerAttemptMs);
       // Plan 06k1 (A4): pause this worker while another run's check window is
       // open.
-      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, agent, attemptTimer);
+      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, agent, attemptTimer, clockSteer.timer);
       const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap" | "compactionFailed">> = [
         donePromise.then(() => "submitted" as const),
         agent.waitSettled().then(() => "settled" as const),
@@ -6594,6 +6807,7 @@ export class Conductor {
       if (tokenCap) races.push(tokenCap.promise.then(() => "tokenCap" as const));
       const outcome = await Promise.race(races);
       workerTimeout.cancel();
+      clockSteer.cancel();
       stopCheckWindowWatch();
       tokenCap?.cancel();
       // design §9.3's "after the effect but before its completion event"
@@ -6629,6 +6843,9 @@ export class Conductor {
       }
       if (outcome === "timeout" || outcome === "tokenCap") {
         await agent.terminate();
+        // Plan 06k3 (A2): the work the worker did not submit in time is
+        // committed to a ref, never discarded.
+        this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
         await this.#sweepAndClear(handle);
         this.#applyEvent({ type: "ATTEMPT_TIMED_OUT" });
         return;
@@ -6641,6 +6858,7 @@ export class Conductor {
         // Plan 06k1 (A6): a failed compaction is the same end — the worker
         // can never submit.
         await agent.terminate();
+        this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
         this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
         return;
       }
@@ -6648,6 +6866,7 @@ export class Conductor {
       // force-killed, crashed, or otherwise — without ever completing a
       // submission. Design §9.3's "agent attempt" reconciliation: kill
       // every recorded shell group, sweep, mark the attempt interrupted.
+      this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
       await this.#sweepAndClear(handle);
       this.#applyEvent({ type: "ATTEMPT_INTERRUPTED" });
     } finally {
@@ -7427,6 +7646,62 @@ export class Conductor {
     return path.join(this.#runDir, "worktrees", `lane-${lane}`);
   }
 
+  /** Plan 06k3 (A4): the candidate a lane's submission started from — its
+   * per-lane base. A lane restarted from its own losing candidate (02k's
+   * `repeatLaneBases`) compares against that candidate, not the phase's own. */
+  #laneStartSha(lane: string, round: number | undefined): string | undefined {
+    if (round === undefined) return this.#state.phase.candidate?.sha;
+    const rounds = this.#state.phase.rounds ?? [];
+    const prev = rounds.find((x) => x.round === round - 1);
+    // A lane restarted from its own previous candidate (02k's per-lane base)
+    // compares against THAT candidate.
+    const repeated = repeatLaneBases(prev)?.[lane];
+    if (repeated) return repeated;
+    // Otherwise the lane started from the phase's own candidate (a repair
+    // round). Round 1 starts from the integration head, which is not a
+    // candidate: an unchanged submission there is not a resubmission.
+    return this.#state.phase.candidate?.sha;
+  }
+
+  /** Plan 06k3 (A2): commit a worker's uncommitted work to
+   * `refs/tt/<run>/unsubmitted/<attempt>-<lane>` so it is never discarded.
+   * The commit is built from a TEMP index and `commit-tree`, so the worktree's
+   * HEAD and index are untouched (a later base decision is not confused by a
+   * save). Recorded as an event so the next attempt of that lane can start
+   * from it and its prompt can name the ref. A clean worktree saves nothing. */
+  #saveUnsubmittedWork(lane: string, attempt: number, worktree: string): void {
+    try {
+      const ref = `refs/tt/${this.#state.phase.runId}/unsubmitted/${attempt}-${lane}`;
+      const sha = gitSaveUnsubmittedWork(
+        this.#plan.repo,
+        worktree,
+        ref,
+        `phase ${this.#state.phase.phaseId} unsubmitted work attempt ${attempt} lane ${lane}`,
+      );
+      if (!sha) return;
+      this.#unsavedLaneWorktrees.delete(lane);
+      this.#applyEvent({ type: "UNSUBMITTED_WORK_SAVED", lane, attempt, ref, sha });
+      this.#log.append("unsubmitted_work_saved", { lane, attempt, ref, sha });
+    } catch (err) {
+      // Plan 06k3 (A2, findings A-13/T-29): the ref was not written, so the
+      // work would be lost when the next round recreates the worktree. Mark
+      // the lane so #buildLane keeps the dirty worktree instead.
+      this.#unsavedLaneWorktrees.add(lane);
+      this.#log.append("unsubmitted_work_save_failed", { lane, attempt, error: String((err as Error)?.message ?? err) });
+    }
+  }
+
+  /** Plan 06k3 (A2): each lane's most recent saved unsubmitted work, keyed by
+   * lane. The next round uses it as that lane's base only when the lane has no
+   * passing candidate to restart from (a passing candidate always wins). */
+  #savedLaneWork(): Map<string, { ref: string; sha: string }> {
+    const out = new Map<string, { ref: string; sha: string }>();
+    for (const w of this.#state.phase.unsubmittedWork ?? []) {
+      out.set(w.lane, { ref: w.ref, sha: w.sha });
+    }
+    return out;
+  }
+
   /** The lane sweep's `cwdUnder`: the SAME directory, with symlinks resolved.
    * `lsof` reports a process's real cwd (on macOS `/tmp` is `/private/tmp`),
    * and `sweepDecision`'s lane rule compares plain paths — so an unresolved
@@ -7581,6 +7856,23 @@ export class Conductor {
           .join(", ")}) starts this round from that candidate, so your worktree already holds your previous work: continue from it and fix what the reviews found.`,
       );
     }
+    // Plan 06k3 (A2): a lane whose previous attempt missed its deadline starts
+    // from its saved unsubmitted work; the prompt names the ref so the worker
+    // knows its earlier work is already in the worktree.
+    if (this.#laneSavedWorkForRound.length > 0) {
+      lines.push(
+        "A lane whose previous attempt ended without submitting starts from its saved uncommitted work, already in its worktree:",
+        ...this.#laneSavedWorkForRound.map((w) => `- lane ${w.lane}: ${w.sha.slice(0, 7)} on ${w.ref}`),
+      );
+    }
+    // Plan 06k3 (A2, findings A-13/T-29): a lane whose work could not be saved
+    // to a ref keeps its dirty worktree; its work is still there.
+    const retained = this.#lanes().filter((l) => this.#unsavedLaneWorktrees.has(l));
+    if (retained.length > 0) {
+      lines.push(
+        `A lane whose unsubmitted work could not be saved to a ref keeps its worktree, so its earlier work is still in it: ${retained.join(", ")}.`,
+      );
+    }
     // Plan 06k1 (A1): when a majority of the previous round's seats said the
     // losing lane had something the winner lacked, the losing lane's anchors
     // are carried into this round's prompt, so both lanes can take them on.
@@ -7626,10 +7918,17 @@ export class Conductor {
     // single-worker reset — never a bare throw the round swallows without a
     // lane-specific reason.
     try {
-      if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
-      crashAt("before_create_worktree");
-      createWorktree(this.#plan.repo, worktree, base);
-      crashAt("after_create_worktree");
+      if (this.#unsavedLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
+        // Plan 06k3 (A2, findings A-13/T-29): the previous attempt's work
+        // could not be written to a ref, so its dirty worktree is kept as-is
+        // and the worker continues in it.
+        this.#log.append("lane_worktree_reused", { lane, round, reason: "unsubmitted work was not saved to a ref" });
+      } else {
+        if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+        crashAt("before_create_worktree");
+        createWorktree(this.#plan.repo, worktree, base);
+        crashAt("after_create_worktree");
+      }
     } catch (err) {
       const error = String((err as Error)?.message ?? err);
       this.#log.append("lane_worktree_failed", { lane, round, base, error });
@@ -7700,9 +7999,13 @@ export class Conductor {
         }
       }
       const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
+      // Plan 06k3 (A2): at 75% of the attempt the lane worker is told how many
+      // minutes remain and to submit. The steer timer pauses with the attempt
+      // clock.
+      const clockSteer = this.#scheduleClockSteer(agentId, handle.agent, this.#deadlines.workerAttemptMs);
       // Plan 06k1 (A4): a lane worker pauses while another run's check window
       // is open, exactly like the single-candidate worker.
-      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, handle.agent, timeout);
+      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, handle.agent, timeout, clockSteer.timer);
       const outcome = await Promise.race([
         handle.donePromise.then(() => "submitted" as const),
         handle.agent.waitSettled().then(() => "settled" as const),
@@ -7714,9 +8017,13 @@ export class Conductor {
         timeout.promise,
       ]);
       timeout.cancel();
+      clockSteer.cancel();
       stopCheckWindowWatch();
       if (outcome !== "submitted") {
         await handle.agent.terminate();
+        // Plan 06k3 (A2): the work the lane did not submit in time is
+        // committed to a ref, never discarded; the next round starts from it.
+        this.#saveUnsubmittedWork(lane, this.#state.phase.attempt.n, worktree);
         const note =
           outcome === "timeout"
             ? "the lane's worker timed out before submitting"
@@ -7737,6 +8044,9 @@ export class Conductor {
         cwdUnder: this.#laneSweepRoot(worktree),
       });
       this.#log.append("sweep", { ...sweepResult, lane });
+      // The lane produced a candidate: its retained dirty worktree is no
+      // longer needed (the candidate carries the work).
+      this.#unsavedLaneWorktrees.delete(lane);
       const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} lane ${lane} candidate`);
       const candidateDir = path.join(this.#paths.candidates, sha);
       if (!fs.existsSync(candidateDir)) materializeCandidate(this.#plan.repo, sha, candidateDir);
@@ -7966,6 +8276,13 @@ export class Conductor {
     // Only turn 2 (after the discovery barrier) knows every seat's
     // discoveries, and only its plan is cached for the hand-off.
     const plan = opts.final ? this.#laneDiscoveryPlan(round, lane, sha) : [];
+    // Plan 06k3 (A3): the lane's submission answers are shown on its findings,
+    // so the reproduction table pairs each finding with THIS lane's answer.
+    const answers = new Map((build?.answers ?? []).map((a) => [a.findingId, a]));
+    const findings =
+      answers.size === 0
+        ? this.#state.phase.findings
+        : this.#state.phase.findings.map((f) => (answers.has(f.id) ? { ...f, answer: answers.get(f.id) } : f));
     const discovered: Decision[] = plan.map(({ seat, disclosure, id }) => ({
       id,
       version: 1,
@@ -7983,9 +8300,33 @@ export class Conductor {
       ...this.#state.phase,
       candidate: { sha, contractVersion: K },
       decisions: [...workerDecisions, ...discovered, ...this.#laneTriggerDecisions(round, lane, sha)],
+      findings,
       ...(build?.coverage !== undefined ? { coverage: build.coverage as Coverage } : {}),
       checkResolution: this.#laneCheckResolutions.get(sha) ?? [],
     };
+  }
+
+  /** Plan 06k3 (A1): one seat's lane review. A review turn that ends without
+   * its submission (timeout, exit, settled) is run once more with a FRESH
+   * agent for that seat before the round fails; the retry is logged. */
+  async #runLaneReview(round: number, lane: string, sha: string, seat: string): Promise<void> {
+    try {
+      await this.#runLaneReviewOnce(round, lane, sha, seat);
+      return;
+    } catch (err) {
+      this.#log.append("lane_review_retried", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
+    }
+    try {
+      await this.#runLaneReviewOnce(round, lane, sha, seat, true);
+    } catch (err) {
+      // Plan 06k3 (A1, finding A-1): only now — after the retry also failed —
+      // does this seat arrive at the discovery barrier. Marking it arrived
+      // while a retry was still coming let the other seats build and cache
+      // their turn-2 plan without the retry's discovery.
+      this.#laneArriveAtBarrier(round, lane, seat);
+      this.#log.append("lane_review_retry_failed", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
+      throw err;
+    }
   }
 
   /** Plan 06g2: one seat's review of one passing lane candidate — today's
@@ -7995,10 +8336,10 @@ export class Conductor {
    * reviews the lane's decisions, findings and item verdicts. A review that
    * cannot be taken THROWS: the round then fails and repeats, so a winner is
    * never handed off with fewer than K × N reviews. */
-  async #runLaneReview(round: number, lane: string, sha: string, seat: string): Promise<void> {
+  async #runLaneReviewOnce(round: number, lane: string, sha: string, seat: string, retry = false): Promise<void> {
     const candidateDir = path.join(this.#paths.candidates, sha);
     const actionId = this.#log.actionId(`lane_review_${round}_${lane}_${seat}`);
-    this.#log.intent(actionId, { round, lane, seat, candidateSha: sha });
+    this.#log.intent(actionId, { round, lane, seat, candidateSha: sha, ...(retry ? { retry: true } : {}) });
     const agentId = `lane-review-${round}-${lane}-${seat}-${actionId}`;
     this.#laneReviewerReads.set(`${seat}@${sha}`, new Set());
     this.#laneReviewerCommands.set(`${seat}@${sha}`, new Set());
@@ -8008,8 +8349,10 @@ export class Conductor {
       cwd: candidateDir,
       // A FRESH session per (round, lane, seat): a seat judging the second
       // candidate must not carry the first's review in context (M's veto of
-      // the shared session), and a later round re-reviews from scratch.
-      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}`),
+      // the shared session), and a later round re-reviews from scratch. Plan
+      // 06k3 (A1): the retry gets its OWN session dir, so the fresh agent does
+      // not inherit the failed attempt's context.
+      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}${retry ? "-retry" : ""}`),
       env: this.#laneEnv(candidateDir, {
         ...(this.#piEnvFor?.("reviewer", agentId) ?? {}),
         TT_CANDIDATE_SHA: sha,
@@ -8021,6 +8364,9 @@ export class Conductor {
       laneReview: { round, lane, sha, seat },
     });
     const lanePhase = this.#lanePhase(round, lane, sha);
+    // Plan 06k3 (A3): the lane's reproduction table, computed once per
+    // candidate after its checks.
+    await this.#ensureReproductionTable(lanePhase, sha);
     try {
       const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
       if (hello === "timeout" || !hello.ok) {
@@ -8132,10 +8478,10 @@ export class Conductor {
         );
       }
     } finally {
-      // A seat that died or timed out never reaches the barrier: the other
-      // seats must not wait out their own deadline for it. Marking it arrived
-      // releases them, and the round still fails on the missing review.
-      this.#laneArriveAtBarrier(round, lane, seat);
+      // Plan 06k3 (A1, finding A-1): a failed attempt does NOT mark the seat
+      // arrived — a retry may still come, and the other seats must wait for
+      // its discovery. The wrapper marks arrival only after the retry also
+      // fails (so nobody waits out their own deadline for a dead seat).
       this.#agents.delete(agentId);
     }
   }
@@ -8163,9 +8509,9 @@ export class Conductor {
     });
   }
 
-  /** One seat's pick turn. The prompt is `buildPickPrompt` (the leader seat
-   * carries the ledger, every earlier round and the other candidates' diffs);
-   * the vote itself is recorded by `submit_pick_vote`. */
+  /** Plan 06k3 (A1): one seat's pick turn. A pick turn that ends without its
+   * vote (timeout, exit, settled) is run once more with a FRESH agent for
+   * that seat before the round fails; the retry is logged. */
   async #runPickTurn(
     round: number,
     base: string,
@@ -8173,8 +8519,36 @@ export class Conductor {
     passing: ReadonlyArray<{ lane: string; sha: string }>,
     revote = false,
   ): Promise<void> {
+    try {
+      await this.#runPickTurnOnce(round, base, seat, passing, revote);
+      return;
+    } catch (err) {
+      this.#log.append("pick_retried", { round, seat, revote, reason: String((err as Error)?.message ?? err) });
+    }
+    try {
+      // Plan 06k3 (A1, findings F-13/D-M-37): the retry runs with a FRESH
+      // session (its own `-retry` dir), exactly like the lane-review retry, so
+      // it does not inherit the failed attempt's context.
+      await this.#runPickTurnOnce(round, base, seat, passing, revote, true);
+    } catch (err) {
+      this.#log.append("pick_retry_failed", { round, seat, revote, reason: String((err as Error)?.message ?? err) });
+      throw err;
+    }
+  }
+
+  /** One seat's pick turn. The prompt is `buildPickPrompt` (the leader seat
+   * carries the ledger, every earlier round and the other candidates' diffs);
+   * the vote itself is recorded by `submit_pick_vote`. */
+  async #runPickTurnOnce(
+    round: number,
+    base: string,
+    seat: string,
+    passing: ReadonlyArray<{ lane: string; sha: string }>,
+    revote = false,
+    retry = false,
+  ): Promise<void> {
     const actionId = this.#log.actionId(`${revote ? "revote" : "pick"}_${round}_${seat}`);
-    this.#log.intent(actionId, { round, seat, lanes: passing.map((c) => c.lane), ...(revote ? { revote: true } : {}) });
+    this.#log.intent(actionId, { round, seat, lanes: passing.map((c) => c.lane), ...(revote ? { revote: true } : {}), ...(retry ? { retry: true } : {}) });
     const agentId = `${revote ? "revote" : "pick"}-${round}-${seat}-${actionId}`;
     const leader = seat === this.#laneLeader();
     const otherDiffs: Record<string, string> = {};
@@ -8206,7 +8580,8 @@ export class Conductor {
       role: "picker",
       agentId,
       cwd: fs.existsSync(candidateDir) ? candidateDir : this.#runDir,
-      sessionDir: path.join(this.#paths.sessions, `pick-${seat}`),
+      // Plan 06k3 (A1, finding D-M-37): the retry gets its own session dir.
+      sessionDir: path.join(this.#paths.sessions, `pick-${seat}${retry ? "-retry" : ""}`),
       env: this.#laneEnv(this.#runDir, {
         ...(this.#piEnvFor?.("picker", agentId) ?? {}),
         TT_REVIEWER: seat,
@@ -8221,7 +8596,10 @@ export class Conductor {
       if (hello === "timeout" || !hello.ok) {
         await handle.agent.terminate();
         this.#log.completion(actionId, { round, seat, ok: false, reason: "the seat did not start" });
-        return;
+        // Plan 06k3 (A1, finding F-13): a picker that never starts is a
+        // failed pick turn, so #runPickTurn's one retry runs. Returning here
+        // let a seat that never starts skip the retry entirely.
+        throw new Error(hello === "timeout" ? "the seat did not start (hello timed out)" : "the seat failed to start");
       }
       await handle.agent.prompt(this.#agentPrompt(prompt));
       const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
@@ -8304,86 +8682,131 @@ export class Conductor {
    * module that decides the sequence; this implements its host callbacks. */
   async #runLaneRound(actionId: string): Promise<void> {
     const lanes = this.#lanes();
-    // The round number: the next one, unless the last round is INCOMPLETE (a
-    // conductor crash left it with fewer lane records than it has lanes) —
-    // then the round is re-run under its own number, and ROUND_STARTED
-    // replaces the partial record rather than leaving it as a stale round.
-    const rounds = this.#state.phase.rounds ?? [];
-    const last = rounds[rounds.length - 1];
-    const round = last !== undefined && last.candidates.length < lanes.length ? last.round : (last?.round ?? 0) + 1;
-    const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
-    // 02k: a repeat of a round that failed only for a missing review or vote
-    // restarts each lane that passed its checks from its own candidate.
-    const laneBases = last && last.round === round - 1 ? repeatLaneBases(last) : undefined;
-    this.#log.intent(actionId, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
-    const host: LaneHost = {
-      phaseId: this.#state.phase.phaseId,
-      goal: this.#state.phase.contract.goal,
-      seats: this.#laneSeats(),
-      leader: this.#laneLeader(),
-      rounds: () => this.#state.phase.rounds ?? [],
-      ledger: () => this.#laneLedgerLines(),
-      earlierRounds: () => this.#laneEarlierRoundLines(round),
-      createWorktree: (lane, at) => {
-        const worktree = this.#laneWorktree(lane);
-        if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
-        createWorktree(this.#plan.repo, worktree, at);
-        return worktree;
-      },
-      lanePrompt: (r, at) => this.#laneWorkerPrompt(r, at),
-      buildLane: async (lane, r, at, prompt) => {
-        const built = await this.#buildLane(lane, r, at, prompt);
-        // Kept for the lane review prompts, which need the lane's own
-        // disclosures before the winner's hand-off assembles them.
-        this.#laneBuilds.set(`${r}-${lane}`, built);
-        return built;
-      },
-      checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
-      reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
-      pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
-      emit: (event) => this.#applyEvent(event),
-    };
-    const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
-    this.#log.completion(actionId, {
-      round,
-      base,
-      lanes,
-      ...(outcome.winner ? { winner: outcome.winner } : {}),
-      ...(outcome.failure ? { failure: outcome.failure } : {}),
-      ...(outcome.missingVotes ? { missingVotes: outcome.missingVotes } : {}),
-      candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
-    });
-    if (outcome.missingVotes) this.#log.append("pick_votes_missing", { round, seats: outcome.missingVotes, winner: outcome.winner?.lane });
-    if (!outcome.winner) {
-      // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
-      // the phase is already CHECKING and the checks are re-running, so this
-      // stopped round must not emit an attempt-failure event.
+    let loggedIntent = false;
+    // Plan 06k3 (A1): a round that fails only because a lane review or pick
+    // vote is still missing after its retry is repeated in place WITHOUT
+    // spending a repair attempt, at most twice per phase; after that it counts
+    // as before. The counter is an event, so a restart cannot reset it.
+    for (;;) {
+      // The round number: the next one, unless the last round is INCOMPLETE (a
+      // conductor crash left it with fewer lane records than it has lanes) —
+      // then the round is re-run under its own number, and ROUND_STARTED
+      // replaces the partial record rather than leaving it as a stale round.
+      const rounds = this.#state.phase.rounds ?? [];
+      const last = rounds[rounds.length - 1];
+      const round = last !== undefined && last.candidates.length < lanes.length ? last.round : (last?.round ?? 0) + 1;
+      const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+      // 02k: a repeat of a round that failed only for a missing review or vote
+      // restarts each lane that passed its checks from its own candidate.
+      const passingBases = last && last.round === round - 1 ? repeatLaneBases(last) : undefined;
+      // Plan 06k3 (A2): a lane that produced no passing candidate starts from
+      // its own saved unsubmitted work (never discarded at its deadline).
+      const saved = this.#savedLaneWork();
+      const prevCandidate = new Map((last?.candidates ?? []).map((c) => [c.lane, c.sha]));
+      const mergedLaneBases: Record<string, string> = {};
+      const usedSaved: Array<{ lane: string; ref: string; sha: string }> = [];
+      for (const lane of lanes) {
+        const passing = passingBases?.[lane];
+        if (passing) {
+          mergedLaneBases[lane] = passing;
+          continue;
+        }
+        // Plan 06k3 (A2, finding A-2): only a lane that produced NO candidate
+        // in the previous round starts from its saved work. A lane that did
+        // produce one starts from the round's own base (the winner / phase
+        // candidate), never from an older saved ref.
+        if (last && prevCandidate.get(lane)) continue;
+        const work = saved.get(lane);
+        if (work) {
+          mergedLaneBases[lane] = work.sha;
+          usedSaved.push({ lane, ref: work.ref, sha: work.sha });
+        }
+      }
+      this.#laneSavedWorkForRound = usedSaved;
+      const laneBases = Object.keys(mergedLaneBases).length > 0 ? mergedLaneBases : undefined;
+      if (!loggedIntent) {
+        this.#log.intent(actionId, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
+        loggedIntent = true;
+      }
+      const host: LaneHost = {
+        phaseId: this.#state.phase.phaseId,
+        goal: this.#state.phase.contract.goal,
+        seats: this.#laneSeats(),
+        leader: this.#laneLeader(),
+        rounds: () => this.#state.phase.rounds ?? [],
+        ledger: () => this.#laneLedgerLines(),
+        earlierRounds: () => this.#laneEarlierRoundLines(round),
+        createWorktree: (lane, at) => {
+          const worktree = this.#laneWorktree(lane);
+          if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+          createWorktree(this.#plan.repo, worktree, at);
+          return worktree;
+        },
+        lanePrompt: (r, at) => this.#laneWorkerPrompt(r, at),
+        buildLane: async (lane, r, at, prompt) => {
+          const built = await this.#buildLane(lane, r, at, prompt);
+          // Kept for the lane review prompts, which need the lane's own
+          // disclosures before the winner's hand-off assembles them.
+          this.#laneBuilds.set(`${r}-${lane}`, built);
+          return built;
+        },
+        checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
+        reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
+        pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
+        emit: (event) => this.#applyEvent(event),
+      };
+      const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
+      this.#log.completion(actionId, {
+        round,
+        base,
+        lanes,
+        ...(outcome.winner ? { winner: outcome.winner } : {}),
+        ...(outcome.failure ? { failure: outcome.failure } : {}),
+        ...(outcome.missingVotes ? { missingVotes: outcome.missingVotes } : {}),
+        candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
+      });
+      if (outcome.missingVotes) this.#log.append("pick_votes_missing", { round, seats: outcome.missingVotes, winner: outcome.winner?.lane });
+      if (!outcome.winner) {
+        // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
+        // the phase is already CHECKING and the checks are re-running, so this
+        // stopped round must not emit an attempt-failure event.
+        if (this.#recheckCancelledLaneRound) {
+          this.#recheckCancelledLaneRound = false;
+          this.#clearLaneRound(round);
+          return;
+        }
+        // Plan 06k3 (A1): a round that could not complete (a missing review or
+        // pick vote after its retry) is repeated in place without spending a
+        // repair attempt, at most twice per phase.
+        if (outcome.failure && (this.#state.phase.roundRepeatsUsed ?? 0) < MAX_ROUND_REPEATS) {
+          this.#log.append("round_repeated", { round, reason: outcome.failure, repeatsUsed: this.#state.phase.roundRepeatsUsed ?? 0 });
+          this.#applyEvent({ type: "ROUND_REPEATED", round, reason: outcome.failure });
+          this.#clearLaneRound(round);
+          continue;
+        }
+        // No candidate passed, OR the round could not complete (a missing
+        // review or pick vote — `runRound` refuses to pick an incomplete
+        // round). Either way the round repeats from the same base, and the
+        // repeat costs ONE repair attempt (a round is one attempt, whatever K
+        // is). ATTEMPT_NO_SUBMISSION is the ordinary "this attempt produced no
+        // acceptable candidate" event; REPAIRING then starts the next round.
+        if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
+        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+        this.#clearLaneRound(round);
+        return;
+      }
       if (this.#recheckCancelledLaneRound) {
+        // Defensive: the recheck stopped the round but a winner still emerged
+        // (a lane submitted just before termination). Do not hand it off.
         this.#recheckCancelledLaneRound = false;
         this.#clearLaneRound(round);
         return;
       }
-      // No candidate passed, OR the round could not complete (a missing
-      // review or pick vote — `runRound` refuses to pick an incomplete
-      // round). Either way the round repeats from the same base, and the
-      // repeat costs ONE repair attempt (a round is one attempt, whatever K
-      // is). ATTEMPT_NO_SUBMISSION is the ordinary "this attempt produced no
-      // acceptable candidate" event; REPAIRING then starts the next round.
-      if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
-      this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+      const build = outcome.builds.find((b) => b.lane === outcome.winner!.lane);
+      await this.#handOffLaneWinner(round, outcome.winner, build);
       this.#clearLaneRound(round);
       return;
     }
-    if (this.#recheckCancelledLaneRound) {
-      // Defensive: the recheck stopped the round but a winner still emerged
-      // (a lane submitted just before termination). Do not hand it off.
-      this.#recheckCancelledLaneRound = false;
-      this.#clearLaneRound(round);
-      return;
-    }
-    const build = outcome.builds.find((b) => b.lane === outcome.winner!.lane);
-    await this.#handOffLaneWinner(round, outcome.winner, build);
-    this.#clearLaneRound(round);
   }
 
   /** Drops one round's per-lane scratch state (its builds, discoveries and
@@ -8439,6 +8862,7 @@ export class Conductor {
       this.#applyEvent({
         type: "SUBMIT_PHASE",
         disclosures: build?.disclosures ?? [],
+        ...(build?.answers ? { findingAnswers: build.answers } : {}),
         ...(build?.prior ? { prior: build.prior } : {}),
         ...(build?.dispute ? { dispute: build.dispute } : {}),
       });
@@ -10779,6 +11203,10 @@ export class Conductor {
 
   async #runReview(actionId: string, reviewer: Reviewer): Promise<void> {
     const dispatchCandidate = this.#state.phase.candidate?.sha;
+    // Plan 06k3 (A3): re-run every open finding's reproduction command in this
+    // candidate (after the checks) and build the table every reviewer prompt
+    // shows. Computed once per candidate, before the first review dispatch.
+    if (dispatchCandidate) await this.#ensureReproductionTable(this.#state.phase, dispatchCandidate);
     // Plan 06b (finding M-1): a fresh dispatch is a fresh review, so the
     // files this seat read in an earlier round no longer count as "read in
     // this review".
@@ -12411,6 +12839,9 @@ export class Conductor {
       // mask still tells the reviewer that this file holds a secret.
       redactText(diff, this.#secretMaskable),
       "```",
+      // Plan 06k3 (A3): the finding answers and reproduction re-runs reach
+      // every reviewer prompt, turn 1 included.
+      ...(this.#reproductionTableLines.get(phase.candidate?.sha ?? "") ?? []),
       "Call submit_discovery with at most 5 choices that change behaviour, interfaces, guarantees or cost where the plan left room. Each choice is one plain sentence of at most 20 words. Do not list implementation details (helper structure, naming, file layout) and do not give review advice here — correctness problems are findings, which you raise in turn 2. An empty list is fine.",
     ].join("\n");
   }
@@ -12519,6 +12950,9 @@ export class Conductor {
         ...openFindings.map((f) => `- ${f.id} [${f.severity} ${f.kind}, raised by ${f.raisedBy}]: ${f.evidence}`),
       );
     }
+    // Plan 06k3 (A3): the worker's answer to each open blocking finding and
+    // the conductor's re-run of its reproduction command on this candidate.
+    lines.push(...(this.#reproductionTableLines.get(C) ?? []));
     // Plan 05e (4): every earlier round's open finding/blocker message, so
     // each reviewer marks each `resolved` or `open` with evidence; a 2-of-3
     // `resolved` majority moves it out of the owner's live view.
@@ -12749,6 +13183,7 @@ interface SubmitPhaseArgs {
   decisions?: DecisionDisclosure[];
   priorDecisions?: PriorDecisionStatement[];
   criterionDispute?: CriterionDispute;
+  findingAnswers?: FindingAnswer[];
   assumptions?: string[];
   deviations?: string[];
 }
@@ -13087,6 +13522,9 @@ export function buildWorkerPrompt(
   /** Plan 06c (R6): the tools the preflight did not find, named so the worker
    * knows what its environment lacks. */
   toolLines: readonly string[] = [],
+  /** Plan 06k3 (A2): a note naming the ref the worker's unsubmitted work from
+   * its previous attempt was saved on, so the next attempt starts from it. */
+  savedWorkNote?: string,
 ): string {
   const structured = isStructured(contract);
   const lines: string[] = [
@@ -13118,12 +13556,19 @@ export function buildWorkerPrompt(
   // worker's (runtime doc §6's structural incentive to substitute it).
   lines.push(...gatePromptLines(contract.gate));
   if (interruptionNote) lines.push("", interruptionNote);
+  if (savedWorkNote) lines.push("", savedWorkNote);
   if (repair) {
     lines.push(
       "",
       `REPAIR (round ${repair.round + 1}): your previous candidate ${repair.previousCandidate.slice(0, 7)} was reviewed and NOT accepted. Fix what blocks acceptance; keep what was approved.`,
     );
-    if (repair.blocking.length > 0) lines.push("Blocking (must be fixed):", ...repair.blocking.map((b) => `- ${b}`));
+    if (repair.blocking.length > 0) {
+      lines.push("Blocking (must be fixed):", ...repair.blocking.map((b) => `- ${b}`));
+      // Plan 06k3 (A3): the submission must answer each open blocking finding.
+      lines.push(
+        "In submit_phase, answer EVERY open blocking finding above in `findingAnswers`: { findingId, status: 'fixed', test } with the test that now covers it, or { findingId, status: 'disputed', reason }. A submission that leaves one unanswered is refused before the freeze, naming the missing ids.",
+      );
+    }
     if (repair.failedDecisions.length > 0) {
       lines.push("Decisions whose vote failed (change them, or keep them and answer the objection with evidence):", ...repair.failedDecisions.map((d) => `- ${d}`));
     }

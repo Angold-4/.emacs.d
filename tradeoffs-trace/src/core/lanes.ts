@@ -25,6 +25,7 @@ import type {
   CriterionDispute,
   DecisionDisclosure,
   Event,
+  FindingAnswer,
   PriorDecisionStatement,
   RoundRecord,
 } from "./types.ts";
@@ -43,6 +44,9 @@ export interface LaneBuild {
   disclosures?: DecisionDisclosure[];
   prior?: PriorDecisionStatement[];
   dispute?: CriterionDispute;
+  /** Plan 06k3 (A3): the lane's answers to the open blocking findings, for
+   * the winner's hand-off. */
+  answers?: FindingAnswer[];
   /** The lane's own `submit_coverage` payload, for the winner's hand-off. */
   coverage?: unknown;
 }

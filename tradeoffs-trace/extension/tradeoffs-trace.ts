@@ -222,6 +222,14 @@ const PriorDecisionParam = Type.Object({
   recommendation: Type.Optional(Type.Object({ choice: Type.String(), reason: Type.String() })),
 });
 
+// Plan 06k3 (A3): one answer per open blocking finding listed in the prompt.
+const FindingAnswerParam = Type.Object({
+  findingId: Type.String({ description: "An open blocking finding id listed in the prompt" }),
+  status: StringEnum(["fixed", "disputed"] as const),
+  test: Type.Optional(Type.String({ description: "fixed only: the test that now covers the finding" })),
+  reason: Type.Optional(Type.String({ description: "disputed only: why the finding is wrong or cannot be fixed" })),
+});
+
 const submitPhaseFields: Record<string, TSchema> = {
   decisions: Type.Array(DecisionParam),
   assumptions: Type.Array(Type.String(), { description: "Assumptions made while implementing" }),
@@ -232,6 +240,12 @@ const submitPhaseFields: Record<string, TSchema> = {
     }),
   ),
   criterionDispute: Type.Optional(CriterionDisputeParam),
+  findingAnswers: Type.Optional(
+    Type.Array(FindingAnswerParam, {
+      description:
+        "Plan 06k3: one answer per open blocking finding listed in the prompt — fixed (with the test that now covers it) or disputed (with the reason). A submission that leaves one unanswered is refused before the freeze.",
+    }),
+  ),
 };
 const SubmitPhaseParams = Type.Object(Object.fromEntries(SUBMIT_PHASE_PARAMS.properties.map((key) => [key, submitPhaseFields[key]])));
 

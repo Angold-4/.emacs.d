@@ -122,7 +122,7 @@ export async function setupConductor(opts: {
    * must submit different (or empty) decisions than the first (e.g.
    * contract-objection.test.ts, so the repair does not re-disclose a
    * duplicate decision). Takes precedence over `workerScript` when given. */
-  workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
+  workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo; state: State }) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 06g2: one script per lane worker (`lane-<round>-<lane>-…`). Absent:
    * `workerScript`/`workerScriptForAttempt` is used for every lane. */
   laneWorkerScriptFor?: (lane: string, round: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
@@ -243,6 +243,11 @@ export async function setupConductor(opts: {
   /** Plan 01b: the conductor's notification clock (injectable), so a test
    * can advance past the 30-minute reminder without waiting. */
   now?: () => number;
+  /** Plan 06k3 (A3): auto-answer every open blocking finding in a repair
+   * worker's `submit_phase`, so the pre-existing repair tests (written before
+   * the finding-answer gate) keep working. Default true; a test that exercises
+   * the gate's refusal passes false. */
+  autoAnswerFindings?: boolean;
 }): Promise<TestConductorSetup> {
   const repo = makeRepo();
   const runRoot = makeRunRoot();
@@ -405,7 +410,8 @@ export async function setupConductor(opts: {
         const lane = laneWorker[2];
         const key = `${round}-${lane}-${agentId}`;
         if (!laneWorkerScriptPaths.has(key)) {
-          laneWorkerScriptPaths.set(key, writeScript(scriptsDir, key, opts.laneWorkerScriptFor(lane, round, conductor.state)));
+          const script = withFindingAnswers(opts.laneWorkerScriptFor(lane, round, conductor.state), conductor.state, opts.autoAnswerFindings !== false);
+          laneWorkerScriptPaths.set(key, writeScript(scriptsDir, key, script));
         }
         return { FAKE_PI_SCRIPT: laneWorkerScriptPaths.get(key)!, ...(opts.extraWorkerEnv ?? {}) };
       }
@@ -432,7 +438,8 @@ export async function setupConductor(opts: {
         if (opts.workerScriptForAttempt) {
           const attempt = Number(agentId.match(/^worker-(\d+)-/)?.[1] ?? "1");
           if (!workerScriptPaths.has(attempt)) {
-            workerScriptPaths.set(attempt, writeScript(scriptsDir, `worker-${attempt}`, opts.workerScriptForAttempt(attempt, { repo })));
+            const script = withFindingAnswers(opts.workerScriptForAttempt(attempt, { repo, state: conductor.state }), conductor.state, opts.autoAnswerFindings !== false);
+            workerScriptPaths.set(attempt, writeScript(scriptsDir, `worker-${attempt}`, script));
           }
           return { FAKE_PI_SCRIPT: workerScriptPaths.get(attempt)!, ...(opts.extraWorkerEnv ?? {}) };
         }
@@ -580,6 +587,29 @@ function owedItemIds(state: State): string[] {
   // Plan 06c (A4/R9): a unanimous thin met/fits is an owed item check too.
   for (const o of thinMetItems(outcomes, workerAnchorsOf(state.phase.coverage))) ids.add(o.item.id);
   return [...ids];
+}
+
+/** Plan 06k3 (A3): add a `findingAnswers` entry for every open blocking
+ * finding to each `submit_phase` step a worker script carries, so the
+ * pre-existing repair tests (written before the gate) keep working. A test
+ * exercising the refusal passes `autoAnswerFindings: false` and controls the
+ * answers itself. */
+function withFindingAnswers(
+  script: { hello?: unknown; steps: FakePiStep[] },
+  state: State,
+  enabled: boolean,
+): { hello?: unknown; steps: FakePiStep[] } {
+  if (!enabled) return script;
+  const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.severity === "blocking");
+  if (open.length === 0) return script;
+  const answers = open.map((f) => ({ findingId: f.id, status: "disputed" as const, reason: "the worker answers this finding in the candidate" }));
+  const steps = script.steps.map((step) => {
+    if (step.kind !== "call-submit" || step.tool !== "submit_phase") return step;
+    const args = { ...((step.args as Record<string, unknown> | undefined) ?? {}) };
+    if (!Array.isArray(args.findingAnswers)) args.findingAnswers = answers;
+    return { ...step, args };
+  });
+  return { ...script, steps };
 }
 
 export function readEvents(runDir: string): LogRecord[] {

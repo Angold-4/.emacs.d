@@ -62,13 +62,20 @@ test("plan 06k2: a resubmission whose tree equals the last reviewed candidate is
             hello: defaultWorkerHello(),
             steps: [{ kind: "call-sh", command: "printf 'attempt 1\\n' > work.txt" }, submitStep()],
           }
-        : {
-            // The repair worker makes NO change. Its first submit is refused;
-            // the test then asks for an unchanged resubmission, and its second
-            // (still unchanged) submit is accepted.
-            hello: defaultWorkerHello(),
-            steps: [{ kind: "sleep", ms: 2_000 }, submitStep(), { kind: "sleep", ms: 8_000 }, submitStep()],
-          },
+        : attempt === 2
+          ? {
+              // The repair worker makes NO change. Its first submit is refused;
+              // the test then asks for an unchanged resubmission, and its
+              // second (still unchanged) submit is accepted.
+              hello: defaultWorkerHello(),
+              steps: [{ kind: "sleep", ms: 2_000 }, submitStep(), { kind: "sleep", ms: 8_000 }, submitStep()],
+            }
+          : {
+              // Plan 06k3: the owner's permission is one-shot, so a later
+              // attempt must make a real change to be accepted.
+              hello: defaultWorkerHello(),
+              steps: [{ kind: "call-sh", command: "printf 'fixed\\n' > work.txt" }, submitStep()],
+            },
     reviewerScriptFor: (reviewer, state) => {
       const round = state.phase.round ?? 1;
       const open = state.phase.findings.filter((f) => f.status === "open");
@@ -215,4 +222,19 @@ test("plan 06k2: only an asking, in-force unchanged-resubmission steer lifts the
   assert.deepEqual(unchangedResubmissionRequesters([], [{ id: "OD-1", text: "resubmit unchanged", status: "in-force" }]), ["directive:OD-1"]);
   assert.deepEqual(unchangedResubmissionRequesters(["resubmit unchanged"], []), ["note:0"]);
   assert.deepEqual(unchangedResubmissionRequesters(["do not resubmit unchanged"], []), []);
+});
+
+test("plan 06k3: an identical note and directive ask once", () => {
+  // The same ask written as a note and an in-force directive is ONE
+  // permission, not two: consuming the note also spends the directive, so a
+  // single steer cannot lift two unchanged submissions.
+  assert.deepEqual(
+    unchangedResubmissionRequesters(["resubmit unchanged"], [{ id: "OD-1", text: "resubmit unchanged", status: "in-force" }]),
+    ["note:0"],
+  );
+  // Different asks still each count.
+  assert.deepEqual(
+    unchangedResubmissionRequesters(["resubmit unchanged"], [{ id: "OD-1", text: "resubmit it unchanged please", status: "in-force" }]),
+    ["note:0", "directive:OD-1"],
+  );
 });

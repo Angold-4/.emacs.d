@@ -63,7 +63,23 @@
         "criterionDispute": {
           "$ref": "#/$defs/criterionDispute",
           "description": "Plan 01g: say a criterion cannot be met as written, naming it verbatim; the conductor records an amendment the reviewers vote on. A criterion that is merely unmet is a normal repair, not a dispute."
+        },
+        "findingAnswers": {
+          "type": "array",
+          "description": "Plan 06k3 (A3): one answer per open blocking finding listed in the prompt: fixed (with the test that now covers it) or disputed (with the reason). A submission that leaves one unanswered is refused before the freeze.",
+          "items": { "$ref": "#/$defs/findingAnswer" }
         }
+      }
+    },
+    "findingAnswer": {
+      "type": "object",
+      "required": ["findingId", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "findingId": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["fixed", "disputed"] },
+        "test": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
       }
     },
     "criterionDispute": {

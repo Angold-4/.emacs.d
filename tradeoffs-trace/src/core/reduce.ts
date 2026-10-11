@@ -128,6 +128,9 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "DEFERRAL_RECORDED",
   "DEFERRAL_RESOLVED",
   "ROUND_STARTED",
+  "ROUND_REPEATED",
+  "UNCHANGED_PERMISSION_USED",
+  "UNSUBMITTED_WORK_SAVED",
   "CANDIDATE_SUBMITTED",
   "CANDIDATE_CHECKED",
   "PICK_VOTE",
@@ -491,6 +494,32 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     // restart folds to know each round's base, lanes, candidates, votes and
     // winner, and the views render. Every one of them is rejected when its
     // round has not started, so a stray event cannot invent a round.
+    // Plan 06k3 (A1): a free repeat of a round that could not complete (a
+    // missing lane review or pick vote after its retry). Record-only: it
+    // counts the repeat so a conductor restart cannot reset the budget, and
+    // never moves the phase (the conductor re-runs the round in place).
+    case "ROUND_REPEATED": {
+      return ok({ ...state, phase: { ...p, roundRepeatsUsed: (p.roundRepeatsUsed ?? 0) + 1 } });
+    }
+
+    // Plan 06k3 (A4): an unchanged-resubmission permission was used. Recorded
+    // as an event so a restart cannot reopen it.
+    case "UNCHANGED_PERMISSION_USED": {
+      const used = p.consumedUnchangedPermissions ?? [];
+      if (used.includes(event.key)) return ok(state);
+      return ok({ ...state, phase: { ...p, consumedUnchangedPermissions: [...used, event.key] } });
+    }
+
+    // Plan 06k3 (A2): uncommitted work saved at a worker's deadline. Record-
+    // only; the next attempt of `lane` reads it to pick its base and name it.
+    case "UNSUBMITTED_WORK_SAVED": {
+      const others = (p.unsubmittedWork ?? []).filter((w) => !(w.lane === event.lane && w.attempt === event.attempt));
+      return ok({
+        ...state,
+        phase: { ...p, unsubmittedWork: [...others, { lane: event.lane, attempt: event.attempt, ref: event.ref, sha: event.sha }] },
+      });
+    }
+
     case "ROUND_STARTED": {
       if (event.round < 1 || event.lanes.length === 0) {
         return rejected(state, "ROUND_STARTED needs a round number and at least one lane");

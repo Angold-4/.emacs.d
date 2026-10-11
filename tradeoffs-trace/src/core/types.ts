@@ -317,6 +317,11 @@ export interface Finding {
   /** Plan 05e: why the finding's severity changed from the raised one (the
    * evaluator's plan check, or the round panel's vote). */
   severityReason?: string;
+  /** Plan 06k3 (A3): the worker's answer to this open blocking finding,
+   * carried by submit_phase — `fixed` with the test that now covers it, or
+   * `disputed` with the reason. A submission that leaves one unanswered is
+   * refused before the freeze. */
+  answer?: FindingAnswer;
   /** Plan 06i: WHO changed the severity — the evaluator's plan check, the
    * round panel's vote, or a reviewer's `sameAs` re-raise. The triage reads
    * it: a panel drop is a recorded review outcome (a trade-off). */
@@ -649,6 +654,16 @@ export interface BallotDisclosure {
   rationale: string;
   evidence: string[];
   contractObjection?: boolean;
+}
+
+/** Plan 06k3 (A3): a worker's answer to one open blocking finding, carried by
+ * `submit_phase`. `fixed` requires the test that now covers it; `disputed`
+ * requires the reason. */
+export interface FindingAnswer {
+  findingId: string;
+  status: "fixed" | "disputed";
+  test?: string;
+  reason?: string;
 }
 
 export interface FindingDisclosure {
@@ -1132,6 +1147,18 @@ export interface PhaseState {
   integrityViolated?: boolean;
   repairRoundsUsed: number;
   repairRoundsGranted: number; // 3 base, +3 per correction (§7.5, §8.1)
+  /** Plan 06k3 (A1): free repeats of a round that failed only because a lane
+   * review or pick vote was still missing after its retry (at most two per
+   * phase). Recorded as an event so a conductor restart cannot reset it. */
+  roundRepeatsUsed?: number;
+  /** Plan 06k3 (A4): the unchanged-resubmission permission keys already
+   * consumed (e.g. `note:0`, `directive:OD-1`). An event, not process
+   * memory, so a conductor restart cannot reopen a spent permission. */
+  consumedUnchangedPermissions?: string[];
+  /** Plan 06k3 (A2): uncommitted work saved when a worker missed its deadline,
+   * one entry per (lane, attempt) — the next attempt of that lane starts from
+   * `ref` and its prompt names it. */
+  unsubmittedWork?: Array<{ lane: string; attempt: number; ref: string; sha: string }>;
   publishedI?: string;
   /** §7.4 `note`: owner notes queued from the inbox, delivered verbatim in
    * the next worker attempt's prompt (see `deliveredNoteCount` for the
@@ -1414,6 +1441,9 @@ export interface EvAttemptStarted {
 export interface EvSubmitPhase {
   type: "SUBMIT_PHASE";
   disclosures: DecisionDisclosure[];
+  /** Plan 06k3 (A3): one answer per open blocking finding (fixed with the
+   * covering test, or disputed with the reason). */
+  findingAnswers?: FindingAnswer[];
   /** Plan 2c: statements about prior decisions (repair attempts only). */
   prior?: PriorDecisionStatement[];
   /** Plan 01g: a criterion the worker says cannot be met as written; freeze
@@ -2434,6 +2464,33 @@ export interface EvRoundStarted {
   lanes: string[];
 }
 
+/** Plan 06k3 (A1): a round that failed only because a lane review or pick
+ * vote was still missing after its retry was repeated without spending a
+ * repair attempt. Record-only; `roundRepeatsUsed` counts them. */
+export interface EvRoundRepeated {
+  type: "ROUND_REPEATED";
+  round: number;
+  reason: string;
+}
+
+/** Plan 06k3 (A4): one unchanged-resubmission permission was used. Record-only
+ * so a conductor restart cannot reopen it. */
+export interface EvUnchangedPermissionUsed {
+  type: "UNCHANGED_PERMISSION_USED";
+  key: string;
+}
+
+/** Plan 06k3 (A2): a worker missed its deadline and its uncommitted work was
+ * committed to `ref` (never discarded); the next attempt of `lane` starts
+ * from it. Record-only. */
+export interface EvUnsubmittedWorkSaved {
+  type: "UNSUBMITTED_WORK_SAVED";
+  lane: string;
+  attempt: number;
+  ref: string;
+  sha: string;
+}
+
 /** One lane froze a candidate. Record-only; `sha` is the lane's commit. */
 export interface EvCandidateSubmitted {
   type: "CANDIDATE_SUBMITTED";
@@ -2505,6 +2562,9 @@ export interface EvRoundReviewSubmitted {
 
 export type Event =
   | EvRoundStarted
+  | EvRoundRepeated
+  | EvUnchangedPermissionUsed
+  | EvUnsubmittedWorkSaved
   | EvCandidateSubmitted
   | EvCandidateChecked
   | EvPickVote
