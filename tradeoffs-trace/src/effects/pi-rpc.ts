@@ -196,9 +196,10 @@ export class PiAgent {
       if (failed) {
         this.#resolveCompactionFailed();
         // Plan 06l (A3/R5): name the cause on the same channel, so the event
-        // the conductor records says "context overflow" rather than a bare
-        // "settled".
-        this.#noteModelFailure(`context overflow: ${typeof e.errorMessage === "string" ? e.errorMessage : "compaction recovery failed"}`);
+        // the conductor records says "failed compaction (context overflow)"
+        // rather than a bare "settled". The 06k1 lane note names the failed
+        // compaction; R5 names the context overflow; this text does both.
+        this.#noteModelFailure(`failed compaction (context overflow: ${typeof e.errorMessage === "string" ? e.errorMessage : "compaction recovery failed"})`);
       }
     }
     // Plan 06l (A3/R5): a terminal model-call failure reported on the turn

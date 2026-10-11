@@ -101,12 +101,13 @@ export function anyCheckWindowOpen(checkLockPath: string): boolean {
     for (const name of fs.readdirSync(dir)) {
       const file = path.join(dir, name);
       try {
-        if (now - fs.statSync(file).mtimeMs > CHECK_WINDOW_STALE_MS) {
+        if (now - fs.statSync(file).mtimeMs > CHECK_WINDOW_STALE_MS || !markerHolderAlive(file, name)) {
           fs.rmSync(file, { force: true });
           continue;
         }
       } catch {
         // a vanished file is not a window
+        continue;
       }
       return true;
     }
@@ -114,6 +115,35 @@ export function anyCheckWindowOpen(checkLockPath: string): boolean {
     // an unreadable dir is not a window
   }
   return false;
+}
+
+/** A marker's holder is alive unless its recorded pid is known dead. A holder
+ * killed before its `release` (a crash, SIGKILL, `node --test
+ * --test-force-exit`) leaves its marker behind; without this check that stale
+ * marker paused every other run's workers on the host until the 6 h mtime
+ * cutoff. The pid comes from the marker's body, else its `<pid>-` file name;
+ * an unreadable or pid-less marker counts as alive (the mtime cutoff still
+ * applies), and EPERM (another user's live process) is alive. */
+function markerHolderAlive(file: string, name: string): boolean {
+  let pid: number | undefined;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: unknown };
+    if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0) pid = parsed.pid;
+  } catch {
+    // fall back to the file name
+  }
+  if (pid === undefined) {
+    const m = /^(\d+)-/.exec(name);
+    if (m) pid = Number(m[1]);
+  }
+  if (pid === undefined || pid <= 0) return true;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
 }
 
 /** Opens a check window for its caller's check run. The returned `release`

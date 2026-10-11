@@ -144,15 +144,15 @@ test("plan 06k3: a lane review that times out is retried once with a fresh seat 
     deadlines: FAST,
     workerScript: () => laneWorkerRound("a", 1),
     laneWorkerScriptFor: (lane, round) => laneWorkerRound(lane, round),
-    laneReviewerScriptFor: (seat, _candidate, state) => {
+    laneReviewerScriptFor: (seat, candidate, state) => {
       const K = state.phase.contract.contractVersion;
       if (seat !== "A") return laneReview(seat as Reviewer, K);
       // Seat A's FIRST review of each candidate ends without submit_review;
-      // its retry (a fresh agent, a new script) does. The two candidates are
-      // reviewed one after the other, so A's calls alternate.
-      const n = (calls.get(seat) ?? 0) + 1;
-      calls.set(seat, n);
-      return laneReview("A", K, n % 2 === 1);
+      // its retry (a fresh agent, a new script) does. Counted per candidate:
+      // since 06l both lanes are reviewed at once, so A's calls interleave.
+      const n = (calls.get(candidate) ?? 0) + 1;
+      calls.set(candidate, n);
+      return laneReview("A", K, n === 1);
     },
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b"),
   });
@@ -571,13 +571,35 @@ test("plan 06k3: an unchanged-resubmission permission used before a conductor re
   const dir = fs.mkdtempSync("/tmp/tt-06k3-restart-");
   const workerScript = path.join(dir, "worker-restart.json");
   const setup = await setupConductor({
-    // A check that keeps failing: every frozen candidate goes straight to a
-    // repair round, so a third attempt runs without needing a reviewer finding.
-    phase: { id: "p1", goal: "do the thing", acceptance: ["it works"], checks: ["test -f fixed.txt"], boundaries: [], reserved: [], rounds: 10 },
-    checks: ["test -f fixed.txt"],
-    phaseChecks: ["test -f fixed.txt"],
+    // Plan 06k2 (A6) refuses a tree equal to the last REVIEWED candidate (a
+    // candidate whose checks failed never reached review, so it is not one).
+    // The checks pass; M's round-1 blocking finding is never withdrawn, so
+    // every reviewed candidate goes to a repair round and a third attempt runs.
+    phase: { id: "p1", goal: "do the thing", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], rounds: 10 },
+    checks: ["true"],
+    phaseChecks: ["true"],
     stubReviews: false,
     deadlines: FAST,
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer,
+            phaseId: "p1",
+            candidateSha: state.phase.candidate?.sha,
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            findings: (state.phase.round ?? 1) === 1 && reviewer === "M" ? [{ kind: "defect", severity: "blocking", evidence: "work.txt:1 the work is not done" }] : [],
+          },
+        },
+      ],
+    }),
     workerScriptForAttempt: (attempt) => {
       if (attempt === 1) {
         return { hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: "printf 'attempt 1\\n' > work.txt" }, submitStep()] };
@@ -593,8 +615,8 @@ test("plan 06k3: an unchanged-resubmission permission used before a conductor re
   });
   try {
     await setup.conductor.start();
-    // Attempt 1's candidate fails its checks, so repair attempt 2 runs and its
-    // unchanged submission is refused once.
+    // Attempt 1's candidate is reviewed and M's finding blocks it, so repair
+    // attempt 2 runs and its unchanged submission is refused once.
     await waitFor(() => readEvents(setup.runDir).some((r) => r.kind === "resubmission_refused"), 120_000, 50, setup.runDir);
     // The owner asks for an unchanged resubmission; the next submit is taken,
     // consuming the permission (recorded as an event). A `note` (not a
@@ -631,7 +653,12 @@ test("plan 06k3: an unchanged-resubmission permission used before a conductor re
     // Restart on the same run. Attempt 3 resubmits the candidate's own tree;
     // the permission is already spent, so the submission is refused before the
     // freeze, naming the earlier candidate.
-    fs.writeFileSync(workerScript, JSON.stringify({ hello: defaultWorkerHello(), steps: [{ kind: "sleep", ms: 1_000 }, submitStep()] }));
+    // It answers M's still-open blocking finding (plan 06k3 A3), so the
+    // refusal it meets is the unchanged-tree one, not the answer gate's.
+    const findingAnswers = rebuilt.phase.findings
+      .filter((f) => f.status === "open" && f.severity === "blocking")
+      .map((f) => ({ findingId: f.id, status: "disputed", reason: "the worker answers this finding in the candidate" }));
+    fs.writeFileSync(workerScript, JSON.stringify({ hello: defaultWorkerHello(), steps: [{ kind: "sleep", ms: 1_000 }, submitStep({ findingAnswers })] }));
     const restarted = new Conductor({
       runDir: setup.runDir,
       plan: setup.plan,

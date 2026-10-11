@@ -823,6 +823,9 @@ test("plan 04a: a later round's new raw messages are evaluated afresh (no stale 
     workerScriptForAttempt: (attempt) => ({
       hello: defaultWorkerHello(),
       steps: [
+        // Plan 06k2 (A6): the repair attempt must change the tree, or its
+        // unchanged resubmission is refused before freeze.
+        ...(attempt > 1 ? [{ kind: "call-sh", command: `printf 'round ${attempt}\\n' > round-${attempt}.txt` }] : []),
         {
           kind: "call-submit",
           tool: "raise_tradeoff",

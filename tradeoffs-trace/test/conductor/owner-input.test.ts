@@ -436,7 +436,12 @@ test("plan 06d: a correction written as an inbox file during REVIEWING and a ste
     // attempt, which is where the queued correction and steer must arrive.
     stubReviews: false,
     extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    // Plan 06k2 (A6): each repair attempt must change the tree, or its
+    // unchanged resubmission is refused before freeze.
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [...(attempt > 1 ? [{ kind: "call-sh", command: `printf 'round ${attempt}\\n' > round-${attempt}.txt` }] : []), submitPhaseStep()],
+    }),
     reviewerScriptFor: (reviewer, state) => {
       const round = state.phase.round ?? 1;
       const open = state.phase.findings.filter((f) => f.status === "open");

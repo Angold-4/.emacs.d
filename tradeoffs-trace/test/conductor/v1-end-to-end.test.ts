@@ -225,6 +225,9 @@ test("plan 04c end to end: BASELINE, the review loop, EVALUATING and the panel, 
                 // 60 s let round two finish before the owner's D on a slow CI suite.
                 command: `i=0; while [ $i -lt 3000 ]; do if [ -f '${releaseFile}' ]; then exit 0; fi; i=$((i+1)); sleep 0.1; done; exit 1`,
               },
+              // Plan 06k2 (A6): the repair must change the tree, or its
+              // unchanged resubmission is refused before freeze.
+              { kind: "call-sh", command: "printf 'round two\\n' > round-2.txt" },
               {
                 kind: "call-submit",
                 tool: "raise_tradeoff",

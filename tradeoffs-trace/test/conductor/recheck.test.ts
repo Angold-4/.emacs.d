@@ -576,7 +576,23 @@ test("plan 06j: a recheck whose worktree reset throws is refused and the stopped
     // an attempt-failure event, no round charged, the worktree tainted so the
     // re-dispatched attempt resets it, and a new repair worker dispatched.
     assert.ok(eventTypes(setup.runDir).includes("ATTEMPT_INTERRUPTED"), "the stopped attempt is recorded as interrupted");
-    assert.equal(setup.conductor.state.phase.repairRoundsUsed, usedBefore, "the refusal charges no round");
+    // The refusal itself charges no round. The worktree stays unremovable, so
+    // the re-dispatched attempt's own reset throws too, and plan 06k2 (A4,
+    // R6) records THAT attempt as failed (ATTEMPT_NO_SUBMISSION), which may
+    // charge a round before this line runs. So count from the log: every
+    // round charged after the refusal must follow a later attempt's own
+    // `worktree_reset_failed`, never the refusal.
+    const afterRefusal = readEvents(setup.runDir);
+    const refusalAt = afterRefusal.findIndex((r) => r.kind === "recheck_reset_failed");
+    let startFailures = 0;
+    for (const r of afterRefusal.slice(refusalAt + 1)) {
+      if (r.kind === "worktree_reset_failed") startFailures += 1;
+      if (r.kind === "event" && (r.event as { type?: string }).type === "REPAIR_ATTEMPT_STARTED") {
+        assert.ok(startFailures > 0, "the refusal charges no round: a round charged after it follows a later attempt's start failure");
+        startFailures -= 1;
+      }
+    }
+    assert.ok(setup.conductor.state.phase.repairRoundsUsed >= usedBefore);
     assert.equal(setup.conductor.state.phase.worktreeTainted, true, "the worktree is tainted for the next attempt");
     await waitFor(
       () => eventsOfType(setup.runDir, "ACTION_STARTED").filter((e) => e.action === "dispatch_worker").length > dispatchesBefore,

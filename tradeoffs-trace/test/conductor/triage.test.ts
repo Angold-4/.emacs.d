@@ -60,6 +60,10 @@ const FAST = {
 };
 
 const WRITE_SRC = "mkdir -p src && printf 'export const a = 1;\\n' > src/a.ts";
+/** Plan 06k2 (A6): a repair attempt must change the tree, or its unchanged
+ * resubmission is refused before freeze. Every attempt writes the same
+ * src/a.ts (the evidence anchors cite its line 1) plus its own marker file. */
+const writeSrcFor = (attempt: number): string => `${WRITE_SRC} && printf 'attempt ${attempt}\\n' > attempt-${attempt}.txt`;
 
 function submitPhaseStep() {
   return { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } };
@@ -174,9 +178,9 @@ test("plan 06i: an advisory that the evaluator confirms as wrong output becomes 
       provisional: false,
       rounds: 2,
     },
-    workerScriptForAttempt: () => ({
+    workerScriptForAttempt: (attempt) => ({
       hello: defaultWorkerHello(),
-      steps: [{ kind: "call-sh", command: WRITE_SRC }, submitPhaseStep()],
+      steps: [{ kind: "call-sh", command: writeSrcFor(attempt) }, submitPhaseStep()],
     }),
     reviewerScriptFor: (reviewer, state) => {
       const round = state.phase.round ?? 1;
@@ -722,7 +726,7 @@ test("plan 06i: a blocking finding from round 1 still open in round 2 gets a fre
     checks: ["true"],
     stubReviews: false,
     phase: { id: "p1", goal: "re-classify an earlier finding", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false, rounds: 2 },
-    workerScriptForAttempt: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: WRITE_SRC }, submitPhaseStep()] }),
+    workerScriptForAttempt: (attempt) => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: writeSrcFor(attempt) }, submitPhaseStep()] }),
     reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
       steps: [
@@ -867,7 +871,7 @@ test("plan 06i: a sameAs advisory downgrade with no evaluator impact is re-promp
     // rounds: 2 so the round-2 sameAs re-raise actually runs (it needs a
     // repair round to exist); the downgrade path is what OD-15(1) requires.
     phase: { id: "p1", goal: "sameAs no impact", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false, rounds: 2 },
-    workerScriptForAttempt: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: WRITE_SRC }, submitPhaseStep()] }),
+    workerScriptForAttempt: (attempt) => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: writeSrcFor(attempt) }, submitPhaseStep()] }),
     reviewerScriptFor: (reviewer, state) => {
       const round = state.phase.round ?? 1;
       const finding = state.phase.findings.find((f) => f.raisedBy === "M");

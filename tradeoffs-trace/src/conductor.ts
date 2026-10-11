@@ -1976,6 +1976,28 @@ export class Conductor {
   #unchangedResubmissionReason(worktree: string, baseSha?: string): string | undefined {
     const C = baseSha ?? this.#state.phase.candidate?.sha;
     if (!C) return undefined;
+    // Plan 06k2 (A6) refuses a tree equal to the last REVIEWED candidate. A
+    // candidate whose round checks failed never reached review: resubmitting
+    // it unchanged (after the owner fixed the environment and granted more
+    // rounds, plan 01b/01e) re-runs the checks, not a review, so it is not
+    // refused. A final-tier failure comes after the review and still counts.
+    const checks = this.#state.phase.checks;
+    if (checks && checks.candidateSha === C && checks.passed === false && (checks.tier ?? "round") === "round") return undefined;
+    // Plan 05e (finding #34): an amendment-only resubmission is identical
+    // bytes resubmitted after an amendment raised on C applied and moved the
+    // contract. CRITERION_AMENDED clears C's reviews and rebinds it to the
+    // new contract version, so C is not yet reviewed under it; the
+    // resubmission is reviewed against the amended criterion only, so it is
+    // not refused.
+    const K = this.#state.phase.contract.contractVersion;
+    const amendedOnC = this.#state.phase.decisions.some(
+      (d) =>
+        d.boundCandidateSha === C &&
+        d.amendment?.status === "applied" &&
+        d.amendment.appliedContractVersion !== undefined &&
+        sameVersion(d.amendment.appliedContractVersion, K),
+    );
+    if (amendedOnC) return undefined;
     // Consume the owner's permission only when it actually lifts a refusal.
     if (!this.#submissionTreeUnchanged(worktree, C)) return undefined;
     if (this.#ownerAskedForUnchangedResubmission()) return undefined;
@@ -10957,7 +10979,19 @@ export class Conductor {
       try {
         const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, string | null>;
         if (parsed && typeof parsed === "object") {
+          // Plan 01a: a declared secret's value never lives in a file. An
+          // older record that holds one is read without it (the value comes
+          // from this process's environment, like every secret) and rewritten.
+          const secrets = Object.keys(parsed).filter((name) => this.#secretNames.includes(name));
+          for (const name of secrets) delete parsed[name];
           this.#recordedEnv = parsed;
+          if (secrets.length > 0) {
+            try {
+              fs.writeFileSync(file, `${JSON.stringify(parsed, null, 2)}\n`);
+            } catch {
+              // a read-only run dir keeps the old file; memory is already clean
+            }
+          }
           return;
         }
       } catch {
@@ -10975,6 +11009,10 @@ export class Conductor {
     // Finding A-12: record a DECLARED name even when it was unset, as an
     // explicit null, so a resume shell supplying it cannot change the check
     // environment.
+    // Plan 01a: a declared secret is never recorded — its value would sit in
+    // a file under the run directory. A check that references it still gets
+    // it from this process's environment (`childEnv`), as before 06k1.
+    for (const name of this.#secretNames) names.delete(name);
     const env: Record<string, string | null> = {};
     for (const name of names) {
       env[name] = process.env[name] ?? null;
