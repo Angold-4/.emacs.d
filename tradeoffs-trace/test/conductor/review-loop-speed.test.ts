@@ -146,7 +146,13 @@ test("no-unshown-ballots: a discovery after the barrier released is a late obser
   const setup = await setupConductor({
     checks: ["true"],
     stubReviews: false,
-    deadlines: { ...fastDeadlines, reviewMs: 4_000 },
+    // B's first dispatch hangs on purpose, so the review deadline must expire
+    // once; its retry, a fresh agent, must then finish both turns inside the
+    // next deadline and its turn-1 share (06l: a third of it). 4 s left the
+    // retry ~1.3 s for turn 1, which a loaded CI runner missed, and a second
+    // miss is BLOCKED by design. 9 s keeps the one intended timeout and gives
+    // the retry room; the assertions are unchanged.
+    deadlines: { ...fastDeadlines, reviewMs: 9_000 },
     workerScript: () => ({
       hello: defaultWorkerHello(),
       steps: [
