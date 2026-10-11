@@ -25,6 +25,8 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 const PERL_BIN = "/usr/bin/perl";
 
@@ -62,6 +64,167 @@ exit 0;
  * lock the same way (its stdin hits EOF), so a crashed gate cannot wedge
  * every later one. */
 const WAITING_HELPER_SCRIPT = HELPER_SCRIPT.replace("flock($fh, LOCK_EX | LOCK_NB)", "flock($fh, LOCK_EX)");
+
+// ---------------------------------------------------------------------------
+// Plan 06k1 (A4): the host-wide check window.
+//
+// A check run of ANY run on the host pauses the worker processes of every
+// OTHER run while it holds the machine. The window is a process-global set
+// plus one marker file per holder under `~/.tradeoffs-trace/check-window/`,
+// so two conductors in one process (a test) and two conductors in separate
+// processes (a host) both see each other's windows. The marker file holds
+// the holder's pid; a crashed holder leaves a stale file, so a marker older
+// than `CHECK_WINDOW_STALE_MS` is ignored.
+// ---------------------------------------------------------------------------
+
+export interface CheckWindow {
+  release: () => void;
+}
+
+const activeCheckWindows = new Set<string>();
+const CHECK_WINDOW_STALE_MS = 6 * 60 * 60 * 1000;
+
+/** The window directory for a check lock: beside the lock, so a machine-wide
+ * lock (`~/.tradeoffs-trace/check.lock`) gives a machine-wide window and a
+ * per-run lock (tests) gives a per-run one. */
+export function checkWindowDir(checkLockPath: string): string {
+  return `${checkLockPath}.window.d`;
+}
+
+/** True while any check window for this check lock is open. */
+export function anyCheckWindowOpen(checkLockPath: string): boolean {
+  const dir = checkWindowDir(checkLockPath);
+  if (activeCheckWindows.has(dir)) return true;
+  try {
+    if (!fs.existsSync(dir)) return false;
+    const now = Date.now();
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try {
+        if (now - fs.statSync(file).mtimeMs > CHECK_WINDOW_STALE_MS || !markerHolderAlive(file, name)) {
+          fs.rmSync(file, { force: true });
+          continue;
+        }
+      } catch {
+        // a vanished file is not a window
+        continue;
+      }
+      return true;
+    }
+  } catch {
+    // an unreadable dir is not a window
+  }
+  return false;
+}
+
+/** A marker's holder is alive unless its recorded pid is known dead. A holder
+ * killed before its `release` (a crash, SIGKILL, `node --test
+ * --test-force-exit`) leaves its marker behind; without this check that stale
+ * marker paused every other run's workers on the host until the 6 h mtime
+ * cutoff. The pid comes from the marker's body, else its `<pid>-` file name;
+ * an unreadable or pid-less marker counts as alive (the mtime cutoff still
+ * applies), and EPERM (another user's live process) is alive. */
+function markerHolderAlive(file: string, name: string): boolean {
+  let pid: number | undefined;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: unknown };
+    if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0) pid = parsed.pid;
+  } catch {
+    // fall back to the file name
+  }
+  if (pid === undefined) {
+    const m = /^(\d+)-/.exec(name);
+    if (m) pid = Number(m[1]);
+  }
+  if (pid === undefined || pid <= 0) return true;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+/** Opens a check window for its caller's check run. The returned `release`
+ * closes it; call it in a `finally`. */
+export function openCheckWindow(checkLockPath: string): CheckWindow {
+  const dir = checkWindowDir(checkLockPath);
+  activeCheckWindows.add(dir);
+  const file = path.join(dir, `${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
+  } catch {
+    // A read-only home must not stop the check; the in-process set still
+    // pauses this process's own other runs.
+  }
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      activeCheckWindows.delete(dir);
+      try {
+        fs.rmSync(file, { force: true });
+      } catch {
+        // best effort
+      }
+    },
+  };
+}
+
+/** Plan 06k1 (A4): a timer whose clock stops while it is paused. Used for a
+ * worker attempt's deadline: while another run's check window is open the
+ * worker is SIGSTOPped and its attempt clock must not run, so a check that
+ * takes minutes does not time the worker out. */
+export class PausableTimer<T> {
+  readonly promise: Promise<T>;
+  #resolve!: (value: T) => void;
+  #remaining: number;
+  #timer: NodeJS.Timeout | undefined;
+  #startedAt: number;
+  #paused = false;
+  #done = false;
+  #value: T;
+
+  constructor(ms: number, value: T) {
+    this.#remaining = ms;
+    this.#value = value;
+    this.#startedAt = Date.now();
+    this.promise = new Promise<T>((resolve) => {
+      this.#resolve = resolve;
+    });
+    this.#timer = setTimeout(() => this.#fire(), ms);
+  }
+
+  #fire(): void {
+    if (this.#done) return;
+    this.#done = true;
+    this.#resolve(this.#value);
+  }
+
+  pause(): void {
+    if (this.#paused || this.#done) return;
+    this.#paused = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#remaining = Math.max(0, this.#remaining - (Date.now() - this.#startedAt));
+  }
+
+  resume(): void {
+    if (!this.#paused || this.#done) return;
+    this.#paused = false;
+    this.#startedAt = Date.now();
+    this.#timer = setTimeout(() => this.#fire(), this.#remaining);
+  }
+
+  cancel(): void {
+    this.#done = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+}
 
 export class LockError extends Error {
   lockPath: string;
@@ -136,6 +299,13 @@ export function acquireWaitingLock(lockPath: string): Promise<Lock> {
 }
 
 function spawnLockHelper(helperScript: string, lockPath: string): Promise<Lock> {
+  // A machine-wide lock lives under `~/.tradeoffs-trace/`, which a fresh
+  // machine (a CI runner) does not have yet; perl's open does not create it.
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  } catch {
+    // The helper's open reports the real failure.
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(PERL_BIN, ["-e", helperScript, lockPath], {
       stdio: ["pipe", "pipe", "pipe"],

@@ -12,7 +12,56 @@
 // work and maps to `undefined`, which the conductor rejects visibly.
 
 import { entryVerdictEvents, type Entry } from "./entries.ts";
-import type { ContractVersion, Event, Message, OwnerCommand } from "./types.ts";
+import type { ContractVersion, Event, Message, OwnerCommand, State } from "./types.ts";
+
+// ---------------------------------------------------------------------------
+// Plan 06d (A1): what an inbox input does
+// ---------------------------------------------------------------------------
+//
+// The owner's input box can reach a run in exactly three ways: it is applied
+// now, queued for the moment the run can apply it, or refused with a reason.
+// `acceptInput` is the ONE place that decides which, from the phase state and
+// whether a worker is live right now. The conductor only executes the
+// decision (steer, queue a note, or record the refusal), so no second caller
+// can invent a different outcome.
+
+export type InputKind = "steer" | "note" | "correction";
+
+export type InputOutcome =
+  | { kind: "applied"; effect: InputKind }
+  | { kind: "queued"; until: "next_attempt" | "awaiting_owner" }
+  | { kind: "refused"; reason: string };
+
+export interface InputCommand {
+  kind: InputKind;
+  text: string;
+  /** True when a worker agent of this run is live right now. The conductor
+   * observes it; it never decides the outcome itself. */
+  workerRunning: boolean;
+}
+
+/** Decide what one owner input does now. Only DONE and BLOCKED refuse: every
+ * other phase either applies the input or queues it for the next worker
+ * attempt, so owner input is never lost. */
+export function acceptInput(state: State, command: InputCommand): InputOutcome {
+  const name = state.phase.phase;
+  if (name === "DONE" || name === "BLOCKED") {
+    return { kind: "refused", reason: `the phase is ${name}; the run no longer accepts owner input` };
+  }
+  // A correction is applied now only while the phase is parked on the owner:
+  // that is the one moment resolving the open requests is what it means.
+  if (command.kind === "correction" && name === "AWAITING_OWNER") {
+    return { kind: "applied", effect: "correction" };
+  }
+  // A steer reaches the worker directly only while one is live.
+  if (command.kind === "steer" && command.workerRunning) {
+    return { kind: "applied", effect: "steer" };
+  }
+  // A note, a correction outside AWAITING_OWNER, or a steer with no worker:
+  // queued for the next worker attempt. It reaches that attempt's prompt (and
+  // the live reviewers' notes) and is marked delivered there.
+  return { kind: "queued", until: "next_attempt" };
+}
 
 /** Plan 05j: the entry commands the review view sends (`s`, `m`, a retitle,
  * and the owner's A/D). The owner's verdict is a verdict on each linked
@@ -257,6 +306,62 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
         runId: b.runId,
         phaseId: b.phaseId,
         event: { type: "FINDING_ACCEPTED_BY_OWNER", findingId: b.recordId, scope: r.scope, by: "owner", ...w },
+      };
+    }
+    case "carry": {
+      // Plan 06g (A5): the owner carries a finding or message to a later
+      // phase's plan. The binding names the record and its version, so a
+      // stale carry (the record changed, or the phase moved to a new
+      // candidate) is rejected like any other owner command.
+      const w = bound();
+      if ("error" in w) return { ok: false, reason: w.error };
+      if (typeof r.toPhase !== "string" || r.toPhase.trim().length === 0) {
+        return { ok: false, reason: "a carry command needs a non-empty 'toPhase'" };
+      }
+      const recordKind = r.recordKind === "finding" || r.recordKind === "message" ? r.recordKind : undefined;
+      return {
+        ok: true,
+        runId: b.runId,
+        phaseId: b.phaseId,
+        event: {
+          type: "ITEM_CARRIED",
+          recordId: b.recordId,
+          ...(recordKind ? { recordKind } : {}),
+          toPhase: r.toPhase.trim(),
+          ...w,
+        },
+      };
+    }
+    case "defer": {
+      // Plan 06i: a deferral puts off an item's fix. It needs a guard — a test
+      // that shows its current cost, or a recorded owner ruling — or it is
+      // refused with the reason (reduce() refuses it too, so a hand-written
+      // inbox file cannot bypass this).
+      const w = bound();
+      if ("error" in w) return { ok: false, reason: w.error };
+      const test = typeof r.test === "string" && r.test.trim().length > 0 ? r.test.trim() : undefined;
+      const ownerRuling =
+        typeof r.ownerRuling === "string" && r.ownerRuling.trim().length > 0 ? r.ownerRuling.trim() : undefined;
+      if (!test && !ownerRuling) {
+        return { ok: false, reason: "a defer command needs a guard: --test <test that shows its current cost> or --owner-ruling <ruling id>" };
+      }
+      const toPhase = typeof r.toPhase === "string" && r.toPhase.trim().length > 0 ? r.toPhase.trim() : undefined;
+      return {
+        ok: true,
+        runId: b.runId,
+        phaseId: b.phaseId,
+        event: {
+          type: "DEFERRAL_RECORDED",
+          deferral: {
+            id: `DEF-${commandId}`,
+            itemId: b.recordId,
+            text: typeof r.text === "string" && r.text.trim().length > 0 ? r.text.trim() : `deferred ${b.recordId}`,
+            ...(test ? { test } : {}),
+            ...(ownerRuling ? { ownerRuling } : {}),
+            ...(toPhase ? { toPhase } : {}),
+            status: "open",
+          },
+        },
       };
     }
     case "revise": {

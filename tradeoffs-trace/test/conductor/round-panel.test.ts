@@ -62,6 +62,13 @@ function workerDelegated() {
 function discoveringReviewer() {
   return (reviewer: string, state: State) => {
     const worker = state.phase.decisions.find((d) => d.source === "worker");
+    const C = state.phase.candidate?.sha;
+    // A re-dispatched seat (a timeout under load) must not discover the same
+    // choice twice: its own earlier discovery already exists on this
+    // candidate. The script is keyed by agent id, so a retry re-runs it.
+    const alreadyDiscovered = state.phase.decisions.some(
+      (d) => d.source === "reviewer-discovered" && d.boundCandidateSha === C && d.id.includes(`-disc-${reviewer}-`),
+    );
     return {
       hello: defaultReviewerHello(),
       steps: [
@@ -72,7 +79,7 @@ function discoveringReviewer() {
             // Both M and A discover one detail choice: two pending items, so
             // the same single panel (three seats) must cover both at once.
             discoveries:
-              reviewer === "B"
+              reviewer === "B" || alreadyDiscovered
                 ? []
                 : [
                     {
@@ -282,15 +289,36 @@ test("plan 05e: a blocking finding goes to the panel with the round's trade-offs
         ],
       };
     },
-    evaluatorScriptFor: (messageType) => ({
-      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
-      steps:
-        messageType === "tradeoff"
-          ? [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [{ messageId: "T-1", action: "publish", title: "batch cancels", summary: "in budget", context: "src/cancel.ts:10", evidence: ["src/cancel.ts:10"] }] } }]
-          : messageType === "finding"
-            ? [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [{ messageId: "F-1", action: "publish", title: "the criterion does not hold", summary: "not validated", context: "src/b.ts:1", evidence: ["src/b.ts:1"], verified: "src/b.ts:1" }] } }]
-            : [],
-    }),
+    evaluatorScriptFor: (messageType, state) => {
+      // The finding is a judgement call: the test is about the round panel's
+      // drop, not about a confirmed wrong value (which the panel may never
+      // downgrade, per plan 06i).
+      const finding = (state.phase.findings ?? []).find((f) => f.status === "open");
+      return {
+        hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+        steps:
+          messageType === "tradeoff"
+            ? [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [{ messageId: "T-1", action: "publish", title: "batch cancels", summary: "in budget", context: "src/cancel.ts:10", evidence: ["src/cancel.ts:10"] }] } }]
+            : messageType === "finding"
+              ? [
+                  {
+                    kind: "call-submit",
+                    tool: "submit_evaluation",
+                    args: {
+                      evaluations: [{ messageId: "F-1", action: "publish", title: "the criterion does not hold", summary: "not validated", context: "src/b.ts:1", evidence: ["src/b.ts:1"], verified: "src/b.ts:1" }],
+                      ...(finding
+                        ? {
+                            itemChecks: [
+                              { id: finding.id, verdict: "confirmed", impact: "judgement", chosen: "accept it as a style point", alternative: "repair it", why: "the reviewer's point is a judgement call", evidence: "README.md:1 the evaluator re-checked" },
+                            ],
+                          }
+                        : {}),
+                    },
+                  },
+                ]
+              : [],
+      };
+    },
     roundPanelScriptFor: (seat, state) => {
       const items = roundPanelItemsNeedingVote(state.phase);
       return {

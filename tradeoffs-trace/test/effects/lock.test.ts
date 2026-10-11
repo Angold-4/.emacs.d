@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { acquireLock, acquireWaitingLock, Lock, LockError } from "../../src/effects/lock.ts";
+import { acquireLock, acquireWaitingLock, anyCheckWindowOpen, checkWindowDir, Lock, LockError, openCheckWindow } from "../../src/effects/lock.ts";
 
 let dir: string;
 const spawned: ChildProcess[] = [];
@@ -135,4 +135,41 @@ test("SIGKILLing the holder process releases the lock", async () => {
   }
   assert.ok(lock, `lock should be acquirable again after the holder was SIGKILLed: ${lastErr}`);
   await lock!.release();
+});
+
+test("a machine-wide lock under a directory that does not exist yet creates it (a fresh CI runner's ~/.tradeoffs-trace)", async () => {
+  const lockPath = path.join(dir, "home", ".tradeoffs-trace", "check.lock");
+  const lock = await acquireWaitingLock(lockPath);
+  assert.ok(fs.existsSync(lockPath));
+  await lock.release();
+});
+
+test("a check-window marker whose holder died is not an open window, and is removed", async () => {
+  // A holder killed before its release (a crash, SIGKILL, `node --test
+  // --test-force-exit`) leaves its marker behind; it must not pause every
+  // other run's workers until the 6 h mtime cutoff.
+  const lockPath = path.join(dir, "check.lock");
+  const windowDir = checkWindowDir(lockPath);
+  fs.mkdirSync(windowDir, { recursive: true });
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const deadPid = child.pid!;
+  await new Promise((resolve) => child.once("exit", resolve));
+  const stale = path.join(windowDir, `${deadPid}-deadbeef.json`);
+  fs.writeFileSync(stale, `${JSON.stringify({ pid: deadPid, at: new Date().toISOString() })}\n`);
+  assert.equal(anyCheckWindowOpen(lockPath), false, "a dead holder's marker is not a window");
+  assert.ok(!fs.existsSync(stale), "the dead holder's marker is removed");
+
+  // A live holder's marker (another process) still counts.
+  const live = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  spawned.push(live);
+  const liveMarker = path.join(windowDir, `${live.pid}-cafebabe.json`);
+  fs.writeFileSync(liveMarker, `${JSON.stringify({ pid: live.pid, at: new Date().toISOString() })}\n`);
+  assert.equal(anyCheckWindowOpen(lockPath), true, "a live holder's marker is a window");
+  fs.rmSync(liveMarker, { force: true });
+
+  // This process's own window is open until released.
+  const window = openCheckWindow(lockPath);
+  assert.equal(anyCheckWindowOpen(lockPath), true);
+  window.release();
+  assert.equal(anyCheckWindowOpen(lockPath), false);
 });

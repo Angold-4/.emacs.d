@@ -1,9 +1,27 @@
-.PHONY: check test test-fast ert live crash
+.PHONY: check check-full check-e2e test test-fast ert live crash
 
 # Node 25 runs TypeScript natively (type stripping) — no build step.
 # `cd` first so the quoted glob always resolves the same way regardless of
 # the caller's cwd (see README).
-check: test ert
+#
+# 06a: `check` is the fast suite a tradeoffs-trace phase pays on every
+# attempt — unit, contract, effects and fake-pi tests plus ERT, under 60 s on
+# an idle machine. The slow real-process conductor suite moved to
+# `check-full` (the whole node suite plus ERT), and a phase names the
+# conductor files it touches with `check-e2e FILES="…"`.
+check: test-fast ert
+
+# Today's check (before 06a): every `test/**/*.test.ts` (including the
+# real-process conductor, crash and live files) plus ERT.
+check-full: test ert
+
+# 06a: only the named conductor test files, with the full suite's own
+# concurrency and per-command timeout (see `test`). The phase's TT_CHECKS
+# names the conductor files it touches, so a fast `check` plus one
+# `check-e2e FILES="…"` covers exactly what changed.
+check-e2e:
+	@test -n "$(FILES)" || { echo 'usage: make check-e2e FILES="test/conductor/a.test.ts …"' >&2; exit 2; }
+	cd $(CURDIR) && TT_NOTIFY_COMMAND=':' node --test --test-force-exit --test-concurrency=3 --test-timeout=180000 $(FILES)
 
 # The Emacs front end (core/init-tradeoffs-trace.el) under ERT in batch mode.
 ert:
@@ -15,9 +33,9 @@ ert:
 # each, see that file's own header comment), not the full 12-boundary
 # sweep; both opt-in live tests skip themselves without TT_LIVE=1. So this
 # costs only the rest of the suite's own genuinely-slow tests.
-# Fast feedback for a worker (plan 2c): the pure core, schemas and effect
-# adapters, without the slow real-process conductor, crash and live tests.
-# The phase CHECKS stay the full `make check`, run by the conductor itself.
+# Fast feedback (plan 2c, now `make check` itself in 06a): the pure core,
+# schemas and effect adapters, without the slow real-process conductor, crash
+# and live tests.
 # TT_NOTIFY_COMMAND=':' (plan 01b): many tests reach AWAITING_OWNER/BLOCKED, and
 # without this the default macOS osascript notifier would pop a banner for each
 # on a developer's machine. The tests that exercise the notifier set their own
@@ -26,6 +44,7 @@ test-fast:
 	cd $(CURDIR) && TT_NOTIFY_COMMAND=':' node --test --test-force-exit --test-timeout=60000 'test/unit/**/*.test.ts' 'test/contract/**/*.test.ts' 'test/effects/**/*.test.ts' 'test/fake-pi/**/*.test.ts'
 
 test:
+	# The full node suite (`make check-full`).
 	# 180s: this packet's tt-start-happy-path and deadline-every-stage
 	# exit-gate tests are both genuinely slow (the former drives a real
 	# `tt start`-launched daemon through production DEFAULT_DEADLINES —

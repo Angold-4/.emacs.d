@@ -357,3 +357,55 @@ test("notify: resolving one request of a park does not write a second record for
     cleanupDir(setup.scriptsDir);
   }
 });
+
+test("plan 06f: a run's live.json row leaves on clean stop, but stays while it waits for the owner", async () => {
+  const readRuns = (root: string): Array<{ id: string; needsOwner: boolean }> => {
+    try {
+      const live = JSON.parse(fs.readFileSync(path.join(root, "live.json"), "utf8")) as {
+        runs: Array<{ id: string; needsOwner: boolean }>;
+      };
+      return live.runs;
+    } catch {
+      return [];
+    }
+  };
+  // A run parked at the owner's desk keeps its row after its conductor stops.
+  const waiting = await setupConductor(awaitingOwnerOptions());
+  try {
+    await waiting.conductor.start();
+    await waitFor(() => waiting.conductor.state.phase.phase === "AWAITING_OWNER", 60_000);
+    const id = path.basename(waiting.runDir);
+    await waitFor(() => readRuns(waiting.runRoot).some((r) => r.id === id && r.needsOwner), 15_000);
+    await waiting.conductor.stop();
+    assert.ok(
+      readRuns(waiting.runRoot).some((r) => r.id === id && r.needsOwner),
+      "an owner-waiting run stays in live.json after its conductor stops",
+    );
+  } finally {
+    cleanupDir(waiting.runRoot);
+    cleanupDir(waiting.scriptsDir);
+    cleanupDir(waiting.repo.dir);
+  }
+  // A run that finishes removes its row (this was the `run?.id` filter bug).
+  const done = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer: Reviewer, state: State) => ({
+      hello: defaultReviewerHello(),
+      steps: [submitReviewStep(reviewer, state)],
+    }),
+    deadlines: FAST,
+  });
+  try {
+    await done.conductor.start();
+    await waitFor(() => done.conductor.state.phase.phase === "DONE", 60_000);
+    const id = path.basename(done.runDir);
+    await waitFor(() => !readRuns(done.runRoot).some((r) => r.id === id), 15_000);
+    assert.ok(!readRuns(done.runRoot).some((r) => r.id === id), "a DONE run's row leaves live.json");
+  } finally {
+    await done.conductor.stop().catch(() => undefined);
+    cleanupDir(done.runRoot);
+    cleanupDir(done.scriptsDir);
+    cleanupDir(done.repo.dir);
+  }
+});

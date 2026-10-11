@@ -13,25 +13,35 @@
 // state. `actions` is what `next()` of the resulting state must equal.
 
 import { carryBallotsForward, carryDecisionsForward } from "./rounds.ts";
+import { leaderOf, seatsOf } from "./seats.ts";
+import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
 import {
   applyFindingAcceptedByOwner,
+  applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
   autoResolveLinkedRequest,
   awaitingOwnerTarget,
   checkFindingAcceptedByOwner,
+  checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  clearRulings,
+  recordRulings,
 } from "./owner-commands.ts";
 import { isBudgetGateRequest, isRepairForcingOption, openItemOwnerRequestsFor } from "./owner-requests.ts";
+import { findOwnerRequest, variantEscalation } from "./triage.ts";
 import {
   accept,
   blockerWithOutcome,
   blockersNeedingPanel,
   DEFAULT_BLOCKER_OPTIONS,
+  evidenceAllRecorded,
+  evidenceOnlyPending,
   evaluationSettled,
   isLiveDecision,
+  pendingEvidenceItems,
   resolvedCorrectionIdsFor,
   reviewsComplete,
   sameVersion,
@@ -96,10 +106,57 @@ function acceptHolds(s: State): boolean {
   return Boolean(s.phase.candidate) && accept(s.phase, s.phase.candidate!.sha, s.phase.contract.contractVersion);
 }
 
+/** Plan 06j (A3): a recheck is available only for the current candidate whose
+ * own checks just failed. A passed check, an interrupted run or a newer
+ * candidate (the recorded check sha no longer matches) refuses it. */
+function recheckAvailable(s: State): boolean {
+  const candidate = s.phase.candidate;
+  const checks = s.phase.checks;
+  return Boolean(candidate && checks && checks.passed === false && checks.interrupted !== true && checks.candidateSha === candidate.sha);
+}
+
+/** Plan 06j (A3): a round recheck and a final recheck re-run the SAME tier the
+ * failed run used. The two rows differ only in the state they enter, so the
+ * conductor re-runs the phase's checks (`round`) or the phase's checks plus
+ * the final check (`final`). */
+function recheckAvailableRound(s: State): boolean {
+  return recheckAvailable(s) && s.phase.checks?.tier !== "final";
+}
+
+function recheckAvailableFinal(s: State): boolean {
+  return recheckAvailable(s) && s.phase.checks?.tier === "final";
+}
+
+/** Plan 06j (A3): the one mutation a recheck applies, whatever tier it enters:
+ * keep the failed record (and its tier) for the re-run, answer the budget-gate
+ * request the failure parked with (a recheck is a check run, not a grant), and
+ * clear the stage's in-flight entries. `restoreRound` is true when the recheck
+ * cancelled a repair attempt that had already charged a round (from
+ * IMPLEMENTING): stopping it charges nothing, so the round is given back. */
+function applyRecheck(s: State, ev: Event, to: "CHECKING" | "FINAL_CHECKING", restoreRound = false): State {
+  const e = ev as Extract<Event, { type: "RECHECK_REQUESTED" }>;
+  return withPhase(s, {
+    phase: to,
+    checks: s.phase.checks,
+    ...(restoreRound ? { repairRoundsUsed: Math.max(0, s.phase.repairRoundsUsed - 1), worktreeTainted: true } : {}),
+    ownerRequests: s.phase.ownerRequests.map((r) =>
+      r.status === "open" && isBudgetGateRequest(r)
+        ? { ...r, status: "resolved" as const, resolution: { option: "recheck", note: e.reason } }
+        : r,
+    ),
+    // Clear the stopped attempt's own in-flight entries: the cancelled worker
+    // returns without the attempt-failure events that normally clear
+    // `dispatch_worker`, and a later `REPAIR_ATTEMPT_STARTED -> IMPLEMENTING`
+    // must dispatch a fresh worker (M-3). `dispatch_worker` is the round's
+    // single entry, so it covers both lanes when workers > 1.
+    inFlight: clearInFlight(s.phase, "dispatch_worker", "run_checks", "run_final_checks"),
+  });
+}
+
 function allThreeReviewsPresent(state: State, upcoming?: Review): boolean {
   const r = state.phase.reviews;
-  const has = (slot: typeof r.M, who: "M" | "A" | "B") => Boolean(slot?.review) || upcoming?.reviewer === who;
-  return has(r.M, "M") && has(r.A, "A") && has(r.B, "B");
+  const has = (who: string) => Boolean(r[who]?.review) || upcoming?.reviewer === who;
+  return seatsOf(state.phase.contract).every(has);
 }
 
 function activePhaseStates(): PhaseStateName[] {
@@ -142,7 +199,8 @@ addRow({
   guard: (_s, ev) => !baselineNeeded(ev),
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }], // next() of the resulting IMPLEMENTING state
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING" }),
+  // OD-2 A2: coverage is per candidate/attempt; a new attempt owes its own.
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined }),
 });
 
 addRow({
@@ -170,7 +228,7 @@ addRow({
   guard: () => true,
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined, inFlight: clearInFlight(s.phase, "run_baseline") }),
 });
 
 addRow({
@@ -182,7 +240,7 @@ addRow({
   guard: () => true,
   to: "IMPLEMENTING",
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", inFlight: clearInFlight(s.phase, "run_baseline") }),
+  apply: (s) => withPhase(s, { phase: "IMPLEMENTING", coverage: undefined, coverageAttempt: undefined, inFlight: clearInFlight(s.phase, "run_baseline") }),
 });
 
 addRow({
@@ -213,11 +271,23 @@ addRow({
   guard: () => true,
   to: "FREEZING",
   actions: [{ type: "freeze" }],
-  apply: (s) =>
-    withPhase(s, {
+  apply: (s, ev) => {
+    // Plan 06k3 (A3): the submission's answers are recorded on the findings
+    // they answer, so the reviewer prompt's table can pair each finding with
+    // the worker's answer. The freeze path has already refused a submission
+    // that left an open blocking finding unanswered.
+    const e = ev as Extract<Event, { type: "SUBMIT_PHASE" }>;
+    const answers = new Map((e.findingAnswers ?? []).map((a) => [a.findingId, a]));
+    const findings =
+      answers.size === 0
+        ? s.phase.findings
+        : s.phase.findings.map((f) => (answers.has(f.id) ? { ...f, answer: answers.get(f.id) } : f));
+    return withPhase(s, {
       phase: "FREEZING",
+      findings,
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
-    }),
+    });
+  },
 });
 
 /** design §4.2/§5.2/§8.1: every entry into AWAITING_OWNER records the owner
@@ -297,10 +367,18 @@ addRow({
   // §9.3: interrupted clears the intent but leaves the obligation, so
   // next() re-emits dispatch_worker ("new attempt on the same session").
   actions: [{ type: "dispatch_worker" }],
-  apply: (s) =>
+  apply: (s, ev) =>
     withPhase(s, {
       phase: "IMPLEMENTING",
       attempt: { ...s.phase.attempt, interrupted: true },
+      // OD-2 A2: an interrupted attempt is re-dispatched as a new attempt, so
+      // it owes its own coverage too.
+      coverage: undefined,
+      coverageAttempt: undefined,
+      // Plan 06j (A3/OD-5): a recheck that stopped this attempt and then
+      // failed to reset its worktree marks the tree tainted, so the
+      // re-dispatched attempt resets it to the frozen candidate first.
+      ...((ev as Extract<Event, { type: "ATTEMPT_INTERRUPTED" }>).taint ? { worktreeTainted: true } : {}),
       inFlight: clearInFlight(s.phase, "dispatch_worker"),
     }),
 });
@@ -337,7 +415,23 @@ addRow({
       // worker kept or changed them (core/rounds.ts); the rest are superseded
       // and can no longer block acceptance.
       decisions: [...carried, ...e.decisions],
+      // Plan 06b (OD-1 A2): a conductor-raised finding that was anchored to an
+      // ITEM belongs to the candidate it was raised on. A new candidate
+      // re-evaluates the item, so the old finding is superseded here; a still
+      // unmet/deviating item gets a fresh one from #applyItemOutcomes.
+      findings: s.phase.findings.map((f) =>
+        f.status === "open" && f.raisedBy === "conductor" && f.itemId
+          ? { ...f, status: "superseded" as const, supersededBy: `candidate ${e.candidateSha.slice(0, 8)} re-evaluated ${f.itemId}` }
+          : f,
+      ),
       round: (s.phase.round ?? 0) + 1,
+      // Plan 06g (A4): the round's BASE, i.e. the candidate this one repairs
+      // (round 1 keeps the phase baseline: absent here). A test that passed at
+      // this base and fails in the new round is a regression; one the base
+      // already failed is a persisting failure, not a regression.
+      ...((s.phase.round ?? 0) >= 1
+        ? { roundBaseFailures: (s.phase.checks?.failures ?? []).filter((f) => !f.loadOnly).map((f) => f.name) }
+        : {}),
       checks: undefined,
       // Plan 05d: this candidate is the one that repairs the previous check
       // failure, so mark the kept split with its sha (finding A-9): the
@@ -350,6 +444,25 @@ addRow({
       pendingDispute: undefined,
       probe: undefined,
       reviews: {},
+      // Plan 06b / OD-1 A2: the previous candidate's item RESULTS are cleared
+      // at each freeze (the check resolution, symbol deviations and overturns
+      // belong to the candidate that just froze). The worker's COVERAGE is
+      // this new candidate's own input — the reviewer prompt and the views
+      // read it — so it is kept until the next worker attempt replaces it.
+      checkResolution: undefined,
+      checkTestLines: undefined,
+      archSymbolDeviations: undefined,
+      overturns: undefined,
+      itemChecks: undefined,
+      // Plan 06i: the triage records belong to the candidate that just froze.
+      // A disposition of `fix` for a finding the new candidate repaired must
+      // not block acceptance for ever; the new candidate is triaged afresh.
+      // (A deferral is an owner's recorded decision, not a candidate fact, so
+      // it is kept.)
+      triage: undefined,
+      // Plan 06c: the final check's pass belongs to the candidate that just
+      // froze, so a new candidate runs it again.
+      finalChecksPassedFor: undefined,
       // Skill fix 5: kept decisions that passed keep their ballots.
       ballots: carryBallotsForward(
         s.phase.decisions,
@@ -360,6 +473,8 @@ addRow({
         s.phase.contract.contractVersion,
         carried,
         e.candidateSha,
+        seatsOf(s.phase.contract),
+        leaderOf(s.phase.contract),
       ),
       overrides: [],
       // design §2.2: a clean freeze (no survivors this time) clears any
@@ -406,7 +521,7 @@ addRow({
   apply: (s) =>
     withPhase(s, {
       phase: "PROBING",
-      checks: { candidateSha: s.phase.candidate!.sha, passed: true },
+      checks: { candidateSha: s.phase.candidate!.sha, passed: true, tier: "round" },
       inFlight: clearInFlight(s.phase, "run_checks"),
     }),
 });
@@ -418,7 +533,7 @@ failureRows("checks-failed", "CHECKING", "CHECKS_FAILED", REPAIR_ATTEMPT_ACTIONS
   const failures = (ev as Extract<Event, { type: "CHECKS_FAILED" }>).failures;
   const candidateSha = s.phase.candidate!.sha;
   return withPhase(s, {
-    checks: { candidateSha, passed: false, ...(failures && failures.length > 0 ? { failures } : {}) },
+    checks: { candidateSha, passed: false, tier: "round", ...(failures && failures.length > 0 ? { failures } : {}) },
     // Plan 05d: keep the split across the repair freeze too, so the reviewers
     // of the repaired candidate see which tests failed and how each was
     // classified (finding A-5).
@@ -441,6 +556,67 @@ addRow({
       checks: { candidateSha: s.phase.candidate!.sha, interrupted: true },
       inFlight: clearInFlight(s.phase, "run_checks"),
     }),
+});
+
+// Plan 06j (A3): the owner re-runs the frozen candidate's checks because the
+// failure looks like the machine. Accepted only when the current candidate's
+// checks just failed (never a passed check, never a newer candidate) and the
+// phase is parked with no worker running; it re-runs the SAME tier, answers
+// the budget-gate request the failure parked with, and spends no round.
+addRow({
+  id: "recheck-requested",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableRound",
+  guard: (s) => recheckAvailableRound(s),
+  to: "CHECKING",
+  actions: [{ type: "run_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "CHECKING"),
+});
+
+// The same, for a candidate whose failed run was the final tier: the recheck
+// enters FINAL_CHECKING so `#runChecks` runs the phase's checks plus the final
+// check again.
+addRow({
+  id: "recheck-requested-final",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableFinal",
+  guard: (s) => recheckAvailableFinal(s),
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "FINAL_CHECKING"),
+});
+
+// Plan 06j (A3, owner steer 19:41Z): a check failure with budget left starts a
+// repair attempt by itself (IMPLEMENTING) before the owner can act. The owner
+// may still recheck the frozen candidate while that attempt has not submitted;
+// the conductor stops the worker (nothing it wrote is kept) and the round it
+// charged is given back, so the checks re-run on the SAME candidate.
+addRow({
+  id: "recheck-requested-from-implementing",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableRound",
+  guard: (s) => recheckAvailableRound(s),
+  to: "CHECKING",
+  actions: [{ type: "run_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "CHECKING", true),
+});
+
+addRow({
+  id: "recheck-requested-final-from-implementing",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "RECHECK_REQUESTED",
+  guardName: "recheckAvailableFinal",
+  guard: (s) => recheckAvailableFinal(s),
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s, ev) => applyRecheck(s, ev, "FINAL_CHECKING", true),
 });
 
 // --- PROBING --------------------------------------------------------
@@ -800,6 +976,26 @@ addRow({
   apply: (s) => withPhase(s, { phase: "RESOLVING", inFlight: clearedAtEvaluationExit(s.phase) }),
 });
 
+// Plan 06i (A1): the triage pass itself failed. A record without a
+// disposition at the end of evaluation is a defect of the loop, never a pass,
+// so the phase parks on the owner with the reason — it never continues to
+// item outcomes or acceptance as if triage had passed.
+addRow({
+  id: "triage-failed",
+  axis: "phase",
+  from: "EVALUATING",
+  trigger: "TRIAGE_FAILED",
+  guardName: "always",
+  guard: () => true,
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s, ev) => {
+    const e = ev as Extract<Event, { type: "TRIAGE_FAILED" }>;
+    const base = withPhase(s, { inFlight: clearedAtEvaluationExit(s.phase) });
+    return enterAwaitingOwner(base, `the triage pass failed: ${e.reason}`);
+  },
+});
+
 // --- RESOLVING --------------------------------------------------------
 /** Plan 01f: a phase whose contract declares a `:GATE:` command gates the
  * candidate before accepting it — `` accept(C, K) `` is what the *gate stage*
@@ -903,13 +1099,28 @@ function applyCriterionAmended(s: State, ev: Event): State {
       ? { ...f, status: "superseded" as const, supersededBy: `amendment ${amendment.id} replaced the wording` }
       : f,
   );
+  // Plan 06b (OD-1 R6, finding disc-B-37): a structured phase carries the
+  // criterion in its requirement item too. Target the item the amendment NAMES
+  // by id; fall back to matching its OLD wording. Never by list position,
+  // which could retarget the wrong requirement.
+  const requirements = s.phase.contract.requirements
+    ? s.phase.contract.requirements.map((r) =>
+        (amendment.itemId ? r.id === amendment.itemId : r.text === amendment.criterion || r.title === amendment.criterion)
+          ? { ...r, title: amendment.proposedWording, text: amendment.proposedWording }
+          : r,
+      )
+    : s.phase.contract.requirements;
   return withPhase(s, {
     phase: "IMPLEMENTING",
-    contract: { ...s.phase.contract, acceptance: e.newAcceptance, contractVersion: e.newContractVersion },
+    contract: { ...s.phase.contract, acceptance: e.newAcceptance, ...(requirements ? { requirements } : {}), contractVersion: e.newContractVersion },
     candidate: s.phase.candidate && { sha: s.phase.candidate.sha, contractVersion: e.newContractVersion },
     decisions,
     findings,
     attempt: { n: s.phase.attempt.n + 1 },
+    // OD-2 A2: the amended contract starts a NEW attempt, so it owes its own
+    // coverage; the previous candidate's report must not satisfy its freeze.
+    coverage: undefined,
+    coverageAttempt: undefined,
     checks: undefined,
     probe: undefined,
     reviews: {},
@@ -1025,16 +1236,162 @@ addRow({
   apply: (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "run_gate") }),
 });
 
+// --- FINAL_CHECKING (plan 06c): the plan's final check ---------------------
+// A phase whose contract declares a final check runs it once for the candidate
+// about to be accepted, after the reviews have passed. A failure is an
+// ordinary check failure: back to REPAIRING (or AWAITING_OWNER when the budget
+// is spent), with the failing test named in a blocking finding.
+function finalDeclared(s: State): boolean {
+  return finalCheckOf(s.phase.contract) !== undefined;
+}
+
+function finalCheckAlreadyPassed(s: State): boolean {
+  return s.phase.finalChecksPassedFor !== undefined && s.phase.finalChecksPassedFor === s.phase.candidate?.sha;
+}
+
+addRow({
+  id: "resolving-final-check-required",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "FINAL_CHECK_REQUIRED",
+  guardName: "acceptHoldsAndFinalDeclared",
+  guard: (s) => acceptHolds(s) && finalDeclared(s) && !finalCheckAlreadyPassed(s),
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { phase: "FINAL_CHECKING" }),
+});
+
+addRow({
+  id: "final-checks-passed-accepted",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "acceptHoldsAndNoGate",
+  guard: (s) => acceptHolds(s) && !gateDeclared(s),
+  to: "ACCEPTED",
+  actions: [{ type: "publish_intent", expectedHead: "H0", candidateI: "I1" }],
+  apply: (s) => {
+    const C = s.phase.candidate!.sha;
+    const K = s.phase.contract.contractVersion;
+    const resolved = resolvedCorrectionIdsFor(s.phase, C, K);
+    const corrections = s.phase.corrections.map((c: Correction) =>
+      resolved.includes(c.id) ? { ...c, status: "resolved" as const } : c,
+    );
+    return withPhase(s, {
+      phase: "ACCEPTED",
+      corrections,
+      finalChecksPassedFor: C,
+      inFlight: clearInFlight(s.phase, "run_final_checks"),
+    });
+  },
+});
+
+addRow({
+  id: "final-checks-passed-gated",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "acceptHoldsAndGateDeclared",
+  guard: (s) => acceptHolds(s) && gateDeclared(s),
+  to: "GATING",
+  actions: [{ type: "run_gate", candidateSha: "C1" }],
+  apply: (s) =>
+    withPhase(s, {
+      phase: "GATING",
+      finalChecksPassedFor: s.phase.candidate?.sha ?? "",
+      checks: { candidateSha: s.phase.candidate!.sha, passed: true, tier: "final" },
+      inFlight: clearInFlight(s.phase, "run_final_checks"),
+    }),
+});
+
+// Plan 06k1 (A5, finding A-8): a correction arrived while the final check ran.
+// It is queued for the next attempt and granted its own round, so a passing
+// final check sends the phase to REPAIRING instead of accepting the candidate
+// without it.
+addRow({
+  id: "final-checks-passed-correction-queued",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_PASSED",
+  guardName: "queuedCorrectionBlocksAcceptance",
+  guard: (s) => !acceptHolds(s) && (s.phase.queuedCorrections ?? []).length > 0,
+  to: "REPAIRING",
+  actions: REPAIR_ATTEMPT_ACTIONS,
+  apply: (s) => withPhase(s, { phase: "REPAIRING", inFlight: clearInFlight(s.phase, "run_final_checks") }),
+});
+
+failureRows(
+  "final-checks-failed",
+  "FINAL_CHECKING",
+  "FINAL_CHECKS_FAILED",
+  REPAIR_ATTEMPT_ACTIONS,
+  "the final check kept failing",
+  (s, ev) => {
+    const e = ev as Extract<Event, { type: "FINAL_CHECKS_FAILED" }>;
+    // An ordinary check failure: the failing tests are kept on `checks` (so
+    // the repair prompt names them) and no finding is raised — a finding
+    // would stay open and block the next candidate's acceptance.
+    return withPhase(s, {
+      checks: {
+        candidateSha: s.phase.candidate!.sha,
+        passed: false,
+        tier: "final",
+        ...(e.failures && e.failures.length > 0 ? { failures: e.failures } : {}),
+      },
+      inFlight: clearInFlight(s.phase, "run_final_checks"),
+    });
+  },
+);
+
+addRow({
+  id: "final-checks-interrupted",
+  axis: "phase",
+  from: "FINAL_CHECKING",
+  trigger: "FINAL_CHECKS_INTERRUPTED",
+  guardName: "always",
+  guard: () => true,
+  to: "FINAL_CHECKING",
+  actions: [{ type: "run_final_checks", candidateSha: "C1" }],
+  apply: (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "run_final_checks") }),
+});
+
 addRow({
   id: "resolving-incomplete-repair",
   axis: "phase",
   from: "RESOLVING",
   trigger: "RESOLVING_INCOMPLETE",
   guardName: "openItemsAndBudgetRemains",
-  guard: (s) => !acceptHolds(s) && budgetRemains(s),
+  // Plan 06b: an evidence-only phase parks on the owner, not a repair round.
+  // Plan 06k1 (A3): a requirement that reached the variant limit is NOT
+  // repaired again; the variant row below parks it for the owner instead.
+  guard: (s) => !acceptHolds(s) && budgetRemains(s) && !evidenceOnlyPending(s.phase) && !variantEscalation(s.phase),
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING" }),
+});
+
+// Plan 06k1 (A3): the same requirement took a new blocking finding of the
+// same kind in N consecutive rounds (default 3, `#+TT_VARIANT_LIMIT`).
+// Another repair would be the loop spinning on variants; the owner is asked
+// whether to carry the remaining variants or fix, and no repair attempt
+// starts. `openItemOwnerRequestsFor` gives the open blocking finding its own
+// request; `enterAwaitingOwner` supplies the budget gate when there is none.
+addRow({
+  id: "resolving-incomplete-variant-limit",
+  axis: "phase",
+  from: "RESOLVING",
+  trigger: "RESOLVING_INCOMPLETE",
+  guardName: "variantLimitReached",
+  guard: (s) => !acceptHolds(s) && budgetRemains(s) && !evidenceOnlyPending(s.phase) && variantEscalation(s.phase) !== undefined,
+  to: "AWAITING_OWNER",
+  actions: [],
+  apply: (s) => {
+    const escalation = variantEscalation(s.phase)!;
+    return enterAwaitingOwner(
+      s,
+      `${escalation.itemId} took a new blocking ${escalation.kind} finding in ${escalation.rounds.length} consecutive rounds (rounds ${escalation.rounds.join(", ")}); carry the remaining variants, or fix?`,
+    );
+  },
 });
 
 addRow({
@@ -1043,10 +1400,51 @@ addRow({
   from: "RESOLVING",
   trigger: "RESOLVING_INCOMPLETE",
   guardName: "openItemsBudgetExhausted",
-  guard: (s) => !acceptHolds(s) && budgetExhausted(s),
+  guard: (s) => !acceptHolds(s) && (budgetExhausted(s) || evidenceOnlyPending(s.phase)),
   to: "AWAITING_OWNER",
   actions: [],
-  apply: (s) => enterAwaitingOwner(s, "the repair budget ran out while items remained open"),
+  apply: (s) =>
+    enterAwaitingOwner(
+      s,
+      evidenceOnlyPending(s.phase)
+        ? `the owner must record evidence for ${pendingEvidenceItems(s.phase).map((i) => i.id).join(", ")}`
+        : "the repair budget ran out while items remained open",
+    ),
+});
+
+// Plan 06b: every `evidence` item is recorded, so the owner has done the
+// thing the phase parked for. The parking request closes and the phase
+// resumes to RESOLVING, where next() re-evaluates accept().
+addRow({
+  id: "awaiting-owner-evidence-recorded",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "EVIDENCE_RECORDED",
+  guardName: "evidenceAllRecorded",
+  guard: (s) => evidenceAllRecorded(s.phase),
+  to: "RESOLVING",
+  // The gate-less fixture (base contract): accept now holds, so the row's
+  // actions are exactly next(RESOLVING).
+  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  // OD-1 (disc-M-56): resolve ONLY the request that parked the phase for
+  // evidence — never an unrelated owner decision. The parking request is the
+  // fallback whose reason names the evidence items.
+  apply: (s) =>
+    withPhase(s, {
+      phase: "RESOLVING",
+      ownerRequests: s.phase.ownerRequests.map((r) =>
+        r.status === "open" && r.reason.startsWith("the owner must record evidence for")
+          ? {
+              ...r,
+              status: "resolved" as const,
+              resolution: { option: "evidence_recorded" },
+              resolvedBinding: s.phase.candidate
+                ? { candidateSha: s.phase.candidate.sha, contractVersion: s.phase.contract.contractVersion }
+                : undefined,
+            }
+          : r,
+      ),
+    }),
 });
 
 // --- ACCEPTED / PUBLISHING --------------------------------------------
@@ -1113,6 +1511,10 @@ addRow({
       phase: "IMPLEMENTING",
       repairRoundsUsed: s.phase.repairRoundsUsed + 1,
       attempt: { n: s.phase.attempt.n + 1 },
+      // OD-2 A2: a repair attempt owes its own coverage; the previous
+      // attempt's report never satisfies the freeze.
+      coverage: undefined,
+      coverageAttempt: undefined,
     }),
 });
 
@@ -1381,11 +1783,18 @@ function applyOwnerCorrection(s: State, ev: Event): State {
         }
       : r,
   );
+  // Plan 06k1 (A2): an owner correction that names a decision id as ruled
+  // settles that decision with no ballots on every later candidate whose
+  // decision keeps the same id and choice.
+  // Plan 06k2 (A8): a negation in the correction clears the ruling it
+  // negates (finding D-B-79).
+  const ruledDecisions = clearRulings(recordRulings(s.phase.ruledDecisions, e.text, s.phase.decisions, e.correctionId), e.text, s.phase.decisions);
   return withPhase(s, {
     phase: "REPAIRING",
     ownerRequests,
     repairRoundsGranted: s.phase.repairRoundsGranted + 3,
     ownerNotes: [...(s.phase.ownerNotes ?? []), e.text],
+    ruledDecisions: ruledDecisions ?? [],
     inFlight: {},
   });
 }
@@ -1420,10 +1829,11 @@ function checkAndApply<E extends Event>(
 const ownerRequestResolved = checkAndApply(checkOwnerRequestResolved, applyOwnerRequestResolved);
 const findingAcceptedByOwner = checkAndApply(checkFindingAcceptedByOwner, applyFindingAcceptedByOwner);
 const overrideCast = checkAndApply(checkOverrideCast, applyOverrideCast);
+const itemCarried = checkAndApply(checkItemCarried, applyItemCarried);
 
 function resolvedRequestFor(s: State, ev: Event): PhaseState["ownerRequests"][number] | undefined {
   const e = ev as Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
-  return s.phase.ownerRequests.find((r) => r.id === e.requestId);
+  return findOwnerRequest(s.phase, e.requestId);
 }
 
 // OWNER_REQUEST_RESOLVED: the plain repair-budget gate request routes on
@@ -1445,6 +1855,31 @@ addRow({
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s, ev) => withPhase(s, { ...ownerRequestResolved.applyPhase(s, ev), phase: "REPAIRING" }),
+});
+
+// Plan 06g (A6): "accept with carried items" — the single decision a phase
+// whose budget is spent offers when only advisories are open. Taking it
+// accepts the candidate as it stands (applyOwnerRequestResolved records
+// `acceptedWithCarried` and the carried ids, and accept() honours them) and
+// the phase resumes to RESOLVING, where next() accepts.
+addRow({
+  id: "awaiting-owner-request-resolved-accept-carried",
+  axis: "phase",
+  from: "AWAITING_OWNER",
+  trigger: "OWNER_REQUEST_RESOLVED",
+  guardName: "budgetGateAcceptCarried",
+  guard: (s, ev) => {
+    const request = resolvedRequestFor(s, ev);
+    const e = ev as Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
+    if (!request || !isBudgetGateRequest(request) || e.option !== "accept_carried") return false;
+    if (!ownerRequestResolved.guardValid(s, ev)) return false;
+    return awaitingOwnerTarget(ownerRequestResolved.applyPhase(s, ev)) !== "AWAITING_OWNER";
+  },
+  to: "RESOLVING",
+  // The gate-less form, exactly like the grant row's own fixture: a phase
+  // whose contract declares a gate asks for `gate_required` first.
+  actions: [{ type: "accept", resolvedCorrectionIds: [] }],
+  apply: (s, ev) => withPhase(s, { ...ownerRequestResolved.applyPhase(s, ev), phase: "RESOLVING" }),
 });
 
 addRow({
@@ -1583,6 +2018,12 @@ addAwaitingOwnerRecordCommandRows(
 addAwaitingOwnerRecordCommandRows("awaiting-owner-finding-accepted", "FINDING_ACCEPTED_BY_OWNER", () => true, findingAcceptedByOwner);
 
 addAwaitingOwnerRecordCommandRows("awaiting-owner-override", "OVERRIDE_CAST", () => true, overrideCast);
+
+// Plan 06g (A5): the owner's `tt carry <run> <id> --to <phase-id>` — mark the
+// item carried with its target, answer the request about it, and (once no
+// blocking item remains uncarried) accept the candidate. It shares the same
+// clears/stays routing as the other record-level owner commands.
+addAwaitingOwnerRecordCommandRows("awaiting-owner-item-carried", "ITEM_CARRIED", () => true, itemCarried);
 
 // --- launch failure (§2.1): a tool-set mismatch is a launch failure, not a
 // warning — straight to BLOCKED, no repair round spent (phase-1b round of
@@ -1874,6 +2315,24 @@ addRow({
   // start_attempt again once the run is unpaused.
   actions: [{ type: "start_attempt" }],
   apply: (s) => ({ ...s, run: "RUN_ACTIVE" }),
+});
+
+// Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
+// run records RUN_RESUMED once at start-up, so the stage clock sees the resume
+// as the start of a new segment. The run was already active, so this is a
+// record-only row (the phase is preserved untouched).
+addRow({
+  id: "run-resumed-active",
+  axis: "run",
+  from: "RUN_ACTIVE",
+  trigger: "RUN_RESUMED",
+  guardName: "always",
+  guard: () => true,
+  to: "RUN_ACTIVE",
+  // The fixture resumes with the phase at READY, so next() recommends
+  // start_attempt once the resume is recorded.
+  actions: [{ type: "start_attempt" }],
+  apply: (s) => s,
 });
 
 export const TRANSITIONS: readonly TransitionRow[] = rows;

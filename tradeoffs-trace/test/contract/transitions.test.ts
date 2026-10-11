@@ -54,6 +54,12 @@ function gatedContract(gate = "deploy/atlas.sh --clean --build", gateCleanup?: s
   return { ...baseState().phase.contract, gate, ...(gateCleanup ? { gateCleanup } : {}) };
 }
 
+/** Plan 06c: the same contract with a final check declared, which inserts the
+ * FINAL_CHECKING stage between RESOLVING and ACCEPTED. */
+function finalContract(finalChecks = ["make check-final"], gate?: string) {
+  return { ...baseState().phase.contract, finalChecks, ...(gate ? { gate } : {}) };
+}
+
 interface Fixture {
   state: State;
   event: Event;
@@ -241,6 +247,102 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "GATE_INTERRUPTED" },
   },
+  // Plan 06c: an acceptable candidate whose contract declares a final check
+  // enters FINAL_CHECKING instead; the final check is the next action.
+  "resolving-final-check-required": {
+    state: baseState({
+      phase: "RESOLVING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECK_REQUIRED" },
+  },
+  "final-checks-passed-accepted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
+  "final-checks-passed-gated": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(["make check-final"], "deploy/atlas.sh --clean --build"),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
+  // Plan 06k1 (A5, finding A-8): a correction queued during FINAL_CHECKING is
+  // an acceptance obligation; a passing final check repairs, not accepts.
+  "final-checks-passed-correction-queued": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      integrationHead: "H0",
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      queuedCorrections: [{ id: "C-1", text: "use UTC everywhere" }],
+      repairRoundsUsed: 0,
+      repairRoundsGranted: 1,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
+  },
+  "final-checks-failed-to-repairing": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_FAILED", evidence: "the final check failed: test 'final check'" },
+  },
+  "final-checks-failed-budget-exhausted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      repairRoundsUsed: 3,
+      repairRoundsGranted: 3,
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_FAILED", evidence: "the final check failed: test 'final check'" },
+  },
+  "final-checks-interrupted": {
+    state: baseState({
+      phase: "FINAL_CHECKING",
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      inFlight: { run_final_checks: { actionId: "a1" } },
+      contract: finalContract(),
+    }),
+    event: { type: "FINAL_CHECKS_INTERRUPTED" },
+  },
   // Plan 01g: a passing amendment (M and A approve it) replaces one
   // acceptance item, bumps the contract version and starts a fresh attempt
   // so the next candidate is judged against the new wording. The resulting
@@ -313,6 +415,60 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "RESOLVING_INCOMPLETE" },
   },
+  // Plan 06k1 (A3): the same requirement took a blocking finding of the same
+  // kind in rounds 1, 2 and 3 (the current round); the variant row parks it.
+  "resolving-incomplete-variant-limit": {
+    state: baseState({
+      phase: "RESOLVING",
+      candidate: C1,
+      round: 3,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: acceptableReviews,
+      findings: [
+        openBlockingFinding({ id: "F-v1", itemId: "R1", roundRaised: 1, status: "repaired" }),
+        openBlockingFinding({ id: "F-v2", itemId: "R1", roundRaised: 2, status: "repaired" }),
+        openBlockingFinding({ id: "F-v3", itemId: "R1", roundRaised: 3 }),
+      ],
+    }),
+    event: { type: "RESOLVING_INCOMPLETE" },
+  },
+  "awaiting-owner-evidence-recorded": {
+    state: baseState({
+      phase: "AWAITING_OWNER",
+      contract: {
+        ...baseState().phase.contract,
+        acceptance: ["the owner run is recorded"],
+        requirements: [{ id: "R1", title: "owner run", text: "the owner run is recorded", arch: [], verify: ["evidence"] }],
+      },
+      candidate: C1,
+      checks: { candidateSha: "C1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      reviews: {
+        M: { review: { ...approvingReview("M", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+        A: { review: { ...approvingReview("A", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+        B: { review: { ...approvingReview("B", "C1", K), items: [{ id: "R1", verdict: "met", evidence: "src/x.ts:1" }] } },
+      },
+      itemEvidence: [{ id: "R1", text: "recorded" }],
+      ownerRequests: [
+        {
+          id: "OR-evidence-1",
+          version: 1,
+          phaseId: "p1",
+          reason: "the owner must record evidence for R1",
+          origin: "repair_budget_exhausted",
+          boundCandidateSha: "C1",
+          boundContractVersion: K,
+          options: [
+            { id: "grant", label: "grant 3 more repair rounds" },
+            { id: "stop", label: "stop the phase" },
+          ],
+          status: "open",
+        },
+      ],
+    }),
+    event: { type: "EVIDENCE_RECORDED", itemId: "R1" },
+  },
   "accepted-publish-intent": {
     state: baseState({ phase: "ACCEPTED", candidate: C1, integrationHead: "H0", probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true } }),
     event: { type: "PUBLISH_INTENT", expectedHead: "H0", candidateI: "I1" },
@@ -345,6 +501,10 @@ const BUILD: Record<string, Fixture> = {
   },
   "run-resumed": {
     state: baseState({ phase: "READY" }, "RUN_PAUSED_BUDGET"),
+    event: { type: "RUN_RESUMED" },
+  },
+  "run-resumed-active": {
+    state: baseState({ phase: "READY" }, "RUN_ACTIVE"),
     event: { type: "RUN_RESUMED" },
   },
   // Plan 05i: the environment preflight and environment (126/127) failures.
@@ -644,6 +804,122 @@ BUILD["awaiting-owner-request-resolved-grant"] = {
     type: "OWNER_REQUEST_RESOLVED",
     requestId: "OR-gate",
     option: "grant",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
+// Plan 06j (A3): the owner rechecks a frozen candidate whose checks just
+// failed. The phase is parked (budget spent) with no worker running; the row
+// re-runs the same tier, keeps the failed record (with its tier) for the
+// re-run, and answers the budget gate with the recheck itself.
+BUILD["recheck-requested"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "round" },
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the checks kept failing",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "grant", label: "grant 3 more repair rounds" }, { id: "stop", label: "stop the phase" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "load-only timing", tier: "round" },
+};
+
+// A recheck of a candidate whose failed run was the final tier enters
+// FINAL_CHECKING, so the same final check runs again.
+BUILD["recheck-requested-final"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "final" },
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the final check kept failing",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "grant", label: "grant one more round" }, { id: "stop", label: "stop the phase" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "killed process", tier: "final" },
+};
+
+// Plan 06j (A3, owner steer 19:41Z): a check failure with budget left started
+// a repair attempt by itself. The owner rechecks before it submits; the worker
+// is stopped and the charged round is given back.
+BUILD["recheck-requested-from-implementing"] = {
+  state: baseState({
+    phase: "IMPLEMENTING",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "round" },
+    repairRoundsUsed: 1,
+    repairRoundsGranted: 2,
+    // The stopped attempt's own dispatch is still in flight when the recheck
+    // arrives; the row must clear it or the next repair stalls.
+    inFlight: { dispatch_worker: { actionId: "w1" } },
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "load-only timing", tier: "round" },
+};
+
+BUILD["recheck-requested-final-from-implementing"] = {
+  state: baseState({
+    phase: "IMPLEMENTING",
+    candidate: C1,
+    checks: { candidateSha: "C1", passed: false, tier: "final" },
+    repairRoundsUsed: 1,
+    repairRoundsGranted: 2,
+  }),
+  event: { type: "RECHECK_REQUESTED", candidateSha: "C1", reason: "killed process", tier: "final" },
+};
+
+// Plan 06g (A6): "accept with carried items" — the budget-spent phase whose
+// only open items are advisories offers this one decision; taking it accepts
+// the candidate as it stands and resumes to RESOLVING, where next() accepts
+// (accept() honours `acceptedWithCarried`).
+BUILD["awaiting-owner-request-resolved-accept-carried"] = {
+  // ODP-2: the carry waives the open review items only; the mechanical gates
+  // (checks passed for C, the probe for C onto the current head) must hold for
+  // acceptance, so the fixture carries them.
+  state: baseState({
+    ...resolvableAwaitingOwnerBase,
+    phase: "AWAITING_OWNER",
+    findings: [
+      { id: "F-adv", version: 1, phaseId: "p1", kind: "defect", severity: "advisory", evidence: "a further edge path, carried", raisedBy: "B", status: "open", boundCandidateSha: "C1" },
+    ],
+    repairRoundsUsed: 3,
+    repairRoundsGranted: 3,
+    ownerRequests: [
+      {
+        id: "OR-gate",
+        version: 1,
+        phaseId: "p1",
+        reason: "the repair budget ran out while items remained open; only advisories are open (F-adv) and they are carried",
+        origin: "repair_budget_exhausted",
+        options: [{ id: "accept_carried", label: "accept with carried items" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "OWNER_REQUEST_RESOLVED",
+    requestId: "OR-gate",
+    option: "accept_carried",
     boundCandidateSha: "C1",
     boundContractVersion: K,
     boundRecordVersion: 1,
@@ -985,6 +1261,122 @@ BUILD["awaiting-owner-finding-accepted-stays"] = {
   },
 };
 
+// Plan 06g (A5): `tt carry <run> <id> --to <phase-id>`. Carrying the only
+// blocking item resolves the request about it and accepts the candidate
+// (`acceptedWithCarried`), so the phase resumes to RESOLVING.
+BUILD["awaiting-owner-item-carried-clears-to-resolving"] = {
+  state: baseState({
+    ...resolvableAwaitingOwnerBase,
+    phase: "AWAITING_OWNER",
+    findings: [findingFixture()],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding open",
+        origin: "open_finding",
+        linkedFindingId: "F1",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "ITEM_CARRIED",
+    recordId: "F1",
+    recordKind: "finding",
+    toPhase: "06h",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
+// An open correction still needs a round even after the carried item clears
+// its request, so the phase resumes to REPAIRING.
+BUILD["awaiting-owner-item-carried-clears-to-repairing"] = {
+  state: baseState({
+    ...resolvableAwaitingOwnerBase,
+    phase: "AWAITING_OWNER",
+    findings: [findingFixture()],
+    corrections: [
+      {
+        id: "C-1",
+        version: 1,
+        phaseId: "p1",
+        targetRecordId: "D-other",
+        correctionText: "x",
+        contractChange: false,
+        status: "open",
+        boundContractVersion: K,
+        grantedRounds: 3,
+      },
+    ],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding open",
+        origin: "open_finding",
+        linkedFindingId: "F1",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "ITEM_CARRIED",
+    recordId: "F1",
+    recordKind: "finding",
+    toPhase: "06h",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
+// A second blocking item is still uncarried, so the phase stays parked.
+BUILD["awaiting-owner-item-carried-stays"] = {
+  state: baseState({
+    phase: "AWAITING_OWNER",
+    candidate: C1,
+    findings: [findingFixture({ id: "F1" }), findingFixture({ id: "F2" })],
+    ownerRequests: [
+      {
+        id: "OR-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding F1 open",
+        origin: "open_finding",
+        linkedFindingId: "F1",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+      {
+        id: "OR-2",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding F2 open",
+        origin: "open_finding",
+        linkedFindingId: "F2",
+        options: [{ id: "accept_risk", label: "accept the risk" }, { id: "repair", label: "repair (grant 3 rounds)" }],
+        status: "open",
+      },
+    ],
+  }),
+  event: {
+    type: "ITEM_CARRIED",
+    recordId: "F1",
+    recordKind: "finding",
+    toPhase: "06h",
+    boundCandidateSha: "C1",
+    boundContractVersion: K,
+    boundRecordVersion: 1,
+  },
+};
+
 function failingBallots() {
   return [
     { reviewer: "M" as const, decisionId: "D1", vote: "reject" as const, rationale: "x", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
@@ -1156,6 +1548,21 @@ BUILD["evaluation-completed"] = {
   event: { type: "EVALUATION_COMPLETED" },
 };
 
+// Plan 06i (A1): the triage pass itself failed, so the phase parks on the
+// owner instead of continuing to item outcomes and acceptance.
+BUILD["triage-failed"] = {
+  state: baseState({
+    phase: "EVALUATING",
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    messages: [rawMessage()],
+    evaluation: { types: { tradeoff: { settled: true } } },
+  }),
+  event: { type: "TRIAGE_FAILED", reason: "the triage pass threw" },
+};
+
 // Plan 04b: the blocker panel. A raised blocker is a raw `blocker` message
 // AND an open blocking finding; each panel's verdict picks the exit from
 // EVALUATING (the message itself is published by the blocker evaluator before
@@ -1194,6 +1601,9 @@ const PANEL_BASE = {
   reviews: acceptableReviews,
   findings: [blockerFinding()],
   messages: [blockerMessage()],
+  // Plan 06i: the open blocking finding owes its impact classification, so its
+  // `finding` evaluator pass must be settled for EVALUATION_COMPLETED to hold.
+  evaluation: { types: { finding: { settled: true } } },
 } as const;
 
 BUILD["panel-escalate"] = {
@@ -1247,6 +1657,16 @@ BUILD["panel-incomplete"] = {
   }),
   event: { type: "EVALUATION_COMPLETED" },
 };
+
+test("plan 06j: a recheck from IMPLEMENTING clears the stopped attempt's dispatch_worker and refunds its round", () => {
+  const fixture = BUILD["recheck-requested-from-implementing"];
+  const result = reduce(fixture.state, fixture.event);
+  assert.equal(result.ok, true, !result.ok ? result.reason : "");
+  assert.equal(result.state.phase.phase, "CHECKING");
+  assert.equal(result.state.phase.inFlight.dispatch_worker, undefined, "the stopped attempt's dispatch must not survive");
+  assert.equal(result.state.phase.repairRoundsUsed, 0, "the charged round is given back");
+  assert.deepEqual(next(result.state), [{ type: "run_checks", candidateSha: "C1" }]);
+});
 
 test("transition table: every row in transitions.ts has a covering fixture", () => {
   const missing = TRANSITIONS.filter((r) => !BUILD[r.id]).map((r) => r.id);
@@ -1479,3 +1899,164 @@ for (const edge of DESIGN_EDGES) {
     assert.ok(hasRow, `no transition row covers ${edge.from} -> ${edge.to} (${edge.cite})`);
   });
 }
+
+test("plan 06b: a criterion amendment's new attempt owes its own coverage (OD-2 A2)", () => {
+  const contract = {
+    ...baseState().phase.contract,
+    acceptance: ["first criterion", "second criterion"],
+    requirements: [
+      { id: "R1", title: "first criterion", text: "first criterion", arch: [], verify: ["review"] },
+      { id: "R2", title: "second criterion", text: "second criterion", arch: [], verify: ["review"] },
+    ],
+  };
+  const state = baseState({
+    phase: "RESOLVING",
+    contract,
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: acceptableReviews,
+    coverage: { items: [{ id: "R1", status: "done", where: [], tests: [] }], arch: [] },
+    decisions: [
+      {
+        id: "D-am",
+        version: 1,
+        phaseId: "p1",
+        source: "worker",
+        class: "reserved",
+        choice: "second criterion v2",
+        whyItMatters: "the letter cannot be met",
+        alternatives: [{ option: "second criterion", consequence: "unsatisfiable" }],
+        recommendation: { choice: "second criterion v2", reason: "satisfiable" },
+        boundCandidateSha: "C1",
+        boundContractVersion: K,
+        amendment: {
+          id: "AM-p1",
+          criterion: "second criterion",
+          itemId: "R2",
+          proposedWording: "second criterion v2",
+          why: "the letter cannot be met",
+          raisedBy: "worker",
+          status: "proposed",
+          previousContractVersion: K,
+        },
+      },
+    ],
+    ballots: [
+      { reviewer: "M", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+      { reviewer: "A", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+    ],
+  });
+  const result = reduce(state, { type: "CRITERION_AMENDED", decisionId: "D-am", newAcceptance: ["first criterion", "second criterion v2"], newContractVersion: CV(2) });
+  assert.ok(result.ok, "the amendment applies");
+  assert.equal(result.state.phase.phase, "IMPLEMENTING");
+  assert.equal(result.state.phase.coverage, undefined, "the amended contract's new attempt owes its own coverage");
+});
+
+test("plan 06b: a criterion amendment rewrites the requirement it names by id", () => {
+  const contract = {
+    ...baseState().phase.contract,
+    acceptance: ["first criterion", "second criterion"],
+    requirements: [
+      { id: "R1", title: "first criterion", text: "first criterion", arch: [], verify: ["review"] },
+      { id: "R2", title: "second criterion", text: "second criterion", arch: [], verify: ["review"] },
+    ],
+  };
+  const state = baseState({
+    phase: "RESOLVING",
+    contract,
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: acceptableReviews,
+    decisions: [
+      {
+        id: "D-am",
+        version: 1,
+        phaseId: "p1",
+        source: "worker",
+        class: "reserved",
+        choice: "second criterion v2",
+        whyItMatters: "the letter cannot be met",
+        alternatives: [{ option: "second criterion", consequence: "unsatisfiable" }],
+        recommendation: { choice: "second criterion v2", reason: "satisfiable" },
+        boundCandidateSha: "C1",
+        boundContractVersion: K,
+        amendment: {
+          id: "AM-p1",
+          criterion: "second criterion",
+          itemId: "R2",
+          proposedWording: "second criterion v2",
+          why: "the letter cannot be met",
+          raisedBy: "worker",
+          status: "proposed",
+          previousContractVersion: K,
+        },
+      },
+    ],
+    ballots: [
+      { reviewer: "M", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+      { reviewer: "A", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+    ],
+  });
+  const result = reduce(state, { type: "CRITERION_AMENDED", decisionId: "D-am", newAcceptance: ["first criterion", "second criterion v2"], newContractVersion: CV(2) });
+  assert.ok(result.ok, "the amendment applies");
+  const requirements = result.state.phase.contract.requirements!;
+  assert.equal(requirements.find((r) => r.id === "R1")!.text, "first criterion");
+  assert.equal(requirements.find((r) => r.id === "R2")!.text, "second criterion v2");
+});
+
+test("criterion amendment rewrites the requirement whose OLD wording matches, not by position (disc-B-37)", () => {
+  const contract = {
+    ...baseState().phase.contract,
+    acceptance: ["first criterion", "second criterion"],
+    requirements: [
+      { id: "R1", title: "first criterion", text: "first criterion", arch: [], verify: ["review"] },
+      { id: "R2", title: "second criterion", text: "second criterion", arch: [], verify: ["review"] },
+    ],
+  };
+  const state = baseState({
+    phase: "RESOLVING",
+    contract,
+    candidate: C1,
+    integrationHead: "H0",
+    checks: { candidateSha: "C1", passed: true },
+    probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+    reviews: acceptableReviews,
+    decisions: [
+      {
+        id: "D-am",
+        version: 1,
+        phaseId: "p1",
+        source: "worker",
+        class: "reserved",
+        choice: "second criterion",
+        whyItMatters: "the letter cannot be met",
+        alternatives: [{ option: "second criterion", consequence: "unsatisfiable" }],
+        recommendation: { choice: "second criterion v2", reason: "satisfiable" },
+        boundCandidateSha: "C1",
+        boundContractVersion: K,
+        amendment: {
+          id: "AM-p1",
+          criterion: "second criterion",
+          proposedWording: "second criterion v2",
+          why: "the letter cannot be met",
+          raisedBy: "worker",
+          status: "proposed",
+          previousContractVersion: K,
+        },
+      },
+    ],
+    ballots: [
+      { reviewer: "M", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+      { reviewer: "A", decisionId: "D-am", vote: "approve", rationale: "satisfiable", evidence: ["e"], boundCandidateSha: "C1", boundContractVersion: K, boundRecordVersion: 1 },
+    ],
+  });
+  const result = reduce(state, { type: "CRITERION_AMENDED", decisionId: "D-am", newAcceptance: ["first criterion", "second criterion v2"], newContractVersion: CV(2) });
+  assert.ok(result.ok, "the amendment applies");
+  const requirements = result.state.phase.contract.requirements!;
+  assert.equal(requirements.find((r) => r.id === "R1")!.text, "first criterion", "the other requirement is untouched");
+  assert.equal(requirements.find((r) => r.id === "R2")!.text, "second criterion v2", "the matching requirement is rewritten by its old wording");
+});

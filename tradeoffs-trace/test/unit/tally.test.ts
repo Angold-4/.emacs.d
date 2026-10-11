@@ -13,7 +13,7 @@ import { CV, makeDecision } from "./helpers.ts";
 const C = "C1";
 const K = CV();
 
-function ballot(reviewer: "M" | "A" | "B", vote: Vote, overrides: Partial<Ballot> = {}): Ballot {
+function ballot(reviewer: string, vote: Vote, overrides: Partial<Ballot> = {}): Ballot {
   return {
     reviewer,
     decisionId: "D1",
@@ -102,6 +102,24 @@ test("vote-table: `delegated` and `reserved` decisions are voted; `detail` is no
   // flagged for the owner), so the reviewers can settle it.
   assert.equal(tally(reserved, ballots, [], C, K), "pass");
   assert.equal(tally(reserved, [ballot("M", "reject"), ballot("A", "approve"), ballot("B", "approve")], [], C, K), "fail");
+});
+
+test("plan 06h: the named leader's approval is required, not the first seat's", () => {
+  const decision = makeDecision();
+  const seats = ["M", "A", "B", "C", "D"];
+  const ballots = [
+    ballot("M", "approve"),
+    ballot("A", "approve"),
+    ballot("B", "reject"),
+    ballot("C", "approve"),
+    ballot("D", "approve"),
+  ];
+  // `#+TT_LEADER: B`: B's rejection vetoes even though four seats approved.
+  assert.equal(tally(decision, ballots, [], C, K, seats, "B"), "fail");
+  // B's approval passes it (four approvals).
+  assert.equal(tally(decision, ballots.map((b) => (b.reviewer === "B" ? { ...b, vote: "approve" as const } : b)), [], C, K, seats, "B"), "pass");
+  // The default leader is the first seat, M.
+  assert.equal(tally(decision, ballots, [], C, K, seats, "M"), "pass");
 });
 
 test("vote-table: a decision with an open linked contract finding is suspended", () => {

@@ -190,6 +190,7 @@ export interface SubmitMessage {
     | "submit_phase"
     | "submit_discovery"
     | "submit_review"
+    | "submit_coverage"
     | "raise_tradeoff"
     | "submit_evaluation"
     | "submit_panel_vote";

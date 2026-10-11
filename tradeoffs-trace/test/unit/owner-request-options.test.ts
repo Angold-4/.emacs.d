@@ -318,7 +318,7 @@ const CASES: Case[] = [
         reason: "attempts kept timing out",
         origin: "repair_budget_exhausted",
         options: [
-          { id: "grant", label: "grant 3 more repair rounds" },
+          { id: "grant", label: "grant one more round" },
           { id: "stop", label: "stop the phase" },
         ],
         status: "open",
@@ -333,7 +333,8 @@ const CASES: Case[] = [
       return { state, requestId: "OR-1" };
     },
     assertEffect: (before, after) => {
-      assert.equal(after.phase.repairRoundsGranted, before.phase.repairRoundsGranted + 3);
+      // Plan 06g (A4): the budget gate lifts the park for exactly ONE round.
+      assert.equal(after.phase.repairRoundsGranted, before.phase.repairRoundsGranted + 1);
       assert.equal(after.phase.phase, "REPAIRING");
     },
   },

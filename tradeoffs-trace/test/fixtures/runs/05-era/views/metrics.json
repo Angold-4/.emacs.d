@@ -1,0 +1,66 @@
+{
+  "phaseId": "p1",
+  "rounds": 1,
+  "wallMs": 2794,
+  "reviewMs": 124,
+  "reviewShare": 0.0444,
+  "ownerWaitMs": 0,
+  "messages": {
+    "tradeoff": {
+      "raised": 0,
+      "raw": 0,
+      "published": 0,
+      "merged": 0,
+      "dropped": 0,
+      "accepted": 0,
+      "refused": 0,
+      "resolved": 0,
+      "superseded": 0
+    },
+    "finding": {
+      "raised": 0,
+      "raw": 0,
+      "published": 0,
+      "merged": 0,
+      "dropped": 0,
+      "accepted": 0,
+      "refused": 0,
+      "resolved": 0,
+      "superseded": 0
+    },
+    "blocker": {
+      "raised": 0,
+      "raw": 0,
+      "published": 0,
+      "merged": 0,
+      "dropped": 0,
+      "accepted": 0,
+      "refused": 0,
+      "resolved": 0,
+      "superseded": 0
+    }
+  },
+  "mergeRate": 0,
+  "dropRate": 0,
+  "ownerVerdicts": {
+    "accept": 0,
+    "refuse": 0
+  },
+  "refuseRate": 0,
+  "blockers": {
+    "escalated": 0,
+    "downgraded": 0,
+    "incomplete": 0
+  },
+  "unexposedTradeoffs": 0,
+  "cleanness": {
+    "liveEntries": 0,
+    "entryBudget": 12,
+    "entryBudgetWarning": false,
+    "entriesPerAnchor": 0,
+    "openHints": 0,
+    "ownerMerges": 0,
+    "ownerSplits": 0,
+    "lintViolations": 0
+  }
+}

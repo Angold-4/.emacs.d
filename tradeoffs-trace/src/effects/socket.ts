@@ -23,7 +23,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { existsSync, unlinkSync } from "node:fs";
 
 import { JSONLDecoder, encodeLine, type HelloMessage, type RunSocketMessage, type ShMessage, type SubmitMessage } from "../core/protocol.ts";
-import { childEnv, runCommand } from "./shell.ts";
+import { childEnv, runCommand, type ResourceSample } from "./shell.ts";
 
 const MAX_SOCKET_PATH_BYTES = 104;
 
@@ -74,8 +74,15 @@ export interface RunSocketHandlers {
    * cancel), so the caller stops tracking the pgid. */
   onShExit?: (agentId: string, commandId: string, pgid: number) => void;
   /** Per-command deadline (design §8.1's "each `sh` command the worker
-   * runs"). Defaults live here so tests can override with ms-scale values. */
-  shDeadline?: ShDeadlineOptions;
+   * runs"). Defaults live here so tests can override with ms-scale values.
+   * Plan 06l (A2): a function form lets the conductor give the narrow
+   * `tt test --changed` loop its own, longer budget than the shell cap. */
+  shDeadline?: ShDeadlineOptions | ((command: string) => ShDeadlineOptions);
+  /** Plan 06e (A1): the environment a `sh` command runs with. The conductor
+   * supplies `childEnv()` plus every resolved secret value, so a command can
+   * reference `$NAME` whatever source (environment or env file) supplied it.
+   * Defaults to `childEnv()`. */
+  shEnv?: () => NodeJS.ProcessEnv;
   /** Plan 01a: refuse a command before it runs. The extension's own guard
    * (`guards.ts`) already refuses one containing a secret value, but a
    * scripted agent (fake-pi in tests) speaks this socket directly, so the
@@ -198,15 +205,18 @@ export class RunSocketServer {
       return;
     }
     const cwd = this.#handlers.cwdFor(agentId);
-    const deadline = this.#handlers.shDeadline ?? {};
+    const declared = this.#handlers.shDeadline;
+    const deadline = typeof declared === "function" ? declared(msg.command) : (declared ?? {});
     let groupId: number | undefined;
     const running = runCommand({
       command: msg.command,
       cwd: msg.cwd ?? cwd,
       // F13: a worker's `sh` command may itself run `node --test`; isolate
       // it from the test runner's own recursion markers exactly like checks
-      // and the probe (see `childEnv`'s doc comment).
-      env: childEnv(),
+      // and the probe (see `childEnv`'s doc comment). Plan 06e (A1): the
+      // conductor adds every resolved secret value, so `$NAME` works whatever
+      // source supplied it.
+      env: this.#handlers.shEnv?.() ?? childEnv(),
       deadlineMs: deadline.deadlineMs,
       termGraceMs: deadline.termGraceMs,
       onIntent: async ({ pgid }) => {
@@ -223,7 +233,7 @@ export class RunSocketServer {
       this.#write(conn.socket, {
         type: "sh_output",
         commandId: msg.commandId,
-        chunk: shTimeoutNote(deadline.deadlineMs),
+        chunk: shTimeoutNote(deadline.deadlineMs, result.resourceSample),
         stream: "stderr",
       });
     }
@@ -263,11 +273,16 @@ export class RunSocketServer {
 /** What an agent reads when its command hits the per-command limit. A bare
  * "timed out" made agents rerun the same command (run b46255dc: a test file
  * that could not finish inside the limit, piped through `tail`, returned no
- * output three times in a row), so say what to do instead. */
-export function shTimeoutNote(deadlineMs: number | undefined): string {
+ * output three times in a row), so say what to do instead. A3 (plan 06e):
+ * the note also says how much memory the command used and how much the
+ * machine had left, from the sampler, so a memory-hungry command is not
+ * rerun blindly. */
+export function shTimeoutNote(deadlineMs: number | undefined, sample?: ResourceSample): string {
   const limit = deadlineMs === undefined ? "the time limit" : `${Math.round(deadlineMs / 1000)} s`;
+  const memory = sample ? ` It used about ${sample.peakRssMB} MB (peak RSS); the machine had about ${sample.freeMemMB} MB free.` : "";
   return (
     `\n[tt: command killed after ${limit} (the per-command limit). The same command will be killed again. ` +
+    `${memory} ` +
     "Narrow it (one test: --test-name-pattern) or find why it does not finish (a test waiting for an event that never comes). " +
     "Output piped through tail or head is lost when a command is killed.]\n"
   );

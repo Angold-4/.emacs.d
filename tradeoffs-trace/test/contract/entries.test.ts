@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
+import { clampMessageTitle } from "../../src/core/messages.ts";
 import {
   accountingLine,
   anchorFromEvidence,
@@ -698,4 +699,18 @@ test("an entry file carries the full history of its linked messages", () => {
   assert.match(file, /B-1 no priced-frame counter/);
   assert.match(file, /T-14/);
   assert.match(file, /F-1/);
+});
+
+test("plan 06c: a 120-character raw title becomes an entry title of at most 80 characters ending at a word boundary", () => {
+  // 120 characters, all whole words, so a mid-word cut is detectable.
+  const raw = "alpha bravo ".repeat(10);
+  assert.equal(raw.length, 120);
+  const title = clampMessageTitle(raw);
+  assert.ok(title.length <= 80, `the entry title is ${title.length} characters`);
+  assert.ok(title.endsWith("…"), "a clamped title says it was cut");
+  const base = title.slice(0, -1);
+  assert.equal(base, raw.slice(0, base.length), "the title keeps the raw text verbatim up to the cut");
+  assert.equal(raw[base.length], " ", "the cut lands on a word boundary (the next raw character is a space)");
+  // A title already within the cap is unchanged.
+  assert.equal(clampMessageTitle("short title"), "short title");
 });

@@ -10,10 +10,39 @@
     "phaseId": { "type": "string", "minLength": 1 },
     "contractVersion": { "$ref": "#/$defs/ContractVersion" },
     "goal": { "type": "string", "minLength": 1 },
-    "acceptance": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "acceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "finalChecks": {
+      "description": "Plan 06c: the phase's final check, frozen into the contract. Only a candidate that has passed review with no open blocker runs it, once.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-    "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+    "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "architecture": { "type": "array", "items": { "type": "object" } },
+    "requirements": { "type": "array", "items": { "type": "object" } },
+    "constraints": { "type": "array", "items": { "type": "object" } },
+    "itemsSynthesized": { "type": "boolean" },
+    "workers": {
+      "description": "Plan 06g: #+TT_WORKERS frozen into the contract — how many lanes one round runs. Present only when the plan asks for more than one; absent is today's single-candidate loop.",
+      "type": "integer",
+      "minimum": 2
+    },
+    "roundsAllowed": {
+      "description": "Plan 06g: #+TT_ROUNDS frozen into the contract — how many rounds the phase may spend. Absent means the default of 3 (core/rounds.ts's roundBudget).",
+      "type": "integer",
+      "minimum": 1
+    },
+    "seats": {
+      "description": "Plan 06h: #+TT_REVIEWERS frozen into the contract. Absent means M A B.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "leader": {
+      "description": "Plan 06h: #+TT_LEADER frozen into the contract. Absent means the first seat.",
+      "type": "string",
+      "minLength": 1
+    }
   },
   "$defs": {
     "ContractVersion": {

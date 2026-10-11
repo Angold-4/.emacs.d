@@ -18,6 +18,9 @@ import { randomUUID } from "node:crypto";
 import { JSONLDecoder, encodeLine, type PiRpcCommand, type PiRpcEvent, type PiRpcResponse } from "../core/protocol.ts";
 import type { Role } from "../core/roles.ts";
 import { redactRecord, type Secret } from "./secrets.ts";
+// A2/C3 (plan 06e): the sweep owns the signalling decision; this module asks
+// it to signal the agent group it recorded at spawn.
+import { groupAlive, signalGroup } from "./sweep.ts";
 
 export interface PiAgentOptions {
   /** The `pi` binary, or an injected stand-in (fake-pi) for tests. Defaults
@@ -52,13 +55,15 @@ export interface TerminateResult {
   signalsSent: TerminateReason[];
 }
 
-function groupAlive(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+/** Plan 06l (A3/R5): true when an agent's own error text names a TERMINAL
+ * model-call failure — the call can never succeed on retry, so the attempt
+ * must end at once rather than wait out its deadline. A 404 `model_not_found`
+ * (the 2026-10-08 gateway incident) and a context-length/overflow refusal
+ * are the two the loop has seen live; a transient 429/503 is deliberately
+ * NOT terminal (pi retries those itself). Exported so the detection is
+ * unit-tested directly. */
+export function terminalModelError(text: string): boolean {
+  return /model_not_found|context[_ ]?(?:length|window|overflow)|maximum context|token limit|\b404\b/i.test(text);
 }
 
 /** A live Pi agent process, driven over RPC. */
@@ -70,6 +75,18 @@ export class PiAgent {
   #onEvent: ((event: PiRpcEvent) => void) | undefined;
   #settled: Promise<void>;
   #resolveSettled!: () => void;
+  /** Plan 06k1 (A6): resolves when a compaction fails (a context overflow
+   * whose recovery was refused), so a worker that will never submit can end
+   * its attempt at once instead of waiting out the attempt deadline. */
+  #compactionFailed: Promise<void>;
+  #resolveCompactionFailed!: () => void;
+  /** Plan 06l (A3/R5): resolves when a terminal model-call failure (a 404
+   * `model_not_found`, a context overflow) is reported, carrying the cause.
+   * An agent in that state can never submit, so the attempt ends at once
+   * instead of waiting out its deadline. */
+  #modelFailed: Promise<string>;
+  #resolveModelFailed!: (reason: string) => void;
+  #modelFailureReason: string | undefined;
   #exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   #exited = false;
   #exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
@@ -110,6 +127,12 @@ export class PiAgent {
 
     this.#settled = new Promise((resolve) => {
       this.#resolveSettled = resolve;
+    });
+    this.#compactionFailed = new Promise((resolve) => {
+      this.#resolveCompactionFailed = resolve;
+    });
+    this.#modelFailed = new Promise((resolve) => {
+      this.#resolveModelFailed = resolve;
     });
 
     child.stdout.on("data", (chunk: Buffer) => {
@@ -164,6 +187,30 @@ export class PiAgent {
     }
     this.#onEvent?.(event);
     if (event.type === "agent_settled") this.#resolveSettled();
+    // Plan 06k1 (A6): pi reports a failed compaction as `compaction_end` with
+    // `willRetry: false` and an error message (the 2026-10-08 incident).
+    // A worker in that state never submits, so the attempt ends at once.
+    if (event.type === "compaction_end") {
+      const e = event as { aborted?: unknown; willRetry?: unknown; errorMessage?: unknown };
+      const failed = e.willRetry === false && (typeof e.errorMessage === "string" ? e.errorMessage.length > 0 : e.aborted === true);
+      if (failed) {
+        this.#resolveCompactionFailed();
+        // Plan 06l (A3/R5): name the cause on the same channel, so the event
+        // the conductor records says "failed compaction (context overflow)"
+        // rather than a bare "settled". The 06k1 lane note names the failed
+        // compaction; R5 names the context overflow; this text does both.
+        this.#noteModelFailure(`failed compaction (context overflow: ${typeof e.errorMessage === "string" ? e.errorMessage : "compaction recovery failed"})`);
+      }
+    }
+    // Plan 06l (A3/R5): a terminal model-call failure reported on the turn
+    // (a 404 `model_not_found`, a context-length refusal) also means the
+    // agent can never submit. The 2026-10-08 incident (runtime doc D6): a
+    // 404 settled silently and the conductor waited out the attempt.
+    if (event.type === "agent_end" || event.type === "error") {
+      const e = event as { errorMessage?: unknown; error?: unknown; willRetry?: unknown };
+      const text = typeof e.errorMessage === "string" ? e.errorMessage : typeof e.error === "string" ? e.error : undefined;
+      if (text && terminalModelError(text)) this.#noteModelFailure(text);
+    }
   }
 
   get exited(): boolean {
@@ -183,6 +230,28 @@ export class PiAgent {
    * process has already exited (nothing further will ever settle). */
   waitSettled(): Promise<void> {
     return this.#settled;
+  }
+
+  /** Plan 06k1 (A6): resolves once a failed compaction is reported. */
+  waitCompactionFailed(): Promise<void> {
+    return this.#compactionFailed;
+  }
+
+  /** Plan 06l (A3/R5): resolves once a terminal model-call failure (404,
+   * context overflow) is reported, carrying the cause. */
+  waitModelFailed(): Promise<string> {
+    return this.#modelFailed;
+  }
+
+  /** The cause of the first terminal model failure seen, if any. */
+  get modelFailureReason(): string | undefined {
+    return this.#modelFailureReason;
+  }
+
+  #noteModelFailure(reason: string): void {
+    if (this.#modelFailureReason !== undefined) return;
+    this.#modelFailureReason = reason;
+    this.#resolveModelFailed(reason);
   }
 
   #send(command: PiRpcCommand): Promise<PiRpcResponse> {
@@ -282,25 +351,11 @@ export class PiAgent {
     const exited = await raceExit(this.#exitPromise, abortGraceMs);
     if (exited || this.#exited) return { signalsSent };
 
-    if (groupAlive(this.pgid)) {
-      try {
-        process.kill(-this.pgid, "SIGTERM");
-        signalsSent.push("sigterm");
-      } catch {
-        // already gone
-      }
-    }
+    if (groupAlive(this.pgid) && signalGroup(this.pgid, "SIGTERM")) signalsSent.push("sigterm");
     const exitedAfterTerm = await raceExit(this.#exitPromise, termGraceMs);
     if (exitedAfterTerm || this.#exited) return { signalsSent };
 
-    if (groupAlive(this.pgid)) {
-      try {
-        process.kill(-this.pgid, "SIGKILL");
-        signalsSent.push("sigkill");
-      } catch {
-        // already gone
-      }
-    }
+    if (groupAlive(this.pgid) && signalGroup(this.pgid, "SIGKILL")) signalsSent.push("sigkill");
     await this.#exitPromise;
     return { signalsSent };
   }

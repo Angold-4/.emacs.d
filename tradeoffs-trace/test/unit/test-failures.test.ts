@@ -92,6 +92,10 @@ test("test-failures: ERT `FAILED <name>` lines are parsed once, with or without 
 test("test-failures: ansi color codes do not hide a failing name", () => {
   const colored = "test exchange_state_machine::tests::cancels_order ... \u001b[31mFAILED\u001b[0m\n";
   assert.deepEqual(parseTestFailures(colored), ["exchange_state_machine::tests::cancels_order"]);
+  // Plan 06j (A2/A-8): a cursor-control prefix is not a numeric SGR code; the
+  // parser must strip it too, or the whole cargo failure line is lost.
+  const cursor = "\u001b[?25ltest a::b ... FAILED\n";
+  assert.deepEqual(parseTestFailures(cursor), ["a::b"]);
 });
 
 test("test-failures: output that names no test yields none", () => {
@@ -276,6 +280,37 @@ test("test-failures: the cargo and Node defaults build the right single-test com
   assert.equal(
     singleTestCommand("a failing test ... is never excused as pre-existing (plan 14h)", meta),
     "node --test --test-name-pattern 'a failing test \\.\\.\\. is never excused as pre-existing \\(plan 14h\\)' 'meta.test.js'",
+  );
+});
+
+// 06a: a tradeoffs-trace phase's TT_CHECKS is `make check` plus
+// `make check-e2e FILES="…"` — a subset of the node suite. A failing test's
+// own reporter line still locates its file, so the re-run targets that one
+// file (the built-in default) or substitutes `{file}` in the plan's
+// `#+TT_RERUN:` template; it never falls back to the whole subset command.
+test("test-failures: a re-run of a test a subset check names uses that test's own file", () => {
+  const output = [
+    "✖ flakes: a newly failing conductor test (1.2ms)",
+    "ℹ tests 1",
+    "ℹ pass 0",
+    "ℹ fail 1",
+    "✖ failing tests:",
+    "",
+    "test at test/conductor/flakes.test.ts:42:1",
+    "✖ flakes: a newly failing conductor test (1.2ms)",
+  ].join("\n");
+  assert.equal(
+    singleTestCommand("flakes: a newly failing conductor test", output),
+    "node --test --test-name-pattern 'flakes: a newly failing conductor test' 'test/conductor/flakes.test.ts'",
+  );
+  assert.deepEqual(
+    rerunCommandsFor(output, ["flakes: a newly failing conductor test"], "node --test --test-name-pattern {name} {file}"),
+    [
+      {
+        name: "flakes: a newly failing conductor test",
+        command: "node --test --test-name-pattern 'flakes: a newly failing conductor test' 'test/conductor/flakes.test.ts'",
+      },
+    ],
   );
 });
 

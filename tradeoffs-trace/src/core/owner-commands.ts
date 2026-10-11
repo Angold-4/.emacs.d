@@ -8,7 +8,163 @@
 import { checkBinding, checkTupleBinding } from "./binding.ts";
 import { applyMessageEvent } from "./messages.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "./owner-requests.ts";
-import type { BindingTuple, ContractVersion, Event, Message, PhaseState } from "./types.ts";
+import { findOwnerRequest, ownerRequestIsStale } from "./triage.ts";
+import type { BindingTuple, ContractVersion, Decision, Event, Message, PhaseState, RuledDecision } from "./types.ts";
+
+/** Plan 06k1 (A2): the words an owner uses to rule a decision, as opposed to
+ * merely mentioning it. A correction or directive that names a decision id
+ * AND one of these words rules it; the ruling carries forward by id+choice. */
+const RULING_WORDS = /\b(ruled|rule|settled|settle|decided|decide|final|no ballots|no vote|without a vote)\b/i;
+
+/** Plan 06k1 (A2, finding A-4): a negation attached to the ruling word, so
+ * "D-1 is not ruled" rules nothing. Kept narrow (not a bare "no") so a
+ * phrase like "D-1 has no open findings and is ruled" still rules. */
+const RULING_NEGATION =
+  /\b(not|never|isn't|isnt|aren't|arent)\s+(?:owner[- ])?(ruled|rule|settled|settle|decided|decide)\b|\bunruled\b|\bundecided\b/i;
+
+/** The clauses a text splits into, so a ruling word attaches only to the ids
+ * in its own clause: `D-1 is ruled; D-2 remains undecided` rules D-1 alone. */
+function rulingClauses(text: string): string[] {
+  return text
+    .split(/[;\n]+|(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** Plan 06k1 (A2, finding A-4): the decision ids an owner correction or
+ * directive text names as ruled, PER ID. A ruling attaches to the id(s) in
+ * its own clause; a negated ruling rules nothing. Pure. */
+export function ruledDecisionIds(text: string, decisions: readonly Decision[]): string[] {
+  if (!text) return [];
+  const clauses = rulingClauses(text);
+  const out: string[] = [];
+  for (const d of decisions) {
+    if (d.id.length === 0) continue;
+    const escaped = d.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mentions = new RegExp(`(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)`);
+    for (const clause of clauses) {
+      if (!mentions.test(clause)) continue;
+      if (!RULING_WORDS.test(clause)) continue;
+      if (RULING_NEGATION.test(clause)) continue;
+      if (!out.includes(d.id)) out.push(d.id);
+      break;
+    }
+  }
+  return out;
+}
+
+/** Plan 06k2 (A8): the decision ids a text NEGATES a ruling on — `D-1 is not
+ * ruled`, `D-1 is unruled`, `D-1 remains undecided`. A later owner word that
+ * negates a ruling clears it, restoring the decision's ballots (finding
+ * D-B-79: a ruling must not survive a negation). Pure. */
+export function negatedRulingIds(text: string, decisions: readonly Decision[]): string[] {
+  if (!text) return [];
+  const clauses = rulingClauses(text);
+  const out: string[] = [];
+  for (const d of decisions) {
+    if (d.id.length === 0) continue;
+    const escaped = d.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mentions = new RegExp(`(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)`);
+    for (const clause of clauses) {
+      if (!mentions.test(clause)) continue;
+      if (!RULING_NEGATION.test(clause)) continue;
+      if (!out.includes(d.id)) out.push(d.id);
+      break;
+    }
+  }
+  return out;
+}
+
+/** Plan 06k2 (A8): clear the rulings a text negates (and the rulings carried
+ * by a withdrawn directive, `by` the directive's own id). Returns the
+ * surviving list, or undefined when none remain. */
+export function clearRulings(
+  existing: readonly RuledDecision[] | undefined,
+  text: string,
+  decisions: readonly Decision[],
+  by?: string,
+): RuledDecision[] | undefined {
+  if (!existing || existing.length === 0) return undefined;
+  const negated = new Set(negatedRulingIds(text, decisions));
+  const out = existing.filter((r) => !negated.has(r.id) && (by === undefined || r.by !== by));
+  return out.length > 0 ? out : undefined;
+}
+
+/** Plan 06k2 (A6, finding A-3/D-B-17): true when an owner text ASKS for an
+ * unchanged resubmission. A negated clause (`do not resubmit unchanged`,
+ * `don't resubmit unchanged`, `never submit it unchanged`) asks for nothing.
+ * Pure. */
+export function asksForUnchangedResubmission(text: string): boolean {
+  if (!text) return false;
+  const clauses = text
+    .split(/[;\n]+|(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  for (const clause of clauses) {
+    const asks =
+      /\b(?:re-?submit|submit|resend|send)\b[^.]{0,40}\bunchanged\b/i.test(clause) ||
+      /\bunchanged\s+(?:re)?submission\b/i.test(clause) ||
+      /\bresubmit\s+(?:it\s+)?as[- ]is\b/i.test(clause);
+    if (!asks) continue;
+    // A negation in the same clause asks for the opposite, not permission.
+    if (/\b(?:not|never|don'?t|doesn'?t|isn'?t|no|mustn'?t|shouldn'?t)\b/i.test(clause)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Plan 06k2 (A6, finding A-3/D-B-17): the keys of the owner steers that ask
+ * for an unchanged resubmission. Only an in-force directive counts — a
+ * withdrawn one no longer asks for anything. Keys are `note:<i>` (the
+ * ownerNotes index) or `directive:<id>`, so a caller can consume one steer's
+ * permission for exactly the next submission. Pure. */
+export function unchangedResubmissionRequesters(
+  ownerNotes: readonly string[],
+  ownerDirectives: readonly { id: string; text: string; status: string }[],
+): string[] {
+  const out: string[] = [];
+  // Plan 06k3 (A4, findings D-M-37/F-15): the SAME ask written as a note and
+  // an in-force directive is ONE permission, not two. Without this the first
+  // submission consumes the note and the directive lifts a SECOND unchanged
+  // submission — including after a restart, where the directive key is still
+  // unconsumed.
+  const seen = new Set<string>();
+  const push = (text: string, key: string): void => {
+    if (!asksForUnchangedResubmission(text)) return;
+    const t = text.trim();
+    if (seen.has(t)) return;
+    seen.add(t);
+    out.push(key);
+  };
+  ownerNotes.forEach((text, i) => push(text, `note:${i}`));
+  for (const d of ownerDirectives) {
+    if (d.status === "in-force") push(d.text, `directive:${d.id}`);
+  }
+  return out;
+}
+
+/** Plan 06k1 (A2): record the rulings a correction/directive text carries,
+ * keyed by id and pinned to the decision's current choice. A second ruling
+ * on the same id replaces the first, so a re-ruled choice is what counts. */
+export function recordRulings(
+  existing: readonly RuledDecision[] | undefined,
+  text: string,
+  decisions: readonly Decision[],
+  by: string,
+): RuledDecision[] | undefined {
+  const ids = ruledDecisionIds(text, decisions);
+  if (ids.length === 0) return existing ? [...existing] : undefined;
+  const out = [...(existing ?? [])];
+  for (const id of ids) {
+    const decision = decisions.find((d) => d.id === id);
+    if (!decision) continue;
+    const at = out.findIndex((r) => r.id === id);
+    const ruling: RuledDecision = { id, choice: decision.choice, by };
+    if (at >= 0) out[at] = ruling;
+    else out.push(ruling);
+  }
+  return out;
+}
 
 export interface CommandCheck {
   ok: boolean;
@@ -62,7 +218,7 @@ export function autoResolveLinkedRequest(
 type EvOwnerRequestResolved = Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
 
 export function checkOwnerRequestResolved(phase: PhaseState, event: EvOwnerRequestResolved): CommandCheck {
-  const request = phase.ownerRequests.find((r) => r.id === event.requestId);
+  const request = findOwnerRequest(phase, event.requestId);
   if (!request) return { ok: false, reason: `unknown owner request ${event.requestId}` };
   if (request.status !== "open") {
     return { ok: false, reason: `owner request ${event.requestId} is already ${request.status}, not open` };
@@ -87,9 +243,9 @@ export function checkOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
 }
 
 export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerRequestResolved): PhaseState {
-  const request = phase.ownerRequests.find((r) => r.id === event.requestId)!;
+  const request = findOwnerRequest(phase, event.requestId)!;
   const ownerRequests = phase.ownerRequests.map((r) =>
-    r.id === event.requestId
+    r === request
       ? {
           ...r,
           status: "resolved" as const,
@@ -104,10 +260,31 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
   // no-op. "budget.granted by owner request <id>": the allowance is granted
   // exactly like a correction's, independent of the exhausted budget.
   if (isBudgetGateRequest(request) && event.option === "grant") {
-    next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 3 };
+    // Plan 06g (A4, owner-verified): the budget gate grants exactly ONE more
+    // round — the owner lifts the park for a single further candidate, never a
+    // fresh three-round allowance. One round is one candidate reviewed.
+    next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 1 };
   }
   if (isRepairForcingOption(request.origin, event.option)) {
     next = { ...next, repairRoundsGranted: next.repairRoundsGranted + 3 };
+  }
+  // Plan 06g (A6): the owner accepts the candidate with the open items
+  // carried. `accept()` honours the flag, and the carried ids are recorded
+  // here (the views list them, and the next phase's plan is built from them).
+  if (isBudgetGateRequest(request) && event.option === "accept_carried") {
+    const carriedItems = next.findings.filter((f) => f.status === "open").map((f) => f.id);
+    next = {
+      ...next,
+      acceptedWithCarried: true,
+      // Plan 06g (ODP-2): the candidate the carry was given for. `accept()`
+      // accepts only when this equals the candidate under acceptance.
+      carriedCandidateSha: event.boundCandidateSha,
+      carriedItems,
+      // A5: every carried item is listed WITH its target. This request has no
+      // explicit `--to` (the owner's one decision carries the leftovers into
+      // the next phase), so the target is the next phase's plan.
+      carriedTo: Object.fromEntries(carriedItems.map((id) => [id, "next"])),
+    };
   }
   if (request.origin === "open_finding" && event.option === "accept_risk" && request.linkedFindingId) {
     // design §4.2: equivalent to accept-finding, with the required scope note.
@@ -148,8 +325,24 @@ export function applyOwnerRequestResolved(phase: PhaseState, event: EvOwnerReque
     }
   }
   // "accept_as_implemented" (failed_vote) and "approve" (reserved_decision)
-  // need no further mutation here: decisionSettled (predicate.ts) reads the
-  // resolved request's own `resolution.option` directly.
+  // settle the decision on THIS candidate through the resolved request's own
+  // `resolution.option` (predicate.ts). Plan 06k1 (A2, finding A-5): the
+  // settlement must CARRY FORWARD to later candidates by id and unchanged
+  // choice, so it is recorded as an owner ruling too — otherwise a later
+  // candidate whose D-1 has no ballots would no longer be settled.
+  const rulingTarget =
+    request.linkedDecisionId !== undefined &&
+    ((request.origin === "failed_vote" && event.option === "accept_as_implemented") ||
+      (request.origin === "reserved_decision" && event.option === "approve"))
+      ? request.linkedDecisionId
+      : undefined;
+  if (rulingTarget !== undefined) {
+    const decision = next.decisions.find((d) => d.id === rulingTarget);
+    if (decision) {
+      const kept = (next.ruledDecisions ?? []).filter((r) => r.id !== rulingTarget);
+      next = { ...next, ruledDecisions: [...kept, { id: rulingTarget, choice: decision.choice, by: "owner" }] };
+    }
+  }
   return next;
 }
 
@@ -186,6 +379,144 @@ export function applyFindingAcceptedByOwner(phase: PhaseState, event: EvFindingA
   );
   const withFinding = { ...phase, findings };
   return autoResolveLinkedRequest(withFinding, event.findingId, "accepted", event.boundCandidateSha, event.boundContractVersion);
+}
+
+// --- ITEM_CARRIED --------------------------------------------------------
+//
+// Plan 06g (A5): the owner's `tt carry <run> <id> --to <phase-id>`. It takes
+// a finding or a message id. Through the inbox it (1) marks the item carried,
+// with the target phase, (2) resolves the open owner request about that item
+// (and the plain budget gate, whose "accept with carried items" decision the
+// carry is), and (3) once no blocking item remains uncarried, accepts the
+// candidate as it stands (`acceptedWithCarried`, honoured by `accept()`).
+// This function is the ONLY place that decides what a carry does.
+
+type EvItemCarried = Extract<Event, { type: "ITEM_CARRIED" }>;
+
+/** The finding or message `recordId` names, with the version its binding
+ * must match. A finding is looked up first unless `recordKind` says
+ * otherwise; a message needs its own lookup because `currentVersionsFor`
+ * (binding.ts) knows decisions, findings and owner requests, not messages. */
+function carriedRecord(
+  phase: PhaseState,
+  recordId: string,
+  recordKind: EvItemCarried["recordKind"],
+): { kind: "finding" | "message"; candidateSha: string; contractVersion: ContractVersion; recordVersion: number; label: string } | undefined {
+  if (recordKind !== "message") {
+    const finding = phase.findings.find((f) => f.id === recordId);
+    if (finding) {
+      return {
+        kind: "finding",
+        candidateSha: phase.candidate?.sha ?? "",
+        contractVersion: phase.contract.contractVersion,
+        recordVersion: finding.version,
+        label: `finding ${finding.id}`,
+      };
+    }
+  }
+  if (recordKind !== "finding") {
+    const message = (phase.messages ?? []).find((m) => m.id === recordId);
+    if (message) {
+      // Like a finding, a message is checked against the PHASE's current
+      // candidate and contract (binding.ts's currentVersionsFor does the same
+      // for decisions and findings); only its record version is its own.
+      return {
+        kind: "message",
+        candidateSha: phase.candidate?.sha ?? "",
+        contractVersion: phase.contract.contractVersion,
+        recordVersion: message.messageVersion,
+        label: `message ${message.id}`,
+      };
+    }
+  }
+  return undefined;
+}
+
+export function checkItemCarried(phase: PhaseState, event: EvItemCarried): CommandCheck {
+  if (!event.toPhase || event.toPhase.trim().length === 0) {
+    return { ok: false, reason: `carrying ${event.recordId} needs a target phase (--to <phase-id>)` };
+  }
+  const record = carriedRecord(phase, event.recordId, event.recordKind);
+  if (!record) return { ok: false, reason: `unknown finding or message ${event.recordId}` };
+  if ((phase.carriedItems ?? []).includes(event.recordId)) {
+    return { ok: false, reason: `${event.recordId} is already carried` };
+  }
+  // OD addendum A: a second owner act on the same id is refused, naming the
+  // existing act. A deferral already put this item's fix off; carrying it too
+  // would silently drop one act.
+  const existingDefer = (phase.deferrals ?? []).find((d) => d.itemId === event.recordId && d.status === "open");
+  if (existingDefer) {
+    return { ok: false, reason: `${event.recordId} is already deferred (${existingDefer.id}); resolve or drop that deferral first` };
+  }
+  return checkBinding(
+    { candidateSha: event.boundCandidateSha, contractVersion: event.boundContractVersion, recordVersion: event.boundRecordVersion },
+    { candidateSha: record.candidateSha, contractVersion: record.contractVersion, recordVersion: record.recordVersion },
+    record.label,
+  );
+}
+
+export function applyItemCarried(phase: PhaseState, event: EvItemCarried): PhaseState {
+  const carriedItems = [...(phase.carriedItems ?? [])];
+  const carriedTo = { ...(phase.carriedTo ?? {}) };
+  const mark = (id: string) => {
+    if (!carriedItems.includes(id)) carriedItems.push(id);
+    carriedTo[id] = event.toPhase;
+  };
+  mark(event.recordId);
+  // A message carry also carries the finding it was raised from (its
+  // `sourceRecordId`), so the blocking item behind a blocker message is
+  // answered too.
+  const message = (phase.messages ?? []).find((m) => m.id === event.recordId);
+  if (message?.sourceRecordId && phase.findings.some((f) => f.id === message.sourceRecordId)) mark(message.sourceRecordId);
+
+  // The record-level action answers the open request about it — including a
+  // request linked to it as a MESSAGE (a blocker's own request carries
+  // `linkedMessageId`, which `autoResolveLinkedRequest` does not match).
+  let next = autoResolveLinkedRequest({ ...phase, carriedItems, carriedTo }, event.recordId, "carried", event.boundCandidateSha, event.boundContractVersion);
+  next = {
+    ...next,
+    ownerRequests: next.ownerRequests.map((r) =>
+      r.status === "open" && r.linkedMessageId === event.recordId
+        ? {
+            ...r,
+            status: "resolved" as const,
+            resolution: { option: "carried" },
+            resolvedBinding: { candidateSha: event.boundCandidateSha, contractVersion: event.boundContractVersion },
+          }
+        : r,
+    ),
+  };
+
+  // The plain budget gate (the phase parked with only advisories open) is the
+  // owner's ONE "accept with carried items" decision: carrying any item
+  // carries every open advisory at once and resolves the gate.
+  const gate = next.ownerRequests.find((r) => r.status === "open" && isBudgetGateRequest(r));
+  if (gate) {
+    for (const f of next.findings.filter((f) => f.status === "open" && f.severity === "advisory")) mark(f.id);
+    next = {
+      ...next,
+      carriedItems,
+      carriedTo,
+      ownerRequests: next.ownerRequests.map((r) =>
+        r.id === gate.id
+          ? {
+              ...r,
+              status: "resolved" as const,
+              resolution: { option: "accept_carried" },
+              resolvedBinding: { candidateSha: event.boundCandidateSha, contractVersion: event.boundContractVersion },
+            }
+          : r,
+      ),
+    };
+  }
+
+  // Accept once no blocking item remains uncarried; advisories never block
+  // acceptance (owner directive ODP-1). The candidate the carry was given for
+  // is recorded so `accept()` can refuse a stale or failing one (ODP-2).
+  const blockingLeft = next.findings.some(
+    (f) => f.status === "open" && f.severity === "blocking" && !carriedItems.includes(f.id),
+  );
+  return blockingLeft ? next : { ...next, acceptedWithCarried: true, carriedCandidateSha: event.boundCandidateSha };
 }
 
 // --- OVERRIDE_CAST -------------------------------------------------------
@@ -231,7 +562,13 @@ export function applyOverrideCast(phase: PhaseState, event: EvOverrideCast): Pha
 export type AwaitingOwnerTarget = "AWAITING_OWNER" | "REPAIRING" | "RESOLVING";
 
 export function awaitingOwnerTarget(phase: PhaseState): AwaitingOwnerTarget {
-  if (phase.ownerRequests.some((r) => r.status === "open")) return "AWAITING_OWNER";
+  // The owner's "accept with carried items" for this candidate answers every
+  // open request, as accept() does; an open correction still needs its round.
+  const carried = Boolean(phase.acceptedWithCarried && phase.candidate && phase.carriedCandidateSha === phase.candidate.sha);
+  // Plan 06i: a non-blocking request (a late discovery's escalation) does not
+  // park the phase, and neither does a stale one (its item is closed or
+  // superseded): the park agrees with accept(), which ignores both.
+  if (!carried && phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) return "AWAITING_OWNER";
   if (phase.corrections.some((c) => c.status === "open")) return "REPAIRING";
   if (phase.candidate) return "RESOLVING";
   return "AWAITING_OWNER";

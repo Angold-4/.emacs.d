@@ -89,7 +89,8 @@ test("awaiting-owner-exits: granting the budget request moves REPAIRING, consumi
     boundRecordVersion: 1,
   });
   assert.equal(granted.phase.phase, "REPAIRING");
-  assert.equal(granted.phase.repairRoundsGranted, 6);
+  // Plan 06g (A4): the budget gate grants exactly ONE more round.
+  assert.equal(granted.phase.repairRoundsGranted, 4);
 });
 
 test("awaiting-owner-exits: stopping the phase moves to BLOCKED citing the request", () => {

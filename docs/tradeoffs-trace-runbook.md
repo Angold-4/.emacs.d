@@ -219,6 +219,38 @@ names the failing test.
 `tt summary` and the status buffer's `flakes` row show flakes per test (count,
 last seen), the repair rounds saved, and launch retries.
 
+### Environment failures: `tt recheck`
+
+A check failure the machine caused must never cost a repair round. When the
+failure is **shown to be the machine** — a killed process (SIGKILL/SIGSEGV,
+exit 137), load-only timing, or an environment the conductor inherited (a
+coloured shell, a stale `FORCE_COLOR`) — the owner can re-run the frozen
+candidate's own checks without dispatching a worker or spending a round:
+
+```sh
+tt recheck <run> --reason "the check was killed by the OOM killer at load 12"
+```
+
+It is accepted only after the current candidate's checks just failed and before
+a newer candidate exists; it records `RECHECK_REQUESTED {candidateSha, reason}`
+and re-runs the **same tier** (`round` or `final`) on the same sha. A passing
+recheck continues as if the checks had passed (the probe, then the reviews);
+the earlier failure stays in the log with the reason. A recheck that fails
+again follows the ordinary check-failure path — it never waives a failure.
+
+When the checks fail with budget left, the conductor has already started a
+repair attempt by itself. A recheck is still accepted then: it stops that
+attempt (awaiting its termination and killing its shell groups), resets every
+worker worktree to the frozen candidate (tracked and untracked writes are
+discarded), gives the round back, and re-runs the same tier. A recheck whose
+worktree reset fails is refused instead, with the stopped attempt recorded as
+an interrupted attempt so the ordinary repair path continues.
+
+Use it **only** for a failure shown to be the machine, never to retry a
+failure the candidate caused: a real failure rechecked is a real failure again,
+and the reason is recorded. A refused recheck names why: the checks passed, a
+newer candidate exists, or the worktree reset failed.
+
 ## Prerequisites
 
 | What | Where / how |
@@ -246,13 +278,87 @@ readlink ~/.tradeoffs-trace/runner/current
 - For the CLI, alias the installed copy:
   `alias tt=~/.tradeoffs-trace/runner/current/tradeoffs-trace/bin/tt`
 
+## Checks for this repository (`check`, `check-e2e`, `check-full`)
+
+`tradeoffs-trace/Makefile` has three targets:
+
+| Target | What it runs | Cost |
+|---|---|---|
+| `make -C tradeoffs-trace check` | the fast suite: unit, contract, effects and fake-pi tests plus ERT | under 60 s on an idle machine |
+| `make -C tradeoffs-trace check-e2e FILES="…"` | only the named conductor test files, with the full suite's own concurrency (3) and 180 s per-command timeout | the named files |
+| `make -C tradeoffs-trace check-full` | today's whole suite: every `test/**/*.test.ts` (including the real-process conductor, crash and live files) plus ERT | 7–15 min |
+
+`crash` (the full crash-boundary sweep) and `live` (the opt-in real-Pi smoke
+tests) are unchanged.
+
+A phase that changes `tradeoffs-trace` writes its `#+TT_CHECKS` as the fast
+check plus one `check-e2e` naming the conductor test files it touches:
+
+```org
+#+TT_CHECKS: make -C tradeoffs-trace check && make -C tradeoffs-trace check-e2e FILES="test/conductor/flakes.test.ts"
+```
+
+Each `#+TT_CHECKS` line is one shell command, so the `&&` runs `check-e2e`
+only when `check` passed; a phase whose two lists must run independently can
+use two `#+TT_CHECKS` lines instead. The named files are exactly the phase's
+own conductor tests; a phase whose work is all in the fast suite names none.
+The conductor still re-runs a newly failing test alone (see "Flaky tests:
+re-run before failing"): the reporter's own file line locates the test, so the
+re-run targets that one file even though `TT_CHECKS` ran a subset.
+`check-full` is the conductor's gate command for the phases that change the
+conductor itself (06a–06e), not something a worker runs on every attempt.
+
+### `TT_CHECKS` versus `TT_FINAL_CHECKS`
+
+`#+TT_CHECKS` (and a phase's `:CHECKS:`) is the **round check**: every
+candidate runs it, before the reviews. `#+TT_FINAL_CHECKS` (or a phase's
+`:FINAL_CHECKS:`, which overrides the plan-level one) is the **final check**:
+only the candidate about to be accepted runs it, once, after the reviews pass
+with no open blocker. The final check runs the phase's round checks and then
+the final command; a failure there is an ordinary check failure, so the phase
+is repaired and the next candidate that reaches acceptance runs it again.
+
+Write the final check to **mirror the repository's CI**, not just the phase's
+own crates: `cargo fmt --all --check` and the CI workflow's own crate list. A
+phase whose `-p` list is narrower than CI can pass every gate and still fail
+the pull request — on 2026-10-08 the valuation 02a–02c phases were accepted
+green while CI failed rustfmt and clippy outside their `-p` lists. The
+coverage lint above warns when the boundaries or the CI `fmt --all` command are
+not mirrored; the warning is the signal to widen the final check before the
+run starts.
+
+Each candidate's check run is recorded at
+`<run>/checks/<candidateSha>/record.json`. Its `tier` field is what the run
+was:
+
+- `round` — the phase's checks only, for a candidate that has not yet passed
+  review (every candidate starts here, and a repair candidate's record stays
+  `round`); `finalCommands` is empty.
+- `final` — the phase's checks **and** the final check, for the candidate about
+  to be accepted; `finalCommands` names the final command and the record's
+  `commands` include it. A `final` run overwrites that candidate's `round`
+  record, so the accepted candidate's record is the one that ran the final
+  check.
+
+The record also carries `load1` (the machine's 1-minute load average) and
+`freeMemMB` (free memory in MiB) at the run, so a slow or flaky check can be
+read against the machine it ran on.
+
+A plan that names no `TT_FINAL_CHECKS` behaves exactly as before: every
+candidate runs only its round checks, no final check is appended, no
+`FINAL_CHECK_REQUIRED`/`FINAL_CHECKS_*` event fires, and every record's tier
+is `round`. Nothing about the check list, the number of runs or the old event
+logs changes for such a plan.
+
 ## Start a run
 
-1. Write or open an Org plan (`~/orgw/PLAN_TEMPLATE.md`). Set `#+TT_BRANCH` to the branch the result publishes to, and `#+TT_CHECKS` to a check command that finishes in a few minutes.
+1. Write or open an Org plan (`~/orgw/PLAN_TEMPLATE.md`). Set `#+TT_BRANCH` to the branch the result publishes to, and `#+TT_CHECKS` to a check command that finishes in a few minutes (see "Checks for this repository" above).
 2. Make sure no checkout has `TT_BRANCH` checked out, or publishing will collide with it.
 3. In the plan buffer, press `C-c m r`. Emacs validates the plan (errors open in `*tt-plan-errors*`), starts the conductor and opens the workspace tab.
 
-From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
+From a shell: `tt start <plan.json> [--env-file <KEY=value file>]`. It takes
+the JSON plan that Emacs writes; `--env-file` supplies secrets the environment
+does not set (see "Secrets" below).
 
 - **Reference documents.** Every `*.md` file the plan names that exists
   (relative to the plan, or under `~`), plus anything in `#+TT_REFS`, is copied
@@ -262,6 +368,60 @@ From a shell: `tt start <plan.json>`. It takes the JSON plan that Emacs writes.
 - **Shallow clones are refused.** A run (or a program node) won't start on a
   shallow clone, because candidate checkouts can't be made from one. Run
   `git fetch --unshallow` first.
+
+## Owner commands through `tt` (plan 06m)
+
+The owner works a run through `tt`, not by hand-writing inbox files. Every
+command resolves the run (directory id, internal run id or readable id) to
+the internal `runId` and the current `phaseId`, writes the inbox command with
+that binding, and waits for the recorded outcome.
+
+- `tt steer <run> "<text|@file>"` — deliver to every live lane worker
+  (`worker-a`, `worker-b`, …) and print one delivered line per lane.
+- `tt note <run> "<text|@file>"` — queue a note for the next worker attempt.
+- `tt correct <run> "<text|@file>"` — correct the phase (a repair when it is
+  parked on the owner).
+- `tt withdraw <run> OD-n` — retract a run directive; later prompts omit it.
+- `tt evidence <run> <item> <file-or-text>` — record an evidence item, bound
+  the same way.
+- `tt verdict <run> <finding> refuse` — settle a finding as refused, with the
+  reason on the record; nothing new is created to answer it.
+
+`--program-wide` makes a steer/note/correction a whole-program directive;
+`--run-id`/`--phase-id` send the binding the caller saw instead of the run's
+current one. `tt input <run> [<command.json>]` sends a structured command (a
+decision view's resolve/override) through the same waiting writer, keeping its
+binding as given.
+
+An input whose binding is missing, null, or names another run or phase is
+rejected into `inbox/rejected/` with the reason, printed, and never applied —
+no writer rebinds it. Emacs writes no inbox file: its input buffer calls
+`tt steer|note|correct` and its decision views `tt input`, and show what the
+writer printed (each lane's delivery, or the refusal's reason).
+
+## Delivering a stack (`tt deliver`, `tt restack`)
+
+`tt deliver <program|run> [--apply]` takes the accepted (DONE) phases in
+dependency order. For each layer it makes one commit with the accepted tree
+on its parent layer's delivered commit, pushes it with `--force-with-lease`
+pinned to the SHA recorded in `programs/<id>/delivery.json` (never a local
+branch ref), opens or updates the PR (base = parent layer, body = the phase
+summary with the whole-stack graph and the trade-offs table, no generated-by
+footer), applies `#+TT_LABELS`, and links the stack with
+`gh stack link --base <root>`. Without `--apply` it prints the plan and
+changes nothing; a rerun is idempotent.
+
+`tt restack <program> --onto <ref> [--apply]` replays the delivered layers
+onto a new base. A conflict whose every hunk lies in a path the plan declares
+generated (`#+TT_GENERATED:`) takes the base side for those hunks only,
+keeping every non-conflicting change; the plan's regenerate commands
+(`#+TT_REGEN:`) then run, the layer is amended and its check runs. Any other
+conflict, or a failing layer check, stops with the layer and paths named.
+Each layer's old parent comes from the ledger (the root's is the old base),
+nothing is pushed until every layer has replayed and passed, and the pushes
+use the same ledger leases. `--onto <branch>` records the new root base in the
+ledger; the next `tt deliver --apply` moves the root PR onto it and refreshes
+every PR body whose stack graph changed, without recommitting any layer.
 
 ## Launching from launchd, cron or a script
 
@@ -340,7 +500,13 @@ Two kinds of finding:
   reviewer can satisfy it. Move it to the plan's `Owner checklist:` list, or
   rewrite it as an observable result a worker produces. An invalid
   `#+TT_MODELS` declaration (see "Models per role and per seat") is an error
-  too. Emacs
+  too. So is a `:VERIFY: test "<name>"` that already exists only in a file or
+  crate the phase's `:CHECKS:` never run (`verify-reach`): the linter finds the
+  test with `git grep` and expands the checks (`make` targets with their
+  `FILES`, `node --test` globs, `cargo test -p`). tt would report such a test
+  missing on every candidate, and no owner command waives that gate (06k1's
+  C1). A check the linter cannot resolve (a script, `npm test`) judges
+  nothing. Emacs
   shows errors in `*tt-plan-errors*` (jump-to-line to the Org file) and starts
   nothing.
 - **Warning — shown, and the start continues.** An item that depends on a
@@ -349,6 +515,15 @@ Two kinds of finding:
   comparison against a contracted limit with no stated tolerance
   (`p99 ≤ its contracted interval`). State a fact that is true when the run
   finishes, or the allowed margin (or the recorded gap a miss becomes).
+- **Warning — coverage (plan 06j).** When the plan names a `#+TT_REPO:`, the
+  linter reads the repository and warns when a phase's `:BOUNDARIES:` cover a
+  crate/package whose checks never name it, or when the repository's CI runs
+  `cargo fmt --all` and no phase check or final check does. **Read these
+  warnings at start**: they are the difference between a phase whose checks
+  can see what its boundaries let it change and one that passes every gate
+  while the pull request's CI fails. A warning clears when the check or final
+  check names the crate (`-p b`) or runs the CI command (`cargo fmt --all
+  --check`).
 
 The measured run is the reason (runtime doc §4): `13j`'s "the owner records a
 live run" parked a phase, and `13i`'s "the recorded live-run SHA is the current
@@ -358,18 +533,154 @@ the conductor commits the candidate. The existing plans in
 (`tradeoffs-trace/test/fixtures/atlas-plans/`): the linter finds exactly one
 error across them, `13j`'s owner-actor item.
 
+## Writing a plan
+
+This is the reference for owner sessions, workers and reviewers (ref
+`06_ref_plan_format.md`). A phase is an Org subtree whose children have fixed
+headings. Every item under **Architecture**, **Requirements** and
+**Constraints** is a subheading with an `:ID:`; the loop carries each item
+mechanically from the plan to the worker, the checks, the reviewers and the
+acceptance decision.
+
+```org
+* Stage 1: two lanes
+  :PROPERTIES:
+  :ID:          stage-1
+  :CHECKS:      make -C tradeoffs-trace check
+  :BOUNDARIES:  tradeoffs-trace/src/**
+  :END:
+** Goal
+   One paragraph: the outcome and why, in the owner's words where possible.
+** Architecture
+*** A1 Round                                                       :data:
+    :PROPERTIES:
+    :ID:       A1
+    :WHERE:    tradeoffs-trace/src/core/rounds.ts
+    :END:
+    #+begin_src typescript
+    interface Round { n: number; base: Sha; lanes: Lane[] }
+    #+end_src
+    One or two sentences: who writes it, who reads it, its invariant.
+*** A2 Pick tally                                                  :rule:
+    :PROPERTIES:
+    :ID:       A2
+    :END:
+    Strict majority of seats; computed by code, never by a model.
+** Requirements
+*** R1 Two candidates from one base
+    :PROPERTIES:
+    :ID:       R1
+    :ARCH:     A1
+    :VERIFY:   test "lanes: two candidates from one base"
+    :END:
+    One paragraph. Sub-lists are parsed as part of the item:
+    - the first point
+    - the second point
+*** R2 Owner's live run
+    :PROPERTIES:
+    :ID:       R2
+    :VERIFY:   evidence
+    :END:
+    The owner records it with `tt evidence` or `C-c m e`.
+** Constraints
+*** C1 K = 1 is today's loop
+    :PROPERTIES:
+    :ID:       C1
+    :VERIFY:   test "lanes: one worker writes no new events"
+    :END:
+    Today's behaviour must not change.
+```
+
+`tt plan template` prints this skeleton; `tt lint` accepts it. `tt lint`
+reads an `.org` plan (`tt lint plan.org`) as well as the JSON Emacs writes,
+and rejects a missing or duplicate `:ID:`, an `:ARCH:` naming no architecture
+item, a `test` verify with no name, and any text lost in parsing — each with
+its file and line.
+
+`:VERIFY:` kinds (several may be listed, e.g. `test "…" review`):
+
+- `test "<name>"` (or `test <file>::<name>`): the test must exist and pass in
+the candidate's check run; the conductor matches it against the node test
+output. A missing or failed one is a blocking finding anchored to the item.
+- `review`: judged by the reviewers in turn 2. This is the default when
+  `:VERIFY:` is absent.
+- `evidence`: the owner records it (`tt evidence <run> <item> <file-or-text>`
+  or `C-c m e`). The phase parks `AWAITING_OWNER` naming the item until then.
+
+Architecture items are high level on purpose: data shapes, state and events,
+ownership, invariants, the module they live in (`:WHERE:`), and a tag —
+`:data:`, `:rule:`, `:flow:` or `:boundary:`. Leave out how to code them. A
+named type, event or function in the item plus a `:WHERE:` file is grepped in
+the candidate before any reviewer is asked; a missing symbol is recorded
+`deviates`.
+
+What the loop does with the items:
+
+1. **Worker prompt** renders the checklist by id; the worker ends its attempt
+   with `submit_coverage` — every requirement and constraint `done`,
+   `partial` or `not_done` with `where` and `tests`, every architecture item
+   `fits` or `deviates` with `where`. A `partial`, `not_done` or `deviates`
+   entry must carry a note, which becomes a trade-off message. The freeze is
+   refused until the coverage is complete.
+2. **Checks** resolve every `test` verify; a missing or failed one is a
+   blocking finding anchored to its item.
+3. **Reviewers** get the same checklist plus the worker's coverage and the
+   check resolution, and `submit_review` must carry a verdict for every
+   requirement and constraint (`met`/`unmet`/`partial`) and every architecture
+   item (`fits`/`deviates`/`unclear`), each with evidence. A review that omits
+   an id is incomplete and is re-asked. Every verdict cites an anchor
+   (`file:line-range`, a test name, or a command); the conductor refuses and
+   re-asks a verdict whose file or lines are not in the candidate, whose `met`
+   anchor touches neither the diff nor the item's `:WHERE:`, or whose cited
+   test did not pass — and a `met`/`fits` verdict must cite a file the
+   reviewer itself read.
+4. **Tally**: per item a strict majority of seats decides. A majority `unmet`
+   requirement or constraint, or a majority `deviates` architecture item,
+   becomes a blocking finding anchored to the item with the reviewers'
+   evidence; the evaluator re-verifies every such majority before it blocks,
+   overturns one the code contradicts (counted against its seat), and audits
+   unanimous `met` verdicts with thin evidence.
+5. **Acceptance** additionally requires every requirement and constraint met
+   by majority with its `test` verifies passed, every architecture item
+   fitting by majority (or its deviation accepted by the owner as a
+   trade-off), and every `evidence` item recorded.
+6. **The repair prompt** lists only the items not met or not fitting, with the
+   evidence.
+
+The old format still parses: a `Goal:` paragraph, an `Acceptance:` list and
+`:RESERVED:`. The Emacs parser turns each acceptance item into `R1..Rn` with
+`review` (or `evidence` for an item that starts `evidence:`) and `:RESERVED:`
+into `C1`, and marks the phase `itemsSynthesized`. Such a phase is NOT
+structured: it owes `submit_phase` only, its prompts carry no item checklist
+and never mention `submit_coverage`, and no coverage or per-item verdict is
+required. The item loop — the checklist, `submit_coverage`, the per-item
+verdicts and the evaluator item check — applies only to a phase that declares
+**Architecture**, **Requirements** or **Constraints** (one `isStructured`
+decision owns this everywhere).
+
+Coverage is per attempt: a repair, a correction or an amended contract starts
+a new worker attempt that owes its own `submit_coverage`, and the freeze
+requires the report bound to the current attempt number — an earlier
+attempt's report never satisfies it.
+
 ## Models per role and per seat
 
 By default every role — the worker, the three reviewers (M, A, B), the
 message evaluators and the blocker panel — runs on Pi's own `defaultModel`
 (`~/.pi/agent/settings.json`). A plan can give a role, or each of its seats, a
 stronger (or just different) model with one keyword. The owner's own
-configuration, with a different model family per reviewer seat and the panel
+configuration (design 06, 2026-10-07): the worker on `deepseek-v4.1-flash-fast`,
+a different model family per reviewer seat (M `claude-opus-5.5`, A
+`gpt-6.1-sol`, B `grok-4.6`), the evaluator on M's model and the panel
 following the reviewers:
 
 ```org
-#+TT_MODELS: worker=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=vercel-ai-gateway:deepseek/deepseek-v4.1-flash reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers
+#+TT_MODELS: worker=vercel-ai-gateway:deepseek/deepseek-v4.1-flash-fast reviewer.M=vercel-ai-gateway:anthropic/claude-opus-5.5 reviewer.A=vercel-ai-gateway:openai/gpt-6.1-sol reviewer.B=vercel-ai-gateway:spacexai/grok-4.6 evaluator=vercel-ai-gateway:anthropic/claude-opus-5.5 panel=reviewers
 ```
+
+Not every model the catalog lists is reachable: the owner's 2026-10-07 probe
+found `spacexai/grok-4.7` answering **403 `restricted`** through the team's
+Vercel AI Gateway, so it is not in the line above.
 
 Space-separated declarations, one per line in the real plans:
 
@@ -406,10 +717,349 @@ model when the seats differ (and the compact per-role line when they do not),
 `tt status` and the status buffer print one `models` line naming `reviewer.M`,
 `panel.1`, …, and `tt summary`'s PR body lists the models per seat.
 
+### `tt models check` (the model preflight)
+
+Before a run or a program spends its first minute on a model the gateway will
+refuse, `tt start` and `tt program start` probe every distinct configured
+provider/model: one tiny prompt in Pi's print mode per distinct model, a 60 s
+bound each, in parallel. Each is reported `ok`, `refused` (with the gateway's
+own message, e.g. `403 restricted`) or `unreachable` (a timeout, a crash, a
+connection error). The record is written to the run/program directory as
+`models-check.json`, and the status `models` line shows it (`check ok`, or
+`check grok-4.7 refused (403 restricted)`).
+
+```sh
+tt models check plan.json      # the same probe on its own; non-zero when any is not ok
+tt models check program.json   # every entry's distinct models
+tt start plan.json             # refuses when a configured model is refused
+tt program start program.json  # likewise for every entry
+```
+
+A **refused** model stops the start (nothing is launched); `--skip-models-check`
+starts anyway, and the refusal is still recorded and shown. An **unreachable**
+model does not stop a start — it may be a transient network problem, not a
+gateway policy — but `tt models check` exits non-zero for it. A plan with no
+`#+TT_MODELS` probes nothing.
+
 `tt lint` rejects, at the keyword's file and line: an unknown role
-(`foo=…`), an unknown seat (`reviewer.X`, `panel.4`), a key named twice, a key
-with an empty model, and `panel=reviewers` together with an explicit
-`panel.N`.
+(`foo=…`), a key named twice, a key with an empty model, and
+`panel=reviewers` together with an explicit `panel.N`. A seat or lane key
+must name a configured seat or lane: `reviewer.<seat>` must be one of the
+seats `#+TT_REVIEWERS` declares, `panel.<i>` must be one of the reviewers'
+positions (there is one panel seat per reviewer), and `worker.<i>` must be one
+of the `#+TT_WORKERS` lanes.
+
+With `#+TT_WORKERS`, a lane may also name its own worker model: `worker.1` is
+lane `a`, `worker.2` is lane `b`, and so on, each falling back to `worker`
+when it is not given. `tt lint` names a lane the plan does not declare as
+unknown, and lists the lanes it does declare.
+
+## Seats, the leader and the lane count (`#+TT_REVIEWERS`, `#+TT_LEADER`)
+
+06h removes the fixed `M`, `A`, `B` and the two-lane limit. A plan declares
+its own seats and its leader:
+
+```org
+#+TT_REVIEWERS: M A B C D
+#+TT_LEADER: B
+#+TT_WORKERS: 5
+#+TT_ROUNDS: 3
+```
+
+- `#+TT_REVIEWERS` is an **odd** list of seat names (default `M A B`). Each
+  seat reviews and votes; the count is the number of reviews per candidate
+  and the number of pick votes in a round.
+- `#+TT_LEADER` names the seat whose approval a decision needs and whose vote
+  breaks a revote tie (default: the first seat).
+- `#+TT_WORKERS` is any positive whole number of lanes (default 1).
+- `#+TT_ROUNDS` is the round budget, a whole number from 1 to 5 (default 3).
+
+**The reviewers must outnumber the lanes.** The seat count must be odd and
+greater than the worker count: 1 or 2 workers need at least 3 reviewers, 3 or
+4 need at least 5, and 5 or 6 need at least 7. `tt lint` refuses a plan that
+breaks the rule and names the smallest valid reviewer count. It also refuses
+an even or empty seat list, a duplicate seat, an unknown leader, a
+non-positive lane count, a `#+TT_ROUNDS` outside 1–5, and a model key that
+names no configured seat or lane — each with the keyword's file and line.
+
+A plan that names neither `#+TT_REVIEWERS` nor `#+TT_LEADER` keeps the fixed
+`M`, `A`, `B` led by `M`, and every 06g test is unchanged.
+
+### A three-lane, five-seat example (3 × 5)
+
+```org
+#+TT_REVIEWERS: M A B C D
+#+TT_LEADER: M
+#+TT_WORKERS: 3
+```
+
+One round runs three lanes (`C1-a`, `C1-b`, `C1-c`). Each of the five seats
+reviews every passing candidate — 3 × 5 = 15 reviews — then each seat casts
+one pick vote (five votes). A candidate needs a strict majority of the five
+seats: **three** votes. If the first vote splits 2-2-1 with no strict
+majority, the top two go to **one revote**; the four non-leader seats vote
+again, and a tie among them is broken by the leader's vote. A single passing
+candidate still wins without a vote. `pickWinner` in `src/core/rounds.ts` is
+the only place the winner is decided, and the leader's tiebreak is code, not a
+model.
+
+The **owner's 06 configuration** is exactly this: `#+TT_REVIEWERS: M A B C D`,
+`#+TT_LEADER: M`, `#+TT_WORKERS: 3`, `#+TT_ROUNDS: 3`. The blocker and round
+panels have as many seats as there are reviewers, and `panel=reviewers` maps
+panel seat *i* to reviewer *i*.
+
+## Several lanes per round (`#+TT_WORKERS`)
+
+A plan can run more than one implementation lane per round:
+
+```org
+#+TT_WORKERS: 2
+#+TT_ROUNDS: 3
+```
+
+> **Status (06g2).** The lane round is implemented: `runRound`
+> (`src/core/lanes.ts`) orchestrates it — two lane worktrees, two worker
+> attempts on the same prompt, two freezes, the per-candidate checks one after
+> the other under `~/.tradeoffs-trace/check.lock`, today's two-turn review once
+> per candidate (each review in its own session, so a seat judging the second
+> candidate is not carrying the first's in context) and the pick turn — and the
+> winner is handed to the single-candidate pipeline with the checks and reviews
+> it already earned (they are never re-run). A review or a vote that cannot be
+> taken fails the round: it repeats, and no winner is ever handed off on fewer
+> than K × N reviews and N votes. The keyword
+> is parsed by the real Emacs parser and linted, the round events reduce into
+> `phase.rounds`, `pickWinner` / `blocksAcceptance` / `roundBudget` are the pure
+> rules (`pickWinner` is the only place a winner is decided), the lane sweep is
+> cwd-scoped, and the views render a round (status, tape, review buffer,
+> `tt summary`). A plan without `#+TT_WORKERS` is untouched.
+>
+> `#+TT_MODELS` may give each lane its own worker model: `worker.1` is lane `a`
+> and `worker.2` is lane `b`, each falling back to `worker`.
+
+`#+TT_WORKERS: K` makes one round start from **one** version (round 1: the
+integration branch head) and run K lanes. Each lane gets its own worktree,
+its own worker and its own sweep, on the same prompt; a phase's own
+`:WORKERS:`/`:ROUNDS:` property overrides the plan's keyword. Any positive
+whole number of lanes is allowed (06h removed the two-lane limit), provided
+the reviewer count is odd and greater than K (see above).
+
+What one round does, in order:
+
+1. each lane works in its own worktree at the round's base and freezes its own
+   candidate (`C2-a`, `C2-b`);
+2. the candidates are checked **one after the other** under the machine-wide
+   lock — checks never run concurrently on one machine;
+3. every configured seat reviews every candidate that passed its checks (K
+   passing candidates are N × K reviews, N the seat count);
+4. each seat casts one pick vote with a one-line why, and the candidate with a
+   strict majority of the seats (3 of 5, 4 of 7, …) wins. With three or more
+   candidates and no strict majority, the top two by votes go to **one
+   revote**, and the leader's vote breaks a tie in the revote. A single
+   passing candidate wins without a vote; a round where no candidate passes
+   repeats from the same base, carrying every lane's failures.
+
+The winner is decided by `pickWinner` in code (`src/core/rounds.ts`), never by
+a model. Acceptance is then the rule in force applied to the winner **alone**;
+the losing candidate is discarded. A lane that crashes or times out yields no
+candidate and does not stop the other lane — the status shows why.
+
+**Every pick vote says what the loser had.** Each seat's `submit_pick_vote`
+carries `loserHad: { yes, anchors, note? }` — whether the lane it did *not*
+pick had something the picked lane lacks, with the anchors (`file:line` or a
+test name). A vote without the field is refused and re-asked once, like an
+incomplete review. When a majority of the votes say yes, the losing lane's
+anchors are carried into the next round's repair prompt, so the next round's
+lanes can take the winner's strengths without losing what the loser had. A
+vote whose `loserHad` is absent (a log written before this field) is shown as
+**not recorded**, never guessed. `tt summary` and the status view report, per
+phase, the rounds, split versus unanimous picks and the rounds where the loser
+had something (`views/metrics.json`'s `picks`).
+
+With `#+TT_WORKERS` absent (or 1) nothing above happens: no round event is
+recorded and the phase is the single-candidate loop it was before.
+
+### The round budget and carried items
+
+A phase may spend **3 rounds** by default; `#+TT_ROUNDS` sets another number
+from 1 to 5. One round is **one pass of the repair budget**, so
+`#+TT_ROUNDS: 3` allows the first round plus two repairs — matching ODP-1's
+"accepted within 3 rounds" — and with K lanes that is up to 3 × K candidates.
+`roundBudget()` is the single source of that number and the FSM's repair
+allowance is `roundBudget - 1`. A round costs one attempt of the repair
+budget, whatever the number of lanes.
+
+From round 2, a finding blocks acceptance only when it either
+
+- names an item of the contract (or of an owner correction) that is unmet on
+  the main path, with the item id and a `file:line`; or
+- is a **regression**: a test or behaviour that passed at the round's base and
+  fails now. The round's base is that round's own starting candidate — the
+  previous candidate in a repair, the phase base in round 1 — never the phase
+  baseline alone.
+
+Anything else — a further edge path, hardening, wording, style — is an
+**advisory**: recorded as a trade-off and carried, never blocking. Round 1 is
+unchanged: every blocking finding blocks.
+
+When the budget is spent the phase stops on the owner and no further round
+starts without an explicit owner grant of **one** round (the budget gate's
+`grant` option adds exactly one). If the only open findings are advisories,
+the owner's single decision is **"accept with carried items"**: taking it
+accepts the candidate and lists the carried items in the run record and in
+`tt summary`, as input for the next phase's plan. If a blocking item is open,
+the owner sees only the blocking items.
+
+The carry waives the **open review items only** — reviewer verdicts, findings,
+decisions and corrections. It never waives the mechanical gates: the checks
+must have passed for the carried candidate, the probe must be that candidate's
+onto the current integration head, the candidate under acceptance must be the
+one the carry was given for, a named `test` verify must have passed, no
+`:WHERE:` symbol deviation may stand unaccepted, and every `evidence` item
+must be recorded.
+
+The owner's disposition is the command
+
+```text
+tt carry <run> <finding-or-message-id> --to <phase-id>
+```
+
+It goes through the run's inbox, like every owner command. It marks the item
+carried with the target phase, answers the open request about it (a contract
+finding's only other option is a correction, which grants three rounds and
+restarts the worker), and once no blocking item remains uncarried it accepts
+the candidate. Every carried item, with its target, is listed in `tt summary`
+and `tt status`.
+
+`tt status` shows one line per lane and the round's cost (`2 worker run(s),
+6 review(s)`), `views/loop.txt` and `views/tape.txt` show both lanes and the
+pick, the review buffer groups the round's candidates with the votes and the
+winner, and `tt summary` lists each round's candidates, votes and winner.
+
+### The variant limit (`#+TT_VARIANT_LIMIT`)
+
+Some requirements attract a *new* blocking finding of the same kind every
+round: fix one variant, the next round finds another. The loop does not spend
+a third round on it. When the same requirement takes a new blocking finding of
+the same kind in **N consecutive rounds** (default **3**, `#+TT_VARIANT_LIMIT:
+2` for a stricter plan), the Nth opens an **owner request** — "carry the
+remaining variants, or fix?" — and **no repair attempt starts**. A gap in the
+rounds, a different kind or a different requirement does not count.
+`variantEscalation` (`src/core/triage.ts`) is the only place the streak is
+counted; the transition table parks the phase on the owner from the finding's
+own request. `#+TT_VARIANT_LIMIT` is frozen into the contract like
+`#+TT_ROUNDS`, and a phase's own `:VARIANT_LIMIT:` overrides the plan's.
+
+### The host check window
+
+Every check run on a host — any program, any run, phase or final tier — holds
+the machine-wide check lock for its duration, and while that window is open the
+**worker processes of every other run on the host are paused** (`SIGSTOP`,
+resumed with `SIGCONT` when the window closes). A paused worker's attempt clock
+does not run, so a check that holds the machine for minutes cannot time another
+run's worker out. The window is a file per holder under `${checkLockPath}.window.d`
+(`~/.tradeoffs-trace/check.lock.window.d` for the default lock) plus a
+process-global set, so two conductors in one process and two conductors in
+separate processes both see each other's windows; a marker older than six
+hours (a crashed holder) is ignored. Because the window is scoped to the lock
+path, a run whose checks use a different lock (tests use a per-run lock) never
+pauses another run's workers. The pause and resume are recorded in the run's
+log (`worker_paused` / `worker_resumed`).
+
+## Triage
+
+Every finding and every discovered decision of the candidate ends in exactly
+**one disposition**, and `disposition(record, evidence)` in
+`src/core/triage.ts` is the only place that decides it. Nothing may silently
+disappear: a record without a disposition at the end of evaluation is a defect
+of the loop, never a pass.
+
+The three dispositions are:
+
+- **fix** — it blocks acceptance until repaired. A record dispositioned `fix`
+  makes `accept()` false whatever its severity label and whatever round it was
+  raised in, so 06g's round-2 downgrade never applies to one.
+- **trade-off** — accepted, recorded with what was chosen, the alternative
+  given up and why. It is listed under `tt summary`'s `#### Trade-offs` and
+  does not block.
+- **escalate** — an owner request is open, naming the record. Acceptance waits
+  for the owner, and `tt summary` lists it under `#### Escalations`.
+
+### The fix rule
+
+One rule separates fix from trade-off:
+
+- anything that gives a **wrong value, offer or output on a reachable path**,
+  or **contradicts the current golden source or the plan**, must be fixed;
+- only **judgement calls** (style, hardening, ergonomics) may be trade-offs;
+- matching an earlier **drafting decision is no exemption** — the choice is
+  re-checked against the current golden source, and a contradiction is a fix.
+
+Severity follows **impact, not the reviewer's label**. A finding filed at
+`advisory` severity whose evaluator re-check confirms a wrong value has impact
+`wrong-output`; its disposition is `fix` and it blocks. The evaluator gives
+every finding and every discovered decision an impact class
+(`wrong-output` | `contract` | `judgement`) through its item-check form, and a
+wrong-output claim is re-checked against the candidate with valid anchors
+before it can be classified. A missing classification is re-prompted once and
+then escalated.
+
+A discovered decision that receives **no ballots**, a failed vote whose
+outcome would change the output, and any unclassifiable item all escalate to
+the owner: they are never quietly kept as a trade-off and never quietly
+dropped. A `detail` decision is **never balloted**, but it still needs the
+evaluator's impact class and a real `chosen`/`alternative`/`why` to be a
+trade-off; without them it escalates like any other unclassified record.
+
+A trade-off needs the evaluator's classification **and** real
+`chosen`/`alternative`/`why` from its check. Neither a reviewer's severity
+label nor a round-panel drop is by itself a trade-off: a panel-lowered finding
+goes through the same judgement path (real three fields → trade-off; a missing
+field → escalate), and the panel's own reason is shown only as context.
+
+### Carry and defer
+
+A **carried** item becomes a real requirement of the phase it is carried to:
+when the next program node starts, the scheduler writes each carried finding
+or decision into its contract as a requirement with an id, the item's text and
+a `VERIFY` — `test "carried <id> is fixed"` for a wrong-output item, `review`
+otherwise. Directive text alone never carries an item. The next node's
+reviewers must give every requirement a verdict, so a carried item cannot be
+forgotten between phases.
+
+A **deferral** puts off an item's fix and needs a **guard**: a test that shows
+its current cost, or a recorded owner ruling. Without either it is refused
+with the reason (`tt defer <run> <id> --test <name>` or
+`--owner-ruling <id>`); with either it is recorded and listed under
+`### Open deferrals` in `tt summary` until it is resolved.
+
+A second owner act on the **same id** is refused with the reason, naming the
+existing act: `tt carry` on an id that already has an open deferral, and
+`tt defer` on an id that is already carried, are both rejected. The two acts
+are not merged and neither is silently dropped.
+
+### A worked example: valuation 01's settled-halt decision
+
+Valuation 01's PR review found six funding issues. One of them, **#5 (a
+settled offer can carry halt)**, had been raised in the loop as drafting
+decision **D9** and approved **3–0** because it matched the plan's drafting
+decision — but it was never re-checked against the **golden note**, which said
+a settled offer must never carry halt. Under 06i this is decided at
+evaluation:
+
+- the evaluator re-checks the choice against the current golden source, not
+  against the drafting decision;
+- the choice contradicts the golden note, so its impact is `contract` and its
+  disposition is `fix` — a 3–0 approve vote is no exemption;
+- it blocks acceptance, and the worker repairs it in the same phase.
+
+The same trace's **#2 (late prediction in the last minute)** is the
+escalation case: reviewer B discovered the decision in 01c but it received
+**no ballots**, so under the old loop it vanished. Under 06i a discovered
+decision with no ballots gets an `escalate` disposition and an open owner
+request naming it, so the owner sees it and acceptance waits. The third case,
+01e's **three confirmed wrong values** raised as blocking by one seat and
+outvoted 2–1, is the severity rule: a confirmed wrong-output record is a `fix`
+whatever the seat count, so the majority vote cannot accept it away.
 
 ## Owner checklist
 
@@ -495,8 +1145,10 @@ and runs independent phases in parallel.
 
 **Time limits per plan.** A repository whose builds and suites take longer than
 the defaults sets its own limits: `#+TT_SH_MINUTES` (one agent command),
-`#+TT_CHECK_MINUTES` (checks and the probe) and `#+TT_ATTEMPT_MINUTES` (one worker
-attempt). Put them in a plan file, or in the program file, where they apply
+`#+TT_CHECK_MINUTES` (checks and the probe), `#+TT_ATTEMPT_MINUTES` (one worker
+attempt) and `#+TT_REVIEW_MINUTES` (one review turn or pick turn; default 15 —
+a lane review's turn 1, its wait for the other seats, and turn 2 each get
+this much, and a large candidate in a slow seat needs more: 02k used 30). Put them in a plan file, or in the program file, where they apply
 to every entry that doesn't set its own. For Rust, also share one cargo target
 directory across worktrees and checkouts. Otherwise every fresh checkout
 rebuilds from scratch:
@@ -524,6 +1176,33 @@ A plan declares the credentials it needs **by name** and nothing else:
 ```org
 #+TT_SECRETS: PYTH_ACCESS_TOKEN KAIKO_KEY
 ```
+
+A secret may also come from a `KEY=value` file the plan names with
+`#+TT_ENV_FILE`, or that `tt start`/`tt program start` takes as `--env-file`:
+
+```org
+#+TT_ENV_FILE: ~/secrets/atlas.env
+#+TT_SECRETS: PYTH_ACCESS_TOKEN KAIKO_KEY
+```
+
+**The file format.** One `KEY=value` assignment per line. Blank lines and
+lines starting with `#` are ignored, an optional `export ` prefix is accepted,
+and single or double quotes around a value are stripped:
+
+```sh
+# vendor keys, never committed
+export PYTH_ACCESS_TOKEN='…'
+KAIKO_KEY=…
+```
+
+**The lookup order is the environment first, then the env file.** A name the
+environment sets wins; a name it does not set is read from the file.
+`--env-file` overrides `#+TT_ENV_FILE` for that run, and the path (never a
+value) is recorded in the run's plan snapshot, so a resumed run resolves the
+same file. A missing variable refuses the start, naming the variable and both
+sources it checked. `effects/secrets.ts` is the only reader of either source,
+and it hands every value to the redactor before any agent starts, so no value
+from the env file can reach a file of the run directory.
 
 - The name goes into the JSON plan (`secrets`); the plan never holds a value.
 - In a program file, `#+TT_SECRETS` declares the names for **every** entry, in
@@ -622,6 +1301,34 @@ pasted a value into the code. The trace buffer masks a declared secret's value
 that a stream file still holds, using Emacs's own environment, so an unredacted
 past run cannot display one either.
 
+## Processes the run owns (what `held` means)
+
+A run signals only the processes it started. Every command it spawns is
+recorded with its process group, and when a phase is cancelled, times out, is
+frozen or recovered from a crash, the **sweep** ends the processes whose group
+is one of those recorded groups — and only those. Every signal the run sends
+(a command's group on timeout, an agent on termination, a pgid recovered from
+a crashed conductor's log, the conductor or scheduler pid an owner stops) is
+sent by that one module, so there is a single place to read what the run may
+signal. Crash recovery additionally checks that a recovered pgid's leader
+started no later than the record that named it. A pid the OS recycled after
+the crash, and a group whose start time cannot be proven at all, are left
+running rather than signalled: safety wins over cleanup.
+
+Any other process with a file under the run's worktree is **held**: it is
+reported, never signalled. `tt status` lists each one as
+`held: <pid> <command> (cwd <dir>)`. A held process does not taint the
+worktree; only ending one of the run's own processes does. A process is held
+because the run cannot prove it owns it — a detached descendant that left its
+group, a bind mount's file server, an editor, or Docker Desktop's own helpers
+(program 14's 14i freezes killed Docker Desktop because an earlier sweep
+signalled every process with a cwd under the worktree). Safety wins over
+cleanup: never signalling a foreign process comes before cleaning up.
+
+An empty sweep is therefore not a guarantee. A process that closed every open
+file under the worktree is invisible to `lsof +D`, which only sees what is
+true at the moment it runs.
+
 ## Watch it
 
 | Where | What you see |
@@ -632,8 +1339,8 @@ past run cannot display one either.
 | trace buffer | one line per tool call (time, command, ✓/✗ exit, duration, last output line), plus `path +a −r` for each file the call changed; the running call in the header. `a` pins another agent. |
 | decision view (`C-c m d`) | the owner directives in force (so `RET` from a directive trade-off line lands on the ruling), then the current round's decisions in the same order as the Trade-offs panel (amendments, flagged, M vetoes, dissent, the rest), each labelled by the tally, with the options, recommendation and each reviewer's ballot; a passed amendment reads `⚑ AMENDED` and shows the old → new wording; the open advisories folded under one `Advisories (N)` heading; other findings grouped by file; earlier rounds one line each. Read-only. |
 | runs list (`C-c m l`) | every run: `RET` opens; stop and continue with `C-c m k` / `C-c m c` in the run's own buffer |
-| mode line | live runs with stage, time and reviews; the oldest owner wait (`⚑ 13f waiting 1h12m`) with a warning-face flash when a new notification arrives |
-| CLI | `tt list`, `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
+| mode line | the runs alive or waiting for the owner and the program nodes waiting to start, read from `<root>/live.json` — a file the conductor and the scheduler keep current — so the mode line is a file read and never starts a process; a warning-face flash when a new notification arrives |
+| CLI | `tt list` (each run's row is cached in `<run>/views/row.json`, keyed by the size and mtime of its `events.jsonl`, so a listing with nothing changed rebuilds no row), `tt status <run>`, `tt state <run>` (JSON), `tt timing <run>` (per-agent time breakdown), `tt redact` (see Secrets) |
 
 ## The decision brief (what needs you, in plain words)
 
@@ -856,6 +1563,16 @@ sent). `tt summary <run>` lists the directives in force in the PR body, and
 
 `RET` sends in Evil normal state; `C-c C-c` sends from any state.
 
+**Steering a state transition.** When a steer widens a state transition — for
+example "recheck from `IMPLEMENTING`" — write it as the **outcome plus the
+cleanup it implies**: name the in-flight dispatch that must be cancelled (the
+running worker attempt, its shell groups, its review) and the worktree cleanup
+that must follow (reset to the frozen candidate, or left tainted). The 06j
+`recheck from IMPLEMENTING` steer did neither and introduced two bugs: a stale
+`inFlight.dispatch_worker` that stalled the next repair, and the stopped
+worker's writes surviving the recheck. A steer that names the cleanup leaves
+nothing for the reviewer to infer.
+
 ## Keys
 
 Every global action lives under `C-c m`; single letters are used only in the
@@ -958,8 +1675,8 @@ choosing one opens it on its own root: every later `tt` command on that
 buffer (refresh, `C-c m k`/`C-c m c`, `C-c m d`, A/D verdicts, directives)
 runs against that root, never the default one. No per-run file is read over
 TRAMP while listing. Remote roots are listed only from a picker or a visible
-buffer; the periodic mode-line refresh reads the local root alone, so a dead
-host cannot stall Emacs in the background.
+buffer; the periodic mode-line refresh reads the local root's `live.json`
+alone, so a dead host cannot stall Emacs in the background.
 
 `C-c m p` in a buffer visiting a program's Org file (`05_program.org`) skips
 the prompt: the running program of that file opens directly when exactly one
@@ -982,6 +1699,70 @@ In Emacs, use `C-c m k` to stop and `C-c m c` to continue, with point in the
 program buffer or the phase's own buffer (status, trace or input). `C-c m k`
 asks first: `RET` confirms, `n` cancels. The run directory and worktree stay on
 disk after a stop.
+
+## Owner input
+
+Whatever you send through the input box reaches the run in exactly one of
+three ways. `acceptInput` (`src/core/owner-inbox.ts`) is the one place that
+decides which, and the decision is recorded as an event; the status shows what
+actually happened, never what Emacs hoped for.
+
+| Outcome | When | What you see |
+|---|---|---|
+| **applied now** | a correction while the phase is `AWAITING_OWNER`; a steer while a worker attempt is live | `correction started`, or `delivered` once Pi acknowledges |
+| **queued** | a correction outside `AWAITING_OWNER`, or a steer while no worker is running | `queued`: it reaches the next worker attempt's prompt verbatim and is shown to live reviewers |
+| **refused** | only `DONE` and `BLOCKED` | `refused: <reason>`, with the same reason in `views/status.txt` and the inbox's `rejected/` note |
+
+Only `DONE` and `BLOCKED` refuse. A correction that arrives while the run is
+reviewing or checking is queued for the next worker attempt; a steer that
+arrives with no worker running is queued the same way. Nothing is dropped and
+nothing is silently re-applied. A queued correction also **grants its own
+round** (three rounds, like a correction applied at `AWAITING_OWNER`), so a
+spent budget cannot drop an owner input. The status buffer's **Owner input**
+section and `views/status.txt` carry the latest queued or refused input with
+its reason, and the input box's header line repeats that line (read from the
+file), so the Emacs front end never computes an outcome itself.
+
+**Ruling a decision so it needs no ballots.** A delegated or reserved decision
+is normally settled by the reviewers' vote. To settle one by ruling, type a
+correction (or directive) that names the decision id and the word "ruled" (or
+"settled" / "decided"), for example `D-p1-7c1e0a4a-1 is ruled: keep the cache
+warm`. The conductor records the ruling pinned to that decision's **id and
+choice**; on every later candidate whose decision keeps the same id and the
+same choice it is settled with **no ballots and no re-tally**. A later
+candidate that changes the choice is not settled by the old ruling and is
+voted normally. A passing mention of an id without a ruling word settles
+nothing.
+
+### Naming a run: the three ids
+
+A binding may name the run by any of the three ids `resolveBinding`
+(`src/core/binding.ts`) matches — it is the only matcher:
+
+- the **internal run id** (`state.phase.runId`, a uuid the log records);
+- the **run directory id** (the directory's basename, what `tt list` shows);
+- the **readable id** (`<program>-NN`), the position of a program node, which
+  survives a retry.
+
+A binding that matches nothing is refused, and the reason lists all three ids
+that would have bound. Corrections written by Emacs carry the binding it saw;
+the same three ids are accepted everywhere a run id is taken.
+
+### Pause and resume a program
+
+```sh
+tt program pause <id>    # running nodes finish; no new node starts until resume
+tt program resume <id>   # starts the next ready node (and clears a stop, too)
+```
+
+A pause is a logged `PROGRAM_PAUSED` event, not a kill: the nodes already
+running go on, the scheduler keeps watching them so their finish is recorded,
+and then it exits reporting `paused`. `tt program resume` records
+`PROGRAM_RESUMED` and starts the next ready node. Exactly one scheduler runs
+per program: it holds `programs/<id>/scheduler.lock` for its whole life, and a
+second scheduler exits at once with `scheduler already running`. A lock left by
+a dead pid is taken over, so a crashed scheduler never blocks the program
+forever.
 
 ## Time limits (defaults)
 
@@ -1147,15 +1928,18 @@ a refresh keeps the expanded messages and point on the same one.
 |---|---|---|
 | `TAB` | on a message heading | shows the description and context in place; the property drawer stays folded |
 | `RET` | on a message heading | opens the message's own `views/messages/<id>.org`: its evidence (path and lines), the plan excerpt it concerns, what was merged into it, every version's history, its ledger entry and its votes |
-| `A` | normal state | accepts the message: writes a `verdict` command with `verdict: "accept"` |
-| `D` | normal state | refuses it: asks for a one-line reason, then writes `verdict: "refuse"` with that reason |
+| `A` | normal state | accepts the message: sends a `verdict` command with `verdict: "accept"` |
+| `D` | normal state | refuses it: asks for a one-line reason, then sends `verdict: "refuse"` with that reason |
 
 The status buffer's `review` row counts the same messages in trade-off
 vocabulary: `T 6 (6 raw) · F 0 · B 0 · C-c m d` — the titled entries plus the
 raw ones, with the raw and dropped counts broken out, matching `review.org`.
 
 `A`/`D` are accepted and refused in the buffer; `A` and `D` override Evil's
-append and delete-to-end-of-line, which is safe in a read-only view. On a
+append and delete-to-end-of-line, which is safe in a read-only view. The
+command runs **asynchronously**: `A`/`D` return at once, the entry shows
+`⧗ A pending` / `⧗ D pending` until the process exits, and the callback
+replaces it with the recorded outcome (or the error) in the echo area. On a
 **live** run the command goes through `<run>/inbox/` and the conductor
 validates its binding; on a run whose conductor has exited it is a **late
 verdict**, dry-run through `reduce()` and appended to `events.jsonl` only if

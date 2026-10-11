@@ -146,3 +146,33 @@ test("program: invalid graphs are refused with the reason", () => {
     /duplicate/,
   );
 });
+
+test("plan 06d: NODE_BLOCKED after NODE_STARTED for the same run id leaves the node running", () => {
+  const nodes = expandProgram(program13);
+  let s = initialProgramState(nodes);
+  s = reduceProgram(s, { type: "NODE_STARTED", node: "13a", runId: "run-a" });
+  s = reduceProgram(s, { type: "NODE_BLOCKED", node: "13a", reason: "stray block" });
+  assert.equal(s.nodes["13a"].status, "running", "the started node keeps running");
+  assert.equal(s.nodes["13a"].runId, "run-a");
+  assert.deepEqual(s.ignoredBlocked, [{ node: "13a", reason: "stray block" }], "the stray block is recorded as ignored");
+  // A node that never started still blocks: only a start protects it.
+  s = reduceProgram(s, { type: "NODE_BLOCKED", node: "13b", reason: "real block" });
+  assert.equal(s.nodes["13b"].status, "blocked");
+});
+
+test("plan 06d: PROGRAM_PAUSED stops new starts while running nodes go on; PROGRAM_RESUMED clears it", () => {
+  const nodes = expandProgram(program13);
+  let s = finish(initialProgramState(nodes), ["13a", "13b"]);
+  s = reduceProgram(s, { type: "PROGRAM_PAUSED" });
+  assert.deepEqual(nextStarts(nodes, s, 4), [], "a paused program starts nothing");
+  assert.equal(programOutcome(nodes, s), "paused");
+  // A node already running still finishes; the pause never touches it.
+  s = reduceProgram(s, { type: "NODE_STARTED", node: "13c", runId: "run-c" });
+  assert.equal(programOutcome(nodes, s), "running", "a running node keeps the scheduler watching");
+  s = reduceProgram(s, { type: "NODE_STATUS", node: "13c", status: "done" });
+  assert.deepEqual(nextStarts(nodes, s, 4), [], "still paused after the running node finished");
+  assert.equal(programOutcome(nodes, s), "paused");
+  // Resume starts the next ready node.
+  s = reduceProgram(s, { type: "PROGRAM_RESUMED" });
+  assert.deepEqual(nextStarts(nodes, s, 4), ["13d", "13e", "13f"]);
+});

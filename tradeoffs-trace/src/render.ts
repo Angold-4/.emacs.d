@@ -13,7 +13,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest } from "./core/types.ts";
+import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest, RoundRecord } from "./core/types.ts";
+import { candidateLabel } from "./core/rounds.ts";
+import { seatsOf } from "./core/seats.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
   projectEntries,
@@ -26,6 +28,8 @@ import {
 } from "./core/entries.ts";
 import { runReviewLint, type ReviewLintResult } from "./core/review-lint.ts";
 import { ledgerEntries } from "./core/messages.ts";
+import { countsLine, isStructured, itemEvidenceFiles, matrixMarkdown, matrixOrg, overturnCounts, phaseItemCounts, phaseItemOutcomes, type ItemLoopState } from "./core/items.ts";
+import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
 import type { Timeline } from "./conductor.ts";
 import type { RunView } from "./view.ts";
 
@@ -362,7 +366,22 @@ export interface EntryReviewPhase {
   ownerRequests?: OwnerRequest[];
   decisions?: Decision[];
   overrides?: Override[];
-  contract?: { contractVersion?: { snapshot: number; sectionSha256: string } };
+  contract?: {
+    contractVersion?: { snapshot: number; sectionSha256: string };
+    // Plan 06b: the structured items, so the review buffer shows the
+    // item-by-seat matrix.
+    architecture?: import("./core/items.ts").ArchitectureItem[];
+    requirements?: import("./core/items.ts").RequirementItem[];
+    constraints?: import("./core/items.ts").ConstraintItem[];
+  };
+  /** Plan 06b: the per-item state the matrix renders. */
+  reviews?: import("./core/types.ts").PhaseState["reviews"];
+  /** Plan 06g: the phase's rounds, so the review buffer groups the candidates
+   * with the pick votes and the winner. Absent for a plan without lanes. */
+  rounds?: RoundRecord[];
+  coverage?: import("./core/items.ts").Coverage;
+  checkResolution?: import("./core/items.ts").VerifyResolution[];
+  overturns?: import("./core/items.ts").Overturn[];
   messages?: Message[];
   entries?: Entry[];
   /** The program a program-level view spans. */
@@ -408,6 +427,9 @@ export interface EntryReviewRender {
   text: string;
   /** One `views/entries/<id>.org` per live entry. */
   files: Array<{ id: string; contents: string }>;
+  /** Plan 06b: one `views/items/<id>.org` per item, the evidence a matrix
+   * cell opens. */
+  itemFiles: Array<{ id: string; contents: string }>;
   lint: ReviewLintResult;
 }
 
@@ -415,6 +437,55 @@ export interface EntryReviewRender {
  * three sections (Blockers, Findings, Trade-offs), with the accounting footer
  * and the lint's first line when a rule fails. Pure projection of
  * `phase.entries` and `phase.messages`; no agent writes it. */
+/** Plan 06g (A5): the review buffer's round section, as Org: one subtree per
+ * round, one child per candidate (its lane, checks result and why it
+ * produced none), then the pick votes and the winner. Pure, so the grouping
+ * is unit-tested without a run directory. */
+export function renderRoundsOrg(rounds: readonly RoundRecord[]): string {
+  const lines: string[] = ["* Rounds", ""];
+  for (const round of rounds) {
+    lines.push(`** Round ${round.round} from ${round.base.slice(0, 7)}`, "");
+    for (const lane of round.lanes) {
+      const candidate = round.candidates.find((c) => c.lane === lane);
+      const label = candidateLabel(round.round, lane);
+      if (!candidate?.sha) {
+        lines.push(`*** ${label} (lane ${lane}) — no candidate${candidate?.note ? `: ${candidate.note}` : ""}`, "");
+        continue;
+      }
+      const state = candidate.ok === undefined ? "checks pending" : candidate.ok ? "checks passed" : "checks failed";
+      const picked = round.picked?.lane === lane ? ", picked" : "";
+      lines.push(`*** ${label} (lane ${lane}) — ${state}${picked}`, "", `    ${candidate.sha}`, "");
+      // Plan 06g2: the candidate's own reviews, grouped under it — every seat
+      // that reviewed it, with what that review raised. The round's reviews
+      // are the round's record; the winner's are also the phase's slots.
+      const reviews = candidate.reviews ?? [];
+      if (reviews.length > 0) {
+        lines.push(
+          `    reviews: ${reviews.length}`,
+          ...reviews
+            .slice()
+            .sort((a, b) => a.seat.localeCompare(b.seat))
+            .map((r) => {
+              const raised = (r.review.findings ?? []).length + (r.review.blockers ?? []).length;
+              return `      - ${r.seat}: ${raised === 0 ? "no findings" : `${raised} finding(s)`}`;
+            }),
+          "",
+        );
+      }
+    }
+    if (round.votes.length > 0) {
+      lines.push("Votes:", ...round.votes.map((v) => `  - ${v.seat} → ${candidateLabel(round.round, v.lane)}: ${v.why}`), "");
+    }
+    lines.push(
+      round.picked
+        ? `Winner: ${candidateLabel(round.round, round.picked.lane)} (${round.picked.sha.slice(0, 7)}, ${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})`
+        : "Winner: none",
+      "",
+    );
+  }
+  return lines.join("\n");
+}
+
 export function projectEntryReview(
   phase: EntryReviewPhase,
   opts: { anchorResolves?: (anchor: EntryAnchor) => boolean; anchorFreshness?: (anchor: EntryAnchor) => AnchorFreshness; lintError?: string } = {},
@@ -425,7 +496,7 @@ export function projectEntryReview(
   const newestCandidateSha = phase.candidate?.sha;
   const projected = projectEntries({ messages, entries, newestCandidateSha, anchorResolves: opts.anchorResolves, anchorFreshness: opts.anchorFreshness });
   const lint = runReviewLint({ projected, newestCandidateSha, messages });
-  const text = program
+  let text = program
     ? renderProgramEntryReview({
         program: phase.program,
         newestCandidateSha,
@@ -458,8 +529,32 @@ export function projectEntryReview(
         anchorFreshness: opts.anchorFreshness,
         lintError: opts.lintError ?? (lint.ok ? undefined : lint.firstLine),
       });
+  // Plan 06b: the review buffer's own item-by-seat matrix, appended to the
+  // rendered review so the owner and reviewers see every item's worker
+  // status, check result and seat verdict in one place.
+  const itemsPhase = {
+    contract: phase.contract ?? {},
+    reviews: phase.reviews,
+    coverage: phase.coverage,
+    checkResolution: phase.checkResolution,
+    overturns: phase.overturns,
+  } as ItemLoopState;
+  const structuredContract = isStructured(phase.contract);
+  const matrix = structuredContract ? matrixOrg(itemsPhase) : [];
+  if (matrix.length > 0) {
+    text += `\n* Plan items\n  ${countsLine(phaseItemCounts(itemsPhase))}\n\n${matrix.map((l) => `  ${l}`).join("\n")}\n`;
+  }
+  // Plan 06g (A5): the review buffer groups the round's candidates with the
+  // pick votes and the winner, so the owner reads both lanes and the pick
+  // rather than only the accepted candidate. Absent (and the buffer is
+  // byte-identical to before) for a plan without `#+TT_WORKERS`.
+  const rounds = phase.rounds ?? [];
+  if (rounds.length > 0) {
+    text += `\n${renderRoundsOrg(rounds)}\n`;
+  }
   const files = projected.views.filter((v) => v.live).map((v) => ({ id: v.entry.id, contents: renderEntryFile(v) }));
-  return { text, files, lint };
+  const itemFiles = structuredContract ? itemEvidenceFiles(itemsPhase) : [];
+  return { text, files, itemFiles, lint };
 }
 
 /** The messages an evaluator merged into TARGET, so the target's own file
@@ -559,6 +654,14 @@ export interface StatusSecretStatus {
   tooShort: string[];
 }
 
+/** A2 (plan 06e): a process with a file under the worktree that the run does
+ * not own. `tt status` lists it under `held` — reported, never signalled. */
+export interface StatusHeldProcess {
+  pid: number;
+  command: string;
+  cwd: string;
+}
+
 /** `views/status.txt`: the same readable status `tt status` prints, from a
  * rebuilt (or live) state and the view computed from the run directory. The
  * Emacs status buffer reads it instead of calling `tt state' every poll. */
@@ -567,6 +670,7 @@ export function renderStatusText(
   state: { run: string; phase: unknown },
   view: RunView & { timeline: Timeline },
   secretStatus: StatusSecretStatus = { missing: [], tooShort: [] },
+  held: readonly StatusHeldProcess[] = [],
 ): string {
   const phase = state.phase as Record<string, unknown>;
   const lines: string[] = [];
@@ -574,6 +678,9 @@ export function renderStatusText(
   lines.push(`run status: ${state.run}`);
   for (const name of secretStatus.missing) lines.push(`secret ${name} not set`);
   for (const name of secretStatus.tooShort) lines.push(`secret ${name} too short to mask (value under 4 characters)`);
+  // A2 (plan 06e): a foreign process holding a worktree file, reported under
+  // `held` and never signalled. One line each, with its pid, command and cwd.
+  for (const h of held) lines.push(`held: ${h.pid} ${h.command} (cwd ${h.cwd})`);
   lines.push(`phase: ${phase.phaseId} — ${phase.phase}`);
   const attempt = phase.attempt as { n: number; interrupted?: boolean } | undefined;
   if (attempt) lines.push(`attempt: ${attempt.n}${attempt.interrupted ? " (interrupted)" : ""}`);
@@ -585,7 +692,10 @@ export function renderStatusText(
   if (probe) lines.push(`probe: ${probe.passed ? `passed (I=${probe.probedI})` : "failed"}`);
   const reviews = phase.reviews as Record<string, { review?: unknown }> | undefined;
   if (reviews) {
-    for (const who of ["M", "A", "B"]) lines.push(`review ${who}: ${reviews[who]?.review ? "submitted" : "pending"}`);
+    // Plan 06h (A2): every configured seat, never a fixed three.
+    for (const who of seatsOf(phase.contract as { seats?: string[] } | undefined)) {
+      lines.push(`review ${who}: ${reviews[who]?.review ? "submitted" : "pending"}`);
+    }
   }
   const ownerRequests = (phase.ownerRequests as Array<{ status: string }>) ?? [];
   lines.push(`open owner requests: ${ownerRequests.filter((r) => r.status === "open").length}`);
@@ -675,6 +785,8 @@ export interface OwnerDirectiveLike {
 
 export interface StatusViewInput {
   runDir: string;
+  /** The run's own state (`RUN_ACTIVE`, …), when known. */
+  runStatus?: string;
   title: string;
   /** `state.phase` — the same shape `tt state` carries. */
   phase: Record<string, unknown>;
@@ -685,6 +797,9 @@ export interface StatusViewInput {
   pendingOwnerInputs?: OwnerInputLike[];
   ownerDirectives?: OwnerDirectiveLike[];
   ownerChecklist?: string[];
+  /** A2 (plan 06e): foreign processes holding a worktree file, listed under
+   * `held`; reported, never signalled. */
+  held?: StatusHeldProcess[];
 }
 
 /** Assemble a `StatusViewInput` from the pieces a caller already has, so the
@@ -692,13 +807,15 @@ export interface StatusViewInput {
 export function statusViewInput(opts: {
   runDir: string;
   plan: { title?: string; phases?: Array<{ ownerChecklist?: string[] }> };
-  state: { phase: unknown };
+  state: { phase: unknown; run?: string };
   view: RunView & { timeline: Timeline };
   alive: boolean;
   secrets?: { missing: string[]; tooShort: string[] };
+  held?: StatusHeldProcess[];
 }): StatusViewInput {
   const phase = opts.state.phase as Record<string, unknown>;
   return {
+    ...(typeof opts.state.run === "string" ? { runStatus: opts.state.run } : {}),
     runDir: opts.runDir,
     title: opts.plan.title ?? "",
     phase,
@@ -709,6 +826,7 @@ export function statusViewInput(opts: {
     pendingOwnerInputs: pendingOwnerInputs(opts.runDir),
     ownerDirectives: (phase.ownerDirectives as OwnerDirectiveLike[] | undefined) ?? [],
     ownerChecklist: opts.plan.phases?.[0]?.ownerChecklist,
+    ...(opts.held ? { held: opts.held } : {}),
   };
 }
 
@@ -728,6 +846,7 @@ function ownerInputStateLabel(state: string | undefined, reason: string | undefi
   switch (state) {
     case "delivered": return "delivered";
     case "noted": return "noted";
+    case "queued": return "queued";
     case "correction-started": return "correction started";
     case "reverted": return "reverted an amendment";
     case "delivery-uncertain": return `delivery uncertain${reason ? ` (${reason})` : ""}`;
@@ -784,50 +903,164 @@ export function renderStatusView(input: StatusViewInput): string {
   const lines: string[] = [];
   const push = (r: string | undefined) => { if (r !== undefined) lines.push(r); };
   lines.push(input.title);
-  lines.push(`run ${path.basename(input.runDir)} · ${input.alive ? "conductor running" : "conductor stopped"} · ${view.elapsed}`);
+  // Plan 06m (C2): the header names the phase and its state too, so the one
+  // view `tt status` prints still reads `· DONE ·` at a glance.
+  lines.push(`run ${path.basename(input.runDir)} · ${phase.phaseId as string} · ${name ?? "?"} · ${input.alive ? "conductor running" : "conductor stopped"} · ${view.elapsed}`);
   lines.push("");
   const attempt = phase.attempt as { n?: number } | undefined;
-  // Plan 05h: the tape's current row, replacing plan 03c's `chart C-c m g`
-  // hint — the owner sees the loop itself in the status, not just where to
-  // find a chart of it.
-  push(row("loop", view.loop));
-  push(row("phase", `${phase.phaseId} · ${name} · round ${view.round} · attempt ${attempt?.n ?? "?"} · repairs ${phase.repairRoundsUsed ?? 0}/${phase.repairRoundsGranted ?? 0}`));
-  push(row("pipeline", view.pipeline));
-  push(row("time", view.time));
-  push(row("gates", view.gates));
-  push(row("gate", view.gate));
-  push(row("base", view.baseline));
-  push(row("amended", view.amendments));
-  push(row("previous", view.previousRound));
-  push(row("reviews", view.reviewLine));
-  push(row("models", view.models));
-  push(view.metricsLine);
-  push(row("verdict", view.verdict));
+  const findings = (phase.findings as Array<{ id?: string; evidence?: string; status?: string; severity?: string }> | undefined) ?? [];
+  const openBlockers = findings.filter((f) => f.status === "open" && f.severity === "blocking");
   const tradeoffs = view.tradeoffs ?? [];
-  if (tradeoffs.length > 0) {
-    lines.push("", `Trade-offs (${tradeoffs.length})`);
-    for (const t of tradeoffs) {
-      lines.push(`  - ${t.text ?? ""}${t.recordId ? `${STATUS_RECORD_MARKER}${t.recordId}` : ""}`);
+  // A lane line starts with a single-letter lane id; the round summary and
+  // the votes line do not.
+  // Plan 06m (OD-1/OD-2): lane panels and seat panels from the phase records,
+  // so the master glyphs and the status panel share one source.
+  const lanePanels = lanePanelsOf(phase, view);
+  const seatPanels = seatPanelsOf(phase, view);
+  const laneHealth = lanePanels.map((l) => `${l.lane} ${l.health}`);
+  const seatHealth = seatPanels.map((s) => `${s.seat} ${s.health}`);
+  const nextStep = view.attention ? `${view.attention}${view.attentionQuestion ? ` — ${view.attentionQuestion}` : ""}` : view.verdict;
+  // Plan 06m (A3/R4, OD-1): PANEL 1, the master panel — at most 6 gauge lines.
+  push(row("stage", `${view.stage} · round ${view.round} · attempt ${attempt?.n ?? "?"} · repairs ${phase.repairRoundsUsed ?? 0}/${phase.repairRoundsGranted ?? 0} · next ${nextStep ?? "?"}`));
+  // Plan 06m (OD-3 point 3): a stage past its limit reads `limit reached` in
+  // the master panel too, never a blank or a cumulative overrun.
+  push(row("loop", view.pipeline?.includes("limit reached") ? `${view.loop ?? ""} (limit reached)`.trim() : view.loop));
+  // Plan 06b: the status line's item counts, e.g. `R 7/8 met · A 3/3 fit · C 2/2`.
+  let unmet: Array<{ id: string; title?: string }> = [];
+  let overturnsText: string | undefined;
+  try {
+    const contract = phase.contract as { architecture?: unknown; requirements?: unknown; constraints?: unknown; itemsSynthesized?: boolean } | undefined;
+    const structured = isStructured(contract);
+    if (structured) {
+      const loopState = {
+        contract,
+        reviews: phase.reviews,
+        coverage: phase.coverage,
+        checkResolution: phase.checkResolution,
+        overturns: phase.overturns,
+      } as unknown as ItemLoopState;
+      const counts = countsLine(phaseItemCounts(loopState));
+      push(row("items", counts));
+      const overturns = overturnCounts(loopState.overturns ?? [], seatsOf(loopState.contract));
+      if (overturns.length > 0) overturnsText = overturns.map((o) => `${o.seat} ${o.count}`).join(" · ");
+      unmet = phaseItemOutcomes(loopState)
+        .filter((o) => o.outcome !== "met" && o.outcome !== "fits")
+        .map((o) => ({ id: o.item.id, title: o.item.title }));
+    }
+  } catch {
+    // A view must never fail to render for a count.
+  }
+  // Plan 06m (contract-70): the gauge counts UNDECIDED decisions, not every
+  // attention-panel line (directives and advisories are not trade-offs).
+  const undecided = ((phase.decisions as Array<Record<string, unknown>> | undefined) ?? []).filter((d) => {
+    const dd = d as unknown as Decision;
+    return isLiveDecision(dd) && !dd.amendment && dd.source !== "trigger" && decisionStatus(dd, phase as never).status !== "passed";
+  });
+  push(row("gauges", `blockers ${openBlockers.length} · trade-offs open ${undecided.length}`));
+  if (laneHealth.length > 0) push(row("lanes", laneHealth.join(" · ")));
+  if (seatHealth.length > 0) push(row("seats", seatHealth.join(" · ")));
+  // Plan 06m (A3/R4, OD-1): PANEL 2, the status panel — the larger detail.
+  const panel2: string[] = [];
+  const p2 = (s: string) => panel2.push(s);
+  if (lanePanels.length > 0) {
+    p2(`Lanes (round ${view.round})`);
+    const cell = (l: LanePanel) => `${l.state}${l.sha ? ` ${l.sha}` : ""} ${l.elapsed}${l.firstFailing ? `  first fail: ${l.firstFailing}` : ""}`;
+    if (lanePanels.length === 1) {
+      p2(`  lane ${lanePanels[0].lane}  ${cell(lanePanels[0])}`);
+    } else {
+      p2(`  ${lanePanels.map((l) => `lane ${l.lane}`).join("  |  ")}`);
+      const width = Math.max(...lanePanels.map((l) => cell(l).length));
+      p2(`  ${lanePanels.map((l) => cell(l).padEnd(width)).join("  |  ")}`);
     }
   }
-  push(row("cost", view.cost?.text));
+  if (seatPanels.length > 0) {
+    p2("Seats");
+    for (const s of seatPanels) {
+      p2(`  ${s.seat}  ${s.model ? `${s.model}  ` : ""}${s.health} ${s.state}  blocking ${s.blocking} · advisory ${s.advisory} · met ${s.met} · unmet ${s.unmet}`);
+    }
+  }
+  if (tradeoffs.length > 0) {
+    p2(`Trade-offs (${tradeoffs.length})`);
+    const seatList = seatsOf(phase.contract as never);
+    for (const t of tradeoffs) {
+      const title = t.title ?? (t.recordId ? recordTitle(phase, t.recordId) : undefined);
+      const ballots = t.recordId ? ballotStateText(phase, t.recordId, seatList) : undefined;
+      const seats = ballots ?? t.seats;
+      p2(`  - ${title ? `${title} — ` : ""}${t.text ?? ""}${seats ? ` [${seats}]` : ""}${t.recordId ? `${STATUS_RECORD_MARKER}${t.recordId}` : ""}`);
+    }
+  }
+  if (unmet.length > 0) {
+    p2(`Unmet items (${unmet.length})`);
+    for (const u of unmet) p2(`  - ${u.id}${u.title ? ` ${truncate(u.title, 80)}` : ""}`);
+  }
+  if (openBlockers.length > 0) {
+    p2(`Open blockers (${openBlockers.length})`);
+    for (const f of openBlockers) p2(`  - ${f.id}${f.evidence ? ` ${truncate(f.evidence, 80)}` : ""}`);
+  }
+  // Plan 06g (A5)/06m (R4): every item the owner carried past this phase,
+  // with its title and the phase it is carried to.
+  const carriedItems = phase.carriedItems ?? [];
+  if (carriedItems.length > 0) {
+    p2(`Carried items (${carriedItems.length})`);
+    for (const id of carriedItems) {
+      const to = phase.carriedTo?.[id];
+      const title = recordTitle(phase, id);
+      p2(`  - ${id}${to ? ` → ${to}` : ""}${title ? ` — ${title}` : ""}`);
+    }
+  }
+  // Plan 06i (A4)/06m (R4): the status lists open deferrals too, with their
+  // title and guard, so a deferred item is visible here and not only in `tt summary`.
+  const openDeferrals = (phase.deferrals ?? []).filter((d) => d.status === "open");
+  if (openDeferrals.length > 0) {
+    p2(`Open deferrals (${openDeferrals.length})`);
+    for (const d of openDeferrals) {
+      const guard = d.test ? `test ${d.test}` : d.ownerRuling ? `owner ruling ${d.ownerRuling}` : "no guard";
+      const title = d.text || recordTitle(phase, d.itemId);
+      p2(`  - ${d.itemId}${d.toPhase ? ` → ${d.toPhase}` : ""} (${guard})${title ? ` — ${truncate(title, 80)}` : ""}`);
+    }
+  }
+  if (overturnsText) p2(`overturns   ${overturnsText}`);
+  if (panel2.length > 0) lines.push("", ...panel2);
+  if (view.verdict) push(row("verdict", view.verdict));
+  push(row("models", view.models));
+  // Plan 06m (A3/R4): the counters (metrics, cost, record counts, environment)
+  // move below the live view into a details block.
+  const details: string[] = [];
+  const dpush = (r: string | undefined) => { if (r !== undefined) details.push(r); };
+  // Plan 06m (C2): `tt status` prints this view, so the CLI's identity line
+  // (`phase: <id> — <STATE>`) stays.
+  // The CLI identity lines `tt status` has always printed (06e/A4 and
+  // `tt start` callers read them): run state, phase, candidate, published.
+  if (input.runStatus) details.push(`run status: ${input.runStatus}`);
+  details.push(`phase: ${phase.phaseId as string} — ${name ?? "?"}`);
+  const candidateSha = (phase.candidate as { sha?: string } | undefined)?.sha;
+  if (candidateSha) details.push(`candidate: ${candidateSha.slice(0, 12)}`);
+  if (typeof phase.publishedI === "string") details.push(`published: ${phase.publishedI.slice(0, 12)}`);
+  dpush(view.metricsLine);
+  dpush(row("cost", view.cost?.text));
   // Plan 05c: the `records' row said `decisions' and disagreed with the
   // review; the `review' row counts in trade-off vocabulary, matching the
   // entries, the raw count and the dropped count `review.org' shows.
-  push(row("review", view.review));
+  dpush(row("review", view.review));
   // Plan 3b: boundary files changed are the worker's trigger records the
-  // reviewers must classify. The old `records' row carried this; it keeps its
-  // own row so the owner still sees a change that no reviewer has classified
-  // (advisory A-5).
+  // reviewers must classify.
   if (view.boundaryFilesChanged > 0) {
-    push(row("boundary", `files changed: ${view.boundaryFilesChanged} (reviewers classify)`));
+    dpush(row("boundary", `files changed: ${view.boundaryFilesChanged} (reviewers classify)`));
   }
-  push(row("blocked", phase.blockedReason as string | undefined));
+  dpush(row("blocked", phase.blockedReason as string | undefined));
   // Plan 05i: the resolved tools, then the environment block itself.
-  for (const line of view.envTools) lines.push(line);
-  if (view.envBlocked) lines.push(view.envBlocked);
-  for (const nm of input.secrets?.missing ?? []) push(row("secret", `${nm} not set`));
-  for (const nm of input.secrets?.tooShort ?? []) push(row("secret", `${nm} too short to mask`));
+  for (const line of view.envTools) details.push(line);
+  if (view.envBlocked) details.push(view.envBlocked);
+  // Plan 06m (C2): the `tt status` forms of these lines, which `tt status`
+  // now prints from this one renderer.
+  for (const nm of input.secrets?.missing ?? []) details.push(`secret ${nm} not set`);
+  for (const nm of input.secrets?.tooShort ?? []) details.push(`secret ${nm} too short to mask (value under 4 characters)`);
+  // A2 (plan 06e): foreign processes holding a worktree file, never signalled.
+  for (const h of input.held ?? []) details.push(`held: ${h.pid} ${h.command} (cwd ${h.cwd})`);
+  if (details.length > 0) {
+    lines.push("", "Details");
+    for (const line of details) lines.push(line);
+  }
   if (name === "DONE" && (input.ownerChecklist?.length ?? 0) > 0) {
     lines.push("", `Owner checklist (${input.ownerChecklist!.length}) — yours, not the worker's`);
     for (const item of input.ownerChecklist!) lines.push(`  - ${truncate(item, 200)}`);
@@ -847,4 +1080,154 @@ export function renderStatusView(input: StatusViewInput): string {
     lines.push("", `⚑ ${label}${suffix}`);
   }
   return `${lines.join("\n")}\n`;
+}
+
+interface LanePanel {
+  lane: string;
+  sha?: string;
+  state: string;
+  elapsed: string;
+  firstFailing?: string;
+  health: string;
+}
+
+/** Plan 06m (OD-1/A-30): one panel per lane of the latest round, with its
+ * state, short sha, its OWN elapsed time and (on a failed check) the first
+ * failing test of THAT lane's check. */
+function lanePanelsOf(phase: Record<string, unknown>, view: { laneElapsed?: Record<string, string> }): LanePanel[] {
+  const rounds = (phase.rounds as Array<{ round: number; lanes: string[]; candidates: Array<{ lane: string; sha?: string; ok?: boolean; note?: string; reviews?: unknown[] }>; picked?: { lane: string } }> | undefined) ?? [];
+  const round = rounds[rounds.length - 1];
+  if (!round) return [];
+  return round.lanes.map((lane) => {
+    const c = round.candidates.find((x) => x.lane === lane);
+    const picked = round.picked?.lane === lane;
+    // A lane whose check is recorded but that froze no candidate (it
+    // crashed, timed out or submitted nothing) says so — never "coding".
+    const state = !c?.sha && c?.ok === false
+      ? "no candidate"
+      : !c?.sha
+      ? "coding"
+      : c.ok === undefined
+        ? "checking"
+        : c.ok === false
+          ? "checks fail"
+          : picked
+            ? "picked"
+            : (c.reviews?.length ?? 0) > 0
+              ? "in review"
+              : "submitted";
+    const health = c?.ok === false ? "✗" : c?.ok === true ? "✓" : "…";
+    // Plan 06m (contract-71/OD-1): the lane's OWN clock — from the round start
+    // to its submission — never the stage's shared clock. A lane whose start
+    // is not on the log reads `?`, not another lane's time.
+    const elapsed = view.laneElapsed?.[lane] ?? "?";
+    const firstFailing = c?.ok === false ? firstFailingOfLane(c.note) : undefined;
+    return { lane, ...(c?.sha ? { sha: c.sha.slice(0, 7) } : {}), state, elapsed, ...(firstFailing ? { firstFailing } : {}), health };
+  });
+}
+
+/** The first failing test of one lane's check, from the lane's own check
+ * note (`the check \`cmd\` failed: test one, test two`); the whole note
+ * when it names no test (a timeout, an exit code, no candidate). */
+function firstFailingOfLane(note: string | undefined): string | undefined {
+  if (!note) return undefined;
+  const m = note.match(/failed: (.+)$/s);
+  if (m) return truncate(m[1].split(", ")[0].trim(), 80);
+  return truncate(note, 80);
+}
+
+interface SeatPanel {
+  seat: string;
+  model?: string;
+  state: string;
+  health: string;
+  blocking: number;
+  advisory: number;
+  met: number;
+  unmet: number;
+}
+
+/** Plan 06m (OD-1/A3): one row per reviewer seat, with its model, its
+ * lifecycle state THIS round (reading, discovery submitted, review
+ * submitted, re-prompted, timed out, retried) and this round's incidents —
+ * from the seat's own log records (`view.seatRound`), never from its
+ * verdict, never cumulative — then its verdict counts. */
+function seatPanelsOf(
+  phase: Record<string, unknown>,
+  view: {
+    reviewers?: Array<{ reviewer: string; state: string; blocking: number; advisory: number }>;
+    seatTable?: { seats: Array<{ seat: string; model?: string }> };
+    seatRound?: Array<{ seat: string; state: string; incidents: string[] }>;
+  },
+): SeatPanel[] {
+  const seatList = seatsOf(phase.contract as never);
+  const reviewers = view.reviewers ?? [];
+  const table = view.seatTable?.seats ?? [];
+  const reviews = (phase.reviews as Record<string, { review?: { items?: Array<{ verdict?: string }> } }> | undefined) ?? {};
+  return seatList.map((seat) => {
+    const r = reviewers.find((x) => x.reviewer === seat);
+    const row = table.find((s) => s.seat === seat);
+    const round = view.seatRound?.find((x) => x.seat === seat);
+    const review = reviews[seat]?.review;
+    const items = review?.items ?? [];
+    const met = items.filter((i) => i.verdict === "met").length;
+    const unmet = items.filter((i) => i.verdict && i.verdict !== "met").length;
+    const lifecycle = round?.state ?? "not started";
+    const incidents = (round?.incidents ?? []).filter((x) => x !== lifecycle);
+    const state = incidents.length > 0 ? `${lifecycle} (${incidents.join(", ")})` : lifecycle;
+    // One glyph per seat for the master panel: ✗ timed out this round, ! a
+    // re-prompt or retry this round, ✓ review submitted, … at work, · idle.
+    const all = [lifecycle, ...(round?.incidents ?? [])];
+    const health = all.includes("timed out")
+      ? "✗"
+      : all.includes("re-prompted") || all.includes("retried")
+        ? "!"
+        : lifecycle === "review submitted"
+          ? "✓"
+          : lifecycle === "not started"
+            ? "·"
+            : "…";
+    return { seat, ...(row?.model ? { model: row.model } : {}), state, health, blocking: r?.blocking ?? 0, advisory: r?.advisory ?? 0, met, unmet };
+  });
+}
+
+/** Plan 06m (OD-1): the per-seat ballot state of a decision, e.g.
+ * `M approve · A reject · B approve`. Undefined when no seat voted. */
+function ballotStateText(phase: Record<string, unknown>, recordId: string, seats: readonly string[]): string | undefined {
+  if (seats.length === 0) return undefined;
+  // Plan 06m (A-32): a ballot counts only when it is bound to the current
+  // candidate and the decision's own version, so a seat that approved v1 and
+  // rejected v2 reads reject; a seat with no ballot reads pending.
+  const candidate = (phase.candidate as { sha?: string } | undefined)?.sha;
+  const decisions = (phase.decisions as Array<{ id?: string; version?: number }> | undefined) ?? [];
+  const decision = decisions.find((d) => d.id === recordId);
+  const ballots =
+    (phase.ballots as Array<{ reviewer?: string; decisionId?: string; vote?: string; boundCandidateSha?: string; boundRecordVersion?: number }> | undefined) ?? [];
+  return seats
+    .map((seat) => {
+      const b = ballots.find(
+        (x) =>
+          x.reviewer === seat &&
+          x.decisionId === recordId &&
+          (!candidate || x.boundCandidateSha === candidate) &&
+          (decision?.version === undefined || x.boundRecordVersion === decision.version),
+      );
+      return `${seat} ${b?.vote ?? "pending"}`;
+    })
+    .join(" · ");
+}
+
+/** Plan 06m (A3/R4): the human title of a record id, from the phase itself, so
+ * a carried item, a deferral or a trade-off line never shows a bare id. */
+function recordTitle(phase: Record<string, unknown>, id: string): string | undefined {
+  const findings = (phase.findings as Array<{ id?: string; evidence?: string }> | undefined) ?? [];
+  const finding = findings.find((x) => x.id === id);
+  if (finding?.evidence) return truncate(finding.evidence, 80);
+  const decisions = (phase.decisions as Array<{ id?: string; choice?: string }> | undefined) ?? [];
+  const decision = decisions.find((x) => x.id === id);
+  if (decision?.choice) return truncate(decision.choice, 80);
+  const messages = (phase.messages as Array<{ id?: string; title?: string }> | undefined) ?? [];
+  const message = messages.find((x) => x.id === id);
+  if (message?.title) return truncate(message.title, 80);
+  return undefined;
 }

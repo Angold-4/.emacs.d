@@ -151,3 +151,125 @@ test("program-e2e: a DAG runs in dependency order on stacked branches; the join 
     cleanupDir(repo.dir);
   }
 });
+
+/** Plan 06f: fast conductor deadlines, injected into the detached scheduler's
+ * own child conductors through `TT_TEST_DEADLINES` (src/cli.ts). */
+const LIVE_FAST: Record<string, number> = {
+  inboxPollMs: 40,
+  abortGraceMs: 300,
+  termGraceMs: 300,
+  helloTimeoutMs: 5_000,
+  workerAttemptMs: 20_000,
+  freezeMs: 10_000,
+  checkMs: 5_000,
+  probeMs: 5_000,
+  reviewMs: 10_000,
+};
+
+test("plan 06f: live.json lists a running run, a run awaiting the owner and a waiting program node", async () => {
+  const repo = makeRepo();
+  const root = shortTmp("tt-live-root");
+  const scriptsDir = shortTmp("tt-live-scripts");
+  // Failing checks walk node a to the repair-budget gate (AWAITING_OWNER) in a
+  // few attempts; node b waits behind a the whole time.
+  const phase = { id: "p1", goal: "g", acceptance: ["it works"], checks: ["false"], boundaries: [], reserved: [] };
+  const plan = (title: string): RunPlanFile => ({
+    title,
+    repo: repo.dir,
+    integrationBranch: "main",
+    checks: ["false"],
+    phases: [phase],
+  });
+  const program: ProgramFile = {
+    title: "live",
+    maxParallel: 1,
+    entries: [
+      { id: "a", after: [], plan: plan("a") },
+      { id: "b", after: ["a"], plan: plan("b") },
+    ],
+  };
+  const programPath = path.join(scriptsDir, "program.json");
+  fs.writeFileSync(programPath, JSON.stringify(program));
+  fs.writeFileSync(
+    path.join(scriptsDir, "worker.json"),
+    JSON.stringify({
+      hello: { role: "worker", tools: ROLE_TOOLS.worker },
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+    }),
+  );
+  fs.writeFileSync(
+    path.join(scriptsDir, "reviewer.json"),
+    JSON.stringify({
+      hello: { role: "reviewer", tools: ROLE_TOOLS.reviewer },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer: "$TT_REVIEWER",
+            phaseId: "p1",
+            candidateSha: "$TT_CANDIDATE_SHA",
+            contractVersion: contractVersionFor(phase),
+            correctionStatements: [],
+            findingStatements: [],
+          },
+        },
+      ],
+    }),
+  );
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    TT_TEST_MODE: "1",
+    TT_TEST_PI_COMMAND: process.execPath,
+    TT_TEST_PI_ARGS_PREFIX: JSON.stringify([FAKE_PI_PATH]),
+    TT_TEST_STUB_REVIEWS: "1",
+    TT_TEST_DEADLINES: JSON.stringify(LIVE_FAST),
+    FAKE_PI_SCRIPT: scriptsDir,
+  };
+  const cli = (args: string[]) => execFileSync(process.execPath, [CLI_PATH, ...args, "--root", root], { encoding: "utf8", env });
+  const live = (): { runs: Array<{ id: string; phase: string; needsOwner: boolean }>; waitingNodes: Array<{ program: string; node: string }> } =>
+    JSON.parse(fs.readFileSync(path.join(root, "live.json"), "utf8")) as never;
+  let programId = "";
+  try {
+    programId = cli(["program", "start", programPath]).trim();
+    assert.ok(programId.length > 0, "tt program start prints the program id");
+    // A run is alive (node a's conductor is in a working phase) while node b is
+    // still waiting to start.
+    await waitFor(
+      () => {
+        try {
+          const l = live();
+          return l.runs.some((r) => r.needsOwner === false) && l.waitingNodes.some((w) => w.node === "b");
+        } catch {
+          return false;
+        }
+      },
+      60_000,
+      200,
+    );
+    // The same run reaches the owner's desk, and node b is still waiting.
+    await waitFor(
+      () => {
+        try {
+          const l = live();
+          return l.runs.some((r) => r.needsOwner === true) && l.waitingNodes.some((w) => w.node === "b");
+        } catch {
+          return false;
+        }
+      },
+      90_000,
+      200,
+    );
+  } finally {
+    if (programId) {
+      try {
+        cli(["program", "stop", programId]);
+      } catch {
+        // already finished
+      }
+    }
+    cleanupDir(root);
+    cleanupDir(scriptsDir);
+    cleanupDir(repo.dir);
+  }
+});

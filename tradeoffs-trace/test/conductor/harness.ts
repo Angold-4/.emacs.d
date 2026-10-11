@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 
 import { Conductor, createRun, runPaths, type ConductorOptions, type RunPlanFile } from "../../src/conductor.ts";
 import { planModelSelector, ROLE_TOOLS, type PlanModels } from "../../src/core/roles.ts";
-import { roundPanelItemsNeedingVote } from "../../src/core/predicate.ts";
+import { itemsNeedingEvaluatorReverify, roundPanelItemsNeedingVote } from "../../src/core/predicate.ts";
+import { phaseItemOutcomes, thinMetItems, workerAnchorsOf } from "../../src/core/items.ts";
 
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { readLog, type LogRecord } from "../../src/effects/log.ts";
@@ -121,7 +122,16 @@ export async function setupConductor(opts: {
    * must submit different (or empty) decisions than the first (e.g.
    * contract-objection.test.ts, so the repair does not re-disclose a
    * duplicate decision). Takes precedence over `workerScript` when given. */
-  workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo }) => { hello?: unknown; steps: FakePiStep[] };
+  workerScriptForAttempt?: (attempt: number, setup: { repo: TestRepo; state: State }) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 06g2: one script per lane worker (`lane-<round>-<lane>-…`). Absent:
+   * `workerScript`/`workerScriptForAttempt` is used for every lane. */
+  laneWorkerScriptFor?: (lane: string, round: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 06g2: one script per lane review (`lane-review-<round>-<lane>-<seat>-…`).
+   * The script's `submit_review` names its candidate with the
+   * `$TT_CANDIDATE_SHA` token, which fake-pi substitutes at dispatch time. */
+  laneReviewerScriptFor?: (seat: string, candidate: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 06g2: one script per pick seat (`pick-<round>-<seat>-…`). */
+  pickScriptFor?: (seat: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04a: the EVALUATING stage's fresh evaluator, ONE PER MESSAGE TYPE.
    * The default script returns an empty `submit_evaluation`, which the
@@ -189,9 +199,25 @@ export async function setupConductor(opts: {
    * the JSON plan. The values are read from the harness process's own
    * environment (set them with `process.env.NAME = …` before calling). */
   secrets?: string[];
+  /** Plan 06e (A1): the plan's `#+TT_ENV_FILE` path, as Emacs would put it in
+   * the JSON plan. A declared secret the harness process does not export is
+   * resolved from this KEY=value file instead. */
+  envFile?: string;
   /** The phase's own goal text (default "do the thing"). A plan's prose is a
    * secret-value carrier too, so a test can quote one in it. */
   goal?: string;
+  /** Plan 06b (OD-2 R1): an exact phase object (e.g. the real Emacs parser's
+   * output) to use instead of the harness's built one. */
+  phase?: import("../../src/conductor.ts").RunPlanPhase;
+  /** Plan 06b: the phase's structured items (architecture/requirements/
+   * constraints). When given, the acceptance list is derived from the
+   * requirements' texts so the item loop (coverage, per-item verdicts, item
+   * acceptance) applies exactly as for an Emacs-parsed plan. */
+  items?: {
+    architecture?: import("../../src/core/items.ts").ArchitectureItem[];
+    requirements?: import("../../src/core/items.ts").RequirementItem[];
+    constraints?: import("../../src/core/items.ts").ConstraintItem[];
+  };
   /** Plan 01f: the phase's `:GATE:` command (omitted = no gate, the
    * pre-01f pipeline) and its `:GATE_CLEANUP:` companion. */
   gate?: string;
@@ -199,6 +225,11 @@ export async function setupConductor(opts: {
   /** Plan 01f: the machine-wide gate lock's path. Two conductors in one test
    * share it to prove their gates never overlap. */
   gateLockPath?: string;
+  /** Plan 06k1 (A4): the machine-wide check lock's path. Defaults to a path
+   * under this setup's own run root, so parallel test files never contend on
+   * the real machine-wide lock (which would pause each other's workers). A
+   * test that wants the machine-wide behavior passes one shared path. */
+  checkLockPath?: string;
   /** The plan's title (default "test plan") — plan prose like any other. */
   title?: string;
   /** #+TT_MODELS: per-role provider/model for the plan (design §2.1). The
@@ -212,6 +243,11 @@ export async function setupConductor(opts: {
   /** Plan 01b: the conductor's notification clock (injectable), so a test
    * can advance past the 30-minute reminder without waiting. */
   now?: () => number;
+  /** Plan 06k3 (A3): auto-answer every open blocking finding in a repair
+   * worker's `submit_phase`, so the pre-existing repair tests (written before
+   * the finding-answer gate) keep working. Default true; a test that exercises
+   * the gate's refusal passes false. */
+  autoAnswerFindings?: boolean;
 }): Promise<TestConductorSetup> {
   const repo = makeRepo();
   const runRoot = makeRunRoot();
@@ -223,15 +259,17 @@ export async function setupConductor(opts: {
     integrationBranch: "main",
     checks: opts.globalChecks ?? opts.checks ?? ["true"],
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
+    ...(opts.envFile ? { envFile: opts.envFile } : {}),
     ...(opts.models ? { models: opts.models } : {}),
     phases: [
-      {
+      opts.phase ?? {
         id: "p1",
         goal: opts.goal ?? "do the thing",
-        acceptance: ["it works", ...(opts.acceptanceFiles ?? [])],
+        acceptance: opts.items?.requirements ? opts.items.requirements.map((r) => r.text) : ["it works", ...(opts.acceptanceFiles ?? [])],
         checks: opts.phaseChecks ?? opts.checks ?? ["true"],
         boundaries: opts.boundaries ?? [],
         reserved: [],
+        ...(opts.items ?? {}),
         ...(opts.gate ? { gate: opts.gate } : {}),
         ...(opts.gateCleanup ? { gateCleanup: opts.gateCleanup } : {}),
       },
@@ -243,6 +281,9 @@ export async function setupConductor(opts: {
   const workerScriptPaths = new Map<number, string>();
 
   const reviewerScriptPaths = new Map<string, string>();
+  const laneWorkerScriptPaths = new Map<string, string>();
+  const laneReviewerScriptPaths = new Map<string, string>();
+  const pickScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
   const briefScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
@@ -287,10 +328,57 @@ export async function setupConductor(opts: {
     };
   };
 
-  const defaultEvaluatorScript = () => ({
-    hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
-    steps: [{ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [] } }],
-  });
+  // Plan 06b (OD-2 A3): the default evaluator answers any owed item re-check
+  // with a `confirmed` check, so a test that does not script the evaluator is
+  // not re-prompted. A test that wants the re-prompt/unchecked path supplies
+  // its own `evaluatorScriptFor` with no itemChecks.
+  const defaultEvaluatorScript = (state: State, messageType: string) => {
+    // Plan 06c (R9): the default evaluator cites a real file of the candidate
+    // (every harness repo has README.md) so a `confirmed` check's anchors
+    // validate; a confirmed check with anchors that do not exist is recorded
+    // `unchecked by evaluator`.
+    const owed = messageType === "finding" && itemsNeedingEvaluatorReverify(state.phase) ? owedItemIds(state) : [];
+    // Plan 06i: the default evaluator also classifies every open finding and
+    // discovered decision (a missing classification is re-prompted once and
+    // then escalates, so an unscripted test must still answer it). A finding
+    // is classified on the finding pass, a discovered decision (a `tradeoff`
+    // message) on the tradeoff pass.
+    const triageIds =
+      messageType === "finding"
+        ? (state.phase.findings ?? []).filter((f) => f.status === "open").map((f) => f.id)
+        : messageType === "tradeoff"
+          ? (state.phase.decisions ?? []).filter((d) => d.source === "reviewer-discovered").map((d) => d.id)
+          : [];
+    const itemChecks = [
+      ...owed.map((id) => ({ id, verdict: "confirmed", evidence: "README.md:1 evaluator: re-checked the candidate and found no contradiction" })),
+      ...triageIds.map((id) =>
+        (state.phase.findings ?? []).some((f) => f.id === id && f.severity === "blocking")
+          ? { id, verdict: "confirmed", impact: "wrong-output", evidence: "README.md:1 evaluator: re-checked the candidate" }
+          : {
+              id,
+              verdict: "confirmed",
+              impact: "judgement",
+              chosen: "accept it as recorded",
+              alternative: "repair it now",
+              why: "the evaluator re-checked the candidate and judged it a style or hardening call",
+              evidence: "README.md:1 evaluator: re-checked the candidate",
+            },
+      ),
+    ];
+    return {
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            ...(itemChecks.length > 0 ? { itemChecks } : {}),
+          },
+        },
+      ],
+    };
+  };
 
   const conductor = new Conductor({
     runDir,
@@ -303,7 +391,7 @@ export async function setupConductor(opts: {
     piArgsPrefix: [FAKE_PI_PATH, ...(opts.extraPiArgsPrefix ?? [])],
     // The same one-liner `tt start` uses, so a plan's #+TT_MODELS reaches
     // every launch in tests exactly as it does in production.
-    providerModelFor: planModelSelector(plan),
+    providerModelFor: planModelSelector(plan, plan.seats),
     extraEnv: opts.extraEnv,
     deadlines: opts.deadlines,
     stubReviews: opts.stubReviews ?? true,
@@ -311,12 +399,47 @@ export async function setupConductor(opts: {
     probeReuse: opts.probeReuse,
     ...(opts.now ? { now: opts.now } : {}),
     gateLockPath: opts.gateLockPath,
+    // Plan 06k1 (A4): default the check lock to a per-run path so parallel
+    // test files never contend on the real machine-wide lock.
+    checkLockPath: opts.checkLockPath ?? path.join(runRoot, "check.lock"),
     piEnvFor: (role, agentId) => {
+      // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
+      const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);
+      if (role === "worker" && laneWorker && opts.laneWorkerScriptFor) {
+        const round = Number(laneWorker[1]);
+        const lane = laneWorker[2];
+        const key = `${round}-${lane}-${agentId}`;
+        if (!laneWorkerScriptPaths.has(key)) {
+          const script = withFindingAnswers(opts.laneWorkerScriptFor(lane, round, conductor.state), conductor.state, opts.autoAnswerFindings !== false);
+          laneWorkerScriptPaths.set(key, writeScript(scriptsDir, key, script));
+        }
+        return { FAKE_PI_SCRIPT: laneWorkerScriptPaths.get(key)!, ...(opts.extraWorkerEnv ?? {}) };
+      }
+      const laneReview = agentId.match(/^lane-review-(\d+)-([a-z])-([A-Za-z0-9_]+)-/);
+      if (role === "reviewer" && laneReview && opts.laneReviewerScriptFor) {
+        const seat = laneReview[3];
+        const key = `lane-review-${agentId}`;
+        if (!laneReviewerScriptPaths.has(key)) {
+          laneReviewerScriptPaths.set(
+            key,
+            writeScript(scriptsDir, key, opts.laneReviewerScriptFor(seat, "$TT_CANDIDATE_SHA", conductor.state)),
+          );
+        }
+        return { FAKE_PI_SCRIPT: laneReviewerScriptPaths.get(key)!, ...(opts.extraReviewerEnv?.(seat as Reviewer) ?? {}) };
+      }
+      const pick = agentId.match(/^(?:pick|revote)-(\d+)-([A-Za-z0-9_]+)-/);
+      if (role === "picker" && pick && opts.pickScriptFor) {
+        const seat = pick[2];
+        const key = `pick-${agentId}`;
+        if (!pickScriptPaths.has(key)) pickScriptPaths.set(key, writeScript(scriptsDir, key, opts.pickScriptFor(seat, conductor.state)));
+        return { FAKE_PI_SCRIPT: pickScriptPaths.get(key)!, ...(opts.extraReviewerEnv?.(seat as Reviewer) ?? {}) };
+      }
       if (role === "worker") {
         if (opts.workerScriptForAttempt) {
           const attempt = Number(agentId.match(/^worker-(\d+)-/)?.[1] ?? "1");
           if (!workerScriptPaths.has(attempt)) {
-            workerScriptPaths.set(attempt, writeScript(scriptsDir, `worker-${attempt}`, opts.workerScriptForAttempt(attempt, { repo })));
+            const script = withFindingAnswers(opts.workerScriptForAttempt(attempt, { repo, state: conductor.state }), conductor.state, opts.autoAnswerFindings !== false);
+            workerScriptPaths.set(attempt, writeScript(scriptsDir, `worker-${attempt}`, script));
           }
           return { FAKE_PI_SCRIPT: workerScriptPaths.get(attempt)!, ...(opts.extraWorkerEnv ?? {}) };
         }
@@ -341,8 +464,8 @@ export async function setupConductor(opts: {
         if (!evaluatorScriptPaths.has(agentId)) {
           const script = opts.evaluatorScriptFor
             ? opts.evaluatorScriptFor(messageType, conductor.state)
-            : defaultEvaluatorScript();
-          evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
+            : defaultEvaluatorScript(conductor.state, messageType);
+          evaluatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, withTriageChecks(script, conductor.state, messageType)));
         }
         return { FAKE_PI_SCRIPT: evaluatorScriptPaths.get(agentId)! };
       }
@@ -386,7 +509,7 @@ export async function setupConductor(opts: {
         }
         return { FAKE_PI_SCRIPT: panelScriptPaths.get(agentId)! };
       }
-      const reviewer = (agentId.match(/^reviewer-([MAB])-/)?.[1] ?? "M") as Reviewer;
+      const reviewer = (agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] ?? "M") as Reviewer;
       if (!reviewerScriptPaths.has(agentId) && opts.reviewerScriptFor) {
         const script = opts.reviewerScriptFor(reviewer, conductor.state);
         reviewerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, script));
@@ -397,6 +520,96 @@ export async function setupConductor(opts: {
   });
 
   return { repo, runRoot, scriptsDir, plan, runDir, conductor };
+}
+
+/** Plan 06i: a test's own evaluator script may predate triage. Inject a
+ * `judgement` classification for every open finding (finding pass) or
+ * discovered decision (tradeoff pass) the script does not already classify,
+ * so an existing test that never knew about triage still answers the
+ * conductor's re-prompt. A test that wants a specific impact supplies its own
+ * entry for the id, which wins. */
+function withTriageChecks(
+  script: { hello?: unknown; steps: Array<{ kind: string; tool?: string; args?: unknown }> },
+  state: State,
+  messageType: string,
+): { hello?: unknown; steps: Array<{ kind: string; tool?: string; args?: unknown }> } {
+  // A BLOCKING finding is a defect: classify it `wrong-output` so it keeps
+  // blocking (fix). An advisory is a judgement call (trade-off). A decision is
+  // a judgement call unless the test classifies it otherwise.
+  const blockingIds = new Set((state.phase.findings ?? []).filter((f) => f.status === "open" && f.severity === "blocking").map((f) => f.id));
+  const ids =
+    messageType === "finding"
+      ? (state.phase.findings ?? []).filter((f) => f.status === "open").map((f) => f.id)
+      : messageType === "tradeoff"
+        ? (state.phase.decisions ?? []).filter((d) => d.source === "reviewer-discovered").map((d) => d.id)
+        : [];
+  if (ids.length === 0) return script;
+  const additions = ids.map((id) =>
+    blockingIds.has(id)
+      ? { id, verdict: "confirmed", impact: "wrong-output", evidence: "README.md:1 evaluator: re-checked the candidate" }
+      : {
+          id,
+          verdict: "confirmed",
+          impact: "judgement",
+          chosen: "accept it as recorded",
+          alternative: "repair it now",
+          why: "the evaluator re-checked the candidate and judged it a style or hardening call",
+          evidence: "README.md:1 evaluator: re-checked the candidate",
+        },
+  );
+  let sawSubmit = false;
+  const steps = script.steps.map((step) => {
+    if (step.kind !== "call-submit" || step.tool !== "submit_evaluation") return step;
+    sawSubmit = true;
+    const args = (step.args && typeof step.args === "object" ? { ...(step.args as Record<string, unknown>) } : {}) as Record<string, unknown>;
+    const existing = Array.isArray(args.itemChecks) ? (args.itemChecks as Array<{ id?: string }>) : [];
+    const covered = new Set(existing.map((c) => c?.id));
+    const missing = additions.filter((a) => !covered.has(a.id));
+    if (missing.length > 0) args.itemChecks = [...existing, ...missing];
+    return { ...step, args };
+  });
+  // A test script that handles only its own message type has no
+  // submit_evaluation step here; add one so the classification is still
+  // recorded (otherwise the finding pass times out and the record escalates).
+  if (!sawSubmit) {
+    steps.push({ kind: "call-submit", tool: "submit_evaluation", args: { evaluations: [], itemChecks: additions } });
+  }
+  return { ...script, steps };
+}
+
+/** Plan 06c: the item ids the finding-pass evaluator owes a check for — every
+ * outcome that is not met/fits, plus every unanimous thin met/fits. Shared
+ * with the conductor's `#owedItemCheckIds` so the harness's default evaluator
+ * answers exactly what is owed. */
+function owedItemIds(state: State): string[] {
+  const outcomes = phaseItemOutcomes(state.phase);
+  const ids = new Set(outcomes.filter((o) => o.outcome !== "met" && o.outcome !== "fits").map((o) => o.item.id));
+  // Plan 06c (A4/R9): a unanimous thin met/fits is an owed item check too.
+  for (const o of thinMetItems(outcomes, workerAnchorsOf(state.phase.coverage))) ids.add(o.item.id);
+  return [...ids];
+}
+
+/** Plan 06k3 (A3): add a `findingAnswers` entry for every open blocking
+ * finding to each `submit_phase` step a worker script carries, so the
+ * pre-existing repair tests (written before the gate) keep working. A test
+ * exercising the refusal passes `autoAnswerFindings: false` and controls the
+ * answers itself. */
+function withFindingAnswers(
+  script: { hello?: unknown; steps: FakePiStep[] },
+  state: State,
+  enabled: boolean,
+): { hello?: unknown; steps: FakePiStep[] } {
+  if (!enabled) return script;
+  const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.severity === "blocking");
+  if (open.length === 0) return script;
+  const answers = open.map((f) => ({ findingId: f.id, status: "disputed" as const, reason: "the worker answers this finding in the candidate" }));
+  const steps = script.steps.map((step) => {
+    if (step.kind !== "call-submit" || step.tool !== "submit_phase") return step;
+    const args = { ...((step.args as Record<string, unknown> | undefined) ?? {}) };
+    if (!Array.isArray(args.findingAnswers)) args.findingAnswers = answers;
+    return { ...step, args };
+  });
+  return { ...script, steps };
 }
 
 export function readEvents(runDir: string): LogRecord[] {

@@ -9,10 +9,12 @@
 // an environment problem.
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { checkFailureLines, checkFailurePromptLines, helloRetryTimeoutMs, runPaths } from "../../src/conductor.ts";
 import { basePhase } from "../unit/helpers.ts";
@@ -24,8 +26,54 @@ import {
   readEvents,
   setupConductor,
   waitFor,
+  type TestConductorSetup,
 } from "./harness.ts";
-import type { Reviewer, State } from "../../src/core/types.ts";
+import type { OwnerRequest, Reviewer, State } from "../../src/core/types.ts";
+
+// Plan 06j (R6): the tape and owner-inbox tests below were moved here, names
+// unchanged, so this phase's own checks (which run flakes.test.ts) can resolve
+// their `:VERIFY:` names. Nothing else from their old files moved.
+const CLI = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
+
+function tt(args: string[]): { status: number; stdout: string; stderr: string } {
+  try {
+    return { status: 0, stdout: execFileSync(process.execPath, [CLI, ...args], { encoding: "utf8" }), stderr: "" };
+  } catch (err) {
+    const e = err as { status?: number; stdout?: Buffer | string; stderr?: Buffer | string };
+    return { status: e.status ?? 1, stdout: e.stdout?.toString() ?? "", stderr: e.stderr?.toString() ?? "" };
+  }
+}
+
+function submitReviewStep(reviewer: Reviewer, state: State) {
+  return {
+    kind: "call-submit",
+    tool: "submit_review",
+    args: {
+      reviewer,
+      phaseId: state.phase.phaseId,
+      candidateSha: state.phase.candidate?.sha,
+      contractVersion: state.phase.contract.contractVersion,
+      correctionStatements: [],
+      findingStatements: [],
+    },
+  };
+}
+
+function openRequests(state: State): OwnerRequest[] {
+  return state.phase.ownerRequests.filter((r) => r.status === "open");
+}
+
+function writeCommand(setup: TestConductorSetup, id: string, command: unknown): string {
+  const file = path.join(runPaths(setup.runDir).inbox, `${id}.json`);
+  fs.writeFileSync(file, JSON.stringify(command));
+  return file;
+}
+
+function eventsOfType(setup: TestConductorSetup, type: string): unknown[] {
+  return readEvents(setup.runDir)
+    .filter((r) => r.kind === "event" && (r.event as { type?: string }).type === type)
+    .map((r) => r.event);
+}
 
 const FAST = {
   abortGraceMs: 200,
@@ -457,5 +505,146 @@ test("flake: a re-run that times out counts as `reproduces alone` and stays with
     cleanupDir(setup.runRoot);
     cleanupDir(setup.scriptsDir);
     fs.rmSync(marker, { force: true });
+  }
+});
+
+test("the loop tape is written on the status beat and rebuilds identically", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [submitReviewStep(reviewer, state)],
+    }),
+    deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+  });
+
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 90_000);
+    const p = runPaths(setup.runDir);
+    assert.ok(fs.existsSync(p.tape), "views/tape.txt must exist after the run");
+    const live = fs.readFileSync(p.tape, "utf8");
+    // The header is the phase's readable id, short title, round, attempt and
+    // elapsed time; at DONE every main-path row is drawn and the head is DONE.
+    // Plan 06j (A4): the assertion reads the attempt budget from the phase it
+    // ran, instead of hard-coding '1/2'. The denominator is
+    // `repairRoundsGranted` (roundBudget - 1), not the round budget, so the
+    // test never goes stale when the plan's budget changes.
+    const granted = setup.conductor.state.phase.repairRoundsGranted;
+    assert.match(live, new RegExp(`^p1 · round 1 · attempt 1\\/${granted} · `, "m"));
+    assert.match(live, /^  ▶  DONE\b/m);
+    assert.match(live, /^  ✓  IMPLEMENT\b/m);
+    assert.doesNotMatch(live, /^  .  GATE\b/m);
+
+    // Delete the live file and rebuild it from the log: identical bytes.
+    fs.rmSync(p.tape);
+    const rebuilt = tt(["contract", "rebuild", setup.runDir]);
+    assert.equal(rebuilt.status, 0, rebuilt.stderr);
+    assert.ok(fs.existsSync(p.tape), "rebuild must write views/tape.txt");
+    assert.equal(fs.readFileSync(p.tape, "utf8"), live);
+    assert.match(tt(["contract", "check", setup.runDir]).stdout, /contract check ok/);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});
+
+test("owner-inbox: a queued note is delivered in the next worker attempt (and, as an owner directive, in every later one)", async () => {
+  const markerDir = fs.mkdtempSync("/tmp/tt-inbox-note-once-");
+  const promptLog = path.join(markerDir, "worker-prompts.log");
+  const noteText = "ONCE-ONLY-NOTE: keep the lock hold under 50us";
+  const setup = await setupConductor({
+    checks: ["false"],
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [submitReviewStep(reviewer, state)],
+    }),
+    deadlines: { ...FAST, inboxPollMs: 40 },
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 60_000);
+    const request = openRequests(setup.conductor.state)[0];
+    assert.ok(request, "expected an open owner request at AWAITING_OWNER");
+    const runId = setup.conductor.state.phase.runId;
+    const candidateSha = setup.conductor.state.phase.candidate!.sha;
+    const contractVersion = setup.conductor.state.phase.contract.contractVersion;
+
+    // Note first (sorts before the grant) so it is queued for the very next
+    // attempt.
+    writeCommand(setup, "cmd-aaa-note", {
+      commandId: "cmd-aaa-note",
+      type: "note",
+      text: noteText,
+      binding: { runId, phaseId: "p1" },
+    });
+    writeCommand(setup, "cmd-bbb-grant", {
+      commandId: "cmd-bbb-grant",
+      type: "resolve",
+      recordKind: "request",
+      option: "grant",
+      binding: { runId, phaseId: "p1", candidateSha, contractVersion, recordId: request.id, recordVersion: request.version },
+    });
+
+    // The budget-gate `grant` lifts the park for exactly ONE more round. To
+    // prove the note's own queue entry is sent once while every LATER prompt
+    // carries it as a directive, run a second granted round: wait for the
+    // first to fail and park again, then grant the next.
+    await waitFor(
+      () => eventsOfType(setup, "REPAIR_ATTEMPT_STARTED").length >= 3 && setup.conductor.state.phase.phase === "AWAITING_OWNER",
+      90_000,
+      50,
+      setup.runDir,
+    );
+    const secondRequest = openRequests(setup.conductor.state)[0];
+    assert.ok(secondRequest, "the second park opens another request");
+    // The repair froze a NEW candidate, so the second grant binds to the
+    // current candidate, not the one the note was first queued under.
+    writeCommand(setup, "cmd-ccc-grant", {
+      commandId: "cmd-ccc-grant",
+      type: "resolve",
+      recordKind: "request",
+      option: "grant",
+      binding: {
+        runId,
+        phaseId: "p1",
+        candidateSha: setup.conductor.state.phase.candidate!.sha,
+        contractVersion: setup.conductor.state.phase.contract.contractVersion,
+        recordId: secondRequest.id,
+        recordVersion: secondRequest.version,
+      },
+    });
+    // Let the second granted repair attempt run (checks keep failing), so a
+    // re-sent note would show up again in its prompt.
+    await waitFor(
+      () => eventsOfType(setup, "REPAIR_ATTEMPT_STARTED").length >= 4 && setup.conductor.state.phase.phase === "AWAITING_OWNER",
+      90_000,
+      50,
+      setup.runDir,
+    );
+    assert.ok(fs.existsSync(promptLog), "expected worker prompts to be captured");
+    const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n").filter((p) => p.trim().length > 0);
+    // The note's own queue entry is delivered to exactly the next attempt…
+    const withNote = prompts.filter((p) => p.includes(`Owner notes: ${noteText}`));
+    assert.equal(withNote.length, 1, "the note's own queue entry reaches exactly one worker attempt's prompt");
+    assert.equal(setup.conductor.state.phase.deliveredNoteCount, 1, "exactly one note must be recorded as delivered");
+    // …and, plan 01i, every input is an owner directive in force: every
+    // later prompt quotes it verbatim, newest last.
+    const firstWithNote = prompts.findIndex((p) => p.includes(`Owner notes: ${noteText}`));
+    const later = prompts.slice(firstWithNote);
+    assert.ok(later.length >= 2, "several later attempts ran");
+    for (const p of later) assert.ok(p.includes(`OD-1: ${noteText}`), "every later prompt carries the directive");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(markerDir, { recursive: true, force: true });
   }
 });

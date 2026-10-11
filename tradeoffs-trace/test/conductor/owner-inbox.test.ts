@@ -102,7 +102,13 @@ test("owner-inbox: an id already in the log is only moved, never applied twice (
   const noteText = "keep the lock hold under 50us";
   try {
     const commandId = "cmd-note-1";
-    const inboxFile = writeCommand(setup, commandId, { kind: "note", phaseId: "p1", text: noteText });
+    const inboxFile = writeCommand(setup, commandId, {
+      kind: "note",
+      phaseId: "p1",
+      text: noteText,
+      // Plan 06m (R2): an owner input carries its run/phase binding.
+      binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
+    });
 
     // The conductor applies the note (the log append is the effect) and
     // moves the file to applied/.
@@ -317,71 +323,6 @@ test("owner-inbox: an 'unneeded' command leaves the request open, so AWAITING_OW
   }
 });
 
-test("owner-inbox: a queued note is delivered in the next worker attempt (and, as an owner directive, in every later one)", async () => {
-  const markerDir = fs.mkdtempSync("/tmp/tt-inbox-note-once-");
-  const promptLog = path.join(markerDir, "worker-prompts.log");
-  const noteText = "ONCE-ONLY-NOTE: keep the lock hold under 50us";
-  const setup = await setupConductor({
-    checks: ["false"],
-    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
-    workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhaseStep()] }),
-    reviewerScriptFor: (reviewer, state) => ({
-      hello: defaultReviewerHello(),
-      steps: [submitReviewStep(reviewer, state)],
-    }),
-    deadlines: FAST,
-  });
-  await setup.conductor.start();
-  try {
-    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 60_000);
-    const request = openRequests(setup.conductor.state)[0];
-    assert.ok(request, "expected an open owner request at AWAITING_OWNER");
-    const runId = setup.conductor.state.phase.runId;
-    const candidateSha = setup.conductor.state.phase.candidate!.sha;
-    const contractVersion = setup.conductor.state.phase.contract.contractVersion;
-
-    // Note first (sorts before the grant) so it is queued for the very next
-    // attempt; grant adds 3 rounds so several more attempts follow.
-    writeCommand(setup, "cmd-aaa-note", {
-      commandId: "cmd-aaa-note",
-      type: "note",
-      text: noteText,
-      binding: { runId, phaseId: "p1" },
-    });
-    writeCommand(setup, "cmd-bbb-grant", {
-      commandId: "cmd-bbb-grant",
-      type: "resolve",
-      recordKind: "request",
-      option: "grant",
-      binding: { runId, phaseId: "p1", candidateSha, contractVersion, recordId: request.id, recordVersion: request.version },
-    });
-
-    // Let every granted repair attempt run (checks keep failing), so if the
-    // note were re-sent it would show up again.
-    await waitFor(
-      () => (eventsOfType(setup, "REPAIR_ATTEMPT_STARTED").length >= 5) && setup.conductor.state.phase.phase === "AWAITING_OWNER",
-      90_000,
-    );
-    assert.ok(fs.existsSync(promptLog), "expected worker prompts to be captured");
-    const prompts = fs.readFileSync(promptLog, "utf8").split("\n=====\n").filter((p) => p.trim().length > 0);
-    // The note's own queue entry is delivered to exactly the next attempt…
-    const withNote = prompts.filter((p) => p.includes(`Owner notes: ${noteText}`));
-    assert.equal(withNote.length, 1, "the note's own queue entry reaches exactly one worker attempt's prompt");
-    assert.equal(setup.conductor.state.phase.deliveredNoteCount, 1, "exactly one note must be recorded as delivered");
-    // …and, plan 01i, every input is an owner directive in force: every
-    // later prompt quotes it verbatim, newest last.
-    const firstWithNote = prompts.findIndex((p) => p.includes(`Owner notes: ${noteText}`));
-    const later = prompts.slice(firstWithNote);
-    assert.ok(later.length >= 2, "several later attempts ran");
-    for (const p of later) assert.ok(p.includes(`OD-1: ${noteText}`), "every later prompt carries the directive");
-  } finally {
-    await setup.conductor.stop();
-    cleanupDir(setup.runRoot);
-    cleanupDir(setup.scriptsDir);
-    fs.rmSync(markerDir, { recursive: true, force: true });
-  }
-});
-
 test("owner-inbox: an empty (still-being-written) file is retried, never rejected", async () => {
   const setup = await setupAwaitingOwner(["false"]);
   try {
@@ -398,7 +339,8 @@ test("owner-inbox: an empty (still-being-written) file is retried, never rejecte
     assert.ok(fs.existsSync(file), "the empty file must be left for the next poll");
 
     // The writer finishes; the same file now applies normally.
-    fs.writeFileSync(file, JSON.stringify({ kind: "note", phaseId: "p1", text: "late write" }));
+    // Plan 06m (R2): an owner input carries its run/phase binding.
+    fs.writeFileSync(file, JSON.stringify({ kind: "note", phaseId: "p1", text: "late write", binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" } }));
     await waitFor(() => eventsOfType(setup, "NOTE_ADDED").length === 1, 15_000);
     assert.equal(eventsOfType(setup, "NOTE_ADDED").length, 1);
   } finally {

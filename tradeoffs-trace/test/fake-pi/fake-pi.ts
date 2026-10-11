@@ -43,7 +43,7 @@ import { randomUUID } from "node:crypto";
 import { JSONLDecoder, encodeLine, type RunSocketMessage } from "../../src/core/protocol.ts";
 
 interface HelloSpec {
-  role: "worker" | "reviewer" | "evaluator";
+  role: "worker" | "reviewer" | "evaluator" | "picker";
   tools: string[];
   agentId?: string;
   piVersion?: string;
@@ -51,7 +51,7 @@ interface HelloSpec {
 
 type Step =
   | { kind: "emit"; event: Record<string, unknown> }
-  | { kind: "call-submit"; tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief"; args: unknown }
+  | { kind: "call-submit"; tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief" | "submit_coverage" | "submit_pick_vote"; args: unknown }
   | { kind: "call-sh"; command: string; cwd?: string }
   // Plan 01a: report one environment variable of THIS agent process as a tool
   // result, so a test can assert what the conductor put in an agent's
@@ -78,6 +78,10 @@ interface Script {
    * conductor's hello limit and the retry — with its longer limit — gets it. */
   helloDelayMs?: number;
   steps: Step[];
+  /** 06a finding #24: how this fake answers a `--print` probe (the models
+   * check's own Pi print mode). Absent: `ok` with `OK`. `hang` never exits,
+   * so the check's 60 s bound must kill it and report `unreachable`. */
+  print?: { mode: "ok" | "refused" | "hang"; text?: string };
 }
 
 let hangingForever = false;
@@ -109,23 +113,30 @@ function recordArgv(): void {
  * JSON script, but a `tt start`-launched (as opposed to in-process-test)
  * reviewer script has no other way to learn a value the conductor only
  * knows at dispatch time, such as the live candidate sha — a real reviewer
- * is simply told this directly. Any string value that is *exactly* one of
- * these tokens is substituted with the named env var at the moment the
- * step runs (recursing into objects and arrays; every other value, and a
- * token naming an unset env var, passes through unchanged). Keeps this to
- * a small, explicit allowlist rather than a general `$VAR` syntax, so a
- * script's own literal string content is never at risk of accidental
- * substitution. */
+ * is simply told this directly. Any occurrence of one of these tokens inside
+ * a string value (or of `$TT_CANDIDATE_SHA8`, the first eight characters of
+ * the sha) is substituted with the named env var at the moment the step runs
+ * (recursing into objects and arrays; a token naming an unset env var passes
+ * through unchanged). Keeps this to a small, explicit allowlist rather than a
+ * general `$VAR` syntax. */
 const ENV_TOKENS = ["$TT_CANDIDATE_SHA", "$TT_REVIEWER"] as const;
 
 function substituteEnvTokens(value: unknown): unknown {
   if (typeof value === "string") {
-    if ((ENV_TOKENS as readonly string[]).includes(value)) {
-      const name = value.slice(1);
-      const v = process.env[name];
-      return v !== undefined && v.length > 0 ? v : value;
+    let out = value;
+    // Plan 06g2: a script may need a record id the conductor derives from the
+    // candidate's first eight characters (`D-<phase>-<sha8>-…`). Handled
+    // BEFORE the full token, whose text it starts with.
+    if (out.includes("$TT_CANDIDATE_SHA8")) {
+      const v = process.env.TT_CANDIDATE_SHA;
+      if (v !== undefined && v.length > 0) out = out.split("$TT_CANDIDATE_SHA8").join(v.slice(0, 8));
     }
-    return value;
+    for (const token of ENV_TOKENS) {
+      if (!out.includes(token)) continue;
+      const v = process.env[token.slice(1)];
+      if (v !== undefined && v.length > 0) out = out.split(token).join(v);
+    }
+    return out;
   }
   if (Array.isArray(value)) return value.map(substituteEnvTokens);
   if (value && typeof value === "object") {
@@ -198,7 +209,15 @@ class RunSocket {
   }
 
   async submit(
-    tool: "submit_phase" | "submit_discovery" | "submit_review" | "raise_tradeoff" | "submit_evaluation" | "submit_brief",
+    tool:
+      | "submit_phase"
+      | "submit_discovery"
+      | "submit_review"
+      | "raise_tradeoff"
+      | "submit_evaluation"
+      | "submit_brief"
+      | "submit_coverage"
+      | "submit_pick_vote",
     args: unknown,
   ): Promise<RunSocketMessage> {
     const id = randomUUID();
@@ -223,6 +242,33 @@ class RunSocket {
 
 async function main(): Promise<void> {
   recordArgv();
+  // 06a finding #24: the models check runs Pi in print mode (`--print`) with
+  // no run socket. Answer that shape here so a unit test can drive `ok`,
+  // `refused` (a 403 body) and `unreachable` (never answers) without a real
+  // model.
+  if (process.argv.includes("--print")) {
+    const printScript = loadScript();
+    const p = printScript.print ?? { mode: "ok" as const };
+    if (p.mode === "refused") {
+      process.stderr.write(`${p.text ?? "403 restricted"}\n`);
+      process.exit(1);
+    }
+    if (p.mode === "hang") {
+      // Survive the stdin `end` handler below (stdio is ignored in print
+      // mode, so it fires at once) — the models check's own bound must kill
+      // this, not a clean exit.
+      hangingForever = true;
+      await new Promise(() => {
+        // An unresolved promise alone does not keep the event loop alive (the
+        // process would just exit 0), so hold a far-future interval; the
+        // models check's own bound must kill this, not a clean exit.
+        setInterval(() => undefined, 1 << 30);
+      });
+      return;
+    }
+    process.stdout.write(`${p.text ?? "OK"}\n`);
+    process.exit(0);
+  }
   const script = loadScript();
   const runSocket = new RunSocket();
   const socketPath = readEnv("TT_SOCKET");
@@ -280,6 +326,21 @@ async function main(): Promise<void> {
             toolName: step.tool,
             result: { content: [{ type: "text", text: ok ? "submission accepted" : `submission rejected: ${reason ?? "no reason given"}` }] },
             isError: !ok,
+          });
+          break;
+        }
+        case "call-tool": {
+          // Plan 06b: a plain tool call (e.g. `read`), so a scripted reviewer
+          // can record the files it read — the conductor requires a met
+          // verdict to cite one of them.
+          const toolCallId = randomUUID();
+          writeStdout({ type: "tool_execution_start", toolCallId, toolName: step.tool, args: step.args ?? {} });
+          writeStdout({
+            type: "tool_execution_end",
+            toolCallId,
+            toolName: step.tool,
+            result: { content: [{ type: "text", text: String(step.result ?? "ok") }] },
+            isError: false,
           });
           break;
         }

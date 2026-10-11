@@ -14,17 +14,25 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { createRun, rebuildState, runPaths, type RunPlanFile } from "./conductor.ts";
+import { createRun, runPaths } from "./conductor.ts";
+import { triageRecordFor } from "./core/triage.ts";
+import type { RequirementItem } from "./core/items.ts";
+import { readRunState } from "./effects/runner.ts";
+import { processAlive } from "./effects/sweep.ts";
 import { envBlockedLine } from "./core/env-preflight.ts";
 import { execFileSync } from "node:child_process";
+import { acquireLock, type Lock } from "./effects/lock.ts";
 
-import { buildView, formatDuration } from "./view.ts";
+import { buildView, formatDuration, updateLiveWaiting } from "./view.ts";
+import { renderStatusView, statusViewInput } from "./render.ts";
 import { notify, oneLine, waitReason, NOTIFY_REMINDER_MS } from "./notify.ts";
 import { renderProgramChart } from "./charts.ts";
 import { projectEntries, renderProgramEntryReview } from "./core/entries.ts";
 import { renderGlossaryOrg } from "./core/briefs.ts";
 import { runReviewLint } from "./core/review-lint.ts";
 import { candidateAnchorFreshness } from "./render.ts";
+// 06a finding #24: the program status names its models check's result.
+import { modelsCheckStatusText, parseModelsCheck } from "./core/models-check.ts";
 
 import {
   expandProgram,
@@ -56,6 +64,10 @@ export function programPaths(dir: string) {
     program: path.join(dir, "program.json"),
     events: path.join(dir, "events.jsonl"),
     pid: path.join(dir, "scheduler.pid"),
+    /** Plan 06d (A3): the exclusive scheduler lock. One scheduler per
+     * program; a second exits at once, and a lock left by a dead pid is
+     * taken over because the OS releases the flock when its holder dies. */
+    lock: path.join(dir, "scheduler.lock"),
     log: path.join(dir, "scheduler.log"),
     /** Plan 03c: the Org program file this program was started from. */
     source: path.join(dir, "source.json"),
@@ -316,12 +328,90 @@ export function withdrawProgramDirective(root: string, dir: string, directiveId:
   return true;
 }
 
+/** Plan 06i: the carried requirements a node's dependencies write into its
+ * contract. Read from each dependency's accepted run: every `carriedItems`
+ * id becomes a requirement named `CARRY-<id>` with the item's own text and a
+ * VERIFY — `test "carried <id> is fixed"` when the item's triage impact is
+ * wrong-output, `review` otherwise. */
+export function carriedRequirementsFor(program: ProgramFile, node: ProgramNode, state: ProgramState, runRoot: string): RequirementItem[] {
+  const out: RequirementItem[] = [];
+  // Separate dedup sets: a carry and a deferral are different owner acts, so
+  // neither may silently drop the other (OD addendum A). The command level
+  // refuses a second act on the same id, so both being present is defensive
+  // only — and if it happened, both are imported rather than one dropped.
+  const seenCarried = new Set<string>();
+  const seenDefer = new Set<string>();
+  // Plan 06i (A4): a carried item/deferral goes ONLY to the phase its
+  // `--to` target names (`carriedTo[id]` / `d.toPhase`) — the runbook's
+  // carry rule. A node is addressed by its node id or its phase id; an
+  // absent target (the `accept_carried` fallback records `"next"`) reaches
+  // the direct dependents, exactly as before.
+  const phaseId = program.entries.find((e) => e.id === node.entry)!.plan.phases[node.phaseIndex].id;
+  // A phase id is only an unambiguous target when it is unique across the
+  // program's nodes; repeated phase ids (every entry using `p1`) must not let
+  // one `--to p1` reach every child. The node id is always unique.
+  const phaseIdCounts = new Map<string, number>();
+  for (const e of program.entries) {
+    for (const ph of e.plan.phases) phaseIdCounts.set(ph.id, (phaseIdCounts.get(ph.id) ?? 0) + 1);
+  }
+  const phaseIdIsUnique = (phaseIdCounts.get(phaseId) ?? 0) === 1;
+  const targetedHere = (to: string | undefined): boolean =>
+    to === undefined || to === "next" || to === node.id || (phaseIdIsUnique && to === phaseId);
+  for (const dep of node.deps) {
+    const s = state.nodes[dep];
+    if (!s?.runId) continue;
+    const read = readRunState(path.join(runRoot, s.runId), runRoot);
+    if (!read) continue;
+    const phase = read.state.phase;
+    for (const id of phase.carriedItems ?? []) {
+      if (seenCarried.has(id)) continue;
+      if (!targetedHere(phase.carriedTo?.[id])) continue;
+      seenCarried.add(id);
+      const record = triageRecordFor(phase.triage, id);
+      const finding = phase.findings.find((f) => f.id === id);
+      const decision = phase.decisions.find((d) => d.id === id);
+      const text = finding?.evidence ?? decision?.choice ?? `carried item ${id}`;
+      const wrongOutput = record?.impact === "wrong-output";
+      out.push({
+        id: `CARRY-${id}`,
+        title: `carried from ${dep}: ${id}`,
+        text: `Carried from ${dep}: ${text}`,
+        arch: [],
+        verify: [wrongOutput ? `test "carried ${id} is fixed"` : "review"],
+      });
+    }
+    // Plan 06i (A4): an open deferral is a requirement of the next node too,
+    // with its guard as the VERIFY (a `test` for a cost test, `review` for an
+    // owner ruling). A deferral never disappears between phases.
+    for (const d of phase.deferrals ?? []) {
+      if (d.status !== "open" || seenDefer.has(d.itemId)) continue;
+      if (!targetedHere(d.toPhase)) continue;
+      seenDefer.add(d.itemId);
+      const record = triageRecordFor(phase.triage, d.itemId);
+      const wrongOutput = record?.impact === "wrong-output";
+      // Plan 06i (A4): a WRONG-OUTPUT item's next-node VERIFY is the FIX
+      // verification, never the cost guard (which already passes today). The
+      // cost test stays attached as context only. A judgement deferral is
+      // judged by its guard (test or review).
+      const costContext = d.test ? ` [cost guard: ${d.test}]` : "";
+      out.push({
+        id: `DEFER-${d.itemId}`,
+        title: `deferred from ${dep}: ${d.itemId}`,
+        text: `Deferred from ${dep}: ${d.text}${costContext}${d.ownerRuling ? ` (owner ruling ${d.ownerRuling})` : ""}`,
+        arch: [],
+        verify: [wrongOutput ? `test "carried ${d.itemId} is fixed"` : d.test ? `test "${d.test}"` : "review"],
+      });
+    }
+  }
+  return out;
+}
+
 function pidAlive(file: string): boolean {
   try {
     const pid = Number(fs.readFileSync(file, "utf8"));
     if (!(pid > 0)) return false;
-    process.kill(pid, 0);
-    return true;
+    // A2/C3 (plan 06e): the sweep owns the signalling decision.
+    return processAlive(pid);
   } catch {
     return false;
   }
@@ -329,18 +419,17 @@ function pidAlive(file: string): boolean {
 
 /** A launched node's status, observed from its run directory. "crashed":
  * the conductor died without a clean stop (no `stopped` marker). */
-export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "crashed" {
+export function observeRun(runDir: string, root: string = path.dirname(runDir)): Exclude<NodeStatus, "waiting"> | "crashed" {
   let phase: string | undefined;
   let envBlocked = false;
-  try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8"));
-    const state = rebuildState(runDir, plan, { lenient: true });
-    phase = state.phase.phase;
+  // A4 (plan 06e): the scheduler reads a node's run through `runnerFor`, so a
+  // run recorded under an installed older runner is read by that runner.
+  const read = readRunState(runDir, root);
+  if (read) {
+    phase = read.state.phase.phase;
     // Plan 05i: an environment block is its own node status, distinct from a
     // code BLOCKED: it is recoverable by fixing the environment and resuming.
-    envBlocked = state.run === "ENV_BLOCKED";
-  } catch {
-    phase = undefined;
+    envBlocked = read.state.run === "ENV_BLOCKED";
   }
   // A terminal phase wins over an environment block (finding M-7): a DONE or
   // BLOCKED run can never be re-blocked by a resume, so the program must not
@@ -361,18 +450,49 @@ export function observeRun(runDir: string): Exclude<NodeStatus, "waiting"> | "cr
  * itself (its plan snapshot is redacted, and its owner-request reasons were
  * redacted when the conductor logged them). `undefined` when the run is not
  * (yet) parked or cannot be read. */
-export function runWaitReason(runDir: string): string | undefined {
-  try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-    const state = rebuildState(runDir, plan, { lenient: true });
-    if (state.run === "ENV_BLOCKED") {
-      return state.phase.env?.blocked ? envBlockedLine(state.phase.env.blocked) : "environment blocked";
-    }
-    if (state.phase.phase === "AWAITING_OWNER" || state.phase.phase === "BLOCKED") return waitReason(state.phase);
-  } catch {
-    // a run whose plan or log cannot be read yet
+export function runWaitReason(runDir: string, root: string = path.dirname(runDir)): string | undefined {
+  const read = readRunState(runDir, root);
+  if (!read) return undefined;
+  const { state } = read;
+  if (state.run === "ENV_BLOCKED") {
+    return state.phase.env?.blocked ? envBlockedLine(state.phase.env.blocked) : "environment blocked";
   }
+  if (state.phase.phase === "AWAITING_OWNER" || state.phase.phase === "BLOCKED") return waitReason(state.phase);
   return undefined;
+}
+
+/** Plan 06c (A3): the baseline-reuse decision, owned by the scheduler. When
+ * a node has exactly one dependency, that dependency's run is DONE, and its
+ * ACCEPTED candidate is exactly this node's base commit, the node reuses the
+ * accepted candidate's passing check record instead of running a baseline.
+ * The choice and its provenance are passed into the run; the conductor never
+ * scans sibling runs itself. */
+function acceptedCandidateBaseline(
+  program: ProgramFile,
+  nodes: ProgramNode[],
+  node: ProgramNode,
+  state: ProgramState,
+  runRoot: string,
+): { fromRunId: string; fromCandidateSha: string } | undefined {
+  if (node.deps.length !== 1) return undefined;
+  const dep = node.deps[0];
+  const depState = state.nodes[dep];
+  if (!depState?.runId || depState.status !== "done") return undefined;
+  const depRunDir = path.join(runRoot, depState.runId);
+  let accepted: string | undefined;
+  const read = readRunState(depRunDir, runRoot);
+  if (!read || read.state.phase.phase !== "DONE") return undefined;
+  accepted = read.state.phase.candidate?.sha;
+  if (!accepted) return undefined;
+  const base = nodeBases(program, nodes, node)[0];
+  let baseSha: string;
+  try {
+    baseSha = git(program.entries.find((e) => e.id === node.entry)!.plan.repo, ["rev-parse", "--verify", `${base}^{commit}`]);
+  } catch {
+    return undefined;
+  }
+  if (baseSha !== accepted) return undefined;
+  return { fromRunId: depState.runId, fromCandidateSha: accepted };
 }
 
 /** How often the scheduler restarts a node whose conductor crashed. */
@@ -428,7 +548,15 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
   }
   for (const id of nextStarts(nodes, state, program.maxParallel)) {
     const node = nodes.find((n) => n.id === id)!;
-    const plan = nodePlan(program, node, programDirectivesInForce(state));
+    // Plan 06i: a dependency's carried items become real requirements of this
+    // node's contract (an id, the item's text and a VERIFY). A wrong-output
+    // item carries a `test` verify; every other carried item is judged by
+    // review. Directive text alone never carries an item.
+    const carried = carriedRequirementsFor(program, node, state, opts.runRoot);
+    const plan = nodePlan(program, node, programDirectivesInForce(state), carried);
+    if (carried.length > 0) {
+      appendProgramEvent(dir, { type: "NODE_CARRIED_ITEMS", node: id, items: carried.map((c) => c.id) } as ProgramEvent);
+    }
     const prepared = prepareBranch(plan.repo, plan.integrationBranch, nodeBases(program, nodes, node), id);
     if (!prepared.ok) {
       record({ type: "NODE_BLOCKED", node: id, reason: prepared.reason });
@@ -442,9 +570,14 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
       record({ type: "NODE_BLOCKED", node: id, reason: String((err as Error).message ?? err) });
       continue;
     }
+    // Plan 06c (A3): the scheduler is the only owner of the baseline-reuse
+    // choice. A node with exactly one dependency whose accepted candidate IS
+    // this node's base reuses that candidate's check record; the path is
+    // passed into the run, and the conductor only consumes it.
+    const baselineReuse = acceptedCandidateBaseline(program, nodes, node, state, opts.runRoot);
     fs.writeFileSync(
       path.join(runDir, "program.json"),
-      JSON.stringify({ programId: path.basename(dir), node: id, readableId: readableIds[id] }),
+      JSON.stringify({ programId: path.basename(dir), node: id, readableId: readableIds[id], ...(baselineReuse ? { baselineReuse } : {}) }),
     );
     record({
       type: "NODE_STARTED",
@@ -457,7 +590,27 @@ export function schedulerTick(dir: string, opts: SchedulerOptions): ProgramOutco
   }
   // Plan 03c: keep `views/program.txt` current after every status change.
   writeProgramChart(dir);
+  // Plan 06f (A2): the scheduler is `live.json`'s node writer, on the same
+  // beat — the nodes still waiting to start are exactly what the mode line
+  // must show while a run is not yet alive.
+  writeProgramLive(dir, nodes, state);
   return programOutcome(nodes, state);
+}
+
+/** Plan 06f (A2): republish this program's waiting nodes in `<root>/live.json`.
+ * Every other program's wait and every run row (written by the conductors) is
+ * preserved. */
+function writeProgramLive(dir: string, nodes: ProgramNode[], state: ProgramState): void {
+  try {
+    const root = path.dirname(path.dirname(dir));
+    const programId = path.basename(dir);
+    const waiting = nodes
+      .filter((n) => state.nodes[n.id]?.status === "waiting")
+      .map((n) => ({ program: programId, node: n.id }));
+    updateLiveWaiting(root, programId, waiting);
+  } catch {
+    // a live file that cannot be written must never stop the scheduler
+  }
 }
 
 /** `{ reason }` only when there is one, so an event payload stays exactly
@@ -525,9 +678,47 @@ export function prepareBranch(
   }
 }
 
-/** The scheduler process: tick until the program is done, stuck or stopped. */
+/** Plan 06d (A3): take the program's exclusive scheduler lock. A second
+ * scheduler fails fast with "scheduler already running"; a lock whose pid is
+ * dead is taken over, because the previous holder's flock died with it. The
+ * returned Lock is released by `runScheduler` when it exits. */
+export async function acquireSchedulerLock(dir: string): Promise<Lock> {
+  return acquireLock(programPaths(dir).lock);
+}
+
+/** The scheduler process: tick until the program is done, stuck, stopped or
+ * paused. Holds `programs/<id>/scheduler.lock` for its whole life. */
 export async function runScheduler(dir: string, opts: SchedulerOptions): Promise<ProgramOutcome> {
-  fs.writeFileSync(programPaths(dir).pid, String(process.pid));
+  let lock: Lock;
+  try {
+    lock = await acquireSchedulerLock(dir);
+  } catch (err) {
+    const message = `scheduler already running for program ${path.basename(dir)}`;
+    fs.appendFileSync(programPaths(dir).log, `${new Date().toISOString()} ${message}\n`);
+    process.stderr.write(`${message}\n`);
+    // Another scheduler holds the program; this process must not start any
+    // node, so it exits at once. `running` reports what the program is doing.
+    return "running";
+  }
+  try {
+    // The lock file names THIS scheduler, not the perl helper that holds the
+    // flock, so a second scheduler's refusal can name the real pid.
+    fs.writeFileSync(programPaths(dir).lock, String(process.pid));
+    fs.writeFileSync(programPaths(dir).pid, String(process.pid));
+    return await schedulerLoop(dir, opts);
+  } finally {
+    // Plan 06f (A2): a scheduler that exits has no node waiting to start, so
+    // its `live.json' wait list is cleared rather than left stale.
+    try {
+      updateLiveWaiting(path.dirname(path.dirname(dir)), path.basename(dir), []);
+    } catch {
+      // best effort: a live file that cannot be written must never matter here
+    }
+    await lock.release();
+  }
+}
+
+async function schedulerLoop(dir: string, opts: SchedulerOptions): Promise<ProgramOutcome> {
   const reminderMs = opts.notifyReminderMs ?? NOTIFY_REMINDER_MS;
   let ticks = 0;
   let stuckNotifiedAt: number | undefined;
@@ -604,8 +795,10 @@ export function notifyProgramOutcome(dir: string, outcome: "done" | "stuck", opt
  * never started, or a hand-made fixture). */
 function nodeCostLine(runDir: string): string | undefined {
   try {
-    const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-    const view = buildView(runDir, plan, pidAlive(path.join(runDir, "conductor.pid")));
+    // A4 (plan 06e): the plan comes from the run's recorded runner.
+    const read = readRunState(runDir, path.dirname(runDir));
+    if (!read) return undefined;
+    const view = buildView(runDir, read.plan, pidAlive(path.join(runDir, "conductor.pid")));
     const cost = view.cost;
     if (!cost) return undefined;
     const parts = [`${cost.rounds} round${cost.rounds === 1 ? "" : "s"}`, `${cost.totalMinutes}m`];
@@ -636,13 +829,9 @@ export function programChartText(dir: string): string {
   for (const n of nodes) {
     const s = state.nodes[n.id];
     if (!s.runId || s.status !== "running") continue;
-    try {
-      const runDir = path.join(root, s.runId);
-      const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-      phaseOf[n.id] = rebuildState(runDir, plan, { lenient: true }).phase.phase;
-    } catch {
-      // the run is not readable (yet); the node still shows its node state
-    }
+    const read = readRunState(path.join(root, s.runId), root);
+    if (read) phaseOf[n.id] = read.state.phase.phase;
+    // else: the run is not readable (yet); the node still shows its node state
   }
   return renderProgramChart({ ...program, readableIds }, nodes, state, { programId: path.basename(dir), phaseOf });
 }
@@ -692,8 +881,9 @@ export function programReviewText(dir: string): string {
     if (!s.runId) continue;
     try {
       const runDir = path.join(root, s.runId);
-      const plan = JSON.parse(fs.readFileSync(path.join(runPaths(runDir).plan, "v1.json"), "utf8")) as RunPlanFile;
-      const phase = rebuildState(runDir, plan, { lenient: true }).phase;
+      const read = readRunState(runDir, root);
+      if (!read) continue;
+      const phase = read.state.phase;
       const sha = phase.candidate?.sha;
       const projected = projectEntries({
         messages: phase.messages ?? [],
@@ -754,9 +944,17 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
   const { program, nodes, state, readableIds, at } = foldProgram(dir);
   const outcome = programOutcome(nodes, state);
   const alive = pidAlive(programPaths(dir).pid);
+  // 06a finding #24: the models preflight's own line, when the program ran it.
+  let modelsCheck: string | undefined;
+  try {
+    modelsCheck = modelsCheckStatusText(parseModelsCheck(JSON.parse(fs.readFileSync(path.join(dir, "models-check.json"), "utf8"))));
+  } catch {
+    modelsCheck = undefined;
+  }
   const lines = [
     `${program.title}`,
     `program ${path.basename(dir)} · scheduler ${alive ? "running" : "stopped"} · ${outcome} · max ${program.maxParallel} in parallel`,
+    ...(modelsCheck ? [`models    ${modelsCheck}`] : []),
     "",
   ];
   const mark: Record<NodeStatus, string> = {
@@ -801,6 +999,41 @@ export function programStatusLines(dir: string, now: Date = new Date(), opts: { 
     for (const d of directives) {
       lines.push(`  - ${d.id}${d.withdrawn ? " [withdrawn]" : " [in force]"}: ${d.text}`);
     }
+  }
+  // Plan 06m (OD-1/A3): every running/needs-you node's master panel and
+  // status panel, from the ONE renderer, so `tt program status` shows the
+  // same dashboard `tt status` does. Skipped for the compact list view.
+  if (opts.nodeDetail !== false) {
+    const panels: Array<{ header: string; master: string[]; status: string[] }> = [];
+    for (const n of nodes) {
+      const s = state.nodes[n.id];
+      if (!s.runId || (s.status !== "running" && s.status !== "needs-you")) continue;
+      try {
+        const runDir = path.join(path.dirname(path.dirname(dir)), s.runId);
+        const read = readRunState(runDir, path.dirname(path.dirname(dir)));
+        if (!read) continue;
+        const alive = pidAlive(path.join(runDir, "conductor.pid"));
+        const view = buildView(runDir, read.plan, alive);
+        const rendered = renderStatusView(statusViewInput({ runDir, plan: read.plan, state: read.state, view, alive })).trimEnd().split("\n");
+        // The master panel is the header plus its gauge block: the FIRST blank
+        // line is the one under the run line, so the master ends at the SECOND
+        // blank (before panel 2), never after the run line (OD-2).
+        const firstBlank = rendered.findIndex((l, i) => i > 0 && l.trim() === "");
+        const secondBlank = firstBlank >= 0 ? rendered.findIndex((l, i) => i > firstBlank + 1 && l.trim() === "") : -1;
+        const splitAt = secondBlank > 0 ? secondBlank : rendered.length;
+        panels.push({
+          header: `── ${n.id} (${readableIds[n.id] ?? s.runId}) ──`,
+          master: rendered.slice(0, splitAt),
+          status: rendered.slice(splitAt),
+        });
+      } catch {
+        // a node whose run cannot be read contributes no panel
+      }
+    }
+    // Plan 06m (OD-2/contract-39): every master panel first, then the status
+    // panels, so several running nodes read master-first.
+    for (const p of panels) lines.push("", p.header, ...p.master);
+    for (const p of panels) lines.push("", `── ${p.header.slice(3)}`, ...p.status);
   }
   return lines;
 }

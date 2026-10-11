@@ -4,11 +4,13 @@
 //
 // A plan declares its secrets by NAME (`#+TT_SECRETS: NAME1 NAME2`, parsed by
 // Emacs into the JSON plan's `secrets`). The conductor resolves each value
-// from *its own* environment, passes it to every agent's environment, and
-// replaces every value with `***NAME***` in everything it writes — and, more
-// importantly, at the one boundary where agent text enters the conductor's
-// in-memory state (see `conductor.ts`'s `#applyEvent`), because prompts are
-// built from that state and a value must never reach a prompt either.
+// from *its own* environment first and from the plan's env file
+// (`#+TT_ENV_FILE` / `--env-file`) second — this module is the ONLY reader of
+// either source — passes it to every agent's environment, and replaces every
+// value with `***NAME***` in everything it writes — and, more importantly, at
+// the one boundary where agent text enters the conductor's in-memory state
+// (see `conductor.ts`'s `#applyEvent`), because prompts are built from that
+// state and a value must never reach a prompt either.
 //
 // Two shapes of "the value is still there" this module refuses to report as
 // success:
@@ -30,9 +32,47 @@ import { readLog } from "./log.ts";
 
 export interface Secret {
   name: string;
-  /** The value, read once from the conductor's own environment. */
+  /** The value, read once from the conductor's own environment or env file. */
   value: string;
 }
+
+/** A `KEY=value` file (`#+TT_ENV_FILE` / `--env-file`): one assignment per
+ * line, `#` comments and blank lines ignored, an optional `export ` prefix,
+ * and single or double quotes around a value stripped. The format is
+ * documented in docs/tradeoffs-trace-runbook.md. */
+export interface EnvFile {
+  path: string;
+  values: Record<string, string>;
+}
+
+/** The one reader of an env file. Every secret value comes through here (or
+ * from the process environment in `resolveSecrets`), so no other module reads
+ * a secret source. An unreadable file is `undefined` — the caller names the
+ * path in its refusal rather than treating it as an empty file. */
+export function loadEnvFile(file: string): EnvFile | undefined {
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+  const values: Record<string, string> = {};
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    let value = match[2].trim();
+    if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1);
+    }
+    values[match[1]] = value;
+  }
+  return { path: file, values };
+}
+
+/** Where a value came from, for a refusal that names every source checked. */
+export type SecretSource = "environment" | "env-file";
 
 /** A value shorter than this cannot be masked safely: replacing every
  * occurrence of `1` (a declared secret named TT exported as "1") would rewrite
@@ -66,22 +106,29 @@ export function secretNames(raw: readonly string[] | undefined): string[] {
   return out;
 }
 
-/** Which of NAMES are set in ENV (the conductor's own environment — a secret
- * is never carried anywhere but the environment), and which are declared but
- * unusable. `values` is every set secret, for the agents' environment;
- * `maskable` is the subset long enough to mask and to match in a command (see
- * MIN_SECRET_LENGTH); `missing` (unset) and `tooShort` are what a status line
- * reports. The run starts in every case. */
+/** Which of NAMES are set, and which are declared but unusable. The lookup
+ * order is the environment first, then the env file (`#+TT_ENV_FILE` /
+ * `--env-file`); a name set in both takes the environment's value. `values`
+ * is every set secret, for the agents' environment; `maskable` is the subset
+ * long enough to mask and to match in a command (see MIN_SECRET_LENGTH);
+ * `missing` (unset) and `tooShort` are what a status line reports; `sources`
+ * names every source checked, for a refusal message. The run starts in every
+ * case (a missing name is refused by the CLI before a run is created). */
 export function resolveSecrets(
   names: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
-): { values: Secret[]; maskable: Secret[]; missing: string[]; tooShort: string[] } {
+  envFile?: string,
+): { values: Secret[]; maskable: Secret[]; missing: string[]; tooShort: string[]; sources: SecretSource[]; envFile?: string } {
+  const fromFile = envFile === undefined ? undefined : loadEnvFile(envFile);
+  const sources: SecretSource[] = ["environment"];
+  if (envFile !== undefined) sources.push("env-file");
   const values: Secret[] = [];
   const maskable: Secret[] = [];
   const missing: string[] = [];
   const tooShort: string[] = [];
   for (const name of names) {
-    const value = env[name];
+    const fromEnv = env[name];
+    const value = fromEnv !== undefined && fromEnv.length > 0 ? fromEnv : fromFile?.values[name];
     if (value === undefined || value.length === 0) {
       missing.push(name);
       continue;
@@ -94,8 +141,9 @@ export function resolveSecrets(
   // AB_KEY=tt-fake-abcd) must be replaced before the shorter one can leave a
   // suffix of it behind.
   maskable.sort((a, b) => b.value.length - a.value.length);
-  return { values, maskable, missing, tooShort };
+  return { values, maskable, missing, tooShort, sources, ...(envFile !== undefined ? { envFile } : {}) };
 }
+
 
 /** The maskable secrets among NAMES, for a caller holding only the names (the
  * extension's guard): it resolves them from its OWN process environment, which

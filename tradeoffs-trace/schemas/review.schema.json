@@ -7,7 +7,7 @@
   "required": ["reviewer", "phaseId", "candidateSha", "contractVersion", "correctionStatements", "findingStatements"],
   "additionalProperties": true,
   "properties": {
-    "reviewer": { "enum": ["M", "A", "B"] },
+    "reviewer": { "type": "string", "minLength": 1, "description": "Plan 06h: any seat #+TT_REVIEWERS declares (default M A B)." },
     "phaseId": { "type": "string", "minLength": 1 },
     "candidateSha": { "type": "string", "minLength": 1 },
     "contractVersion": { "$ref": "#/$defs/ContractVersion" },
@@ -33,6 +33,36 @@
           "findingId": { "type": "string", "minLength": 1 },
           "status": { "enum": ["confirm", "withdraw"] },
           "evidence": { "type": "string" }
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "description": "Plan 06b: a verdict for every requirement and constraint (met/unmet/partial, with evidence).",
+      "items": {
+        "type": "object",
+        "required": ["id", "verdict", "evidence"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "verdict": { "enum": ["met", "unmet", "partial"] },
+          "evidence": { "type": "string", "minLength": 1 },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "arch": {
+      "type": "array",
+      "description": "Plan 06b: a verdict for every architecture item (fits/deviates/unclear, with evidence).",
+      "items": {
+        "type": "object",
+        "required": ["id", "verdict", "evidence"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "verdict": { "enum": ["fits", "deviates", "unclear"] },
+          "evidence": { "type": "string", "minLength": 1 },
+          "note": { "type": "string" }
         }
       }
     },

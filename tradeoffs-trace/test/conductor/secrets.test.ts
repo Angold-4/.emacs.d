@@ -6,7 +6,7 @@
 // the literal value.
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,8 @@ import {
 } from "../../src/conductor.ts";
 import { EventLog } from "../../src/effects/log.ts";
 import { resolveSecrets } from "../../src/effects/secrets.ts";
+import { ROLE_TOOLS } from "../../src/core/roles.ts";
+import { parseOrgPlan } from "../../src/core/org-plan.ts";
 import type { PhaseState } from "../../src/core/types.ts";
 
 const CLI_PATH = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
@@ -721,5 +723,157 @@ test("secrets: an unset declared secret is recorded and the run still runs", asy
       cleanupDir(setup.scriptsDir);
       cleanupDir(setup.repo.dir);
     }
+  }
+});
+
+// Plan 06e (A1/R1): a KEY=value file the plan names with #+TT_ENV_FILE (the
+// JSON plan's `envFile`) supplies a declared secret the environment does not
+// set. The real `tt start` CLI must not refuse, and the value must reach the
+// agents.
+test("plan 06e: tt start with TT_ENV_FILE satisfies TT_SECRETS with the variables absent from the environment", async () => {
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  const repo = makeRepo();
+  const root = path.join("/tmp", `tt-envfile-root-${randomBytes(4).toString("hex")}`);
+  const scriptsDir = path.join("/tmp", `tt-envfile-scripts-${randomBytes(4).toString("hex")}`);
+  fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  const envFile = path.join(scriptsDir, "secrets.env");
+  fs.writeFileSync(envFile, `# the run's credentials\nFAKE_ENV_KEY="${value}"\n`);
+  const marker = path.join(scriptsDir, "secret-present");
+  const fakePi = fileURLToPath(new URL("../fake-pi/fake-pi.ts", import.meta.url));
+  let runId = "";
+  try {
+    // The Org keyword `#+TT_ENV_FILE` becomes the JSON plan's `envFile`.
+    assert.equal(
+      parseOrgPlan(`#+TITLE: t\n#+TT_ENV_FILE: ${envFile}\n#+TT_SECRETS: FAKE_ENV_KEY\n`).envFile,
+      envFile,
+    );
+    const plan: RunPlanFile = {
+      title: "env file secret",
+      repo: repo.dir,
+      integrationBranch: "main",
+      checks: ["true"],
+      secrets: ["FAKE_ENV_KEY"],
+      envFile,
+      phases: [{ id: "p1", goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [], reserved: [] }],
+    };
+    const planPath = path.join(scriptsDir, "plan.json");
+    fs.writeFileSync(planPath, JSON.stringify(plan));
+    fs.writeFileSync(
+      path.join(scriptsDir, "worker.json"),
+      JSON.stringify({
+        hello: { role: "worker", tools: ROLE_TOOLS.worker },
+        steps: [
+          // $FAKE_ENV_KEY is absent from this process's environment, so the
+          // marker can only appear if the env file supplied it to the agent's
+          // command environment. The marker is written OUTSIDE the run dir.
+          { kind: "call-sh", command: `test -n "$FAKE_ENV_KEY" && printf present > ${marker}` },
+          { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        ],
+      }),
+    );
+
+    delete process.env.FAKE_ENV_KEY;
+    const env: NodeJS.ProcessEnv = {
+      TT_TEST_MODE: "1",
+      TT_TEST_PI_COMMAND: process.execPath,
+      TT_TEST_PI_ARGS_PREFIX: JSON.stringify([fakePi]),
+      TT_TEST_STUB_REVIEWS: "1",
+      TT_TEST_DEADLINES: JSON.stringify({ abortGraceMs: 300, termGraceMs: 300, helloTimeoutMs: 5_000, workerAttemptMs: 60_000 }),
+      FAKE_PI_SCRIPT: scriptsDir,
+    };
+    const start = await runCli(["start", planPath, "--root", root], env);
+    assert.equal(start.code, 0, "tt start must not refuse: the env file supplies the secret");
+    runId = start.stdout.trim();
+    assert.ok(runId.length > 0, "expected tt start to print a run id");
+
+    await waitFor(() => fs.existsSync(marker), 60_000);
+
+    // The value itself appears in no file of the run directory.
+    const offenders: string[] = [];
+    for (const file of filesUnder(path.join(root, runId))) {
+      if (fs.readFileSync(file).includes(value)) offenders.push(path.relative(path.join(root, runId), file));
+    }
+    assert.deepEqual(offenders, [], "the env-file value must not reach the run directory");
+  } finally {
+    try {
+      if (runId) execFileSync("pkill", ["-9", "-f", path.join(root, runId)]);
+    } catch {
+      // already gone
+    }
+    cleanupDir(root);
+    cleanupDir(scriptsDir);
+    cleanupDir(repo.dir);
+  }
+});
+
+// Plan 06e (A1/R2): the value arrives through the env file, an agent echoes
+// it, and no file of the run directory holds it.
+test("plan 06e: no secret value from TT_ENV_FILE appears in any file of the run directory", async () => {
+  const value = `tt-${randomBytes(12).toString("hex")}`;
+  const scriptsDir = fs.mkdtempSync("/tmp/tt-envfile-leak-");
+  const envFile = path.join(scriptsDir, "secrets.env");
+  fs.writeFileSync(envFile, `FAKE_ENV_KEY=${value}\n`);
+  delete process.env.FAKE_ENV_KEY;
+  let setup: Awaited<ReturnType<typeof setupConductor>> | undefined;
+  try {
+    setup = await setupConductor({
+      checks: ["true"],
+      secrets: ["FAKE_ENV_KEY"],
+      envFile,
+      workerScript: () => ({
+        hello: defaultWorkerHello(),
+        steps: [
+          // The agent echoes the secret. The conductor's `sh` environment
+          // resolves it from the env file; redaction must catch the output.
+          { kind: "call-sh", command: "echo $FAKE_ENV_KEY" },
+          { kind: "emit-env", name: "FAKE_ENV_KEY" },
+          { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        ],
+      }),
+      reviewerScriptFor: (reviewer, state) => ({
+        hello: defaultReviewerHello(),
+        steps: [
+          {
+            kind: "call-submit",
+            tool: "submit_review",
+            args: {
+              reviewer,
+              phaseId: state.phase.phaseId,
+              candidateSha: state.phase.candidate?.sha,
+              contractVersion: state.phase.contract.contractVersion,
+              correctionStatements: [],
+              findingStatements: [],
+            },
+          },
+        ],
+      }),
+      deadlines: { abortGraceMs: 500, termGraceMs: 500, helloTimeoutMs: 5_000, reviewMs: 10_000 },
+    });
+
+    await setup.conductor.start();
+    await waitFor(() => setup!.conductor.state.phase.phase === "DONE", 90_000);
+
+    const offenders: string[] = [];
+    for (const file of filesUnder(setup.runDir)) {
+      if (fs.readFileSync(file).includes(value)) offenders.push(path.relative(setup.runDir, file));
+    }
+    assert.deepEqual(offenders, [], "the env-file value must not survive anywhere under the run directory");
+
+    // The value did reach the agents: the emitted environment shows it masked.
+    const streams = fs
+      .readdirSync(runPaths(setup.runDir).stream)
+      .map((f) => fs.readFileSync(path.join(runPaths(setup.runDir).stream, f), "utf8"))
+      .join("\n");
+    assert.match(streams, /FAKE_ENV_KEY=\*\*\*FAKE_ENV_KEY\*\*\*/);
+  } finally {
+    await setup?.conductor.stop();
+    if (setup) {
+      cleanupDir(setup.runRoot);
+      cleanupDir(setup.scriptsDir);
+      cleanupDir(setup.repo.dir);
+    }
+    fs.rmSync(scriptsDir, { recursive: true, force: true });
+    delete process.env.FAKE_ENV_KEY;
   }
 });

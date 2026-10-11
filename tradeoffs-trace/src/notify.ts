@@ -39,7 +39,13 @@ export interface NotificationRecord {
   kind: "run" | "program";
   title: string;
   node?: string;
+  /** Plan 06m (A4): the phase that is waiting, so the notification names it
+   * and not only the run. Absent for a program-level notification. */
+  phase?: string;
   reason: string;
+  /** Plan 06m (A4): the command that answers this wait (e.g. a `tt verdict`
+   * or `tt carry`), so the owner is told what unblocks it. */
+  command?: string;
   waitKey: string;
   at: string;
   reminder?: boolean;
@@ -98,6 +104,28 @@ export function readNotifications(root: string): NotificationRecord[] {
 export function oneLine(text: string, max = 300): string {
   const t = text.replace(/\s+/g, " ").trim();
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+/** Plan 06m (A4): the command that answers a run's wait, in one line. The
+ * owner request's own links decide it: a blocker or finding is answered by a
+ * verdict, a decision or finding by a carry/verdict, and a budget gate by a
+ * carry or a correction. Kept beside `waitReason` so a notification names
+ * the run, the phase, the why and the answer from one place. */
+export function answeringCommand(
+  runId: string,
+  phase: { ownerRequests: ReadonlyArray<{ status: string; origin?: string; linkedMessageId?: string; linkedFindingId?: string; linkedDecisionId?: string }> },
+): string | undefined {
+  const open = phase.ownerRequests.filter((r) => r.status === "open");
+  if (open.length === 0) return undefined;
+  const r = open[open.length - 1];
+  if (r.linkedMessageId) return `tt verdict ${runId} ${r.linkedMessageId} accept|refuse`;
+  if (r.origin === "repair_budget_exhausted" || r.origin === "failed_vote" || r.origin === "reserved_decision") {
+    return `tt carry ${runId} ${r.linkedFindingId ?? r.linkedDecisionId ?? "<item>"} --to <next-phase>  (or tt verdict ${runId} <messageId> accept|refuse)`;
+  }
+  if (r.linkedFindingId || r.linkedDecisionId) {
+    return `tt carry ${runId} ${r.linkedFindingId ?? r.linkedDecisionId} --to <next-phase>`;
+  }
+  return `tt correct ${runId} "<text>"`;
 }
 
 /** The one-line reason a run is waiting, derived from its phase state. Kept
@@ -166,7 +194,10 @@ export function notifierCommand(record: NotificationRecord, env: NodeJS.ProcessE
   const override = env.TT_NOTIFY_COMMAND;
   if (typeof override === "string" && override.trim() !== "") return { command: "/bin/sh", args: ["-c", override] };
   if (process.platform === "darwin") {
-    const body = record.node ? `${record.title} [${record.node}]: ${record.reason}` : `${record.title}: ${record.reason}`;
+    const where = record.node ? `${record.title} [${record.node}]` : record.title;
+    const phase = record.phase ? ` (${record.phase})` : "";
+    const answer = record.command ? ` — answer: ${record.command}` : "";
+    const body = `${where}${phase}: ${record.reason}${answer}`;
     const script = `display notification "${escapeAppleScript(body)}" with title "tradeoffs-trace"`;
     return { command: "osascript", args: ["-e", script] };
   }
@@ -189,7 +220,19 @@ function runNotifier(record: NotificationRecord, opts: NotifyOptions): void {
   if (!spec) return;
   let result;
   try {
-    result = spawnSync(spec.command, spec.args, { env: { ...env }, timeout: opts.timeoutMs ?? 5_000, stdio: "ignore" });
+    // Plan 06m (A4): the configured command receives the run, phase, reason
+    // and the command that answers the wait, so a notifier script can act on
+    // them (the record is also in notifications.jsonl).
+    const payloadEnv: NodeJS.ProcessEnv = {
+      ...env,
+      TT_NOTIFY_RUN: record.id,
+      TT_NOTIFY_TITLE: record.title,
+      ...(record.node ? { TT_NOTIFY_NODE: record.node } : {}),
+      ...(record.phase ? { TT_NOTIFY_PHASE: record.phase } : {}),
+      TT_NOTIFY_REASON: record.reason,
+      ...(record.command ? { TT_NOTIFY_ANSWER: record.command } : {}),
+    };
+    result = spawnSync(spec.command, spec.args, { env: payloadEnv, timeout: opts.timeoutMs ?? 5_000, stdio: "ignore" });
   } catch (err) {
     fail(opts, String((err as Error)?.message ?? err));
     return;

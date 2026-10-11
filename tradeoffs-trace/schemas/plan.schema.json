@@ -20,6 +20,15 @@
       "additionalProperties": false,
       "properties": {
         "worker": { "$ref": "#/$defs/RoleModel" },
+        "workerLanes": {
+          "description": "Plan 06g2: per-lane worker models (worker.1, worker.2); a lane without one uses worker's.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "1": { "$ref": "#/$defs/RoleModel" },
+            "2": { "$ref": "#/$defs/RoleModel" }
+          }
+        },
         "reviewer": { "$ref": "#/$defs/RoleModel" },
         "reviewerSeats": {
           "description": "Per-seat reviewer models (reviewer.M, reviewer.A, reviewer.B); a seat without one uses reviewer's.",
@@ -72,21 +81,130 @@
     "rerunLine": {
       "description": "Lint-only: the 1-based line of #+TT_RERUN in the source Org file.",
       "type": "integer"
+    },
+    "workers": {
+      "description": "Plan 06g/06h: #+TT_WORKERS — how many lanes one round runs, any positive whole number. Absent is today's single-candidate loop. A value that is not a whole number is passed through as written so `tt lint` can name it.",
+      "type": ["integer", "string"]
+    },
+    "workersLine": {
+      "description": "Lint-only: the 1-based line of #+TT_WORKERS in the source Org file.",
+      "type": "integer"
+    },
+    "rounds": {
+      "description": "Plan 06g: #+TT_ROUNDS — how many rounds a phase may spend before it parks on the owner (1 to 5). Absent means the default of 3. A value that is not a whole number is passed through as written so `tt lint` can name it.",
+      "type": ["integer", "string"]
+    },
+    "roundsLine": {
+      "description": "Lint-only: the 1-based line of #+TT_ROUNDS in the source Org file.",
+      "type": "integer"
+    },
+    "seats": {
+      "description": "Plan 06h: #+TT_REVIEWERS — the odd list of reviewer seats. Absent means M A B.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "seatsLine": {
+      "description": "Lint-only: the 1-based line of #+TT_REVIEWERS in the source Org file.",
+      "type": "integer"
+    },
+    "leader": {
+      "description": "Plan 06h: #+TT_LEADER — the leader seat. Absent means the first seat.",
+      "type": "string",
+      "minLength": 1
+    },
+    "leaderLine": {
+      "description": "Lint-only: the 1-based line of #+TT_LEADER in the source Org file.",
+      "type": "integer"
     }
   },
   "$defs": {
     "PlanPhase": {
       "type": "object",
-      "required": ["id", "goal", "acceptance", "checks", "boundaries", "reserved", "provisional"],
+      "required": ["id", "goal", "checks", "boundaries", "reserved", "provisional"],
       "additionalProperties": false,
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "line": { "description": "The 1-based line of the phase headline, for a phase-override finding.", "type": "integer" },
         "goal": { "type": "string", "minLength": 1 },
-        "acceptance": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "acceptance": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "checks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "finalChecks": {
+          "description": "Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by the phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted runs it, once.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
         "boundaries": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "reserved": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "provisional": { "type": "boolean" }
+        "provisional": { "type": "boolean" },
+        "workers": {
+          "description": "Plan 06g: the phase's own :WORKERS: (overrides #+TT_WORKERS) — how many lanes one round runs.",
+          "type": "integer"
+        },
+        "rounds": {
+          "description": "Plan 06g: the phase's own :ROUNDS: (overrides #+TT_ROUNDS) — how many rounds the phase may spend.",
+          "type": "integer"
+        },
+        "seats": {
+          "description": "Plan 06h: the phase's own :REVIEWERS: (overrides #+TT_REVIEWERS) — the odd list of reviewer seats.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "leader": {
+          "description": "Plan 06h: the phase's own :LEADER: (overrides #+TT_LEADER).",
+          "type": "string",
+          "minLength": 1
+        },
+        "architecture": { "type": "array", "items": { "$ref": "#/$defs/ArchitectureItem" } },
+        "requirements": { "type": "array", "items": { "$ref": "#/$defs/RequirementItem" } },
+        "constraints": { "type": "array", "items": { "$ref": "#/$defs/ConstraintItem" } }
+      }
+    },
+    "ArchitectureItem": {
+      "description": "One architecture item (an :ID: subheading under Architecture).",
+      "type": "object",
+      "required": ["id", "title", "text", "tags"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "text": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "where": { "type": "string" },
+        "whereLine": { "type": "integer" },
+        "rawText": { "type": "string" },
+        "line": { "type": "integer" }
+      }
+    },
+    "RequirementItem": {
+      "description": "One requirement item (an :ID: subheading under Requirements).",
+      "type": "object",
+      "required": ["id", "title", "text", "arch", "verify"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "text": { "type": "string" },
+        "arch": { "type": "array", "items": { "type": "string" } },
+        "verify": { "type": "array", "items": { "type": "string" } },
+        "rawText": { "type": "string" },
+        "line": { "type": "integer" },
+        "archLine": { "type": "integer" },
+        "verifyLine": { "type": "integer" }
+      }
+    },
+    "ConstraintItem": {
+      "description": "One constraint item (an :ID: subheading under Constraints).",
+      "type": "object",
+      "required": ["id", "title", "text", "verify"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "text": { "type": "string" },
+        "verify": { "type": "array", "items": { "type": "string" } },
+        "rawText": { "type": "string" },
+        "line": { "type": "integer" },
+        "verifyLine": { "type": "integer" }
       }
     },
     "RoleModel": {

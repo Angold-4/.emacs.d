@@ -106,7 +106,7 @@ export function makeMessage(overrides: Partial<Message> = {}): Message {
  * findings to speak to (design §6.3: required even when there are no
  * decisions to vote on). */
 export function approvingReview(
-  reviewer: "M" | "A" | "B",
+  reviewer: string,
   candidateSha: string,
   contractVersion: ContractVersion,
   extra: { correctionStatements?: { correctionId: string; status: "honored" | "not_honored" }[]; findingStatements?: { findingId: string; status: "confirm" | "withdraw" }[] } = {},

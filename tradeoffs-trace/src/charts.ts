@@ -77,7 +77,8 @@ export interface ChartModels {
   reviewer?: string;
   evaluator?: string;
   panel?: string;
-  reviewerSeats?: Partial<Record<"M" | "A" | "B", string>>;
+  /** Plan 06h: keyed by seat name, so any `#+TT_REVIEWERS` list works. */
+  reviewerSeats?: Record<string, string | undefined>;
   panelSeats?: Partial<Record<string, string>>;
 }
 type ModelRole = "worker" | "reviewer" | "evaluator" | "panel";
@@ -138,7 +139,7 @@ function edgeLine(row: TransitionRow, triggerWidth: number, toWidth: number, gua
  * readable; the run-axis rows get their own small section. */
 export function renderPhaseChart(
   rows: readonly TransitionRow[] = TRANSITIONS,
-  opts: { stats?: ChartStats; model?: string; models?: ChartModels; now?: Date } = {},
+  opts: { stats?: ChartStats; model?: string; models?: ChartModels; now?: Date; roundLines?: readonly string[]; seats?: readonly string[] } = {},
 ): string {
   const stats = opts.stats ?? { entries: {}, timeMs: {} };
   const fallback = opts.model && opts.model.length > 0 ? opts.model : "default";
@@ -149,6 +150,12 @@ export function renderPhaseChart(
   lines.push("tradeoffs-trace phase chart — generated from TRANSITIONS (src/core/transitions.ts); do not edit");
   lines.push(`current state: ${stats.current ?? "?"}${stats.current ? `   (entered ${stats.entries[stats.current] ?? 0}x - ${formatMs(stats.timeMs[stats.current])})` : ""}`);
   if (stats.currentRun) lines.push(`current run: ${stats.currentRun}`);
+  // Plan 06g (A5): with `#+TT_WORKERS` the chart names the round's lanes and
+  // its pick, so the drawn state machine and the run agree about what a round
+  // is. Absent for a plan without lanes.
+  if (opts.roundLines && opts.roundLines.length > 0) {
+    for (const line of opts.roundLines) lines.push(`round: ${line}`);
+  }
   // Plan 05d: CHECKING's own re-run step (a newly failing test is re-run
   // alone before the check may fail; a load-only flake passes it).
   lines.push("note: a check that names new failures re-runs each alone before it may fail; a load-only flake passes it (FLAKE_OBSERVED)");
@@ -194,13 +201,14 @@ export function renderPhaseChart(
         // the point of three seats. When every seat resolves to the same
         // model (a plan that only sets the four flat roles), the box keeps
         // its single per-role line, exactly as before per-seat models.
-        const reviewerSeat = (seat: "M" | "A" | "B") => opts.models?.reviewerSeats?.[seat] ?? modelFor("reviewer");
+        const reviewerSeat = (seat: string) => opts.models?.reviewerSeats?.[seat] ?? modelFor("reviewer");
         const panelSeat = (seat: string) => opts.models?.panelSeats?.[seat] ?? modelFor("panel");
         if (state === "REVIEWING") {
-          const seats = (["M", "A", "B"] as const).map((s) => [s, reviewerSeat(s)] as const);
+          // Plan 06h (A2): every configured seat, never a fixed three.
+          const seats = (opts.seats ?? ["M", "A", "B"]).map((s) => [s, reviewerSeat(s)] as const);
           bits.push(
             seats.every(([, m]) => m === seats[0][1])
-              ? `${dispatch.roles} - model ${seats[0][1]}`
+              ? `${seats.map(([s]) => s).join(", ")} - model ${seats[0][1]}`
               : seats.map(([s, m]) => `${s} ${m}`).join(" · "),
           );
         } else if (state === "EVALUATING") {
@@ -278,7 +286,8 @@ export interface LoopTapePhase {
   attempt: { n: number; interrupted?: boolean };
   repairRoundsUsed: number;
   repairRoundsGranted: number;
-  contract: { gate?: string };
+  /** Plan 06h (A2): the frozen seats, so the tape names every one. */
+  contract: { gate?: string; seats?: readonly string[] };
   blockedReason?: string;
   ownerRequests?: Array<{ origin?: string; status?: string; linkedMessageId?: string }>;
 }
@@ -290,6 +299,10 @@ export interface LoopTapePhase {
 export interface LoopTapeInput {
   /** The phase's readable id and short title (`tapeLabel`), e.g. `05g seat models`. */
   label: string;
+  /** Plan 06g (A5): the round's lanes and pick, one line each — the tape
+   * shows both lanes and the pick beside the step rows. Absent for a plan
+   * without `#+TT_WORKERS`. */
+  lanes?: readonly string[];
   /** The phase's current round (`view.round`). */
   round: number;
   phases: ReadonlyArray<{ phase: string; at: string }>;
@@ -300,6 +313,10 @@ export interface LoopTapeInput {
   models?: ChartModels;
   /** Per-stage deadlines (`view.stageLimits`); the current row shows `x of y`. */
   limits?: Record<string, number>;
+  /** Plan 06k2 (A1): the two-lane round's own sub-phase (`LANE REVIEW` or
+   * `PICK`), so the tape head names it and the attempt clock stops instead
+   * of counting the review/pick time against the implement limit. */
+  lanePhase?: "LANE REVIEW" | "PICK";
 }
 
 /** One drawn tape row. */
@@ -402,12 +419,12 @@ function tapeSeat(models: ChartModels | undefined, role: "reviewer" | "panel", s
 
 /** Who is on the current step, and on which model, matching the chart's own
  * per-seat resolution. Only the three dispatching steps name anyone. */
-function tapeWorking(step: string, models: ChartModels | undefined): string | undefined {
+function tapeWorking(step: string, models: ChartModels | undefined, seatsOfRound: readonly string[] = ["M", "A", "B"]): string | undefined {
   if (step === "IMPLEMENT") return `worker · ${tapeModel(models, "worker")}`;
   if (step === "REVIEW") {
-    const seats = (["M", "A", "B"] as const).map((s) => [s, tapeSeat(models, "reviewer", s)] as const);
+    const seats = seatsOfRound.map((s) => [s, tapeSeat(models, "reviewer", s)] as const);
     return seats.every(([, m]) => m === seats[0][1])
-      ? `M·A·B · ${seats[0][1]}`
+      ? `${seats.map(([s]) => s).join("·")} · ${seats[0][1]}`
       : seats.map(([s, m]) => `${s} ${m}`).join(" · ");
   }
   if (step === "EVALUATE") {
@@ -493,10 +510,22 @@ export function buildLoopTape(input: LoopTapeInput): { header: string; rows: Loo
       time,
       // Off the path nobody is on the step any more: the arrow names the
       // reason instead of a model.
-      annotation: mark === "▶" && !offPath ? tapeWorking(s.name, input.models) : undefined,
+      annotation: mark === "▶" && !offPath ? tapeWorking(s.name, input.models, input.phase.contract.seats) : undefined,
       arrow: k === ci ? arrow : undefined,
     };
   });
+  // Plan 06k2 (A1): the lane round's own sub-phase replaces the IMPLEMENT
+  // head, and its time is shown WITHOUT the implement limit — the attempt
+  // clock stopped when both lanes submitted, so it can never read "over by"
+  // while the lane reviews or the pick run.
+  if (input.lanePhase && ci >= 0 && currentStep === "IMPLEMENT" && rows[ci]) {
+    rows[ci] = {
+      ...rows[ci],
+      name: input.lanePhase,
+      time: times["IMPLEMENT"] === undefined ? "" : formatTapeMs(times["IMPLEMENT"]),
+      annotation: input.lanePhase === "LANE REVIEW" ? tapeWorking("REVIEW", input.models, input.phase.contract.seats) : "pick turn",
+    };
+  }
 
   const firstAt = phases[0]?.at;
   const elapsed = firstAt ? formatTapeMs(Math.max(0, input.endMs - Date.parse(firstAt))) : "0s";
@@ -517,6 +546,12 @@ export function renderLoopTape(input: LoopTapeInput): string {
     if (r.annotation) line += `   ${r.annotation}`;
     if (r.arrow) line += `  → ${r.arrow}`;
     lines.push(line.replace(/ +$/, ""));
+  }
+  // Plan 06g (A5): the round's lanes and its pick, under the step rows, so
+  // the tape shows both lanes and the pick rather than only the winner.
+  if (input.lanes && input.lanes.length > 0) {
+    lines.push("");
+    for (const lane of input.lanes) lines.push(`  lanes        ${lane}`.replace(/ +$/, ""));
   }
   return `${lines.join("\n")}\n`;
 }
@@ -543,28 +578,73 @@ const NODE_MARK: Record<string, string> = {
   "env-blocked": "E",
 };
 
+/** Plan 06f (A4): the program graph lists nodes in topological order of
+ * AFTER, with file order breaking ties. Pure and stable: a node whose
+ * dependencies are already placed keeps its file position relative to its
+ * peers, so a program already in dependency order is unchanged. A cycle (a
+ * hand-made `program.json`; lint refuses one) keeps the remaining nodes in
+ * file order rather than dropping them. */
+export function topologicalNodes(nodes: readonly ProgramNode[]): ProgramNode[] {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const order = new Map(nodes.map((n, i) => [n.id, i]));
+  const rank = (id: string) => order.get(id) ?? 0;
+  const remaining = new Map(nodes.map((n) => [n.id, n.deps.filter((d) => byId.has(d))]));
+  const dependents = new Map<string, string[]>();
+  for (const n of nodes) {
+    for (const d of remaining.get(n.id)!) {
+      const list = dependents.get(d);
+      if (list) list.push(n.id);
+      else dependents.set(d, [n.id]);
+    }
+  }
+  const ready = nodes.filter((n) => remaining.get(n.id)!.length === 0).map((n) => n.id);
+  ready.sort((a, b) => rank(a) - rank(b));
+  const out: ProgramNode[] = [];
+  while (ready.length > 0) {
+    const id = ready.shift()!;
+    out.push(byId.get(id)!);
+    for (const dependent of dependents.get(id) ?? []) {
+      const left = remaining.get(dependent)!.filter((d) => d !== id);
+      remaining.set(dependent, left);
+      if (left.length === 0) {
+        ready.push(dependent);
+        ready.sort((a, b) => rank(a) - rank(b));
+      }
+    }
+  }
+  for (const n of nodes) if (!out.includes(n)) out.push(n);
+  return out;
+}
+
 /** The program dependency graph as an ASCII chart: one box per node, carrying
  * its readable id (`<program>-NN`), its entry, its node state and, while it
  * runs, the phase state of its run. Under each box, the `after` edges name
- * the nodes it waits for — a join lists several. */
+ * the nodes it waits for — a join lists several. Plan 06f (A4): the boxes are
+ * in topological order of AFTER (file order breaks ties), so a node is always
+ * drawn after the nodes it waits for. */
 export function renderProgramChart(
   program: { title: string; maxParallel?: number; readableIds?: Record<string, string> },
   nodes: readonly ProgramNode[],
   state: ProgramState,
   opts: { programId: string; phaseOf?: Record<string, string> } = { programId: "" },
 ): string {
+  // The readable id's positional fallback uses the node's ORIGINAL file
+  // position, never its topological position, so reordering the chart never
+  // renumbers a node that has no recorded id.
+  const originalIndex = new Map(nodes.map((n, i) => [n.id, i]));
   const readable = (n: ProgramNode, i: number) =>
     program.readableIds?.[n.id] ?? `${opts.programId}-${String(i + 1).padStart(2, "0")}`;
+  const ordered = topologicalNodes(nodes);
   const lines: string[] = [];
   lines.push(`program ${opts.programId} — ${program.title}`);
   lines.push(`${nodes.length} node${nodes.length === 1 ? "" : "s"} · max ${program.maxParallel ?? 1} in parallel`);
   lines.push("");
-  const inner = Math.max(...nodes.map((n, i) => `${readable(n, i)}  ${n.id}`.length), 16) + 2;
+  const labelOf = (n: ProgramNode) => `${readable(n, originalIndex.get(n.id) ?? 0)}  ${n.id}`;
+  const inner = Math.max(...nodes.map((n) => labelOf(n).length), 16) + 2;
   const bar = `+${"-".repeat(inner)}+`;
-  for (let i = 0; i < nodes.length; i++) {
-    const n = nodes[i];
+  for (const n of ordered) {
     const s = state.nodes[n.id] ?? { status: "waiting" as const };
-    const label = `${readable(n, i)}  ${n.id}`;
+    const label = labelOf(n);
     const bits = [s.status];
     const phase = s.status === "running" ? opts.phaseOf?.[n.id] : undefined;
     if (phase) bits.push(phase);
@@ -572,7 +652,9 @@ export function renderProgramChart(
     lines.push(`${marker}${bar}`);
     lines.push(`  | ${label.padEnd(inner - 1)}|  ${bits.join(" - ")}`);
     lines.push(`  ${bar}`);
-    lines.push(`      after: ${n.deps.length > 0 ? n.deps.map((d) => readable(nodes.find((x) => x.id === d)!, nodes.findIndex((x) => x.id === d))).join(", ") : "(none)"}`);
+    lines.push(
+      `      after: ${n.deps.length > 0 ? n.deps.map((d) => readable(nodes.find((x) => x.id === d)!, originalIndex.get(d) ?? 0)).join(", ") : "(none)"}`,
+    );
     if (s.reason) lines.push(`      ${s.reason}`);
     if (s.runId) lines.push(`      run: ${s.runId}`);
     lines.push("");

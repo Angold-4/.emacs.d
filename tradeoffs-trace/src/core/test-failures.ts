@@ -16,6 +16,12 @@
 // conductor owns the run that produces the output and the file that keeps the
 // result; the view reads that file through `parseBaseline`.
 
+// Plan 06j (A2/A-8): every parser of check output strips the SAME escapes.
+// A numeric-SGR-only regex misses a cursor-control prefix such as
+// `ESC[?25l`, which would drop a cargo failure entirely; `stripAnsi`
+// (items.ts) is the one implementation.
+import { stripAnsi } from "./items.ts";
+
 /** One check command's baseline result. */
 export interface BaselineCommand {
   /** The command exactly as it was run (plan secrets already resolved). */
@@ -101,8 +107,6 @@ const ERT_FAILED = /^\s*FAILED\s+(?:\d+\/\d+\s+)?(\S+)/;
 const NOT_A_TEST_NAME = /^failing tests?:$/;
 /** A TAP line can carry a trailing ` # reason` comment. */
 const TAP_COMMENT = /\s+#.*$/;
-/** Color codes make every one of the patterns above miss. */
-const ANSI = /\u001b\[[0-9;]*m/g;
 
 /** Plan 05d: which runner a parsed failing name came from. Only the Node test
  * runner and cargo have built-in single-test commands (`singleTestCommand`);
@@ -136,7 +140,7 @@ const NODE_SPEC_LOCATION = /^\s*test at (.+?):\d+:\d+\s*$/;
  * the runner its line came from and (for node:test) the file the reporter
  * located it in, when one was written. Deduped by name. */
 export function parseTestFailuresDetailed(output: string): ParsedTestFailure[] {
-  const text = output.replace(ANSI, "");
+  const text = stripAnsi(output);
   const lines = text.split("\n").map((l) => l.trimEnd());
   const out: ParsedTestFailure[] = [];
   const byName = new Map<string, ParsedTestFailure>();
@@ -355,7 +359,7 @@ export interface TestRerunOutcome {
  * (never a `# SKIP`/`# TODO` one), cargo's `test <name> ... ok`, or ERT's
  * `passed  1/1  <name>`. Anything else keeps the strict rule. */
 export function rerunProvesTheTestRan(output: string, name: string): boolean {
-  const text = output.replace(ANSI, "");
+  const text = stripAnsi(output);
   const literal = escapeRegExp(name);
   return (
     new RegExp(`^\\s*[\\u2714\\u2713]\\s+${literal}(?:\\s+\\(\\d+(?:\\.\\d+)?ms\\))?\\s*$`, "m").test(text) || // node spec

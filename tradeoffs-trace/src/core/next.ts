@@ -18,13 +18,15 @@
 // exactly, and calling next() again after the matching ACTION_STARTED
 // returns [] (no double dispatch) for the dispatch-shaped ones.
 
+import { finalCheckOf } from "./checks.ts";
 import { gateCommandOf } from "./gate.ts";
+import { seatsOf } from "./seats.ts";
 import {
   accept,
   amendmentToApply,
   blockersNeedingPanel,
   evaluationSettled,
-  PANEL_SEATS,
+  panelSeatNumbers,
   panelSeatSettled,
   panelSeatsSettled,
   resolvedCorrectionIdsFor,
@@ -87,8 +89,8 @@ export function next(state: State): Action[] {
     case "REVIEWING": {
       if (!p.candidate) return [];
       const actions: Action[] = [];
-      for (const who of ["M", "A", "B"] as const) {
-        const key = `review_${who}` as const;
+      for (const who of seatsOf(p.contract)) {
+        const key = `review_${who}` as InFlightKey;
         if (!hasValidReview(p, who) && !p.inFlight[key]) {
           actions.push({ type: "dispatch_review", reviewer: who });
         }
@@ -104,15 +106,16 @@ export function next(state: State): Action[] {
     case "EVALUATING": {
       const pending = typesNeedingEvaluation(p).filter((t) => p.evaluation?.types?.[t]?.settled !== true);
       const actions: Action[] = [];
+      const seatCount = seatsOf(p.contract).length;
       for (const t of pending) {
         if (!p.inFlight[`dispatch_evaluation_${t}`]) actions.push({ type: "dispatch_evaluation", messageType: t });
       }
-      // Plan 04b: three fresh panel seats per raw blocker, dispatched in
+      // Plan 04b/06h: one fresh panel seat per reviewer, dispatched in
       // parallel as their own logged actions, each with its own deadline.
       for (const blockerId of blockersNeedingPanel(p)) {
         const panel = p.panel!.blockers![blockerId];
         if (panel.decided) continue;
-        for (const seat of PANEL_SEATS) {
+        for (const seat of panelSeatNumbers(seatCount)) {
           if (panelSeatSettled(panel.seats?.[String(seat)])) continue;
           const key = `dispatch_panel_${blockerId}_${seat}` as InFlightKey;
           if (!p.inFlight[key]) actions.push({ type: "dispatch_panel", blockerId, seat });
@@ -125,7 +128,7 @@ export function next(state: State): Action[] {
       const evaluatorsSettled = pending.length === 0;
       const roundItems = evaluatorsSettled ? roundPanelItemsNeedingVote(p) : [];
       if (evaluatorsSettled && roundItems.length > 0 && !p.panel?.round?.decided) {
-        for (const seat of PANEL_SEATS) {
+        for (const seat of panelSeatNumbers(seatCount)) {
           if (roundPanelSeatSettled(p.panel?.round?.seats?.[String(seat)])) continue;
           const key = `dispatch_round_panel_${seat}` as InFlightKey;
           if (!p.inFlight[key]) actions.push({ type: "dispatch_round_panel", seat });
@@ -136,13 +139,13 @@ export function next(state: State): Action[] {
       // agent's — one action per undecided blocker, computed from the votes.
       for (const blockerId of blockersNeedingPanel(p)) {
         const panel = p.panel!.blockers![blockerId];
-        if (!panel.decided && panelSeatsSettled(panel)) return [{ type: "panel_decide", blockerId }];
+        if (!panel.decided && panelSeatsSettled(panel, seatCount)) return [{ type: "panel_decide", blockerId }];
       }
       if (
         evaluatorsSettled &&
         roundItems.length > 0 &&
         !p.panel?.round?.decided &&
-        roundPanelSeatsSettled(p.panel?.round)
+        roundPanelSeatsSettled(p.panel?.round, seatCount)
       ) {
         return [{ type: "round_panel_decide" }];
       }
@@ -161,6 +164,9 @@ export function next(state: State): Action[] {
       const amendment = amendmentToApply(p, C, K);
       if (amendment) return [{ type: "apply_amendment", decisionId: amendment.id }];
       if (accept(p, C, K)) {
+        // Plan 06c: an acceptable candidate with a declared final check runs
+        // it first, once; the FINAL_CHECKING stage asks for it.
+        if (finalCheckOf(p.contract) && p.finalChecksPassedFor !== C) return [{ type: "final_check_required" }];
         // Plan 01f: an acceptable candidate with a declared gate is gated
         // first; the gate stage then asks for the gate command itself. A
         // gate-less phase accepts exactly as it did before plan 01f.
@@ -169,6 +175,12 @@ export function next(state: State): Action[] {
       }
       return [{ type: "resolving_incomplete" }];
     }
+
+    // Plan 06c: the plan's final check, run once for the candidate about to
+    // be accepted.
+    case "FINAL_CHECKING":
+      if (!p.candidate) return [];
+      return p.inFlight.run_final_checks ? [] : [{ type: "run_final_checks", candidateSha: p.candidate.sha }];
 
     // Plan 01f: the conductor's own gate command, run once for this
     // candidate (a recorded pass for an identical tree is reused instead,

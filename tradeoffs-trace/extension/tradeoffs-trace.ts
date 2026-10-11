@@ -29,8 +29,9 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { guardedSearchPath, guardedShCommand, guardedWritePath, readGuardConfigFromEnv, readSearchRootsFromEnv } from "./guards.ts";
+import { capToolResult } from "../src/effects/rpc.ts";
 
-import { validate, type JSONSchema } from "../src/core/schema.ts";
+import { dropEmptyStrings, validate, type JSONSchema } from "../src/core/schema.ts";
 import { validateCuratorProposal } from "../src/core/entries.ts";
 import { briefIssue } from "../src/core/briefs.ts";
 import { reviewIngestionIssue } from "../src/core/predicate.ts";
@@ -51,6 +52,7 @@ import {
   SUBMIT_BRIEF_PARAMS,
   SUBMIT_DISCOVERY_PARAMS,
   SUBMIT_EVALUATION_PARAMS,
+  SUBMIT_COVERAGE_PARAMS,
   SUBMIT_PANEL_VOTE_PARAMS,
   SUBMIT_PHASE_PARAMS,
   SUBMIT_REVIEW_PARAMS,
@@ -102,6 +104,8 @@ const BRIEF_SCHEMA = loadSchema("../schemas/decision-brief.schema.json");
 const SUBMISSION_SCHEMA_FILE = loadSchema("../schemas/submission.schema.json");
 const SUBMIT_PHASE_SCHEMA = subschema(SUBMISSION_SCHEMA_FILE, "submitPhase");
 const SUBMIT_DISCOVERY_SCHEMA = subschema(SUBMISSION_SCHEMA_FILE, "submitDiscovery");
+// Plan 06b: the worker's per-item coverage.
+const SUBMIT_COVERAGE_SCHEMA = subschema(SUBMISSION_SCHEMA_FILE, "submitCoverage");
 
 // --- typebox parameter schemas (what the model sees / what Pi enforces
 // structurally before `execute` runs). Each is built by mapping over the
@@ -218,6 +222,14 @@ const PriorDecisionParam = Type.Object({
   recommendation: Type.Optional(Type.Object({ choice: Type.String(), reason: Type.String() })),
 });
 
+// Plan 06k3 (A3): one answer per open blocking finding listed in the prompt.
+const FindingAnswerParam = Type.Object({
+  findingId: Type.String({ description: "An open blocking finding id listed in the prompt" }),
+  status: StringEnum(["fixed", "disputed"] as const),
+  test: Type.Optional(Type.String({ description: "fixed only: the test that now covers the finding" })),
+  reason: Type.Optional(Type.String({ description: "disputed only: why the finding is wrong or cannot be fixed" })),
+});
+
 const submitPhaseFields: Record<string, TSchema> = {
   decisions: Type.Array(DecisionParam),
   assumptions: Type.Array(Type.String(), { description: "Assumptions made while implementing" }),
@@ -228,6 +240,12 @@ const submitPhaseFields: Record<string, TSchema> = {
     }),
   ),
   criterionDispute: Type.Optional(CriterionDisputeParam),
+  findingAnswers: Type.Optional(
+    Type.Array(FindingAnswerParam, {
+      description:
+        "Plan 06k3: one answer per open blocking finding listed in the prompt — fixed (with the test that now covers it) or disputed (with the reason). A submission that leaves one unanswered is refused before the freeze.",
+    }),
+  ),
 };
 const SubmitPhaseParams = Type.Object(Object.fromEntries(SUBMIT_PHASE_PARAMS.properties.map((key) => [key, submitPhaseFields[key]])));
 
@@ -239,7 +257,8 @@ const SubmitDiscoveryParams = Type.Object(
 );
 
 const submitReviewFields: Record<string, TSchema> = {
-  reviewer: StringEnum(["M", "A", "B"] as const),
+  // Plan 06h: any seat the plan's #+TT_REVIEWERS declares (default M A B).
+  reviewer: Type.String({ description: "Your reviewer seat, as the conductor told it to you" }),
   phaseId: Type.String(),
   candidateSha: Type.String(),
   contractVersion: ContractVersionParam,
@@ -268,7 +287,54 @@ const submitReviewFields: Record<string, TSchema> = {
       { description: "Plan 05e: mark every earlier-round finding/blocker resolved or open; a 2-of-3 resolved majority closes it" },
     ),
   ),
+  // Plan 06b: a verdict for every requirement and constraint, and every
+  // architecture item. A review that omits an id is incomplete.
+  items: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String({ description: "The requirement or constraint id from the checklist" }),
+        verdict: StringEnum(["met", "unmet", "partial"] as const),
+        evidence: Type.String({ description: "file:line-range in the candidate, a test name, or a command you ran" }),
+        note: Type.Optional(Type.String()),
+      }),
+      { description: "One verdict per requirement and constraint; a missing id is an incomplete review" },
+    ),
+  ),
+  arch: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String({ description: "The architecture item id from the checklist" }),
+        verdict: StringEnum(["fits", "deviates", "unclear"] as const),
+        evidence: Type.String({ description: "file:line-range in the candidate, a test name, or a command you ran" }),
+        note: Type.Optional(Type.String()),
+      }),
+      { description: "One verdict per architecture item; a missing id is an incomplete review" },
+    ),
+  ),
 };
+
+// Plan 06b: the worker's `submit_coverage` — a status for every requirement
+// and constraint, and fits/deviates for every architecture item.
+const CoverageEntryParam = Type.Object({
+  id: Type.String({ description: "The requirement or constraint id from the checklist" }),
+  status: StringEnum(["done", "partial", "not_done"] as const),
+  where: Type.Array(Type.String(), { description: "file:line locations, when known" }),
+  tests: Type.Array(Type.String(), { description: "Test names you ran" }),
+  note: Type.Optional(Type.String({ description: "Required when status is partial or not_done; becomes a trade-off message" })),
+});
+const ArchCoverageEntryParam = Type.Object({
+  id: Type.String({ description: "The architecture item id from the checklist" }),
+  fits: StringEnum(["yes", "deviates"] as const),
+  where: Type.Array(Type.String(), { description: "file:line locations, when known" }),
+  note: Type.Optional(Type.String({ description: "Required when fits is deviates; becomes a trade-off message" })),
+});
+const submitCoverageFields: Record<string, TSchema> = {
+  items: Type.Array(CoverageEntryParam),
+  arch: Type.Array(ArchCoverageEntryParam),
+};
+const SubmitCoverageParams = Type.Object(
+  Object.fromEntries(SUBMIT_COVERAGE_PARAMS.properties.map((key) => [key, submitCoverageFields[key]])),
+);
 const SubmitReviewParams = Type.Object(
   Object.fromEntries(SUBMIT_REVIEW_PARAMS.properties.map((key) => [key, submitReviewFields[key]])),
 );
@@ -312,6 +378,25 @@ const EvaluationParam = Type.Object({
 });
 const submitEvaluationFields: Record<string, TSchema> = {
   evaluations: Type.Array(EvaluationParam, { description: "One entry per raw message you were shown" }),
+  itemChecks: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String({ description: "The plan item, finding or discovered-decision id from the re-check list" }),
+        verdict: StringEnum(["confirmed", "contradicted"] as const),
+        evidence: Type.String({ description: "What you checked in the candidate, as a file:line citation" }),
+        impact: Type.Optional(
+          StringEnum(["wrong-output", "contract", "judgement"] as const, {
+            description:
+              "Plan 06i, a finding or discovered decision only: wrong-output (a wrong value, offer or output on a reachable path), contract (it contradicts the golden source or the plan), or judgement (style, hardening, ergonomics)",
+          }),
+        ),
+        chosen: Type.Optional(Type.String({ description: "Plan 06i, judgement only: what is accepted (with alternative and why, or the record escalates)" })),
+        alternative: Type.Optional(Type.String({ description: "Plan 06i, judgement only: the alternative given up" })),
+        why: Type.Optional(Type.String({ description: "Plan 06i, judgement only: why the judgement call is acceptable" })),
+      }),
+      { description: "Plan 06b/06i: your re-check of each plan item, finding or discovered decision that owes one, with its impact class" },
+    ),
+  ),
 };
 const SubmitEvaluationParams = Type.Object(
   Object.fromEntries(SUBMIT_EVALUATION_PARAMS.properties.map((key) => [key, submitEvaluationFields[key]])),
@@ -324,7 +409,7 @@ const PanelOptionParam = Type.Object({
 });
 const submitPanelVoteFields: Record<string, TSchema> = {
   blockerId: Type.String({ description: "The raw blocker message id this vote is about" }),
-  seat: Type.Integer({ description: "This seat's number (1, 2 or 3)" }),
+  seat: Type.Integer({ minimum: 1, description: "This seat's number (1..N, one per reviewer)" }),
   vote: StringEnum(["block", "downgrade"] as const, {
     description: "block: stop the work until the owner decides; downgrade: an ordinary blocking finding for the next worker attempt",
   }),
@@ -469,11 +554,13 @@ class RunSocketClient {
       | "submit_phase"
       | "submit_discovery"
       | "submit_review"
+      | "submit_coverage"
       | "raise_tradeoff"
       | "submit_evaluation"
       | "submit_panel_vote"
       | "submit_round_panel_votes"
       | "submit_brief"
+      | "submit_pick_vote"
       | "curate_entries",
     args: unknown,
     timeoutMs = 60000,
@@ -520,7 +607,8 @@ export default function (pi: ExtensionAPI) {
   const client = new RunSocketClient();
   const guardConfig = readGuardConfigFromEnv();
   let activeTools: string[] = [];
-  const role = (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | "curator" | undefined) ?? "worker";
+  const role =
+    (readEnv("TT_ROLE") as "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker" | undefined) ?? "worker";
   const accepted = new Set<string>();
   // A reviewer's turn 2 starts with the first agent_start after its
   // discovery (turn 1) was accepted; before that, turn 1 is still running.
@@ -532,7 +620,13 @@ export default function (pi: ExtensionAPI) {
    * is satisfied. Worker: submit_phase. Reviewer: submit_discovery in turn
    * 1, then submit_review in turn 2 (design §3.3 two-turn review). */
   function owedSubmission(): string | undefined {
-    if (role === "worker") return accepted.has("submit_phase") ? undefined : "submit_phase";
+    if (role === "worker") {
+      // Plan 06b (OD-1): a STRUCTURED phase (the conductor sets TT_ITEMS=1)
+      // makes the worker end with submit_coverage before submit_phase; an
+      // old-format phase owes submit_phase only.
+      if (readEnv("TT_ITEMS") === "1" && !accepted.has("submit_coverage")) return "submit_coverage";
+      return accepted.has("submit_phase") ? undefined : "submit_phase";
+    }
     // Plan 05j: the curator owes no submission; an empty proposals list is a
     // valid pass and settling without one is allowed.
     if (role === "curator") return undefined;
@@ -550,12 +644,20 @@ export default function (pi: ExtensionAPI) {
       const owed = round ? "submit_round_panel_votes" : "submit_panel_vote";
       return accepted.has(owed) ? undefined : owed;
     }
+    // Plan 06g2: the round's pick turn — a picker seat votes for one
+    // candidate of the round; it owes exactly submit_pick_vote.
+    if (role === "picker") return accepted.has("submit_pick_vote") ? undefined : "submit_pick_vote";
+    // Plan 06g2: a lane candidate's review is today's two-turn review, once
+    // per candidate, so it follows the ordinary reviewer branch below —
+    // turn 1 owes submit_discovery, then turn 2 owes submit_review.
     if (!accepted.has("submit_discovery")) return "submit_discovery";
     if (reviewTurnStarted && !accepted.has("submit_review")) return "submit_review";
     return undefined;
   }
 
   const REMINDER_TEXT: Record<string, string> = {
+    submit_coverage:
+      "You have not called submit_coverage yet. For every requirement and constraint, give status done, partial or not_done with where and tests; for every architecture item, give fits or deviates with where. A partial, not_done or deviates entry must carry a note.",
     submit_phase:
       "You have not called submit_phase yet. The phase cannot finish without it — call submit_phase with your decisions, assumptions and deviations before finishing.",
     submit_discovery:
@@ -568,6 +670,8 @@ export default function (pi: ExtensionAPI) {
       "You have not called submit_panel_vote yet. Vote block (stop the work until the owner decides — propose two or three options for the owner) or downgrade (an ordinary blocking finding for the next worker attempt), with a reason.",
     submit_round_panel_votes:
       "You have not called submit_round_panel_votes yet. Return one {messageId, verdict: 'keep'|'drop', reason} for EVERY item the prompt listed, in one call.",
+    submit_pick_vote:
+      "You have not called submit_pick_vote yet. Vote for exactly one candidate of the round, by lane, with a one-line why.",
   };
 
   pi.on("session_start", async () => {
@@ -668,6 +772,7 @@ export default function (pi: ExtensionAPI) {
       | "submit_phase"
       | "submit_discovery"
       | "submit_review"
+      | "submit_coverage"
       | "raise_tradeoff"
       | "submit_evaluation"
       | "submit_panel_vote"
@@ -716,9 +821,25 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Submit the phase's decisions, assumptions and deviations",
     parameters: SubmitPhaseParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(SUBMIT_PHASE_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_phase", params);
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_coverage",
+    label: "Submit Coverage",
+    description:
+      "Cover every requirement and constraint (done/partial/not_done, with where and tests) and every architecture item (fits/deviates, with where). The phase cannot freeze until the coverage is complete.",
+    promptSnippet: "Submit your coverage of every requirement, constraint and architecture item",
+    parameters: SubmitCoverageParams,
+    async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
+      const error = validateOrError(SUBMIT_COVERAGE_SCHEMA, params);
+      if (error) return { isError: true, content: [{ type: "text", text: error }] };
+      return submitTool("submit_coverage", params);
     },
   });
 
@@ -730,6 +851,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Submit the decisions you discovered in the diff",
     parameters: SubmitDiscoveryParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(SUBMIT_DISCOVERY_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_discovery", params);
@@ -743,6 +865,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Submit your review of the candidate",
     parameters: SubmitReviewParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(REVIEW_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       // The same shared ingestion rule reduce() applies for
@@ -777,6 +900,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Vote block or downgrade on the raw blocker",
     parameters: SubmitPanelVoteParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(PANEL_VOTE_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text", text: error }] };
       return submitTool("submit_panel_vote", params);
@@ -791,7 +915,36 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Vote keep or drop on every pending item",
     parameters: SubmitRoundPanelVotesParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       return submitTool("submit_round_panel_votes", params);
+    },
+  });
+
+  // Plan 06g2: one seat's pick vote in a two-lane round. The round's winner
+  // is decided in code (core/rounds.ts's pickWinner), never by a model; this
+  // tool only records one seat's vote for one lane.
+  pi.registerTool({
+    name: "submit_pick_vote",
+    label: "Submit Pick Vote",
+    description:
+      "Cast your pick vote for one candidate of the round: { round, seat, lane, why, loserHad: { yes, anchors, note? } }.",
+    promptSnippet: "Vote for one candidate of the round, by lane, with a one-line why and what the losing lane had",
+    parameters: Type.Object({
+      round: Type.Number(),
+      seat: Type.String(),
+      lane: Type.String(),
+      why: Type.String(),
+      // Plan 06k1 (A1): the conductor requires it; without it in the schema a
+      // model cannot send it as an object and every vote is refused.
+      loserHad: Type.Object({
+        yes: Type.Boolean(),
+        anchors: Type.Array(Type.String()),
+        note: Type.Optional(Type.String()),
+      }),
+    }),
+    async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
+      return submitTool("submit_pick_vote", params);
     },
   });
 
@@ -803,6 +956,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Return one publish/merge/drop entry per raw message",
     parameters: SubmitEvaluationParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       return submitTool("submit_evaluation", params);
     },
   });
@@ -815,6 +969,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Write the owner-facing brief for each open owner item",
     parameters: SubmitBriefParams,
     async execute(_toolCallId, params) {
+      params = dropEmptyStrings(params) as typeof params;
       const error = validateOrError(BRIEF_SCHEMA, params);
       if (error) return { isError: true, content: [{ type: "text" as const, text: error }] };
       const issue = briefIssue(params as never);
@@ -882,7 +1037,9 @@ export default function (pi: ExtensionAPI) {
         const exit = await client.runShell(params.command, params.cwd, (msg) => chunks.push(msg.chunk), waitMs);
         return {
           isError: exit.code !== 0,
-          content: [{ type: "text" as const, text: chunks.join("") || `(no output, exit ${exit.code})` }],
+          // Plan 06k2 (A6): cap the whole result (bytes, single line included)
+          // before it reaches the model's context.
+          content: [{ type: "text" as const, text: capToolResult(chunks.join("") || `(no output, exit ${exit.code})`) }],
           details: { exitCode: exit.code, signal: exit.signal },
         };
       } catch (err) {

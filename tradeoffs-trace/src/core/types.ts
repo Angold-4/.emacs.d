@@ -37,6 +37,9 @@ export interface RecordBinding {
 // §1.1 Plan and phase contract
 // ---------------------------------------------------------------------------
 
+import type { ArchitectureItem, ConstraintItem, RequirementItem } from "./items.ts";
+import type { Deferral, TriageRecord } from "./triage.ts";
+
 export interface PlanPhase {
   id: string;
   goal: string;
@@ -45,6 +48,32 @@ export interface PlanPhase {
   boundaries: string[];
   reserved: string[];
   provisional: boolean;
+  /** Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by a
+   * phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted runs
+   * it, once. Absent on a plan that declares none, which behaves as before. */
+  finalChecks?: string[];
+  /** Plan 06g: `#+TT_WORKERS:` — how many lanes one round runs. Absent (or 1)
+   * is today's single-candidate loop; 2 is the two-lane round. */
+  workers?: number;
+  /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before it
+   * parks on the owner. Absent means the default of 3. */
+  rounds?: number;
+  /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` — how many consecutive rounds may
+   * each raise a new blocking finding of the same kind on one requirement
+   * before the owner is asked. Absent means 3. */
+  variantLimit?: number;
+  /** Plan 06h (A1): `#+TT_REVIEWERS:` — the odd list of reviewer seats.
+   * Absent means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A1): `#+TT_LEADER:` — the seat whose approval and tie-break
+   * vote decide. Absent means the first seat. */
+  leader?: string;
+  /** Plan 06b: the structured items of a phase subtree (ref
+   * refs/06_ref_plan_format.md). Absent on an old-format plan, where
+   * `acceptance`/`reserved` are the only items. */
+  architecture?: ArchitectureItem[];
+  requirements?: RequirementItem[];
+  constraints?: ConstraintItem[];
 }
 
 export interface Plan {
@@ -53,15 +82,61 @@ export interface Plan {
   phases: PlanPhase[];
 }
 
+/** Plan 06h (A1): the run's seat configuration, recorded in the init event so
+ * a run replays with its own seats even after the plan changes. An old log
+ * that records none means `M`, `A` and `B`, led by `M`. */
+export interface Seats {
+  seats: string[];
+  leader: string;
+  workers: number;
+}
+
 /** The frozen contract a phase is evaluated against: one phase of one plan snapshot. */
 export interface PhaseContract {
   phaseId: string;
   contractVersion: ContractVersion;
   goal: string;
+  /** Plan 06i (A3): the phase's golden note — the current source a choice
+   * that matches an earlier drafting decision is re-checked against. A
+   * `contract` classification must cite it. */
+  golden?: string;
   acceptance: string[];
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 06c: the phase's final check, frozen into the contract. Only a
+   * candidate that has passed review with no open blocker runs it, once
+   * (core/checks.ts's `checkTier`). */
+  finalChecks?: string[];
+  /** Plan 06g: `#+TT_WORKERS:` frozen into the contract — how many lanes one
+   * round runs. Absent (or 1) is today's single-candidate loop. */
+  workers?: number;
+  /** Plan 06g: `#+TT_ROUNDS:` frozen into the contract, or undefined for the
+   * default (3). `roundBudget()` reads this; nothing else decides the budget. */
+  roundsAllowed?: number;
+  /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` frozen into the contract, or
+   * undefined for the default (3). `variantLimitOf()` reads this. */
+  variantLimit?: number;
+  /** Plan 06h (A1/A2): the frozen reviewer seats. `seatsOf(contract)` is the
+   * only source of the seat list; every place that used to hard-code M, A and
+   * B reads it. Absent on an old contract means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A2): the frozen leader. Absent means the first seat. */
+  leader?: string;
+  /** Plan 06b: the structured items of the frozen contract. The FSM,
+   * prompts, checks, verdicts and acceptance all read these; absent on an
+   * old-format phase, where `itemsFromPhase` synthesizes R1..Rn from
+   * `acceptance` and C1 from `reserved`. */
+  architecture?: ArchitectureItem[];
+  requirements?: RequirementItem[];
+  constraints?: ConstraintItem[];
+  /** Plan 06b: true when the conductor synthesized these items from an
+   * old-format `acceptance`/`:RESERVED:` list. The items are carried through
+   * the matrix and acceptance either way; the coverage and per-item verdict
+   * REQUIREMENTS apply once the worker has submitted coverage (the extension
+   * makes every real worker do so), so a hand-built in-process plan keeps its
+   * old behaviour. */
+  itemsSynthesized?: boolean;
   /** Plan 01f: the phase's own expensive, live command (the plan's `:GATE:`
    * property). Declaring one inserts a GATING stage between RESOLVING and
    * ACCEPTED: the conductor runs this command itself, once per candidate the
@@ -131,6 +206,9 @@ export interface CriterionAmendment {
   id: string;
   criterion: string; // the replaced acceptance item, verbatim
   proposedWording: string; // the replacement
+  /** Plan 06b (OD-1 R6): on a structured phase, the requirement item id the
+   * amendment names. The rewrite targets this id, never a list position. */
+  itemId?: string;
   why: string;
   raisedBy: "worker" | Reviewer;
   status: AmendmentStatus;
@@ -167,6 +245,10 @@ export interface Decision {
   /** Plan 2c: reviewers who independently discovered this same choice and
    * matched their discovery to this record (design §3.3, §10). */
   alsoSeenBy?: Reviewer[];
+  /** Plan 06b: the plan item this finding is anchored to (an R, C or A id),
+   * when a per-item majority produced it. The repair prompt and the item
+   * matrix use it to point at the exact point. */
+  itemId?: string;
 }
 
 /** Plan 2c: in a repair attempt the worker states, for each of its prior
@@ -190,8 +272,10 @@ export interface PriorDecisionStatement {
 
 export type FindingKind = "defect" | "contract" | "integration";
 export type FindingSeverity = "blocking" | "advisory";
-export type FindingStatus = "open" | "repaired" | "disproved" | "accepted" | "superseded";
-export type Reviewer = "M" | "A" | "B";
+export type FindingStatus = "open" | "repaired" | "disproved" | "accepted" | "superseded" | "merged";
+/** Plan 06h: a seat is any name `#+TT_REVIEWERS` declares. The default is
+ * still `M`, `A` and `B`, but nothing in the code may assume that set. */
+export type Reviewer = string;
 
 export interface Finding {
   id: string;
@@ -209,6 +293,10 @@ export interface Finding {
   reproduction?: { command: string; result: "reproduced" | "not_reproduced" | "inconclusive" };
   repairedByCandidateSha?: string;
   disprovedEvidence?: string;
+  /** Plan 06i (C3): the record this finding was merged into as a duplicate
+   * (06c B4: "merged", never "disproved"). Its triage disposition is the
+   * original's. */
+  mergedInto?: string;
   acceptedScope?: string; // required scope note (§4.2, §10.4 `x`)
   /** Plan 01g: the acceptance item this `contract` finding disputes verbatim
    * (set when it was raised with a `criterionDispute`). A later amendment of
@@ -229,6 +317,19 @@ export interface Finding {
   /** Plan 05e: why the finding's severity changed from the raised one (the
    * evaluator's plan check, or the round panel's vote). */
   severityReason?: string;
+  /** Plan 06k3 (A3): the worker's answer to this open blocking finding,
+   * carried by submit_phase — `fixed` with the test that now covers it, or
+   * `disputed` with the reason. A submission that leaves one unanswered is
+   * refused before the freeze. */
+  answer?: FindingAnswer;
+  /** Plan 06i: WHO changed the severity — the evaluator's plan check, the
+   * round panel's vote, or a reviewer's `sameAs` re-raise. The triage reads
+   * it: a panel drop is a recorded review outcome (a trade-off). */
+  severityChangedBy?: "evaluator" | "panel" | "reviewer";
+  /** Plan 06k1 (A3): the phase round this finding was raised in, so the
+   * variant limit can count the same requirement's blocking findings across
+   * consecutive rounds. Set by the conductor when the finding is raised. */
+  roundRaised?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +501,11 @@ export interface OwnerRequest {
    * no-op. See owner-requests.ts for what each origin offers. */
   options: OwnerRequestOption[];
   status: OwnerRequestStatus;
+  /** Plan 06i: `false` for an escalation of an item OUTSIDE the round's
+   * ballot/evaluation window (a discovery that arrived after the prompts). It
+   * is recorded and visible, but it does not gate acceptance, so a late
+   * discovery never stalls the phase. Absent means blocking. */
+  blocking?: boolean;
   /** `option` is the chosen option's *id* (never its label). */
   resolution?: { option: string; note?: string };
   /** The (candidate, contract) the *resolution* was bound to — design §6.3's
@@ -473,6 +579,16 @@ export interface DecisionBrief {
 
 export type CorrectionStatus = "open" | "addressed" | "resolved" | "withdrawn";
 
+/** Plan 06k1 (A2): an owner ruling on one decision. `choice` pins the
+ * ruling to the exact choice the owner ruled on: a later candidate that
+ * changes the decision's choice is NOT settled by this ruling. */
+export interface RuledDecision {
+  id: string;
+  choice: string;
+  /** The correction or directive id that ruled it. */
+  by: string;
+}
+
 export interface Correction {
   id: string;
   version: number;
@@ -538,6 +654,16 @@ export interface BallotDisclosure {
   rationale: string;
   evidence: string[];
   contractObjection?: boolean;
+}
+
+/** Plan 06k3 (A3): a worker's answer to one open blocking finding, carried by
+ * `submit_phase`. `fixed` requires the test that now covers it; `disputed`
+ * requires the reason. */
+export interface FindingAnswer {
+  findingId: string;
+  status: "fixed" | "disputed";
+  test?: string;
+  reason?: string;
 }
 
 export interface FindingDisclosure {
@@ -608,6 +734,12 @@ export interface Review {
    * evidence. A majority `resolved` moves the message to `resolved`; a
    * majority `open` (or no majority) leaves it live. */
   resolutionStatements?: FindingResolutionStatement[];
+  /** Plan 06b: this reviewer's verdict on every requirement and constraint
+   * (`met`/`unmet`/`partial`) and every architecture item
+   * (`fits`/`deviates`/`unclear`), each with evidence. A review that omits an
+   * id is incomplete under the existing complete-ballot rule. */
+  items?: import("./items.ts").ItemVerdict[];
+  arch?: import("./items.ts").ArchVerdict[];
 }
 
 /** Plan 05e: one reviewer's mark on an earlier round's open finding/blocker
@@ -755,6 +887,7 @@ export type PhaseStateName =
   | "REVIEWING"
   | "EVALUATING"
   | "RESOLVING"
+  | "FINAL_CHECKING"
   | "GATING"
   | "ACCEPTED"
   | "PUBLISHING"
@@ -818,6 +951,8 @@ export type OwnerInputKind = "steer" | "note" | "correction" | "directive" | "wi
 export type OwnerInputState =
   | "delivered" // steer acknowledged by Pi (deliver.done)
   | "noted" // note queued for the next worker attempt
+  | "queued" // plan 06d: a correction outside AWAITING_OWNER, or a steer with no
+  // running worker, queued for the next worker attempt (never refused)
   | "correction-started" // AWAITING_OWNER correction: requests resolved, repair started
   | "delivery-uncertain" // steer intent recorded, no acknowledgement (never resent)
   | "reverted" // plan 01g: a correction naming an amendment id restored its criterion
@@ -830,6 +965,10 @@ export interface OwnerInputRecord {
   state: OwnerInputState;
   attemptId?: string; // steer: the worker attempt id it was bound to
   reason?: string; // refused / delivery-uncertain detail
+  /** Plan 06m (A2): per-target outcome for a steer delivered to every live
+   * lane worker, keyed by its label (`worker-a`, `worker-b`). Absent for a
+   * single-candidate steer (whose `attemptId` names the one worker). */
+  deliveries?: Record<string, OwnerInputState>;
   at: string; // ISO timestamp the conductor recorded
 }
 
@@ -912,6 +1051,10 @@ export interface ChecksResult {
   candidateSha: string;
   passed?: boolean;
   interrupted?: boolean;
+  /** Plan 06j (A3): which tier the last run used, so a recheck from
+   * AWAITING_OWNER re-runs the SAME tier (`round` or `final`). Absent on an
+   * old log means `round`. */
+  tier?: "round" | "final";
   /** Plan 05d: every new failing test of the candidate's last check (each
    * re-run alone), so the worker's repair prompt labels a real failure and a
    * flake apart (finding #35). Cleared when the next candidate freezes. */
@@ -951,15 +1094,14 @@ export type InFlightKey =
   | "freeze"
   | "run_checks"
   | "dispatch_probe"
-  | "review_M"
-  | "review_A"
-  | "review_B"
+  | `review_${string}`
   | "dispatch_evaluation_tradeoff"
   | "dispatch_evaluation_finding"
   | "dispatch_evaluation_blocker"
   | `dispatch_panel_${string}_${number}`
   | `dispatch_round_panel_${number}`
   | "run_gate"
+  | "run_final_checks"
   | "publish_cas";
 
 /** The full state of one phase, as reduce()/next() see it. */
@@ -974,11 +1116,18 @@ export interface PhaseState {
   candidate?: CandidateRef; // set once FREEZING completes
   checks?: ChecksResult;
   probe?: ProbeResult;
-  reviews: { M?: ReviewSlot; A?: ReviewSlot; B?: ReviewSlot };
+  /** Plan 06h: keyed by seat name, so any `#+TT_REVIEWERS` list works. An
+   * old state/fixture with `M`/`A`/`B` keeps working unchanged. */
+  reviews: Record<string, ReviewSlot>;
   decisions: Decision[];
   findings: Finding[];
   ownerRequests: OwnerRequest[];
   corrections: Correction[];
+  /** Plan 06k1 (A2): decisions the owner ruled on by an owner correction or
+   * directive that names the id as ruled. A ruling settles the decision on
+   * every later candidate whose decision has the same id and choice, with no
+   * ballots and no re-tally. */
+  ruledDecisions?: RuledDecision[];
   ballots: Ballot[];
   overrides: Override[];
   /** Outstanding dispatches next() must not re-emit (design §9.3's intent
@@ -1002,6 +1151,18 @@ export interface PhaseState {
   integrityViolated?: boolean;
   repairRoundsUsed: number;
   repairRoundsGranted: number; // 3 base, +3 per correction (§7.5, §8.1)
+  /** Plan 06k3 (A1): free repeats of a round that failed only because a lane
+   * review or pick vote was still missing after its retry (at most two per
+   * phase). Recorded as an event so a conductor restart cannot reset it. */
+  roundRepeatsUsed?: number;
+  /** Plan 06k3 (A4): the unchanged-resubmission permission keys already
+   * consumed (e.g. `note:0`, `directive:OD-1`). An event, not process
+   * memory, so a conductor restart cannot reopen a spent permission. */
+  consumedUnchangedPermissions?: string[];
+  /** Plan 06k3 (A2): uncommitted work saved when a worker missed its deadline,
+   * one entry per (lane, attempt) — the next attempt of that lane starts from
+   * `ref` and its prompt names it. */
+  unsubmittedWork?: Array<{ lane: string; attempt: number; ref: string; sha: string }>;
   publishedI?: string;
   /** §7.4 `note`: owner notes queued from the inbox, delivered verbatim in
    * the next worker attempt's prompt (see `deliveredNoteCount` for the
@@ -1013,6 +1174,15 @@ export interface PhaseState {
    * and then logs NOTES_DELIVERED, so a note reaches the *next* attempt
    * (§7.4) instead of every later one. Optional/absent = none delivered. */
   deliveredNoteCount?: number;
+  /** Plan 06k1 (A5, finding A-8): corrections that arrived while the phase
+   * was reviewing, evaluating or final-checking. They are queued for the next
+   * worker attempt's prompt and are an acceptance obligation until that
+   * prompt has been sent (cleared by NOTES_DELIVERED), so a correction is
+   * never lost to timing and `accept()` refuses until it is delivered. */
+  queuedCorrections?: Array<{ id: string; text: string; /** Plan 06k2 (A8): the position this note occupies in `ownerNotes`, so
+   * NOTES_DELIVERED clears exactly the corrections a prompt carried (finding
+   * F-M-14) and never one queued after it. */
+    index?: number }>;
   /** §3.5/§10.4 `s`: record ids the owner marked "should have been
    * surfaced" — the observed miss sample, recorded as a pilot metric. */
   misses?: string[];
@@ -1089,9 +1259,152 @@ export interface PhaseState {
    * been re-dispatched once. Folded from BRIEF_RETRY_ATTEMPTED, so the retry
    * is once per candidate even across a restart. */
   briefRetries?: string[];
+  /** Plan 06g: the phase's rounds, in order — each round's base, lanes,
+   * candidates, pick votes and winner. Absent for a plan without
+   * `#+TT_WORKERS`, where no round event is ever recorded. */
+  rounds?: RoundRecord[];
+  /** Plan 06g (A6): the owner's `accept_carried` decision at budget
+   * exhaustion — "accept with carried items". Set only by that owner option;
+   * `accept()` honours it, and the views list `carriedItems`. */
+  acceptedWithCarried?: boolean;
+  /** Plan 06g: the open items carried past this phase, by finding id. */
+  carriedItems?: string[];
+  /** Plan 06g (ODP-2): the candidate sha the owner's carry was given for.
+   * `accept()` accepts only when it equals the candidate under acceptance, so
+   * a carry can never accept a stale or failing candidate. */
+  carriedCandidateSha?: string;
+  /** Plan 06g (A4): the test names that failed at THIS round's base — the
+   * phase base in round 1, the previous candidate in a repair. Recorded at
+   * the freeze, so `#regressionTests` compares against the round's base, not
+   * the phase base. Absent in round 1 (the phase baseline is the base then). */
+  roundBaseFailures?: string[];
+  /** Plan 06g (A5): the target phase each carried item goes to, keyed by the
+   * finding/message id (`tt carry <run> <id> --to <phase-id>`). `accept_carried`
+   * carries the open items without a named target, so an id may be absent. */
+  carriedTo?: Record<string, string>;
+  /** Plan 06b: the worker's `submit_coverage` payload. The freeze is refused
+   * until it covers every R, C and A. */
+  coverage?: import("./items.ts").Coverage;
+  /** OD-2 A2 / owner steer: the attempt number this coverage was submitted
+   * in. The freeze requires it to equal the current `attempt.n`, so an
+   * earlier attempt's report can never satisfy a later attempt's gate. */
+  coverageAttempt?: number;
+  /** Plan 06b: every `test` verify resolved against the candidate's check
+   * run. A missing or failed one is a blocking finding anchored to its item. */
+  checkResolution?: import("./items.ts").VerifyResolution[];
+  /** The candidate's check-run test-result lines, so a reviewer's cited test
+   * resolves even when it is not a plan verify. */
+  checkTestLines?: string[];
+  /** Plan 06b: the items the owner recorded with `tt evidence`, and the
+   * recording. The phase parks AWAITING_OWNER until every `evidence` item is
+   * here. */
+  itemEvidence?: Array<{ id: string; text: string; at?: string; commandId?: string }>;
+  /** Plan 06b: architecture item ids whose deviation the owner accepted as a
+   * trade-off. */
+  acceptedDeviations?: string[];
+  /** Plan 06b: architecture items whose `:WHERE:` symbol the conductor
+   * grepped for and did not find in the candidate. Recorded as `deviates`
+   * before any reviewer is asked. */
+  archSymbolDeviations?: string[];
+  /** Plan 06b: verdicts the evaluator's re-verification overturned, each
+   * counted against its seat. */
+  overturns?: import("./items.ts").Overturn[];
+  /** Plan 06b (OD-1 R3b): the evaluator's substantive re-check of an item's
+   * majority verdict, recorded with what it checked. A `contradicted` check
+   * overturns the majority (the FINDING_VERIFIED path). */
+  itemChecks?: Array<{
+    itemId: string;
+    verdict: "confirmed" | "contradicted" | "unchecked";
+    evidence: string;
+    /** Plan 06i: the evaluator's impact class for a finding or discovered decision (through the same item-check form). */
+    impact?: import("./triage.ts").Impact;
+    /** Plan 06i: a judgement call's own chosen/alternative/why, given by the
+     * evaluator. A judgement record without all three escalates; the
+     * conductor never supplies stock text. */
+    chosen?: string;
+    alternative?: string;
+    why?: string;
+  }>;
+  /** Plan 06i: one triage record per finding and per discovered decision of
+   * the current candidate, keyed by id. A record without a disposition at the
+   * end of evaluation is a defect of the loop, never a pass. */
+  triage?: TriageRecord[];
+  /** Plan 06i: deferrals whose fix is put off. Each needs a guard — a test
+   * that shows its current cost, or a recorded owner ruling — and is listed
+   * under "Open deferrals" in `tt summary` until resolved. */
+  deferrals?: Deferral[];
+  /** Plan 06c: the candidate whose `final` check run already passed, so
+   * RESOLVING accepts it without asking for the final check again. Cleared
+   * when a new candidate freezes. */
+  finalChecksPassedFor?: string;
 }
 
 /** Plan 05d: one recorded flake, as folded from a FLAKE_OBSERVED event. */
+// ---------------------------------------------------------------------------
+// Plan 06g: the round (K lanes, one base, one winner)
+// ---------------------------------------------------------------------------
+
+/** One lane's result inside a round. `sha` is set when the lane froze a
+ * candidate; `ok` when its checks ran (true = passed). A lane that crashed,
+ * timed out or produced no submission leaves both unset and carries `note`,
+ * so the status can say why. */
+export interface LaneCandidateRecord {
+  lane: string; // "a", "b", …
+  sha?: string;
+  ok?: boolean;
+  note?: string;
+  /** Plan 06g2 (A3): the reviews this candidate drew, one per seat — the
+   * round's own per-candidate record, so the review buffer groups them by
+   * candidate. Set only once a review arrives; absent on a candidate whose
+   * reviews have not been recorded (or on a plan without lanes). */
+  reviews?: Array<{ seat: string; review: Review }>;
+}
+
+/** Plan 06k1 (A1): what the losing lane had that the seat's pick did not.
+ * `yes` false with no anchors is an explicit "nothing"; a vote whose
+ * `loserHad` is absent was not recorded (an old log). */
+export interface LoserHad {
+  yes: boolean;
+  anchors: string[];
+  note?: string;
+}
+
+/** One seat's vote in a round's pick turn. `why` is the one-line reason;
+ * `loserHad` says whether the losing lane had something the picked lane
+ * lacked. A vote without `loserHad` is re-asked once, like an incomplete
+ * review, and only reaches the log if the re-ask also failed. */
+export interface PickVote {
+  seat: string; // "M", "A", "B"
+  lane: string;
+  why: string;
+  /** Plan 06k1 (A1): required on every new vote; absent only in a log
+   * written before this phase (the views show "not recorded"). */
+  loserHad?: LoserHad;
+}
+
+/** Plan 06h (A3): the one revote a 3+-candidate round runs when no lane has
+ * a strict majority. `lanes` are the top two by first-round votes. */
+export interface RoundRevote {
+  lanes: string[];
+  votes: PickVote[];
+}
+
+/** One round of a phase: the base it started from, its lanes, their
+ * candidates, the pick turn's votes and the winner. Reduced from the
+ * ROUND_STARTED / CANDIDATE_SUBMITTED / CANDIDATE_CHECKED / PICK_VOTE /
+ * CANDIDATE_PICKED record events, so a restart rebuilds it from the log. */
+export interface RoundRecord {
+  round: number;
+  base: string;
+  lanes: string[];
+  candidates: LaneCandidateRecord[];
+  votes: PickVote[];
+  /** Plan 06h (A3): present only when 3+ candidates split with no strict
+   * majority and the top two went to a revote. */
+  revote?: RoundRevote;
+  picked?: { lane: string; sha: string; votes: number };
+}
+
 export interface FlakeObservation {
   name: string;
   command: string;
@@ -1132,6 +1445,9 @@ export interface EvAttemptStarted {
 export interface EvSubmitPhase {
   type: "SUBMIT_PHASE";
   disclosures: DecisionDisclosure[];
+  /** Plan 06k3 (A3): one answer per open blocking finding (fixed with the
+   * covering test, or disputed with the reason). */
+  findingAnswers?: FindingAnswer[];
   /** Plan 2c: statements about prior decisions (repair attempts only). */
   prior?: PriorDecisionStatement[];
   /** Plan 01g: a criterion the worker says cannot be met as written; freeze
@@ -1142,6 +1458,9 @@ export interface EvSubmitPhase {
 /** Plan 04a: the base baseline finished (run or reused). */
 export interface EvBaselineCompleted {
   type: "BASELINE_COMPLETED";
+  /** Plan 06c (A3): the parent candidate whose passing check record this run
+   * reused as its baseline, when it reused one. */
+  reusedFrom?: string;
 }
 /** Plan 04a: the base baseline could not be taken in time; the checks stay
  * strict and the work continues. */
@@ -1372,9 +1691,19 @@ export interface EvCandidateApproved {
 }
 export interface EvAttemptNoSubmission {
   type: "ATTEMPT_NO_SUBMISSION";
+  /** Plan 06l (A3/R5): the cause when the attempt ended because the agent
+   * process exited, settled, or failed its model call terminally (a 404, a
+   * context overflow) without submitting. Absent for a plain silent settle. */
+  note?: string;
 }
 export interface EvAttemptInterrupted {
   type: "ATTEMPT_INTERRUPTED";
+  /** Plan 06j (A3/OD-5): the stopped attempt left a worktree the next one
+   * must reset before it starts (a recheck whose worktree reset failed). */
+  taint?: boolean;
+  /** Plan 06l (R5): why the attempt ended, e.g. the worker's exit code or
+   * signal, so a dead agent's cause is on the event. */
+  note?: string;
 }
 /** Phase 1b addition (pure, additive): `decisions` are the fully assembled,
  * bound Decision records the conductor built from `phase.pendingDisclosures`
@@ -1407,6 +1736,21 @@ export interface EvChecksFailed {
 }
 export interface EvChecksInterrupted {
   type: "CHECKS_INTERRUPTED";
+}
+
+/** Plan 06j (A3): the owner asks the conductor to re-run the frozen
+ * candidate's own checks, because the failure looks like the machine (a
+ * killed process, load-only timing, an inherited environment) rather than
+ * the code. It dispatches no worker and spends no repair round; the earlier
+ * failure stays in the log with `reason`. Accepted only after
+ * CHECKS_FAILED/FINAL_CHECKS_FAILED on the current candidate and before a
+ * newer candidate exists. */
+export interface EvRecheckRequested {
+  type: "RECHECK_REQUESTED";
+  candidateSha: string;
+  reason: string;
+  /** The tier the failed run used, so the recheck re-runs the same one. */
+  tier?: "round" | "final";
 }
 
 /** Plan 05d: one new failing test that passed when re-run alone — a flake,
@@ -1495,6 +1839,16 @@ export interface EvProbeInterrupted {
 export interface EvReviewSubmitted {
   type: "REVIEW_SUBMITTED";
   review: Review;
+  /** Plan 06g: the candidate this review judged, when the round reviewed more
+   * than one (K ≥ 2). Absent on the single-lane loop, where the phase's own
+   * candidate is the only one there could be. */
+  candidate?: string;
+  /** Plan 06g2: the round whose winner this review is promoted into the
+   * phase's review slots for. The round already recorded it as a
+   * ROUND_REVIEW_SUBMITTED when it was submitted, so a view that counts the
+   * round's reviews must not count this promotion a second time. Absent on
+   * the single-lane loop. */
+  promotedFrom?: number;
 }
 export interface EvReviewTimedOut {
   type: "REVIEW_TIMED_OUT";
@@ -1530,7 +1884,10 @@ export interface EvFindingConfirmedRepaired {
 export interface EvFindingDisproved {
   type: "FINDING_DISPROVED";
   findingId: string;
-  byReviewer: Reviewer;
+  /** Plan 06m (A1/R2): the owner may refuse a finding directly; it is
+   * settled as disproved with the refusal reason on the record, and creates
+   * nothing that must be answered. */
+  byReviewer: Reviewer | "owner";
   evidence: string;
 }
 export interface EvFindingAcceptedByOwner extends RecordBinding {
@@ -1573,6 +1930,38 @@ export interface EvAccepted {
  * RESOLVING --ACCEPTED--> ACCEPTED edge). */
 export interface EvGateRequired {
   type: "GATE_REQUIRED";
+}
+
+/** Plan 06c: the candidate is acceptable and its contract declares a final
+ * check — so the final check runs first, once. Emitted by the conductor
+ * exactly when next() asks for it, never for a phase without a final check
+ * (which keeps the old RESOLVING --ACCEPTED--> ACCEPTED edge). */
+export interface EvFinalCheckRequired {
+  type: "FINAL_CHECK_REQUIRED";
+}
+
+/** Plan 06c: the final check ran and passed, so the candidate is accepted. */
+export interface EvFinalChecksPassed {
+  type: "FINAL_CHECKS_PASSED";
+  candidateSha: string;
+}
+
+/** Plan 06c: the final check failed. An ordinary check failure: the phase
+ * returns to REPAIRING (or AWAITING_OWNER when the repair budget is spent),
+ * with a blocking finding carrying `evidence` (the failing test's name and
+ * the check log's tail). */
+export interface EvFinalChecksFailed {
+  type: "FINAL_CHECKS_FAILED";
+  evidence: string;
+  /** Plan 06c: the final run's failing tests, classified like a normal check
+   * failure, so the repair prompt names them. */
+  failures?: CheckFailureClass[];
+}
+
+/** Plan 06c: the conductor died while running the final check. Like an
+ * interrupted gate, it is rerun rather than counted as passed or failed. */
+export interface EvFinalChecksInterrupted {
+  type: "FINAL_CHECKS_INTERRUPTED";
 }
 
 /** Plan 01f: the gate command failed — a non-zero exit, or a kill at the
@@ -1686,6 +2075,20 @@ export interface EvNoteAdded {
   type: "NOTE_ADDED";
   phaseId: string;
   text: string;
+}
+
+/** Plan 06k1 (A5): an owner correction that arrived while the phase was
+ * reviewing, evaluating, final-checking or parked but not yet able to apply
+ * it. It is queued as a note for the next attempt's prompt AND grants its
+ * own round (so a spent budget cannot drop it). Record-only: it moves no
+ * phase-state name; `repairRoundsGranted` is raised so the next repair can
+ * run. */
+export interface EvOwnerCorrectionQueued {
+  type: "OWNER_CORRECTION_QUEUED";
+  phaseId: string;
+  correctionId: string;
+  text: string;
+  grantedRounds: number;
 }
 
 /** Plan 2d (§7.4/§9.3): records — or updates, keyed by `input.id` — one
@@ -1959,7 +2362,238 @@ export interface EvBriefRetryAttempted {
   requestIds: string[];
 }
 
+/** Plan 06b: the item-loop state, as one record-only event so a conductor
+ * restart rebuilds the worker's coverage, the check resolution, the owner's
+ * evidence recordings, the accepted deviations and the evaluator's overturns
+ * from the log alone. Fields are replaced when present. */
+export interface EvItemStateUpdated {
+  type: "ITEM_STATE_UPDATED";
+  coverage?: import("./items.ts").Coverage;
+  coverageAttempt?: number;
+  checkResolution?: import("./items.ts").VerifyResolution[];
+  checkTestLines?: string[];
+  itemEvidence?: Array<{ id: string; text: string; at?: string; commandId?: string }>;
+  acceptedDeviations?: string[];
+  archSymbolDeviations?: string[];
+  overturns?: import("./items.ts").Overturn[];
+}
+
+/** Plan 06b: every `evidence` item is now recorded, so the phase the owner
+ * parked resumes to RESOLVING (and acceptance, if nothing else is open). */
+export interface EvEvidenceRecorded {
+  type: "EVIDENCE_RECORDED";
+  itemId: string;
+}
+
+/** Plan 06b (OD-1 R3b): the evaluator's substantive re-check of one item's
+ * majority verdict, with the evidence of what it checked. */
+export interface EvItemCheckRecorded {
+  type: "ITEM_CHECK_RECORDED";
+  itemId: string;
+  /** `unchecked` is the conductor's own record that the evaluator gave no
+   * check for a required item after one re-prompt. */
+  verdict: "confirmed" | "contradicted" | "unchecked";
+  evidence: string;
+  /** Plan 06i: the evaluator's impact class for a finding or discovered
+   * decision, given through the same item-check form. Absent for a contract
+   * item (its impact is implicit). */
+  impact?: import("./triage.ts").Impact;
+  /** Plan 06i: a judgement call's own chosen/alternative/why, from the same
+   * form. All three, or the record escalates. */
+  chosen?: string;
+  alternative?: string;
+  why?: string;
+}
+
+/** Plan 06i (C3): a finding the evaluator merged into another record as a
+ * duplicate. It keeps its own triage record, linked to the original's
+ * disposition (06c B4: "merged", never "disproved"). */
+export interface EvFindingMerged {
+  type: "FINDING_MERGED";
+  findingId: string;
+  /** The record (message or finding id) it was merged into. */
+  into: string;
+  byReviewer: Reviewer;
+}
+
+/** Plan 06i: one finding's or discovered decision's triage record, with its
+ * impact class and (once the loop has decided) exactly one disposition. A
+ * record-only event, so a restart rebuilds the triage from the log. */
+export interface EvTriageRecorded {
+  type: "TRIAGE_RECORDED";
+  record: TriageRecord;
+}
+
+/** Plan 06i: a deferral — an item whose fix is put off with a guard (a test
+ * that shows its current cost, or a recorded owner ruling). Record-only. */
+export interface EvDeferralRecorded {
+  type: "DEFERRAL_RECORDED";
+  deferral: Deferral;
+}
+
+/** Plan 06i: a deferral was resolved (its fix landed). Record-only. */
+export interface EvDeferralResolved {
+  type: "DEFERRAL_RESOLVED";
+  deferralId: string;
+}
+
+/** Plan 06i (A1): the triage pass itself failed. A record without a
+ * disposition at the end of evaluation is a defect of the loop, never a pass,
+ * so this stops acceptance and parks the phase on the owner with the reason.
+ */
+export interface EvTriageFailed {
+  type: "TRIAGE_FAILED";
+  reason: string;
+}
+
+/** Plan 06g (A5): the owner carries one finding or message to a later
+ * phase's plan (`tt carry <run> <id> --to <phase-id>`). Record-only unless
+ * the phase is AWAITING_OWNER: there it answers the open request about the
+ * record, and once no blocking item remains uncarried it accepts the
+ * candidate (`acceptedWithCarried`). owner-commands.ts is the only place
+ * that decides what a carry does. */
+export interface EvItemCarried {
+  type: "ITEM_CARRIED";
+  recordId: string;
+  /** Which record the id names; absent means the lookup tries a finding
+   * first, then a message. */
+  recordKind?: "finding" | "message";
+  /** The phase id the item is carried to. */
+  toPhase: string;
+  boundCandidateSha: string;
+  boundContractVersion: ContractVersion;
+  boundRecordVersion: number;
+}
+
+// ---------------------------------------------------------------------------
+// Plan 06g: the round's record events (all absent when TT_WORKERS is absent)
+// ---------------------------------------------------------------------------
+
+/** A round began: `lanes` are its lane ids, `base` the one version every lane
+ * starts from (round 1: the integration branch head). Record-only. */
+export interface EvRoundStarted {
+  type: "ROUND_STARTED";
+  round: number;
+  base: string;
+  lanes: string[];
+}
+
+/** Plan 06k3 (A1): a round that failed only because a lane review or pick
+ * vote was still missing after its retry was repeated without spending a
+ * repair attempt. Record-only; `roundRepeatsUsed` counts them. */
+export interface EvRoundRepeated {
+  type: "ROUND_REPEATED";
+  round: number;
+  reason: string;
+}
+
+/** Plan 06k3 (A4): one unchanged-resubmission permission was used. Record-only
+ * so a conductor restart cannot reopen it. */
+export interface EvUnchangedPermissionUsed {
+  type: "UNCHANGED_PERMISSION_USED";
+  key: string;
+}
+
+/** Plan 06k3 (A2): a worker missed its deadline and its uncommitted work was
+ * committed to `ref` (never discarded); the next attempt of `lane` starts
+ * from it. Record-only. */
+export interface EvUnsubmittedWorkSaved {
+  type: "UNSUBMITTED_WORK_SAVED";
+  lane: string;
+  attempt: number;
+  ref: string;
+  sha: string;
+}
+
+/** One lane froze a candidate. Record-only; `sha` is the lane's commit. */
+export interface EvCandidateSubmitted {
+  type: "CANDIDATE_SUBMITTED";
+  round: number;
+  lane: string;
+  sha: string;
+}
+
+/** One lane's checks ran. `ok` is false for a failure; a lane that crashed,
+ * timed out or submitted nothing records no candidate at all (the status
+ * shows its `note` instead). Record-only. */
+export interface EvCandidateChecked {
+  type: "CANDIDATE_CHECKED";
+  round: number;
+  lane: string;
+  ok: boolean;
+  note?: string;
+}
+
+/** One seat's vote in a round's pick turn, with its one-line why. A seat
+ * votes once; a later PICK_VOTE from the same seat replaces the earlier one.
+ * Record-only. */
+export interface EvPickVote {
+  type: "PICK_VOTE";
+  round: number;
+  seat: string;
+  lane: string;
+  why: string;
+  /** Plan 06k1 (A1): what the losing lane had that this seat's pick lacked.
+   * Absent only on a log written before this phase. */
+  loserHad?: LoserHad;
+  /** Plan 06h (A3): true when this vote is in the top-two revote rather than
+   * the first pick turn. Absent means the first turn (old logs unchanged). */
+  revote?: boolean;
+}
+
+/** Plan 06h (A3): the top two lanes go to one revote. Record-only. */
+export interface EvRevoteStarted {
+  type: "REVOTE_STARTED";
+  round: number;
+  lanes: string[];
+}
+
+/** The round's winner, decided by core/rounds.ts's `pickWinner` (never by a
+ * model) and recorded here. `votes` is the number of pick votes the winner
+ * took (0 when it was the only passing candidate and won without a vote).
+ * Record-only. */
+export interface EvCandidatePicked {
+  type: "CANDIDATE_PICKED";
+  round: number;
+  lane: string;
+  sha: string;
+  votes: number;
+}
+
+/** Plan 06g2: one seat's review of one lane candidate, recorded while the
+ * round runs (the phase is still IMPLEMENTING, so no review slot exists to
+ * hold it). Record-only: the round's own per-candidate review record. The
+ * winner's reviews are promoted into the phase's review slots at hand-off
+ * (a REVIEW_SUBMITTED carrying `promotedFrom`), so the acceptance rule reads
+ * the winner's reviews and nothing else. */
+export interface EvRoundReviewSubmitted {
+  type: "ROUND_REVIEW_SUBMITTED";
+  round: number;
+  lane: string;
+  seat: string;
+  review: Review;
+}
+
 export type Event =
+  | EvRoundStarted
+  | EvRoundRepeated
+  | EvUnchangedPermissionUsed
+  | EvUnsubmittedWorkSaved
+  | EvCandidateSubmitted
+  | EvCandidateChecked
+  | EvPickVote
+  | EvRevoteStarted
+  | EvCandidatePicked
+  | EvRoundReviewSubmitted
+  | EvItemCarried
+  | EvItemStateUpdated
+  | EvEvidenceRecorded
+  | EvItemCheckRecorded
+  | EvTriageRecorded
+  | EvDeferralRecorded
+  | EvDeferralResolved
+  | EvFindingMerged
+  | EvTriageFailed
   | EvReviewLintFailed
   | EvBriefsRecorded
   | EvBriefRetryAttempted
@@ -1993,6 +2627,7 @@ export type Event =
   | EvChecksPassed
   | EvChecksFailed
   | EvChecksInterrupted
+  | EvRecheckRequested
   | EvEnvChecked
   | EvEnvPreflightFailed
   | EvEnvCheckFailed
@@ -2016,6 +2651,10 @@ export type Event =
   | EvGateRequired
   | EvGateFailed
   | EvGateInterrupted
+  | EvFinalCheckRequired
+  | EvFinalChecksPassed
+  | EvFinalChecksFailed
+  | EvFinalChecksInterrupted
   | EvPublishIntent
   | EvPublishCompleted
   | EvPublishStale
@@ -2032,6 +2671,7 @@ export type Event =
   | EvIntegrityViolated
   | EvDecisionAdded
   | EvNoteAdded
+  | EvOwnerCorrectionQueued
   | EvOwnerInputRecorded
   | EvDirectiveAdded
   | EvDirectiveWithdrawn

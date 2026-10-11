@@ -9,8 +9,11 @@ import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
 import { loopTapeHead, renderLoopTape, tapeLabel, type ChartModels } from "./charts.ts";
+import { laneRoundPhase } from "./core/loop-view.ts";
 import { effectiveChecks } from "./core/checks.ts";
 import { planModelSelector, type PlanModels, type RoleModel } from "./core/roles.ts";
+// 06a finding #24: the `models` line also carries the models check's result.
+import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./core/models-check.ts";
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { decisionStatus, isLiveDecision } from "./core/predicate.ts";
@@ -18,11 +21,80 @@ import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baselin
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import { notAcceptedReasons, reviewerOutcomes, tradeoffEntries, type ReviewerOutcome, type TradeoffEntry } from "./core/verdict.ts";
+import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCounts } from "./core/items.ts";
 // Plan 05c: the status view's `review' row is counted from the same messages
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
+import { candidateLabel } from "./core/rounds.ts";
+import { seatsOf } from "./core/seats.ts";
+import { computeSeatTable, renderSeatTable, seatRoundStates, type SeatRound, type SeatTable } from "./core/seat-table.ts";
 import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
+
+// ---------------------------------------------------------------------------
+// The live file (plan 06f, A2)
+// ---------------------------------------------------------------------------
+
+/** Plan 06f (A2): the one file the Emacs mode line reads. The conductor and
+ * the scheduler keep it current — atomically (write a temporary file, then
+ * rename), on every phase change and node change. Emacs only reads it. */
+export interface Live {
+  updatedAt: string;
+  runs: { id: string; title: string; phase: string; needsOwner: boolean }[];
+  waitingNodes: { program: string; node: string }[];
+}
+
+/** The `live.json` path for a run root. */
+export function livePath(root: string): string {
+  return path.join(root, "live.json");
+}
+
+/** The current `live.json`, or an empty one when it is missing or malformed.
+ * A reader never fails: an old or half-written file simply lists nothing. */
+export function readLive(root: string): Live {
+  try {
+    const raw = JSON.parse(fs.readFileSync(livePath(root), "utf8")) as Partial<Live>;
+    return {
+      updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : "",
+      runs: Array.isArray(raw.runs) ? raw.runs : [],
+      waitingNodes: Array.isArray(raw.waitingNodes) ? raw.waitingNodes : [],
+    };
+  } catch {
+    return { updatedAt: "", runs: [], waitingNodes: [] };
+  }
+}
+
+/** Plan 06f (A2): write `live.json` atomically. Only the conductor and the
+ * scheduler call this; a reader can therefore never see a torn file. */
+export function writeLive(root: string, live: Live): void {
+  const file = livePath(root);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(live)}\n`);
+  fs.renameSync(tmp, file);
+}
+
+/** Plan 06f (A2): replace THIS run's row in `live.json`, keeping every other
+ * run and every waiting node another writer recorded. The id is passed
+ * separately from the row so a closed conductor can remove its own row
+ * (`run` undefined) — the earlier `run?.id` form left every row in place. */
+export function updateLiveRun(
+  root: string,
+  id: string,
+  run: { title: string; phase: string; needsOwner: boolean } | undefined,
+): void {
+  const live = readLive(root);
+  const runs = live.runs.filter((r) => r.id !== id);
+  if (run) runs.push({ id, ...run });
+  writeLive(root, { updatedAt: new Date().toISOString(), runs, waitingNodes: live.waitingNodes });
+}
+
+/** Plan 06f (A2): replace THIS program's waiting nodes in `live.json`,
+ * keeping every other program's wait and every run row. */
+export function updateLiveWaiting(root: string, program: string, waitingNodes: { program: string; node: string }[]): void {
+  const live = readLive(root);
+  const others = live.waitingNodes.filter((w) => w.program !== program);
+  writeLive(root, { updatedAt: new Date().toISOString(), runs: live.runs, waitingNodes: [...others, ...waitingNodes] });
+}
 
 // ---------------------------------------------------------------------------
 // Pipeline
@@ -93,13 +165,32 @@ export interface StageSpan {
 /** `lastEventAt`: when the conductor is not running, the current stage
  * stops counting at the last logged event instead of running on. */
 export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string): StageSpan[] {
+  // Plan 06c (A5): a stage's duration is the sum of its RUNNING segments. A
+  // segment runs from the stage start, or a resume (RUN_RESUMED / an
+  // interrupted attempt), to the next stop record or the stage end. A stopped
+  // interval never counts — for the current stage and for completed stages
+  // alike. This is the ONE place durations are computed.
+  const stops = (timeline.stops ?? []).map((t) => Date.parse(t)).sort((a, b) => a - b);
+  const resumes = (timeline.restarts ?? []).map((t) => Date.parse(t)).sort((a, b) => a - b);
+  const stoppedMs = (start: number, end: number): number => {
+    let total = 0;
+    for (const s of stops) {
+      if (s < start || s >= end) continue;
+      const r = resumes.find((t) => t > s);
+      const until = Math.min(r ?? end, end);
+      if (until > s) total += until - s;
+    }
+    return total;
+  };
   const spans: StageSpan[] = [];
   for (const p of timeline.phases) {
     const stage = STAGE_OF[p.phase] ?? p.phase.toLowerCase();
     const last = spans[spans.length - 1];
     if (last && last.stage === stage) continue;
     if (last) {
-      last.ms = Date.parse(p.at) - Date.parse(last.startedAt);
+      const start = Date.parse(last.startedAt);
+      const end = Date.parse(p.at);
+      last.ms = Math.max(0, end - start - stoppedMs(start, end));
       last.current = false;
       // A gate or review that hands the phase back to implement failed. A
       // baseline -> implement step is the normal path, not a failure.
@@ -108,16 +199,15 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
     spans.push({ stage, startedAt: p.at, ms: 0, failed: false, current: true });
   }
   const last = spans[spans.length - 1];
-  // The current stage counts from the last restart inside it: an interrupted
-  // attempt that was re-dispatched has a fresh deadline.
-  const restart = (timeline.restarts ?? []).filter((t) => last && Date.parse(t) >= Date.parse(last.startedAt)).pop();
-  if (last && restart) last.startedAt = restart;
   if (last) {
-    if (last.stage === "DONE" || last.stage === "BLOCKED") last.current = false;
-    else {
-      last.ms = (lastEventAt ? Date.parse(lastEventAt) : now.getTime()) - Date.parse(last.startedAt);
-      if (lastEventAt) last.current = false;
-    }
+    const end = lastEventAt ? Date.parse(lastEventAt) : now.getTime();
+    // Plan 06c (A5/OD-5): the current stage also SUMS its running segments —
+    // its completed segments (stage start, or a RUN_RESUMED, until the stop)
+    // plus the running segment (the last RUN_RESUMED until now). `startedAt`
+    // stays the stage's own start; it is never reset to the last resume.
+    const start = Date.parse(last.startedAt);
+    last.ms = Math.max(0, end - start - stoppedMs(start, end));
+    if (last.stage === "DONE" || last.stage === "BLOCKED" || lastEventAt) last.current = false;
   }
   return spans;
 }
@@ -131,25 +221,33 @@ export function stageSpans(timeline: Timeline, now: Date, lastEventAt?: string):
  * same selector the launch sites use — so the line names what each seat ran
  * on, not just the role's shared default. A plan that only sets the four flat
  * roles keeps the four-entry line unchanged. */
-export function modelEntries(models: PlanModels | undefined): Array<{ role: string; value: string }> {
+export function modelEntries(models: PlanModels | undefined, seats?: readonly string[]): Array<{ role: string; value: string }> {
   if (!models) return [];
-  const select = planModelSelector({ models });
+  // Plan 06h (A2): a plan with per-seat models names EVERY configured seat,
+  // including a seat that falls back to the shared reviewer model. `seats`
+  // is the contract's own list; absent, the declared model keys stand in.
+  const perSeat = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
+  const configured = seats && seats.length > 0 ? seats : perSeat ? Object.keys(models.reviewerSeats!) : [];
+  const select = planModelSelector({ models }, configured.length > 0 ? configured : undefined);
   const out: Array<{ role: string; value: string }> = [];
   const push = (role: string, m: RoleModel | undefined): void => {
     if (!m) return;
     out.push({ role, value: m.provider ? `${m.provider}:${m.model ?? ""}` : m.model ?? "" });
   };
   push("worker", models.worker);
-  const reviewerSeats = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
-  if (reviewerSeats) {
-    for (const seat of ["M", "A", "B"] as const) push(`reviewer.${seat}`, select("reviewer", seat));
+  if (perSeat) {
+    for (const seat of configured) push(`reviewer.${seat}`, select("reviewer", seat));
   } else {
     push("reviewer", models.reviewer);
   }
   push("evaluator", models.evaluator);
-  const panelSeats = models.panelFrom === "reviewers" || (models.panelSeats ? Object.keys(models.panelSeats).length > 0 : false);
-  if (panelSeats) {
-    for (const seat of ["1", "2", "3"] as const) push(`panel.${seat}`, select("panel", seat));
+  const panelSeatKeys = models.panelSeats ? Object.keys(models.panelSeats) : [];
+  if (panelSeatKeys.length > 0) {
+    for (const seat of panelSeatKeys) push(`panel.${seat}`, select("panel", seat));
+  } else if (models.panelFrom === "reviewers") {
+    // panel=reviewers: one panel seat per configured reviewer, by position.
+    const list = configured.length > 0 ? configured : ["M", "A", "B"];
+    for (let i = 1; i <= list.length; i++) push(`panel.${i}`, select("panel", String(i)));
   } else {
     push("panel", models.panel);
   }
@@ -160,25 +258,34 @@ export function modelEntries(models: PlanModels | undefined): Array<{ role: stri
  * undefined when the plan set none (a run that uses Pi's `defaultModel` needs
  * no line). The status view pads the `models` label itself, so the value
  * carries no `models:` prefix. */
-export function modelsLineText(models: PlanModels | undefined): string | undefined {
-  const entries = modelEntries(models);
+export function modelsLineText(models: PlanModels | undefined, seats?: readonly string[]): string | undefined {
+  const entries = modelEntries(models, seats);
   return entries.length > 0 ? entries.map((e) => `${e.role}=${e.value}`).join(" ") : undefined;
 }
 
 /** The plan's own models in the shape `renderLoopTape` reads. Only what the
  * plan declares enters the tape, never Pi's settings, so the live file and a
  * `tt contract rebuild` agree; a role with no declared model reads `default`. */
-export function chartModelsFromPlan(models: PlanModels | undefined): ChartModels | undefined {
+export function chartModelsFromPlan(models: PlanModels | undefined, seats?: readonly string[]): ChartModels | undefined {
   if (!models) return undefined;
-  const select = planModelSelector({ models });
+  // Plan 06h (A2): expand every configured seat, not a fixed three.
+  const perSeat = models.reviewerSeats ? Object.keys(models.reviewerSeats).length > 0 : false;
+  const configured = seats && seats.length > 0 ? seats : perSeat ? Object.keys(models.reviewerSeats!) : [];
+  const select = planModelSelector({ models }, configured.length > 0 ? configured : undefined);
   const name = (m: RoleModel | undefined): string | undefined => m?.model;
+  const panelPerSeat = models.panelSeats ? Object.keys(models.panelSeats).length > 0 : false;
+  const panelKeys = panelPerSeat
+    ? Object.keys(models.panelSeats!)
+    : models.panelFrom === "reviewers"
+      ? configured.map((_, i) => String(i + 1))
+      : [];
   return {
     worker: name(select("worker")),
     reviewer: name(select("reviewer")),
     evaluator: name(select("evaluator")),
     panel: name(select("panel")),
-    reviewerSeats: { M: name(select("reviewer", "M")), A: name(select("reviewer", "A")), B: name(select("reviewer", "B")) },
-    panelSeats: { "1": name(select("panel", 1)), "2": name(select("panel", 2)), "3": name(select("panel", 3)) },
+    reviewerSeats: perSeat ? Object.fromEntries(configured.map((s) => [s, name(select("reviewer", s))])) : {},
+    panelSeats: Object.fromEntries(panelKeys.map((s) => [s, name(select("panel", s))])),
   };
 }
 
@@ -192,7 +299,7 @@ export function formatDuration(ms: number): string {
 
 /** "implement 30s → freeze 1s → checks ✗ 10m00s → implement 26m → … →
  * review 12s… (14m48s left)". Attempts after the first are numbered. */
-export function pipelineLine(spans: StageSpan[], limits: Record<string, number> = stageDeadlineMs()): string {
+export function pipelineLine(spans: StageSpan[], limits: Record<string, number | undefined> = stageDeadlineMs()): string {
   let attempt = 0;
   const parts = spans.map((s) => {
     let name = s.stage;
@@ -204,8 +311,10 @@ export function pipelineLine(spans: StageSpan[], limits: Record<string, number> 
     const d = formatDuration(s.ms);
     if (s.current) {
       const limit = limits[s.stage];
-      const left =
-        limit === undefined ? "" : limit >= s.ms ? ` (${formatDuration(limit - s.ms)} left)` : ` (over by ${formatDuration(s.ms - limit)})`;
+      // Plan 06m (R4/disc-M-11): the top block shows time used and left in
+      // THIS attempt; a stage past its limit reads `limit reached`, never a
+      // cumulative "over by".
+      const left = limit === undefined ? "" : limit < s.ms ? " (limit reached)" : ` (${formatDuration(limit - s.ms)} left)`;
       return `${name} ${d}…${left}`;
     }
     return `${name}${s.failed ? " ✗" : ""} ${d}`;
@@ -401,6 +510,17 @@ export interface RunView {
    * (`base fails: N tests: …`). Undefined when the base passes or no baseline
    * was taken. */
   baseline?: string;
+  /** Plan 06g (A5): one line per lane of the current round, then the round's
+   * cost — `a C1-a ✓`, `b (no candidate: the lane crashed)`. Undefined for a
+   * plan without `#+TT_WORKERS`, which records no round at all. */
+  lanes?: string[];
+  /** Plan 06m (contract-71): each lane's own elapsed time, from the round
+   * start to its candidate submission (or now while it is still coding). */
+  laneElapsed?: Record<string, string>;
+  /** Plan 06m (OD-1/A3): each seat's lifecycle state in the current review
+   * round (reading, discovery submitted, review submitted, re-prompted,
+   * timed out, retried), from the seat's own log records this round. */
+  seatRound?: SeatRound[];
   previousRound?: string;
   reviewers: ReviewerOutcome[];
   reviewLine: string;
@@ -549,10 +669,10 @@ export function buildView(
   plan: RunPlanFile,
   alive: boolean,
   now = new Date(),
-): RunView & { timeline: Timeline; tape: string } {
+): RunView & { timeline: Timeline; tape: string; seatsTable: string; seatTable: SeatTable } {
   // One read of the control log gives both the timeline and the events the
   // balance metrics need, so nothing here parses the log twice.
-  const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
+  const { timeline, events, records } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
   const spans = stageSpans(timeline, now, alive ? undefined : lastEventAt(runDir));
   const current = spans[spans.length - 1];
@@ -591,6 +711,9 @@ export function buildView(
       : ` · gate ${gateRecord.passed ? `✓${gateRecord.reused ? " (reused)" : ""}` : "✗"}`;
   let gates: string;
   let previousRound: string | undefined;
+  // Plan 06g (A5): one line per lane of the phase's latest round, then the
+  // round's cost. Empty for a plan without `#+TT_WORKERS`.
+  const lanes = lanesView(phase);
   if (repairing && stage === "implement") {
     gates = `pending (round ${round + 1})`;
     previousRound = C ? `round ${round} · ${C.slice(0, 7)} · ${reasons.length > 0 ? `not accepted: ${reasons.join("; ")}` : "not accepted"}` : undefined;
@@ -695,32 +818,77 @@ export function buildView(
   // Plan 05h: the loop tape is a projection of the same log read as the
   // metrics — its durations end at `endMs`, the last logged timestamp, never a
   // wall clock, so `tt contract rebuild` reproduces the live file.
+  // Plan 06k2 (A1): the lane round's own sub-phase, so the loop view shows
+  // LANE REVIEW / PICK and the attempt clock stops when both lanes submit.
+  const lanePhase = laneRoundPhase(phase);
   const tapeInput = {
     label: tapeLabel(phase.phaseId),
     round,
+    ...(lanes.length > 0 ? { lanes } : {}),
     phases: timeline.phases,
     phase,
     run: timeline.state.run,
     endMs: timelineEndMs(timeline, events),
-    models: chartModelsFromPlan(plan.models),
+    models: chartModelsFromPlan(plan.models, seatsOf(phase.contract)),
     limits: stageLimits(plan),
+    ...(lanePhase ? { lanePhase } : {}),
   };
   const tape = renderLoopTape(tapeInput);
+  // 06a finding #24: the `models` row names what the plan configured AND what
+  // the preflight found (`check ok`, or the refused model and its gateway
+  // message).
+  const modelsText = modelsLineText(plan.models, seatsOf(phase.contract));
+  const modelsCheckText = modelsCheckStatusText(readModelsCheck(runDir));
+  const models = [modelsText, modelsCheckText].filter((s): s is string => s !== undefined && s.length > 0).join(" · ") || undefined;
+  // Plan 06l (A5): the seat table is computed from the SAME log snapshot the
+  // timeline and metrics were, so `views/seats.txt`, `tt seats` and the phase
+  // summary can never disagree with each other.
+  const seatTable = computeSeatTable(records, seatsOf(phase.contract), chartModelsFromPlan(plan.models, seatsOf(phase.contract))?.reviewerSeats);
+  // Plan 06m (contract-71): each lane's own elapsed time, from the round's
+  // start to its candidate submission (or now while it is still coding).
+  const laneElapsed: Record<string, string> = {};
+  {
+    const lastRound = phase.rounds?.[phase.rounds.length - 1];
+    const started = [...records]
+      .reverse()
+      .find((r) => r.kind === "event" && (r.event as { type?: string }).type === "ROUND_STARTED" && (!lastRound || (r.event as { round?: number }).round === lastRound.round));
+    const startMs = started ? Date.parse(started.ts) : undefined;
+    if (startMs !== undefined && lastRound) {
+      for (const lane of lastRound.lanes) {
+        const submitted = [...records]
+          .reverse()
+          .find(
+            (r) =>
+              r.kind === "event" &&
+              (r.event as { type?: string }).type === "CANDIDATE_SUBMITTED" &&
+              (r.event as { lane?: string }).lane === lane &&
+              (r.event as { round?: number }).round === lastRound.round,
+          );
+        const end = submitted ? Date.parse(submitted.ts) : now.getTime();
+        laneElapsed[lane] = formatDuration(Math.max(0, end - startMs));
+      }
+    }
+  }
   return {
     timeline,
     tape,
+    seatsTable: renderSeatTable(seatTable),
+    seatTable,
+    seatRound: seatRoundStates(records, seatsOf(phase.contract)),
     metrics,
     metricsLine: metricsLine(metrics),
-    models: modelsLineText(plan.models),
+    models,
     loop: loopTapeHead(tapeInput),
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
-    pipeline: pipelineLine(spans, stageLimits(plan)),
+    pipeline: pipelineLine(spans, lanePhase ? { ...stageLimits(plan), implement: undefined } : stageLimits(plan)),
     gates,
     gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord, phase.integrationHead) : undefined,
     baseline: baselineStatusLine(baseline),
     previousRound,
+    ...(lanes.length > 0 ? { lanes } : {}),
+    ...(Object.keys(laneElapsed).length > 0 ? { laneElapsed } : {}),
     reviewers,
     reviewLine: reviewers.map((r) => r.label).join("   "),
     verdict,
@@ -808,6 +976,17 @@ function readBaseline(runDir: string): Baseline | undefined {
   }
 }
 
+/** 06a finding #24: the models check's record at `<run>/models-check.json`,
+ * or undefined when it has not run (an old run, or a plan with no
+ * `#+TT_MODELS`). A malformed record is no record. */
+function readModelsCheck(runDir: string): ModelsCheck | undefined {
+  try {
+    return parseModelsCheck(JSON.parse(fs.readFileSync(path.join(runDir, "models-check.json"), "utf8")));
+  } catch {
+    return undefined;
+  }
+}
+
 function probeReused(runDir: string, C: string): boolean {
   try {
     const text = fs.readFileSync(runPaths(runDir).events, "utf8");
@@ -875,7 +1054,7 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
   // follow-up, not a blocker. The PR body must not hide it.
   const followUps = (phase.messages ?? []).filter((m) => m.followUp);
   // #+TT_MODELS: the models the run actually used, one line per role.
-  const models = modelEntries(plan.models);
+  const models = modelEntries(plan.models, seatsOf(phase.contract));
   const lines = [
     `## ${phase.phaseId}`,
     "",
@@ -897,11 +1076,28 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     `- Reviews on the accepted candidate ${C ? C.slice(0, 9) : "?"}: ${v.reviewLine}`,
     `- ${v.round} review round(s); ${fixed.length} blocking finding(s) raised and fixed before acceptance`,
     `- ${live.length} trade-off(s), ${flagged.length} flagged for the owner`,
+    ...(() => {
+      const c = phase.contract;
+      if (!isStructured(c)) return [];
+      const itemsPhase = { contract: c, reviews: phase.reviews, coverage: phase.coverage, checkResolution: phase.checkResolution, overturns: phase.overturns };
+      const matrix = matrixMarkdown(itemsPhase);
+      const overturns = overturnCounts(phase.overturns ?? [], seatsOf(c));
+      const overturnLine = overturns.length > 0 ? [`- Overturned verdicts (counted against a seat): ${overturns.map((o) => `${o.seat} ${o.count}`).join(" · ")}`] : [];
+      return matrix.length > 0 ? [`- ${countsLine(phaseItemCounts(itemsPhase))}`, ...overturnLine, "", ...matrix, ""] : [];
+    })(),
     "",
     ...(models.length > 0
       ? ["### Models per role", "", ...models.map((m) => `- ${m.role}: ${m.value}`), ""]
       : []),
     ...metricsSummary(v.metrics),
+    // Plan 06l (A5): the same per-seat table `views/seats.txt` holds, so the
+    // phase summary shows what each reviewer seat cost and found.
+    "",
+    "### Seat table",
+    "",
+    "```",
+    ...v.seatsTable.trimEnd().split("\n"),
+    "```",
   ];
   // Plan 01c: the owner's own checklist (from the plan's `Owner checklist:`
   // list). It is not a worker/reviewer acceptance criterion, so it is not
@@ -936,6 +1132,10 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     lines.push("", `### Open advisory findings (${advisories.length}) — accepted, not fixed`, "");
     for (const f of advisories) lines.push(`- **${f.raisedBy}**: ${oneLine(f.evidence, 400)}`);
   }
+  lines.push(...roundsSection(phase));
+  lines.push(...triageSection(phase));
+  lines.push(...openDeferralsSection(phase));
+  lines.push(...carriedItemsSection(phase));
   if (followUps.length > 0) {
     lines.push("", `### Follow-ups (refused after DONE — recorded, not blocking)`, "");
     for (const m of followUps) {
@@ -948,6 +1148,155 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
     for (const t of extra.removedTests) lines.push(`- ${t}`);
   }
   return `${lines.join("\n")}\n`;
+}
+
+/** Plan 06g (A5): `tt summary` lists each round's candidates, votes and
+ * winner. Empty for a plan without `#+TT_WORKERS`, which records no round. */
+export function roundsSection(phase: PhaseState): string[] {
+  const rounds = phase.rounds ?? [];
+  if (rounds.length === 0) return [];
+  const lines = ["", `### Rounds (${rounds.length})`, ""];
+  for (const round of rounds) {
+    const candidates = round.lanes
+      .map((lane) => {
+        const c = round.candidates.find((x) => x.lane === lane);
+        const label = candidateLabel(round.round, lane);
+        if (!c?.sha) return `${label} no candidate${c?.note ? ` (${c.note})` : ""}`;
+        return `${label} ${c.sha.slice(0, 7)} ${c.ok === true ? "checks ✓" : c.ok === false ? "checks ✗" : "checking"}`;
+      })
+      .join(" · ");
+    const votes = round.votes.length > 0 ? `votes ${round.votes.map((v) => `${v.seat}→${v.lane}`).join(" ")}` : "no vote";
+    const picked = round.picked
+      ? `winner ${candidateLabel(round.round, round.picked.lane)} (${round.picked.sha.slice(0, 7)}, ${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})`
+      : "no winner";
+    lines.push(`- Round ${round.round} from ${round.base.slice(0, 7)}: ${candidates} — ${votes} — ${picked}`);
+    // Plan 06g2: the reviews each candidate drew, so `tt summary` shows the
+    // round's own per-candidate review record beside the votes and the winner.
+    const reviewed = round.candidates
+      .filter((c) => (c.reviews ?? []).length > 0)
+      .map((c) => `${candidateLabel(round.round, c.lane)}: ${(c.reviews ?? []).map((r) => r.seat).sort().join("/")}`);
+    if (reviewed.length > 0) lines.push(`  reviews — ${reviewed.join(" · ")}`);
+  }
+  return lines;
+}
+
+/** Plan 06g (A6): the owner's "accept with carried items" decision at the end
+ * of the round budget. The carried items are the next phase's plan input, so
+ * `tt summary` lists them by id, with what each one says. Empty for a phase
+ * the owner did not accept that way. Exported so the summary's own words are
+ * unit-tested, not a copy of them. */
+/** Plan 06g (A5): the status view's lane lines — one per lane of the phase's
+ * LATEST round, then the round's cost. A lane that produced no candidate
+ * says why (its `note`), so a crashed lane is visible and never silent. Empty
+ * for a phase without rounds (no `#+TT_WORKERS`), which is today's view
+ * unchanged. */
+export function lanesView(phase: PhaseState): string[] {
+  const round = (phase.rounds ?? [])[Math.max(0, (phase.rounds ?? []).length - 1)];
+  if (!round) return [];
+  const lines = round.lanes.map((lane) => {
+    const candidate = round.candidates.find((c) => c.lane === lane);
+    const label = candidateLabel(round.round, lane);
+    if (!candidate?.sha) return `${lane} ${candidate?.note ? `(no candidate: ${candidate.note})` : "(no candidate yet)"}`;
+    const short = candidate.sha.slice(0, 7);
+    const state = candidate.ok === undefined ? "checking" : candidate.ok ? "checks ✓" : "checks ✗";
+    const picked = round.picked?.lane === lane ? ` — picked (${round.picked.votes} vote${round.picked.votes === 1 ? "" : "s"})` : "";
+    const reviews = candidate.reviews ?? [];
+    const reviewed = reviews.length > 0 ? ` — reviewed by ${reviews.map((r) => r.seat).sort().join(", ")}` : "";
+    return `${lane} ${label} ${short} ${state}${reviewed}${picked}`;
+  });
+  const passing = round.candidates.filter((c) => c.ok === true).length;
+  // Plan 06h (A2): the review count is the configured seat count, never 3.
+  const seats = seatsOf(phase.contract).length;
+  lines.push(
+    `round ${round.round} from ${round.base.slice(0, 7)}: ${round.lanes.length} worker run(s), ${passing * seats} review(s)`,
+  );
+  if (round.votes.length > 0) {
+    lines.push(`votes: ${round.votes.map((v) => `${v.seat}→${v.lane}`).join(" · ")}`);
+  }
+  return lines;
+}
+
+/** Plan 06i: `tt summary` lists every dispositioned item in its own
+ * section — fixes, trade-offs and escalations — so nothing the loop found
+ * disappears. Empty for a phase with no triage records. */
+export function triageSection(phase: PhaseState): string[] {
+  const records = phase.triage ?? [];
+  if (records.length === 0) return [];
+  const fixes = records.filter((r) => r.disposition?.kind === "fix");
+  const tradeoffs = records.filter((r) => r.disposition?.kind === "tradeoff");
+  const escalations = records.filter((r) => r.disposition?.kind === "escalate");
+  const label = (id: string) => {
+    const f = phase.findings.find((x) => x.id === id);
+    if (f) return `${id} (${f.raisedBy}): ${oneLine(f.evidence, 300)}`;
+    const d = phase.decisions.find((x) => x.id === id);
+    if (d) return `${id}: ${oneLine(d.choice, 300)}`;
+    return id;
+  };
+  // A repaired finding's fix record is history, not an open blocker (finding
+  // M-77/B-82): list it separately so a DONE summary never reads as if a
+  // repaired item still blocks. `blockingTriageRecords` already omits it from
+  // accept(), so the summary now agrees with the gate.
+  const isRepaired = (id: string) => phase.findings.some((f) => f.id === id && f.status === "repaired");
+  const openFixes = fixes.filter((r) => !isRepaired(r.itemId));
+  const repairedFixes = fixes.filter((r) => isRepaired(r.itemId));
+  const lines = ["", `### Triage (${records.length} item(s))`, ""];
+  lines.push(`#### Fixes (${openFixes.length}) — blocking until repaired`, "");
+  if (openFixes.length === 0) lines.push("- none", "");
+  for (const r of openFixes) {
+    const d = r.disposition;
+    lines.push(`- ${label(r.itemId)} — ${d?.kind === "fix" ? d.reason : ""}`);
+  }
+  if (openFixes.length > 0) lines.push("");
+  lines.push(`#### Repaired (${repairedFixes.length})`, "");
+  if (repairedFixes.length === 0) lines.push("- none", "");
+  for (const r of repairedFixes) {
+    const d = r.disposition;
+    lines.push(`- ${label(r.itemId)} — ${d?.kind === "fix" ? d.reason : ""}`);
+  }
+  if (repairedFixes.length > 0) lines.push("");
+  lines.push(`#### Trade-offs (${tradeoffs.length}) — accepted`, "");
+  if (tradeoffs.length === 0) lines.push("- none", "");
+  for (const r of tradeoffs) {
+    const d = r.disposition;
+    if (d?.kind !== "tradeoff") continue;
+    lines.push(`- ${label(r.itemId)} — chosen: ${oneLine(d.chosen, 200)}; alternative: ${oneLine(d.alternative, 200)}; why: ${oneLine(d.why, 300)}`);
+  }
+  if (tradeoffs.length > 0) lines.push("");
+  lines.push(`#### Escalations (${escalations.length}) — owner request open`, "");
+  if (escalations.length === 0) lines.push("- none", "");
+  for (const r of escalations) {
+    const d = r.disposition;
+    if (d?.kind !== "escalate") continue;
+    lines.push(`- ${label(r.itemId)} — ${oneLine(d.reason, 300)} (owner request ${d.ownerRequestId})`);
+  }
+  return lines;
+}
+
+/** Plan 06i: `tt summary`'s "Open deferrals" — every deferral whose fix is
+ * still put off, with the guard that admitted it (a test that shows its
+ * current cost, or a recorded owner ruling). Empty when there are none. */
+export function openDeferralsSection(phase: PhaseState): string[] {
+  const open = (phase.deferrals ?? []).filter((d) => d.status === "open");
+  if (open.length === 0) return [];
+  const lines = ["", `### Open deferrals (${open.length})`, ""];
+  for (const d of open) {
+    const guard = d.test ? `test: ${d.test}` : d.ownerRuling ? `owner ruling: ${d.ownerRuling}` : "no guard";
+    lines.push(`- ${d.itemId}${d.toPhase ? ` → ${d.toPhase}` : ""} (${guard}): ${oneLine(d.text, 400)}`);
+  }
+  return lines;
+}
+
+export function carriedItemsSection(phase: PhaseState): string[] {
+  if (!phase.acceptedWithCarried) return [];
+  const carried = (phase.carriedItems ?? []).map(
+    (id) => phase.findings.find((f) => f.id === id) ?? { id, raisedBy: "?", evidence: "(no longer in the record)" },
+  );
+  const lines = ["", `### Carried items (${carried.length}) — accepted with the owner's decision`, ""];
+  for (const f of carried) {
+    const to = phase.carriedTo?.[f.id];
+    lines.push(`- **${f.id}**${to ? ` → ${to}` : ""} (${f.raisedBy}): ${oneLine(f.evidence, 400)}`);
+  }
+  return lines;
 }
 
 function oneLine(text: string, max: number): string {

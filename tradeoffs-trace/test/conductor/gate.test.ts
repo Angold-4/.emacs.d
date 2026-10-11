@@ -29,6 +29,7 @@ import {
   readEvents,
   setupConductor,
   waitFor,
+  type FakePiStep,
 } from "./harness.ts";
 import {
   buildContract,
@@ -560,7 +561,17 @@ test("gate: a reviewer is told the conductor owns the gate and shown the failed 
     // The real two-turn review: turn 1 discovers, turn 2 votes and raises
     // findings — and is where the gate section belongs.
     stubReviews: false,
-    workerScript,
+    // Plan 06k2 (A6): the gate runs after the reviews, so its failed
+    // candidate was reviewed; the repair attempt must change the tree, or
+    // its unchanged resubmission is refused before freeze. Round 2's
+    // reviewers are shown the latest verified (failed) gate record.
+    workerScriptForAttempt: (attempt) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        ...(attempt > 1 ? [{ kind: "call-sh", command: `printf 'round ${attempt}\\n' > round-${attempt}.txt` } as FakePiStep] : []),
+        ...workerScript().steps,
+      ],
+    }),
     reviewerScriptFor: (reviewer, state) => ({
       hello: defaultReviewerHello(),
       steps: [

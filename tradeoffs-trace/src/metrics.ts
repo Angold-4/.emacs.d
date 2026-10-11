@@ -12,7 +12,9 @@
 
 import { readLog } from "./effects/log.ts";
 import { projectEntries } from "./core/entries.ts";
-import type { Message, MessageType, PhaseState } from "./core/types.ts";
+import { pickStats } from "./core/rounds.ts";
+import { seatsOf } from "./core/seats.ts";
+import type { LoserHad, Message, MessageType, PhaseState } from "./core/types.ts";
 
 /** Plan 05j: the live-entry budget. Above it the review buffer is warning the
  * owner that the phase is carrying more topics than one review can hold. */
@@ -31,6 +33,15 @@ export interface MetricEvent {
   ts?: string;
   verdict?: string;
   outcome?: string;
+  /** Plan 06k1 (A1): a pick vote's round, seat, lane and loserHad, folded
+   * into the pick metrics. */
+  round?: number;
+  seat?: string;
+  lane?: string;
+  loserHad?: LoserHad;
+  /** Plan 06k1 (A1): PICK_VOTE's own event has no explicit seat count; the
+   * phase's contract supplies it. Kept here so the fold is self-contained. */
+  revote?: boolean;
   /** Plan 05d: FLAKE_OBSERVED carries the test's name, the command and
    * whether the check it belonged to was saved by it. */
   name?: string;
@@ -56,6 +67,17 @@ export interface FlakeMetrics {
   roundsSaved: number;
   /** Worker launches retried after a hello timeout. */
   launchRetries: number;
+}
+
+/** Plan 06k1 (A1): the round's pick shape, folded from PICK_VOTE events.
+ * `notRecorded` counts rounds whose votes predate `loserHad` (the views show
+ * "not recorded"). */
+export interface PickMetrics {
+  rounds: number;
+  split: number;
+  unanimous: number;
+  loserHadSomething: number;
+  notRecorded: number;
 }
 
 /** Per type: how many messages were raised, and where they ended up. `raw`
@@ -102,6 +124,9 @@ export interface PhaseMetrics {
   unexposedTradeoffs: number;
   /** Plan 05d: flakes per test, rounds saved and launch retries. */
   flakes: FlakeMetrics;
+  /** Plan 06k1 (A1): the pick shape per round (split vs unanimous, and
+   * rounds where the loser had something). */
+  picks: PickMetrics;
   /** Plan 05j: the cleanness of the entry ledger. */
   cleanness: {
     /** Live entries in the phase's review. */
@@ -263,6 +288,22 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
     launchRetries,
   };
 
+  // Plan 06k1 (A1): the pick shape per round, from the phase's own round
+  // records. `pickStats` is the single source: it uses the DECIDING votes (the
+  // revote when one ran) and counts a loser-had-something yes only from a
+  // seat that picked the WINNING lane (findings A-9 and D-B-54).
+  const seatCount = seatsOf(phase.contract).length;
+  const picks: PickMetrics = { rounds: 0, split: 0, unanimous: 0, loserHadSomething: 0, notRecorded: 0 };
+  for (const round of phase.rounds ?? []) {
+    if (round.votes.length === 0 && !(round.revote && round.revote.votes.length > 0)) continue;
+    const stats = pickStats(round, seatCount);
+    picks.rounds += 1;
+    if (stats.split) picks.split += 1;
+    else picks.unanimous += 1;
+    if (!stats.recorded) picks.notRecorded += 1;
+    if (stats.loserHadSomething) picks.loserHadSomething += 1;
+  }
+
   const projected = projectEntries({ messages: phase.messages ?? [], entries: phase.entries ?? [] });
   const liveEntries = projected.views.filter((v) => v.live).length;
   const distinctAnchors = new Set(projected.views.filter((v) => v.live).map((v) => JSON.stringify(v.anchor))).size;
@@ -290,6 +331,7 @@ export function computeMetrics(phase: PhaseState, timeline: MetricsTimeline, eve
     ownerVerdicts: { accept, refuse },
     refuseRate: ratio(refuse, accept + refuse),
     blockers,
+    picks,
     unexposedTradeoffs,
     flakes,
     cleanness,
@@ -337,7 +379,14 @@ export function metricsLine(m: PhaseMetrics): string {
   ];
   const flakes = flakesLine(m);
   if (flakes) parts.push(flakes);
+  if (m.picks.rounds > 0) parts.push(picksLine(m.picks));
   return `metrics   ${parts.join(" · ")}`;
+}
+
+/** Plan 06k1 (A1): the one-line pick summary for the status buffer. */
+export function picksLine(p: PickMetrics): string {
+  const notRecorded = p.notRecorded > 0 ? `, ${p.notRecorded} not recorded` : "";
+  return `picks ${p.rounds} round${p.rounds === 1 ? "" : "s"}: ${p.split} split, ${p.unanimous} unanimous, ${p.loserHadSomething} loser-had-something${notRecorded}`;
 }
 
 /** Plan 05d: the status buffer's own `flakes` row (flakes per test, rounds
@@ -377,6 +426,7 @@ export function metricsSummary(m: PhaseMetrics): string[] {
     `- Owner wait: ${duration(m.ownerWaitMs)}`,
     `- Blockers: ${m.blockers.escalated} escalated, ${m.blockers.downgraded} downgraded, ${m.blockers.incomplete} incomplete`,
     `- Unexposed-decision proxy (reviewer-raised trade-offs the worker did not raise): ${m.unexposedTradeoffs}`,
+    `- Picks: ${m.picks.rounds} round${m.picks.rounds === 1 ? "" : "s"} · ${m.picks.split} split · ${m.picks.unanimous} unanimous · ${m.picks.loserHadSomething} loser-had-something${m.picks.notRecorded > 0 ? ` · ${m.picks.notRecorded} not recorded` : ""}`,
     `- Flakes per test: ${m.flakes.perTest.length === 0 ? "none" : m.flakes.perTest.map((t) => `\`${t.name}\` ×${t.count} (last ${t.lastSeen || "?"})`).join(", ")}`,
     `- Rounds saved by load-only re-runs: ${m.flakes.roundsSaved}; launch retries: ${m.flakes.launchRetries}`,
     `- Cleanness: ${m.cleanness.liveEntries} live entries (budget ${m.cleanness.entryBudget}${m.cleanness.entryBudgetWarning ? ", OVER BUDGET" : ""}) · ${m.cleanness.entriesPerAnchor} entries per distinct anchor · ${m.cleanness.openHints} open ≈ hints · owner merges/splits ${m.cleanness.ownerMerges}/${m.cleanness.ownerSplits} · lint violations ${m.cleanness.lintViolations}`,

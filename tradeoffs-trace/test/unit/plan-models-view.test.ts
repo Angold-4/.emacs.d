@@ -11,7 +11,7 @@ import { test } from "node:test";
 import type { RunPlanFile } from "../../src/conductor.ts";
 import type { PlanModels } from "../../src/core/roles.ts";
 import { renderStatusText, renderStatusView, statusViewInput } from "../../src/render.ts";
-import { buildView, modelEntries, modelsLineText, prSummary } from "../../src/view.ts";
+import { buildView, chartModelsFromPlan, modelEntries, modelsLineText, prSummary } from "../../src/view.ts";
 
 const MODELS: PlanModels = {
   worker: { model: "deepseek/deepseek-v4.1-flash" },
@@ -107,6 +107,27 @@ test("modelEntries: per-seat models expand to one entry per seat", () => {
     { role: "panel.2", value: "deepseek/deepseek-v4.1-flash" },
     { role: "panel.3", value: "vercel-ai-gateway:spacexai/grok-4.6" },
   ]);
+});
+
+test("plan 06h: per-seat models expand to EVERY configured seat, not only the overridden ones", () => {
+  const sparse: PlanModels = { reviewer: { model: "shared" }, reviewerSeats: { C: { model: "c" } }, panelFrom: "reviewers" };
+  const seats = ["M", "A", "B", "C", "D"];
+  const entries = modelEntries(sparse, seats);
+  // Every configured seat is named, even those with no per-seat override.
+  assert.deepEqual(
+    entries.filter((e) => e.role.startsWith("reviewer.")).map((e) => e.role),
+    ["reviewer.M", "reviewer.A", "reviewer.B", "reviewer.C", "reviewer.D"],
+  );
+  assert.equal(entries.find((e) => e.role === "reviewer.C")!.value, "c");
+  assert.equal(entries.find((e) => e.role === "reviewer.D")!.value, "shared", "a seat with no override falls back to the shared reviewer model");
+  // panel=reviewers maps panel seat i to reviewer i, for all five.
+  assert.equal(entries.filter((e) => e.role.startsWith("panel.")).length, 5);
+  assert.equal(entries.find((e) => e.role === "panel.4")!.value, "c", "panel seat 4 follows the 4th reviewer, C");
+  assert.equal(entries.find((e) => e.role === "panel.5")!.value, "shared", "panel seat 5 follows reviewer D, which falls back to the shared model");
+  // The chart's per-seat maps carry all five seats too.
+  const chart = chartModelsFromPlan(sparse, seats)!;
+  assert.deepEqual(Object.keys(chart.reviewerSeats!).sort(), ["A", "B", "C", "D", "M"]);
+  assert.deepEqual(Object.keys(chart.panelSeats!).sort(), ["1", "2", "3", "4", "5"]);
 });
 
 test("the status line and tt summary name every seat's model", () => {

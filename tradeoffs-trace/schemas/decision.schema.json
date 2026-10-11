@@ -28,7 +28,7 @@
     "boundContractVersion": { "$ref": "#/$defs/ContractVersion" },
     "supersededByCorrection": { "type": "string", "minLength": 1 },
     "supersededBy": { "type": "string", "minLength": 1 },
-    "alsoSeenBy": { "type": "array", "items": { "enum": ["M", "A", "B"] } }
+    "alsoSeenBy": { "type": "array", "items": { "type": "string", "minLength": 1 } }
   },
   "$defs": {
     "Alternative": {

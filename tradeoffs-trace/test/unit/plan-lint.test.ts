@@ -333,3 +333,79 @@ test("plan-lint: a full per-seat declaration passes and an empty seat model fail
   assert.match(empty[0].problem, /empty model/);
   assert.match(empty[0].problem, /reviewer\.B/);
 });
+
+test("plan 06g: tt lint refuses TT_WORKERS 3 naming 06h", () => {
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  // 1 and 2 are this plan version's lanes; absent is the same as 1.
+  assert.deepEqual(lintPlan(base).filter((f) => f.rule === "worker-count"), []);
+  assert.deepEqual(lintPlan({ ...base, workers: 1, workersLine: 3 }).filter((f) => f.rule === "worker-count"), []);
+  // Plan 06k2 (A5): two lanes are valid with no warning — the stale
+  // "the two-lane round arrives in 06g2" warning was dropped (the conductor
+  // runs lanes whenever workers > 1).
+  const two = lintPlan({ ...base, workers: 2, workersLine: 3 });
+  assert.deepEqual(two.filter((f) => f.rule === "worker-count"), [], "TT_WORKERS 2 is accepted with no warning");
+  assert.equal(hasLintErrors(two), false);
+
+  const three = lintPlan({ ...base, workers: 3, workersLine: 3 });
+  const finding = three.find((f) => f.rule === "worker-count");
+  assert.ok(finding, "TT_WORKERS 3 must be refused");
+  assert.equal(finding!.severity, "error");
+  assert.equal(finding!.line, 3);
+  assert.match(finding!.problem, /3 lanes/);
+  // The message names 06h as the phase that allows more lanes.
+  assert.match(finding!.fix, /06h/);
+  assert.equal(hasLintErrors(three), true);
+
+  // A value that is not a whole number of lanes is refused too, naming it.
+  const text = lintPlan({ ...base, workers: "two" as unknown as number, workersLine: 4 });
+  assert.match(text.find((f) => f.rule === "worker-count")!.problem, /got two/);
+  assert.equal(lintPlan({ ...base, workers: 0, workersLine: 4 }).find((f) => f.rule === "worker-count")!.severity, "error");
+});
+
+test("plan 06g: tt lint reads worker.1/worker.2 as lane models and names any other lane", () => {
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  // The two lanes this plan version runs are accepted, with or without a model.
+  assert.deepEqual(
+    lintPlan({ ...base, models: { workerLanes: { "1": { model: "one" }, "2": { model: "two" } } }, modelsLine: 3 }).filter(
+      (f) => f.rule === "model-declaration",
+    ),
+    [],
+  );
+  // A third lane is 06h's, named as such.
+  const third = lintPlan({ ...base, models: { workerLanes: { "3": { model: "three" } } }, modelsLine: 3 }).find(
+    (f) => f.rule === "model-declaration",
+  );
+  assert.ok(third, "worker.3 must be refused");
+  assert.match(third!.problem, /unknown worker lane worker\.3/);
+  assert.match(third!.fix, /worker\.1 or worker\.2/);
+  // A lane with an empty model is the same error as any other key's.
+  const empty = lintPlan({ ...base, models: { workerLanes: { "1": {} } }, modelsLine: 3 }).find(
+    (f) => f.rule === "model-declaration",
+  );
+  assert.match(empty!.problem, /worker\.1/);
+  assert.match(empty!.problem, /empty model/);
+});
+
+test("plan 06h: tt lint refuses an invalid phase :REVIEWERS:/:LEADER: override with a line", () => {
+  // An even phase seat list, a duplicate and an unknown phase leader.
+  const even = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B", "C"], line: 12 }]));
+  assert.ok(even.some((f) => f.rule === "reviewer-seat" && /phase :REVIEWERS:/.test(f.problem) && f.line === 12));
+  const dupe = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B", "A"], line: 13 }]));
+  assert.ok(dupe.some((f) => f.rule === "reviewer-seat" && /more than once/.test(f.problem) && f.line === 13));
+  const leader = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B"], leader: "X", line: 14 }]));
+  assert.ok(leader.some((f) => f.rule === "reviewer-leader" && /not one of the reviewer seats/.test(f.problem) && f.line === 14));
+  // Too few phase reviewers for the effective worker count, naming the smallest.
+  const few = lintPlan(plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B"], line: 15 }], "/x/PLAN.org") );
+  assert.deepEqual(few.filter((f) => f.rule === "worker-count"), [], "3 reviewers with the default 1 worker is fine");
+  const fewWorkers = lintPlan({ ...plan([{ id: "p", acceptance: ["it works"], seats: ["M", "A", "B"], line: 15 }]), workers: 3, workersLine: 2 });
+  assert.ok(fewWorkers.some((f) => f.rule === "worker-count" && /at least 5 reviewers/.test(f.problem)));
+});
+
+test("plan 06g: #+TT_ROUNDS must be a positive whole number, and 3 is the default", () => {
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  assert.deepEqual(lintPlan({ ...base, rounds: 5, roundsLine: 4 }).filter((f) => f.rule === "worker-count"), []);
+  assert.deepEqual(lintPlan(base).filter((f) => f.rule === "worker-count"), []);
+  const bad = lintPlan({ ...base, rounds: 0, roundsLine: 4 }).find((f) => f.rule === "worker-count");
+  assert.ok(bad, "#+TT_ROUNDS: 0 must be refused");
+  assert.match(bad!.fix, /default/);
+});

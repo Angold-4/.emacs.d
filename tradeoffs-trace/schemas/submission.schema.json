@@ -63,7 +63,23 @@
         "criterionDispute": {
           "$ref": "#/$defs/criterionDispute",
           "description": "Plan 01g: say a criterion cannot be met as written, naming it verbatim; the conductor records an amendment the reviewers vote on. A criterion that is merely unmet is a normal repair, not a dispute."
+        },
+        "findingAnswers": {
+          "type": "array",
+          "description": "Plan 06k3 (A3): one answer per open blocking finding listed in the prompt: fixed (with the test that now covers it) or disputed (with the reason). A submission that leaves one unanswered is refused before the freeze.",
+          "items": { "$ref": "#/$defs/findingAnswer" }
         }
+      }
+    },
+    "findingAnswer": {
+      "type": "object",
+      "required": ["findingId", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "findingId": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["fixed", "disputed"] },
+        "test": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
       }
     },
     "criterionDispute": {
@@ -100,6 +116,38 @@
           "maxItems": 5,
           "items": { "$ref": "#/$defs/decisionDisclosure" }
         }
+      }
+    },
+    "coverageEntry": {
+      "type": "object",
+      "required": ["id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["done", "partial", "not_done"] },
+        "where": { "type": "array", "items": { "type": "string" } },
+        "tests": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
+    },
+    "archCoverageEntry": {
+      "type": "object",
+      "required": ["id", "fits"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "fits": { "enum": ["yes", "deviates"] },
+        "where": { "type": "array", "items": { "type": "string" } },
+        "note": { "type": "string" }
+      }
+    },
+    "submitCoverage": {
+      "type": "object",
+      "required": ["items", "arch"],
+      "additionalProperties": true,
+      "properties": {
+        "items": { "type": "array", "items": { "$ref": "#/$defs/coverageEntry" } },
+        "arch": { "type": "array", "items": { "$ref": "#/$defs/archCoverageEntry" } }
       }
     }
   }

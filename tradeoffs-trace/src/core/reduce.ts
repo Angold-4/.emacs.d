@@ -20,13 +20,19 @@ import { applyCarryWithContract, applyMessageEvent, checkMessageBinding } from "
 import { next as computeNext } from "./next.ts";
 import {
   applyFindingAcceptedByOwner,
+  applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
   checkFindingAcceptedByOwner,
+  checkItemCarried,
   checkOverrideCast,
   checkOwnerRequestResolved,
+  clearRulings,
+  recordRulings,
 } from "./owner-commands.ts";
-import { isLiveDecision, panelOutcome, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { isLiveDecision, panelOutcome, panelSeatNumbers, panelSeatSettled, panelSeatsSettled, reviewIngestionIssue, sameVersion } from "./predicate.ts";
+import { seatsOf } from "./seats.ts";
+import { findOwnerRequest } from "./triage.ts";
 import { rowsFor } from "./transitions.ts";
 import type {
   BindingTuple,
@@ -62,6 +68,11 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "CHECKS_PASSED",
   "CHECKS_FAILED",
   "CHECKS_INTERRUPTED",
+  "RECHECK_REQUESTED",
+  "FINAL_CHECK_REQUIRED",
+  "FINAL_CHECKS_PASSED",
+  "FINAL_CHECKS_FAILED",
+  "FINAL_CHECKS_INTERRUPTED",
   "ENV_CHECKED",
   "ENV_PREFLIGHT_FAILED",
   "ENV_CHECK_FAILED",
@@ -108,8 +119,28 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "INTEGRITY_VIOLATED",
   "BRIEFS_RECORDED",
   "BRIEF_RETRY_ATTEMPTED",
+  "ITEM_STATE_UPDATED",
+  "EVIDENCE_RECORDED",
+  "ITEM_CHECK_RECORDED",
+  "FINDING_MERGED",
+  "TRIAGE_RECORDED",
+  "TRIAGE_FAILED",
+  "DEFERRAL_RECORDED",
+  "DEFERRAL_RESOLVED",
+  "ROUND_STARTED",
+  "ROUND_REPEATED",
+  "UNCHANGED_PERMISSION_USED",
+  "UNSUBMITTED_WORK_SAVED",
+  "CANDIDATE_SUBMITTED",
+  "CANDIDATE_CHECKED",
+  "PICK_VOTE",
+  "REVOTE_STARTED",
+  "CANDIDATE_PICKED",
+  "ROUND_REVIEW_SUBMITTED",
+  "ITEM_CARRIED",
   "DECISION_ADDED",
   "NOTE_ADDED",
+  "OWNER_CORRECTION_QUEUED",
   "OWNER_INPUT_RECORDED",
   "DIRECTIVE_ADDED",
   "DIRECTIVE_WITHDRAWN",
@@ -204,8 +235,10 @@ function withoutEvaluationInFlight(p: PhaseState, type: MessageType): PhaseState
   return inFlight;
 }
 
-/** Plan 04b: the three seats a panel may have. */
-const PANEL_SEAT_KEYS = new Set(["1", "2", "3"]);
+/** Plan 04b/06h: the panel seat keys a phase may have — one per reviewer. */
+function panelSeatKeys(p: PhaseState): Set<string> {
+  return new Set(panelSeatNumbers(seatsOf(p.contract).length).map(String));
+}
 
 function withoutPanelSeatInFlight(p: PhaseState, blockerId: string, seat: string): PhaseState["inFlight"] {
   const inFlight = { ...p.inFlight };
@@ -232,6 +265,26 @@ function withoutRoundPanelSeatInFlight(p: PhaseState, seat: string): PhaseState[
  * only ever append or amend a record without moving the phase's own FSM
  * state, so they have no row in transitions.ts (which is scoped to
  * phase-state-changing edges, per the plan's phase-0 brief). */
+/** Plan 06g: replace (or insert) one lane's candidate record, preserving
+ * every other lane's. */
+function upsertLane(
+  candidates: import("./types.ts").LaneCandidateRecord[],
+  lane: string,
+  patch: Partial<import("./types.ts").LaneCandidateRecord>,
+): import("./types.ts").LaneCandidateRecord[] {
+  const existing = candidates.find((c) => c.lane === lane);
+  if (!existing) return [...candidates, { lane, ...patch }];
+  return candidates.map((c) => (c.lane === lane ? { ...c, ...patch } : c));
+}
+
+/** Plan 06g: replace one round record in order. */
+function replaceRound(
+  rounds: import("./types.ts").RoundRecord[] | undefined,
+  record: import("./types.ts").RoundRecord,
+): import("./types.ts").RoundRecord[] {
+  return (rounds ?? []).map((r) => (r.round === record.round ? record : r));
+}
+
 function applyRecordEvent(state: State, event: Event): ReduceResult | undefined {
   const p = state.phase;
   switch (event.type) {
@@ -325,12 +378,252 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: applyOverrideCast(p, event) });
     }
 
+    case "ITEM_CARRIED": {
+      // Plan 06g (A5): the owner's carry. The AWAITING_OWNER rows route it;
+      // every other phase records it (mark carried, answer the request, and
+      // accept once nothing blocking is uncarried) without moving the phase.
+      const check = checkItemCarried(p, event);
+      if (!check.ok) return rejected(state, check.reason!);
+      return ok({ ...state, phase: applyItemCarried(p, event) });
+    }
+
     case "FINDING_RAISED": {
       // design §4.1: "a finding needs evidence" — reject one with none.
       if (!event.finding.evidence || event.finding.evidence.trim().length === 0) {
         return rejected(state, "a finding must carry evidence; got none");
       }
       return ok({ ...state, phase: { ...p, findings: [...p.findings, event.finding] } });
+    }
+
+    case "ITEM_CHECK_RECORDED": {
+      // Plan 06b (OD-1 R3b): the evaluator's re-check of an item's majority
+      // verdict, merged by item id (the latest check wins). Plan 06i: the same
+      // form carries the evaluator's impact class for a finding or discovered
+      // decision, so one check is both the re-check and the classification.
+      const others = (p.itemChecks ?? []).filter((c) => c.itemId !== event.itemId);
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          itemChecks: [
+            ...others,
+            {
+              itemId: event.itemId,
+              verdict: event.verdict,
+              evidence: event.evidence,
+              ...(event.impact ? { impact: event.impact } : {}),
+              ...(event.chosen ? { chosen: event.chosen } : {}),
+              ...(event.alternative ? { alternative: event.alternative } : {}),
+              ...(event.why ? { why: event.why } : {}),
+            },
+          ],
+        },
+      });
+    }
+
+    case "FINDING_MERGED": {
+      // Plan 06i (C3): a duplicate finding is merged, not disproved, and
+      // linked to the record it duplicates. Its own triage record copies the
+      // original's disposition, so nothing leaves the ledger without one.
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      const findings = p.findings.map((f) =>
+        f.id === event.findingId ? { ...f, status: "merged" as const, mergedInto: event.into, version: f.version + 1 } : f,
+      );
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "TRIAGE_RECORDED": {
+      // Plan 06i: one record per finding/discovered decision, merged by id
+      // (the latest disposition wins). Record-only: the phase's own FSM state
+      // never moves here; `accept()` and the views read the records.
+      const others = (p.triage ?? []).filter((r) => r.itemId !== event.record.itemId);
+      return ok({ ...state, phase: { ...p, triage: [...others, event.record] } });
+    }
+
+    case "DEFERRAL_RECORDED": {
+      // Plan 06i: a deferral needs a guard — a test that shows its current
+      // cost, or a recorded owner ruling. Without either it is refused with
+      // the reason, never recorded silently. Recorded once per item id.
+      const d = event.deferral;
+      // OD addendum A: a second owner act on the same id is refused, naming
+      // the existing act. A carry already put this item into the next phase's
+      // contract; deferring it too would silently drop one act.
+      if ((p.carriedItems ?? []).includes(d.itemId)) {
+        return rejected(state, `${d.itemId} is already carried (to ${p.carriedTo?.[d.itemId] ?? "next"}); resolve that carry first`);
+      }
+      if (!(d.test && d.test.trim().length > 0) && !(d.ownerRuling && d.ownerRuling.trim().length > 0)) {
+        return rejected(state, `deferring ${d.itemId} needs a guard: a test that shows its current cost, or a recorded owner ruling`);
+      }
+      const others = (p.deferrals ?? []).filter((x) => x.itemId !== d.itemId);
+      return ok({ ...state, phase: { ...p, deferrals: [...others, d] } });
+    }
+
+    case "DEFERRAL_RESOLVED": {
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          deferrals: (p.deferrals ?? []).map((d) => (d.id === event.deferralId ? { ...d, status: "resolved" as const } : d)),
+        },
+      });
+    }
+
+    case "ITEM_STATE_UPDATED": {
+      // Plan 06b: the item loop's own state, merged record-only. Nothing
+      // here moves the phase; the freeze, checks, reviews and acceptance
+      // read it.
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          ...(event.coverage ? { coverage: event.coverage } : {}),
+          ...(event.coverageAttempt !== undefined ? { coverageAttempt: event.coverageAttempt } : {}),
+          ...(event.checkResolution ? { checkResolution: event.checkResolution } : {}),
+          ...(event.checkTestLines ? { checkTestLines: event.checkTestLines } : {}),
+          ...(event.itemEvidence ? { itemEvidence: event.itemEvidence } : {}),
+          ...(event.acceptedDeviations ? { acceptedDeviations: event.acceptedDeviations } : {}),
+          ...(event.archSymbolDeviations ? { archSymbolDeviations: event.archSymbolDeviations } : {}),
+          ...(event.overturns ? { overturns: event.overturns } : {}),
+        },
+      });
+    }
+
+    // Plan 06g: the round's record events. None of them moves the phase —
+    // the conductor's own orchestration does that — but they are the log a
+    // restart folds to know each round's base, lanes, candidates, votes and
+    // winner, and the views render. Every one of them is rejected when its
+    // round has not started, so a stray event cannot invent a round.
+    // Plan 06k3 (A1): a free repeat of a round that could not complete (a
+    // missing lane review or pick vote after its retry). Record-only: it
+    // counts the repeat so a conductor restart cannot reset the budget, and
+    // never moves the phase (the conductor re-runs the round in place).
+    case "ROUND_REPEATED": {
+      return ok({ ...state, phase: { ...p, roundRepeatsUsed: (p.roundRepeatsUsed ?? 0) + 1 } });
+    }
+
+    // Plan 06k3 (A4): an unchanged-resubmission permission was used. Recorded
+    // as an event so a restart cannot reopen it.
+    case "UNCHANGED_PERMISSION_USED": {
+      const used = p.consumedUnchangedPermissions ?? [];
+      if (used.includes(event.key)) return ok(state);
+      return ok({ ...state, phase: { ...p, consumedUnchangedPermissions: [...used, event.key] } });
+    }
+
+    // Plan 06k3 (A2): uncommitted work saved at a worker's deadline. Record-
+    // only; the next attempt of `lane` reads it to pick its base and name it.
+    case "UNSUBMITTED_WORK_SAVED": {
+      const others = (p.unsubmittedWork ?? []).filter((w) => !(w.lane === event.lane && w.attempt === event.attempt));
+      return ok({
+        ...state,
+        phase: { ...p, unsubmittedWork: [...others, { lane: event.lane, attempt: event.attempt, ref: event.ref, sha: event.sha }] },
+      });
+    }
+
+    case "ROUND_STARTED": {
+      if (event.round < 1 || event.lanes.length === 0) {
+        return rejected(state, "ROUND_STARTED needs a round number and at least one lane");
+      }
+      const others = (p.rounds ?? []).filter((r) => r.round !== event.round);
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          rounds: [
+            ...others,
+            { round: event.round, base: event.base, lanes: [...event.lanes], candidates: [], votes: [] },
+          ].sort((a, b) => a.round - b.round),
+        },
+      });
+    }
+
+    case "CANDIDATE_SUBMITTED": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `CANDIDATE_SUBMITTED for round ${event.round}, which has not started`);
+      if (!round.lanes.includes(event.lane)) {
+        return rejected(state, `CANDIDATE_SUBMITTED names lane ${event.lane}, not a lane of round ${event.round}`);
+      }
+      const candidates = upsertLane(round.candidates, event.lane, { sha: event.sha });
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
+    }
+
+    case "CANDIDATE_CHECKED": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `CANDIDATE_CHECKED for round ${event.round}, which has not started`);
+      if (!round.lanes.includes(event.lane)) {
+        return rejected(state, `CANDIDATE_CHECKED names lane ${event.lane}, not a lane of round ${event.round}`);
+      }
+      const candidates = upsertLane(round.candidates, event.lane, { ok: event.ok, ...(event.note ? { note: event.note } : {}) });
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
+    }
+
+    case "REVOTE_STARTED": {
+      // Plan 06h (A3): the top two lanes go to one revote. Record-only.
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `REVOTE_STARTED for round ${event.round}, which has not started`);
+      if (event.lanes.length !== 2 || event.lanes.some((l) => !round.lanes.includes(l))) {
+        return rejected(state, `REVOTE_STARTED names ${event.lanes.join(", ")}, not two lanes of round ${event.round}`);
+      }
+      return ok({
+        ...state,
+        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, revote: { lanes: [...event.lanes], votes: [] } }) },
+      });
+    }
+
+    case "PICK_VOTE": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `PICK_VOTE for round ${event.round}, which has not started`);
+      if (!round.lanes.includes(event.lane)) {
+        return rejected(state, `PICK_VOTE names lane ${event.lane}, not a lane of round ${event.round}`);
+      }
+      // A seat votes once: a later vote from the same seat replaces the
+      // earlier one, exactly like a re-cast ballot.
+      const vote: import("./types.ts").PickVote = {
+        seat: event.seat,
+        lane: event.lane,
+        why: event.why,
+        ...(event.loserHad ? { loserHad: event.loserHad } : {}),
+      };
+      if (event.revote) {
+        if (!round.revote || !round.revote.lanes.includes(event.lane)) {
+          return rejected(state, `PICK_VOTE names lane ${event.lane}, not a revote lane of round ${event.round}`);
+        }
+        const votes = [...round.revote.votes.filter((v) => v.seat !== event.seat), vote];
+        return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, revote: { ...round.revote, votes } }) } });
+      }
+      const votes = [...round.votes.filter((v) => v.seat !== event.seat), vote];
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, votes }) } });
+    }
+
+    case "ROUND_REVIEW_SUBMITTED": {
+      // Plan 06g2: one seat's review of one lane candidate, recorded while
+      // the round runs (no review slot exists yet). Record-only; the round's
+      // per-candidate record, which the review buffer groups by candidate.
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `ROUND_REVIEW_SUBMITTED for round ${event.round}, which has not started`);
+      const candidate = round.candidates.find((c) => c.lane === event.lane);
+      if (!candidate?.sha) {
+        return rejected(state, `ROUND_REVIEW_SUBMITTED names lane ${event.lane}, which submitted no candidate of round ${event.round}`);
+      }
+      if (event.review.candidateSha !== candidate.sha) {
+        return rejected(state, `ROUND_REVIEW_SUBMITTED for ${event.lane} names candidate ${event.review.candidateSha}, not ${candidate.sha}`);
+      }
+      const reviews = [...(candidate.reviews ?? []).filter((r) => r.seat !== event.seat), { seat: event.seat, review: event.review }];
+      const candidates = upsertLane(round.candidates, event.lane, { reviews });
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
+    }
+
+    case "CANDIDATE_PICKED": {
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `CANDIDATE_PICKED for round ${event.round}, which has not started`);
+      const candidate = round.candidates.find((c) => c.lane === event.lane);
+      if (!candidate || candidate.sha !== event.sha) {
+        return rejected(state, `CANDIDATE_PICKED names ${event.sha} in lane ${event.lane}, which that lane did not submit`);
+      }
+      return ok({
+        ...state,
+        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, picked: { lane: event.lane, sha: event.sha, votes: event.votes } }) },
+      });
     }
 
     case "DECISION_ADDED": {
@@ -397,7 +690,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       }
       const finding = p.findings.find((f) => f.id === event.findingId);
       if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
-      if (finding.raisedBy !== event.byReviewer) {
+      // Plan 06m (A1/R2): the owner's refusal settles the finding (with the
+      // reason on the record) and creates nothing to answer; a reviewer may
+      // still only withdraw its own finding.
+      if (finding.raisedBy !== event.byReviewer && event.byReviewer !== "owner") {
         return rejected(
           state,
           `only the raising reviewer (${finding.raisedBy}) may withdraw finding ${event.findingId}, not ${event.byReviewer}`,
@@ -452,7 +748,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const finding = p.findings.find((f) => f.id === event.findingId);
       if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
       const findings = p.findings.map((f) =>
-        f.id === event.findingId ? { ...f, severity: event.severity, severityReason: event.reason.trim() } : f,
+        f.id === event.findingId ? { ...f, severity: event.severity, severityReason: event.reason.trim(), severityChangedBy: event.by } : f,
       );
       return ok({ ...state, phase: { ...p, findings } });
     }
@@ -636,7 +932,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const panel = p.panel?.blockers?.[event.blockerId];
       if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = panel.seats?.[seatKey];
       if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
       if (seat?.unavailable) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is unavailable`);
@@ -690,7 +986,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const panel = p.panel?.blockers?.[event.blockerId];
       if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = panel.seats?.[seatKey];
       if (seat?.vote !== undefined) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} already voted`);
       if (panelSeatSettled(seat)) return rejected(state, `panel seat ${seatKey} of blocker ${event.blockerId} is already unavailable`);
@@ -717,10 +1013,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const panel = p.panel?.blockers?.[event.blockerId];
       if (!panel) return rejected(state, `no panel is open for blocker ${event.blockerId}`);
       if (panel.decided) return rejected(state, `blocker ${event.blockerId}'s panel has already decided`);
-      if (!panelSeatsSettled(panel)) {
+      if (!panelSeatsSettled(panel, panelSeatKeys(p).size)) {
         return rejected(state, `blocker ${event.blockerId}'s panel still has undecided seats`);
       }
-      const computed = panelOutcome(panel);
+      const computed = panelOutcome(panel, panelSeatKeys(p).size);
       if (event.outcome !== computed) {
         return rejected(
           state,
@@ -753,7 +1049,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, `ROUND_PANEL_VOTE is only valid in EVALUATING, not ${p.phase}`);
       }
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `round panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `round panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = p.panel?.round?.seats?.[seatKey];
       if (seat?.votes !== undefined) return rejected(state, `round panel seat ${seatKey} already voted`);
       if (seat?.unavailable) return rejected(state, `round panel seat ${seatKey} is unavailable`);
@@ -784,7 +1080,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         return rejected(state, `ROUND_PANEL_SEAT_UNAVAILABLE is only valid in EVALUATING, not ${p.phase}`);
       }
       const seatKey = String(event.seat);
-      if (!PANEL_SEAT_KEYS.has(seatKey)) return rejected(state, `round panel seat must be 1, 2 or 3, not ${String(event.seat)}`);
+      if (!panelSeatKeys(p).has(seatKey)) return rejected(state, `round panel seat must be 1..${panelSeatKeys(p).size}, not ${String(event.seat)}`);
       const seat = p.panel?.round?.seats?.[seatKey];
       if (seat?.votes !== undefined) return rejected(state, `round panel seat ${seatKey} already voted`);
       if (seat?.unavailable === true && (seat.dispatches ?? 0) >= 2) {
@@ -899,6 +1195,37 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({ ...state, phase: { ...p, ownerNotes: [...(p.ownerNotes ?? []), event.text] } });
     }
 
+    case "OWNER_CORRECTION_QUEUED": {
+      // Plan 06k1 (A5): a correction that could not be applied now is queued
+      // for the next attempt's prompt AND grants its own round, so a spent
+      // budget never drops an owner input. Record-only: the phase-state name
+      // does not move.
+      if (typeof event.text !== "string" || event.text.trim().length === 0) {
+        return rejected(state, "a queued correction must carry non-empty text");
+      }
+      const granted = Number.isFinite(event.grantedRounds) && event.grantedRounds > 0 ? Math.floor(event.grantedRounds) : 3;
+      // Plan 06k1 (A2, T-2): a queued correction is still an owner ruling —
+      // record it exactly like an applied one, so a lost owner input never
+      // drops the ruling it carries.
+      // Plan 06k2 (A8): a negation in the same text clears the ruling.
+      const ruledDecisions = clearRulings(recordRulings(p.ruledDecisions, event.text, p.decisions, event.correctionId), event.text, p.decisions);
+      // Plan 06k1 (A5, finding A-8): the queued correction is an acceptance
+      // obligation until its text reaches a worker prompt (NOTES_DELIVERED).
+      // Plan 06k2 (A8): the correction's position in `ownerNotes`, so
+      // NOTES_DELIVERED can clear exactly the corrections a prompt carried.
+      const queuedCorrections = [...(p.queuedCorrections ?? []), { id: event.correctionId, text: event.text, index: p.ownerNotes?.length ?? 0 }];
+      return ok({
+        ...state,
+        phase: {
+          ...p,
+          ownerNotes: [...(p.ownerNotes ?? []), event.text],
+          repairRoundsGranted: p.repairRoundsGranted + granted,
+          ruledDecisions,
+          queuedCorrections,
+        },
+      });
+    }
+
     case "DIRECTIVE_ADDED": {
       // Plan 01i: a numbered owner directive. Record-only (moves no phase
       // state name) but binding: every later prompt quotes it verbatim
@@ -925,7 +1252,11 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // before `cmd-prog-ODP-2`, and prompts and the status must still read
       // oldest → newest. `seq` is the number in the id (`OD-n` or `ODP-n`).
       const ownerDirectives = [...existing, added].sort((a, b) => a.seq - b.seq);
-      return ok({ ...state, phase: { ...p, ownerDirectives } });
+      // Plan 06k1 (A2): a directive that names a decision id as ruled settles
+      // it, exactly like a correction. Plan 06k2 (A8): a negation in the same
+      // text clears it instead.
+      const ruledDecisions = clearRulings(recordRulings(p.ruledDecisions, directive.text, p.decisions, directive.id), directive.text, p.decisions);
+      return ok({ ...state, phase: { ...p, ownerDirectives, ruledDecisions: ruledDecisions ?? [] } });
     }
 
     case "DIRECTIVE_WITHDRAWN": {
@@ -939,7 +1270,10 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const ownerDirectives = (p.ownerDirectives ?? []).map((d) =>
         d.id === event.directiveId ? { ...d, status: "withdrawn" as const, withdrawnAt: event.at } : d,
       );
-      return ok({ ...state, phase: { ...p, ownerDirectives } });
+      // Plan 06k2 (A8): a ruling the withdrawn directive carried is cleared
+      // (finding D-B-79: it must not survive the directive's withdrawal).
+      const ruledDecisions = clearRulings(p.ruledDecisions, "", p.decisions, event.directiveId);
+      return ok({ ...state, phase: { ...p, ownerDirectives, ruledDecisions: ruledDecisions ?? [] } });
     }
 
     case "DIRECTIVE_DELIVERED": {
@@ -988,7 +1322,7 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // unstick it — the blocking finding on this candidate. The metric
       // lives in `unneededRequestIds`, so the owner can still grant/stop/
       // repair the request afterwards.
-      const request = p.ownerRequests.find((r) => r.id === event.requestId);
+      const request = findOwnerRequest(p, event.requestId);
       if (!request) return rejected(state, `unknown owner request ${event.requestId}`);
       if (request.status !== "open") {
         return rejected(state, `owner request ${event.requestId} is already ${request.status}, not open`);
@@ -1011,7 +1345,17 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!Number.isInteger(event.count) || event.count <= 0) {
         return rejected(state, "a notes-delivered event must carry a positive integer count");
       }
-      return ok({ ...state, phase: { ...p, deliveredNoteCount: (p.deliveredNoteCount ?? 0) + event.count } });
+      // Plan 06k1 (A5, finding A-8): the prompt that just went out carried
+      // every note up to the new delivered count. Plan 06k2 (A8, finding
+      // F-M-14): only the queued corrections that prompt actually carried are
+      // cleared — a correction queued AFTER the prompt was built stays an
+      // acceptance obligation for the next attempt.
+      const deliveredNoteCount = (p.deliveredNoteCount ?? 0) + event.count;
+      const queuedCorrections = (p.queuedCorrections ?? []).filter((c) => (c.index ?? 0) >= deliveredNoteCount);
+      return ok({
+        ...state,
+        phase: { ...p, deliveredNoteCount, queuedCorrections },
+      });
     }
 
     case "FLAKE_OBSERVED": {

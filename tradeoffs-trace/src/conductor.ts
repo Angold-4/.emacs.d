@@ -23,12 +23,48 @@ import { reduce } from "./core/reduce.ts";
 import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { candidateAnchorFreshness, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
-import { buildView } from "./view.ts";
+import { buildView, lanesView, updateLiveRun } from "./view.ts";
 import { renderPhaseChart, statsFromTimeline } from "./charts.ts";
 import { metricEvents, projectMetrics, type MetricEvent } from "./metrics.ts";
-import { expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent } from "./core/owner-inbox.ts";
+import { acceptInput, expandEntryCommand, normalizeDecisionViewCommand, ownerCommandToEvent, type InputKind } from "./core/owner-inbox.ts";
+import { unchangedResubmissionRequesters } from "./core/owner-commands.ts";
+// Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
+// and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
+// winner or whether a finding blocks by itself.
+import { advisoryReason, blocksAcceptance, candidateLabel, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
+// Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
+// implements its `LaneHost` with the worktree, agent, check, review and vote
+// machinery below and calls it; it decides nothing about lanes itself.
+import { isLaneRound, laneFailureLines, lanesOfContract, repeatLaneBases, runRound, type LaneBuild, type LaneCheck, type LaneHost } from "./core/lanes.ts";
+// Plan 06h (A1/A2): the seat list, its leader and the lane count are the
+// plan's, read from one place (`seatsOf`/`leaderOf`).
+import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
+// Plan 06i: triage — the only place fix / trade-off / escalate is decided.
+import {
+  blockingTriageRecords,
+  discoveredDecisions,
+  disposition,
+  escalationRequestId,
+  evidenceForDecision,
+  evidenceForFinding,
+  goldenCited,
+  hasBlockingFix,
+  impactOverride,
+  isClassified,
+  ledgerRecords,
+  openFindings,
+  findOwnerRequest,
+  ownerRequestIsStale,
+  recordClassified,
+  recordImpact,
+  undispositionedBlockingFinding,
+  uniqueOwnerRequestId,
+  type Disposition,
+  type TriageRecord,
+} from "./core/triage.ts";
+import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
-import { effectiveChecks } from "./core/checks.ts";
+import { checkCommands, checkTier, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand } from "./core/checks.ts";
 // Plan 05i: the pure environment preflight — parse every declared shell
 // command's executable and resolve it in the conductor's own PATH. See the
 // module's header.
@@ -68,7 +104,7 @@ import {
   type BaselineCommand,
   type TestRerunOutcome,
 } from "./core/test-failures.ts";
-import { contentHashOf, ledgerEntries, type MessageContent } from "./core/messages.ts";
+import { clampMessageTitle, contentHashOf, ledgerEntries, MESSAGE_TITLE_MAX, type MessageContent } from "./core/messages.ts";
 import type {
   Action,
   Ballot,
@@ -83,6 +119,7 @@ import type {
   DirectiveScope,
   Event,
   Finding,
+  FindingAnswer,
   PriorDecisionStatement,
   FindingDisclosure,
   InFlightKey,
@@ -96,6 +133,7 @@ import type {
   PhaseState,
   Review,
   Reviewer,
+  Seats,
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
@@ -108,14 +146,18 @@ import {
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
-import { rerunBudgetMs } from "./core/checks.ts";
+import { CHANGED_TEST_BUDGET_MS, isChangedTestCommand, rerunBudgetMs } from "./core/checks.ts";
 import {
   decisionSettled,
   decisionStatus,
   findingCitesAcceptanceOrReserved,
   isLiveDecision,
+  reviewIngestionIssue,
+  panelMajority,
+  ownerRuledDecision,
   panelOptionsFor,
   panelOutcome,
+  panelSeatNumbers,
   panelSeatsSettled,
   reviewsComplete,
   roundPanelItemsNeedingVote,
@@ -125,16 +167,54 @@ import {
   sameVersion,
 } from "./core/predicate.ts";
 import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
-import { isRepairForcingOption } from "./core/owner-requests.ts";
+import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { notAcceptedReasons } from "./core/verdict.ts";
+import { itemsNeedingEvaluatorReverify, pendingEvidenceItems } from "./core/predicate.ts";
+// Plan 06b: the pure item machinery (coverage, test-verify resolution,
+// verdict validation, per-item majority, the matrix and the status counts).
+import {
+  architectureSymbols,
+  checkResolutionLines,
+  checklistLines,
+  flatItems,
+  isStructured,
+  itemNeedsEvidence,
+  coverageComplete,
+  coverageIssues,
+  coverageLines,
+  coverageNoteLines,
+  emptyCoverage,
+  evidenceFileAnchors,
+  itemsFromPhase,
+  requirementAndConstraintItems,
+  phaseItemOutcomes,
+  repairItemLines,
+  resolveTestVerifies,
+  reviewItemsIssues,
+  reviewRequestLines,
+  resolveAnchorPath,
+  reverify,
+  symbolPresent,
+  tallyItems,
+  testResultLines,
+  testVerifyProblems,
+  thinMetItems,
+  verdictIssues,
+  type Coverage,
+  type FlatItem,
+  type ItemOutcome,
+  type PlanItems,
+  type SeatItemVerdict,
+  type VerdictContext,
+} from "./core/items.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
-import { acquireLock, acquireWaitingLock, type Lock } from "./effects/lock.ts";
-import { killGroup, childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
-import { sweep, type SweepResult } from "./effects/sweep.ts";
+import { acquireLock, acquireWaitingLock, anyCheckWindowOpen, openCheckWindow, PausableTimer, type Lock } from "./effects/lock.ts";
+import { childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
+import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
   createWorktree,
   diffHunks,
@@ -150,6 +230,7 @@ import {
   publishCAS,
   removeWorktree,
   candidateTree,
+  saveUnsubmittedWork as gitSaveUnsubmittedWork,
   verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
@@ -159,7 +240,7 @@ import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, sec
 // same refusal at the socket, where a scripted agent's commands arrive).
 import { secretUseInCommand } from "../extension/guards.ts";
 // Plan 01b: owner-wait notifications (see notify.ts's own header for the rule).
-import { notify, oneLine, waitReason } from "./notify.ts";
+import { answeringCommand, notify, oneLine, waitReason } from "./notify.ts";
 import { crashAt, CRASH_BOUNDARIES, PHASE_2_CRASH_BOUNDARIES } from "./effects/crash.ts";
 import { loadavg } from "node:os";
 
@@ -182,6 +263,13 @@ const OWNER_COMMAND_SCHEMA: Record<string, unknown> = JSON.parse(
  * second and third chance within the same turn, and one that never does
  * cannot wedge the turn. */
 export const MAX_INCOMPLETE_REVIEW_REJECTIONS = 2;
+
+/** Plan 06k3 (A1): how many times a two-lane round that fails only because a
+ * lane review or pick vote is still missing (after its seat retry) is
+ * repeated without spending a repair attempt. Two: a transient seat loss does
+ * not cost a round, but a round that keeps losing seats still counts after
+ * that. */
+export const MAX_ROUND_REPEATS = 2;
 
 // ---------------------------------------------------------------------------
 // Config — design §8.1 defaults, overridable per run.
@@ -283,6 +371,16 @@ export interface RunPlanPhase {
   checks: string[];
   boundaries: string[];
   reserved: string[];
+  /** Plan 06b: the structured items of a phase subtree (ref
+   * refs/06_ref_plan_format.md). Absent on an old-format plan. */
+  architecture?: import("./core/items.ts").ArchitectureItem[];
+  requirements?: import("./core/items.ts").RequirementItem[];
+  constraints?: import("./core/items.ts").ConstraintItem[];
+  /** Plan 06b (OD-1 R9): true when the parser SYNTHESIZED these items from
+   * an old-format `acceptance`/`:RESERVED:` list. The items exist for the
+   * views and lint, but the phase owes submit_phase only, exactly like a
+   * hand-written old-format JSON plan. */
+  itemsSynthesized?: boolean;
   /** Plan 01c: 1-based lines in the source Org file of the `acceptance`
    * items, parallel to the array. Emacs records them so `tt lint` can point
    * at the offending line; a hand-written JSON plan has no lines and the
@@ -296,6 +394,24 @@ export interface RunPlanPhase {
   /** Plan 01c: 1-based lines of `ownerChecklist` in the source Org file. */
   ownerChecklistLines?: number[];
   provisional?: boolean;
+  /** Plan 06g: `#+TT_WORKERS:` — how many lanes one round runs (1 or 2 in
+   * this plan version; more is 06h's). Absent (or 1) is today's
+   * single-candidate loop. */
+  workers?: number;
+  /** Plan 06g: `#+TT_ROUNDS:` — how many rounds one phase may spend before
+   * it parks on the owner. Absent means the default of 3. */
+  rounds?: number;
+  /** Plan 06h (A1): `#+TT_REVIEWERS:` (or the phase's own `:REVIEWERS:`).
+   * Absent means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A1): `#+TT_LEADER:` (or the phase's own `:LEADER:`). Absent
+   * means the first seat. */
+  leader?: string;
+  /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` (or the phase's own
+   * `:VARIANT_LIMIT:`). How many consecutive rounds may each raise a new
+   * blocking finding of the same kind on one requirement before the owner is
+   * asked instead. Absent means 3. */
+  variantLimit?: number;
   /** Plan 01f: the phase's `:GATE:` command — the expensive, live proof the
    * conductor runs itself after checks, probe and reviews pass, and before
    * acceptance. Undeclared on every phase that predates plan 01f. */
@@ -303,12 +419,47 @@ export interface RunPlanPhase {
   /** Plan 01f: the phase's `:GATE_CLEANUP:` command, run after the gate
    * whatever its outcome. */
   gateCleanup?: string;
+  /** Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by
+   * the phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted
+   * runs it, once. */
+  finalChecks?: string[];
+  /** Plan 06i (A3): the phase's golden note (`#+TT_GOLDEN:`, overridden by
+   * the phase's `:GOLDEN:`). A choice justified only by an earlier drafting
+   * decision is re-checked against it; a `contract` classification must cite
+   * it. */
+  golden?: string;
+  /** Plan 06m (A6): the plan's declared generated paths (`#+TT_GENERATED:`,
+   * overridden by the phase's `:GENERATED:`). A restack conflict whose every
+   * hunk lies in one of these takes the base side for those hunks only. */
+  generated?: string[];
+  /** Plan 06m (A6): the plan's regenerate commands (`#+TT_REGEN:`, overridden
+   * by the phase's `:REGEN:`), run after a restack resolution and before the
+   * layer's check. */
+  regen?: string[];
 }
 
 /** The on-disk plan file `tt start` reads. Only phase 0 (index 0) is run by
  * this packet's single-phase conductor. */
 export interface RunPlanFile {
   title: string;
+  /** Plan 06m (A5): the labels `tt deliver` applies to each PR
+   * (`#+TT_LABELS:`). Absent means none. */
+  labels?: string[];
+  /** Plan 06k1 (A6): environment variable names the plan declares its checks
+   * need, recorded at start alongside PATH and re-used by every check and
+   * resume. Absent on every plan that predates this field. */
+  envVars?: string[];
+  /** Plan 06g: the plan's `#+TT_WORKERS:` — how many lanes one round runs.
+   * Emacs records the whole number (or the raw text, which `tt lint`
+   * refuses). Absent (or 1) is today's single-candidate loop. */
+  workers?: number;
+  /** Plan 06g: the plan's `#+TT_ROUNDS:` — how many rounds one phase may
+   * spend. Absent means the default of 3. */
+  rounds?: number;
+  /** Plan 06h (A1): the plan's `#+TT_REVIEWERS:`. Absent means `M A B`. */
+  seats?: string[];
+  /** Plan 06h (A1): the plan's `#+TT_LEADER:`. Absent means the first seat. */
+  leader?: string;
   /** Plan 01c: the Org file this JSON plan was parsed from, recorded by Emacs
    * so `tt lint` can name the file the owner edited rather than its temporary
    * JSON copy. Never read by the conductor. */
@@ -339,6 +490,12 @@ export interface RunPlanFile {
    * conductor writes. A name that is unset at start is reported in the
    * status; the run starts anyway. */
   secrets?: string[];
+  /** Plan 06e (A1): a `KEY=value` file (`#+TT_ENV_FILE`, or `tt start
+   * --env-file`) that supplies a declared secret when the environment does
+   * not. The lookup order is the environment first, then this file. The path
+   * is recorded here (never a value), so a resumed run resolves the same
+   * source. Only effects/secrets.ts reads it. */
+  envFile?: string;
   /** Plan 01i: program-wide owner directives already in force when this
    * run's node was started (D5). They seed the phase's directive list, so a
    * node started after the owner's ruling still carries it in every prompt.
@@ -429,6 +586,11 @@ export interface ConductorOptions {
    * runs) never gate at once; tests point it at a temp path so they neither
    * contend with a real run nor with each other. */
   gateLockPath?: string;
+  /** Plan 06g2 (C2): the machine-wide lock every candidate check runs
+   * under, so two lanes' checks — in one round, or in two runs on this
+   * machine — never overlap in time. Defaults to
+   * `~/.tradeoffs-trace/check.lock`. */
+  checkLockPath?: string;
   /** Decision briefs: when true, the conductor records a deterministic brief
    * for every open owner item after evaluation, so the owner always has one
    * above the evidence even when the evaluator's model did not call
@@ -465,6 +627,10 @@ const MESSAGE_EVENT_TYPES = new Set<string>([
   "FINDING_SEVERITY_CHANGED",
   "FINDING_VERIFIED",
   "FINDING_RESOLVED_BY_VOTE",
+  // Plan 06m (R2-49): an owner's refusal of a finding changes the review's
+  // blocker projection, so it must rewrite the views in the same beat.
+  "FINDING_DISPROVED",
+  "FINDING_ACCEPTED_BY_OWNER",
   "CANDIDATE_APPROVED",
   // Plan 05j: the entry ledger and the review lint are projections too, so an
   // owner's s/m/A/D on an entry (or a curator's link) must rewrite the views
@@ -498,6 +664,7 @@ export function runPaths(runDir: string) {
     ledger: path.join(runDir, "ledger.jsonl"),
     review: path.join(runDir, "views", "review.org"),
     messagesView: path.join(runDir, "views", "messages"),
+    itemsView: path.join(runDir, "views", "items"),
     // Plan 05j: one file per live ENTRY, the RET target from the review view.
     entriesView: path.join(runDir, "views", "entries"),
     status: path.join(runDir, "views", "status.txt"),
@@ -509,6 +676,9 @@ export function runPaths(runDir: string) {
     // Plan 04c: the balance metrics (a deterministic projection of state and
     // the control log; `tt contract rebuild`/`check` include it).
     metrics: path.join(runDir, "views", "metrics.json"),
+    // Plan 06l (A5): the per-seat cost/findings table, a deterministic
+    // projection of the same log; `tt seats` prints it.
+    seats: path.join(runDir, "views", "seats.txt"),
     inbox: path.join(runDir, "inbox"),
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
@@ -634,8 +804,14 @@ export function amendContractVersion(contract: PhaseContract, acceptance: string
         checks: contract.checks,
         boundaries: contract.boundaries,
         reserved: contract.reserved,
+        architecture: contract.architecture,
+        requirements: contract.requirements,
+        constraints: contract.constraints,
         gate: contract.gate,
         gateCleanup: contract.gateCleanup,
+        finalChecks: contract.finalChecks,
+        seats: contract.seats,
+        leader: contract.leader,
       }),
     )
     .digest("hex");
@@ -643,20 +819,52 @@ export function amendContractVersion(contract: PhaseContract, acceptance: string
 }
 
 export function buildContract(phase: RunPlanPhase): PhaseContract {
+  // Plan 06b (OD-1): a STRUCTURED phase declares architecture/requirements/
+  // constraints and carries the item loop; an old-format phase (Goal +
+  // Acceptance + :RESERVED:) declares none and owes submit_phase only. The
+  // items are taken as the plan declares them — never synthesized into the
+  // contract — so `#structured()` is exactly "the plan declared items".
+  // OD-1 R9: items the parser synthesized from the old format are NOT
+  // declared items — the phase stays unstructured and owes submit_phase only.
+  const declaredItems = phase.itemsSynthesized !== true && (phase.architecture !== undefined || phase.requirements !== undefined || phase.constraints !== undefined);
+  const acceptance = (phase.acceptance?.length ?? 0) > 0 ? phase.acceptance : (phase.requirements ?? []).map((r) => r.text);
   return {
     phaseId: phase.id,
     contractVersion: contractVersionFor(phase),
     goal: phase.goal,
-    acceptance: phase.acceptance,
+    acceptance,
     checks: phase.checks,
     boundaries: phase.boundaries,
     reserved: phase.reserved,
+    ...(phase.architecture ? { architecture: phase.architecture } : {}),
+    ...(phase.requirements ? { requirements: phase.requirements } : {}),
+    ...(phase.constraints ? { constraints: phase.constraints } : {}),
+    ...(declaredItems ? {} : { itemsSynthesized: true }),
     // Plan 01f: a declared gate is part of the frozen contract — the FSM
     // (next.ts/transitions.ts) reads it to decide whether the phase gates at
     // all, and every prompt that mentions the gate quotes the same text.
     ...(gateCommandOf(phase) ? { gate: phase.gate } : {}),
     ...(phase.gateCleanup ? { gateCleanup: phase.gateCleanup } : {}),
+    // Plan 06c: a declared final check is part of the frozen contract.
+    ...(finalCheckOf(phase) ? { finalChecks: phase.finalChecks } : {}),
+    ...(typeof phase.golden === "string" && phase.golden.trim().length > 0 ? { golden: phase.golden } : {}),
+    // Plan 06g: the lane count and the round budget are frozen into the
+    // contract, so the FSM, the prompts and the views all read one value.
+    ...(workersOf(phase) > 1 ? { workers: workersOf(phase) } : {}),
+    ...(typeof phase.rounds === "number" && phase.rounds > 0 ? { roundsAllowed: Math.floor(phase.rounds) } : {}),
+    ...(typeof phase.variantLimit === "number" && phase.variantLimit > 0 ? { variantLimit: Math.floor(phase.variantLimit) } : {}),
+    // Plan 06h (A2): the seats and the leader are frozen too, so every
+    // reader has ONE source of the seat list (`seatsOf`).
+    ...(phase.seats && phase.seats.length > 0 ? { seats: [...phase.seats] } : {}),
+    ...(typeof phase.leader === "string" && phase.leader.length > 0 ? { leader: phase.leader } : {}),
   };
+}
+
+/** Plan 06g/06h: the number of lanes one round runs. `#+TT_WORKERS` when the
+ * plan declares it, 1 otherwise — and 1 is today's single-candidate loop,
+ * which records no round event at all. */
+export function workersOf(phase: Pick<RunPlanPhase, "workers">): number {
+  return workerCountOf(phase);
 }
 
 export function initialState(
@@ -664,8 +872,19 @@ export function initialState(
   phase: RunPlanPhase,
   integrationHead: string,
   programDirectives: RunPlanDirectiveSeed[] = [],
+  /** Plan 06h (A1): the seats the init event recorded, so a run replays with
+   * its own seats even if the plan changed. Absent (an old log) means the
+   * plan's own seats, and `M A B` when it declares none. */
+  initSeats?: Seats,
 ): State {
-  const contract = buildContract(phase);
+  const built = buildContract(phase);
+  const contract: PhaseContract = initSeats
+    ? {
+        ...built,
+        ...(initSeats.seats.length > 0 ? { seats: [...initSeats.seats] } : {}),
+        ...(initSeats.leader.length > 0 ? { leader: initSeats.leader } : {}),
+      }
+    : built;
   const phaseState: PhaseState = {
     runId,
     phaseId: phase.id,
@@ -682,7 +901,15 @@ export function initialState(
     overrides: [],
     inFlight: {},
     repairRoundsUsed: 0,
-    repairRoundsGranted: 3,
+    // Plan 06g (A4, owner-verified): `roundBudget(contract)` is the only place
+    // that decides how many ROUNDS a phase may spend — `#+TT_ROUNDS` when the
+    // plan names it, the default of 3 otherwise. One round is one candidate
+    // reviewed, so the repair allowance the FSM compares against is
+    // `roundBudget - 1`: the first candidate is round 1 and each later round
+    // is one repair. `#+TT_ROUNDS: 3` therefore reviews exactly 3 candidates
+    // (the first plus two repairs), matching ODP-1's "accepted within 3
+    // rounds".
+    repairRoundsGranted: roundBudget(contract) - 1,
     // Plan 01i: a program-wide directive in force when this node was started
     // seeds the phase's own list (scope `program`, seeded), so it is quoted
     // in every prompt from the first attempt. The plan snapshot is on disk,
@@ -740,7 +967,7 @@ export function createRun(root: string, plan: RunPlanFile, runId = randomUUID().
   // text — see `#withValues`, which puts the real value back for the commands
   // the plan asks for, and only for them.
   const declared = secretNames(plan.secrets);
-  const { maskable } = resolveSecrets(declared);
+  const { maskable } = resolveSecrets(declared, process.env, plan.envFile);
   fs.writeFileSync(path.join(p.plan, "v1.json"), JSON.stringify(redactRecord(plan, maskable), null, 2));
   // Snapshot the plan's reference documents (same-named files get a numeric
   // prefix); a missing one is skipped and noted rather than failing the run.
@@ -833,16 +1060,18 @@ export function rebuildState(runDir: string, plan: RunPlanFile, opts: { lenient?
   const initRecord = records.find((r) => r.kind === "init");
   let runId: string;
   let integrationHead: string;
+  let initSeats: Seats | undefined;
   if (initRecord) {
-    const init = initRecord.event as { runId: string; integrationHead: string };
+    const init = initRecord.event as { runId: string; integrationHead: string; seats?: Seats };
     runId = init.runId;
     integrationHead = init.integrationHead;
+    initSeats = init.seats;
   } else {
     runId = randomUUID().slice(0, 8);
     integrationHead = currentHead(plan.repo, plan.integrationBranch);
   }
   return foldEvents(
-    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? []),
+    initialState(runId, plan.phases[0], integrationHead, plan.ownerDirectives ?? [], initSeats),
     records,
     opts.lenient === true,
   );
@@ -861,14 +1090,51 @@ export interface Timeline {
    * (program 14: 14g showed "over by 22m" right after a resume, counting the
    * whole time it was stopped). */
   restarts?: string[];
+  /** Plan 06c (A5): the instants a conductor stop was recorded, so the span
+   * computation can exclude a stopped interval from a stage's duration. */
+  stops?: string[];
+}
+
+/** Plan 06c (A5): the instants a new stage segment starts. A clean `tt stop`
+ * writes a `stop` record and the resume writes no event of its own, so the
+ * FIRST event after a stop is the resume; a conductor that starts on an
+ * existing run writes a `resume` record. An interrupted attempt and an
+ * environment unblock are new segments too. Pure, so the rule is unit-tested
+ * directly rather than inferred from a hand-built timeline. */
+export function restartInstants(records: readonly LogRecord[]): string[] {
+  const out: string[] = [];
+  let stopped = false;
+  for (const record of records) {
+    if (record.kind === "stop") {
+      stopped = true;
+      continue;
+    }
+    if (record.kind === "resume") {
+      out.push(record.ts);
+      stopped = false;
+      continue;
+    }
+    if (record.kind !== "event") continue;
+    const push = (ts: string) => {
+      if (out[out.length - 1] !== ts) out.push(ts);
+    };
+    if (stopped) {
+      push(record.ts);
+      stopped = false;
+    }
+    const type = (record.event as { type?: string }).type;
+    if (type === "ATTEMPT_INTERRUPTED" || type === "RUN_RESUMED") push(record.ts);
+  }
+  return out;
 }
 
 function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): Timeline {
-  const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string } | undefined;
-  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? []);
+  const init = records.find((r) => r.kind === "init")?.event as { runId: string; integrationHead: string; seats?: Seats } | undefined;
+  let state = initialState(init?.runId ?? "", plan.phases[0], init?.integrationHead ?? "", plan.ownerDirectives ?? [], init?.seats);
   const phases: Timeline["phases"] = [];
   const rounds: Timeline["rounds"] = [];
-  const restarts: string[] = [];
+  const restarts = restartInstants(records);
+  const stops = records.filter((r) => r.kind === "stop").map((r) => r.ts);
   for (const record of records) {
     if (record.kind !== "event") continue;
     const before = state;
@@ -876,7 +1142,6 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
     if (!result.ok) continue;
     state = result.state;
     const type = (record.event as { type?: string }).type;
-    if (type === "ATTEMPT_INTERRUPTED") restarts.push(record.ts);
     const prevC = before.phase.candidate?.sha;
     if (type === "FREEZE_COMPLETED" && prevC) {
       const reasons = notAcceptedReasons(before.phase);
@@ -898,7 +1163,7 @@ function timelineFromRecords(records: readonly LogRecord[], plan: RunPlanFile): 
       phases.push({ phase: state.phase.phase, at: record.ts });
     }
   }
-  return { state, phases, rounds, restarts };
+  return { state, phases, rounds, restarts, stops };
 }
 
 export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
@@ -910,9 +1175,9 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
  * The balance metrics need both; building them from a single snapshot keeps
  * the projection consistent with the timeline it is drawn beside, and avoids
  * re-parsing the whole log once per status beat. */
-export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { timeline: Timeline; events: MetricEvent[] } {
+export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { timeline: Timeline; events: MetricEvent[]; records: LogRecord[] } {
   const { records } = readLog(runPaths(runDir).events);
-  return { timeline: timelineFromRecords(records, plan), events: metricEvents(records) };
+  return { timeline: timelineFromRecords(records, plan), events: metricEvents(records), records };
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
@@ -994,6 +1259,39 @@ interface AgentHandle {
    * mode or for a worker handle. */
   discoveryResolve: () => void;
   discoveryPromise: Promise<void>;
+  /** Plan 06g2: the lane this agent belongs to (a lane worker or a lane
+   * reviewer), so its submissions are recorded against the lane's candidate
+   * rather than the phase's own. Absent on the single-candidate loop. */
+  lane?: string;
+  /** Plan 06g2: the round this agent belongs to. */
+  laneRound?: number;
+  /** Plan 06g2: a lane worker's `submit_phase` payload, captured for the
+   * winner's hand-off (the round's lanes never move the phase themselves). */
+  laneSubmission?: {
+    disclosures: DecisionDisclosure[];
+    prior?: PriorDecisionStatement[];
+    dispute?: CriterionDispute;
+    /** Plan 06k3 (A3): the lane's answers to the open blocking findings. */
+    answers?: FindingAnswer[];
+  };
+  /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
+   * winner's hand-off. */
+  laneCoverage?: unknown;
+  /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
+  pickSeat?: string;
+  /** Plan 06h (A3): true when this pick turn is the top-two revote. */
+  pickRevote?: boolean;
+  /** Plan 06g2: the (round, lane, candidate, seat) a lane review records its
+   * `submit_review` against. */
+  laneReview?: { round: number; lane: string; sha: string; seat: string };
+  /** Plan 06g2: a lane reviewer's turn-1 discoveries, kept per lane until the
+   * winner's hand-off applies them (the phase has no candidate to bind them to
+   * while the round runs). */
+  laneDiscoveries?: DecisionDisclosure[];
+  /** Plan 06g2: waiters for this agent's next `agent_settled`, so a lane
+   * review can wait out each of its two turns (the same technique
+   * `#runReview` uses for the single-candidate path). Set for lane agents. */
+  settleWaiters?: Array<() => void>;
   /** Plan 04a: the message type this evaluator handles. */
   messageType?: MessageType;
   /** Plan 04b: the raw blocker this panel seat votes on, and its seat number.
@@ -1012,6 +1310,10 @@ interface AgentHandle {
    * had rejected for a title that ends mid-word or was cut to fit the cap
    * (at most MAX_INCOMPLETE_REVIEW_REJECTIONS, then accepted as is). */
   evaluationTitleRejections?: number;
+  /** Plan 06b (OD-2 A3): how many times this evaluator has been re-prompted
+   * for a missing item check (at most once, then the item is recorded
+   * `unchecked`). */
+  itemCheckRejections?: number;
   /** A `submit_review` from this agent is being recorded. A second call
    * while it is (run cc1992e2: B called the tool twice) is refused. */
   reviewInFlight?: boolean;
@@ -1025,6 +1327,27 @@ interface AgentHandle {
 
 /** `#applyReviewFindingsAndBallots` found the round over after an await. */
 const STALE_REVIEW = "stale review";
+
+/** Plan 06b: the text a `:WHERE:` token names. A file is read as it is; a
+ * directory (a crate, a package) is every source file under it, skipping
+ * build output and VCS metadata, so a symbol declared anywhere inside it is
+ * found. A missing path throws, which the caller records as a deviation. */
+export function readWhereText(target: string): string {
+  if (!fs.statSync(target).isDirectory()) return fs.readFileSync(target, "utf8");
+  const skip = new Set(["target", "node_modules", ".git"]);
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    const entries = fs.readdirSync(d, { withFileTypes: true }).sort((x, y) => x.name.localeCompare(y.name));
+    for (const e of entries) {
+      if (skip.has(e.name)) continue;
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile() && /\.(rs|ts|tsx|js|el|go|py|toml)$/.test(e.name)) out.push(fs.readFileSync(full, "utf8"));
+    }
+  };
+  walk(target);
+  return out.join("\n");
+}
 
 export class Conductor {
   #runDir: string;
@@ -1070,6 +1393,71 @@ export class Conductor {
    * `~/.tradeoffs-trace/gate.lock`). Held only while the gate command runs,
    * so two phases never gate at once. */
   #gateLockPath: string;
+  /** Plan 06g2 (C2): the machine-wide lock each lane candidate's checks run
+   * under (default `~/.tradeoffs-trace/check.lock`), held only while one
+   * candidate is checked. */
+  #checkLockPath: string;
+  /** Plan 06k1 (A6): the environment this run's checks need, recorded once at
+   * start (PATH plus every variable the plan or the starter declares) and
+   * re-used by every check and every resume, so a resume from a shell without
+   * JAVA_HOME or the original PATH still checks with them. */
+  /** Plan 06k1 (A6): the environment recorded at start. `null` records a
+   * DECLARED variable that was unset at start, so a resume shell that
+   * supplies it does not change the check environment (finding A-12). */
+  #recordedEnv: Record<string, string | null> = {};
+  /** Plan 06g2: the winner's hand-off — the lane build and round whose
+   * reviews are promoted into the phase's review slots once the probe has
+   * passed (the FSM's REVIEWING state is only reachable then). */
+  #pendingLaneWinner:
+    | { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> }
+    | undefined;
+  /** Plan 06g2: each lane candidate's combined check output this round, so
+   * the winner's hand-off can resolve its `test` verifies without re-running
+   * the checks. */
+  #laneCheckOutputs = new Map<string, string>();
+  /** Plan 06g2: each lane candidate's own `test`-verify resolution. */
+  #laneCheckResolutions = new Map<string, ReturnType<typeof resolveTestVerifies>>();
+  /** Plan 06g2: this round's lane builds, keyed `<round>-<lane>` — the lane
+   * review prompts need each lane's own disclosures. */
+  #laneBuilds = new Map<string, LaneBuild>();
+  /** Plan 06g2: each lane candidate's turn-1 discoveries, keyed
+   * `<round>-<lane>` then by seat. The phase has no candidate to bind them to
+   * while the round runs, so the winner's are applied at the hand-off. */
+  #laneDiscoveries = new Map<string, Map<string, DecisionDisclosure[]>>();
+  /** Plan 06g2: each lane candidate's discovery-id plan, computed ONCE — when
+   * the first of its turn-2 prompts is built — and reused at the hand-off, so
+   * the ids the seats balloted are the ids that appear even though the freeze
+   * grows the phase's decision list in between. */
+  #laneDiscoveryPlans = new Map<string, Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }>>();
+  /** Plan 06g2: the per-candidate discovery barrier, keyed `<round>-<lane>`. */
+  #laneBarriers = new Map<string, { arrived: Set<string>; waiters: Array<() => void> }>();
+  /** Plan 06k2 (A7): each lane candidate's boundary-trigger decisions,
+   * computed BEFORE its lane reviews so the seats ballot them with the rest;
+   * reused at the hand-off so the ids that were balloted are the ids that
+   * appear. Keyed `<round>-<lane>`. */
+  #laneTriggers = new Map<string, Decision[]>();
+  /** Plan 06k2 (A7): the boundary paths each lane's triggers cover, for the
+   * sampling log at the hand-off. Keyed `<round>-<lane>`. */
+  #laneTriggerPaths = new Map<string, string[]>();
+  /** Plan 06k2 (A8): the absolute number of owner notes the round's lane
+   * prompt actually carried, recorded when the prompt is built. A note
+   * queued AFTER that build is not marked delivered by it. Keyed by round. */
+  #lanePromptDeliveredNoteCount = new Map<number, number>();
+  /** Plan 06k3 (A2): the saved unsubmitted-work refs the current round's
+   * lanes start from, for the shared lane prompt. Set before the round's
+   * prompt is built. */
+  #laneSavedWorkForRound: Array<{ lane: string; ref: string; sha: string }> = [];
+  /** Plan 06k3 (A2, findings A-13/T-29): lanes whose unsubmitted-work ref
+   * could not be written. Their dirty worktree is retained (never removed)
+   * so the work is not lost, and the next attempt continues in it. */
+  #unsavedLaneWorktrees = new Set<string>();
+  /** Plan 06k3 (A3): the re-run result of each open finding's reproduction
+   * command, per candidate, for the reviewer prompt table. Computed once per
+   * candidate (after the checks) and reused by every reviewer prompt. */
+  #reproductionTableLines = new Map<string, string[]>();
+  /** Plan 06k3 (A3, finding M-9): one in-flight reproduction-table computation
+   * per candidate, so three parallel reviewer dispatches share it. */
+  #reproductionTablePending = new Map<string, Promise<void>>();
   /** Plan 01a: the plan's declared secret names; the values resolved from
    * the conductor's own environment at start (`#secretValues` is every set
    * value, for the agents' environment; `#secretMaskable` is the subset long
@@ -1099,6 +1487,9 @@ export class Conductor {
   /** Plan 04a: the current baseline action's id, so each baseline command's
    * process group can be recorded for crash recovery (advisory A-15). */
   #baselineActionId: string | undefined;
+  /** Plan 06c: the parent candidate whose passing check record this run
+   * reused as its baseline (A3), named on BASELINE_COMPLETED. */
+  #baselineReusedFrom: string | undefined;
   /** B-24: the baseline stage timed out; a late run must not be recorded. */
   #baselineTimedOut = false;
   #runStartedAt = Date.now();
@@ -1138,6 +1529,9 @@ export class Conductor {
    * ever signals groups this conductor knows are live, never a recycled pgid
    * from an old log record. */
   #liveShGroups = new Set<number>();
+  /** ODP-3: the run's own STAGE command groups (a check, the baseline, the
+   * gate) that are still running, each with the time it was recorded. */
+  #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
@@ -1171,6 +1565,19 @@ export class Conductor {
    * `ENV_CHECKED` on an already-terminal (DONE/BLOCKED) run does not trip the
    * auto-stop before `start()` finishes scanning the inbox. */
   #envGateActive = false;
+  /** Plan 06c (R6): the tools the preflight could not find, resolved once per
+   * conductor and named in every agent prompt. */
+  #agentToolsMissing: string[] | undefined;
+  /** Plan 06j (A3): the worker attempts a recheck stopped. `#runWorkerAttempt`
+   * reads and clears its own id after its race settles, so the cancellation
+   * emits no ATTEMPT_INTERRUPTED/ATTEMPT_NO_SUBMISSION (the phase is already
+   * CHECKING and the checks are re-running on the frozen candidate). A set so
+   * every lane worker of a multi-lane round is covered (OD-5(3)). */
+  #recheckCancelledAttempts = new Set<string>();
+  /** Plan 06j (A3/OD-5(3)): a recheck stopped a multi-lane round. Its
+   * `#runLaneRound` reads and clears this before emitting any attempt-failure
+   * event, so the stopped round never fights the recheck. */
+  #recheckCancelledLaneRound = false;
 
   constructor(opts: ConductorOptions) {
     this.#runDir = opts.runDir;
@@ -1190,6 +1597,7 @@ export class Conductor {
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
+    this.#checkLockPath = opts.checkLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "check.lock");
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -1238,12 +1646,15 @@ export class Conductor {
     // file), and every writer below redacts them. A declared name that is
     // unset is recorded and reported — the run still starts.
     this.#secretNames = secretNames(this.#plan.secrets);
-    const resolved = resolveSecrets(this.#secretNames);
+    const resolved = resolveSecrets(this.#secretNames, process.env, this.#plan.envFile);
     this.#secretValues = resolved.values;
     this.#secretMaskable = resolved.maskable;
     this.#missingSecrets = resolved.missing;
     this.#tooShortSecrets = resolved.tooShort;
     this.#log = new EventLog(this.#paths.events, this.#secretMaskable);
+    // Plan 06k1 (A6): record the check environment once, before any check or
+    // resume can need it.
+    this.#recordCheckEnv();
 
     // design §2.1: assert the Pi version before ever launching it — but
     // only when the real `pi` binary is actually going to be used for at
@@ -1257,21 +1668,51 @@ export class Conductor {
     const { records } = readLog(this.#paths.events);
     const initRecord = records.find((r) => r.kind === "init");
     if (initRecord) {
-      const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string };
+      const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string; seats?: Seats };
       const mine = runnerRevision();
       if (init.runnerRevision && init.runnerRevision !== mine && process.env.TT_ALLOW_RUNNER_MISMATCH !== "1") {
         throw new RunnerMismatchError(
           `run was started under runner ${init.runnerRevision}; this conductor is ${mine} — refusing to resume (reinstall that runner, or start a new run)`,
         );
       }
-      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? []);
+      this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? [], init.seats);
     } else {
       const head = currentHead(this.#plan.repo, this.#integrationBranch);
       const runId = randomUUID().slice(0, 8);
-      this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision() });
-      this.#state = initialState(runId, this.#plan.phases[0], head, this.#plan.ownerDirectives ?? []);
+      // Plan 06h (A1): the init event records the run's EFFECTIVE seats (a
+      // phase's own `:REVIEWERS:`/`:LEADER:` wins over the plan's), so a
+      // later replay uses its own seats even after the plan changes. An old
+      // log with none recorded means M, A and B.
+      const phase0 = this.#plan.phases[0];
+      const effectiveSeats = seatsRecordOf({
+        seats: phase0.seats && phase0.seats.length > 0 ? phase0.seats : this.#plan.seats,
+        leader: phase0.leader ?? this.#plan.leader,
+        workers: phase0.workers ?? this.#plan.workers,
+      });
+      this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision(), seats: effectiveSeats });
+      this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats);
     }
     this.#state = foldEvents(this.#state, records);
+    // Plan 06c (A5/OD-3): a conductor that starts on an existing, non-terminal
+    // run records a real RUN_RESUMED event once at start-up (drive-suspended,
+    // so nothing dispatches before start() is ready). The stage clock treats it
+    // as the start of a new segment, so the stopped interval never counts.
+    // ENV_BLOCKED keeps its own RUN_RESUMED in the preflight gate below, and a
+    // budget pause keeps its own resume path.
+    if (
+      initRecord &&
+      records.length > 1 &&
+      this.#state.run === "RUN_ACTIVE" &&
+      this.#state.phase.phase !== "DONE" &&
+      this.#state.phase.phase !== "BLOCKED"
+    ) {
+      this.#driveSuspended = true;
+      try {
+        this.#applyEvent({ type: "RUN_RESUMED" });
+      } finally {
+        this.#driveSuspended = false;
+      }
+    }
     // Plan 05i: resolve every declared command's executable before the
     // baseline and before any agent launch. A missing tool stops the run in
     // ENV_BLOCKED (visible, and recoverable with `tt resume` once the
@@ -1291,6 +1732,9 @@ export class Conductor {
     // Plan 03b: the status view exists immediately; the coalesced write keeps
     // it fresh afterwards without rebuilding the view on every message event.
     this.#writeStatusViewSafe();
+    // Plan 06f (A2): a conductor starting on an existing run republishes its
+    // row so a stale `live.json` (from a crash) reflects the resumed run.
+    this.#writeLive();
     // Plan 01b: seed the park-episode counter from the log, so a restarted
     // conductor keeps the same notification key for the wait it is resuming.
     // Plan 05k (OD-7): the retry gate counts only AWAITING_OWNER entries;
@@ -1324,7 +1768,16 @@ export class Conductor {
       // here as well as in the agent's extension guard — a scripted agent
       // (fake-pi) sends its `sh` messages straight to this socket.
       refuseSh: (_agentId, command) => secretUseInCommand(command, this.#secretNames),
-      shDeadline: { deadlineMs: this.#deadlines.shCommandMs, termGraceMs: this.#deadlines.termGraceMs },
+      // Plan 06l (A2): `tt test --changed` gets its own budget (20 min),
+      // never the conductor's shell cap; every other command keeps the cap.
+      shDeadline: (command: string) => ({
+        deadlineMs: isChangedTestCommand(command) ? CHANGED_TEST_BUDGET_MS : this.#deadlines.shCommandMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+      }),
+      // Plan 06e (A1): a `sh` command's environment carries childEnv() plus
+      // every resolved secret value, so `$NAME` works whether the environment
+      // or the env file supplied the value.
+      shEnv: () => this.#gateEnv(),
       onNoSubmission: (agentId) => this.#onNoSubmission(agentId),
     });
 
@@ -1396,12 +1849,20 @@ export class Conductor {
    * nothing to disambiguate. */
   #reconcileWorktree(): void {
     const ACTION_ID = "create-worktree";
+    // Plan 06k1 (A6): a run that already froze a candidate resumes at the
+    // LAST FROZEN CANDIDATE, not the phase base. Restarting a repair from the
+    // base would silently throw away the candidate the phase is repairing
+    // (the 2026-10-09 incident: `program resume` after `program stop` brought
+    // the worktree back at the 02e base). A run with no candidate yet starts
+    // from the integration head, exactly as before. Plan 06k3 (A2, finding
+    // A-3): a saved unsubmitted work commit that descends from that candidate
+    // is the real base, so a restart keeps the work the worker did not submit.
+    const baseSha = this.#singleWorkerBase();
     const { records } = readLog(this.#paths.events);
     const intentRecord = records.find((r) => r.kind === "intent" && r.actionId === ACTION_ID);
     const completed = records.some((r) => r.kind === "completion" && r.actionId === ACTION_ID);
 
     if (intentRecord && !completed) {
-      const { baseSha } = intentRecord.event as { worktree: string; baseSha: string };
       if (this.#worktreeMatches(baseSha)) {
         this.#log.completion(ACTION_ID, { reused: true, baseSha });
       } else {
@@ -1414,14 +1875,32 @@ export class Conductor {
       return;
     }
 
-    if (this.#worktreeMatches(this.#state.phase.integrationHead)) return; // already created and completed
+    if (this.#worktreeMatches(baseSha)) return; // already created and completed
     if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
-    const baseSha = this.#state.phase.integrationHead;
     this.#log.intent(ACTION_ID, { worktree: this.#paths.worktree, baseSha });
     crashAt("before_create_worktree");
     createWorktree(this.#plan.repo, this.#paths.worktree, baseSha);
     crashAt("after_create_worktree");
     this.#log.completion(ACTION_ID, { created: true, baseSha });
+  }
+
+  /** Plan 06k3 (A2, finding A-3): the base a resumed single worker's worktree
+   * starts from — the saved unsubmitted work when it descends from the frozen
+   * candidate (so a restart after a timeout keeps that work), else the
+   * candidate, else the integration head. */
+  #singleWorkerBase(): string {
+    const candidate = this.#state.phase.candidate?.sha;
+    const saved = this.#savedLaneWork().get("a");
+    if (saved) {
+      if (!candidate) return saved.sha;
+      try {
+        execFileSync("git", ["-C", this.#plan.repo, "merge-base", "--is-ancestor", candidate, saved.sha], { encoding: "utf8" });
+        return saved.sha;
+      } catch {
+        // The saved work predates the current candidate: it is stale.
+      }
+    }
+    return candidate ?? this.#state.phase.integrationHead;
   }
 
   #worktreeMatches(baseSha: string): boolean {
@@ -1433,18 +1912,164 @@ export class Conductor {
     }
   }
 
+  /** Plan 06k2 (A6) / plan 06k3 (A4): true when `worktree`'s tree is
+   * identical to `againstSha` (the candidate the submission started from) — a
+   * worker that changed nothing. */
+  #submissionTreeUnchanged(worktree: string, againstSha: string): boolean {
+    const C = againstSha;
+    if (!C) return false;
+    try {
+      const candidateTree = execFileSync("git", ["-C", this.#plan.repo, "rev-parse", `${C}^{tree}`], { encoding: "utf8" }).trim();
+      // Plan 06k2 (A6, finding A-2): compare the tree the freeze would commit,
+      // not the porcelain status. A staged-then-reverted tracked file reads as
+      // `M ` (dirty) but `git add -A` restores the candidate's bytes, so the
+      // frozen tree is identical. Mirror the freeze on a TEMP index, so the
+      // real index is never touched.
+      const tmpIndex = path.join(os.tmpdir(), `tt-tree-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const gitEnv = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+      try {
+        execFileSync("git", ["-C", worktree, "read-tree", "HEAD"], { encoding: "utf8", env: gitEnv });
+        execFileSync("git", ["-C", worktree, "add", "-A"], { encoding: "utf8", env: gitEnv });
+        const frozenTree = execFileSync("git", ["-C", worktree, "write-tree"], { encoding: "utf8", env: gitEnv }).trim();
+        return frozenTree === candidateTree;
+      } finally {
+        fs.rmSync(tmpIndex, { force: true });
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  /** Plan 06k2 (A6, finding A-3/D-B-17) / plan 06k3 (A4): the owner asked for
+   * an unchanged resubmission. Only an ASKING, in-force steer counts (a
+   * negated text or a withdrawn directive asks for nothing), and each
+   * permission lifts exactly one submission — the next one. The permission's
+   * use is an EVENT (`UNCHANGED_PERMISSION_USED`), not process memory, so a
+   * conductor restart cannot reopen it. */
+  #ownerAskedForUnchangedResubmission(): boolean {
+    const keys = unchangedResubmissionRequesters(
+      this.#state.phase.ownerNotes ?? [],
+      this.#state.phase.ownerDirectives ?? [],
+    );
+    const used = new Set(this.#state.phase.consumedUnchangedPermissions ?? []);
+    const key = keys.find((k) => !used.has(k));
+    if (key === undefined) return false;
+    this.#applyEvent({ type: "UNCHANGED_PERMISSION_USED", key });
+    return true;
+  }
+
+  /** Plan 06k3 (A3): the open blocking findings this submission must answer,
+   * and the reason it is refused when one is unanswered or malformed. */
+  #findingAnswerIssue(answers: FindingAnswer[] | undefined): string | undefined {
+    const open = this.#state.phase.findings.filter((f) => f.status === "open" && f.severity === "blocking");
+    if (open.length === 0) return undefined;
+    const byId = new Map((answers ?? []).map((a) => [a.findingId, a]));
+    const missing = open.filter((f) => !byId.has(f.id)).map((f) => f.id);
+    if (missing.length > 0) {
+      return `submit_phase refused: these open blocking findings are unanswered: ${missing.join(", ")}. Answer each in findingAnswers: fixed (with the test that now covers it) or disputed (with the reason)`;
+    }
+    for (const f of open) {
+      const a = byId.get(f.id)!;
+      if (a.status === "fixed") {
+        if (!a.test || a.test.trim().length === 0) return `submit_phase refused: finding ${f.id} is answered 'fixed' but gives no test`;
+      } else if (a.status === "disputed") {
+        if (!a.reason || a.reason.trim().length === 0) return `submit_phase refused: finding ${f.id} is answered 'disputed' but gives no reason`;
+      } else {
+        return `submit_phase refused: finding ${f.id} has an unknown answer status ${JSON.stringify((a as { status?: unknown }).status)}`;
+      }
+    }
+    return undefined;
+  }
+
+  /** Plan 06k2 (A6) / plan 06k3 (A4): refuse a submission whose tree equals
+   * the candidate it started from before freeze. For the phase's own worker
+   * that is the last reviewed candidate; for a lane it is the candidate that
+   * LANE started from (its per-lane base), so a lane restarted from its own
+   * losing candidate that resubmits it unchanged is refused naming that
+   * candidate. Returns the reason, or undefined when the submission may
+   * proceed. */
+  #unchangedResubmissionReason(worktree: string, baseSha?: string): string | undefined {
+    const C = baseSha ?? this.#state.phase.candidate?.sha;
+    if (!C) return undefined;
+    // Plan 06k2 (A6) refuses a tree equal to the last REVIEWED candidate. A
+    // candidate whose round checks failed never reached review: resubmitting
+    // it unchanged (after the owner fixed the environment and granted more
+    // rounds, plan 01b/01e) re-runs the checks, not a review, so it is not
+    // refused. A final-tier failure comes after the review and still counts.
+    const checks = this.#state.phase.checks;
+    if (checks && checks.candidateSha === C && checks.passed === false && (checks.tier ?? "round") === "round") return undefined;
+    // Plan 05e (finding #34): an amendment-only resubmission is identical
+    // bytes resubmitted after an amendment raised on C applied and moved the
+    // contract. CRITERION_AMENDED clears C's reviews and rebinds it to the
+    // new contract version, so C is not yet reviewed under it; the
+    // resubmission is reviewed against the amended criterion only, so it is
+    // not refused.
+    const K = this.#state.phase.contract.contractVersion;
+    const amendedOnC = this.#state.phase.decisions.some(
+      (d) =>
+        d.boundCandidateSha === C &&
+        d.amendment?.status === "applied" &&
+        d.amendment.appliedContractVersion !== undefined &&
+        sameVersion(d.amendment.appliedContractVersion, K),
+    );
+    if (amendedOnC) return undefined;
+    // Consume the owner's permission only when it actually lifts a refusal.
+    if (!this.#submissionTreeUnchanged(worktree, C)) return undefined;
+    if (this.#ownerAskedForUnchangedResubmission()) return undefined;
+    return `this submission's tree is identical to the last reviewed candidate ${C.slice(0, 7)}; make a change, or have the owner ask for an unchanged resubmission`;
+  }
+
   /** Every recorded `sh` group pgid for `agentId` (from `#onShIntent`'s own
    * `sh-<agentId>-<pgid>` intent records — those never get a completion of
    * their own, so `pendingIntents` is not the right lens for them; this
    * reads every logged one regardless, since a crashed agent's shell groups
    * are exactly what design §9.3's "agent attempt" row means by "every
    * recorded shell group"). */
-  #recordedShGroups(records: readonly LogRecord[], agentId: string): number[] {
+  #recordedShGroups(records: readonly LogRecord[], agentId: string): Array<{ pgid: number; ts: number }> {
     const prefix = `sh-${agentId}-`;
     return records
       .filter((r) => r.kind === "intent" && typeof r.actionId === "string" && r.actionId.startsWith(prefix))
-      .map((r) => (r.event as { pgid: number }).pgid)
-      .filter((pgid) => Number.isFinite(pgid));
+      .map((r) => ({ pgid: (r.event as { pgid: number }).pgid, ts: Date.parse(r.ts) }))
+      .filter((g) => Number.isFinite(g.pgid));
+  }
+
+  /** Signals a process group read from a PREVIOUS conductor's log, but only
+   * when its leader started no later than the record that named it. A pgid
+   * the OS recycled after the crash belongs to a foreign process; A2/C3
+   * forbid signalling it, so it is logged and left alone. Every recovery
+   * kill goes through here — the one place crash recovery signals a group. */
+  async #killRecordedGroup(pgid: number, recordedAtMs: number): Promise<void> {
+    if (!Number.isFinite(recordedAtMs) || !groupStartedBefore(pgid, recordedAtMs)) {
+      this.#log.append("sweep_skipped", {
+        pgid,
+        reason: "pgid leader did not start at the recorded time (recycled or foreign); not signalled",
+      });
+      return;
+    }
+    await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+  }
+
+  /** Every process group THIS RUN recorded at spawn: the pgid of every intent
+   * record in the log, plus every live agent and shell group. A2 (plan 06e):
+   * the sweep may signal only these — a process in any other group is
+   * reported as HELD, never signalled. */
+  #ownPgids(): number[] {
+    const pgids = new Set<number>();
+    try {
+      for (const r of readLog(this.#paths.events).records) {
+        if (r.kind !== "intent") continue;
+        const pgid = (r.event as { pgid?: unknown }).pgid;
+        if (typeof pgid === "number" && Number.isFinite(pgid)) pgids.add(pgid);
+      }
+    } catch {
+      // an unreadable log: fall back to the live handles below
+    }
+    for (const handle of this.#agents.values()) {
+      pgids.add(handle.agent.pgid);
+      for (const g of handle.shGroups) pgids.add(g);
+    }
+    for (const g of this.#liveShGroups) pgids.add(g);
+    return [...pgids];
   }
 
   /** design §9.3's per-effect reconciliation table, driven off
@@ -1478,7 +2103,7 @@ export class Conductor {
       for (const rec of records) {
         if (rec.kind !== "intent" || typeof rec.actionId !== "string" || !rec.actionId.startsWith(prefix)) continue;
         const pgid = (rec.event as { pgid?: number }).pgid;
-        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+        if (typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(rec.ts));
       }
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       this.#applyEvent(
@@ -1493,9 +2118,9 @@ export class Conductor {
       // publishes that type's raw messages `unevaluated` and settles it.
       const messageType = key.slice("dispatch_evaluation_".length) as MessageType;
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
       this.#log.completion(actionId, { messageType, interrupted: true, reason: "crash-recovery" });
       this.#applyEvent(
@@ -1515,9 +2140,9 @@ export class Conductor {
       const blockerId = rest.slice(0, sep);
       const seat = Number(rest.slice(sep + 1));
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
       this.#log.completion(actionId, { blockerId, seat, interrupted: true, reason: "crash-recovery" });
       this.#panelSeatUnavailable(blockerId, seat, this.#state.phase.candidate?.sha, "the conductor died while the seat voted");
@@ -1530,9 +2155,9 @@ export class Conductor {
       // loss makes it unavailable, and the remaining real votes decide.
       const seat = Number(key.slice("dispatch_round_panel_".length));
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
       this.#log.completion(actionId, { seat, interrupted: true, reason: "crash-recovery" });
       this.#roundPanelSeatUnavailable(seat, "the conductor died while the seat voted");
@@ -1541,12 +2166,26 @@ export class Conductor {
 
     if (key === "dispatch_worker") {
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
-      for (const shPgid of this.#recordedShGroups(records, payload.agentId as string)) {
-        await killGroup(shPgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
+      for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
+        await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
       }
-      const sweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
+      // Plan 06g2: a crash during a lane round left up to two lane worktrees
+      // (and their own agents) behind; each is swept inside its own tree, so a
+      // lane's survivors can never be another lane's. The round itself is
+      // re-dispatched from scratch (ROUND_STARTED replaces the partial round).
+      for (const lane of this.#laneRoundEnabled() ? this.#lanes() : []) {
+        const worktree = this.#laneWorktree(lane);
+        if (!fs.existsSync(worktree)) continue;
+        const laneSweep = await sweep(worktree, {
+          ownPgids: this.#ownPgids(),
+          exceptPids: [],
+          cwdUnder: this.#laneSweepRoot(worktree),
+        });
+        this.#log.append("sweep", { ...laneSweep, lane, reason: "crash-recovery" });
+      }
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       if (typeof payload.sessionDir === "string") this.#recoveredSessionDir = payload.sessionDir;
       this.#applyEvent({ type: "ATTEMPT_INTERRUPTED" });
@@ -1555,7 +2194,7 @@ export class Conductor {
 
     if (key === "freeze") {
       const found = findCommitByTrailer(this.#paths.worktree, actionId);
-      const sweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
       if (found) {
         const decisions = this.#assembleDecisions(found);
@@ -1569,17 +2208,26 @@ export class Conductor {
       return;
     }
 
-    if (key === "run_checks") {
-      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
-      this.#applyEvent({ type: "CHECKS_INTERRUPTED" });
-      return;
-    }
-
     if (key === "dispatch_probe") {
       const candidateSha = payload.candidateSha as string;
       discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
       this.#applyEvent({ type: "PROBE_INTERRUPTED" });
+      return;
+    }
+
+    if (key === "run_checks") {
+      // Plan 06c: a conductor that stopped during CHECKING leaves the check
+      // in flight. Kill the orphaned check command, then rerun the check
+      // (CHECKS_INTERRUPTED clears the in-flight entry and re-dispatches).
+      for (const rec of records) {
+        if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
+        if (!rec.actionId.startsWith(`check-sh-${actionId}-`)) continue;
+        const pgid = (rec.event as { pgid?: number }).pgid;
+        if (typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(rec.ts));
+      }
+      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#applyEvent({ type: "CHECKS_INTERRUPTED" });
       return;
     }
 
@@ -1598,7 +2246,7 @@ export class Conductor {
         if (rec.kind !== "intent" || typeof rec.actionId !== "string") continue;
         if (!prefixes.some((p) => rec.actionId.startsWith(p))) continue;
         const pgid = (rec.event as { pgid?: number }).pgid;
-        if (typeof pgid === "number") await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+        if (typeof pgid === "number") await this.#killRecordedGroup(pgid, Date.parse(rec.ts));
       }
       discardProbeByBranch(this.#plan.repo, this.#state.phase.runId, candidateSha);
       this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
@@ -1606,10 +2254,18 @@ export class Conductor {
       return;
     }
 
-    if (key === "review_M" || key === "review_A" || key === "review_B") {
+    if (key === "run_final_checks") {
+      // Plan 06c: like an interrupted gate, an interrupted final check is
+      // rerun rather than counted as passed or failed.
+      this.#log.completion(actionId, { interrupted: true, reason: "crash-recovery" });
+      this.#applyEvent({ type: "FINAL_CHECKS_INTERRUPTED" });
+      return;
+    }
+
+    if (key.startsWith("review_")) {
       const reviewer = key.slice("review_".length) as Reviewer;
       const pgid = payload.pgid as number | undefined;
-      if (pgid !== undefined) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined);
+      if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
       this.#log.completion(actionId, { reviewer, interrupted: true, reason: "crash-recovery" });
       // design §9.3: "Reviewer: discard; start a new review." REVIEW_TIMED_OUT
       // is the existing core event for exactly that (discard this review
@@ -1659,8 +2315,14 @@ export class Conductor {
    * reconciliation: assembles+binds `phase.pendingDisclosures` into real
    * `Decision` records for `candidateSha` (design §6.2/§7.1's binding), and
    * validates each against `schemas/decision.schema.json`. */
-  #assembleDecisions(candidateSha: string): Decision[] {
-    const disclosures: DecisionDisclosure[] = this.#state.phase.pendingDisclosures ?? [];
+  #assembleDecisions(
+    candidateSha: string,
+    /** Plan 06g2: assemble a LANE's decisions from its own submission instead
+     * of the phase's pending one, with exactly the ids the winner's hand-off
+     * will produce (same disclosures, same sha, same phase). */
+    lane?: { disclosures: DecisionDisclosure[]; dispute?: CriterionDispute },
+  ): Decision[] {
+    const disclosures: DecisionDisclosure[] = lane ? lane.disclosures : (this.#state.phase.pendingDisclosures ?? []);
     const decisions: Decision[] = disclosures.map((d, i) => ({
       id: `D-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-${i + 1}`,
       version: 1,
@@ -1678,11 +2340,23 @@ export class Conductor {
     // `reserved` decision the reviewers vote on in turn 2 like any other. A
     // passing tally rewrites the accepted item (next()'s `apply_amendment`);
     // a failing one leaves it unchanged and never blocks acceptance.
-    const dispute = this.#state.phase.pendingDispute;
+    const dispute = lane ? lane.dispute : this.#state.phase.pendingDispute;
+    // Plan 06c (R7): an amendment whose proposed text equals the current
+    // criterion changes nothing, so it is never raised (no decision, no
+    // message, no ballot, no status line).
+    const noopDispute = dispute !== undefined && dispute.proposedWording.trim() === dispute.criterion.trim();
+    if (noopDispute) {
+      this.#log.append("dispute_ignored", {
+        raisedBy: "worker",
+        criterion: dispute.criterion,
+        reason: "the proposed wording equals the current criterion",
+      });
+    }
     // Dedup only an IDENTICAL proposal: a different wording for the same
     // criterion is a genuinely different choice, and a second dispute with
     // the same wording is logged rather than silently dropped (A-13).
     const alreadyProposed =
+      !noopDispute &&
       dispute !== undefined &&
       this.#state.phase.decisions.some(
         (d) =>
@@ -1697,7 +2371,7 @@ export class Conductor {
         reason: "an identical amendment for this criterion is already proposed",
       });
     }
-    if (dispute && !alreadyProposed) {
+    if (dispute && !alreadyProposed && !noopDispute) {
       const short = candidateSha.slice(0, 8);
       decisions.push({
         id: `D-${this.#state.phase.phaseId}-${short}-amendment`,
@@ -1720,6 +2394,7 @@ export class Conductor {
           id: `AM-${this.#state.phase.phaseId}-${short}`,
           criterion: dispute.criterion,
           proposedWording: dispute.proposedWording,
+          ...(this.#criterionItemId(dispute.criterion) ? { itemId: this.#criterionItemId(dispute.criterion)! } : {}),
           why: dispute.why,
           raisedBy: "worker",
           status: "proposed",
@@ -1756,6 +2431,9 @@ export class Conductor {
     }
     // Plan 03b: flush the status view once before the log closes.
     this.#writeStatusViewSafe();
+    // Plan 06f (A2): a stopped conductor is neither alive nor waiting, so its
+    // row leaves `live.json` here.
+    this.#writeLive();
     // design §9.3: `tt stop` ends a run's conductor cleanly — the stop event
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
@@ -1765,6 +2443,10 @@ export class Conductor {
       // the log may already be closed (a second stop call); never fatal.
     }
     await this.#killLiveShGroups();
+    // ODP-3: a check, the baseline or the gate still running when the
+    // conductor stops is signalled here, like any other stage's group — and
+    // only when its leader is proven to be this run's own.
+    await this.#killLiveStageGroups();
     for (const handle of this.#agents.values()) {
       // Plan 2d: a clean stop uses the short stopAbortGraceMs, not the
       // 30 s cancellation grace — `tt stop` must finish within 15 s.
@@ -1783,6 +2465,7 @@ export class Conductor {
     // A group whose agent handle was already dropped (a force-killed
     // worker's orphaned command), or one that started while stopping.
     await this.#killLiveShGroups();
+    await this.#killLiveStageGroups();
     await this.#socket?.close();
     await this.#lock?.release();
     this.#log?.close();
@@ -1816,7 +2499,15 @@ export class Conductor {
     // here, before reduce(), and the log's own copy is redacted from the same
     // event (`EventLog` keeps its own pass as a backstop for its other
     // callers: intents, completions, sweeps).
-    const logged = redactRecord(raw, this.#secretMaskable) as Event;
+    // Plan 06k1 (A3): stamp every raised finding with the round it was
+    // raised in, so the variant limit can count a requirement's blocking
+    // findings across consecutive rounds. Set once, at the single point an
+    // event enters the state, so every raise site gets it.
+    const withRound: Event =
+      raw.type === "FINDING_RAISED" && raw.finding.roundRaised === undefined
+        ? ({ ...raw, finding: { ...raw.finding, roundRaised: this.#state.phase.round ?? 0 } } as Event)
+        : raw;
+    const logged = redactRecord(withRound, this.#secretMaskable) as Event;
     const before = this.#state.phase.phase;
     const result = reduce(this.#state, logged);
     if (!result.ok) {
@@ -1845,6 +2536,9 @@ export class Conductor {
     // a park's requests (which bounces through AWAITING_OWNER back to itself)
     // is not.
     if (before !== "AWAITING_OWNER" && this.#state.phase.phase === "AWAITING_OWNER") this.#awaitingEpisode += 1;
+    // Plan 06f (A2): the Emacs mode line reads `live.json`; every phase change
+    // rewrites this run's row (and only this run's row) there.
+    if (before !== this.#state.phase.phase) this.#writeLive();
     this.#syncBudgetTimer();
     if (!this.#driveSuspended) this.drive();
     // Plan 01b: before `#maybeAutoStop` can tear the log down for BLOCKED.
@@ -1975,11 +2669,32 @@ export class Conductor {
 
   /** Plan 2d: the three input-box kinds (design §7.4), detected by shape in
    * either the flat `kind` form or the decision view's `type` form. */
-  #ownerInputKindOf(raw: unknown): OwnerInputKind | undefined {
+  #ownerInputKindOf(raw: unknown): InputKind | undefined {
     if (!raw || typeof raw !== "object") return undefined;
     const r = raw as Record<string, unknown>;
     const kind = typeof r.type === "string" ? r.type : typeof r.kind === "string" ? r.kind : undefined;
     return kind === "steer" || kind === "note" || kind === "correction" ? kind : undefined;
+  }
+
+  /** Plan 06m (A1/R2): validate an owner input's binding. Returns the refusal
+   * reason, or undefined when it names this run and this phase. The ONE place
+   * that decides it, so a steer, note, correction and evidence are all bound
+   * the same way. */
+  #inputBindingError(raw: Record<string, unknown>): string | undefined {
+    const binding = raw.binding;
+    if (!binding || typeof binding !== "object") {
+      return "an owner input needs a 'binding' naming the run and phase it was sent to";
+    }
+    const runId = (binding as { runId?: unknown }).runId;
+    if (typeof runId !== "string" || runId.length === 0) return "the binding is missing 'runId'";
+    const phaseId = (binding as { phaseId?: unknown }).phaseId;
+    if (typeof phaseId !== "string" || phaseId.length === 0) return "the binding is missing 'phaseId'";
+    const resolved = resolveBinding(this.#runBinding(), runId);
+    if (!resolved.ok) return resolved.reason;
+    if (phaseId !== this.#state.phase.phaseId) {
+      return `command is bound to phase ${phaseId}, but this run is on phase ${this.#state.phase.phaseId}`;
+    }
+    return undefined;
   }
 
   /** Plan 2d: records one owner input's actually-observed effect. Record-
@@ -1992,6 +2707,7 @@ export class Conductor {
     state: OwnerInputState,
     attemptId?: string,
     reason?: string,
+    deliveries?: Record<string, OwnerInputState>,
   ): void {
     // `id` is the inbox command id, so the logged event carries it: recovery
     // then knows a replayed file was already applied (design §9.3) instead of
@@ -2006,6 +2722,7 @@ export class Conductor {
           state,
           ...(attemptId ? { attemptId } : {}),
           ...(reason ? { reason } : {}),
+          ...(deliveries && Object.keys(deliveries).length > 0 ? { deliveries } : {}),
           at: new Date().toISOString(),
         },
       },
@@ -2024,10 +2741,17 @@ export class Conductor {
     const out: Array<{ target: string; agentId: string; agent: PiAgent }> = [];
     for (const h of this.#agents.values()) {
       if (h.agent.exited) continue;
-      const target = h.role === "worker" ? "worker" : (h.agentId.match(/^reviewer-([MAB])-/)?.[1] ?? h.agentId);
-      out.push({ target, agentId: h.agentId, agent: h.agent });
+      out.push({ target: workerTarget(h.role, h.agentId), agentId: h.agentId, agent: h.agent });
     }
     return out;
+  }
+
+  /** Plan 06m (A2): the live lane workers of this run, each under its lane
+   * label (`worker-a`, `worker-b`, …). A single-candidate worker keeps the
+   * historical `worker` label; a lane worker's label comes from its own
+   * agent id (`lane-<round>-<lane>-…`). */
+  #liveWorkers(): Array<{ target: string; agentId: string; agent: PiAgent }> {
+    return this.#liveAgents().filter((l) => l.target === "worker" || l.target.startsWith("worker-"));
   }
 
   /** Plan 01i: records one directive, then steers it at once to every live
@@ -2148,9 +2872,13 @@ export class Conductor {
     if (expanded.skipped.length > 0) {
       this.#log.append("entry_verdict_skipped", { commandId, entryId: raw.entryId, skipped: expanded.skipped });
     }
-    if (expanded.runId && expanded.runId !== this.#state.phase.runId) {
-      this.#rejectInboxFile(file, commandId, `command is bound to run ${expanded.runId}, but this run is ${this.#state.phase.runId}`);
-      return;
+    if (expanded.runId) {
+      // Plan 06d (A2/C3): resolveBinding is the only place that matches a run.
+      const resolved = resolveBinding(this.#runBinding(), expanded.runId);
+      if (!resolved.ok) {
+        this.#rejectInboxFile(file, commandId, resolved.reason);
+        return;
+      }
     }
     if (expanded.phaseId && expanded.phaseId !== this.#state.phase.phaseId) {
       this.#rejectInboxFile(file, commandId, `command is bound to phase ${expanded.phaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
@@ -2353,22 +3081,34 @@ export class Conductor {
       // own event and the intent, add it now (idempotent by command id) so
       // the recovered input is still a directive in every later prompt.
       const directive = this.#addDirective(text, scope, commandId, []);
-      const recovered: "delivered" | "delivery-uncertain" = completion ? "delivered" : "delivery-uncertain";
-      if (!recorded) {
-        if (completion) {
-          const outcome = completion.event as { agentId?: string; attemptId?: string };
-          this.#recordOwnerInput(commandId, "steer", text, "delivered", outcome.attemptId ?? boundAttemptId);
-        } else {
-          this.#recordOwnerInput(
-            commandId,
-            "steer",
-            text,
-            "delivery-uncertain",
-            boundAttemptId,
-            "the conductor restarted between sending the steer and Pi acknowledging it; it is never resent automatically",
-          );
+      // Plan 06m (A2/R3): recover the per-lane outcomes from the aggregate
+      // completion's `targets` map, so a crash after two lanes acknowledged
+      // does not lose them or turn a failed lane into `delivered`.
+      const targetMap = completion ? (completion.event as { targets?: Record<string, string> }).targets : undefined;
+      const deliveries: Record<string, OwnerInputState> = {};
+      if (targetMap && typeof targetMap === "object") {
+        for (const [target, value] of Object.entries(targetMap)) {
+          const state: OwnerInputState = value === "delivered" ? "delivered" : "delivery-uncertain";
+          deliveries[target] = state;
+          this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state });
         }
-        this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state: recovered });
+      }
+      const hasTargets = Object.keys(deliveries).length > 0;
+      const allDelivered = hasTargets && Object.values(deliveries).every((s) => s === "delivered");
+      if (!recorded) {
+        this.#recordOwnerInput(
+          commandId,
+          "steer",
+          text,
+          allDelivered ? "delivered" : "delivery-uncertain",
+          boundAttemptId,
+          allDelivered || !hasTargets
+            ? hasTargets
+              ? undefined
+              : "the conductor restarted between sending the steer and Pi acknowledging it; it is never resent automatically"
+            : "Pi could not accept the steer for every lane",
+          hasTargets ? deliveries : undefined,
+        );
       }
       this.#appliedCommandIds.add(commandId);
       crashAt("before_inbox_move");
@@ -2376,53 +3116,95 @@ export class Conductor {
       return;
     }
 
-    const worker = [...this.#agents.values()].find((h) => h.role === "worker" && !h.agent.exited);
-    if (!worker) {
-      const reason = "no worker attempt is running; the conductor refused the steer (it was not delivered)";
-      this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, reason);
-      this.#rejectInboxFile(file, commandId, reason);
+    // Plan 06m (A2): a steer reaches every live lane worker, each under its
+    // lane label (`worker-a`, `worker-b`), through the same per-worker path a
+    // single-candidate steer uses.
+    const workers = this.#liveWorkers();
+    // Plan 06d (A1/C3): the observation may have changed since the inbox
+    // block last asked acceptInput (the worker can exit in between), so ask
+    // the one policy again rather than deciding here. A steer with no worker
+    // is queued, never refused: owner input is never lost.
+    const decision = acceptInput(this.#state, { kind: "steer", text, workerRunning: workers.length > 0 });
+    if (decision.kind === "refused") {
+      this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, decision.reason);
+      this.#rejectInboxFile(file, commandId, decision.reason);
       return;
     }
-    const attemptId = boundAttemptId ?? worker.agentId;
+    if (decision.kind === "queued" || workers.length === 0) {
+      const event: Event = { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text };
+      const result = reduce(this.#state, event);
+      if (!result.ok) {
+        this.#recordOwnerInput(commandId, "steer", text, "refused", boundAttemptId, result.reason);
+        this.#rejectInboxFile(file, commandId, result.reason);
+        return;
+      }
+      this.#appliedCommandIds.add(commandId);
+      this.#applyEvent(event, commandId);
+      this.#addDirective(text, scope, commandId);
+      this.#recordOwnerInput(commandId, "steer", text, "queued");
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+      return;
+    }
+    const attemptId = boundAttemptId ?? workers[0].agentId;
     // Plan 01i: every input is also an owner directive. It is recorded before
     // the steer is sent (so a crash between the two still leaves the ruling in
     // every later prompt), and the worker's own steer below is that
     // directive's delivery — never a second, duplicate steer. The exemption
-    // is that worker's *agent id* (`worker-<n>-<actionId>`), not its label.
-    const directive = this.#addDirective(text, scope, commandId, [worker.agentId]);
+    // is each worker's *agent id*, not its label.
+    const directive = this.#addDirective(text, scope, commandId, workers.map((w) => w.agentId));
     // Mark in flight (NOT applied): the file must stay in the inbox until the
     // acknowledgement decides its fate, so a crash here can still recover it.
     this.#steerInFlight.add(commandId);
-    this.#log.intent(actionId, { commandId, agentId: worker.agentId, attemptId, text });
-    const ack = worker.agent.steer(text);
+    this.#log.intent(actionId, { commandId, targets: workers.map((w) => w.target), text });
     // design §9.3: the boundary between sending the steer and its
     // acknowledgement — a crash here leaves the outcome unknown.
     crashAt("before_steer_ack");
-    const finish = (state: "delivered" | "delivery-uncertain", reason?: string): void => {
+    const deliveries: Record<string, "delivered" | "delivery-uncertain"> = {};
+    let settled = 0;
+    const finishOne = (target: string, state: "delivered" | "delivery-uncertain"): void => {
+      deliveries[target] = state;
+      this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target, state });
+      settled += 1;
+      if (settled < workers.length) return;
+      const allDelivered = workers.every((w) => deliveries[w.target] === "delivered");
+      const overall: "delivered" | "delivery-uncertain" = allDelivered ? "delivered" : "delivery-uncertain";
+      this.#log.completion(actionId, { outcome: allDelivered ? "steer-acknowledged" : "steer-failed", targets: deliveries });
       this.#steerInFlight.delete(commandId);
       this.#appliedCommandIds.add(commandId);
-      this.#recordOwnerInput(commandId, "steer", text, state, attemptId, reason);
-      this.#applyEvent({ type: "DIRECTIVE_DELIVERED", directiveId: directive.id, target: "worker", state });
+      this.#recordOwnerInput(
+        commandId,
+        "steer",
+        text,
+        overall,
+        attemptId,
+        allDelivered ? undefined : "Pi could not accept the steer for every lane",
+        deliveries,
+      );
       crashAt("before_inbox_move");
       this.#moveInboxFile(file, this.#paths.inboxApplied);
     };
-    void ack.then(
-      () => {
-        if (this.#closed) return;
-        this.#log.completion(actionId, { outcome: "steer-acknowledged", agentId: worker.agentId, attemptId });
-        finish("delivered");
-      },
-      (err) => {
-        if (this.#closed) return;
-        this.#log.completion(actionId, {
-          outcome: "steer-failed",
-          agentId: worker.agentId,
-          attemptId,
-          error: String((err as Error)?.message ?? err),
-        });
-        finish("delivery-uncertain", "Pi could not accept the steer");
-      },
-    );
+    for (const w of workers) {
+      const target = w.target;
+      const targetAction = `deliver-${commandId}-${target}-${w.agentId}`;
+      void w.agent.steer(text).then(
+        () => {
+          if (this.#closed) return;
+          this.#log.completion(targetAction, { outcome: "steer-acknowledged", target, agentId: w.agentId });
+          finishOne(target, "delivered");
+        },
+        (err) => {
+          if (this.#closed) return;
+          this.#log.completion(targetAction, {
+            outcome: "steer-failed",
+            target,
+            agentId: w.agentId,
+            error: String((err as Error)?.message ?? err),
+          });
+          finishOne(target, "delivery-uncertain");
+        },
+      );
+    }
   }
 
   /** One inbox file. The command id is the filename's basename (design §9.1
@@ -2433,6 +3215,263 @@ export class Conductor {
    * visibly — a `command_rejected` log record plus the file moved to
    * rejected/ with the reason beside it; (3) otherwise the event is appended
    * (the effect), the id is remembered, and only then is the file moved. */
+  /** Plan 06b: record one `evidence` item the owner recorded with
+   * `tt evidence`. When it was the last pending evidence item and the phase
+   * parked on the owner for it, the fallback request is resolved so the phase
+   * resumes to RESOLVING and acceptance. */
+  #processEvidenceCommand(file: string, commandId: string, raw: { item?: unknown; text?: unknown }): void {
+    const name = this.#state.phase.phase;
+    if (name === "DONE" || name === "BLOCKED") {
+      this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
+      return;
+    }
+    // OD-2 (disc-M-91): an old-format phase has no structured items and never
+    // parks for evidence, so a recording there has no effect; refuse it
+    // rather than accept a no-op.
+    if (!this.#structured()) {
+      this.#rejectInboxFile(file, commandId, "this phase has no structured items, so it has no evidence items to record");
+      return;
+    }
+    // Plan 06m (A1/R2): evidence is bound to the run and phase like any owner
+    // input; a missing/foreign binding is refused with the reason.
+    const bindingError = this.#inputBindingError(raw as Record<string, unknown>);
+    if (bindingError) {
+      this.#rejectInboxFile(file, commandId, bindingError);
+      return;
+    }
+    const itemId = typeof raw.item === "string" ? raw.item.trim() : "";
+    const text = typeof raw.text === "string" ? raw.text.trim() : "";
+    const evidenceItems = flatItems(this.#planItems()).filter((i) => itemNeedsEvidence(i));
+    const item = evidenceItems.find((i) => i.id === itemId);
+    if (!item) {
+      this.#rejectInboxFile(file, commandId, `${itemId || "(no item)"} is not an evidence item of this phase`);
+      return;
+    }
+    if (text.length === 0) {
+      this.#rejectInboxFile(file, commandId, "evidence needs non-empty text or an existing file");
+      return;
+    }
+    const existing = this.#state.phase.itemEvidence ?? [];
+    this.#applyEvent({
+      type: "ITEM_STATE_UPDATED",
+      itemEvidence: [...existing.filter((e) => e.id !== itemId), { id: itemId, text, at: new Date().toISOString(), commandId }],
+    });
+    this.#log.append("item_evidence_recorded", { commandId, item: itemId });
+    // Resume once nothing else stands in the way: the evidence the phase
+    // parked for is recorded, so the phase returns to RESOLVING (where
+    // accept() now holds) and the parking request closes.
+    if (this.#state.phase.phase === "AWAITING_OWNER" && pendingEvidenceItems(this.#state.phase).length === 0) {
+      this.#applyEvent({ type: "EVIDENCE_RECORDED", itemId });
+    }
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 06m (A1/R2): `tt verdict <run> <finding> refuse`. The finding is
+   * settled as disproved with the refusal reason on the record; nothing new
+   * is created to answer. A binding that does not name this run/phase is
+   * refused with the reason. */
+  #processFindingVerdictCommand(file: string, commandId: string, raw: Record<string, unknown>): void {
+    const name = this.#state.phase.phase;
+    if (name === "DONE" || name === "BLOCKED") {
+      this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
+      return;
+    }
+    const bindingError = this.#inputBindingError(raw);
+    if (bindingError) {
+      this.#rejectInboxFile(file, commandId, bindingError);
+      return;
+    }
+    const findingId = typeof raw.findingId === "string" ? raw.findingId.trim() : "";
+    const finding = this.#state.phase.findings.find((f) => f.id === findingId);
+    if (!finding) {
+      this.#rejectInboxFile(file, commandId, `no finding ${findingId || "(none named)"} in phase ${this.#state.phase.phaseId}`);
+      return;
+    }
+    if (raw.verdict !== "refuse") {
+      this.#rejectInboxFile(file, commandId, "a finding verdict is refuse (an owner refusal settles the finding)");
+      return;
+    }
+    // Plan 06m (R2-82/disc-M-57): a refusal carries a real reason on the
+    // record, and it settles the blocker message it was raised from so the
+    // review.org entry does not stay live.
+    const reason = typeof raw.reason === "string" ? raw.reason.trim() : "";
+    if (reason.length === 0) {
+      this.#rejectInboxFile(file, commandId, `refusing finding ${findingId} needs a non-empty --reason`);
+      return;
+    }
+    const result = reduce(this.#state, { type: "FINDING_DISPROVED", findingId, byReviewer: "owner", evidence: reason });
+    if (!result.ok) {
+      this.#rejectInboxFile(file, commandId, result.reason);
+      return;
+    }
+    // Plan 06m (R2, M-94): every message raised from the refused finding is
+    // settled, bound to the version it is at (a MESSAGE_* event without the
+    // binding is refused by checkMessageBinding): a published or refused one
+    // is resolved by the owner, a raw (not yet evaluated) one is dropped, so
+    // review.org and the status list exactly the blockers that remain. The
+    // settlements are applied BEFORE the finding is disproved and with the
+    // drive suspended: disproving the last blocker can accept the candidate,
+    // publish and auto-stop the run synchronously, after which no event would
+    // be recorded. A settlement that cannot be applied is logged, never
+    // silently skipped.
+    const settlements: Event[] = [];
+    for (const message of this.#state.phase.messages ?? []) {
+      if (message.sourceRecordId !== findingId) continue;
+      const binding = {
+        messageId: message.id,
+        boundCandidateSha: message.boundCandidateSha,
+        boundContractVersion: message.boundContractVersion,
+        boundRecordVersion: message.messageVersion,
+      };
+      const settledReason = `refused by the owner: ${reason}`;
+      const event: Event | undefined =
+        message.state === "published" || message.state === "refused"
+          ? { type: "MESSAGE_RESOLVED", ...binding, by: "owner", reason: settledReason }
+          : message.state === "raw"
+            ? { type: "MESSAGE_DROPPED", ...binding, by: "owner", reason: settledReason }
+            : undefined;
+      if (!event) continue;
+      const settled = reduce(this.#state, event);
+      if (!settled.ok) {
+        this.#log.append("error", { where: "finding_refusal_message", findingId, messageId: message.id, error: settled.reason });
+        continue;
+      }
+      settlements.push(event);
+    }
+    const wasSuspended = this.#driveSuspended;
+    this.#driveSuspended = true;
+    try {
+      for (const event of settlements) this.#applyEvent(event, commandId);
+      this.#applyEvent({ type: "FINDING_DISPROVED", findingId, byReviewer: "owner", evidence: reason }, commandId);
+    } finally {
+      this.#driveSuspended = wasSuspended;
+    }
+    this.#appliedCommandIds.add(commandId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+    if (!wasSuspended) this.drive();
+  }
+
+  /** Plan 06j (A3): apply one `tt recheck`. Refused with a reason unless the
+   * current candidate's checks just failed and the phase is parked with no
+   * worker running; the event re-runs the same tier, dispatches no worker and
+   * spends no repair round. A hand-written inbox file is checked exactly like
+   * the CLI's own path. */
+  async #processRecheckCommand(file: string, commandId: string, raw: Record<string, unknown>): Promise<void> {
+    const name = this.#state.phase.phase;
+    if (name === "DONE" || name === "BLOCKED") {
+      this.#rejectInboxFile(file, commandId, `the phase is ${name}; the run no longer accepts owner input`);
+      return;
+    }
+    const reason = typeof raw.reason === "string" ? raw.reason.trim() : "";
+    if (reason.length === 0) {
+      this.#rejectInboxFile(file, commandId, 'a recheck needs a non-empty --reason "<why the failure is the machine>"');
+      return;
+    }
+    const candidate = this.#state.phase.candidate;
+    const checks = this.#state.phase.checks;
+    if (!candidate) {
+      this.#rejectInboxFile(file, commandId, "recheck refused: the phase has no frozen candidate yet");
+      return;
+    }
+    // The command names the candidate the owner saw. A command for any other
+    // candidate (an older one, while a newer candidate exists) is refused.
+    const binding = raw.binding && typeof raw.binding === "object" ? (raw.binding as Record<string, unknown>) : {};
+    const namedSha = typeof binding.candidateSha === "string" ? binding.candidateSha : "";
+    if (namedSha !== "" && namedSha !== candidate.sha) {
+      this.#rejectInboxFile(file, commandId, `recheck refused: a newer candidate exists (${candidate.sha.slice(0, 9)}); recheck only the candidate whose checks just failed`);
+      return;
+    }
+    if (checks?.passed === true) {
+      this.#rejectInboxFile(file, commandId, "recheck refused: the current candidate's checks passed");
+      return;
+    }
+    if (checks && checks.candidateSha !== candidate.sha) {
+      this.#rejectInboxFile(file, commandId, `recheck refused: a newer candidate exists (${candidate.sha.slice(0, 9)}); recheck only the candidate whose checks just failed`);
+      return;
+    }
+    if (!checks || checks.passed !== false || checks.interrupted === true) {
+      this.#rejectInboxFile(file, commandId, "recheck refused: the current candidate's checks did not just fail");
+      return;
+    }
+    if (name === "IMPLEMENTING") {
+      // Plan 06j (A3, OD-5): a check failure with budget left starts a repair
+      // attempt by itself, and the owner may still recheck the frozen
+      // candidate while it has not submitted (the phase would be FREEZING
+      // otherwise). Stop EVERY live lane worker (not just the first), kill
+      // the shell groups it left, then reset EVERY worker worktree to the
+      // frozen candidate UNCONDITIONALLY (an agent that already exited may
+      // have left writes) before the checks re-run. A reset that throws
+      // refuses the recheck: the run stays as it was and the reason is
+      // owner-visible. The round it charged is given back by the transition.
+      //
+      // The awaits below yield to the event loop; mark the command in flight
+      // so the next inbox scan leaves the file alone.
+      this.#steerInFlight.add(commandId);
+      try {
+        // Stop every worker handle (live or exited), killing the shell groups
+        // Pi left behind. `#recheckCancelledAttempts` keeps the stopped
+        // attempts from emitting their own attempt-failure events, so the
+        // phase stays IMPLEMENTING until the recheck event moves it. The lane
+        // flag is set BEFORE the awaits (M-28), so a lane round that settles
+        // inside that window is still suppressed rather than dropping the
+        // next round's winner.
+        if (this.#laneRoundEnabled()) this.#recheckCancelledLaneRound = true;
+        const workers = [...this.#agents.values()].filter((h) => h.role === "worker");
+        for (const worker of workers) {
+          this.#recheckCancelledAttempts.add(worker.agentId);
+          await worker.agent.terminate().catch(() => undefined);
+          for (const pgid of worker.shGroups) await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs });
+        }
+        // Reset every worker worktree to the frozen candidate, whether or not
+        // a live handle was found (OD-5(1)/(3)).
+        try {
+          for (const worktree of [this.#paths.worktree, ...(this.#laneRoundEnabled() ? this.#lanes().map((lane) => this.#laneWorktree(lane)) : [])]) {
+            if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+            createWorktree(this.#plan.repo, worktree, candidate.sha);
+          }
+        } catch (err) {
+          // The reset can only run after the worker is stopped, so the
+          // attempt is already gone. Refuse the recheck (OD-5(2)), then
+          // record the stopped attempt exactly like a crashed one — the
+          // ordinary attempt-failure transition re-dispatches a repair
+          // worker and charges no round — and taint the worktree so that
+          // worker resets it to the frozen candidate first.
+          const reason = `recheck refused: could not reset the worker worktree to the frozen candidate (${String((err as Error)?.message ?? err)})`;
+          this.#log.append("recheck_reset_failed", { candidateSha: candidate.sha, error: String((err as Error)?.message ?? err) });
+          // The recheck is refused, so the lane suppression must not survive
+          // to drop the next round's winner (M-28).
+          if (this.#laneRoundEnabled()) this.#recheckCancelledLaneRound = false;
+          this.#rejectInboxFile(file, commandId, reason);
+          this.#applyEvent({ type: "ATTEMPT_INTERRUPTED", taint: true });
+          return;
+        }
+        // The cancelled attempt has no attempt-failure event of its own, so
+        // record why the round was refunded (M-39).
+        this.#log.append("recheck_cancelled_repair", {
+          candidateSha: candidate.sha,
+          agents: workers.map((w) => w.agentId),
+          refundedRound: this.#state.phase.repairRoundsUsed,
+        });
+      } finally {
+        this.#steerInFlight.delete(commandId);
+      }
+    } else if (name !== "AWAITING_OWNER") {
+      this.#rejectInboxFile(file, commandId, `recheck refused: the phase is ${name}; only a parked or repairing phase whose checks just failed accepts a recheck`);
+      return;
+    }
+    const tier = checks.tier === "final" || raw.tier === "final" ? "final" : "round";
+    try {
+      this.#applyEvent({ type: "RECHECK_REQUESTED", candidateSha: candidate.sha, reason, tier }, commandId);
+    } catch (err) {
+      this.#rejectInboxFile(file, commandId, `recheck refused: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    this.#appliedCommandIds.add(commandId);
+    crashAt("before_inbox_move");
+    this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
   #processInboxFile(file: string): void {
     if (this.#closed) return;
     const name = path.basename(file);
@@ -2502,6 +3541,33 @@ export class Conductor {
       return;
     }
 
+    // Plan 06j (A3): `tt recheck <run> --reason "…"` — the owner asks for the
+    // frozen candidate's checks to run again after an environmental failure.
+    // Handled before the input-kind map so a hand-written file cannot bypass
+    // the same conditions the CLI checks.
+    if (raw !== null && typeof raw === "object" && (raw as { type?: unknown }).type === "recheck") {
+      // Async because stopping an IMPLEMENTING worker awaits its termination
+      // and the worktree reset; `#steerInFlight` keeps a second scan off the
+      // file until it finishes.
+      void this.#processRecheckCommand(file, commandId, raw as Record<string, unknown>);
+      return;
+    }
+
+    // Plan 06b: `tt evidence <run> <item> <file-or-text>` — the owner's
+    // recording of an `evidence` item. Handled before the input-kind map.
+    if (raw !== null && typeof raw === "object" && (raw as { type?: unknown }).type === "evidence") {
+      this.#processEvidenceCommand(file, commandId, raw as { item?: unknown; text?: unknown });
+      return;
+    }
+
+    // Plan 06m (A1/R2): `tt verdict <run> <finding> refuse` — the owner
+    // settles a finding as refused (disproved) with the reason on the record,
+    // creating nothing that must be answered.
+    if (raw !== null && typeof raw === "object" && (raw as { type?: unknown }).type === "finding-verdict") {
+      this.#processFindingVerdictCommand(file, commandId, raw as Record<string, unknown>);
+      return;
+    }
+
     // Plan 05j: the review view's entry commands. An entry-verdict expands to
     // one OWNER_VERDICT per linked message; split/merge/retitle are one
     // ENTRY_* event each. Handled before the conductor-state mapping.
@@ -2518,17 +3584,20 @@ export class Conductor {
     // is also an owner directive, phase-scoped unless the sender asked for
     // `scope: "program"` (`C-u` in a run's input box, D5).
     const inputKind = this.#ownerInputKindOf(raw);
-    let noteKindText: { text: string; scope: DirectiveScope; programWide: boolean } | undefined;
     if (inputKind) {
       const inputText = (raw as { text?: unknown }).text;
       if (typeof inputText !== "string" || inputText.trim().length === 0) {
         this.#rejectInboxFile(file, commandId, "an owner input must carry non-empty text");
         return;
       }
-      if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
-        const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
-        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, reason);
-        this.#rejectInboxFile(file, commandId, reason);
+      // Plan 06m (A1/R2): every owner input carries a full binding. A
+      // missing binding, a null/empty run id, an unknown run id or another
+      // phase's id is refused with the reason and lands in inbox/rejected —
+      // never applied.
+      const bindingError = this.#inputBindingError(raw as Record<string, unknown>);
+      if (bindingError) {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, bindingError);
+        this.#rejectInboxFile(file, commandId, bindingError);
         return;
       }
       const scope: DirectiveScope = (raw as { scope?: unknown }).scope === "program" ? "program" : "phase";
@@ -2536,7 +3605,9 @@ export class Conductor {
       // withdraws one directive — whatever kind the phase would otherwise
       // have made of the text. A withdrawal that names no valid id is
       // refused visibly: it must never be recorded as a *new* binding ruling,
-      // which would leave the intended one in force.
+      // which would leave the intended one in force. A withdrawal is not one
+      // of the three input outcomes `acceptInput` decides, so it keeps its own
+      // terminal check (the same refusal text).
       const parsedWithdraw = parseWithdrawInput(inputText);
       if (parsedWithdraw?.kind === "malformed") {
         this.#recordOwnerInput(commandId, "withdraw", inputText, "refused", undefined, parsedWithdraw.reason);
@@ -2544,6 +3615,12 @@ export class Conductor {
         return;
       }
       if (parsedWithdraw?.kind === "withdraw") {
+        if (this.#state.phase.phase === "DONE" || this.#state.phase.phase === "BLOCKED") {
+          const reason = `the phase is ${this.#state.phase.phase}; the run no longer accepts owner input`;
+          this.#recordOwnerInput(commandId, "withdraw", inputText, "refused", undefined, reason);
+          this.#rejectInboxFile(file, commandId, reason);
+          return;
+        }
         this.#processWithdraw(file, commandId, inputText, parsedWithdraw.id, { forwardProgram: true, pushed: false });
         return;
       }
@@ -2567,7 +3644,21 @@ export class Conductor {
           return;
         }
       }
+      // Plan 06d (A1/C3): acceptInput is the only place that decides an
+      // input's outcome. The conductor observes whether a worker is live and
+      // then only executes that decision — never decides it here.
+      const workerRunning = this.#liveAgents().some((l) => l.target === "worker");
+      const outcome = acceptInput(this.#state, { kind: inputKind, text: inputText, workerRunning });
+      if (outcome.kind === "refused") {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, outcome.reason);
+        this.#rejectInboxFile(file, commandId, outcome.reason);
+        return;
+      }
       if (inputKind === "steer") {
+        // A steer always goes through #processSteerCommand: it first recovers
+        // a recorded intent (a crash between the RPC send and its ack), then
+        // steers the live worker or queues for the next attempt — the same
+        // at-most-once delivery discipline as before.
         if (programWide) {
           this.#processProgramWideInput(file, commandId, "steer", inputText);
           return;
@@ -2575,7 +3666,45 @@ export class Conductor {
         this.#processSteerCommand(file, commandId, raw, inputText, effectiveScope);
         return;
       }
-      noteKindText = { text: inputText, scope: effectiveScope, programWide };
+      // A queued note or correction is carried as a note so it reaches the
+      // next worker attempt's prompt verbatim; an applied correction at
+      // AWAITING_OWNER resolves the open requests and starts a repair.
+      const queueAsNote = outcome.kind === "queued";
+      // Plan 06k1 (A5): a correction that arrives while the phase is
+      // reviewing, evaluating, final-checking or parked is queued as a note
+      // for the next attempt AND grants its own round, so a spent budget
+      // cannot drop it. A plain note just queues.
+      const event: Event = queueAsNote
+        ? inputKind === "correction"
+          ? { type: "OWNER_CORRECTION_QUEUED", phaseId: this.#state.phase.phaseId, correctionId: `C-${commandId}`, text: inputText, grantedRounds: 3 }
+          : { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
+        : { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: inputText };
+      const result = reduce(this.#state, event);
+      if (!result.ok) {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, result.reason);
+        this.#rejectInboxFile(file, commandId, result.reason);
+        return;
+      }
+      this.#appliedCommandIds.add(commandId);
+      this.#applyEvent(event, commandId);
+      // Plan 01i: every input is also an owner directive — recorded here, on
+      // top of the event above, so it is steered to every live agent now and
+      // quoted in every later prompt.
+      if (programWide) this.#forwardProgramDirective(commandId, inputText);
+      else this.#addDirective(inputText, effectiveScope, commandId);
+      // The recorded effect the status view reads, never an inference: a
+      // queued correction or steer is `queued`; a note is `noted`; a
+      // correction applied at AWAITING_OWNER started a repair.
+      if (queueAsNote && inputKind === "note") {
+        this.#recordOwnerInput(commandId, "note", inputText, "noted");
+      } else if (queueAsNote) {
+        this.#recordOwnerInput(commandId, inputKind, inputText, "queued");
+      } else {
+        this.#recordOwnerInput(commandId, "correction", inputText, "correction-started");
+      }
+      crashAt("before_inbox_move");
+      this.#moveInboxFile(file, this.#paths.inboxApplied);
+      return;
     }
 
     // Two encodings reach the inbox: schemas/owner-command.schema.json's flat
@@ -2611,14 +3740,38 @@ export class Conductor {
       boundPhaseId = normalized.phaseId;
     }
     // The decision view's binding carries run/phase ids too (design §7.1); a
-    // command for another run or phase is stale by the same rule.
-    if (boundRunId && boundRunId !== this.#state.phase.runId) {
-      this.#rejectInboxFile(file, commandId, `command is bound to run ${boundRunId}, but this run is ${this.#state.phase.runId}`);
-      return;
+    // command for another run or phase is stale by the same rule. Plan 06d
+    // (A2/C3): resolveBinding is the only place that matches a run, and it
+    // accepts the internal id, the run directory id and the readable id.
+    if (boundRunId) {
+      const resolved = resolveBinding(this.#runBinding(), boundRunId);
+      if (!resolved.ok) {
+        this.#rejectInboxFile(file, commandId, resolved.reason);
+        return;
+      }
     }
     if (boundPhaseId && boundPhaseId !== this.#state.phase.phaseId) {
       this.#rejectInboxFile(file, commandId, `command is bound to phase ${boundPhaseId}, but this run is on phase ${this.#state.phase.phaseId}`);
       return;
+    }
+    // Plan 06i (A4/R7): a deferral's guard must be substantive, so a
+    // hand-written inbox file cannot bypass the CLI's own check.
+    if (event.type === "DEFERRAL_RECORDED") {
+      const d = event.deferral;
+      // OD addendum A: a second owner act on the same id is refused, naming
+      // the existing act (a hand-written inbox file cannot bypass the CLI).
+      if ((this.#state.phase.carriedItems ?? []).includes(d.itemId)) {
+        this.#rejectInboxFile(file, commandId, `${d.itemId} is already carried (to ${this.#state.phase.carriedTo?.[d.itemId] ?? "next"}); resolve that carry first`);
+        return;
+      }
+      if (d.test && !this.#deferralTestExists(d.test)) {
+        this.#rejectInboxFile(file, commandId, `no resolved or existing test named "${d.test}" shows the item's current cost`);
+        return;
+      }
+      if (d.ownerRuling && !this.#recordedOwnerRuling(d.ownerRuling)) {
+        this.#rejectInboxFile(file, commandId, `${d.ownerRuling} is not a recorded owner input, directive or request`);
+        return;
+      }
     }
     const result = reduce(this.#state, event);
     if (!result.ok) {
@@ -2627,28 +3780,23 @@ export class Conductor {
     }
     this.#appliedCommandIds.add(commandId);
     this.#applyEvent(event, commandId);
-    // Plan 01i: a note or a correction is a directive too — recorded here,
-    // on top of the event above, so it is steered to every live agent now
-    // and quoted in every later prompt (a correction still resolves the open
-    // requests and grants its 3 rounds first: today's behaviour, unchanged).
-    if (noteKindText) {
-      if (noteKindText.programWide) {
-        this.#forwardProgramDirective(commandId, noteKindText.text);
-      } else {
-        this.#addDirective(noteKindText.text, noteKindText.scope, commandId);
-      }
-    }
-    // The recorded effect for the input box's status view: a note is queued
-    // for the next attempt the moment it is applied; a correction has just
-    // resolved the open requests and started a repair.
-    const recordedText = (raw as { text?: unknown }).text;
-    if (event.type === "NOTE_ADDED" && typeof recordedText === "string") {
-      this.#recordOwnerInput(commandId, "note", recordedText, "noted");
-    } else if (event.type === "OWNER_CORRECTION" && typeof recordedText === "string") {
-      this.#recordOwnerInput(commandId, "correction", recordedText, "correction-started");
-    }
     crashAt("before_inbox_move");
     this.#moveInboxFile(file, this.#paths.inboxApplied);
+  }
+
+  /** Plan 06i (A4/R7): a deferral's `--test` guard is substantive only when
+   * the item resolver resolved that test against this phase's check run, or
+   * the repo's own test files contain it. */
+  #deferralTestExists(test: string): boolean {
+    // The item resolver must have RESOLVED the test against this phase's check
+    // run; a mere mention in the repo is not a test that shows the cost.
+    return (this.#state.phase.checkResolution ?? []).some((r) => r.name === test && r.outcome === "passed");
+  }
+
+  /** Plan 06i (A4/R7): an `--owner-ruling` guard is substantive only when it
+   * names a RECORDED OWNER INPUT (an inbox command id). */
+  #recordedOwnerRuling(id: string): boolean {
+    return (this.#state.phase.ownerInputs ?? []).some((i) => i.id === id);
   }
 
   /** Moves an inbox file into `destDir`. A missing source is a no-op (it was
@@ -2717,7 +3865,9 @@ export class Conductor {
         kind: "run",
         title: redactText(this.#plan.title, this.#secretMaskable),
         ...(node ? { node } : {}),
+        phase: phase.phaseId,
         reason: redactText(waitReason(phase), this.#secretMaskable),
+        ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
         waitKey: `${runId}:${wait}`,
       },
       {
@@ -2740,6 +3890,27 @@ export class Conductor {
     }
   }
 
+  /** Plan 06d (A2): the readable id (`<program>-NN`) the scheduler recorded in
+   * this run's `program.json`, or undefined for a hand-started run. */
+  #readableId(): string | undefined {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as { readableId?: unknown };
+      return typeof raw.readableId === "string" && raw.readableId.length > 0 ? raw.readableId : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Plan 06d (A2): the three ids a binding may use to name this run, resolved
+   * by the one `resolveBinding`. The conductor never compares ids itself. */
+  #runBinding(): { runId: string; dirId: string; readableId?: string } {
+    return {
+      runId: this.#state.phase.runId,
+      dirId: path.basename(this.#runDir),
+      ...(this.#readableId() ? { readableId: this.#readableId()! } : {}),
+    };
+  }
+
   /** design §8.1's "run execution budget ... tokens" and "per-attempt token
    * cap": called from every agent's `onEvent` with each raw RPC event.
    * `message_update`'s `usage` payload's shape is Pi-version-dependent and
@@ -2754,6 +3925,19 @@ export class Conductor {
   /** Plan 3b: per worker, the worktree's `git diff --numstat` totals after
    * its last tool call, and the queue that keeps the snapshots in order. */
   #fileSnapshots = new Map<string, { totals: Map<string, [number, number]>; queue: Promise<void> }>();
+
+  /** Plan 06b: the files each reviewer itself read in this review, from its
+   * recorded `read` tool calls. A `met`/`fits` verdict must cite at least one
+   * of them, never only the worker's own anchors. */
+  #reviewerReads = new Map<Reviewer, Set<string>>();
+  /** A lane review's own reads and commands, keyed `${seat}@${candidateSha}`:
+   * one seat reviews both lanes at once, so the two must not mix. */
+  #laneReviewerReads = new Map<string, Set<string>>();
+  #laneReviewerCommands = new Map<string, Set<string>>();
+
+  /** Plan 06b: the shell commands each reviewer itself ran in this review, so
+   * a verdict that cites a command must cite one it actually ran. */
+  #reviewerCommands = new Map<Reviewer, Set<string>>();
 
   /** Plan 3b: after each worker tool call, append one `tt_file_changes`
    * record to its stream naming the files that call changed ("path +a −r",
@@ -2809,6 +3993,82 @@ export class Conductor {
   /** Races `deadline` against the stall watchdog: resolves "timeout" early
    * when the agent stalls twice (see `Deadlines.stallMs`). Watching starts
    * now, just after the agent was prompted. */
+  /** Plan 06k1 (A4): while another run's check window is open, pause this
+   * worker's process group (SIGSTOP) and its attempt clock, so a check that
+   * holds the machine for minutes does not time the worker out. Resumes
+   * (SIGCONT) the moment the window closes. Returns a stop function. */
+  #watchCheckWindow(agentId: string, agent: PiAgent, ...timers: Array<PausableTimer<"timeout" | "steer">>): () => void {
+    let paused = false;
+    const pause = () => {
+      paused = true;
+      for (const timer of timers) timer.pause();
+      const a = this.#activity.get(agentId);
+      if (a) a.busy = false;
+      try {
+        process.kill(-agent.pgid, "SIGSTOP");
+      } catch {
+        // the agent may have exited; the attempt race handles that
+      }
+      this.#log.append("worker_paused", { agentId, reason: "another run's check window is open" });
+    };
+    const resume = () => {
+      paused = false;
+      for (const timer of timers) timer.resume();
+      const a = this.#activity.get(agentId);
+      if (a) {
+        a.busy = true;
+        a.lastAt = Date.now();
+      }
+      try {
+        process.kill(-agent.pgid, "SIGCONT");
+      } catch {
+        // best effort
+      }
+      this.#log.append("worker_resumed", { agentId, reason: "the check window closed" });
+    };
+    const iv = setInterval(() => {
+      if (this.#closed) return;
+      const open = anyCheckWindowOpen(this.#checkLockPath);
+      if (open && !paused) pause();
+      else if (!open && paused) resume();
+    }, 100);
+    iv.unref?.();
+    return () => {
+      clearInterval(iv);
+      if (paused) {
+        paused = false;
+        try {
+          process.kill(-agent.pgid, "SIGCONT");
+        } catch {
+          // best effort
+        }
+      }
+    };
+  }
+
+  /** Plan 06k3 (A2): at 75% of the attempt the worker (single or lane) is
+   * told how many minutes remain and to submit. The steer is a PausableTimer,
+   * so `#watchCheckWindow` pauses it with the attempt clock: a paused attempt
+   * is not steered early, and the minutes named are the active minutes left.
+   * Returns the timer (to hand to `#watchCheckWindow`) and a cancel function. */
+  #scheduleClockSteer(agentId: string, agent: PiAgent, attemptMs: number): { timer: PausableTimer<"steer">; cancel: () => void } {
+    const at = Math.max(1, Math.floor(attemptMs * 0.75));
+    const remainingMs = Math.max(0, attemptMs - at);
+    const minutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+    const timer = new PausableTimer<"steer">(at, "steer");
+    void timer.promise.then(() => {
+      if (this.#closed) return;
+      this.#log.append("clock_steer", { agentId, minutesLeft: minutes });
+      const coverage = this.#structured() ? " Call submit_coverage first, then submit_phase." : "";
+      void agent
+        .steer(
+          `You have about ${minutes} minute${minutes === 1 ? "" : "s"} left in this attempt. Wrap up and call submit_phase now with what you have.${coverage}`,
+        )
+        .catch(() => undefined);
+    });
+    return { timer, cancel: () => timer.cancel() };
+  }
+
   #withStallWatch(
     agentId: string,
     agent: PiAgent,
@@ -2961,6 +4221,29 @@ export class Conductor {
         // Plan 05e (finding #34): the round's evaluators and panels have
         // settled, so the candidate's final approval state is known.
         try {
+          // Plan 06b: the item loop settles FIRST — the per-item majority, the
+          // evaluator's overturns, and a blocking finding for every item a
+          // majority did not meet (or fit). Its conductor-raised findings must
+          // exist before triage so every one of them gets a disposition.
+          this.#applyItemOutcomes();
+        } catch (err) {
+          this.#log.append("error", { where: "item_outcomes", error: String((err as Error)?.message ?? err) });
+        }
+        try {
+          // Plan 06i: triage every finding and discovered decision — including
+          // the item findings just raised — so nothing disappears and
+          // acceptance waits on a fix or an owner request.
+          this.#applyTriage();
+        } catch (err) {
+          // A1: a record without a disposition is a defect of the loop, never
+          // a pass. The failure is recorded and the phase parks on the owner;
+          // it never continues to acceptance as if triage had passed.
+          const reason = String((err as Error)?.message ?? err);
+          this.#log.append("triage_failed", { error: reason });
+          this.#applyEvent({ type: "TRIAGE_FAILED", reason });
+          return;
+        }
+        try {
           this.#recordCandidateApproval();
         } catch (err) {
           this.#log.append("error", { where: "candidate_approval", error: String((err as Error)?.message ?? err) });
@@ -2981,8 +4264,9 @@ export class Conductor {
         // not invent one.
         const blockerId = action.blockerId as string;
         const panel = this.#state.phase.panel?.blockers?.[blockerId];
-        if (!panel || panel.decided || !panelSeatsSettled(panel)) return;
-        const outcome = panelOutcome(panel);
+        const panelCount = this.#laneSeats().length;
+        if (!panel || panel.decided || !panelSeatsSettled(panel, panelCount)) return;
+        const outcome = panelOutcome(panel, panelCount);
         const blockReasons = Object.values(panel.seats ?? {})
           .filter((s) => s.vote === "block" && s.reason)
           .map((s) => s.reason as string);
@@ -2991,7 +4275,7 @@ export class Conductor {
           blockerId,
           outcome,
           ...(blockReasons.length > 0 ? { reason: blockReasons.join("; ") } : {}),
-          ...(outcome === "escalate" ? { options: panelOptionsFor(panel) } : {}),
+          ...(outcome === "escalate" ? { options: panelOptionsFor(panel, panelCount) } : {}),
         });
         return;
       }
@@ -3009,6 +4293,13 @@ export class Conductor {
       case "dispatch_worker": {
         const actionId = this.#log.actionId(kind);
         this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_worker", actionId });
+        // Plan 06g2 (A1): with `#+TT_WORKERS: 2` one dispatch is one ROUND,
+        // and `core/lanes.ts`'s `runRound` orchestrates it. The conductor
+        // decides nothing about lanes beyond calling it.
+        if (this.#laneRoundEnabled()) {
+          void this.#runLaneRound(actionId).catch((err) => this.#logUnexpected("run_round", err));
+          return;
+        }
         void this.#runWorkerAttempt(actionId).catch((err) => this.#logUnexpected("dispatch_worker", err));
         return;
       }
@@ -3057,6 +4348,17 @@ export class Conductor {
         const actionId = this.#log.actionId(kind);
         this.#applyEvent({ type: "ACTION_STARTED", action: "run_gate", actionId });
         void this.#runGate(actionId, action.candidateSha as string).catch((err) => this.#logUnexpected("run_gate", err));
+        return;
+      }
+      // Plan 06c: the candidate is acceptable and its contract declares a
+      // final check — enter FINAL_CHECKING, from where next() asks for it.
+      case "final_check_required":
+        this.#applyEvent({ type: "FINAL_CHECK_REQUIRED" });
+        return;
+      case "run_final_checks": {
+        const actionId = this.#log.actionId(kind);
+        this.#applyEvent({ type: "ACTION_STARTED", action: "run_final_checks", actionId });
+        void this.#runChecks(actionId, action.candidateSha as string).catch((err) => this.#logUnexpected("run_final_checks", err));
         return;
       }
       case "resolving_incomplete":
@@ -3160,9 +4462,113 @@ export class Conductor {
   async #onSubmitChecked(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
     const handle = this.#agents.get(agentId);
     if (!handle) return { ok: false, reason: "unknown agent" };
+    if (msg.tool === "submit_coverage") {
+      // Plan 06b: the worker's per-item coverage. It is recorded even when
+      // incomplete (so the worker and the status see what is missing), but
+      // the freeze is refused until every R, C and A is covered with its
+      // required note.
+      if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
+        return { ok: false, reason: `submit_coverage is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      // Plan 06g2: a lane worker's coverage belongs to its lane, not to the
+      // phase — the winner's is applied at the hand-off. An incomplete one is
+      // refused back to the lane worker like any other.
+      if (handle.lane !== undefined) {
+        if (!this.#structured()) return { ok: true };
+        const args = msg.args as Coverage;
+        const issues = coverageIssues(args, this.#planItems());
+        handle.laneCoverage = args;
+        if (issues.length > 0) {
+          const reason = `coverage is incomplete: ${issues.join("; ")}`;
+          this.#log.append("coverage_refused", { at: "submit_coverage", lane: handle.lane, issues, reason });
+          return { ok: false, reason };
+        }
+        return { ok: true };
+      }
+      // OD-1: an old-format phase owes submit_phase only, so a stray coverage
+      // call is a harmless no-op rather than a refusal.
+      if (!this.#structured()) return { ok: true };
+      const args = msg.args as Coverage;
+      const issues = coverageIssues(args, this.#planItems());
+      // OD-2 A2: bind the report to the attempt it was submitted in.
+      this.#applyEvent({ type: "ITEM_STATE_UPDATED", coverage: args, coverageAttempt: this.#state.phase.attempt.n });
+      if (issues.length > 0) {
+        const reason = `coverage is incomplete: ${issues.join("; ")}`;
+        this.#log.append("coverage_refused", { at: "submit_coverage", issues, reason });
+        return { ok: false, reason };
+      }
+      if (this.#state.phase.candidate) this.#applyCoverageNotes(args, this.#state.phase.candidate.sha);
+      return { ok: true };
+    }
     if (msg.tool === "submit_phase") {
       if (handle.role !== "worker" || this.#state.phase.phase !== "IMPLEMENTING") {
         return { ok: false, reason: `submit_phase is not accepted in phase ${this.#state.phase.phase}` };
+      }
+      // Plan 06g2: a lane worker's submission is the lane's candidate, never
+      // the phase's own — the round freezes it, and the winner's payload is
+      // applied at the hand-off (a synthetic SUBMIT_PHASE). The coverage gate
+      // is the same one the phase's own worker owes.
+      if (handle.lane !== undefined) {
+        if (this.#itemsEnforced()) {
+          const args = handle.laneCoverage as Coverage | undefined;
+          const issues = args ? coverageIssues(args, this.#planItems()) : ["no coverage was submitted for this lane"];
+          if (issues.length > 0) {
+            const reason = `submit_phase refused until submit_coverage is complete: ${issues.join("; ")}`;
+            this.#log.append("coverage_refused", { at: "submit_phase", lane: handle.lane, issues, reason });
+            return { ok: false, reason };
+          }
+        }
+        const args = msg.args as SubmitPhaseArgs;
+        // Plan 06k3 (A3): every open blocking finding must be answered before
+        // the lane's submission is taken.
+        const laneAnswerIssue = this.#findingAnswerIssue(args.findingAnswers);
+        if (laneAnswerIssue) {
+          this.#log.append("finding_answer_refused", { at: "submit_phase", lane: handle.lane, reason: laneAnswerIssue });
+          return { ok: false, reason: laneAnswerIssue };
+        }
+        // Plan 06k2 (A6): a lane whose tree equals the candidate that lane
+        // started from is refused before its freeze, unless the owner asked
+        // for an unchanged resubmission.
+        const laneStart = this.#laneStartSha(handle.lane, handle.laneRound);
+        const laneUnchanged = this.#unchangedResubmissionReason(this.#laneWorktree(handle.lane), laneStart);
+        if (laneUnchanged) {
+          this.#log.append("resubmission_refused", { at: "submit_phase", lane: handle.lane, candidateSha: laneStart, reason: laneUnchanged });
+          return { ok: false, reason: laneUnchanged };
+        }
+        handle.laneSubmission = {
+          disclosures: args.decisions ?? [],
+          ...(args.priorDecisions ? { prior: args.priorDecisions } : {}),
+          ...(args.criterionDispute ? { dispute: args.criterionDispute } : {}),
+          ...(args.findingAnswers ? { answers: args.findingAnswers } : {}),
+        };
+        handle.doneResolve();
+        return { ok: true };
+      }
+      // Plan 06b: the freeze is refused until the coverage is complete AND
+      // bound to the CURRENT attempt (OD-2 A2).
+      if (this.#itemsEnforced()) {
+        const bound = this.#state.phase.coverageAttempt === this.#state.phase.attempt.n;
+        const issues = bound ? coverageIssues(this.#state.phase.coverage, this.#planItems()) : ["no coverage was submitted for this attempt"];
+        if (issues.length > 0) {
+          const reason = `submit_phase refused until submit_coverage is complete: ${issues.join("; ")}`;
+          this.#log.append("coverage_refused", { at: "submit_phase", issues, reason });
+          return { ok: false, reason };
+        }
+      }
+      // Plan 06k3 (A3): every open blocking finding must be answered before
+      // the submission is taken; the refusal names the missing ids.
+      const answerIssue = this.#findingAnswerIssue((msg.args as SubmitPhaseArgs).findingAnswers);
+      if (answerIssue) {
+        this.#log.append("finding_answer_refused", { at: "submit_phase", reason: answerIssue });
+        return { ok: false, reason: answerIssue };
+      }
+      // Plan 06k2 (A6): a worker that resubmits a candidate byte-identical
+      // to the last reviewed one is refused before the freeze, unless the
+      // owner's steer asked for an unchanged resubmission.
+      const unchanged = this.#unchangedResubmissionReason(this.#paths.worktree);
+      if (unchanged) {
+        this.#log.append("resubmission_refused", { at: "submit_phase", candidateSha: this.#state.phase.candidate?.sha, reason: unchanged });
+        return { ok: false, reason: unchanged };
       }
       // design §6.2/§9.3 (round-of-review item 3): SUBMIT_PHASE is logged
       // with the raw disclosure *before* anything else — freeze is an
@@ -3204,6 +4610,7 @@ export class Conductor {
       this.#applyEvent({
         type: "SUBMIT_PHASE",
         disclosures: args.decisions ?? [],
+        ...(args.findingAnswers ? { findingAnswers: args.findingAnswers } : {}),
         ...(prior.length > 0 ? { prior } : {}),
         ...(dispute ? { dispute } : {}),
       });
@@ -3214,10 +4621,52 @@ export class Conductor {
       return { ok: true };
     }
     if (msg.tool === "submit_review") {
+      // Plan 06g2: a lane reviewer's review belongs to the round's candidate
+      // (the phase is still IMPLEMENTING and has no candidate of its own). It
+      // is recorded as the round's per-candidate review; the winner's is
+      // promoted into the phase's review slots at the hand-off.
+      if (handle.laneReview !== undefined) {
+        const { round, lane, sha, seat } = handle.laneReview;
+        const review = msg.args as Review;
+        if (review.candidateSha !== sha) {
+          return { ok: false, reason: `submit_review candidateSha ${review.candidateSha} does not match lane ${lane}'s candidate ${sha}` };
+        }
+        if (review.reviewer !== seat) {
+          return { ok: false, reason: `submit_review reviewer ${review.reviewer} does not match the seat this dispatch reviews as (${seat})` };
+        }
+        const issue = reviewIngestionIssue(review);
+        if (issue) return { ok: false, reason: issue };
+        // A lane review judges the lane's own candidate, not the phase's
+        // frozen one (which does not exist yet in round 1, and is another
+        // tree after it): its anchors resolve against that candidate.
+        const itemIssues = this.#reviewItemIssues(review, sha);
+        // A ballot is required for every votable record the lane's turn-2
+        // prompt listed (the worker's own decisions and the seats'
+        // discoveries); an incomplete review is refused back to the model
+        // within the same turn, like the single-candidate path.
+        const missing = this.#missingDemandedBallots(review, handle);
+        if (missing.length > 0 || itemIssues.length > 0) {
+          const rejections = handle.incompleteReviewRejections ?? 0;
+          if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
+            handle.incompleteReviewRejections = rejections + 1;
+            const reason =
+              `incomplete review: a ballot is required for every record the turn-2 prompt listed. Missing: ${missing
+                .map((m) => `${m.id} (${m.choice})`)
+                .join("; ")}` + (itemIssues.length > 0 ? `; item verdicts: ${itemIssues.join("; ")}` : "");
+            this.#log.append("incomplete_review_rejected", { reviewer: seat, agentId, lane, missing: missing.map((m) => m.id), itemIssues });
+            return { ok: false, reason };
+          }
+          this.#log.append("incomplete_review", { reviewer: seat, agentId, lane, missing: missing.map((m) => m.id), itemIssues, rejections });
+        }
+        this.#applyEvent({ type: "ROUND_REVIEW_SUBMITTED", round, lane, seat, review });
+        this.#log.append("lane_review_submitted", { round, lane, seat, candidateSha: sha });
+        handle.doneResolve();
+        return { ok: true };
+      }
       if (handle.role !== "reviewer" || this.#state.phase.phase !== "REVIEWING") {
         return { ok: false, reason: `submit_review is not accepted in phase ${this.#state.phase.phase}` };
       }
-      const review = msg.args as Review;
+      let review = msg.args as Review;
       if (review.candidateSha !== this.#state.phase.candidate?.sha) {
         return { ok: false, reason: "submit_review candidateSha does not match the current candidate" };
       }
@@ -3266,20 +4715,29 @@ export class Conductor {
         // stubborn model cannot wedge the turn. The demanded set is the
         // prompt-time snapshot, so a late discovery is never demanded.
         const missing = this.#missingDemandedBallots(review, handle);
-        if (missing.length > 0) {
+        // Plan 06b: the same complete-ballot rule extended to items — every
+        // R and C needs a verdict, every A needs one, and every verdict must
+        // cite anchors the code can follow. A refusal re-asks the reviewer.
+        const itemIssues = this.#reviewItemIssues(review);
+        if (missing.length > 0 || itemIssues.length > 0) {
           const rejections = handle.incompleteReviewRejections ?? 0;
           if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
             handle.incompleteReviewRejections = rejections + 1;
             // The reason is logged beside the missing ids, so the record is the
             // same text the model is refused with (a test does not have to race
             // the reviewer's stream file to read it).
-            const reason = `incomplete review: a ballot is required for every listed record not marked carried. Missing: ${missing
+            const ballots = `a ballot is required for every listed record not marked carried. Missing: ${missing
               .map((m) => `${m.id} (${m.choice})`)
               .join("; ")}`;
+            const reason =
+              itemIssues.length > 0
+                ? `incomplete or unverifiable review: ${itemIssues.join("; ")}${missing.length > 0 ? `; ${ballots}` : ""}`
+                : `incomplete review: ${ballots}`;
             this.#log.append("incomplete_review_rejected", {
               reviewer: review.reviewer,
               agentId,
               missing: missing.map((m) => m.id),
+              itemIssues,
               rejection: rejections + 1,
               reason,
             });
@@ -3289,8 +4747,21 @@ export class Conductor {
             reviewer: review.reviewer,
             agentId,
             missing: missing.map((m) => m.id),
+            itemIssues,
             rejections,
           });
+        }
+        // Plan 06b (finding M-16): an invalid verdict never counts, even once
+        // the rejection cap accepts the review as-is. Drop every item verdict
+        // the code refused, so it cannot enter the tally.
+        if (itemIssues.length > 0 && this.#itemsEnforced()) {
+          const items = this.#planItems();
+          const flat = flatItems(items);
+          const valid = (v: { id: string }): boolean => {
+            const item = flat.find((i) => i.id === v.id);
+            return item ? verdictIssues(item, v as import("./core/items.ts").ItemVerdict, this.#verdictContext(item, review.reviewer)).length === 0 : true;
+          };
+          review = { ...review, items: (review.items ?? []).filter(valid), arch: (review.arch ?? []).filter(valid) };
         }
         // Ordering matters, and in TWO conflicting directions at once — a
         // real bug this packet's own contract-objection test caught: if
@@ -3360,7 +4831,73 @@ export class Conductor {
       handle.doneResolve();
       return { ok: true };
     }
+    if (msg.tool === "submit_pick_vote") {
+      // Plan 06g2: one seat's vote in the round's pick turn. The round decides
+      // the winner in code (`pickWinner`); this only records the vote.
+      if (handle.pickSeat === undefined) {
+        return { ok: false, reason: "submit_pick_vote is only accepted from a seat's pick turn" };
+      }
+      const args = msg.args as { round?: unknown; seat?: unknown; lane?: unknown; why?: unknown; loserHad?: unknown };
+      const round = typeof args.round === "number" ? args.round : Number(args.round);
+      const seat = typeof args.seat === "string" ? args.seat : handle.pickSeat;
+      const lane = typeof args.lane === "string" ? args.lane : "";
+      const why = typeof args.why === "string" ? args.why.trim() : "";
+      if (!Number.isInteger(round) || round !== handle.laneRound) {
+        return { ok: false, reason: `submit_pick_vote names round ${String(args.round)}, not the pick turn's round ${String(handle.laneRound)}` };
+      }
+      if (seat !== handle.pickSeat) {
+        return { ok: false, reason: `submit_pick_vote names seat ${seat}, not this turn's seat ${handle.pickSeat}` };
+      }
+      if (why.length === 0) return { ok: false, reason: "submit_pick_vote needs a non-empty why" };
+      // Plan 06k1 (A1): every pick vote carries loserHad — whether the losing
+      // lane had something the picked lane lacked. A vote without it is
+      // refused back to the model (re-asked once, like an incomplete review),
+      // so the round's record always says what the seats saw.
+      const loserHadIssue = checkLoserHad(args.loserHad);
+      if (loserHadIssue) return { ok: false, reason: loserHadIssue };
+      const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+      if (!roundRecord) return { ok: false, reason: `round ${round} has not started` };
+      const candidate = roundRecord.candidates.find((c) => c.lane === lane);
+      if (!candidate?.sha) return { ok: false, reason: `submit_pick_vote names lane ${lane}, which submitted no candidate of round ${round}` };
+      if (candidate.ok !== true) return { ok: false, reason: `submit_pick_vote names lane ${lane}, whose candidate did not pass its checks` };
+      const loserHad = args.loserHad as { yes: boolean; anchors?: unknown; note?: unknown };
+      this.#applyEvent({
+        type: "PICK_VOTE",
+        round,
+        seat,
+        lane,
+        why,
+        loserHad: {
+          yes: loserHad.yes === true,
+          anchors: Array.isArray(loserHad.anchors) ? loserHad.anchors.map((a) => String(a)) : [],
+          ...(typeof loserHad.note === "string" && loserHad.note.trim().length > 0 ? { note: loserHad.note.trim() } : {}),
+        },
+        ...(handle.pickRevote ? { revote: true } : {}),
+      });
+      handle.doneResolve();
+      return { ok: true };
+    }
     if (msg.tool === "submit_discovery") {
+      // Plan 06g2: a lane review's turn 1. The discoveries belong to the
+      // lane's candidate, which the phase does not hold while the round runs,
+      // so they are kept per lane until the winner's hand-off applies them.
+      if (handle.laneReview !== undefined) {
+        const discoveries = (msg.args as { discoveries?: DecisionDisclosure[] }).discoveries ?? [];
+        handle.laneDiscoveries = discoveries;
+        const key = `${handle.laneReview.round}-${handle.laneReview.lane}`;
+        const bySeat = this.#laneDiscoveries.get(key) ?? new Map<string, DecisionDisclosure[]>();
+        bySeat.set(handle.laneReview.seat, discoveries);
+        this.#laneDiscoveries.set(key, bySeat);
+        this.#log.append("discovery_submitted", {
+          agentId,
+          reviewer: handle.laneReview.seat,
+          count: discoveries.length,
+          lane: handle.laneReview.lane,
+          round: handle.laneReview.round,
+        });
+        handle.discoveryResolve();
+        return { ok: true };
+      }
       if (this.#stubReviews) {
         // Phase 1's stub reviewers are not expected to call it — accepted
         // as a no-op so a scripted call does not fail a test outright.
@@ -3434,11 +4971,113 @@ export class Conductor {
       if (!Array.isArray(entries)) {
         return { ok: false, reason: "submit_evaluation needs an evaluations array" };
       }
+      // Plan 06b (OD-2 A3): ONE item-check form, submit_evaluation.itemChecks[]
+      // = { id, verdict, evidence }. For every item with a review-only
+      // majority unmet/deviates the evaluator owes a check: a missing one is
+      // re-prompted once, then recorded `unchecked` (visible, never silent).
+      // Plan 06i: the same form carries a finding's/discovered decision's
+      // impact class. Parsed BEFORE the B-16 whole-submission check, because a
+      // triage classification is independent of the message evaluations: a
+      // submission whose evaluations are incomplete still classifies its
+      // records (they are recorded), while the messages themselves stay
+      // unevaluated exactly as before.
+      const owed = this.#owedItemCheckIds(messageType);
+      const checkEvents: Event[] = [];
+      const provided = new Set<string>();
+      const itemChecks = (msg.args as { itemChecks?: unknown }).itemChecks;
+      if (Array.isArray(itemChecks)) {
+        for (const c of itemChecks as Array<{ id?: unknown; verdict?: unknown; evidence?: unknown; impact?: unknown; chosen?: unknown; alternative?: unknown; why?: unknown }>) {
+          const id = typeof c?.id === "string" ? c.id.trim() : "";
+          const verdict = c?.verdict === "confirmed" || c?.verdict === "contradicted" ? c.verdict : undefined;
+          const evidence = typeof c?.evidence === "string" ? c.evidence.trim() : "";
+          // Plan 06i: the same item-check form carries the evaluator's impact
+          // class for a finding or discovered decision. An unknown value is
+          // ignored, which leaves the record unclassified and escalates.
+          const impact =
+            c?.impact === "wrong-output" || c?.impact === "contract" || c?.impact === "judgement" ? c.impact : undefined;
+          // Plan 06i: a judgement call's own chosen/alternative/why, from the
+          // evaluator. The conductor never supplies stock text.
+          const chosen = typeof c?.chosen === "string" && c.chosen.trim().length > 0 ? c.chosen.trim() : undefined;
+          const alternative = typeof c?.alternative === "string" && c.alternative.trim().length > 0 ? c.alternative.trim() : undefined;
+          const why = typeof c?.why === "string" && c.why.trim().length > 0 ? c.why.trim() : undefined;
+          const isTriage = openFindings(this.#state.phase).some((f) => f.id === id) || discoveredDecisions(this.#state.phase).some((d) => d.id === id);
+          if (id.length === 0 || !verdict || evidence.length === 0) continue;
+          if (isTriage && impact === undefined) continue;
+          // OD-15(2): for a finding/decision, only a CONFIRMED check with an
+          // impact is a supplied classification. A `contradicted` verdict does
+          // not classify (triage.ts only reads confirmed), so it must be
+          // re-prompted once like a missing one, then escalated. A plan item's
+          // contradicted check is still a supplied check (it overturns).
+          if (!isTriage || verdict === "confirmed") provided.add(id);
+          // OD-2 A3 (carried here): a `confirmed` check has its anchors
+          // validated exactly like a `contradicted` one. A confirmed check
+          // whose anchors do not exist in the candidate is recorded as
+          // `unchecked by evaluator`, never as a confirmation.
+          if (verdict === "confirmed") {
+            const item = flatItems(this.#planItems()).find((i) => i.id === id);
+            const ctx = item ? this.#verdictContext(item, "M") : undefined;
+            // Plan 06i: a finding or discovered decision is not a plan item, so
+            // its confirmed anchors are validated directly against the
+            // candidate (the same 06c rule).
+            // A finding or discovered decision is not a plan item: its
+            // confirmed anchors are a candidate file:line. A golden note may
+            // substitute ONLY for a `contract` classification — a wrong-output
+            // claim still needs a reachable-path anchor (A3's 06c rule).
+            const goldenOk = impact === "contract" && goldenCited(this.#state.phase, evidence);
+            const valid = item
+              ? Boolean(ctx) && this.#itemCheckAnchorsValid(evidence, ctx!)
+              : this.#candidateAnchorsValid(evidence) || goldenOk;
+            if (!valid) {
+              // Plan 06k2 (A2): an anchor that does not resolve (missing, or
+              // ambiguous because two tracked files match a bare path) is
+              // re-asked ONCE for a repo-relative path before the item is
+              // `unchecked`. The re-ask is the existing missing-check
+              // re-prompt: not counting the check as supplied makes the id
+              // owed again. Only after that one re-prompt is it unchecked.
+              const rejections = handle.itemCheckRejections ?? 0;
+              const resolved = evidenceFileAnchors(evidence).map((a) => this.#resolveCandidatePath(a.path));
+              const ambiguous = resolved.some((r) => r.kind === "ambiguous");
+              this.#log.append("item_check_anchor_invalid", { messageType, agentId, itemId: id, evidence, ambiguous });
+              if (rejections < 1) {
+                provided.delete(id);
+              } else {
+                checkEvents.push({
+                  type: "ITEM_CHECK_RECORDED",
+                  itemId: id,
+                  verdict: "unchecked",
+                  evidence: `unchecked by evaluator: the confirmed check's anchors do not exist in the candidate (${evidence})`,
+                });
+              }
+              continue;
+            }
+          }
+          checkEvents.push({
+            type: "ITEM_CHECK_RECORDED",
+            itemId: id,
+            verdict,
+            evidence,
+            ...(impact ? { impact } : {}),
+            ...(chosen ? { chosen } : {}),
+            ...(alternative ? { alternative } : {}),
+            ...(why ? { why } : {}),
+          });
+        }
+      }
       // B-16 / owner directive 1: validate the WHOLE submission before
-      // applying anything. An invalid one is refused back to the evaluator
-      // (like an incomplete review), never partly applied.
+      // applying the message evaluations. An invalid one is refused back to
+      // the evaluator (like an incomplete review), never partly applied —
+      // except that the independent triage classifications above are kept,
+      // so a record is never left unclassified merely because the evaluator's
+      // message entries were incomplete.
       const issue = this.#evaluationIssue(messageType, entries as EvaluationEntry[]);
-      if (issue) return { ok: false, reason: `invalid evaluation: ${issue}` };
+      if (issue) {
+        // Plan 06i: the item checks are independent of the message
+        // evaluations, so they are recorded even when the submission is
+        // refused for its message entries (B-16 governs the evaluations, not
+        // the classification).
+        if (checkEvents.length > 0) this.#applyEvents(checkEvents);
+        return { ok: false, reason: `invalid evaluation: ${issue}` };
+      }
       // Plan 05c: a published title must be one complete line, not a
       // truncation at the 80-character cap. Refused back to the model, at
       // most MAX_INCOMPLETE_REVIEW_REJECTIONS times, then accepted as is —
@@ -3449,6 +5088,12 @@ export class Conductor {
         if (rejections < MAX_INCOMPLETE_REVIEW_REJECTIONS) {
           handle.evaluationTitleRejections = rejections + 1;
           this.#log.append("evaluation_title_rejected", { messageType, agentId, detail: titleIssue, rejection: rejections + 1 });
+          // Plan 06i (A3, F-A-100): a title is independent of an item check,
+          // so a valid classification survives the title-only re-prompt —
+          // exactly like the message-shape refusal above. Without this a
+          // format nit would erase a confirmed wrong-output and change its
+          // disposition from fix to escalate.
+          if (checkEvents.length > 0) this.#applyEvents(checkEvents);
           return {
             ok: false,
             reason: `invalid title: ${titleIssue}. Give one complete line of at most 80 characters — rewrite it shorter rather than cutting it.`,
@@ -3457,7 +5102,29 @@ export class Conductor {
         this.#log.append("evaluation_title_accepted", { messageType, agentId, detail: titleIssue, rejections });
       }
       const events = this.#evaluationEvents(messageType, entries as EvaluationEntry[]);
-      this.#applyEvents([...events, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
+      const missing = owed.filter((id) => !provided.has(id));
+      if (missing.length > 0) {
+        const rejections = handle.itemCheckRejections ?? 0;
+        if (rejections < 1) {
+          handle.itemCheckRejections = rejections + 1;
+          this.#log.append("item_check_rejected", { messageType, agentId, missing });
+          // Plan 06i (A3, F-A-99): the checks that ARE valid are persisted
+          // before the re-prompt, so a valid classification survives it and
+          // the retry owes only the missing ids (owed is recomputed from the
+          // retained checks). Otherwise a valid wrong-output confirmation
+          // would be discarded and its disposition could change to escalate.
+          if (checkEvents.length > 0) this.#applyEvents(checkEvents);
+          return {
+            ok: false,
+            reason: `submit_evaluation owes an itemCheck for: ${missing.join(", ")}. For a plan item give { id, verdict: confirmed|contradicted, evidence }. For a finding or discovered decision give { id, verdict: confirmed, impact: wrong-output|contract|judgement, evidence } and, when the impact is judgement, also chosen, alternative and why — without all three the record escalates to the owner.`,
+          };
+        }
+        this.#log.append("item_check_unchecked", { messageType, agentId, missing });
+        for (const id of missing) {
+          checkEvents.push({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "the evaluator gave no item check after a re-prompt; the record escalates" });
+        }
+      }
+      this.#applyEvents([...events, ...checkEvents, { type: "EVALUATOR_FINISHED", messageType, evaluated: entries.length }]);
       handle.doneResolve();
       return { ok: true };
     }
@@ -3743,6 +5410,11 @@ export class Conductor {
       const id = typeof entry?.messageId === "string" ? entry.messageId : "";
       const message = byId.get(id);
       if (!message || message.type !== messageType) continue;
+      // Plan 06i: an evaluator entry for a message that is neither raw nor
+      // refused is a no-op — the message was already settled (e.g. a later
+      // round's classification pass re-publishes nothing). Ignoring it keeps
+      // the item-check half of the submission applicable.
+      if (message.state !== "raw" && message.state !== "refused") continue;
       const binding = {
         messageId: id,
         boundCandidateSha: message.boundCandidateSha,
@@ -3762,8 +5434,18 @@ export class Conductor {
       }
       const sourceFinding = message.sourceRecordId ? this.#state.phase.findings.find((f) => f.id === message.sourceRecordId) : undefined;
       if (entry.action === "merge") {
+        // `#evaluationIssue` (above) refuses a merge that does not name
+        // another raw message of the same type, so `into` is always set here;
+        // the undefined fallback below is defensive only (OD addendum B).
         const into = typeof entry.into === "string" && entry.into.trim().length > 0 ? entry.into.trim() : undefined;
         events.push({ type: "MESSAGE_MERGED", ...binding, by: "evaluator", reason: into ? `merged into ${into}` : "merged" });
+        // Plan 06i (C3): the finding behind a merged message is MERGED, not
+        // disproved, and linked to the record it duplicates. Its triage
+        // disposition is the original's, so nothing leaves the ledger
+        // without one.
+        if (sourceFinding && sourceFinding.status === "open" && into) {
+          events.push({ type: "FINDING_MERGED", findingId: sourceFinding.id, into, byReviewer: sourceFinding.raisedBy as Reviewer });
+        }
       } else if (entry.action === "drop") {
         const reason = typeof entry.reason === "string" && entry.reason.trim().length > 0 ? entry.reason.trim() : "dropped by the evaluator";
         events.push({ type: "MESSAGE_DROPPED", ...binding, by: "evaluator", reason });
@@ -3897,7 +5579,7 @@ export class Conductor {
   // -- work packet 2a: real reviewer discovery/ballots/findings -----------
 
   #reviewerFromAgentId(agentId: string): Reviewer {
-    return (agentId.match(/^reviewer-([MAB])-/)?.[1] as Reviewer | undefined) ?? "M";
+    return (agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] as Reviewer | undefined) ?? this.#laneSeats()[0] ?? "M";
   }
 
   /** design §3.3's second decision source: a reviewer's turn-1
@@ -3907,19 +5589,85 @@ export class Conductor {
    * no attach-to-existing-id matching yet. Assembles+binds each one exactly
    * like a worker's disclosure (id/version/boundCandidateSha/
    * boundContractVersion), validates it, and emits `DECISION_ADDED`. */
-  #applyDiscoveries(discoveries: DecisionDisclosure[], reviewer: Reviewer): string | undefined {
+  #applyDiscoveries(
+    discoveries: DecisionDisclosure[],
+    reviewer: Reviewer,
+    /** Plan 06g2: the number the FIRST of these discoveries takes. A lane
+     * round passes the numbers its turn-2 prompt listed, so the ballots a seat
+     * cast name exactly the records that appear here. */
+    opts: { firstIndex?: number } = {},
+  ): string | undefined {
     const candidate = this.#state.phase.candidate;
     if (!candidate) return "no candidate exists yet to bind a discovered decision to";
     if (this.#discoveryClosed()) {
       // Plan 2c no-unshown-ballots: the other reviewers are already voting on
       // the merged list, so a record added now could never get their ballots.
       this.#log.append("late_discovery", { reviewer, candidateSha: candidate.sha, discoveries });
+      // Plan 06i (owner ruling): a late discovery must not be DROPPED (C3),
+      // but it must not stall the phase either. It is recorded with an
+      // `escalate` disposition and an open, NON-blocking owner request naming
+      // it, so it is visible in the status and `tt summary` and the phase
+      // still reaches DONE. It is not added to `decisions` (it could never
+      // get the other seats' ballots).
+      const K = this.#state.phase.contract.contractVersion;
+      // Plan 06i (A3, F-A-98): a late discovery never joins `decisions`, so
+      // numbering from `decisions.length + 1` restarts at the same value on
+      // every late call — a second late batch from one reviewer would reuse
+      // an itemId and reduce() would overwrite the first TRIAGE_RECORDED
+      // (C3). Allocate past any id already recorded for this reviewer.
+      const latePrefix = `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-late-`;
+      const taken = new Set((this.#state.phase.triage ?? []).map((r) => r.itemId));
+      let n = this.#state.phase.decisions.length + 1;
+      for (const d of discoveries) {
+        let itemId = `${latePrefix}${n}`;
+        while (taken.has(itemId)) {
+          n += 1;
+          itemId = `${latePrefix}${n}`;
+        }
+        taken.add(itemId);
+        n += 1;
+        const ownerRequestId = uniqueOwnerRequestId(this.#state.phase, `OR-${this.#state.phase.phaseId}-triage-${itemId}`);
+        // Plan 06i (C2): the disposition is computed by disposition() (the
+        // sole decider); the conductor only records it and opens the request
+        // it names.
+        const record: TriageRecord = {
+          itemId,
+          source: "decision",
+          impact: "judgement",
+          disposition: disposition(
+            { itemId, source: "decision", impact: "judgement" },
+            {
+              lateDiscovery: true,
+              ownerRequestId,
+              reason: `the discovery "${d.choice}" arrived after the review window; it is recorded and offered to the owner, never dropped`,
+            },
+          ),
+        };
+        this.#applyEvent({ type: "TRIAGE_RECORDED", record });
+        this.#applyEvent({
+          type: "OWNER_REQUEST_OPENED",
+          request: {
+            id: ownerRequestId,
+            version: 1,
+            phaseId: this.#state.phase.phaseId,
+            reason: `a discovered decision arrived after the review window: ${d.choice}`,
+            origin: "failed_vote",
+            linkedDecisionId: itemId,
+            boundCandidateSha: candidate.sha,
+            boundContractVersion: K,
+            options: FAILED_VOTE_OPTIONS,
+            status: "open",
+            blocking: false,
+          },
+        });
+      }
       return undefined;
     }
     const K = this.#state.phase.contract.contractVersion;
+    let index = opts.firstIndex ?? this.#state.phase.decisions.length + 1;
     for (const d of discoveries) {
       const decision: Decision = {
-        id: `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-${this.#state.phase.decisions.length + 1}`,
+        id: `D-${this.#state.phase.phaseId}-${candidate.sha.slice(0, 8)}-disc-${reviewer}-${index}`,
         version: 1,
         phaseId: this.#state.phase.phaseId,
         source: "reviewer-discovered",
@@ -3935,6 +5683,7 @@ export class Conductor {
       if (!result.valid) {
         return `discovered decision fails schemas/decision.schema.json: ${result.errors.join("; ")}`;
       }
+      index += 1;
       this.#applyEvent({ type: "DECISION_ADDED", decision });
       // Plan 04a item 2: a reviewer's discovered trade-off is raised as a raw
       // message too, so the evaluator checks it in EVALUATING like any other
@@ -3953,6 +5702,46 @@ export class Conductor {
    * instead of throwing, like `#applyDiscoveries`. */
   /** Plan 05e: the ids of the owner directives in force, which a blocking
    * finding may cite as its ground (`cite the directive id`). */
+  /** Plan 06g (A6): what `blocksAcceptance` may look at — the contract's item
+   * ids (R, C and A; for an old-format phase the synthesized R1..Rn), every
+   * owner directive in force and every correction's id, plus the tests that
+   * passed at the round's base and fail now. Nothing here is model-supplied. */
+  #acceptanceGate(): AcceptanceGate {
+    const contract = this.#state.phase.contract;
+    const itemIds = [
+      ...flatItems(itemsFromPhase(contract)).map((i) => i.id),
+      ...this.#directiveIds(),
+      ...this.#state.phase.corrections.map((c) => c.id),
+    ].filter((id) => typeof id === "string" && id.length > 0);
+    return { itemIds, regressions: this.#regressionTests(), triage: blockingTriageRecords(this.#state.phase) };
+  }
+
+  /** Plan 06g (A6b): the tests that failed in this candidate's checks and
+   * passed at the round's base — the conductor's own regression split (a
+   * load-only flake is not one: it passed alone). */
+  #regressionTests(): string[] {
+    const phase = this.#state.phase;
+    const current = phase.checks;
+    const failures = current?.failures ?? phase.lastCheckFailures?.failures ?? [];
+    if (failures.length === 0) return [];
+    // The round's base: the phase base in round 1, the previous candidate in
+    // a repair (recorded at the freeze). This is the ONLY correct base — not
+    // `#baselineFailedCommands()`, which is the phase base for every round.
+    const base = new Set(this.#roundBaseFailures());
+    // A test the base already failed is not a regression; a load-only failure
+    // passed when re-run alone, so it is not one either.
+    return failures.filter((f) => !f.loadOnly && !base.has(f.name)).map((f) => f.name);
+  }
+
+  /** Plan 06g (A4): the tests that failed at this round's base — the phase
+   * base's failures in round 1, the previous candidate's check failures in a
+   * repair. Recorded by `freezeCompleted` (`roundBaseFailures`), so a test
+   * that PASSED at round 1's candidate and fails in round 2 is a regression,
+   * while a test the base already failed is a persisting failure. */
+  #roundBaseFailures(): string[] {
+    return this.#state.phase.roundBaseFailures ?? this.#baselineFailedCommands().flatMap((c) => c.failures ?? []);
+  }
+
   #directiveIds(): string[] {
     return (this.#state.phase.ownerDirectives ?? []).map((d) => d.id).filter((id) => typeof id === "string" && id.length > 0);
   }
@@ -4131,6 +5920,35 @@ export class Conductor {
       if (asBlocker) asBlocker = false;
       if (severity === "blocking") severity = "advisory";
     }
+    // Plan 06g (A6, owner directive ODP-1): from round 2 a blocking finding
+    // blocks only when it names an unmet item of the contract (or of an owner
+    // correction) with its id and a file:line, or is a regression — a test or
+    // behaviour that passed at the round's base and fails now. Anything else
+    // (a further edge path, hardening, wording, style) is an advisory:
+    // recorded as a carried item, never blocking. `blocksAcceptance` is the
+    // only place that decides this, for one lane or two.
+    const round = this.#state.phase.round ?? 1;
+    let roundDowngrade: string | undefined;
+    if (severity === "blocking" && round >= 2) {
+      const ground: FindingGround = {
+        severity,
+        evidence: fd.evidence,
+        ...(fd.criterionDispute?.criterion ? { criterionDisputed: fd.criterionDispute.criterion } : {}),
+      };
+      const gate = this.#acceptanceGate();
+      if (!blocksAcceptance(ground, round, gate)) {
+        roundDowngrade = `A6 round ${round}: ${advisoryReason(ground, round, gate)}`;
+        this.#log.append("round_advisory", {
+          reviewer,
+          candidateSha,
+          round,
+          reason: roundDowngrade,
+          raisedAsBlocker: asBlocker,
+        });
+        if (asBlocker) asBlocker = false;
+        severity = "advisory";
+      }
+    }
     // Plan 05e (3a/3b): every finding — including one raised through a
     // reviewer's `blockers` list, which is a blocking finding too — goes
     // through the record comparison and the runnable re-run before any agent
@@ -4184,6 +6002,10 @@ export class Conductor {
         ? { criterionDisputed: fd.criterionDispute.criterion }
         : {}),
       ...(reproduction !== undefined ? { reproduction } : {}),
+      // Plan 06g (A6): why this finding is advisory although it was raised
+      // blocking — the round rule's own sentence, so the record and the views
+      // never disagree about it.
+      ...(roundDowngrade !== undefined ? { severityReason: roundDowngrade } : {}),
     };
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
@@ -4220,6 +6042,12 @@ export class Conductor {
     return undefined;
   }
 
+  /** Plan 06b (OD-1 R6): the requirement item id whose text is the disputed
+   * criterion, or undefined on an old-format phase. */
+  #criterionItemId(criterion: string): string | undefined {
+    return this.#state.phase.contract.requirements?.find((r) => r.text === criterion || r.title === criterion)?.id;
+  }
+
   /** Plan 01g: assembles a reviewer-raised `criterionDispute` into an
    * amendment record (a `reserved` decision) bound to the candidate/contract
    * being reviewed, exactly like a worker disclosure. It is votable like any
@@ -4227,6 +6055,31 @@ export class Conductor {
    * raises one in turn 2, after this round's ballot demand was captured, so
    * it is voted in a later round (carryDecisionsForward keeps amendments). */
   #addAmendmentDecision(dispute: CriterionDispute, raisedBy: Reviewer, candidateSha: string): void {
+    // Finding D-B-66: an empty (or whitespace-only) proposed wording states
+    // no position. Ignore it entirely — no amendment and no reject vote.
+    if (dispute.proposedWording.trim().length === 0) {
+      this.#log.append("dispute_ignored", {
+        reviewer: raisedBy,
+        criterion: dispute.criterion,
+        reason: "the proposed wording is empty; ignored",
+      });
+      return;
+    }
+    // Plan 06c (R7) / 06k1 (A2): an amendment whose proposed text changes
+    // nothing — the criterion's own text, or a "retain the criterion
+    // unchanged" phrase — is never raised or shown as an amendment. Plan
+    // 06k1: it is recorded as a vote AGAINST any worker amendment for the
+    // same criterion, so the worker's proposal is voted down rather than
+    // silently joined.
+    if (isNoChangeAmendmentWording(dispute.proposedWording, dispute.criterion)) {
+      this.#castAgainstAmendment(dispute.criterion, raisedBy, candidateSha);
+      this.#log.append("dispute_ignored", {
+        reviewer: raisedBy,
+        criterion: dispute.criterion,
+        reason: "the proposed wording retains the criterion unchanged; recorded as a vote against any amendment for it",
+      });
+      return;
+    }
     const K = this.#state.phase.contract.contractVersion;
     const short = candidateSha.slice(0, 8);
     const n = this.#state.phase.decisions.length + 1;
@@ -4248,6 +6101,7 @@ export class Conductor {
         id: `AM-${this.#state.phase.phaseId}-${short}-${raisedBy}-${n}`,
         criterion: dispute.criterion,
         proposedWording: dispute.proposedWording,
+        ...(this.#criterionItemId(dispute.criterion) ? { itemId: this.#criterionItemId(dispute.criterion)! } : {}),
         why: dispute.why,
         raisedBy,
         status: "proposed",
@@ -4281,6 +6135,34 @@ export class Conductor {
     this.#applyEvent({ type: "DECISION_ADDED", decision });
   }
 
+  /** Plan 06k1 (A2): a reviewer's "retain the criterion unchanged" is a vote
+   * against the worker's amendment for the same criterion, not an amendment
+   * of its own. Bound to the amendment decision's own version, so
+   * `currentBallot` counts it as the reviewer's latest vote. */
+  #castAgainstAmendment(criterion: string, reviewer: Reviewer, candidateSha: string): void {
+    const K = this.#state.phase.contract.contractVersion;
+    const target = this.#state.phase.decisions.find(
+      (d) =>
+        d.amendment !== undefined &&
+        d.amendment.status === "proposed" &&
+        d.amendment.criterion === criterion &&
+        d.boundCandidateSha === candidateSha &&
+        sameVersion(d.boundContractVersion, K),
+    );
+    if (!target) return;
+    const ballot: Ballot = {
+      reviewer,
+      decisionId: target.id,
+      vote: "reject",
+      rationale: "retain the criterion unchanged; the proposed amendment should not pass",
+      evidence: [`amendment-${target.amendment!.id}`],
+      boundCandidateSha: candidateSha,
+      boundContractVersion: K,
+      boundRecordVersion: target.version,
+    };
+    this.#applyEvent({ type: "BALLOT_CAST", ballot });
+  }
+
   /** design §8.1's reproduction-command deadline: runs `command` in a fresh
    * disposable checkout of `candidateSha` (never the reviewer's own
    * read-only checkout — a reproduction command might itself be
@@ -4303,6 +6185,92 @@ export class Conductor {
     } finally {
       checkout.dispose();
     }
+  }
+
+  /** Plan 06k3 (A3): run one finding's reproduction command in the candidate
+   * and return its exit, timeout and last output lines. */
+  async #rerunReproduction(
+    command: string,
+    candidateSha: string,
+  ): Promise<{ exitCode: number | null; timedOut: boolean; tail: string }> {
+    const checkout = disposableCheckout(this.#plan.repo, candidateSha);
+    try {
+      const running = runCommand({
+        command,
+        cwd: checkout.dir,
+        deadlineMs: this.#deadlines.reproductionMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+      });
+      const result = await running.result;
+      return { exitCode: result.exitCode, timedOut: result.timedOut, tail: result.output.slice(-2000) };
+    } finally {
+      checkout.dispose();
+    }
+  }
+
+  /** Plan 06k3 (A3): the reviewer prompt's finding table — one row per open
+   * finding whose record carries a reproduction command: the finding, the
+   * worker's answer, and the re-run's result on this candidate (passes now /
+   * still fails, with its last output lines). Computed once per candidate,
+   * after the checks. Reviewers judge the table; nothing is bounced or
+   * accepted automatically. */
+  async #ensureReproductionTable(phase: PhaseState, candidateSha: string): Promise<void> {
+    if (this.#reproductionTableLines.has(candidateSha)) return;
+    // Plan 06k3 (A3, finding M-9): the three seats review in parallel, so a
+    // second seat must await the FIRST seat's in-flight computation rather
+    // than start its own. Without this every seat re-ran every reproduction.
+    const pending = this.#reproductionTablePending.get(candidateSha);
+    if (pending) {
+      await pending;
+      return;
+    }
+    const run = this.#computeReproductionTable(phase, candidateSha);
+    this.#reproductionTablePending.set(candidateSha, run);
+    try {
+      await run;
+    } finally {
+      this.#reproductionTablePending.delete(candidateSha);
+    }
+  }
+
+  async #computeReproductionTable(phase: PhaseState, candidateSha: string): Promise<void> {
+    // A3 says every OPEN finding with a reproduction command, blocking or
+    // advisory: the worker's answer is required only for the blocking ones,
+    // but the re-run is a fact for any of them.
+    const open = phase.findings.filter((f) => f.status === "open" && f.reproduction?.command);
+    if (open.length === 0) {
+      this.#reproductionTableLines.set(candidateSha, []);
+      return;
+    }
+    const lines = [
+      "Open findings whose reproduction command the conductor re-ran on this candidate (judge these; the conductor neither bounces nor accepts them automatically):",
+    ];
+    for (const f of open) {
+      const run = await this.#rerunReproduction(f.reproduction!.command, candidateSha);
+      this.#log.append("finding_reproduction_rerun", {
+        findingId: f.id,
+        candidateSha,
+        command: f.reproduction!.command,
+        exitCode: run.exitCode,
+        timedOut: run.timedOut,
+      });
+      const answer = f.answer
+        ? f.answer.status === "fixed"
+          ? `fixed (test: ${f.answer.test ?? "?"})`
+          : `disputed (${f.answer.reason ?? "?"})`
+        : "unanswered";
+      const verdict = run.timedOut ? "inconclusive (timed out)" : run.exitCode === 0 ? "passes now" : `still fails (exit ${run.exitCode})`;
+      const tailLines = run.tail
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .slice(-5)
+        .map((l) => `      ${redactText(l, this.#secretMaskable)}`);
+      lines.push(
+        `- ${f.id} "${oneLine(f.evidence)}": worker answer: ${answer}; re-run \`${f.reproduction!.command}\`: ${verdict}`,
+        ...(run.exitCode !== 0 || run.timedOut ? ["    last output lines:", ...tailLines] : []),
+      );
+    }
+    this.#reproductionTableLines.set(candidateSha, lines);
   }
 
   /** design §5/§6.1's real turn-2 review outcome: a ballot per votable
@@ -4479,7 +6447,7 @@ export class Conductor {
    * this runs). Undefined until all three are present. */
   #threeReviewsWith(review: Review): Review[] | undefined {
     const list: Review[] = [];
-    for (const who of ["M", "A", "B"] as const) {
+    for (const who of seatsOf(this.#state.phase.contract)) {
       const r = who === review.reviewer ? review : this.#state.phase.reviews[who]?.review;
       if (!r || r.candidateSha !== review.candidateSha) return undefined;
       list.push(r);
@@ -4507,7 +6475,7 @@ export class Conductor {
         const s = (r.resolutionStatements ?? []).find((x) => x.messageId === id);
         if (s?.status === "resolved") resolved += 1;
       }
-      if (resolved < 2) continue;
+      if (resolved < panelMajority(reviews.length)) continue;
       const evidence = reviews
         .flatMap((r) => (r.resolutionStatements ?? []).filter((s) => s.messageId === id && s.status === "resolved"))
         .map((s) => s.evidence)
@@ -4545,8 +6513,11 @@ export class Conductor {
     const K = phase.contract.contractVersion;
     if (!reviewsComplete(phase, C, K)) return;
     if ((phase.approvedCandidates ?? []).some((a) => a.candidateSha === C)) return;
-    if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open")) return;
-    if (phase.ownerRequests.some((r) => r.status === "open")) return;
+    // Plan 06i (A2): approval follows the item's disposition, like accept().
+    // A fix disposition blocks; a trade-off does not; an untriaged blocking
+    // finding still blocks (fail safe).
+    if (hasBlockingFix(phase) || undispositionedBlockingFinding(phase)) return;
+    if (phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) return;
     for (const decision of phase.decisions) {
       if (!isLiveDecision(decision)) continue;
       if (decision.amendment) continue;
@@ -4577,7 +6548,7 @@ export class Conductor {
    * is only the imperative shell (git diff, assembling+binding trigger
    * Decision records, logging the sample). Never throws on a bad diff —
    * best-effort, since a run should not fail over sampling data. */
-  #recordBoundaryDataAndSample(candidateSha: string): void {
+  #recordBoundaryDataAndSample(candidateSha: string, opts: { lane?: { round: number; lane: string } } = {}): void {
     let paths: string[];
     let hunks: ReturnType<typeof diffHunks>;
     try {
@@ -4591,13 +6562,26 @@ export class Conductor {
     const contract = this.#state.phase.contract;
     const acceptanceFiles = contract.acceptance.filter((a) => a.includes("/"));
     const citationTexts = [
+      // Plan 06k2 (A7): every decision and finding of the phase counts as a
+      // citation, superseded ones included, so a path an earlier round's
+      // decision cited is not re-triggered.
       ...this.#state.phase.decisions.flatMap((d) => [d.choice, d.whyItMatters, ...d.alternatives.map((a) => `${a.option} ${a.consequence}`)]),
       ...this.#state.phase.findings.map((f) => f.evidence),
     ];
 
-    const triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
+    let triggerPaths: string[];
+    if (opts.lane) {
+      // Plan 06k2 (A7): the winner's triggers were computed before its lane
+      // reviews and balloted there; apply exactly those records (never
+      // create a second set nobody ever saw).
+      const cached = this.#laneTriggers.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+      for (const decision of cached) this.#applyEvent({ type: "DECISION_ADDED", decision });
+      triggerPaths = this.#laneTriggerPaths.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+    } else {
+      triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
+    }
     const K = contract.contractVersion;
-    for (const p of triggerPaths) {
+    for (const p of opts.lane ? [] : triggerPaths) {
       const decision: Decision = {
         id: `D-${this.#state.phase.phaseId}-${candidateSha.slice(0, 8)}-trigger-${this.#state.phase.decisions.length + 1}`,
         version: 1,
@@ -4662,6 +6646,42 @@ export class Conductor {
     this.#log.append("intent", { agentId, pgid }, `sh-${agentId}-${pgid}`);
   }
 
+  /** ODP-3 (carried from 06c, owner-confirmed): a STAGE command's own process
+   * group — a check, the baseline, the gate — is tracked like an agent's `sh`
+   * command, so `stop()` signals it too. A check that is still running when
+   * the conductor stops must not outlive the run.
+   *
+   * It is tracked with the time it was recorded, and killed through
+   * `#killRecordedGroup` (fail-closed): a pgid the OS recycled after the
+   * command's own group ended belongs to some other process, and A2/C3 forbid
+   * signalling it. That is not theoretical — without the check, a stop could
+   * signal an unrelated process whose pgid had been reused (caught by
+   * test/effects/shell.test.ts's TERM-ignoring escalation test under a
+   * parallel `make check`). */
+  #onStageShIntent(pgid: number): void {
+    if (this.#stopRequested) {
+      // runCommand resumes the group (SIGCONT) right after this returns;
+      // killing it first would make that resume fail. Kill it just after.
+      setImmediate(() => void killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs }).catch(() => undefined));
+      return;
+    }
+    this.#liveStageGroups.set(pgid, Date.now());
+  }
+
+  /** The stage command in PGID finished (or was killed): stop tracking it, so
+   * `stop()` does not signal a group that is already gone. */
+  #onStageShExit(pgid: number): void {
+    this.#liveStageGroups.delete(pgid);
+  }
+
+  /** Signal every stage command group this run is still running, each only
+   * when its leader is proven to be the run's own (`#killRecordedGroup`). */
+  async #killLiveStageGroups(): Promise<void> {
+    const groups = [...this.#liveStageGroups.entries()];
+    this.#liveStageGroups.clear();
+    await Promise.all(groups.map(([pgid, at]) => this.#killRecordedGroup(pgid, at)));
+  }
+
   #onNoSubmission(agentId: string): void {
     const handle = this.#agents.get(agentId);
     // A reviewer's missing submission is detected from agent_settled in
@@ -4672,6 +6692,10 @@ export class Conductor {
   #cwdFor(agentId: string): string | undefined {
     const handle = this.#agents.get(agentId);
     if (!handle) return undefined;
+    // Plan 06g2: a lane agent's commands run in ITS OWN lane worktree (a lane
+    // worker) or in the candidate it reviews — never in another lane's tree.
+    if (handle.laneReview) return path.join(this.#paths.candidates, handle.laneReview.sha);
+    if (handle.lane !== undefined) return this.#laneWorktree(handle.lane);
     return handle.role === "worker" ? this.#paths.worktree : this.#candidateDir();
   }
 
@@ -4727,8 +6751,19 @@ export class Conductor {
     if (this.#state.phase.worktreeTainted && this.#state.phase.candidate) {
       const sha = this.#state.phase.candidate.sha;
       this.#log.append("worktree_reset", { candidateSha: sha, reason: "worktree tainted by a sweep that found survivors" });
-      removeWorktree(this.#plan.repo, this.#paths.worktree);
-      createWorktree(this.#plan.repo, this.#paths.worktree, sha);
+      // Plan 06k2 (A4): a worktree create/remove that throws while starting a
+      // worker attempt is recorded as THIS attempt's failure, never left as
+      // an in-flight dispatch. `ATTEMPT_NO_SUBMISSION` clears `dispatch_worker`
+      // and moves the phase to REPAIRING, so the next attempt starts.
+      try {
+        removeWorktree(this.#plan.repo, this.#paths.worktree);
+        createWorktree(this.#plan.repo, this.#paths.worktree, sha);
+      } catch (err) {
+        const error = String((err as Error)?.message ?? err);
+        this.#log.append("worktree_reset_failed", { candidateSha: sha, error });
+        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+        return;
+      }
     }
 
     // Plan 04a: the base baseline now runs entirely in its own BASELINE
@@ -4760,10 +6795,13 @@ export class Conductor {
       TT_SOCKET: this.#paths.sock,
       // The extension waits this long for a command's result: the conductor's
       // per-command limit plus room for the kill and its report.
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_WORKTREE: this.#paths.worktree,
       TT_RUN_DIR: this.#runDir,
       TT_PROTECTED: protectedPaths,
+      // Plan 06b (OD-1): a structured phase makes the worker submit coverage;
+      // an old-format phase does not.
+      TT_ITEMS: this.#structured() ? "1" : "0",
       // Where find/grep/ls may search: the worktree and the plan's references.
       TT_SEARCH_ROOTS: [this.#paths.worktree, this.#paths.refs].join(path.delimiter),
       // Plan 01a: the plan's secrets — the names (so the extension guard
@@ -4915,6 +6953,15 @@ export class Conductor {
       const undelivered = allNotes.slice(deliveredCount);
       const queuedNotes = undelivered.join("\n");
       const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
+      // Plan 06k3 (A2, finding A-3): name the ref this attempt's unsubmitted
+      // work was saved on, and claim the worktree holds it ONLY when it does
+      // (the worktree may have been reset to the candidate).
+      const savedWork = this.#savedLaneWork().get("a");
+      const savedWorkNote = savedWork
+        ? `Your previous attempt's unsubmitted work is saved on ${savedWork.ref} (${savedWork.sha.slice(0, 7)}).${
+            this.#worktreeMatches(savedWork.sha) ? " Your worktree already holds it; continue from it and submit." : ""
+          }`
+        : undefined;
       await agent.prompt(
         buildWorkerPrompt(
           contract,
@@ -4926,6 +6973,8 @@ export class Conductor {
           this.#state.phase.ownerDirectives,
           this.#baselineFailedCommands(),
           this.#state.phase.messages,
+          this.#agentToolLines(),
+          savedWorkNote,
         ),
       );
       // Record delivery only after the prompt was sent; a crash between the
@@ -4936,16 +6985,30 @@ export class Conductor {
         this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: undelivered.length });
       }
 
+      const attemptTimer = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
       const workerTimeout = this.#withStallWatch(
         agentId,
         agent,
-        cancelableTimeout(this.#deadlines.workerAttemptMs, "timeout" as const),
+        attemptTimer,
         "Owner (conductor): no progress for a while. Continue the work now, or call submit_phase with what you have and disclose what is unfinished.",
       );
-      const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap">> = [
+      // Plan 06k3 (A2): at 75% of the attempt the worker is told how many
+      // minutes remain and to submit. The steer timer is paused with the
+      // attempt clock, so a paused attempt is not steered early.
+      const clockSteer = this.#scheduleClockSteer(agentId, agent, this.#deadlines.workerAttemptMs);
+      // Plan 06k1 (A4): pause this worker while another run's check window is
+      // open.
+      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, agent, attemptTimer, clockSteer.timer);
+      const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap" | "compactionFailed" | "modelFailed">> = [
         donePromise.then(() => "submitted" as const),
         agent.waitSettled().then(() => "settled" as const),
         agent.waitExit().then(() => "exited" as const),
+        // Plan 06k1 (A6): a failed compaction means this worker will never
+        // submit; end the attempt now instead of waiting out its deadline.
+        agent.waitCompactionFailed().then(() => "compactionFailed" as const),
+        // Plan 06l (A3/R5): a terminal model-call failure (404, context
+        // overflow) is the same end — never wait out the attempt deadline.
+        agent.waitModelFailed().then(() => "modelFailed" as const),
         workerTimeout.promise,
       ];
       // design §8.1: "per-attempt token cap from Pi usage events" — treated
@@ -4955,12 +7018,23 @@ export class Conductor {
       if (tokenCap) races.push(tokenCap.promise.then(() => "tokenCap" as const));
       const outcome = await Promise.race(races);
       workerTimeout.cancel();
+      clockSteer.cancel();
+      stopCheckWindowWatch();
       tokenCap?.cancel();
       // design §9.3's "after the effect but before its completion event"
       // boundary: the race has resolved (the effect happened) but nothing
       // below has recorded it yet.
       crashAt("after_dispatch_worker");
       this.#log.completion(actionId, { outcome });
+      // Plan 06j (A3): the owner rechecked this candidate and the conductor
+      // stopped this attempt. The phase is already CHECKING and the checks
+      // are re-running on the frozen candidate, so an attempt-failure event
+      // here would undo the recheck. `#processRecheckCommand` set this before
+      // terminating the agent.
+      if (this.#recheckCancelledAttempts.has(agentId)) {
+        this.#recheckCancelledAttempts.delete(agentId);
+        return;
+      }
 
       if (outcome === "submitted") {
         // Freeze already kicked off from #onSubmit; nothing more to do
@@ -4980,25 +7054,46 @@ export class Conductor {
       }
       if (outcome === "timeout" || outcome === "tokenCap") {
         await agent.terminate();
+        // Plan 06k3 (A2): the work the worker did not submit in time is
+        // committed to a ref, never discarded.
+        this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
         await this.#sweepAndClear(handle);
         this.#applyEvent({ type: "ATTEMPT_TIMED_OUT" });
         return;
       }
-      if (outcome === "settled") {
+      if (outcome === "settled" || outcome === "compactionFailed" || outcome === "modelFailed") {
         // agent_settled with no submission: either the extension's
         // no_submission signal already resolved donePromise (handled
         // above) or the agent settled without ever reaching that guard
         // (e.g. a scripted fake-pi with no hello/tool-call plumbing).
+        // Plan 06k1 (A6): a failed compaction is the same end — the worker
+        // can never submit. Plan 06l (A3/R5): so is a terminal model-call
+        // failure, and the event NAMES the cause.
         await agent.terminate();
-        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+        this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
+        // The cause is read after terminate(), when every event the agent
+        // sent has been handled: an agent that reports a terminal failure and
+        // then settles can win the race as "settled", and the event must
+        // still name the cause.
+        const note =
+          outcome === "compactionFailed"
+            ? agent.modelFailureReason ?? "context overflow (compaction recovery failed)"
+            : outcome === "modelFailed"
+              ? agent.modelFailureReason ?? "the model call failed terminally"
+              : agent.modelFailureReason;
+        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION", ...(note ? { note } : {}) });
         return;
       }
       // outcome === "exited": the agent process ended on its own —
       // force-killed, crashed, or otherwise — without ever completing a
       // submission. Design §9.3's "agent attempt" reconciliation: kill
       // every recorded shell group, sweep, mark the attempt interrupted.
+      // Plan 06l (R5): the event names the cause (exit code or signal).
+      const exit = await agent.waitExit();
+      const cause = exit.signal ? `signal ${exit.signal}` : `exit code ${exit.code ?? "unknown"}`;
+      this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
       await this.#sweepAndClear(handle);
-      this.#applyEvent({ type: "ATTEMPT_INTERRUPTED" });
+      this.#applyEvent({ type: "ATTEMPT_INTERRUPTED", note: `the worker exited (${cause}) without submitting` });
     } finally {
       if (!submittedKeepHandle) this.#agents.delete(agentId);
     }
@@ -5012,7 +7107,7 @@ export class Conductor {
     const phase = this.#state.phase;
     const C = phase.candidate?.sha;
     if (!C) return undefined;
-    const reviewed = (["M", "A", "B"] as const).some((w) => phase.reviews[w]?.review?.candidateSha === C);
+    const reviewed = seatsOf(phase.contract).some((w) => phase.reviews[w]?.review?.candidateSha === C);
     const checksFailed = phase.checks?.candidateSha === C && phase.checks.passed === false;
     const probeFailed = phase.probe?.candidateSha === C && phase.probe.passed === false;
     if (!reviewed && !checksFailed && !probeFailed) return undefined;
@@ -5046,6 +7141,11 @@ export class Conductor {
     // to the NEXT attempt (round-3 review, advisory A-6), never a permanent
     // must-fix item — see ownerBlockerChoiceLines' own rule.
     blocking.push(...ownerBlockerChoiceLines(phase, C));
+    // Plan 06b: list only the items a majority did not meet (or fit), with
+    // the reviewers' evidence, so the repair addresses exactly those points.
+    if (this.#structured()) {
+      blocking.push(...repairItemLines(this.#itemOutcomes(), phase.overturns ?? []));
+    }
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
@@ -5075,6 +7175,642 @@ export class Conductor {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // Plan 06b: the item loop. Every point of a structured plan is an A, R or
+  // C item the loop carries mechanically: the worker's coverage, the check
+  // resolution, the reviewers' per-item verdicts and the acceptance decision.
+  // -------------------------------------------------------------------------
+
+  /** The phase's structured items (synthesizing the old format when the
+   * contract carries only an acceptance list). */
+  #planItems(): PlanItems {
+    return itemsFromPhase(this.#state.phase.contract);
+  }
+
+  /** OD-2 A1: the ONE structured-ness decision, shared with the prompts, the
+   * views and the extension. */
+  #structured(): boolean {
+    return isStructured(this.#state.phase.contract);
+  }
+
+  /** The item loop (coverage, per-item verdicts, symbol pre-check, tally)
+   * applies exactly to a structured phase. */
+  #itemsEnforced(): boolean {
+    return this.#structured();
+  }
+
+  #itemTestOutcomes(): Map<string, "passed" | "failed" | "missing"> {
+    const m = new Map<string, "passed" | "failed" | "missing">();
+    for (const r of this.#state.phase.checkResolution ?? []) m.set(r.name, r.outcome);
+    return m;
+  }
+
+  /** The worker's own anchors (its coverage `where` entries), which a
+   * `met`/`fits` verdict may not lean on alone. */
+  #workerAnchors(): string[] {
+    const out: string[] = [];
+    for (const e of this.#state.phase.coverage?.items ?? []) out.push(...e.where);
+    for (const e of this.#state.phase.coverage?.arch ?? []) out.push(...e.where);
+    return out;
+  }
+
+  /** A lane reviewer's `read` and `sh` calls, as `#runReview` records a
+   * single-candidate reviewer's; a read path inside the candidate directory
+   * is kept repo-relative. */
+  #trackLaneReviewerTool(lr: { seat: string; sha: string }, candidateDir: string, event: unknown): void {
+    if ((event as { type?: string }).type !== "tool_execution_start") return;
+    const e = event as { toolName?: string; args?: unknown };
+    const key = `${lr.seat}@${lr.sha}`;
+    if (e.toolName === "read") {
+      const a = e.args as Record<string, unknown> | undefined;
+      const file = a?.path ?? a?.file ?? a?.file_path;
+      if (typeof file === "string" && file.trim().length > 0) {
+        const prefix = `${candidateDir}/`;
+        const rel = file.startsWith(prefix) ? file.slice(prefix.length) : file.replace(/^\.\//, "");
+        const set = this.#laneReviewerReads.get(key) ?? new Set<string>();
+        set.add(rel);
+        this.#laneReviewerReads.set(key, set);
+      }
+    }
+    if (e.toolName === "sh") {
+      const a = e.args as { command?: unknown } | undefined;
+      if (typeof a?.command === "string" && a.command.trim().length > 0) {
+        const set = this.#laneReviewerCommands.get(key) ?? new Set<string>();
+        set.add(a.command.trim());
+        this.#laneReviewerCommands.set(key, set);
+      }
+    }
+  }
+
+  #reviewerReadFiles(reviewer: Reviewer): string[] {
+    return [...(this.#reviewerReads.get(reviewer) ?? [])];
+  }
+
+  #reviewerRanCommands(reviewer: Reviewer): string[] {
+    return [...(this.#reviewerCommands.get(reviewer) ?? [])];
+  }
+
+  /** The candidate's changed files (repo-relative), diffed against the phase
+   * BASE (the integration head the phase started from), not the candidate's
+   * parent commit: freeze commits stack and may be empty, so a `C^..C` diff
+   * would hide an earlier attempt's change (finding disc-M-31). */
+  #diffFiles(C: string): string[] {
+    const base = this.#state.phase.integrationHead;
+    try {
+      return execFileSync("git", ["-C", this.#plan.repo, "diff", "--name-only", base, C], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+    } catch {
+      try {
+        return execFileSync("git", ["-C", this.#plan.repo, "diff", "--name-only", `${C}^`, C], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+      } catch {
+        return [];
+      }
+    }
+  }
+
+  /** The code facts a verdict is validated against: candidate file lines,
+   * the diff, the item's `:WHERE:`, the check run's test outcomes, the files
+   * this reviewer read, and the worker's own anchors. */
+  #verdictContext(item: FlatItem, reviewer: Reviewer, candidateSha?: string): VerdictContext {
+    const dir = candidateSha ? path.join(this.#paths.candidates, candidateSha) : this.#candidateDir();
+    const C = candidateSha ?? this.#state.phase.candidate?.sha ?? "";
+    return {
+      lineCount: (p: string) => {
+        try {
+          return fs.readFileSync(path.join(dir, p), "utf8").split("\n").length;
+        } catch {
+          return undefined;
+        }
+      },
+      diffFiles: C ? this.#diffFiles(C) : [],
+      ...(item.where ? { where: item.where } : {}),
+      testOutcomes: this.#itemTestOutcomes(),
+      checkOutput: (this.#state.phase.checkTestLines ?? []).join("\n"),
+      reviewerReadFiles: candidateSha ? [...(this.#laneReviewerReads.get(`${reviewer}@${candidateSha}`) ?? [])] : this.#reviewerReadFiles(reviewer),
+      workerAnchors: this.#workerAnchors(),
+      reviewerCommands: candidateSha ? [...(this.#laneReviewerCommands.get(`${reviewer}@${candidateSha}`) ?? [])] : this.#reviewerRanCommands(reviewer),
+    };
+  }
+
+  /** Every reason a review's item section must be refused and re-asked: a
+   * missing verdict (the complete-ballot rule extended to items), an invalid
+   * verdict value, or a verdict whose anchors the code cannot follow. */
+  #reviewItemIssues(review: Review, candidateSha?: string): string[] {
+    if (!this.#itemsEnforced()) return [];
+    const items = this.#planItems();
+    const issues = reviewItemsIssues({ items: review.items ?? [], arch: review.arch ?? [] }, items);
+    const flat = flatItems(items);
+    for (const v of review.items ?? []) {
+      const item = flat.find((i) => i.id === v.id);
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
+    }
+    for (const v of review.arch ?? []) {
+      const item = flat.find((i) => i.id === v.id);
+      if (item) issues.push(...verdictIssues(item, v, this.#verdictContext(item, review.reviewer, candidateSha)));
+    }
+    return issues;
+  }
+
+  /** The per-item majority across the three reviews. */
+  #itemOutcomes(): ItemOutcome[] {
+    const reviews = seatsOf(this.#state.phase.contract).map((seat) => {
+      const r = this.#state.phase.reviews[seat]?.review;
+      return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
+    });
+    const outcomes = tallyItems(this.#planItems(), reviews, this.#state.phase.overturns ?? []);
+    // A symbol the conductor could not find is `deviates` regardless of the
+    // seats' own verdicts.
+    const symbolDeviations = this.#state.phase.archSymbolDeviations ?? [];
+    for (const o of outcomes) {
+      if (o.item.kind === "architecture" && symbolDeviations.includes(o.item.id) && o.outcome !== "deviates") o.outcome = "deviates";
+    }
+    return outcomes;
+  }
+
+  /** The evaluator's re-verification: a majority unmet/deviates verdict the
+   * code contradicts is overturned, and a unanimous thin-evidence met verdict
+   * is audited. Each overturn is counted against its seat. */
+  /** Plan 06i: a finding's or discovered decision's confirmed anchors must
+   * cite at least one file:line that exists in the candidate, in range — the
+   * same rule as a plan item's check. */
+  #candidateAnchorsValid(evidence: string): boolean {
+    const anchors = evidenceFileAnchors(evidence);
+    if (anchors.length === 0) return false;
+    const dir = this.#candidateDir();
+    return anchors.every((a) => {
+      const resolved = this.#resolveCandidatePath(a.path);
+      if (resolved.kind !== "ok") return false;
+      try {
+        const lines = fs.readFileSync(path.join(dir, resolved.path), "utf8").split("\n").length;
+        return a.start >= 1 && a.end <= lines;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  /** Plan 06k2 (A2): the tracked files of the current candidate, for
+   * resolving a bare or crate-relative evaluator anchor. Best-effort (empty
+   * when there is no candidate or git cannot read it). */
+  #candidateTrackedFiles(): string[] {
+    const C = this.#state.phase.candidate?.sha ?? "";
+    if (!C) return [];
+    try {
+      return execFileSync("git", ["-C", this.#plan.repo, "ls-tree", "-r", "--name-only", C], { encoding: "utf8" })
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Plan 06k2 (A2): resolve a bare or crate-relative anchor path to the one
+   * candidate file it names. An exact candidate-relative path wins; otherwise
+   * exactly one tracked file whose path ends with `/<anchor>` resolves; two
+   * or more matches are `ambiguous` (the evaluator is re-asked once for a
+   * repo-relative path); none is `missing`. */
+  #resolveCandidatePath(anchorPath: string): { kind: "ok"; path: string } | { kind: "ambiguous" } | { kind: "missing" } {
+    return resolveAnchorPath(anchorPath, this.#candidateTrackedFiles());
+  }
+
+  /** OD-2 A3: an evaluator item check's evidence must cite at least one
+   * file:line that exists in the candidate, in range. */
+  #itemCheckAnchorsValid(evidence: string, ctx: VerdictContext): boolean {
+    const anchors = evidenceFileAnchors(evidence);
+    if (anchors.length === 0) return false;
+    return anchors.every((a) => {
+      const resolved = this.#resolveCandidatePath(a.path);
+      if (resolved.kind !== "ok") return false;
+      const lines = ctx.lineCount(resolved.path);
+      return lines !== undefined && a.start >= 1 && a.end <= lines;
+    });
+  }
+
+  /** Plan 06b (OD-2 A3, ODP-2): the item ids the evaluator owes a check for.
+   * The duty sits with the FINDING pass only (disc-M-89), and covers every
+   * outcome that is not met/fits (ODP-2: never raise an item blocker without
+   * a check). An architecture deviation the owner already accepted is not a
+   * blocker and owes no check. */
+  #owedItemCheckIds(messageType: MessageType): string[] {
+    const ids = new Set<string>();
+    // Plan 06i (A3): a discovered decision is published as a `tradeoff`
+    // message, so its impact classification is owed on that pass; a finding's
+    // on the `finding` pass. A missing one is re-prompted ONCE and then
+    // escalated, never defaulted.
+    if (messageType === "tradeoff") {
+      for (const d of discoveredDecisions(this.#state.phase)) {
+        if (!recordClassified(this.#state.phase, "decision", d.id)) ids.add(d.id);
+      }
+      return [...ids];
+    }
+    if (messageType !== "finding") return [];
+    if (this.#itemsEnforced() && itemsNeedingEvaluatorReverify(this.#state.phase)) {
+      const accepted = new Set(this.#state.phase.acceptedDeviations ?? []);
+      for (const o of phaseItemOutcomes(this.#state.phase)) {
+        if (o.outcome === "met" || o.outcome === "fits") continue;
+        if (o.item.kind === "architecture" && accepted.has(o.item.id)) continue;
+        ids.add(o.item.id);
+      }
+      // Plan 06c (A4/R9): a unanimous thin met/fits is an OWED item check too.
+      // A missing one is re-prompted once, then recorded `unchecked`; a
+      // `contradicted` check with valid anchors overturns it, and code never
+      // withdraws the verdict on its own.
+      for (const o of thinMetItems(phaseItemOutcomes(this.#state.phase), this.#workerAnchors())) ids.add(o.item.id);
+    }
+    // Plan 06i (A3): every open finding owes its impact classification
+    // through the same form.
+    for (const f of openFindings(this.#state.phase)) {
+      if (!recordClassified(this.#state.phase, "finding", f.id)) ids.add(f.id);
+    }
+    return [...ids];
+  }
+
+  #itemOverturns(outcomes: readonly ItemOutcome[]): import("./core/items.ts").Overturn[] {
+    const out: import("./core/items.ts").Overturn[] = [];
+    const readsBySeat: Record<string, readonly string[]> = {
+      M: this.#reviewerReadFiles("M"),
+      A: this.#reviewerReadFiles("A"),
+      B: this.#reviewerReadFiles("B"),
+    };
+    for (const o of outcomes) {
+      const ctx = this.#verdictContext(o.item, (o.seats[0]?.seat ?? "M") as Reviewer);
+      const testOverturns = reverify(o.item, o.seats, ctx, readsBySeat);
+      if (testOverturns.length > 0) {
+        out.push(...testOverturns);
+        continue;
+      }
+      // Plan 06b (OD-1 R3b): the evaluator's substantive re-check. A
+      // `contradicted` check overturns every seat whose verdict made the
+      // majority, recorded with what the evaluator checked.
+      if (o.outcome === "unmet" || o.outcome === "deviates") {
+        const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
+        // OD-2 A3: a contradicted check overturns only when its evidence
+        // anchors are valid (each cited file exists and its lines are in
+        // range), exactly like a reviewer verdict.
+        if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
+          for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
+            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted it: ${check.evidence}` });
+          }
+        }
+      }
+      // Plan 06c (R5): a unanimous thin met/fits the evaluator contradicts
+      // (with valid anchors) is overturned too.
+      if ((o.outcome === "met" || o.outcome === "fits") && thinMetItems([o], this.#workerAnchors()).length > 0) {
+        const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id && c.verdict === "contradicted");
+        if (check && this.#itemCheckAnchorsValid(check.evidence, ctx)) {
+          for (const v of o.seats.filter((s) => s.verdict === o.outcome)) {
+            out.push({ seat: v.seat, id: o.item.id, kind: o.item.kind, verdict: v.verdict, effect: "flip", reason: `evaluator re-check contradicted the thin met verdict: ${check.evidence}` });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Plan 06b (layer 1): for an architecture item with `:WHERE:` and a named
+   * type/event/function, grep the candidate for the symbol. A missing one is
+   * recorded `deviates` (and a blocking finding) before any reviewer is
+   * asked. Runs once the candidate exists, before REVIEWING. */
+  #applyArchitectureSymbols(C: string): void {
+    if (!this.#structured()) return;
+    const dir = this.#candidateDir();
+    const deviates: string[] = [];
+    for (const arch of this.#planItems().architecture) {
+      if (!arch.where) continue;
+      const symbols = architectureSymbols(arch);
+      if (symbols.length === 0) continue;
+      let text = "";
+      let missingFile = false;
+      let fileShaped = false;
+      for (const token of arch.where.split(/[\s,;]+/).filter(Boolean)) {
+        // Only a file-shaped token (a path or a name with an extension) can be
+        // grepped; a bare module name is left to the reviewers.
+        if (!/[/.]/.test(token)) continue;
+        fileShaped = true;
+        try {
+          text += `${readWhereText(path.join(dir, token))}\n`;
+        } catch {
+          // The `:WHERE:` file does not exist in the candidate. A missing
+          // module is the clearest deviation, so it is recorded as one rather
+          // than skipped (finding M-15).
+          missingFile = true;
+        }
+      }
+      if (!fileShaped) continue;
+      if (missingFile || symbols.some((s) => !symbolPresent(text, s))) deviates.push(arch.id);
+    }
+    if (deviates.length === 0) return;
+    this.#applyEvent({ type: "ITEM_STATE_UPDATED", archSymbolDeviations: deviates });
+    for (const id of deviates) {
+      if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === id)) continue;
+      const arch = this.#planItems().architecture.find((a) => a.id === id);
+      const finding: Finding = {
+        id: `F-${this.#state.phase.phaseId}-symbol-${id}-${this.#state.phase.findings.length + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: `${id}${arch ? ` ${arch.title}` : ""} — :WHERE: ${arch?.where ?? ""} does not name the symbol(s) ${architectureSymbols(arch!).join(", ")}`,
+        raisedBy: "conductor",
+        status: "open",
+        boundCandidateSha: C,
+        itemId: id,
+      };
+      this.#applyEvent({ type: "FINDING_RAISED", finding });
+    }
+  }
+
+  /** Plan 06i: the triage pass — after the reviews and the evaluator's
+   * item checks, before the item tally. EVERY finding and EVERY discovered
+   * decision of the ledger gets exactly one disposition from `disposition()`
+   * (the only place that decides); a duplicate copies its original's record.
+   * An escalation opens an owner request naming the item, so acceptance
+   * waits for it and nothing disappears.
+   *
+   * The evaluator's impact classification arrives through its item-check
+   * form (`itemChecks[] = { id, verdict, impact, evidence, chosen,
+   * alternative, why }`). A record the evaluator did not classify (or
+   * explicitly left `unchecked` after its one re-prompt) is UNCLASSIFIED and
+   * escalates — the conductor never guesses an impact. */
+  #applyTriage(): void {
+    const phase = this.#state.phase;
+    if (!phase.candidate) return;
+    const C = phase.candidate.sha;
+    const K = phase.contract.contractVersion;
+    // Plan 06i (A4): a deferral whose item is no longer open (repaired or
+    // superseded) is resolved here, so "until resolved" is reachable and the
+    // status stops listing it.
+    for (const d of phase.deferrals ?? []) {
+      if (d.status !== "open") continue;
+      const finding = phase.findings.find((f) => f.id === d.itemId);
+      const decision = phase.decisions.find((x) => x.id === d.itemId);
+      const stillOpen = finding ? finding.status === "open" : decision ? !(decision.supersededBy || decision.supersededByCorrection) : false;
+      if (!stillOpen) this.#applyEvent({ type: "DEFERRAL_RESOLVED", deferralId: d.id });
+    }
+    const dispositionFor = (source: "finding" | "decision", id: string): Disposition => {
+      // Plan 06i (A3, F-A-97): an escalation must name a request that EXISTS.
+      // If an open request already links the item (an open_finding park
+      // request, a blocker_panel request), the disposition reuses THAT id;
+      // only when the item has no open request is the triage request opened
+      // under the deterministic triage id. Otherwise the record would cite a
+      // request that was never opened and the owner could not answer it.
+      const ownerRequestId = escalationRequestId(phase, id);
+      const fresh = this.#state.phase;
+      if (source === "finding") {
+        const finding = fresh.findings.find((f) => f.id === id)!;
+        const evidence = evidenceForFinding(finding, fresh);
+        return disposition({ itemId: id, source, impact: recordImpact(fresh, id) }, { ...evidence, ownerRequestId });
+      }
+      const decision = fresh.decisions.find((d) => d.id === id)!;
+      // The vote outcome is computed here (triage.ts must not import the
+      // predicate's tally): a delegated/reserved decision that was balloted
+      // and did not settle failed its vote, and its outcome would change the
+      // output, so it escalates rather than reading as an accepted trade-off.
+      const balloted = (fresh.ballots ?? []).some((b) => b.decisionId === id);
+      const voteFailed = decision.class !== "detail" && balloted && !decisionSettled(decision, fresh, C, K);
+      const evidence = evidenceForDecision(decision, fresh, voteFailed);
+      return disposition({ itemId: id, source, impact: recordImpact(fresh, id) }, { ...evidence, ownerRequestId });
+    };
+
+    const entries = ledgerRecords(phase);
+    const openRequests = new Set(
+      phase.ownerRequests
+        .filter((r) => r.status === "open")
+        .flatMap((r) => [r.linkedFindingId, r.linkedDecisionId])
+        .filter((id): id is string => typeof id === "string"),
+    );
+    // Pass 1: every record that is not a duplicate of another.
+    const duplicates: Array<{ source: "finding" | "decision"; id: string; into: string }> = [];
+    for (const { source, id } of entries) {
+      const finding = source === "finding" ? phase.findings.find((f) => f.id === id) : undefined;
+      const mergedInto = finding?.status === "merged" ? finding.mergedInto : undefined;
+      if (mergedInto) {
+        duplicates.push({ source, id, into: mergedInto });
+        continue;
+      }
+      const record: TriageRecord = { itemId: id, source, impact: recordImpact(phase, id), disposition: dispositionFor(source, id) };
+      this.#applyEvent({ type: "TRIAGE_RECORDED", record });
+      if (record.disposition?.kind === "escalate" && !openRequests.has(id)) {
+        this.#openTriageRequest(record, record.disposition);
+        openRequests.add(id);
+      }
+    }
+    // Pass 2: duplicates, each linked to its ORIGINAL's disposition (C3). A
+    // chain of duplicates is followed transitively to the first record that is
+    // not itself a duplicate, so a chain never fabricates an escalation.
+    for (const dup of duplicates) {
+      const originalId = this.#ultimateOriginal(dup.id, dup.into);
+      const original = (this.#state.phase.triage ?? []).find((r) => r.itemId === originalId);
+      const ownerRequestId = uniqueOwnerRequestId(phase, `OR-${phase.phaseId}-triage-${dup.id}`);
+      const record: TriageRecord = {
+        itemId: dup.id,
+        source: dup.source,
+        impact: original?.impact ?? "judgement",
+        // Plan 06i (C2): even the orphan-duplicate fallback goes through
+        // disposition() — the sole decider — rather than building a
+        // disposition by hand.
+        disposition:
+          original?.disposition ??
+          disposition(
+            { itemId: dup.id, source: dup.source, impact: original?.impact ?? "judgement" },
+            {
+              orphanDuplicate: true,
+              ownerRequestId,
+              reason: `the original ${originalId} of duplicate ${dup.id} has no disposition`,
+            },
+          ),
+        duplicateOf: originalId,
+      };
+      this.#applyEvent({ type: "TRIAGE_RECORDED", record });
+      // M-30: an escalation must name a request that actually exists, so the
+      // owner can answer it and acceptance waits for it.
+      if (!original && record.disposition?.kind === "escalate" && !openRequests.has(dup.id)) {
+        this.#openTriageRequest(record, record.disposition);
+        openRequests.add(dup.id);
+      }
+    }
+  }
+
+  /** The finding behind a message id, if the message was raised from one. */
+  #findingBehind(id: string): string | undefined {
+    const message = (this.#state.phase.messages ?? []).find((m) => m.id === id);
+    return message?.sourceRecordId ?? (this.#state.phase.findings.some((f) => f.id === id) ? id : undefined);
+  }
+
+  /** Plan 06i (C3): the first record in a duplicate chain that is not itself
+   * a duplicate — the original whose disposition a duplicate copies. */
+  #ultimateOriginal(dupId: string, into: string): string {
+    const seen = new Set<string>([dupId]);
+    let cur = this.#findingBehind(into) ?? into;
+    while (!seen.has(cur)) {
+      seen.add(cur);
+      const finding = this.#state.phase.findings.find((f) => f.id === cur);
+      if (!finding?.mergedInto) return cur;
+      cur = this.#findingBehind(finding.mergedInto) ?? finding.mergedInto;
+    }
+    return cur;
+  }
+
+  /** Plan 06i: open the owner request an escalation names. The request's id
+   * is the one the disposition recorded, so the triage record and the request
+   * always name each other. It is the same request the phase's own park would
+   * open (open_finding / failed_vote), so the owner has the ordinary options
+   * and no duplicate request is raised later. */
+  #openTriageRequest(record: TriageRecord, esc: Extract<import("./core/triage.ts").Disposition, { kind: "escalate" }>): void {
+    const phase = this.#state.phase;
+    const C = phase.candidate?.sha;
+    const K = phase.contract.contractVersion;
+    if (record.source === "finding") {
+      const finding = phase.findings.find((f) => f.id === record.itemId);
+      if (!finding) return;
+      this.#applyEvent({
+        type: "OWNER_REQUEST_OPENED",
+        request: {
+          id: esc.ownerRequestId,
+          version: 1,
+          phaseId: phase.phaseId,
+          reason: esc.reason,
+          origin: "open_finding",
+          linkedFindingId: finding.id,
+          boundCandidateSha: C,
+          boundContractVersion: K,
+          options: openFindingOptions(finding.kind),
+          status: "open",
+        },
+      });
+      return;
+    }
+    const decision = phase.decisions.find((d) => d.id === record.itemId);
+    if (!decision) return;
+    this.#applyEvent({
+      type: "OWNER_REQUEST_OPENED",
+      request: {
+        id: esc.ownerRequestId,
+        version: 1,
+        phaseId: phase.phaseId,
+        reason: esc.reason,
+        origin: "failed_vote",
+        linkedDecisionId: decision.id,
+        relatedBallots: phase.ballots.filter((b) => b.decisionId === decision.id),
+        boundCandidateSha: C,
+        boundContractVersion: K,
+        options: FAILED_VOTE_OPTIONS,
+        status: "open",
+      },
+    });
+  }
+
+  /** After the reviews and evaluation settle: compute the per-item majority,
+   * record the overturns, and raise a blocking finding anchored to every item
+   * a majority did not meet (or fit). */
+  #applyItemOutcomes(): void {
+    if (!this.#itemsEnforced()) return;
+    const C = this.#state.phase.candidate?.sha;
+    if (!C) return;
+    const raw = this.#itemOutcomes();
+    const overturns = this.#itemOverturns(raw);
+    this.#applyEvent({ type: "ITEM_STATE_UPDATED", overturns });
+    // Recompute with the overturns applied, so an overturned verdict neither
+    // blocks nor raises a finding.
+    const outcomes = this.#itemOutcomes();
+    const overturned = new Set(overturns.map((o) => o.id));
+    for (const o of outcomes) {
+      if (o.item.kind === "architecture") {
+        const accepted = (this.#state.phase.acceptedDeviations ?? []).includes(o.item.id);
+        if (o.outcome === "fits" || accepted) continue;
+        if (overturned.has(o.item.id)) continue;
+        this.#ensureItemCheck(o.item.id);
+        this.#raiseItemFinding(o, C);
+        continue;
+      }
+      if (o.outcome === "met") continue;
+      if (overturned.has(o.item.id)) continue;
+      this.#ensureItemCheck(o.item.id);
+      this.#raiseItemFinding(o, C);
+    }
+  }
+
+  /** ODP-2: an item blocker is never raised without an evaluator item check.
+   * When the evaluator gave none (even after its re-prompt), the conductor
+   * records its own `unchecked` check so the blocker is never silent. */
+  #ensureItemCheck(id: string): void {
+    if ((this.#state.phase.itemChecks ?? []).some((c) => c.itemId === id)) return;
+    this.#applyEvent({ type: "ITEM_CHECK_RECORDED", itemId: id, verdict: "unchecked", evidence: "no evaluator item check was recorded" });
+  }
+
+  /** One blocking finding, anchored to its item, with the reviewers' own
+   * evidence. A conductor-raised finding: no model is asked to confirm what
+   * the recorded votes already say. */
+  #raiseItemFinding(o: ItemOutcome, C: string): void {
+    if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === o.item.id)) return;
+    // OD-2 A3: name the evaluator's own re-check, so an item that blocked
+    // without one is visible to the owner as `unchecked`, never silent.
+    const check = (this.#state.phase.itemChecks ?? []).find((c) => c.itemId === o.item.id);
+    const checkDetail = check ? (check.verdict === "unchecked" ? " — no item check was given after a re-prompt" : ` — ${check.evidence}`) : "";
+    const checkNote = check ? ` [evaluator re-check: ${check.verdict}${checkDetail}]` : "";
+    const evidence = `${o.item.id} ${o.item.title} — ${o.outcome}${o.evidence.length > 0 ? `: ${o.evidence.join(" | ")}` : ""}${checkNote}`;
+    const finding: Finding = {
+      id: `F-${this.#state.phase.phaseId}-item-${o.item.id}-${this.#state.phase.findings.length + 1}`,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      // A deviating architecture item is a defect against the plan's own
+      // shape, not a contract objection: the owner may accept the deviation
+      // as a trade-off (`accept_risk`) or ask for a repair.
+      kind: "defect",
+      severity: "blocking",
+      evidence,
+      raisedBy: "conductor",
+      status: "open",
+      boundCandidateSha: C,
+      itemId: o.item.id,
+    };
+    this.#applyEvent({ type: "FINDING_RAISED", finding });
+  }
+
+  /** A `test` verify that is missing from or failed in the candidate's check
+   * run is a blocking finding anchored to its item. */
+  #applyTestVerifyFindings(C: string): void {
+    if (!this.#itemsEnforced()) return;
+    const resolutions = this.#state.phase.checkResolution ?? [];
+    const problems = testVerifyProblems(resolutions);
+    if (problems.length === 0) return;
+    for (const id of new Set(resolutions.filter((r) => r.outcome !== "passed").map((r) => r.id))) {
+      if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === id)) continue;
+      const item = flatItems(this.#planItems()).find((i) => i.id === id);
+      const lines = resolutions.filter((r) => r.id === id && r.outcome !== "passed").map((r) => `test "${r.name}" ${r.outcome}`);
+      const finding: Finding = {
+        id: `F-${this.#state.phase.phaseId}-test-${id}-${this.#state.phase.findings.length + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: `${id}${item ? ` ${item.title}` : ""} — ${lines.join(", ")}`,
+        raisedBy: "conductor",
+        status: "open",
+        boundCandidateSha: C,
+        itemId: id,
+      };
+      this.#applyEvent({ type: "FINDING_RAISED", finding });
+    }
+  }
+
+  /** The worker's coverage as a trade-off message per partial/not_done item
+   * and per deviating architecture item (ref doc: the note becomes a
+   * trade-off message). Deduped by the item id. */
+  #applyCoverageNotes(coverage: Coverage, C: string): void {
+    for (const { id, note } of coverageNoteLines(coverage, this.#planItems())) {
+      // OD-2 (disc-M-92): coverage is per attempt, so the message is keyed by
+      // the candidate too — a repair's changed note is never deduplicated
+      // against an earlier candidate's.
+      this.#raiseMessage(
+        "tradeoff",
+        `coverage-${C.slice(0, 8)}-${id}`,
+        { type: "tradeoff", title: `${id} not fully covered`, context: "", summary: note, evidence: [note] },
+        C,
+      );
+    }
+  }
+
   async #sweepAndClear(handle: AgentHandle): Promise<void> {
     for (const pgid of handle.shGroups) {
       await killGroup(pgid, { termGraceMs: this.#deadlines.termGraceMs });
@@ -5084,7 +7820,7 @@ export class Conductor {
     // e.g. a test tearing down right after an interrupted attempt re-
     // dispatched a new one. Nothing further to record once closed.
     if (this.#closed) return;
-    const result = await sweep(this.#paths.worktree, { exceptPids: [] });
+    const result = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
     if (this.#closed) return;
     this.#log.append("sweep", result);
   }
@@ -5110,6 +7846,1430 @@ export class Conductor {
    * unblock via the timeout branch's own `terminate()`, which is what makes
    * a hung `waitSettled()` resolve at all). */
   async #runFreeze(actionId: string): Promise<void> {
+    return this.#runFreezeImpl(actionId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Plan 06g2: the two-lane round (A1/A2)
+  // -------------------------------------------------------------------------
+
+  /** The lanes this phase's frozen contract runs (a, b for `#+TT_WORKERS: 2`). */
+  #lanes(): string[] {
+    return lanesOfContract(this.#state.phase.contract);
+  }
+
+  /** True when this phase runs more than one lane per round. A plan without
+   * `#+TT_WORKERS` (or with 1) keeps today's single-candidate loop exactly. */
+  #laneRoundEnabled(): boolean {
+    return isLaneRound(this.#state.phase.contract);
+  }
+
+  /** Each lane's own worktree, under the run directory (A2). The lane id is
+   * part of the path, so a sweep scoped to one lane's worktree can never
+   * reach the other's. */
+  #laneWorktree(lane: string): string {
+    return path.join(this.#runDir, "worktrees", `lane-${lane}`);
+  }
+
+  /** Plan 06k3 (A4): the candidate a lane's submission started from — its
+   * per-lane base. A lane restarted from its own losing candidate (02k's
+   * `repeatLaneBases`) compares against that candidate, not the phase's own. */
+  #laneStartSha(lane: string, round: number | undefined): string | undefined {
+    if (round === undefined) return this.#state.phase.candidate?.sha;
+    const rounds = this.#state.phase.rounds ?? [];
+    const prev = rounds.find((x) => x.round === round - 1);
+    // A lane restarted from its own previous candidate (02k's per-lane base)
+    // compares against THAT candidate.
+    const repeated = repeatLaneBases(prev)?.[lane];
+    if (repeated) return repeated;
+    // Otherwise the lane started from the phase's own candidate (a repair
+    // round). Round 1 starts from the integration head, which is not a
+    // candidate: an unchanged submission there is not a resubmission.
+    return this.#state.phase.candidate?.sha;
+  }
+
+  /** Plan 06k3 (A2): commit a worker's uncommitted work to
+   * `refs/tt/<run>/unsubmitted/<attempt>-<lane>` so it is never discarded.
+   * The commit is built from a TEMP index and `commit-tree`, so the worktree's
+   * HEAD and index are untouched (a later base decision is not confused by a
+   * save). Recorded as an event so the next attempt of that lane can start
+   * from it and its prompt can name the ref. A clean worktree saves nothing. */
+  #saveUnsubmittedWork(lane: string, attempt: number, worktree: string): void {
+    try {
+      const ref = `refs/tt/${this.#state.phase.runId}/unsubmitted/${attempt}-${lane}`;
+      const sha = gitSaveUnsubmittedWork(
+        this.#plan.repo,
+        worktree,
+        ref,
+        `phase ${this.#state.phase.phaseId} unsubmitted work attempt ${attempt} lane ${lane}`,
+      );
+      if (!sha) return;
+      this.#unsavedLaneWorktrees.delete(lane);
+      this.#applyEvent({ type: "UNSUBMITTED_WORK_SAVED", lane, attempt, ref, sha });
+      this.#log.append("unsubmitted_work_saved", { lane, attempt, ref, sha });
+    } catch (err) {
+      // Plan 06k3 (A2, findings A-13/T-29): the ref was not written, so the
+      // work would be lost when the next round recreates the worktree. Mark
+      // the lane so #buildLane keeps the dirty worktree instead.
+      this.#unsavedLaneWorktrees.add(lane);
+      this.#log.append("unsubmitted_work_save_failed", { lane, attempt, error: String((err as Error)?.message ?? err) });
+    }
+  }
+
+  /** Plan 06k3 (A2): each lane's most recent saved unsubmitted work, keyed by
+   * lane. The next round uses it as that lane's base only when the lane has no
+   * passing candidate to restart from (a passing candidate always wins). */
+  #savedLaneWork(): Map<string, { ref: string; sha: string }> {
+    const out = new Map<string, { ref: string; sha: string }>();
+    for (const w of this.#state.phase.unsubmittedWork ?? []) {
+      out.set(w.lane, { ref: w.ref, sha: w.sha });
+    }
+    return out;
+  }
+
+  /** The lane sweep's `cwdUnder`: the SAME directory, with symlinks resolved.
+   * `lsof` reports a process's real cwd (on macOS `/tmp` is `/private/tmp`),
+   * and `sweepDecision`'s lane rule compares plain paths — so an unresolved
+   * `cwdUnder` would make every survivor look like another lane's and be held
+   * instead of killed. */
+  #laneSweepRoot(worktree: string): string {
+    try {
+      return fs.realpathSync(worktree);
+    } catch {
+      return worktree;
+    }
+  }
+
+  /** The environment one lane agent runs with: its OWN worktree (so the
+   * extension's write/`sh` guards and `TT_SEARCH_ROOTS` are lane-scoped), the
+   * same secrets and run paths as every other agent. */
+  #laneEnv(worktree: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    const contract = this.#state.phase.contract;
+    const protectedPaths = contract.acceptance.filter((a) => a.includes("/")).join(",");
+    return {
+      ...this.#extraEnv,
+      ...extra,
+      TT_SOCKET: this.#paths.sock,
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
+      TT_WORKTREE: worktree,
+      TT_RUN_DIR: this.#runDir,
+      TT_PROTECTED: protectedPaths,
+      TT_ITEMS: this.#structured() ? "1" : "0",
+      TT_SEARCH_ROOTS: [worktree, this.#paths.refs].join(path.delimiter),
+      TT_SECRETS: this.#secretNames.join(" "),
+      ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
+    };
+  }
+
+  /** Spawns one lane agent (a lane worker, a lane reviewer or a pick seat) and
+   * registers its handle, exactly like the single-lane dispatches do. */
+  #spawnLaneAgent(opts: {
+    role: Role;
+    agentId: string;
+    cwd: string;
+    sessionDir: string;
+    env: NodeJS.ProcessEnv;
+    seat?: string;
+    lane?: string;
+    laneRound?: number;
+    laneReview?: { round: number; lane: string; sha: string; seat: string };
+    pickSeat?: string;
+    pickRevote?: boolean;
+  }): AgentHandle {
+    let helloResolve!: (r: HelloResult) => void;
+    const helloPromise = new Promise<HelloResult>((resolve) => {
+      helloResolve = resolve;
+    });
+    let doneResolve!: () => void;
+    const donePromise = new Promise<void>((resolve) => {
+      doneResolve = resolve;
+    });
+    let discoveryResolve!: () => void;
+    const discoveryPromise = new Promise<void>((resolve) => {
+      discoveryResolve = resolve;
+    });
+    fs.mkdirSync(opts.sessionDir, { recursive: true });
+    const providerModel =
+      opts.role === "worker"
+        ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
+          // position, which the caller passes as `seat`.
+          this.#providerModelFor?.("worker", opts.seat ?? opts.lane)
+        : // A pick seat runs on its own reviewer seat's model.
+          this.#providerModelFor?.(opts.role === "picker" ? "reviewer" : opts.role, opts.seat);
+    const command = this.#resolvePiCommand(opts.role);
+    const streamFile = path.join(this.#paths.stream, `${opts.agentId}.jsonl`);
+    // Declared before the spawn so the event callback below can never see it
+    // in its temporal dead zone.
+    const settleWaiters: Array<() => void> = [];
+    const agent = spawnPiAgent({
+      command,
+      args: [
+        ...this.#resolvePiArgsPrefix(opts.role),
+        ...launchArgs(opts.role, {
+          sessionDir: opts.sessionDir,
+          continueSession: hasSessionFile(opts.sessionDir),
+          noSession: command !== undefined,
+          provider: providerModel?.provider,
+          model: providerModel?.model,
+        }),
+      ],
+      cwd: opts.cwd,
+      env: opts.env,
+      role: opts.role,
+      agentId: opts.agentId,
+      streamFile,
+      secrets: this.#secretMaskable,
+      abortGraceMs: this.#deadlines.abortGraceMs,
+      termGraceMs: this.#deadlines.termGraceMs,
+      onEvent: (event) => {
+        this.#noteActivity(opts.agentId, event);
+        this.#trackRunTokens(opts.agentId, event);
+        if (opts.laneReview) this.#trackLaneReviewerTool(opts.laneReview, opts.cwd, event);
+        // Plan 06g2: a lane review has two turns and must wait out each one;
+        // `waitSettled()` is one-shot, so per-turn waiters are resolved here
+        // (exactly like `#runReview`'s own `settleWaiters`).
+        if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
+      },
+    });
+    const handle: AgentHandle = {
+      agent,
+      role: opts.role,
+      agentId: opts.agentId,
+      helloResolve,
+      helloPromise,
+      shGroups: new Set(),
+      doneResolve,
+      donePromise,
+      discoveryResolve,
+      discoveryPromise,
+      settleWaiters,
+      ...(opts.lane !== undefined ? { lane: opts.lane } : {}),
+      ...(opts.laneRound !== undefined ? { laneRound: opts.laneRound } : {}),
+      ...(opts.laneReview ? { laneReview: opts.laneReview } : {}),
+      ...(opts.pickSeat !== undefined ? { pickSeat: opts.pickSeat } : {}),
+      ...(opts.pickRevote ? { pickRevote: true } : {}),
+    };
+    this.#agents.set(opts.agentId, handle);
+    // Plan 06g2: record the lane agent's own process group, so a crashed
+    // conductor's recovery can attribute it to this run (`#ownPgids`) and the
+    // lane sweep can end it — the same intent/completion discipline every
+    // other dispatch follows.
+    this.#log.intent(`lane-agent-${opts.agentId}`, { agentId: opts.agentId, pgid: agent.pgid, cwd: opts.cwd });
+    return handle;
+  }
+
+  /** The round's worker prompt: the SAME text for every lane (A2). It is the
+   * ordinary worker prompt plus the round's own lines — which lanes exist,
+   * the one base they share, and what the previous round's lanes got wrong. */
+  #laneWorkerPrompt(round: number, base: string): string {
+    const previous = (this.#state.phase.rounds ?? []).find((r) => r.round === round - 1);
+    const failures = laneFailureLines(previous);
+    const lines: string[] = [
+      `Round ${round} of this phase starts from ${base.slice(0, 7)} and runs ${this.#lanes().length} lanes. You are the worker of one lane; another worker builds a second candidate from the same base with this same prompt, in its own worktree. Do not touch another lane's worktree.`,
+    ];
+    if (failures.length > 0) {
+      lines.push(`The previous round's lanes (round ${previous!.round}):`, ...failures.map((f) => `- ${f}`));
+    }
+    // 02k: a lane whose candidate passed in a round that could not complete
+    // restarts from that candidate (repeatLaneBases); say so, so the worker
+    // continues from its own work instead of rebuilding it.
+    const restarted = repeatLaneBases(previous);
+    if (restarted) {
+      lines.push(
+        `Round ${previous!.round} could not complete (a review or pick vote was missing), not because of your code. A lane whose candidate passed its checks (${Object.entries(restarted)
+          .map(([l, sha]) => `lane ${l}: ${sha.slice(0, 7)}`)
+          .join(", ")}) starts this round from that candidate, so your worktree already holds your previous work: continue from it and fix what the reviews found.`,
+      );
+    }
+    // Plan 06k3 (A2): a lane whose previous attempt missed its deadline starts
+    // from its saved unsubmitted work; the prompt names the ref so the worker
+    // knows its earlier work is already in the worktree.
+    if (this.#laneSavedWorkForRound.length > 0) {
+      lines.push(
+        "A lane whose previous attempt ended without submitting starts from its saved uncommitted work, already in its worktree:",
+        ...this.#laneSavedWorkForRound.map((w) => `- lane ${w.lane}: ${w.sha.slice(0, 7)} on ${w.ref}`),
+      );
+    }
+    // Plan 06k3 (A2, findings A-13/T-29): a lane whose work could not be saved
+    // to a ref keeps its dirty worktree; its work is still there.
+    const retained = this.#lanes().filter((l) => this.#unsavedLaneWorktrees.has(l));
+    if (retained.length > 0) {
+      lines.push(
+        `A lane whose unsubmitted work could not be saved to a ref keeps its worktree, so its earlier work is still in it: ${retained.join(", ")}.`,
+      );
+    }
+    // Plan 06k1 (A1): when a majority of the previous round's seats said the
+    // losing lane had something the winner lacked, the losing lane's anchors
+    // are carried into this round's prompt, so both lanes can take them on.
+    const anchors = loserAnchors(previous, this.#laneSeats());
+    if (anchors.length > 0) {
+      const losers = previous ? losingLanes(previous).join(", ") : "the losing lane";
+      lines.push(
+        `The losing lane (${losers}) had something the winner lacked — carry these anchors into your candidate:`,
+        ...anchors.map((a) => `- ${a}`),
+      );
+    }
+    // Plan 06k1 (A5, finding A-8): a queued correction must reach the next
+    // LANE attempt's prompt too, exactly like the single-candidate worker.
+    const allNotes = this.#state.phase.ownerNotes ?? [];
+    const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
+    const queuedNotes = allNotes.slice(deliveredCount).join("\n");
+    // Plan 06k2 (A8): record the absolute note count this prompt carries, so
+    // `#buildLane` marks delivered only these and never a note queued after
+    // the prompt was built (finding F-M-14).
+    this.#lanePromptDeliveredNoteCount.set(round, allNotes.length);
+    const ownerNotes = [this.#plan.ownerNotes, queuedNotes].filter((n) => n && n.length > 0).join("\n");
+    return `${buildWorkerPrompt(
+      this.#state.phase.contract,
+      ownerNotes.length > 0 ? ownerNotes : undefined,
+      undefined,
+      this.#repairContext(),
+      runReferences(this.#runDir),
+      this.#secretNames,
+      this.#state.phase.ownerDirectives,
+      this.#baselineFailedCommands(),
+      this.#state.phase.messages,
+      this.#agentToolLines(),
+    )}\n\n${lines.join("\n")}`;
+  }
+
+  /** One lane: its own worktree at the round's base, its own worker and its
+   * own sweep (A2). Returns the frozen candidate sha and the lane's
+   * disclosures, or a note saying why the lane produced none. */
+  async #buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild> {
+    const worktree = this.#laneWorktree(lane);
+    // Plan 06k2 (A4, finding M-1): a lane worktree create/remove that throws
+    // is recorded as THIS lane attempt's failure, exactly like the
+    // single-worker reset — never a bare throw the round swallows without a
+    // lane-specific reason.
+    try {
+      if (this.#unsavedLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
+        // Plan 06k3 (A2, findings A-13/T-29): the previous attempt's work
+        // could not be written to a ref, so its dirty worktree is kept as-is
+        // and the worker continues in it.
+        this.#log.append("lane_worktree_reused", { lane, round, reason: "unsubmitted work was not saved to a ref" });
+      } else {
+        if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+        crashAt("before_create_worktree");
+        createWorktree(this.#plan.repo, worktree, base);
+        crashAt("after_create_worktree");
+      }
+    } catch (err) {
+      const error = String((err as Error)?.message ?? err);
+      this.#log.append("lane_worktree_failed", { lane, round, base, error });
+      return { lane, note: `the lane's worktree could not be created: ${error}` };
+    }
+    const actionId = this.#log.actionId(`lane_${round}_${lane}`);
+    this.#log.intent(actionId, { lane, round, worktree, base });
+    let agentId = `lane-${round}-${lane}-${actionId}`;
+    const sessionDir = path.join(this.#paths.sessions, `lane-worker-${lane}`);
+    const spawnLane = (): AgentHandle =>
+      this.#spawnLaneAgent({
+        role: "worker",
+        agentId,
+        cwd: worktree,
+        sessionDir,
+        env: this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}),
+        lane,
+        laneRound: round,
+        // `worker.N` names the lane by its 1-based position (a = 1, b = 2).
+        seat: String(this.#lanes().indexOf(lane) + 1),
+      });
+    let handle = spawnLane();
+    try {
+      let hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout") {
+        // Plan 06k2 (A1): a lane worker that fails to launch is retried once
+        // before the round continues with one lane. The retry is logged, and
+        // a retry that also misses hello leaves the lane with no candidate,
+        // exactly as before. The retry gets a fresh agent id, so a test can
+        // script the first launch to fail and the retry to start.
+        const failedAgentId = handle.agentId;
+        await handle.agent.terminate();
+        this.#agents.delete(failedAgentId);
+        const bytes = sessionBytes(sessionDir);
+        const retryMs = helloRetryTimeoutMs(this.#deadlines.helloTimeoutMs, bytes);
+        this.#applyEvent({
+          type: "LAUNCH_RETRIED",
+          role: "worker",
+          timeoutMs: this.#deadlines.helloTimeoutMs,
+          retryTimeoutMs: retryMs,
+          sessionBytes: bytes,
+        });
+        this.#log.append("lane_launch_retried", { lane, round, agentId: failedAgentId, retryTimeoutMs: retryMs });
+        agentId = `lane-${round}-${lane}-${actionId}-retry`;
+        handle = spawnLane();
+        hello = await raceTimeout(handle.helloPromise, retryMs, "hello");
+      }
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        const note = hello === "timeout" ? "the lane's worker did not start (hello timed out)" : "the lane's worker failed to start";
+        this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
+        return { lane, note };
+      }
+      await handle.agent.prompt(prompt);
+      // Plan 06k1 (A5, finding D-M-63): a queued correction counts as
+      // delivered only now that a lane worker that STARTED received the
+      // prompt carrying it. Both lanes send the same prompt; the first to get
+      // here records the delivery, and the second sees nothing left to
+      // deliver. If both lanes fail before this point, the obligation stays.
+      // Plan 06k2 (A8, finding F-M-14): only the notes the prompt ACTUALLY
+      // carried (recorded when it was built) are marked delivered — a note
+      // queued after the build stays queued for the next attempt.
+      {
+        const deliveredCount = this.#state.phase.deliveredNoteCount ?? 0;
+        const carried = this.#lanePromptDeliveredNoteCount.get(round) ?? deliveredCount;
+        if (carried > deliveredCount) {
+          this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: carried - deliveredCount });
+        }
+      }
+      const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
+      // Plan 06k3 (A2): at 75% of the attempt the lane worker is told how many
+      // minutes remain and to submit. The steer timer pauses with the attempt
+      // clock.
+      const clockSteer = this.#scheduleClockSteer(agentId, handle.agent, this.#deadlines.workerAttemptMs);
+      // Plan 06k1 (A4): a lane worker pauses while another run's check window
+      // is open, exactly like the single-candidate worker.
+      const stopCheckWindowWatch = this.#watchCheckWindow(agentId, handle.agent, timeout, clockSteer.timer);
+      const outcome = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        handle.agent.waitSettled().then(() => "settled" as const),
+        handle.agent.waitExit().then(() => "exited" as const),
+        // Plan 06k1 (A6, D-M-47): a failed compaction means this lane worker
+        // can never submit; end its attempt at once, exactly like the
+        // single-candidate worker, instead of waiting out the deadline.
+        handle.agent.waitCompactionFailed().then(() => "compactionFailed" as const),
+        // Plan 06l (A3/R5): a terminal model-call failure (404, context
+        // overflow) ends it at once too, with the cause named.
+        handle.agent.waitModelFailed().then(() => "modelFailed" as const),
+        timeout.promise,
+      ]);
+      timeout.cancel();
+      clockSteer.cancel();
+      stopCheckWindowWatch();
+      if (outcome !== "submitted") {
+        await handle.agent.terminate();
+        // Plan 06k3 (A2): the work the lane did not submit in time is
+        // committed to a ref, never discarded; the next round starts from it.
+        this.#saveUnsubmittedWork(lane, this.#state.phase.attempt.n, worktree);
+        const note =
+          outcome === "timeout"
+            ? "the lane's worker timed out before submitting"
+            : outcome === "compactionFailed" || outcome === "modelFailed"
+              ? `the lane's worker ended without submitting: ${handle.agent.modelFailureReason ?? (outcome === "compactionFailed" ? "context overflow (compaction recovery failed)" : "the model call failed terminally")}`
+              : handle.agent.modelFailureReason
+                ? // reported a terminal failure, then settled first in the race
+                  `the lane's worker ended without submitting: ${handle.agent.modelFailureReason}`
+                : `the lane's worker ended without submit_phase (${outcome})`;
+        this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
+        return { lane, note };
+      }
+      await handle.agent.terminate();
+      this.#agents.delete(agentId);
+      // The lane's own sweep: scoped to THIS lane's worktree (06g's
+      // `sweepDecision` with `cwdUnder`), so it can never signal a process the
+      // other lane started.
+      const sweepResult: SweepResult = await sweep(worktree, {
+        ownPgids: this.#ownPgids(),
+        exceptPids: [],
+        cwdUnder: this.#laneSweepRoot(worktree),
+      });
+      this.#log.append("sweep", { ...sweepResult, lane });
+      // The lane produced a candidate: its retained dirty worktree is no
+      // longer needed (the candidate carries the work).
+      this.#unsavedLaneWorktrees.delete(lane);
+      const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} lane ${lane} candidate`);
+      const candidateDir = path.join(this.#paths.candidates, sha);
+      if (!fs.existsSync(candidateDir)) materializeCandidate(this.#plan.repo, sha, candidateDir);
+      this.#log.completion(actionId, { lane, round, candidateSha: sha, tainted: sweepResult.tainted });
+      return {
+        lane,
+        sha,
+        // The lane's own sweep result, carried to FREEZE_COMPLETED at the
+        // hand-off (a lane that left a survivor taints the winner's tree
+        // exactly as the single-candidate freeze would).
+        tainted: sweepResult.tainted,
+        ...(handle.laneSubmission ?? { disclosures: [] }),
+        ...(handle.laneCoverage !== undefined ? { coverage: handle.laneCoverage } : {}),
+      };
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** One candidate's checks, run under the machine-wide lock (C2). */
+  async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
+    const lock = await acquireWaitingLock(this.#checkLockPath);
+    // Plan 06k1 (A4): the check holds the host-wide window for its duration,
+    // so every other run's workers are paused while it runs.
+    const window = openCheckWindow(this.#checkLockPath);
+    try {
+      this.#log.append("lane_check_started", { round, lane, candidateSha: sha });
+      const result = await this.#runLaneChecks(lane, sha);
+      this.#log.append("lane_check_finished", { round, lane, candidateSha: sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
+      return result;
+    } finally {
+      window.release();
+      await lock.release();
+    }
+  }
+
+  /** Runs the effective check commands for one lane candidate in a fresh
+   * checkout of its commit and writes `checks/<sha>/record.json`. Nothing
+   * about the phase moves here: a candidate that fails its checks records
+   * CANDIDATE_CHECKED { ok: false } and the round goes on with the other
+   * lane. */
+  async #runLaneChecks(lane: string, candidateSha: string): Promise<LaneCheck> {
+    const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
+    const outDir = path.join(this.#paths.checks, candidateSha);
+    fs.mkdirSync(outDir, { recursive: true });
+    const commands = checkCommands(
+      this.#plan.checks,
+      this.#state.phase.contract.checks,
+      this.#state.phase.contract.finalChecks,
+      "round",
+    );
+    const recordCommands: CheckRecordCommand[] = [];
+    const recordLoad1 = Math.round(loadavg()[0] * 100) / 100;
+    const recordFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
+    let passed = true;
+    let combinedOutput = "";
+    let firstFailure: string | undefined;
+    try {
+      if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
+        passed = false;
+        firstFailure = "the checkout no longer matches the candidate commit";
+      }
+      for (const rawCommand of commands) {
+        if (!passed) break;
+        const command = this.#withValues(rawCommand);
+        const startedAt = Date.now();
+        // Plan 06l (A4): a re-run alone must finish inside this same
+        // per-command deadline.
+        const deadlineAt = startedAt + this.#deadlines.checkMs;
+        const result = await runCommand({
+          command,
+          cwd: checkoutDir.dir,
+          env: this.#checkEnv(),
+          deadlineMs: this.#deadlines.checkMs,
+          termGraceMs: this.#deadlines.termGraceMs,
+          onIntent: ({ pgid }) => {
+            this.#onStageShIntent(pgid);
+            this.#log.intent(`lane-check-sh-${lane}-${pgid}`, { pgid });
+          },
+        }).result;
+        combinedOutput += `${result.output}\n`;
+        this.#recordCheck(outDir, command, result);
+        recordCommands.push({
+          command,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+          durationMs: Date.now() - startedAt,
+          passed: result.exitCode === 0 && !result.timedOut,
+          log: this.#checkLogName(command),
+        });
+        if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
+          passed = false;
+          firstFailure = "the checkout no longer matches the candidate commit";
+          break;
+        }
+        if (result.exitCode === 0 && !result.timedOut) continue;
+        // Plan 01e's pre-existing rule, unchanged: a failing check whose every
+        // parsed failing test also failed on the round's base is not this
+        // candidate's failure.
+        if (failedNormally(result)) {
+          const verdict = classifyCheckFailure(result.output, this.#baseFailuresFor(command), this.#requiredTestTexts());
+          if (verdict.excused) {
+            this.#log.append("check_failures_pre_existing", { candidateSha, command, failures: verdict.parsed, lane });
+            continue;
+          }
+          if (verdict.newFailures.length > 0) {
+            // Plan 06l (A4): before any new failure fails a LANE check, re-run
+            // each alone. A test that passes alone is recorded as flaky (its
+            // own FLAKE_OBSERVED, so the status view and the phase summary
+            // list it) and does not fail the check; only the tests that still
+            // fail alone fail it.
+            const classifications = await this.#classifyNewFailures({
+              output: result.output,
+              names: verdict.newFailures,
+              failingExitCode: result.exitCode,
+              cwd: checkoutDir.dir,
+              deadlineAt,
+              // Plan 06l (A4): ONE isolated re-run. A test that fails it is a
+              // real failure even if a later run might pass.
+              maxReruns: 1,
+            });
+            const loadOnly = classifications.filter((c) => c.loadOnly);
+            const real = classifications.filter((c) => c.reproducesAlone);
+            const machineLoad = Math.round(loadavg()[0] * 100) / 100;
+            for (const c of loadOnly) {
+              this.#log.append("lane_check_flake", {
+                candidateSha,
+                command,
+                lane,
+                name: c.name,
+                ...(c.rerunCommand !== undefined ? { rerunCommand: c.rerunCommand } : {}),
+                failingExitCode: c.failingExitCode,
+                rerunExitCodes: c.rerunExitCodes,
+                loadAverage: machineLoad,
+              });
+              this.#applyEvent({
+                type: "FLAKE_OBSERVED",
+                name: c.name,
+                command,
+                ...(c.rerunCommand !== undefined ? { rerunCommand: c.rerunCommand } : {}),
+                failingExitCode: c.failingExitCode,
+                rerunExitCodes: c.rerunExitCodes,
+                loadAverage: machineLoad,
+                savedRound: real.length === 0,
+                candidateSha,
+              });
+            }
+            if (real.length === 0) {
+              this.#log.append("lane_check_failures_load_only", { candidateSha, command, lane, tests: classifications });
+              continue;
+            }
+            firstFailure = `the check \`${command}\` failed: ${real.map((c) => c.name).join(", ")}`;
+          }
+        }
+        if (!firstFailure) firstFailure = `the check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}`;
+        passed = false;
+      }
+      this.#writeCheckRecord(outDir, {
+        candidateSha,
+        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
+        tier: "round",
+        passed,
+        commands: recordCommands,
+        finalCommands: [],
+        load1: recordLoad1,
+        freeMemMB: recordFreeMemMB,
+        at: new Date().toISOString(),
+      });
+      // The item test-verifies are resolved for the winner only (the hand-off
+      // applies them); a loser's output must not touch the phase's item state.
+      this.#laneCheckOutputs.set(candidateSha, combinedOutput);
+      if (this.#itemsEnforced()) {
+        this.#laneCheckResolutions.set(candidateSha, resolveTestVerifies(this.#planItems(), combinedOutput));
+      }
+      return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
+    } finally {
+      checkoutDir.dispose();
+    }
+  }
+
+  /** Plan 06g2: the ids the lane's discoveries will have, in the order the
+   * hand-off applies them. ONE plan for both sides: the lane's turn-2 prompt
+   * shows these ids, and the hand-off passes the same numbers to
+   * `#applyDiscoveries`, so a seat's ballot always names the record that
+   * appears. The numbering starts after every record the phase ALREADY holds
+   * (each survives FREEZE_COMPLETED, carried forward) and the lane's own
+   * worker decisions — which is exactly where `#applyDiscoveries` would number
+   * from — then walks M, A and B in seat order. */
+  #laneDiscoveryPlan(
+    round: number,
+    lane: string,
+    sha: string,
+  ): Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }> {
+    const key = `${round}-${lane}`;
+    const cached = this.#laneDiscoveryPlans.get(key);
+    if (cached) return cached;
+    const build = this.#laneBuilds.get(key);
+    const workerDecisions = build
+      ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
+      : [];
+    let n = this.#state.phase.decisions.length + workerDecisions.length;
+    const out: Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }> = [];
+    for (const seat of this.#laneSeats()) {
+      for (const disclosure of this.#laneDiscoveries.get(key)?.get(seat) ?? []) {
+        n += 1;
+        out.push({ seat, disclosure, id: `D-${this.#state.phase.phaseId}-${sha.slice(0, 8)}-disc-${seat}-${n}`, index: n });
+      }
+    }
+    this.#laneDiscoveryPlans.set(key, out);
+    return out;
+  }
+
+  /** Plan 06k2 (A7): one lane candidate's boundary-trigger decisions,
+   * computed BEFORE its lane reviews (bound to that candidate) so the lane
+   * reviewers ballot them with the candidate's other records. Citations
+   * count every decision and finding of the phase (superseded ones
+   * included), plus the lane's own worker decisions, so a path an earlier
+   * round's decision cited is not re-triggered. Cached by `<round>-<lane>`,
+   * so the hand-off applies exactly the ids the seats balloted. */
+  #laneTriggerDecisions(round: number, lane: string, sha: string): Decision[] {
+    const key = `${round}-${lane}`;
+    const cached = this.#laneTriggers.get(key);
+    if (cached) return cached;
+    let out: Decision[] = [];
+    try {
+      const contract = this.#state.phase.contract;
+      const build = this.#laneBuilds.get(key);
+      const workerDecisions = build
+        ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
+        : [];
+      const citationTexts = [
+        ...this.#state.phase.decisions.flatMap((d) => [d.choice, d.whyItMatters, ...d.alternatives.map((a) => `${a.option} ${a.consequence}`)]),
+        ...this.#state.phase.findings.map((f) => f.evidence),
+        ...workerDecisions.flatMap((d) => [d.choice, d.whyItMatters, ...d.alternatives.map((a) => `${a.option} ${a.consequence}`)]),
+      ];
+      const paths = diffNameOnly(this.#plan.repo, this.#state.phase.integrationHead, sha);
+      const acceptanceFiles = contract.acceptance.filter((a) => a.includes("/"));
+      const triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
+      const K = contract.contractVersion;
+      out = triggerPaths.map((p, i) => ({
+        id: `D-${this.#state.phase.phaseId}-${sha.slice(0, 8)}-trigger-${i + 1}`,
+        version: 1,
+        phaseId: this.#state.phase.phaseId,
+        source: "trigger" as const,
+        class: "delegated" as const,
+        choice: `Diff touches boundary/dependency/acceptance-relevant path '${p}' with no decision or finding citing it`,
+        whyItMatters: "Boundary-relevant paths need an explicit review disposition (design §3.3/§3.4) — silence here is not the same as approval.",
+        alternatives: [
+          { option: "treat it as already covered", consequence: "a boundary or dependency change could go unreviewed" },
+          { option: "classify and review it explicitly", consequence: "costs one more decision to settle before acceptance" },
+        ],
+        recommendation: { choice: "classify and review this trigger explicitly", reason: `'${p}' matched a boundary/dependency/acceptance rule with no citing record` },
+        boundCandidateSha: sha,
+        boundContractVersion: K,
+      }));
+    } catch (err) {
+      this.#log.append("sampling_error", { candidateSha: sha, lane, error: String((err as Error)?.message ?? err) });
+    }
+    this.#laneTriggers.set(key, out);
+    this.#laneTriggerPaths.set(key, out.map((d) => /'([^']+)'/.exec(d.choice)?.[1] ?? ""));
+    return out;
+  }
+
+  /** The lane phase a lane review is built from: the round's candidate, the
+   * lane's own decisions (the worker's disclosures, assembled exactly as the
+   * hand-off will assemble them), its coverage and its check resolution, the
+   * discoveries the three seats made on THIS candidate, and the candidate's
+   * boundary triggers. Never the phase's own candidate/decisions, which
+   * belong to another version. */
+  #lanePhase(round: number, lane: string, sha: string, opts: { final?: boolean } = {}): PhaseState {
+    const K = this.#state.phase.contract.contractVersion;
+    const build = this.#laneBuilds.get(`${round}-${lane}`);
+    const workerDecisions = build
+      ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
+      : [];
+    // Only turn 2 (after the discovery barrier) knows every seat's
+    // discoveries, and only its plan is cached for the hand-off.
+    const plan = opts.final ? this.#laneDiscoveryPlan(round, lane, sha) : [];
+    // Plan 06k3 (A3): the lane's submission answers are shown on its findings,
+    // so the reproduction table pairs each finding with THIS lane's answer.
+    const answers = new Map((build?.answers ?? []).map((a) => [a.findingId, a]));
+    const findings =
+      answers.size === 0
+        ? this.#state.phase.findings
+        : this.#state.phase.findings.map((f) => (answers.has(f.id) ? { ...f, answer: answers.get(f.id) } : f));
+    const discovered: Decision[] = plan.map(({ seat, disclosure, id }) => ({
+      id,
+      version: 1,
+      phaseId: this.#state.phase.phaseId,
+      source: "reviewer-discovered",
+      class: disclosure.classProposal,
+      choice: disclosure.choice,
+      whyItMatters: disclosure.whyItMatters,
+      alternatives: disclosure.alternatives,
+      recommendation: disclosure.recommendation,
+      boundCandidateSha: sha,
+      boundContractVersion: K,
+    }));
+    return {
+      ...this.#state.phase,
+      candidate: { sha, contractVersion: K },
+      decisions: [...workerDecisions, ...discovered, ...this.#laneTriggerDecisions(round, lane, sha)],
+      findings,
+      ...(build?.coverage !== undefined ? { coverage: build.coverage as Coverage } : {}),
+      checkResolution: this.#laneCheckResolutions.get(sha) ?? [],
+    };
+  }
+
+  /** Plan 06l (A3): the discovery turn's own deadline — a third of the
+   * per-stage review deadline (#85), so the discovery barrier never waits a
+   * full review deadline for one seat. */
+  #discoveryDeadlineMs(): number {
+    return Math.max(1, Math.floor(this.#deadlines.reviewMs / 3));
+  }
+
+  /** Plan 06l (A2): the extension's own wait for a `sh` result. It must cover
+   * the longest per-command budget (`tt test --changed`), or a worker's narrow
+   * test run would return a client-side timeout while the conductor still has
+   * it running. A normal command still ends at the shell cap, well inside it. */
+  #shWaitMs(): number {
+    return Math.max(this.#deadlines.shCommandMs, CHANGED_TEST_BUDGET_MS) + 30_000;
+  }
+
+  /** Plan 06k3 (A1): one seat's lane review. A review turn that ends without
+   * its submission (timeout, exit, settled) is run once more with a FRESH
+   * agent for that seat before the round fails; the retry is logged. */
+  async #runLaneReview(round: number, lane: string, sha: string, seat: string): Promise<void> {
+    try {
+      await this.#runLaneReviewOnce(round, lane, sha, seat);
+      return;
+    } catch (err) {
+      this.#log.append("lane_review_retried", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
+    }
+    try {
+      await this.#runLaneReviewOnce(round, lane, sha, seat, true);
+    } catch (err) {
+      // Plan 06k3 (A1, finding A-1): only now — after the retry also failed —
+      // does this seat arrive at the discovery barrier. Marking it arrived
+      // while a retry was still coming let the other seats build and cache
+      // their turn-2 plan without the retry's discovery.
+      this.#laneArriveAtBarrier(round, lane, seat);
+      this.#log.append("lane_review_retry_failed", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
+      throw err;
+    }
+  }
+
+  /** Plan 06g2: one seat's review of one passing lane candidate — today's
+   * two-turn review, once per candidate (design §3.3): turn 1 discovers the
+   * behavioural choices before the worker's own disclosure is shown, the
+   * three seats' discoveries merge behind a per-candidate barrier, and turn 2
+   * reviews the lane's decisions, findings and item verdicts. A review that
+   * cannot be taken THROWS: the round then fails and repeats, so a winner is
+   * never handed off with fewer than K × N reviews. */
+  async #runLaneReviewOnce(round: number, lane: string, sha: string, seat: string, retry = false): Promise<void> {
+    const candidateDir = path.join(this.#paths.candidates, sha);
+    const actionId = this.#log.actionId(`lane_review_${round}_${lane}_${seat}`);
+    this.#log.intent(actionId, { round, lane, seat, candidateSha: sha, ...(retry ? { retry: true } : {}) });
+    const agentId = `lane-review-${round}-${lane}-${seat}-${actionId}`;
+    this.#laneReviewerReads.set(`${seat}@${sha}`, new Set());
+    this.#laneReviewerCommands.set(`${seat}@${sha}`, new Set());
+    const handle = this.#spawnLaneAgent({
+      role: "reviewer",
+      agentId,
+      cwd: candidateDir,
+      // A FRESH session per (round, lane, seat): a seat judging the second
+      // candidate must not carry the first's review in context (M's veto of
+      // the shared session), and a later round re-reviews from scratch. Plan
+      // 06k3 (A1): the retry gets its OWN session dir, so the fresh agent does
+      // not inherit the failed attempt's context.
+      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}${retry ? "-retry" : ""}`),
+      env: this.#laneEnv(candidateDir, {
+        ...(this.#piEnvFor?.("reviewer", agentId) ?? {}),
+        TT_CANDIDATE_SHA: sha,
+        TT_REVIEWER: seat,
+      }),
+      lane,
+      laneRound: round,
+      seat,
+      laneReview: { round, lane, sha, seat },
+    });
+    const lanePhase = this.#lanePhase(round, lane, sha);
+    // Plan 06k3 (A3): the lane's reproduction table, computed once per
+    // candidate after its checks.
+    await this.#ensureReproductionTable(lanePhase, sha);
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "the reviewer did not start" });
+        throw new Error("the reviewer did not start");
+      }
+      // 02k (2026-10-10): each stage of a lane review has its own reviewMs —
+      // turn 1, the wait for the other seats' discovery, and turn 2 with its
+      // re-prompt. One timer across all three let a slow seat's barrier wait
+      // and its turn-2 re-prompts run it out of time, and the missing review
+      // discarded the whole two-lane round (02k rounds 1 and 2).
+      // Plan 06l (A3): turn 1 (discovery) has its OWN, shorter deadline — a
+      // third of the per-stage review deadline — so a seat late on turn 1 is
+      // retried then and the barrier never waits a full review deadline for
+      // one seat.
+      let timeout = cancelableTimeout(this.#discoveryDeadlineMs(), "timeout" as const);
+      const nextSettle = () =>
+        new Promise<"settled">((resolve) => handle.settleWaiters!.push(() => resolve("settled")));
+
+      // Turn 1: discover, before the worker's own disclosure is shown.
+      const settled1 = nextSettle();
+      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn1Prompt(seat as Reviewer, lanePhase, candidateDir)));
+      const raced1 = await Promise.race([
+        handle.discoveryPromise.then(() => "discovered" as const),
+        timeout.promise,
+        settled1,
+        // A crashed reviewer ends the attempt at once, never at reviewMs.
+        handle.agent.waitExit().then(() => "exited" as const),
+        // Plan 06l (A3/A-8): a terminal model failure (404, context overflow)
+        // ends the turn at once, so the seat's one retry starts immediately.
+        handle.agent.waitModelFailed().then(() => "failed" as const),
+        handle.agent.waitCompactionFailed().then(() => "failed" as const),
+      ]);
+      // The discovery reply and the turn's own settle are two channels; the
+      // settle can win the race. What matters is whether the discovery was
+      // ACCEPTED, so the recorded discovery (not the race's winner) decides.
+      const turn1 = raced1 !== "discovered" && handle.laneDiscoveries !== undefined ? ("discovered" as const) : raced1;
+      if (turn1 !== "discovered") {
+        timeout.cancel();
+        await handle.agent.terminate();
+        const why =
+          turn1 === "settled"
+            ? "settled without submit_discovery (turn 1)"
+            : turn1 === "exited"
+              ? "the reviewer's process exited before submit_discovery (turn 1)"
+              : turn1 === "failed"
+                ? `the reviewer's model call failed terminally (turn 1): ${handle.agent.modelFailureReason ?? "unknown"}`
+                : "timeout (turn 1)";
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: why });
+        throw new Error(why);
+      }
+      const turn1Settled = await Promise.race([settled1, timeout.promise]);
+      if (turn1Settled === "timeout") {
+        timeout.cancel();
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "timeout (turn 1 did not settle)" });
+        throw new Error("timeout (turn 1 did not settle)");
+      }
+      // The per-candidate discovery barrier: no seat gets turn 2 until all
+      // three have finished turn 1 on THIS candidate, so every turn-2 prompt
+      // lists the same merged records and every seat can ballot the others'.
+      this.#laneArriveAtBarrier(round, lane, seat);
+      timeout.cancel();
+      timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      const barrier = await Promise.race([this.#laneBarrierReleased(round, lane).then(() => "released" as const), timeout.promise]);
+      if (barrier === "timeout") {
+        timeout.cancel();
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "timeout (waiting for the other seats' discovery)" });
+        throw new Error("timeout (waiting for the other seats' discovery)");
+      }
+
+      // Turn 2: the lane's decisions (the worker's own, plus every seat's
+      // discoveries) with a ballot demanded for each votable one. The plan's
+      // ids are cached here and reused at the hand-off.
+      timeout.cancel();
+      timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      const merged = this.#lanePhase(round, lane, sha, { final: true });
+      const settled2 = nextSettle();
+      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn2Prompt(seat as Reviewer, handle, merged, candidateDir)));
+      const reviewRecorded = () =>
+        ((this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane)?.reviews ?? []).some(
+          (r) => r.seat === seat,
+        );
+      let turn2 = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        timeout.promise,
+        settled2,
+        handle.agent.waitExit().then(() => "exited" as const),
+        handle.agent.waitModelFailed().then(() => "failed" as const),
+        handle.agent.waitCompactionFailed().then(() => "failed" as const),
+      ]);
+      // Same channel race as turn 1: the recorded review, not the race's
+      // winner, says whether the submission landed.
+      if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
+      if (turn2 === "settled") {
+        this.#log.append("review_reprompt", { reviewer: seat, agentId, reason: "turn 2 settled without submit_review" });
+        const settled3 = nextSettle();
+        await handle.agent.prompt(
+          this.#agentPrompt(
+            `You ended your review turn without calling submit_review. That tool is required to finish this review. ` +
+              `Call submit_review now with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, ` +
+              `findingStatements, items and arch, then end your turn.`,
+          ),
+        );
+        turn2 = await Promise.race([
+          handle.donePromise.then(() => "submitted" as const),
+          timeout.promise,
+          settled3,
+          handle.agent.waitExit().then(() => "exited" as const),
+          handle.agent.waitModelFailed().then(() => "failed" as const),
+          handle.agent.waitCompactionFailed().then(() => "failed" as const),
+        ]);
+        if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
+      }
+      timeout.cancel();
+      await handle.agent.terminate();
+      const ok = turn2 === "submitted";
+      this.#log.completion(actionId, { round, lane, seat, ok, ...(ok ? {} : { reason: turn2 }) });
+      if (!ok) {
+        throw new Error(
+          turn2 === "settled"
+            ? "settled without submit_review (turn 2, after one re-prompt)"
+            : turn2 === "exited"
+              ? "the reviewer's process exited before submit_review (turn 2)"
+              : turn2 === "failed"
+                ? `the reviewer's model call failed terminally (turn 2): ${handle.agent.modelFailureReason ?? "unknown"}`
+                : "timeout (turn 2)",
+        );
+      }
+    } finally {
+      // Plan 06k3 (A1, finding A-1): a failed attempt does NOT mark the seat
+      // arrived — a retry may still come, and the other seats must wait for
+      // its discovery. The wrapper marks arrival only after the retry also
+      // fails (so nobody waits out their own deadline for a dead seat).
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** The per-(round, lane) discovery barrier: every seat that arrives waits
+   * until all of the round's seats have, exactly like the single-candidate
+   * path's `#discoveryBarrier` but keyed by the candidate under review. */
+  #laneArriveAtBarrier(round: number, lane: string, seat: string): void {
+    const key = `${round}-${lane}`;
+    const barrier = this.#laneBarriers.get(key) ?? { arrived: new Set<string>(), waiters: [] };
+    if (barrier.arrived.has(seat)) return;
+    barrier.arrived.add(seat);
+    this.#laneBarriers.set(key, barrier);
+    if (this.#laneSeats().every((s) => barrier.arrived.has(s))) barrier.waiters.splice(0).forEach((f) => f());
+  }
+
+  #laneBarrierReleased(round: number, lane: string): Promise<void> {
+    const key = `${round}-${lane}`;
+    const barrier = this.#laneBarriers.get(key);
+    if (barrier && this.#laneSeats().every((s) => barrier.arrived.has(s))) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const b = this.#laneBarriers.get(key) ?? { arrived: new Set<string>(), waiters: [] };
+      b.waiters.push(resolve);
+      this.#laneBarriers.set(key, b);
+    });
+  }
+
+  /** Plan 06k3 (A1): one seat's pick turn. A pick turn that ends without its
+   * vote (timeout, exit, settled) is run once more with a FRESH agent for
+   * that seat before the round fails; the retry is logged. */
+  async #runPickTurn(
+    round: number,
+    base: string,
+    seat: string,
+    passing: ReadonlyArray<{ lane: string; sha: string }>,
+    revote = false,
+  ): Promise<void> {
+    try {
+      await this.#runPickTurnOnce(round, base, seat, passing, revote);
+      return;
+    } catch (err) {
+      this.#log.append("pick_retried", { round, seat, revote, reason: String((err as Error)?.message ?? err) });
+    }
+    try {
+      // Plan 06k3 (A1, findings F-13/D-M-37): the retry runs with a FRESH
+      // session (its own `-retry` dir), exactly like the lane-review retry, so
+      // it does not inherit the failed attempt's context.
+      await this.#runPickTurnOnce(round, base, seat, passing, revote, true);
+    } catch (err) {
+      this.#log.append("pick_retry_failed", { round, seat, revote, reason: String((err as Error)?.message ?? err) });
+      throw err;
+    }
+  }
+
+  /** One seat's pick turn. The prompt is `buildPickPrompt` (the leader seat
+   * carries the ledger, every earlier round and the other candidates' diffs);
+   * the vote itself is recorded by `submit_pick_vote`. */
+  async #runPickTurnOnce(
+    round: number,
+    base: string,
+    seat: string,
+    passing: ReadonlyArray<{ lane: string; sha: string }>,
+    revote = false,
+    retry = false,
+  ): Promise<void> {
+    const actionId = this.#log.actionId(`${revote ? "revote" : "pick"}_${round}_${seat}`);
+    this.#log.intent(actionId, { round, seat, lanes: passing.map((c) => c.lane), ...(revote ? { revote: true } : {}), ...(retry ? { retry: true } : {}) });
+    const agentId = `${revote ? "revote" : "pick"}-${round}-${seat}-${actionId}`;
+    const leader = seat === this.#laneLeader();
+    const otherDiffs: Record<string, string> = {};
+    if (leader) {
+      for (const c of passing) {
+        try {
+          otherDiffs[c.lane] = diffText(this.#plan.repo, base, c.sha);
+        } catch {
+          otherDiffs[c.lane] = "(diff unavailable)";
+        }
+      }
+    }
+    const prompt = buildPickPrompt({
+      seat,
+      leader,
+      phaseId: this.#state.phase.phaseId,
+      goal: this.#state.phase.contract.goal,
+      round,
+      base,
+      candidates: passing.map((c) => ({ lane: c.lane, sha: c.sha, label: candidateLabel(round, c.lane) })),
+      ledger: this.#laneLedgerLines(),
+      earlierRounds: this.#laneEarlierRoundLines(round),
+      otherDiffs,
+      seats: this.#laneSeats(),
+      ...(revote ? { revote: true } : {}),
+    });
+    const candidateDir = path.join(this.#paths.candidates, passing[0]?.sha ?? base);
+    const handle = this.#spawnLaneAgent({
+      role: "picker",
+      agentId,
+      cwd: fs.existsSync(candidateDir) ? candidateDir : this.#runDir,
+      // Plan 06k3 (A1, finding D-M-37): the retry gets its own session dir.
+      sessionDir: path.join(this.#paths.sessions, `pick-${seat}${retry ? "-retry" : ""}`),
+      env: this.#laneEnv(this.#runDir, {
+        ...(this.#piEnvFor?.("picker", agentId) ?? {}),
+        TT_REVIEWER: seat,
+      }),
+      laneRound: round,
+      seat,
+      pickSeat: seat,
+      ...(revote ? { pickRevote: true } : {}),
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        this.#log.completion(actionId, { round, seat, ok: false, reason: "the seat did not start" });
+        // Plan 06k3 (A1, finding F-13): a picker that never starts is a
+        // failed pick turn, so #runPickTurn's one retry runs. Returning here
+        // let a seat that never starts skip the retry entirely.
+        throw new Error(hello === "timeout" ? "the seat did not start (hello timed out)" : "the seat failed to start");
+      }
+      await handle.agent.prompt(this.#agentPrompt(prompt));
+      const timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      let outcome = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        handle.agent.waitSettled().then(() => "settled" as const),
+        handle.agent.waitExit().then(() => "exited" as const),
+        timeout.promise,
+      ]);
+      // Plan 06k1 (A1): a pick turn that settles without a vote is re-asked
+      // ONCE (like an incomplete review), so a missing `loserHad` or a
+      // dropped vote gets one more chance before it fails the round.
+      if (outcome === "settled" && !this.#pickVoteRecorded(round, seat, revote)) {
+        this.#log.append("pick_reprompt", { round, seat, reason: "the pick turn settled without submit_pick_vote" });
+        // A settle waiter registered BEFORE the prompt, so it fires on the
+        // NEW turn's settle, not the one that just happened.
+        const settled2 = new Promise<"settled">((resolve) => handle.settleWaiters!.push(() => resolve("settled")));
+        await handle.agent.prompt(
+          this.#agentPrompt(
+            `You ended your pick turn without recording a vote. Call submit_pick_vote now with round, seat, lane, why, ` +
+              `and loserHad (whether the losing lane had something your pick lacked: { yes, anchors, note? }), then end your turn.`,
+          ),
+        );
+        outcome = await Promise.race([handle.donePromise.then(() => "submitted" as const), timeout.promise, settled2]);
+      }
+      timeout.cancel();
+      await handle.agent.terminate();
+      const ok = outcome === "submitted" || this.#pickVoteRecorded(round, seat, revote);
+      this.#log.completion(actionId, { round, seat, ok, ...(ok ? {} : { reason: outcome }) });
+      // Plan 06g2: a missing vote fails the round (it repeats); the pick is
+      // never taken with fewer than all seats' votes.
+      if (!ok) throw new Error(`the pick turn ${outcome} without a vote`);
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** Plan 06k1 (A1): whether this seat's pick vote (or revote) is already
+   * recorded for the round. */
+  #pickVoteRecorded(round: number, seat: string, revote: boolean): boolean {
+    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+    if (!record) return false;
+    return revote ? (record.revote?.votes ?? []).some((v) => v.seat === seat) : record.votes.some((v) => v.seat === seat);
+  }
+
+  /** Plan 06h (A2): the seats that review and vote, from the frozen
+   * contract's `#+TT_REVIEWERS` (default `M A B`). */
+  #laneSeats(): string[] {
+    return seatsOf(this.#state.phase.contract);
+  }
+
+  /** Plan 06h (A2): the leader seat, from the frozen contract's
+   * `#+TT_LEADER` (default the first seat). */
+  #laneLeader(): string {
+    return leaderOf(this.#state.phase.contract);
+  }
+
+  /** The settled ledger, one line per record — the leader seat's pick
+   * context. */
+  #laneLedgerLines(): string[] {
+    const messages = this.#state.phase.messages ?? [];
+    return ledgerEntries(messages).map((e) => {
+      const message = messages.find((m) => m.id === e.messageId);
+      return `${e.messageId} ${e.state}${message ? `: ${oneLine(message.title)}` : ""}`;
+    });
+  }
+
+  /** Every earlier round's candidates, votes and winner, one line each. */
+  #laneEarlierRoundLines(round: number): string[] {
+    return (this.#state.phase.rounds ?? [])
+      .filter((r) => r.round < round)
+      .map((r) => {
+        const votes = r.votes.map((v) => `${v.seat}→${v.lane}`).join(" ");
+        const picked = r.picked ? `${candidateLabel(r.round, r.picked.lane)} won (${r.picked.votes} vote(s))` : "no winner";
+        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}`;
+      });
+  }
+
+  /** The round's own orchestration: `runRound` (core/lanes.ts) is the only
+   * module that decides the sequence; this implements its host callbacks. */
+  async #runLaneRound(actionId: string): Promise<void> {
+    const lanes = this.#lanes();
+    let loggedIntent = false;
+    // Plan 06k3 (A1): a round that fails only because a lane review or pick
+    // vote is still missing after its retry is repeated in place WITHOUT
+    // spending a repair attempt, at most twice per phase; after that it counts
+    // as before. The counter is an event, so a restart cannot reset it.
+    for (;;) {
+      // The round number: the next one, unless the last round is INCOMPLETE (a
+      // conductor crash left it with fewer lane records than it has lanes) —
+      // then the round is re-run under its own number, and ROUND_STARTED
+      // replaces the partial record rather than leaving it as a stale round.
+      const rounds = this.#state.phase.rounds ?? [];
+      const last = rounds[rounds.length - 1];
+      const round = last !== undefined && last.candidates.length < lanes.length ? last.round : (last?.round ?? 0) + 1;
+      const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+      // 02k: a repeat of a round that failed only for a missing review or vote
+      // restarts each lane that passed its checks from its own candidate.
+      const passingBases = last && last.round === round - 1 ? repeatLaneBases(last) : undefined;
+      // Plan 06k3 (A2): a lane that produced no passing candidate starts from
+      // its own saved unsubmitted work (never discarded at its deadline).
+      const saved = this.#savedLaneWork();
+      const prevCandidate = new Map((last?.candidates ?? []).map((c) => [c.lane, c.sha]));
+      const mergedLaneBases: Record<string, string> = {};
+      const usedSaved: Array<{ lane: string; ref: string; sha: string }> = [];
+      for (const lane of lanes) {
+        const passing = passingBases?.[lane];
+        if (passing) {
+          mergedLaneBases[lane] = passing;
+          continue;
+        }
+        // Plan 06k3 (A2, finding A-2): only a lane that produced NO candidate
+        // in the previous round starts from its saved work. A lane that did
+        // produce one starts from the round's own base (the winner / phase
+        // candidate), never from an older saved ref.
+        if (last && prevCandidate.get(lane)) continue;
+        const work = saved.get(lane);
+        if (work) {
+          mergedLaneBases[lane] = work.sha;
+          usedSaved.push({ lane, ref: work.ref, sha: work.sha });
+        }
+      }
+      this.#laneSavedWorkForRound = usedSaved;
+      const laneBases = Object.keys(mergedLaneBases).length > 0 ? mergedLaneBases : undefined;
+      if (!loggedIntent) {
+        this.#log.intent(actionId, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
+        loggedIntent = true;
+      }
+      const host: LaneHost = {
+        phaseId: this.#state.phase.phaseId,
+        goal: this.#state.phase.contract.goal,
+        seats: this.#laneSeats(),
+        leader: this.#laneLeader(),
+        rounds: () => this.#state.phase.rounds ?? [],
+        ledger: () => this.#laneLedgerLines(),
+        earlierRounds: () => this.#laneEarlierRoundLines(round),
+        createWorktree: (lane, at) => {
+          const worktree = this.#laneWorktree(lane);
+          if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+          createWorktree(this.#plan.repo, worktree, at);
+          return worktree;
+        },
+        lanePrompt: (r, at) => this.#laneWorkerPrompt(r, at),
+        buildLane: async (lane, r, at, prompt) => {
+          const built = await this.#buildLane(lane, r, at, prompt);
+          // Kept for the lane review prompts, which need the lane's own
+          // disclosures before the winner's hand-off assembles them.
+          this.#laneBuilds.set(`${r}-${lane}`, built);
+          return built;
+        },
+        checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
+        reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
+        pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
+        emit: (event) => this.#applyEvent(event),
+      };
+      const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
+      this.#log.completion(actionId, {
+        round,
+        base,
+        lanes,
+        ...(outcome.winner ? { winner: outcome.winner } : {}),
+        ...(outcome.failure ? { failure: outcome.failure } : {}),
+        ...(outcome.missingVotes ? { missingVotes: outcome.missingVotes } : {}),
+        candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
+      });
+      if (outcome.missingVotes) this.#log.append("pick_votes_missing", { round, seats: outcome.missingVotes, winner: outcome.winner?.lane });
+      if (!outcome.winner) {
+        // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
+        // the phase is already CHECKING and the checks are re-running, so this
+        // stopped round must not emit an attempt-failure event.
+        if (this.#recheckCancelledLaneRound) {
+          this.#recheckCancelledLaneRound = false;
+          this.#clearLaneRound(round);
+          return;
+        }
+        // Plan 06k3 (A1): a round that could not complete (a missing review or
+        // pick vote after its retry) is repeated in place without spending a
+        // repair attempt, at most twice per phase.
+        if (outcome.failure && (this.#state.phase.roundRepeatsUsed ?? 0) < MAX_ROUND_REPEATS) {
+          this.#log.append("round_repeated", { round, reason: outcome.failure, repeatsUsed: this.#state.phase.roundRepeatsUsed ?? 0 });
+          this.#applyEvent({ type: "ROUND_REPEATED", round, reason: outcome.failure });
+          this.#clearLaneRound(round);
+          continue;
+        }
+        // No candidate passed, OR the round could not complete (a missing
+        // review or pick vote — `runRound` refuses to pick an incomplete
+        // round). Either way the round repeats from the same base, and the
+        // repeat costs ONE repair attempt (a round is one attempt, whatever K
+        // is). ATTEMPT_NO_SUBMISSION is the ordinary "this attempt produced no
+        // acceptable candidate" event; REPAIRING then starts the next round.
+        if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
+        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+        this.#clearLaneRound(round);
+        return;
+      }
+      if (this.#recheckCancelledLaneRound) {
+        // Defensive: the recheck stopped the round but a winner still emerged
+        // (a lane submitted just before termination). Do not hand it off.
+        this.#recheckCancelledLaneRound = false;
+        this.#clearLaneRound(round);
+        return;
+      }
+      const build = outcome.builds.find((b) => b.lane === outcome.winner!.lane);
+      await this.#handOffLaneWinner(round, outcome.winner, build);
+      this.#clearLaneRound(round);
+      return;
+    }
+  }
+
+  /** Drops one round's per-lane scratch state (its builds, discoveries and
+   * barrier) once the round is over, so a long run does not accumulate them. */
+  #clearLaneRound(round: number): void {
+    for (const lane of this.#lanes()) {
+      this.#laneBuilds.delete(`${round}-${lane}`);
+      this.#laneDiscoveries.delete(`${round}-${lane}`);
+      this.#laneDiscoveryPlans.delete(`${round}-${lane}`);
+      this.#laneBarriers.delete(`${round}-${lane}`);
+      this.#laneTriggers.delete(`${round}-${lane}`);
+      this.#laneTriggerPaths.delete(`${round}-${lane}`);
+    }
+    this.#lanePromptDeliveredNoteCount.delete(round);
+  }
+
+  /** Hands the round's winner to the single-candidate pipeline: the winner
+   * becomes the phase's candidate, with the checks and reviews it already
+   * earned — the checks are NOT re-run and the reviews are NOT re-taken. The
+   * probe then runs for real (next()'s PROBING), and the winner's reviews are
+   * promoted into the phase's review slots as soon as the phase reaches
+   * REVIEWING. */
+  async #handOffLaneWinner(
+    round: number,
+    winner: { lane: string; sha: string; votes: number },
+    build: LaneBuild | undefined,
+  ): Promise<void> {
+    const roundRecord = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+    const candidate = roundRecord?.candidates.find((c) => c.lane === winner.lane);
+    const reviews = candidate?.reviews ?? [];
+    // The worktree the phase's own worker would have used is set to the
+    // winner, so every later stage that reads `paths.worktree` sees the
+    // winner's tree (a repair round's lanes are created fresh from its sha).
+    try {
+      if (fs.existsSync(this.#paths.worktree)) removeWorktree(this.#plan.repo, this.#paths.worktree);
+      createWorktree(this.#plan.repo, this.#paths.worktree, winner.sha);
+    } catch (err) {
+      this.#log.append("error", { where: "lane_winner_worktree", error: String((err as Error)?.message ?? err) });
+    }
+    fs.writeFileSync(path.join(this.#runDir, "candidate-sha.txt"), winner.sha);
+    this.#pendingLaneWinner = {
+      round,
+      lane: winner.lane,
+      sha: winner.sha,
+      build: build ?? { lane: winner.lane, sha: winner.sha },
+      reviews,
+    };
+    let assembled: Decision[] = [];
+    this.#driveSuspended = true;
+    try {
+      // The winner's own submit_phase payload, replayed as the phase's own
+      // (its disclosures are the ones the winner's worker made).
+      this.#applyEvent({
+        type: "SUBMIT_PHASE",
+        disclosures: build?.disclosures ?? [],
+        ...(build?.answers ? { findingAnswers: build.answers } : {}),
+        ...(build?.prior ? { prior: build.prior } : {}),
+        ...(build?.dispute ? { dispute: build.dispute } : {}),
+      });
+      assembled = this.#assembleDecisions(winner.sha);
+      this.#applyEvent({
+        type: "FREEZE_COMPLETED",
+        candidateSha: winner.sha,
+        decisions: assembled,
+        // The winner's own lane sweep, never a hard-coded false.
+        tainted: build?.tainted === true,
+      });
+      // Plan 06g2: the winner lane's turn-1 discoveries become the phase's own
+      // records, bound to the winner. The reviews' ballots name the ids the
+      // lane's turn-2 prompt listed (the lane's worker decisions and these
+      // discoveries), so the ids must match exactly — and they do, because
+      // `#lanePhase` and `#applyDiscoveries` derive them the same way (worker
+      // decisions first, then M, A and B in seat order).
+      const plan = this.#laneDiscoveryPlan(round, winner.lane, winner.sha);
+      for (const seat of this.#laneSeats()) {
+        const entries = plan.filter((e) => e.seat === seat);
+        if (entries.length === 0) continue;
+        const err = this.#applyDiscoveries(
+          entries.map((e) => e.disclosure),
+          seat as Reviewer,
+          { firstIndex: entries[0].index },
+        );
+        if (err) this.#log.append("error", { where: "lane_winner_discoveries", seat, error: err });
+      }
+      // The winner's checks already ran (under the machine-wide lock); its
+      // record is applied, never re-run.
+      this.#applyEvent({ type: "CHECKS_PASSED" });
+      if (this.#itemsEnforced()) {
+        const output = this.#laneCheckOutputs.get(winner.sha) ?? "";
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolveTestVerifies(this.#planItems(), output) });
+        this.#applyTestVerifyFindings(winner.sha);
+        if (build?.coverage) {
+          this.#applyEvent({
+            type: "ITEM_STATE_UPDATED",
+            coverage: build.coverage as Coverage,
+            coverageAttempt: this.#state.phase.attempt.n,
+          });
+        }
+      }
+    } finally {
+      this.#driveSuspended = false;
+    }
+    // The same bookkeeping #runFreeze does once a candidate exists: carry the
+    // messages, raise each decision as a trade-off, note the coverage, sample
+    // the boundary data.
+    this.#carryMessages(winner.sha);
+    for (const decision of assembled) {
+      this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), winner.sha);
+    }
+    if (this.#itemsEnforced() && build?.coverage) this.#applyCoverageNotes(build.coverage as Coverage, winner.sha);
+    this.#recordBoundaryDataAndSample(winner.sha, { lane: { round, lane: winner.lane } });
+    this.drive();
+  }
+
+  /** Promotes the round winner's recorded reviews into the phase's review
+   * slots, once the phase has reached REVIEWING (the only state a
+   * REVIEW_SUBMITTED row accepts). Called by `#runProbe` right after
+   * PROBE_PASSED, with `drive()` suspended, so `next()` never dispatches a
+   * second review for a seat the round already reviewed. */
+  async #promoteLaneWinnerReviews(sha: string): Promise<void> {
+    const pending = this.#pendingLaneWinner;
+    if (!pending || pending.sha !== sha) return;
+    this.#pendingLaneWinner = undefined;
+    // The caller has `drive()` suspended: the winner's findings/ballots, its
+    // three reviews and their statements all land before anything dispatches.
+    // The order is the single-candidate path's own (see `#onSubmitChecked`):
+    // findings/ballots first, then REVIEW_SUBMITTED (the third completes the
+    // round), then the finding statements.
+    for (const { review } of pending.reviews) {
+      let error: string | undefined;
+      try {
+        error = await this.#applyReviewFindingsAndBallots(review);
+      } catch (err) {
+        error = `threw: ${String((err as Error)?.message ?? err)}`;
+      }
+      if (error) this.#log.append("error", { where: "lane_winner_review", error });
+      this.#applyEvent({ type: "REVIEW_SUBMITTED", review, candidate: sha, promotedFrom: pending.round });
+      try {
+        this.#applyReviewFindingStatements(review);
+      } catch (err) {
+        this.#log.append("error", { where: "lane_winner_finding_statements", error: String((err as Error)?.message ?? err) });
+      }
+    }
+  }
+
+  async #runFreezeImpl(actionId: string): Promise<void> {
     this.#log.intent(actionId, { worktree: this.#paths.worktree });
     crashAt("before_freeze");
     const handle = this.#activeWorkerHandle;
@@ -5128,7 +9288,7 @@ export class Conductor {
       if (timedOut) return undefined;
 
       // step 2: sweep.
-      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       if (timedOut) return undefined;
       this.#log.append("sweep", sweepResult);
 
@@ -5181,7 +9341,7 @@ export class Conductor {
         await handle.agent.terminate().catch(() => undefined);
         this.#agents.delete(handle.agentId);
       }
-      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { exceptPids: [] });
+      const sweepResult: SweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
       this.#log.completion(actionId, { timedOut: true, tainted: true, reason: outcome });
       this.#applyEvent({ type: "FREEZE_TIMED_OUT" });
@@ -5200,6 +9360,9 @@ export class Conductor {
     // happened; the completion record has not.
     crashAt("after_freeze");
     this.#log.completion(actionId, { candidateSha: outcome.candidateSha, tainted: outcome.tainted });
+    // Plan 06b (OD-1 A2): FREEZE_COMPLETED resets the per-candidate item
+    // record, so capture this candidate's coverage before applying it.
+    const coverageAtFreeze = this.#state.phase.coverage;
     this.#applyEvent({
       type: "FREEZE_COMPLETED",
       candidateSha: outcome.candidateSha,
@@ -5216,6 +9379,10 @@ export class Conductor {
     for (const decision of outcome.decisions) {
       this.#raiseMessage("tradeoff", decision.id, this.#decisionContent(decision), outcome.candidateSha);
     }
+    // Plan 06b: every partial/not_done coverage entry and every deviating
+    // architecture item becomes a trade-off message, once the candidate
+    // exists for it to bind to.
+    if (this.#structured() && coverageAtFreeze) this.#applyCoverageNotes(coverageAtFreeze, outcome.candidateSha);
     // Work packet 2a: boundary triggers (design §3.3) and §3.5's sampling
     // data need a real candidate (for the diff, and for DECISION_ADDED's
     // own binding check) — only possible once FREEZE_COMPLETED above has
@@ -5241,6 +9408,7 @@ export class Conductor {
       // the link resolves inside the run directory (finding M-25).
       fs.writeFileSync(path.join(path.dirname(this.#paths.review), "glossary.org"), `* Owner glossary\n${renderGlossaryOrg()}\n`);
       this.#writeEntryViews(rendered.files);
+      this.#writeItemViews(rendered.itemFiles);
       this.#recordReviewLint(rendered.lint);
       this.#writeMessageViews();
     } catch (err) {
@@ -5253,6 +9421,35 @@ export class Conductor {
       this.#writeStatusView();
     } catch (err) {
       this.#logUnexpected("write_status_view", err);
+    }
+  }
+
+  /** Plan 06f (A2): keep this run's row in `<root>/live.json` current. The
+   * conductor is one of the file's two writers (the scheduler is the other);
+   * every write is atomic, and every other run's row and every waiting node
+   * another writer recorded is preserved. A stopped conductor removes its own
+   * row rather than leaving a stale `alive` entry behind. */
+  #writeLive(): void {
+    try {
+      const root = path.dirname(this.#runDir);
+      const id = path.basename(this.#runDir);
+      const needsOwner = this.#state.phase.phase === "AWAITING_OWNER";
+      // A closed run is neither alive nor waiting, so its row leaves. The one
+      // exception is a run still AWAITING_OWNER: the goal counts "waiting for
+      // the owner" as live even when its conductor has been stopped, so the
+      // mode line keeps showing it until the owner acts (M's veto of
+      // D-disc-M-24). Passing `id` explicitly is what makes the removal land.
+      if (this.#closed && !needsOwner) {
+        updateLiveRun(root, id, undefined);
+        return;
+      }
+      updateLiveRun(root, id, {
+        title: redactText(this.#plan.title, this.#secretMaskable),
+        phase: this.#state.phase.phase,
+        needsOwner,
+      });
+    } catch (err) {
+      this.#logUnexpected("write_live", err);
     }
   }
 
@@ -5329,6 +9526,19 @@ export class Conductor {
     }
   }
 
+  /** Plan 06b: one `views/items/<id>.org` per item, the evidence a matrix
+   * cell opens. */
+  #writeItemViews(files: Array<{ id: string; contents: string }>): void {
+    const ids = new Set(files.map((f) => f.id));
+    fs.mkdirSync(this.#paths.itemsView, { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(this.#paths.itemsView, `${f.id}.org`), f.contents);
+    for (const name of fs.readdirSync(this.#paths.itemsView)) {
+      if (name.endsWith(".org") && !ids.has(name.slice(0, -4))) {
+        fs.rmSync(path.join(this.#paths.itemsView, name), { force: true });
+      }
+    }
+  }
+
   /** Plan 05j: `REVIEW_LINT_FAILED` records a violation the view's first line
    * already names. One event per distinct violation, so a steady violation is
    * not logged on every render beat. */
@@ -5381,6 +9591,7 @@ export class Conductor {
         view,
         alive: !this.#closed,
         secrets: { missing: this.#missingSecrets, tooShort: this.#tooShortSecrets },
+        held: loggedHeld(this.#runDir),
       }),
     );
     fs.writeFileSync(this.#paths.status, redactText(text, this.#secretMaskable));
@@ -5388,6 +9599,9 @@ export class Conductor {
     // already built the metrics from this beat's one log snapshot, so writing
     // them here reuses it instead of parsing the whole log a second time.
     fs.writeFileSync(this.#paths.metrics, projectMetrics(view.metrics));
+    // Plan 06l (A5): the same beat keeps `views/seats.txt` current, from the
+    // same snapshot; `tt seats` prints these exact bytes.
+    fs.writeFileSync(this.#paths.seats, redactText(view.seatsTable, this.#secretMaskable));
     // Plan 03c: the same beat keeps the phase chart (`views/loop.txt`) current;
     // it is generated from TRANSITIONS, so it can never drift from the loop.
     const stats = statsFromTimeline(view.timeline, new Date());
@@ -5408,7 +9622,14 @@ export class Conductor {
       reviewerSeats: { M: modelFor("reviewer", "M"), A: modelFor("reviewer", "A"), B: modelFor("reviewer", "B") },
       panelSeats: { "1": modelFor("panel", 1), "2": modelFor("panel", 2), "3": modelFor("panel", 3) },
     };
-    fs.writeFileSync(this.#paths.loop, redactText(renderPhaseChart(undefined, { stats, models }), this.#secretMaskable));
+    // Plan 06g (A5): the chart names the round's lanes and its pick when the
+    // phase has any (a plan without `#+TT_WORKERS` passes none, and the
+    // chart is byte-identical to before).
+    const roundLines = lanesView(this.#state.phase);
+    fs.writeFileSync(
+      this.#paths.loop,
+      redactText(renderPhaseChart(undefined, { stats, models, seats: this.#laneSeats(), ...(roundLines.length > 0 ? { roundLines } : {}) }), this.#secretMaskable),
+    );
     // Plan 05h: the same beat keeps the loop tape (`views/tape.txt`) current.
     // `buildView` already built it from this beat's one log snapshot, so it
     // is written here rather than rebuilt; its durations end at the log's own
@@ -5600,6 +9821,80 @@ export class Conductor {
     );
   }
 
+  /** Plan 06c: write `checks/<sha>/record.json` — the candidate's check
+   * record, naming its tier, the commands it ran, the final command when
+   * there was one, and the machine's load at the run. A `final` run
+   * overwrites the candidate's `round` record, so the accepted candidate's
+   * record is the one that ran the final check. */
+  #writeCheckRecord(outDir: string, record: CheckRecord): void {
+    try {
+      // The commands ran with plan secrets resolved; on disk they keep the
+      // mask every other run file keeps.
+      const masked: CheckRecord = {
+        ...record,
+        commands: record.commands.map((c) => ({ ...c, command: redactText(c.command, this.#secretMaskable) })),
+        finalCommands: record.finalCommands.map((c) => redactText(c, this.#secretMaskable)),
+      };
+      fs.writeFileSync(path.join(outDir, "record.json"), `${JSON.stringify(masked, null, 2)}\n`);
+    } catch (err) {
+      this.#log.append("error", { where: "check_record", error: String((err as Error)?.message ?? err) });
+    }
+  }
+
+  /** Plan 06c (A3): the passing check record a parent node's accepted
+   * candidate left for exactly this base commit, if one exists. The child
+   * node's base IS that candidate, so its checks already passed there; the
+   * record is adopted as the child's baseline and nothing runs. The program's
+   * own event log names every sibling run, so this never needs a path the
+   * scheduler did not record. */
+  #candidateRecordBaseline(commands: readonly string[], key: string): { record: Baseline; sourceDir: string } | undefined {
+    // Plan 06c (A3): the SCHEDULER chose this reuse when it started this node
+    // and recorded the parent's accepted candidate and run in the node's
+    // `program.json`. The conductor only consumes the given path; it never
+    // scans sibling runs to decide a baseline itself.
+    let reuse: { fromRunId?: unknown; fromCandidateSha?: unknown } | undefined;
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(this.#runDir, "program.json"), "utf8")) as {
+        baselineReuse?: { fromRunId?: unknown; fromCandidateSha?: unknown };
+      };
+      reuse = info.baselineReuse;
+    } catch {
+      return undefined;
+    }
+    if (!reuse || typeof reuse.fromRunId !== "string" || typeof reuse.fromCandidateSha !== "string") return undefined;
+    const baseSha = reuse.fromCandidateSha;
+    const dir = path.join(path.dirname(this.#runDir), reuse.fromRunId, "checks", baseSha);
+    let record: CheckRecord | undefined;
+    try {
+      record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(dir, "record.json"), "utf8")));
+    } catch {
+      record = undefined;
+    }
+    if (!record || !record.passed) return undefined;
+    // The record's final command (if any) is not part of the child's own
+    // check list; the phase's checks are.
+    const runCommands = record.commands.filter((c) => !record.finalCommands.includes(c.command));
+    if (runCommands.length !== commands.length) return undefined;
+    if (!runCommands.every((c, i) => c.command === this.#baselineCommandName(commands[i]))) return undefined;
+    const baseline: Baseline = {
+      baseSha,
+      tree: this.#baselineTree(),
+      key,
+      at: record.at,
+      commands: runCommands.map((c) => ({
+        command: c.command,
+        exitCode: c.exitCode,
+        signal: c.signal ?? null,
+        timedOut: c.timedOut,
+        durationMs: c.durationMs,
+        failures: [],
+        ...(c.log ? { log: c.log } : {}),
+      })),
+      failures: [],
+    };
+    return { record: baseline, sourceDir: dir };
+  }
+
   /** The log file name a check command's evidence gets under its gate's
    * directory — shared by `#recordCheck` and the baseline record, which names
    * the same file. */
@@ -5641,6 +9936,30 @@ export class Conductor {
     const cleanup = this.#state.phase.contract.gateCleanup;
     if (cleanup && cleanup.trim().length > 0) commands.push(this.#withValues(cleanup));
     return commands;
+  }
+
+  /** Plan 06c (R6): the tools the preflight did not find on this machine,
+   * named in every agent prompt so the worker reaches for an alternative
+   * instead of a tool the environment lacks. Resolved once per conductor
+   * (the PATH does not change under a running conductor). */
+  #agentToolLines(): string[] {
+    if (this.#agentToolsMissing === undefined) {
+      const names = ["timeout", "gtimeout", "rg", "jq", "docker", "cargo"];
+      this.#agentToolsMissing = names.filter((n) => this.#resolveExecutable(n) === undefined);
+    }
+    if (this.#agentToolsMissing.length === 0) return [];
+    return [
+      "",
+      `Tools the environment preflight did not find on this machine (use an available alternative): ${this.#agentToolsMissing.join(", ")}.`,
+    ];
+  }
+
+  /** Plan 06c (A5): every agent prompt names the tools the preflight did not
+   * find. `buildWorkerPrompt` takes them directly; every other prompt is
+   * wrapped here so no role is left uninformed. */
+  #agentPrompt(text: string): string {
+    const lines = this.#agentToolLines();
+    return lines.length > 0 ? `${text}\n${lines.join("\n")}` : text;
   }
 
   /** Resolve one executable in the conductor's own environment with
@@ -5758,7 +10077,8 @@ export class Conductor {
    * resolved), which is both what the baseline records and what the C gate
    * and the probe execute. */
   #resolvedEffectiveChecks(): string[] {
-    return effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks).map((c) => this.#withValues(c));
+    // Plan 06c (A1/C2): the round list comes from the one chooser too.
+    return checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, "round").map((c) => this.#withValues(c));
   }
 
   #baselineKey(commands: readonly string[]): string {
@@ -5897,6 +10217,9 @@ export class Conductor {
         return false;
       }
     }
+    // Plan 06c (A3): a base that IS a parent node's accepted candidate is
+    // adopted by `#ensureBaseline` (no command runs, BASELINE_COMPLETED is
+    // recorded with `reusedFrom`), so the stage still runs here.
     return true;
   }
 
@@ -5914,6 +10237,7 @@ export class Conductor {
     let outcome: "done" | "timeout";
     this.#baselineActionId = actionId;
     this.#baselineTimedOut = false;
+    this.#baselineReusedFrom = undefined;
     try {
       outcome = await Promise.race([this.#ensureBaseline().then(() => "done" as const), timer.promise]);
     } catch (err) {
@@ -5955,7 +10279,11 @@ export class Conductor {
     }
     crashAt("after_run_baseline");
     this.#log.completion(actionId, { outcome: outcome === "done" ? "completed" : "timed out" });
-    this.#applyEvent({ type: outcome === "done" ? "BASELINE_COMPLETED" : "BASELINE_TIMED_OUT" });
+    if (outcome === "done" && this.#baselineReusedFrom) {
+      this.#applyEvent({ type: "BASELINE_COMPLETED", reusedFrom: this.#baselineReusedFrom });
+    } else {
+      this.#applyEvent({ type: outcome === "done" ? "BASELINE_COMPLETED" : "BASELINE_TIMED_OUT" });
+    }
   }
 
   /** Plan 01e: run the phase's checks once on the base, at the start of the
@@ -5969,6 +10297,15 @@ export class Conductor {
     const key = this.#baselineKey(commands);
     const local = this.#readBaseline();
     if (local && this.#baselineCovers(local, key, commands)) return;
+
+    // Plan 06c (A3): a child node whose base is its parent's accepted
+    // candidate reuses that candidate's passing check record instead of
+    // running a baseline again.
+    const candidate = this.#candidateRecordBaseline(commands, key);
+    if (candidate) {
+      this.#adoptBaseline(candidate.record, candidate.sourceDir, "parent candidate", candidate.record.baseSha);
+      return;
+    }
 
     // A program node reuses a sibling's identical-base baseline before paying
     // for its own run (runtime doc §4: every node of atlas plan 13's base paid
@@ -6049,9 +10386,10 @@ export class Conductor {
   /** Reuses a record another run took: the record and its logs are copied into
    * this run's own `checks/base/`, so the run directory stays self-contained,
    * and the reuse is logged with where it came from. */
-  #adoptBaseline(record: Baseline, sourceDir: string, source: string): void {
+  #adoptBaseline(record: Baseline, sourceDir: string, source: string, reusedFrom?: string): void {
     this.#writeBaselineLocal(record, sourceDir);
-    this.#log.append("baseline", { ...record, reused: true, source });
+    this.#log.append("baseline", { ...record, reused: true, source, ...(reusedFrom ? { reusedFrom } : {}) });
+    if (reusedFrom) this.#baselineReusedFrom = reusedFrom;
   }
 
   /** Waits (bounded) for the node that holds the shared baseline lock to
@@ -6135,20 +10473,25 @@ export class Conductor {
         // command's deadline, exactly as a candidate's does.
         const deadlineAt = startedAt + this.#deadlines.checkMs;
         // Same isolation and per-command deadline as the C gate (F13).
+        // ODP-3: tracked live, so `stop()` signals the baseline's group too.
+        let baselinePgid: number | undefined;
         const running = runCommand({
           command,
           cwd: checkout.dir,
-          env: childEnv(),
+          env: this.#checkEnv(),
           deadlineMs: this.#deadlines.checkMs,
           termGraceMs: this.#deadlines.termGraceMs,
           // Plan 04a / advisory A-15: record the command's own process group
           // so a crash-recovery restart can kill the orphaned baseline run
           // instead of starting a second copy of the same heavy suite.
           onIntent: ({ pgid }) => {
+            baselinePgid = pgid;
+            this.#onStageShIntent(pgid);
             this.#log.intent(`baseline-sh-${this.#baselineActionId ?? "?"}-${pgid}`, { pgid });
           },
         });
         const result = await running.result;
+        if (baselinePgid !== undefined) this.#onStageShExit(baselinePgid);
         this.#recordCheck(outDir, command, result);
         // Plan 05i: 126/127 means the shell could not execute this command.
         // Abort the whole baseline (no record is written) rather than
@@ -6276,11 +10619,32 @@ export class Conductor {
   }
 
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
+    // Plan 06k1 (A4): every check run on the host — phase or final tier —
+    // holds the machine-wide check lock and the host-wide check window, so
+    // two runs' checks never overlap and every other run's workers pause
+    // while this one runs.
+    const lock = await acquireWaitingLock(this.#checkLockPath);
+    const window = openCheckWindow(this.#checkLockPath);
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
     const outDir = path.join(this.#paths.checks, candidateSha);
     fs.mkdirSync(outDir, { recursive: true });
+    // Plan 06c: `checkTier` decides which commands this candidate runs. From
+    // CHECKING the candidate has not been reviewed yet, so the tier is
+    // `round`; from FINAL_CHECKING it has passed review with no open blocker,
+    // so the tier is `final` and the phase's final check is appended.
+    // Plan 06j (A3): a recheck re-runs the SAME tier the failed run used,
+    // which the kept `checks.tier` records.
+    const tier = checkTier(this.#state.phase.contract, {
+      sha: candidateSha,
+      reviewed: this.#state.phase.phase === "FINAL_CHECKING" || this.#state.phase.checks?.tier === "final",
+      openBlocker: false,
+    });
+    const finalCommands = tier === "final" ? (this.#state.phase.contract.finalChecks ?? []).map((c) => this.#withValues(c)) : [];
+    const recordCommands: CheckRecordCommand[] = [];
+    const recordLoad1 = Math.round(loadavg()[0] * 100) / 100;
+    const recordFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
     try {
       const before = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
       let passed = before;
@@ -6291,6 +10655,9 @@ export class Conductor {
        * the owner) can see exactly what is new. Plan 05d narrows this to the
        * names that still fail when re-run alone. */
       let newFailures: string[] = [];
+      /** Plan 06b: the combined output of every check command, so each item's
+       * `test` verify is resolved against the check run by name. */
+      let combinedOutput = "";
       /** Plan 05d: every new failing test of the failing command, with its
        * `reproduces alone` / `load-only` label, for the repair prompt. */
       let checkFailures: CheckFailureClass[] = [];
@@ -6301,7 +10668,14 @@ export class Conductor {
         // F04: the effective list is the global plan checks followed by the
         // phase contract's own checks, deduped by exact command string — the
         // same list `#runProbe` executes against the merged integration I.
-        for (const rawCommand of effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+        // Plan 06c: the `final` tier appends the phase's final check, decided
+        // by `checkTier` above, never here.
+        for (const rawCommand of checkCommands(
+          this.#plan.checks,
+          this.#state.phase.contract.checks,
+          this.#state.phase.contract.finalChecks,
+          tier,
+        )) {
           // Plan 01a: a plan that pasted a value into its check line gets it
           // back here (the snapshot it may have been read from is masked).
           const command = this.#withValues(rawCommand);
@@ -6313,22 +10687,45 @@ export class Conductor {
           // Plan 05d: a re-run alone must finish inside this same per-command
           // deadline (design §8.1). `deadlineAt` is that deadline's wall time.
           const deadlineAt = startedAt + this.#deadlines.checkMs;
+          // ODP-3: the check's own process group, tracked live so `stop()`
+          // signals it like every other stage's.
+          let checkPgid: number | undefined;
           const running = runCommand({
             command,
             cwd: checkoutDir.dir,
             // F13: isolate the child from the Node test runner's own
             // recursion markers so a check that runs `node --test` actually
             // runs (and can fail) instead of silently skipping.
-            env: childEnv(),
+            env: this.#checkEnv(),
             deadlineMs: this.#deadlines.checkMs,
             termGraceMs: this.#deadlines.termGraceMs,
+            // Plan 06c: record the command's process group so a crash/stop
+            // during CHECKING can kill the orphan and re-run the check.
+            // ODP-3: it is also tracked live, so `stop()` signals it like any
+            // other stage's group.
+            onIntent: ({ pgid }) => {
+              checkPgid = pgid;
+              this.#onStageShIntent(pgid);
+              this.#log.intent(`check-sh-${actionId}-${pgid}`, { pgid });
+            },
           });
           const result = await running.result;
+          if (checkPgid !== undefined) this.#onStageShExit(checkPgid);
+          combinedOutput += `${result.output}\n`;
           // Plan 05d: the machine's load average at the failing run is part
           // of the flake evidence (findings #10, #31).
           const machineLoad = Math.round(loadavg()[0] * 100) / 100;
           if (result.timedOut) timedOut = true;
           this.#recordCheck(outDir, command, result);
+          recordCommands.push({
+            command,
+            exitCode: result.exitCode,
+            signal: result.signal,
+            timedOut: result.timedOut,
+            durationMs: Date.now() - startedAt,
+            passed: result.exitCode === 0 && !result.timedOut,
+            log: this.#checkLogName(command),
+          });
           // Plan 05i: 126/127 means the shell could not execute the command
           // (`command not found` / `not executable`). That is the machine, not
           // the code: stop the run in ENV_BLOCKED instead of recording a
@@ -6378,6 +10775,9 @@ export class Conductor {
                   failingExitCode: result.exitCode,
                   cwd: checkoutDir.dir,
                   deadlineAt,
+                  // Plan 06l (A4): ONE isolated re-run (a later pass must not
+                  // hide a test that failed alone).
+                  maxReruns: 1,
                 });
                 const loadOnly = classifications.filter((c) => c.loadOnly);
                 const real = classifications.filter((c) => c.reproducesAlone);
@@ -6444,32 +10844,93 @@ export class Conductor {
         ...(checkFailures.length > 0 ? { checkFailures } : {}),
         reason: !passed && timedOut ? "timeout" : undefined,
       });
-      this.#applyEvent(
-        passed
-          ? { type: "CHECKS_PASSED" }
-          : { type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) },
-      );
+      // Plan 06c: the record names the tier, the final command when there was
+      // one, and the machine's load at the run.
+      this.#writeCheckRecord(outDir, {
+        candidateSha,
+        ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
+        tier,
+        passed,
+        commands: recordCommands,
+        finalCommands,
+        load1: recordLoad1,
+        freeMemMB: recordFreeMemMB,
+        at: new Date().toISOString(),
+      });
+      // Plan 06b: resolve every item's `test` verify against the candidate's
+      // own (round) check run. A named test that is missing from or failed in
+      // the output is a blocking finding anchored to its item. The final
+      // check's run does not re-resolve them.
+      if (tier === "round" && this.#itemsEnforced()) {
+        const resolutions = resolveTestVerifies(this.#planItems(), combinedOutput);
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions, checkTestLines: testResultLines(combinedOutput) });
+        this.#applyTestVerifyFindings(candidateSha);
+      }
+      if (tier === "final") {
+        if (passed) {
+          this.#applyEvent({ type: "FINAL_CHECKS_PASSED", candidateSha });
+        } else {
+          const failing = recordCommands.filter((c) => !c.passed).map((c) => c.command);
+          const tail = combinedOutput.split("\n").filter((l) => l.trim().length > 0).slice(-20).join("\n");
+          // Keep the SAME rerun classification an ordinary check failure has
+          // (loadOnly, reproducesAlone, rerunExitCodes): a load-only flake is
+          // never relabelled a real regression, and the record says which
+          // reruns were actually performed. Only when the loop classified
+          // nothing (its output named no test) do we fall back to the names.
+          const failingExitCode = recordCommands.find((c) => !c.passed)?.exitCode ?? null;
+          const finalFailures: CheckFailureClass[] =
+            checkFailures.length > 0
+              ? checkFailures
+              : parseTestFailures(combinedOutput).map((name) => ({
+                  name,
+                  reproducesAlone: true,
+                  loadOnly: false,
+                  failingExitCode,
+                  rerunExitCodes: [],
+                }));
+          this.#applyEvent({
+            type: "FINAL_CHECKS_FAILED",
+            evidence: `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${tail ? `\n${tail}` : ""}`,
+            ...(finalFailures.length > 0 ? { failures: finalFailures } : {}),
+          });
+        }
+      } else if (passed) {
+        this.#applyEvent({ type: "CHECKS_PASSED" });
+      } else {
+        this.#applyEvent({ type: "CHECKS_FAILED", ...(checkFailures.length > 0 ? { failures: checkFailures } : {}) });
+        // Plan 06g (A4): a test that PASSED at this round's base (the previous
+        // candidate in a repair, the phase base in round 1) and fails now is a
+        // true regression — recorded so the reason is observable, and distinct
+        // from a persisting failure the base already had.
+        const regressions = this.#regressionTests();
+        if (regressions.length > 0) {
+          this.#log.append("round_regression", { candidateSha, round: this.#state.phase.round ?? 1, tests: regressions });
+        }
+      }
     } finally {
       checkoutDir.dispose();
+      window.release();
+      await lock.release();
     }
   }
 
   /** Plan 05d: re-run each newly failing test alone, inside the failing
-   * check's own deadline, and label it. Up to two re-runs per test (a test
-   * that passes on the first is not run again); a re-run that times out or
-   * finds no time left counts as `reproduces alone`, the strict direction. */
+   * check's own deadline, and label it. Plan 06l (A4): a candidate's new
+   * failure gets ONE isolated re-run (a base failure already got one); a
+   * re-run that times out or finds no time left counts as `reproduces alone`,
+   * the strict direction. */
   async #classifyNewFailures(params: {
     output: string;
     names: readonly string[];
     failingExitCode: number | null;
     cwd: string;
     deadlineAt: number;
-    /** Plan 05d: a base failure is re-run alone **once** (finding #25); a
-     * candidate's new failure up to twice. */
+    /** Plan 05d: a base failure is re-run alone **once** (finding #25);
+     * plan 06l (A4) gives a candidate's new failure one isolated re-run too. */
     maxReruns?: number;
   }): Promise<CheckFailureClass[]> {
     const plans = rerunCommandsFor(params.output, params.names, this.#plan.rerun);
-    const maxReruns = params.maxReruns ?? 2;
+    const maxReruns = params.maxReruns ?? 1;
     const out: CheckFailureClass[] = [];
     for (const plan of plans) {
       const reruns: TestRerunOutcome[] = [];
@@ -6480,7 +10941,7 @@ export class Conductor {
           const running = runCommand({
             command: plan.command,
             cwd: params.cwd,
-            env: childEnv(),
+            env: this.#checkEnv(),
             deadlineMs: budget,
             termGraceMs: this.#deadlines.termGraceMs,
           });
@@ -6532,7 +10993,8 @@ export class Conductor {
     const sameTree = treeOf(this.#plan.repo, result.I) === treeOf(this.#plan.repo, candidateSha);
     const reuse = this.#probeReuse && sameTree && checks?.candidateSha === candidateSha && checks.passed === true;
     if (reuse) this.#log.append("probe_checks_reused", { candidateSha, I: result.I, reason: "I has the candidate's tree; checks passed on the candidate" });
-    for (const rawCommand of reuse ? [] : effectiveChecks(this.#plan.checks, this.#state.phase.contract.checks)) {
+    // Plan 06c (A1/C2): the probe re-runs the round list from the one chooser.
+    for (const rawCommand of reuse ? [] : checkCommands(this.#plan.checks, this.#state.phase.contract.checks, this.#state.phase.contract.finalChecks, "round")) {
       const command = this.#withValues(rawCommand);
       // design §8.1: "integration probe (merge plus its checks) | as for
       // checks, per command | kill its group; discard the probe branch |
@@ -6543,7 +11005,7 @@ export class Conductor {
         command,
         cwd: result.checkoutDir,
         // F13: same test-runner-marker isolation as the C gate (see childEnv).
-        env: childEnv(),
+        env: this.#checkEnv(),
         deadlineMs: this.#deadlines.probeMs,
         termGraceMs: this.#deadlines.termGraceMs,
       });
@@ -6573,7 +11035,21 @@ export class Conductor {
       reason: timedOutCommand !== undefined ? "timeout" : undefined,
     });
     if (passed) {
-      this.#applyEvent({ type: "PROBE_PASSED", probedI: result.I });
+      // Plan 06b: grep the candidate for every architecture `:WHERE:` symbol
+      // before the reviewers are asked.
+      this.#applyArchitectureSymbols(candidateSha);
+      // Plan 06g2: PROBE_PASSED moves the phase to REVIEWING, where `next()`
+      // would dispatch all three reviews — but a lane round's winner was
+      // already reviewed. Both the move and the promotion happen with `drive()`
+      // suspended, so the phase never sits in REVIEWING without them.
+      this.#driveSuspended = true;
+      try {
+        this.#applyEvent({ type: "PROBE_PASSED", probedI: result.I });
+        await this.#promoteLaneWinnerReviews(candidateSha);
+      } finally {
+        this.#driveSuspended = false;
+      }
+      this.drive();
     } else if (timedOutCommand !== undefined) {
       this.#applyEvent({ type: "PROBE_FAILED", evidence: `timeout: integration probe command '${timedOutCommand}' timed out on probed integration ${result.I}` });
     } else {
@@ -6662,7 +11138,77 @@ export class Conductor {
    * values, so a gate command that needs a vendor key gets it from the
    * environment rather than from its own text (plan 01a's rule). */
   #gateEnv(): NodeJS.ProcessEnv {
-    return { ...childEnv(), ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])) };
+    return { ...this.#checkEnv(), ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])) };
+  }
+
+  /** Plan 06k1 (A6): the environment a check runs with — `childEnv()` plus the
+   * environment this run recorded at start. The recorded values win, so a
+   * resume from a shell that lost JAVA_HOME or PATH still checks with them. */
+  #checkEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...childEnv() };
+    for (const [name, value] of Object.entries(this.#recordedEnv)) {
+      if (value === null) delete env[name];
+      else env[name] = value;
+    }
+    return env;
+  }
+
+  /** Plan 06k1 (A6): record, once, the environment this run's checks need —
+   * `PATH` plus every variable the plan declares (`envVars`) or a check
+   * command references (`$NAME`/`${NAME}`). On a resume the recorded file is
+   * read back, so the resuming shell's own environment never changes a check.
+   * Written at start, before any check runs. */
+  #recordCheckEnv(): void {
+    const file = path.join(this.#runDir, "check-env.json");
+    if (fs.existsSync(file)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, string | null>;
+        if (parsed && typeof parsed === "object") {
+          // Plan 01a: a declared secret's value never lives in a file. An
+          // older record that holds one is read without it (the value comes
+          // from this process's environment, like every secret) and rewritten.
+          const secrets = Object.keys(parsed).filter((name) => this.#secretNames.includes(name));
+          for (const name of secrets) delete parsed[name];
+          this.#recordedEnv = parsed;
+          if (secrets.length > 0) {
+            try {
+              fs.writeFileSync(file, `${JSON.stringify(parsed, null, 2)}\n`);
+            } catch {
+              // a read-only run dir keeps the old file; memory is already clean
+            }
+          }
+          return;
+        }
+      } catch {
+        // fall through and re-record from this process's environment
+      }
+    }
+    const names = new Set<string>(["PATH", ...(this.#plan.envVars ?? [])]);
+    const commands = [
+      ...this.#plan.checks,
+      ...this.#plan.phases.flatMap((p) => [...p.checks, ...(p.finalChecks ?? []), ...(p.gate ? [p.gate] : [])]),
+    ];
+    for (const command of commands) {
+      for (const m of command.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) names.add(m[1]);
+    }
+    // Finding A-12: record a DECLARED name even when it was unset, as an
+    // explicit null, so a resume shell supplying it cannot change the check
+    // environment.
+    // Plan 01a: a declared secret is never recorded — its value would sit in
+    // a file under the run directory. A check that references it still gets
+    // it from this process's environment (`childEnv`), as before 06k1.
+    for (const name of this.#secretNames) names.delete(name);
+    const env: Record<string, string | null> = {};
+    for (const name of names) {
+      env[name] = process.env[name] ?? null;
+    }
+    this.#recordedEnv = env;
+    try {
+      fs.writeFileSync(file, `${JSON.stringify(env, null, 2)}\n`);
+    } catch {
+      // A read-only run dir must not stop the run; the in-memory copy still
+      // serves this process, and the next start re-records.
+    }
   }
 
   /** Plan 01f: the conductor's own gate. Takes the machine-wide gate lock
@@ -6821,6 +11367,8 @@ export class Conductor {
         } else {
           const startedAt = new Date().toISOString();
           const startedMs = Date.now();
+          // ODP-3: tracked live, so `stop()` signals the gate's group too.
+          let gatePgid: number | undefined;
           const running = runCommand({
             command,
             cwd: probed.checkoutDir,
@@ -6829,9 +11377,14 @@ export class Conductor {
             termGraceMs: this.#deadlines.termGraceMs,
             // Design §2.2: the command's process group is recorded before it
             // runs, so a crashed gate is recoverable (see `#reconcileOne`).
-            onIntent: ({ pgid }) => this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid }),
+            onIntent: ({ pgid }) => {
+              gatePgid = pgid;
+              this.#onStageShIntent(pgid);
+              this.#log.intent(`gate-sh-${actionId}-${pgid}`, { pgid });
+            },
           });
           const gateResult = await running.result;
+          if (gatePgid !== undefined) this.#onStageShExit(gatePgid);
           // Plan 05i: 126/127 is the shell failing to execute the command, not
           // the gate failing. Record it (the record carries the exit, and a
           // non-passing record is never reused) but block on the environment
@@ -6852,15 +11405,22 @@ export class Conductor {
           if (cleanupCommand) {
             cleanupStartedAt = new Date().toISOString();
             const cleanupStartedMs = Date.now();
+            // ODP-3: tracked live, so `stop()` signals the cleanup's group too.
+            let cleanupPgid: number | undefined;
             const cleanup = runCommand({
               command: cleanupCommand,
               cwd: probed.checkoutDir,
               env: this.#gateEnv(),
               deadlineMs: this.#deadlines.gateMs,
               termGraceMs: this.#deadlines.termGraceMs,
-              onIntent: ({ pgid }) => this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid }),
+              onIntent: ({ pgid }) => {
+                cleanupPgid = pgid;
+                this.#onStageShIntent(pgid);
+                this.#log.intent(`gate-cleanup-sh-${actionId}-${pgid}`, { pgid });
+              },
             });
             cleanupResult = await cleanup.result;
+            if (cleanupPgid !== undefined) this.#onStageShExit(cleanupPgid);
             cleanupMs = Date.now() - cleanupStartedMs;
           }
           const passed = !gateResult.timedOut && gateResult.exitCode === 0;
@@ -6983,6 +11543,15 @@ export class Conductor {
 
   async #runReview(actionId: string, reviewer: Reviewer): Promise<void> {
     const dispatchCandidate = this.#state.phase.candidate?.sha;
+    // Plan 06k3 (A3): re-run every open finding's reproduction command in this
+    // candidate (after the checks) and build the table every reviewer prompt
+    // shows. Computed once per candidate, before the first review dispatch.
+    if (dispatchCandidate) await this.#ensureReproductionTable(this.#state.phase, dispatchCandidate);
+    // Plan 06b (finding M-1): a fresh dispatch is a fresh review, so the
+    // files this seat read in an earlier round no longer count as "read in
+    // this review".
+    this.#reviewerReads.set(reviewer, new Set());
+    this.#reviewerCommands.set(reviewer, new Set());
     const agentId = `reviewer-${reviewer}-${actionId}`;
     const streamFile = path.join(this.#paths.stream, `${agentId}.jsonl`);
     const candidateDir = this.#candidateDir();
@@ -6993,7 +11562,7 @@ export class Conductor {
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
       // The extension waits this long for a command's result: the conductor's
       // per-command limit plus room for the kill and its report.
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       // Plan 01a: same secrets as the worker (a reviewer's reproduction
       // command or check run may need one) — names plus values, set last.
@@ -7072,6 +11641,30 @@ export class Conductor {
       onEvent: (event) => {
         this.#noteActivity(agentId, event);
         this.#trackRunTokens(agentId, event);
+        // Plan 06b: record the files this reviewer itself read, so a
+        // met/fits verdict can be required to cite one of them.
+        if ((event as { type?: string }).type === "tool_execution_start") {
+          const e = event as { toolName?: string; args?: unknown };
+          if (e.toolName === "read") {
+            const a = e.args as Record<string, unknown> | undefined;
+            const file = a?.path ?? a?.file ?? a?.file_path;
+            if (typeof file === "string" && file.trim().length > 0) {
+              const set = this.#reviewerReads.get(reviewer) ?? new Set<string>();
+              set.add(file.replace(/^\.\//, ""));
+              this.#reviewerReads.set(reviewer, set);
+            }
+          }
+          // A `sh` tool call is a command the reviewer ran (findings
+          // F-contract-12, disc-M-33).
+          if (e.toolName === "sh") {
+            const a = e.args as { command?: unknown } | undefined;
+            if (typeof a?.command === "string" && a.command.trim().length > 0) {
+              const set = this.#reviewerCommands.get(reviewer) ?? new Set<string>();
+              set.add(a.command.trim());
+              this.#reviewerCommands.set(reviewer, set);
+            }
+          }
+        }
         if ((event as { type?: string }).type === "agent_settled") settleWaiters.splice(0).forEach((f) => f());
       },
     });
@@ -7131,7 +11724,7 @@ export class Conductor {
 
       if (this.#stubReviews) {
         await agent.prompt(
-          buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives),
+          this.#agentPrompt(buildReviewerPrompt(this.#state.phase, reviewer, this.#secretNames, this.#state.phase.ownerDirectives)),
         );
         const outcome = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise]);
         reviewTimeout.cancel();
@@ -7153,9 +11746,11 @@ export class Conductor {
       // worker's disclosed decisions, open findings/corrections — ever get
       // sent, and only then is submit_review (with a real ballot per
       // votable decision) accepted at all (#onSubmit's own turn-order
-      // check). One shared `reviewMs` deadline covers both turns.
+      // check). One shared `reviewMs` deadline covers both turns; plan 06l's
+      // shorter turn-1 discovery deadline is the LANE review's per-stage
+      // deadline (#85), which this single-candidate flow does not have.
       const settled1 = nextSettle();
-      await agent.prompt(this.#buildReviewerTurn1Prompt(reviewer));
+      await agent.prompt(this.#agentPrompt(this.#buildReviewerTurn1Prompt(reviewer)));
       const turn1 = await Promise.race([discoveryPromise.then(() => "discovered" as const), reviewTimeout.promise, settled1]);
       if (turn1 !== "discovered") {
         reviewTimeout.cancel();
@@ -7200,8 +11795,25 @@ export class Conductor {
         return;
       }
       const settled2 = nextSettle();
-      await agent.prompt(this.#buildReviewerTurn2Prompt(reviewer, handle));
-      const turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled2]);
+      await agent.prompt(this.#agentPrompt(this.#buildReviewerTurn2Prompt(reviewer, handle)));
+      let turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled2]);
+      // Plan 06c (A2): the review stage owns this turn's outcome. A turn that
+      // settles WITHOUT submit_review is asked once more, naming the missing
+      // tool; only a second silent settle counts as the seat timing out, and
+      // a submission in the second turn counts like any other. The re-prompt
+      // shares the reviewer's one deadline.
+      if (turn2 === "settled") {
+        this.#log.append("review_reprompt", { reviewer, agentId, reason: "turn 2 settled without submit_review" });
+        const settled3 = nextSettle();
+        await agent.prompt(
+          this.#agentPrompt(
+            `You ended your review turn without calling submit_review. That tool is required to finish this review. ` +
+              `Call submit_review now with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, ` +
+              `findingStatements, items and arch, then end your turn.`,
+          ),
+        );
+        turn2 = await Promise.race([donePromise.then(() => "submitted" as const), reviewTimeout.promise, settled3]);
+      }
       reviewTimeout.cancel();
       if (turn2 === "submitted") {
         await agent.terminate();
@@ -7209,7 +11821,7 @@ export class Conductor {
         return;
       }
       await agent.terminate();
-      const why2 = turn2 === "settled" ? "settled without submit_review (turn 2)" : "timeout (turn 2: submit_review)";
+      const why2 = turn2 === "settled" ? "settled without submit_review (turn 2, after one re-prompt)" : "timeout (turn 2: submit_review)";
       this.#log.completion(actionId, { reviewer, ok: false, reason: why2 });
       this.#reviewTimedOut(reviewer, dispatchCandidate);
     } finally {
@@ -7245,7 +11857,7 @@ export class Conductor {
       ...this.#piEnvFor?.("curator", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -7308,7 +11920,7 @@ export class Conductor {
         this.#log.completion(actionId, { candidateSha, ok: false, reason: hello === "exited" ? "curator exited before hello" : "curator did not start" });
         return;
       }
-      await agent.prompt(this.#buildCuratorPrompt());
+      await agent.prompt(this.#agentPrompt(this.#buildCuratorPrompt()));
       const settled = nextSettle();
       // A cancelable deadline (never `raceTimeout`, whose timer survives the
       // race and keeps the process alive): the conductor's own `stop()`
@@ -7566,7 +12178,7 @@ export class Conductor {
       }
       const concern = concerns.find((c) => c.id === id);
       const opts = { allItems: concerns, files: concern?.files, planRefs: concern?.planRefs, noRecommendationReason: reason };
-      const request = phase.ownerRequests.find((r) => r.id === id);
+      const request = findOwnerRequest(phase, id);
       if (request) {
         briefs.push({ ...fallbackBrief(request, { catalogs, ...opts }), candidateSha: C });
         this.#briefBackstopEpisode.set(`${C}::${id}`, this.#awaitingEpisode);
@@ -7602,7 +12214,7 @@ export class Conductor {
       ...this.#piEnvFor?.("evaluator", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -7689,7 +12301,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_brief for each item listed.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildBriefPrompt(ids));
+      await agent.prompt(this.#agentPrompt(this.#buildBriefPrompt(ids)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         briefTimeout.promise,
@@ -7752,7 +12364,7 @@ export class Conductor {
     ];
     const concerns = this.#briefConcerns();
     for (const id of ids) {
-      const request = phase.ownerRequests.find((r) => r.id === id);
+      const request = findOwnerRequest(phase, id);
       const decision = !request ? this.#liveReservedDecisions(phase).find((d) => d.id === id) : undefined;
       const entry = !request && !decision ? this.#ownerMarkedEntries(phase).find((e) => e.id === id) : undefined;
       const others = concerns.find((c) => c.id === id);
@@ -7787,7 +12399,7 @@ export class Conductor {
       ...this.#piEnvFor?.("evaluator", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -7887,7 +12499,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_evaluation.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildEvaluatorPrompt(messageType));
+      await agent.prompt(this.#agentPrompt(this.#buildEvaluatorPrompt(messageType)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         evaluatorTimeout.promise,
@@ -7931,6 +12543,8 @@ export class Conductor {
       "",
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
+      // Plan 06i (A3): the golden note a `contract` classification must cite.
+      ...(phase.contract.golden ? ["", "Golden note (the current source a choice must be re-checked against; a `contract` classification must cite it):", phase.contract.golden] : []),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
       ...ledgerPromptLines(phase.messages),
@@ -7955,6 +12569,50 @@ export class Conductor {
         `Owner-refused ${messageType} messages (report whether this candidate addressed each):`,
         ...refused.map((m) => `- ${m.id} "${m.title}" — refused: ${m.settlement?.reason ?? "no reason given"}`),
       );
+    }
+    // Plan 06b (OD-1 R3b): a majority unmet/deviates item needs the
+    // evaluator's substantive re-check against the candidate before it
+    // blocks. The check is recorded with what was checked.
+    const owedIds = this.#owedItemCheckIds("finding");
+    const reverifyItems = itemsNeedingEvaluatorReverify(phase)
+      ? phaseItemOutcomes(phase).filter((o) => owedIds.includes(o.item.id))
+      : [];
+    if (reverifyItems.length > 0) {
+      lines.push(
+        "",
+        "Plan-item re-check: each item below owes an evaluator check. Re-check it against the candidate's code and record exactly what you checked:",
+        ...reverifyItems.map(
+          (o) =>
+            `- ${o.item.id} ${o.item.title}: ${o.outcome}${o.outcome === "met" || o.outcome === "fits" ? " (thin unanimous evidence — audit it)" : " (a majority judged it unmet or deviating)"}; seats: ${o.evidence.join(" | ")}`,
+        ),
+        "Add one `itemChecks[]` entry = { id, verdict: confirmed|contradicted, evidence } for each item above. `evidence` must cite a file:line in the candidate. Use `contradicted` only when the candidate's code proves the verdict wrong; otherwise `confirmed`.",
+      );
+    }
+    // Plan 06i: every finding and discovered decision gets an impact class
+    // through the SAME item-check form. `wrong-output` is a wrong value,
+    // offer or output on a reachable path; `contract` contradicts the golden
+    // source or the plan; `judgement` is style, hardening or ergonomics.
+    // A finding is classified on the `finding` pass; a discovered decision is
+    // published as a `tradeoff` message, so it is classified on that pass
+    // (finding M-7: the prompt must run for decisions too).
+    {
+      const rows =
+        messageType === "finding"
+          ? openFindings(phase).map((f) => `- ${f.id} (finding, raised ${f.raisedBy}, severity ${f.severity}): ${f.evidence}`)
+          : messageType === "tradeoff"
+            ? discoveredDecisions(phase).map((d) => `- ${d.id} (discovered decision): ${d.choice} — ${d.whyItMatters}`)
+            : [];
+      if (rows.length > 0) {
+        lines.push(
+          "",
+          "Plan 06i triage: classify each finding and discovered decision below. Add one `itemChecks[]` entry = { id, verdict: confirmed, impact, evidence } for each. `impact` is one of:",
+          "- wrong-output: a wrong value, offer or output on a reachable path (it MUST be fixed);",
+          "- contract: it contradicts the current golden source or the plan (a drafting decision is no exemption);",
+          "- judgement: style, hardening or ergonomics only (a trade-off).",
+          "For a `judgement` impact also give `chosen`, `alternative` and `why`; without all three the record escalates to the owner. Do not omit the impact: a record you leave unclassified escalates.",
+          ...rows,
+        );
+      }
     }
     lines.push(
       "",
@@ -8013,7 +12671,7 @@ export class Conductor {
       ...this.#piEnvFor?.("panel", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -8110,7 +12768,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_panel_vote.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildPanelPrompt(blockerId, seat));
+      await agent.prompt(this.#agentPrompt(this.#buildPanelPrompt(blockerId, seat)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         seatTimeout.promise,
@@ -8211,7 +12869,7 @@ export class Conductor {
       ...this.#piEnvFor?.("panel", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -8303,7 +12961,7 @@ export class Conductor {
         "Owner (conductor): no progress for a while. Finish now and call submit_round_panel_votes.",
       );
       const settled = nextSettle();
-      await agent.prompt(this.#buildRoundPanelPrompt(seat));
+      await agent.prompt(this.#agentPrompt(this.#buildRoundPanelPrompt(seat)));
       const outcome = await Promise.race([
         donePromise.then(() => "submitted" as const),
         seatTimeout.promise,
@@ -8383,15 +13041,16 @@ export class Conductor {
   #decideRoundPanel(): void {
     const phase = this.#state.phase;
     const round = phase.panel?.round;
-    if (!round || round.decided || !roundPanelSeatsSettled(round)) return;
+    const panelCount = this.#laneSeats().length;
+    if (!round || round.decided || !roundPanelSeatsSettled(round, panelCount)) return;
     const items = roundPanelItemsNeedingVote(phase);
     if (items.length === 0) return;
     const decisions = items.map((messageId) => {
       const m = (phase.messages ?? []).find((x) => x.id === messageId)!;
       const kind = m.type === "finding" ? "finding" : "tradeoff";
-      const outcome = roundPanelOutcomeFor(round, messageId, kind);
-      const reasons = ["1", "2", "3"]
-        .map((n) => ({ n, vote: round.seats?.[n]?.votes?.find((v) => v.messageId === messageId) }))
+      const outcome = roundPanelOutcomeFor(round, messageId, kind, panelCount);
+      const reasons = panelSeatNumbers(panelCount)
+        .map((n) => ({ n: String(n), vote: round.seats?.[String(n)]?.votes?.find((v) => v.messageId === messageId) }))
         .filter((x): x is { n: string; vote: NonNullable<typeof x.vote> } => x.vote !== undefined)
         .map((x) => `seat ${x.n}: ${x.vote.reason}`);
       return { messageId, outcome, reason: reasons.join("; ") };
@@ -8448,7 +13107,7 @@ export class Conductor {
   #barrierComplete(candidate: string): boolean {
     const b = this.#barrierFor(candidate);
     const phase = this.#state.phase;
-    return (["M", "A", "B"] as const).every((w) => b.arrived.has(w) || phase.reviews[w]?.review?.candidateSha === candidate);
+    return seatsOf(phase.contract).every((w) => b.arrived.has(w) || phase.reviews[w]?.review?.candidateSha === candidate);
   }
 
   #arriveAtDiscoveryBarrier(reviewer: Reviewer, candidate: string): void {
@@ -8483,8 +13142,9 @@ export class Conductor {
    * review EXCEPT the worker's own disclosure (`source === "worker"`) — a
    * reviewer must discover its own choices from the diff before ever seeing
    * what the worker disclosed. */
-  #buildReviewerTurn1Prompt(reviewer: Reviewer): string {
-    const phase = this.#state.phase;
+  #buildReviewerTurn1Prompt(reviewer: Reviewer, phaseOverride?: PhaseState, candidateDirOverride?: string): string {
+    const phase = phaseOverride ?? this.#state.phase;
+    const candidateDir = candidateDirOverride ?? this.#candidateDir();
     let diff = "(diff unavailable)";
     try {
       diff = diffText(this.#plan.repo, phase.integrationHead, phase.candidate!.sha);
@@ -8497,7 +13157,8 @@ export class Conductor {
       "Acceptance criteria:",
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
-      `Candidate checkout (read-only): ${this.#candidateDir()}`,
+      ...goldenPromptLines(phase.contract.golden),
+      `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
@@ -8520,6 +13181,9 @@ export class Conductor {
       // mask still tells the reviewer that this file holds a secret.
       redactText(diff, this.#secretMaskable),
       "```",
+      // Plan 06k3 (A3): the finding answers and reproduction re-runs reach
+      // every reviewer prompt, turn 1 included.
+      ...(this.#reproductionTableLines.get(phase.candidate?.sha ?? "") ?? []),
       "Call submit_discovery with at most 5 choices that change behaviour, interfaces, guarantees or cost where the plan left room. Each choice is one plain sentence of at most 20 words. Do not list implementation details (helper structure, naming, file layout) and do not give review advice here — correctness problems are findings, which you raise in turn 2. An empty list is fine.",
     ].join("\n");
   }
@@ -8527,8 +13191,16 @@ export class Conductor {
   /** Turn 2 (design §6.1): every live record on this candidate (the worker's
    * disclosures, all reviewers' discoveries after the discovery barrier, and
    * triggers), open findings and open corrections. */
-  #buildReviewerTurn2Prompt(reviewer: Reviewer, handle?: AgentHandle): string {
-    const phase = this.#state.phase;
+  #buildReviewerTurn2Prompt(
+    reviewer: Reviewer,
+    handle?: AgentHandle,
+    /** Plan 06g2: the lane's own phase (its candidate, its decisions, its
+     * coverage) when this is a lane review; the phase's own state otherwise. */
+    phaseOverride?: PhaseState,
+    candidateDirOverride?: string,
+  ): string {
+    const phase = phaseOverride ?? this.#state.phase;
+    const candidateDir = candidateDirOverride ?? this.#candidateDir();
     const C = phase.candidate?.sha ?? "";
     const K = phase.contract.contractVersion;
     const live = phase.decisions.filter((d) => isLiveDecision(d) && d.boundCandidateSha === C);
@@ -8549,6 +13221,10 @@ export class Conductor {
             (d) =>
               (d.class === "delegated" || d.class === "reserved") &&
               !carriedIds.has(d.id) &&
+              // Plan 06k1 (A2, finding A-3): a decision the owner ruled is
+              // settled without ballots, so the live demand must not ask for
+              // one — the same fact `decisionSettled` reads.
+              !ownerRuledDecision(phase, d) &&
               (!d.amendment || d.amendment.status === "proposed"),
           )
           .map((d) => [d.id, d.choice]),
@@ -8574,7 +13250,9 @@ export class Conductor {
     const openCorrections = phase.corrections.filter((c) => c.status === "open");
     const lines = [
       `Turn 2 of 2 for candidate ${C.slice(0, 7)} (contract snapshot ${K.snapshot}). All three reviewers finished turn 1; this is the complete list of records on this candidate.`,
+      `Candidate checkout (read-only): ${candidateDir}`,
       ...secretPromptLines(this.#secretNames),
+      ...goldenPromptLines(phase.contract.golden),
       // Plan 01f: reviewers are told the conductor produces the gate's
       // evidence and shown the record when one exists (the failed gate that
       // sent the phase into this repair round, or a record reused for this
@@ -8590,6 +13268,16 @@ export class Conductor {
       // Plan 05d: the candidate's own failing tests, each re-run alone, so a
       // reviewer never calls a real regression a flake or a flake a defect.
       ...checkFailurePromptLines(phase),
+      // Plan 06b: the same checklist the worker saw, the worker's coverage,
+      // the check resolution, and the verdicts this review must carry.
+      ...(this.#structured()
+        ? [
+            ...checklistLines(this.#planItems()),
+            ...coverageLines(phase.coverage, this.#planItems()),
+            ...checkResolutionLines(phase.checkResolution ?? []),
+            ...reviewRequestLines(this.#planItems()),
+          ]
+        : []),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
@@ -8604,6 +13292,9 @@ export class Conductor {
         ...openFindings.map((f) => `- ${f.id} [${f.severity} ${f.kind}, raised by ${f.raisedBy}]: ${f.evidence}`),
       );
     }
+    // Plan 06k3 (A3): the worker's answer to each open blocking finding and
+    // the conductor's re-run of its reproduction command on this candidate.
+    lines.push(...(this.#reproductionTableLines.get(C) ?? []));
     // Plan 05e (4): every earlier round's open finding/blocker message, so
     // each reviewer marks each `resolved` or `open` with evidence; a 2-of-3
     // `resolved` majority moves it out of the owner's live view.
@@ -8759,15 +13450,6 @@ function parseAnchor(raw: unknown): { path: string; lines: [number, number] } | 
   return { path: a.path.trim(), lines: [start as number, end as number] };
 }
 
-/** Plan 04a: a published message title is at most 80 characters. */
-function clampMessageTitle(title: string): string {
-  const t = title.replace(/\s+/g, " ").trim();
-  return t.length > 80 ? `${t.slice(0, 79)}…` : t;
-}
-
-/** The 80-character cap a published title must fit. */
-export const MESSAGE_TITLE_MAX = 80;
-
 /** Plan 05c: why an evaluator's title is not one complete line, or undefined
  * when it is. A title is refused when it is longer than the cap, ends with
  * the ellipsis a cut leaves (`…' or `...'), or ends mid-word — the last case
@@ -8843,6 +13525,7 @@ interface SubmitPhaseArgs {
   decisions?: DecisionDisclosure[];
   priorDecisions?: PriorDecisionStatement[];
   criterionDispute?: CriterionDispute;
+  findingAnswers?: FindingAnswer[];
   assumptions?: string[];
   deviations?: string[];
 }
@@ -8875,12 +13558,7 @@ function sleepMs(ms: number): Promise<void> {
  * one. A recycled pid can only make a stale lock look live for one bounded
  * wait, never wedge a run. */
 function pidRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return processAlive(pid);
 }
 
 function cancelableTimeout<T>(ms: number, value: T): { promise: Promise<T>; cancel: () => void } {
@@ -8948,6 +13626,19 @@ export function allocateDirectiveId(
 export type WithdrawInput =
   | { kind: "withdraw"; id: string }
   | { kind: "malformed"; reason: string };
+
+/** Plan 06m (A2): the target label a live agent is steered under. A lane
+ * worker is named by its lane (`worker-a`, `worker-b`, …); a single-candidate
+ * worker keeps the historical `worker` label; a reviewer is its seat letter.
+ * The ONE place that decides a label, so the conductor's deliveries, the
+ * recorded OWNER_INPUT_RECORDED and the status view never disagree. */
+export function workerTarget(role: string, agentId: string): string {
+  if (role === "worker") {
+    const lane = agentId.match(/^lane-\d+-([a-z])-/)?.[1];
+    return lane ? `worker-${lane}` : "worker";
+  }
+  return agentId.match(/^reviewer-([A-Za-z0-9_]+)-/)?.[1] ?? agentId;
+}
 
 export function parseWithdrawInput(text: string): WithdrawInput | undefined {
   const t = text.trim();
@@ -9160,6 +13851,19 @@ export function referenceLines(references: string[]): string[] {
   ];
 }
 
+/** Plan 06k2 (A5): the golden-source section every worker, reviewer and
+ * evaluator prompt carries, so a choice is re-checked against the current
+ * source rather than an earlier drafting decision. Empty when the contract
+ * declares none. */
+export function goldenPromptLines(golden: string | undefined): string[] {
+  if (typeof golden !== "string" || golden.trim().length === 0) return [];
+  return [
+    "",
+    "Golden source (the current source a choice must be re-checked against; a `contract` classification must cite it):",
+    golden.trim(),
+  ];
+}
+
 export function buildWorkerPrompt(
   contract: PhaseContract,
   ownerNotes?: string,
@@ -9170,16 +13874,32 @@ export function buildWorkerPrompt(
   directives?: readonly OwnerDirective[],
   baselineCommands?: readonly BaselineCommand[],
   messages?: readonly Message[],
+  /** Plan 06c (R6): the tools the preflight did not find, named so the worker
+   * knows what its environment lacks. */
+  toolLines: readonly string[] = [],
+  /** Plan 06k3 (A2): a note naming the ref the worker's unsubmitted work from
+   * its previous attempt was saved on, so the next attempt starts from it. */
+  savedWorkNote?: string,
 ): string {
+  const structured = isStructured(contract);
   const lines: string[] = [
     `Goal: ${contract.goal}`,
     "",
     "Acceptance criteria:",
     ...contract.acceptance.map((a) => `- ${a}`),
+    ...(structured ? checklistLines(itemsFromPhase(contract)) : []),
     ...secretPromptLines(secrets),
+    ...goldenPromptLines(contract.golden),
     ...referenceLines(references),
     ...baselinePromptLines(baselineCommands),
+    ...toolLines,
   ];
+  if (structured) {
+    lines.push(
+      "",
+      "End your attempt with submit_coverage: for every requirement and constraint above, give status done, partial or not_done with where and tests; for every architecture item, give fits or deviates with where. A partial, not_done or deviates entry must carry a note, which becomes a trade-off message. The phase cannot freeze until the coverage is complete.",
+    );
+  }
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
   lines.push(...directiveLines(directives));
@@ -9191,12 +13911,19 @@ export function buildWorkerPrompt(
   // worker's (runtime doc §6's structural incentive to substitute it).
   lines.push(...gatePromptLines(contract.gate));
   if (interruptionNote) lines.push("", interruptionNote);
+  if (savedWorkNote) lines.push("", savedWorkNote);
   if (repair) {
     lines.push(
       "",
       `REPAIR (round ${repair.round + 1}): your previous candidate ${repair.previousCandidate.slice(0, 7)} was reviewed and NOT accepted. Fix what blocks acceptance; keep what was approved.`,
     );
-    if (repair.blocking.length > 0) lines.push("Blocking (must be fixed):", ...repair.blocking.map((b) => `- ${b}`));
+    if (repair.blocking.length > 0) {
+      lines.push("Blocking (must be fixed):", ...repair.blocking.map((b) => `- ${b}`));
+      // Plan 06k3 (A3): the submission must answer each open blocking finding.
+      lines.push(
+        "In submit_phase, answer EVERY open blocking finding above in `findingAnswers`: { findingId, status: 'fixed', test } with the test that now covers it, or { findingId, status: 'disputed', reason }. A submission that leaves one unanswered is refused before the freeze, naming the missing ids.",
+      );
+    }
     if (repair.failedDecisions.length > 0) {
       lines.push("Decisions whose vote failed (change them, or keep them and answer the objection with evidence):", ...repair.failedDecisions.map((d) => `- ${d}`));
     }
@@ -9214,6 +13941,7 @@ export function buildWorkerPrompt(
     "If a criterion cannot be met AS WRITTEN (not merely unmet yet), say so instead of faking it: call submit_phase with `criterionDispute` = { criterion: <one acceptance item above, verbatim>, why, proposedWording }. The conductor records it as an amendment the reviewers vote on; if the normal tally passes, the wording is replaced for this phase and the next candidate is judged against it. A criterion that is merely unmet is a normal repair, not a dispute.",
     "How to work:",
     `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target). With node --test, pass --test-force-exit so a test that leaks a process cannot hold the command open. Do not pipe test output through tail or head: a command killed at the per-command time limit then returns nothing. If a test file is slow, run one test at a time with --test-name-pattern.`,
+    `- Plan 06l (A2): between edits run \`tt test --changed --run "$TT_RUN_DIR"\` (the matching worker tool): it runs only the plan's check test files that import a file you changed, reuses a recorded pass when the tree is unchanged, prints failures only, and has its own time budget. Run the full checks once before submitting.`,
     "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",
     "- Edit files with the edit and write tools.",
     "- In submit_phase, write each decision's choice as one plain sentence of at most 20 words; put the reasoning in whyItMatters and the alternatives. Disclose choices that change behaviour, interfaces, guarantees or cost.",
@@ -9234,6 +13962,7 @@ export function buildReviewerPrompt(
     `Goal: ${phase.contract.goal}`,
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
     ...secretPromptLines(secrets),
+    ...goldenPromptLines(phase.contract.golden),
     ...directiveLines(directives),
     // Plan 01f: the same rule every reviewer prompt carries — the conductor
     // owns the gate evidence, and no agent may run the command or substitute
@@ -9242,9 +13971,133 @@ export function buildReviewerPrompt(
     // Plan 05d: name the candidate's own failing tests (each re-run alone), so
     // a reviewer never calls a real regression a flake or a flake a defect.
     ...checkFailurePromptLines(phase),
+    // Plan 06b: the same checklist the worker saw, plus the worker's coverage
+    // and the check resolution, and the verdicts this review must carry.
+    ...(isStructured(phase.contract)
+      ? [
+          ...checklistLines(itemsFromPhase(phase.contract)),
+          ...coverageLines(phase.coverage, itemsFromPhase(phase.contract)),
+          ...checkResolutionLines(phase.checkResolution ?? []),
+          ...reviewRequestLines(itemsFromPhase(phase.contract)),
+        ]
+      : []),
     ...((directives ?? []).some((d) => d.status === "in-force") ? ["", DIRECTIVE_BINDING_STATEMENT] : []),
-    "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements and findingStatements.",
+    "Call submit_review with reviewer, phaseId, candidateSha, contractVersion, correctionStatements, findingStatements, items and arch.",
   ].join("\n");
+}
+
+/** Plan 06g: one candidate as a pick prompt names it. */
+export interface PickPromptCandidate {
+  lane: string;
+  sha: string;
+  /** `C<round>-<lane>`. */
+  label: string;
+}
+
+export interface PickPromptInput {
+  /** The seat voting: M, A or B. */
+  seat: string;
+  /** True for the leader seat (M), the only one that carries the full
+   * context (plan 06g, A4). */
+  leader: boolean;
+  phaseId: string;
+  goal: string;
+  round: number;
+  base: string;
+  candidates: PickPromptCandidate[];
+  /** Leader only: the settled ledger, one line per record. */
+  ledger?: readonly string[];
+  /** Leader only: every earlier round's reviews and votes, one line each. */
+  earlierRounds?: readonly string[];
+  /** Leader only: the other candidates' diffs, by lane. The candidate the
+   * leader is voting on is in `candidates`, not here. */
+  otherDiffs?: Readonly<Record<string, string>>;
+  /** The seats that vote (the configured reviewer seats). */
+  seats: readonly string[];
+  /** Plan 06h (A3): true for the top-two revote turn, where the leader's
+   * vote breaks a tie. */
+  revote?: boolean;
+}
+
+/** Plan 06g (A4): the pick turn's prompt. Each seat votes for one candidate
+ * with a one-line why. The leader (M) carries the full context — the settled
+ * ledger, every earlier round's reviews and votes, and the other candidate's
+ * diff — and its vote counts once, exactly like the others'. A and B carry
+ * none of it: they see the round's candidates and vote.
+ *
+ * Pure and exported so a unit test exercises exactly the words the conductor
+ * sends. */
+export function buildPickPrompt(input: PickPromptInput): string {
+  const lines: string[] = [
+    `You are reviewer ${input.seat}${input.leader ? " (the leader seat)" : ""}. Cast your pick vote for phase ${input.phaseId}, round ${input.round}.`,
+    `Goal: ${input.goal}`,
+    `Round ${input.round} started from ${input.base}.`,
+    "",
+    `Candidates of round ${input.round}:`,
+    ...input.candidates.map((c) => `- ${c.label} ${c.sha.slice(0, 7)} (lane ${c.lane})`),
+  ];
+  if (input.leader) {
+    lines.push(
+      "",
+      "The settled ledger:",
+      ...(input.ledger && input.ledger.length > 0 ? input.ledger.map((l) => `- ${l}`) : ["- (nothing settled yet)"]),
+      "",
+      "Earlier rounds' reviews and votes:",
+      ...(input.earlierRounds && input.earlierRounds.length > 0 ? input.earlierRounds.map((l) => `- ${l}`) : ["- (this is round 1)"]),
+    );
+    for (const c of input.candidates) {
+      const diff = input.otherDiffs?.[c.lane];
+      if (diff === undefined) continue;
+      lines.push("", `Candidate ${c.label}'s diff:`, diff.trim().length > 0 ? diff : "(no diff)");
+    }
+  }
+  lines.push(
+    "",
+    `Vote for exactly one candidate of round ${input.round}, by lane, with a one-line why. The candidates are checked one after the other and only a passing candidate can win.`,
+    input.revote
+      ? `This is the REVOTE between the top two. Seats voting: ${input.seats.join(", ")}. The seats other than the leader need a strict majority; a tie among them is broken by the leader's vote.`
+      : `Seats voting: ${input.seats.join(", ")}. A candidate needs a strict majority (${Math.floor(input.seats.length / 2) + 1} of ${input.seats.length}); with a single passing candidate the vote is skipped and it wins.`,
+    "Your vote counts once, exactly like every other seat's.",
+    "Say whether the LOSING lane had something your pick lacks. Cast it with submit_pick_vote:",
+    '  { round, seat, lane, why, loserHad: { yes: true|false, anchors: ["file:line" or "test name"], note?: "one line" } }',
+    "`loserHad.yes` true means the lane you did NOT pick has something the picked lane lacks; name what it is in `anchors`. `false` with no anchors is an explicit \"nothing\". The field is required; a vote without it is refused and asked once more.",
+  );
+  return lines.join("\n");
+}
+
+/** Plan 06k1 (A2): whether an amendment's proposed wording keeps the
+ * criterion unchanged. The criterion's own text is the obvious case; a
+ * reviewer may also say "retain the criterion unchanged" (or "keep as
+ * written"). Such a proposal is a vote against the amendment, never an
+ * amendment of its own. */
+export function isNoChangeAmendmentWording(proposed: string, criterion: string): boolean {
+  const p = proposed.trim();
+  // Finding D-B-66: empty (or whitespace-only) wording expresses no position
+  // at all — it is neither a retain proposal nor an amendment, so it must not
+  // synthesize a reject vote. The caller ignores it.
+  if (p.length === 0) return false;
+  if (p === criterion.trim()) return true;
+  if (/^\s*no\s+change\b/i.test(p)) return true;
+  return /^\s*(retain|keep|leave|preserve)\b[\s\S]*\b(unchanged|as[- ]is|as written|the same|no change)\b/i.test(p);
+}
+
+/** Plan 06k1 (A1): validate a `loserHad` argument. Returns a refusal reason
+ * (so the model re-asks once) or undefined when it is well-formed. */
+export function checkLoserHad(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return "submit_pick_vote needs loserHad: whether the losing lane had something the picked lane lacks ({ yes, anchors, note? })";
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return "submit_pick_vote's loserHad must be an object { yes, anchors, note? }";
+  }
+  const lh = value as { yes?: unknown; anchors?: unknown };
+  if (typeof lh.yes !== "boolean") return "submit_pick_vote's loserHad needs a boolean yes";
+  if (lh.anchors !== undefined && !Array.isArray(lh.anchors)) return "submit_pick_vote's loserHad.anchors must be an array";
+  const anchors = Array.isArray(lh.anchors) ? lh.anchors : [];
+  if (lh.yes === true && anchors.length === 0) {
+    return "submit_pick_vote's loserHad says yes but names no anchor; name what the losing lane had (file:line or a test name)";
+  }
+  return undefined;
 }
 
 /** The tree object id of `rev` in `repo`, or undefined if it cannot be read. */

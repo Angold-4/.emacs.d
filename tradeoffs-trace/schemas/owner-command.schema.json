@@ -19,6 +19,7 @@
     { "$ref": "#/$defs/DVResolve" },
     { "$ref": "#/$defs/DVOverride" },
     { "$ref": "#/$defs/DVAcceptFinding" },
+    { "$ref": "#/$defs/DVCarry" },
     { "$ref": "#/$defs/DVRevise" },
     { "$ref": "#/$defs/DVAmend" },
     { "$ref": "#/$defs/DVNote" },
@@ -84,6 +85,17 @@
         "type": { "const": "accept-finding" },
         "recordKind": { "type": "string", "minLength": 1 },
         "scope": { "type": "string", "minLength": 1 },
+        "binding": { "$ref": "#/$defs/RecordBinding" }
+      }
+    },
+    "DVCarry": {
+      "description": "Plan 06g (A5): the decision view's owner carry — move one finding or message to a later phase's plan. `toPhase` names the target phase.",
+      "type": "object",
+      "required": ["type", "binding", "toPhase"],
+      "properties": {
+        "type": { "const": "carry" },
+        "recordKind": { "enum": ["finding", "message"] },
+        "toPhase": { "type": "string", "minLength": 1 },
         "binding": { "$ref": "#/$defs/RecordBinding" }
       }
     },

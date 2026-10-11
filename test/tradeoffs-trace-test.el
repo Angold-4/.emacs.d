@@ -7,6 +7,17 @@
 (require 'ert)
 (require 'init-tradeoffs-trace)
 
+;; ODP-1: loading the module installs its global mode-line and notification
+;; timers (+tt--ensure-mode-line's 1 s first tick, the workspace refresh
+;; timer). In a slow ERT run the real timer can fire inside a test and start
+;; its own async `tt` calls, which is a test-isolation bug, not a code bug.
+;; Cancel every load-time timer here, before any test runs; the two tests that
+;; exercise the tick call it directly.
+(dolist (timer-var '(+tt--mode-line-timer +tt--notify-timer +tt--timer))
+  (let ((timer (symbol-value timer-var)))
+    (when (timerp timer) (cancel-timer timer))
+    (set timer-var nil)))
+
 (defconst +tt-test--valid-plan "#+TITLE: sum validation
 #+TT_REPO: /tmp/tt-ert-repo
 #+TT_BRANCH: main
@@ -51,6 +62,141 @@
     (should (equal (alist-get 'boundaries p1) ["src/api/**" "package.json"]))
     (should (equal (alist-get 'reserved p1) ["public API types" "persistence format"]))
     (should (eq (alist-get 'provisional (aref (alist-get 'phases plan) 1)) t))))
+
+(defconst +tt-test--structured-plan
+  (concat "#+TITLE: structured\n"
+          "#+TT_REPO: /tmp/tt-ert-repo\n"
+          "#+TT_BRANCH: main\n"
+          "#+TT_CHECKS: make check\n\n"
+          "* Stage 1: two lanes\n"
+          "  :PROPERTIES:\n"
+          "  :ID:          stage-1\n"
+          "  :CHECKS:      make check\n"
+          "  :END:\n"
+          "** Goal\n"
+          "   The outcome and why, in the owner's words.\n"
+          "** Architecture\n"
+          "*** A1 Round                                                       :data:\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       A1\n"
+          "    :WHERE:    src/core/rounds.ts\n"
+          "    :END:\n"
+          "    #+begin_src typescript\n"
+          "    interface Round { n: number }\n"
+          "    #+end_src\n"
+          "    Who writes it, who reads it.\n"
+          "*** A2 Pick tally                                                   :rule:\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       A2\n"
+          "    :END:\n"
+          "    Strict majority of seats.\n"
+          "*** A3 Flow                                                         :flow:\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       A3\n"
+          "    :END:\n"
+          "    Plan to worker to checks.\n"
+          "** Requirements\n"
+          "*** R1 Two candidates from one base\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R1\n"
+          "    :ARCH:     A1\n"
+          "    :VERIFY:   test \"lanes: two candidates\"\n"
+          "    :END:\n"
+          "    One paragraph.\n"
+          "    - a sub-point\n"
+          "    - another sub-point\n"
+          "*** R2 Owner's live run\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R2\n"
+          "    :VERIFY:   evidence\n"
+          "    :END:\n"
+          "    The owner records it.\n"
+          "*** R3 Reviewed\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R3\n"
+          "    :VERIFY:   review\n"
+          "    :END:\n"
+          "    A reviewer judges it.\n"
+          "*** R4 Tally\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       R4\n"
+          "    :ARCH:     A2\n"
+          "    :VERIFY:   test \"lanes: tally\"\n"
+          "    :END:\n"
+          "    The tally is by code.\n"
+          "** Constraints\n"
+          "*** C1 K = 1\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       C1\n"
+          "    :VERIFY:   test \"lanes: one worker\"\n"
+          "    :END:\n"
+          "    Today's loop.\n"
+          "*** C2 Public API\n"
+          "    :PROPERTIES:\n"
+          "    :ID:       C2\n"
+          "    :VERIFY:   review\n"
+          "    :END:\n"
+          "    The public API does not change.\n")
+  "Plan 06b: the structured fixture the ERT parser tests share.")
+
+(ert-deftest tradeoffs-trace-plan-structured-parse ()
+  "Plan 06b: a structured phase parses to goal, 3 A, 4 R and 2 C items."
+  (let* ((parsed (+tt-test--parse +tt-test--structured-plan))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0))
+         (arch (alist-get 'architecture p1))
+         (reqs (alist-get 'requirements p1))
+         (cons (alist-get 'constraints p1)))
+    (should (null (plist-get parsed :errors)))
+    (should (equal (alist-get 'goal p1) "The outcome and why, in the owner's words."))
+    (should (= (length arch) 3))
+    (should (equal (mapcar (lambda (a) (alist-get 'id a)) arch) '("A1" "A2" "A3")))
+    (should (equal (alist-get 'tags (aref arch 0)) (vector "data")))
+    (should (equal (alist-get 'where (aref arch 0)) "src/core/rounds.ts"))
+    ;; The source block stays inside A1's text.
+    (should (string-match-p "interface Round" (alist-get 'text (aref arch 0))))
+    (should (= (length reqs) 4))
+    (should (equal (mapcar (lambda (r) (alist-get 'id r)) reqs) '("R1" "R2" "R3" "R4")))
+    (should (equal (alist-get 'arch (aref reqs 0)) (vector "A1")))
+    (should (equal (alist-get 'verify (aref reqs 0)) (vector "test \"lanes: two candidates\"")))
+    (should (equal (alist-get 'verify (aref reqs 1)) (vector "evidence")))
+    ;; The sub-list stays inside R1's text (#41).
+    (should (string-match-p "a sub-point" (alist-get 'text (aref reqs 0))))
+    (should (string-match-p "another sub-point" (alist-get 'text (aref reqs 0))))
+    (should (= (length cons) 2))
+    (should (equal (mapcar (lambda (c) (alist-get 'id c)) cons) '("C1" "C2")))))
+
+(ert-deftest tradeoffs-trace-plan-structured-schema-clean ()
+  "Plan 06b (OD-1 R8): a parsed structured phase carries no null optional
+fields, and an old-format phase is marked synthesized so the conductor keeps
+it unstructured (R9)."
+  (let* ((parsed (+tt-test--parse +tt-test--structured-plan))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0)))
+    (should (null (plist-get parsed :errors)))
+    (dolist (item (seq-concatenate 'list (alist-get 'architecture p1)
+                                   (alist-get 'requirements p1)
+                                   (alist-get 'constraints p1)))
+      (dolist (cell item)
+        (should-not (null (cdr cell)))))
+    (let ((old (aref (alist-get 'phases (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)) 0)))
+      (should (eq (alist-get 'itemsSynthesized old) t)))))
+
+(ert-deftest tradeoffs-trace-plan-old-format-items ()
+  "Plan 06b: an old-format phase synthesizes R1..Rn and C1."
+  (let* ((parsed (+tt-test--parse +tt-test--valid-plan))
+         (p1 (aref (alist-get 'phases (plist-get parsed :plan)) 0))
+         (reqs (alist-get 'requirements p1))
+         (cons (alist-get 'constraints p1)))
+    (should (null (plist-get parsed :errors)))
+    (should (equal (mapcar (lambda (r) (alist-get 'id r)) reqs) '("R1" "R2")))
+    (should (equal (alist-get 'verify (aref reqs 0)) (vector "review")))
+    (should (= (length cons) 1))
+    (should (equal (alist-get 'id (aref cons 0)) "C1"))
+    ;; An `evidence:' item becomes an evidence verify.
+    (let* ((text (concat "#+TITLE: t\n#+TT_REPO: /tmp/x\n#+TT_BRANCH: main\n\n"
+                         "* Phase 1: p\n  :PROPERTIES:\n  :ID: p1\n  :CHECKS: true\n  :END:\n"
+                         "  Goal: g\n  Acceptance:\n  - evidence: the owner live run is recorded\n  - a worker check\n"))
+           (ev (aref (alist-get 'requirements (aref (alist-get 'phases (plist-get (+tt-test--parse text) :plan)) 0)) 0)))
+      (should (equal (alist-get 'verify ev) (vector "evidence"))))))
 
 (ert-deftest tradeoffs-trace-plan-rerun-keyword ()
   "Plan 05d: #+TT_RERUN becomes the plan's rerun template and its line."
@@ -527,6 +673,84 @@ run that is not part of a program can only apply it to its phase."
         (+tt-input-send '(4))
         (should (equal (alist-get 'scope written) "phase"))))))
 
+;; Plan 06m (A1/C2, OD-3(2)): Emacs sends every owner command through the
+;; CLI's ONE waiting writer and shows what it printed; it writes no inbox file.
+(ert-deftest tradeoffs-trace-owner-commands-use-the-cli-writer ()
+  "Plan 06m (A1/C2, OD-3(2)): a steer/note/correction goes through `tt
+steer|note|correct' (text in a file, the binding the owner saw as
+`--run-id'/`--phase-id', `--program-wide' for a whole-program directive) and
+a decision command through `tt input' with its full binding; the printed
+outcome is returned and shown, a refusal is signalled with its reason, and
+no inbox file is ever written by Emacs."
+  (let ((dir (make-temp-file "tt-ert-run" t))
+        (calls nil)
+        (texts nil)
+        (reply "delivered to worker-a: delivered\ndelivered to worker-b: delivered"))
+    (unwind-protect
+        (cl-letf (((symbol-function '+tt--cli)
+                   (lambda (&rest args)
+                     (push args calls)
+                     ;; The writer reads its argument file at call time.
+                     (let ((arg (nth 2 args)))
+                       (push (with-temp-buffer
+                               (insert-file-contents (if (string-prefix-p "@" arg) (substring arg 1) arg))
+                               (buffer-string))
+                             texts))
+                     reply)))
+          (let ((binding '((runId . "r1") (phaseId . "p1"))))
+            ;; A phase steer: `tt steer', the binding kept, the outcome returned.
+            (should (equal (+tt--write-command dir `((type . "steer") (text . "cap at 64") (scope . "phase") (binding . ,binding)))
+                           reply))
+            (let ((args (car calls)))
+              (should (equal (nth 0 args) "steer"))
+              (should (equal (nth 1 args) dir))
+              (should (string-prefix-p "@" (nth 2 args)))
+              (should (equal (nthcdr 3 args) '("--run-id" "r1" "--phase-id" "p1"))))
+            (should (equal (car texts) "cap at 64"))
+            ;; A program-wide note: the same writer, `--program-wide'.
+            (+tt--write-command dir `((type . "note") (text . "--json is not a flag here") (scope . "program") (binding . ,binding)))
+            (should (equal (nth 0 (car calls)) "note"))
+            (should (member "--program-wide" (car calls)))
+            (should (equal (car texts) "--json is not a flag here"))
+            ;; A correction is `tt correct'.
+            (+tt--write-command dir `((type . "correction") (text . "revert AM-1") (binding . ,binding)))
+            (should (equal (nth 0 (car calls)) "correct"))
+            ;; A decision command goes through `tt input' with its FULL binding.
+            (+tt--write-command dir '((type . "resolve") (option . "repair")
+                                      (binding (runId . "r1") (phaseId . "p1") (recordId . "F-M-9") (recordVersion . 2))))
+            (should (equal (nth 0 (car calls)) "input"))
+            (let ((sent (json-read-from-string (car texts))))
+              (should (equal (alist-get 'type sent) "resolve"))
+              (should (equal (alist-get 'recordId (alist-get 'binding sent)) "F-M-9"))
+              (should (equal (alist-get 'phaseId (alist-get 'binding sent)) "p1"))))
+          ;; Emacs wrote no inbox file and left no argument file behind.
+          (should-not (file-exists-p (expand-file-name "inbox" dir)))
+          (should-not (directory-files dir nil "\\`tt-owner-")))
+      (delete-directory dir t))
+    ;; A refusal: the CLI exits non-zero; the reason is signalled, not "queued".
+    (cl-letf (((symbol-function '+tt--cli)
+               (lambda (&rest args)
+                 (error "tt %s failed: %s" (string-join args " ")
+                        "note rejected: command is bound to phase p2, but this run is on phase p1"))))
+      (let* ((dir (make-temp-file "tt-ert-run" t))
+             (err (unwind-protect
+                      (should-error (+tt--write-command dir '((type . "note") (text . "x") (binding (runId . "r1") (phaseId . "p2"))))
+                                    :type 'user-error)
+                    (delete-directory dir t))))
+        (should (equal (cadr err) "note rejected: command is bound to phase p2, but this run is on phase p1"))))
+    ;; The input box shows the writer's printed outcome, never "queued in the inbox".
+    (let ((shown nil))
+      (cl-letf (((symbol-function '+tt--state) (lambda (_) (+tt-test--input-state "IMPLEMENTING" t)))
+                ((symbol-function '+tt--cli) (lambda (&rest _) "delivered to worker-a: delivered"))
+                ((symbol-function '+tt--command-temp-file) (lambda (&rest _) "/tmp/tt-ert-owner.txt"))
+                ((symbol-function 'message) (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+        (with-temp-buffer
+          (insert "cap the retry loop at 64")
+          (setq +tt--run-dir "/tmp/tt-ert/abcd1234")
+          (+tt-input-send)
+          (should (string-match-p "delivered to worker-a: delivered" shown))
+          (should-not (string-match-p "inbox" shown)))))))
+
 (ert-deftest tradeoffs-trace-program-input-writes-a-program-directive ()
   "Plan 01i: the program buffer's input box records a program-wide directive
 through the CLI, which appends the event and steers every running node now."
@@ -630,7 +854,7 @@ and an unknown id is refused by that command."
 
 (ert-deftest tradeoffs-trace-plan-deadlines ()
   "Per-plan time limits reach the JSON plan in ms; none means no field."
-  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n#+TT_GATE_MINUTES: 45\n"
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_SH_MINUTES: 15\n#+TT_CHECK_MINUTES: 30\n#+TT_ATTEMPT_MINUTES: 90\n#+TT_GATE_MINUTES: 45\n#+TT_REVIEW_MINUTES: 30\n"
                                                    +tt-test--valid-plan))
                           :plan))
          (d (alist-get 'deadlines plan)))
@@ -640,6 +864,8 @@ and an unknown id is refused by that command."
     (should (= (alist-get 'workerAttemptMs d) 5400000))
     ;; Plan 01f: the gate's own limit, defaulting to 30 minutes when unwritten.
     (should (= (alist-get 'gateMs d) 2700000))
+    ;; 02k: the review (and pick) turn limit, for large candidates.
+    (should (= (alist-get 'reviewMs d) 1800000))
     (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
 
 (ert-deftest tradeoffs-trace-plan-gate ()
@@ -687,6 +913,18 @@ and an unknown id is refused by that command."
   (should-not (assq 'secrets (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
   ;; An empty #+TT_SECRETS declares nothing.
   (should-not (assq 'secrets (plist-get (+tt-test--parse (concat "#+TT_SECRETS:\n" +tt-test--valid-plan)) :plan))))
+
+(ert-deftest tradeoffs-trace-plan-env-file ()
+  "Plan 06e: #+TT_ENV_FILE becomes the plan's envFile, as an absolute path.
+The lookup order is the environment first, then this file."
+  ;; A relative name resolves against the plan's own directory (/tmp here).
+  (let ((plan (plist-get (+tt-test--parse (concat "#+TT_ENV_FILE: secrets.env\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'envFile plan) "/tmp/secrets.env")))
+  (let ((plan (plist-get (+tt-test--parse (concat "#+TT_ENV_FILE: /abs/keys.env\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'envFile plan) "/abs/keys.env")))
+  ;; No keyword (or an empty one) declares no env file.
+  (should-not (assq 'envFile (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+  (should-not (assq 'envFile (plist-get (+tt-test--parse (concat "#+TT_ENV_FILE:\n" +tt-test--valid-plan)) :plan))))
 
 (ert-deftest tradeoffs-trace-plan-models ()
   "#+TT_MODELS becomes the plan's models map: provider optional, model may
@@ -896,17 +1134,24 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (delete-directory root t))))
 
 (ert-deftest tradeoffs-trace-mode-line-wait ()
-  "Plan 01b: the mode-line segment names the oldest waiting program node."
-  (let ((fixture
-         (concat "[{\"id\":\"p1\",\"title\":\"plan 13\",\"waiting\":["
-                 "{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\","
-                 "\"duration\":\"1h12m\",\"reason\":\"the repair budget ran out\"}]}]")))
-    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) fixture)))
-      (let ((+tt--notify-flash nil))
-        (should (equal (+tt--mode-line-wait) " [⚑ 13f waiting 1h12m]"))))
-    ;; No program waiting: no segment.
-    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) "[]")))
-      (should (null (+tt--mode-line-wait))))))
+  "Plan 06f (A2): the mode-line segment names a waiting program node from
+`live.json', and no CLI call is made to get it."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-live" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
+         (+tt--notify-flash nil))
+    (unwind-protect
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"2026-09-24T05:00:00.000Z\",\"runs\":[],"
+                    "\"waitingNodes\":[{\"program\":\"p1\",\"node\":\"13f\"}]}"))
+          (cl-letf (((symbol-function '+tt--cli-on)
+                     (lambda (&rest _) (error "the mode line must not call the CLI"))))
+            (should (equal (+tt--mode-line-wait) " [⚑ 13f waiting]")))
+          ;; No program waiting: no segment.
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[],\"waitingNodes\":[]}"))
+          (should (null (+tt--mode-line-wait))))
+      (delete-directory root t))))
 
 (ert-deftest tradeoffs-trace-notification-echo ()
   "Plan 01b: each new notifications.jsonl line is shown in the echo area once."
@@ -983,13 +1228,21 @@ first, and a value shorter than the conductor's own minimum is never masked."
       (delete-file file))))
 
 (ert-deftest tradeoffs-trace-mode-line-wait-without-live-run ()
-  "Plan 01b: a waiting node whose run conductor is gone still shows its wait."
-  (let ((fixture "[{\"id\":\"p1\",\"waiting\":[{\"node\":\"13f\",\"since\":\"2026-09-24T04:59:00.000Z\",\"duration\":\"1h12m\"}]}]"))
-    (cl-letf (((symbol-function '+tt--cli-on) (lambda (&rest _) fixture))
-              ((symbol-function '+tt--run-rows) (lambda () nil)))
-      (let ((+tt--notify-flash nil))
-        (+tt--mode-line-update)
-        (should (string-match-p "⚑ 13f waiting 1h12m" +tt--mode-line-string))))))
+  "Plan 06f (A2): a waiting node whose run conductor is gone still shows its
+wait, read from `live.json' (a file, never the CLI)."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-live-wait" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
+         (+tt--notify-flash nil))
+    (unwind-protect
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[],"
+                    "\"waitingNodes\":[{\"program\":\"p1\",\"node\":\"13f\"}]}"))
+          (cl-letf (((symbol-function '+tt--cli-on)
+                     (lambda (&rest _) (error "the mode line must not call the CLI"))))
+            (+tt--mode-line-update)
+            (should (string-match-p "⚑ 13f waiting" +tt--mode-line-string))))
+      (delete-directory root t))))
 
 (defconst +tt-test--amended-state
   '((meta (title . "sum validation"))
@@ -1374,6 +1627,43 @@ inert as it was before the key existed — no error, and nothing opened."
           "  not frozen yet\n")
   "A fixture `views/review.org' with a decision brief, a blocker, a trade-off and a raw finding.")
 
+(defconst +tt-test--review-items-org
+  (concat "* Plan items\n"
+          "  R 2/2 met · A 1/1 fit · C 1/1\n\n"
+          "  | item | worker | check | M | A | B |\n"
+          "  |------+--------+-------+---+---+---|\n"
+          "  | [[items/R1.org][R1 Two candidates]] | done | pass | met | met | met |\n"
+          "  | [[items/A1.org][A1 Round]] | yes | — | fits | fits | fits |\n")
+  "Plan 06b: the item-by-seat matrix the runtime appends to `views/review.org'.")
+
+(ert-deftest tradeoffs-trace-review-item-matrix ()
+  "Plan 06b: the review buffer shows the item-by-seat matrix and the counts,
+and RET on a row opens the item's evidence file."
+  (let ((dir (make-temp-file "tt-ert-items" t)) (opened nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views/items" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert +tt-test--review-items-org))
+          (with-temp-file (expand-file-name "views/items/R1.org" dir)
+            (insert "* R1 Two candidates\n* Verdict: met\n  - M: met — src/core/rounds.ts:1\n"))
+          (let ((+tt--run-dir dir)) (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              (should (string-match-p "Plan items" (buffer-string)))
+              (should (string-match-p "R 2/2 met · A 1/1 fit · C 1/1" (buffer-string)))
+              (should (string-match-p "R1 Two candidates" (buffer-string)))
+              (should (string-match-p "A1 Round" (buffer-string)))
+              ;; RET on the R1 matrix row opens its item evidence file.
+              (goto-char (point-min))
+              (search-forward "R1 Two candidates")
+              (goto-char (match-beginning 0))
+              (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
+                (+tt-review-open-message))
+              (should (equal opened (expand-file-name "views/items/R1.org" dir))))))
+      (delete-directory dir t))))
+
 (defun +tt-test--review-buffer (dir)
   "Open DIR's review the real way: +tt-review on a fixture run directory.
 A-17/OD-2: the buffer must be opened through +tt-review (the mode first,
@@ -1406,8 +1696,10 @@ A/D and the mtime refresh all work in a real, file-visiting buffer."
               (goto-char (match-beginning 0))
               (+tt-review-open-message))
             (should (equal opened (expand-file-name "views/messages/T-1.org" dir)))
-            ;; A calls tt verdict with the heading's run dir and full binding.
-            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "verdict applied"))
+            ;; A calls tt verdict (asynchronously) with the heading's run dir
+            ;; and full binding.
+            (cl-letf (((symbol-function '+tt--cli-async-result)
+                       (lambda (_root args callback) (setq calls args) (funcall callback 0 "verdict applied")))
                       ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
               (goto-char (point-min))
               (search-forward "B-1")
@@ -1467,7 +1759,8 @@ asks for a one-line reason; a raw message is not yet frozen."
         (let ((buf (+tt-test--review-buffer dir))
               (calls nil))
           (with-current-buffer buf
-            (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "queued verdict x"))
+            (cl-letf (((symbol-function '+tt--cli-async-result)
+                       (lambda (_root args callback) (setq calls args) (funcall callback 0 "queued verdict x")))
                       ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
               ;; A on the blocker: the full binding from the heading.
               (goto-char (point-min))
@@ -1803,7 +2096,8 @@ command the review view already uses."
           (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
           (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
             (with-current-buffer buf
-              (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "entry accept applied")))
+              (cl-letf (((symbol-function '+tt--cli-async-result)
+                         (lambda (_root args callback) (setq calls args) (funcall callback 0 "entry accept applied"))))
                 (goto-char (point-min))
                 (search-forward "Should this stand")
                 (goto-char (match-beginning 0))
@@ -1934,6 +2228,8 @@ owner's merge; A/D act on the entry."
               (+tt-review-open-message))
             (should (equal opened (expand-file-name "views/entries/E-1.org" dir)))
             (cl-letf (((symbol-function '+tt--cli) (lambda (&rest args) (setq calls args) "ok"))
+                      ((symbol-function '+tt--cli-async-result)
+                       (lambda (_root args callback) (setq calls args) (funcall callback 0 "ok")))
                       ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil)))
               ;; s on the entry splits its first linked message.
               (goto-char (point-min))
@@ -2047,8 +2343,8 @@ binding, so a trade-off line still opens the decision view."
       (unwind-protect
           (let ((buf (+tt-test--review-buffer dir)))
             (with-current-buffer buf
-              (cl-letf (((symbol-function '+tt--cli)
-                         (lambda (&rest _) (error "tt verdict failed: %s" reason)))
+              (cl-letf (((symbol-function '+tt--cli-async-result)
+                         (lambda (_root _args callback) (funcall callback 1 reason)))
                         ((symbol-function '+tt-review-refresh) (lambda (&optional _) nil))
                         ((symbol-function 'message)
                          (lambda (fmt &rest args) (push (apply #'format fmt args) echoed))))
@@ -2760,21 +3056,23 @@ The source-file picker and run resolution both go through this (finding M-3)."
     (should-not (+tt--same-file-p "/home/me/a.org" "/home/me/b.org"))))
 
 (ert-deftest tradeoffs-trace-mode-line-does-not-poll-remote-roots ()
-  "The 10-second mode-line timer only touches the local root.
-A dead remote host must never block Emacs in the background (M-2/D-13)."
-  (let* ((root1 (make-temp-file "tt-ert-root1" t))
-         (root2 (file-name-as-directory "/ssh:dead:~/.tradeoffs-trace/"))
+  "Plan 06f (A2/C2): the mode-line update reads only the local `live.json'.
+No root — remote or local — is polled and no process is started."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-root1" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
          (called nil))
     (unwind-protect
-        (cl-letf (((symbol-function '+tt--roots) (lambda () (list root1 root2)))
-                  ((symbol-function '+tt--cli-on)
-                   (lambda (root &rest _) (push root called) "[]"))
-                  ((symbol-function '+tt--notify-flash) nil))
-          (let ((+tt-root root1))
-            (+tt--mode-line-update))
-          (should (member (file-name-as-directory root1) called))
-          (should-not (member root2 called)))
-      (delete-directory root1 t))))
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[{\"id\":\"r1\",\"title\":\"t\",\"phase\":\"IMPLEMENTING\",\"needsOwner\":false}],\"waitingNodes\":[]}"))
+          (cl-letf (((symbol-function '+tt--roots) (lambda () (list "/ssh:dead:~/.tradeoffs-trace/")))
+                    ((symbol-function '+tt--cli-on) (lambda (r &rest _) (push r called) "[]"))
+                    ((symbol-function '+tt--cli-async) (lambda (&rest _) (error "the mode line must not start a process")))
+                    ((symbol-function '+tt--notify-flash) nil))
+            (+tt--mode-line-update)
+            (should (null called))
+            (should (string-match-p "tt:r1 IMPLEMENTING" +tt--mode-line-string))))
+      (delete-directory root t))))
 
 ;;; The mode-line timer and workspace refresh never block Emacs on Node.
 
@@ -2813,43 +3111,114 @@ A dead remote host must never block Emacs in the background (M-2/D-13)."
           (should-not (seq-some (lambda (b) (string-prefix-p " *tt-async" (buffer-name b))) (buffer-list))))
       (delete-directory root t))))
 
-(ert-deftest tradeoffs-trace-mode-line-tick-is-async-and-skips-when-unchanged ()
-  "The mode-line timer never calls the synchronous CLI, and calls none at all
-when no run file changed and nothing shown is ageing."
+(ert-deftest tradeoffs-trace-mode-line-tick-is-file-only-and-skips-when-unchanged ()
+  "Plan 06f (A2/C2): the 10 s timer re-reads `live.json' only when its stamp
+changed, and never starts a process."
   (let* ((root (file-name-as-directory (make-temp-file "tt-root-" t)))
-         (log (expand-file-name "calls" root))
-         (fake (+tt-test--fake-node
-                root (format "#!/bin/sh\necho \"$2\" >> %s\necho '[]'\n" log)))
-         (+tt-runner (car fake))
-         (+tt-node (cdr fake))
-         (+tt-root root)
-         (+tt--mode-line-inflight nil)
+         (+tt--live-file (expand-file-name "live.json" root))
          (+tt--mode-line-stamp nil)
          (+tt--mode-line-at 0)
-         (+tt--mode-line-ageing nil)
          (+tt--mode-line-string "")
-         (+tt--notify-flash nil)
-         (calls (lambda () (if (file-exists-p log)
-                               (length (split-string (with-temp-buffer (insert-file-contents log) (buffer-string)) "\n" t))
-                             0))))
+         (+tt--notify-flash nil))
     (unwind-protect
-        (cl-letf (((symbol-function '+tt--cli-on)
-                   (lambda (&rest _) (error "the timer must not run the synchronous CLI"))))
-          (make-directory (expand-file-name "run1" root))
-          (write-region "{}\n" nil (expand-file-name "run1/events.jsonl" root))
+        (cl-letf (((symbol-function 'make-process)
+                   (lambda (&rest _) (error "the timer must not start a process")))
+                  ((symbol-function 'process-file)
+                   (lambda (&rest _) (error "the timer must not run process-file"))))
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[{\"id\":\"r1\",\"title\":\"t\",\"phase\":\"IMPLEMENTING\",\"needsOwner\":false}],\"waitingNodes\":[]}"))
           (+tt--mode-line-tick)
-          (should (+tt-test--wait (lambda () (not +tt--mode-line-inflight))))
-          (should (= 2 (funcall calls)))     ; program list + list
-          ;; Nothing changed: the next tick spawns nothing.
+          (should (string-match-p "tt:r1 IMPLEMENTING" +tt--mode-line-string))
+          ;; Unchanged: the tick keeps the last indicator and starts nothing.
+          (setq +tt--mode-line-string "sentinel")
           (+tt--mode-line-tick)
-          (should-not +tt--mode-line-inflight)
-          (should (= 2 (funcall calls)))
-          ;; A run's event log grows: the next tick lists again.
-          (write-region "{}\n{}\n" nil (expand-file-name "run1/events.jsonl" root))
+          (should (equal +tt--mode-line-string "sentinel"))
+          ;; The file changes: the tick re-reads it.
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"\",\"runs\":[{\"id\":\"r1\",\"title\":\"t\",\"phase\":\"DONE\",\"needsOwner\":false}],\"waitingNodes\":[]}"))
           (+tt--mode-line-tick)
-          (should (+tt-test--wait (lambda () (not +tt--mode-line-inflight))))
-          (should (= 4 (funcall calls))))
+          (should (string-match-p "tt:r1 DONE" +tt--mode-line-string)))
       (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-mode-line-from-live-json-without-cli ()
+  "Plan 06f (R4): the mode line renders a live.json fixture with the CLI
+unavailable.  Unmet if any mode-line path starts a process."
+  (let* ((root (file-name-as-directory (make-temp-file "tt-ert-live-ml" t)))
+         (+tt--live-file (expand-file-name "live.json" root))
+         (+tt--mode-line-string "")
+         (+tt--mode-line-stamp nil)
+         (+tt--mode-line-at 0)
+         (+tt--notify-flash nil))
+    (unwind-protect
+        (progn
+          (with-temp-file +tt--live-file
+            (insert "{\"updatedAt\":\"2026-10-07T00:00:00.000Z\","
+                    "\"runs\":[{\"id\":\"abc12345\",\"title\":\"running\",\"phase\":\"REVIEWING\",\"needsOwner\":false},"
+                    "{\"id\":\"def67890\",\"title\":\"parked\",\"phase\":\"AWAITING_OWNER\",\"needsOwner\":true}],"
+                    "\"waitingNodes\":[{\"program\":\"prog1\",\"node\":\"b\"}]}"))
+          ;; The CLI is unavailable: any process launch signals an error.
+          (cl-letf (((symbol-function 'process-file)
+                     (lambda (&rest _) (error "mode-line path ran process-file")))
+                    ((symbol-function 'call-process)
+                     (lambda (&rest _) (error "mode-line path ran call-process")))
+                    ((symbol-function 'make-process)
+                     (lambda (&rest _) (error "mode-line path started a process"))))
+            (+tt--mode-line-update)
+            (should (string-match-p "tt:abc1 REVIEWING" +tt--mode-line-string))
+            (should (string-match-p "tt:def6 AWAITING_OWNER ⚑" +tt--mode-line-string))
+            (should (string-match-p "⚑ b waiting" +tt--mode-line-string))
+            ;; The timer path is a file read too.
+            (setq +tt--mode-line-stamp nil)
+            (+tt--mode-line-tick)
+            (should (string-match-p "tt:abc1 REVIEWING" +tt--mode-line-string))))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-review-a-is-async-and-pending ()
+  "Plan 06f (R5): A on a review entry returns at once, marks the entry
+pending, and the callback later shows the recorded outcome."
+  (let* ((run (file-name-as-directory (make-temp-file "tt-ert-verdict-" t)))
+         (fake (+tt-test--fake-node
+                run "#!/bin/sh\nsleep 1\necho \"entry accept applied: E-1 in run x\"\n"))
+         (+tt-runner (car fake))
+         (+tt-node (cdr fake))
+         (msgs nil)
+         (buf (get-buffer-create "*tt-test-review-async*")))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views" run) t)
+          (with-temp-file (expand-file-name "views/review.org" run)
+            (insert "* E-1 a topic\n  :PROPERTIES:\n  :ID: E-1\n  :END:\n  body\n"))
+          (with-current-buffer buf
+            (+tt-review-mode)
+            (setq +tt--run-dir run +tt-review--file (expand-file-name "views/review.org" run))
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert-file-contents +tt-review--file))
+            (+tt-review--setup)
+            (goto-char (point-min))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args) (push (apply #'format fmt args) msgs))))
+              (let ((+tt--cli-root run)
+                    (started (float-time))
+                    (marker (lambda ()
+                              (seq-some (lambda (ov)
+                                          (equal (overlay-get ov '+tt-review-pending) "E-1"))
+                                        (overlays-in (point-min) (point-max))))))
+                (+tt-review-accept)
+                ;; Returned at once, before the slow CLI could have exited.
+                (should (< (- (float-time) started) 0.5))
+                ;; The entry shows pending at once, visibly (an overlay), and
+                ;; no second marker is stacked.
+                (should (gethash "E-1" +tt-review--pending))
+                (should (string-match-p "pending" (gethash "E-1" +tt-review--pending)))
+                (should (funcall marker))
+                ;; The callback later clears the VISIBLE marker and shows the
+                ;; outcome.
+                (should (+tt-test--wait (lambda () (not (gethash "E-1" +tt-review--pending))) 5))
+                (should-not (funcall marker))
+                (should (seq-some (lambda (m) (string-match-p "applied" m)) msgs))))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (delete-directory run t))))
 
 (ert-deftest tradeoffs-trace-workspace-refresh-renders-node-views-only-on-change ()
   "The 2 s workspace timer re-renders the input header (a `tt state' call)
@@ -3002,3 +3371,304 @@ the real auxiliary maps are checked too (finding M-4)."
     (should (commandp (lookup-key (cdr (assq +tt-decisions-mode-map +tt--evil-normal-maps)) (kbd "TAB"))))
     (should (commandp (lookup-key (cdr (assq +tt-input-mode-map +tt--evil-normal-maps)) (kbd "RET"))))
     (should (commandp '+tt--refresh-all))))
+
+(ert-deftest tradeoffs-trace-input-header-last-owner-input ()
+  "Plan 06d (A4/R6): the input header reads the latest queued or refused
+owner input from views/status.txt, so Emacs never computes the outcome."
+  (let* ((root (make-temp-file "tt-ert-run" t))
+         (views (expand-file-name "views" root))
+         (status (expand-file-name "status.txt" views)))
+    (unwind-protect
+        (progn
+          (make-directory views t)
+          (with-temp-file status
+            (insert "sum validation\n"
+                    "run abcd1234 · conductor running · 1m\n\n"
+                    "Owner input (3)\n"
+                    "  - a delivered steer — delivered (steer)\n"
+                    "  - a queued correction — queued (correction)\n"
+                    "  - a refused note — refused: the phase is DONE (note)\n"))
+          ;; The latest queued or refused line is the refused one.
+          (should (equal (+tt--input-header-last root)
+                         "  - a refused note — refused: the phase is DONE (note)"))
+          ;; The latest queued line wins when it comes after a refused one.
+          (with-temp-file status
+            (insert "Owner input (2)\n"
+                    "  - a refused note — refused: too late (note)\n"
+                    "  - a queued steer — queued (steer)\n"))
+          (should (equal (+tt--input-header-last root) "  - a queued steer — queued (steer)"))
+          ;; A note is queued for the next attempt too (A-5): a `noted' line
+          ;; after an older queued one is the latest input the header shows.
+          (with-temp-file status
+            (insert "Owner input (2)\n"
+                    "  - a queued correction — queued (correction)\n"
+                    "  - a noted note — noted (note)\n"))
+          (should (equal (+tt--input-header-last root) "  - a noted note — noted (note)"))
+          ;; A status with no queued or refused input yields nil.
+          (with-temp-file status (insert "run abcd1234\n"))
+          (should-not (+tt--input-header-last root)))
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-input-header-shows-last-owner-input ()
+  "Plan 06d (A4/R6): the input header line carries the latest queued or
+refused input read from views/status.txt."
+  (let* ((root (make-temp-file "tt-ert-run" t))
+         (views (expand-file-name "views" root))
+         (status (expand-file-name "status.txt" views))
+         (saved header-line-format))
+    (unwind-protect
+        (progn
+          (make-directory views t)
+          (with-temp-file status
+            (insert "Owner input (1)\n  - queued text — queued (correction)\n"))
+          (let ((+tt--run-dir root)
+                (+tt--input-program-dir nil))
+            (cl-letf (((symbol-function '+tt--state) (lambda (_) '((state (phase (phase . "REVIEWING"))))))
+                      ((symbol-function '+tt--input-header)
+                       (lambda (&optional _ program)
+                         (if program "P" "sending notes the next worker attempt"))))
+              (+tt--render-input-header)
+              (should (string-match-p "sending notes the next worker attempt" header-line-format))
+              (should (string-match-p "last owner input" header-line-format))
+              (should (string-match-p "queued text — queued (correction)" header-line-format)))))
+      (setq header-line-format saved)
+      (delete-directory root t))))
+
+(ert-deftest tradeoffs-trace-plan-workers ()
+  "Plan 06g: #+TT_WORKERS and #+TT_ROUNDS reach the plan JSON, and a phase's
+own :WORKERS:/:ROUNDS: property overrides the plan's keyword."
+  ;; The plan-level keywords are recorded with their line, as whole numbers.
+  (let* ((text (concat "#+TT_WORKERS: 2\n#+TT_ROUNDS: 5\n" +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (= (alist-get 'workers plan) 2))
+    (should (= (alist-get 'workersLine plan) 1))
+    (should (= (alist-get 'rounds plan) 5))
+    (should (= (alist-get 'roundsLine plan) 2))
+    ;; Every phase inherits the plan's own count.
+    (should (= (alist-get 'workers (aref (alist-get 'phases plan) 0)) 2)))
+  ;; A value that is not a whole number is passed through as written, so
+  ;; `tt lint' names it rather than the plan silently defaulting.
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_WORKERS: two\n" +tt-test--valid-plan)) :plan)))
+    (should (equal (alist-get 'workers plan) "two")))
+  ;; A phase's own property wins over the plan's keyword.
+  (let* ((plan (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+    (should-not (assq 'workers (aref (alist-get 'phases plan) 0))))
+  (let* ((text (replace-regexp-in-string ":END:" "  :WORKERS:   2\n  :ROUNDS:    4\n  :END:" +tt-test--valid-plan :fixedcase))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (= (alist-get 'workers (aref (alist-get 'phases plan) 0)) 2))
+    (should (= (alist-get 'rounds (aref (alist-get 'phases plan) 0)) 4))))
+
+(ert-deftest tradeoffs-trace-plan-seats ()
+  "Plan 06h (A1): #+TT_REVIEWERS and #+TT_LEADER reach the plan JSON, a
+ phase's own :REVIEWERS:/:LEADER: overrides them, and the plan-level seats
+ and their line are recorded for `tt lint'."
+  (let* ((text (concat "#+TT_REVIEWERS: M A B C D\n#+TT_LEADER: B\n" +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (append (alist-get 'seats plan) nil) '("M" "A" "B" "C" "D")))
+    (should (= (alist-get 'seatsLine plan) 1))
+    (should (equal (alist-get 'leader plan) "B"))
+    (should (= (alist-get 'leaderLine plan) 2))
+    ;; Every phase inherits the plan's seats and leader.
+    (should (equal (append (alist-get 'seats (aref (alist-get 'phases plan) 0)) nil) '("M" "A" "B" "C" "D")))
+    (should (equal (alist-get 'leader (aref (alist-get 'phases plan) 0)) "B")))
+  ;; A plan that names neither carries no seats/leader, so the runtime keeps
+  ;; the fixed M A B led by M.
+  (let* ((plan (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+    (should-not (assq 'seats plan))
+    (should-not (assq 'leader plan))
+    (should-not (assq 'seats (aref (alist-get 'phases plan) 0))))
+  ;; A phase's own properties win over the plan's keywords.
+  (let* ((text (replace-regexp-in-string
+                ":END:" "  :REVIEWERS: M A B C D E\n  :LEADER:    C\n  :END:"
+                +tt-test--valid-plan :fixedcase))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (append (alist-get 'seats (aref (alist-get 'phases plan) 0)) nil) '("M" "A" "B" "C" "D" "E")))
+    (should (equal (alist-get 'leader (aref (alist-get 'phases plan) 0)) "C"))))
+
+(ert-deftest tradeoffs-trace-review-buffer-rounds ()
+  "Plan 06g (A5): the review buffer groups the round's candidates, with the
+pick votes and the winner — both lanes, not only the accepted one. The
+section is rendered by the runtime (renderRoundsOrg); this checks the buffer
+shows it, folds it like any other section, and never mistakes a candidate
+heading for a votable message."
+  (let* ((dir (make-temp-file "tt-ert-review-rounds" t))
+         (rounds (concat "* Rounds\n"
+                         "\n"
+                         "** Round 2 from bbbbbbb\n"
+                         "\n"
+                         "*** C2-a (lane a) — checks passed\n"
+                         "\n"
+                         "    cccccccccccccccccccccccccccccccccccccccc\n"
+                         "\n"
+                         "*** C2-b (lane b) — checks passed, picked\n"
+                         "\n"
+                         "    dddddddddddddddddddddddddddddddddddddddd\n"
+                         "\n"
+                         "Votes:\n"
+                         "  - M → C2-b: b is the smaller diff\n"
+                         "  - A → C2-b: b keeps the lock short\n"
+                         "  - B → C2-a: a names the edge path\n"
+                         "\n"
+                         "Winner: C2-b (ddddddd, 2 votes)\n"))
+         (opened nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views/messages" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert (concat +tt-test--review-org "\n" rounds)))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              ;; Both lanes are visible, each under its own candidate heading.
+              (should (string-search "*** C2-a (lane a) — checks passed" (buffer-string)))
+              (should (string-search "*** C2-b (lane b) — checks passed, picked" (buffer-string)))
+              ;; The votes and the winner are visible with them.
+              (should (string-search "M → C2-b: b is the smaller diff" (buffer-string)))
+              (should (string-search "Winner: C2-b (ddddddd, 2 votes)" (buffer-string)))
+              ;; A candidate heading carries no :ID:, so RET/A/D stay inert on
+              ;; it — the grouping never looks like a votable message.
+              (goto-char (point-min))
+              (search-forward "*** C2-a")
+              (goto-char (match-beginning 0))
+              (should-not (+tt-review--message-heading-p))
+              (cl-letf (((symbol-function 'find-file) (lambda (f) (setq opened f) buf)))
+                (should-error (+tt-review-open-message)))
+              (should-not opened))))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-review-buffer-five-seats ()
+  "Plan 06h (R6): the review buffer shows every configured seat's review and
+ every lane of a four-lane, five-seat round — not only M, A and B, and not
+ only the accepted candidate."
+  (let* ((dir (make-temp-file "tt-ert-review-five-seats" t))
+         (rounds (concat "* Rounds\n"
+                         "\n"
+                         "** Round 1 from bbbbbbb\n"
+                         "\n"
+                         "*** C1-a (lane a) — checks passed, picked\n"
+                         "\n"
+                         "    1111111111111111111111111111111111111111\n"
+                         "\n"
+                         "    reviews: 5\n"
+                         "      - A: no findings\n"
+                         "      - B: no findings\n"
+                         "      - C: no findings\n"
+                         "      - D: no findings\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "*** C1-d (lane d) — checks passed\n"
+                         "\n"
+                         "    4444444444444444444444444444444444444444\n"
+                         "\n"
+                         "    reviews: 5\n"
+                         "      - A: no findings\n"
+                         "      - B: no findings\n"
+                         "      - C: no findings\n"
+                         "      - D: no findings\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "Votes:\n"
+                         "  - M → C1-a: M picks\n"
+                         "  - A → C1-a: A picks\n"
+                         "  - B → C1-a: B picks\n"
+                         "  - C → C1-d: C picks\n"
+                         "  - D → C1-d: D picks\n"
+                         "\n"
+                         "Winner: C1-a (1111111, 3 votes)\n")))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views/messages" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert (concat +tt-test--review-org "\n" rounds)))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              ;; Four lanes, each candidate with all five seats' reviews.
+              (should (string-search "*** C1-a (lane a) — checks passed, picked" (buffer-string)))
+              (should (string-search "*** C1-d (lane d) — checks passed" (buffer-string)))
+              (should (= 2 (how-many "    reviews: 5")))
+              (should (string-search "- D: no findings" (buffer-string)))
+              ;; The five seats' votes and the winner are shown.
+              (should (string-search "- C → C1-d: C picks" (buffer-string)))
+              (should (string-search "- D → C1-d: D picks" (buffer-string)))
+              (should (string-search "Winner: C1-a (1111111, 3 votes)" (buffer-string))))))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
+      (delete-directory dir t))))
+
+(ert-deftest tradeoffs-trace-plan-worker-lane-models ()
+  "Plan 06g2: #+TT_MODELS worker.1/worker.2 reach the plan JSON as
+workerLanes, so each lane of a two-lane round may run its own model."
+  (let* ((text (concat "#+TT_WORKERS: 2\n#+TT_MODELS: worker=gateway:shared worker.1=gateway:one worker.2=gateway:two\n"
+                       +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan))
+         (models (alist-get 'models plan)))
+    (should (equal (alist-get 'model (alist-get 'worker models)) "shared"))
+    (should (equal (alist-get 'model (alist-get (intern "1") (alist-get 'workerLanes models))) "one"))
+    (should (equal (alist-get 'model (alist-get (intern "2") (alist-get 'workerLanes models))) "two"))
+    ;; A plan without worker.N carries no workerLanes at all.
+    (let* ((plain (plist-get (+tt-test--parse (concat "#+TT_MODELS: worker=gateway:shared\n" +tt-test--valid-plan)) :plan)))
+      (should-not (assq 'workerLanes (alist-get 'models plain))))))
+
+(ert-deftest tradeoffs-trace-review-buffer-round-reviews ()
+  "Plan 06g2 (A3): the review buffer groups each candidate's OWN reviews
+under it — every seat that reviewed it — so the owner reads the round's six
+reviews (M/A/B on both lanes), not only the winner's."
+  (let* ((dir (make-temp-file "tt-ert-review-round-reviews" t))
+         (rounds (concat "* Rounds\n"
+                         "\n"
+                         "** Round 2 from bbbbbbb\n"
+                         "\n"
+                         "*** C2-a (lane a) — checks passed\n"
+                         "\n"
+                         "    cccccccccccccccccccccccccccccccccccccccc\n"
+                         "\n"
+                         "    reviews: 3\n"
+                         "      - A: no findings\n"
+                         "      - B: 1 finding(s)\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "*** C2-b (lane b) — checks passed, picked\n"
+                         "\n"
+                         "    dddddddddddddddddddddddddddddddddddddddd\n"
+                         "\n"
+                         "    reviews: 3\n"
+                         "      - A: no findings\n"
+                         "      - B: no findings\n"
+                         "      - M: no findings\n"
+                         "\n"
+                         "Votes:\n"
+                         "  - M → C2-b: b is the smaller diff\n"
+                         "  - A → C2-b: b keeps the lock short\n"
+                         "  - B → C2-a: a names the edge path\n"
+                         "\n"
+                         "Winner: C2-b (ddddddd, 2 votes)\n")))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "views/messages" dir) t)
+          (with-temp-file (expand-file-name "views/review.org" dir)
+            (insert (concat +tt-test--review-org "\n" rounds)))
+          (let ((+tt--run-dir dir))
+            (+tt-review))
+          (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+          (let ((buf (get-file-buffer (expand-file-name "views/review.org" dir))))
+            (with-current-buffer buf
+              ;; Each candidate's own reviews are grouped under it.
+              (should (string-search "*** C2-a (lane a) — checks passed" (buffer-string)))
+              (should (string-search "*** C2-b (lane b) — checks passed, picked" (buffer-string)))
+              (should (= 2 (how-many "    reviews: 3")))
+              (should (string-search "- B: 1 finding(s)" (buffer-string)))
+              ;; A review line is not a votable message heading either.
+              (goto-char (point-min))
+              (search-forward "reviews: 3")
+              (goto-char (match-beginning 0))
+              (should-not (+tt-review--message-heading-p)))))
+      (when (timerp +tt--timer) (cancel-timer +tt--timer) (setq +tt--timer nil))
+      (when-let* ((b (get-file-buffer (expand-file-name "views/review.org" dir)))) (kill-buffer b))
+      (delete-directory dir t))))

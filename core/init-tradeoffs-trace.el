@@ -6,7 +6,7 @@
 ;;
 ;; Emacs front end for tradeoffs-trace (docs/tradeoffs-trace.md).  The
 ;; conductor is a detached Node daemon; Emacs only starts runs, renders the
-;; run directory, and writes owner commands into the run's inbox.  Everything
+;; run directory, and sends owner commands through the `tt' CLI writer.  Everything
 ;; shown here is rebuilt from `~/.tradeoffs-trace/<run>/' (`tt state'), so it
 ;; survives closing buffers or restarting Emacs.
 ;;
@@ -289,35 +289,43 @@ ROOT is the root the command belongs to and decides the host it runs on."
 
 (defun +tt--cli-async (root args callback)
   "Run `tt' ARGS against the local ROOT without blocking Emacs.
-CALLBACK gets the trimmed stdout when the process exits 0, else nil.  For
-timers only: a synchronous `+tt--cli-on' costs a whole Node start plus the
-command (`tt list' folds every run's event log, over 1 s with ~100 runs), and
-on a timer that froze Emacs for that long every tick.  Interactive commands
-keep `+tt--cli', which reports failures."
-  (condition-case nil
+CALLBACK gets the trimmed stdout when the process exits 0, else nil.  A thin
+stdout-only wrapper over `+tt--cli-async-result' (the one owner of the async
+process), kept for callers that only care about success and stdout."
+  (+tt--cli-async-result
+   root args
+   (lambda (status text) (funcall callback (and (eq status 0) text)))))
+
+(defun +tt--cli-async-result (root args callback)
+  "Run `tt' ARGS against ROOT without blocking Emacs.
+CALLBACK gets (STATUS . TEXT): the exit status and the combined stdout and
+stderr (trimmed).  An owner command's outcome can be on stdout even when it
+exits non-zero (a refused verdict), so both are reported rather than only a
+success/failure boolean."
+  (condition-case err
       (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir root)))
              (default-directory (file-name-as-directory root))
              (out (generate-new-buffer " *tt-async*"))
-             (err (generate-new-buffer " *tt-async-stderr*")))
+             (err-buf (generate-new-buffer " *tt-async-stderr*")))
         (make-process
-         :name "tt-async" :buffer out :stderr err :noquery t :connection-type 'pipe
+         :name "tt-async" :buffer out :stderr err-buf :noquery t :connection-type 'pipe
          :command (append (list +tt-node cli) args (list "--root" (directory-file-name root)))
          :sentinel
          (lambda (proc _event)
            (unless (process-live-p proc)
-             (let ((ok (and (eq (process-status proc) 'exit) (eq (process-exit-status proc) 0)))
-                   (text (if (buffer-live-p out) (with-current-buffer out (buffer-string)) "")))
-               (dolist (b (list out err))
+             (let ((status (process-exit-status proc))
+                   (text (concat
+                          (if (buffer-live-p out) (with-current-buffer out (buffer-string)) "")
+                          (if (buffer-live-p err-buf) (with-current-buffer err-buf (buffer-string)) ""))))
+               (dolist (b (list out err-buf))
                  (when (buffer-live-p b)
-                   ;; The stderr pipe has its own process: never let killing
-                   ;; its buffer ask "buffer has a running process".
                    (when-let* ((p (get-buffer-process b)))
                      (set-process-query-on-exit-flag p nil)
                      (delete-process p))
                    (kill-buffer b)))
-               (funcall callback (and ok (string-trim text)))))))
+               (funcall callback status (string-trim text))))))
         t)
-    (error (funcall callback nil) nil)))
+    (error (funcall callback 1 (error-message-string err)) nil)))
 
 (defun +tt--file-stamp (file)
   "FILE's modification time and size, or nil when it does not exist (one stat)."
@@ -480,11 +488,180 @@ Org line the owner will edit rather than at a temporary JSON copy."
             (forward-line 1)))))
     (nreverse lines)))
 
+;;; Plan 06b: the structured plan format (refs/06_ref_plan_format.md).
+;; A phase subtree names four headings — Goal, Architecture, Requirements,
+;; Constraints — and every item under the last three is a subheading with an
+;; `:ID:`. The item's own body (sub-lists and source blocks included) is its
+;; text, kept whole: the #41 failure was a parser that cut the goal at its
+;; first sub-list.
+
+(defun +tt--headline-title (hl)
+  "The plain title of headline HL, without its tags or TODO keyword."
+  (let ((title (org-element-property :title hl)))
+    (if (stringp title)
+        title
+      (string-trim (buffer-substring-no-properties
+                    (org-element-property :begin hl)
+                    (or (org-element-property :end hl) (point-max)))))))
+
+(defun +tt--child-headlines (hl)
+  "The direct child headlines of HL, in order."
+  (seq-filter (lambda (el) (eq (org-element-type el) 'headline))
+              (org-element-contents hl)))
+
+(defun +tt--property-line (hl name)
+  "1-based line of property NAME in HL's own property drawer, or nil."
+  (let ((beg (org-element-property :begin hl))
+        (end (or (org-element-property :end hl) (point-max))))
+    (save-excursion
+      (goto-char beg)
+      (when (re-search-forward "^[ \t]*:PROPERTIES:[ \t]*$" end t)
+        (let ((drawer-end (save-excursion
+                            (when (re-search-forward "^[ \t]*:END:[ \t]*$" end t)
+                              (point)))))
+          (when drawer-end
+            (goto-char beg)
+            (when (re-search-forward (concat "^[ \t]*:" (regexp-quote name) ":[ \t]*") drawer-end t)
+              (line-number-at-pos))))))))
+
+(defun +tt--parse-item (hl kind)
+  "Parse one structured item headline HL of KIND into a plan-JSON alist.
+KIND is `architecture', `requirement' or `constraint'.  The item's text is
+its whole body, so sub-lists and source blocks stay inside it; `rawText'
+keeps the same text so `tt lint' can prove nothing was lost in parsing."
+  (let* ((body (+tt--phase-body hl))
+         (text (string-trim body))
+         ;; Plan 06b (finding M-2): `rawText' is the literal source body,
+         ;; captured independently of `text', so `tt lint' can see a line the
+         ;; parse dropped.  The property drawer is part of the raw text and
+         ;; `lostTextLines' ignores it.
+         (raw (let ((beg (org-element-property :contents-begin hl))
+                    (end (org-element-property :contents-end hl)))
+                (if (and beg end)
+                    (string-trim (buffer-substring-no-properties beg end))
+                  text)))
+         (verify (org-element-property :VERIFY hl))
+         (arch (org-element-property :ARCH hl))
+         (where (org-element-property :WHERE hl))
+         (title (string-trim (+tt--headline-title hl)))
+         (item-id (org-element-property :ID hl))
+         (where-line (+tt--property-line hl "WHERE"))
+         (arch-line (+tt--property-line hl "ARCH"))
+         (verify-line (+tt--property-line hl "VERIFY"))
+         (line (line-number-at-pos (org-element-property :begin hl))))
+    ;; OD-1 R8: omit every absent optional field.  A `nil' written as JSON
+    ;; `null' violates the item schema (`where` must be a string, and
+    ;; `additionalProperties' is false), so a real parsed plan must not carry
+    ;; one.
+    `(,@(when item-id `((id . ,item-id)))
+      (title . ,title)
+      (text . ,text)
+      (rawText . ,raw)
+      ;; Tags are an architecture property only (OD-1 R8: the requirement and
+      ;; constraint schemas forbid extra fields).
+      ,@(when (eq kind 'architecture)
+          `((tags . ,(vconcat (org-element-property :tags hl)))
+            ,@(when where `((where . ,where)))
+            ,@(when where-line `((whereLine . ,where-line)))))
+      ,@(when (eq kind 'requirement)
+          `((arch . ,(vconcat (and arch (split-string arch "[ \t,]+" t))))
+            ,@(when arch-line `((archLine . ,arch-line)))))
+      ,@(when (memq kind '(requirement constraint))
+          `((verify . ,(vconcat (and verify (list verify))))
+            ,@(when verify-line `((verifyLine . ,verify-line)))))
+      (line . ,line))))
+
+(defun +tt--parse-structure (hl)
+  "Parse HL's Goal/Architecture/Requirements/Constraints children.
+Return a plist (:goal :architecture :requirements :constraints), or nil when
+HL has none of those headings (an old-format phase)."
+  (let ((goal nil) (architecture nil) (requirements nil) (constraints nil) (found nil))
+    (dolist (child (+tt--child-headlines hl))
+      (let ((title (string-trim (+tt--headline-title child))))
+        (cond
+         ((equal title "Goal")
+          (setq found t)
+          (setq goal (string-trim (+tt--phase-body child))))
+         ((equal title "Architecture")
+          (setq found t)
+          (setq architecture (mapcar (lambda (i) (+tt--parse-item i 'architecture))
+                                     (+tt--child-headlines child))))
+         ((equal title "Requirements")
+          (setq found t)
+          (setq requirements (mapcar (lambda (i) (+tt--parse-item i 'requirement))
+                                     (+tt--child-headlines child))))
+         ((equal title "Constraints")
+          (setq found t)
+          (setq constraints (mapcar (lambda (i) (+tt--parse-item i 'constraint))
+                                    (+tt--child-headlines child)))))))
+    (when found
+      (list :goal goal :architecture architecture :requirements requirements :constraints constraints))))
+
+(defun +tt--synthesize-items (acceptance acceptance-lines reserved)
+  "The old format as structured items: R1..Rn and C1.
+Each acceptance item is review, or evidence when it starts with the word
+evidence and a colon.  This is the same synthesis `src/core/items.ts' does,
+so an old plan reaches the loop as items without changing meaning."
+  (let ((n 0))
+    (list
+     :requirements
+     (vconcat
+      (mapcar (lambda (text)
+                (setq n (1+ n))
+                `((id . ,(format "R%d" n))
+                  (title . ,text)
+                  (text . ,text)
+                  (rawText . ,text)
+                  (arch . [])
+                  (verify . ,(if (string-match-p "\\`[ \t]*evidence[ \t]*:" text)
+                                 (vector "evidence")
+                               (vector "review")))
+                  ,@(when (nth (1- n) acceptance-lines) `((line . ,(nth (1- n) acceptance-lines))))))
+              acceptance))
+     :constraints
+     (vconcat
+      (when (and reserved (seq-filter (lambda (r) (not (string-empty-p (string-trim r)))) reserved))
+        (let ((text (mapconcat #'string-trim (seq-filter (lambda (r) (not (string-empty-p (string-trim r)))) reserved) "; ")))
+          (list `((id . "C1") (title . ,text) (text . ,text) (rawText . ,text)
+                  (verify . ,(vector "review"))))))))))
+
 (defun +tt--parse-phase (hl)
   "Parse phase headline HL into (PHASE-ALIST . ERRORS)."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
          (id (org-element-property :ID hl))
          (checks (org-element-property :CHECKS hl))
+         ;; Plan 06c: the final check runs once on the candidate about to be
+         ;; accepted. A phase's own :FINAL_CHECKS: overrides the plan's
+         ;; #+TT_FINAL_CHECKS; a plan that names neither behaves as before.
+         (final-checks (or (org-element-property :FINAL_CHECKS hl)
+                           (+tt--keyword "TT_FINAL_CHECKS")))
+         ;; Plan 06g: how many lanes one round runs, and how many rounds the
+         ;; phase may spend. A phase's own :WORKERS:/:ROUNDS: overrides the
+         ;; plan's #+TT_WORKERS/#+TT_ROUNDS; a plan that names neither keeps
+         ;; today's one-lane loop and the default three rounds.
+         (workers (or (org-element-property :WORKERS hl)
+                      (+tt--keyword "TT_WORKERS")))
+         (rounds (or (org-element-property :ROUNDS hl)
+                     (+tt--keyword "TT_ROUNDS")))
+         ;; Plan 06k1 (A3): how many consecutive rounds may each raise a new
+         ;; blocking finding of the same kind on one requirement before the
+         ;; owner is asked. A phase's own :VARIANT_LIMIT: overrides the plan's
+         ;; #+TT_VARIANT_LIMIT; neither keeps the default of 3.
+         (variant-limit (or (org-element-property :VARIANT_LIMIT hl)
+                            (+tt--keyword "TT_VARIANT_LIMIT")))
+         ;; Plan 06k2 (A5): the current source a choice must be re-checked
+         ;; against. A phase's own :GOLDEN: overrides the plan's
+         ;; #+TT_GOLDEN; the contract carries it into the worker, reviewer
+         ;; and evaluator prompts.
+         (golden (or (org-element-property :GOLDEN hl)
+                     (+tt--keyword "TT_GOLDEN")))
+         ;; Plan 06h: the reviewer seats and their leader. A phase's own
+         ;; :REVIEWERS:/:LEADER: overrides the plan's #+TT_REVIEWERS/#+TT_LEADER;
+         ;; a plan that names neither keeps the fixed M A B, led by M.
+         (reviewers (or (org-element-property :REVIEWERS hl)
+                        (+tt--keyword "TT_REVIEWERS")))
+         (leader (or (org-element-property :LEADER hl)
+                     (+tt--keyword "TT_LEADER")))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -496,7 +673,13 @@ Org line the owner will edit rather than at a temporary JSON copy."
          (reserved (org-element-property :RESERVED hl))
          (provisional (member "provisional" (org-element-property :tags hl)))
          (body (+tt--phase-body hl))
-         (goal (+tt--goal body))
+         (structure (+tt--parse-structure hl))
+         (structured (and structure
+                          (or (plist-get structure :architecture)
+                              (plist-get structure :requirements)
+                              (plist-get structure :constraints))))
+         (goal (or (and structure (plist-get structure :goal))
+                   (+tt--goal body)))
          (acceptance (+tt--list-items "Acceptance:" body))
          (acceptance-lines (+tt--list-lines hl "Acceptance:"))
          ;; Plan 01c: the owner's own checklist, next to Acceptance.  Its
@@ -504,23 +687,59 @@ Org line the owner will edit rather than at a temporary JSON copy."
          ;; acceptance; they are shown once the phase is DONE.
          (owner-checklist (+tt--list-items "Owner checklist:" body))
          (owner-checklist-lines (+tt--list-lines hl "Owner checklist:"))
+         (reserved-list (and reserved (split-string reserved ";" t "[ \t]+")))
+         ;; Plan 06b: a structured phase carries architecture/requirements/
+         ;; constraints; an old-format phase synthesizes R1..Rn and C1 so the
+         ;; loop sees items either way.
+         (synthesized (unless structured
+                        (+tt--synthesize-items acceptance acceptance-lines reserved-list)))
+         (architecture (and structure (plist-get structure :architecture)))
+         (requirements (if structured
+                           (plist-get structure :requirements)
+                         (plist-get synthesized :requirements)))
+         (constraints (if structured
+                          (plist-get structure :constraints)
+                        (plist-get synthesized :constraints)))
          (errors nil))
     (unless provisional
       (unless id (push (cons line "phase has no :ID: property") errors))
       (unless checks (push (cons line "phase has no :CHECKS: property") errors))
       (unless goal (push (cons line "phase has no \"Goal:\" line") errors))
-      (unless acceptance (push (cons line "phase has no \"Acceptance:\" list") errors)))
+      (unless (or structured acceptance)
+        (push (cons line "phase has no \"Acceptance:\" list and no Requirements heading") errors)))
     (cons `((id . ,(or id (format "line-%d" line)))
+            (line . ,line)
             (goal . ,(or goal ""))
             (acceptance . ,(vconcat acceptance))
             (acceptanceLines . ,(vconcat acceptance-lines))
             (checks . ,(vconcat (and checks (list checks))))
+            ,@(when final-checks
+                `((finalChecks . ,(vconcat (list final-checks)))))
+            ,@(when workers
+                `((workers . ,(+tt--count-value workers))))
+            ,@(when rounds
+                `((rounds . ,(+tt--count-value rounds))))
+            ,@(when variant-limit
+                `((variantLimit . ,(+tt--count-value variant-limit))))
+            ,@(when golden
+                `((golden . ,(string-trim golden))))
+            ,@(when reviewers
+                `((seats . ,(vconcat (split-string reviewers "[ \t,]+" t)))))
+            ,@(when leader
+                `((leader . ,(string-trim leader))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
-            (reserved . ,(vconcat (and reserved (split-string reserved ";" t "[ \t]+"))))
+            (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
             ,@(when owner-checklist
                 `((ownerChecklist . ,(vconcat owner-checklist))
                   (ownerChecklistLines . ,(vconcat owner-checklist-lines))))
+            ;; OD-1 R9: an old-format phase's items are synthesized, not
+            ;; declared, so the conductor keeps it unstructured (it owes
+            ;; submit_phase only) while lint and the views still see R1..Rn.
+            ,@(unless structured '((itemsSynthesized . t)))
+            ,@(when architecture `((architecture . ,(vconcat architecture))))
+            ,@(when requirements `((requirements . ,(vconcat requirements))))
+            ,@(when constraints `((constraints . ,(vconcat constraints))))
             ,@(when gate `((gate . ,gate)))
             ,@(when gate-cleanup `((gateCleanup . ,gate-cleanup))))
           (nreverse errors))))
@@ -551,9 +770,9 @@ so no agent searches the file system for them."
 
 (defun +tt--plan-deadlines ()
   "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES,
-#+TT_ATTEMPT_MINUTES and #+TT_GATE_MINUTES, as the conductor's deadline
-fields in ms (or nil).  For repositories whose builds and suites outlast the
-defaults (3, 5, 45, 30)."
+#+TT_ATTEMPT_MINUTES, #+TT_GATE_MINUTES and #+TT_REVIEW_MINUTES, as the
+conductor's deadline fields in ms (or nil).  For repositories whose builds,
+suites and candidates outlast the defaults (3, 5, 45, 30, 15)."
   (let ((ms (lambda (kw) (let ((v (+tt--keyword kw)))
                            (and v (string-match-p "\\`[0-9]+\\'" v) (* 60000 (string-to-number v))))))
         (out nil))
@@ -563,6 +782,9 @@ defaults (3, 5, 45, 30)."
     ;; Plan 01f: a gate defaults to 30 minutes — a 15-minute --clean --build
     ;; fits, the old 8-minute sh limit did not (runtime doc §6).
     (when-let* ((v (funcall ms "TT_GATE_MINUTES"))) (push (cons 'gateMs v) out))
+    ;; 02k (2026-10-10): one review turn (and one pick turn) on a large
+    ;; candidate outlasted the fixed 15 minutes and discarded a two-lane round.
+    (when-let* ((v (funcall ms "TT_REVIEW_MINUTES"))) (push (cons 'reviewMs v) out))
     (nreverse out)))
 
 (defun +tt--plan-secrets ()
@@ -571,6 +793,15 @@ Only names ever appear in a plan, in this buffer or in the JSON the conductor
 reads: the values live in the environment (design §7)."
   (seq-remove #'string-empty-p
               (split-string (or (+tt--keyword "TT_SECRETS") "") "[ \t,]+" t)))
+
+(defun +tt--plan-env-file ()
+  "The KEY=value file #+TT_ENV_FILE names, as an absolute path, or nil.
+Plan 06e (A1): a declared secret may come from this file when the environment
+does not set it; the lookup order is the environment first, then the file."
+  (let ((v (+tt--keyword "TT_ENV_FILE")))
+    (when (and v (not (string-empty-p (string-trim v))))
+      (expand-file-name (string-trim v)
+                        (file-name-directory (expand-file-name (or buffer-file-name default-directory)))))))
 
 (defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel" "curator")
   "Roles #+TT_MODELS may assign a model to (design §2.1).
@@ -605,15 +836,18 @@ suffix (`openai/gpt-6-sol:high'), so `openai/gpt-6-sol:high' is all model.
 MODELS is an alist for the plan JSON: plain roles as
 (ROLE . ((provider . P)? (model . M))), the reviewer seats as
 (reviewerSeats . ((M . ...) (A . ...) ...)), the panel seats as
-(panelSeats . ((1 . ...) ...)), and (panelFrom . \"reviewers\") for the
-`panel=reviewers' value that makes every panel seat follow the reviewer of
-its position.  A key is `role' or `role.SEAT' (e.g. `reviewer.M', `panel.2').
+(panelSeats . ((1 . ...) ...)), the worker lanes as
+(workerLanes . ((1 . ...) (2 . ...))), and (panelFrom . \"reviewers\") for
+the `panel=reviewers' value that makes every panel seat follow the reviewer
+of its position.  A key is `role' or `role.SEAT' (e.g. `reviewer.M',
+`panel.2', `worker.1').
 LINE is the 1-based line of the keyword.  REPEATED lists the keys the keyword
 named more than once (the later declaration wins): a JSON object cannot carry
 a duplicate key, so the parser records them for `tt lint' to report."
   (when-let* ((at (+tt--keyword-at "TT_MODELS")))
     (let ((seen nil) (repeated nil)
-          (models nil) (reviewer-seats nil) (panel-seats nil) (panel-from nil))
+          (models nil) (reviewer-seats nil) (panel-seats nil) (worker-lanes nil)
+          (panel-from nil))
       (dolist (tok (split-string (car at) "[ \t,]+" t))
         (let* ((eq (string-match "=" tok))
                (key (if eq (substring tok 0 eq) tok))
@@ -636,21 +870,37 @@ a duplicate key, so the parser records them for `tt lint' to report."
             (let ((sym (intern seat)))
               (setq panel-seats (cons (cons sym entry)
                                       (assq-delete-all sym panel-seats)))))
+           ;; Plan 06g2: `worker.N' — a lane's own worker model, so a
+           ;; two-lane round may run its two workers on different models.
+           ((and dot (equal role "worker"))
+            (let ((sym (intern seat)))
+              (setq worker-lanes (cons (cons sym entry)
+                                       (assq-delete-all sym worker-lanes)))))
            (t
             ;; A key named twice keeps only its LAST declaration (the run is
             ;; blocked by lint anyway); one entry per key keeps the JSON object
             ;; valid and the winner unambiguous.
             (let ((sym (intern key)))
               (setq models (cons (cons sym entry) (assq-delete-all sym models))))))))
-      (when (or models reviewer-seats panel-seats panel-from)
+      (when (or models reviewer-seats panel-seats worker-lanes panel-from)
         (let ((out (nreverse models)))
           (when reviewer-seats
             (setq out (append out (list (cons 'reviewerSeats (nreverse reviewer-seats))))))
           (when panel-seats
             (setq out (append out (list (cons 'panelSeats (nreverse panel-seats))))))
+          (when worker-lanes
+            (setq out (append out (list (cons 'workerLanes (nreverse worker-lanes))))))
           (when panel-from
             (setq out (append out (list (cons 'panelFrom panel-from)))))
           (list out (cdr at) (delete-dups (nreverse repeated))))))))
+
+(defun +tt--count-value (raw)
+  "RAW as a whole number, or RAW itself when it is not one.
+Plan 06g: `#+TT_WORKERS' and `#+TT_ROUNDS' are counts.  A value that is not
+all digits is passed through as written, so `tt lint' can name the bad value
+instead of the plan silently taking a default."
+  (let ((s (string-trim raw)))
+    (if (string-match-p "\\`[0-9]+\\'" s) (string-to-number s) s)))
 
 (defun +tt-parse-plan ()
   "Parse the current Org plan buffer.
@@ -691,12 +941,39 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(when rerun
                       `((rerun . ,(car rerun))
                         (rerunLine . ,(cdr rerun))))
+                  ;; Plan 06g: #+TT_WORKERS and #+TT_ROUNDS. A value that is
+                  ;; not a whole number is passed through as written, so
+                  ;; `tt lint' can name it rather than silently defaulting.
+                  ,@(let ((w (+tt--keyword-at "TT_WORKERS")))
+                      (and w (list (cons 'workers (+tt--count-value (car w)))
+                                   (cons 'workersLine (cdr w)))))
+                  ,@(let ((r (+tt--keyword-at "TT_ROUNDS")))
+                      (and r (list (cons 'rounds (+tt--count-value (car r)))
+                                   (cons 'roundsLine (cdr r)))))
+                  ,@(let ((v (+tt--keyword-at "TT_VARIANT_LIMIT")))
+                      (and v (list (cons 'variantLimit (+tt--count-value (car v)))
+                                   (cons 'variantLimitLine (cdr v)))))
+                  ;; Plan 06k2 (A5): the plan's golden source; a phase's own
+                  ;; :GOLDEN: overrides it in +tt--parse-phase.
+                  ,@(let ((g (+tt--keyword-at "TT_GOLDEN")))
+                      (and g (list (cons 'golden (string-trim (car g)))
+                                   (cons 'goldenLine (cdr g)))))
+                  ;; Plan 06h: the reviewer seats and their leader, for the
+                  ;; conductor's init event and `tt lint'.
+                  ,@(let ((s (+tt--keyword-at "TT_REVIEWERS")))
+                      (and s (list (cons 'seats (vconcat (split-string (car s) "[ \t,]+" t)))
+                                   (cons 'seatsLine (cdr s)))))
+                  ,@(let ((l (+tt--keyword-at "TT_LEADER")))
+                      (and l (list (cons 'leader (string-trim (car l)))
+                                   (cons 'leaderLine (cdr l)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))
                       (and r `((references . ,(vconcat r)))))
                   ,@(let ((s (+tt--plan-secrets)))
                       (and s `((secrets . ,(vconcat s)))))
+                  ,@(let ((f (+tt--plan-env-file)))
+                      (and f `((envFile . ,f))))
                   ,@(let ((m (+tt--plan-models)))
                       (and m
                            (append `((models . ,(nth 0 m))
@@ -948,6 +1225,9 @@ several phases runs them in order."
          ;; declaration (plan 14 declared its vendor keys once, here, and no
          ;; entry received them).
          (program-secrets (+tt--plan-secrets))
+         ;; #+TT_ENV_FILE in the program file: the default for every entry
+         ;; whose own plan does not name one.
+         (program-env-file (+tt--plan-env-file))
          ;; #+TT_MODELS in a *program* file: the per-role default for every
          ;; entry that does not set its own (an entry's own value wins).  A
          ;; plan file treated as a one-entry program is parsed by
@@ -978,6 +1258,8 @@ several phases runs them in order."
                     (let ((own (append (alist-get 'secrets plan) nil)))
                       (setq plan (cons `(secrets . ,(vconcat (seq-uniq (append own program-secrets))))
                                        (assq-delete-all 'secrets (copy-alist plan))))))
+                  (when (and program-env-file (not (assq 'envFile plan)))
+                    (setq plan (cons `(envFile . ,program-env-file) plan)))
                   (setq plan (+tt--merge-models plan program-models))
                   (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
     (unless entries (push (cons 1 "program has no entries") errors))
@@ -1353,12 +1635,21 @@ own tab and takes the whole frame."
 (defun +tt--ensure-timer ()
   "Start the workspace refresh timer."
   (unless (timerp +tt--timer)
-    (setq +tt--timer (run-with-timer +tt-refresh-interval +tt-refresh-interval #'+tt--refresh-all))))
+    (setq +tt--timer
+          ;; Plan 06f (C2): the timer must never reach `process-file' for
+          ;; `tt', so it asks for the file-only refresh.
+          (run-with-timer +tt-refresh-interval +tt-refresh-interval
+                          (lambda () (+tt--refresh-all 'timer))))))
 
-(defun +tt--refresh-all ()
+(defun +tt--refresh-all (&optional from-timer)
   "Refresh every visible tradeoffs-trace buffer; stop the timer if none.
 Interactive, and bound to `gr' in Evil normal state (never a bare `g', which
-would swallow Evil's `g' prefix) and to `g' elsewhere."
+would swallow Evil's `g' prefix) and to `g' elsewhere.
+
+Plan 06f (C2): FROM-TIMER non-nil (the 2 s workspace timer) refreshes only
+the file-backed views.  The input header and the program buffer need a
+synchronous `tt' call, and a timer callback must never reach `process-file'
+for `tt'; press `gr' to refresh those."
   (interactive)
   (let ((any nil)
         ;; An explicit refresh (`gr') always re-renders; the timer re-renders
@@ -1370,23 +1661,26 @@ would swallow Evil's `g' prefix) and to `g' elsewhere."
           (setq any t)
           (ignore-errors
             (cond ((derived-mode-p '+tt-trace-mode) (+tt--render-trace win))
-                  ((derived-mode-p '+tt-status-mode) (+tt--render-status))
+                  ((derived-mode-p '+tt-status-mode) (+tt--render-status from-timer))
                   ((derived-mode-p '+tt-review-mode) (+tt-review-refresh))
                   ;; Each of the next two runs a synchronous `tt' (a Node
                   ;; start, ~0.3 s): every 2 s that froze Emacs while a
-                  ;; workspace or program buffer was visible.
+                  ;; workspace or program buffer was visible.  The timer
+                  ;; therefore skips them (C2); `gr' still refreshes them.
                   ((derived-mode-p '+tt-input-mode)
-                   (when (+tt--needs-render-p
-                          (if +tt--input-program-dir
-                              nil
-                            (list (expand-file-name "events.jsonl" +tt--run-dir)
-                                  (expand-file-name "conductor.pid" +tt--run-dir))))
-                     (+tt--render-input-header)))
+                   (unless from-timer
+                     (when (+tt--needs-render-p
+                            (if +tt--input-program-dir
+                                nil
+                              (list (expand-file-name "events.jsonl" +tt--run-dir)
+                                    (expand-file-name "conductor.pid" +tt--run-dir))))
+                       (+tt--render-input-header))))
                   ((derived-mode-p '+tt-program-mode)
-                   (when (+tt--needs-render-p
-                          (mapcar (lambda (f) (expand-file-name f +tt--program-dir))
-                                  '("events.jsonl" "program.json" "views/program.txt")))
-                     (+tt--render-program)))
+                   (unless from-timer
+                     (when (+tt--needs-render-p
+                            (mapcar (lambda (f) (expand-file-name f +tt--program-dir))
+                                    '("events.jsonl" "program.json" "views/program.txt")))
+                       (+tt--render-program))))
                   ;; Plan 05h: the tape has its own `+tt-tape-refresh-interval'
                   ;; timer; the workspace beat only makes sure it is running
                   ;; while the buffer is visible.
@@ -1624,6 +1918,7 @@ the longer one behind — the same order secrets.ts's byLengthDesc uses."
   (pcase state
     ("delivered" "delivered")
     ("noted" "noted")
+    ("queued" "queued")
     ("correction-started" "correction started")
     ("reverted" "reverted an amendment")
     ("delivery-uncertain" (format "delivery uncertain%s" (if reason (format " (%s)" reason) "")))
@@ -1702,13 +1997,37 @@ picked up' once 30 s have passed.  Nothing is inferred beyond that.  Plan
                           (if kind (format " (%s)" kind) ""))))))
     (+tt--render-directives s)))
 
+(defun +tt--input-header-last (run-dir)
+  "The latest queued or refused owner input, read from views/status.txt.
+Plan 06d (A4/R6): the input header states what the run actually did with the
+owner's input, so it reads the runtime's own record instead of computing an
+outcome itself.  Returns nil when the file is missing or holds no queued or
+refused input.  The status text line is `  - TEXT — queued (kind)',
+`  - TEXT — noted (kind)' (a note is queued for the next attempt) or
+`  - TEXT — refused: REASON (kind)'."
+  (let ((file (and run-dir (expand-file-name "views/status.txt" run-dir))))
+    (when (and file (file-exists-p file))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-max))
+        ;; Each line is `  - TEXT — LABEL (kind)'; the label is `queued',
+        ;; `noted' (a queued note) or `refused: …'.  Match the whole line, not
+        ;; just up to the label.
+        (when (re-search-backward "^  - .*\\(?: — queued \\| — noted \\| — refused: \\)" nil t)
+          (buffer-substring (line-beginning-position) (line-end-position)))))))
+
 (defun +tt--render-input-header ()
-  "Recompute the *tt-input* header line from the current run state."
+  "Recompute the *tt-input* header line from the current run state.
+Plan 06d (A4/R6): the latest queued or refused input is read from
+views/status.txt, never inferred here."
   (setq header-line-format
         (condition-case err
-            (if +tt--input-program-dir
-                (+tt--input-header nil t)
-              (+tt--input-header (+tt--state +tt--run-dir)))
+            (let* ((base (if +tt--input-program-dir
+                             (+tt--input-header nil t)
+                           (+tt--input-header (+tt--state +tt--run-dir))))
+                   (last (and (not +tt--input-program-dir)
+                              (+tt--input-header-last +tt--run-dir))))
+              (if last (format "%s  ·  last owner input: %s" base last) base))
           (error (format "Cannot deliver input: %s" (error-message-string err))))))
 
 (defun +tt--status-row (label value &optional face)
@@ -1890,11 +2209,13 @@ attention line are restored here, matching `+tt--render-status-from'."
       (when (re-search-forward "^⚑ " nil t)
         (put-text-property (line-beginning-position) (line-end-position) 'face 'error)))))
 
-(defun +tt--render-status ()
+(defun +tt--render-status (&optional file-only)
   "Render the status buffer.
 Plan 03b: reads the runtime's `views/status.txt' when it exists (a file
 read, so it costs nothing over TRAMP and calls neither `tt' nor
-`process-file'); falls back to `tt state' for a run from before the view."
+`process-file'); falls back to `tt state' for a run from before the view.
+Plan 06f (C2): FILE-ONLY (the timer path) skips that fallback, so a timer
+callback can never reach `process-file' for `tt'."
   (let ((inhibit-read-only t)
         (file (and +tt--run-dir (expand-file-name "views/status.txt" +tt--run-dir))))
     (erase-buffer)
@@ -1902,7 +2223,8 @@ read, so it costs nothing over TRAMP and calls neither `tt' nor
         (progn (insert-file-contents file)
                (+tt--status-restore-records)
                (+tt--status-restore-faces))
-      (+tt--render-status-from (+tt--state +tt--run-dir) +tt--run-dir))))
+      (unless file-only
+        (+tt--render-status-from (+tt--state +tt--run-dir) +tt--run-dir)))))
 
 (defun +tt-open-tradeoff ()
   "Open the decision view at the trade-off record on this line (RET).
@@ -2175,20 +2497,53 @@ the program buffer.  `f' toggles to the full phase chart and back."
 
 ;;;;; Input
 
+(defun +tt--command-temp-file (run-dir contents)
+  "Write CONTENTS to a fresh temporary file beside RUN-DIR; return its name.
+The file lives on the host that runs `tt' (RUN-DIR may be remote), outside
+the run's inbox: it is only the argument the CLI writer reads."
+  (make-temp-file (expand-file-name "tt-owner-" run-dir) nil ".txt" contents))
+
+(defun +tt--cli-outcome (&rest args)
+  "Run the `tt' owner-command writer with ARGS; return its printed outcome.
+A refused command exits non-zero: its printed reason is signalled as a
+`user-error', so the owner sees why and the input is not lost."
+  (condition-case err
+      (string-trim (apply #'+tt--cli args))
+    (error
+     (let ((msg (error-message-string err)))
+       (user-error "%s" (if (string-match "\\`tt [^\n]*? failed: " msg)
+                            (substring msg (match-end 0))
+                          msg))))))
+
 (defun +tt--write-command (run-dir command)
-  "Write owner COMMAND (an alist) into RUN-DIR's inbox; return its id.
-The document is written to a temporary name and renamed into place, so a
-conductor poll can never observe a truncated or half-written file (which it
-would otherwise reject permanently as malformed)."
-  (let* ((id (format "cmd-%s-%04x" (format-time-string "%Y%m%dT%H%M%S") (random 65536)))
-         (inbox (expand-file-name "inbox" run-dir))
-         (final (expand-file-name (concat id ".json") inbox))
-         (tmp (expand-file-name (concat id ".json.tmp") inbox))
-         (payload (json-encode (cons (cons 'commandId id) command))))
-    (make-directory inbox t)
-    (write-region payload nil tmp nil 'silent)
-    (rename-file tmp final t)
-    id))
+  "Send owner COMMAND (an alist) through the CLI writer; return its outcome.
+Plan 06m (A1/C2, OD-3(2)): Emacs keeps no inbox-file writer of its own and
+sends every owner command through the ONE waiting writer the CLI uses, which
+waits for the conductor's recorded outcome and prints it — each lane's
+delivery for a steer, the recorded state otherwise.  A steer/note/correction
+goes through `tt steer|note|correct' (text in a file, so no text is ever
+parsed as a flag; `--program-wide' for a whole-program directive), with the
+binding the owner saw passed as `--run-id'/`--phase-id'; a decision command
+(resolve/override) goes through `tt input', which keeps its full binding as
+given.  Either way a foreign or stale binding is refused by the conductor,
+never rebound.  Returns the printed outcome; a refusal signals a `user-error'
+with its reason."
+  (let* ((type (alist-get 'type command))
+         (sub (pcase type ("steer" "steer") ("note" "note") ("correction" "correct")))
+         (binding (alist-get 'binding command)))
+    (if sub
+        (let ((tmp (+tt--command-temp-file run-dir (or (alist-get 'text command) ""))))
+          (unwind-protect
+              (apply #'+tt--cli-outcome
+                     (append (list sub run-dir (concat "@" (+tt--local-arg tmp)))
+                             (when (equal (alist-get 'scope command) "program") (list "--program-wide"))
+                             (when (alist-get 'runId binding) (list "--run-id" (alist-get 'runId binding)))
+                             (when (alist-get 'phaseId binding) (list "--phase-id" (alist-get 'phaseId binding)))))
+            (ignore-errors (delete-file tmp))))
+      (let ((tmp (+tt--command-temp-file run-dir (json-encode command))))
+        (unwind-protect
+            (+tt--cli-outcome "input" run-dir tmp)
+          (ignore-errors (delete-file tmp)))))))
 
 (defun +tt--input-scope-note (&optional program-wide not-in-program)
   "The scope sentence the input header shows before sending.
@@ -2325,17 +2680,21 @@ PROGRAM-WIDE makes it an owner directive for the whole program (D5)."
              ;; own directive, and the confirmation must say what the header
              ;; and the recorded record say.
              (effective (if (and program-wide (alist-get 'program s)) "program" "phase"))
-             (id (+tt--write-command
-                  run-dir
-                  `((type . ,kind) (text . ,text)
-                    (scope . ,effective)
-                    (binding . ,binding)))))
+             ;; Plan 06m (OD-3(2)): sent through the CLI's waiting writer;
+             ;; what it printed — each lane's delivery, or the recorded
+             ;; state — is what the owner is shown.  A refusal signals with
+             ;; its reason and leaves the text in the buffer.
+             (outcome (+tt--write-command
+                       run-dir
+                       `((type . ,kind) (text . ,text)
+                         (scope . ,effective)
+                         (binding . ,binding)))))
         (erase-buffer)
         (if revert-id
-            (message "tradeoffs-trace: correction %s queued in the inbox (%s) — it reverts %s; see Owner input in the status buffer"
-                     kind id revert-id)
-          (message "tradeoffs-trace: %s queued in the inbox (%s), as an owner directive for %s; see Owner input in the status buffer"
-                   kind id (if (equal effective "program") "the whole program" "this phase"))))))))
+            (message "tradeoffs-trace: correction (reverts %s): %s" revert-id outcome)
+          (message "tradeoffs-trace: %s, an owner directive for %s: %s"
+                   kind (if (equal effective "program") "the whole program" "this phase") outcome))
+        outcome)))))
 
 (defun +tt-program-input ()
   "Open this program's input box: text sent there is a program-wide directive."
@@ -2541,7 +2900,10 @@ user set."
   (setq-local font-lock-defaults nil)
   (when (fboundp 'font-lock-mode) (font-lock-mode -1))
   (+tt-review--apply-faces)
-  (+tt-review--fold-messages))
+  (+tt-review--fold-messages)
+  ;; Plan 06f (A3): a refresh must not lose the marker of a verdict still in
+  ;; flight, so every pending id gets its marker drawn again.
+  (+tt-review--apply-pending))
 
 (defun +tt-review--message-id ()
   "The id of the message at point, or nil."
@@ -2563,14 +2925,29 @@ After a refresh a message may have disappeared; point then goes to the top."
     (when (looking-at "^[ \t]*- \\([A-Z]-[0-9]+\\) ")
       (match-string-no-properties 1))))
 
+(defun +tt-review--item-id-at-point ()
+  "The item id of the Plan-items matrix row at point, or nil.
+Plan 06b: a row's first cell links to `views/items/<id>.org'."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^[ \t]*| *\\[\\[items/\\([^]]+\\)\\.org\\]")
+      (match-string-no-properties 1))))
+
 (defun +tt-review-open-message ()
-  "Open the detail file for the entry or message at point (RET).
+  "Open the detail file for the entry, item or message at point (RET).
 Plan 05j: an entry heading (`E-n') opens `views/entries/<id>.org', a linked
-message line opens `views/messages/<id>.org'. Decision briefs: RET chooses one
-of the brief's options and resolves the owner request."
+message line opens `views/messages/<id>.org'. Plan 06b: a Plan-items matrix
+row opens `views/items/<id>.org' (the cell's evidence). Decision briefs: RET
+chooses one of the brief's options and resolves the owner request."
   (interactive)
-  (if (+tt-review--brief-kind)
-      (+tt-review--brief-choose)
+  (cond
+   ((+tt-review--brief-kind) (+tt-review--brief-choose))
+   ((+tt-review--item-id-at-point)
+    (let* ((item (+tt-review--item-id-at-point))
+           (file (and +tt--run-dir (expand-file-name (concat "views/items/" item ".org") +tt--run-dir))))
+      (unless (and file (file-exists-p file)) (user-error "No item file for %s" item))
+      (find-file file)))
+   (t
     (let* ((entry (+tt-review--entry-id))
            (id (cond (entry entry)
                      ((+tt-review--bullet-message-id))
@@ -2579,7 +2956,7 @@ of the brief's options and resolves the owner request."
            (file (and id +tt--run-dir (expand-file-name (concat dir id ".org") +tt--run-dir))))
       (unless id (user-error "No entry or message on this line"))
       (unless (and file (file-exists-p file)) (user-error "No detail file for %s" id))
-      (find-file file))))
+      (find-file file)))))
 
 (defun +tt-review--entry-id ()
   "The `E-n' id of the entry at point, or nil."
@@ -2693,23 +3070,25 @@ option also prompts for the non-empty scope note the request requires."
          (refuse (and accept-option (not (equal option accept-option)))))
     (cond
      ((equal command "entry")
+      ;; Plan 06f (A3): the same asynchronous path the entry verdict uses.
       (let ((reason (when refuse (read-string "Reason (optional): "))))
-        (message "%s"
-                 (apply #'+tt--cli
-                        (append (list "entry" +tt--run-dir (if (equal option "accept") "accept" "refuse") (+tt-review--message-id))
-                                (when (and reason (not (string-empty-p reason))) (list "--reason" reason)))))))
+        (+tt-review--send-async
+         (+tt-review--message-id) "A/D pending"
+         (append (list "entry" +tt--run-dir (if (equal option "accept") "accept" "refuse") (+tt-review--message-id))
+                 (when (and reason (not (string-empty-p reason))) (list "--reason" reason))))))
      (t
       (unless binding
         (user-error "This brief has no full binding; refresh the review (g) and try again"))
       (cond
        ((equal command "override")
         (let ((reason (when refuse (read-string "Reason (optional): "))))
-          (+tt--write-command
-           +tt--run-dir
-           (list (cons 'type "override")
-                 (cons 'vote (if (equal option "approve") "approve" "reject"))
-                 (cons 'binding binding)))
-          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason))))
+          ;; The override's own printed outcome is what the owner is shown.
+          (prog1 (+tt--write-command
+                  +tt--run-dir
+                  (list (cons 'type "override")
+                        (cons 'vote (if (equal option "approve") "approve" "reject"))
+                        (cons 'binding binding)))
+            (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason)))))
        (t
         (let* ((note (when (equal option "accept_risk")
                        (let ((n (read-string "Scope note for accepting the risk: ")))
@@ -2718,12 +3097,12 @@ option also prompts for the non-empty scope note the request requires."
                          n)))
                (reason (when (and refuse (not note)) (read-string "Reason (optional): ")))
                (carried (or note (and reason (not (string-empty-p reason)) reason))))
-          (+tt--write-command
-           +tt--run-dir
-           (append (list (cons 'type "resolve") (cons 'option option))
-                   (when carried (list (cons 'note carried)))
-                   (list (cons 'binding binding))))
-          (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason)))))))))
+          (prog1 (+tt--write-command
+                  +tt--run-dir
+                  (append (list (cons 'type "resolve") (cons 'option option))
+                          (when carried (list (cons 'note carried)))
+                          (list (cons 'binding binding))))
+            (when (and reason (not (string-empty-p reason))) (+tt-review--brief-note reason))))))))))
 
 (defun +tt-review--brief-choose ()
   "Prompt for one of the brief's options (by plain label) and send it."
@@ -2759,6 +3138,74 @@ tuple the owner saw; a missing property is refused before this runs."
            "--run-id" (nth 4 binding)
            "--phase-id" (nth 5 binding)))))
 
+(defvar-local +tt-review--pending nil
+  "Hash of id -> pending label for owner commands sent asynchronously.
+Plan 06f (A3): A/D mark the entry pending at once and the process callback
+clears the mark.  The mark is buffer-local, never written to `review.org'.")
+
+(defvar-local +tt-review--pending-overlays nil
+  "Hash of id -> the overlay showing that id's pending marker.
+Kept beside `+tt-review--pending' so a marker can be DELETED, not just
+forgotten: `erase-buffer' collapses an overlay rather than removing it, and a
+collapsed overlay still draws its `after-string'.")
+
+(defun +tt-review--clear-overlays ()
+  "Delete every pending overlay before a redraw (never stack two)."
+  (when +tt-review--pending-overlays
+    (maphash (lambda (_id ov) (when (overlayp ov) (delete-overlay ov))) +tt-review--pending-overlays)
+    (setq +tt-review--pending-overlays (make-hash-table :test 'equal))))
+
+(defun +tt-review--apply-pending ()
+  "Draw the pending marker on every id in `+tt-review--pending'.
+Called after every render, so a refresh keeps the markers of commands still
+in flight; any previous overlay is deleted first, so markers never stack."
+  (+tt-review--clear-overlays)
+  (when +tt-review--pending
+    (unless +tt-review--pending-overlays (setq +tt-review--pending-overlays (make-hash-table :test 'equal)))
+    (maphash
+     (lambda (id label)
+       (save-excursion
+         (when (+tt-review--goto-id id)
+           (let ((ov (make-overlay (line-beginning-position) (line-end-position))))
+             (overlay-put ov 'after-string (propertize (format "  ⧗ %s" label) 'face 'warning))
+             (overlay-put ov '+tt-review-pending id)
+             (overlay-put ov 'evaporate t)
+             (puthash id ov +tt-review--pending-overlays)))))
+     +tt-review--pending)))
+
+(defun +tt-review--mark-pending (id label)
+  "Mark ID as pending with LABEL, visibly and at once (plan 06f, A3)."
+  (when id
+    (unless +tt-review--pending (setq +tt-review--pending (make-hash-table :test 'equal)))
+    (puthash id label +tt-review--pending)
+    (+tt-review--apply-pending)))
+
+(defun +tt-review--clear-pending (id)
+  "Delete ID's pending marker and forget it (the callback replaces it)."
+  (when (and +tt-review--pending id)
+    (remhash id +tt-review--pending)
+    (when +tt-review--pending-overlays
+      (let ((ov (gethash id +tt-review--pending-overlays)))
+        (when (overlayp ov) (delete-overlay ov)))
+      (remhash id +tt-review--pending-overlays))))
+
+(defun +tt-review--send-async (id label args)
+  "Mark ID pending, run `tt' ARGS asynchronously, and show the outcome.
+Plan 06f (A3): the command returns at once; the process callback clears the
+pending mark, reports the recorded outcome (or the error) in the echo area
+and refreshes the review."
+  (+tt-review--mark-pending id label)
+  (let ((buf (current-buffer)))
+    (+tt--cli-async-result
+     (+tt--cli-root-for args) args
+     (lambda (status text)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (+tt-review--clear-pending id)
+           (message "%s" (cond ((not (string-empty-p text)) text)
+                                (t (format "owner command for %s failed (exit %s)" id status))))
+           (+tt-review-refresh t)))))))
+
 (defun +tt-review--settleable-id ()
   "The id at point when the message can be settled, else signal an error.
 A raw message is not yet frozen, and a heading without the full binding is
@@ -2774,23 +3221,22 @@ refused rather than settled against the run's current state."
 
 (defun +tt-review--verdict (verdict reason)
   "Send VERDICT (`accept'/`refuse') for the message at point.
-A raw message cannot be settled yet (contract v1: it is not yet frozen);
-one already published is sent through `tt verdict' with its full binding.
-A missing binding property is refused locally, and a stale verdict's reason
-is shown in the echo area and the buffer refreshes."
-  (if (+tt-review--entry-id)
-      ;; Plan 05j: A/D act on the ENTRY, not one message: the owner settles the
-      ;; topic once. Refusing asks for a one-line reason like a message.
-      (progn
-        (condition-case err
-            (message "%s" (apply #'+tt--cli (append (list "entry" +tt--run-dir (if (equal verdict "accept") "accept" "refuse") (+tt-review--entry-id)) (when (and reason (not (string-empty-p reason))) (list "--reason" reason)))))
-          (error (message "%s" (error-message-string err))))
-        (+tt-review-refresh t))
-    (let ((id (+tt-review--settleable-id)))
-      (condition-case err
-          (message "%s" (apply #'+tt--cli (+tt-review--verdict-args id verdict reason)))
-        (error (message "%s" (error-message-string err))))
-      (+tt-review-refresh t))))
+Plan 06f (A3): the command runs asynchronously, the entry is marked pending
+at once, and the process callback reports the recorded outcome.  A raw
+message cannot be settled yet (contract v1: it is not yet frozen); one
+already published is sent through `tt verdict' with its full binding.  A
+missing binding property is refused locally."
+  (let ((label (if (equal verdict "accept") "A pending" "D pending")))
+    (if (+tt-review--entry-id)
+        ;; Plan 05j: A/D act on the ENTRY, not one message: the owner settles
+        ;; the topic once.  Refusing asks for a one-line reason like a message.
+        (let ((id (+tt-review--entry-id)))
+          (+tt-review--send-async
+           id label
+           (append (list "entry" +tt--run-dir (if (equal verdict "accept") "accept" "refuse") id)
+                   (when (and reason (not (string-empty-p reason))) (list "--reason" reason)))))
+      (let ((id (+tt-review--settleable-id)))
+        (+tt-review--send-async id label (+tt-review--verdict-args id verdict reason))))))
 
 (defun +tt-review-accept ()
   "Resolve the brief at point with its accept option (A), or accept the entry
@@ -3310,144 +3756,102 @@ Emacs started are not replayed."
 
 ;; The mode-line indicator is refreshed on a 10 s timer.  It must never block:
 ;; the listing it needs (`tt list' and `tt program list') is a Node start plus
-;; a fold of every run's event log, over 1 s with ~100 runs, and run
-;; synchronously on the timer it froze Emacs for that long every 10 s even
-;; with no tradeoffs-trace buffer open.  The timer therefore (1) runs both
-;; commands as asynchronous processes and renders in their sentinels, and
-;; (2) does not run them at all when no run or program file changed since the
-;; last refresh and nothing shown is ageing (no live run, no waiting node).
-;; `+tt--mode-line-update' keeps the synchronous form for tests and callers
-;; that want the answer now.
+;; a fold of every run's event log, over 1 s with ~100 runs.  Plan 06f (A2):
+;; the mode line now reads `<+tt-root>/live.json' — a file the conductor and
+;; the scheduler keep current — so the timer is a file read and never a
+;; process, and Emacs can never be blocked by a listing however many runs
+;; exist.  The 10 s timer re-reads the file only when its stamp changed (or
+;; the last read is older than `+tt-mode-line-max-age').
 
-(defun +tt--waiting-from-json (jsons)
-  "Waiting nodes in the `tt program list --json' outputs JSONS, oldest first."
-  (let (rows)
-    (dolist (json jsons)
-      (when json
-        (dolist (p (json-parse-string json :object-type 'alist :array-type 'list
-                                      :null-object nil :false-object :false))
-          (dolist (w (alist-get 'waiting p))
-            (push (cons (or (alist-get 'since w) "") w) rows)))))
-    (mapcar #'cdr (sort rows (lambda (a b) (string< (car a) (car b)))))))
+(defvar +tt--live-file nil
+  "Override for the live file; defaults to `<+tt-root>/live.json'.")
 
-(defun +tt--waiting-nodes ()
-  "Waiting nodes across every program of every root, oldest wait first.
-One `tt program list --json' call per root; nil when there is no program or
-no wait.  A root whose call fails is skipped with a message."
-  (+tt--waiting-from-json
-   (mapcar (lambda (root)
-             (+tt--root-call root (lambda () (+tt--cli-on root "program" "list" "--json"))))
-           (+tt--listing-roots))))
+(defun +tt--live-path ()
+  "The `live.json' path the mode line reads."
+  (or +tt--live-file (expand-file-name "live.json" +tt-root)))
+
+(defun +tt--live-read ()
+  "Parse `<+tt-root>/live.json', or nil when it is missing or malformed.
+Reads a file only: no process, local or remote, is ever started."
+  (let ((file (+tt--live-path)))
+    (when (file-exists-p file)
+      (ignore-errors
+        (with-temp-buffer
+          (insert-file-contents file)
+          (json-parse-string (buffer-string) :object-type 'alist :array-type 'list
+                             :null-object nil :false-object :false))))))
+
+(defun +tt--live-waiting ()
+  "The waiting nodes in `live.json', oldest (lowest node id) first."
+  (let ((rows (alist-get 'waitingNodes (+tt--live-read))))
+    (sort (copy-sequence rows)
+          (lambda (a b) (string< (or (alist-get 'node a) "") (or (alist-get 'node b) ""))))))
 
 (defun +tt--mode-line-wait-from (waiting)
-  "The `⚑ <node> waiting <duration>' segment for the first of WAITING, or nil."
+  "The `⚑ <node> waiting' segment for the first of WAITING, or nil."
   (when-let* ((w (car waiting)))
-    (propertize (format " [⚑ %s waiting %s]" (alist-get 'node w) (alist-get 'duration w))
+    (propertize (format " [⚑ %s waiting]" (alist-get 'node w))
                 'face (if (and +tt--notify-flash
                                (< (float-time (time-since +tt--notify-flash)) 10))
                           'warning 'error))))
 
 (defun +tt--mode-line-wait ()
-  "The `⚑ <node> waiting <duration>' mode-line segment, or nil."
-  (+tt--mode-line-wait-from (+tt--waiting-nodes)))
+  "The `⚑ <node> waiting' mode-line segment, or nil."
+  (+tt--mode-line-wait-from (+tt--live-waiting)))
 
-(defvar +tt--mode-line-ageing nil
-  "Non-nil when the indicator shows something that ages by itself (a live
-run's stage time, a wait's duration), so the timer refreshes it every tick.")
-
-(defun +tt--mode-line-apply (rows waiting)
-  "Set the mode-line indicator from run ROWS and WAITING nodes."
-  (let* ((wait (+tt--mode-line-wait-from waiting))
+(defun +tt--mode-line-apply (live)
+  "Set the mode-line indicator from the parsed LIVE file.
+LIVE's `runs' are the runs alive or waiting for the owner; its
+`waitingNodes' are the program nodes waiting to start.  No CLI call is made."
+  (let* ((rows (and live (alist-get 'runs live)))
+         (wait (+tt--mode-line-wait-from (and live (alist-get 'waitingNodes live))))
          (flash (and +tt--notify-flash
-                     (< (float-time (time-since +tt--notify-flash)) 10)))
-         (live (seq-some (lambda (r) (eq (alist-get 'alive r) t)) rows)))
-    (setq +tt--mode-line-ageing (and (or live wait) t))
+                     (< (float-time (time-since +tt--notify-flash)) 10))))
     (setq +tt--mode-line-string
-          (if (not live)
+          (if (null rows)
               ;; A waiting program whose run conductor is stopped or dead
               ;; (BLOCKED, crashed) still shows its wait, not just a flash.
               (cond (wait wait)
                     (flash (propertize " [⚑]" 'face 'warning))
                     (t ""))
-            (let ((shown (seq-filter (lambda (r) (or (eq (alist-get 'alive r) t)
-                                                      (equal (alist-get 'attention r) "needs you")))
-                                     rows)))
-              (concat
-               (cond (wait wait)
-                     (flash (propertize " [⚑]" 'face 'warning))
-                     (t ""))
-               (if (null shown) ""
-                 (concat " ["
-                         (mapconcat
-                          (lambda (r)
-                            (propertize (format "tt:%s %s %s %s" (substring (or (alist-get 'readableId r) (alist-get 'id r)) 0 4)
-                                                (alist-get 'stage r) (alist-get 'stageElapsed r)
-                                                (replace-regexp-in-string " +" "" (or (alist-get 'reviews r) "")))
-                                        'face (+tt--attention-face r)))
-                          shown " | ")
-                         "]")))))))
-  (force-mode-line-update t))
+            (concat
+             (cond (wait wait)
+                   (flash (propertize " [⚑]" 'face 'warning))
+                   (t ""))
+             " ["
+             (mapconcat
+              (lambda (r)
+                (let ((id (or (alist-get 'id r) "")))
+                  (propertize (format "tt:%s %s%s"
+                                      (substring id 0 (min 4 (length id)))
+                                      (or (alist-get 'phase r) "")
+                                      (if (eq (alist-get 'needsOwner r) t) " ⚑" ""))
+                              'face (if (eq (alist-get 'needsOwner r) t) 'error 'default))))
+              rows " | ")
+             "]")))
+  (force-mode-line-update t)))
 
 (defun +tt--mode-line-update ()
-  "Refresh the mode-line indicator now, synchronously, from `tt list'.
-Only the local root is listed: a dead remote host must never block Emacs
-from the mode line (findings M-2/D-13).  The timer uses
-`+tt--mode-line-tick', which never blocks."
-  (let ((+tt--roots-override (+tt--background-roots)))
-    (+tt--mode-line-apply (ignore-errors (+tt--list)) (+tt--waiting-nodes))))
+  "Refresh the mode-line indicator now, from the local `live.json'.
+A file read only: it never starts a process, local or remote (M-2/D-13)."
+  (+tt--mode-line-apply (+tt--live-read)))
 
-(defun +tt--root-stamp (root)
-  "A cheap fingerprint of the local ROOT: the stamp of every run's and
-program's event log and program state, in one directory walk (stats only,
-no Node).  Equal stamps mean no run or program changed."
-  (let (stamps)
-    (dolist (dir (directory-files root t "\\`[^.]" t))
-      (when (file-directory-p dir)
-        (push (+tt--file-stamp (expand-file-name "events.jsonl" dir)) stamps)))
-    (let ((programs (expand-file-name "programs" root)))
-      (when (file-directory-p programs)
-        (dolist (dir (directory-files programs t "\\`[^.]" t))
-          (push (+tt--file-stamp (expand-file-name "events.jsonl" dir)) stamps)
-          (push (+tt--file-stamp (expand-file-name "program.json" dir)) stamps))))
-    stamps))
-
-(defvar +tt--mode-line-inflight nil "Non-nil while an asynchronous refresh runs.")
-(defvar +tt--mode-line-stamp nil "The root stamp the indicator was last computed from.")
-(defvar +tt--mode-line-at 0 "`float-time' of the last asynchronous refresh.")
+(defvar +tt--mode-line-stamp nil "The live-file stamp the indicator was last computed from.")
+(defvar +tt--mode-line-at 0 "`float-time' of the last live-file read.")
 
 (defcustom +tt-mode-line-max-age 300
-  "Seconds after which the mode-line indicator is recomputed even if nothing changed."
+  "Seconds after which the mode-line indicator is recomputed even if the live file is unchanged."
   :type 'integer)
 
 (defun +tt--mode-line-tick ()
-  "Timer body: refresh the indicator asynchronously, and only when needed.
-Skipped while a refresh is running; skipped when the local root's stamp is
-unchanged, nothing shown is ageing and the last refresh is younger than
-`+tt-mode-line-max-age'."
-  (unless +tt--mode-line-inflight
-    (let* ((root (car (+tt--background-roots)))
-           (stamp (ignore-errors (+tt--root-stamp root))))
-      (when (or (not (equal stamp +tt--mode-line-stamp))
-                ;; Only durations change: once a minute is enough.
-                (and +tt--mode-line-ageing (> (- (float-time) +tt--mode-line-at) 60))
-                (> (- (float-time) +tt--mode-line-at) +tt-mode-line-max-age))
-        (setq +tt--mode-line-inflight t)
-        (+tt--cli-async
-         root '("program" "list" "--json")
-         (lambda (programs)
-           (+tt--cli-async
-            root '("list" "--json")
-            (lambda (list)
-              (unwind-protect
-                  ;; A failed call keeps the last indicator rather than
-                  ;; clearing it; the next change or max age retries.
-                  (when (and programs list)
-                    (+tt--mode-line-apply
-                     (+tt--sort-rows (ignore-errors (+tt--rows-from-json root list)))
-                     (ignore-errors (+tt--waiting-from-json (list programs))))
-                    (setq +tt--mode-line-stamp stamp
-                          +tt--mode-line-at (float-time)))
-                (setq +tt--mode-line-inflight nil))))))))))
+  "Timer body: re-read `live.json' when its stamp changed (or it is stale).
+Reads a file only; no process is ever started from this timer."
+  (let ((stamp (ignore-errors (+tt--file-stamp (+tt--live-path)))))
+    (when (or (not (equal stamp +tt--mode-line-stamp))
+              (> (- (float-time) +tt--mode-line-at) +tt-mode-line-max-age))
+      (setq +tt--mode-line-stamp stamp
+            +tt--mode-line-at (float-time))
+      (+tt--mode-line-apply (+tt--live-read)))))
 
 (defun +tt--ensure-mode-line ()
   "Install the display-only mode-line indicator and its timers."
@@ -3458,9 +3862,23 @@ unchanged, nothing shown is ageing and the last refresh is younger than
   (unless (timerp +tt--notify-timer)
     (setq +tt--notify-timer (run-with-timer 1 3 #'+tt--notifications-poll))))
 
+;;;###autoload
+(defun +tt-evidence (item file-or-text)
+  "Record the owner's evidence for ITEM (the `C-c m e' command).
+FILE-OR-TEXT is an existing file whose contents are recorded, or the text
+itself.  A phase parked `AWAITING_OWNER' for an `evidence' item resumes once
+every evidence item is recorded (plan 06b)."
+  (interactive
+   (list (read-string "Item id: ")
+         (read-string "Evidence (file or text): ")))
+  (let* ((run (+tt--resolve-run))
+         (out (+tt--cli-outcome "evidence" run item file-or-text)))
+    (message "%s" out)))
+
 ;;;; Keys
 
 (keymap-global-set "C-c m r" #'+tt-run)
+(keymap-global-set "C-c m e" #'+tt-evidence)
 (keymap-global-set "C-c m s" #'+tt-show)
 (keymap-global-set "C-c m d" #'+tt-review)
 (keymap-global-set "C-c m D" #'+tt-program-review)

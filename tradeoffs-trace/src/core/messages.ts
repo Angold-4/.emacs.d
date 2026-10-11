@@ -23,6 +23,23 @@
 import { createHash } from "node:crypto";
 
 import { sameVersion } from "./predicate.ts";
+
+/** The 80-character cap a published message (and entry) title must fit. */
+export const MESSAGE_TITLE_MAX = 80;
+
+/** Plan 06c (R6): an entry title built from a raw message is at most
+ * `MESSAGE_TITLE_MAX` characters and ends at a word boundary. A title already
+ * within the cap is returned unchanged (whitespace collapsed); a longer one is
+ * cut at the last space that leaves room for the trailing ellipsis, so it
+ * never ends mid-word. */
+export function clampMessageTitle(title: string): string {
+  const t = title.replace(/\s+/g, " ").trim();
+  if (t.length <= MESSAGE_TITLE_MAX) return t;
+  const cut = t.slice(0, MESSAGE_TITLE_MAX - 1);
+  const lastSpace = cut.lastIndexOf(" ");
+  const base = lastSpace > 0 ? cut.slice(0, lastSpace) : cut;
+  return `${base}…`;
+}
 import type {
   ContractVersion,
   Message,

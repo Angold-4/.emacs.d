@@ -29,7 +29,13 @@
 // itself, or directly) rather than re-deriving the same facts — round-1
 // review item 5's last bullet: openItemsRemain must not reimplement this.
 
+import { leaderOf, seatsOf } from "./seats.ts";
 import { currentBallot, isValidBallot, tally } from "./tally.ts";
+// Plan 06b: the per-item acceptance half — every R and C met by majority with
+// its test verifies passed, every A fitting by majority or its deviation
+// accepted by the owner, and every evidence item recorded.
+import { flatItems, isStructured, itemNeedsEvidence, itemsAccept, itemsFromPhase, phaseItemOutcomes, tallyItems, testVerifyProblems, thinMetItems, workerAnchorsOf } from "./items.ts";
+import { discoveredDecisions, hasBlockingFix, openFindings, ownerRequestIsStale, recordClassified, undispositionedBlockingFinding } from "./triage.ts";
 import type { RoundPanelOutcome, RoundPanelState } from "./types.ts";
 import type {
   ContractVersion,
@@ -79,7 +85,7 @@ export function reviewIngestionIssue(review: Review): string | undefined {
  * status that is not exactly `"honored"` all make it false. */
 export function addressed(correction: Correction, phase: PhaseState, C: string, K: ContractVersion): boolean {
   if (!sameVersion(correction.boundContractVersion, K)) return false;
-  for (const who of ["M", "A", "B"] as const) {
+  for (const who of seatsOf(phase.contract)) {
     const review = phase.reviews[who]?.review;
     if (!review) return false;
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
@@ -97,9 +103,37 @@ export const EVALUATOR_TYPES = ["tradeoff", "finding", "blocker"] as const;
  * with a raw message to check, or one with an owner-refused message awaiting
  * its "was it addressed" report (owner correction, item 3). */
 export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
-  return (EVALUATOR_TYPES as readonly MessageType[]).filter((t) =>
+  const types = (EVALUATOR_TYPES as readonly MessageType[]).filter((t) =>
     (phase.messages ?? []).some((m) => m.type === t && (m.state === "raw" || m.state === "refused")),
   );
+  // Plan 06b (OD-1 R3b): a majority `unmet`/`deviates` needs the evaluator's
+  // substantive re-check against the candidate before it blocks. Force one
+  // `finding` evaluator pass for it when no finding message already asks.
+  if (itemsNeedingEvaluatorReverify(phase) && !types.includes("finding")) types.push("finding");
+  // Plan 06i (A3): a finding or discovered decision that still owes its impact
+  // classification needs its evaluator pass even with no raw message of that
+  // type this round — otherwise the classification is owed but never asked
+  // and the record escalates.
+  if (openFindings(phase).some((f) => !recordClassified(phase, "finding", f.id)) && !types.includes("finding")) {
+    types.push("finding");
+  }
+  if (discoveredDecisions(phase).some((d) => !recordClassified(phase, "decision", d.id)) && !types.includes("tradeoff")) {
+    types.push("tradeoff");
+  }
+  return types;
+}
+
+/** Plan 06b (OD-1 R3b): true when a structured phase has an item whose
+ * majority verdict is `unmet` or `deviates`, so the evaluator must re-check
+ * it against the candidate before it can block. */
+export function itemsNeedingEvaluatorReverify(phase: PhaseState): boolean {
+  if (!isStructured(phase.contract)) return false;
+  // ODP-2: an item blocker is never raised without an evaluator item check,
+  // so every outcome that is not met/fits owes one.
+  const outcomes = phaseItemOutcomes(phase);
+  if (outcomes.some((o) => o.outcome !== "met" && o.outcome !== "fits")) return true;
+  // Plan 06c (R5): a unanimous thin met/fits is audited by the evaluator.
+  return thinMetItems(outcomes, workerAnchorsOf(phase.coverage)).length > 0;
 }
 
 /** Plan 04a: whether everything EVALUATING waits for has settled. In 04a
@@ -110,8 +144,22 @@ export function typesNeedingEvaluation(phase: PhaseState): MessageType[] {
 // Plan 04b: the blocker panel
 // ---------------------------------------------------------------------------
 
-/** The three seats every panel has. */
+/** The default number of seats every panel has, kept for callers that
+ * predate `#+TT_REVIEWERS`. From 06h a panel has as many seats as there are
+ * reviewers, so every function below takes the count. */
 export const PANEL_SEATS = [1, 2, 3] as const;
+
+/** Plan 06h (A2): the panel seat numbers for `count` reviewers, 1-based. */
+export function panelSeatNumbers(count: number): number[] {
+  const n = Number.isInteger(count) && count >= 1 ? count : 3;
+  return Array.from({ length: n }, (_, i) => i + 1);
+}
+
+/** The strict majority of `count` seats: 2 of 3, 3 of 5, 4 of 7. */
+export function panelMajority(count: number): number {
+  const n = Number.isInteger(count) && count >= 1 ? count : 3;
+  return Math.floor(n / 2) + 1;
+}
 
 /** The fallback pair of owner options: what an ordinary open-finding request
  * for the blocker offers, worded exactly as `applyOwnerRequestResolved` and
@@ -134,22 +182,23 @@ export function panelSeatSettled(seat: PanelSeatState | undefined): boolean {
   return seat.unavailable === true && seat.dispatches >= 2;
 }
 
-export function panelSeatsSettled(panel: PanelState | undefined): boolean {
-  return PANEL_SEATS.every((n) => panelSeatSettled(panel?.seats?.[String(n)]));
+export function panelSeatsSettled(panel: PanelState | undefined, count = 3): boolean {
+  return panelSeatNumbers(count).every((n) => panelSeatSettled(panel?.seats?.[String(n)]));
 }
 
 /** The panel's verdict from its recorded votes: a majority `block` escalates,
  * a majority `downgrade` downgrades, anything else (including a split or two
  * unavailable seats) is incomplete. Only the core computes this; the
  * conductor may not invent an outcome. */
-export function panelOutcome(panel: PanelState): PanelOutcome {
+export function panelOutcome(panel: PanelState, count = 3): PanelOutcome {
   const votes = Object.values(panel.seats ?? {})
     .map((s) => s.vote)
     .filter((v): v is "block" | "downgrade" => v === "block" || v === "downgrade");
+  const needed = panelMajority(count);
   const blocks = votes.filter((v) => v === "block").length;
   const downgrades = votes.filter((v) => v === "downgrade").length;
-  if (blocks >= 2) return "escalate";
-  if (downgrades >= 2) return "downgrade";
+  if (blocks >= needed) return "escalate";
+  if (downgrades >= needed) return "downgrade";
   return "incomplete";
 }
 
@@ -157,9 +206,9 @@ export function panelOutcome(panel: PanelState): PanelOutcome {
  * options, in seat order, deduped by id and capped at three (a `block` vote
  * proposes two or three). Falls back to DEFAULT_BLOCKER_OPTIONS so an
  * escalation always has options. */
-export function panelOptionsFor(panel: PanelState): PanelOption[] {
+export function panelOptionsFor(panel: PanelState, count = 3): PanelOption[] {
   const out: PanelOption[] = [];
-  for (const n of PANEL_SEATS) {
+  for (const n of panelSeatNumbers(count)) {
     const seat = panel.seats?.[String(n)];
     if (seat?.vote !== "block") continue;
     for (const option of seat.options ?? []) {
@@ -209,8 +258,8 @@ export function roundPanelSeatSettled(seat: import("./types.ts").RoundPanelSeatS
   return seat.unavailable === true && seat.dispatches >= 2;
 }
 
-export function roundPanelSeatsSettled(round: RoundPanelState | undefined): boolean {
-  return PANEL_SEATS.every((n) => roundPanelSeatSettled(round?.seats?.[String(n)]));
+export function roundPanelSeatsSettled(round: RoundPanelState | undefined, count = 3): boolean {
+  return panelSeatNumbers(count).every((n) => roundPanelSeatSettled(round?.seats?.[String(n)]));
 }
 
 /** The items this round's panel votes on: every published trade-off message
@@ -228,7 +277,7 @@ export function roundPanelItemsNeedingVote(phase: PhaseState): string[] {
     if (m.type === "tradeoff") {
       const decision = m.sourceRecordId ? phase.decisions.find((d) => d.id === m.sourceRecordId) : undefined;
       if (decision) {
-        const all = (["M", "A", "B"] as const).every((who) =>
+        const all = seatsOf(phase.contract).every((who) =>
           isValidBallot(currentBallot(phase.ballots, decision.id, who, C, K, decision.version)),
         );
         if (all) continue;
@@ -249,14 +298,20 @@ export function roundPanelItemsNeedingVote(phase: PhaseState): string[] {
  * keeps it (a trade-off is published to the owner; a blocking finding keeps
  * blocking). Otherwise a trade-off is dropped and a finding becomes
  * advisory — a 2-of-3 majority is the only way a finding blocks. */
-export function roundPanelOutcomeFor(round: RoundPanelState | undefined, messageId: string, kind: "tradeoff" | "finding"): RoundPanelOutcome {
-  const votes = PANEL_SEATS.map((n) => round?.seats?.[String(n)]?.votes?.find((v) => v.messageId === messageId)).filter(
-    (v): v is NonNullable<typeof v> => v !== undefined,
-  );
-  const count = (verdict: string) => votes.filter((v) => v.verdict === verdict).length;
-  if (count("keep") >= 2) return "keep";
-  if (count("drop") >= 2) return "drop";
-  if (count("downgrade") >= 2) return "downgrade";
+export function roundPanelOutcomeFor(
+  round: RoundPanelState | undefined,
+  messageId: string,
+  kind: "tradeoff" | "finding",
+  count = 3,
+): RoundPanelOutcome {
+  const votes = panelSeatNumbers(count)
+    .map((n) => round?.seats?.[String(n)]?.votes?.find((v) => v.messageId === messageId))
+    .filter((v): v is NonNullable<typeof v> => v !== undefined);
+  const needed = panelMajority(count);
+  const tally = (verdict: string) => votes.filter((v) => v.verdict === verdict).length;
+  if (tally("keep") >= needed) return "keep";
+  if (tally("drop") >= needed) return "drop";
+  if (tally("downgrade") >= needed) return "downgrade";
   return kind === "finding" ? "downgrade" : "drop";
 }
 
@@ -340,7 +395,7 @@ export function findingCitesAcceptanceOrReserved(
  * SAME candidate against a new head), whether REVIEWING needs to dispatch
  * anything at all or the phase can go straight to RESOLVING. */
 export function reviewsComplete(phase: PhaseState, C: string, K: ContractVersion): boolean {
-  return (["M", "A", "B"] as const).every((who) => {
+  return seatsOf(phase.contract).every((who) => {
     const review = phase.reviews[who]?.review;
     return Boolean(review) && review!.candidateSha === C && sameVersion(review!.contractVersion, K);
   });
@@ -423,8 +478,16 @@ export function amendmentToApply(
       // meaningless — next() must agree with the row's own guard, or the
       // conductor emits an event the reducer refuses and throws.
       phase.contract.acceptance.includes(d.amendment.criterion) &&
-      tally(d, phase.ballots, phase.findings, C, K) === "pass",
+      tally(d, phase.ballots, phase.findings, C, K, seatsOf(phase.contract), leaderOf(phase.contract)) === "pass",
   );
+}
+
+/** Plan 06k1 (A2): true when the owner ruled this decision — the recorded
+ * ruling matches its id and its (unchanged) choice. Exported so the live
+ * ballot demand reads the same fact `decisionSettled` does, and never asks a
+ * reviewer for a ballot the owner's ruling already settled. */
+export function ownerRuledDecision(phase: PhaseState, decision: Decision): boolean {
+  return (phase.ruledDecisions ?? []).some((r) => r.id === decision.id && r.choice === decision.choice);
 }
 
 export function decisionSettled(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): boolean {
@@ -433,7 +496,11 @@ export function decisionSettled(decision: Decision, phase: PhaseState, C: string
   // delegated and reserved alike: the reviewers' vote, an owner override,
   // or the owner accepting it after a failed vote. A reserved decision is
   // flagged for the owner (DecisionStatus.flagged), never held for them.
-  if (tally(decision, phase.ballots, phase.findings, C, K) === "pass") return true;
+  // Plan 06k1 (A2): a decision the owner ruled on is settled with no
+  // ballots, on every later candidate whose decision has the same id and
+  // choice. Checked before the tally so the ruling is never re-tallied.
+  if (ownerRuledDecision(phase, decision)) return true;
+  if (tally(decision, phase.ballots, phase.findings, C, K, seatsOf(phase.contract), leaderOf(phase.contract)) === "pass") return true;
   const overridden = phase.overrides.some(
     (o) =>
       o.decisionId === decision.id &&
@@ -450,6 +517,10 @@ export function decisionSettled(decision: Decision, phase: PhaseState, C: string
 
 /** accept(C, K): the only way a phase may reach ACCEPTED. */
 export function accept(phase: PhaseState, C: string, K: ContractVersion): boolean {
+  // Mechanical gates are facts (ODP-1, ODP-2): the checks must have passed
+  // for C, and the probe must be for C onto the CURRENT integration head. They
+  // are evaluated BEFORE the owner's accept-with-carried shortcut, so a carry
+  // can never accept a failing or stale candidate.
   if (!(phase.checks && phase.checks.candidateSha === C && phase.checks.passed === true)) {
     return false;
   }
@@ -467,15 +538,78 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     return false;
   }
 
-  for (const who of ["M", "A", "B"] as const) {
+  // Plan 06b (OD-1): a STRUCTURED phase additionally requires its `test`
+  // verifies passed, no unaccepted `:WHERE:` symbol deviation, and every
+  // `evidence` item recorded. These are MECHANICAL item gates (ODP-3): they are
+  // evaluated BEFORE the owner's carry shortcut, so a carry can never waive a
+  // missing named test verify, a symbol deviation or unrecorded evidence. The
+  // item REVIEW VERDICTS (the tally below) are review items the carry does
+  // waive. An old-format phase declares no items and keeps today's rule.
+  const itemsEnforced = isStructured(phase.contract);
+  const items = itemsEnforced ? itemsFromPhase(phase.contract) : undefined;
+  let acceptedDeviations: Set<string> | undefined;
+  let evidenceRecorded: string[] | undefined;
+  if (itemsEnforced) {
+    if (testVerifyProblems(phase.checkResolution ?? []).length > 0) return false;
+    // An architecture deviation is accepted when the owner accepts the item's
+    // own blocking finding as a trade-off (`accept_risk`), or when it is
+    // recorded in `acceptedDeviations`.
+    acceptedDeviations = new Set([
+      ...(phase.acceptedDeviations ?? []),
+      ...phase.findings.filter((f) => f.itemId && f.status === "accepted").map((f) => f.itemId!),
+    ]);
+    // A `:WHERE:` symbol the conductor could not find is a deviation the
+    // owner must accept before acceptance, whatever the seats said.
+    if ((phase.archSymbolDeviations ?? []).some((id) => !acceptedDeviations!.has(id))) return false;
+    evidenceRecorded = (phase.itemEvidence ?? []).map((e) => e.id);
+    // Every `evidence` item is owner-recorded, never waived by a carry.
+    if (flatItems(items!).some((i) => itemNeedsEvidence(i) && !evidenceRecorded!.includes(i.id))) return false;
+  }
+
+  // Plan 06g (A6/ODP-2/ODP-3): the owner's "accept with carried items" decision
+  // at the end of the round budget accepts the candidate the carry was given
+  // for (`carriedCandidateSha`), waiving only the OPEN REVIEW ITEMS — the
+  // review verdicts, open findings, decisions and corrections that are carried.
+  // It never waives the mechanical gates above (checks, probe, test verifies,
+  // symbol deviations, evidence), the candidate binding, or another
+  // candidate's gate/probe.
+  if (phase.acceptedWithCarried) return phase.carriedCandidateSha === C;
+
+  // Plan 06i: a record the triage dispositioned `fix` blocks acceptance,
+  // whatever the reviewer's severity label and whatever round it was raised
+  // in (06g's round-2 downgrade never applies to a wrong-output record). A
+  // wrong-output finding is item-linked by definition, so it is never
+  // downgraded. An explicit owner carry above is the one owner decision that
+  // accepts with the item, exactly as it does for any open review item.
+  // Plan 06i (A2): acceptance follows the item's disposition, never the
+  // reviewer's label. A fix disposition blocks; a trade-off does not; an
+  // in-window escalation blocks through its open owner request below. A
+  // blocking finding that has not been triaged yet still blocks (fail safe).
+  if (hasBlockingFix(phase) || undispositionedBlockingFinding(phase)) return false;
+
+  for (const who of seatsOf(phase.contract)) {
     const review = phase.reviews[who]?.review;
     if (!review) return false;
     if (review.candidateSha !== C || !sameVersion(review.contractVersion, K)) return false;
   }
 
-  if (phase.findings.some((f) => f.severity === "blocking" && f.status === "open")) {
-    return false;
+  if (itemsEnforced) {
+    const reviews = seatsOf(phase.contract).map((seat) => {
+      const r = phase.reviews[seat]?.review;
+      return { seat, items: r ? { items: r.items ?? [], arch: r.arch ?? [] } : undefined };
+    });
+    const outcomes = tallyItems(items!, reviews, phase.overturns ?? []);
+    if (
+      !itemsAccept(items!, outcomes, {
+        acceptedDeviations: [...acceptedDeviations!],
+        evidenceRecorded: evidenceRecorded!,
+      })
+    ) {
+      return false;
+    }
   }
+
+
 
   for (const decision of phase.decisions) {
     // A decision superseded by a correction (design §7.5 step 1) is
@@ -492,7 +626,10 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     if (!decisionSettled(decision, phase, C, K)) return false;
   }
 
-  if (phase.ownerRequests.some((r) => r.status === "open")) {
+  // Plan 06i: a non-blocking owner request (a late discovery's escalation)
+  // is visible but does not gate acceptance; an open request whose linked
+  // item is already closed is moot and does not gate it either.
+  if (phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) {
     return false;
   }
 
@@ -501,7 +638,49 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
     if (!addressed(correction, phase, C, K)) return false;
   }
 
+  // Plan 06k1 (A5, finding A-8): a correction queued while the phase was
+  // reviewing, evaluating or final-checking has not reached a worker prompt
+  // yet. It is an acceptance obligation: the phase repairs (granting the
+  // correction's own round) until NOTES_DELIVERED clears it, so a correction
+  // is never lost to timing and never accepted around.
+  if ((phase.queuedCorrections ?? []).length > 0) return false;
+
   return true;
+}
+
+/** Plan 06b: true when the ONLY thing keeping the phase from acceptance is an
+ * unrecorded `evidence` item. Then the phase parks AWAITING_OWNER naming the
+ * item instead of spending a repair round the worker cannot satisfy. */
+/** The `evidence` items not yet recorded. */
+export function pendingEvidenceItems(phase: PhaseState) {
+  if (!isStructured(phase.contract)) return [];
+  const items = itemsFromPhase(phase.contract);
+  const recorded = new Set((phase.itemEvidence ?? []).map((e) => e.id));
+  return flatItems(items).filter((i) => itemNeedsEvidence(i) && !recorded.has(i.id));
+}
+
+/** True when the phase has at least one `evidence` item and every one is
+ * recorded. */
+export function evidenceAllRecorded(phase: PhaseState): boolean {
+  if (!isStructured(phase.contract)) return false;
+  const ev = flatItems(itemsFromPhase(phase.contract)).filter((i) => itemNeedsEvidence(i));
+  if (ev.length === 0) return false;
+  const recorded = new Set((phase.itemEvidence ?? []).map((e) => e.id));
+  return ev.every((i) => recorded.has(i.id));
+}
+
+export function evidenceOnlyPending(phase: PhaseState): boolean {
+  if (!isStructured(phase.contract)) return false;
+  if (!phase.candidate) return false;
+  const pending = pendingEvidenceItems(phase);
+  if (pending.length === 0) return false;
+  // Everything else acceptable: pretend the evidence is recorded and ask
+  // accept() whether only the evidence stood in the way.
+  const withEvidence: PhaseState = {
+    ...phase,
+    itemEvidence: [...(phase.itemEvidence ?? []), ...pending.map((i) => ({ id: i.id, text: "pending" }))],
+  };
+  return accept(withEvidence, phase.candidate.sha, phase.contract.contractVersion);
 }
 
 /** done(phase) ⇔ accept(C, K) ∧ the integration branch points at the probed I. */
@@ -550,26 +729,38 @@ export function decisionStatus(decision: Decision, phase: PhaseState): DecisionS
 }
 
 function votedStatus(decision: Decision, phase: PhaseState, C: string, K: ContractVersion): DecisionStatus {
+  const seats = seatsOf(phase.contract);
+  const leader = leaderOf(phase.contract);
   if (decisionSettled(decision, phase, C, K)) {
-    const t = tally(decision, phase.ballots, phase.findings, C, K);
+    const t = tally(decision, phase.ballots, phase.findings, C, K, seats, leader);
     return { status: "passed", reason: t === "pass" ? "vote passed" : "settled by the owner" };
   }
-  const t = tally(decision, phase.ballots, phase.findings, C, K);
+  const t = tally(decision, phase.ballots, phase.findings, C, K, seats, leader);
   if (t === "suspended") return { status: "suspended", reason: `linked finding ${decision.linkedFindingId} is open` };
-  const vote = (who: "M" | "A" | "B") => {
+  const vote = (who: string) => {
     const b = currentBallot(phase.ballots, decision.id, who, C, K, decision.version);
     return isValidBallot(b) ? b.vote : undefined;
   };
-  const reviewsDone = (["M", "A", "B"] as const).every((w) => phase.reviews[w]?.review?.candidateSha === C);
-  const m = vote("M");
-  const a = vote("A");
-  const b = vote("B");
-  if (!reviewsDone && (m === undefined || (a === undefined && b === undefined))) return { status: "pending", reason: "votes not cast yet" };
+  const reviewsDone = seats.every((w) => phase.reviews[w]?.review?.candidateSha === C);
+  const leaderVote = vote(leader);
+  const others = seats.filter((s) => s !== leader);
+  const missingOthers = others.filter((s) => vote(s) === undefined);
+  if (!reviewsDone && (leaderVote === undefined || missingOthers.length === others.length)) return { status: "pending", reason: "votes not cast yet" };
   const reasons: string[] = [];
-  if (m === undefined) reasons.push("missing ballot from M");
-  else if (m === "reject") reasons.push("M veto");
-  if (a !== "approve" && b !== "approve") {
-    reasons.push(a === undefined && b === undefined ? "no ballot from A or B" : "neither A nor B approved");
+  if (leaderVote === undefined) reasons.push(`missing ballot from ${leader}`);
+  else if (leaderVote === "reject") reasons.push(`${leader} veto`);
+  const otherApprovals = others.filter((s) => vote(s) === "approve").length;
+  if (seats.length === 3 && others.length === 2) {
+    // The default `M A B` keeps the exact 06g wording.
+    const a = vote(others[0]);
+    const b = vote(others[1]);
+    if (a !== "approve" && b !== "approve") {
+      reasons.push(a === undefined && b === undefined ? `no ballot from ${others[0]} or ${others[1]}` : `neither ${others[0]} nor ${others[1]} approved`);
+    }
+  } else {
+    const needed = Math.floor(seats.length / 2) + 1;
+    const approvals = (leaderVote === "approve" ? 1 : 0) + otherApprovals;
+    if (approvals < needed) reasons.push(`only ${approvals} of ${seats.length} seats approved`);
   }
   return { status: "failed", reason: reasons.join("; ") || "vote failed" };
 }

@@ -565,8 +565,12 @@ function driveOnce(rng: () => number): RunResult {
         // evaluation_complete appears; the dispatch case is kept for
         // completeness (an evaluator that finds nothing).
         case "dispatch_evaluation": {
-          state = step(state, { type: "ACTION_STARTED", action: "dispatch_evaluation", actionId: freshId("a") });
-          state = step(state, { type: "EVALUATOR_FINISHED", evaluated: 0 });
+          // Plan 06i: a finding/discovered decision that still owes its impact
+          // classification forces its evaluator pass even with no raw message,
+          // so the action names a message type; answer exactly that one.
+          const messageType = (action as { messageType?: string }).messageType;
+          state = step(state, { type: "ACTION_STARTED", action: "dispatch_evaluation", actionId: freshId("a"), messageType });
+          state = step(state, { type: "EVALUATOR_FINISHED", messageType, evaluated: 0 });
           break;
         }
 

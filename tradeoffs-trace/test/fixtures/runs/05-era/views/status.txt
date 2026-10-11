@@ -1,0 +1,12 @@
+test plan
+run 2667a49a · conductor stopped · 3s
+
+loop      ▶ DONE 0s
+phase     p1 · DONE · round 1 · attempt 1 · repairs 0/3
+pipeline  baseline 0s → … → checks 0s → probe 0s → review 0s → evaluate 0s → resolve 0s → publish 0s → DONE
+gates     checks ✓ · probe ✓ (reused)
+reviews   M ✓   A ✓   B ✓
+metrics   1 round · review 4% (0s of 3s) · T 0/0 F 0/0 B 0/0 raw/published · merge 0% drop 0% · A 0 D 0 (D 0%) · owner wait 0s · blockers 0 escalated, 0 downgraded · unexposed 0 · entries 0 · hints 0 · m/s 0/0 · lint 0
+verdict   accepted and published
+cost      1 round · 0m total · next round ≈ 0 min
+review    T 0 · F 0 · B 0 · C-c m d

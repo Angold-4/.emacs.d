@@ -234,7 +234,12 @@ test("criterion-disputes: a correction naming the amendment id restores the orig
     // Only an explicit correction naming the id restores the wording.
     fs.writeFileSync(
       path.join(inbox, "cmd-revert-1.json"),
-      JSON.stringify({ type: "correction", text: `revert ${amendmentId} because the owner disagrees` }),
+      JSON.stringify({
+        type: "correction",
+        text: `revert ${amendmentId} because the owner disagrees`,
+        // Plan 06m (R2): an owner input carries its run/phase binding.
+        binding: { runId: setup.conductor.state.phase.runId, phaseId: setup.conductor.state.phase.phaseId },
+      }),
     );
     await waitFor(() => setup.conductor.state.phase.decisions.some((d) => d.amendment?.status === "reverted"), 30_000, 20, setup.runDir);
 

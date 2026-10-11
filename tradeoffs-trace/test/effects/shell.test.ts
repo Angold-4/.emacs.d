@@ -4,7 +4,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { childEnv, killGroup, runCommand } from "../../src/effects/shell.ts";
+import { childEnv, runCommand } from "../../src/effects/shell.ts";
+// A2/C3 (plan 06e): the sweep owns the signalling decision, so the recovery
+// path's killGroup lives there now.
+import { killGroup } from "../../src/effects/sweep.ts";
 
 let dir: string;
 
@@ -83,10 +86,14 @@ test("cancel() kills the whole group, including grandchildren", async () => {
 });
 
 test("deadline escalation: a TERM-ignoring command ends in SIGKILL", async () => {
+  // Plan 06k2 (A3): a loaded host can delay the shell past the old 100 ms
+  // deadline, so the trap may not be installed when SIGTERM arrives and the
+  // command dies without escalating. A load-tolerant budget keeps the
+  // assertion (SIGTERM then SIGKILL) honest.
   const { result } = runCommand({
     command: "trap '' TERM; sleep 100",
-    deadlineMs: 100,
-    termGraceMs: 300,
+    deadlineMs: 400,
+    termGraceMs: 800,
   });
   const outcome = await result;
   assert.equal(outcome.timedOut, true);
@@ -95,10 +102,13 @@ test("deadline escalation: a TERM-ignoring command ends in SIGKILL", async () =>
 });
 
 test("a command that honors SIGTERM does not escalate to SIGKILL", async () => {
+  // Plan 06k2 (A3): a loaded host can delay the trap's own handling; a
+  // larger term grace keeps this from flaking (it was the 06i load-only
+  // failure).
   const { result } = runCommand({
     command: "trap 'exit 7' TERM; sleep 100",
-    deadlineMs: 100,
-    termGraceMs: 2000,
+    deadlineMs: 400,
+    termGraceMs: 8000,
   });
   const outcome = await result;
   assert.equal(outcome.timedOut, true);
@@ -148,6 +158,8 @@ test("R2.F13 childEnv: strips exactly the test-runner recursion markers, preserv
     FOO: "bar",
     NODE_TEST_CONTEXT: "child-v8",
     NODE_TEST_WORKER_ID: "1",
+    FORCE_COLOR: "3",
+    CLICOLOR_FORCE: "1",
   };
   const env = childEnv(source);
   assert.equal(env.NODE_TEST_CONTEXT, undefined);
@@ -158,9 +170,15 @@ test("R2.F13 childEnv: strips exactly the test-runner recursion markers, preserv
   assert.equal(env.TT_SOCKET, "/tmp/s");
   assert.equal(env.FAKE_PI_SCRIPT, "/tmp/s.json");
   assert.equal(env.FOO, "bar");
+  // Plan 06j (A2): a conductor that inherited a coloured shell must never pass
+  // the colour on to a check; NO_COLOR=1 is forced.
+  assert.equal(env.FORCE_COLOR, undefined, "FORCE_COLOR is scrubbed from every check's environment");
+  assert.equal(env.CLICOLOR_FORCE, undefined, "CLICOLOR_FORCE is scrubbed from every check's environment");
+  assert.equal(env.NO_COLOR, "1", "NO_COLOR=1 is forced so a check never colours its output");
   // The caller's object is not mutated.
   assert.equal(source.NODE_TEST_CONTEXT, "child-v8");
-  assert.equal(JSON.stringify(Object.keys(env).sort()), JSON.stringify(["FAKE_PI_SCRIPT", "FOO", "HOME", "NODE_OPTIONS", "PATH", "TT_SOCKET"]));
+  assert.equal(source.FORCE_COLOR, "3");
+  assert.equal(JSON.stringify(Object.keys(env).sort()), JSON.stringify(["FAKE_PI_SCRIPT", "FOO", "HOME", "NODE_OPTIONS", "NO_COLOR", "PATH", "TT_SOCKET"]));
 });
 
 // The real-Node proof: with the markers inherited, a nested `node --test`

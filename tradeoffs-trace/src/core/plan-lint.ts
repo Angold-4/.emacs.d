@@ -21,18 +21,66 @@
 // numbers come from the Org source: Emacs records them on `acceptanceLines`
 // when it parses the plan, and a hand-written JSON plan simply gets no line.
 
+import { matchesGlob } from "./boundaries.ts";
+import { parseVerify, verifyKindIssue } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
 export type LintSeverity = "error" | "warning";
 
-export type LintRule = "owner-actor" | "human-actor" | "future-dependency" | "no-tolerance" | "model-declaration" | "rerun-template";
+export type LintRule =
+  | "owner-actor"
+  | "human-actor"
+  | "future-dependency"
+  | "no-tolerance"
+  | "model-declaration"
+  | "rerun-template"
+  // Plan 06j (A1): a phase's checks cannot see what its :BOUNDARIES: let it
+  // change, or the repository's CI runs something the plan never does.
+  | "coverage"
+  // Plan 06g: `#+TT_WORKERS`/`#+TT_ROUNDS` and, from 06h, the reviewer count
+  // and seat list.
+  | "worker-count"
+  // Plan 06h (A4): the reviewer seat list and its leader.
+  | "reviewer-seat"
+  | "reviewer-leader"
+  // Plan 06b: the structured-plan rules (refs/06_ref_plan_format.md).
+  | "item-id"
+  | "item-arch"
+  | "item-verify"
+  | "item-text-loss"
+  // A `test` verify defined only where the phase's checks never run: tt
+  // reports it missing on every candidate, a gate no owner command waives.
+  | "verify-reach";
 
 /** The roles #+TT_MODELS may assign a model to. */
 const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
 
-/** The seat names `reviewer.N` and `panel.N` accept (design §2.1). */
-const REVIEWER_SEATS = new Set(["M", "A", "B"]);
-const PANEL_SEATS = new Set(["1", "2", "3"]);
+/** The default seats when the plan declares none. */
+const DEFAULT_REVIEWER_SEATS = ["M", "A", "B"];
+
+/** Plan 06h (A4): the smallest reviewer count that is odd and greater than
+ * the worker count — 1 or 2 workers need 3, 3 or 4 need 5, 5 or 6 need 7. */
+export function smallestReviewerCount(workers: number): number {
+  const w = Number.isInteger(workers) && workers >= 1 ? workers : 1;
+  return w % 2 === 0 ? w + 1 : w + 2;
+}
+
+/** The seats a plan declares, or the default `M A B`. */
+function reviewerSeatsOf(plan: LintPlanInput): string[] {
+  const declared = plan.seats;
+  if (Array.isArray(declared) && declared.length > 0) return declared;
+  return [...DEFAULT_REVIEWER_SEATS];
+}
+
+/** The lane numbers a plan's worker count names, 1-based. A plan without
+ * `#+TT_REVIEWERS` is the 06g2 plan and names at most two lanes. */
+function workerLanesOf(plan: LintPlanInput): string[] {
+  const hasNewSeats = Array.isArray(plan.seats) && plan.seats.length > 0;
+  const n = Number.isInteger(plan.workers) && (plan.workers as number) >= 1 ? (plan.workers as number) : 1;
+  // A 06g2 plan (no `#+TT_REVIEWERS`) names at most two lanes, whatever its
+  // worker count, so worker.1/worker.2 stay valid and worker.3 is 06h's.
+  return Array.from({ length: hasNewSeats ? n : 2 }, (_, i) => String(i + 1));
+}
 
 /** The slice of #+TT_MODELS the linter reads. `models` is what Emacs parsed
  * (`{ worker?: { provider?, model }, reviewerSeats?: { M?: … }, … }`), with
@@ -68,19 +116,84 @@ export interface LintFinding {
   fix: string;
 }
 
+/** One structured item (`:ID:` subheading) as the linter reads it. The line
+ * fields are recorded by the Emacs parser; a hand-written JSON plan may omit
+ * them and the finding simply carries no line. */
+export interface LintItemInput {
+  id?: string;
+  title?: string;
+  text?: string;
+  /** The exact Org body, when the parser recorded it. `lintItems` reports a
+   * parsed `text` that is missing a line of `rawText`. */
+  rawText?: string;
+  /** Architecture only: the module/area the item lives in. */
+  where?: string;
+  whereLine?: number;
+  tags?: string[];
+  /** Requirements only: the architecture ids the item is realised by. */
+  arch?: string[];
+  /** Requirements and constraints: the raw `:VERIFY:` strings. */
+  verify?: string[];
+  line?: number;
+  archLine?: number;
+  verifyLine?: number;
+}
+
 /** The slice of a plan the linter needs. `RunPlanFile`/`RunPlanPhase` are
  * structurally assignable to it, so the CLI can pass a parsed plan directly. */
 export interface LintPhaseInput {
   id?: string;
+  /** The phase's Goal paragraph, when the parser read it. */
+  goal?: string;
+  /** Plan 06j (A1): the phase's ordinary checks (`:CHECKS:`), as the
+   * coverage rule reads them. */
+  checks?: string[];
+  /** Plan 06j (A1): the phase's `:BOUNDARIES:` globs. */
+  boundaries?: string[];
   acceptance?: string[];
   /** 1-based source lines of `acceptance`, parallel to it (Emacs records
    * these; absent for a hand-written JSON plan). */
   acceptanceLines?: number[];
+  /** Plan 06b: the structured items of the phase subtree. Absent on an
+   * old-format plan (only `acceptance`), where no item rule fires. */
+  architecture?: LintItemInput[];
+  requirements?: LintItemInput[];
+  constraints?: LintItemInput[];
+  /** Plan 06c: the phase's final check (`#+TT_FINAL_CHECKS`, overridden by
+   * the phase's `:FINAL_CHECKS:`). Absent leaves the plan as before. */
+  finalChecks?: string[];
+  /** Plan 06h (A4/C2): a phase's own `:REVIEWERS:` override. It must satisfy
+   * the same rule as the plan's `#+TT_REVIEWERS`. */
+  seats?: string[];
+  /** Plan 06h (A4/C2): a phase's own `:LEADER:` override. */
+  leader?: string;
+  /** Plan 06h: the 1-based line of the phase headline, used as the line for
+   * a phase-override finding when the property's own line is not recorded. */
+  line?: number;
+  /** Plan 06k2 (A5): the phase's own `:GOLDEN:` note, overriding the plan's
+   * `#+TT_GOLDEN:`; the contract's golden source. */
+  golden?: string;
+  /** Plan 06k2 (A8): the phase's own `:VARIANT_LIMIT:`, overriding the
+   * plan's `#+TT_VARIANT_LIMIT:`. Lint refuses a value below 2 exactly as it
+   * does the plan-level one. */
+  variantLimit?: number;
+  /** Lint-only: the 1-based line of the phase's `:VARIANT_LIMIT:`. */
+  variantLimitLine?: number;
+  /** Plan 06m (A6): the phase's own `:GENERATED:` globs, overriding the
+   * plan's `#+TT_GENERATED:`. */
+  generated?: string[];
+  /** Plan 06m (A6): the phase's own `:REGEN:` commands, overriding the
+   * plan's `#+TT_REGEN:`. */
+  regen?: string[];
 }
 
 export interface LintPlanInput {
   /** The Org file this JSON came from, when known. */
   sourceFile?: string;
+  /** Plan 06j (A1): the absolute path of the git repository the plan runs
+   * on (`#+TT_REPO:`). The coverage rule reads it; absent means no coverage
+   * facts and no coverage warnings. */
+  repo?: string;
   phases?: LintPhaseInput[];
   models?: LintModels;
   modelsLine?: number;
@@ -90,10 +203,55 @@ export interface LintPlanInput {
   /** Lint-only: the 1-based line of `#+TT_RERUN:` in the source Org file. */
   rerunLine?: number;
   modelsRepeated?: string[];
+  /** Plan 06e (A1): the `#+TT_ENV_FILE:` KEY=value file, resolved to an
+   * absolute path by Emacs. A declared secret the environment does not set is
+   * looked up here second. */
+  envFile?: string;
   /** Roles this entry inherited from a program-level #+TT_MODELS. They are
    * already checked once at the program level; rechecking them per entry
    * would report the program's line against the entry's own file. */
   modelsFromProgram?: string[];
+  /** Plan 06g/06h: the plan's `#+TT_WORKERS:` — how many lanes one round
+   * runs. Any positive whole number from 06h on. Absent (or 1) is today's
+   * single-candidate loop. */
+  workers?: number;
+  /** Lint-only: the 1-based line of `#+TT_WORKERS:` in the source Org file. */
+  workersLine?: number;
+  /** Plan 06g: the plan's `#+TT_ROUNDS:` — how many rounds one phase may
+   * spend before it parks on the owner. Absent means the default of 3. */
+  rounds?: number;
+  /** Lint-only: the 1-based line of `#+TT_ROUNDS:` in the source Org file. */
+  roundsLine?: number;
+  /** Plan 06m (A5): the labels `tt deliver` applies to each PR
+   * (`#+TT_LABELS:`). */
+  labels?: string[];
+  /** Plan 06m (A6): the plan's `#+TT_GENERATED:` globs. */
+  generated?: string[];
+  /** Plan 06m (A6): the plan's `#+TT_REGEN:` commands. */
+  regen?: string[];
+  /** Plan 06k2 (A5): the plan's `#+TT_GOLDEN:` — the current source a choice
+   * must be re-checked against. Exported into plan.json and carried into the
+   * contract so the worker, reviewer and evaluator prompts can name it. */
+  golden?: string;
+  /** Lint-only: the 1-based line of `#+TT_GOLDEN:`. */
+  goldenLine?: number;
+  /** Plan 06k1 (A3): the plan's `#+TT_VARIANT_LIMIT:` — how many consecutive
+   * rounds may each raise a new blocking finding of the same kind on one
+   * requirement before the owner is asked. Absent means the default of 3. */
+  variantLimit?: number;
+  /** Lint-only: the 1-based line of `#+TT_VARIANT_LIMIT:`. */
+  variantLimitLine?: number;
+  /** Plan 06h (A1/A4): the plan's `#+TT_REVIEWERS:` — the odd list of
+   * reviewer seats. Absent means `M A B`. The JSON field is `seats`, the
+   * same one the conductor freezes into the contract. */
+  seats?: string[];
+  /** Lint-only: the 1-based line of `#+TT_REVIEWERS:`. */
+  seatsLine?: number;
+  /** Plan 06h (A1/A4): the plan's `#+TT_LEADER:`. Absent means the first
+   * seat. */
+  leader?: string;
+  /** Lint-only: the 1-based line of `#+TT_LEADER:`. */
+  leaderLine?: number;
 }
 
 export interface LintProgramInput {
@@ -106,6 +264,18 @@ export interface LintProgramInput {
   models?: LintModels;
   modelsLine?: number;
   modelsRepeated?: string[];
+  /** Plan 06g: a program file may also declare `#+TT_WORKERS:` and
+   * `#+TT_ROUNDS:`; the same rules apply. */
+  workers?: number;
+  workersLine?: number;
+  rounds?: number;
+  roundsLine?: number;
+  /** Plan 06h (A1/A4): a program file may also declare `#+TT_REVIEWERS:` and
+   * `#+TT_LEADER:`; the same rules apply. */
+  seats?: string[];
+  seatsLine?: number;
+  leader?: string;
+  leaderLine?: number;
 }
 
 /** True for the JSON shape `tt program start` reads (a list of plan entries
@@ -207,7 +377,7 @@ function modelFinding(plan: LintPlanInput, item: string, problem: string, fix: s
 interface ModelDecl {
   key: string;
   model: LintRoleModel | undefined;
-  kind: "role" | "reviewer-seat" | "panel-seat";
+  kind: "role" | "reviewer-seat" | "panel-seat" | "worker-seat";
   seat?: string;
 }
 
@@ -227,11 +397,13 @@ function modelDeclarations(models: LintModels | undefined): ModelDecl[] {
   if (!models) return [];
   const out: ModelDecl[] = [];
   for (const [key, raw] of Object.entries(models)) {
-    if (key === "reviewerSeats" || key === "panelSeats" || key === "panelFrom") continue;
+    if (key === "reviewerSeats" || key === "panelSeats" || key === "panelFrom" || key === "workerLanes") continue;
     out.push({ key, model: asRoleModel(raw), kind: "role" });
   }
   for (const [seat, model] of seatEntries(models.reviewerSeats)) out.push({ key: `reviewer.${seat}`, model, kind: "reviewer-seat", seat });
   for (const [seat, model] of seatEntries(models.panelSeats)) out.push({ key: `panel.${seat}`, model, kind: "panel-seat", seat });
+  // Plan 06g2: a lane's own worker model (`worker.1`, `worker.2`).
+  for (const [seat, model] of seatEntries(models.workerLanes)) out.push({ key: `worker.${seat}`, model, kind: "worker-seat", seat });
   return out;
 }
 
@@ -252,12 +424,58 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
       out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown role ${decl.key}`, "use one of worker, reviewer, evaluator, panel, curator"));
       continue;
     }
-    if (decl.kind === "reviewer-seat" && !REVIEWER_SEATS.has(decl.seat!)) {
-      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown reviewer seat ${decl.key}`, "use reviewer.M, reviewer.A or reviewer.B"));
+    const seats = reviewerSeatsOf(plan);
+    const panelSeats = seats.map((_, i) => String(i + 1));
+    const lanes = workerLanesOf(plan);
+    const hasNewSeats = Array.isArray(plan.seats) && plan.seats.length > 0;
+    if (decl.kind === "reviewer-seat" && !seats.includes(decl.seat!)) {
+      out.push(
+        modelFinding(
+          plan,
+          decl.key,
+          hasNewSeats
+            ? `#+TT_MODELS names the reviewer seat ${decl.key}, which #+TT_REVIEWERS does not declare`
+            : `#+TT_MODELS names the unknown reviewer seat ${decl.key}`,
+          hasNewSeats
+            ? `name one of the declared seats (${seats.map((s) => `reviewer.${s}`).join(", ")}), or add ${decl.seat} to #+TT_REVIEWERS`
+            : "use reviewer.M, reviewer.A or reviewer.B",
+        ),
+      );
       continue;
     }
-    if (decl.kind === "panel-seat" && !PANEL_SEATS.has(decl.seat!)) {
-      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown panel seat ${decl.key}`, "use panel.1, panel.2 or panel.3"));
+    if (decl.kind === "panel-seat" && !panelSeats.includes(decl.seat!)) {
+      out.push(
+        modelFinding(
+          plan,
+          decl.key,
+          hasNewSeats
+            ? `#+TT_MODELS names the panel seat ${decl.key}, which the ${seats.length} reviewers do not have`
+            : `#+TT_MODELS names the unknown panel seat ${decl.key}`,
+          hasNewSeats ? `use one of panel.${panelSeats.join(", panel.")} (one panel seat per reviewer)` : "use panel.1, panel.2 or panel.3",
+        ),
+      );
+      continue;
+    }
+    if (decl.kind === "worker-seat" && !lanes.includes(decl.seat!)) {
+      if (Array.isArray(plan.seats) && plan.seats.length > 0) {
+        out.push(
+          modelFinding(
+            plan,
+            decl.key,
+            `#+TT_MODELS names the worker lane ${decl.key}, but #+TT_WORKERS declares ${lanes.length}`,
+            `use one of worker.${lanes.join(", worker.")}`,
+          ),
+        );
+      } else {
+        out.push(
+          modelFinding(
+            plan,
+            decl.key,
+            `#+TT_MODELS names the unknown worker lane ${decl.key}`,
+            "use worker.1 or worker.2 (this plan version runs one or two lanes; more is 06h's phase)",
+          ),
+        );
+      }
       continue;
     }
     const model = decl.model?.model;
@@ -320,12 +538,197 @@ export function lintRerun(plan: LintPlanInput): LintFinding[] {
   ];
 }
 
-/** Lint one plan (all its phases' acceptance items, its #+TT_MODELS and its
- * #+TT_RERUN). Pure. */
+/** Lines of `rawText` that the parsed `text` does not carry: the proof that a
+ * parser dropped part of an item (a sub-list or a source block cut off at the
+ * first blank line, the #41 failure). Property-drawer and blank lines are not
+ * item text and are ignored. */
+export function lostTextLines(rawText: string | undefined, text: string | undefined): string[] {
+  if (typeof rawText !== "string" || rawText.trim().length === 0) return [];
+  const parsed = text ?? "";
+  const missing: string[] = [];
+  for (const raw of rawText.split("\n")) {
+    const line = raw.trim();
+    if (line.length === 0) continue;
+    if (/^:(?:PROPERTIES|END):$/i.test(line)) continue;
+    if (/^:[A-Za-z0-9_]+:\s*/.test(line)) continue;
+    if (!parsed.includes(line)) missing.push(line);
+  }
+  return missing;
+}
+
+/** Plan 06b: lint a phase's structured items — a missing or duplicate `:ID:`,
+ * an `:ARCH:` naming no architecture item, a `test` verify without a name, and
+ * text lost in parsing (a line of `rawText` the parsed `text` does not
+ * carry). */
+export function lintItems(phase: LintPhaseInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  const phaseId = phase.id ?? "?";
+  const architecture = phase.architecture ?? [];
+  const requirements = phase.requirements ?? [];
+  const constraints = phase.constraints ?? [];
+  const all: Array<{ kind: string; item: LintItemInput }> = [
+    ...architecture.map((item) => ({ kind: "architecture", item })),
+    ...requirements.map((item) => ({ kind: "requirement", item })),
+    ...constraints.map((item) => ({ kind: "constraint", item })),
+  ];
+  const architectureIds = new Set(architecture.map((a) => a.id).filter((id): id is string => typeof id === "string" && id.length > 0));
+  const seen = new Map<string, number>();
+  const finding = (rule: LintRule, item: LintItemInput, line: number | undefined, problem: string, fix: string): LintFinding => ({
+    severity: "error",
+    rule,
+    phaseId,
+    item: (item.text ?? item.title ?? item.id ?? "(item)").split("\n")[0],
+    line,
+    sourceFile: undefined,
+    problem,
+    fix,
+  });
+  for (const { item } of all) {
+    const id = item.id;
+    if (typeof id !== "string" || id.trim().length === 0) {
+      out.push(finding("item-id", item, item.line, "the item has no :ID: property", "give the subheading an :ID: property (for example A1, R2 or C1)"));
+    } else if (seen.has(id)) {
+      out.push(finding("item-id", item, item.line, `the item id ${id} is already used at line ${seen.get(id)}`, `give each item a unique :ID: (${id} is taken)`));
+    } else {
+      seen.set(id, item.line ?? 0);
+    }
+    for (const raw of item.verify ?? []) {
+      // Plan 06k2 (A5): a `:VERIFY:` kind the runtime cannot use (e.g.
+      // `grep "x"`) is an error with the file and line, never silently read
+      // as `review`.
+      const unknown = verifyKindIssue(raw);
+      if (unknown !== undefined) {
+        out.push(
+          finding(
+            "item-verify",
+            item,
+            item.verifyLine ?? item.line,
+            `:VERIFY: names an unknown kind ${JSON.stringify(unknown)}: ${JSON.stringify(raw)}`,
+            'use one of the three kinds: test "<the test name>", review or evidence',
+          ),
+        );
+        continue;
+      }
+      for (const v of parseVerify(raw)) {
+        if (v.kind === "test" && v.name.trim().length === 0) {
+          out.push(finding("item-verify", item, item.verifyLine ?? item.line, `a test verify has no name: ${JSON.stringify(raw)}`, 'write test "<the test name>" (the name as the test runner prints it), or drop the test kind'));
+        }
+      }
+    }
+    const missing = lostTextLines(item.rawText, item.text);
+    if (missing.length > 0) {
+      out.push(finding("item-text-loss", item, item.line, `the parsed item text is missing ${missing.length} source line(s), starting with ${JSON.stringify(missing[0])}`, "keep the whole item body in the parsed text: a sub-list or a source block inside an item belongs to that item"));
+    }
+  }
+  for (const item of requirements) {
+    for (const arch of item.arch ?? []) {
+      if (!architectureIds.has(arch)) {
+        out.push(finding("item-arch", item, item.archLine ?? item.line, `:ARCH: names ${arch}, which is no architecture item of this phase`, "name an existing architecture item id (one of " + ([...architectureIds].join(", ") || "none") + "), or add the architecture item"));
+      }
+    }
+  }
+  return out;
+}
+
+/** Plan 06h (A4/C2): lint a phase's own `:REVIEWERS:`/`:LEADER:` override
+ * with the same rule as the plan's `#+TT_REVIEWERS`/`#+TT_LEADER`. The
+ * effective worker count is the phase's own `:WORKERS:` or the plan's. */
+export function lintPhaseSeats(phase: LintPhaseInput, plan: LintPlanInput): LintFinding[] {
+  const hasSeats = Array.isArray(phase.seats) && phase.seats.length > 0;
+  const hasLeader = typeof phase.leader === "string" && phase.leader.trim().length > 0;
+  if (!hasSeats && !hasLeader) return [];
+  const out: LintFinding[] = [];
+  const phaseId = `${phase.id ?? "?"}/reviewers`;
+  const line = phase.line ?? plan.seatsLine;
+  const sourceFile = plan.sourceFile;
+  const effectiveSeats = hasSeats ? phase.seats! : plan.seats && plan.seats.length > 0 ? plan.seats : [...DEFAULT_REVIEWER_SEATS];
+  if (hasSeats) {
+    if (phase.seats!.length % 2 === 0) {
+      out.push({
+        severity: "error",
+        rule: "reviewer-seat",
+        phaseId,
+        item: `:REVIEWERS: ${phase.seats!.join(" ")}`,
+        line,
+        sourceFile,
+        problem: `the phase :REVIEWERS: names ${phase.seats!.length} seats; the count must be odd`,
+        fix: `write an odd number of seats (${phase.seats!.length + 1}, or ${Math.max(1, phase.seats!.length - 1)})`,
+      });
+    }
+    const seen = new Set<string>();
+    const dupes = new Set<string>();
+    for (const s of phase.seats!) {
+      if (seen.has(s)) dupes.add(s);
+      seen.add(s);
+    }
+    if (dupes.size > 0) {
+      out.push({
+        severity: "error",
+        rule: "reviewer-seat",
+        phaseId,
+        item: `:REVIEWERS: ${phase.seats!.join(" ")}`,
+        line,
+        sourceFile,
+        problem: `the phase :REVIEWERS: names ${[...dupes].join(", ")} more than once`,
+        fix: "give each seat a unique name",
+      });
+    }
+    const workers = Number.isInteger(phase.workers) && (phase.workers as number) >= 1 ? (phase.workers as number) : Number.isInteger(plan.workers) && (plan.workers as number) >= 1 ? (plan.workers as number) : 1;
+    const smallest = smallestReviewerCount(workers);
+    if (phase.seats!.length < smallest) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId,
+        item: `:REVIEWERS: ${phase.seats!.join(" ")}`,
+        line,
+        sourceFile,
+        problem: `${workers} worker${workers === 1 ? "" : "s"} needs at least ${smallest} reviewers; the phase :REVIEWERS: names ${phase.seats!.length}`,
+        fix: `name at least ${smallest} reviewers in the phase :REVIEWERS:`,
+      });
+    }
+  }
+  if (hasLeader && !effectiveSeats.includes(phase.leader!)) {
+    out.push({
+      severity: "error",
+      rule: "reviewer-leader",
+      phaseId: `${phase.id ?? "?"}/leader`,
+      item: `:LEADER: ${phase.leader}`,
+      line,
+      sourceFile,
+      problem: `the phase :LEADER: names ${phase.leader}, which is not one of the reviewer seats (${effectiveSeats.join(", ")})`,
+      fix: `name one of the declared seats (${effectiveSeats.join(", ")}), or add ${phase.leader} to the phase :REVIEWERS:`,
+    });
+  }
+  return out;
+}
+
+/** Lint one plan (all its phases' acceptance items, its structured items,
+ * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan)];
+  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
+    // Plan 06k2 (A8, finding A-4): a phase-level :VARIANT_LIMIT: below 2 is
+    // refused exactly like the plan-level one; otherwise a phase override of
+    // 1 reaches variantLimitOf and silently disables escalation.
+    if (phase.variantLimit !== undefined) {
+      const n = phase.variantLimit;
+      if (!Number.isInteger(n) || n < 2) {
+        out.push({
+          severity: "error",
+          rule: "worker-count",
+          phaseId,
+          item: `:VARIANT_LIMIT: ${String(n)}`,
+          line: phase.variantLimitLine ?? phase.line,
+          sourceFile: plan.sourceFile,
+          problem: `:VARIANT_LIMIT must be a whole number of 2 or more, got ${String(n)} (a limit below 2 escalates on the first round and silently disables escalation)`,
+          fix: "write :VARIANT_LIMIT: 2 or more, or drop the phase override",
+        });
+      }
+    }
+    for (const finding of lintPhaseSeats(phase, plan)) out.push(finding);
+    for (const finding of lintItems(phase)) out.push({ ...finding, sourceFile: plan.sourceFile });
     const acceptance = phase.acceptance ?? [];
     acceptance.forEach((item, i) => {
       const line = phase.acceptanceLines?.[i];
@@ -373,10 +776,444 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
 /** Lint every entry's plan in a program file; phase ids are prefixed with the
  * entry id so two entries with the same phase id stay tellable apart. */
 export function lintProgram(program: LintProgramInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(program)];
+  const out: LintFinding[] = [...lintModels(program), ...lintWorkers(program)];
   for (const entry of program.entries ?? []) {
     for (const finding of lintPlan(entry.plan ?? { phases: [] })) {
       out.push({ ...finding, phaseId: entry.id ? `${entry.id}/${finding.phaseId}` : finding.phaseId });
+    }
+  }
+  return out;
+}
+
+/** Plan 06g/06h: lint `#+TT_WORKERS:`, `#+TT_ROUNDS:`, `#+TT_REVIEWERS:` and
+ * `#+TT_LEADER:`. `#+TT_WORKERS` is any positive whole number of lanes from
+ * 06h on; `#+TT_ROUNDS` is a whole number from 1 to 5; the reviewer list must
+ * be odd, non-empty and duplicate-free, with at least one reviewer more than
+ * the lanes; the leader must name a seat. A value that is not a whole number
+ * is an error too: it would reach the conductor as `NaN`.
+ *
+ * Lint never rounds a count: a non-integer is refused, not silently floored. */
+export function lintWorkers(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  const seats = plan.seats;
+  // Plan 06h: a plan that names no `#+TT_REVIEWERS` is the 06g2 plan, so it
+  // keeps the two-lane limit; the new keywords are what opt into more lanes.
+  const hasNewSeats = Array.isArray(seats) && seats.length > 0;
+  const declaredSeats = hasNewSeats ? seats! : [...DEFAULT_REVIEWER_SEATS];
+  if (plan.workers !== undefined) {
+    const n = plan.workers;
+    if (!Number.isInteger(n) || n < 1) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "workers",
+        item: `#+TT_WORKERS: ${String(n)}`,
+        line: plan.workersLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_WORKERS must be a whole number of lanes, got ${String(n)}`,
+        fix: "write #+TT_WORKERS: 1 (today's loop), or any whole number of lanes from 1 on",
+      });
+    } else if (!hasNewSeats && n > 2) {
+      // The 06g2 behaviour, kept for a plan without `#+TT_REVIEWERS`.
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "workers",
+        item: `#+TT_WORKERS: ${n}`,
+        line: plan.workersLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_WORKERS names ${n} lanes; this plan version runs at most 2`,
+        fix: "write #+TT_WORKERS: 2, or wait for 06h, the phase that makes the lane count adjustable (3, 4, … lanes)",
+      });
+    }
+    // Plan 06k2 (A5): the stale "the two-lane round arrives in 06g2" warning
+    // is dropped — the conductor runs lanes whenever workers > 1, so it only
+    // misled a plan author.
+  }
+  // Plan 06k2 (A8): a variant limit below 2 would escalate on the first
+  // round, silently disabling escalation's purpose; it is a lint error.
+  if (plan.variantLimit !== undefined) {
+    const n = plan.variantLimit;
+    if (!Number.isInteger(n) || n < 2) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "variant-limit",
+        item: `#+TT_VARIANT_LIMIT: ${String(n)}`,
+        line: plan.variantLimitLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_VARIANT_LIMIT must be a whole number of 2 or more, got ${String(n)} (a limit below 2 escalates on the first round and silently disables escalation)`,
+        fix: "write #+TT_VARIANT_LIMIT: 3 (the default), or a whole number of 2 or more",
+      });
+    }
+  }
+  // Plan 06h (A4): the reviewer list must be non-empty, odd, duplicate-free
+  // and greater than the worker count.
+  if (Array.isArray(seats)) {
+    if (seats.length === 0) {
+      out.push({
+        severity: "error",
+        rule: "reviewer-seat",
+        phaseId: "reviewers",
+        item: "#+TT_REVIEWERS: (empty)",
+        line: plan.seatsLine,
+        sourceFile: plan.sourceFile,
+        problem: "#+TT_REVIEWERS names no seat",
+        fix: "write an odd list of seats, for example #+TT_REVIEWERS: M A B",
+      });
+    } else {
+      if (seats.length % 2 === 0) {
+        out.push({
+          severity: "error",
+          rule: "reviewer-seat",
+          phaseId: "reviewers",
+          item: `#+TT_REVIEWERS: ${seats.join(" ")}`,
+          line: plan.seatsLine,
+          sourceFile: plan.sourceFile,
+          problem: `#+TT_REVIEWERS names ${seats.length} seats; the count must be odd`,
+          fix: `write an odd number of seats (${seats.length + 1}, or ${Math.max(1, seats.length - 1)})`,
+        });
+      }
+      const seen = new Set<string>();
+      const dupes = new Set<string>();
+      for (const s of seats) {
+        if (seen.has(s)) dupes.add(s);
+        seen.add(s);
+      }
+      if (dupes.size > 0) {
+        out.push({
+          severity: "error",
+          rule: "reviewer-seat",
+          phaseId: "reviewers",
+          item: `#+TT_REVIEWERS: ${seats.join(" ")}`,
+          line: plan.seatsLine,
+          sourceFile: plan.sourceFile,
+          problem: `#+TT_REVIEWERS names ${[...dupes].join(", ")} more than once`,
+          fix: "give each seat a unique name",
+        });
+      }
+    }
+  }
+  const workers = Number.isInteger(plan.workers) && (plan.workers as number) >= 1 ? (plan.workers as number) : 1;
+  const smallest = smallestReviewerCount(workers);
+  if (hasNewSeats && declaredSeats.length < smallest) {
+    out.push({
+      severity: "error",
+      rule: "worker-count",
+      phaseId: "workers",
+      item: `#+TT_WORKERS: ${workers}`,
+      line: plan.workersLine ?? plan.seatsLine,
+      sourceFile: plan.sourceFile,
+      problem: `${workers} worker${workers === 1 ? "" : "s"} needs at least ${smallest} reviewers; #+TT_REVIEWERS names ${declaredSeats.length}`,
+      fix: `name at least ${smallest} reviewers, for example #+TT_REVIEWERS: ${Array.from({ length: smallest }, (_, i) => String.fromCharCode(65 + i)).join(" ")}`,
+    });
+  }
+  // Plan 06h (A4): the leader must name a seat.
+  if (typeof plan.leader === "string" && plan.leader.trim().length > 0 && !declaredSeats.includes(plan.leader)) {
+    out.push({
+      severity: "error",
+      rule: "reviewer-leader",
+      phaseId: "leader",
+      item: `#+TT_LEADER: ${plan.leader}`,
+      line: plan.leaderLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_LEADER names ${plan.leader}, which is not one of the reviewer seats (${declaredSeats.join(", ")})`,
+      fix: `name one of the declared seats (${declaredSeats.join(", ")}), or add ${plan.leader} to #+TT_REVIEWERS`,
+    });
+  }
+  if (plan.rounds !== undefined) {
+    const n = plan.rounds;
+    if (!Number.isInteger(n) || n < 1 || n > 5) {
+      out.push({
+        severity: "error",
+        rule: "worker-count",
+        phaseId: "rounds",
+        item: `#+TT_ROUNDS: ${String(n)}`,
+        line: plan.roundsLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_ROUNDS must be a whole number of rounds from 1 to 5, got ${String(n)}`,
+        fix: "write #+TT_ROUNDS: 3 (the default), or a whole number from 1 to 5",
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Plan 06j (A1): coverage warnings
+// ---------------------------------------------------------------------------
+
+/** One package/crate the repository defines. `dir` is repo-relative, with
+ * POSIX separators (`.` for a package at the repository root). */
+export interface RepoPackage {
+  name: string;
+  dir: string;
+}
+
+/** What `checkCoverageWarnings` reads about the repository. Built by
+ * `readRepoFacts` (I/O) and passed in, so this module stays pure. */
+export interface RepoFacts {
+  /** Every package/crate the repository defines. */
+  packages: RepoPackage[];
+  /** Every command line the repository's CI workflows run. */
+  ciCommands: string[];
+  /** True for a cargo repository, whose packages are named by `-p`/
+   * `--package`; a non-cargo package is named as a plain token. */
+  cargo: boolean;
+  /** Plan 06j (M-93): workspace members whose manifest cannot be read or has
+   * no `[package]` name. They are surfaced as warnings rather than skipped,
+   * so a crate the lint cannot judge is never a quiet false green. */
+  memberIssues?: string[];
+}
+
+/** An empty fact set: a plan with no repository, or one whose path does not
+ * exist, warns about nothing. */
+export function emptyRepoFacts(): RepoFacts {
+  return { packages: [], ciCommands: [], cargo: false };
+}
+
+/** True when `globSeg` matches one path segment (`*` matches within one
+ * segment, exactly as core/boundaries.ts's `matchesGlob`). */
+function segmentMatches(globSeg: string, dirSeg: string): boolean {
+  return globSeg === "**" || matchesGlob(globSeg, dirSeg);
+}
+
+/** Can the glob match a path that starts with `dirSegs`? `**` consumes any
+ * number of segments; every other segment matches exactly one. This is the
+ * one place the "does a boundary reach this package" question is decided: a
+ * glob whose first segment is `*` followed by `src/**` reaches package `a`
+ * (it matches `a/src/...`), while `*.md` does not reach a nested package
+ * (its first segment cannot match two). */
+function globCanReachDir(globSegs: readonly string[], dirSegs: readonly string[]): boolean {
+  const rec = (gi: number, di: number): boolean => {
+    if (di === dirSegs.length) return true;
+    if (gi === globSegs.length) return false;
+    const seg = globSegs[gi];
+    if (seg === "**") return rec(gi + 1, di) || rec(gi, di + 1);
+    return segmentMatches(seg, dirSegs[di]) && rec(gi + 1, di + 1);
+  };
+  return rec(0, 0);
+}
+
+/** True when a `:BOUNDARIES:` glob covers a package directory: the glob can
+ * match a path inside (or at) the directory, with `*` limited to one path
+ * segment (`crates/**` covers `crates/a`; `crates/a/src/**` covers `crates/a`;
+ * a `*` followed by `src/**` covers `a`; `*.md` does not cover
+ * `packages/b`). */
+export function globCoversDir(glob: string, dir: string): boolean {
+  const g = glob.trim().replace(/\/+$/, "");
+  const d = dir.trim().replace(/\/+$/, "") || ".";
+  if (g.length === 0) return false;
+  // A root package is the whole repository, so any repo-relative glob covers
+  // it: a `src/**` boundary lets the phase change the single root crate.
+  if (d === ".") return !g.startsWith("/") && !g.startsWith("..");
+  const globSegs = g.split("/").filter((s) => s.length > 0);
+  const dirSegs = d.split("/").filter((s) => s.length > 0);
+  return globCanReachDir(globSegs, dirSegs);
+}
+
+/** True when a command names `name` the way the repository's package manager
+ * does: cargo uses `-p`/`--package`; any other package is named as a plain
+ * token (e.g. `--workspace a`). */
+export function commandNamesPackage(command: string, name: string, cargo: boolean): boolean {
+  const tokens = command.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if ((t === "-p" || t === "--package") && tokens[i + 1] === name) return true;
+    if (t === `-p=${name}` || t === `--package=${name}`) return true;
+    if (cargo && t.startsWith("-p") && t.length > 2 && t.slice(2) === name) return true;
+  }
+  return !cargo && tokens.includes(name);
+}
+
+/** One command segment's words, with leading `VAR=value` environment
+ * assignments dropped (`RUSTFLAGS=x cargo fmt …` still starts at `cargo`). */
+function segmentWords(segment: string): string[] {
+  const tokens = segment.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+  return tokens.slice(i);
+}
+
+/** The argument tokens of a cargo-fmt invocation in a segment, or undefined
+ * when the segment is not one. Recognises `cargo [+toolchain] fmt …` and the
+ * `cargo-fmt …` binary, so a toolchain selector, an env prefix or the
+ * standalone binary all count (M-86/contract-39). */
+function cargoFmtArgs(segment: string): string[] | undefined {
+  const words = segmentWords(segment);
+  let i = 0;
+  if (words[i] === "cargo") {
+    i += 1;
+    if (words[i] !== undefined && /^\+\S+$/.test(words[i])) i += 1;
+    if (words[i] !== "fmt") return undefined;
+    i += 1;
+  } else if (words[i] === "cargo-fmt") {
+    i += 1;
+  } else {
+    return undefined;
+  }
+  return words.slice(i);
+}
+
+/** True when a command runs `cargo fmt --all --check` in one invocation. A
+ * plain `cargo fmt --all` reformats and exits 0, so it never catches the
+ * rustfmt drift CI rejects; `--all` in another segment (`cargo fmt -p a
+ * --check && cargo clippy --all`) is not the same invocation either. This is
+ * the PLAN QUALIFIER side (OD-13): only this form clears the CI warning. */
+export function runsCargoFmtAll(command: string): boolean {
+  for (const segment of command.split(/[;&|\n]+/)) {
+    const args = cargoFmtArgs(segment);
+    if (args && args.includes("--all") && args.includes("--check")) return true;
+  }
+  return false;
+}
+
+/** True when a command runs `cargo fmt --all` in one segment, with or without
+ * `--check`. This is the CI TRIGGER side (OD-13): a CI that runs `cargo fmt
+ * --all` and then `git diff --exit-code` gates on formatting just the same, so
+ * it must raise the coverage warning when the plan never does. */
+export function ciRunsCargoFmtAll(command: string): boolean {
+  for (const segment of command.split(/[;&|\n]+/)) {
+    const args = cargoFmtArgs(segment);
+    if (args && args.includes("--all")) return true;
+  }
+  return false;
+}
+
+/** Plan 06j (A1): the ONE place coverage is judged. Warnings only, never
+ * errors. For a cargo repository a phase warns when a crate whose directory
+ * its `:BOUNDARIES:` cover is named by no `-p` in its checks or final checks;
+ * for any repository a covered package the checks never name warns; and a
+ * repository whose CI runs `cargo fmt --all` while no phase check or final
+ * check does warns once. */
+export function checkCoverageWarnings(plan: LintPlanInput, repo: RepoFacts): LintFinding[] {
+  const out: LintFinding[] = [];
+  const phases = plan.phases ?? [];
+  const commandsOf = (phase: LintPhaseInput): string[] => [...(phase.checks ?? []), ...(phase.finalChecks ?? [])];
+  for (const phase of phases) {
+    const commands = commandsOf(phase);
+    const boundaries = phase.boundaries ?? [];
+    for (const pkg of repo.packages) {
+      if (!boundaries.some((g) => globCoversDir(g, pkg.dir))) continue;
+      if (commands.some((c) => commandNamesPackage(c, pkg.name, repo.cargo))) continue;
+      out.push({
+        severity: "warning",
+        rule: "coverage",
+        phaseId: phase.id ?? "?",
+        item: `${pkg.name} (${pkg.dir})`,
+        line: phase.line,
+        sourceFile: plan.sourceFile,
+        problem: `the phase's :BOUNDARIES: cover ${pkg.dir}, but no check or final check names the package ${pkg.name}`,
+        fix: repo.cargo
+          ? `add -p ${pkg.name} to the phase's :CHECKS: or :FINAL_CHECKS:, or narrow :BOUNDARIES:`
+          : `name ${pkg.name} in the phase's :CHECKS: or :FINAL_CHECKS:, or narrow :BOUNDARIES:`,
+      });
+    }
+  }
+  // OD-13: CI triggers on any `cargo fmt --all`; the plan only clears it with
+  // `cargo fmt --all --check` in one invocation.
+  for (const issue of repo.memberIssues ?? []) {
+    out.push({
+      severity: "warning",
+      rule: "coverage",
+      phaseId: "coverage",
+      item: issue,
+      sourceFile: plan.sourceFile,
+      problem: issue,
+      fix: "give the member a readable Cargo.toml with a [package] name, or remove it from the workspace members",
+    });
+  }
+  const ciFmt = repo.ciCommands.find(ciRunsCargoFmtAll);
+  if (ciFmt !== undefined && !phases.some((p) => commandsOf(p).some(runsCargoFmtAll))) {
+    out.push({
+      severity: "warning",
+      rule: "coverage",
+      phaseId: "coverage",
+      item: ciFmt,
+      sourceFile: plan.sourceFile,
+      problem: "the repository's CI runs `cargo fmt --all`, but no phase check or final check does",
+      fix: "add `cargo fmt --all --check` to the phase's :FINAL_CHECKS:, or a plan-wide #+TT_FINAL_CHECKS:",
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Verify reach: a named test the phase's checks never run
+// ---------------------------------------------------------------------------
+
+/** Where one named test is defined: a repo-relative file, and for a Rust test
+ * the cargo package that owns it. */
+export interface VerifySite {
+  file: string;
+  kind: "node" | "cargo";
+  pkg?: string;
+}
+
+/** What one phase's `:CHECKS:` run, as far as the lint can resolve it.
+ * `nodeFiles` are repo-relative globs of node test files; `cargo` is the
+ * packages `cargo test` runs ("all" for a workspace run). An `…Unknown` flag
+ * means a check runs tests the lint could not resolve, and the rule stays
+ * quiet for that kind rather than guess. */
+export interface TestSelection {
+  nodeFiles: string[];
+  nodeUnknown: boolean;
+  cargo: string[] | "all";
+  cargoUnknown: boolean;
+}
+
+/** What `checkVerifyReach` reads, built by `readVerifyReachFacts` (I/O). */
+export interface VerifyReachFacts {
+  /** Named test → where it is defined. A name with no site is not written
+   * yet (the worker will add it) and is not judged. */
+  sites: Record<string, VerifySite[]>;
+  /** Phase id → what its checks run. */
+  selections: Record<string, TestSelection>;
+}
+
+/** True when the selection runs a test defined at `site`. */
+export function selectionRuns(selection: TestSelection, site: VerifySite): boolean {
+  if (site.kind === "node") return selection.nodeUnknown || selection.nodeFiles.some((g) => matchesGlob(g, site.file));
+  if (selection.cargoUnknown || selection.cargo === "all") return true;
+  return site.pkg !== undefined && selection.cargo.includes(site.pkg);
+}
+
+/** 06k1's lesson (C1, 2026-10-10): `:VERIFY: test "plan 06g: …"` lived in
+ * test/conductor/lanes.test.ts while the phase ran `check-e2e FILES="…"`
+ * without it. The probe reported the test missing on every candidate, and a
+ * missing named test is a mechanical gate no owner command waives, so an
+ * all-met candidate could never be accepted. An error, so the plan cannot
+ * start: a test that already exists only where the checks never look. */
+export function checkVerifyReach(plan: LintPlanInput, facts: VerifyReachFacts): LintFinding[] {
+  const out: LintFinding[] = [];
+  for (const phase of plan.phases ?? []) {
+    const selection = facts.selections[phase.id ?? ""];
+    if (!selection) continue;
+    const items = [...(phase.requirements ?? []), ...(phase.constraints ?? [])];
+    for (const item of items) {
+      for (const raw of item.verify ?? []) {
+        for (const v of parseVerify(raw)) {
+          if (v.kind !== "test" || v.name.length === 0) continue;
+          const sites = v.file ? [{ file: v.file, kind: /\.rs$/.test(v.file) ? ("cargo" as const) : ("node" as const) }] : (facts.sites[v.name] ?? []);
+          if (sites.length === 0) continue;
+          if (sites.some((s) => selectionRuns(selection, s))) continue;
+          const where = sites.map((s) => (s.pkg ? `${s.file} (${s.pkg})` : s.file)).join(", ");
+          const first = sites[0];
+          out.push({
+            severity: "error",
+            rule: "verify-reach",
+            phaseId: phase.id ?? "?",
+            item: v.name,
+            line: item.verifyLine ?? item.line,
+            sourceFile: plan.sourceFile,
+            problem: `${item.id ?? "?"}'s test "${v.name}" is defined only in ${where}, which the phase's :CHECKS: never run — tt would report it missing on every candidate, and no owner command waives that gate`,
+            fix:
+              first.kind === "cargo" && first.pkg
+                ? `add -p ${first.pkg} to the phase's cargo test check, or name a test the checks run`
+                : `add ${first.file} to the phase's check list (e.g. check-e2e FILES="…"), or name a test the checks run`,
+          });
+        }
+      }
     }
   }
   return out;
