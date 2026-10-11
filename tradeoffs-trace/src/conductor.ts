@@ -33,7 +33,7 @@ import { unchangedResubmissionRequesters } from "./core/owner-commands.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, blocksAcceptance, candidateLabel, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
+import { advisoryReason, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
@@ -8626,10 +8626,33 @@ export class Conductor {
       boundCandidateSha: sha,
       boundContractVersion: K,
     }));
+    // The worker's earlier decisions, carried forward with THIS lane's own
+    // `priorDecisions` exactly as the hand-off will carry them. A `changed`
+    // one is a new version on this candidate, so the lane's seats must see
+    // and ballot it here. Before this, it reached the phase only at the
+    // hand-off, after every lane review, and the gate then failed it for
+    // "missing ballot" in every later round (settlement 01c rounds 2-3). A
+    // `kept` one that passed brings its ballots along.
+    const carriedPrior = carryDecisionsForward(this.#state.phase.decisions, build?.prior, sha, K).filter(
+      (d) => isLiveDecision(d) && d.boundCandidateSha === sha,
+    );
+    const carriedBallots = carryBallotsForward(
+      this.#state.phase.decisions,
+      this.#state.phase.ballots,
+      this.#state.phase.findings,
+      build?.prior,
+      this.#state.phase.candidate?.sha,
+      K,
+      carriedPrior,
+      sha,
+      this.#laneSeats(),
+      this.#laneLeader(),
+    );
     return {
       ...this.#state.phase,
       candidate: { sha, contractVersion: K },
-      decisions: [...workerDecisions, ...discovered, ...this.#laneTriggerDecisions(round, lane, sha)],
+      decisions: [...carriedPrior, ...workerDecisions, ...discovered, ...this.#laneTriggerDecisions(round, lane, sha)],
+      ballots: [...this.#state.phase.ballots, ...carriedBallots],
       findings,
       ...(build?.coverage !== undefined ? { coverage: build.coverage as Coverage } : {}),
       checkResolution: this.#laneCheckResolutions.get(sha) ?? [],
