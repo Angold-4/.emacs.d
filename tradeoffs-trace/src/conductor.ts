@@ -6893,12 +6893,16 @@ export class Conductor {
         // failure, and the event NAMES the cause.
         await agent.terminate();
         this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
+        // The cause is read after terminate(), when every event the agent
+        // sent has been handled: an agent that reports a terminal failure and
+        // then settles can win the race as "settled", and the event must
+        // still name the cause.
         const note =
           outcome === "compactionFailed"
             ? agent.modelFailureReason ?? "context overflow (compaction recovery failed)"
             : outcome === "modelFailed"
               ? agent.modelFailureReason ?? "the model call failed terminally"
-              : undefined;
+              : agent.modelFailureReason;
         this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION", ...(note ? { note } : {}) });
         return;
       }
@@ -8075,7 +8079,10 @@ export class Conductor {
             ? "the lane's worker timed out before submitting"
             : outcome === "compactionFailed" || outcome === "modelFailed"
               ? `the lane's worker ended without submitting: ${handle.agent.modelFailureReason ?? (outcome === "compactionFailed" ? "context overflow (compaction recovery failed)" : "the model call failed terminally")}`
-              : `the lane's worker ended without submit_phase (${outcome})`;
+              : handle.agent.modelFailureReason
+                ? // reported a terminal failure, then settled first in the race
+                  `the lane's worker ended without submitting: ${handle.agent.modelFailureReason}`
+                : `the lane's worker ended without submit_phase (${outcome})`;
         this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
         return { lane, note };
       }
