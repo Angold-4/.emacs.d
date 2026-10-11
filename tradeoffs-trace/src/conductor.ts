@@ -146,7 +146,7 @@ import {
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
-import { rerunBudgetMs } from "./core/checks.ts";
+import { CHANGED_TEST_BUDGET_MS, isChangedTestCommand, rerunBudgetMs } from "./core/checks.ts";
 import {
   decisionSettled,
   decisionStatus,
@@ -661,6 +661,9 @@ export function runPaths(runDir: string) {
     // Plan 04c: the balance metrics (a deterministic projection of state and
     // the control log; `tt contract rebuild`/`check` include it).
     metrics: path.join(runDir, "views", "metrics.json"),
+    // Plan 06l (A5): the per-seat cost/findings table, a deterministic
+    // projection of the same log; `tt seats` prints it.
+    seats: path.join(runDir, "views", "seats.txt"),
     inbox: path.join(runDir, "inbox"),
     inboxApplied: path.join(runDir, "inbox", "applied"),
     inboxRejected: path.join(runDir, "inbox", "rejected"),
@@ -1157,9 +1160,9 @@ export function rebuildTimeline(runDir: string, plan: RunPlanFile): Timeline {
  * The balance metrics need both; building them from a single snapshot keeps
  * the projection consistent with the timeline it is drawn beside, and avoids
  * re-parsing the whole log once per status beat. */
-export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { timeline: Timeline; events: MetricEvent[] } {
+export function rebuildTimelineWithEvents(runDir: string, plan: RunPlanFile): { timeline: Timeline; events: MetricEvent[]; records: LogRecord[] } {
   const { records } = readLog(runPaths(runDir).events);
-  return { timeline: timelineFromRecords(records, plan), events: metricEvents(records) };
+  return { timeline: timelineFromRecords(records, plan), events: metricEvents(records), records };
 }
 
 /** Folds every `"event"`-kind record in `records` (in order) through
@@ -1750,7 +1753,12 @@ export class Conductor {
       // here as well as in the agent's extension guard — a scripted agent
       // (fake-pi) sends its `sh` messages straight to this socket.
       refuseSh: (_agentId, command) => secretUseInCommand(command, this.#secretNames),
-      shDeadline: { deadlineMs: this.#deadlines.shCommandMs, termGraceMs: this.#deadlines.termGraceMs },
+      // Plan 06l (A2): `tt test --changed` gets its own budget (20 min),
+      // never the conductor's shell cap; every other command keeps the cap.
+      shDeadline: (command: string) => ({
+        deadlineMs: isChangedTestCommand(command) ? CHANGED_TEST_BUDGET_MS : this.#deadlines.shCommandMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+      }),
       // Plan 06e (A1): a `sh` command's environment carries childEnv() plus
       // every resolved secret value, so `$NAME` works whether the environment
       // or the env file supplied the value.
@@ -6587,7 +6595,7 @@ export class Conductor {
       TT_SOCKET: this.#paths.sock,
       // The extension waits this long for a command's result: the conductor's
       // per-command limit plus room for the kill and its report.
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_WORKTREE: this.#paths.worktree,
       TT_RUN_DIR: this.#runDir,
       TT_PROTECTED: protectedPaths,
@@ -6791,13 +6799,16 @@ export class Conductor {
       // Plan 06k1 (A4): pause this worker while another run's check window is
       // open.
       const stopCheckWindowWatch = this.#watchCheckWindow(agentId, agent, attemptTimer, clockSteer.timer);
-      const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap" | "compactionFailed">> = [
+      const races: Array<Promise<"submitted" | "settled" | "exited" | "timeout" | "tokenCap" | "compactionFailed" | "modelFailed">> = [
         donePromise.then(() => "submitted" as const),
         agent.waitSettled().then(() => "settled" as const),
         agent.waitExit().then(() => "exited" as const),
         // Plan 06k1 (A6): a failed compaction means this worker will never
         // submit; end the attempt now instead of waiting out its deadline.
         agent.waitCompactionFailed().then(() => "compactionFailed" as const),
+        // Plan 06l (A3/R5): a terminal model-call failure (404, context
+        // overflow) is the same end — never wait out the attempt deadline.
+        agent.waitModelFailed().then(() => "modelFailed" as const),
         workerTimeout.promise,
       ];
       // design §8.1: "per-attempt token cap from Pi usage events" — treated
@@ -6850,25 +6861,35 @@ export class Conductor {
         this.#applyEvent({ type: "ATTEMPT_TIMED_OUT" });
         return;
       }
-      if (outcome === "settled" || outcome === "compactionFailed") {
+      if (outcome === "settled" || outcome === "compactionFailed" || outcome === "modelFailed") {
         // agent_settled with no submission: either the extension's
         // no_submission signal already resolved donePromise (handled
         // above) or the agent settled without ever reaching that guard
         // (e.g. a scripted fake-pi with no hello/tool-call plumbing).
         // Plan 06k1 (A6): a failed compaction is the same end — the worker
-        // can never submit.
+        // can never submit. Plan 06l (A3/R5): so is a terminal model-call
+        // failure, and the event NAMES the cause.
         await agent.terminate();
         this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
-        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
+        const note =
+          outcome === "compactionFailed"
+            ? agent.modelFailureReason ?? "context overflow (compaction recovery failed)"
+            : outcome === "modelFailed"
+              ? agent.modelFailureReason ?? "the model call failed terminally"
+              : undefined;
+        this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION", ...(note ? { note } : {}) });
         return;
       }
       // outcome === "exited": the agent process ended on its own —
       // force-killed, crashed, or otherwise — without ever completing a
       // submission. Design §9.3's "agent attempt" reconciliation: kill
       // every recorded shell group, sweep, mark the attempt interrupted.
+      // Plan 06l (R5): the event names the cause (exit code or signal).
+      const exit = await agent.waitExit();
+      const cause = exit.signal ? `signal ${exit.signal}` : `exit code ${exit.code ?? "unknown"}`;
       this.#saveUnsubmittedWork("a", this.#state.phase.attempt.n, this.#paths.worktree);
       await this.#sweepAndClear(handle);
-      this.#applyEvent({ type: "ATTEMPT_INTERRUPTED" });
+      this.#applyEvent({ type: "ATTEMPT_INTERRUPTED", note: `the worker exited (${cause}) without submitting` });
     } finally {
       if (!submittedKeepHandle) this.#agents.delete(agentId);
     }
@@ -7725,7 +7746,7 @@ export class Conductor {
       ...this.#extraEnv,
       ...extra,
       TT_SOCKET: this.#paths.sock,
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_WORKTREE: worktree,
       TT_RUN_DIR: this.#runDir,
       TT_PROTECTED: protectedPaths,
@@ -8014,6 +8035,9 @@ export class Conductor {
         // can never submit; end its attempt at once, exactly like the
         // single-candidate worker, instead of waiting out the deadline.
         handle.agent.waitCompactionFailed().then(() => "compactionFailed" as const),
+        // Plan 06l (A3/R5): a terminal model-call failure (404, context
+        // overflow) ends it at once too, with the cause named.
+        handle.agent.waitModelFailed().then(() => "modelFailed" as const),
         timeout.promise,
       ]);
       timeout.cancel();
@@ -8027,8 +8051,8 @@ export class Conductor {
         const note =
           outcome === "timeout"
             ? "the lane's worker timed out before submitting"
-            : outcome === "compactionFailed"
-              ? "the lane's worker ended after a failed compaction without submitting"
+            : outcome === "compactionFailed" || outcome === "modelFailed"
+              ? `the lane's worker ended without submitting: ${handle.agent.modelFailureReason ?? (outcome === "compactionFailed" ? "context overflow (compaction recovery failed)" : "the model call failed terminally")}`
               : `the lane's worker ended without submit_phase (${outcome})`;
         this.#log.completion(actionId, { lane, round, outcome: "no-candidate", reason: note });
         return { lane, note };
@@ -8113,6 +8137,9 @@ export class Conductor {
         if (!passed) break;
         const command = this.#withValues(rawCommand);
         const startedAt = Date.now();
+        // Plan 06l (A4): a re-run alone must finish inside this same
+        // per-command deadline.
+        const deadlineAt = startedAt + this.#deadlines.checkMs;
         const result = await runCommand({
           command,
           cwd: checkoutDir.dir,
@@ -8150,7 +8177,54 @@ export class Conductor {
             this.#log.append("check_failures_pre_existing", { candidateSha, command, failures: verdict.parsed, lane });
             continue;
           }
-          if (verdict.newFailures.length > 0) firstFailure = `the check \`${command}\` failed: ${verdict.newFailures.join(", ")}`;
+          if (verdict.newFailures.length > 0) {
+            // Plan 06l (A4): before any new failure fails a LANE check, re-run
+            // each alone. A test that passes alone is recorded as flaky (its
+            // own FLAKE_OBSERVED, so the status view and the phase summary
+            // list it) and does not fail the check; only the tests that still
+            // fail alone fail it.
+            const classifications = await this.#classifyNewFailures({
+              output: result.output,
+              names: verdict.newFailures,
+              failingExitCode: result.exitCode,
+              cwd: checkoutDir.dir,
+              deadlineAt,
+              // Plan 06l (A4): ONE isolated re-run. A test that fails it is a
+              // real failure even if a later run might pass.
+              maxReruns: 1,
+            });
+            const loadOnly = classifications.filter((c) => c.loadOnly);
+            const real = classifications.filter((c) => c.reproducesAlone);
+            const machineLoad = Math.round(loadavg()[0] * 100) / 100;
+            for (const c of loadOnly) {
+              this.#log.append("lane_check_flake", {
+                candidateSha,
+                command,
+                lane,
+                name: c.name,
+                ...(c.rerunCommand !== undefined ? { rerunCommand: c.rerunCommand } : {}),
+                failingExitCode: c.failingExitCode,
+                rerunExitCodes: c.rerunExitCodes,
+                loadAverage: machineLoad,
+              });
+              this.#applyEvent({
+                type: "FLAKE_OBSERVED",
+                name: c.name,
+                command,
+                ...(c.rerunCommand !== undefined ? { rerunCommand: c.rerunCommand } : {}),
+                failingExitCode: c.failingExitCode,
+                rerunExitCodes: c.rerunExitCodes,
+                loadAverage: machineLoad,
+                savedRound: real.length === 0,
+                candidateSha,
+              });
+            }
+            if (real.length === 0) {
+              this.#log.append("lane_check_failures_load_only", { candidateSha, command, lane, tests: classifications });
+              continue;
+            }
+            firstFailure = `the check \`${command}\` failed: ${real.map((c) => c.name).join(", ")}`;
+          }
         }
         if (!firstFailure) firstFailure = `the check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}`;
         passed = false;
@@ -8306,6 +8380,21 @@ export class Conductor {
     };
   }
 
+  /** Plan 06l (A3): the discovery turn's own deadline — a third of the
+   * per-stage review deadline (#85), so the discovery barrier never waits a
+   * full review deadline for one seat. */
+  #discoveryDeadlineMs(): number {
+    return Math.max(1, Math.floor(this.#deadlines.reviewMs / 3));
+  }
+
+  /** Plan 06l (A2): the extension's own wait for a `sh` result. It must cover
+   * the longest per-command budget (`tt test --changed`), or a worker's narrow
+   * test run would return a client-side timeout while the conductor still has
+   * it running. A normal command still ends at the shell cap, well inside it. */
+  #shWaitMs(): number {
+    return Math.max(this.#deadlines.shCommandMs, CHANGED_TEST_BUDGET_MS) + 30_000;
+  }
+
   /** Plan 06k3 (A1): one seat's lane review. A review turn that ends without
    * its submission (timeout, exit, settled) is run once more with a FRESH
    * agent for that seat before the round fails; the retry is logged. */
@@ -8379,7 +8468,11 @@ export class Conductor {
       // re-prompt. One timer across all three let a slow seat's barrier wait
       // and its turn-2 re-prompts run it out of time, and the missing review
       // discarded the whole two-lane round (02k rounds 1 and 2).
-      let timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
+      // Plan 06l (A3): turn 1 (discovery) has its OWN, shorter deadline — a
+      // third of the per-stage review deadline — so a seat late on turn 1 is
+      // retried then and the barrier never waits a full review deadline for
+      // one seat.
+      let timeout = cancelableTimeout(this.#discoveryDeadlineMs(), "timeout" as const);
       const nextSettle = () =>
         new Promise<"settled">((resolve) => handle.settleWaiters!.push(() => resolve("settled")));
 
@@ -8392,6 +8485,10 @@ export class Conductor {
         settled1,
         // A crashed reviewer ends the attempt at once, never at reviewMs.
         handle.agent.waitExit().then(() => "exited" as const),
+        // Plan 06l (A3/A-8): a terminal model failure (404, context overflow)
+        // ends the turn at once, so the seat's one retry starts immediately.
+        handle.agent.waitModelFailed().then(() => "failed" as const),
+        handle.agent.waitCompactionFailed().then(() => "failed" as const),
       ]);
       // The discovery reply and the turn's own settle are two channels; the
       // settle can win the race. What matters is whether the discovery was
@@ -8405,7 +8502,9 @@ export class Conductor {
             ? "settled without submit_discovery (turn 1)"
             : turn1 === "exited"
               ? "the reviewer's process exited before submit_discovery (turn 1)"
-              : "timeout (turn 1)";
+              : turn1 === "failed"
+                ? `the reviewer's model call failed terminally (turn 1): ${handle.agent.modelFailureReason ?? "unknown"}`
+                : "timeout (turn 1)";
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: why });
         throw new Error(why);
       }
@@ -8447,6 +8546,8 @@ export class Conductor {
         timeout.promise,
         settled2,
         handle.agent.waitExit().then(() => "exited" as const),
+        handle.agent.waitModelFailed().then(() => "failed" as const),
+        handle.agent.waitCompactionFailed().then(() => "failed" as const),
       ]);
       // Same channel race as turn 1: the recorded review, not the race's
       // winner, says whether the submission landed.
@@ -8461,7 +8562,14 @@ export class Conductor {
               `findingStatements, items and arch, then end your turn.`,
           ),
         );
-        turn2 = await Promise.race([handle.donePromise.then(() => "submitted" as const), timeout.promise, settled3]);
+        turn2 = await Promise.race([
+          handle.donePromise.then(() => "submitted" as const),
+          timeout.promise,
+          settled3,
+          handle.agent.waitExit().then(() => "exited" as const),
+          handle.agent.waitModelFailed().then(() => "failed" as const),
+          handle.agent.waitCompactionFailed().then(() => "failed" as const),
+        ]);
         if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
       }
       timeout.cancel();
@@ -8474,7 +8582,9 @@ export class Conductor {
             ? "settled without submit_review (turn 2, after one re-prompt)"
             : turn2 === "exited"
               ? "the reviewer's process exited before submit_review (turn 2)"
-              : "timeout (turn 2)",
+              : turn2 === "failed"
+                ? `the reviewer's model call failed terminally (turn 2): ${handle.agent.modelFailureReason ?? "unknown"}`
+                : "timeout (turn 2)",
         );
       }
     } finally {
@@ -9282,6 +9392,9 @@ export class Conductor {
     // already built the metrics from this beat's one log snapshot, so writing
     // them here reuses it instead of parsing the whole log a second time.
     fs.writeFileSync(this.#paths.metrics, projectMetrics(view.metrics));
+    // Plan 06l (A5): the same beat keeps `views/seats.txt` current, from the
+    // same snapshot; `tt seats` prints these exact bytes.
+    fs.writeFileSync(this.#paths.seats, redactText(view.seatsTable, this.#secretMaskable));
     // Plan 03c: the same beat keeps the phase chart (`views/loop.txt`) current;
     // it is generated from TRANSITIONS, so it can never drift from the loop.
     const stats = statsFromTimeline(view.timeline, new Date());
@@ -10455,6 +10568,9 @@ export class Conductor {
                   failingExitCode: result.exitCode,
                   cwd: checkoutDir.dir,
                   deadlineAt,
+                  // Plan 06l (A4): ONE isolated re-run (a later pass must not
+                  // hide a test that failed alone).
+                  maxReruns: 1,
                 });
                 const loadOnly = classifications.filter((c) => c.loadOnly);
                 const real = classifications.filter((c) => c.reproducesAlone);
@@ -10592,21 +10708,22 @@ export class Conductor {
   }
 
   /** Plan 05d: re-run each newly failing test alone, inside the failing
-   * check's own deadline, and label it. Up to two re-runs per test (a test
-   * that passes on the first is not run again); a re-run that times out or
-   * finds no time left counts as `reproduces alone`, the strict direction. */
+   * check's own deadline, and label it. Plan 06l (A4): a candidate's new
+   * failure gets ONE isolated re-run (a base failure already got one); a
+   * re-run that times out or finds no time left counts as `reproduces alone`,
+   * the strict direction. */
   async #classifyNewFailures(params: {
     output: string;
     names: readonly string[];
     failingExitCode: number | null;
     cwd: string;
     deadlineAt: number;
-    /** Plan 05d: a base failure is re-run alone **once** (finding #25); a
-     * candidate's new failure up to twice. */
+    /** Plan 05d: a base failure is re-run alone **once** (finding #25);
+     * plan 06l (A4) gives a candidate's new failure one isolated re-run too. */
     maxReruns?: number;
   }): Promise<CheckFailureClass[]> {
     const plans = rerunCommandsFor(params.output, params.names, this.#plan.rerun);
-    const maxReruns = params.maxReruns ?? 2;
+    const maxReruns = params.maxReruns ?? 1;
     const out: CheckFailureClass[] = [];
     for (const plan of plans) {
       const reruns: TestRerunOutcome[] = [];
@@ -11222,7 +11339,7 @@ export class Conductor {
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
       // The extension waits this long for a command's result: the conductor's
       // per-command limit plus room for the kill and its report.
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       // Plan 01a: same secrets as the worker (a reviewer's reproduction
       // command or check run may need one) — names plus values, set last.
@@ -11406,7 +11523,9 @@ export class Conductor {
       // worker's disclosed decisions, open findings/corrections — ever get
       // sent, and only then is submit_review (with a real ballot per
       // votable decision) accepted at all (#onSubmit's own turn-order
-      // check). One shared `reviewMs` deadline covers both turns.
+      // check). One shared `reviewMs` deadline covers both turns; plan 06l's
+      // shorter turn-1 discovery deadline is the LANE review's per-stage
+      // deadline (#85), which this single-candidate flow does not have.
       const settled1 = nextSettle();
       await agent.prompt(this.#agentPrompt(this.#buildReviewerTurn1Prompt(reviewer)));
       const turn1 = await Promise.race([discoveryPromise.then(() => "discovered" as const), reviewTimeout.promise, settled1]);
@@ -11515,7 +11634,7 @@ export class Conductor {
       ...this.#piEnvFor?.("curator", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -11872,7 +11991,7 @@ export class Conductor {
       ...this.#piEnvFor?.("evaluator", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -12057,7 +12176,7 @@ export class Conductor {
       ...this.#piEnvFor?.("evaluator", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -12329,7 +12448,7 @@ export class Conductor {
       ...this.#piEnvFor?.("panel", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -12527,7 +12646,7 @@ export class Conductor {
       ...this.#piEnvFor?.("panel", agentId),
       TT_SOCKET: this.#paths.sock,
       TT_SEARCH_ROOTS: [candidateDir, this.#paths.refs].join(path.delimiter),
-      TT_SH_WAIT_MS: String(this.#deadlines.shCommandMs + 30_000),
+      TT_SH_WAIT_MS: String(this.#shWaitMs()),
       TT_RUN_DIR: this.#runDir,
       TT_SECRETS: this.#secretNames.join(" "),
       ...Object.fromEntries(this.#secretValues.map((s) => [s.name, s.value])),
@@ -13586,6 +13705,7 @@ export function buildWorkerPrompt(
     "If a criterion cannot be met AS WRITTEN (not merely unmet yet), say so instead of faking it: call submit_phase with `criterionDispute` = { criterion: <one acceptance item above, verbatim>, why, proposedWording }. The conductor records it as an amendment the reviewers vote on; if the normal tally passes, the wording is replaced for this phase and the next candidate is judged against it. A criterion that is merely unmet is a normal repair, not a dispute.",
     "How to work:",
     `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target). With node --test, pass --test-force-exit so a test that leaks a process cannot hold the command open. Do not pipe test output through tail or head: a command killed at the per-command time limit then returns nothing. If a test file is slow, run one test at a time with --test-name-pattern.`,
+    `- Plan 06l (A2): between edits run \`tt test --changed --run "$TT_RUN_DIR"\` (the matching worker tool): it runs only the plan's check test files that import a file you changed, reuses a recorded pass when the tree is unchanged, prints failures only, and has its own time budget. Run the full checks once before submitting.`,
     "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",
     "- Edit files with the edit and write tools.",
     "- In submit_phase, write each decision's choice as one plain sentence of at most 20 words; put the reasoning in whyItMatters and the alternatives. Disclose choices that change behaviour, interfaces, guarantees or cost.",

@@ -27,6 +27,7 @@ import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCoun
 import { reviewSummary } from "./render.ts";
 import { candidateLabel } from "./core/rounds.ts";
 import { seatsOf } from "./core/seats.ts";
+import { computeSeatTable, renderSeatTable, type SeatTable } from "./core/seat-table.ts";
 import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
 import type { PhaseState } from "./core/types.ts";
 
@@ -659,10 +660,10 @@ export function buildView(
   plan: RunPlanFile,
   alive: boolean,
   now = new Date(),
-): RunView & { timeline: Timeline; tape: string } {
+): RunView & { timeline: Timeline; tape: string; seatsTable: string; seatTable: SeatTable } {
   // One read of the control log gives both the timeline and the events the
   // balance metrics need, so nothing here parses the log twice.
-  const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
+  const { timeline, events, records } = rebuildTimelineWithEvents(runDir, plan);
   const phase = timeline.state.phase;
   const spans = stageSpans(timeline, now, alive ? undefined : lastEventAt(runDir));
   const current = spans[spans.length - 1];
@@ -830,9 +831,15 @@ export function buildView(
   const modelsText = modelsLineText(plan.models, seatsOf(phase.contract));
   const modelsCheckText = modelsCheckStatusText(readModelsCheck(runDir));
   const models = [modelsText, modelsCheckText].filter((s): s is string => s !== undefined && s.length > 0).join(" · ") || undefined;
+  // Plan 06l (A5): the seat table is computed from the SAME log snapshot the
+  // timeline and metrics were, so `views/seats.txt`, `tt seats` and the phase
+  // summary can never disagree with each other.
+  const seatTable = computeSeatTable(records, seatsOf(phase.contract), chartModelsFromPlan(plan.models, seatsOf(phase.contract))?.reviewerSeats);
   return {
     timeline,
     tape,
+    seatsTable: renderSeatTable(seatTable),
+    seatTable,
     metrics,
     metricsLine: metricsLine(metrics),
     models,
@@ -1047,6 +1054,14 @@ export function prSummary(runDir: string, plan: RunPlanFile, extra: { removedTes
       ? ["### Models per role", "", ...models.map((m) => `- ${m.role}: ${m.value}`), ""]
       : []),
     ...metricsSummary(v.metrics),
+    // Plan 06l (A5): the same per-seat table `views/seats.txt` holds, so the
+    // phase summary shows what each reviewer seat cost and found.
+    "",
+    "### Seat table",
+    "",
+    "```",
+    ...v.seatsTable.trimEnd().split("\n"),
+    "```",
   ];
   // Plan 01c: the owner's own checklist (from the plan's `Owner checklist:`
   // list). It is not a worker/reviewer acceptance criterion, so it is not
