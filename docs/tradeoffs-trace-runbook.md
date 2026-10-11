@@ -836,6 +836,40 @@ A plan can run more than one implementation lane per round:
 > `#+TT_MODELS` may give each lane its own worker model: `worker.1` is lane `a`
 > and `worker.2` is lane `b`, each falling back to `worker`.
 
+### A worker prompt per lane (`#+TT_WORKER_PROMPT`)
+
+To A/B-test a worker disposition, give one lane's worker extra system-prompt
+text and leave the other lane as it is:
+
+```org
+#+TT_WORKERS: 2
+#+TT_WORKER_PROMPT: a=~/orgw/skills/tradeoffs-trace/vendor/ponytail/skills/ponytail/SKILL.md,~/orgw/skills/tradeoffs-trace/prompts/ponytail-tt-shim.md
+```
+
+- **Syntax.** `lane=<file>[,<file>…]`, one token per lane, separated by
+  spaces. Each file is passed to that lane's worker as its own
+  `--append-system-prompt <file>`, in the order written. `lane=none` names no
+  file. A relative path resolves against the plan's directory; `~` is
+  allowed; a path may not contain a space or a comma. A file is passed as-is
+  (a skill's YAML front matter is not stripped).
+- **Who gets it.** Only the worker of that lane, on every launch of it
+  (its `--continue` sessions and its repair rounds too). Reviewers, pick
+  seats, the evaluator, the curator and the panels never do. A single-worker
+  plan (no `#+TT_WORKERS`, or 1) uses lane `a`'s files.
+- **Program and plan.** In a program file the keyword is every entry's
+  default; an entry's own keyword overrides it **lane by lane** — an entry
+  that writes `b=none` keeps the program's lane `a`.
+- **Lint.** `tt lint` refuses a lane the plan does not run, an empty file
+  name and a file that is missing or unreadable.
+- **Recorded.** At the run's first start the conductor copies each file into
+  `<run>/worker-prompts/` and records its source, copy and sha256 in the
+  `init` record of `events.jsonl`; the worker is launched with the copy, so a
+  later edit of the source never reaches a resumed run (a resume whose copy is
+  gone refuses to start). The status details block and `tt state`'s `view`
+  name each lane's files: `prompts   a=SKILL.md@1a2b3c4d,ponytail-tt-shim.md@9f8e7d6c`.
+- The files are never collected as references (`#+TT_REFS`/`*.md` names), so
+  the other lane's worker and the reviewers are not pointed at them.
+
 `#+TT_WORKERS: K` makes one round start from **one** version (round 1: the
 integration branch head) and run K lanes. Each lane gets its own worktree,
 its own worker and its own sweep, on the same prompt; a phase's own

@@ -9,11 +9,13 @@
 // 13j's owner-actor item — and no false error anywhere else.
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { parseOrgPlan } from "../../src/core/org-plan.ts";
 import { formatFinding, hasLintErrors, lintPlan, lintProgram, type LintFinding, type LintPhaseInput, type LintPlanInput } from "../../src/core/plan-lint.ts";
 
 const FIXTURES = fileURLToPath(new URL("../fixtures/atlas-plans", import.meta.url));
@@ -408,4 +410,56 @@ test("plan 06g: #+TT_ROUNDS must be a positive whole number, and 3 is the defaul
   const bad = lintPlan({ ...base, rounds: 0, roundsLine: 4 }).find((f) => f.rule === "worker-count");
   assert.ok(bad, "#+TT_ROUNDS: 0 must be refused");
   assert.match(bad!.fix, /default/);
+});
+
+test("plan lane-prompt: lint refuses a missing file, an empty file name and an unknown lane; a readable file on a known lane passes", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tt-lint-lane-prompt-"));
+  try {
+    const skill = path.join(dir, "SKILL.md");
+    writeFileSync(skill, "---\nname: ponytail\n---\nBe brief.\n");
+    const base: LintPlanInput = { ...plan([{ id: "p", acceptance: ["it works"] }]), workers: 2, workerPromptLine: 4 };
+    const rule = (p: LintPlanInput) => lintPlan(p).filter((f) => f.rule === "worker-prompt");
+
+    assert.deepEqual(rule({ ...base, workerPrompt: { a: [skill, skill], b: [] } }), []);
+
+    const missing = rule({ ...base, workerPrompt: { a: [skill, path.join(dir, "nope.md")] } });
+    assert.equal(missing.length, 1);
+    assert.equal(missing[0].severity, "error");
+    assert.equal(missing[0].line, 4);
+    assert.match(missing[0].problem, /nope\.md for lane a, which is not a readable file/);
+    // A directory is not a prompt file either.
+    assert.equal(rule({ ...base, workerPrompt: { a: [dir] } }).length, 1);
+
+    assert.match(rule({ ...base, workerPrompt: { a: [""] } })[0].problem, /empty file name/);
+
+    const unknown = rule({ ...base, workerPrompt: { z: [skill], Lane: [skill] } });
+    assert.equal(unknown.length, 2);
+    assert.match(unknown[0].problem, /names lane z, but this plan runs lanes a, b/);
+    assert.match(unknown[1].problem, /unknown lane Lane/);
+    // A single-worker plan with reviewer seats runs only lane a.
+    const single = rule({ ...base, workers: 1, seats: ["M", "A", "B"], workerPrompt: { b: [skill] } });
+    assert.match(single[0].problem, /names lane b, but this plan runs one lane \(a\)/);
+
+    // A program's declaration is linted once, at the program level; the
+    // entry's inherited lane is not rechecked against the entry's file.
+    const program = lintProgram({
+      sourceFile: "/x/PROGRAM.org",
+      workerPrompt: { a: [path.join(dir, "gone.md")] },
+      workerPromptLine: 3,
+      entries: [{ id: "e1", plan: { ...base, workerPrompt: { a: [path.join(dir, "gone.md")] }, workerPromptFromProgram: ["a"] } }],
+    }).filter((f) => f.rule === "worker-prompt");
+    assert.equal(program.length, 1);
+    assert.equal(program[0].sourceFile, "/x/PROGRAM.org");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("plan lane-prompt: tt lint's Org reader reads #+TT_WORKER_PROMPT per lane, files in order, ~ and relative paths expanded", () => {
+  const parsed = parseOrgPlan(
+    "#+TITLE: t\n#+TT_WORKER_PROMPT: a=~/p/SKILL.md,shim.md b=none\n\n* p\n  :PROPERTIES:\n  :ID: p\n  :END:\n",
+    "/plans/x/plan.org",
+  );
+  assert.deepEqual(parsed.workerPrompt, { a: [path.join(homedir(), "p/SKILL.md"), "/plans/x/shim.md"], b: [] });
+  assert.equal(parsed.workerPromptLine, 2);
 });

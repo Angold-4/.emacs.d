@@ -989,6 +989,69 @@ entry's own value for a role wins over it."
               (should (equal (alist-get 'modelsFromProgram pb) [reviewer])))))
       (delete-directory dir t))))
 
+;; plan lane-prompt: #+TT_WORKER_PROMPT names, per lane, the files appended
+;; to that lane's worker system prompt, in order.
+(ert-deftest tradeoffs-trace-plan-lane-prompt-plan-level ()
+  "plan lane-prompt: the plan keyword becomes a per-lane map of absolute
+paths in order; `none' is an empty list; `~' and relative paths expand."
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_WORKER_PROMPT: a=~/p/SKILL.md,shim.md b=none\n" +tt-test--valid-plan)) :plan))
+         (map (alist-get 'workerPrompt plan)))
+    (should (equal (alist-get 'a map) (vector (expand-file-name "~/p/SKILL.md") "/tmp/shim.md")))
+    (should (equal (alist-get 'b map) []))
+    (should (= (alist-get 'workerPromptLine plan) 1))
+    ;; The JSON the conductor reads: lane b is an empty list, not null.
+    (should (string-match-p "\"b\":\\[\\]" (json-encode plan))))
+  ;; A prompt file is never collected as a reference every agent is shown,
+  ;; even when it exists and ends in .md.
+  (let* ((f (make-temp-file "tt-ert-lane-prompt" nil ".md"))
+         (plan (plist-get (+tt-test--parse (concat "#+TT_WORKER_PROMPT: a=" f "\n" +tt-test--valid-plan)) :plan)))
+    (unwind-protect
+        (progn
+          (should (equal (alist-get 'a (alist-get 'workerPrompt plan)) (vector f)))
+          (should-not (member f (append (alist-get 'references plan) nil))))
+      (delete-file f)))
+  ;; An empty path is kept for `tt lint' to name.
+  (let ((map (alist-get 'workerPrompt (plist-get (+tt-test--parse (concat "#+TT_WORKER_PROMPT: a=\n" +tt-test--valid-plan)) :plan))))
+    (should (equal (alist-get 'a map) [""])))
+  ;; No keyword, no field.
+  (should-not (assq 'workerPrompt (plist-get (+tt-test--parse +tt-test--valid-plan) :plan))))
+
+(ert-deftest tradeoffs-trace-program-lane-prompt-merge ()
+  "plan lane-prompt: a program's #+TT_WORKER_PROMPT reaches every entry and
+merges lane by lane: an entry's own lane wins and the program's other lanes
+stay (never the whole map replaced, as a phase's TT_*_MINUTES does)."
+  (let* ((dir (make-temp-file "tt-ert-prog-prompt" t))
+         (plan-a (expand-file-name "a.org" dir))
+         (plan-b (expand-file-name "b.org" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file plan-a (insert +tt-test--valid-plan))
+          (with-temp-file plan-b (insert (concat "#+TT_WORKER_PROMPT: b=own-b.md\n"
+                                                 (replace-regexp-in-string "p1" "q1" +tt-test--valid-plan))))
+          (with-temp-buffer
+            (insert "#+TITLE: pm\n#+TT_PROGRAM: 2\n#+TT_WORKER_PROMPT: a=SKILL.md,shim.md b=prog-b.md\n\n* 13a\n  :PROPERTIES:\n  :PLAN: a.org\n  :END:\n* 13c\n  :PROPERTIES:\n  :PLAN: b.org\n  :AFTER: 13a\n  :END:\n")
+            (setq buffer-file-name (expand-file-name "program.org" dir) default-directory dir)
+            (org-mode)
+            (let* ((program (plist-get (+tt-parse-program) :program))
+                   (entries (alist-get 'entries program))
+                   (pa (alist-get 'plan (aref entries 0)))
+                   (pb (alist-get 'plan (aref entries 1)))
+                   (in (lambda (f) (expand-file-name f dir))))
+              (set-buffer-modified-p nil) (setq buffer-file-name nil)
+              ;; an entry with none of its own inherits every lane, in order
+              (should (equal (alist-get 'a (alist-get 'workerPrompt pa)) (vector (funcall in "SKILL.md") (funcall in "shim.md"))))
+              (should (equal (alist-get 'b (alist-get 'workerPrompt pa)) (vector (funcall in "prog-b.md"))))
+              (should (equal (alist-get 'workerPromptFromProgram pa) ["a" "b"]))
+              ;; the entry's own lane b wins; the program's lane a stays
+              (should (equal (alist-get 'b (alist-get 'workerPrompt pb)) (vector (funcall in "own-b.md"))))
+              (should (equal (alist-get 'a (alist-get 'workerPrompt pb)) (vector (funcall in "SKILL.md") (funcall in "shim.md"))))
+              (should (equal (alist-get 'workerPromptFromProgram pb) ["a"]))
+              (should (= (alist-get 'workerPromptLine pb) 1))
+              ;; the program object keeps its own declaration for `tt lint'
+              (should (equal (alist-get 'a (alist-get 'workerPrompt program)) (vector (funcall in "SKILL.md") (funcall in "shim.md"))))
+              (should (= (alist-get 'workerPromptLine program) 3)))))
+      (delete-directory dir t))))
+
 (ert-deftest tradeoffs-trace-plan-model-seats ()
   "#+TT_MODELS names a seat as `reviewer.M' / `panel.2', and
 `panel=reviewers' records panelFrom for every panel seat; Pi's thinking

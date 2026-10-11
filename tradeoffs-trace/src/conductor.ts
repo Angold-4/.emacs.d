@@ -20,6 +20,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { reduce } from "./core/reduce.ts";
+import { parseWorkerPromptRecord, SINGLE_WORKER_LANE, workerPromptPaths, type WorkerPromptMap, type WorkerPromptRecord } from "./core/worker-prompt.ts";
+import { resolveWorkerPrompts } from "./effects/worker-prompt.ts";
 import { curatorEvent, entryVerdictEvents, formatAnchor, planEntryEvents, validateLink, type CuratorProposal, type Entry } from "./core/entries.ts";
 import { projectLedger, projectMessages } from "./core/messages.ts";
 import { candidateAnchorFreshness, projectEntryReview, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
@@ -522,6 +524,17 @@ export interface RunPlanFile {
   rerun?: string;
   /** Lint-only: the 1-based line of `#+TT_RERUN:` in the source Org file. */
   rerunLine?: number;
+  /** `#+TT_WORKER_PROMPT`: per lane (`a`, `b`, …), the files appended to that
+   * lane's worker system prompt, in order (lane `a`'s for a single worker).
+   * Emacs merges a program's map into each entry lane by lane. The conductor
+   * copies and hashes them at the first start (the `init` record's
+   * `workerPrompts`); every launch after that uses the record, never this. */
+  workerPrompt?: WorkerPromptMap;
+  /** Lint-only: the 1-based line of `#+TT_WORKER_PROMPT`. */
+  workerPromptLine?: number;
+  /** Lint-only: the lanes this entry inherited from the program's keyword
+   * (linted once, at the program level). */
+  workerPromptFromProgram?: string[];
 }
 
 /** Plan 01i: a program-wide owner directive a node's plan was started with. */
@@ -1464,6 +1477,9 @@ export class Conductor {
    * enough to mask and to match in a command); and the names that were unset
    * or unusable then (reported by `tt status`, never a reason not to run). */
   #secretNames: string[] = [];
+  /** `#+TT_WORKER_PROMPT`, as the `init` record froze it: per lane, the run's
+   * own copies of the files appended to that lane's worker. */
+  #workerPrompts: WorkerPromptRecord | undefined;
   #secretValues: Secret[] = [];
   #secretMaskable: Secret[] = [];
   #missingSecrets: string[] = [];
@@ -1668,7 +1684,7 @@ export class Conductor {
     const { records } = readLog(this.#paths.events);
     const initRecord = records.find((r) => r.kind === "init");
     if (initRecord) {
-      const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string; seats?: Seats };
+      const init = initRecord.event as { runId: string; integrationHead: string; runnerRevision?: string; seats?: Seats; workerPrompts?: unknown };
       const mine = runnerRevision();
       if (init.runnerRevision && init.runnerRevision !== mine && process.env.TT_ALLOW_RUNNER_MISMATCH !== "1") {
         throw new RunnerMismatchError(
@@ -1676,6 +1692,15 @@ export class Conductor {
         );
       }
       this.#state = initialState(init.runId, this.#plan.phases[0], init.integrationHead, this.#plan.ownerDirectives ?? [], init.seats);
+      // `#+TT_WORKER_PROMPT`: a resumed run keeps the copies its first start
+      // made. A copy that is gone would reach Pi as literal prompt text, so
+      // the resume refuses instead.
+      this.#workerPrompts = parseWorkerPromptRecord(init.workerPrompts);
+      for (const files of Object.values(this.#workerPrompts ?? {})) {
+        for (const f of files) {
+          if (!fs.existsSync(f.path)) throw new Error(`#+TT_WORKER_PROMPT: the run's copy ${f.path} of ${f.source} is missing; start a new run`);
+        }
+      }
     } else {
       const head = currentHead(this.#plan.repo, this.#integrationBranch);
       const runId = randomUUID().slice(0, 8);
@@ -1689,7 +1714,17 @@ export class Conductor {
         leader: phase0.leader ?? this.#plan.leader,
         workers: phase0.workers ?? this.#plan.workers,
       });
-      this.#log.append("init", { runId, integrationHead: head, runnerRevision: runnerRevision(), seats: effectiveSeats });
+      // `#+TT_WORKER_PROMPT`: copy and hash each lane's files now, once, so the
+      // run's prompt is reproducible and the views can name it. An unreadable
+      // file throws before the init record exists.
+      this.#workerPrompts = resolveWorkerPrompts(this.#plan.workerPrompt, path.join(this.#runDir, "worker-prompts"));
+      this.#log.append("init", {
+        runId,
+        integrationHead: head,
+        runnerRevision: runnerRevision(),
+        seats: effectiveSeats,
+        ...(this.#workerPrompts ? { workerPrompts: this.#workerPrompts } : {}),
+      });
       this.#state = initialState(runId, phase0, head, this.#plan.ownerDirectives ?? [], effectiveSeats);
     }
     this.#state = foldEvents(this.#state, records);
@@ -6848,6 +6883,8 @@ export class Conductor {
             noSession: workerPiCommand !== undefined,
             provider: workerProviderModel?.provider,
             model: workerProviderModel?.model,
+            // `#+TT_WORKER_PROMPT`: a single worker takes lane a's files.
+            appendSystemPrompt: workerPromptPaths(this.#workerPrompts, SINGLE_WORKER_LANE),
           }),
         ],
         cwd: this.#paths.worktree,
@@ -8011,6 +8048,11 @@ export class Conductor {
           noSession: command !== undefined,
           provider: providerModel?.provider,
           model: providerModel?.model,
+          // `#+TT_WORKER_PROMPT`: only a lane WORKER gets its lane's files;
+          // a lane reviewer or pick seat never does.
+          ...(opts.role === "worker" && opts.lane !== undefined
+            ? { appendSystemPrompt: workerPromptPaths(this.#workerPrompts, opts.lane) }
+            : {}),
         }),
       ],
       cwd: opts.cwd,

@@ -185,6 +185,10 @@ export interface LaunchOptions {
    * `--continue`), so a repair attempt or a later review round keeps the
    * agent's own earlier reasoning (design §2, §6.1). */
   continueSession?: boolean;
+  /** `#+TT_WORKER_PROMPT`: files appended to the agent's system prompt (Pi's
+   * `--append-system-prompt`, once per file, in order). Only a lane worker
+   * (or the single worker, from lane `a`) is ever given any. */
+  appendSystemPrompt?: readonly string[];
 }
 
 /** Builds the full `pi` argv (everything after the `pi` binary itself) for
@@ -207,6 +211,7 @@ export function launchArgs(role: Role, opts: LaunchOptions = {}): string[] {
   ];
   if (opts.provider) args.push("--provider", opts.provider);
   if (opts.model) args.push("--model", opts.model);
+  for (const file of opts.appendSystemPrompt ?? []) args.push("--append-system-prompt", file);
   if (opts.sessionDir && !opts.noSession) {
     args.push("--session-dir", opts.sessionDir);
     if (opts.continueSession) args.push("--continue");

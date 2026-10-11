@@ -758,7 +758,13 @@ so no agent searches the file system for them."
       (goto-char (point-min))
       ;; Markdown only: plans name sibling .org plans for ordering, not as references.
       (while (re-search-forward "\\(?:~/\\|/\\)?[[:alnum:]_./-]*[[:alnum:]_-]\\.md\\_>" nil t)
-        (push (match-string-no-properties 0) found)))
+        ;; A #+TT_WORKER_PROMPT file is one lane's worker prompt, not a
+        ;; reference: as a reference every agent (the other lane's worker and
+        ;; the reviewers included) would be pointed at it.
+        (unless (save-excursion
+                  (beginning-of-line)
+                  (let ((case-fold-search t)) (looking-at-p "[ \t]*#\\+TT_WORKER_PROMPT:")))
+          (push (match-string-no-properties 0) found))))
     (let ((out nil))
       (dolist (name (nreverse found))
         (let ((abs (expand-file-name name (if (string-prefix-p "~" name) "~" dir))))
@@ -802,6 +808,53 @@ does not set it; the lookup order is the environment first, then the file."
     (when (and v (not (string-empty-p (string-trim v))))
       (expand-file-name (string-trim v)
                         (file-name-directory (expand-file-name (or buffer-file-name default-directory)))))))
+
+(defun +tt--plan-worker-prompt ()
+  "Parse #+TT_WORKER_PROMPT into (MAP . LINE), or nil when absent or empty.
+The keyword names, per lane, the files appended to that lane's worker system
+prompt (Pi's `--append-system-prompt'), in order:
+`#+TT_WORKER_PROMPT: a=~/p/SKILL.md,~/p/shim.md b=none'.  MAP is an alist
+\((LANE . [ABSOLUTE-PATH ...]) ...) for the plan JSON; `none' is an empty
+vector, so a phase can clear a lane the program set.  Each path is expanded
+against the plan's directory (`~' allowed); an empty path stays \"\" so
+`tt lint' can name it, as does an unknown lane or an unreadable file.  A
+lane named twice keeps its later value."
+  (when-let* ((at (+tt--keyword-at "TT_WORKER_PROMPT")))
+    (let ((dir (file-name-directory (expand-file-name (or buffer-file-name default-directory))))
+          (map nil))
+      (dolist (tok (split-string (car at) "[ \t]+" t))
+        (let* ((eq (string-match "=" tok))
+               (lane (intern (if eq (substring tok 0 eq) tok)))
+               (val (if eq (substring tok (1+ eq)) ""))
+               (files (if (equal val "none")
+                          nil
+                        (mapcar (lambda (f) (if (string-empty-p f) f (expand-file-name f dir)))
+                                (split-string val "," nil)))))
+          (setq map (cons (cons lane (vconcat files)) (assq-delete-all lane map)))))
+      (when map (cons (nreverse map) (cdr at))))))
+
+(defun +tt--merge-worker-prompt (plan program)
+  "PLAN with the program's #+TT_WORKER_PROMPT merged in lane by lane.
+PROGRAM is (MAP . LINE) from `+tt--plan-worker-prompt', or nil.  The
+entry's own lane wins; a lane only the program names is inherited and
+recorded in `workerPromptFromProgram', so `tt lint' checks it once, at the
+program level.  Unlike the deadline maps, a phase never drops the program's
+other lanes by naming one of its own."
+  (if (not program)
+      plan
+    (let* ((own (append (alist-get 'workerPrompt plan) nil))
+           (merged (append own nil))
+           (inherited nil))
+      (dolist (cell (car program))
+        (unless (assq (car cell) own)
+          (setq merged (append merged (list cell)))
+          (push (symbol-name (car cell)) inherited)))
+      (setq plan (cons `(workerPrompt . ,merged) (assq-delete-all 'workerPrompt (copy-alist plan))))
+      (unless (assq 'workerPromptLine plan)
+        (setq plan (cons `(workerPromptLine . ,(cdr program)) plan)))
+      (when inherited
+        (setq plan (cons `(workerPromptFromProgram . ,(vconcat (nreverse inherited))) plan)))
+      plan)))
 
 (defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel" "curator")
   "Roles #+TT_MODELS may assign a model to (design §2.1).
@@ -974,6 +1027,11 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                       (and s `((secrets . ,(vconcat s)))))
                   ,@(let ((f (+tt--plan-env-file)))
                       (and f `((envFile . ,f))))
+                  ;; A per-lane worker system prompt (A/B of worker
+                  ;; dispositions); reviewers and the other roles never get it.
+                  ,@(let ((w (+tt--plan-worker-prompt)))
+                      (and w `((workerPrompt . ,(car w))
+                               (workerPromptLine . ,(cdr w)))))
                   ,@(let ((m (+tt--plan-models)))
                       (and m
                            (append `((models . ,(nth 0 m))
@@ -1233,6 +1291,9 @@ several phases runs them in order."
          ;; plan file treated as a one-entry program is parsed by
          ;; `+tt-parse-plan' below, so it is not parsed again here.
          (program-models (and (+tt--keyword "TT_PROGRAM") (+tt--plan-models)))
+         ;; #+TT_WORKER_PROMPT in a program file: every entry's default, merged
+         ;; lane by lane (an entry's own lane wins, its other lanes stay).
+         (program-worker-prompt (and (+tt--keyword "TT_PROGRAM") (+tt--plan-worker-prompt)))
          (entries nil) (errors nil))
     (if (not (+tt--keyword "TT_PROGRAM"))
         (let ((parsed (+tt-parse-plan)))
@@ -1261,6 +1322,7 @@ several phases runs them in order."
                   (when (and program-env-file (not (assq 'envFile plan)))
                     (setq plan (cons `(envFile . ,program-env-file) plan)))
                   (setq plan (+tt--merge-models plan program-models))
+                  (setq plan (+tt--merge-worker-prompt plan program-worker-prompt))
                   (push `((id . ,id) (after . ,(vconcat after)) (plan . ,plan)) entries)))))))))
     (unless entries (push (cons 1 "program has no entries") errors))
     (list :program (append `((title . ,title)
@@ -1275,7 +1337,12 @@ several phases runs them in order."
                              (append `((models . ,(nth 0 program-models))
                                        (modelsLine . ,(nth 1 program-models)))
                                      (when (nth 2 program-models)
-                                       `((modelsRepeated . ,(vconcat (nth 2 program-models))))))))
+                                       `((modelsRepeated . ,(vconcat (nth 2 program-models)))))))
+                           ;; The program file's own #+TT_WORKER_PROMPT, for
+                           ;; `tt lint' (entries carry the merged map).
+                           (when program-worker-prompt
+                             `((workerPrompt . ,(car program-worker-prompt))
+                               (workerPromptLine . ,(cdr program-worker-prompt)))))
           :errors (sort errors (lambda (a b) (< (car a) (car b)))))))
 
 (defvar-local +tt--program-dir nil "Program directory shown by this buffer.")
@@ -2095,6 +2162,8 @@ open the decision view at that record."
     ;; Plan 05h: the models row is a row like the others (`models` padded, no
     ;; `models:' prefix), so the label column stays aligned.
     (+tt--status-row "models" (alist-get 'models v))
+    ;; #+TT_WORKER_PROMPT: which lane's worker ran with which prompt files.
+    (+tt--status-row "prompts" (alist-get 'workerPrompts v))
     (+tt--status-row "verdict" (alist-get 'verdict v)
                      (if (equal name "DONE") 'success 'warning))
     ;; Plan 01h: the trade-offs panel directly under the verdict, then what

@@ -21,6 +21,9 @@
 // numbers come from the Org source: Emacs records them on `acceptanceLines`
 // when it parses the plan, and a hand-written JSON plan simply gets no line.
 
+import * as fs from "node:fs";
+
+import { expandPromptPath, isLaneId } from "./worker-prompt.ts";
 import { matchesGlob } from "./boundaries.ts";
 import { parseVerify, verifyKindIssue } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
@@ -50,7 +53,9 @@ export type LintRule =
   | "item-text-loss"
   // A `test` verify defined only where the phase's checks never run: tt
   // reports it missing on every candidate, a gate no owner command waives.
-  | "verify-reach";
+  | "verify-reach"
+  // `#+TT_WORKER_PROMPT`: an unknown lane, an empty path or an unreadable file.
+  | "worker-prompt";
 
 /** The roles #+TT_MODELS may assign a model to. */
 const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
@@ -252,6 +257,14 @@ export interface LintPlanInput {
   leader?: string;
   /** Lint-only: the 1-based line of `#+TT_LEADER:`. */
   leaderLine?: number;
+  /** `#+TT_WORKER_PROMPT`: lane to the files appended to its worker. Kept
+   * open (`unknown`) so a malformed value still reaches the linter. */
+  workerPrompt?: Record<string, unknown>;
+  /** Lint-only: the 1-based line of `#+TT_WORKER_PROMPT:`. */
+  workerPromptLine?: number;
+  /** Lanes this entry inherited from the program's `#+TT_WORKER_PROMPT`,
+   * already linted once at the program level. */
+  workerPromptFromProgram?: string[];
 }
 
 export interface LintProgramInput {
@@ -276,6 +289,10 @@ export interface LintProgramInput {
   seatsLine?: number;
   leader?: string;
   leaderLine?: number;
+  /** A program file may also declare `#+TT_WORKER_PROMPT:` (every entry's
+   * default, merged lane by lane); the same rules apply, once. */
+  workerPrompt?: Record<string, unknown>;
+  workerPromptLine?: number;
 }
 
 /** True for the JSON shape `tt program start` reads (a list of plan entries
@@ -706,7 +723,7 @@ export function lintPhaseSeats(phase: LintPhaseInput, plan: LintPlanInput): Lint
 /** Lint one plan (all its phases' acceptance items, its structured items,
  * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan)];
+  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan), ...lintWorkerPrompt(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
     // Plan 06k2 (A8, finding A-4): a phase-level :VARIANT_LIMIT: below 2 is
@@ -776,10 +793,73 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
 /** Lint every entry's plan in a program file; phase ids are prefixed with the
  * entry id so two entries with the same phase id stay tellable apart. */
 export function lintProgram(program: LintProgramInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(program), ...lintWorkers(program)];
+  const out: LintFinding[] = [...lintModels(program), ...lintWorkers(program), ...lintWorkerPrompt(program)];
   for (const entry of program.entries ?? []) {
     for (const finding of lintPlan(entry.plan ?? { phases: [] })) {
       out.push({ ...finding, phaseId: entry.id ? `${entry.id}/${finding.phaseId}` : finding.phaseId });
+    }
+  }
+  return out;
+}
+
+/** True when PATH names a regular file this process can read. The one
+ * filesystem read in the linter: a prompt file that is missing at lint time
+ * would otherwise stop the run at its first start. */
+function readableFile(p: string): boolean {
+  try {
+    const abs = expandPromptPath(p);
+    if (!fs.statSync(abs).isFile()) return false;
+    fs.accessSync(abs, fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `#+TT_WORKER_PROMPT`: every lane must be one the plan runs (`a` for a
+ * single worker; `a`, `b`, … up to the plan's or a phase's `#+TT_WORKERS`),
+ * and every file must be a readable file. A lane inherited from the program
+ * was linted there and is skipped here. */
+export function lintWorkerPrompt(plan: LintPlanInput | LintProgramInput): LintFinding[] {
+  const map = plan.workerPrompt;
+  if (!map || typeof map !== "object") return [];
+  const inherited = new Set((plan as LintPlanInput).workerPromptFromProgram ?? []);
+  const phaseWorkers = ((plan as LintPlanInput).phases ?? []).map((p) => (Number.isInteger(p.workers) ? (p.workers as number) : 1));
+  const count = Math.max(workerLanesOf(plan as LintPlanInput).length, ...phaseWorkers);
+  const known = Array.from({ length: count }, (_, i) => String.fromCharCode(97 + i));
+  const out: LintFinding[] = [];
+  const finding = (item: string, problem: string, fix: string): LintFinding => ({
+    severity: "error",
+    rule: "worker-prompt",
+    phaseId: "worker-prompt",
+    item,
+    line: plan.workerPromptLine,
+    sourceFile: plan.sourceFile,
+    problem,
+    fix,
+  });
+  for (const [lane, raw] of Object.entries(map)) {
+    if (inherited.has(lane)) continue;
+    if (!known.includes(lane)) {
+      out.push(
+        finding(
+          `${lane}=`,
+          isLaneId(lane)
+            ? `#+TT_WORKER_PROMPT names lane ${lane}, but this plan runs ${count === 1 ? "one lane (a)" : `lanes ${known.join(", ")}`}`
+            : `#+TT_WORKER_PROMPT names the unknown lane ${lane}`,
+          `name one of the lanes ${known.join(", ")} (write lane=<file>[,<file>…])`,
+        ),
+      );
+      continue;
+    }
+    const files = Array.isArray(raw) ? raw : [raw];
+    for (const f of files) {
+      const file = typeof f === "string" ? f : "";
+      if (file.trim().length === 0) {
+        out.push(finding(`${lane}=`, `#+TT_WORKER_PROMPT gives lane ${lane} an empty file name`, `write ${lane}=<file>[,<file>…], or ${lane}=none`));
+      } else if (!readableFile(file)) {
+        out.push(finding(`${lane}=${file}`, `#+TT_WORKER_PROMPT names ${file} for lane ${lane}, which is not a readable file`, "fix the path (it is expanded against the plan's directory; ~ is allowed)"));
+      }
     }
   }
   return out;

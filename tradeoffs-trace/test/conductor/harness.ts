@@ -236,6 +236,9 @@ export async function setupConductor(opts: {
    * harness turns it into `providerModelFor` with the same one-liner
    * `tt start` uses; a test asserts the resulting launch argv. */
   models?: PlanModels;
+  /** `#+TT_WORKER_PROMPT`: per lane, the files appended to that lane's worker
+   * system prompt, as Emacs puts them in the JSON plan. */
+  workerPrompt?: Record<string, string[]>;
   /** Extra env merged into every agent's own environment (the Conductor's
    * `extraEnv`), e.g. `FAKE_PI_ARGV_LOG` to record what each role was
    * launched with. */
@@ -261,6 +264,7 @@ export async function setupConductor(opts: {
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
     ...(opts.envFile ? { envFile: opts.envFile } : {}),
     ...(opts.models ? { models: opts.models } : {}),
+    ...(opts.workerPrompt ? { workerPrompt: opts.workerPrompt } : {}),
     phases: [
       opts.phase ?? {
         id: "p1",
