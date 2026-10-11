@@ -107,6 +107,38 @@ export function freezeCommit(worktree: string, actionId: string, message: string
   return git(["-C", worktree, "rev-parse", "HEAD"]);
 }
 
+/** Plan 06k3 (A2): commits everything currently in `worktree` to a commit
+ * WITHOUT touching its HEAD or index — the tree is built on a TEMP index and
+ * the commit is made with `commit-tree`. Updates `ref` (e.g.
+ * `refs/tt/<run>/unsubmitted/<attempt>-<lane>`) to the new commit and returns
+ * its sha, or `undefined` when the worktree is clean (nothing to save). */
+export function saveUnsubmittedWork(repo: string, worktree: string, ref: string, message: string): string | undefined {
+  if (git(["-C", worktree, "status", "--porcelain"]).length === 0) return undefined;
+  const tmpIndex = path.join(os.tmpdir(), `tt-save-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+  try {
+    git(["-C", worktree, "read-tree", "HEAD"], { env });
+    git(["-C", worktree, "add", "-A"], { env });
+    const tree = git(["-C", worktree, "write-tree"], { env });
+    const parent = git(["-C", worktree, "rev-parse", "HEAD"]);
+    const sha = git(["-C", worktree, ...IDENTITY_ARGS, ...NO_HOOKS_ARGS, "commit-tree", tree, "-p", parent, "-m", message]);
+    // Plan 06k3 (A2, findings A-13/T-29): the ref must hold the work, so a
+    // failed update-ref is retried once after clearing a stale lock. If it
+    // still fails, the error propagates: the caller retains the dirty
+    // worktree rather than pretending the ref was written.
+    try {
+      git(["-C", repo, "update-ref", ref, sha]);
+    } catch {
+      const common = git(["-C", repo, "rev-parse", "--git-common-dir"]);
+      fs.rmSync(path.resolve(repo, common, `${ref}.lock`), { force: true });
+      git(["-C", repo, "update-ref", ref, sha]);
+    }
+    return sha;
+  } finally {
+    fs.rmSync(tmpIndex, { force: true });
+  }
+}
+
 /** Finds the commit (searching all refs) whose `TT-Action` trailer equals
  * `actionId`, for recovery after a crash between the freeze commit and its
  * completion event (design §9.3: "worktree HEAD carries trailer

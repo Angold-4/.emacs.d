@@ -558,7 +558,15 @@ test("plan 06g: a missing lane review fails the round, so no winner is picked on
     stubReviews: true,
     deadlines: FAST,
     workerScript: () => laneWorker("a"),
-    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    // Plan 06k3 (A4): a lane restarted from its own round-1 candidate must
+    // make a change; the round-aware worker writes a round-specific file.
+    laneWorkerScriptFor: (lane, round) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf 'lane ${lane} r${round}\n' > lane-${lane}-r${round}.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
     laneReviewerScriptFor: (seat, _candidate, state) => {
       const K = state.phase.contract.contractVersion;
       // One seat of the FIRST round never submits its review; from round 2 on
@@ -578,8 +586,8 @@ test("plan 06g: a missing lane review fails the round, so no winner is picked on
     assert.equal(phase.rounds?.length, 2, "the incomplete round repeated");
     assert.equal(phase.rounds![0].picked, undefined, "round 1 picked no winner with a review missing");
     assert.equal(phase.rounds![0].candidates.every((c) => (c.reviews ?? []).length < 3), true);
-    // The repeat costs one repair attempt, and round 2 completed with six.
-    assert.equal(phase.repairRoundsUsed, 1);
+    // Plan 06k3 (A1): the repeat is free — no repair attempt is spent.
+    assert.equal(phase.repairRoundsUsed, 0, "the missing-review repeat spent no repair attempt");
     for (const c of phase.rounds![1].candidates) assert.equal((c.reviews ?? []).length, 3);
     assert.equal(phase.phase, "DONE");
     // 02k: each lane restarted from its own round-1 candidate, not the base.
@@ -642,7 +650,15 @@ test("plan 06g: a missing pick vote fails the round, so a majority is never inve
     stubReviews: true,
     deadlines: FAST,
     workerScript: () => laneWorker("a"),
-    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    // Plan 06k3 (A4): round 2's lanes restart from their own round-1
+    // candidates, so they must make a change.
+    laneWorkerScriptFor: (lane, round) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf 'lane ${lane} r${round}\n' > lane-${lane}-r${round}.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
     laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
     pickScriptFor: (seat, state) => {
       // Seat B dies before voting in the first round; from round 2 on it votes.
@@ -664,6 +680,8 @@ test("plan 06g: a missing pick vote fails the round, so a majority is never inve
     assert.equal(phase.rounds![0].picked, undefined, "no winner was picked without all three votes");
     assert.ok((phase.rounds![0].votes.length ?? 0) < 3);
     assert.equal(phase.rounds![1].votes.length, 3);
+    // Plan 06k3 (A1): the repeat is free — no repair attempt is spent.
+    assert.equal(phase.repairRoundsUsed, 0, "the missing-vote repeat spent no repair attempt");
     assert.equal(phase.phase, "DONE");
   } finally {
     await teardown(setup);
