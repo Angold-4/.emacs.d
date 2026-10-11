@@ -1362,6 +1362,9 @@ export function readWhereText(target: string): string {
   return out.join("\n");
 }
 
+/** Plan 06g2: a lane round's winner awaiting its reviews' promotion. */
+type PendingLaneWinner = { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> };
+
 export class Conductor {
   #runDir: string;
   #paths: ReturnType<typeof runPaths>;
@@ -1421,9 +1424,10 @@ export class Conductor {
   /** Plan 06g2: the winner's hand-off — the lane build and round whose
    * reviews are promoted into the phase's review slots once the probe has
    * passed (the FSM's REVIEWING state is only reachable then). */
-  #pendingLaneWinner:
-    | { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> }
-    | undefined;
+  #pendingLaneWinner: PendingLaneWinner | undefined;
+  /** The winner whose reviews `#promoteLaneWinnerReviews` is promoting right
+   * now (`#pendingLaneWinner` is cleared when promotion starts). */
+  #promotingLaneWinner: string | undefined;
   /** Plan 06g2: each lane candidate's combined check output this round, so
    * the winner's hand-off can resolve its `test` verifies without re-running
    * the checks. */
@@ -4366,6 +4370,16 @@ export class Conductor {
       }
       case "dispatch_review": {
         const reviewer = action.reviewer as Reviewer;
+        // A lane round's winner was already reviewed: its reviews are pending
+        // or being promoted. A drive() that slips in meanwhile (the hand-off
+        // carrying many messages, or an `#applyEvents` that clears the
+        // suspension) must not start a second review pass. That pass's new
+        // discoveries could never get ballots (settlement 01c round 6).
+        const reviewedWinner = this.#pendingLaneWinner?.sha ?? this.#promotingLaneWinner;
+        if (reviewedWinner !== undefined && reviewedWinner === this.#state.phase.candidate?.sha) {
+          this.#log.append("review_dispatch_held", { reviewer, candidateSha: reviewedWinner, reason: "the lane winner's reviews are being promoted" });
+          return;
+        }
         const actionId = this.#log.actionId(kind);
         this.#applyEvent({ type: "ACTION_STARTED", action: "dispatch_review", actionId, reviewer });
         void this.#runReview(actionId, reviewer).catch((err) => this.#logUnexpected("dispatch_review", err));
@@ -9326,6 +9340,15 @@ export class Conductor {
     const pending = this.#pendingLaneWinner;
     if (!pending || pending.sha !== sha) return;
     this.#pendingLaneWinner = undefined;
+    this.#promotingLaneWinner = sha;
+    try {
+      await this.#promoteLaneWinnerReviewsOf(pending, sha);
+    } finally {
+      this.#promotingLaneWinner = undefined;
+    }
+  }
+
+  async #promoteLaneWinnerReviewsOf(pending: PendingLaneWinner, sha: string): Promise<void> {
     // The caller has `drive()` suspended: the winner's findings/ballots, its
     // three reviews and their statements all land before anything dispatches.
     // The order is the single-candidate path's own (see `#onSubmitChecked`):
