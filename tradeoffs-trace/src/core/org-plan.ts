@@ -156,6 +156,7 @@ function parsePhaseNode(
   globalFinalChecks?: string,
   globalGenerated?: string[],
   globalRegen?: string[],
+  globalWidePaths?: string[],
 ): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
@@ -198,6 +199,13 @@ function parsePhaseNode(
       ? { regen: splitCommands(node.props.REGEN) }
       : globalRegen && globalRegen.length > 0
         ? { regen: globalRegen }
+        : {}),
+    // Plan 06n (A5): the phase's own :WIDE_PATHS: overrides the plan's
+    // #+TT_WIDE_PATHS:, exactly like :GENERATED:.
+    ...(node.props.WIDE_PATHS
+      ? { widePaths: splitList(node.props.WIDE_PATHS) }
+      : globalWidePaths && globalWidePaths.length > 0
+        ? { widePaths: globalWidePaths }
         : {}),
   };
   if (structured) {
@@ -356,7 +364,8 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const globalFinalChecks = first("TT_FINAL_CHECKS")?.value;
   const globalGenerated = first("TT_GENERATED") ? splitList(first("TT_GENERATED")!.value) : undefined;
   const globalRegen = first("TT_REGEN") ? splitCommands(first("TT_REGEN")!.value) : undefined;
-  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen));
+  const globalWidePaths = first("TT_WIDE_PATHS") ? splitList(first("TT_WIDE_PATHS")!.value) : undefined;
+  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths));
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
   const workers = first("TT_WORKERS");
@@ -376,6 +385,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(labels ? { labels: splitList(labels.value) } : {}),
     ...(globalGenerated ? { generated: globalGenerated } : {}),
     ...(globalRegen ? { regen: globalRegen } : {}),
+    ...(globalWidePaths ? { widePaths: globalWidePaths } : {}),
     phases,
     ...parseModels(first("TT_MODELS")),
     ...parseWorkerPrompt(first("TT_WORKER_PROMPT"), sourceFile),

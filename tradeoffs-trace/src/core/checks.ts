@@ -18,6 +18,8 @@
 // `Conductor#runChecks` (candidate C) and `Conductor#runProbe` (probed
 // integration I) both call it, so both gates execute the same list.
 
+import { matchesGlob } from "./boundaries.ts";
+
 /** Resolve the one effective, order-preserving, exact-duplicate-deduped list
  * of check commands for a gate. `globalChecks` comes first, then
  * `phaseChecks`; a command already seen (by exact string equality) is
@@ -209,6 +211,18 @@ export interface CheckCandidateContext {
   sha: string;
   reviewed: boolean;
   openBlocker: boolean;
+  /** Plan 06n (A5): the candidate's diff touches a declared wide path, so
+   * its checks in this round are the final checks whatever its review
+   * state. */
+  widePathTouched?: boolean;
+}
+
+/** Plan 06n (A5): true when any changed path matches a wide-path glob. A
+ * plan with no `#+TT_WIDE_PATHS:` (or an empty list) touches nothing, so its
+ * checks are unchanged. */
+export function diffTouchesWidePath(changed: readonly string[], widePaths: readonly string[] | undefined): boolean {
+  if (!widePaths || widePaths.length === 0) return false;
+  return changed.some((p) => widePaths.some((g) => matchesGlob(g, p)));
 }
 
 /** The one final-check command a phase declares, or undefined. An empty or
@@ -219,14 +233,16 @@ export function finalCheckOf(phase: { finalChecks?: readonly string[] } | undefi
   return first;
 }
 
-/** `final` only for a candidate that has passed review with no open blocker
- * AND whose phase declares a final check; `round` otherwise. This is the
- * only place the tier is decided. */
+/** `final` for a candidate that has passed review with no open blocker, or
+ * one whose diff touched a declared wide path (plan 06n A5); `round`
+ * otherwise. Only a phase that declares a final check ever gets `final`.
+ * This is the only place the tier is decided. */
 export function checkTier(
   phase: { finalChecks?: readonly string[] } | undefined,
   candidate: CheckCandidateContext,
 ): CheckTier {
   if (!finalCheckOf(phase)) return "round";
+  if (candidate.widePathTouched) return "final";
   return candidate.reviewed && !candidate.openBlocker ? "final" : "round";
 }
 

@@ -108,6 +108,10 @@ export interface PhaseContract {
    * candidate that has passed review with no open blocker runs it, once
    * (core/checks.ts's `checkTier`). */
   finalChecks?: string[];
+  /** Plan 06n (A5): the wide-path globs (`#+TT_WIDE_PATHS:`, overridden by
+   * the phase's `:WIDE_PATHS:`). A candidate whose diff touches one runs the
+   * final check in its round. */
+  widePaths?: string[];
   /** Plan 06g: `#+TT_WORKERS:` frozen into the contract — how many lanes one
    * round runs. Absent (or 1) is today's single-candidate loop. */
   workers?: number;
@@ -666,6 +670,16 @@ export interface FindingAnswer {
   reason?: string;
 }
 
+/** Plan 06n (A4): a worker's answer to one numbered item of an in-force owner
+ * directive (`OD-n.k`), carried by `submit_phase`. A `not-done` answer must
+ * give the reason. */
+export interface DirectiveAnswer {
+  id: string;
+  status: "done" | "not-done";
+  where?: string;
+  reason?: string;
+}
+
 export interface FindingDisclosure {
   kind: FindingKind;
   severity: FindingSeverity;
@@ -1144,6 +1158,13 @@ export interface PhaseState {
   /** Plan 2c: the worker's kept/changed/withdrawn statements about its prior
    * decisions, carried by SUBMIT_PHASE and consumed by FREEZE_COMPLETED. */
   pendingPrior?: PriorDecisionStatement[];
+  /** Plan 06n (A4): the worker's answers to the numbered items of the
+   * in-force owner directives, carried by SUBMIT_PHASE so the reviewers can
+   * see each item's status. */
+  pendingDirectiveAnswers?: DirectiveAnswer[];
+  /** Plan 06n (A4): every directive item the phase has answered, merged by id
+   * across submissions, so an answered item is never demanded again. */
+  directiveAnswers?: DirectiveAnswer[];
   /** Plan 2c: the number of candidates frozen in this phase so far (the
    * review round); 0 before the first freeze. */
   round?: number;
@@ -1448,6 +1469,9 @@ export interface EvSubmitPhase {
   /** Plan 06k3 (A3): one answer per open blocking finding (fixed with the
    * covering test, or disputed with the reason). */
   findingAnswers?: FindingAnswer[];
+  /** Plan 06n (A4): one answer per numbered item of an in-force owner
+   * directive (done with where, or not-done with the reason). */
+  directiveAnswers?: DirectiveAnswer[];
   /** Plan 2c: statements about prior decisions (repair attempts only). */
   prior?: PriorDecisionStatement[];
   /** Plan 01g: a criterion the worker says cannot be met as written; freeze
@@ -1696,6 +1720,9 @@ export interface EvAttemptNoSubmission {
    * context overflow) without submitting. Absent for a plain silent settle. */
   note?: string;
 }
+export interface EvWorkerResumed {
+  type: "WORKER_RESUMED";
+}
 export interface EvAttemptInterrupted {
   type: "ATTEMPT_INTERRUPTED";
   /** Plan 06j (A3/OD-5): the stopped attempt left a worktree the next one
@@ -1880,6 +1907,16 @@ export interface EvFindingConfirmedRepaired {
   findingId: string;
   byReviewer: Reviewer;
   candidateSha: string;
+}
+
+/** Plan 06n (A2/R3): the evaluator's open-finding re-check answered `repaired`
+ * with a valid anchor on the current candidate. It closes the finding exactly
+ * as a reviewer's confirmation does, with the evaluator as the confirmer. */
+export interface EvFindingEvaluatorRepaired {
+  type: "FINDING_EVALUATOR_REPAIRED";
+  findingId: string;
+  candidateSha: string;
+  evidence: string;
 }
 export interface EvFindingDisproved {
   type: "FINDING_DISPROVED";
@@ -2621,6 +2658,7 @@ export type Event =
   | EvAttemptTimedOut
   | EvAttemptNoSubmission
   | EvAttemptInterrupted
+  | EvWorkerResumed
   | EvFreezeCompleted
   | EvFreezeTimedOut
   | EvFreezeInterrupted
@@ -2641,6 +2679,7 @@ export type Event =
   | EvOverrideCast
   | EvFindingRaised
   | EvFindingConfirmedRepaired
+  | EvFindingEvaluatorRepaired
   | EvFindingDisproved
   | EvFindingAcceptedByOwner
   | EvFindingSeverityLowered

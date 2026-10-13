@@ -391,6 +391,26 @@ test("view-tradeoffs: a superseded amendment is history and is not offered", () 
   assert.deepEqual(tradeoffEntries(basePhase({ decisions: [superseded] })), []);
 });
 
+test("plan 06n: the status header's round equals the last ROUND_STARTED after an interrupted round", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-view-round-"));
+  try {
+    const dir = path.join(root, "run");
+    fs.mkdirSync(dir, { recursive: true });
+    const lines: string[] = [JSON.stringify({ seq: 1, ts: at(0), kind: "init", event: { runId: "r1", integrationHead: "H0" } })];
+    // Rounds 1-4 all started; round 3 was interrupted before it completed, so
+    // `timeline.rounds` (completed freezes) would not name round 4.
+    [1, 2, 3, 4].forEach((round, i) => {
+      lines.push(JSON.stringify({ seq: i + 2, ts: at(i), kind: "event", event: { type: "ROUND_STARTED", round, base: `b${round}`, lanes: ["a", "b"] } }));
+    });
+    fs.writeFileSync(path.join(dir, "events.jsonl"), `${lines.join("\n")}\n`);
+    const view = buildView(dir, plan, false, new Date(at(10)));
+    assert.equal(view.round, 4, "the header's round is the last ROUND_STARTED");
+    assert.match(view.tape.split("\n")[0], /· round 4 ·/, "the tape header agrees");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("program status: each node gets its rounds, minutes, owner wait and top trade-off", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tt-view-prog-"));
   try {

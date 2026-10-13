@@ -129,7 +129,7 @@ export async function setupConductor(opts: {
   /** Plan 06g2: one script per lane review (`lane-review-<round>-<lane>-<seat>-…`).
    * The script's `submit_review` names its candidate with the
    * `$TT_CANDIDATE_SHA` token, which fake-pi substitutes at dispatch time. */
-  laneReviewerScriptFor?: (seat: string, candidate: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  laneReviewerScriptFor?: (seat: string, candidate: string, state: State, lane?: string) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 06g2: one script per pick seat (`pick-<round>-<seat>-…`). */
   pickScriptFor?: (seat: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
@@ -426,7 +426,7 @@ export async function setupConductor(opts: {
         if (!laneReviewerScriptPaths.has(key)) {
           laneReviewerScriptPaths.set(
             key,
-            writeScript(scriptsDir, key, opts.laneReviewerScriptFor(seat, "$TT_CANDIDATE_SHA", conductor.state)),
+            writeScript(scriptsDir, key, opts.laneReviewerScriptFor(seat, "$TT_CANDIDATE_SHA", conductor.state, laneReview[2])),
           );
         }
         return { FAKE_PI_SCRIPT: laneReviewerScriptPaths.get(key)!, ...(opts.extraReviewerEnv?.(seat as Reviewer) ?? {}) };

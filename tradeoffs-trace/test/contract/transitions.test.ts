@@ -88,6 +88,11 @@ const BUILD: Record<string, Fixture> = {
     state: baseState({ phase: "IMPLEMENTING", inFlight: { dispatch_worker: { actionId: "a1" } } }),
     event: { type: "ATTEMPT_INTERRUPTED" },
   },
+  // Plan 06n (A3): a clean stop resumes the same round in place.
+  "worker-resumed-in-place": {
+    state: baseState({ phase: "IMPLEMENTING", inFlight: { dispatch_worker: { actionId: "a1" } } }),
+    event: { type: "WORKER_RESUMED" },
+  },
   "freeze-completed": {
     state: baseState({ phase: "FREEZING", inFlight: { freeze: { actionId: "a1" } } }),
     event: { type: "FREEZE_COMPLETED", candidateSha: "C1", decisions: [] },

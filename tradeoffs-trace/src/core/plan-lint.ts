@@ -190,6 +190,9 @@ export interface LintPhaseInput {
   /** Plan 06m (A6): the phase's own `:REGEN:` commands, overriding the
    * plan's `#+TT_REGEN:`. */
   regen?: string[];
+  /** Plan 06n (A5): the phase's own `:WIDE_PATHS:` globs, overriding the
+   * plan's `#+TT_WIDE_PATHS:`. */
+  widePaths?: string[];
 }
 
 export interface LintPlanInput {
@@ -234,6 +237,8 @@ export interface LintPlanInput {
   generated?: string[];
   /** Plan 06m (A6): the plan's `#+TT_REGEN:` commands. */
   regen?: string[];
+  /** Plan 06n (A5): the plan's `#+TT_WIDE_PATHS:` globs. */
+  widePaths?: string[];
   /** Plan 06k2 (A5): the plan's `#+TT_GOLDEN:` — the current source a choice
    * must be re-checked against. Exported into plan.json and carried into the
    * contract so the worker, reviewer and evaluator prompts can name it. */

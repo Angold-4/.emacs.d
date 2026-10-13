@@ -83,13 +83,14 @@ function laneWorker(lane: string): { hello: unknown; steps: FakePiStep[] } {
 function laneReview(
   seat: Reviewer,
   contractVersion: unknown,
-  opts: { findings?: unknown[]; findingStatements?: unknown[]; ballots?: unknown[]; discoveries?: unknown[] } = {},
+  opts: { findings?: unknown[]; findingStatements?: unknown[]; ballots?: unknown[]; discoveries?: unknown[]; items?: unknown[]; read?: string } = {},
 ): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: defaultReviewerHello(),
     steps: [
       { kind: "call-submit", tool: "submit_discovery", args: { discoveries: opts.discoveries ?? [] } },
       { kind: "wait-for-prompt" },
+      ...(opts.read ? [{ kind: "call-tool", tool: "read", args: { path: opts.read } } as FakePiStep] : []),
       {
         kind: "call-submit",
         tool: "submit_review",
@@ -102,6 +103,7 @@ function laneReview(
           findingStatements: opts.findingStatements ?? [],
           ballots: opts.ballots ?? [],
           findings: opts.findings ?? [],
+          ...(opts.items ? { items: opts.items, arch: [] } : {}),
         },
       },
     ],
@@ -362,6 +364,70 @@ test("plan 06g: round 1's winner not accepted makes round 2 start both lanes fro
   } finally {
     await teardown(setup);
     cleanupDir(promptLog);
+  }
+});
+
+test("plan 06n: after lane a wins, lane b's next prompt names a's candidate as its base and lane b starts a fresh session", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-06n-fresh-");
+  const promptLog = path.join(dir, "prompts.txt");
+  const argvDir = path.join(dir, "argv");
+  const setup = await setupConductor({
+    phase: lanePhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog, FAKE_PI_ARGV_LOG: argvDir },
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => {
+      const round = liveRound(state);
+      const K = state.phase.contract.contractVersion;
+      if (round === 1) {
+        // M raises one blocking finding so round 1 is not accepted and a
+        // round 2 follows.
+        return seat === "M"
+          ? laneReview("M", K, {
+              findings: [{ kind: "defect", severity: "blocking", evidence: "it works is unmet: src/lane-a.txt:1 the lane's output is wrong" }],
+            })
+          : laneReview(seat as Reviewer, K);
+      }
+      const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === "M");
+      return seat === "M"
+        ? laneReview("M", K, { findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed in this candidate" })) })
+        : laneReview(seat as Reviewer, K);
+    },
+    // Every seat picks lane a, so lane a wins round 1 and lane b loses.
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    assert.equal(phase.rounds?.length, 2, "two rounds ran");
+    const winnerSha = phase.rounds![0].picked!.sha;
+    assert.equal(phase.rounds![0].picked!.lane, "a", "round 1 picked lane a");
+    assert.equal(phase.rounds![1].base, winnerSha, "round 2 starts from lane a's candidate");
+
+    // Lane b's round-2 prompt names lane a's candidate as its base and says
+    // lane b's own previous candidate is not in the worktree.
+    const prompts = fs.readFileSync(promptLog, "utf8").split("=====").filter((p) => p.includes("Round 2 of this phase"));
+    assert.equal(prompts.length, 2, "both lanes were prompted in round 2");
+    for (const prompt of prompts) {
+      assert.match(prompt, new RegExp(`starts from ${winnerSha.slice(0, 7)}`), "the prompt names lane a's candidate as the base");
+      assert.match(prompt, /picked lane a/, "the prompt names lane a as the round-1 winner");
+      assert.match(prompt, /losing lane \(b\) has its own previous candidate no longer in the worktree/, "the losing lane is told its candidate is gone");
+    }
+
+    // The losing lane's worker starts a fresh session; the winner's continues.
+    const sessions = readLog(runPaths(setup.runDir).events).records.filter((r) => r.kind === "lane_session");
+    const r2 = sessions.filter((r) => (r.event as { round?: number }).round === 2);
+    const sessionOf = (lane: string) => r2.find((r) => (r.event as { lane?: string }).lane === lane)?.event as { continueSession?: boolean } | undefined;
+    assert.equal(sessionOf("a")?.continueSession, true, "the winning lane keeps its session");
+    assert.equal(sessionOf("b")?.continueSession, false, "the losing lane starts a fresh session");
+  } finally {
+    await teardown(setup);
+    cleanupDir(dir);
   }
 });
 
@@ -1021,6 +1087,75 @@ test("plan 06l: both lanes' reviews run concurrently and the pick still waits fo
     assert.ok(firstPick >= lastFinish, `the pick (${firstPick}) must start after the last review (${lastFinish})`);
     const phase = setup.conductor.state.phase;
     for (const c of phase.rounds![0].candidates) assert.equal((c.reviews ?? []).length, 3);
+  } finally {
+    await teardown(setup);
+  }
+});
+
+/** A structured lane worker that submits coverage for R1 and R2. */
+function structuredLaneWorker(lane: string): { hello: unknown; steps: FakePiStep[] } {
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `printf 'lane ${lane}\\n' > lane-${lane}.txt` },
+      {
+        kind: "call-submit",
+        tool: "submit_coverage",
+        args: {
+          items: [
+            { id: "R1", status: "done", where: [`lane-${lane}.txt:1`], tests: [] },
+            { id: "R2", status: "done", where: [`lane-${lane}.txt:1`], tests: [] },
+          ],
+          arch: [],
+        },
+      },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+test("plan 06n: a candidate that loses a met item in a file it changed is never adopted, and the next round restarts from the best candidate", async () => {
+  // Plan 06n (A7/R9a): lane b's reviews mark both items met, lane a's mark R1
+  // unmet, so lane a lost an item the round's best candidate met. Even with
+  // every seat voting for lane a, it cannot be picked.
+  const setup = await setupConductor({
+    phase: lanePhase({
+      requirements: [
+        { id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["review"] },
+        { id: "R2", title: "R2 holds", text: "R2 holds", arch: [], verify: ["review"] },
+      ],
+      constraints: [],
+    }),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => structuredLaneWorker("a"),
+    laneWorkerScriptFor: (lane) => structuredLaneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state, lane) => {
+      const K = state.phase.contract.contractVersion;
+      const items =
+        lane === "a"
+          ? [
+              { id: "R1", verdict: "unmet", evidence: "lane-a.txt:1 not done" },
+              { id: "R2", verdict: "met", evidence: "lane-a.txt:1" },
+            ]
+          : [
+              { id: "R1", verdict: "met", evidence: "lane-b.txt:1" },
+              { id: "R2", verdict: "met", evidence: "lane-b.txt:1" },
+            ];
+      return laneReview(seat as Reviewer, K, { items, read: lane === "a" ? "lane-a.txt" : "lane-b.txt" });
+    },
+    // Every seat picks lane a, the lane that lost an item.
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => (setup.conductor.state.phase.rounds?.[0]?.votes.length ?? 0) >= 3, 150_000, 50, setup.runDir);
+    const round = setup.conductor.state.phase.rounds![0];
+    assert.deepEqual((round.candidates.find((c) => c.lane === "b")?.reviews ?? []).length, 3, "lane b was reviewed");
+    assert.equal(round.picked?.lane, "b", "lane a cannot be picked: it lost an item the round's best candidate met");
+    assert.notEqual(round.picked?.lane, "a");
   } finally {
     await teardown(setup);
   }
