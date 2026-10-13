@@ -1567,6 +1567,12 @@ export class Conductor {
    * gate) that are still running, each with the time it was recorded. */
   #liveStageGroups = new Map<number, number>();
   #stopRequested = false;
+  /** Plan 06n (A3): set when this start reconciled a lane round's dispatch
+   * that a clean `tt stop` ended, so the next `#runLaneRound` resumes that
+   * round under its own number even when every lane was already checked (a
+   * stop during the reviews or the pick). Read once, from the log's own stop
+   * record, never persisted. */
+  #resumeStoppedRound = false;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
    * #onSubmit, consumed by #runFreeze (the "freeze" action's dispatch runs
@@ -2263,8 +2269,11 @@ export class Conductor {
       // and check results stay, and the round resumes in place, so no lane
       // worktree is swept as crash recovery and no ATTEMPT_INTERRUPTED is
       // recorded.
-      const cleanStop = records.some((r) => r.kind === "stop" && Date.parse(r.ts) >= Date.parse(intentRecord?.ts ?? ""));
+      // A single-candidate attempt keeps its own interruption path.
+      const cleanStop =
+        this.#laneRoundEnabled() && records.some((r) => r.kind === "stop" && Date.parse(r.ts) >= Date.parse(intentRecord?.ts ?? ""));
       if (cleanStop) {
+        this.#resumeStoppedRound = true;
         this.#log.completion(actionId, { interrupted: false, reason: "clean stop" });
         this.#applyEvent({ type: "WORKER_RESUMED" });
         return;
@@ -8463,7 +8472,15 @@ export class Conductor {
       const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} lane ${lane} candidate`);
       const candidateDir = path.join(this.#paths.candidates, sha);
       if (!fs.existsSync(candidateDir)) materializeCandidate(this.#plan.repo, sha, candidateDir);
-      this.#log.completion(actionId, { lane, round, candidateSha: sha, tainted: sweepResult.tainted });
+      // Plan 06n (A3/A4): the lane's submit_phase payload is part of its
+      // completion record, so a round resumed after a clean stop hands the
+      // kept candidate's disclosures, answers and coverage to its reviews and
+      // the hand-off exactly as this live build does (`#resumedLaneBuild`).
+      const payload = {
+        ...(handle.laneSubmission ?? { disclosures: [] }),
+        ...(handle.laneCoverage !== undefined ? { coverage: handle.laneCoverage } : {}),
+      };
+      this.#log.completion(actionId, { lane, round, candidateSha: sha, tainted: sweepResult.tainted, build: payload });
       return {
         lane,
         sha,
@@ -8471,12 +8488,62 @@ export class Conductor {
         // hand-off (a lane that left a survivor taints the winner's tree
         // exactly as the single-candidate freeze would).
         tainted: sweepResult.tainted,
-        ...(handle.laneSubmission ?? { disclosures: [] }),
-        ...(handle.laneCoverage !== undefined ? { coverage: handle.laneCoverage } : {}),
+        ...payload,
       };
     } finally {
       this.#agents.delete(agentId);
     }
+  }
+
+  /** Plan 06n (A3/A4/A5): a candidate kept from a round stopped mid-way.
+   * The live build's in-memory records died with the stopped conductor, so
+   * they are restored from the lane's own intent (its start) and completion
+   * (its submit_phase payload and sweep) records, and from the candidate's
+   * check record on disk when it was checked before the stop. The resumed
+   * round's checks, reviews and hand-off then see what the live build would
+   * have given them. */
+  #resumedLaneBuild(round: number, lane: string, sha: string): LaneBuild {
+    const key = `${round}-${lane}`;
+    const live = this.#laneBuilds.get(key);
+    if (live?.sha === sha) return live;
+    const { records } = readLog(this.#paths.events);
+    let build: LaneBuild = { lane, sha };
+    for (let i = records.length - 1; i >= 0; i -= 1) {
+      const r = records[i];
+      if (r.kind !== "completion" || typeof r.actionId !== "string") continue;
+      const done = r.event as { lane?: string; round?: number; candidateSha?: string; tainted?: boolean; build?: Partial<LaneBuild> };
+      if (done.lane !== lane || done.round !== round || done.candidateSha !== sha) continue;
+      const intent = records.find((x) => x.kind === "intent" && x.actionId === r.actionId)?.event as { base?: string } | undefined;
+      if (typeof intent?.base === "string" && !this.#laneCheckBases.has(key)) this.#laneCheckBases.set(key, intent.base);
+      build = { ...(done.build ?? {}), lane, sha, ...(done.tainted !== undefined ? { tainted: done.tainted } : {}) };
+      break;
+    }
+    this.#laneBuilds.set(key, build);
+    // A candidate checked before the stop: its output (for the hand-off's
+    // test-verify resolution) is the check's own per-command logs.
+    if (!this.#laneCheckOutputs.has(sha)) {
+      const outDir = path.join(this.#paths.checks, sha);
+      try {
+        const record = parseCheckRecord(JSON.parse(fs.readFileSync(path.join(outDir, "record.json"), "utf8")));
+        if (record) {
+          const output = record.commands
+            .map((c) => {
+              try {
+                return fs.readFileSync(path.join(outDir, c.log ?? this.#checkLogName(c.command)), "utf8");
+              } catch {
+                return "";
+              }
+            })
+            .join("\n");
+          this.#laneCheckOutputs.set(sha, output);
+          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, resolveTestVerifies(this.#planItems(), output));
+        }
+      } catch {
+        // Not checked before the stop: the resumed round checks it now.
+      }
+    }
+    this.#log.append("lane_build_resumed", { round, lane, candidateSha: sha, payload: build.disclosures !== undefined });
+    return build;
   }
 
   /** One candidate's checks, run under the machine-wide lock (C2). */
@@ -9237,15 +9304,22 @@ export class Conductor {
       const rounds = this.#state.phase.rounds ?? [];
       const last = rounds[rounds.length - 1];
       // Plan 06n (A3): a round with no pick is unfinished while any lane
-      // lacks a candidate OR a check result. Such a round is resumed under its
-      // own number (the candidates already frozen are kept), not replaced.
+      // lacks a record or has a submitted candidate with no check result, or
+      // when a clean stop ended it (a stop during the reviews or the pick
+      // leaves every lane checked). Such a round is resumed under its own
+      // number (the candidates already frozen are kept), not replaced. A round
+      // that ENDED without a pick (every lane recorded and checked, no stop)
+      // is over: the next round takes the next number.
+      const resumeStopped = this.#resumeStoppedRound;
+      this.#resumeStoppedRound = false;
       const unfinished =
         last !== undefined &&
         !last.picked &&
-        lanes.some((lane) => {
-          const c = last.candidates.find((x) => x.lane === lane);
-          return !c || typeof c.sha !== "string" || c.sha.length === 0 || c.ok === undefined;
-        });
+        (resumeStopped ||
+          lanes.some((lane) => {
+            const c = last.candidates.find((x) => x.lane === lane);
+            return !c || (typeof c.sha === "string" && c.sha.length > 0 && c.ok === undefined);
+          }));
       const round = unfinished ? last!.round : (last?.round ?? 0) + 1;
       const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
@@ -9302,6 +9376,9 @@ export class Conductor {
           this.#laneBuilds.set(`${r}-${lane}`, built);
           return built;
         },
+        // Plan 06n (A3): a candidate kept from a stopped round brings back its
+        // recorded build (payload, start and check output).
+        resumeLane: (r, lane, sha) => this.#resumedLaneBuild(r, lane, sha),
         checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
         reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
@@ -9313,6 +9390,16 @@ export class Conductor {
         stopRequested: () => this.#stopRequested,
       };
       const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
+      // Plan 06n (A3): a clean stop left the round in place; the next start
+      // resumes it. Nothing further is recorded here.
+      if (outcome.stopped) {
+        try {
+          this.#log.append("round_stopped", { round, reason: "the owner stopped the run" });
+        } catch {
+          // the stopping conductor may already have closed its log.
+        }
+        return;
+      }
       this.#log.completion(actionId, {
         round,
         base,
@@ -9323,12 +9410,6 @@ export class Conductor {
         candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
       });
       if (outcome.missingVotes) this.#log.append("pick_votes_missing", { round, seats: outcome.missingVotes, winner: outcome.winner?.lane });
-      // Plan 06n (A3): a clean stop left the round in place; the next start
-      // resumes it. Nothing further is recorded here.
-      if (outcome.stopped) {
-        this.#log.append("round_stopped", { round, reason: "the owner stopped the run" });
-        return;
-      }
       if (!outcome.winner) {
         // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
         // the phase is already CHECKING and the checks are re-running, so this
