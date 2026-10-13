@@ -33,7 +33,7 @@ import { unchangedResubmissionRequesters } from "./core/owner-commands.ts";
 // Plan 06g: the round's only decision points — `pickWinner`, `blocksAcceptance`
 // and `roundBudget` (architecture A3 and A6). Nothing in this file decides a
 // winner or whether a finding blocks by itself.
-import { advisoryReason, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, losingLanes, loserAnchors, roundBudget, type AcceptanceGate, type FindingGround } from "./core/rounds.ts";
+import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryBallotsForward, carryDecisionsForward, everyLaneLost, losingLanes, loserAnchors, regressedItems, roundBudget, type AcceptanceGate, type FindingGround, type PickGuard } from "./core/rounds.ts";
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
@@ -136,6 +136,7 @@ import type {
   PhaseState,
   Review,
   Reviewer,
+  RoundRecord,
   Seats,
   State,
 } from "./core/types.ts";
@@ -1573,6 +1574,11 @@ export class Conductor {
    * stop during the reviews or the pick). Read once, from the log's own stop
    * record, never persisted. */
   #resumeStoppedRound = false;
+  /** Plan 06n (A7): the best candidate's sha when the round being built
+   * restarts every lane from it (the previous pick regressed, or every lane
+   * lost an item), so a lane whose own candidate is not that base starts a
+   * fresh session. Set by `#runLaneRound` before the round's lanes start. */
+  #laneRoundRestartFromBest: string | undefined;
   #integrationBranch: string;
   /** The worker handle a `submit_phase` was just accepted from — set by
    * #onSubmit, consumed by #runFreeze (the "freeze" action's dispatch runs
@@ -7305,6 +7311,15 @@ export class Conductor {
     if (this.#structured()) {
       blocking.push(...repairItemLines(this.#itemOutcomes(), phase.overturns ?? []));
     }
+    // Plan 06n (A7/R9c): a candidate that regressed is not the next base; the
+    // items it lost come FIRST, with its sha for reference only.
+    const regressed = (phase.rounds ?? []).find((r) => r.regressed?.sha === C)?.regressed;
+    if (regressed) {
+      const best = this.#pickGuard(Number.POSITIVE_INFINITY)?.best;
+      blocking.unshift(
+        `Regressed (fix these first): ${regressed.items.join(", ")} — met by the best candidate${best ? ` ${best.sha.slice(0, 7)}` : ""}, lost by candidate ${C.slice(0, 7)} in code it changed. ${C.slice(0, 7)} was not adopted; this round starts from the best candidate, and ${C.slice(0, 7)} is for reference only.`,
+      );
+    }
     const failedDecisions: string[] = [];
     for (const d of phase.decisions) {
       if (!isLiveDecision(d) || d.class === "detail") continue;
@@ -8240,17 +8255,37 @@ export class Conductor {
     }
     // Plan 06n (A1): name the winning lane and its candidate as the base, and
     // tell the losing lane its own previous candidate is not in the worktree.
-    if (previous?.picked) {
+    // Plan 06n (A7/R9c): a pick that regressed was not adopted; every lane
+    // restarts from the best candidate.
+    if (previous?.picked && previous.regressed) {
+      const winner = previous.picked;
+      lines.push(
+        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), but its evaluation lost ${previous.regressed.items.join(", ")}, which the best candidate ${base.slice(0, 7)} met, in code it changed. It was not adopted: every lane's worktree was reset to the best candidate ${base.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met; ${winner.sha.slice(0, 7)} is for reference only.`,
+      );
+    } else if (previous?.picked) {
       const winner = previous.picked;
       const losers = previous.lanes.filter((l) => l !== winner.lane);
       lines.push(
         `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). Every lane's worktree was reset to that candidate, so the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree.`,
       );
     }
+    // Plan 06n (A7/R9b): every lane lost an item the best candidate met, so
+    // the round picked no lane and every lane restarts from the best
+    // candidate, each told which items it lost.
+    const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
+    const lostByLane = previous ? everyLaneLost(previous, previousGuard) : undefined;
+    if (lostByLane) {
+      const best = previousGuard!.best;
+      lines.push(
+        `Round ${previous!.round} picked no lane: every lane lost a plan item that the best candidate ${best.sha.slice(0, 7)} (round ${best.round}, lane ${best.lane}) met — ${Object.entries(lostByLane)
+          .map(([l, ids]) => `lane ${l} lost ${ids.join(", ")}`)
+          .join("; ")}. Every lane's worktree was reset to the best candidate ${best.sha.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met.`,
+      );
+    }
     // 02k: a lane whose candidate passed in a round that could not complete
     // restarts from that candidate (repeatLaneBases); say so, so the worker
     // continues from its own work instead of rebuilding it.
-    const restarted = repeatLaneBases(previous);
+    const restarted = lostByLane ? undefined : repeatLaneBases(previous);
     if (restarted) {
       lines.push(
         `Round ${previous!.round} could not complete (a review or pick vote was missing), not because of your code. A lane whose candidate passed its checks (${Object.entries(restarted)
@@ -8322,7 +8357,12 @@ export class Conductor {
     // fresh session, never continuing from memory of its own lost edits. The
     // winning lane keeps its session.
     const previous = (this.#state.phase.rounds ?? []).find((r) => r.round === round - 1);
-    const freshSession = previous?.picked !== undefined && previous.picked.lane !== lane;
+    // Plan 06n (A7): a round that restarts every lane from the best candidate
+    // starts fresh every lane whose own previous candidate is not that base.
+    const own = previous?.candidates.find((c) => c.lane === lane)?.sha;
+    const freshSession =
+      (previous?.picked !== undefined && previous.picked.lane !== lane) ||
+      (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base);
     // Recorded so a test (and the owner) can see the session decision; the
     // production session dir still exists, the fresh start just skips
     // `--continue`.
@@ -9321,10 +9361,32 @@ export class Conductor {
             return !c || (typeof c.sha === "string" && c.sha.length > 0 && c.ok === undefined);
           }));
       const round = unfinished ? last!.round : (last?.round ?? 0) + 1;
-      const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+      // Plan 06n (A7): before a new round starts, the last round's evaluated
+      // pick is adopted as the base or, when it lost a met item in code it
+      // changed, recorded as a regression (ITEMS_REGRESSED).
+      if (!unfinished) this.#recordRegression(last);
+      const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
+      const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
+      const restartGuard = this.#pickGuard(round);
+      // An unfinished round resumes from its own base. A new round starts from
+      // the phase's candidate (the last adopted pick) — or, when that pick
+      // regressed, from the best candidate.
+      const base = unfinished
+        ? last!.base
+        : previous?.regressed && restartGuard
+          ? restartGuard.best.sha
+          : round === 1
+            ? this.#state.phase.integrationHead
+            : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
-      const passingBases = last && last.round === round - 1 ? repeatLaneBases(last) : undefined;
+      // Plan 06n (A7/R9b): a round where every lane lost an item restarts
+      // every lane from the best candidate.
+      const passingBases = previous && previous.round === round - 1 ? repeatLaneBases(previous, previousGuard) : undefined;
+      this.#laneRoundRestartFromBest =
+        !unfinished && previous && ((previous.regressed && restartGuard) || everyLaneLost(previous, previousGuard))
+          ? (restartGuard ?? previousGuard)!.best.sha
+          : undefined;
       // Plan 06k3 (A2): a lane that produced no passing candidate starts from
       // its own saved unsubmitted work (never discarded at its deadline).
       const saved = this.#savedLaneWork();
@@ -9384,8 +9446,8 @@ export class Conductor {
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),
         // Plan 06n (A7): the pick compares each lane's item reviews against
-        // the round's best candidate.
-        itemIds: () => flatItems(this.#planItems()).map((i) => i.id),
+        // the phase's best candidate from the earlier rounds.
+        pickGuard: () => this.#pickGuard(round),
         // Plan 06n (A3): the round records nothing after a requested stop.
         stopRequested: () => this.#stopRequested,
       };
@@ -9435,6 +9497,15 @@ export class Conductor {
         // is). ATTEMPT_NO_SUBMISSION is the ordinary "this attempt produced no
         // acceptable candidate" event; REPAIRING then starts the next round.
         if (outcome.failure) this.#log.append("round_incomplete", { round, reason: outcome.failure });
+        // Plan 06n (A7/R9b): every passing lane lost an item the best
+        // candidate met, so no lane was picked; the next round restarts every
+        // lane from the best candidate.
+        {
+          const record = (this.#state.phase.rounds ?? []).find((r) => r.round === round);
+          const guard = this.#pickGuard(round);
+          const lost = record ? everyLaneLost(record, guard) : undefined;
+          if (lost) this.#log.append("round_no_pick_items_lost", { round, best: guard!.best.sha, lost });
+        }
         this.#applyEvent({ type: "ATTEMPT_NO_SUBMISSION" });
         this.#clearLaneRound(round);
         return;
@@ -9451,6 +9522,47 @@ export class Conductor {
       this.#clearLaneRound(round);
       return;
     }
+  }
+
+  /** Plan 06n (A7): what a round's pick compares each lane against — the
+   * phase's best candidate from the rounds before `round`, with the plan's
+   * item ids. Undefined for an unstructured plan or before any pick. */
+  #pickGuard(round: number): PickGuard | undefined {
+    if (!this.#itemsEnforced()) return undefined;
+    const itemIds = flatItems(this.#planItems()).map((i) => i.id);
+    const seatCount = this.#laneSeats().length;
+    const best = bestCandidate(this.#state.phase.rounds ?? [], itemIds, seatCount, round);
+    return best ? { best, itemIds, seatCount } : undefined;
+  }
+
+  /** Plan 06n (A7/R9c-d): once the phase has evaluated `last`'s pick and not
+   * accepted it, compare its evaluated items with the best candidate. An item
+   * the best candidate met that the pick does not meet, with its not-met
+   * evidence in a file the pick changed against the best candidate, is a
+   * regression: ITEMS_REGRESSED is recorded, and the next round restarts from
+   * the best candidate instead of the pick. An item whose evidence anchors
+   * only in unchanged files is a newly found defect: the pick is adopted as
+   * today. This chooses a base only; it never accepts a candidate. */
+  #recordRegression(last: RoundRecord | undefined): void {
+    if (!last?.picked || last.regressed || !this.#itemsEnforced()) return;
+    const picked = last.picked.sha;
+    const phase = this.#state.phase;
+    if (phase.candidate?.sha !== picked) return;
+    // Evaluated: the pick's reviews were promoted into the phase.
+    if (!seatsOf(phase.contract).some((w) => phase.reviews[w]?.review?.candidateSha === picked)) return;
+    const guard = this.#pickGuard(last.round);
+    if (!guard || guard.best.sha === picked) return;
+    let changed: string[];
+    try {
+      changed = diffNameOnly(this.#plan.repo, guard.best.sha, picked);
+    } catch (err) {
+      this.#log.append("error", { where: "regression_diff", error: String((err as Error)?.message ?? err) });
+      return;
+    }
+    const items = regressedItems(guard.best, this.#itemOutcomes(), changed);
+    if (items.length === 0) return;
+    this.#log.append("items_regressed", { round: last.round, items, sha: picked, best: guard.best.sha, changed });
+    this.#applyEvent({ type: "ITEMS_REGRESSED", round: last.round, items, sha: picked });
   }
 
   /** Drops one round's per-lane scratch state (its builds, discoveries and

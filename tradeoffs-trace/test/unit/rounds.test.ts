@@ -13,17 +13,23 @@ import { baseState, CV } from "./helpers.ts";
 
 import {
   advisoryReason,
+  bestCandidate,
   blocksAcceptance,
   candidateLabel,
   DEFAULT_ROUND_BUDGET,
+  everyLaneLost,
   laneIds,
+  laneMetItems,
+  latestRegression,
   openAdvisories,
   passingCandidates,
   pickWinner,
+  regressedItems,
   revotePair,
   roundBudget,
 } from "../../src/core/rounds.ts";
-import type { Finding, RoundRecord } from "../../src/core/types.ts";
+import { repeatLaneBases } from "../../src/core/lanes.ts";
+import type { Finding, LaneCandidateRecord, Review, RoundRecord } from "../../src/core/types.ts";
 
 function round(overrides: Partial<RoundRecord> = {}): RoundRecord {
   return {
@@ -351,4 +357,112 @@ test("plan 06g: openAdvisories lists exactly the carried items — open, advisor
     finding({ id: "F-3", severity: "advisory", status: "repaired" }),
   ];
   assert.deepEqual(openAdvisories(findings).map((f) => f.id), ["F-1"]);
+});
+
+// Plan 06n (A7): the progress rule's pure half.
+
+const SEATS = ["M", "A", "B"];
+const IDS = ["R1", "R2"];
+
+/** A lane candidate whose three seats give these verdicts per item. */
+function reviewed(lane: string, sha: string, verdicts: Record<string, string[]>): LaneCandidateRecord {
+  return {
+    lane,
+    sha,
+    ok: true,
+    reviews: SEATS.map((seat, i) => ({
+      seat,
+      review: {
+        items: Object.entries(verdicts).map(([id, v]) => ({ id, verdict: v[i], evidence: `${lane}.txt:1` })),
+        arch: [],
+      } as unknown as Review,
+    })),
+  };
+}
+
+const ALL_MET = { R1: ["met", "met", "met"], R2: ["met", "met", "met"] };
+const R1_UNMET = { R1: ["unmet", "unmet", "met"], R2: ["met", "met", "met"] };
+const R2_UNMET = { R1: ["met", "met", "met"], R2: ["unmet", "unmet", "unmet"] };
+
+/** Round 1 picked lane a, whose reviews met R1 and R2: the best candidate. */
+const ROUND1 = round({ round: 1, candidates: [reviewed("a", "C1a", ALL_MET), reviewed("b", "C1b", R1_UNMET)], picked: { lane: "a", sha: "C1a", votes: 3 } });
+
+test("plan 06n: a lane meets an item only by a strict majority of the seats", () => {
+  // [met, partial, partial] does not meet R1; [met, met, partial] does.
+  const thin = reviewed("a", "X", { R1: ["met", "partial", "partial"], R2: ["met", "met", "partial"] });
+  assert.deepEqual([...laneMetItems(thin, IDS, 3)], ["R2"]);
+  // A missing seat's review never counts toward the majority of the seats.
+  const two = { ...reviewed("a", "X", ALL_MET), reviews: reviewed("a", "X", ALL_MET).reviews!.slice(0, 1) };
+  assert.deepEqual([...laneMetItems(two, IDS, 3)], []);
+});
+
+test("plan 06n (R9a): a lane that lost an item the best candidate met cannot be picked over one that lost none", () => {
+  const best = bestCandidate([ROUND1], IDS, 3, 2)!;
+  assert.deepEqual(best, { round: 1, lane: "a", sha: "C1a", met: ["R1", "R2"] });
+  const guard = { best, itemIds: IDS, seatCount: 3 };
+  // Every seat votes for lane a, which lost R1; lane b lost nothing and wins.
+  const r2 = round({
+    round: 2,
+    candidates: [reviewed("a", "C2a", R1_UNMET), reviewed("b", "C2b", ALL_MET)],
+    votes: SEATS.map((seat) => ({ seat, lane: "a", why: "a" })),
+  });
+  assert.equal(pickWinner(r2, SEATS, "M", guard)?.lane, "b");
+  // Without a best candidate (round 1), the votes decide as before.
+  assert.equal(pickWinner(r2, SEATS, "M", undefined)?.lane, "a");
+});
+
+test("plan 06n (R9b): when both lanes lose an item, no lane is picked and both restart from the best candidate", () => {
+  const guard = { best: bestCandidate([ROUND1], IDS, 3, 2)!, itemIds: IDS, seatCount: 3 };
+  const r2 = round({
+    round: 2,
+    candidates: [reviewed("a", "C2a", R1_UNMET), reviewed("b", "C2b", R2_UNMET)],
+    votes: SEATS.map((seat) => ({ seat, lane: "a", why: "a" })),
+  });
+  assert.equal(pickWinner(r2, SEATS, "M", guard), undefined, "no lane is picked");
+  assert.deepEqual(everyLaneLost(r2, guard), { a: ["R1"], b: ["R2"] }, "each lane's lost items are named");
+  assert.deepEqual(repeatLaneBases(r2, guard), { a: "C1a", b: "C1a" }, "both lanes restart from the best candidate, not their own");
+  // A no-pick round for a missing vote still restarts each lane from its own.
+  assert.deepEqual(repeatLaneBases(round({ round: 2, candidates: [reviewed("a", "C2a", ALL_MET), reviewed("b", "C2b", ALL_MET)] }), guard), { a: "C2a", b: "C2b" });
+});
+
+test("plan 06n (R9c/R9d): a lost item is a regression only when its evidence anchors in a file the pick changed", () => {
+  const best = bestCandidate([ROUND1], IDS, 3, 2)!;
+  const outcome = (id: string, verdict: string, evidence: string) => ({
+    item: { id },
+    outcome: verdict,
+    seats: SEATS.map((seat) => ({ seat, verdict, evidence })),
+  });
+  // (c) R1 unmet with evidence in src/a.ts, which the pick changed.
+  assert.deepEqual(regressedItems(best, [outcome("R1", "unmet", "src/a.ts:3-9 the guard is gone"), outcome("R2", "met", "src/b.ts:1")], ["src/a.ts"]), ["R1"]);
+  // (d) R1 unmet with evidence only in src/old.ts, unchanged since the best:
+  // a newly found defect in old code, so the pick is adopted.
+  assert.deepEqual(regressedItems(best, [outcome("R1", "unmet", "src/old.ts:3 never handled"), outcome("R2", "met", "src/b.ts:1")], ["src/a.ts"]), []);
+  // A regressed round is no longer a best-candidate source, and the status
+  // names its items until a later round picks.
+  const r2 = round({ round: 2, candidates: [reviewed("a", "C2a", ALL_MET)], picked: { lane: "a", sha: "C2a", votes: 0 }, regressed: { items: ["R1"], sha: "C2a" } });
+  assert.equal(bestCandidate([ROUND1, r2], IDS, 3)?.sha, "C1a");
+  assert.deepEqual(latestRegression([ROUND1, r2]), { round: 2, items: ["R1"], sha: "C2a" });
+  assert.equal(latestRegression([ROUND1, r2, round({ round: 3, picked: { lane: "b", sha: "C1b", votes: 2 } })]), undefined);
+});
+
+test("plan 06n: ITEMS_REGRESSED validates against the event schema and marks the round's pick", () => {
+  const schema = JSON.parse(readFileSync(new URL("../../schemas/event.schema.json", import.meta.url), "utf8"));
+  const event = { type: "ITEMS_REGRESSED", round: 1, items: ["R1"], sha: "C1a" };
+  assert.ok(validate(schema, event).valid, "the event validates");
+  let state = baseState({ phase: "IMPLEMENTING" });
+  for (const e of [
+    { type: "ROUND_STARTED", round: 1, base: "B0", lanes: ["a", "b"] },
+    { type: "CANDIDATE_SUBMITTED", round: 1, lane: "a", sha: "C1a" },
+    { type: "CANDIDATE_CHECKED", round: 1, lane: "a", ok: true },
+  ]) {
+    const r = reduce(state, e);
+    assert.ok(r.ok, `${e.type}: ${!r.ok ? r.reason : ""}`);
+    state = r.state;
+  }
+  assert.equal(reduce(state, event).ok, false, "a round with no pick cannot regress");
+  const picked = reduce(state, { type: "CANDIDATE_PICKED", round: 1, lane: "a", sha: "C1a", votes: 0 });
+  assert.ok(picked.ok);
+  const r = reduce(picked.state, event);
+  assert.ok(r.ok, !r.ok ? r.reason : "");
+  assert.deepEqual(r.state.phase.rounds![0].regressed, { items: ["R1"], sha: "C1a" });
 });

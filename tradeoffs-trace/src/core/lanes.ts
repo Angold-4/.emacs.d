@@ -20,7 +20,7 @@
 // conductor never calls `runRound`, and the single-candidate loop is byte for
 // byte what it was.
 
-import { candidateLabel, laneIds, passingCandidates, pickWinner, revotePair, type RoundWinner } from "./rounds.ts";
+import { candidateLabel, everyLaneLost, laneIds, passingCandidates, pickWinner, revotePair, type PickGuard, type RoundWinner } from "./rounds.ts";
 import type {
   CriterionDispute,
   DecisionDisclosure,
@@ -108,9 +108,10 @@ export interface LaneHost {
   ): Promise<void>;
   /** Record one round event. */
   emit(event: Event): void;
-  /** Plan 06n (A7): the plan item ids the pick compares a lane's reviews
-   * against. Empty (or absent) keeps the old pick. */
-  itemIds?(): readonly string[];
+  /** Plan 06n (A7): the phase's best candidate and the plan items the pick
+   * compares each lane's reviews against. Undefined (no best candidate yet,
+   * or an unstructured plan) keeps the old pick. */
+  pickGuard?(): PickGuard | undefined;
   /** Plan 06n (A3): true once the owner asked the run to stop. `runRound`
    * checks it before lane checks, reviews and the pick, and records nothing
    * after it. */
@@ -161,9 +162,14 @@ function errorNote(err: unknown): string {
  * whose candidate passed its checks restarts from that candidate. A round in
  * which no candidate passed keeps `base` for every lane (the repeat sees the
  * failures; plan 06g). Derived from the round record, so it survives a
- * conductor restart. */
-export function repeatLaneBases(last: RoundRecord | undefined): Record<string, string> | undefined {
+ * conductor restart.
+ *
+ * Plan 06n (A7/R9b): a round that picked no lane because every passing lane
+ * lost an item the best candidate met restarts EVERY lane from the best
+ * candidate, never from its own regressing candidate. */
+export function repeatLaneBases(last: RoundRecord | undefined, guard?: PickGuard): Record<string, string> | undefined {
   if (!last || last.picked) return undefined;
+  if (everyLaneLost(last, guard)) return Object.fromEntries(last.lanes.map((lane) => [lane, guard!.best.sha]));
   const out: Record<string, string> = {};
   for (const c of passingCandidates(last)) if (typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
   return Object.keys(out).length > 0 ? out : undefined;
@@ -334,7 +340,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       // no missing vote could make another lane win, so the round picks and
       // records which seats did not vote. Otherwise the round fails as before:
       // a majority is never invented.
-      const decided = afterPick && passing.length === 2 ? pickWinner(afterPick, host.seats, host.leader, host.itemIds?.()) : undefined;
+      const decided = afterPick && passing.length === 2 ? pickWinner(afterPick, host.seats, host.leader, host.pickGuard?.()) : undefined;
       if (decided) missingVotes = missing;
       else failure = pickFailures[0] ?? `the pick turn is missing a vote from ${missing.join(", ")}`;
     }
@@ -368,7 +374,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   if (failure) return { round: ctx.round, base: ctx.base, lanes, builds, failure };
 
   // 5. `pickWinner` — code, never a model — decides the round.
-  const winner = finalRecord ? pickWinner(finalRecord, host.seats, host.leader, host.itemIds?.()) : undefined;
+  const winner = finalRecord ? pickWinner(finalRecord, host.seats, host.leader, host.pickGuard?.()) : undefined;
   if (winner) {
     host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: winner.lane, sha: winner.sha, votes: winner.votes });
   }

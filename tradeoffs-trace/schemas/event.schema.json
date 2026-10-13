@@ -24,7 +24,7 @@
         "CRITERION_AMENDED", "CRITERION_REVERTED",
         "NOTE_ADDED", "OWNER_INPUT_RECORDED", "OWNER_CORRECTION", "OWNER_REQUEST_MARKED_UNNEEDED", "MISS_RECORDED", "NOTES_DELIVERED", "DECISION_MATCHED", "FINDING_ALSO_RAISED",
         "MESSAGE_RAISED", "MESSAGE_PUBLISHED", "MESSAGE_MERGED", "MESSAGE_DROPPED", "OWNER_VERDICT", "MESSAGE_RESOLVED", "MESSAGE_ADDRESS_REPORTED", "MESSAGE_SUPERSEDED", "MESSAGE_CARRIED",
-        "ROUND_STARTED", "CANDIDATE_SUBMITTED", "CANDIDATE_CHECKED", "PICK_VOTE", "CANDIDATE_PICKED", "ROUND_REVIEW_SUBMITTED",
+        "ROUND_STARTED", "CANDIDATE_SUBMITTED", "CANDIDATE_CHECKED", "PICK_VOTE", "CANDIDATE_PICKED", "ITEMS_REGRESSED", "ROUND_REVIEW_SUBMITTED",
         "ITEM_CARRIED", "TRIAGE_RECORDED", "TRIAGE_FAILED", "DEFERRAL_RECORDED", "DEFERRAL_RESOLVED"
       ]
     }
@@ -107,6 +107,7 @@
     { "type": "object", "required": ["type", "round", "seat", "lane", "why"], "properties": { "type": { "const": "PICK_VOTE" }, "round": { "type": "integer", "minimum": 1 }, "seat": { "type": "string", "minLength": 1 }, "lane": { "type": "string", "minLength": 1 }, "why": { "type": "string", "minLength": 1 }, "revote": { "type": "boolean", "description": "Plan 06h: true when this is the top-two revote turn" } } },
     { "type": "object", "required": ["type", "round", "lanes"], "properties": { "type": { "const": "REVOTE_STARTED" }, "round": { "type": "integer", "minimum": 1 }, "lanes": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string", "minLength": 1 } } } },
     { "type": "object", "required": ["type", "round", "lane", "sha", "votes"], "properties": { "type": { "const": "CANDIDATE_PICKED" }, "round": { "type": "integer", "minimum": 1 }, "lane": { "type": "string", "minLength": 1 }, "sha": { "type": "string", "minLength": 1 }, "votes": { "type": "integer", "minimum": 0 } } },
+    { "type": "object", "required": ["type", "round", "items", "sha"], "properties": { "type": { "const": "ITEMS_REGRESSED" }, "round": { "type": "integer", "minimum": 1 }, "items": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }, "sha": { "type": "string", "minLength": 1 } } },
     { "type": "object", "required": ["type", "round", "lane", "seat", "review"], "properties": { "type": { "const": "ROUND_REVIEW_SUBMITTED" }, "round": { "type": "integer", "minimum": 1 }, "lane": { "type": "string", "minLength": 1 }, "seat": { "type": "string", "minLength": 1 }, "review": { "type": "object" } } },
     { "type": "object", "required": ["type", "recordId", "toPhase", "boundCandidateSha", "boundContractVersion", "boundRecordVersion"], "properties": { "type": { "const": "ITEM_CARRIED" }, "recordId": { "type": "string", "minLength": 1 }, "recordKind": { "enum": ["finding", "message"] }, "toPhase": { "type": "string", "minLength": 1 } } },
     { "type": "object", "required": ["type", "record"], "properties": { "type": { "const": "TRIAGE_RECORDED" }, "record": { "type": "object" } } },
