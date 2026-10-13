@@ -24,6 +24,7 @@ import { candidateLabel, laneIds, passingCandidates, pickWinner, revotePair, typ
 import type {
   CriterionDispute,
   DecisionDisclosure,
+  DirectiveAnswer,
   Event,
   FindingAnswer,
   PriorDecisionStatement,
@@ -47,6 +48,9 @@ export interface LaneBuild {
   /** Plan 06k3 (A3): the lane's answers to the open blocking findings, for
    * the winner's hand-off. */
   answers?: FindingAnswer[];
+  /** Plan 06n (A4): the lane's answers to the numbered directive items, for
+   * its reviewers and the winner's hand-off. */
+  directiveAnswers?: DirectiveAnswer[];
   /** The lane's own `submit_coverage` payload, for the winner's hand-off. */
   coverage?: unknown;
 }
@@ -83,6 +87,10 @@ export interface LaneHost {
   /** Run lane's worker in its own worktree and freeze its result to a
    * candidate, or say why it produced none. */
   buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild>;
+  /** Plan 06n (A3): the recorded build of a candidate this round already
+   * holds (a round stopped mid-way and resumed): its submit_phase payload and
+   * start, restored from the lane's own records. Absent keeps `{ lane, sha }`. */
+  resumeLane?(round: number, lane: string, sha: string): LaneBuild;
   /** Check one candidate, under the machine-wide lock, one after the other
    * (C2: two candidates' checks never overlap). */
   checkCandidate(round: number, lane: string, sha: string): Promise<LaneCheck>;
@@ -183,15 +191,20 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
     lanes.map(async (lane): Promise<LaneBuild> => {
       const prior = existing?.candidates.find((c) => c.lane === lane);
       if (prior && typeof prior.sha === "string" && prior.sha.length > 0) {
+        // Plan 06n (A3): a kept candidate brings back its recorded build, so
+        // its reviews and the hand-off see the lane's own payload; only an
+        // unchecked one is checked.
         const sha = prior.sha;
+        const kept: LaneBuild = host.resumeLane?.(ctx.round, lane, sha) ?? { lane, sha };
         if (prior.ok === undefined) {
+          if (host.stopRequested?.()) return kept;
           let check: LaneCheck;
           try {
             check = await host.checkCandidate(ctx.round, lane, sha);
           } catch (err) {
             check = { ok: false, note: `the check could not run: ${errorNote(err)}` };
           }
-          if (host.stopRequested?.()) return { lane, sha };
+          if (host.stopRequested?.()) return kept;
           host.emit({
             type: "CANDIDATE_CHECKED",
             round: ctx.round,
@@ -200,8 +213,10 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
             ...(check.note ? { note: check.note } : {}),
           });
         }
-        return { lane, sha };
+        return kept;
       }
+      // Plan 06n (A3): nothing new starts after a requested stop.
+      if (host.stopRequested?.()) return { lane, note: "the run was stopped" };
       let build: LaneBuild;
       try {
         build = await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
