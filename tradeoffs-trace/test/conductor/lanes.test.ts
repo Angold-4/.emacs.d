@@ -12,7 +12,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { rebuildState } from "../../src/conductor.ts";
+import { rebuildState, type RunPlanFile } from "../../src/conductor.ts";
+import { renderStatusView, statusViewInput } from "../../src/render.ts";
+import { buildView } from "../../src/view.ts";
 import { readLog } from "../../src/effects/log.ts";
 import { runPaths } from "../../src/conductor.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
@@ -1092,12 +1094,14 @@ test("plan 06l: both lanes' reviews run concurrently and the pick still waits fo
   }
 });
 
-/** A structured lane worker that submits coverage for R1 and R2. */
-function structuredLaneWorker(lane: string): { hello: unknown; steps: FakePiStep[] } {
+/** A structured lane worker that submits coverage for R1 and R2. Each round
+ * appends to its lane's file, so a later round's tree always differs; a lane
+ * told to `fail` writes the marker its checks reject. */
+function structuredLaneWorker(lane: string, round = 1, fail = false): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: defaultWorkerHello(),
     steps: [
-      { kind: "call-sh", command: `printf 'lane ${lane}\\n' > lane-${lane}.txt` },
+      { kind: "call-sh", command: `printf 'lane ${lane} round ${round}${fail ? " fail" : ""}\n' >> lane-${lane}.txt` },
       {
         kind: "call-submit",
         tool: "submit_coverage",
@@ -1115,9 +1119,113 @@ function structuredLaneWorker(lane: string): { hello: unknown; steps: FakePiStep
 }
 
 test("plan 06n: a candidate that loses a met item in a file it changed is never adopted, and the next round restarts from the best candidate", async () => {
-  // Plan 06n (A7/R9a): lane b's reviews mark both items met, lane a's mark R1
-  // unmet, so lane a lost an item the round's best candidate met. Even with
-  // every seat voting for lane a, it cannot be picked.
+  // Plan 06n (A7/R9), end to end over three rounds:
+  // - round 1: both lanes meet R1 and R2; lane a is picked and becomes the
+  //   best candidate (M's blocking finding keeps the phase going);
+  // - round 2: lane b fails its checks, so lane a is the only passing lane
+  //   and is picked although its reviews mark R1 unmet with evidence in
+  //   lane-a.txt, a file it changed: (c) ITEMS_REGRESSED [R1], round 3 starts
+  //   from the best candidate and its repair prompt lists R1 first;
+  // - round 3: every seat votes for lane a, which lost R2; lane b lost
+  //   nothing, so (a) lane a cannot be picked and lane b wins.
+  const dir = fs.mkdtempSync("/tmp/tt-06n-r9-");
+  const promptLog = path.join(dir, "prompts.txt");
+  const met = (lane: string) => [
+    { id: "R1", verdict: "met", evidence: `lane-${lane}.txt:1` },
+    { id: "R2", verdict: "met", evidence: `lane-${lane}.txt:1` },
+  ];
+  const setup = await setupConductor({
+    phase: lanePhase({
+      requirements: [
+        { id: "R1", title: "R1 holds", text: "R1 holds", arch: [], verify: ["review"] },
+        { id: "R2", title: "R2 holds", text: "R2 holds", arch: [], verify: ["review"] },
+      ],
+      constraints: [],
+      checks: ["if grep -q fail lane-b.txt 2>/dev/null; then exit 1; fi; exit 0"],
+    }),
+    checks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => structuredLaneWorker("a"),
+    laneWorkerScriptFor: (lane, round) => structuredLaneWorker(lane, round, lane === "b" && round === 2),
+    laneReviewerScriptFor: (seat, _candidate, state, lane) => {
+      const round = liveRound(state);
+      const K = state.phase.contract.contractVersion;
+      const read = `lane-${lane}.txt`;
+      let items = met(lane!);
+      if (round === 2 && lane === "a") items = [{ id: "R1", verdict: "unmet", evidence: "lane-a.txt:1 the R1 guard is gone" }, items[1]];
+      if (round === 3 && lane === "a") items = [items[0], { id: "R2", verdict: "unmet", evidence: "lane-a.txt:1 R2 is lost" }];
+      if (round === 1) {
+        return seat === "M"
+          ? laneReview("M", K, { items, read, findings: [{ kind: "defect", severity: "blocking", evidence: `lane-${lane}.txt:1 the output is wrong` }] })
+          : laneReview(seat as Reviewer, K, { items, read });
+      }
+      const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === "M");
+      return seat === "M"
+        ? laneReview("M", K, { items, read, findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed in this candidate" })) })
+        : laneReview(seat as Reviewer, K, { items, read });
+    },
+    // Every seat always votes for lane a.
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const rounds = phase.rounds!;
+    assert.equal(rounds.length, 3, "three rounds ran");
+    const best = rounds[0].picked!;
+    assert.equal(best.lane, "a", "round 1 picked lane a, the best candidate");
+    const rejected = rounds[1].picked!;
+    assert.equal(rejected.lane, "a", "round 2 picked lane a, the only passing lane");
+
+    // (c) The regression is recorded, with the ids and the rejected sha.
+    const regressed = readEvents(setup.runDir)
+      .filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "ITEMS_REGRESSED")
+      .map((r) => r.event);
+    assert.deepEqual(regressed, [{ type: "ITEMS_REGRESSED", round: 2, items: ["R1"], sha: rejected.sha }]);
+    // The next round restarts from the best candidate, never the rejected one.
+    assert.equal(rounds[2].base, best.sha, "round 3 starts from the best candidate");
+    // Its repair prompt lists R1 first, with the rejected sha for reference.
+    const r3 = fs.readFileSync(promptLog, "utf8").split("=====").filter((p) => p.includes("Round 3 of this phase"));
+    assert.equal(r3.length, 2, "both lanes were prompted in round 3");
+    for (const prompt of r3) {
+      assert.match(prompt, new RegExp(`Regressed \\(fix these first\\): R1 — met by the best candidate ${best.sha.slice(0, 7)}, lost by candidate ${rejected.sha.slice(0, 7)}`));
+      const blocking = prompt.slice(prompt.indexOf("Blocking (must be fixed):")).split("\n");
+      assert.match(blocking[1] ?? "", /^- Regressed \(fix these first\): R1/, `R1's regression is the first blocking line: ${blocking.slice(0, 3).join(" | ")}`);
+      assert.match(prompt, /its evaluation lost R1/, "the round prompt says the pick was not adopted");
+    }
+    // The status shows the regression while it is the latest pick.
+    const view = buildView(setup.runDir, setup.plan as RunPlanFile, false);
+    const atRegression = { ...setup.conductor.state, phase: { ...phase, rounds: rounds.slice(0, 2) } };
+    const status = renderStatusView(statusViewInput({ runDir: setup.runDir, plan: setup.plan as RunPlanFile, state: atRegression, view, alive: false }));
+    assert.match(status, /regressed: R1/, "the status names the regressed item");
+
+    // Neither lane continues a session that remembers the rejected edits.
+    const sessions = readLog(runPaths(setup.runDir).events).records.filter(
+      (r) => r.kind === "lane_session" && (r.event as { round?: number }).round === 3,
+    );
+    assert.deepEqual(
+      sessions.map((r) => (r.event as { continueSession?: boolean }).continueSession),
+      [false, false],
+      "both lanes start round 3 in a fresh session",
+    );
+
+    // (a) Round 3: lane a lost R2 against the best candidate; lane b lost
+    // none, so lane b is picked although every seat voted for lane a.
+    assert.equal(rounds[2].votes.filter((v) => v.lane === "a").length, 3, "every seat voted for lane a");
+    assert.equal(rounds[2].picked?.lane, "b", "lane a cannot be picked: it lost an item the best candidate met");
+    assert.equal(phase.candidate?.sha, rounds[2].picked?.sha, "the accepted candidate is round 3's pick");
+  } finally {
+    await teardown(setup);
+    cleanupDir(dir);
+  }
+});
+
+test("plan 06n (R9b): when both lanes lose a met item no lane is picked and both restart from the best candidate", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-06n-r9b-");
+  const promptLog = path.join(dir, "prompts.txt");
   const setup = await setupConductor({
     phase: lanePhase({
       requirements: [
@@ -1130,33 +1238,64 @@ test("plan 06n: a candidate that loses a met item in a file it changed is never 
     phaseChecks: ["true"],
     stubReviews: true,
     deadlines: FAST,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
     workerScript: () => structuredLaneWorker("a"),
-    laneWorkerScriptFor: (lane) => structuredLaneWorker(lane),
+    laneWorkerScriptFor: (lane, round) => structuredLaneWorker(lane, round),
     laneReviewerScriptFor: (seat, _candidate, state, lane) => {
+      const round = liveRound(state);
       const K = state.phase.contract.contractVersion;
-      const items =
-        lane === "a"
-          ? [
-              { id: "R1", verdict: "unmet", evidence: "lane-a.txt:1 not done" },
-              { id: "R2", verdict: "met", evidence: "lane-a.txt:1" },
-            ]
-          : [
-              { id: "R1", verdict: "met", evidence: "lane-b.txt:1" },
-              { id: "R2", verdict: "met", evidence: "lane-b.txt:1" },
-            ];
-      return laneReview(seat as Reviewer, K, { items, read: lane === "a" ? "lane-a.txt" : "lane-b.txt" });
+      const read = `lane-${lane}.txt`;
+      const ev = `lane-${lane}.txt:1`;
+      let items = [
+        { id: "R1", verdict: "met", evidence: ev },
+        { id: "R2", verdict: "met", evidence: ev },
+      ];
+      // Round 2: lane a loses R1, lane b loses R2.
+      if (round === 2) items = items.map((i) => ((lane === "a" ? i.id === "R1" : i.id === "R2") ? { ...i, verdict: "unmet", evidence: `${ev} lost` } : i));
+      if (round === 1) {
+        return seat === "M"
+          ? laneReview("M", K, { items, read, findings: [{ kind: "defect", severity: "blocking", evidence: `${ev} the output is wrong` }] })
+          : laneReview(seat as Reviewer, K, { items, read });
+      }
+      const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === "M");
+      return seat === "M"
+        ? laneReview("M", K, { items, read, findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed in this candidate" })) })
+        : laneReview(seat as Reviewer, K, { items, read });
     },
-    // Every seat picks lane a, the lane that lost an item.
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
   });
   try {
     await setup.conductor.start();
-    await waitFor(() => (setup.conductor.state.phase.rounds?.[0]?.votes.length ?? 0) >= 3, 150_000, 50, setup.runDir);
-    const round = setup.conductor.state.phase.rounds![0];
-    assert.deepEqual((round.candidates.find((c) => c.lane === "b")?.reviews ?? []).length, 3, "lane b was reviewed");
-    assert.equal(round.picked?.lane, "b", "lane a cannot be picked: it lost an item the round's best candidate met");
-    assert.notEqual(round.picked?.lane, "a");
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
+    const rounds = setup.conductor.state.phase.rounds!;
+    assert.equal(rounds.length, 3, "three rounds ran");
+    const best = rounds[0].picked!;
+    assert.equal(rounds[1].votes.length, 3, "round 2's seats all voted");
+    assert.equal(rounds[1].picked, undefined, "round 2 picked no lane: both lanes lost an item");
+    // Round 3's lanes both start from the best candidate, never from their
+    // own regressing round-2 candidates.
+    const intents = readLog(runPaths(setup.runDir).events).records.filter(
+      (r) => {
+        const e = r.event as { round?: number; lane?: string; worktree?: string; base?: string };
+        return r.kind === "intent" && e.round === 3 && typeof e.lane === "string" && typeof e.worktree === "string";
+      },
+    );
+    assert.deepEqual(
+      intents.map((r) => (r.event as { base?: string }).base).sort(),
+      [best.sha, best.sha],
+      "both lanes restart from the best candidate",
+    );
+    // Each lane is told which items it lost.
+    const r3 = fs.readFileSync(promptLog, "utf8").split("=====").filter((p) => p.includes("Round 3 of this phase"));
+    assert.equal(r3.length, 2);
+    for (const prompt of r3) {
+      assert.match(prompt, /Round 2 picked no lane: every lane lost a plan item/);
+      assert.match(prompt, /lane a lost R1; lane b lost R2/);
+      assert.doesNotMatch(prompt, /could not complete \(a review or pick vote was missing\)/);
+    }
+    assert.equal(rounds[2].picked?.lane, "a", "round 3 picks as usual");
   } finally {
     await teardown(setup);
+    cleanupDir(dir);
   }
 });

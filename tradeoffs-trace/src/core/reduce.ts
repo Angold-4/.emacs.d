@@ -138,6 +138,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "PICK_VOTE",
   "REVOTE_STARTED",
   "CANDIDATE_PICKED",
+  "ITEMS_REGRESSED",
   "ROUND_REVIEW_SUBMITTED",
   "ITEM_CARRIED",
   "DECISION_ADDED",
@@ -625,6 +626,22 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       return ok({
         ...state,
         phase: { ...p, rounds: replaceRound(p.rounds, { ...round, picked: { lane: event.lane, sha: event.sha, votes: event.votes } }) },
+      });
+    }
+
+    case "ITEMS_REGRESSED": {
+      // Plan 06n (A7): record-only. The round's pick is marked as a
+      // regression; the conductor reads the mark to restart the next round
+      // from the best candidate. Nothing is accepted or rejected here.
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `ITEMS_REGRESSED for round ${event.round}, which has not started`);
+      if (!round.picked || round.picked.sha !== event.sha) {
+        return rejected(state, `ITEMS_REGRESSED names ${event.sha}, which round ${event.round} did not pick`);
+      }
+      if (event.items.length === 0) return rejected(state, `ITEMS_REGRESSED for round ${event.round} names no item`);
+      return ok({
+        ...state,
+        phase: { ...p, rounds: replaceRound(p.rounds, { ...round, regressed: { items: [...event.items], sha: event.sha } }) },
       });
     }
 

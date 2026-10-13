@@ -1421,6 +1421,11 @@ export interface RoundRecord {
    * majority and the top two went to a revote. */
   revote?: RoundRevote;
   picked?: { lane: string; sha: string; votes: number };
+  /** Plan 06n (A7): set by ITEMS_REGRESSED when the evaluated pick lost items
+   * the phase's best candidate met, in code it changed. The pick is not
+   * adopted as the next round's base; the next round restarts from the best
+   * candidate. */
+  regressed?: { items: string[]; sha: string };
 }
 
 export interface FlakeObservation {
@@ -1716,6 +1721,16 @@ export interface EvAttemptNoSubmission {
    * process exited, settled, or failed its model call terminally (a 404, a
    * context overflow) without submitting. Absent for a plain silent settle. */
   note?: string;
+}
+/** Plan 06n (A7): the round's evaluated pick `sha` lost `items` that the
+ * phase's best candidate met, in code it changed, so it is not adopted as the
+ * next round's base. Record-only: it marks the round, never accepts or
+ * rejects a candidate. */
+export interface EvItemsRegressed {
+  type: "ITEMS_REGRESSED";
+  round: number;
+  items: string[];
+  sha: string;
 }
 export interface EvWorkerResumed {
   type: "WORKER_RESUMED";
@@ -2656,6 +2671,7 @@ export type Event =
   | EvAttemptNoSubmission
   | EvAttemptInterrupted
   | EvWorkerResumed
+  | EvItemsRegressed
   | EvFreezeCompleted
   | EvFreezeTimedOut
   | EvFreezeInterrupted
