@@ -2034,18 +2034,13 @@ export class Conductor {
     return undefined;
   }
 
-  /** Plan 06n (A4): every numbered item of an in-force owner directive must
-   * be answered by a submission. A `not-done` answer must give the reason. A
-   * directive with no numbered list owes no answer. Returns the refusal, or
-   * undefined when the answers are complete. */
+  /** Plan 06n (A4): every numbered item of an in-force owner directive
+   * delivered since the last pick must be answered by a submission. A
+   * `not-done` answer must give the reason. A directive with no numbered list,
+   * or one delivered before the last pick, owes no answer. Returns the
+   * refusal, or undefined when the answers are complete. */
   #directiveAnswerIssue(answers: DirectiveAnswer[] | undefined): string | undefined {
-    // Plan 06n (A4): only a directive with a numbered list is answered item
-    // by item; a plain directive owes no answer.
-    // Plan 06n (A4): only numbered items owe an answer, and only until one is
-    // given — an item answered in an earlier round is never re-demanded
-    // ("delivered since the last pick", finding A-11).
-    const answered = new Set((this.#state.phase.directiveAnswers ?? []).map((a) => a.id));
-    const required = directiveItems(this.#state.phase.ownerDirectives).filter((i) => i.id !== i.directiveId && !answered.has(i.id));
+    const required = directiveItemsOwed(this.#state.phase.ownerDirectives, this.#lastPickAt());
     if (required.length === 0) return undefined;
     const byId = new Map((answers ?? []).map((a) => [a.id, a]));
     const missing = required.filter((i) => !byId.has(i.id)).map((i) => i.id);
@@ -2059,6 +2054,18 @@ export class Conductor {
       } else if (a.status !== "done") {
         return `submit_phase refused: directive item ${item.id} has an unknown answer status ${JSON.stringify((a as { status?: unknown }).status)}`;
       }
+    }
+    return undefined;
+  }
+
+  /** Plan 06n (A4): when the phase last adopted a candidate — the last
+   * FREEZE_COMPLETED, which a lane round's pick hands off as — read from the
+   * log, so it needs no state of its own. Undefined before the first one. */
+  #lastPickAt(): string | undefined {
+    const { records } = readLog(this.#paths.events);
+    for (let i = records.length - 1; i >= 0; i -= 1) {
+      const r = records[i];
+      if (r.kind === "event" && (r.event as { type?: string }).type === "FREEZE_COMPLETED") return r.ts;
     }
     return undefined;
   }
@@ -13993,6 +14000,20 @@ export function directiveItems(directives: readonly OwnerDirective[] | undefined
   return out;
 }
 
+/** Plan 06n (A4): the numbered directive items a submission owes an answer
+ * to: every item `OD-n.k` of an in-force directive delivered after `since`
+ * (the last pick), or of every in-force directive when there was no pick
+ * yet. A directive without a numbered list owes none. Pure. */
+export function directiveItemsOwed(directives: readonly OwnerDirective[] | undefined, since: string | undefined): DirectiveItem[] {
+  const sinceMs = since === undefined ? undefined : Date.parse(since);
+  return directiveItems(directives).filter((i) => {
+    if (i.id === i.directiveId) return false;
+    if (sinceMs === undefined || !Number.isFinite(sinceMs)) return true;
+    const at = Date.parse((directives ?? []).find((d) => d.id === i.directiveId)?.at ?? "");
+    return !Number.isFinite(at) || at > sinceMs;
+  });
+}
+
 /** Plan 01i: the prompt section that makes the owner's directives binding —
  * every directive still in force, verbatim, newest last. Plan 06n (A4): a
  * directive with a numbered list is shown as its items `OD-n.k`, so the
@@ -14237,7 +14258,7 @@ export function buildWorkerPrompt(
   if (directiveItems(directives).some((i) => i.id !== i.directiveId)) {
     lines.push(
       "",
-      "In submit_phase, answer EVERY numbered owner-directive item above in `directiveAnswers`: { id, status: 'done', where } with where it is done, or { id, status: 'not-done', reason }. A submission that leaves one unanswered is refused before the freeze, naming the missing ids.",
+      "In submit_phase, answer every numbered owner-directive item above that the owner sent since the last picked candidate in `directiveAnswers`: { id, status: 'done', where } with where it is done, or { id, status: 'not-done', reason }. A submission that leaves one unanswered is refused before the freeze, naming the missing ids.",
     );
   }
   // Plan 04a: the settled ledger, and any message the owner refused (which
