@@ -66,7 +66,7 @@ import {
 } from "./core/triage.ts";
 import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
-import { checkCommands, checkTier, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand } from "./core/checks.ts";
+import { checkCommands, checkTier, diffTouchesWidePath, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand, type CheckTier } from "./core/checks.ts";
 // Plan 05i: the pure environment preflight — parse every declared shell
 // command's executable and resolve it in the conductor's own PATH. See the
 // module's header.
@@ -118,6 +118,7 @@ import type {
   DecisionBrief,
   DecisionDisclosure,
   EvFlakeObserved,
+  DirectiveAnswer,
   DirectiveScope,
   Event,
   Finding,
@@ -425,6 +426,10 @@ export interface RunPlanPhase {
    * the phase's `:FINAL_CHECKS:`). Only the candidate about to be accepted
    * runs it, once. */
   finalChecks?: string[];
+  /** Plan 06n (A5): the wide-path globs (`#+TT_WIDE_PATHS:`, overridden by
+   * the phase's `:WIDE_PATHS:`). A candidate whose diff touches one runs the
+   * final check in its round. */
+  widePaths?: string[];
   /** Plan 06i (A3): the phase's golden note (`#+TT_GOLDEN:`, overridden by
    * the phase's `:GOLDEN:`). A choice justified only by an earlier drafting
    * decision is re-checked against it; a `contract` classification must cite
@@ -860,6 +865,9 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     ...(phase.gateCleanup ? { gateCleanup: phase.gateCleanup } : {}),
     // Plan 06c: a declared final check is part of the frozen contract.
     ...(finalCheckOf(phase) ? { finalChecks: phase.finalChecks } : {}),
+    // Plan 06n (A5): the wide-path globs are frozen too, so the check tier
+    // reads the same list for every round.
+    ...(phase.widePaths && phase.widePaths.length > 0 ? { widePaths: [...phase.widePaths] } : {}),
     ...(typeof phase.golden === "string" && phase.golden.trim().length > 0 ? { golden: phase.golden } : {}),
     // Plan 06g: the lane count and the round budget are frozen into the
     // contract, so the FSM, the prompts and the views all read one value.
@@ -1286,6 +1294,8 @@ interface AgentHandle {
     dispute?: CriterionDispute;
     /** Plan 06k3 (A3): the lane's answers to the open blocking findings. */
     answers?: FindingAnswer[];
+    /** Plan 06n (A4): the lane's answers to the numbered directive items. */
+    directiveAnswers?: DirectiveAnswer[];
   };
   /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
    * winner's hand-off. */
@@ -1464,6 +1474,10 @@ export class Conductor {
    * lanes start from, for the shared lane prompt. Set before the round's
    * prompt is built. */
   #laneSavedWorkForRound: Array<{ lane: string; ref: string; sha: string }> = [];
+  /** Plan 06n (A5): each lane candidate's own starting sha, keyed
+   * `<round>-<lane>`, so its check can diff against its lane's start and
+   * choose the final tier when a wide path is touched. */
+  #laneCheckBases = new Map<string, string>();
   /** Plan 06k3 (A2, findings A-13/T-29): lanes whose unsubmitted-work ref
    * could not be written. Their dirty worktree is retained (never removed)
    * so the work is not lost, and the next attempt continues in it. */
@@ -2020,6 +2034,35 @@ export class Conductor {
     return undefined;
   }
 
+  /** Plan 06n (A4): every numbered item of an in-force owner directive must
+   * be answered by a submission. A `not-done` answer must give the reason. A
+   * directive with no numbered list owes no answer. Returns the refusal, or
+   * undefined when the answers are complete. */
+  #directiveAnswerIssue(answers: DirectiveAnswer[] | undefined): string | undefined {
+    // Plan 06n (A4): only a directive with a numbered list is answered item
+    // by item; a plain directive owes no answer.
+    // Plan 06n (A4): only numbered items owe an answer, and only until one is
+    // given — an item answered in an earlier round is never re-demanded
+    // ("delivered since the last pick", finding A-11).
+    const answered = new Set((this.#state.phase.directiveAnswers ?? []).map((a) => a.id));
+    const required = directiveItems(this.#state.phase.ownerDirectives).filter((i) => i.id !== i.directiveId && !answered.has(i.id));
+    if (required.length === 0) return undefined;
+    const byId = new Map((answers ?? []).map((a) => [a.id, a]));
+    const missing = required.filter((i) => !byId.has(i.id)).map((i) => i.id);
+    if (missing.length > 0) {
+      return `submit_phase refused: these owner-directive items are unanswered: ${missing.join(", ")}. Answer each in directiveAnswers: done (with where) or not-done (with the reason)`;
+    }
+    for (const item of required) {
+      const a = byId.get(item.id)!;
+      if (a.status === "not-done") {
+        if (!a.reason || a.reason.trim().length === 0) return `submit_phase refused: directive item ${item.id} is answered 'not-done' but gives no reason`;
+      } else if (a.status !== "done") {
+        return `submit_phase refused: directive item ${item.id} has an unknown answer status ${JSON.stringify((a as { status?: unknown }).status)}`;
+      }
+    }
+    return undefined;
+  }
+
   /** Plan 06k2 (A6) / plan 06k3 (A4): refuse a submission whose tree equals
    * the candidate it started from before freeze. For the phase's own worker
    * that is the last reviewed candidate; for a lane it is the candidate that
@@ -2208,6 +2251,16 @@ export class Conductor {
       if (pgid !== undefined) await this.#killRecordedGroup(pgid, Date.parse(intentRecord?.ts ?? ""));
       for (const shGroup of this.#recordedShGroups(records, payload.agentId as string)) {
         await this.#killRecordedGroup(shGroup.pgid, shGroup.ts);
+      }
+      // Plan 06n (A3): a clean `tt stop` is not a crash. The lanes' candidates
+      // and check results stay, and the round resumes in place, so no lane
+      // worktree is swept as crash recovery and no ATTEMPT_INTERRUPTED is
+      // recorded.
+      const cleanStop = records.some((r) => r.kind === "stop" && Date.parse(r.ts) >= Date.parse(intentRecord?.ts ?? ""));
+      if (cleanStop) {
+        this.#log.completion(actionId, { interrupted: false, reason: "clean stop" });
+        this.#applyEvent({ type: "WORKER_RESUMED" });
+        return;
       }
       const sweepResult = await sweep(this.#paths.worktree, { ownPgids: this.#ownPgids(), exceptPids: [] });
       this.#log.append("sweep", sweepResult);
@@ -4575,6 +4628,13 @@ export class Conductor {
           this.#log.append("finding_answer_refused", { at: "submit_phase", lane: handle.lane, reason: laneAnswerIssue });
           return { ok: false, reason: laneAnswerIssue };
         }
+        // Plan 06n (A4): every numbered item of an in-force directive must be
+        // answered before the lane's submission is taken.
+        const laneDirectiveIssue = this.#directiveAnswerIssue(args.directiveAnswers);
+        if (laneDirectiveIssue) {
+          this.#log.append("directive_answer_refused", { at: "submit_phase", lane: handle.lane, reason: laneDirectiveIssue });
+          return { ok: false, reason: laneDirectiveIssue };
+        }
         // Plan 06k2 (A6): a lane whose tree equals the candidate that lane
         // started from is refused before its freeze, unless the owner asked
         // for an unchanged resubmission.
@@ -4589,6 +4649,7 @@ export class Conductor {
           ...(args.priorDecisions ? { prior: args.priorDecisions } : {}),
           ...(args.criterionDispute ? { dispute: args.criterionDispute } : {}),
           ...(args.findingAnswers ? { answers: args.findingAnswers } : {}),
+          ...(args.directiveAnswers ? { directiveAnswers: args.directiveAnswers } : {}),
         };
         handle.doneResolve();
         return { ok: true };
@@ -4610,6 +4671,13 @@ export class Conductor {
       if (answerIssue) {
         this.#log.append("finding_answer_refused", { at: "submit_phase", reason: answerIssue });
         return { ok: false, reason: answerIssue };
+      }
+      // Plan 06n (A4): the numbered items of an in-force directive must each
+      // be answered before the submission is taken.
+      const directiveIssue = this.#directiveAnswerIssue((msg.args as SubmitPhaseArgs).directiveAnswers);
+      if (directiveIssue) {
+        this.#log.append("directive_answer_refused", { at: "submit_phase", reason: directiveIssue });
+        return { ok: false, reason: directiveIssue };
       }
       // Plan 06k2 (A6): a worker that resubmits a candidate byte-identical
       // to the last reviewed one is refused before the freeze, unless the
@@ -4660,6 +4728,7 @@ export class Conductor {
         type: "SUBMIT_PHASE",
         disclosures: args.decisions ?? [],
         ...(args.findingAnswers ? { findingAnswers: args.findingAnswers } : {}),
+        ...(args.directiveAnswers ? { directiveAnswers: args.directiveAnswers } : {}),
         ...(prior.length > 0 ? { prior } : {}),
         ...(dispute ? { dispute } : {}),
       });
@@ -5044,7 +5113,8 @@ export class Conductor {
       if (Array.isArray(itemChecks)) {
         for (const c of itemChecks as Array<{ id?: unknown; verdict?: unknown; evidence?: unknown; impact?: unknown; chosen?: unknown; alternative?: unknown; why?: unknown }>) {
           const id = typeof c?.id === "string" ? c.id.trim() : "";
-          const verdict = c?.verdict === "confirmed" || c?.verdict === "contradicted" ? c.verdict : undefined;
+          const verdict =
+            c?.verdict === "confirmed" || c?.verdict === "contradicted" || c?.verdict === "repaired" ? c.verdict : undefined;
           const evidence = typeof c?.evidence === "string" ? c.evidence.trim() : "";
           // Plan 06i: the same item-check form carries the evaluator's impact
           // class for a finding or discovered decision. An unknown value is
@@ -5056,20 +5126,25 @@ export class Conductor {
           const chosen = typeof c?.chosen === "string" && c.chosen.trim().length > 0 ? c.chosen.trim() : undefined;
           const alternative = typeof c?.alternative === "string" && c.alternative.trim().length > 0 ? c.alternative.trim() : undefined;
           const why = typeof c?.why === "string" && c.why.trim().length > 0 ? c.why.trim() : undefined;
-          const isTriage = openFindings(this.#state.phase).some((f) => f.id === id) || discoveredDecisions(this.#state.phase).some((d) => d.id === id);
+          const isFinding = openFindings(this.#state.phase).some((f) => f.id === id);
+          const isTriage = isFinding || discoveredDecisions(this.#state.phase).some((d) => d.id === id);
           if (id.length === 0 || !verdict || evidence.length === 0) continue;
-          if (isTriage && impact === undefined) continue;
+          // Plan 06n (A2/R3): `repaired` closes a FINDING only, and carries no
+          // impact classification.
+          if (verdict === "repaired" && !isFinding) continue;
+          if (isTriage && verdict !== "repaired" && impact === undefined) continue;
           // OD-15(2): for a finding/decision, only a CONFIRMED check with an
           // impact is a supplied classification. A `contradicted` verdict does
           // not classify (triage.ts only reads confirmed), so it must be
           // re-prompted once like a missing one, then escalated. A plan item's
           // contradicted check is still a supplied check (it overturns).
-          if (!isTriage || verdict === "confirmed") provided.add(id);
+          if (!isTriage || verdict === "confirmed" || verdict === "repaired") provided.add(id);
           // OD-2 A3 (carried here): a `confirmed` check has its anchors
           // validated exactly like a `contradicted` one. A confirmed check
           // whose anchors do not exist in the candidate is recorded as
-          // `unchecked by evaluator`, never as a confirmation.
-          if (verdict === "confirmed") {
+          // `unchecked by evaluator`, never as a confirmation. Plan 06n: a
+          // `repaired` answer is validated the same way.
+          if (verdict === "confirmed" || verdict === "repaired") {
             const item = flatItems(this.#planItems()).find((i) => i.id === id);
             const ctx = item ? this.#verdictContext(item, "M") : undefined;
             // Plan 06i: a finding or discovered decision is not a plan item, so
@@ -5106,6 +5181,16 @@ export class Conductor {
               }
               continue;
             }
+          }
+          // Plan 06n (A2/R3): an evaluator `repaired` with a valid anchor
+          // closes the finding as FINDING_CONFIRMED_REPAIRED does, with the
+          // evaluator as the confirmer.
+          if (verdict === "repaired") {
+            const candidateSha = this.#state.phase.candidate?.sha;
+            if (candidateSha) {
+              checkEvents.push({ type: "FINDING_EVALUATOR_REPAIRED", findingId: id, candidateSha, evidence });
+            }
+            continue;
           }
           checkEvents.push({
             type: "ITEM_CHECK_RECORDED",
@@ -8033,6 +8118,10 @@ export class Conductor {
     laneReview?: { round: number; lane: string; sha: string; seat: string };
     pickSeat?: string;
     pickRevote?: boolean;
+    /** Plan 06n (A1): start a lane worker in a FRESH session even when one
+     * exists — the losing lane after the other lane won must not continue
+     * from its own lost edits. */
+    freshSession?: boolean;
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -8065,7 +8154,7 @@ export class Conductor {
         ...this.#resolvePiArgsPrefix(opts.role),
         ...launchArgs(opts.role, {
           sessionDir: opts.sessionDir,
-          continueSession: hasSessionFile(opts.sessionDir),
+          continueSession: opts.freshSession === true ? false : hasSessionFile(opts.sessionDir),
           noSession: command !== undefined,
           provider: providerModel?.provider,
           model: providerModel?.model,
@@ -8132,6 +8221,15 @@ export class Conductor {
     ];
     if (failures.length > 0) {
       lines.push(`The previous round's lanes (round ${previous!.round}):`, ...failures.map((f) => `- ${f}`));
+    }
+    // Plan 06n (A1): name the winning lane and its candidate as the base, and
+    // tell the losing lane its own previous candidate is not in the worktree.
+    if (previous?.picked) {
+      const winner = previous.picked;
+      const losers = previous.lanes.filter((l) => l !== winner.lane);
+      lines.push(
+        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). Every lane's worktree was reset to that candidate, so the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree.`,
+      );
     }
     // 02k: a lane whose candidate passed in a round that could not complete
     // restarts from that candidate (repeatLaneBases); say so, so the worker
@@ -8200,6 +8298,19 @@ export class Conductor {
    * own sweep (A2). Returns the frozen candidate sha and the lane's
    * disclosures, or a note saying why the lane produced none. */
   async #buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild> {
+    // Plan 06n (A5): remember this lane's own start, so its check can diff
+    // against it and pick the final tier when a wide path is touched.
+    this.#laneCheckBases.set(`${round}-${lane}`, base);
+    // Plan 06n (A1): when the previous round picked the OTHER lane, this lane
+    // lost and its worktree was reset to the winner's candidate. It starts a
+    // fresh session, never continuing from memory of its own lost edits. The
+    // winning lane keeps its session.
+    const previous = (this.#state.phase.rounds ?? []).find((r) => r.round === round - 1);
+    const freshSession = previous?.picked !== undefined && previous.picked.lane !== lane;
+    // Recorded so a test (and the owner) can see the session decision; the
+    // production session dir still exists, the fresh start just skips
+    // `--continue`.
+    this.#log.append("lane_session", { lane, round, continueSession: !freshSession });
     const worktree = this.#laneWorktree(lane);
     // Plan 06k2 (A4, finding M-1): a lane worktree create/remove that throws
     // is recorded as THIS lane attempt's failure, exactly like the
@@ -8237,6 +8348,7 @@ export class Conductor {
         laneRound: round,
         // `worker.N` names the lane by its 1-based position (a = 1, b = 2).
         seat: String(this.#lanes().indexOf(lane) + 1),
+        ...(freshSession ? { freshSession: true } : {}),
       });
     let handle = spawnLane();
     try {
@@ -8368,7 +8480,7 @@ export class Conductor {
     const window = openCheckWindow(this.#checkLockPath);
     try {
       this.#log.append("lane_check_started", { round, lane, candidateSha: sha });
-      const result = await this.#runLaneChecks(lane, sha);
+      const result = await this.#runLaneChecks(lane, sha, this.#laneCheckBases.get(`${round}-${lane}`));
       this.#log.append("lane_check_finished", { round, lane, candidateSha: sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
       return result;
     } finally {
@@ -8382,15 +8494,25 @@ export class Conductor {
    * about the phase moves here: a candidate that fails its checks records
    * CANDIDATE_CHECKED { ok: false } and the round goes on with the other
    * lane. */
-  async #runLaneChecks(lane: string, candidateSha: string): Promise<LaneCheck> {
+  async #runLaneChecks(lane: string, candidateSha: string, laneBase?: string): Promise<LaneCheck> {
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
     const outDir = path.join(this.#paths.checks, candidateSha);
     fs.mkdirSync(outDir, { recursive: true });
+    // Plan 06n (A5): a candidate whose diff against its lane's start touches a
+    // wide path runs the final checks in this round; one that touches none
+    // runs the round checks, exactly as before.
+    const widePaths = this.#state.phase.contract.widePaths;
+    const widePathTouched =
+      laneBase !== undefined && widePaths && widePaths.length > 0
+        ? diffTouchesWidePath(diffNameOnly(this.#plan.repo, laneBase, candidateSha), widePaths)
+        : false;
+    const tier: CheckTier = widePathTouched ? "final" : "round";
+    const finalCommands = tier === "final" ? (this.#state.phase.contract.finalChecks ?? []).map((c) => this.#withValues(c)) : [];
     const commands = checkCommands(
       this.#plan.checks,
       this.#state.phase.contract.checks,
       this.#state.phase.contract.finalChecks,
-      "round",
+      tier,
     );
     const recordCommands: CheckRecordCommand[] = [];
     const recordLoad1 = Math.round(loadavg()[0] * 100) / 100;
@@ -8502,10 +8624,10 @@ export class Conductor {
       this.#writeCheckRecord(outDir, {
         candidateSha,
         ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
-        tier: "round",
+        tier,
         passed,
         commands: recordCommands,
-        finalCommands: [],
+        finalCommands,
         load1: recordLoad1,
         freeMemMB: recordFreeMemMB,
         at: new Date().toISOString(),
@@ -8668,6 +8790,9 @@ export class Conductor {
       decisions: [...carriedPrior, ...workerDecisions, ...discovered, ...this.#laneTriggerDecisions(round, lane, sha)],
       ballots: [...this.#state.phase.ballots, ...carriedBallots],
       findings,
+      // Plan 06n (A4): this lane's directive-item answers reach its own
+      // reviewers, next to the finding answers.
+      ...(build?.directiveAnswers ? { pendingDirectiveAnswers: build.directiveAnswers } : {}),
       ...(build?.coverage !== undefined ? { coverage: build.coverage as Coverage } : {}),
       checkResolution: this.#laneCheckResolutions.get(sha) ?? [],
     };
@@ -9104,7 +9229,17 @@ export class Conductor {
       // replaces the partial record rather than leaving it as a stale round.
       const rounds = this.#state.phase.rounds ?? [];
       const last = rounds[rounds.length - 1];
-      const round = last !== undefined && last.candidates.length < lanes.length ? last.round : (last?.round ?? 0) + 1;
+      // Plan 06n (A3): a round with no pick is unfinished while any lane
+      // lacks a candidate OR a check result. Such a round is resumed under its
+      // own number (the candidates already frozen are kept), not replaced.
+      const unfinished =
+        last !== undefined &&
+        !last.picked &&
+        lanes.some((lane) => {
+          const c = last.candidates.find((x) => x.lane === lane);
+          return !c || typeof c.sha !== "string" || c.sha.length === 0 || c.ok === undefined;
+        });
+      const round = unfinished ? last!.round : (last?.round ?? 0) + 1;
       const base = round === 1 ? this.#state.phase.integrationHead : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
@@ -9164,6 +9299,11 @@ export class Conductor {
         reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),
+        // Plan 06n (A7): the pick compares each lane's item reviews against
+        // the round's best candidate.
+        itemIds: () => flatItems(this.#planItems()).map((i) => i.id),
+        // Plan 06n (A3): the round records nothing after a requested stop.
+        stopRequested: () => this.#stopRequested,
       };
       const outcome = await runRound(host, { round, base, lanes, ...(laneBases ? { laneBases } : {}) });
       this.#log.completion(actionId, {
@@ -9176,6 +9316,12 @@ export class Conductor {
         candidates: outcome.builds.map((b) => ({ lane: b.lane, sha: b.sha, note: b.note })),
       });
       if (outcome.missingVotes) this.#log.append("pick_votes_missing", { round, seats: outcome.missingVotes, winner: outcome.winner?.lane });
+      // Plan 06n (A3): a clean stop left the round in place; the next start
+      // resumes it. Nothing further is recorded here.
+      if (outcome.stopped) {
+        this.#log.append("round_stopped", { round, reason: "the owner stopped the run" });
+        return;
+      }
       if (!outcome.winner) {
         // Plan 06j (A3/OD-5(3)): a recheck stopped this round's lane workers;
         // the phase is already CHECKING and the checks are re-running, so this
@@ -9229,6 +9375,7 @@ export class Conductor {
       this.#laneBarriers.delete(`${round}-${lane}`);
       this.#laneTriggers.delete(`${round}-${lane}`);
       this.#laneTriggerPaths.delete(`${round}-${lane}`);
+      this.#laneCheckBases.delete(`${round}-${lane}`);
     }
     this.#lanePromptDeliveredNoteCount.delete(round);
   }
@@ -9273,6 +9420,7 @@ export class Conductor {
         type: "SUBMIT_PHASE",
         disclosures: build?.disclosures ?? [],
         ...(build?.answers ? { findingAnswers: build.answers } : {}),
+        ...(build?.directiveAnswers ? { directiveAnswers: build.directiveAnswers } : {}),
         ...(build?.prior ? { prior: build.prior } : {}),
         ...(build?.dispute ? { dispute: build.dispute } : {}),
       });
@@ -10738,10 +10886,18 @@ export class Conductor {
     // so the tier is `final` and the phase's final check is appended.
     // Plan 06j (A3): a recheck re-runs the SAME tier the failed run used,
     // which the kept `checks.tier` records.
+    // Plan 06n (A5): a candidate whose diff touches a wide path runs the
+    // final checks even before review, exactly as a lane candidate does.
+    const widePaths = this.#state.phase.contract.widePaths;
+    const widePathTouched =
+      widePaths && widePaths.length > 0
+        ? diffTouchesWidePath(diffNameOnly(this.#plan.repo, this.#state.phase.integrationHead, candidateSha), widePaths)
+        : false;
     const tier = checkTier(this.#state.phase.contract, {
       sha: candidateSha,
       reviewed: this.#state.phase.phase === "FINAL_CHECKING" || this.#state.phase.checks?.tier === "final",
       openBlocker: false,
+      widePathTouched,
     });
     const finalCommands = tier === "final" ? (this.#state.phase.contract.finalChecks ?? []).map((c) => this.#withValues(c)) : [];
     const recordCommands: CheckRecordCommand[] = [];
@@ -13286,6 +13442,8 @@ export class Conductor {
       // Plan 06k3 (A3): the finding answers and reproduction re-runs reach
       // every reviewer prompt, turn 1 included.
       ...(this.#reproductionTableLines.get(phase.candidate?.sha ?? "") ?? []),
+      // Plan 06n (A4): the directive-item answers reach the reviewers too.
+      ...directiveAnswerLines(phase),
       "Call submit_discovery with at most 5 choices that change behaviour, interfaces, guarantees or cost where the plan left room. Each choice is one plain sentence of at most 20 words. Do not list implementation details (helper structure, naming, file layout) and do not give review advice here — correctness problems are findings, which you raise in turn 2. An empty list is fine.",
     ].join("\n");
   }
@@ -13397,6 +13555,8 @@ export class Conductor {
     // Plan 06k3 (A3): the worker's answer to each open blocking finding and
     // the conductor's re-run of its reproduction command on this candidate.
     lines.push(...(this.#reproductionTableLines.get(C) ?? []));
+    // Plan 06n (A4): the directive-item answers reach turn 2 as well.
+    lines.push(...directiveAnswerLines(phase));
     // Plan 05e (4): every earlier round's open finding/blocker message, so
     // each reviewer marks each `resolved` or `open` with evidence; a 2-of-3
     // `resolved` majority moves it out of the owner's live view.
@@ -13628,6 +13788,7 @@ interface SubmitPhaseArgs {
   priorDecisions?: PriorDecisionStatement[];
   criterionDispute?: CriterionDispute;
   findingAnswers?: FindingAnswer[];
+  directiveAnswers?: DirectiveAnswer[];
   assumptions?: string[];
   deviations?: string[];
 }
@@ -13788,16 +13949,83 @@ export function withdrawCommandOf(raw: unknown): { directiveId: string; text: st
   return { directiveId: r.directiveId, text };
 }
 
+/** Plan 06n (A4): one numbered item of a directive. A directive whose text
+ * has numbered lines (`1. …`, `2. …`) splits into `OD-n.k`; a directive with
+ * no numbered list stays one item named by its own id. */
+export interface DirectiveItem {
+  id: string;
+  text: string;
+  directiveId: string;
+  scope: DirectiveScope;
+}
+
+/** Split a directive's text on `^\s*\d+[.)]` lines. Two or more items make a
+ * list; fewer than two means the text is not a numbered list, so it stays
+ * whole. Pure. */
+function splitDirectiveItems(text: string): string[] {
+  const items: string[] = [];
+  let current: string[] | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*\d+[.)]\s*(.*)$/.exec(line);
+    if (m) {
+      if (current) items.push(current.join("\n").trim());
+      current = [m[1]];
+    } else if (current) {
+      current.push(line);
+    }
+  }
+  if (current) items.push(current.join("\n").trim());
+  return items.filter((s) => s.length > 0);
+}
+
+/** Plan 06n (A4): every item of every in-force directive, in order. */
+export function directiveItems(directives: readonly OwnerDirective[] | undefined): DirectiveItem[] {
+  const out: DirectiveItem[] = [];
+  for (const d of directives ?? []) {
+    if (d.status !== "in-force") continue;
+    const items = splitDirectiveItems(d.text);
+    if (items.length >= 1) {
+      items.forEach((text, i) => out.push({ id: `${d.id}.${i + 1}`, text, directiveId: d.id, scope: d.scope }));
+    } else {
+      out.push({ id: d.id, text: d.text, directiveId: d.id, scope: d.scope });
+    }
+  }
+  return out;
+}
+
 /** Plan 01i: the prompt section that makes the owner's directives binding —
- * every directive still in force, verbatim, newest last. Empty when none is
- * in force, so a prompt with no directive gains no section. */
+ * every directive still in force, verbatim, newest last. Plan 06n (A4): a
+ * directive with a numbered list is shown as its items `OD-n.k`, so the
+ * worker can answer each one. Empty when none is in force, so a prompt with
+ * no directive gains no section. */
 export function directiveLines(directives: readonly OwnerDirective[] | undefined): string[] {
   const inForce = (directives ?? []).filter((d) => d.status === "in-force");
   if (inForce.length === 0) return [];
+  const lines = ["", "Owner directives (binding):"];
+  for (const d of inForce) {
+    const scope = d.scope === "program" ? " (whole program)" : "";
+    // The full binding text is always shown (finding A-12), with the numbered
+    // items listed under it so the worker can answer each by id.
+    lines.push(`- ${d.id}${scope}: ${d.text}`);
+    splitDirectiveItems(d.text).forEach((text, i) => lines.push(`  - ${d.id}.${i + 1}: ${text}`));
+  }
+  return lines;
+}
+
+/** Plan 06n (A4): the worker's answers to the numbered directive items, shown
+ * to the reviewers next to the finding answers. Empty when the candidate
+ * carries none. */
+export function directiveAnswerLines(phase: { pendingDirectiveAnswers?: DirectiveAnswer[] }): string[] {
+  const answers = phase.pendingDirectiveAnswers ?? [];
+  if (answers.length === 0) return [];
   return [
     "",
-    "Owner directives (binding):",
-    ...inForce.map((d) => `- ${d.id}${d.scope === "program" ? " (whole program)" : ""}: ${d.text}`),
+    "Owner directive answers (this candidate):",
+    ...answers.map((a) =>
+      a.status === "done"
+        ? `- ${a.id}: done${a.where && a.where.trim().length > 0 ? ` (where: ${a.where})` : ""}`
+        : `- ${a.id}: not-done${a.reason && a.reason.trim().length > 0 ? ` (reason: ${a.reason})` : ""}`,
+    ),
   ];
 }
 
@@ -14005,6 +14233,13 @@ export function buildWorkerPrompt(
   if (contract.boundaries.length > 0) lines.push("", "Boundaries:", ...contract.boundaries.map((b) => `- ${b}`));
   if (ownerNotes) lines.push("", `Owner notes: ${ownerNotes}`);
   lines.push(...directiveLines(directives));
+  // Plan 06n (A4): a numbered directive owes one answer per item.
+  if (directiveItems(directives).some((i) => i.id !== i.directiveId)) {
+    lines.push(
+      "",
+      "In submit_phase, answer EVERY numbered owner-directive item above in `directiveAnswers`: { id, status: 'done', where } with where it is done, or { id, status: 'not-done', reason }. A submission that leaves one unanswered is refused before the freeze, naming the missing ids.",
+    );
+  }
   // Plan 04a: the settled ledger, and any message the owner refused (which
   // the next attempt must address, with the owner's reason).
   lines.push(...refusedPromptLines(messages));
@@ -14066,6 +14301,7 @@ export function buildReviewerPrompt(
     ...secretPromptLines(secrets),
     ...goldenPromptLines(phase.contract.golden),
     ...directiveLines(directives),
+    ...directiveAnswerLines(phase),
     // Plan 01f: the same rule every reviewer prompt carries — the conductor
     // owns the gate evidence, and no agent may run the command or substitute
     // for its record.

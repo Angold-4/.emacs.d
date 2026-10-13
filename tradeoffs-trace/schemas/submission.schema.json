@@ -68,7 +68,23 @@
           "type": "array",
           "description": "Plan 06k3 (A3): one answer per open blocking finding listed in the prompt: fixed (with the test that now covers it) or disputed (with the reason). A submission that leaves one unanswered is refused before the freeze.",
           "items": { "$ref": "#/$defs/findingAnswer" }
+        },
+        "directiveAnswers": {
+          "type": "array",
+          "description": "Plan 06n (A4): one answer per numbered item of an in-force owner directive: done (with where) or not-done (with the reason). A submission that leaves one unanswered is refused before the freeze.",
+          "items": { "$ref": "#/$defs/directiveAnswer" }
         }
+      }
+    },
+    "directiveAnswer": {
+      "type": "object",
+      "required": ["id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["done", "not-done"] },
+        "where": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
       }
     },
     "findingAnswer": {

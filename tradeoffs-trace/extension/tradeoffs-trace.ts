@@ -230,6 +230,15 @@ const FindingAnswerParam = Type.Object({
   reason: Type.Optional(Type.String({ description: "disputed only: why the finding is wrong or cannot be fixed" })),
 });
 
+// Plan 06n (A4): one answer per numbered item of an in-force owner directive
+// (`OD-n.k`). A not-done answer must give the reason.
+const DirectiveAnswerParam = Type.Object({
+  id: Type.String({ description: "A numbered directive item id listed in the prompt (e.g. OD-3.1)" }),
+  status: StringEnum(["done", "not-done"] as const),
+  where: Type.Optional(Type.String({ description: "done only: where the item is done (a file:line or a test)" })),
+  reason: Type.Optional(Type.String({ description: "not-done only: why the item is not done" })),
+});
+
 const submitPhaseFields: Record<string, TSchema> = {
   decisions: Type.Array(DecisionParam),
   assumptions: Type.Array(Type.String(), { description: "Assumptions made while implementing" }),
@@ -244,6 +253,12 @@ const submitPhaseFields: Record<string, TSchema> = {
     Type.Array(FindingAnswerParam, {
       description:
         "Plan 06k3: one answer per open blocking finding listed in the prompt — fixed (with the test that now covers it) or disputed (with the reason). A submission that leaves one unanswered is refused before the freeze.",
+    }),
+  ),
+  directiveAnswers: Type.Optional(
+    Type.Array(DirectiveAnswerParam, {
+      description:
+        "Plan 06n: one answer per numbered item of an in-force owner directive — done (with where) or not-done (with the reason). A submission that leaves one unanswered is refused before the freeze.",
     }),
   ),
 };
@@ -382,7 +397,10 @@ const submitEvaluationFields: Record<string, TSchema> = {
     Type.Array(
       Type.Object({
         id: Type.String({ description: "The plan item, finding or discovered-decision id from the re-check list" }),
-        verdict: StringEnum(["confirmed", "contradicted"] as const),
+        verdict: StringEnum(["confirmed", "contradicted", "repaired"] as const, {
+          description:
+            "confirmed/contradicted: the re-check's outcome for a plan item, finding or discovered decision. Plan 06n: `repaired` (a finding only) closes it when the current candidate no longer has the defect; give a valid anchor on the current candidate.",
+        }),
         evidence: Type.String({ description: "What you checked in the candidate, as a file:line citation" }),
         impact: Type.Optional(
           StringEnum(["wrong-output", "contract", "judgement"] as const, {

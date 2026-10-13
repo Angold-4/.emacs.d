@@ -62,6 +62,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ATTEMPT_TIMED_OUT",
   "ATTEMPT_NO_SUBMISSION",
   "ATTEMPT_INTERRUPTED",
+  "WORKER_RESUMED",
   "FREEZE_COMPLETED",
   "FREEZE_TIMED_OUT",
   "FREEZE_INTERRUPTED",
@@ -86,6 +87,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "OVERRIDE_CAST",
   "FINDING_RAISED",
   "FINDING_CONFIRMED_REPAIRED",
+  "FINDING_EVALUATOR_REPAIRED",
   "FINDING_DISPROVED",
   "FINDING_ACCEPTED_BY_OWNER",
   "FINDING_SEVERITY_LOWERED",
@@ -680,6 +682,34 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         f.id === event.findingId
           ? { ...f, status: "repaired" as const, repairedByCandidateSha: event.candidateSha }
           : f,
+      );
+      return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "FINDING_EVALUATOR_REPAIRED": {
+      // Plan 06n (A2/R3): the evaluator's open-finding re-check answered
+      // `repaired` with a valid anchor on the current candidate. The finding
+      // closes exactly as a reviewer's confirmation does; the evaluator is
+      // the confirmer.
+      const finding = p.findings.find((f) => f.id === event.findingId);
+      if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
+      if (!p.candidate || event.candidateSha !== p.candidate.sha) {
+        return rejected(state, `finding ${event.findingId} must be confirmed repaired against the current candidate`);
+      }
+      if (event.candidateSha === finding.boundCandidateSha) {
+        return rejected(
+          state,
+          `finding ${event.findingId} cannot be confirmed repaired on the same candidate it was raised on (${finding.boundCandidateSha})`,
+        );
+      }
+      if (!p.checks || p.checks.candidateSha !== event.candidateSha || p.checks.passed !== true) {
+        return rejected(state, `checks must have passed on candidate ${event.candidateSha} before finding ${event.findingId} can close`);
+      }
+      if (!event.evidence || event.evidence.trim().length === 0) {
+        return rejected(state, `finding ${event.findingId} repaired by evaluator requires the evidence anchor`);
+      }
+      const findings = p.findings.map((f) =>
+        f.id === event.findingId ? { ...f, status: "repaired" as const, repairedByCandidateSha: event.candidateSha } : f,
       );
       return ok({ ...state, phase: { ...p, findings } });
     }
@@ -1618,7 +1648,17 @@ export function reduce(state: State, event: unknown): ReduceResult {
     if (ev.type === "SUBMIT_PHASE") {
       working = {
         ...state,
-        phase: { ...state.phase, pendingDisclosures: ev.disclosures, pendingPrior: ev.prior, pendingDispute: ev.dispute },
+        phase: {
+          ...state.phase,
+          pendingDisclosures: ev.disclosures,
+          pendingPrior: ev.prior,
+          pendingDispute: ev.dispute,
+          // Plan 06n (A4): the directive-item answers reach the reviewers
+          // through the phase state, next to the finding answers. A submission
+          // with none clears them, so a later candidate never shows a stale
+          // answer (finding M-8).
+          pendingDirectiveAnswers: ev.directiveAnswers ?? [],
+        },
       };
     }
 

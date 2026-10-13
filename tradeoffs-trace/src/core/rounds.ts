@@ -193,9 +193,66 @@ export interface RoundWinner {
  * - two or more: the lane with a strict majority of the seats' pick votes
  *   (2 of 3, 3 of 5, 4 of 7) wins. A round whose votes give no lane a
  *   majority has no winner. */
-export function pickWinner(round: RoundRecord, seats: number | readonly string[], leader?: string): RoundWinner | undefined {
-  const passing = passingCandidates(round);
+/** Plan 06n (A7): the items a candidate's reviews mark met or fits (a
+ * majority of its reviews). */
+export function laneMetItems(candidate: LaneCandidateRecord, itemIds: readonly string[]): Set<string> {
+  const reviews = candidate.reviews ?? [];
+  const out = new Set<string>();
+  for (const id of itemIds) {
+    let met = 0;
+    let unmet = 0;
+    for (const r of reviews) {
+      const v = (r.review.items ?? []).find((i) => i.id === id)?.verdict;
+      if (v === "met" || v === "fits") met += 1;
+      else if (v === "unmet" || v === "deviates") unmet += 1;
+    }
+    if (met > unmet) out.add(id);
+  }
+  return out;
+}
+
+/** Plan 06n (A7): the round's best candidate — the passing candidate whose
+ * reviews mark the most items met/fits, the later one on a tie. */
+export function bestLaneCandidate(round: RoundRecord, itemIds: readonly string[]): LaneCandidateRecord | undefined {
+  let best: LaneCandidateRecord | undefined;
+  let bestCount = -1;
+  for (const c of passingCandidates(round)) {
+    const n = laneMetItems(c, itemIds).size;
+    if (n >= bestCount) {
+      best = c;
+      bestCount = n;
+    }
+  }
+  return best;
+}
+
+/** Plan 06n (A7): the items the round's best candidate met that `lane`'s own
+ * reviews mark unmet. A lane with none is eligible at the pick. */
+export function lostItems(round: RoundRecord, lane: string, itemIds: readonly string[]): string[] {
+  const best = bestLaneCandidate(round, itemIds);
+  const candidate = passingCandidates(round).find((c) => c.lane === lane);
+  if (!best || !candidate) return [];
+  const bestMet = laneMetItems(best, itemIds);
+  const laneMet = laneMetItems(candidate, itemIds);
+  return [...bestMet].filter((id) => !laneMet.has(id));
+}
+
+export function pickWinner(
+  round: RoundRecord,
+  seats: number | readonly string[],
+  leader?: string,
+  itemIds?: readonly string[],
+): RoundWinner | undefined {
+  let passing = passingCandidates(round);
   if (passing.length === 0) return undefined;
+  // Plan 06n (A7): a lane that lost an item the round's best candidate met is
+  // not eligible while another lane lost none; if every lane lost one, the
+  // round picks no lane (the next round restarts from the best candidate).
+  if (itemIds && itemIds.length > 0 && passing.length > 1) {
+    const eligible = passing.filter((c) => lostItems(round, c.lane, itemIds).length === 0);
+    if (eligible.length === 0) return undefined;
+    passing = eligible;
+  }
   if (passing.length === 1) return { lane: passing[0].lane, sha: passing[0].sha as string, votes: 0 };
   const seatList = typeof seats === "number" ? undefined : seats;
   const seatCount = typeof seats === "number" ? seats : seats.length;

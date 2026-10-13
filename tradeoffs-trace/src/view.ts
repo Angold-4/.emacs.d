@@ -608,6 +608,17 @@ export interface RunCost {
  * immediately precedes is a candidate being reviewed (FREEZE_COMPLETED is
  * FREEZING → CHECKING). A CHECKING re-entry from AMEND/CRITERION_REVERTED is
  * preceded by some other stage and is not a new round. */
+/** Plan 06n (A6): the round number of the last ROUND_STARTED event, or
+ * undefined for a run that records no lane round (the single-candidate
+ * loop). Pure, from the same event snapshot the timeline was built beside. */
+export function lastRoundStarted(events: readonly { type?: string; round?: number }[]): number | undefined {
+  let last: number | undefined;
+  for (const e of events) {
+    if (e.type === "ROUND_STARTED" && typeof e.round === "number") last = e.round;
+  }
+  return last;
+}
+
 function roundStarts(timeline: Timeline): string[] {
   const starts: string[] = [];
   for (let i = 1; i < timeline.phases.length; i++) {
@@ -686,7 +697,12 @@ export function buildView(
   const C = phase.candidate?.sha;
   const reviewers = reviewerOutcomes(phase);
   const reasons = notAcceptedReasons(phase);
-  const round = timeline.rounds.length + (C ? 1 : 0);
+  // Plan 06n (A6): the header's round is the round of the last ROUND_STARTED,
+  // so it always equals the events. The old `timeline.rounds.length + 1`
+  // inferred it from completed freezes, which drifts when a round was
+  // interrupted (a partial round still started). A plan without lane rounds
+  // records no ROUND_STARTED, so the inference remains the fallback.
+  const round = lastRoundStarted(events) ?? timeline.rounds.length + (C ? 1 : 0);
 
   // Plan 01e: the base's own baseline, read from `<run>/checks/base/`; a
   // candidate's passing checks that leaned on it are shown as such, and the
@@ -834,6 +850,10 @@ export function buildView(
     phase,
     run: timeline.state.run,
     endMs: timelineEndMs(timeline, events),
+    // Plan 06n (A3): the tape subtracts stopped time, the same instants
+    // `stageSpans` reads from the timeline.
+    stops: timeline.stops ?? [],
+    restarts: timeline.restarts ?? [],
     models: chartModelsFromPlan(plan.models, seatsOf(phase.contract)),
     limits: stageLimits(plan),
     ...(lanePhase ? { lanePhase } : {}),
