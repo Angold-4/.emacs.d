@@ -1162,9 +1162,6 @@ export interface PhaseState {
    * in-force owner directives, carried by SUBMIT_PHASE so the reviewers can
    * see each item's status. */
   pendingDirectiveAnswers?: DirectiveAnswer[];
-  /** Plan 06n (A4): every directive item the phase has answered, merged by id
-   * across submissions, so an answered item is never demanded again. */
-  directiveAnswers?: DirectiveAnswer[];
   /** Plan 2c: the number of candidates frozen in this phase so far (the
    * review round); 0 before the first freeze. */
   round?: number;
