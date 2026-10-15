@@ -356,6 +356,22 @@ failureRows(
   (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "dispatch_worker") }),
 );
 
+// Plan 06n (A3): a clean `tt stop` during a lane round resumes the SAME round.
+// The in-flight dispatch is cleared and the round is re-driven, but no
+// ATTEMPT_INTERRUPTED is recorded (that would start a fresh attempt and
+// discard the candidates the lanes already froze).
+addRow({
+  id: "worker-resumed-in-place",
+  axis: "phase",
+  from: "IMPLEMENTING",
+  trigger: "WORKER_RESUMED",
+  guardName: "always",
+  guard: () => true,
+  to: "IMPLEMENTING",
+  actions: [{ type: "dispatch_worker" }],
+  apply: (s) => withPhase(s, { inFlight: clearInFlight(s.phase, "dispatch_worker") }),
+});
+
 addRow({
   id: "attempt-interrupted",
   axis: "phase",

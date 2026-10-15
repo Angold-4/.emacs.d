@@ -310,6 +310,11 @@ export interface LoopTapeInput {
   /** The run-axis state (`RUN_ACTIVE`/`RUN_PAUSED_BUDGET`). */
   run?: string;
   endMs: number;
+  /** Plan 06n (A3): the instants a conductor stop was recorded and the
+   * instants a resume/restart began, so a stopped interval is subtracted
+   * from every step's duration exactly as `stageSpans` does. */
+  stops?: readonly string[];
+  restarts?: readonly string[];
   models?: ChartModels;
   /** Per-stage deadlines (`view.stageLimits`); the current row shows `x of y`. */
   limits?: Record<string, number>;
@@ -466,13 +471,30 @@ export function buildLoopTape(input: LoopTapeInput): { header: string; rows: Loo
   }
   const slice = phases.slice(startIdx);
 
+  // Plan 06n (A3): a stopped interval never counts toward a step's duration
+  // (the same rule `stageSpans` applies). A stop with no later restart runs
+  // to the segment end.
+  const stops = (input.stops ?? []).map((t) => Date.parse(t)).sort((a, b) => a - b);
+  const resumes = (input.restarts ?? []).map((t) => Date.parse(t)).sort((a, b) => a - b);
+  const stoppedMs = (start: number, end: number): number => {
+    let total = 0;
+    for (const s of stops) {
+      if (s < start || s >= end) continue;
+      const r = resumes.find((t) => t > s);
+      const until = Math.min(r ?? end, end);
+      if (until > s) total += until - s;
+    }
+    return total;
+  };
+
   const times: Record<string, number> = {};
   const seen = new Set<string>();
   let lastMain: string | undefined;
   for (let i = 0; i < slice.length; i++) {
     const step = TAPE_STEP_OF_STATE[slice[i].phase];
+    const start = Date.parse(slice[i].at);
     const end = i + 1 < slice.length ? Date.parse(slice[i + 1].at) : input.endMs;
-    const ms = Math.max(0, end - Date.parse(slice[i].at));
+    const ms = Math.max(0, end - start - stoppedMs(start, end));
     if (!step) continue;
     times[step] = (times[step] ?? 0) + ms;
     seen.add(step);
@@ -528,7 +550,11 @@ export function buildLoopTape(input: LoopTapeInput): { header: string; rows: Loo
   }
 
   const firstAt = phases[0]?.at;
-  const elapsed = firstAt ? formatTapeMs(Math.max(0, input.endMs - Date.parse(firstAt))) : "0s";
+  const elapsedStart = firstAt ? Date.parse(firstAt) : undefined;
+  const elapsed =
+    elapsedStart === undefined
+      ? "0s"
+      : formatTapeMs(Math.max(0, input.endMs - elapsedStart - stoppedMs(elapsedStart, input.endMs)));
   const header = `${input.label} · round ${input.round} · attempt ${phase.attempt.n}/${phase.repairRoundsGranted} · ${elapsed}`;
   return { header, rows, head: ci >= 0 ? rows[ci] : undefined };
 }

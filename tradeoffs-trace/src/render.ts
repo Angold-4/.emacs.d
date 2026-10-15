@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest, RoundRecord } from "./core/types.ts";
-import { candidateLabel } from "./core/rounds.ts";
+import { candidateLabel, latestRegression } from "./core/rounds.ts";
 import { seatsOf } from "./core/seats.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
@@ -941,7 +941,10 @@ export function renderStatusView(input: StatusViewInput): string {
         overturns: phase.overturns,
       } as unknown as ItemLoopState;
       const counts = countsLine(phaseItemCounts(loopState));
-      push(row("items", counts));
+      // Plan 06n (A7/R9c): a pick that lost met items is not adopted; the
+      // status names the items until a later round picks.
+      const regression = latestRegression(phase.rounds as RoundRecord[] | undefined);
+      push(row("items", regression ? `${counts} · regressed: ${regression.items.join(", ")}` : counts));
       const overturns = overturnCounts(loopState.overturns ?? [], seatsOf(loopState.contract));
       if (overturns.length > 0) overturnsText = overturns.map((o) => `${o.seat} ${o.count}`).join(" · ");
       unmet = phaseItemOutcomes(loopState)

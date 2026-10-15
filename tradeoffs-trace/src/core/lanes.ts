@@ -20,10 +20,11 @@
 // conductor never calls `runRound`, and the single-candidate loop is byte for
 // byte what it was.
 
-import { candidateLabel, laneIds, passingCandidates, pickWinner, revotePair, type RoundWinner } from "./rounds.ts";
+import { candidateLabel, everyLaneLost, laneIds, passingCandidates, pickWinner, revotePair, type PickGuard, type RoundWinner } from "./rounds.ts";
 import type {
   CriterionDispute,
   DecisionDisclosure,
+  DirectiveAnswer,
   Event,
   FindingAnswer,
   PriorDecisionStatement,
@@ -47,6 +48,9 @@ export interface LaneBuild {
   /** Plan 06k3 (A3): the lane's answers to the open blocking findings, for
    * the winner's hand-off. */
   answers?: FindingAnswer[];
+  /** Plan 06n (A4): the lane's answers to the numbered directive items, for
+   * its reviewers and the winner's hand-off. */
+  directiveAnswers?: DirectiveAnswer[];
   /** The lane's own `submit_coverage` payload, for the winner's hand-off. */
   coverage?: unknown;
 }
@@ -83,6 +87,10 @@ export interface LaneHost {
   /** Run lane's worker in its own worktree and freeze its result to a
    * candidate, or say why it produced none. */
   buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild>;
+  /** Plan 06n (A3): the recorded build of a candidate this round already
+   * holds (a round stopped mid-way and resumed): its submit_phase payload and
+   * start, restored from the lane's own records. Absent keeps `{ lane, sha }`. */
+  resumeLane?(round: number, lane: string, sha: string): LaneBuild;
   /** Check one candidate, under the machine-wide lock, one after the other
    * (C2: two candidates' checks never overlap). */
   checkCandidate(round: number, lane: string, sha: string): Promise<LaneCheck>;
@@ -100,6 +108,14 @@ export interface LaneHost {
   ): Promise<void>;
   /** Record one round event. */
   emit(event: Event): void;
+  /** Plan 06n (A7): the phase's best candidate and the plan items the pick
+   * compares each lane's reviews against. Undefined (no best candidate yet,
+   * or an unstructured plan) keeps the old pick. */
+  pickGuard?(): PickGuard | undefined;
+  /** Plan 06n (A3): true once the owner asked the run to stop. `runRound`
+   * checks it before lane checks, reviews and the pick, and records nothing
+   * after it. */
+  stopRequested?(): boolean;
 }
 
 export interface RoundContext {
@@ -130,6 +146,10 @@ export interface RoundOutcome {
   /** 02k: seats whose pick vote is missing from a round that still picked,
    * because the votes cast already gave the winner a majority of all seats. */
   missingVotes?: readonly string[];
+  /** Plan 06n (A3): the owner stopped the run mid-round. Nothing after the
+   * stop was recorded, and the partial round is left in place for the next
+   * start to finish. */
+  stopped?: boolean;
 }
 
 function errorNote(err: unknown): string {
@@ -142,9 +162,14 @@ function errorNote(err: unknown): string {
  * whose candidate passed its checks restarts from that candidate. A round in
  * which no candidate passed keeps `base` for every lane (the repeat sees the
  * failures; plan 06g). Derived from the round record, so it survives a
- * conductor restart. */
-export function repeatLaneBases(last: RoundRecord | undefined): Record<string, string> | undefined {
+ * conductor restart.
+ *
+ * Plan 06n (A7/R9b): a round that picked no lane because every passing lane
+ * lost an item the best candidate met restarts EVERY lane from the best
+ * candidate, never from its own regressing candidate. */
+export function repeatLaneBases(last: RoundRecord | undefined, guard?: PickGuard): Record<string, string> | undefined {
   if (!last || last.picked) return undefined;
+  if (everyLaneLost(last, guard)) return Object.fromEntries(last.lanes.map((lane) => [lane, guard!.best.sha]));
   const out: Record<string, string> = {};
   for (const c of passingCandidates(last)) if (typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
   return Object.keys(out).length > 0 ? out : undefined;
@@ -153,7 +178,11 @@ export function repeatLaneBases(last: RoundRecord | undefined): Record<string, s
 /** One round: K lanes from one base, one winner. See the module comment. */
 export async function runRound(host: LaneHost, ctx: RoundContext): Promise<RoundOutcome> {
   const lanes = [...ctx.lanes];
-  host.emit({ type: "ROUND_STARTED", round: ctx.round, base: ctx.base, lanes });
+  // Plan 06n (A3): a round the conductor stopped mid-way is resumed, not
+  // restarted. Its candidates and check results are kept; ROUND_STARTED is
+  // not emitted again (which would wipe them).
+  const existing = host.rounds().find((r) => r.round === ctx.round);
+  if (!existing) host.emit({ type: "ROUND_STARTED", round: ctx.round, base: ctx.base, lanes });
 
   // 1. Each lane gets its own worktree, worker and sweep, on the same prompt.
   //    The lanes run in parallel; one lane's failure never stops the other
@@ -166,6 +195,34 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   // records no candidate at all: its note is what the status shows.
   const builds = await Promise.all(
     lanes.map(async (lane): Promise<LaneBuild> => {
+      const prior = existing?.candidates.find((c) => c.lane === lane);
+      if (prior && typeof prior.sha === "string" && prior.sha.length > 0) {
+        // Plan 06n (A3): a kept candidate brings back its recorded build, so
+        // its reviews and the hand-off see the lane's own payload; only an
+        // unchecked one is checked.
+        const sha = prior.sha;
+        const kept: LaneBuild = host.resumeLane?.(ctx.round, lane, sha) ?? { lane, sha };
+        if (prior.ok === undefined) {
+          if (host.stopRequested?.()) return kept;
+          let check: LaneCheck;
+          try {
+            check = await host.checkCandidate(ctx.round, lane, sha);
+          } catch (err) {
+            check = { ok: false, note: `the check could not run: ${errorNote(err)}` };
+          }
+          if (host.stopRequested?.()) return kept;
+          host.emit({
+            type: "CANDIDATE_CHECKED",
+            round: ctx.round,
+            lane,
+            ok: check.ok,
+            ...(check.note ? { note: check.note } : {}),
+          });
+        }
+        return kept;
+      }
+      // Plan 06n (A3): nothing new starts after a requested stop.
+      if (host.stopRequested?.()) return { lane, note: "the run was stopped" };
       let build: LaneBuild;
       try {
         build = await host.buildLane(lane, ctx.round, ctx.laneBases?.[lane] ?? ctx.base, prompt);
@@ -173,6 +230,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
         build = { lane, note: `the lane failed: ${errorNote(err)}` };
       }
       if (typeof build.sha === "string" && build.sha.length > 0) {
+        if (host.stopRequested?.()) return build;
         host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha });
         let check: LaneCheck;
         try {
@@ -180,6 +238,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
         } catch (err) {
           check = { ok: false, note: `the check could not run: ${errorNote(err)}` };
         }
+        if (host.stopRequested?.()) return build;
         host.emit({
           type: "CANDIDATE_CHECKED",
           round: ctx.round,
@@ -188,6 +247,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
           ...(check.note ? { note: check.note } : {}),
         });
       } else {
+        if (host.stopRequested?.()) return build;
         host.emit({
           type: "CANDIDATE_CHECKED",
           round: ctx.round,
@@ -199,6 +259,8 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       return build;
     }),
   );
+  // Plan 06n (A3): nothing after a requested stop is recorded.
+  if (host.stopRequested?.()) return { round: ctx.round, base: ctx.base, lanes, builds, stopped: true };
 
   const record = host.rounds().find((r) => r.round === ctx.round);
   const passing = record ? passingCandidates(record) : [];
@@ -206,7 +268,8 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   // 3. M, A and B each review every passing candidate — K × N reviews. A
   //    review that cannot be taken is NOT a candidate with fewer reviews: the
   //    round fails and repeats, so no winner is ever handed off with an
-  //    incomplete set.
+  //    incomplete set. A requested stop records nothing here either.
+  if (host.stopRequested?.()) return { round: ctx.round, base: ctx.base, lanes, builds, stopped: true };
   let failure: string | undefined;
   // Plan 06l (A1): every passing candidate's reviews run AT THE SAME TIME —
   // each seat reviews the two lanes as two separate turns (distinct agents,
@@ -247,6 +310,9 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   //    passing candidate the vote is skipped — it wins without one. Every
   //    seat must vote before a winner is picked.
   let missingVotes: string[] | undefined;
+  if (!failure && passing.length > 1 && host.stopRequested?.()) {
+    return { round: ctx.round, base: ctx.base, lanes, builds, stopped: true };
+  }
   if (!failure && passing.length > 1) {
     // Every seat gets its pick turn; one seat's failure no longer stops the
     // others (02k: a pick that failed discarded the round before the
@@ -274,7 +340,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
       // no missing vote could make another lane win, so the round picks and
       // records which seats did not vote. Otherwise the round fails as before:
       // a majority is never invented.
-      const decided = afterPick && passing.length === 2 ? pickWinner(afterPick, host.seats, host.leader) : undefined;
+      const decided = afterPick && passing.length === 2 ? pickWinner(afterPick, host.seats, host.leader, host.pickGuard?.()) : undefined;
       if (decided) missingVotes = missing;
       else failure = pickFailures[0] ?? `the pick turn is missing a vote from ${missing.join(", ")}`;
     }
@@ -308,7 +374,7 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
   if (failure) return { round: ctx.round, base: ctx.base, lanes, builds, failure };
 
   // 5. `pickWinner` — code, never a model — decides the round.
-  const winner = finalRecord ? pickWinner(finalRecord, host.seats, host.leader) : undefined;
+  const winner = finalRecord ? pickWinner(finalRecord, host.seats, host.leader, host.pickGuard?.()) : undefined;
   if (winner) {
     host.emit({ type: "CANDIDATE_PICKED", round: ctx.round, lane: winner.lane, sha: winner.sha, votes: winner.votes });
   }

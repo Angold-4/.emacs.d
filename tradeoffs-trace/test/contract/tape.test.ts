@@ -190,6 +190,32 @@ test("a repair starts a fresh tape round, not a sum of rounds", () => {
   assert.doesNotMatch(tape, /31m/);
 });
 
+test("plan 06n: the loop tape subtracts stopped time from the stage elapsed", () => {
+  // The stage ran 10 minutes, the conductor was stopped for 2 hours, then it
+  // ran 5 more: the tape's IMPLEMENT row shows 15m, never 2h15m.
+  const tape = renderLoopTape({
+    label: "06n stop clock",
+    round: 1,
+    phases: phases([
+      ["READY", "2026-09-27T09:00:00.000Z"],
+      ["IMPLEMENTING", "2026-09-27T09:00:00.000Z"],
+      ["FREEZING", "2026-09-27T11:15:00.000Z"],
+      ["CHECKING", "2026-09-27T11:15:10.000Z"],
+      ["REVIEWING", "2026-09-27T11:22:10.000Z"],
+    ]),
+    phase: tapePhase({ phase: "REVIEWING" }),
+    run: "RUN_ACTIVE",
+    endMs: Date.parse("2026-09-27T11:26:22.000Z"),
+    stops: ["2026-09-27T09:10:00.000Z"],
+    restarts: ["2026-09-27T11:10:00.000Z"],
+  });
+  assert.match(tape, /^  ✓  IMPLEMENT   15m$/m, "10m before the stop plus 5m after it");
+  assert.doesNotMatch(tape, /2h15m/);
+  // The header's total elapsed is the running time too: 26m22s of work, not
+  // 2h26m22s of wall time.
+  assert.match(tape, /^06n stop clock · round 1 · attempt 1\/3 · 26m22s$/m);
+});
+
 test("a phase with a gate draws the GATE row; one without does not", () => {
   const withGate = renderLoopTape({ ...REVIEW, phase: tapePhase({ phase: "REVIEWING", contract: { gate: "make gate" } }) });
   assertGolden("gate.txt", withGate);

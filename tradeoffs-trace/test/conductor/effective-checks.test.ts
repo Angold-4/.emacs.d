@@ -616,6 +616,94 @@ test("plan 06c: a plan without TT_FINAL_CHECKS checks every candidate exactly as
   }
 });
 
+test("plan 06n: a candidate touching a TT_WIDE_PATHS glob runs the final checks in its round", async () => {
+  const finalMarker = `/tmp/tt-wide-final-${randomUUID().slice(0, 8)}`;
+  fs.rmSync(finalMarker, { force: true });
+  const finalCommand = `echo final >> ${finalMarker}`;
+  // The real Emacs parser reads #+TT_WIDE_PATHS into the phase.
+  const phase = parseOrgPhase(
+    [
+      "#+TITLE: 06n",
+      "#+TT_REPO: /tmp/x",
+      "#+TT_BRANCH: main",
+      "#+TT_CHECKS: true",
+      `#+TT_FINAL_CHECKS: ${finalCommand}`,
+      "#+TT_WIDE_PATHS: config/**",
+      "",
+      "* Phase 1: p",
+      "  :PROPERTIES:",
+      "  :ID: p1",
+      "  :CHECKS: true",
+      "  :END:",
+      "  Goal: g",
+      "  Acceptance:",
+      "  - it works",
+    ].join("\n") + "\n",
+  );
+  assert.deepEqual(phase.widePaths, ["config/**"], "the real parser wrote widePaths into the phase");
+  phase.workers = 2;
+  const setup = await setupConductor({
+    phase,
+    stubReviews: false,
+    deadlines: FINAL_DEADLINES,
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [] }),
+    // lane a touches the wide path, lane b touches src only.
+    laneWorkerScriptFor: (lane) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: lane === "a" ? "mkdir -p config && printf 'x\n' > config/x.yaml" : "mkdir -p src && printf 'y\n' > src/y.txt" },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    laneReviewerScriptFor: (seat, _candidate, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        {
+          kind: "call-submit",
+          tool: "submit_review",
+          args: {
+            reviewer: seat,
+            phaseId: state.phase.phaseId,
+            candidateSha: "$TT_CANDIDATE_SHA",
+            contractVersion: state.phase.contract.contractVersion,
+            correctionStatements: [],
+            findingStatements: [],
+            ballots: [],
+            findings: [],
+          },
+        },
+      ],
+    }),
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(
+      () => readEvents(setup.runDir).filter((r) => r.kind === "lane_check_finished").length >= 2,
+      120_000,
+      50,
+      setup.runDir,
+    );
+    const round = setup.conductor.state.phase.rounds![0];
+    const shaA = round.candidates.find((c) => c.lane === "a")!.sha!;
+    const shaB = round.candidates.find((c) => c.lane === "b")!.sha!;
+    const recordA = checkRecord(setup.runDir, shaA);
+    assert.equal(recordA.tier, "final", "lane a touches config/** so it runs the final checks");
+    assert.deepEqual(recordA.finalCommands, [finalCommand], "the final command is named on lane a's record");
+    assert.ok(recordA.commands.some((c) => c.command === finalCommand), "lane a ran the final command");
+    const recordB = checkRecord(setup.runDir, shaB);
+    assert.equal(recordB.tier, "round", "lane b touches only src/ so it runs the round checks");
+    assert.deepEqual(recordB.finalCommands, [], "lane b ran no final command");
+    assert.equal(fs.readFileSync(finalMarker, "utf8").trim().split("\n").length, 1, "the final command ran once, for lane a");
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(finalMarker, { force: true });
+  }
+});
+
 test("plan 06c: check records carry load average and free memory", async () => {
   const setup = await setupConductor({
     checks: ["true"],

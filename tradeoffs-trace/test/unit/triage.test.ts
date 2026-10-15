@@ -13,12 +13,13 @@ import {
   dispositionReason,
   escalationRequestId,
   evidenceForFinding,
+  latestRequestRepair,
   ledgerRecords,
   type TriageRecord,
 } from "../../src/core/triage.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { checkItemCarried } from "../../src/core/owner-commands.ts";
-import { baseState } from "./helpers.ts";
+import { baseState, CV } from "./helpers.ts";
 import type { Decision, Finding, PhaseState } from "../../src/core/types.ts";
 
 test("plan 06i: disposition gives a judgement call a trade-off only when chosen, alternative and why are all present", () => {
@@ -220,6 +221,126 @@ test("plan 06i: a carry and a defer on the same id are refused, each naming the 
   );
   assert.equal(r.ok, false, "a defer on a carried id is refused");
   assert.match(r.ok ? "" : r.reason, /carried/, "the refusal names the existing carry");
+});
+
+test("plan 06n: a contract finding citing a plan item or an in-force OD is triaged as a fix and opens no owner request", () => {
+  // A defect finding the evaluator classified `contract`, in a phase with a
+  // golden note. Without a plan/directive citation its contract classification
+  // is ungrounded and escalates; a citation of R1 or OD-2 makes it a fix.
+  const finding: Finding = {
+    id: "F-1",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: "the candidate contradicts R1: it never checks the bound",
+    raisedBy: "A",
+    status: "open",
+    boundCandidateSha: "C1",
+  };
+  const base = {
+    phaseId: "p1",
+    candidate: { sha: "C1" },
+    contract: {
+      contractVersion: { snapshot: 1, sectionSha256: "x" },
+      golden: "the bound must always be checked before every write",
+      requirements: [{ id: "R1", title: "the bound is checked", text: "", rawText: "", arch: [], verify: [] }],
+    },
+    findings: [finding],
+    decisions: [],
+    ballots: [],
+    ownerDirectives: [{ id: "OD-2", status: "in-force" }],
+    itemChecks: [
+      { itemId: "F-1", verdict: "confirmed", impact: "contract", evidence: "the finding cites R1: the bound is never checked" },
+    ],
+  } as unknown as PhaseState;
+  // Evidence names R1 -> a classified plan contradiction -> fix (no request).
+  const dR1 = disposition({ itemId: "F-1", source: "finding", impact: "contract" }, evidenceForFinding(finding, base));
+  assert.equal(dR1.kind, "fix", "a finding citing R1 is a fix, not an escalation");
+
+  // Evidence names an in-force OD -> fix.
+  const odFinding: Finding = { ...finding, evidence: "violates OD-2: the cap was removed" };
+  const odCheck = { ...base, itemChecks: [{ itemId: "F-1", verdict: "confirmed", impact: "contract", evidence: "violates OD-2: the cap was removed" }] } as unknown as PhaseState;
+  const dOd = disposition({ itemId: "F-1", source: "finding", impact: "contract" }, evidenceForFinding(odFinding, odCheck));
+  assert.equal(dOd.kind, "fix", "a finding citing an in-force OD-2 is a fix");
+
+  // Evidence names neither and does not cite the golden note -> escalates as today.
+  const bareFinding: Finding = { ...finding, evidence: "this just feels wrong to me" };
+  const bare = { ...base, itemChecks: [{ itemId: "F-1", verdict: "confirmed", impact: "contract", evidence: "this just feels wrong to me" }] } as unknown as PhaseState;
+  const dNeither = disposition({ itemId: "F-1", source: "finding", impact: "contract" }, evidenceForFinding(bareFinding, bare));
+  assert.equal(dNeither.kind, "escalate", "a contract classification citing neither still escalates");
+
+  // A withdrawn directive does not count.
+  const withdrawn = { ...odCheck, ownerDirectives: [{ id: "OD-2", status: "withdrawn" }] } as unknown as PhaseState;
+  const dWithdrawn = disposition({ itemId: "F-1", source: "finding", impact: "contract" }, evidenceForFinding(odFinding, withdrawn));
+  assert.equal(dWithdrawn.kind, "escalate", "a withdrawn directive is not a plan citation");
+});
+
+test("plan 06n: a finding resolved repair is not re-escalated, and an evaluator repaired answer closes it", () => {
+  const finding: Finding = {
+    id: "F-1",
+    version: 1,
+    phaseId: "p1",
+    kind: "defect",
+    severity: "blocking",
+    evidence: "src/a.ts:1 the bound is never checked",
+    raisedBy: "A",
+    status: "open",
+    boundCandidateSha: "C1",
+  };
+  // (a) The owner resolved the finding's request as `repair`: triage gives a
+  // fix disposition (so it blocks until repaired) and never escalates it
+  // again, however many evaluations run.
+  const phase = {
+    phaseId: "p1",
+    candidate: { sha: "C2" },
+    contract: { contractVersion: { snapshot: 1, sectionSha256: "x" } },
+    findings: [finding],
+    decisions: [],
+    ballots: [],
+    ownerRequests: [
+      {
+        id: "OR-p1-finding-1",
+        version: 1,
+        phaseId: "p1",
+        reason: "finding F-1 is open",
+        origin: "open_finding",
+        linkedFindingId: "F-1",
+        status: "resolved",
+        resolution: { option: "repair" },
+        options: [{ id: "repair", label: "repair" }],
+      },
+    ],
+  } as unknown as PhaseState;
+  assert.equal(latestRequestRepair(phase, "F-1"), true, "the latest request was resolved repair");
+  const d = disposition({ itemId: "F-1", source: "finding", impact: "wrong-output" }, evidenceForFinding(finding, phase));
+  assert.equal(d.kind, "fix", "a finding the owner sent to repair stays a fix, never a new escalation");
+
+  // (b) The evaluator answers `repaired` with a valid anchor on the current
+  // candidate: the finding closes exactly as a reviewer confirmation does.
+  const state = baseState({
+    phase: "EVALUATING",
+    candidate: { sha: "C2", contractVersion: CV() },
+    checks: { candidateSha: "C2", passed: true },
+    findings: [finding],
+  });
+  const r = reduce(state, { type: "FINDING_EVALUATOR_REPAIRED", findingId: "F-1", candidateSha: "C2", evidence: "src/a.ts:1 re-checked" });
+  assert.ok(r.ok, r.ok ? "" : r.reason);
+  const closed = r.state.phase.findings.find((f) => f.id === "F-1")!;
+  assert.equal(closed.status, "repaired", "the evaluator's repaired answer closes the finding");
+  assert.equal(closed.repairedByCandidateSha, "C2");
+  // A repaired finding is no longer open, so it no longer blocks acceptance.
+  assert.equal(r.state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking"), false);
+
+  // The same candidate it was raised on may not close it.
+  const sameCandidate = baseState({
+    phase: "EVALUATING",
+    candidate: { sha: "C1", contractVersion: CV() },
+    checks: { candidateSha: "C1", passed: true },
+    findings: [{ ...finding, boundCandidateSha: "C1" }],
+  });
+  const rejected = reduce(sameCandidate, { type: "FINDING_EVALUATOR_REPAIRED", findingId: "F-1", candidateSha: "C1", evidence: "src/a.ts:1" });
+  assert.equal(rejected.ok, false, "a finding cannot be repaired on the candidate it was raised on");
 });
 
 test("plan 06i: ledgerRecords covers every finding and every discovered decision of the ledger", () => {

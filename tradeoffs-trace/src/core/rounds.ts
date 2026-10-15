@@ -20,6 +20,7 @@
 // Superseded records are kept for history and never votable (predicate.ts's
 // `isLiveDecision`).
 
+import { evidenceFileAnchors, pathInList } from "./items.ts";
 import { isLiveDecision } from "./predicate.ts";
 import { findingDispositionIsTradeoff, triageFixFor } from "./triage.ts";
 import { DEFAULT_SEATS } from "./seats.ts";
@@ -185,6 +186,124 @@ export interface RoundWinner {
   votes: number;
 }
 
+/** Plan 06n (A7): the plan items a lane candidate's reviews meet — `met` (an
+ * R or C) or `fits` (an A) from a strict majority of the seats (2 of 3, 3 of
+ * 5), the same rule `tallyItem` applies to the phase's own reviews. A
+ * `partial` or a missing verdict is not a `met`, so [met, partial, partial]
+ * does not meet the item. */
+export function laneMetItems(candidate: LaneCandidateRecord, itemIds: readonly string[], seatCount?: number): Set<string> {
+  const reviews = candidate.reviews ?? [];
+  const needed = Math.floor((seatCount ?? reviews.length) / 2) + 1;
+  const out = new Set<string>();
+  for (const id of itemIds) {
+    let met = 0;
+    for (const r of reviews) {
+      const item = (r.review.items ?? []).find((i) => i.id === id)?.verdict;
+      const arch = (r.review.arch ?? []).find((a) => a.id === id)?.verdict;
+      if (item === "met" || arch === "fits") met += 1;
+    }
+    if (reviews.length > 0 && met >= needed) out.add(id);
+  }
+  return out;
+}
+
+/** Plan 06n (A7): the phase's best candidate. */
+export interface BestCandidate {
+  round: number;
+  lane: string;
+  sha: string;
+  /** The plan items it met (met or fits), in plan order. */
+  met: string[];
+}
+
+/** Plan 06n (A7): the phase's best candidate — of the candidates the phase
+ * adopted and evaluated (each earlier round's pick that was not rejected as a
+ * regression), the one whose reviews meet the most plan items, the later one
+ * on a tie. Only rounds before `beforeRound` count (a round's own lanes are
+ * compared against it, never against themselves). Derived from the round
+ * records alone, so it needs no state of its own and survives a restart. */
+export function bestCandidate(
+  rounds: readonly RoundRecord[],
+  itemIds: readonly string[],
+  seatCount: number,
+  beforeRound = Number.POSITIVE_INFINITY,
+): BestCandidate | undefined {
+  if (itemIds.length === 0) return undefined;
+  let best: BestCandidate | undefined;
+  for (const r of rounds) {
+    if (r.round >= beforeRound || !r.picked || r.regressed) continue;
+    const candidate = r.candidates.find((c) => c.lane === r.picked!.lane && c.sha === r.picked!.sha);
+    if (!candidate) continue;
+    const metSet = laneMetItems(candidate, itemIds, seatCount);
+    const met = itemIds.filter((id) => metSet.has(id));
+    if (!best || met.length >= best.met.length) best = { round: r.round, lane: r.picked.lane, sha: r.picked.sha, met };
+  }
+  return best;
+}
+
+/** Plan 06n (A7): what the pick compares each lane against — the plan's item
+ * ids, the seat count and the phase's best candidate. */
+export interface PickGuard {
+  best: BestCandidate;
+  itemIds: readonly string[];
+  seatCount: number;
+}
+
+/** Plan 06n (A7): the items the best candidate met that this lane's reviews
+ * do not meet. A lane that lost none is eligible at the pick. */
+export function lostItems(candidate: LaneCandidateRecord, guard: PickGuard): string[] {
+  const met = laneMetItems(candidate, guard.itemIds, guard.seatCount);
+  return guard.best.met.filter((id) => !met.has(id));
+}
+
+/** Plan 06n (A7/R9b): each passing lane's lost items, when two or more lanes
+ * passed and every one of them lost an item — the round picks no lane and the
+ * next round restarts every lane from the best candidate. Undefined when some
+ * lane lost nothing (or fewer than two lanes passed). */
+export function everyLaneLost(round: RoundRecord, guard: PickGuard | undefined): Record<string, string[]> | undefined {
+  if (!guard) return undefined;
+  const passing = passingCandidates(round);
+  if (passing.length < 2) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const c of passing) {
+    const lost = lostItems(c, guard);
+    if (lost.length === 0) return undefined;
+    out[c.lane] = lost;
+  }
+  return out;
+}
+
+/** Plan 06n (A7/R9c-d): the items the best candidate met that the picked
+ * candidate's evaluation does not meet AND whose not-met evidence anchors in
+ * a file the picked candidate changed against the best one — a regression.
+ * An item whose evidence anchors only in files unchanged since the best
+ * candidate is a newly found defect in old code, not a regression. Pure:
+ * `outcomes` are the evaluated item outcomes, `changed` is
+ * `diffNameOnly(best, picked)`. */
+export function regressedItems(
+  best: BestCandidate,
+  outcomes: ReadonlyArray<{ item: { id: string }; outcome: string; seats: ReadonlyArray<{ verdict: string; evidence: string }> }>,
+  changed: readonly string[],
+): string[] {
+  const byId = new Map(outcomes.map((o) => [o.item.id, o]));
+  const out: string[] = [];
+  for (const id of best.met) {
+    const o = byId.get(id);
+    if (!o || o.outcome === "met" || o.outcome === "fits") continue;
+    const evidence = o.seats.filter((s) => s.verdict !== "met" && s.verdict !== "fits").map((s) => s.evidence);
+    const anchored = evidence.some((e) => evidenceFileAnchors(e).some((a) => pathInList(a.path, changed)));
+    if (anchored) out.push(id);
+  }
+  return out;
+}
+
+/** Plan 06n (A7): the regression the status shows — the latest picked
+ * round's ITEMS_REGRESSED record, while no later round has picked. */
+export function latestRegression(rounds: readonly RoundRecord[] | undefined): { round: number; items: string[]; sha: string } | undefined {
+  const picked = [...(rounds ?? [])].reverse().find((r) => r.picked);
+  return picked?.regressed ? { round: picked.round, ...picked.regressed } : undefined;
+}
+
 /** `pickWinner(round, seats)` is the ONLY place that decides a round's
  * winner, in code, never by a model (plan 06g, A3):
  *
@@ -192,10 +311,30 @@ export interface RoundWinner {
  * - exactly one passes: it wins without a vote;
  * - two or more: the lane with a strict majority of the seats' pick votes
  *   (2 of 3, 3 of 5, 4 of 7) wins. A round whose votes give no lane a
- *   majority has no winner. */
-export function pickWinner(round: RoundRecord, seats: number | readonly string[], leader?: string): RoundWinner | undefined {
-  const passing = passingCandidates(round);
+ *   majority has no winner.
+ *
+ * Plan 06n (A7): with a `guard`, a lane that lost an item the phase's best
+ * candidate met is not eligible while another lane lost none; when every
+ * passing lane lost one, the round has no winner. */
+export function pickWinner(
+  round: RoundRecord,
+  seats: number | readonly string[],
+  leader?: string,
+  guard?: PickGuard,
+): RoundWinner | undefined {
+  let passing = passingCandidates(round);
   if (passing.length === 0) return undefined;
+  if (guard && passing.length > 1) {
+    const eligible = passing.filter((c) => lostItems(c, guard).length === 0);
+    if (eligible.length === 0) return undefined;
+    if (eligible.length === 1) {
+      // The only eligible lane wins whatever the votes; it keeps the votes it
+      // took.
+      const only = eligible[0];
+      return { lane: only.lane, sha: only.sha as string, votes: round.votes.filter((v) => v.lane === only.lane).length };
+    }
+    passing = eligible;
+  }
   if (passing.length === 1) return { lane: passing[0].lane, sha: passing[0].sha as string, votes: 0 };
   const seatList = typeof seats === "number" ? undefined : seats;
   const seatCount = typeof seats === "number" ? seats : seats.length;

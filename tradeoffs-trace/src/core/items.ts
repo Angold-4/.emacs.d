@@ -653,7 +653,7 @@ export interface VerdictContext {
 /** True when `path` (or the `:WHERE:` text) matches one of `files`. A
  * `file:line` anchor and a bare `file` name match each other: the line is a
  * locator, not part of the path. */
-function pathInList(path: string, files: readonly string[]): boolean {
+export function pathInList(path: string, files: readonly string[]): boolean {
   const norm = (p: string) => p.replace(/^(\.\/)+/, "").replace(/:\d+(?:-\d+)?$/, "");
   const p = norm(path);
   return files.some((f) => {

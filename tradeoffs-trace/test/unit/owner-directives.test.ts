@@ -12,6 +12,7 @@ import {
   allocateDirectiveId,
   buildReviewerPrompt,
   buildWorkerPrompt,
+  directiveItemsOwed,
   directiveLines,
   parseWithdrawInput,
   reviewerTurn2DirectiveSection,
@@ -208,4 +209,19 @@ test("owner-directives: the real turn-2 prompt builder uses that section (a stat
   const src = fs.readFileSync(new URL("../../src/conductor.ts", import.meta.url), "utf8");
   const turn2 = src.slice(src.indexOf("#buildReviewerTurn2Prompt"), src.indexOf("// -- publish", src.indexOf("#buildReviewerTurn2Prompt")));
   assert.ok(turn2.includes("reviewerTurn2DirectiveSection(phase.ownerDirectives)"), "turn 2 must spread the section");
+});
+
+test("plan 06n: only a numbered directive delivered since the last pick owes answers", () => {
+  const old = directive({ id: "OD-1", text: "1. keep the guard\n2. keep the docs", at: "2026-10-12T10:00:00.000Z" });
+  const plain = directive({ id: "OD-2", seq: 2, text: "do not touch the schema", at: "2026-10-12T12:00:00.000Z" });
+  const fresh = directive({ id: "OD-3", seq: 3, text: "1. add the guard\n2. update the docs\n3. add the test", at: "2026-10-12T12:00:00.000Z" });
+  const withdrawn = directive({ id: "OD-4", seq: 4, text: "1. a\n2. b", at: "2026-10-12T12:00:00.000Z", status: "withdrawn" });
+  const all = [old, plain, fresh, withdrawn];
+  // Before any pick every numbered in-force directive is owed.
+  assert.deepEqual(directiveItemsOwed(all, undefined).map((i) => i.id), ["OD-1.1", "OD-1.2", "OD-3.1", "OD-3.2", "OD-3.3"]);
+  // After a pick at 11:00, OD-1 (delivered before it) owes nothing; a plain
+  // directive and a withdrawn one never owe an answer.
+  assert.deepEqual(directiveItemsOwed(all, "2026-10-12T11:00:00.000Z").map((i) => i.id), ["OD-3.1", "OD-3.2", "OD-3.3"]);
+  // After a later pick, nothing is owed.
+  assert.deepEqual(directiveItemsOwed(all, "2026-10-12T13:00:00.000Z"), []);
 });

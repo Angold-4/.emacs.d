@@ -838,3 +838,99 @@ test("owner-directives: withdrawing a program ruling from a run's own box retire
     await h.cleanup();
   }
 });
+
+test("plan 06n: a submission missing an answer to a numbered steer item is refused, and the answers reach the reviewers", async () => {
+  const dir = shortTmp("tt-dir-numbered");
+  const promptLogs = new Map<Reviewer, string>();
+  for (const r of ["M", "A", "B"] as Reviewer[]) promptLogs.set(r, path.join(dir, `reviewer-${r}-prompts.log`));
+  const text = "1. add the guard\n2. update the docs\n3. add the test";
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        // Stay up long enough for the owner's numbered steer to arrive.
+        { kind: "sleep", ms: 4_000 },
+        // Only OD-1.1 answered: refused, naming OD-1.2 and OD-1.3.
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [], directiveAnswers: [{ id: "OD-1.1", status: "done", where: "src/a.ts:1" }] } },
+        // A not-done answer with no reason: refused.
+        {
+          kind: "call-submit",
+          tool: "submit_phase",
+          args: {
+            decisions: [],
+            assumptions: [],
+            deviations: [],
+            directiveAnswers: [
+              { id: "OD-1.1", status: "done", where: "src/a.ts:1" },
+              { id: "OD-1.2", status: "not-done" },
+              { id: "OD-1.3", status: "done", where: "test/a.test.ts" },
+            ],
+          },
+        },
+        // Complete: accepted.
+        {
+          kind: "call-submit",
+          tool: "submit_phase",
+          args: {
+            decisions: [],
+            assumptions: [],
+            deviations: [],
+            directiveAnswers: [
+              { id: "OD-1.1", status: "done", where: "src/a.ts:1" },
+              { id: "OD-1.2", status: "not-done", reason: "the docs live in another phase" },
+              { id: "OD-1.3", status: "done", where: "test/a.test.ts" },
+            ],
+          },
+        },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => ({
+      hello: defaultReviewerHello(),
+      steps: [
+        { kind: "call-submit", tool: "submit_discovery", args: { discoveries: [] } },
+        { kind: "wait-for-prompt" },
+        submitReviewStep(reviewer, state),
+      ],
+    }),
+    extraReviewerEnv: (reviewer) => ({ FAKE_PI_PROMPT_LOG: promptLogs.get(reviewer)! }),
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.agentPgids.some((a) => a.role === "worker"), 30_000);
+    writeCommand(setup.runDir, "cmd-numbered", inputCommand(setup, "steer", text));
+    await waitFor(() => (directives(setup).find((d) => d.commandId === "cmd-numbered")?.deliveries.worker ?? "") === "delivered", 20_000);
+
+    // The submission is accepted only with all three items answered.
+    await waitFor(() => eventsOfType(setup.runDir, "SUBMIT_PHASE").length === 1, 60_000);
+    const refusals = readEvents(setup.runDir)
+      .filter((r) => r.kind === "directive_answer_refused")
+      .map((r) => String((r.event as { reason?: string }).reason ?? ""));
+    assert.ok(refusals.some((r) => /OD-1\.2/.test(r) && /OD-1\.3/.test(r)), `the first refusal names the missing items: ${refusals.join(" | ")}`);
+    assert.ok(refusals.some((r) => /not-done/.test(r) && /reason/.test(r)), `a not-done answer without a reason is refused: ${refusals.join(" | ")}`);
+    assert.equal(eventsOfType(setup.runDir, "SUBMIT_PHASE").length, 1, "exactly one accepted submission");
+
+    // The reviewers see each item's status.
+    await waitFor(
+      () =>
+        (["M", "A", "B"] as Reviewer[]).every((r) => {
+          const log = fs.existsSync(promptLogs.get(r)!) ? fs.readFileSync(promptLogs.get(r)!, "utf8") : "";
+          return log.includes("Turn 1 of 2") && log.includes("OD-1.1: done");
+        }),
+      90_000,
+    );
+    for (const r of ["M", "A", "B"] as Reviewer[]) {
+      const prompts = fs.readFileSync(promptLogs.get(r)!, "utf8");
+      assert.match(prompts, /- OD-1\.1: done \(where: src\/a\.ts:1\)/, `${r} sees OD-1.1 done`);
+      assert.match(prompts, /- OD-1\.2: not-done \(reason: the docs live in another phase\)/, `${r} sees OD-1.2 not-done`);
+      assert.match(prompts, /- OD-1\.3: done \(where: test\/a\.test\.ts\)/, `${r} sees OD-1.3 done`);
+    }
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

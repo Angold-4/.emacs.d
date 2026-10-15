@@ -655,6 +655,11 @@ so an old plan reaches the loop as items without changing meaning."
          ;; and evaluator prompts.
          (golden (or (org-element-property :GOLDEN hl)
                      (+tt--keyword "TT_GOLDEN")))
+         ;; Plan 06n (A5): the wide-path globs. A phase's own :WIDE_PATHS:
+         ;; overrides the plan's #+TT_WIDE_PATHS;; a candidate whose diff
+         ;; touches one runs the final check in its round.
+         (wide-paths (or (org-element-property :WIDE_PATHS hl)
+                         (+tt--keyword "TT_WIDE_PATHS")))
          ;; Plan 06h: the reviewer seats and their leader. A phase's own
          ;; :REVIEWERS:/:LEADER: overrides the plan's #+TT_REVIEWERS/#+TT_LEADER;
          ;; a plan that names neither keeps the fixed M A B, led by M.
@@ -723,6 +728,8 @@ so an old plan reaches the loop as items without changing meaning."
                 `((variantLimit . ,(+tt--count-value variant-limit))))
             ,@(when golden
                 `((golden . ,(string-trim golden))))
+            ,@(when wide-paths
+                `((widePaths . ,(vconcat (split-string wide-paths "[ \t,]+" t)))))
             ,@(when reviewers
                 `((seats . ,(vconcat (split-string reviewers "[ \t,]+" t)))))
             ,@(when leader

@@ -473,6 +473,44 @@ export function recordClassified(phase: PhaseState, source: "finding" | "decisio
   return isContractFinding(phase, id) || isConductorItemFinding(phase, id) || isClassified(phase, id);
 }
 
+/** Plan 06n (A2): the plan item ids of the phase's frozen contract (R*, A*,
+ * C*), from the items the phase declares. A finding whose evidence names one
+ * is a plan contradiction by construction. */
+export function planItemIds(phase: PhaseState): Set<string> {
+  const ids = new Set<string>();
+  for (const item of phase.contract.requirements ?? []) ids.add(item.id);
+  for (const item of phase.contract.architecture ?? []) ids.add(item.id);
+  for (const item of phase.contract.constraints ?? []) ids.add(item.id);
+  return ids;
+}
+
+/** Plan 06n (A2): the ids of the owner directives in force in this phase
+ * (`OD-n`). A withdrawn directive never counts. */
+export function inForceDirectiveIds(phase: PhaseState): Set<string> {
+  const ids = new Set<string>();
+  for (const d of phase.ownerDirectives ?? []) if (d.status === "in-force") ids.add(d.id);
+  return ids;
+}
+
+/** Plan 06n (A2): true when `text` names one of `ids` as a whole token, so
+ * `R1` is cited but `R10` is not. Pure. */
+export function citesAnyId(text: string, ids: ReadonlySet<string>): boolean {
+  if (!text || ids.size === 0) return false;
+  for (const id of ids) {
+    const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(?:^|[^A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`).test(text)) return true;
+  }
+  return false;
+}
+
+/** Plan 06n (A2): true when the evidence cites a plan item of the phase or an
+ * in-force owner directive. Such a record is a plan contradiction (a fix),
+ * whatever the golden note says. */
+export function citesPlanOrDirective(phase: PhaseState, evidence: string | undefined): boolean {
+  if (!evidence) return false;
+  return citesAnyId(evidence, planItemIds(phase)) || citesAnyId(evidence, inForceDirectiveIds(phase));
+}
+
 /** Plan 06i (A3): a `contract` classification must be grounded in the golden
  * note when the phase declares one — a distinctive run of the note's own
  * words, so an evaluator cannot assert a contradiction it did not read. */
@@ -487,6 +525,15 @@ export function goldenCited(phase: PhaseState, evidence: string): boolean {
   return matched >= Math.min(3, sig.length) && matched / sig.length >= 0.5;
 }
 
+/** Plan 06n (A2/R3): true when the finding's latest owner request was
+ * resolved with the `repair` option, so the owner already sent it to repair
+ * and it must not be escalated again. */
+export function latestRequestRepair(phase: PhaseState, findingId: string): boolean {
+  const requests = (phase.ownerRequests ?? []).filter((r) => r.linkedFindingId === findingId);
+  const latest = requests[requests.length - 1];
+  return latest?.resolution?.option === "repair";
+}
+
 /** The triage evidence for one finding, assembled from facts the conductor
  * and the evaluator established. Nothing here is model-invented: the
  * judgement fields come from the evaluator's own check, never stock text. */
@@ -498,6 +545,12 @@ export function evidenceForFinding(finding: Finding, phase: PhaseState): TriageE
   const impact = impactOverride(phase, finding.id) ?? (contractFinding ? "contract" : conductorItemFinding ? "wrong-output" : undefined);
   if (finding.status === "repaired") {
     return { classified: true, fate: "repaired", fateReason: `repaired at candidate ${(finding.repairedByCandidateSha ?? "").slice(0, 8) || "a later candidate"}` };
+  }
+  // Plan 06n (A2/R3): the owner already resolved this finding's request as
+  // `repair`, so it is a fix that blocks until it is actually repaired; it
+  // must never open another owner request.
+  if (latestRequestRepair(phase, finding.id)) {
+    return { classified: true, fate: "repaired", fateReason: "the owner resolved this finding's request as repair" };
   }
   if (finding.status === "merged") {
     return { classified: true, fate: "disproved", fateReason: `merged into ${finding.mergedInto ?? "an existing record"}` };
@@ -516,6 +569,10 @@ export function evidenceForFinding(finding: Finding, phase: PhaseState): TriageE
   const contractImpact = contractFinding || (check?.verdict === "confirmed" && impact === "contract");
   const hasGolden = typeof phase.contract.golden === "string" && phase.contract.golden.trim().length > 0;
   const cited = contractImpact && check ? goldenCited(phase, check.evidence) : false;
+  // Plan 06n (A2): evidence that names a plan item of the phase or an
+  // in-force owner directive is a classified plan contradiction (a fix), not
+  // an ungrounded contract classification that escalates.
+  const planCited = contractImpact && (citesPlanOrDirective(phase, finding.evidence) || (check ? citesPlanOrDirective(phase, check.evidence) : false));
   // A round-panel drop is the recorded review outcome: the panel voted not to
   // keep the finding blocking. An evaluator/reviewer severity change is not.
   const panelDropped = finding.severity === "advisory" && finding.severityChangedBy === "panel";
@@ -526,18 +583,19 @@ export function evidenceForFinding(finding: Finding, phase: PhaseState): TriageE
     // otherwise the record is unclassified and escalates (A3's golden
     // re-check). A reviewer's severity label NEVER classifies a record: only
     // an evaluator's confirmed impact does.
-    classified: classified && (!contractImpact || !hasGolden || cited),
+    classified: classified && (planCited || !contractImpact || !hasGolden || cited),
     wrongOutputConfirmed: check?.verdict === "confirmed" && impact === "wrong-output",
     contradictsGolden: cited,
-    contradictsPlan: contractImpact && (!hasGolden || !check),
+    contradictsPlan: planCited || (contractImpact && (!hasGolden || !check)),
     // The judgement fields are the evaluator's own, never stock text, and a
     // missing one is NEVER borrowed from another field: without all three the
     // record escalates (A2/R4).
     chosen: check?.chosen,
     alternative: check?.alternative,
     why: check?.why,
-    reason:
-      contractImpact && hasGolden && !cited
+    reason: planCited
+      ? `the finding cites a plan item or an in-force owner directive: ${finding.evidence}`
+      : contractImpact && hasGolden && !cited
         ? `the contract classification does not cite the golden note`
         : check?.verdict === "confirmed" && impact === "wrong-output"
           ? `wrong output confirmed by the evaluator: ${check.evidence}`
@@ -566,18 +624,22 @@ export function evidenceForDecision(decision: Decision, phase: PhaseState, voteF
   const contractImpact = check?.verdict === "confirmed" && impact === "contract";
   const hasGolden = typeof phase.contract.golden === "string" && phase.contract.golden.trim().length > 0;
   const cited = contractImpact && check ? goldenCited(phase, check.evidence) : false;
+  // Plan 06n (A2): a check whose evidence names a plan item or an in-force
+  // owner directive is a plan contradiction, exactly as for a finding.
+  const planCited = contractImpact && check ? citesPlanOrDirective(phase, check.evidence) : false;
   return {
-    classified: classified && (!contractImpact || !hasGolden || cited),
+    classified: classified && (planCited || !contractImpact || !hasGolden || cited),
     noBallots,
     failedVoteChangesOutput: voteFailed,
     wrongOutputConfirmed: check?.verdict === "confirmed" && impact === "wrong-output",
     contradictsGolden: cited,
-    contradictsPlan: contractImpact && !hasGolden,
+    contradictsPlan: planCited || (contractImpact && !hasGolden),
     chosen: check?.chosen,
     alternative: check?.alternative,
     why: check?.why,
-    reason:
-      contractImpact && hasGolden && !cited
+    reason: planCited
+      ? `the decision cites a plan item or an in-force owner directive: ${check?.evidence ?? ""}`
+      : contractImpact && hasGolden && !cited
         ? `the contract classification of ${decision.id} does not cite the golden note`
         : noBallots
           ? `decision ${decision.id} received no ballots`
