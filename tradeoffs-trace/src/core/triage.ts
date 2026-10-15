@@ -618,6 +618,18 @@ export function evidenceForDecision(decision: Decision, phase: PhaseState, voteF
   if (phase.candidate && decision.boundCandidateSha !== phase.candidate.sha) {
     return { classified: true, fate: "superseded", fateReason: `superseded by candidate ${phase.candidate.sha.slice(0, 8)}` };
   }
+  // A decision the owner ruled on (same id and choice, plan 06k1 A2) or an
+  // amendment already applied to the contract is settled; the evaluator never
+  // classifies such records, so without this they escalated as unclassified
+  // and reopened a blocking owner request on every new candidate (mm 02a run
+  // 9617119b, 2026-10-15: amendment A-55 raised four times, three repair
+  // rounds spent).
+  if ((phase.ruledDecisions ?? []).some((r) => r.id === decision.id && r.choice === decision.choice)) {
+    return { classified: true, fate: "accepted", fateReason: "ruled by the owner" };
+  }
+  if (decision.amendment?.status === "applied") {
+    return { classified: true, fate: "accepted", fateReason: `amendment ${decision.amendment.id} applied to the contract` };
+  }
   // Only a decision that NEEDS a vote (delegated or reserved) can disappear
   // by receiving none. A `detail` decision is settled by its class.
   const noBallots = decision.class !== "detail" && !(phase.ballots ?? []).some((b) => b.decisionId === decision.id);
