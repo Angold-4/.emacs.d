@@ -106,6 +106,22 @@ function acceptHolds(s: State): boolean {
   return Boolean(s.phase.candidate) && accept(s.phase, s.phase.candidate!.sha, s.phase.contract.contractVersion);
 }
 
+/** The checks record a passing final check leaves: the candidate's checks
+ * passed, at the final tier. */
+function finalChecksPassedRecord(s: State): NonNullable<PhaseState["checks"]> {
+  return { candidateSha: s.phase.candidate!.sha, passed: true, tier: "final" };
+}
+
+/** acceptHolds() for a FINAL_CHECKS_PASSED event, judged on the state the
+ * passing final check produces rather than the record it replaces. After a
+ * failed final check and `tt recheck`, `phase.checks` still holds the failed
+ * final record (applyRecheck keeps it for the re-run), so the pre-event state
+ * rejected every final check that passed only on a recheck and the run sat in
+ * FINAL_CHECKING (index 20e run d3db1625, 2026-10-15). */
+function acceptHoldsOnFinalPass(s: State): boolean {
+  return Boolean(s.phase.candidate) && acceptHolds(withPhase(s, { checks: finalChecksPassedRecord(s) }));
+}
+
 /** Plan 06j (A3): a recheck is available only for the current candidate whose
  * own checks just failed. A passed check, an interrupted run or a newer
  * candidate (the recorded check sha no longer matches) refuses it. */
@@ -1283,7 +1299,7 @@ addRow({
   from: "FINAL_CHECKING",
   trigger: "FINAL_CHECKS_PASSED",
   guardName: "acceptHoldsAndNoGate",
-  guard: (s) => acceptHolds(s) && !gateDeclared(s),
+  guard: (s) => acceptHoldsOnFinalPass(s) && !gateDeclared(s),
   to: "ACCEPTED",
   actions: [{ type: "publish_intent", expectedHead: "H0", candidateI: "I1" }],
   apply: (s) => {
@@ -1297,6 +1313,7 @@ addRow({
       phase: "ACCEPTED",
       corrections,
       finalChecksPassedFor: C,
+      checks: finalChecksPassedRecord(s),
       inFlight: clearInFlight(s.phase, "run_final_checks"),
     });
   },
@@ -1308,14 +1325,14 @@ addRow({
   from: "FINAL_CHECKING",
   trigger: "FINAL_CHECKS_PASSED",
   guardName: "acceptHoldsAndGateDeclared",
-  guard: (s) => acceptHolds(s) && gateDeclared(s),
+  guard: (s) => acceptHoldsOnFinalPass(s) && gateDeclared(s),
   to: "GATING",
   actions: [{ type: "run_gate", candidateSha: "C1" }],
   apply: (s) =>
     withPhase(s, {
       phase: "GATING",
       finalChecksPassedFor: s.phase.candidate?.sha ?? "",
-      checks: { candidateSha: s.phase.candidate!.sha, passed: true, tier: "final" },
+      checks: finalChecksPassedRecord(s),
       inFlight: clearInFlight(s.phase, "run_final_checks"),
     }),
 });
@@ -1330,7 +1347,7 @@ addRow({
   from: "FINAL_CHECKING",
   trigger: "FINAL_CHECKS_PASSED",
   guardName: "queuedCorrectionBlocksAcceptance",
-  guard: (s) => !acceptHolds(s) && (s.phase.queuedCorrections ?? []).length > 0,
+  guard: (s) => !acceptHoldsOnFinalPass(s) && (s.phase.queuedCorrections ?? []).length > 0,
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING", inFlight: clearInFlight(s.phase, "run_final_checks") }),
