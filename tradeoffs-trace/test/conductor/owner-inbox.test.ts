@@ -349,3 +349,61 @@ test("owner-inbox: an empty (still-being-written) file is retried, never rejecte
     cleanupDir(setup.scriptsDir);
   }
 });
+
+// tt 09-5: on 2026-10-25 a repair-budget gate on a phase whose every attempt
+// produced nothing could not be answered — the binding needs a candidate and
+// the phase had none. The decision view now binds NO_CANDIDATE ("none"), and
+// the gate's grant and stop move the phase with no candidate at all.
+test("tt 09-5: a budget gate on a phase with no candidate resolves with grant, then with stop", async () => {
+  const setup = await setupConductor({
+    checks: ["true"],
+    // The worker never submits: every attempt times out with no candidate.
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "hang-forever" }] }),
+    deadlines: { ...FAST, workerAttemptMs: 1_500 },
+  });
+  await setup.conductor.start();
+  try {
+    const parked = () => {
+      const p = setup.conductor.state.phase;
+      return p.phase === "AWAITING_OWNER" ? openRequests(setup.conductor.state).find((r) => r.origin === "repair_budget_exhausted") : undefined;
+    };
+    const resolve = (id: string, request: OwnerRequest, option: string) =>
+      writeCommand(setup, id, {
+        commandId: id,
+        type: "resolve",
+        recordKind: "request",
+        option,
+        binding: {
+          runId: setup.conductor.state.phase.runId,
+          phaseId: "p1",
+          candidateSha: "none",
+          contractVersion: setup.conductor.state.phase.contract.contractVersion,
+          recordId: request.id,
+          recordVersion: request.version,
+        },
+      });
+
+    await waitFor(() => parked() !== undefined, 90_000);
+    assert.equal(setup.conductor.state.phase.candidate, undefined, "the gate is on a phase with no candidate");
+    const first = parked()!;
+    const granted = setup.conductor.state.phase.repairRoundsGranted;
+    resolve("cmd-grant", first, "grant");
+    await waitFor(() => eventsOfType(setup, "OWNER_REQUEST_RESOLVED").length === 1, 15_000);
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 0, "the no-candidate binding is not stale");
+    assert.ok(setup.conductor.state.phase.repairRoundsGranted >= granted + 1, "grant gives one more round");
+
+    // The granted attempt also produces nothing, so the gate parks again.
+    await waitFor(() => {
+      const r = parked();
+      return r !== undefined && r.id !== first.id;
+    }, 60_000);
+    resolve("cmd-stop", parked()!, "stop");
+    await waitFor(() => setup.conductor.state.phase.phase === "BLOCKED", 15_000);
+    assert.match(setup.conductor.state.phase.blockedReason ?? "", /stopped by the owner/);
+    assert.equal(readEvents(setup.runDir).filter((r) => r.kind === "command_rejected").length, 0);
+  } finally {
+    await setup.conductor.stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
+  }
+});

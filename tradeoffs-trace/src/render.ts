@@ -16,6 +16,7 @@ import * as path from "node:path";
 import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest, RoundRecord } from "./core/types.ts";
 import { candidateLabel, latestRegression } from "./core/rounds.ts";
 import { seatsOf } from "./core/seats.ts";
+import { wireCandidateSha } from "./core/binding.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
   projectEntries,
@@ -515,12 +516,14 @@ export function projectEntryReview(
         ownerRequests: phase.ownerRequests,
         decisions: phase.decisions,
         overrides: phase.overrides,
+        // tt 09-5: a phase with no candidate binds NO_CANDIDATE, so a brief
+        // on it (a budget gate) can still be resolved.
         resolveBinding:
-          phase.contract?.contractVersion && phase.candidate?.sha && phase.runId && phase.phaseId
+          phase.contract?.contractVersion && phase.runId && phase.phaseId
             ? {
                 runId: phase.runId,
                 phaseId: phase.phaseId,
-                candidateSha: phase.candidate.sha,
+                candidateSha: wireCandidateSha(phase.candidate?.sha),
                 recordVersion: 1,
                 contractVersion: phase.contract.contractVersion,
               }
