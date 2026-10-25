@@ -2010,7 +2010,10 @@ async function cmdInput(runArg: string, root: string, file?: string): Promise<vo
   const kind = typeof raw.type === "string" ? raw.type : typeof raw.kind === "string" ? raw.kind : "input";
   const commandId = `input-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
   let command = raw;
-  if (!("binding" in raw)) {
+  // Only the decision-view form (`type`) carries a binding; the flat `kind`
+  // form names its own binding fields and the schema refuses an extra one
+  // (exex 01a1: a flat `resolve` was rejected because a binding was added).
+  if (!("binding" in raw) && typeof raw.kind !== "string") {
     const state = rebuildState(runDir, readPlan(runDir), { lenient: true });
     command = { ...raw, binding: { runId: state.phase.runId, phaseId: state.phase.phaseId } };
   }
