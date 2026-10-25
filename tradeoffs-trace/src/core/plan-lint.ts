@@ -55,7 +55,9 @@ export type LintRule =
   // reports it missing on every candidate, a gate no owner command waives.
   | "verify-reach"
   // `#+TT_WORKER_PROMPT`: an unknown lane, an empty path or an unreadable file.
-  | "worker-prompt";
+  | "worker-prompt"
+  // tt 09-1: a cheap command that only the final (acceptance) check runs.
+  | "cheap-final-check";
 
 /** The roles #+TT_MODELS may assign a model to. */
 const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
@@ -198,6 +200,9 @@ export interface LintPhaseInput {
 export interface LintPlanInput {
   /** The Org file this JSON came from, when known. */
   sourceFile?: string;
+  /** tt 09-1: the plan's global round checks (`#+TT_CHECKS:`), which every
+   * candidate runs before the phase's own :CHECKS:. */
+  checks?: string[];
   /** Plan 06j (A1): the absolute path of the git repository the plan runs
    * on (`#+TT_REPO:`). The coverage rule reads it; absent means no coverage
    * facts and no coverage warnings. */
@@ -728,7 +733,7 @@ export function lintPhaseSeats(phase: LintPhaseInput, plan: LintPlanInput): Lint
 /** Lint one plan (all its phases' acceptance items, its structured items,
  * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan), ...lintWorkerPrompt(plan)];
+  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan), ...lintWorkerPrompt(plan), ...lintCheapFinalChecks(plan)];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
     // Plan 06k2 (A8, finding A-4): a phase-level :VARIANT_LIMIT: below 2 is
@@ -1219,6 +1224,138 @@ export function checkCoverageWarnings(plan: LintPlanInput, repo: RepoFacts): Lin
       problem: "the repository's CI runs `cargo fmt --all`, but no phase check or final check does",
       fix: "add `cargo fmt --all --check` to the phase's :FINAL_CHECKS:, or a plan-wide #+TT_FINAL_CHECKS:",
     });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// tt 09-1: a cheap check that runs only at acceptance
+// ---------------------------------------------------------------------------
+//
+// exex 01a showed "green" candidates with the work undone (fact Vecs left,
+// tests emptied): the cheap mechanical checks that would have caught them (rg,
+// git diff, file sets, jq) sat in #+TT_FINAL_CHECKS, which runs only on the
+// candidate about to be accepted. Green must mean the items' mechanical
+// checks pass, so a cheap acceptance-only segment is a warning: it belongs in
+// #+TT_CHECKS too, where every candidate runs it and the fix loop returns it to
+// the lane like a compile error. Only genuinely slow work stays final-only.
+
+/** The top-level ` && ` segments of one shell command, trimmed. A `&&` inside
+ * quotes, `$( … )`, `( … )` or backticks does not split; `||`, `;` and pipes
+ * never split (they are part of their segment). */
+export function topLevelAndSegments(command: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let single = false;
+  let double = false;
+  let backtick = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (single) {
+      if (ch === "'") single = false;
+      continue;
+    }
+    if (ch === "\\") {
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      double = !double;
+      continue;
+    }
+    if (ch === "`") {
+      backtick = !backtick;
+      continue;
+    }
+    if (backtick) continue;
+    // `$( … )` nests inside double quotes, so parentheses count there too.
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    if (double) continue;
+    if (ch === "'") {
+      single = true;
+      continue;
+    }
+    if (depth === 0 && ch === "&" && command[i + 1] === "&") {
+      out.push(command.slice(start, i).trim());
+      start = i + 2;
+      i += 1;
+    }
+  }
+  out.push(command.slice(start).trim());
+  return out.filter((s) => s.length > 0);
+}
+
+/** Programs whose run is a build, a test suite or a gate tt cannot call cheap. */
+const EXPENSIVE_PROGRAMS = new Set(["cargo", "npm", "npx", "pnpm", "yarn", "ast-grep"]);
+/** Scripts that build or replay a corpus (exex's reference harness, Verus). */
+const EXPENSIVE_SCRIPTS = new Set(["verus-verify.sh", "reference.sh"]);
+/** A segment that only sets up the shell checks nothing on its own. */
+const SETUP_WORDS = new Set(["cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", ":"]);
+
+/** True when one check segment is cheap: it invokes no cargo (`cargo xtask`
+ * included), npm/ast-grep, scripts/verus-verify.sh, reference.sh or release
+ * build. Single-quoted text is a literal (an rg/grep pattern), never a
+ * command, so `rg 'cargo'` is still cheap. */
+export function isCheapCheckSegment(segment: string): boolean {
+  const unquoted = segment.replace(/'[^']*'/g, "''");
+  const words = unquoted.split(/[\s;|&()<>`"$!]+/).filter(Boolean);
+  for (const w of words) {
+    const base = w.split("/").pop() ?? w;
+    if (EXPENSIVE_PROGRAMS.has(base) || base.startsWith("cargo-")) return false;
+    if (EXPENSIVE_SCRIPTS.has(base)) return false;
+    if (w === "--release" || w === "--profile=release") return false;
+  }
+  return true;
+}
+
+function normalizeSegment(segment: string): string {
+  return segment.replace(/\s+/g, " ").trim();
+}
+
+/** tt 09-1: per phase, a warning for each cheap top-level segment of the final
+ * check that the round checks (#+TT_CHECKS plus the phase's :CHECKS:) do not
+ * also run. A segment that only reads what an earlier, slow segment of the
+ * same chain wrote (`cargo run … > out.txt && grep … out.txt`) cannot run
+ * alone and is not reported; neither is a shell setup word (`cd dir`). */
+export function lintCheapFinalChecks(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  for (const phase of plan.phases ?? []) {
+    const finals = (phase.finalChecks ?? []).filter((c) => c.trim().length > 0);
+    if (finals.length === 0) continue;
+    const roundSegments = new Set(
+      [...(plan.checks ?? []), ...(phase.checks ?? [])].flatMap((c) => [normalizeSegment(c), ...topLevelAndSegments(c).map(normalizeSegment)]),
+    );
+    const seen = new Set<string>();
+    for (const final of finals) {
+      const written: string[] = [];
+      for (const segment of topLevelAndSegments(final)) {
+        const key = normalizeSegment(segment);
+        const reads = written.some((file) => segment.includes(file));
+        // A `>` inside a single-quoted pattern (`rg 'Vec<Fact>'`) is no redirect.
+        // A path under target/ an earlier segment names (`--timing
+        // target/t.json`) is that segment's output too.
+        const unquoted = segment.replace(/'[^']*'/g, "''");
+        for (const m of unquoted.matchAll(/>{1,2}\s*([\w./-]+)/g)) if (m[1] !== "/dev/null") written.push(m[1]);
+        for (const m of unquoted.matchAll(/(?:^|[\s=])(target\/[\w./-]+)/g)) written.push(m[1]);
+        if (seen.has(key) || roundSegments.has(key) || reads) continue;
+        const first = key.replace(/^!\s*/, "").split(" ")[0] ?? "";
+        if (SETUP_WORDS.has(first) || /^[A-Za-z_][A-Za-z0-9_]*=\S*$/.test(key)) continue;
+        if (!isCheapCheckSegment(segment)) continue;
+        seen.add(key);
+        out.push({
+          severity: "warning",
+          rule: "cheap-final-check",
+          phaseId: phase.id ?? "?",
+          item: key,
+          line: phase.line,
+          sourceFile: plan.sourceFile,
+          problem: `the acceptance-only check \`${key}\` is cheap; put it in #+TT_CHECKS too, so a candidate that has not done it cannot go green`,
+          fix: "add the command to #+TT_CHECKS (or the phase's :CHECKS:); keep only slow work (cargo, release builds, reference.sh, Verus) final-only",
+        });
+      }
+    }
   }
   return out;
 }

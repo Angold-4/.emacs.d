@@ -378,8 +378,12 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const variantLimitValue = parseCount(variantLimit);
   const repo = first("TT_REPO")?.value;
   const labels = first("TT_LABELS");
+  // tt 09-1: the global round checks, as one command (as Emacs sends it), so
+  // the cheap-final-check rule sees what every candidate already runs.
+  const globalChecks = first("TT_CHECKS")?.value?.trim();
   return {
     ...(sourceFile ? { sourceFile } : {}),
+    ...(globalChecks ? { checks: [globalChecks] } : {}),
     ...(repo && repo.trim().length > 0 ? { repo: repo.trim() } : {}),
     ...(envFile && envFile.trim().length > 0 ? { envFile: envFile.trim() } : {}),
     ...(labels ? { labels: splitList(labels.value) } : {}),
