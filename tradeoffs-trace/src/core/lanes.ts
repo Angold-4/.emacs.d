@@ -159,6 +159,11 @@ export interface RoundOutcome {
   stopped?: boolean;
 }
 
+/** exex 01a2: at most this many fixes of a red candidate per lane per round;
+ * past it the red candidate is the lane's record and the next round starts
+ * from it. */
+export const MAX_LANE_FIXES = 5;
+
 function errorNote(err: unknown): string {
   return String((err as Error)?.message ?? err);
 }
@@ -263,7 +268,9 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
         // has time. Its worker fixes the failure on its own candidate and
         // submits again; each new commit is submitted and checked like the
         // first. Only a green candidate, or a lane out of time, ends the loop.
-        while (!check.ok && host.fixLane && !host.stopRequested?.()) {
+        let fixes = 0;
+        while (!check.ok && host.fixLane && fixes < MAX_LANE_FIXES && !host.stopRequested?.()) {
+          fixes += 1;
           let fixed: LaneBuild;
           try {
             fixed = await host.fixLane(build.lane, ctx.round, build.sha!, check.note ?? "the checks failed");

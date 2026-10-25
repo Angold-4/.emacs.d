@@ -8582,7 +8582,14 @@ export class Conductor {
       `The failure: ${failure}`,
       ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
     ].join("\n");
-    return this.#buildLane(lane, round, sha, prompt, { of: sha, timeoutMs: remainingMs });
+    const fixed = await this.#buildLane(lane, round, sha, prompt, { of: sha, timeoutMs: remainingMs });
+    // A "fix" whose tree is the red candidate's own tree changed nothing:
+    // checking it again would only repeat the failure, so the loop ends.
+    if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
+      this.#log.append("lane_fix_unchanged", { lane, round, sha, fixedSha: fixed.sha });
+      return { lane, note: `the lane's fix of ${sha.slice(0, 7)} changed nothing` };
+    }
+    return fixed;
   }
 
   /** exex 01a2: the lines of a failed candidate's check output a worker needs
