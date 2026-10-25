@@ -253,6 +253,11 @@ export interface PickGuard {
  * do not meet. A lane that lost none is eligible at the pick. */
 export function lostItems(candidate: LaneCandidateRecord, guard: PickGuard): string[] {
   const met = laneMetItems(candidate, guard.itemIds, guard.seatCount);
+  // Progress is measured as a whole: a lane that meets more plan items than
+  // the best candidate moved the phase forward even if it traded some away,
+  // and the items it lost are repair targets, not a veto. Without this a
+  // stub that met only the easy items outranked the work every seat picked.
+  if (met.size > guard.best.met.length) return [];
   return guard.best.met.filter((id) => !met.has(id));
 }
 
@@ -286,6 +291,10 @@ export function regressedItems(
   changed: readonly string[],
 ): string[] {
   const byId = new Map(outcomes.map((o) => [o.item.id, o]));
+  // As in `lostItems`: a pick that meets more plan items than the best
+  // candidate is progress, so nothing it lost counts as a regression.
+  const pickMet = outcomes.filter((o) => o.outcome === "met" || o.outcome === "fits").length;
+  if (pickMet > best.met.length) return [];
   const out: string[] = [];
   for (const id of best.met) {
     const o = byId.get(id);
