@@ -563,7 +563,17 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!round.lanes.includes(event.lane)) {
         return rejected(state, `CANDIDATE_CHECKED names lane ${event.lane}, not a lane of round ${event.round}`);
       }
-      const candidates = upsertLane(round.candidates, event.lane, { ok: event.ok, ...(event.note ? { note: event.note } : {}) });
+      // 09-2 (async review): a candidate's reviews start when it is
+      // submitted, while its checks run. A failed check discards any review
+      // that already landed: a red candidate's reviews never count, and the
+      // lane's fixed candidate is reviewed afresh from its own submission.
+      const patch: Partial<import("./types.ts").LaneCandidateRecord> = { ok: event.ok, ...(event.note ? { note: event.note } : {}) };
+      const candidates = upsertLane(round.candidates, event.lane, patch).map((c) => {
+        if (c.lane !== event.lane || event.ok || c.reviews === undefined) return c;
+        const red = { ...c };
+        delete red.reviews;
+        return red;
+      });
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
     }
 
@@ -618,6 +628,11 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (event.review.candidateSha !== candidate.sha) {
         return rejected(state, `ROUND_REVIEW_SUBMITTED for ${event.lane} names candidate ${event.review.candidateSha}, not ${candidate.sha}`);
       }
+      // 09-2 (async review): a review that lands after its candidate failed
+      // its checks is stale — its review set was cancelled. It is ignored
+      // (the state is unchanged), never attached to the red candidate, so it
+      // cannot count toward the pick or reach the lane's next candidate.
+      if (candidate.ok === false) return ok(state);
       const reviews = [...(candidate.reviews ?? []).filter((r) => r.seat !== event.seat), { seat: event.seat, review: event.review }];
       const candidates = upsertLane(round.candidates, event.lane, { reviews });
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });

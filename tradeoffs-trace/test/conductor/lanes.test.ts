@@ -1369,11 +1369,80 @@ test("exex 01a2: a red lane candidate goes back to its own worker, which fixes i
     const reviewed = (a.reviews ?? []).map((r) => r.review.candidateSha);
     assert.ok(reviewed.length > 0 && reviewed.every((sha) => sha === a.sha), "only the green commit was reviewed");
     const prompts = fs.readFileSync(path.join(promptLog, "prompts.txt"), "utf8");
-    assert.match(prompts, /FAILED the round checks, so it was NOT handed to review/);
+    assert.match(prompts, /FAILED the round checks, so its reviews were cancelled/);
     const { records } = readLog(runPaths(setup.runDir).events);
     assert.ok(records.some((r) => r.kind === "lane_fix_started"), "the fix is recorded");
+    // 09-2: the red candidate's reviews started at its submission and were
+    // cancelled when its check failed; none was retried.
+    const cancels = records.filter((r) => r.kind === "lane_reviews_cancelled").map((r) => r.event as { lane: string; candidateSha: string });
+    assert.equal(cancels.length, 1, "only the red candidate's reviews were cancelled");
+    assert.equal(cancels[0].lane, "a");
+    assert.notEqual(cancels[0].candidateSha, a.sha);
+    assert.equal(records.filter((r) => r.kind === "lane_review_retried").length, 0, "a cancelled review is never retried");
   } finally {
     await teardown(setup);
     cleanupDir(promptLog);
+  }
+});
+
+// tt 09-2 (async review): a candidate's reviews start when its lane submits,
+// while its checks run. Each check sleeps 3 s (and the machine-wide lock
+// queues lane b's behind lane a's), so every lane's reviews are dispatched
+// before its check finishes, the reviewers are told the checks are running,
+// the two checks still never overlap, and the round completes.
+test("09-2: a lane's reviews are dispatched before its check finishes, and the round completes", async () => {
+  const promptDir = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))), ".lane-async-"));
+  const setup = await setupConductor({
+    phase: lanePhase({ checks: ["sleep 3 && true"] }),
+    checks: ["sleep 3 && true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    extraReviewerEnv: (seat) => ({ FAKE_PI_PROMPT_LOG: path.join(promptDir, `reviewer-${seat}.txt`) }),
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} picks`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const records = readLog(runPaths(setup.runDir).events).records;
+    const round = setup.conductor.state.phase.rounds![0];
+    for (const c of round.candidates) {
+      // The lane's review dispatches (one intent per seat) come before its
+      // check's finish record.
+      const finished = records.find(
+        (r) => r.kind === "lane_check_finished" && (r.event as { lane?: string }).lane === c.lane && (r.event as { candidateSha?: string }).candidateSha === c.sha,
+      );
+      assert.ok(finished, `lane ${c.lane}'s check finished`);
+      const dispatched = records.filter(
+        (r) => r.kind === "intent" && (r.event as { candidateSha?: string }).candidateSha === c.sha && typeof (r.event as { seat?: string }).seat === "string",
+      );
+      assert.equal(dispatched.length, 3, `lane ${c.lane}: one review per seat, dispatched once`);
+      for (const d of dispatched) {
+        assert.ok(Date.parse(d.ts) < Date.parse(finished!.ts), `lane ${c.lane}: review ${d.ts} dispatched before its check finished (${finished!.ts})`);
+      }
+      assert.equal(c.ok, true);
+      assert.deepEqual((c.reviews ?? []).map((r) => r.seat).sort(), ["A", "B", "M"], `lane ${c.lane}: all three reviews count`);
+    }
+    // The pick waited for all six reviews, and the round picked.
+    const submitted = records.filter((r) => r.kind === "lane_review_submitted").map((r) => Date.parse(r.ts));
+    assert.equal(submitted.length, 6);
+    const firstPick = Math.min(
+      ...records.filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "PICK_VOTE").map((r) => Date.parse(r.ts)),
+    );
+    assert.ok(firstPick >= Math.max(...submitted), "no seat voted before every review was in");
+    assert.equal(round.picked?.lane, "b");
+    assert.equal(records.filter((r) => r.kind === "lane_reviews_cancelled").length, 0, "a passing candidate's reviews are never cancelled");
+    // C2 still holds: the two checks never overlap.
+    const [first, second] = checkIntervals(setup.runDir).sort((x, y) => x.start - y.start);
+    assert.ok(first.finish <= second.start, "the two checks never overlap");
+    // The reviewers were told the checks run in parallel with them.
+    const prompts = ["M", "A", "B"].map((seat) => fs.readFileSync(path.join(promptDir, `reviewer-${seat}.txt`), "utf8")).join("\n");
+    assert.match(prompts, /checks are running in parallel with your review; the conductor reports their result/);
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptDir);
   }
 });
