@@ -2061,6 +2061,29 @@ RET chooses an option and sends the same encoding."
           (kill-buffer buf))
       (delete-directory dir t)))))
 
+(ert-deftest tradeoffs-trace-brief-resolve-on-a-phase-with-no-candidate ()
+  "tt 09-5: a brief on a phase with no candidate carries `:CANDIDATE_SHA: none'
+and still resolves — the binding sends \"none\", never an empty or missing sha."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (written nil)
+        (+tt-test--review-org (string-replace "   :CANDIDATE_SHA: C1\n" "   :CANDIDATE_SHA: none\n"
+                                              +tt-test--review-org)))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir)))
+          (with-current-buffer buf
+            (cl-letf (((symbol-function '+tt--write-command)
+                       (lambda (_run-dir command) (setq written command) "cmd-1"))
+                      ((symbol-function 'read-string) (lambda (&rest _) "")))
+              (goto-char (point-min))
+              (search-forward "Should a vendor excluded")
+              (goto-char (match-beginning 0))
+              (+tt-review--brief-resolve "repair")
+              (should (equal (alist-get 'type written) "resolve"))
+              (should (equal (alist-get 'option written) "repair"))
+              (should (equal (alist-get 'candidateSha (alist-get 'binding written)) "none"))))
+          (kill-buffer buf))
+      (delete-directory dir t))))
+
 (defconst +tt-test--brief-override-org
   (concat "#+TITLE: tradeoffs-trace review\n"
           "#+CONTRACT_VERSION: v1\n"

@@ -21,7 +21,7 @@ import type { ReviewLintResult } from "./core/review-lint.ts";
 import { candidateAnchorFreshness, pendingOwnerInputs, projectEntryReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
-import { resolveBinding } from "./core/binding.ts";
+import { resolveBinding, wireCandidateSha } from "./core/binding.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
   checkCoverageWarnings,
@@ -2159,7 +2159,7 @@ async function cmdCarry(positional: string[], root: string, toPhase: string | un
   // Like every record command, the binding is the PHASE's current candidate
   // and contract plus the record's own version (owner-commands.ts's
   // checkItemCarried matches it the same way).
-  const boundCandidateSha = state.phase.candidate?.sha ?? "";
+  const boundCandidateSha = wireCandidateSha(state.phase.candidate?.sha);
   const boundContractVersion = state.phase.contract.contractVersion;
   const boundRecordVersion = finding ? finding.version : message!.messageVersion;
   const inbox = path.join(runDir, "inbox");
@@ -2257,7 +2257,7 @@ async function cmdDefer(
     binding: {
       runId: state.phase.runId,
       phaseId: state.phase.phaseId,
-      candidateSha: state.phase.candidate?.sha ?? "",
+      candidateSha: wireCandidateSha(state.phase.candidate?.sha),
       contractVersion: state.phase.contract.contractVersion,
       recordId,
       recordVersion: boundRecordVersion,

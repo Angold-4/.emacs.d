@@ -57,6 +57,36 @@ export function resolveBinding(run: RunBinding, binding: string | { runId?: stri
   };
 }
 
+// ---------------------------------------------------------------------------
+// tt 09-5: a phase with no candidate
+// ---------------------------------------------------------------------------
+//
+// A phase whose every attempt timed out (or whose round produced nothing) can
+// still park on the owner — a repair-budget gate — with no candidate at all.
+// Inside tt "no candidate" is the empty sha (`phase.candidate?.sha ?? ""`), but
+// a decision-view binding must name its candidate (schema minLength 1; an Org
+// property cannot carry an empty value), so on 2026-10-25 such a gate could not
+// be answered. On the wire the explicit value is `NO_CANDIDATE`; these two are
+// the only places that convert, so the views, the CLI and Emacs all write it
+// and the normalizer reads it back as the empty sha the binding check compares.
+
+/** The binding's explicit "this phase has no candidate" (never a git sha). */
+export const NO_CANDIDATE = "none";
+
+/** The candidate a binding names for SHA: the sha itself, or NO_CANDIDATE. */
+export function wireCandidateSha(sha: string | undefined): string {
+  return sha && sha.length > 0 ? sha : NO_CANDIDATE;
+}
+
+/** A binding's candidate as tt compares it: NO_CANDIDATE is the empty sha. */
+export function candidateFromWire(sha: string): string {
+  return sha === NO_CANDIDATE ? "" : sha;
+}
+
+function candidateText(sha: string): string {
+  return sha === "" || sha === NO_CANDIDATE ? "no candidate" : `candidate ${sha}`;
+}
+
 function sameVersion(a: ContractVersion, b: ContractVersion): boolean {
   return a.snapshot === b.snapshot && a.sectionSha256 === b.sectionSha256;
 }
@@ -69,10 +99,10 @@ export function checkBinding(
   current: { candidateSha: string; contractVersion: ContractVersion; recordVersion: number },
   recordLabel: string,
 ): BindingCheckResult {
-  if (bound.candidateSha !== current.candidateSha) {
+  if (candidateFromWire(bound.candidateSha) !== candidateFromWire(current.candidateSha)) {
     return {
       ok: false,
-      reason: `${recordLabel} is bound to candidate ${bound.candidateSha}, but the phase is now at candidate ${current.candidateSha} — it changed since you viewed it`,
+      reason: `${recordLabel} is bound to ${candidateText(bound.candidateSha)}, but the phase is now at ${candidateText(current.candidateSha)} — it changed since you viewed it`,
     };
   }
   if (!sameVersion(bound.contractVersion, current.contractVersion)) {
