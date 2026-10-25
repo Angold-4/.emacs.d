@@ -156,14 +156,10 @@ test("plan 06l: a check failure that passes alone is recorded as flaky and does 
   realSetup.plan.rerun = "case {name} in 'a flaky test') printf '✔ %s\\n' {name}; exit 0;; *) printf '✖ %s\\n' {name}; exit 1;; esac";
   try {
     await realSetup.conductor.start();
-    // lane a's check fails, so the round repeats until the attempt budget is
-    // spent or lane b alone passes; either way the failure must be recorded.
-    await waitFor(
-      () => records(realSetup.runDir).some((r) => r.kind === "lane_check_finished" && (r.event as { lane?: string }).lane === "a" && (r.event as { passed?: boolean }).passed === false),
-      120_000,
-      50,
-      realSetup.runDir,
-    );
+    // lane a's check fails; its fix (exex 01a2) changes nothing, so lane b
+    // alone passes and is picked. Wait for the phase to finish, so no lane
+    // fix is still running when the conductor stops.
+    await waitFor(() => realSetup.conductor.state.phase.phase === "DONE", 180_000, 50, realSetup.runDir);
     const finished = records(realSetup.runDir).find(
       (r) => r.kind === "lane_check_finished" && (r.event as { lane?: string }).lane === "a" && (r.event as { passed?: boolean }).passed === false,
     );

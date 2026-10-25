@@ -797,7 +797,12 @@ test("plan 06g: one lane crashing leaves the other candidate checked, reviewed a
   }
 });
 
-test("plan 06g: both candidates failing checks repeats the round from the same base with both lanes' failures", async () => {
+// exex 01a2 (replaces plan 06g's "repeats from the same base"): both lanes'
+// round-1 candidates are red, and each lane's fix changes nothing, so the
+// round ends with no passing candidate. Round 2 keeps the round's base but
+// each lane continues from ITS OWN red candidate (never thrown away), carries
+// both lanes' failures in its prompt, fixes the tree and passes.
+test("exex 01a2: when both lanes are still red, the repeat continues each lane from its own candidate with both failures", async () => {
   const promptLog = fs.mkdtempSync("/tmp/tt-06g2-prompts-");
   const setup = await setupConductor({
     phase: lanePhase(),
@@ -816,7 +821,13 @@ test("plan 06g: both candidates failing checks repeats the round from the same b
               { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
             ],
           }
-        : laneWorker(lane),
+        : {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: `rm -f lane-marker.txt && printf 'lane ${lane}\n' > lane-${lane}.txt` },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          },
     laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", "the only candidate"),
   });
@@ -826,8 +837,17 @@ test("plan 06g: both candidates failing checks repeats the round from the same b
     const phase = setup.conductor.state.phase;
     assert.equal(phase.rounds?.length, 2, "the round repeated");
     const [first, second] = phase.rounds!;
-    assert.deepEqual(first.candidates.map((c) => c.ok), [false, false], "round 1: both candidates failed their checks");
-    assert.equal(second.base, first.base, "the repeat starts from the same base");
+    assert.deepEqual(first.candidates.map((c) => c.ok), [false, false], "round 1: both candidates stayed red");
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.equal(records.filter((r) => r.kind === "lane_fix_unchanged").length, 2, "each lane's fix changed nothing, so its loop ended");
+    assert.equal(second.base, first.base, "the round's base is unchanged");
+    const roundTwo = records.find((r) => r.kind === "intent" && (r.event as { round?: number }).round === 2 && (r.event as { laneBases?: unknown }).laneBases);
+    assert.deepEqual(
+      (roundTwo!.event as { laneBases: Record<string, string> }).laneBases,
+      Object.fromEntries(first.candidates.map((c) => [c.lane, c.sha])),
+      "each lane continues from its own red candidate",
+    );
+    assert.deepEqual(second.candidates.map((c) => c.ok), [true, true], "round 2 fixed both trees");
     // A round costs ONE attempt, whatever its lanes: round 1 failed, round 2 ran.
     assert.equal(phase.repairRoundsUsed, 1);
     // Both lanes' prompts of round 2 carry both failures of round 1.
