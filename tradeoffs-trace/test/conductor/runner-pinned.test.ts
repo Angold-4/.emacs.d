@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { EventLog } from "../../src/effects/log.ts";
 import { RunnerMismatchError, runPaths, runnerRevision } from "../../src/conductor.ts";
-import { cleanupDir, defaultWorkerHello, setupConductor } from "./harness.ts";
+import { cleanupDir, defaultWorkerHello, setupConductor, waitFor } from "./harness.ts";
 
 const pkgRoot = fileURLToPath(new URL("../..", import.meta.url));
 const cli = path.join(pkgRoot, "src", "cli.ts");
@@ -141,6 +141,62 @@ test("plan 06e: an installed runner for the recorded revision reads the run", ()
     const status = ttStatus(fixture.runDir, fixture.runRoot);
     assert.match(status, new RegExp(`SERVED BY ${FIXTURE_05_REVISION}`), "the recorded runner served the read");
   } finally {
+    fixture.cleanup();
+  }
+});
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// tt 09-5: `tt resume` relaunches a run on the runner it started with. On
+// 2026-10-25 a run recorded under an older runner could only be resumed by
+// finding that runner's cli by hand; the current conductor refuses it.
+test("tt 09-5: `tt resume` spawns the conductor from the run's own installed runner and says so", async () => {
+  const fixture = installFixture05();
+  try {
+    const installed = path.join(fixture.runRoot, "runner", FIXTURE_05_REVISION, "tradeoffs-trace");
+    fs.mkdirSync(path.join(installed, "src"), { recursive: true });
+    fs.writeFileSync(path.join(installed, "RUNNER_SHA"), `${FIXTURE_05_REVISION}\n`);
+    // The frozen copy's CLI records how it was launched, so the spawn is
+    // observable without running a real conductor.
+    const marker = path.join(fixture.runRoot, "spawned-by-installed.json");
+    fs.writeFileSync(
+      path.join(installed, "src", "cli.ts"),
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)));\n`,
+    );
+    const out = execFileSync(process.execPath, [cli, "resume", fixture.runDir, "--root", fixture.runRoot], { encoding: "utf8" });
+    const [runId, runnerLine] = out.trim().split("\n");
+    assert.equal(runId, path.basename(fixture.runDir), "the first line is still the run id");
+    assert.match(runnerLine, new RegExp(`^runner ${FIXTURE_05_REVISION} \\(the run's own, installed at ${escapeRe(installed)}\\)$`));
+    await waitFor(() => fs.existsSync(marker), 15_000);
+    const argv = JSON.parse(fs.readFileSync(marker, "utf8")) as string[];
+    assert.deepEqual(argv, ["__run-conductor", fixture.runDir], "the installed runner's cli runs the conductor for this run");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("tt 09-5: `tt resume` of a run whose runner is not installed keeps this checkout, which refuses visibly", async () => {
+  const fixture = installFixture05();
+  try {
+    const out = execFileSync(process.execPath, [cli, "resume", fixture.runDir, "--root", fixture.runRoot], {
+      encoding: "utf8",
+      // fake pi, so the conductor reaches its runner check without the real binary
+      env: { ...process.env, TT_TEST_MODE: "1", TT_TEST_PI_COMMAND: process.execPath },
+    });
+    assert.match(
+      out,
+      new RegExp(`^runner ${runnerRevision()} \\(this checkout\\); the run was started under ${FIXTURE_05_REVISION}, which is not installed`, "m"),
+    );
+    assert.match(out, new RegExp(`tt runner install ${FIXTURE_05_REVISION}`));
+    // Today's behaviour: this checkout's conductor refuses with its clear error.
+    const log = runPaths(fixture.runDir).log;
+    await waitFor(() => fs.existsSync(log) && /refusing to resume/.test(fs.readFileSync(log, "utf8")), 15_000);
+  } finally {
+    try {
+      execFileSync("pkill", ["-f", fixture.runDir]);
+    } catch {
+      // already gone
+    }
     fixture.cleanup();
   }
 });
