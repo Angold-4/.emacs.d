@@ -21,6 +21,7 @@ import {
   laneIds,
   laneMetItems,
   latestRegression,
+  lostItems,
   openAdvisories,
   passingCandidates,
   pickWinner,
@@ -443,6 +444,25 @@ test("plan 06n (R9c/R9d): a lost item is a regression only when its evidence anc
   assert.equal(bestCandidate([ROUND1, r2], IDS, 3)?.sha, "C1a");
   assert.deepEqual(latestRegression([ROUND1, r2]), { round: 2, items: ["R1"], sha: "C2a" });
   assert.equal(latestRegression([ROUND1, r2, round({ round: 3, picked: { lane: "b", sha: "C1b", votes: 2 } })]), undefined);
+});
+
+test("exex 01: a lane that meets more plan items than the best candidate is progress even when it traded some away", () => {
+  const ids = ["R1", "R2", "R3", "R4"];
+  // The best candidate met only the easy items R1 and R2 (a stub).
+  const stub = round({ round: 1, candidates: [reviewed("a", "C1a", { R1: ["met", "met", "met"], R2: ["met", "met", "met"], R3: ["unmet", "unmet", "unmet"], R4: ["unmet", "unmet", "unmet"] })], picked: { lane: "a", sha: "C1a", votes: 3 } });
+  const guard = { best: bestCandidate([stub], ids, 3, 2)!, itemIds: ids, seatCount: 3 };
+  // Lane a does the real work (R2, R3, R4) but lost R1; lane b lost R2 and gained nothing.
+  const work = reviewed("a", "C2a", { R1: ["unmet", "unmet", "met"], R2: ["met", "met", "met"], R3: ["met", "met", "met"], R4: ["met", "met", "met"] });
+  const r2 = round({ round: 2, candidates: [work, reviewed("b", "C2b", { R1: ["met", "met", "met"], R2: ["unmet", "unmet", "unmet"], R3: ["unmet", "unmet", "unmet"], R4: ["unmet", "unmet", "unmet"] })], votes: SEATS.map((seat) => ({ seat, lane: "a", why: "a" })) });
+  assert.deepEqual(lostItems(work, guard), [], "more items met overall: nothing counts as lost");
+  assert.equal(everyLaneLost(r2, guard), undefined, "the round is not a no-pick round");
+  assert.equal(pickWinner(r2, SEATS, "M", guard)?.lane, "a", "the seats' pick stands");
+  // The evaluated pick is no regression either.
+  const outcome = (id: string, verdict: string) => ({ item: { id }, outcome: verdict, seats: SEATS.map((seat) => ({ seat, verdict, evidence: "src/a.ts:1" })) });
+  assert.deepEqual(regressedItems(guard.best, [outcome("R1", "unmet"), outcome("R2", "met"), outcome("R3", "met"), outcome("R4", "met")], ["src/a.ts"]), []);
+  // Meeting the same number while trading items is still guarded (R9a/R9b unchanged).
+  const trade = reviewed("a", "C2a", { R1: ["unmet", "unmet", "unmet"], R2: ["met", "met", "met"], R3: ["met", "met", "met"], R4: ["unmet", "unmet", "unmet"] });
+  assert.deepEqual(lostItems(trade, guard), ["R1"]);
 });
 
 test("plan 06n: ITEMS_REGRESSED validates against the event schema and marks the round's pick", () => {
