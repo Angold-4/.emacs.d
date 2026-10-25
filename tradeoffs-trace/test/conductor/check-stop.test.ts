@@ -266,8 +266,15 @@ test("plan 06n: a stop during the lane reviews resumes the same round with both 
   let resumed: Conductor | undefined;
   try {
     await setup.conductor.start();
+    // 09-2: reviews now start at submission, so a running reviewer no longer
+    // implies both checks were recorded. Wait for the recorded check results
+    // themselves (not the `lane_check_finished` log line, which precedes
+    // CANDIDATE_CHECKED by the lock release), then for a review in flight.
     await waitFor(
-      () => readLog(runPaths(setup.runDir).events).records.filter((r) => r.kind === "lane_check_finished").length >= 2,
+      () => {
+        const round = setup.conductor.state.phase.rounds?.[0];
+        return round !== undefined && round.candidates.length === 2 && round.candidates.every((c) => c.ok === true);
+      },
       120_000,
       50,
       setup.runDir,
