@@ -8558,13 +8558,15 @@ export class Conductor {
 
   /** exex 01a2: a lane never hands in a red tree. Its worker gets the
    * failing checks back on its own candidate, continuing its own session, with
-   * the attempt time it has left, and submits again. A lane with under a
-   * minute left keeps its red candidate for this round (the next round starts
+   * the attempt time it has left, and submits again. A lane with almost no
+   * time left keeps its red candidate for this round (the next round starts
    * from it, `repeatLaneBases`). */
   async #fixLane(lane: string, round: number, sha: string, failure: string): Promise<LaneBuild> {
     const started = this.#laneStartedAt.get(`${round}-${lane}`) ?? Date.now();
     const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - started);
-    if (remainingMs < 60_000) {
+    // Under a minute (or a tenth of a short attempt) is too little to fix
+    // anything: the red candidate stays this round's record.
+    if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
       this.#log.append("lane_fix_skipped", { lane, round, sha, reason: "no attempt time left" });
       return { lane, note: `the lane's candidate ${sha.slice(0, 7)} is red and its attempt time is spent` };
     }
