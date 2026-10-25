@@ -15,6 +15,7 @@ import * as path from "node:path";
 
 import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest, RoundRecord } from "./core/types.ts";
 import { candidateLabel, latestRegression } from "./core/rounds.ts";
+import { consolidationLine, latestConsolidationLine } from "./core/lanes.ts";
 import { seatsOf } from "./core/seats.ts";
 import { wireCandidateSha } from "./core/binding.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
@@ -483,6 +484,9 @@ export function renderRoundsOrg(rounds: readonly RoundRecord[]): string {
         : "Winner: none",
       "",
     );
+    // tt 09 (change 3): the round's combine step, when it ran.
+    const consolidated = consolidationLine(round);
+    if (consolidated) lines.push(`${consolidated.charAt(0).toUpperCase()}${consolidated.slice(1)}`, "");
   }
   return lines.join("\n");
 }
@@ -981,6 +985,10 @@ export function renderStatusView(input: StatusViewInput): string {
     }
     // tt 09-6: each lane's check result and the seats' item verdicts.
     for (const line of laneDetailLines(phase)) p2(line);
+    // tt 09 (change 3): the combine step between rounds, so the owner sees
+    // which commit the lanes start from and which items it carries.
+    const combined = latestConsolidationLine(phase.rounds as RoundRecord[] | undefined);
+    if (combined) p2(`  ${combined}`);
   }
   if (seatPanels.length > 0) {
     p2("Seats");

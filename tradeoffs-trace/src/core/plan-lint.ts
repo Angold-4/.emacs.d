@@ -57,10 +57,13 @@ export type LintRule =
   // `#+TT_WORKER_PROMPT`: an unknown lane, an empty path or an unreadable file.
   | "worker-prompt"
   // tt 09-1: a cheap command that only the final (acceptance) check runs.
-  | "cheap-final-check";
+  | "cheap-final-check"
+  // tt 09 (change 3): `#+TT_CONSOLIDATE` is `on` or `off`.
+  | "consolidate";
 
 /** The roles #+TT_MODELS may assign a model to. */
-const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator"]);
+// tt 09 (change 3): `consolidator` — the model that combines the lanes.
+const MODEL_ROLES = new Set(["worker", "reviewer", "evaluator", "panel", "curator", "consolidator"]);
 
 /** The default seats when the plan declares none. */
 const DEFAULT_REVIEWER_SEATS = ["M", "A", "B"];
@@ -195,6 +198,9 @@ export interface LintPhaseInput {
   /** Plan 06n (A5): the phase's own `:WIDE_PATHS:` globs, overriding the
    * plan's `#+TT_WIDE_PATHS:`. */
   widePaths?: string[];
+  /** tt 09 (change 3): the phase's own `:CONSOLIDATE:` (`on`/`off`),
+   * overriding the plan's `#+TT_CONSOLIDATE:`. */
+  consolidate?: unknown;
 }
 
 export interface LintPlanInput {
@@ -267,6 +273,12 @@ export interface LintPlanInput {
   leader?: string;
   /** Lint-only: the 1-based line of `#+TT_LEADER:`. */
   leaderLine?: number;
+  /** tt 09 (change 3): the plan's `#+TT_CONSOLIDATE:` — `on` (the default
+   * with two or more workers) or `off`. Kept as written so lint can name a
+   * bad value. */
+  consolidate?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_CONSOLIDATE:`. */
+  consolidateLine?: number;
   /** `#+TT_WORKER_PROMPT`: lane to the files appended to its worker. Kept
    * open (`unknown`) so a malformed value still reaches the linter. */
   workerPrompt?: Record<string, unknown>;
@@ -448,7 +460,7 @@ export function lintModels(plan: LintPlanInput): LintFinding[] {
   for (const decl of modelDeclarations(plan.models)) {
     if (inherited.has(decl.key)) continue;
     if (decl.kind === "role" && !MODEL_ROLES.has(decl.key)) {
-      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown role ${decl.key}`, "use one of worker, reviewer, evaluator, panel, curator"));
+      out.push(modelFinding(plan, decl.key, `#+TT_MODELS names the unknown role ${decl.key}`, "use one of worker, reviewer, evaluator, panel, curator, consolidator"));
       continue;
     }
     const seats = reviewerSeatsOf(plan);
@@ -733,9 +745,19 @@ export function lintPhaseSeats(phase: LintPhaseInput, plan: LintPlanInput): Lint
 /** Lint one plan (all its phases' acceptance items, its structured items,
  * its #+TT_MODELS and its #+TT_RERUN). Pure. */
 export function lintPlan(plan: LintPlanInput): LintFinding[] {
-  const out: LintFinding[] = [...lintModels(plan), ...lintRerun(plan), ...lintWorkers(plan), ...lintWorkerPrompt(plan), ...lintCheapFinalChecks(plan)];
+  const out: LintFinding[] = [
+    ...lintModels(plan),
+    ...lintRerun(plan),
+    ...lintWorkers(plan),
+    ...lintWorkerPrompt(plan),
+    ...lintCheapFinalChecks(plan),
+    ...lintConsolidate(plan),
+  ];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
+    if (phase.consolidate !== undefined && !isConsolidateValue(phase.consolidate)) {
+      out.push(consolidateFinding(":CONSOLIDATE:", phase.consolidate, phaseId, phase.line, plan.sourceFile));
+    }
     // Plan 06k2 (A8, finding A-4): a phase-level :VARIANT_LIMIT: below 2 is
     // refused exactly like the plan-level one; otherwise a phase override of
     // 1 reaches variantLimitOf and silently disables escalation.
@@ -1027,6 +1049,31 @@ export function lintWorkers(plan: LintPlanInput): LintFinding[] {
     }
   }
   return out;
+}
+
+/** tt 09 (change 3): `#+TT_CONSOLIDATE:` (or a phase's `:CONSOLIDATE:`)
+ * takes `on` or `off`, in any case. */
+export function isConsolidateValue(value: unknown): boolean {
+  return typeof value === "string" && /^(on|off)$/i.test(value.trim());
+}
+
+function consolidateFinding(keyword: string, value: unknown, phaseId: string, line: number | undefined, sourceFile: string | undefined): LintFinding {
+  return {
+    severity: "error",
+    rule: "consolidate",
+    phaseId,
+    item: `${keyword} ${String(value)}`,
+    line,
+    sourceFile,
+    problem: `${keyword} must be on or off, got ${JSON.stringify(String(value))}`,
+    fix: "write on (the default with two or more workers: a consolidator combines what each lane met) or off (the next round starts from the winner only)",
+  };
+}
+
+/** tt 09 (change 3): lint the plan's `#+TT_CONSOLIDATE:` value. */
+export function lintConsolidate(plan: LintPlanInput): LintFinding[] {
+  if (plan.consolidate === undefined || isConsolidateValue(plan.consolidate)) return [];
+  return [consolidateFinding("#+TT_CONSOLIDATE:", plan.consolidate, "consolidate", plan.consolidateLine, plan.sourceFile)];
 }
 
 // ---------------------------------------------------------------------------

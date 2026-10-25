@@ -14,6 +14,12 @@ export const PI_VERSION = "0.87.0";
 
 export type Role = "worker" | "reviewer" | "evaluator" | "panel" | "curator" | "picker";
 
+/** tt 09 (change 3): the roles a MODEL is resolved for. The consolidator is
+ * a worker by its tools (it edits a worktree and calls submit_phase), but it
+ * runs on its own model: `#+TT_MODELS consolidator=…`, else the leader
+ * seat's reviewer model. */
+export type ModelRole = Role | "consolidator";
+
 /** The reviewer seats (design §2.1): three reviewers of different model
  * families, whose disagreement is the point of having three. */
 export type ReviewerSeat = "M" | "A" | "B";
@@ -61,6 +67,9 @@ export interface PlanModels {
    * on the evaluator's model when that is configured, else on Pi's default,
    * exactly like an evaluator (OD-2) — so it is never skipped. */
   curator?: RoleModel;
+  /** tt 09 (change 3): the consolidator's model. Absent: the leader seat's
+   * reviewer model (a strong model integrates the lanes, 07). */
+  consolidator?: RoleModel;
 }
 
 /** The model each panel seat takes from the reviewer seats, by position. */
@@ -81,11 +90,15 @@ export function planModelSelector(
   /** Plan 06h: the configured reviewer seats, so `panel=reviewers` maps panel
    * seat i to reviewer i for any N (default `M A B`). */
   reviewerSeats?: readonly string[],
-): (role: Role, seat?: ReviewerSeat | PanelSeat | string | number) => RoleModel | undefined {
+): (role: ModelRole, seat?: ReviewerSeat | PanelSeat | string | number) => RoleModel | undefined {
   const models = plan.models;
   const seats = reviewerSeats && reviewerSeats.length > 0 ? reviewerSeats : ["M", "A", "B"];
-  const select = (role: Role, seat?: ReviewerSeat | PanelSeat | string | number): RoleModel | undefined => {
+  const select = (role: ModelRole, seat?: ReviewerSeat | PanelSeat | string | number): RoleModel | undefined => {
     if (!models) return undefined;
+    // tt 09 (change 3): the consolidator runs on `consolidator=…`, else on
+    // the model of the seat the caller names (the leader), else the first
+    // seat's — the leader's default.
+    if (role === "consolidator") return models.consolidator ?? select("reviewer", seat ?? seats[0]);
     if (role === "reviewer") {
       if (seat !== undefined) {
         const own = models.reviewerSeats?.[String(seat) as ReviewerSeat];

@@ -3544,6 +3544,23 @@ own :WORKERS:/:ROUNDS: property overrides the plan's keyword."
     (should (= (alist-get 'workers (aref (alist-get 'phases plan) 0)) 2))
     (should (= (alist-get 'rounds (aref (alist-get 'phases plan) 0)) 4))))
 
+(ert-deftest tradeoffs-trace-plan-consolidate ()
+  "tt 09 (change 3): #+TT_CONSOLIDATE and a phase's own :CONSOLIDATE: reach
+the plan JSON as written, with the keyword's line for `tt lint'; a plan that
+names neither carries no field (the combine step stays on with 2+ workers)."
+  (let* ((text (concat "#+TT_WORKERS: 2\n#+TT_CONSOLIDATE: off\n" +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (alist-get 'consolidate plan) "off"))
+    (should (= (alist-get 'consolidateLine plan) 2))
+    (should (equal (alist-get 'consolidate (aref (alist-get 'phases plan) 0)) "off")))
+  (let* ((plan (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+    (should-not (assq 'consolidate plan))
+    (should-not (assq 'consolidate (aref (alist-get 'phases plan) 0))))
+  (let* ((text (replace-regexp-in-string ":END:" "  :CONSOLIDATE: on\n  :END:"
+                                         (concat "#+TT_CONSOLIDATE: off\n" +tt-test--valid-plan) :fixedcase))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (alist-get 'consolidate (aref (alist-get 'phases plan) 0)) "on"))))
+
 (ert-deftest tradeoffs-trace-plan-seats ()
   "Plan 06h (A1): #+TT_REVIEWERS and #+TT_LEADER reach the plan JSON, a
  phase's own :REVIEWERS:/:LEADER: overrides them, and the plan-level seats

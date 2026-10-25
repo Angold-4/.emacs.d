@@ -47,6 +47,9 @@ export function planModelTargets(models: PlanModels | undefined, seats?: readonl
   // Plan 05j: the curator runs on the evaluator's model unless the plan names
   // its own; either way it is a model this run will use.
   if (models.curator) push("curator", models.curator);
+  // tt 09 (change 3): the consolidator runs on the leader's model unless the
+  // plan names its own; a named one is probed like any other.
+  if (models.consolidator) push("consolidator", models.consolidator);
   const panelSeatKeys = models.panelSeats ? Object.keys(models.panelSeats) : [];
   if (panelSeatKeys.length > 0) {
     for (const seat of panelSeatKeys) push(`panel.${seat}`, select("panel", seat));
