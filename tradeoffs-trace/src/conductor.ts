@@ -1449,24 +1449,35 @@ export class Conductor {
    * review prompts need each lane's own disclosures. */
   #laneBuilds = new Map<string, LaneBuild>();
   /** Plan 06g2: each lane candidate's turn-1 discoveries, keyed
-   * `<round>-<lane>` then by seat. The phase has no candidate to bind them to
-   * while the round runs, so the winner's are applied at the hand-off. */
+   * `<round>-<lane>-<sha>` (`#laneReviewKey`) then by seat. The phase has no
+   * candidate to bind them to while the round runs, so the winner's are
+   * applied at the hand-off. 09-2: keyed by the candidate, not only the lane:
+   * a lane's reviews start at each submission, so a cancelled red candidate's
+   * discoveries must never reach its fixed successor. */
   #laneDiscoveries = new Map<string, Map<string, DecisionDisclosure[]>>();
   /** Plan 06g2: each lane candidate's discovery-id plan, computed ONCE — when
    * the first of its turn-2 prompts is built — and reused at the hand-off, so
    * the ids the seats balloted are the ids that appear even though the freeze
    * grows the phase's decision list in between. */
   #laneDiscoveryPlans = new Map<string, Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }>>();
-  /** Plan 06g2: the per-candidate discovery barrier, keyed `<round>-<lane>`. */
+  /** Plan 06g2: the per-candidate discovery barrier, keyed
+   * `<round>-<lane>-<sha>` (09-2: a cancelled candidate's seats never count
+   * as arrived for the lane's next candidate). */
   #laneBarriers = new Map<string, { arrived: Set<string>; waiters: Array<() => void> }>();
   /** Plan 06k2 (A7): each lane candidate's boundary-trigger decisions,
    * computed BEFORE its lane reviews so the seats ballot them with the rest;
    * reused at the hand-off so the ids that were balloted are the ids that
-   * appear. Keyed `<round>-<lane>`. */
+   * appear. Keyed `<round>-<lane>-<sha>` (09-2). */
   #laneTriggers = new Map<string, Decision[]>();
   /** Plan 06k2 (A7): the boundary paths each lane's triggers cover, for the
-   * sampling log at the hand-off. Keyed `<round>-<lane>`. */
+   * sampling log at the hand-off. Keyed `<round>-<lane>-<sha>` (09-2). */
   #laneTriggerPaths = new Map<string, string[]>();
+  /** 09-2 (async review): one lane candidate's review cancellation, keyed
+   * `<round>-<lane>-<sha>`. A candidate's reviews start at its submission,
+   * while its checks run; a failed check resolves this, and every stage of
+   * those reviews (start, turn 1, the discovery barrier, turn 2) ends at once
+   * without a retry. */
+  #laneReviewCancels = new Map<string, { cancelled: boolean; promise: Promise<"cancelled">; resolve: () => void }>();
   /** Plan 06k2 (A8): the absolute number of owner notes the round's lane
    * prompt actually carried, recorded when the prompt is built. A note
    * queued AFTER that build is not marked delivered by it. Keyed by round. */
@@ -4777,6 +4788,15 @@ export class Conductor {
         if (review.reviewer !== seat) {
           return { ok: false, reason: `submit_review reviewer ${review.reviewer} does not match the seat this dispatch reviews as (${seat})` };
         }
+        // 09-2 (async review): a review of a candidate that failed its checks
+        // (or was replaced by the lane's fix) was cancelled; one that still
+        // arrives is acknowledged so the late agent stops, and never counts.
+        const current = (this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane);
+        if (this.#laneReviewCancelled(round, lane, sha) || current?.sha !== sha || current.ok === false) {
+          this.#log.append("stale_lane_review_ignored", { round, lane, seat, candidateSha: sha, current: current?.sha ?? null });
+          handle.doneResolve();
+          return { ok: true };
+        }
         const issue = reviewIngestionIssue(review);
         if (issue) return { ok: false, reason: issue };
         // A lane review judges the lane's own candidate, not the phase's
@@ -5034,7 +5054,7 @@ export class Conductor {
       if (handle.laneReview !== undefined) {
         const discoveries = (msg.args as { discoveries?: DecisionDisclosure[] }).discoveries ?? [];
         handle.laneDiscoveries = discoveries;
-        const key = `${handle.laneReview.round}-${handle.laneReview.lane}`;
+        const key = this.#laneReviewKey(handle.laneReview.round, handle.laneReview.lane, handle.laneReview.sha);
         const bySeat = this.#laneDiscoveries.get(key) ?? new Map<string, DecisionDisclosure[]>();
         bySeat.set(handle.laneReview.seat, discoveries);
         this.#laneDiscoveries.set(key, bySeat);
@@ -6740,9 +6760,10 @@ export class Conductor {
       // Plan 06k2 (A7): the winner's triggers were computed before its lane
       // reviews and balloted there; apply exactly those records (never
       // create a second set nobody ever saw).
-      const cached = this.#laneTriggers.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+      const laneKey = this.#laneReviewKey(opts.lane.round, opts.lane.lane, candidateSha);
+      const cached = this.#laneTriggers.get(laneKey) ?? [];
       for (const decision of cached) this.#applyEvent({ type: "DECISION_ADDED", decision });
-      triggerPaths = this.#laneTriggerPaths.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+      triggerPaths = this.#laneTriggerPaths.get(laneKey) ?? [];
     } else {
       triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
     }
@@ -8573,7 +8594,7 @@ export class Conductor {
     const digest = this.#laneCheckFailureDigest(sha);
     this.#log.append("lane_fix_started", { lane, round, sha, remainingMs });
     const prompt = [
-      `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so it was NOT handed to review. A lane never hands in a red tree: the reviewers only ever see a candidate whose checks pass.`,
+      `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree: a candidate's reviews count only once its checks pass.`,
       "",
       "Fix exactly what fails, in this worktree (it holds your candidate). Keep all your other work; do not delete, skip or #[ignore] a test, weaken an assertion, or remove required work to make a check pass (ODP-2) — if the failure is a real limit, raise it as a BLOCKER with the exact error instead.",
       "Run the failing command yourself until it passes, then run the full round checks, then call submit_coverage and submit_phase again with your complete payload (your disclosures, coverage and answers, updated for what you changed).",
@@ -8857,10 +8878,10 @@ export class Conductor {
     lane: string,
     sha: string,
   ): Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }> {
-    const key = `${round}-${lane}`;
+    const key = this.#laneReviewKey(round, lane, sha);
     const cached = this.#laneDiscoveryPlans.get(key);
     if (cached) return cached;
-    const build = this.#laneBuilds.get(key);
+    const build = this.#laneBuilds.get(`${round}-${lane}`);
     const workerDecisions = build
       ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
       : [];
@@ -8881,16 +8902,17 @@ export class Conductor {
    * reviewers ballot them with the candidate's other records. Citations
    * count every decision and finding of the phase (superseded ones
    * included), plus the lane's own worker decisions, so a path an earlier
-   * round's decision cited is not re-triggered. Cached by `<round>-<lane>`,
-   * so the hand-off applies exactly the ids the seats balloted. */
+   * round's decision cited is not re-triggered. Cached by
+   * `<round>-<lane>-<sha>`, so the hand-off applies exactly the ids the seats
+   * balloted. */
   #laneTriggerDecisions(round: number, lane: string, sha: string): Decision[] {
-    const key = `${round}-${lane}`;
+    const key = this.#laneReviewKey(round, lane, sha);
     const cached = this.#laneTriggers.get(key);
     if (cached) return cached;
     let out: Decision[] = [];
     try {
       const contract = this.#state.phase.contract;
-      const build = this.#laneBuilds.get(key);
+      const build = this.#laneBuilds.get(`${round}-${lane}`);
       const workerDecisions = build
         ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
         : [];
@@ -9021,16 +9043,20 @@ export class Conductor {
       await this.#runLaneReviewOnce(round, lane, sha, seat);
       return;
     } catch (err) {
+      // 09-2: a cancelled review (its candidate failed its checks) is never
+      // retried; `runRound` discards it.
+      if (this.#laneReviewCancelled(round, lane, sha)) throw err;
       this.#log.append("lane_review_retried", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
     }
     try {
       await this.#runLaneReviewOnce(round, lane, sha, seat, true);
     } catch (err) {
+      if (this.#laneReviewCancelled(round, lane, sha)) throw err;
       // Plan 06k3 (A1, finding A-1): only now — after the retry also failed —
       // does this seat arrive at the discovery barrier. Marking it arrived
       // while a retry was still coming let the other seats build and cache
       // their turn-2 plan without the retry's discovery.
-      this.#laneArriveAtBarrier(round, lane, seat);
+      this.#laneArriveAtBarrier(round, lane, sha, seat);
       this.#log.append("lane_review_retry_failed", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
       throw err;
     }
@@ -9042,8 +9068,12 @@ export class Conductor {
    * three seats' discoveries merge behind a per-candidate barrier, and turn 2
    * reviews the lane's decisions, findings and item verdicts. A review that
    * cannot be taken THROWS: the round then fails and repeats, so a winner is
-   * never handed off with fewer than K × N reviews. */
+   * never handed off with fewer than K × N reviews. 09-2: it starts at the
+   * candidate's submission, while its checks run, and a failed check cancels
+   * it (`#cancelLaneReviews`). */
   async #runLaneReviewOnce(round: number, lane: string, sha: string, seat: string, retry = false): Promise<void> {
+    // 09-2: a review of a candidate already cancelled never spawns an agent.
+    if (this.#laneReviewCancelled(round, lane, sha)) throw new Error(`the review was cancelled: ${candidateLabel(round, lane)} failed its checks`);
     const candidateDir = path.join(this.#paths.candidates, sha);
     const actionId = this.#log.actionId(`lane_review_${round}_${lane}_${seat}`);
     this.#log.intent(actionId, { round, lane, seat, candidateSha: sha, ...(retry ? { retry: true } : {}) });
@@ -9058,8 +9088,10 @@ export class Conductor {
       // candidate must not carry the first's review in context (M's veto of
       // the shared session), and a later round re-reviews from scratch. Plan
       // 06k3 (A1): the retry gets its OWN session dir, so the fresh agent does
-      // not inherit the failed attempt's context.
-      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}${retry ? "-retry" : ""}`),
+      // not inherit the failed attempt's context. 09-2: and per candidate — a
+      // lane's fixed candidate is reviewed in the same round as its cancelled
+      // red one, never in that one's session.
+      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}-${sha.slice(0, 12)}${retry ? "-retry" : ""}`),
       env: this.#laneEnv(candidateDir, {
         ...(this.#piEnvFor?.("reviewer", agentId) ?? {}),
         TT_CANDIDATE_SHA: sha,
@@ -9071,11 +9103,20 @@ export class Conductor {
       laneReview: { round, lane, sha, seat },
     });
     const lanePhase = this.#lanePhase(round, lane, sha);
+    // 09-2: every wait below also ends the moment the candidate's checks
+    // fail (`#cancelLaneReviews`), so a cancelled review stops at once.
+    const cancelled = this.#laneReviewCancel(round, lane, sha).promise;
+    const endCancelled = async (stage: string): Promise<never> => {
+      await handle.agent.terminate();
+      this.#log.completion(actionId, { round, lane, seat, ok: false, reason: `cancelled: the candidate failed its checks (${stage})` });
+      throw new Error(`the review was cancelled: ${candidateLabel(round, lane)} failed its checks`);
+    };
     // Plan 06k3 (A3): the lane's reproduction table, computed once per
-    // candidate after its checks.
+    // candidate.
     await this.#ensureReproductionTable(lanePhase, sha);
     try {
-      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      const hello = await Promise.race([raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello"), cancelled]);
+      if (hello === "cancelled") return await endCancelled("start");
       if (hello === "timeout" || !hello.ok) {
         await handle.agent.terminate();
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "the reviewer did not start" });
@@ -9096,11 +9137,16 @@ export class Conductor {
 
       // Turn 1: discover, before the worker's own disclosure is shown.
       const settled1 = nextSettle();
-      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn1Prompt(seat as Reviewer, lanePhase, candidateDir)));
+      await handle.agent.prompt(
+        this.#agentPrompt(
+          [this.#buildReviewerTurn1Prompt(seat as Reviewer, lanePhase, candidateDir), ...this.#laneChecksRunningLines(round, lane, sha)].join("\n"),
+        ),
+      );
       const raced1 = await Promise.race([
         handle.discoveryPromise.then(() => "discovered" as const),
         timeout.promise,
         settled1,
+        cancelled,
         // A crashed reviewer ends the attempt at once, never at reviewMs.
         handle.agent.waitExit().then(() => "exited" as const),
         // Plan 06l (A3/A-8): a terminal model failure (404, context overflow)
@@ -9111,6 +9157,10 @@ export class Conductor {
       // The discovery reply and the turn's own settle are two channels; the
       // settle can win the race. What matters is whether the discovery was
       // ACCEPTED, so the recorded discovery (not the race's winner) decides.
+      if (raced1 === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("turn 1");
+      }
       const turn1 = raced1 !== "discovered" && handle.laneDiscoveries !== undefined ? ("discovered" as const) : raced1;
       if (turn1 !== "discovered") {
         timeout.cancel();
@@ -9126,7 +9176,11 @@ export class Conductor {
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: why });
         throw new Error(why);
       }
-      const turn1Settled = await Promise.race([settled1, timeout.promise]);
+      const turn1Settled = await Promise.race([settled1, timeout.promise, cancelled]);
+      if (turn1Settled === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("turn 1");
+      }
       if (turn1Settled === "timeout") {
         timeout.cancel();
         await handle.agent.terminate();
@@ -9136,10 +9190,18 @@ export class Conductor {
       // The per-candidate discovery barrier: no seat gets turn 2 until all
       // three have finished turn 1 on THIS candidate, so every turn-2 prompt
       // lists the same merged records and every seat can ballot the others'.
-      this.#laneArriveAtBarrier(round, lane, seat);
+      this.#laneArriveAtBarrier(round, lane, sha, seat);
       timeout.cancel();
       timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
-      const barrier = await Promise.race([this.#laneBarrierReleased(round, lane).then(() => "released" as const), timeout.promise]);
+      const barrier = await Promise.race([
+        this.#laneBarrierReleased(round, lane, sha).then(() => "released" as const),
+        timeout.promise,
+        cancelled,
+      ]);
+      if (barrier === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("waiting for the other seats' discovery");
+      }
       if (barrier === "timeout") {
         timeout.cancel();
         await handle.agent.terminate();
@@ -9154,7 +9216,11 @@ export class Conductor {
       timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
       const merged = this.#lanePhase(round, lane, sha, { final: true });
       const settled2 = nextSettle();
-      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn2Prompt(seat as Reviewer, handle, merged, candidateDir)));
+      await handle.agent.prompt(
+        this.#agentPrompt(
+          [this.#buildReviewerTurn2Prompt(seat as Reviewer, handle, merged, candidateDir), ...this.#laneChecksRunningLines(round, lane, sha)].join("\n"),
+        ),
+      );
       const reviewRecorded = () =>
         ((this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane)?.reviews ?? []).some(
           (r) => r.seat === seat,
@@ -9163,10 +9229,15 @@ export class Conductor {
         handle.donePromise.then(() => "submitted" as const),
         timeout.promise,
         settled2,
+        cancelled,
         handle.agent.waitExit().then(() => "exited" as const),
         handle.agent.waitModelFailed().then(() => "failed" as const),
         handle.agent.waitCompactionFailed().then(() => "failed" as const),
       ]);
+      if (turn2 === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("turn 2");
+      }
       // Same channel race as turn 1: the recorded review, not the race's
       // winner, says whether the submission landed.
       if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
@@ -9180,14 +9251,20 @@ export class Conductor {
               `findingStatements, items and arch, then end your turn.`,
           ),
         );
-        turn2 = await Promise.race([
+        const reprompted = await Promise.race([
           handle.donePromise.then(() => "submitted" as const),
           timeout.promise,
           settled3,
+          cancelled,
           handle.agent.waitExit().then(() => "exited" as const),
           handle.agent.waitModelFailed().then(() => "failed" as const),
           handle.agent.waitCompactionFailed().then(() => "failed" as const),
         ]);
+        if (reprompted === "cancelled") {
+          timeout.cancel();
+          return await endCancelled("turn 2");
+        }
+        turn2 = reprompted;
         if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
       }
       timeout.cancel();
@@ -9214,11 +9291,66 @@ export class Conductor {
     }
   }
 
+  /** 09-2: the key of one lane candidate's review state (discoveries, their
+   * id plan, triggers, barrier, cancellation). */
+  #laneReviewKey(round: number, lane: string, sha: string): string {
+    return `${round}-${lane}-${sha}`;
+  }
+
+  /** 09-2: one lane candidate's review cancellation, created on first use. */
+  #laneReviewCancel(round: number, lane: string, sha: string): { cancelled: boolean; promise: Promise<"cancelled">; resolve: () => void } {
+    const key = this.#laneReviewKey(round, lane, sha);
+    let entry = this.#laneReviewCancels.get(key);
+    if (!entry) {
+      let resolve!: () => void;
+      const promise = new Promise<"cancelled">((r) => (resolve = () => r("cancelled")));
+      entry = { cancelled: false, promise, resolve };
+      this.#laneReviewCancels.set(key, entry);
+    }
+    return entry;
+  }
+
+  /** 09-2: true once this lane candidate's reviews were cancelled. */
+  #laneReviewCancelled(round: number, lane: string, sha: string): boolean {
+    return this.#laneReviewCancels.get(this.#laneReviewKey(round, lane, sha))?.cancelled === true;
+  }
+
+  /** 09-2 (async review): the candidate failed its checks, so its in-flight
+   * reviews are cancelled: every stage of them ends at once (no retry), their
+   * agents are terminated, and a submission that still arrives is ignored. */
+  #cancelLaneReviews(round: number, lane: string, sha: string): void {
+    const entry = this.#laneReviewCancel(round, lane, sha);
+    if (entry.cancelled) return;
+    entry.cancelled = true;
+    entry.resolve();
+    try {
+      this.#log.append("lane_reviews_cancelled", { round, lane, candidateSha: sha });
+    } catch {
+      // a stopping conductor may already have closed its log.
+    }
+    for (const handle of this.#agents.values()) {
+      const r = handle.laneReview;
+      if (r && r.round === round && r.lane === lane && r.sha === sha) void handle.agent.terminate().catch(() => undefined);
+    }
+  }
+
+  /** 09-2: a lane review starts at the candidate's submission, so its checks
+   * may still be running when a turn's prompt is built. The reviewer is told
+   * so, and judges the code and the delta; the conductor owns the check
+   * result. Empty once the candidate's check result is recorded. */
+  #laneChecksRunningLines(round: number, lane: string, sha: string): string[] {
+    const candidate = (this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane);
+    if (candidate?.sha !== sha || candidate.ok !== undefined) return [];
+    return [
+      "This candidate's checks are running in parallel with your review; the conductor reports their result (a failed check cancels this review). Judge the code and the delta; do not run the checks yourself.",
+    ];
+  }
+
   /** The per-(round, lane) discovery barrier: every seat that arrives waits
    * until all of the round's seats have, exactly like the single-candidate
    * path's `#discoveryBarrier` but keyed by the candidate under review. */
-  #laneArriveAtBarrier(round: number, lane: string, seat: string): void {
-    const key = `${round}-${lane}`;
+  #laneArriveAtBarrier(round: number, lane: string, sha: string, seat: string): void {
+    const key = this.#laneReviewKey(round, lane, sha);
     const barrier = this.#laneBarriers.get(key) ?? { arrived: new Set<string>(), waiters: [] };
     if (barrier.arrived.has(seat)) return;
     barrier.arrived.add(seat);
@@ -9226,8 +9358,8 @@ export class Conductor {
     if (this.#laneSeats().every((s) => barrier.arrived.has(s))) barrier.waiters.splice(0).forEach((f) => f());
   }
 
-  #laneBarrierReleased(round: number, lane: string): Promise<void> {
-    const key = `${round}-${lane}`;
+  #laneBarrierReleased(round: number, lane: string, sha: string): Promise<void> {
+    const key = this.#laneReviewKey(round, lane, sha);
     const barrier = this.#laneBarriers.get(key);
     if (barrier && this.#laneSeats().every((s) => barrier.arrived.has(s))) return Promise.resolve();
     return new Promise<void>((resolve) => {
@@ -9535,6 +9667,9 @@ export class Conductor {
           return fixed;
         },
         reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
+        // 09-2 (async review): a candidate that failed its checks has its
+        // in-flight reviews ended.
+        cancelReviews: (r, lane, sha) => this.#cancelLaneReviews(r, lane, sha),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),
         // Plan 06n (A7): the pick compares each lane's item reviews against
@@ -9662,12 +9797,13 @@ export class Conductor {
   #clearLaneRound(round: number): void {
     for (const lane of this.#lanes()) {
       this.#laneBuilds.delete(`${round}-${lane}`);
-      this.#laneDiscoveries.delete(`${round}-${lane}`);
-      this.#laneDiscoveryPlans.delete(`${round}-${lane}`);
-      this.#laneBarriers.delete(`${round}-${lane}`);
-      this.#laneTriggers.delete(`${round}-${lane}`);
-      this.#laneTriggerPaths.delete(`${round}-${lane}`);
       this.#laneCheckBases.delete(`${round}-${lane}`);
+      // 09-2: the per-candidate review state is keyed `<round>-<lane>-<sha>`,
+      // one entry per candidate the lane submitted this round.
+      const prefix = `${round}-${lane}-`;
+      for (const map of [this.#laneDiscoveries, this.#laneDiscoveryPlans, this.#laneBarriers, this.#laneTriggers, this.#laneTriggerPaths, this.#laneReviewCancels]) {
+        for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key);
+      }
     }
     this.#lanePromptDeliveredNoteCount.delete(round);
   }

@@ -30,6 +30,18 @@ class FakeHost implements LaneHost {
   silentReviewSeat?: string;
   /** A seat whose pick turn records no vote. */
   silentVoteSeat?: string;
+  /** 09-2: how long one review takes; 0 records it at once. */
+  reviewDelayMs = 0;
+  /** 09-2: every review dispatch, check start/end and cancel, in order. */
+  timeline: string[] = [];
+  /** 09-2: the `<lane>@<sha>` review sets the round cancelled. */
+  cancels: string[] = [];
+  /** 09-2: a cancelled review throws once its delay is over, like a
+   * terminated review agent; set to undefined for a host that cannot cancel. */
+  cancelReviews?: LaneHost["cancelReviews"] = (_round: number, lane: string, sha: string) => {
+    this.timeline.push(`cancel-${lane}@${sha}`);
+    this.cancels.push(`${lane}@${sha}`);
+  };
   constructor(lanes: Record<string, string | { note: string }>) {
     this.lanes = lanes;
   }
@@ -56,11 +68,16 @@ class FakeHost implements LaneHost {
     // A real await: if the round ran two checks concurrently, the log would
     // interleave start-a/start-b.
     this.checkLog.push(`start-${lane}`);
+    this.timeline.push(`check-start-${lane}`);
     await new Promise((resolve) => setTimeout(resolve, 5));
     this.checkLog.push(`end-${lane}`);
+    this.timeline.push(`check-end-${lane}`);
     return this.lanes[lane] === "C1a" || this.lanes[lane] === "C1b" ? { ok: true } : { ok: false };
   }
   async reviewCandidate(round: number, lane: string, sha: string, seat: string): Promise<void> {
+    this.timeline.push(`review-${lane}:${seat}@${sha}`);
+    if (this.reviewDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.reviewDelayMs));
+    if (this.cancelReviews && this.cancels.includes(`${lane}@${sha}`)) throw new Error("the review was cancelled");
     if (seat === this.silentReviewSeat) return;
     this.reviews.push(`${lane}:${seat}`);
     this.emit({
@@ -97,7 +114,9 @@ test("plan 06l: runRound starts each lane's check as that lane submits and revie
 
   // The emitted record: one round, two candidates, two checks, six reviews,
   // three votes, one winner.
-  assert.deepEqual(types(host).slice(0, 5), [
+  // 09-2: the reviews land while the checks run, so only the non-review
+  // events keep this order.
+  assert.deepEqual(types(host).filter((t) => t !== "ROUND_REVIEW_SUBMITTED").slice(0, 5), [
     "ROUND_STARTED",
     "CANDIDATE_SUBMITTED",
     "CANDIDATE_SUBMITTED",
@@ -291,8 +310,11 @@ test("exex 01a2: a lane never hands in a red tree — a failed check goes back t
   assert.equal(a.sha, "C1a");
   assert.equal(a.ok, true, "the fixed commit is checked afresh; the red result never carries over");
   assert.equal(a.fixes, 1);
-  assert.ok(host.reviews.includes("a:M") && host.reviews.includes("b:M"), "both lanes reach review, only once green");
-  assert.ok(!host.reviews.some((r) => r.startsWith("a:") && host.events.some((e) => e.type === "ROUND_REVIEW_SUBMITTED" && (e as { review: { candidateSha: string } }).review.candidateSha === "Xa")), "the red tree is never reviewed");
+  // 09-2 (replaces "the red tree is never reviewed"): the red tree's reviews
+  // started at its submission and were cancelled when its check failed; only
+  // the fixed commit's reviews count.
+  assert.deepEqual(host.cancels, ["a@Xa"]);
+  assert.deepEqual(a.reviews?.map((r) => r.review.candidateSha), ["C1a", "C1a", "C1a"]);
   assert.ok(outcome.winner);
 });
 
@@ -303,7 +325,10 @@ test("exex 01a2: a lane out of time keeps its red candidate, unreviewed, and the
   const a = host.rounds()[0].candidates.find((c) => c.lane === "a")!;
   assert.equal(a.sha, "Xa");
   assert.equal(a.ok, false);
-  assert.ok(!host.reviews.some((r) => r.startsWith("a:")), "a red candidate is never reviewed");
+  // 09-2 (replaces "a red candidate is never reviewed"): its reviews were
+  // cancelled at the failed check and none is recorded on it.
+  assert.deepEqual(host.cancels, ["a@Xa"]);
+  assert.equal(a.reviews, undefined, "a red candidate's reviews never count");
   assert.equal(outcome.winner?.lane, "b");
 });
 
@@ -316,4 +341,140 @@ test("exex 01a2: a fix that hands back the same commit ends the loop instead of 
   };
   await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
   assert.equal(calls, 1);
+});
+
+// tt 09-2 (async review): reviews start at the candidate's submission, in
+// parallel with its checks; a failed check cancels them.
+test("09-2: a candidate's reviews start when its lane submits, before its check resolves", async () => {
+  const host = new FakeHost({ a: "C1a", b: { note: "no candidate" } });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  host.checkCandidate = async (_round: number, lane: string) => {
+    host.timeline.push(`check-start-${lane}`);
+    await gate;
+    host.timeline.push(`check-end-${lane}`);
+    return { ok: true };
+  };
+  host.reviewDelayMs = 1;
+  const running = runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  // The check is held open; every seat's review is already dispatched.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(host.timeline.filter((t) => t.startsWith("review-")).sort(), ["review-a:A@C1a", "review-a:B@C1a", "review-a:M@C1a"]);
+  assert.ok(!host.timeline.includes("check-end-a"), "the check has not finished");
+  assert.equal(host.rounds()[0].candidates.find((c) => c.lane === "a")?.reviews?.length, 3, "the reviews landed while the check ran");
+  release();
+  const outcome = await running;
+  assert.deepEqual(outcome.winner, { lane: "a", sha: "C1a", votes: 0 });
+  assert.equal(outcome.failure, undefined);
+});
+
+test("09-2: a failed check cancels its reviews, they are not counted, and the fixed candidate gets fresh reviews", async () => {
+  const host = new FakeHost({ a: "Xa", b: "C1b" });
+  // Reviews outlast the 5 ms check, so the red candidate's are in flight
+  // when its check fails.
+  host.reviewDelayMs = 20;
+  host.fixLane = async (lane: string) => ({ lane, sha: "C1a", disclosures: [] });
+  host.checkCandidate = async (_round: number, lane: string, sha: string) => {
+    host.timeline.push(`check-start-${lane}@${sha}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    host.timeline.push(`check-end-${lane}@${sha}`);
+    return sha.startsWith("C1") ? { ok: true } : { ok: false, note: "error[E0432]: unresolved import" };
+  };
+  const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.deepEqual(host.cancels, ["a@Xa"], "only the red candidate's reviews are cancelled");
+  const t = host.timeline;
+  assert.ok(t.indexOf("review-a:M@Xa") < t.indexOf("check-end-a@Xa"), "the red candidate was under review while its check ran");
+  assert.ok(t.indexOf("cancel-a@Xa") < t.indexOf("review-a:M@C1a"), "cancelled before the fixed candidate's reviews start");
+  assert.ok(t.indexOf("review-a:M@C1a") < t.indexOf("check-end-a@C1a"), "the fixed candidate is reviewed from its own submission");
+  assert.equal(host.events.filter((e) => e.type === "ROUND_REVIEW_SUBMITTED" && e.review.candidateSha === "Xa").length, 0);
+  const a = host.rounds()[0].candidates.find((c) => c.lane === "a")!;
+  assert.deepEqual(a.reviews?.map((r) => `${r.seat}@${r.review.candidateSha}`).sort(), ["A@C1a", "B@C1a", "M@C1a"]);
+  assert.equal(outcome.failure, undefined);
+  assert.ok(outcome.winner, "both lanes complete their K x N reviews and the round picks");
+});
+
+test("09-2: reviews a host could not cancel still never count — on the red candidate or on the lane's next one", async () => {
+  for (const fixDelayMs of [40, 0]) {
+    // 40: the stale reviews land while the lane is still red (the reducer
+    // ignores them). 0: they land after the fixed candidate was submitted
+    // (they name the old sha and never attach to the new one).
+    const host = new FakeHost({ a: "Xa", b: "C1b" });
+    host.cancelReviews = undefined;
+    host.reviewDelayMs = 20;
+    let fixedOnce = false;
+    host.fixLane = async (lane: string) => {
+      await new Promise((resolve) => setTimeout(resolve, fixDelayMs));
+      fixedOnce = true;
+      return { lane, sha: "C1a", disclosures: [] };
+    };
+    host.checkCandidate = async (_round: number, _lane: string, sha: string) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return sha.startsWith("C1") ? { ok: true } : { ok: false, note: "red" };
+    };
+    const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+    assert.ok(fixedOnce);
+    const a = host.rounds()[0].candidates.find((c) => c.lane === "a")!;
+    assert.deepEqual(a.reviews?.map((r) => r.review.candidateSha), ["C1a", "C1a", "C1a"], `fix delay ${fixDelayMs}`);
+    assert.ok(outcome.winner, `fix delay ${fixDelayMs}`);
+  }
+});
+
+test("09-2: the pick waits until every passing candidate's reviews are complete", async () => {
+  const host = new FakeHost({ a: "C1a", b: "C1b" });
+  host.reviewDelayMs = 30;
+  const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  const order = types(host);
+  const lastReview = order.lastIndexOf("ROUND_REVIEW_SUBMITTED");
+  assert.equal(order.filter((t) => t === "ROUND_REVIEW_SUBMITTED").length, 6);
+  assert.ok(lastReview < order.indexOf("PICK_VOTE"), "no seat votes before all six reviews are in");
+  assert.ok(order.lastIndexOf("CANDIDATE_CHECKED") < lastReview, "the reviews outlasted the checks and were still waited for");
+  assert.equal(outcome.winner?.lane, "b");
+
+  // A missing review still fails the round (today's K x N rule).
+  const silent = new FakeHost({ a: "C1a", b: "C1b" });
+  silent.reviewDelayMs = 30;
+  silent.silentReviewSeat = "A";
+  const failed = await runRound(silent, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.match(failed.failure ?? "", /reviewed by 2 of 3 seats/);
+  assert.equal(failed.winner, undefined);
+});
+
+test("09-2: the reducer drops a red candidate's reviews and ignores one that lands after its check failed", () => {
+  const review = (seat: string, sha: string) => ({
+    reviewer: seat as "M",
+    phaseId: "p1",
+    candidateSha: sha,
+    contractVersion: CV(),
+    correctionStatements: [],
+    findingStatements: [],
+  });
+  const apply = (state: ReturnType<typeof baseState>, event: Event) => {
+    const r = reduce(state, event);
+    assert.ok(r.ok, (r as { reason?: string }).reason);
+    return r.state;
+  };
+  let state = baseState({ phase: "IMPLEMENTING" });
+  state = apply(state, { type: "ROUND_STARTED", round: 1, base: "B0", lanes: ["a", "b"] });
+  state = apply(state, { type: "CANDIDATE_SUBMITTED", round: 1, lane: "a", sha: "Xa" });
+  // A review that lands while the check runs is recorded...
+  state = apply(state, { type: "ROUND_REVIEW_SUBMITTED", round: 1, lane: "a", seat: "M", review: review("M", "Xa") });
+  assert.equal(state.phase.rounds![0].candidates[0].reviews?.length, 1);
+  // ...and dropped when the check fails.
+  state = apply(state, { type: "CANDIDATE_CHECKED", round: 1, lane: "a", ok: false, note: "red" });
+  assert.equal(state.phase.rounds![0].candidates[0].reviews, undefined);
+  // A stale review that lands on the red candidate is ignored: accepted,
+  // and the state is unchanged (so the log replays it as a no-op).
+  const late = reduce(state, { type: "ROUND_REVIEW_SUBMITTED", round: 1, lane: "a", seat: "A", review: review("A", "Xa") });
+  assert.ok(late.ok);
+  assert.equal(late.state, state);
+  // Once the lane submitted its fix, a review naming the old sha never
+  // attaches to the new candidate.
+  state = apply(state, { type: "CANDIDATE_SUBMITTED", round: 1, lane: "a", sha: "C1a" });
+  const stale = reduce(state, { type: "ROUND_REVIEW_SUBMITTED", round: 1, lane: "a", seat: "B", review: review("B", "Xa") });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.state.phase.rounds![0].candidates[0].reviews, undefined);
+  // A passing check keeps the reviews that landed while it ran.
+  state = apply(state, { type: "ROUND_REVIEW_SUBMITTED", round: 1, lane: "a", seat: "M", review: review("M", "C1a") });
+  state = apply(state, { type: "CANDIDATE_CHECKED", round: 1, lane: "a", ok: true });
+  assert.deepEqual(state.phase.rounds![0].candidates[0].reviews?.map((r) => r.seat), ["M"]);
 });

@@ -36,6 +36,14 @@ import { groupAlive, signalGroup } from "./sweep.ts";
 const DEFAULT_TERM_GRACE_MS = 10_000;
 const STOP_POLL_INTERVAL_MS = 5;
 const STOP_POLL_TIMEOUT_MS = 5_000;
+/** 09-2: how long a command's result waits, after its process exited, for
+ * its stdout/stderr to drain. Node may emit `exit` before the pipes' last
+ * `data`; resolving on `exit` alone dropped a fast check's whole output
+ * under load (a lane check whose reviewers had just started printed its
+ * failing test name, yet the conductor read an empty output and could not
+ * classify the failure). Bounded, because a background grandchild that
+ * inherited the pipes can hold them open long after the command ended. */
+const STDIO_DRAIN_MS = 2_000;
 
 /** The Node test runner sets two variables on the processes it launches —
  * `NODE_TEST_CONTEXT` and `NODE_TEST_WORKER_ID` — purely to coordinate its
@@ -326,19 +334,37 @@ export function runCommand(options: RunCommandOptions): RunningCommand {
         rejectResult(err);
       });
 
-    c.once("exit", (code, signal) => {
-      if (deadlineTimer) clearTimeout(deadlineTimer);
-      if (termTimer) clearTimeout(termTimer);
-      stopSampling();
+    // 09-2: the result is the exit status plus ALL the output, so it resolves
+    // once the pipes closed too (`close`), or STDIO_DRAIN_MS after `exit`.
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let closed = false;
+    let drainTimer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const settle = (): void => {
+      if (settled || exited === undefined) return;
+      settled = true;
+      if (drainTimer) clearTimeout(drainTimer);
       resolveResult({
-        exitCode: code,
-        signal: signal as NodeJS.Signals | null,
+        exitCode: exited.code,
+        signal: exited.signal,
         timedOut,
         cancelled: cancelRequested,
         output,
         signalsSent,
         ...(sampled ? { resourceSample: { peakRssMB, freeMemMB } } : {}),
       });
+    };
+    c.once("exit", (code, signal) => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      if (termTimer) clearTimeout(termTimer);
+      stopSampling();
+      exited = { code, signal: signal as NodeJS.Signals | null };
+      if (closed) settle();
+      else drainTimer = setTimeout(settle, STDIO_DRAIN_MS);
+    });
+    c.once("close", () => {
+      closed = true;
+      settle();
     });
   });
 
