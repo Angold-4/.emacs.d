@@ -235,7 +235,7 @@ import {
   removeWorktree,
   candidateTree,
   saveUnsubmittedWork as gitSaveUnsubmittedWork,
-  verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween, headOf } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
@@ -1479,6 +1479,9 @@ export class Conductor {
    * `<round>-<lane>`, so its check can diff against its lane's start and
    * choose the final tier when a wide path is touched. */
   #laneCheckBases = new Map<string, string>();
+  /** exex 01a2: when each lane's worker started this round (`round-lane`), so
+   * a fix after a red check gets only the attempt time that is left. */
+  #laneStartedAt = new Map<string, number>();
   /** Plan 06k3 (A2, findings A-13/T-29): lanes whose unsubmitted-work ref
    * could not be written. Their dirty worktree is retained (never removed)
    * so the work is not lost, and the next attempt continues in it. */
@@ -8348,10 +8351,20 @@ export class Conductor {
   /** One lane: its own worktree at the round's base, its own worker and its
    * own sweep (A2). Returns the frozen candidate sha and the lane's
    * disclosures, or a note saying why the lane produced none. */
-  async #buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild> {
+  async #buildLane(
+    lane: string,
+    round: number,
+    base: string,
+    prompt: string,
+    fix?: { of: string; timeoutMs: number },
+  ): Promise<LaneBuild> {
     // Plan 06n (A5): remember this lane's own start, so its check can diff
-    // against it and pick the final tier when a wide path is touched.
-    this.#laneCheckBases.set(`${round}-${lane}`, base);
+    // against it and pick the final tier when a wide path is touched. A fix
+    // keeps the lane's original start: its candidate is still measured from it.
+    if (!fix) {
+      this.#laneCheckBases.set(`${round}-${lane}`, base);
+      this.#laneStartedAt.set(`${round}-${lane}`, Date.now());
+    }
     // Plan 06n (A1): when the previous round picked the OTHER lane, this lane
     // lost and its worktree was reset to the winner's candidate. It starts a
     // fresh session, never continuing from memory of its own lost edits. The
@@ -8360,9 +8373,12 @@ export class Conductor {
     // Plan 06n (A7): a round that restarts every lane from the best candidate
     // starts fresh every lane whose own previous candidate is not that base.
     const own = previous?.candidates.find((c) => c.lane === lane)?.sha;
+    // exex 01a2: a fix continues the lane's own session, which holds the work
+    // it is fixing.
     const freshSession =
-      (previous?.picked !== undefined && previous.picked.lane !== lane) ||
-      (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base);
+      !fix &&
+      ((previous?.picked !== undefined && previous.picked.lane !== lane) ||
+        (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base));
     // Recorded so a test (and the owner) can see the session decision; the
     // production session dir still exists, the fresh start just skips
     // `--continue`.
@@ -8373,7 +8389,11 @@ export class Conductor {
     // single-worker reset — never a bare throw the round swallows without a
     // lane-specific reason.
     try {
-      if (this.#unsavedLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
+      if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
+        // exex 01a2: the worktree already holds the red candidate (its
+        // freeze commit); the worker fixes it in place.
+        this.#log.append("lane_worktree_reused", { lane, round, reason: `fixing its red candidate ${fix.of}` });
+      } else if (this.#unsavedLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
         // Plan 06k3 (A2, findings A-13/T-29): the previous attempt's work
         // could not be written to a ref, so its dirty worktree is kept as-is
         // and the worker continues in it.
@@ -8390,7 +8410,7 @@ export class Conductor {
       return { lane, note: `the lane's worktree could not be created: ${error}` };
     }
     const actionId = this.#log.actionId(`lane_${round}_${lane}`);
-    this.#log.intent(actionId, { lane, round, worktree, base });
+    this.#log.intent(actionId, { lane, round, worktree, base, ...(fix ? { fixOf: fix.of } : {}) });
     let agentId = `lane-${round}-${lane}-${actionId}`;
     const sessionDir = path.join(this.#paths.sessions, `lane-worker-${lane}`);
     const spawnLane = (): AgentHandle =>
@@ -8454,11 +8474,12 @@ export class Conductor {
           this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: carried - deliveredCount });
         }
       }
-      const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
+      const attemptMs = fix?.timeoutMs ?? this.#deadlines.workerAttemptMs;
+      const timeout = new PausableTimer<"timeout">(attemptMs, "timeout");
       // Plan 06k3 (A2): at 75% of the attempt the lane worker is told how many
       // minutes remain and to submit. The steer timer pauses with the attempt
       // clock.
-      const clockSteer = this.#scheduleClockSteer(agentId, handle.agent, this.#deadlines.workerAttemptMs);
+      const clockSteer = this.#scheduleClockSteer(agentId, handle.agent, attemptMs);
       // Plan 06k1 (A4): a lane worker pauses while another run's check window
       // is open, exactly like the single-candidate worker.
       const stopCheckWindowWatch = this.#watchCheckWindow(agentId, handle.agent, timeout, clockSteer.timer);
@@ -8533,6 +8554,62 @@ export class Conductor {
     } finally {
       this.#agents.delete(agentId);
     }
+  }
+
+  /** exex 01a2: a lane never hands in a red tree. Its worker gets the
+   * failing checks back on its own candidate, continuing its own session, with
+   * the attempt time it has left, and submits again. A lane with under a
+   * minute left keeps its red candidate for this round (the next round starts
+   * from it, `repeatLaneBases`). */
+  async #fixLane(lane: string, round: number, sha: string, failure: string): Promise<LaneBuild> {
+    const started = this.#laneStartedAt.get(`${round}-${lane}`) ?? Date.now();
+    const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - started);
+    if (remainingMs < 60_000) {
+      this.#log.append("lane_fix_skipped", { lane, round, sha, reason: "no attempt time left" });
+      return { lane, note: `the lane's candidate ${sha.slice(0, 7)} is red and its attempt time is spent` };
+    }
+    const digest = this.#laneCheckFailureDigest(sha);
+    this.#log.append("lane_fix_started", { lane, round, sha, remainingMs });
+    const prompt = [
+      `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so it was NOT handed to review. A lane never hands in a red tree: the reviewers only ever see a candidate whose checks pass.`,
+      "",
+      "Fix exactly what fails, in this worktree (it holds your candidate). Keep all your other work; do not delete, skip or #[ignore] a test, weaken an assertion, or remove required work to make a check pass (ODP-2) — if the failure is a real limit, raise it as a BLOCKER with the exact error instead.",
+      "Run the failing command yourself until it passes, then run the full round checks, then call submit_coverage and submit_phase again with your complete payload (your disclosures, coverage and answers, updated for what you changed).",
+      `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes of this attempt left.`,
+      "",
+      `The failure: ${failure}`,
+      ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
+    ].join("\n");
+    return this.#buildLane(lane, round, sha, prompt, { of: sha, timeoutMs: remainingMs });
+  }
+
+  /** exex 01a2: the lines of a failed candidate's check output a worker needs
+   * to fix it — compile errors with their locations, failing tests and
+   * panics — at most `limit` lines, errors first. */
+  #laneCheckFailureDigest(sha: string, limit = 160): string {
+    const dir = path.join(this.#paths.checks, sha);
+    let text = "";
+    try {
+      for (const f of fs.readdirSync(dir)) if (f.endsWith(".log")) text += fs.readFileSync(path.join(dir, f), "utf8") + "\n";
+    } catch {
+      return "";
+    }
+    const lines = text.split("\n");
+    const keep: string[] = [];
+    for (let i = 0; i < lines.length && keep.length < limit; i++) {
+      const line = lines[i];
+      if (/^error(\[E\d+\])?:/.test(line) || /^warning: unused/.test(line)) {
+        // the message and its location/snippet lines
+        for (let j = i; j < Math.min(lines.length, i + 8) && keep.length < limit; j++) {
+          if (j > i && /^(error|warning)/.test(lines[j])) break;
+          keep.push(lines[j]);
+        }
+      } else if (/^test .* FAILED$/.test(line) || /panicked at/.test(line) || /^Diff in /.test(line) || /^---- .* stdout ----$/.test(line)) {
+        keep.push(line);
+        if (/panicked at/.test(line) && i + 1 < lines.length) keep.push(lines[i + 1]);
+      }
+    }
+    return keep.join("\n").trim();
   }
 
   /** Plan 06n (A3/A4/A5): a candidate kept from a round stopped mid-way.
@@ -9442,6 +9519,12 @@ export class Conductor {
         // recorded build (payload, start and check output).
         resumeLane: (r, lane, sha) => this.#resumedLaneBuild(r, lane, sha),
         checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
+        // exex 01a2: a red candidate goes back to its own lane's worker.
+        fixLane: async (lane, r, sha, failure) => {
+          const fixed = await this.#fixLane(lane, r, sha, failure);
+          if (fixed.sha) this.#laneBuilds.set(`${r}-${lane}`, fixed);
+          return fixed;
+        },
         reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),

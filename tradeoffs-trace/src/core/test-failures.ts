@@ -124,12 +124,34 @@ export interface ParsedTestFailure {
   name: string;
   runner: TestRunner;
   file?: string;
+  /** exex 01a2: for cargo, the package and target the failing test was built
+   * in, read from the `Running … (target/…/deps/<crate>-<hash>)` line above
+   * it, so the re-run builds and runs only that target. */
+  cargoTarget?: CargoTarget;
 }
+
+/** A cargo test target: a package's library unit tests (the package is the
+ * crate name with `_` read as `-`), or one integration test file (whose
+ * binary is named after the file, so cargo finds its package itself). */
+export type CargoTarget = { kind: "lib"; package: string } | { kind: "test"; test: string };
 
 /** Cargo's `Running … (target/<…>/deps/…)` line. It is `Running <kind> <path>`
  * for a unit-test target (`unittests src/lib.rs`) but `Running <path>` for an
  * integration test target (`tests/x.rs`). */
-const CARGO_RUNNING = /^\s*Running\s+(.+?)\s+\(target\/[^)]*\/deps\/.*\)\s*$/;
+const CARGO_RUNNING = /^\s*Running\s+(.+?)\s+\((target\/[^)]*\/deps\/[^)]*)\)\s*$/;
+
+/** The cargo target a `Running` line names: `unittests src/lib.rs` is the
+ * package's library tests, `tests/<file>.rs` one integration test. The
+ * library's package is the binary's crate name (`deps/<crate>-<hash>`) with
+ * `_` read as `-`, the workspace's package naming. Anything else (a bin, a
+ * doctest) has no target, and the old default applies. */
+export function cargoTargetOf(desc: string, source: string, binary: string): CargoTarget | undefined {
+  const stem = binary.replace(/^.*\//, "").replace(/-[0-9a-f]{6,}$/, "");
+  if (!/^[A-Za-z0-9_]+$/.test(stem)) return undefined;
+  if (desc === "unittests" && /(^|\/)src\/lib\.rs$/.test(source)) return { kind: "lib", package: stem.replace(/_/g, "-") };
+  if (desc === "" && /^tests\/[^/]+\.rs$/.test(source)) return { kind: "test", test: source.replace(/^tests\//, "").replace(/\.rs$/, "") };
+  return undefined;
+}
 
 /** TAP's location line (`location: '/tmp/x.test.js:3:1'`). */
 const NODE_TAP_LOCATION = /^\s*location: '(.+?):\d+:\d+'\s*$/;
@@ -146,7 +168,8 @@ export function parseTestFailuresDetailed(output: string): ParsedTestFailure[] {
   const byName = new Map<string, ParsedTestFailure>();
   let specFile: string | undefined;
   let cargoFile: string | undefined;
-  const add = (raw: string, runner: TestRunner, file?: string): void => {
+  let cargoTarget: CargoTarget | undefined;
+  const add = (raw: string, runner: TestRunner, file?: string, target?: CargoTarget): void => {
     const name = raw.trim();
     if (name.length === 0 || NOT_A_TEST_NAME.test(name)) return;
     const existing = byName.get(name);
@@ -158,7 +181,12 @@ export function parseTestFailuresDetailed(output: string): ParsedTestFailure[] {
       if (existing.file === undefined && file !== undefined) existing.file = file;
       return;
     }
-    const parsed: ParsedTestFailure = file !== undefined ? { name, runner, file } : { name, runner };
+    const parsed: ParsedTestFailure = {
+      name,
+      runner,
+      ...(file !== undefined ? { file } : {}),
+      ...(target !== undefined ? { cargoTarget: target } : {}),
+    };
     byName.set(name, parsed);
     out.push(parsed);
   };
@@ -173,11 +201,12 @@ export function parseTestFailuresDetailed(output: string): ParsedTestFailure[] {
       const path = parts[parts.length - 1];
       const desc = parts.length > 1 ? parts[0] : "";
       cargoFile = desc === "unittests" || !path.endsWith(".rs") ? undefined : path.replace(/^.*\//, "").replace(/\.rs$/, "");
+      cargoTarget = cargoTargetOf(desc, path, running[2]);
       continue;
     }
     const cargo = line.match(CARGO_FAILED);
     if (cargo) {
-      add(cargo[1], "cargo", cargoFile);
+      add(cargo[1], "cargo", cargoFile, cargoTarget);
       continue;
     }
     // The spec reporter writes `test at <file>:<line>:<col>` just above the
@@ -306,7 +335,18 @@ export function singleTestCommand(name: string, output: string, template?: strin
     // replacement pattern.
     return template.replace(/\{(name|file|crate)\}/g, (_m, key: string) => shellQuote(values[key]!));
   }
-  if (named?.runner === "cargo") return `cargo test -- --exact ${shellQuote(name)}`;
+  if (named?.runner === "cargo") {
+    // exex 01a2: the workspace-wide `cargo test -- --exact <name>` rebuilt
+    // every crate's tests and ran past the check deadline, so a load-only
+    // flake was recorded as `reproduces alone`. The test's own package and
+    // target re-run in seconds, alone, on one thread.
+    const t = named.cargoTarget;
+    if (t) {
+      const target = t.kind === "lib" ? `-p ${shellQuote(t.package)} --lib` : `--test ${shellQuote(t.test)}`;
+      return `cargo test ${target} -- --exact ${shellQuote(name)} --test-threads=1`;
+    }
+    return `cargo test -- --exact ${shellQuote(name)}`;
+  }
   if (named?.runner === "node") {
     // The file must be known: `node --test --test-name-pattern` exits 0 when
     // nothing matches, so a pattern with no file could report a real failure

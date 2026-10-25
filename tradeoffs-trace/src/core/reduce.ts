@@ -546,7 +546,14 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!round.lanes.includes(event.lane)) {
         return rejected(state, `CANDIDATE_SUBMITTED names lane ${event.lane}, not a lane of round ${event.round}`);
       }
-      const candidates = upsertLane(round.candidates, event.lane, { sha: event.sha });
+      // exex 01a2: a lane whose candidate failed its checks fixes it and
+      // submits again in the same round; the new commit starts unchecked, so
+      // the old check result never carries over to it.
+      const prior = round.candidates.find((c) => c.lane === event.lane);
+      const candidates =
+        prior && prior.sha !== event.sha
+          ? [...round.candidates.filter((c) => c.lane !== event.lane), { lane: event.lane, sha: event.sha, fixes: (prior.fixes ?? 0) + 1 }]
+          : upsertLane(round.candidates, event.lane, { sha: event.sha });
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, candidates }) } });
     }
 
