@@ -306,9 +306,15 @@ success/failure boolean."
       (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir root)))
              (default-directory (file-name-as-directory root))
              (out (generate-new-buffer " *tt-async*"))
-             (err-buf (generate-new-buffer " *tt-async-stderr*")))
+             (err-buf (generate-new-buffer " *tt-async-stderr*"))
+             ;; An explicit stderr pipe with a silent sentinel: given a bare
+             ;; buffer, `make-process' makes this pipe itself with the default
+             ;; sentinel, which writes "Process tt-async stderr finished" into
+             ;; ERR-BUF, so the reported text could end with that line.
+             (err-pipe (make-pipe-process :name "tt-async stderr" :buffer err-buf
+                                          :noquery t :sentinel #'ignore)))
         (make-process
-         :name "tt-async" :buffer out :stderr err-buf :noquery t :connection-type 'pipe
+         :name "tt-async" :buffer out :stderr err-pipe :noquery t :connection-type 'pipe
          :command (append (list +tt-node cli) args (list "--root" (directory-file-name root)))
          :sentinel
          (lambda (proc _event)
