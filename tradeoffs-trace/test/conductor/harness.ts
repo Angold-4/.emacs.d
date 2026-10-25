@@ -132,6 +132,10 @@ export async function setupConductor(opts: {
   laneReviewerScriptFor?: (seat: string, candidate: string, state: State, lane?: string) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 06g2: one script per pick seat (`pick-<round>-<seat>-…`). */
   pickScriptFor?: (seat: string, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** tt 09 (change 3): one script per consolidator run
+   * (`consolidate-<round>-…`), `n` counting this round's runs from 1 (the
+   * build, then each fix). Absent: the worker script. */
+  consolidatorScriptFor?: (round: number, n: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04a: the EVALUATING stage's fresh evaluator, ONE PER MESSAGE TYPE.
    * The default script returns an empty `submit_evaluation`, which the
@@ -288,6 +292,7 @@ export async function setupConductor(opts: {
   const laneWorkerScriptPaths = new Map<string, string>();
   const laneReviewerScriptPaths = new Map<string, string>();
   const pickScriptPaths = new Map<string, string>();
+  const consolidatorScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
   const briefScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
@@ -407,6 +412,16 @@ export async function setupConductor(opts: {
     // test files never contend on the real machine-wide lock.
     checkLockPath: opts.checkLockPath ?? path.join(runRoot, "check.lock"),
     piEnvFor: (role, agentId) => {
+      // tt 09 (change 3): the consolidator's own script, one per run.
+      const consolidate = agentId.match(/^consolidate-(\d+)-/);
+      if (role === "worker" && consolidate && opts.consolidatorScriptFor) {
+        const round = Number(consolidate[1]);
+        if (!consolidatorScriptPaths.has(agentId)) {
+          const n = [...consolidatorScriptPaths.keys()].filter((k) => k.startsWith(`consolidate-${round}-`)).length + 1;
+          consolidatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, opts.consolidatorScriptFor(round, n, conductor.state)));
+        }
+        return { FAKE_PI_SCRIPT: consolidatorScriptPaths.get(agentId)!, ...(opts.extraWorkerEnv ?? {}) };
+      }
       // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
       const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);
       if (role === "worker" && laneWorker && opts.laneWorkerScriptFor) {

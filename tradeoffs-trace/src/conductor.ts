@@ -37,7 +37,24 @@ import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryB
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
-import { isLaneRound, laneFailureLines, lanesOfContract, repeatLaneBases, runRound, type LaneBuild, type LaneCheck, type LaneHost } from "./core/lanes.ts";
+import {
+  consolidatedBase,
+  consolidatedLabel,
+  consolidationEnabled,
+  consolidationLine,
+  consolidationPlan,
+  isLaneRound,
+  itemEvidence,
+  laneFailureLines,
+  lanesOfContract,
+  repeatLaneBases,
+  runConsolidation,
+  runRound,
+  type ConsolidationPlan,
+  type LaneBuild,
+  type LaneCheck,
+  type LaneHost,
+} from "./core/lanes.ts";
 // Plan 06h (A1/A2): the seat list, its leader and the lane count are the
 // plan's, read from one place (`seatsOf`/`leaderOf`).
 import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
@@ -147,6 +164,7 @@ import {
   PI_VERSION,
   ROLE_TOOLS,
   type PlanModels,
+  type ModelRole,
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
@@ -411,6 +429,10 @@ export interface RunPlanPhase {
   /** Plan 06h (A1): `#+TT_LEADER:` (or the phase's own `:LEADER:`). Absent
    * means the first seat. */
   leader?: string;
+  /** tt 09 (change 3): `#+TT_CONSOLIDATE:` (or the phase's own
+   * `:CONSOLIDATE:`), `on` or `off`. Absent means on whenever the phase runs
+   * two or more lanes. */
+  consolidate?: string;
   /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` (or the phase's own
    * `:VARIANT_LIMIT:`). How many consecutive rounds may each raise a new
    * blocking finding of the same kind on one requirement before the owner is
@@ -574,7 +596,7 @@ export interface ConductorOptions {
    * against the real `pi` binary must pick a real provider/model, which
    * nothing else on `ConductorOptions` carries. Absent (the default): no
    * `--provider`/`--model` flag is added, i.e. Pi's own default. */
-  providerModelFor?: (role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined;
+  providerModelFor?: (role: ModelRole, seat?: string | number) => { provider?: string; model?: string } | undefined;
   extraEnv?: NodeJS.ProcessEnv;
   /** Plan 05i: the environment the preflight resolves declared executables
    * in (defaults to `process.env`, the conductor's own environment). Tests
@@ -879,6 +901,9 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     // reader has ONE source of the seat list (`seatsOf`).
     ...(phase.seats && phase.seats.length > 0 ? { seats: [...phase.seats] } : {}),
     ...(typeof phase.leader === "string" && phase.leader.length > 0 ? { leader: phase.leader } : {}),
+    // tt 09 (change 3): the combine step is on by default; only an explicit
+    // `off` is frozen, so every older contract keeps its shape.
+    ...(typeof phase.consolidate === "string" && phase.consolidate.trim().toLowerCase() === "off" ? { consolidate: false as const } : {}),
   };
 }
 
@@ -1301,6 +1326,13 @@ interface AgentHandle {
   /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
    * winner's hand-off. */
   laneCoverage?: unknown;
+  /** tt 09 (change 3): set on the consolidator — the round it combines and
+   * its own worktree. Its submissions belong to the combine step, never to a
+   * lane or the phase. */
+  consolidation?: { round: number; worktree: string };
+  /** tt 09 (change 3): the consolidator's `submit_phase` report of what it
+   * changed beyond the taken work (its `deviations`). */
+  consolidationAdded?: string[];
   /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
   pickSeat?: string;
   /** Plan 06h (A3): true when this pick turn is the top-two revote. */
@@ -1400,7 +1432,7 @@ export class Conductor {
   #piArgsPrefix: string[];
   #piCommandFor: ((role: Role) => string | undefined) | undefined;
   #piArgsPrefixFor: ((role: Role) => string[] | undefined) | undefined;
-  #providerModelFor: ((role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined) | undefined;
+  #providerModelFor: ((role: ModelRole, seat?: string | number) => { provider?: string; model?: string } | undefined) | undefined;
   #extraEnv: NodeJS.ProcessEnv;
   /** Plan 05i: the environment `#runEnvPreflight` resolves tools in. */
   #preflightEnv: NodeJS.ProcessEnv;
@@ -4600,6 +4632,22 @@ export class Conductor {
   async #onSubmitChecked(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
     const handle = this.#agents.get(agentId);
     if (!handle) return { ok: false, reason: "unknown agent" };
+    // tt 09 (change 3): the consolidator's submissions belong to the combine
+    // step, not to a lane or the phase. Its commit is judged by the round
+    // checks and then by the next round's reviews of the lanes built on it,
+    // so no coverage, finding-answer or directive gate applies to it.
+    if (handle.consolidation) {
+      if (msg.tool === "submit_coverage") return { ok: true };
+      if (msg.tool === "submit_phase") {
+        const args = msg.args as SubmitPhaseArgs;
+        handle.consolidationAdded = (args.deviations ?? []).filter((d) => typeof d === "string" && d.trim().length > 0);
+        handle.doneResolve();
+        return { ok: true };
+      }
+      if (msg.tool === "raise_tradeoff") {
+        return { ok: false, reason: "the consolidator raises no trade-off: take the listed lane's work, and name anything you changed beyond it in submit_phase's deviations" };
+      }
+    }
     if (msg.tool === "submit_coverage") {
       // Plan 06b: the worker's per-item coverage. It is recorded even when
       // incomplete (so the worker and the status see what is missing), but
@@ -6883,6 +6931,8 @@ export class Conductor {
     // worker) or in the candidate it reviews — never in another lane's tree.
     if (handle.laneReview) return path.join(this.#paths.candidates, handle.laneReview.sha);
     if (handle.lane !== undefined) return this.#laneWorktree(handle.lane);
+    // tt 09 (change 3): the consolidator works in its own worktree.
+    if (handle.consolidation) return handle.consolidation.worktree;
     return handle.role === "worker" ? this.#paths.worktree : this.#candidateDir();
   }
 
@@ -8080,6 +8130,10 @@ export class Conductor {
     // compares against THAT candidate.
     const repeated = repeatLaneBases(prev)?.[lane];
     if (repeated) return repeated;
+    // tt 09 (change 3): a round after a consolidation starts every lane from
+    // the consolidated commit.
+    const consolidated = consolidatedBase(rounds, round);
+    if (consolidated) return consolidated;
     // Otherwise the lane started from the phase's own candidate (a repair
     // round). Round 1 starts from the integration head, which is not a
     // candidate: an unchanged submission there is not a resubmission.
@@ -8177,6 +8231,10 @@ export class Conductor {
      * exists — the losing lane after the other lane won must not continue
      * from its own lost edits. */
     freshSession?: boolean;
+    /** tt 09 (change 3): the consolidator — a worker by its tools, on the
+     * `consolidator` model (`#+TT_MODELS consolidator=…`, else the leader
+     * seat's). */
+    consolidation?: { round: number; worktree: string };
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -8191,8 +8249,9 @@ export class Conductor {
       discoveryResolve = resolve;
     });
     fs.mkdirSync(opts.sessionDir, { recursive: true });
-    const providerModel =
-      opts.role === "worker"
+    const providerModel = opts.consolidation
+      ? this.#providerModelFor?.("consolidator", this.#laneLeader())
+      : opts.role === "worker"
         ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
           // position, which the caller passes as `seat`.
           this.#providerModelFor?.("worker", opts.seat ?? opts.lane)
@@ -8255,6 +8314,7 @@ export class Conductor {
       ...(opts.laneReview ? { laneReview: opts.laneReview } : {}),
       ...(opts.pickSeat !== undefined ? { pickSeat: opts.pickSeat } : {}),
       ...(opts.pickRevote ? { pickRevote: true } : {}),
+      ...(opts.consolidation ? { consolidation: opts.consolidation } : {}),
     };
     this.#agents.set(opts.agentId, handle);
     // Plan 06g2: record the lane agent's own process group, so a crashed
@@ -8286,12 +8346,29 @@ export class Conductor {
       lines.push(
         `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), but its evaluation lost ${previous.regressed.items.join(", ")}, which the best candidate ${base.slice(0, 7)} met, in code it changed. It was not adopted: every lane's worktree was reset to the best candidate ${base.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met; ${winner.sha.slice(0, 7)} is for reference only.`,
       );
+    } else if (previous?.picked && previous.consolidated?.ok && previous.consolidated.sha === base) {
+      // tt 09 (change 3): the winner was combined with what the other lanes
+      // met; every lane starts from the consolidated commit and is told which
+      // items it carries, so no lane redoes them or drops them.
+      const winner = previous.picked;
+      const c = previous.consolidated;
+      const label = consolidatedLabel(previous.round, winner.lane, c.took);
+      lines.push(
+        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), and a consolidator combined it with the plan items another lane met and it did not: ${c.took.map((t) => `lane ${t.lane}'s ${t.items.join(", ")} (from ${t.sha.slice(0, 7)})`).join("; ")}. Every lane's worktree was reset to that consolidated commit ${label} ${base.slice(0, 7)} — this round's base — so no lane's own previous candidate is in the worktree. Keep everything it meets, including ${c.took.flatMap((t) => t.items).join(", ")}; build on it, do not redo or drop that work.`,
+      );
     } else if (previous?.picked) {
       const winner = previous.picked;
       const losers = previous.lanes.filter((l) => l !== winner.lane);
       lines.push(
         `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). Every lane's worktree was reset to that candidate, so the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree.`,
       );
+      // tt 09 (change 3): a consolidation that failed leaves the round on the
+      // winner; the items the other lane met are named with where they are.
+      if (previous.consolidated && !previous.consolidated.ok) {
+        lines.push(
+          `Combining it with what the other lane met failed (${previous.consolidated.note ?? "no reason recorded"}). These plan items were met by another lane and not by the winner — take that work from its candidate: ${previous.consolidated.took.map((t) => `lane ${t.lane} ${t.sha.slice(0, 7)}: ${t.items.join(", ")}`).join("; ")}.`,
+        );
+      }
     }
     // Plan 06n (A7/R9b): every lane lost an item the best candidate met, so
     // the round picked no lane and every lane restarts from the best
@@ -8640,6 +8717,250 @@ export class Conductor {
       }
     }
     return keep.join("\n").trim();
+  }
+
+  // -------------------------------------------------------------------------
+  // tt 09 (change 3): combine the lanes
+  // -------------------------------------------------------------------------
+
+  /** The consolidator's own worktree, beside the lanes'. */
+  #consolidationWorktree(): string {
+    return path.join(this.#runDir, "worktrees", "consolidator");
+  }
+
+  /** tt 09 (change 3): the combine step after round `roundNo`, whose pick the
+   * phase evaluated and did not accept. When another passing lane met plan
+   * items the winner did not (`consolidationPlan`, the seats' per-item
+   * verdicts), a consolidator starts from the winner in its own worktree,
+   * takes that lane's work for exactly those items, and its commit goes
+   * through the round checks with the lane fix loop (`runConsolidation`).
+   * ROUND_CONSOLIDATED records the result either way: a green commit is the
+   * next round's base for every lane; a failure keeps today's base (the
+   * winner) and says why. Returns "stopped" when the owner's stop or a
+   * recheck ended it mid-way — nothing is recorded then. */
+  async #consolidateRound(roundNo: number): Promise<"stopped" | undefined> {
+    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
+    if (!record?.picked || record.consolidated || record.regressed) return undefined;
+    if (!consolidationEnabled(this.#state.phase.contract) || !this.#itemsEnforced()) return undefined;
+    // Only a pick the phase adopted and evaluated is combined (a round that
+    // was handed off and then not accepted).
+    if (this.#state.phase.candidate?.sha !== record.picked.sha) return undefined;
+    const itemIds = flatItems(this.#planItems()).map((i) => i.id);
+    const plan = consolidationPlan(record, itemIds, this.#laneSeats().length);
+    if (!plan) return undefined;
+    this.#log.append("consolidation_started", { round: roundNo, from: plan.winner.sha, lane: plan.winner.lane, took: plan.takes });
+    const startedAt = Date.now();
+    const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
+    const outcome = await runConsolidation({
+      build: () => this.#buildConsolidation(plan, this.#consolidationPrompt(plan)),
+      check: (sha) => this.#checkConsolidation(plan, sha),
+      fix: async (sha, failure) => {
+        const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - startedAt);
+        // The lane rule: too little time left to fix anything keeps the red
+        // commit, and the next round starts from the winner.
+        if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
+          this.#log.append("consolidation_fix_skipped", { round: roundNo, sha, reason: "no attempt time left" });
+          return { lane: "consolidator", note: "its attempt time is spent" };
+        }
+        this.#log.append("consolidation_fix_started", { round: roundNo, sha, remainingMs });
+        const digest = this.#laneCheckFailureDigest(sha);
+        const prompt = [
+          `Your consolidated commit ${sha.slice(0, 7)} FAILED the round checks, so it cannot be the next round's base.`,
+          "",
+          "Fix exactly what fails, in this worktree (it holds your commit). Keep the winner's work and the work you took; do not delete, skip or #[ignore] a test, weaken an assertion, or drop a taken item to make a check pass.",
+          "Run the failing command until it passes, then call submit_phase again (decisions [], assumptions [], and in deviations every change you made beyond the taken work).",
+          `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
+          "",
+          `The failure: ${failure}`,
+          ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
+        ].join("\n");
+        const fixed = await this.#buildConsolidation(plan, prompt, { of: sha, timeoutMs: remainingMs });
+        if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
+          this.#log.append("consolidation_fix_unchanged", { round: roundNo, sha, fixedSha: fixed.sha });
+          return { lane: "consolidator", note: `its fix of ${sha.slice(0, 7)} changed nothing` };
+        }
+        return fixed;
+      },
+      stopRequested: stopped,
+    });
+    if (outcome.stopped || stopped()) {
+      this.#log.append("consolidation_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
+      return "stopped";
+    }
+    // The consolidator's own diff beyond the taken lanes' files, measured
+    // (07: its extra diff must be small and reported, not just requested).
+    let extraFiles: string[] | undefined;
+    if (outcome.ok && outcome.sha) {
+      try {
+        const taken = new Set(plan.takes.flatMap((t) => diffNameOnly(this.#plan.repo, plan.winner.sha, t.sha)));
+        extraFiles = diffNameOnly(this.#plan.repo, plan.winner.sha, outcome.sha).filter((f) => !taken.has(f));
+      } catch {
+        extraFiles = undefined;
+      }
+    }
+    this.#log.append(outcome.ok ? "consolidation_passed" : "consolidation_failed", {
+      round: roundNo,
+      from: plan.winner.sha,
+      took: plan.takes,
+      ...(outcome.sha ? { sha: outcome.sha } : {}),
+      ...(outcome.note ? { note: outcome.note } : {}),
+      ...(outcome.added ? { added: outcome.added } : {}),
+      ...(extraFiles ? { extraFiles } : {}),
+      fixes: outcome.fixes,
+      ms: Date.now() - startedAt,
+    });
+    this.#applyEvent({
+      type: "ROUND_CONSOLIDATED",
+      round: roundNo,
+      from: plan.winner.sha,
+      lane: plan.winner.lane,
+      took: plan.takes,
+      ok: outcome.ok,
+      ...(outcome.ok && outcome.sha ? { sha: outcome.sha } : {}),
+      ...(outcome.note ? { note: outcome.note } : {}),
+      ...(outcome.added && outcome.added.length > 0 ? { added: outcome.added } : {}),
+      fixes: outcome.fixes,
+    });
+    return undefined;
+  }
+
+  /** tt 09 (change 3): the consolidator's prompt — the winner and the other
+   * lanes' commits, the exact items to take (id, text and the seats' evidence
+   * anchors), and 07's constraints on a consolidator. */
+  #consolidationPrompt(plan: ConsolidationPlan): string {
+    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === plan.round);
+    const items = flatItems(this.#planItems());
+    const winner = candidateLabel(plan.round, plan.winner.lane);
+    const lines: string[] = [
+      `You are the CONSOLIDATOR of round ${plan.round} of phase ${this.#state.phase.phaseId}. Goal of the phase: ${this.#state.phase.contract.goal}`,
+      "",
+      `Round ${plan.round} ran ${record?.lanes.length ?? 2} lanes from one base. The seats picked lane ${plan.winner.lane} (${winner}, commit ${plan.winner.sha}), and its evaluation did not accept the phase. Another lane met plan items the winner did not (a strict majority of the seats said so). Your worktree holds the winner's commit ${plan.winner.sha}. Your one job: take the other lane's work for EXACTLY these items onto it, so the next round starts from both lanes' strengths.`,
+      "",
+    ];
+    for (const take of plan.takes) {
+      const candidate = record?.candidates.find((c) => c.lane === take.lane && c.sha === take.sha);
+      lines.push(`From lane ${take.lane} (${candidateLabel(plan.round, take.lane)}, commit ${take.sha}):`);
+      for (const id of take.items) {
+        const item = items.find((i) => i.id === id);
+        lines.push(`- ${id}${item ? ` ${oneLine(item.title)}: ${oneLine(item.text, 600)}` : ""}`);
+        const evidence = candidate ? itemEvidence(candidate, id, this.#laneSeats()) : [];
+        if (evidence.length > 0) lines.push(`  the seats' evidence it is met: ${evidence.map((e) => oneLine(e, 300)).join(" | ")}`);
+      }
+      lines.push("");
+    }
+    lines.push(
+      "How:",
+      `- Read the other lane's work with git (both commits are in this repository): \`git diff ${plan.winner.sha.slice(0, 12)} <lane commit>\`, \`git show <lane commit>:<path>\`, and \`git checkout <lane commit> -- <path>\` for a file only that lane changed.`,
+      "- Keep everything the winner already meets. Never rewrite the winner's work wholesale and never revert it; take the other lane's work only for the listed items.",
+      "- Do not weaken, skip, #[ignore] or delete a test, and do not drop a test either lane wrote for these items.",
+      "- Keep your own extra diff small: change only what integrating the two needs (a conflict, a call site, an import).",
+      "- Do not commit; tt commits your worktree when you submit. tt runs the round checks on your commit and sends any failure back to you, so run only a fast compile and the targeted tests of the items you took.",
+      "- Then call submit_phase with decisions [] and assumptions [], and in deviations one line per change you made beyond the taken work (path — why), or none.",
+      `- You have about ${Math.max(1, Math.floor(this.#deadlines.workerAttemptMs / 60_000))} minutes.`,
+    );
+    return lines.join("\n");
+  }
+
+  /** tt 09 (change 3): one consolidator run in its own worktree at the
+   * winner (or, for a fix, on its own red commit, continuing its session),
+   * frozen to a commit. Mirrors `#buildLane` without the lane-only parts (no
+   * owner-note delivery, no saved unsubmitted work: a failed consolidation
+   * only falls back to the winner). */
+  async #buildConsolidation(plan: ConsolidationPlan, prompt: string, fix?: { of: string; timeoutMs: number }): Promise<LaneBuild> {
+    const worktree = this.#consolidationWorktree();
+    try {
+      if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
+        this.#log.append("consolidation_worktree_reused", { round: plan.round, reason: `fixing its red commit ${fix.of}` });
+      } else {
+        if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+        createWorktree(this.#plan.repo, worktree, plan.winner.sha);
+      }
+    } catch (err) {
+      const error = String((err as Error)?.message ?? err);
+      this.#log.append("consolidation_worktree_failed", { round: plan.round, error });
+      return { lane: "consolidator", note: `its worktree could not be created: ${error}` };
+    }
+    const actionId = this.#log.actionId(`consolidate_${plan.round}`);
+    this.#log.intent(actionId, { round: plan.round, consolidator: true, worktree, base: plan.winner.sha, ...(fix ? { fixOf: fix.of } : {}) });
+    const agentId = `consolidate-${plan.round}-${actionId}`;
+    const handle = this.#spawnLaneAgent({
+      role: "worker",
+      agentId,
+      cwd: worktree,
+      sessionDir: path.join(this.#paths.sessions, `consolidator-${plan.round}`),
+      // It owes submit_phase only: no coverage turn (TT_ITEMS=0).
+      env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
+      consolidation: { round: plan.round, worktree },
+      // A fix continues the session that holds the work; a first build (or a
+      // restart's re-run) starts fresh.
+      ...(fix ? {} : { freshSession: true }),
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        const note = hello === "timeout" ? "the consolidator did not start (hello timed out)" : "the consolidator failed to start";
+        this.#log.completion(actionId, { round: plan.round, outcome: "no-commit", reason: note });
+        return { lane: "consolidator", note };
+      }
+      await handle.agent.prompt(prompt);
+      const timeout = new PausableTimer<"timeout">(fix?.timeoutMs ?? this.#deadlines.workerAttemptMs, "timeout");
+      const outcome = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        handle.agent.waitSettled().then(() => "settled" as const),
+        handle.agent.waitExit().then(() => "exited" as const),
+        handle.agent.waitCompactionFailed().then(() => "compactionFailed" as const),
+        handle.agent.waitModelFailed().then(() => "modelFailed" as const),
+        timeout.promise,
+      ]);
+      timeout.cancel();
+      await handle.agent.terminate();
+      // A settle with no submission also resolves `donePromise`
+      // (`#onNoSubmission`); only a recorded submit_phase is a submission.
+      if (outcome !== "submitted" || handle.consolidationAdded === undefined) {
+        const note =
+          outcome === "timeout"
+            ? "the consolidator timed out before submitting"
+            : handle.agent.modelFailureReason
+              ? `the consolidator ended without submitting: ${handle.agent.modelFailureReason}`
+              : `the consolidator ended without submit_phase (${outcome})`;
+        this.#log.completion(actionId, { round: plan.round, outcome: "no-commit", reason: note });
+        return { lane: "consolidator", note };
+      }
+      const sweepResult: SweepResult = await sweep(worktree, {
+        ownPgids: this.#ownPgids(),
+        exceptPids: [],
+        cwdUnder: this.#laneSweepRoot(worktree),
+      });
+      this.#log.append("sweep", { ...sweepResult, consolidator: true });
+      const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} round ${plan.round} consolidation`);
+      // A commit with the winner's own tree took nothing: it is no base.
+      if (!fix && treeOf(this.#plan.repo, sha) === treeOf(this.#plan.repo, plan.winner.sha)) {
+        this.#log.completion(actionId, { round: plan.round, outcome: "unchanged", sha });
+        return { lane: "consolidator", note: "the consolidator changed nothing on the winner" };
+      }
+      this.#log.completion(actionId, { round: plan.round, consolidatedSha: sha, added: handle.consolidationAdded });
+      return { lane: "consolidator", sha, added: handle.consolidationAdded };
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** tt 09 (change 3): the round checks on a consolidated commit, under the
+   * machine-wide lock, exactly as a lane candidate's (the winner is its base
+   * for the wide-path tier). */
+  async #checkConsolidation(plan: ConsolidationPlan, sha: string): Promise<LaneCheck> {
+    const lock = await acquireWaitingLock(this.#checkLockPath);
+    const window = openCheckWindow(this.#checkLockPath);
+    try {
+      this.#log.append("consolidation_check_started", { round: plan.round, sha });
+      const result = await this.#runLaneChecks("consolidator", sha, plan.winner.sha);
+      this.#log.append("consolidation_check_finished", { round: plan.round, sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
+      return result;
+    } finally {
+      window.release();
+      await lock.release();
+    }
   }
 
   /** Plan 06n (A3/A4/A5): a candidate kept from a round stopped mid-way.
@@ -9541,7 +9862,9 @@ export class Conductor {
       .map((r) => {
         const votes = r.votes.map((v) => `${v.seat}→${v.lane}`).join(" ");
         const picked = r.picked ? `${candidateLabel(r.round, r.picked.lane)} won (${r.picked.votes} vote(s))` : "no winner";
-        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}`;
+        // tt 09 (change 3): the round's combine step, when it ran.
+        const consolidated = consolidationLine(r);
+        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}${consolidated ? ` — ${consolidated}` : ""}`;
       });
   }
 
@@ -9583,19 +9906,34 @@ export class Conductor {
       // pick is adopted as the base or, when it lost a met item in code it
       // changed, recorded as a regression (ITEMS_REGRESSED).
       if (!unfinished) this.#recordRegression(last);
+      // tt 09 (change 3): a pick the phase did not accept is combined with
+      // the plan items another lane met and it did not, before the next
+      // round starts; a green consolidation is that round's base for every
+      // lane. Recorded as ROUND_CONSOLIDATED, so a restart never redoes it.
+      if (!unfinished && last?.picked) {
+        const consolidated = await this.#consolidateRound(last.round);
+        if (consolidated === "stopped") {
+          // A recheck stopped the consolidator (the phase is CHECKING again),
+          // or the owner stopped the run: nothing was recorded, and the next
+          // start consolidates again.
+          this.#recheckCancelledLaneRound = false;
+          return;
+        }
+      }
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
       const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
       const restartGuard = this.#pickGuard(round);
       // An unfinished round resumes from its own base. A new round starts from
       // the phase's candidate (the last adopted pick) — or, when that pick
-      // regressed, from the best candidate.
+      // regressed, from the best candidate; tt 09 (change 3): or, when that
+      // pick was consolidated, from the consolidated commit.
       const base = unfinished
         ? last!.base
         : previous?.regressed && restartGuard
           ? restartGuard.best.sha
           : round === 1
             ? this.#state.phase.integrationHead
-            : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+            : (consolidatedBase(this.#state.phase.rounds, round) ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
       // Plan 06n (A7/R9b): a round where every lane lost an item restarts

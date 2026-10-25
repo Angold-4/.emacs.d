@@ -207,6 +207,9 @@ function parsePhaseNode(
       : globalWidePaths && globalWidePaths.length > 0
         ? { widePaths: globalWidePaths }
         : {}),
+    // tt 09 (change 3): the phase's own :CONSOLIDATE: (on/off), kept as
+    // written so lint can name a bad value.
+    ...(node.props.CONSOLIDATE ? { consolidate: node.props.CONSOLIDATE.trim() } : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -373,6 +376,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const variantLimit = first("TT_VARIANT_LIMIT");
   const golden = first("TT_GOLDEN");
   const leader = first("TT_LEADER");
+  const consolidate = first("TT_CONSOLIDATE");
   const workersValue = parseCount(workers);
   const roundsValue = parseCount(rounds);
   const variantLimitValue = parseCount(variantLimit);
@@ -400,6 +404,7 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(variantLimitValue !== undefined ? { variantLimit: variantLimitValue, variantLimitLine: variantLimit!.line } : {}),
     ...(golden && golden.value.trim().length > 0 ? { golden: golden.value.trim(), goldenLine: golden.line } : {}),
     ...(leader ? { leader: leader.value.trim(), leaderLine: leader.line } : {}),
+    ...(consolidate ? { consolidate: consolidate.value.trim(), consolidateLine: consolidate.line } : {}),
   };
 }
 

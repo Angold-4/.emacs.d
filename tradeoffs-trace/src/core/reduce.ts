@@ -139,6 +139,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "REVOTE_STARTED",
   "CANDIDATE_PICKED",
   "ITEMS_REGRESSED",
+  "ROUND_CONSOLIDATED",
   "ROUND_REVIEW_SUBMITTED",
   "ITEM_CARRIED",
   "DECISION_ADDED",
@@ -665,6 +666,33 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         ...state,
         phase: { ...p, rounds: replaceRound(p.rounds, { ...round, regressed: { items: [...event.items], sha: event.sha } }) },
       });
+    }
+
+    case "ROUND_CONSOLIDATED": {
+      // tt 09 (change 3): record-only. The round's pick is marked with the
+      // combine step's result; the conductor reads it to start every lane of
+      // the next round from the consolidated commit (or, when it failed, from
+      // the winner as before). Nothing is accepted or rejected here.
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `ROUND_CONSOLIDATED for round ${event.round}, which has not started`);
+      if (!round.picked || round.picked.sha !== event.from || round.picked.lane !== event.lane) {
+        return rejected(state, `ROUND_CONSOLIDATED starts from ${event.from}, which round ${event.round} did not pick`);
+      }
+      if (event.took.length === 0) return rejected(state, `ROUND_CONSOLIDATED for round ${event.round} takes no lane's items`);
+      if (event.ok && !(typeof event.sha === "string" && event.sha.length > 0)) {
+        return rejected(state, `ROUND_CONSOLIDATED for round ${event.round} is ok but names no commit`);
+      }
+      const consolidated: import("./types.ts").RoundConsolidation = {
+        from: event.from,
+        lane: event.lane,
+        took: event.took.map((t) => ({ lane: t.lane, sha: t.sha, items: [...t.items] })),
+        ok: event.ok,
+        ...(event.sha ? { sha: event.sha } : {}),
+        ...(event.note ? { note: event.note } : {}),
+        ...(event.added ? { added: [...event.added] } : {}),
+        ...(event.fixes !== undefined ? { fixes: event.fixes } : {}),
+      };
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, consolidated }) } });
     }
 
     case "DECISION_ADDED": {

@@ -21,13 +21,16 @@
 // conductor never calls `runRound`, and the single-candidate loop is byte for
 // byte what it was.
 
-import { candidateLabel, everyLaneLost, laneIds, passingCandidates, pickWinner, revotePair, type PickGuard, type RoundWinner } from "./rounds.ts";
+import { candidateLabel, everyLaneLost, laneIds, laneMetItems, passingCandidates, pickWinner, revotePair, type PickGuard, type RoundWinner } from "./rounds.ts";
 import type {
+  ConsolidationTake,
   CriterionDispute,
   DecisionDisclosure,
   DirectiveAnswer,
   Event,
   FindingAnswer,
+  LaneCandidateRecord,
+  PhaseContract,
   PriorDecisionStatement,
   RoundRecord,
 } from "./types.ts";
@@ -54,6 +57,9 @@ export interface LaneBuild {
   directiveAnswers?: DirectiveAnswer[];
   /** The lane's own `submit_coverage` payload, for the winner's hand-off. */
   coverage?: unknown;
+  /** tt 09 (change 3): a consolidator's own report of what it changed beyond
+   * the work it took (its submit_phase `deviations`). */
+  added?: string[];
 }
 
 /** One candidate's check result. `ok` false carries the note the status and
@@ -511,4 +517,216 @@ export function laneFailureLines(round: RoundRecord | undefined): string[] {
     if (candidate.ok === true) out.push(`${label} (lane ${lane}) passed its checks`);
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// tt 09 (change 3): combine the lanes
+// ---------------------------------------------------------------------------
+//
+// exex 01a2: the two lanes specialised — lane a finished the production
+// removal, lane b the test conversion — and three rounds never converged:
+// each round kept ONE winner and the next round started every lane from it,
+// so the losing lane's half was thrown away every time. Now, after a round
+// whose pick the phase did not accept, a consolidator starts from the winner
+// and takes the other lane's work for exactly the plan items that lane met
+// and the winner did not (07's reduce step). Its commit goes through the round
+// checks with the lane fix loop, and a green one is the next round's base for
+// every lane. The rules below are pure; the conductor runs the agent and the
+// checks through `ConsolidationHost`.
+
+/** True when a phase combines its lanes: it runs two or more lanes and its
+ * plan did not say `#+TT_CONSOLIDATE: off`. A single-worker phase never
+ * consolidates. */
+export function consolidationEnabled(contract: Pick<PhaseContract, "workers" | "consolidate">): boolean {
+  return isLaneRound(contract) && contract.consolidate !== false;
+}
+
+/** What one consolidation does: start from the round's winner and take each
+ * listed lane's work for its listed items. */
+export interface ConsolidationPlan {
+  round: number;
+  winner: { lane: string; sha: string };
+  takes: ConsolidationTake[];
+}
+
+/** The trigger rule. A round that picked a winner (and whose pick was not
+ * rejected as a regression) consolidates when another PASSING lane met a plan
+ * item the winner did not — met meaning a strict majority of the seats said
+ * `met` (or `fits` for an A), `laneMetItems`'s rule. Each such item is taken
+ * once, from the first lane (in lane order) that met it. Undefined when no
+ * lane met anything the winner lacks: nothing changes. Derived from the round
+ * record alone, so it replays after a restart. The caller decides that the
+ * phase is repairing (a round is only consolidated once its pick was not
+ * accepted). */
+export function consolidationPlan(
+  round: RoundRecord | undefined,
+  itemIds: readonly string[],
+  seatCount: number,
+): ConsolidationPlan | undefined {
+  if (!round?.picked || round.regressed || itemIds.length === 0) return undefined;
+  const picked = round.picked;
+  const winner = round.candidates.find((c) => c.lane === picked.lane && c.sha === picked.sha);
+  if (!winner) return undefined;
+  const winnerMet = laneMetItems(winner, itemIds, seatCount);
+  const taken = new Set<string>();
+  const takes: ConsolidationTake[] = [];
+  for (const c of passingCandidates(round)) {
+    if (c.lane === picked.lane) continue;
+    const met = laneMetItems(c, itemIds, seatCount);
+    const items = itemIds.filter((id) => met.has(id) && !winnerMet.has(id) && !taken.has(id));
+    if (items.length === 0) continue;
+    for (const id of items) taken.add(id);
+    takes.push({ lane: c.lane, sha: c.sha as string, items });
+  }
+  return takes.length > 0 ? { round: round.round, winner: { lane: picked.lane, sha: picked.sha }, takes } : undefined;
+}
+
+/** The seats' evidence that one candidate met one item: `<seat>: <evidence>`
+ * for each seat whose verdict was `met` (or `fits`), in `seats` order when
+ * given (reviews are recorded in the order they arrived). The consolidator's
+ * prompt quotes it so it knows where the work it takes lives. */
+export function itemEvidence(candidate: LaneCandidateRecord, id: string, seats?: readonly string[]): string[] {
+  const out: string[] = [];
+  const rank = (seat: string) => (seats && seats.includes(seat) ? seats.indexOf(seat) : Number.MAX_SAFE_INTEGER);
+  const reviews = [...(candidate.reviews ?? [])].sort((a, b) => rank(a.seat) - rank(b.seat));
+  for (const r of reviews) {
+    const item = (r.review.items ?? []).find((i) => i.id === id);
+    const arch = (r.review.arch ?? []).find((a) => a.id === id);
+    const hit = item?.verdict === "met" ? item : arch?.verdict === "fits" ? arch : undefined;
+    if (hit) out.push(`${r.seat}: ${hit.evidence}`);
+  }
+  return out;
+}
+
+/** Base selection: the commit every lane of the round after `beforeRound`'s
+ * last pick starts from, when that pick was consolidated — the latest picked
+ * round (before `beforeRound`) whose consolidation passed its checks and
+ * started from that very pick. A round that picked no lane in between does
+ * not change it (its lanes started from the same consolidated base). Undefined
+ * when the latest pick was not consolidated, its consolidation failed, or the
+ * pick regressed: the caller keeps today's base (the winner, or the best
+ * candidate). */
+export function consolidatedBase(rounds: readonly RoundRecord[] | undefined, beforeRound = Number.POSITIVE_INFINITY): string | undefined {
+  let latest: RoundRecord | undefined;
+  for (const r of rounds ?? []) {
+    if (r.round >= beforeRound || !r.picked) continue;
+    if (!latest || r.round > latest.round) latest = r;
+  }
+  if (!latest || latest.regressed) return undefined;
+  const c = latest.consolidated;
+  return c?.ok && typeof c.sha === "string" && c.sha.length > 0 && c.from === latest.picked!.sha ? c.sha : undefined;
+}
+
+/** How a consolidated commit is named in the views: `C2-a+b` (round 2's
+ * winner a, with lane b's items). */
+export function consolidatedLabel(round: number, winnerLane: string, takes: readonly ConsolidationTake[]): string {
+  return `${candidateLabel(round, winnerLane)}+${takes.map((t) => t.lane).join("+")}`;
+}
+
+/** The status/round line of a round's combine step, or undefined when the
+ * round was not consolidated:
+ * `consolidated C2-a+b 1234567 = C2-a + lane b's items R6, C3`, or why it
+ * failed and that the next round starts from the winner. */
+export function consolidationLine(round: RoundRecord): string | undefined {
+  const c = round.consolidated;
+  if (!c) return undefined;
+  const winner = candidateLabel(round.round, c.lane);
+  const took = c.took.map((t) => `lane ${t.lane}'s items ${t.items.join(", ")}`).join(" + ");
+  if (c.ok && c.sha) {
+    const fixes = c.fixes ? ` (after ${c.fixes} fix${c.fixes === 1 ? "" : "es"})` : "";
+    return `consolidated ${consolidatedLabel(round.round, c.lane, c.took)} ${c.sha.slice(0, 7)} = ${winner} + ${took}${fixes}`;
+  }
+  return `consolidation of ${winner} + ${took} failed: ${c.note ?? "no reason recorded"} — the next round starts from ${winner}`;
+}
+
+/** The status panel's combine line: the latest round's own consolidation,
+ * or — once the next round has started from it — the consolidation that
+ * round's base came from. Undefined when neither applies. */
+export function latestConsolidationLine(rounds: readonly RoundRecord[] | undefined): string | undefined {
+  const list = [...(rounds ?? [])].sort((a, b) => a.round - b.round);
+  const latest = list[list.length - 1];
+  if (!latest) return undefined;
+  const own = consolidationLine(latest);
+  if (own) return own;
+  const from = list.find((r) => r.round < latest.round && r.consolidated?.ok && r.consolidated.sha === latest.base);
+  const line = from ? consolidationLine(from) : undefined;
+  return line ? `round ${latest.round} starts from ${line}` : undefined;
+}
+
+/** Everything `runConsolidation` asks the conductor to do. */
+export interface ConsolidationHost {
+  /** Run the consolidator from the winner and freeze its commit, or say why
+   * it produced none. */
+  build(): Promise<LaneBuild>;
+  /** The round checks on the consolidated commit, under the machine-wide
+   * lock, exactly as a lane candidate's. */
+  check(sha: string): Promise<LaneCheck>;
+  /** The consolidator fixes its own red commit (its session, its worktree),
+   * like `LaneHost.fixLane`; no sha means it could not. */
+  fix(sha: string, failure: string): Promise<LaneBuild>;
+  stopRequested?(): boolean;
+}
+
+export interface ConsolidationOutcome {
+  ok: boolean;
+  /** The green consolidated commit. */
+  sha?: string;
+  /** Why the consolidation failed; the next round starts from the winner. */
+  note?: string;
+  fixes: number;
+  /** What the consolidator says it changed beyond the taken work. */
+  added?: string[];
+  /** The owner stopped the run mid-way: nothing is recorded. */
+  stopped?: boolean;
+}
+
+/** The combine step's sequence: build, check, and the lane's bounded fix loop
+ * (at most MAX_LANE_FIXES fixes, ending early on a fix that changes nothing).
+ * A consolidation that produced nothing or stayed red is a failure with its
+ * reason — the caller then keeps today's behaviour (the next round starts
+ * from the winner). */
+export async function runConsolidation(host: ConsolidationHost): Promise<ConsolidationOutcome> {
+  if (host.stopRequested?.()) return { ok: false, fixes: 0, stopped: true };
+  let build: LaneBuild;
+  try {
+    build = await host.build();
+  } catch (err) {
+    build = { lane: "consolidator", note: `the consolidator failed: ${errorNote(err)}` };
+  }
+  if (host.stopRequested?.()) return { ok: false, fixes: 0, stopped: true };
+  if (typeof build.sha !== "string" || build.sha.length === 0) {
+    return { ok: false, fixes: 0, note: build.note ?? "the consolidator produced no commit" };
+  }
+  const check = async (sha: string): Promise<LaneCheck> => {
+    try {
+      return await host.check(sha);
+    } catch (err) {
+      return { ok: false, note: `the check could not run: ${errorNote(err)}` };
+    }
+  };
+  let result = await check(build.sha);
+  let fixes = 0;
+  let fixNote: string | undefined;
+  while (!result.ok && fixes < MAX_LANE_FIXES && !host.stopRequested?.()) {
+    fixes += 1;
+    let fixed: LaneBuild;
+    try {
+      fixed = await host.fix(build.sha!, result.note ?? "the checks failed");
+    } catch (err) {
+      fixed = { lane: "consolidator", note: `the fix attempt failed: ${errorNote(err)}` };
+    }
+    if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) {
+      fixNote = fixed.note;
+      break;
+    }
+    build = { ...fixed, added: fixed.added ?? build.added };
+    result = await check(build.sha!);
+  }
+  if (host.stopRequested?.()) return { ok: false, fixes, stopped: true };
+  if (result.ok) return { ok: true, sha: build.sha, fixes, ...(build.added ? { added: build.added } : {}) };
+  return {
+    ok: false,
+    fixes,
+    note: `its commit ${build.sha!.slice(0, 7)} failed the round checks: ${result.note ?? "a check command failed"}${fixNote ? ` (${fixNote})` : ""}`,
+  };
 }
