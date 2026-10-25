@@ -593,3 +593,14 @@ export function removedTestsBetween(repo: string, base: string, candidateSha: st
   }));
   return removedTests(files);
 }
+
+/** exex 01a2: the commit a worktree's HEAD is at, or undefined when it cannot
+ * be read (a fix reuses a lane's worktree only when it still holds the red
+ * candidate). */
+export function headOf(worktree: string): string | undefined {
+  try {
+    return git(["-C", worktree, "rev-parse", "HEAD"]);
+  } catch {
+    return undefined;
+  }
+}

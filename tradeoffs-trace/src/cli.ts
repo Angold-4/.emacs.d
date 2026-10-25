@@ -7,6 +7,7 @@
 // `<run>/conductor.log`, so the parent (this CLI invocation) returns the
 // run id immediately rather than blocking for the whole run.
 
+import { adoptRecordedPath } from "./effects/run-env.ts";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -1122,6 +1123,7 @@ function testStubReviews(): boolean {
  * script) to stay inside this packet's file scope. */
 async function runConductorProcess(runDir: string): Promise<void> {
   const p = runPaths(runDir);
+  adoptRecordedPath(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const { piCommand, piArgsPrefix } = testPiInjection();
   // A plan's own limits (TT_*_MINUTES), then the test-only override.

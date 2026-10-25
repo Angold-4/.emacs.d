@@ -1376,6 +1376,9 @@ export interface LaneCandidateRecord {
    * candidate. Set only once a review arrives; absent on a candidate whose
    * reviews have not been recorded (or on a plan without lanes). */
   reviews?: Array<{ seat: string; review: Review }>;
+  /** exex 01a2: how many times this lane fixed a candidate that failed its
+   * checks and submitted again in this round. Absent means none. */
+  fixes?: number;
 }
 
 /** Plan 06k1 (A1): what the losing lane had that the seat's pick did not.

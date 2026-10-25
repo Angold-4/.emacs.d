@@ -16,6 +16,7 @@ import { baseState, CV } from "./helpers.ts";
 /** A host that records every event into a real reduced phase, so
  * `rounds()`/`pickWinner` see exactly what a live round would. */
 class FakeHost implements LaneHost {
+  fixLane?: LaneHost["fixLane"];
   readonly phaseId = "p1";
   readonly goal = "build two candidates";
   readonly seats = ["M", "A", "B"];
@@ -262,8 +263,57 @@ test("02k: a round with a winner, or with no passing candidate, keeps the round'
   assert.ok(picked.rounds()[0].picked, "a complete round picks");
   assert.equal(repeatLaneBases(picked.rounds()[0]), undefined);
 
-  const nonePassed = new FakeHost({ a: "Xa", b: { note: "no candidate" } });
-  await runRound(nonePassed, { round: 1, base: "B0", lanes: ["a", "b"] });
-  assert.equal(repeatLaneBases(nonePassed.rounds()[0]), undefined, "failed checks repeat from the same base (plan 06g)");
+  const nothing = new FakeHost({ a: { note: "crashed" }, b: { note: "no candidate" } });
+  await runRound(nothing, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.equal(repeatLaneBases(nothing.rounds()[0]), undefined, "lanes with no candidate repeat from the same base");
   assert.equal(repeatLaneBases(undefined), undefined);
+});
+
+test("exex 01a2: a lane whose candidate is still red when its time runs out continues from that candidate next round", async () => {
+  const host = new FakeHost({ a: "Xa", b: { note: "no candidate" } });
+  await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.deepEqual(repeatLaneBases(host.rounds()[0]), { a: "Xa" }, "lane a keeps its own work; lane b, with none, starts from the base");
+});
+
+test("exex 01a2: a lane never hands in a red tree — a failed check goes back to the same lane, which fixes it and submits again", async () => {
+  const host = new FakeHost({ a: "Xa", b: "C1b" });
+  const fixes: string[] = [];
+  host.fixLane = async (lane: string, _round: number, sha: string, failure: string) => {
+    fixes.push(`${lane}:${sha}:${failure}`);
+    host.lanes.a = "C1a"; // the fixed commit passes
+    return { lane, sha: "C1a", disclosures: [] };
+  };
+  host.checkCandidate = async (_round: number, _lane: string, sha: string) =>
+    sha.startsWith("C1") ? { ok: true } : { ok: false, note: "error[E0432]: unresolved import" };
+  const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.deepEqual(fixes, ["a:Xa:error[E0432]: unresolved import"], "only the red lane is asked to fix, with its own failure");
+  const a = host.rounds()[0].candidates.find((c) => c.lane === "a")!;
+  assert.equal(a.sha, "C1a");
+  assert.equal(a.ok, true, "the fixed commit is checked afresh; the red result never carries over");
+  assert.equal(a.fixes, 1);
+  assert.ok(host.reviews.includes("a:M") && host.reviews.includes("b:M"), "both lanes reach review, only once green");
+  assert.ok(!host.reviews.some((r) => r.startsWith("a:") && host.events.some((e) => e.type === "ROUND_REVIEW_SUBMITTED" && (e as { review: { candidateSha: string } }).review.candidateSha === "Xa")), "the red tree is never reviewed");
+  assert.ok(outcome.winner);
+});
+
+test("exex 01a2: a lane out of time keeps its red candidate, unreviewed, and the round goes on with the other lane", async () => {
+  const host = new FakeHost({ a: "Xa", b: "C1b" });
+  host.fixLane = async (lane: string) => ({ lane, note: "the lane's candidate is red and its attempt time is spent" });
+  const outcome = await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  const a = host.rounds()[0].candidates.find((c) => c.lane === "a")!;
+  assert.equal(a.sha, "Xa");
+  assert.equal(a.ok, false);
+  assert.ok(!host.reviews.some((r) => r.startsWith("a:")), "a red candidate is never reviewed");
+  assert.equal(outcome.winner?.lane, "b");
+});
+
+test("exex 01a2: a fix that hands back the same commit ends the loop instead of re-checking it forever", async () => {
+  const host = new FakeHost({ a: "Xa", b: "C1b" });
+  let calls = 0;
+  host.fixLane = async (lane: string, _round: number, sha: string) => {
+    calls += 1;
+    return { lane, sha, disclosures: [] };
+  };
+  await runRound(host, { round: 1, base: "B0", lanes: ["a", "b"] });
+  assert.equal(calls, 1);
 });

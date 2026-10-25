@@ -258,7 +258,7 @@ test("test-failures: the detailed parse tags the runner and node's own file", ()
 test("test-failures: the cargo and Node defaults build the right single-test command", () => {
   assert.equal(
     singleTestCommand("exchange_state_machine::tests::cancels_order", CARGO_OUTPUT),
-    "cargo test -- --exact 'exchange_state_machine::tests::cancels_order'",
+    "cargo test -p 'exchange-state-machine' --lib -- --exact 'exchange_state_machine::tests::cancels_order' --test-threads=1",
   );
   // The spec reporter locates the test's file, so the Node default names it.
   // Every substituted value is one single-quoted word, and the pattern is
@@ -448,4 +448,26 @@ test("test-failures: a failing test the phase is required to fix is never excuse
   // Whole words only, and module paths match on the test's own name.
   assert.equal(testIsNamedIn("tests::coverage::gate_is_rerun_when_the_base_moves", [directive]), true);
   assert.equal(testIsNamedIn("gate_is_rerun", [directive]), false);
+});
+
+// exex 01a2: the workspace-wide `cargo test -- --exact <name>` rebuilt every
+// crate's tests and ran past the check deadline, so a load-only flake was
+// recorded as a real failure. The re-run targets the failing test's own
+// package (a library) or test file (an integration test), alone.
+test("exex 01a2: a cargo re-run targets the failing test's own library or test file, on one thread", () => {
+  const out = [
+    "     Running unittests src/lib.rs (target/x86_64-unknown-linux-gnu/debug/deps/trade_core_runner-fe123c339e7efe7b)",
+    "test request_tracker::tests::an_idle_owner_without_a_cpu_of_its_own_backs_off ... FAILED",
+    "     Running tests/settlement_e2e.rs (target/x86_64-unknown-linux-gnu/debug/deps/settlement_e2e-0123456789abcdef)",
+    "test a_full_session ... FAILED",
+    "     Running unittests src/main.rs (target/debug/deps/tt_tool-0123456789abcdef)",
+    "test cli::parses ... FAILED",
+  ].join("\n");
+  assert.equal(
+    singleTestCommand("request_tracker::tests::an_idle_owner_without_a_cpu_of_its_own_backs_off", out),
+    "cargo test -p 'trade-core-runner' --lib -- --exact 'request_tracker::tests::an_idle_owner_without_a_cpu_of_its_own_backs_off' --test-threads=1",
+  );
+  assert.equal(singleTestCommand("a_full_session", out), "cargo test --test 'settlement_e2e' -- --exact 'a_full_session' --test-threads=1");
+  // A binary target has no known package/target shape: the old default.
+  assert.equal(singleTestCommand("cli::parses", out), "cargo test -- --exact 'cli::parses'");
 });

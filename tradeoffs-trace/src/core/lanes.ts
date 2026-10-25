@@ -94,6 +94,13 @@ export interface LaneHost {
   /** Check one candidate, under the machine-wide lock, one after the other
    * (C2: two candidates' checks never overlap). */
   checkCandidate(round: number, lane: string, sha: string): Promise<LaneCheck>;
+  /** exex 01a2: a lane never hands in a red tree. When its candidate fails
+   * the checks, the SAME lane's worker gets the failure back on its own
+   * candidate and submits again, while its attempt time lasts. The host owns
+   * the clock: a lane with no time left returns `{ lane, note }` (no sha) and
+   * the red candidate stays the lane's record for this round. Absent keeps
+   * the old rule (a failed check ends the lane's round). */
+  fixLane?(lane: string, round: number, sha: string, failure: string): Promise<LaneBuild>;
   /** One seat reviews one passing candidate. */
   reviewCandidate(round: number, lane: string, sha: string, seat: string): Promise<void>;
   /** One seat's pick turn. The host builds the prompt (`buildPickPrompt`)
@@ -159,10 +166,10 @@ function errorNote(err: unknown): string {
 /** The per-lane starting points for a repeat of `last`. A round with a
  * passing candidate and no winner could not complete (a missing review or
  * pick vote; `runRound` picks whenever the set is complete), so each lane
- * whose candidate passed its checks restarts from that candidate. A round in
- * which no candidate passed keeps `base` for every lane (the repeat sees the
- * failures; plan 06g). Derived from the round record, so it survives a
- * conductor restart.
+ * whose candidate passed its checks restarts from that candidate, and (exex
+ * 01a2) a lane whose candidate was still red when its time ran out continues
+ * from that red candidate; only a lane with no candidate at all keeps `base`.
+ * Derived from the round record, so it survives a conductor restart.
  *
  * Plan 06n (A7/R9b): a round that picked no lane because every passing lane
  * lost an item the best candidate met restarts EVERY lane from the best
@@ -172,6 +179,12 @@ export function repeatLaneBases(last: RoundRecord | undefined, guard?: PickGuard
   if (everyLaneLost(last, guard)) return Object.fromEntries(last.lanes.map((lane) => [lane, guard!.best.sha]));
   const out: Record<string, string> = {};
   for (const c of passingCandidates(last)) if (typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
+  // exex 01a2: a lane whose candidate was still red when its time ran out
+  // continues from that candidate, never from the round's base: restarting
+  // threw away the lanes' whole removal three rounds running.
+  for (const c of last.candidates) {
+    if (out[c.lane] === undefined && c.ok === false && typeof c.sha === "string" && c.sha.length > 0) out[c.lane] = c.sha;
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -246,6 +259,35 @@ export async function runRound(host: LaneHost, ctx: RoundContext): Promise<Round
           ok: check.ok,
           ...(check.note ? { note: check.note } : {}),
         });
+        // exex 01a2: a red tree is never the lane's hand-in while it still
+        // has time. Its worker fixes the failure on its own candidate and
+        // submits again; each new commit is submitted and checked like the
+        // first. Only a green candidate, or a lane out of time, ends the loop.
+        while (!check.ok && host.fixLane && !host.stopRequested?.()) {
+          let fixed: LaneBuild;
+          try {
+            fixed = await host.fixLane(build.lane, ctx.round, build.sha!, check.note ?? "the checks failed");
+          } catch (err) {
+            fixed = { lane: build.lane, note: `the fix attempt failed: ${errorNote(err)}` };
+          }
+          if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) break;
+          build = fixed;
+          if (host.stopRequested?.()) return build;
+          host.emit({ type: "CANDIDATE_SUBMITTED", round: ctx.round, lane: build.lane, sha: build.sha! });
+          try {
+            check = await host.checkCandidate(ctx.round, build.lane, build.sha!);
+          } catch (err) {
+            check = { ok: false, note: `the check could not run: ${errorNote(err)}` };
+          }
+          if (host.stopRequested?.()) return build;
+          host.emit({
+            type: "CANDIDATE_CHECKED",
+            round: ctx.round,
+            lane: build.lane,
+            ok: check.ok,
+            ...(check.note ? { note: check.note } : {}),
+          });
+        }
       } else {
         if (host.stopRequested?.()) return build;
         host.emit({

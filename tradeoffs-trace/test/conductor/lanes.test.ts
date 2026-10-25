@@ -1299,3 +1299,61 @@ test("plan 06n (R9b): when both lanes lose a met item no lane is picked and both
     cleanupDir(dir);
   }
 });
+
+// exex 01a2: a lane never hands in a red tree. Lane a's first candidate fails
+// the round check; the conductor gives the failure back to lane a's own
+// worker (continuing its session, on its own candidate), which fixes it and
+// submits again. Only the green commit is reviewed, and the round picks.
+test("exex 01a2: a red lane candidate goes back to its own worker, which fixes it in the same round", async () => {
+  const promptLog = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))), ".lane-fix-"));
+  const launches: Record<string, number> = {};
+  const setup = await setupConductor({
+    phase: lanePhase({ checks: ["test ! -f red.txt"] }),
+    checks: ["test ! -f red.txt"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 60_000 },
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: path.join(promptLog, "prompts.txt") },
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => {
+      launches[lane] = (launches[lane] ?? 0) + 1;
+      if (lane !== "a") return laneWorker(lane);
+      return launches[lane] === 1
+        ? {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "printf 'lane a\\n' > lane-a.txt && printf 'broken\\n' > red.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          }
+        : {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "rm red.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          };
+    },
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} prefers a`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const round = setup.conductor.state.phase.rounds![0];
+    const a = round.candidates.find((c) => c.lane === "a")!;
+    assert.equal(launches.a, 2, "lane a's worker was launched once to build and once to fix");
+    assert.equal(a.fixes, 1);
+    assert.equal(a.ok, true, "the fixed candidate passed its own check");
+    assert.equal(round.picked?.lane, "a");
+    const reviewed = (a.reviews ?? []).map((r) => r.review.candidateSha);
+    assert.ok(reviewed.length > 0 && reviewed.every((sha) => sha === a.sha), "only the green commit was reviewed");
+    const prompts = fs.readFileSync(path.join(promptLog, "prompts.txt"), "utf8");
+    assert.match(prompts, /FAILED the round checks, so it was NOT handed to review/);
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.ok(records.some((r) => r.kind === "lane_fix_started"), "the fix is recorded");
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptLog);
+  }
+});
