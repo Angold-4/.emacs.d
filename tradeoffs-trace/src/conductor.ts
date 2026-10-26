@@ -6184,25 +6184,14 @@ export class Conductor {
     // domains. Outside it the point fields are optional and ignored, so a
     // finding never gains them by accident.
     const domainMode = (this.#state.phase.contract.domains?.length ?? 0) > 0;
-    // Plan 07a (D2): in domain mode a reviewer's finding (never a blocker) is
-    // one point — `item`, `whereKey(where)` and `doneWhen`. A second reviewer
-    // naming the same point is recorded on the open finding
-    // (`FINDING_ALSO_RAISED`) instead of being raised again. The incoming
-    // values are trimmed and `where` may be absent, exactly as they are
-    // stored, so a trailing space cannot defeat the fold. Outside domain mode
-    // the fields are absent, so this never fires.
-    if (!opts.raisedAsBlocker && fd.item && fd.doneWhen && domainMode) {
-      const item = fd.item.trim();
-      const doneWhen = fd.doneWhen.trim();
-      const key = whereKey(fd.where ?? "");
-      const existing = this.#state.phase.findings.find(
-        (f) => f.status === "open" && f.item === item && f.doneWhen === doneWhen && whereKey(f.where ?? "") === key,
-      );
-      if (existing) {
-        this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer });
-        return undefined;
-      }
-    }
+    // Plan 07a (D2/OD-6): in domain mode a reviewer's finding (never a
+    // blocker) is one point — `item`, `whereKey(where)` and `doneWhen`. A
+    // second reviewer naming the same point is recorded on the open finding
+    // (`FINDING_ALSO_RAISED`) instead of being raised again. `#foldDuplicatePoint`
+    // decides it, and never folds away a duplicate's own contract amendment or
+    // decision link. Outside domain mode the fields are absent, so this never
+    // fires.
+    if (this.#foldDuplicatePoint(fd, reviewer, opts.raisedAsBlocker === true)) return undefined;
     // Plan 05e (finding #34): a new point on bytes the reviewers already
     // approved is an advisory finding, not a blocker, unless it violates an
     // acceptance item or a reserved rule. That applies to a point filed
@@ -6353,6 +6342,41 @@ export class Conductor {
       }
     }
     return undefined;
+  }
+
+  /** Plan 07a (D2/OD-6): in domain mode a reviewer's finding (never a
+   * blocker) is one point — `item`, `whereKey(where)` and `doneWhen`. A
+   * second reviewer naming the same point is recorded on the open finding
+   * (`FINDING_ALSO_RAISED`) instead of being raised again, so one point keeps
+   * one home and every seat that raised it.
+   *
+   * The fold never loses information: a duplicate carrying its own contract
+   * amendment (`criterionDispute`) or decision link (`linkedDecisionId`) is
+   * folded only when the open finding already carries the same one; otherwise
+   * it is raised on its own, so its amendment is voted and its link kept. A
+   * duplicate carrying neither always folds. The incoming values are trimmed
+   * and `where` may be absent, exactly as they are stored, so a trailing
+   * space cannot defeat the fold. Outside domain mode the fields are absent,
+   * so this never fires. Returns true when the duplicate was folded. */
+  #foldDuplicatePoint(fd: FindingDisclosure, reviewer: Reviewer, raisedAsBlocker: boolean): boolean {
+    if (raisedAsBlocker || !fd.item || !fd.doneWhen) return false;
+    if ((this.#state.phase.contract.domains?.length ?? 0) === 0) return false;
+    const item = fd.item.trim();
+    const doneWhen = fd.doneWhen.trim();
+    const key = whereKey(fd.where ?? "");
+    // OD-6 (D-M-50/D-M-51): a duplicate with its own amendment or link is not
+    // folded into a finding that carries a different one — the fold would drop
+    // it. An identical one is already on the open finding, so folding loses
+    // nothing. A duplicate carrying neither folds into the first open point.
+    const existing = this.#state.phase.findings.find((f) => {
+      if (f.status !== "open" || f.item !== item || f.doneWhen !== doneWhen || whereKey(f.where ?? "") !== key) return false;
+      if (fd.criterionDispute?.criterion !== undefined && fd.criterionDispute.criterion !== f.criterionDisputed) return false;
+      if (fd.linkedDecisionId !== undefined && fd.linkedDecisionId !== f.linkedDecisionId) return false;
+      return true;
+    });
+    if (!existing) return false;
+    this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer });
+    return true;
   }
 
   /** Plan 06b (OD-1 R6): the requirement item id whose text is the disputed

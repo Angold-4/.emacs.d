@@ -355,6 +355,54 @@ test("a point with trailing whitespace still folds into the open one", async () 
   }
 });
 
+test("a duplicate carrying a criterion dispute is not folded and its dispute survives", async () => {
+  const point = { domain: "booking", item: "R1", where: "src/core/rounds.ts:1 fn", expected: "x", doneWhen: "true" };
+  // M and A carry the same amendment (it is already on the open finding, so
+  // folding loses nothing); B carries a different one, which the fold would
+  // drop, so B's point is raised on its own (OD-6 / D-M-50, D-M-51).
+  const dispute = (criterion: string) => ({ criterion, why: "the wording is wrong", proposedWording: `${criterion} exactly` });
+  const setup = await setupConductor({
+    items: ITEMS,
+    domains: DOMAINS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript,
+    reviewerScriptFor: (reviewer, state) =>
+      reviewerScript(reviewer, state, {
+        findings: [
+          {
+            kind: "defect",
+            severity: "advisory",
+            evidence: "the point",
+            ...point,
+            criterionDispute: dispute(reviewer === "B" ? "R2 is judged by review" : "R1 proves it"),
+          },
+        ],
+      }),
+  });
+  try {
+    await setup.conductor.start();
+    const matching = () => setup.conductor.state.phase.findings.filter((f) => f.item === "R1");
+    await waitFor(
+      () => matching().length === 2 && matching().some((f) => (f.alsoRaisedBy ?? []).length === 1),
+      90_000,
+      50,
+      setup.runDir,
+    );
+    assert.equal(matching().length, 2, "a different dispute is raised, not folded away");
+    assert.deepEqual(
+      [...new Set(matching().map((f) => f.criterionDisputed))].sort(),
+      ["R1 proves it", "R2 is judged by review"],
+      "both disputes survive on their own finding",
+    );
+    assert.equal(matching().find((f) => f.criterionDisputed === "R1 proves it")!.alsoRaisedBy!.length, 1, "the identical duplicate folded into it");
+    assert.equal((matching().find((f) => f.criterionDisputed === "R2 is judged by review")!.alsoRaisedBy ?? []).length, 0, "the differing duplicate was not folded");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("a conductor finding without TT_DOMAINS carries no domain", async () => {
   const setup = await setupConductor({
     items: ITEMS,
