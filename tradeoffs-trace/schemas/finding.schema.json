@@ -30,17 +30,6 @@
     "disprovedEvidence": { "type": "string", "minLength": 1 },
     "acceptedScope": { "type": "string", "minLength": 1 },
     "criterionDisputed": { "type": "string", "minLength": 1 },
-    "criterionDispute": {
-      "type": "object",
-      "description": "Plan 07a (OD-7): the whole dispute raised with this finding — criterion, why and proposedWording — so a duplicate's dispute is compared as a whole and a different amendment is never folded away.",
-      "required": ["criterion", "why", "proposedWording"],
-      "additionalProperties": false,
-      "properties": {
-        "criterion": { "type": "string", "minLength": 1 },
-        "why": { "type": "string", "minLength": 1 },
-        "proposedWording": { "type": "string", "minLength": 1 }
-      }
-    },
     "supersededBy": { "type": "string", "minLength": 1 },
     "alsoRaisedBy": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "verified": { "type": "string", "minLength": 1 },

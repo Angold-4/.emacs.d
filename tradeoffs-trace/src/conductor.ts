@@ -832,16 +832,6 @@ function lastLines(text: string, n: number): string {
   return all.slice(Math.max(0, all.length - n)).join("\n");
 }
 
-/** Plan 07a (OD-7/D-M-68): deep equality of two criterion disputes — the
- * criterion, the why and the proposed wording. The duplicate-point fold uses
- * it so a second seat's different amendment is never folded away: an absent
- * dispute on either side is not equal to a present one. */
-function sameCriterionDispute(a: CriterionDispute | undefined, b: CriterionDispute | undefined): boolean {
-  if (a === undefined && b === undefined) return true;
-  if (a === undefined || b === undefined) return false;
-  return a.criterion === b.criterion && a.why === b.why && a.proposedWording === b.proposedWording;
-}
-
 export function contractVersionFor(phase: RunPlanPhase, snapshot = 1): ContractVersion {
   const sectionSha256 = createHash("sha256").update(JSON.stringify(phase)).digest("hex");
   return { snapshot, sectionSha256 };
@@ -6304,12 +6294,6 @@ export class Conductor {
       ...(fd.criterionDispute?.criterion && fd.criterionDispute.criterion.trim().length > 0
         ? { criterionDisputed: fd.criterionDispute.criterion }
         : {}),
-      // Plan 07a (OD-7): in domain mode keep the WHOLE dispute on the
-      // finding so a later duplicate's dispute can be compared as a whole
-      // (criterion, why and proposedWording), not by criterion alone. Outside
-      // domain mode the fold never fires, so the finding stays byte-identical
-      // to before (C1).
-      ...(domainMode && fd.criterionDispute !== undefined ? { criterionDispute: fd.criterionDispute } : {}),
       ...(reproduction !== undefined ? { reproduction } : {}),
       // Plan 06g (A6): why this finding is advisory although it was raised
       // blocking — the round rule's own sentence, so the record and the views
@@ -6361,45 +6345,74 @@ export class Conductor {
   }
 
   /** Plan 07a (D2/OD-6/OD-7): in domain mode a reviewer's finding (never a
-   * blocker) is one point — `item`, `whereKey(where)` and `doneWhen`. A
-   * second reviewer naming the same point is recorded on the open finding
-   * (`FINDING_ALSO_RAISED`) instead of being raised again, so one point keeps
-   * one home and every seat that raised it.
+   * blocker) is one point — `domain`, `item`, `whereKey(where)` and
+   * `doneWhen`. A second reviewer naming the same point is recorded on the
+   * open finding (`FINDING_ALSO_RAISED`) instead of being raised again, so
+   * one point keeps one home and every seat that raised it.
    *
-   * The fold never loses information: a duplicate carrying its own contract
-   * amendment (`criterionDispute`) or decision link (`linkedDecisionId`) is
-   * folded only when the open finding already carries exactly the same one;
-   * otherwise it is raised on its own, so its amendment is voted and its link
-   * kept. OD-7 compares the WHOLE dispute (criterion, why and proposedWording)
-   * and the link: a different reason or proposed wording is a different
-   * amendment, not a duplicate. A duplicate carrying neither always folds.
-   * The incoming point values are trimmed and `where` may be absent, exactly
-   * as they are stored, so a trailing space cannot defeat the fold. Outside
-   * domain mode the fields are absent, so this never fires. Returns true when
-   * the duplicate was folded. */
+   * The fold never loses information: the key is all four fields, so two
+   * points in different domains (or with a different item, location or
+   * doneWhen) are never folded together. A duplicate carrying its own
+   * contract amendment (`criterionDispute`) or decision link
+   * (`linkedDecisionId`) is folded only when the open finding already carries
+   * exactly the same one; otherwise it is raised on its own, so its amendment
+   * is voted and its link kept. The whole dispute — criterion, reason and
+   * proposed wording — is compared, not just the criterion, so two seats
+   * disputing the same criterion with different wording stay two findings
+   * (D-M-68). A duplicate carrying neither always folds. The incoming values
+   * are trimmed and `where` may be absent, exactly as they are stored, so a
+   * trailing space cannot defeat the fold. Outside domain mode the fields are
+   * absent, so this never fires. Returns true when the duplicate was folded. */
   #foldDuplicatePoint(fd: FindingDisclosure, reviewer: Reviewer, raisedAsBlocker: boolean): boolean {
     if (raisedAsBlocker || !fd.item || !fd.doneWhen) return false;
     if ((this.#state.phase.contract.domains?.length ?? 0) === 0) return false;
     const item = fd.item.trim();
     const doneWhen = fd.doneWhen.trim();
     const key = whereKey(fd.where ?? "");
-    // OD-6/OD-7 (D-M-50/D-M-51/D-M-68): a duplicate with its own amendment or
+    // Lead round 11: the domain is part of the point's identity — the same
+    // item, location and doneWhen in two different domains is two points and
+    // is never folded. OD-7 (D-M-68): a duplicate with its own amendment or
     // link is not folded into a finding that carries a different one — the
-    // fold would drop it. An identical one is already on the open finding, so
-    // folding loses nothing. A duplicate carrying neither folds into the
-    // first open point.
+    // fold would drop it. The whole `criterionDispute` (criterion, reason,
+    // proposed wording) and the `linkedDecisionId` must match exactly; the
+    // finding stores only the criterion, so its full dispute is read from the
+    // amendment decision it created. A duplicate carrying neither folds into
+    // the first open point.
+    const domain = (fd.domain ?? "").trim();
     const existing = this.#state.phase.findings.find((f) => {
-      if (f.status !== "open" || f.item !== item || f.doneWhen !== doneWhen || whereKey(f.where ?? "") !== key) return false;
-      // OD-7 (D-M-68): compare the WHOLE dispute, not just its criterion. A
-      // duplicate whose why or proposedWording differs carries a different
-      // amendment; folding it would drop that amendment before it is voted.
-      if (fd.criterionDispute !== undefined && !sameCriterionDispute(fd.criterionDispute, f.criterionDispute)) return false;
+      if (f.status !== "open" || f.item !== item || f.doneWhen !== doneWhen || whereKey(f.where ?? "") !== key || (f.domain ?? "") !== domain) return false;
+      if (fd.criterionDispute !== undefined && !this.#sameCriterionDispute(fd.criterionDispute, this.#disputeOf(f))) return false;
       if (fd.linkedDecisionId !== undefined && fd.linkedDecisionId !== f.linkedDecisionId) return false;
       return true;
     });
     if (!existing) return false;
     this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer });
     return true;
+  }
+
+  /** OD-7 (D-M-68): the full `criterionDispute` a finding was raised with.
+   * The finding stores only the criterion (`criterionDisputed`); its reason
+   * and proposed wording live on the amendment decision it created. Returns
+   * undefined when the finding carried no dispute or no amendment decision
+   * was made (an empty or no-change proposal states no position). */
+  #disputeOf(f: Finding): CriterionDispute | undefined {
+    if (!f.criterionDisputed) return undefined;
+    const decision = this.#state.phase.decisions.find(
+      (d) =>
+        d.amendment !== undefined &&
+        d.amendment.criterion === f.criterionDisputed &&
+        d.amendment.raisedBy === f.raisedBy &&
+        d.boundCandidateSha === f.boundCandidateSha,
+    );
+    return decision?.amendment
+      ? { criterion: decision.amendment.criterion, why: decision.amendment.why, proposedWording: decision.amendment.proposedWording }
+      : undefined;
+  }
+
+  /** OD-7 (D-M-68): two criterion disputes are the same only when every field
+   * (criterion, reason and proposed wording) matches. */
+  #sameCriterionDispute(a: CriterionDispute | undefined, b: CriterionDispute | undefined): boolean {
+    return a !== undefined && b !== undefined && a.criterion === b.criterion && a.why === b.why && a.proposedWording === b.proposedWording;
   }
 
   /** Plan 06b (OD-1 R6): the requirement item id whose text is the disputed
