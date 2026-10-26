@@ -234,6 +234,8 @@ export async function setupConductor(opts: {
    * the real machine-wide lock (which would pause each other's workers). A
    * test that wants the machine-wide behavior passes one shared path. */
   checkLockPath?: string;
+  /** How many checks may run at once (default: the conductor's, 2). */
+  checkSlots?: number;
   /** The plan's title (default "test plan") — plan prose like any other. */
   title?: string;
   /** #+TT_MODELS: per-role provider/model for the plan (design §2.1). The
@@ -411,6 +413,7 @@ export async function setupConductor(opts: {
     // Plan 06k1 (A4): default the check lock to a per-run path so parallel
     // test files never contend on the real machine-wide lock.
     checkLockPath: opts.checkLockPath ?? path.join(runRoot, "check.lock"),
+    ...(opts.checkSlots !== undefined ? { checkSlots: opts.checkSlots } : {}),
     piEnvFor: (role, agentId) => {
       // tt 09 (change 3): the consolidator's own script, one per run.
       const consolidate = agentId.match(/^consolidate-(\d+)-/);

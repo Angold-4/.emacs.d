@@ -229,6 +229,8 @@ test("plan 06g: a two-lane plan parsed by the real Emacs parser builds two candi
   // 2. Run it with fake-pi.
   const promptLog = path.join(dir, "lane-prompts.txt");
   const setup = await setupConductor({
+    // One check slot: this test pins the serial-lock behaviour (C2).
+    checkSlots: 1,
     phase,
     checks: ["true"],
     phaseChecks: ["true"],
@@ -1561,13 +1563,15 @@ test("tt 09: a consolidation that changes nothing falls back to the winner and r
 });
 
 // tt 09-2 (async review): a candidate's reviews start when its lane submits,
-// while its checks run. Each check sleeps 3 s (and the machine-wide lock
-// queues lane b's behind lane a's), so every lane's reviews are dispatched
+// while its checks run. Each check sleeps 3 s (and, with one check slot, the
+// machine-wide lock queues lane b's behind lane a's), so every lane's reviews are dispatched
 // before its check finishes, the reviewers are told the checks are running,
 // the two checks still never overlap, and the round completes.
 test("09-2: a lane's reviews are dispatched before its check finishes, and the round completes", async () => {
   const promptDir = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))), ".lane-async-"));
   const setup = await setupConductor({
+    // One check slot: this test pins the serial-lock behaviour (C2).
+    checkSlots: 1,
     phase: lanePhase({ checks: ["sleep 3 && true"] }),
     checks: ["sleep 3 && true"],
     phaseChecks: ["true"],

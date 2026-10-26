@@ -7735,10 +7735,7 @@ export class Conductor {
       let text = "";
       let missingFile = false;
       let fileShaped = false;
-      for (const token of arch.where.split(/[\s,;]+/).filter(Boolean)) {
-        // Only a file-shaped token (a path or a name with an extension) can be
-        // grepped; a bare module name is left to the reviewers.
-        if (!/[/.]/.test(token)) continue;
+      for (const token of whereFileTokens(arch.where)) {
         fileShaped = true;
         try {
           text += `${readWhereText(path.join(dir, token))}\n`;
@@ -14964,6 +14961,18 @@ export function referenceLines(references: string[]): string[] {
     "Reference documents for this plan (outside the repository; read them with the read tool, do not search for them):",
     ...references.map((r) => `- ${r}`),
   ];
+}
+
+/** The `:WHERE:` tokens the symbol check can read as files: a path or a name
+ * with an extension. A bare module name, and a glob (`crates/x/src/**`, which
+ * names no single file and was read as a missing one, raising a false
+ * deviation on every candidate: exex 01b1 F-110/F-119), are left to the
+ * reviewers. */
+export function whereFileTokens(where: string): string[] {
+  return where
+    .split(/[\s,;]+/)
+    .filter(Boolean)
+    .filter((token) => /[/.]/.test(token) && !/[*?[\]{}]/.test(token));
 }
 
 /** Plan 06k2 (A5): the golden-source section every worker, reviewer and
