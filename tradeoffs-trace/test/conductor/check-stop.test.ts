@@ -311,9 +311,12 @@ test("plan 06g/ODP-3: a stop during the checks signals the run's own check proce
   const armed = path.join(markerDir, "armed");
   // While `armed` is absent this check exits at once (the base baseline's
   // run); once the worker has created it, the check records its own process
-  // group and sleeps well past the stop. `$$` is the shell's pid, which
-  // runCommand makes the group leader, so `$$` IS the pgid.
-  const check = `sh -c '[ -f ${armed} ] && { echo $$ > ${pgidFile}; touch ${startedFile}; sleep 120; }; exit 0'`;
+  // group and sleeps well past the stop. `runCommand` runs the command as
+  // `/bin/sh -c 'kill -STOP $$; exec /bin/sh -c "$1"'`, so the group leader
+  // is the process runCommand spawned — not `$$` inside this nested `sh -c`,
+  // which some shells (dash) fork as a child. Record the actual pgid so the
+  // test measures the group the conductor signals, not a child's pid.
+  const check = `sh -c '[ -f ${armed} ] && { ps -o pgid= -p $$ | tr -d " " > ${pgidFile}; touch ${startedFile}; sleep 120; }; exit 0'`;
 
   const setup = await setupConductor({
     // The check runs on its own, after the freeze: the worker has no other

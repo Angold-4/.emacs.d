@@ -1415,6 +1415,16 @@ export function readWhereText(target: string): string {
   return out.join("\n");
 }
 
+/** Plan 07a (OD-3): the check lock a conductor takes by default — its own
+ * root's `check.lock`, not the machine-wide `~/.tradeoffs-trace/check.lock`.
+ * Identical for the default root, but a conductor started with `--root
+ * /tmp/...` gets an isolated lock, so it never sees another run's open check
+ * window and never pauses its own workers against it. `opts.checkLockPath`
+ * still wins. */
+function defaultCheckLockPath(runDir: string): string {
+  return path.join(path.dirname(runDir), "check.lock");
+}
+
 /** Plan 06g2: a lane round's winner awaiting its reviews' promotion. */
 type PendingLaneWinner = { round: number; lane: string; sha: string; build: LaneBuild; reviews: Array<{ seat: string; review: Review }> };
 
@@ -1700,7 +1710,12 @@ export class Conductor {
     this.#probeReuse = opts.probeReuse ?? true;
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
-    this.#checkLockPath = opts.checkLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "check.lock");
+    // Plan 07a (OD-3): the check lock defaults to the run's own root, not the
+    // machine-wide `~/.tradeoffs-trace/check.lock`. Identical for the default
+    // root, but a conductor started with `--root /tmp/...` now takes an
+    // isolated check lock, so it never sees another run's open check window
+    // and never pauses its own workers against it. `opts.checkLockPath` wins.
+    this.#checkLockPath = opts.checkLockPath ?? defaultCheckLockPath(this.#runDir);
     this.#checkSlots = opts.checkSlots ?? (Number(process.env.TT_CHECK_SLOTS) || DEFAULT_CHECK_SLOTS);
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
@@ -1712,6 +1727,14 @@ export class Conductor {
 
   get runDir(): string {
     return this.#runDir;
+  }
+
+  /** Plan 07a (OD-3): the check lock this conductor uses — its own root's
+   * `check.lock` unless `opts.checkLockPath` overrode it. Exposed so a test
+   * can assert a conductor with a non-default root never takes the
+   * machine-wide `~/.tradeoffs-trace/check.lock`. */
+  get checkLockPath(): string {
+    return this.#checkLockPath;
   }
 
   /** The pgid of every currently-live agent process, keyed by role and
