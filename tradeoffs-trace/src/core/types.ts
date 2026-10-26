@@ -117,6 +117,16 @@ export interface PhaseContract {
    * the phase's `:WIDE_PATHS:`). A candidate whose diff touches one runs the
    * final check in its round. */
   widePaths?: string[];
+  /** Plan 07c (D4): `#+TT_FIX_ROUNDS: domains` frozen into the contract.
+   * Present only when the plan switched fix rounds on; absent means every
+   * round is today's. */
+  fixRounds?: "domains";
+  /** Plan 07c (D4): `#+TT_FIXERS` (default 4) — the most fixer tasks (one
+   * per domain) one fix round runs. */
+  fixers?: number;
+  /** Plan 07c (D4): `#+TT_FIX_CHECKS` — the fast command every fixer's own
+   * commit must pass before it is merged. */
+  fixChecks?: string;
   /** Plan 06g: `#+TT_WORKERS:` frozen into the contract — how many lanes one
    * round runs. Absent (or 1) is today's single-candidate loop. */
   workers?: number;
@@ -1480,6 +1490,11 @@ export interface RoundRecord {
    * not. `ok` with a `sha` makes that commit the next round's base for every
    * lane; `ok` false records why the next round starts from the winner. */
   consolidated?: RoundConsolidation;
+  /** Plan 07c (D4): set by ROUND_FIXED once the round's open fix findings
+   * were grouped by domain and one fixer per domain ran from the same base.
+   * With a `candidate`, the next round is a single-lane round on that merged
+   * commit; without one it is today's two-lane round. */
+  fixed?: RoundFixed;
 }
 
 /** tt 09 (change 3): one lane's work a consolidation takes onto the winner —
@@ -1508,6 +1523,28 @@ export interface RoundConsolidation {
   added?: string[];
   /** How many times the consolidator fixed a red commit. */
   fixes?: number;
+}
+
+/** Plan 07c (D4.6): one fixer task as `ROUND_FIXED` records it — the domain,
+ * the findings it owned, its green commit (when it produced one) and, when it
+ * was skipped, why. */
+export interface FixTaskRecord {
+  domain: string;
+  findingIds: string[];
+  sha?: string;
+  note?: string;
+}
+
+/** Plan 07c (D4.6): the fix step of one round, as `ROUND_FIXED` records it.
+ * `base` is the commit the fixers started from and the merged candidate's own
+ * check base; `tasks` is one entry per fixer (its commit or why it was
+ * skipped); `merges` are the fixer commits actually merged, in task order;
+ * `candidate` is the merged commit, when at least one fixer's work merged. */
+export interface RoundFixed {
+  base: string;
+  tasks: FixTaskRecord[];
+  merges: { sha: string }[];
+  candidate?: string;
 }
 
 export interface FlakeObservation {
@@ -1820,6 +1857,20 @@ export interface EvRoundConsolidated {
   note?: string;
   added?: string[];
   fixes?: number;
+}
+/** Plan 07c (D4.6): the fix step between a picked-but-not-accepted round and
+ * the next one. `base` is what the fixers started from, `tasks` one entry per
+ * fixer (its commit or why it was skipped), `merges` the fixer commits merged
+ * in task order and `candidate` the merged commit. Record-only: a candidate
+ * makes the next round a single-lane round on it; without one the next round
+ * is today's two-lane round. */
+export interface EvRoundFixed {
+  type: "ROUND_FIXED";
+  round: number;
+  base: string;
+  tasks: FixTaskRecord[];
+  merges: { sha: string }[];
+  candidate?: string;
 }
 /** Plan 06n (A7): the round's evaluated pick `sha` lost `items` that the
  * phase's best candidate met, in code it changed, so it is not adopted as the
@@ -2793,6 +2844,7 @@ export type Event =
   | EvWorkerResumed
   | EvItemsRegressed
   | EvRoundConsolidated
+  | EvRoundFixed
   | EvFreezeCompleted
   | EvFreezeTimedOut
   | EvFreezeInterrupted

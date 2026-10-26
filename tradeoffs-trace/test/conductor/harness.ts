@@ -136,6 +136,10 @@ export async function setupConductor(opts: {
    * (`consolidate-<round>-…`), `n` counting this round's runs from 1 (the
    * build, then each fix). Absent: the worker script. */
   consolidatorScriptFor?: (round: number, n: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
+  /** Plan 07c (D4): one script per fixer run (`fix-<round>-<domain>-…`), `n`
+   * counting this round's runs for that domain from 1 (the build, then each
+   * fix). Absent: the worker script. */
+  fixerScriptFor?: (domain: string, round: number, n: number, state: State) => { hello?: unknown; steps: FakePiStep[] };
   reviewerScriptFor?: (reviewer: Reviewer, state: State) => { hello?: unknown; steps: FakePiStep[] };
   /** Plan 04a: the EVALUATING stage's fresh evaluator, ONE PER MESSAGE TYPE.
    * The default script returns an empty `submit_evaluation`, which the
@@ -299,6 +303,7 @@ export async function setupConductor(opts: {
   const laneReviewerScriptPaths = new Map<string, string>();
   const pickScriptPaths = new Map<string, string>();
   const consolidatorScriptPaths = new Map<string, string>();
+  const fixerScriptPaths = new Map<string, string>();
   const evaluatorScriptPaths = new Map<string, string>();
   const briefScriptPaths = new Map<string, string>();
   const curatorScriptPaths = new Map<string, string>();
@@ -428,6 +433,18 @@ export async function setupConductor(opts: {
           consolidatorScriptPaths.set(agentId, writeScript(scriptsDir, agentId, opts.consolidatorScriptFor(round, n, conductor.state)));
         }
         return { FAKE_PI_SCRIPT: consolidatorScriptPaths.get(agentId)!, ...(opts.extraWorkerEnv ?? {}) };
+      }
+      // Plan 07c (D4): a fixer's own script, one per run, keyed by round and
+      // domain (`fix-<round>-<domain>-fixer-<seq>-<rand>`).
+      const fixer = agentId.match(/^fix-(\d+)-(.+?)-fixer-\d+-[0-9a-f]+$/);
+      if (role === "worker" && fixer && opts.fixerScriptFor) {
+        const round = Number(fixer[1]);
+        const domain = fixer[2];
+        if (!fixerScriptPaths.has(agentId)) {
+          const n = [...fixerScriptPaths.keys()].filter((k) => k.startsWith(`fix-${round}-${domain}-`)).length + 1;
+          fixerScriptPaths.set(agentId, writeScript(scriptsDir, agentId, opts.fixerScriptFor(domain, round, n, conductor.state)));
+        }
+        return { FAKE_PI_SCRIPT: fixerScriptPaths.get(agentId)!, ...(opts.extraWorkerEnv ?? {}) };
       }
       // Plan 06g2: a lane agent's own script, keyed by its lane/round/seat.
       const laneWorker = agentId.match(/^lane-(\d+)-([a-z])-/);

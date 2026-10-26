@@ -617,6 +617,27 @@ export function consolidatedBase(rounds: readonly RoundRecord[] | undefined, bef
   return c?.ok && typeof c.sha === "string" && c.sha.length > 0 && c.from === latest.picked!.sha ? c.sha : undefined;
 }
 
+/** Plan 07c (D4.7): the fix round that repairs `beforeRound`'s predecessor,
+ * when its merged candidate exists. Like `consolidatedBase`: the latest
+ * picked round before `beforeRound` whose fix step produced a candidate. The
+ * next round is then a single-lane round on that candidate, checked from the
+ * fix round's base. Undefined when the latest pick was not fixed, its fixers
+ * all failed, or the pick regressed. */
+export function fixRoundCandidate(
+  rounds: readonly RoundRecord[] | undefined,
+  beforeRound = Number.POSITIVE_INFINITY,
+): { candidate: string; base: string } | undefined {
+  let latest: RoundRecord | undefined;
+  for (const r of rounds ?? []) {
+    if (r.round >= beforeRound || !r.picked) continue;
+    if (!latest || r.round > latest.round) latest = r;
+  }
+  if (!latest || latest.regressed) return undefined;
+  const fixed = latest.fixed;
+  if (!fixed || typeof fixed.candidate !== "string" || fixed.candidate.length === 0) return undefined;
+  return { candidate: fixed.candidate, base: fixed.base };
+}
+
 /** How a consolidated commit is named in the views: `C2-a+b` (round 2's
  * winner a, with lane b's items). */
 export function consolidatedLabel(round: number, winnerLane: string, takes: readonly ConsolidationTake[]): string {

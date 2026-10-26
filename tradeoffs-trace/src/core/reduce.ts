@@ -141,6 +141,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "CANDIDATE_PICKED",
   "ITEMS_REGRESSED",
   "ROUND_CONSOLIDATED",
+  "ROUND_FIXED",
   "ROUND_REVIEW_SUBMITTED",
   "ITEM_CARRIED",
   "DECISION_ADDED",
@@ -694,6 +695,29 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         ...(event.fixes !== undefined ? { fixes: event.fixes } : {}),
       };
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, consolidated }) } });
+    }
+
+    case "ROUND_FIXED": {
+      // Plan 07c (D4.6): record-only. The round's fix step is marked with its
+      // result; the conductor reads it to start the next round as a
+      // single-lane round on the merged candidate (or, without one, today's
+      // two-lane round), and to never re-run the fixers after it.
+      const round = (p.rounds ?? []).find((r) => r.round === event.round);
+      if (!round) return rejected(state, `ROUND_FIXED for round ${event.round}, which has not started`);
+      if (!round.picked) return rejected(state, `ROUND_FIXED for round ${event.round}, which picked no lane`);
+      if (event.tasks.length === 0) return rejected(state, `ROUND_FIXED for round ${event.round} names no task`);
+      const fixed: import("./types.ts").RoundFixed = {
+        base: event.base,
+        tasks: event.tasks.map((t) => ({
+          domain: t.domain,
+          findingIds: [...t.findingIds],
+          ...(t.sha ? { sha: t.sha } : {}),
+          ...(t.note ? { note: t.note } : {}),
+        })),
+        merges: event.merges.map((m) => ({ sha: m.sha })),
+        ...(event.candidate ? { candidate: event.candidate } : {}),
+      };
+      return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, fixed }) } });
     }
 
     case "DECISION_ADDED": {

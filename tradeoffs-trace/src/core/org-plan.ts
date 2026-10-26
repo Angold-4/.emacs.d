@@ -161,6 +161,9 @@ function parsePhaseNode(
   globalRegen?: string[],
   globalWidePaths?: string[],
   globalDomains?: Domain[],
+  globalFixRounds?: string,
+  globalFixers?: number,
+  globalFixChecks?: string,
 ): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
@@ -217,6 +220,11 @@ function parsePhaseNode(
     // Plan 07a (D1): the plan's #+TT_DOMAINS applies to every phase (there
     // is no phase-level override; D1 makes it a per-plan switch).
     ...(globalDomains && globalDomains.length > 0 ? { domains: globalDomains } : {}),
+    // Plan 07c (D4): the fix-round keywords are per-plan switches too, so
+    // every phase inherits them, exactly like #+TT_DOMAINS.
+    ...(globalFixRounds ? { fixRounds: globalFixRounds } : {}),
+    ...(globalFixers !== undefined ? { fixers: globalFixers } : {}),
+    ...(globalFixChecks ? { fixChecks: globalFixChecks } : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -377,7 +385,19 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const globalWidePaths = first("TT_WIDE_PATHS") ? splitList(first("TT_WIDE_PATHS")!.value) : undefined;
   const globalDomainsKeyword = first("TT_DOMAINS");
   const globalDomains = globalDomainsKeyword ? parseDomains(globalDomainsKeyword.value) : undefined;
-  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains));
+  // Plan 07c (D4): the fix-round keywords, read as written so lint can name
+  // a bad value; carried onto every phase like the domains.
+  const globalFixRoundsKeyword = first("TT_FIX_ROUNDS");
+  const globalFixRounds = globalFixRoundsKeyword ? globalFixRoundsKeyword.value.trim() : undefined;
+  const globalFixersKeyword = first("TT_FIXERS");
+  const globalFixers = globalFixersKeyword ? parseCount(globalFixersKeyword) : undefined;
+  const globalFixChecksKeyword = first("TT_FIX_CHECKS");
+  const globalFixChecks = globalFixChecksKeyword ? globalFixChecksKeyword.value.trim() : undefined;
+  const phases = roots
+    .filter((r) => r.level === 1)
+    .map((r) =>
+      parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains, globalFixRounds, globalFixers, globalFixChecks),
+    );
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
   const workers = first("TT_WORKERS");
@@ -416,6 +436,9 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(consolidate ? { consolidate: consolidate.value.trim(), consolidateLine: consolidate.line } : {}),
     ...(globalDomains && globalDomains.length > 0 ? { domains: globalDomains } : {}),
     ...(globalDomainsKeyword ? { domainsLine: globalDomainsKeyword.line } : {}),
+    ...(globalFixRounds ? { fixRounds: globalFixRounds, fixRoundsLine: globalFixRoundsKeyword!.line } : {}),
+    ...(globalFixers !== undefined ? { fixers: globalFixers, fixersLine: globalFixersKeyword!.line } : {}),
+    ...(globalFixChecks ? { fixChecks: globalFixChecks, fixChecksLine: globalFixChecksKeyword!.line } : {}),
   };
 }
 

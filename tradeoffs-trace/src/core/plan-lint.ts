@@ -65,7 +65,10 @@ export type LintRule =
   // tt 09-1: a cheap command that only the final (acceptance) check runs.
   | "cheap-final-check"
   // tt 09 (change 3): `#+TT_CONSOLIDATE` is `on` or `off`.
-  | "consolidate";
+  | "consolidate"
+  // Plan 07c (D4): `#+TT_FIX_ROUNDS` needs `#+TT_DOMAINS`; the value is
+  // `domains`, and `#+TT_FIXERS` is a positive whole number.
+  | "fix-rounds";
 
 /** The roles #+TT_MODELS may assign a model to. */
 // tt 09 (change 3): `consolidator` — the model that combines the lanes.
@@ -212,6 +215,15 @@ export interface LintPhaseInput {
   /** Plan 07a (D1): the plan's declared domains (`#+TT_DOMAINS:`), carried
    * onto every phase. Absent means domain mode is off. */
   domains?: Domain[];
+  /** Plan 07c (D4): `#+TT_FIX_ROUNDS:` (`domains` switches fix rounds on),
+   * carried onto every phase. Kept open so lint can name a bad value. */
+  fixRounds?: unknown;
+  /** Plan 07c (D4): `#+TT_FIXERS:` — the most fixer tasks one fix round
+   * runs. Kept open so lint can name a bad value. */
+  fixers?: unknown;
+  /** Plan 07c (D4): `#+TT_FIX_CHECKS:` — the fast command a fixer's own
+   * commit must pass. */
+  fixChecks?: unknown;
 }
 
 export interface LintPlanInput {
@@ -295,6 +307,19 @@ export interface LintPlanInput {
   domains?: Domain[];
   /** Lint-only: the 1-based line of `#+TT_DOMAINS:`. */
   domainsLine?: number;
+  /** Plan 07c (D4): the plan's `#+TT_FIX_ROUNDS:` — `domains` or a bad
+   * value. Kept as written so lint can name it. */
+  fixRounds?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_FIX_ROUNDS:`. */
+  fixRoundsLine?: number;
+  /** Plan 07c (D4): the plan's `#+TT_FIXERS:`. */
+  fixers?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_FIXERS:`. */
+  fixersLine?: number;
+  /** Plan 07c (D4): the plan's `#+TT_FIX_CHECKS:`. */
+  fixChecks?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_FIX_CHECKS:`. */
+  fixChecksLine?: number;
   /** `#+TT_WORKER_PROMPT`: lane to the files appended to its worker. Kept
    * open (`unknown`) so a malformed value still reaches the linter. */
   workerPrompt?: Record<string, unknown>;
@@ -795,6 +820,7 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
     ...lintCheapFinalChecks(plan),
     ...lintConsolidate(plan),
     ...lintDomains(plan),
+    ...lintFixRounds(plan),
   ];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
@@ -1140,6 +1166,56 @@ export function lintDomains(plan: LintPlanInput): LintFinding[] {
     problem,
     fix: "write each domain as <name>=<glob>[,<glob>…] with a unique [a-z0-9-]+ name and at least one glob",
   }));
+}
+
+/** Plan 07c (D4): lint the fix-round keywords. `#+TT_FIX_ROUNDS` needs
+ * `#+TT_DOMAINS` (there is nothing to group by without them) and its only
+ * value is `domains`; `#+TT_FIXERS` is a positive whole number. A plan
+ * without `#+TT_FIX_ROUNDS` is today's, whatever the other two say. */
+export function lintFixRounds(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  const fixRounds = plan.fixRounds ?? (plan.phases ?? []).find((p) => p.fixRounds !== undefined)?.fixRounds;
+  const domains = plan.domains ?? (plan.phases ?? []).find((p) => p.domains && p.domains.length > 0)?.domains;
+  if (fixRounds !== undefined) {
+    const value = typeof fixRounds === "string" ? fixRounds.trim() : fixRounds;
+    if (value !== "domains") {
+      out.push({
+        severity: "error",
+        rule: "fix-rounds",
+        phaseId: "fix-rounds",
+        item: `#+TT_FIX_ROUNDS: ${String(fixRounds)}`,
+        line: plan.fixRoundsLine,
+        sourceFile: plan.sourceFile,
+        problem: `#+TT_FIX_ROUNDS must be domains, got ${JSON.stringify(String(fixRounds))}`,
+        fix: "write #+TT_FIX_ROUNDS: domains (the only fix-round mode), or drop the keyword",
+      });
+    } else if (!domains || domains.length === 0) {
+      out.push({
+        severity: "error",
+        rule: "fix-rounds",
+        phaseId: "fix-rounds",
+        item: "#+TT_FIX_ROUNDS: domains",
+        line: plan.fixRoundsLine,
+        sourceFile: plan.sourceFile,
+        problem: "#+TT_FIX_ROUNDS: domains needs #+TT_DOMAINS: without declared domains there is nothing to group the fix findings by",
+        fix: "declare #+TT_DOMAINS: name=glob[,glob…] …, or drop #+TT_FIX_ROUNDS",
+      });
+    }
+  }
+  const fixers = plan.fixers ?? (plan.phases ?? []).find((p) => p.fixers !== undefined)?.fixers;
+  if (fixers !== undefined && (!Number.isInteger(fixers) || (fixers as number) < 1)) {
+    out.push({
+      severity: "error",
+      rule: "fix-rounds",
+      phaseId: "fix-rounds",
+      item: `#+TT_FIXERS: ${String(fixers)}`,
+      line: plan.fixersLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_FIXERS must be a whole number of 1 or more, got ${String(fixers)}`,
+      fix: "write #+TT_FIXERS: 4 (the default), or a positive whole number of tasks",
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -704,6 +704,13 @@ because `domainOf' takes the first match."
          ;; like #+TT_CONSOLIDATE; domain mode is on exactly when the plan
          ;; declares one (there is no phase override).
          (domains (+tt--keyword "TT_DOMAINS"))
+         ;; Plan 07c (D4): fix rounds. Per-plan keywords like
+         ;; #+TT_DOMAINS: #+TT_FIX_ROUNDS: domains switches them on,
+         ;; #+TT_FIXERS: n caps the tasks and #+TT_FIX_CHECKS: <cmd> is the
+         ;; fast check every fixer's own commit must pass.
+         (fix-rounds (+tt--keyword "TT_FIX_ROUNDS"))
+         (fixers (+tt--keyword "TT_FIXERS"))
+         (fix-checks (+tt--keyword "TT_FIX_CHECKS"))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -775,6 +782,12 @@ because `domainOf' takes the first match."
                 `((consolidate . ,(string-trim consolidate))))
             ,@(when domains
                 `((domains . ,(+tt--parse-domains domains))))
+            ,@(when fix-rounds
+                `((fixRounds . ,(string-trim fix-rounds))))
+            ,@(when fixers
+                `((fixers . ,(+tt--count-value fixers))))
+            ,@(when fix-checks
+                `((fixChecks . ,(string-trim fix-checks))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
@@ -1080,6 +1093,18 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((d (+tt--keyword-at "TT_DOMAINS")))
                       (and d (list (cons 'domains (+tt--parse-domains (car d)))
                                    (cons 'domainsLine (cdr d)))))
+                  ;; Plan 07c (D4): #+TT_FIX_ROUNDS, #+TT_FIXERS and
+                  ;; #+TT_FIX_CHECKS, as written, so `tt lint' can read them
+                  ;; (and refuse TT_FIX_ROUNDS without TT_DOMAINS).
+                  ,@(let ((f (+tt--keyword-at "TT_FIX_ROUNDS")))
+                      (and f (list (cons 'fixRounds (string-trim (car f)))
+                                   (cons 'fixRoundsLine (cdr f)))))
+                  ,@(let ((f (+tt--keyword-at "TT_FIXERS")))
+                      (and f (list (cons 'fixers (+tt--count-value (car f)))
+                                   (cons 'fixersLine (cdr f)))))
+                  ,@(let ((f (+tt--keyword-at "TT_FIX_CHECKS")))
+                      (and f (list (cons 'fixChecks (string-trim (car f)))
+                                   (cons 'fixChecksLine (cdr f)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))

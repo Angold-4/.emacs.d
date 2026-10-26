@@ -51,6 +51,20 @@
       "description": "Plan 07a (D1): the phase's declared domains (#+TT_DOMAINS), frozen into the contract. Absent means domain mode is off, exactly as today.",
       "type": "array",
       "items": { "$ref": "#/$defs/Domain" }
+    },
+    "fixRounds": {
+      "description": "Plan 07c (D4): #+TT_FIX_ROUNDS frozen into the contract. Present only when the plan switched fix rounds on; absent means every round is today's.",
+      "const": "domains"
+    },
+    "fixers": {
+      "description": "Plan 07c (D4): #+TT_FIXERS frozen into the contract — the most fixer tasks one fix round runs. Absent means the default of 4.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "fixChecks": {
+      "description": "Plan 07c (D4): #+TT_FIX_CHECKS frozen into the contract — the fast command every fixer's own commit must pass.",
+      "type": "string",
+      "minLength": 1
     }
   },
   "$defs": {
