@@ -357,10 +357,19 @@ test("a point with trailing whitespace still folds into the open one", async () 
 
 test("a duplicate carrying a criterion dispute is not folded and its dispute survives", async () => {
   const point = { domain: "booking", item: "R1", where: "src/core/rounds.ts:1 fn", expected: "x", doneWhen: "true" };
-  // M and A carry the same amendment (it is already on the open finding, so
-  // folding loses nothing); B carries a different one, which the fold would
-  // drop, so B's point is raised on its own (OD-6 / D-M-50, D-M-51).
-  const dispute = (criterion: string) => ({ criterion, why: "the wording is wrong", proposedWording: `${criterion} exactly` });
+  // Three distinct disputes on the SAME point. M raises R1 (wording p1) and
+  // R2; A repeats M's R1 dispute verbatim (it is already on the open finding,
+  // so folding loses nothing); B disputes the SAME criterion R1 but proposes
+  // different wording — a different amendment that must not be folded away
+  // (OD-6 / D-M-50, D-M-51; OD-7 / D-M-68).
+  const dispute = (criterion: string, proposedWording: string) => ({ criterion, why: "the wording is wrong", proposedWording });
+  const pointFinding = (criterion: string, proposedWording: string) => ({
+    kind: "defect",
+    severity: "advisory",
+    evidence: "the point",
+    ...point,
+    criterionDispute: dispute(criterion, proposedWording),
+  });
   const setup = await setupConductor({
     items: ITEMS,
     domains: DOMAINS,
@@ -370,34 +379,48 @@ test("a duplicate carrying a criterion dispute is not folded and its dispute sur
     workerScript,
     reviewerScriptFor: (reviewer, state) =>
       reviewerScript(reviewer, state, {
-        findings: [
-          {
-            kind: "defect",
-            severity: "advisory",
-            evidence: "the point",
-            ...point,
-            criterionDispute: dispute(reviewer === "B" ? "R2 is judged by review" : "R1 proves it"),
-          },
-        ],
+        findings:
+          reviewer === "M"
+            ? [pointFinding("R1 proves it", "R1 proves it, fixed"), pointFinding("R2 is judged by review", "R2 is judged by review, fixed")]
+            : reviewer === "A"
+              ? [pointFinding("R1 proves it", "R1 proves it, fixed")]
+              : [pointFinding("R1 proves it", "R1 proves it, reworded")],
       }),
   });
   try {
     await setup.conductor.start();
     const matching = () => setup.conductor.state.phase.findings.filter((f) => f.item === "R1");
     await waitFor(
-      () => matching().length === 2 && matching().some((f) => (f.alsoRaisedBy ?? []).length === 1),
+      () => matching().length === 3 && matching().some((f) => (f.alsoRaisedBy ?? []).length === 1),
       90_000,
       50,
       setup.runDir,
     );
-    assert.equal(matching().length, 2, "a different dispute is raised, not folded away");
+    assert.equal(matching().length, 3, "each distinct dispute stays its own finding");
     assert.deepEqual(
-      [...new Set(matching().map((f) => f.criterionDisputed))].sort(),
-      ["R1 proves it", "R2 is judged by review"],
-      "both disputes survive on their own finding",
+      matching()
+        .map((f) => `${f.criterionDisputed} :: ${f.criterionDispute?.proposedWording}`)
+        .sort(),
+      [
+        "R1 proves it :: R1 proves it, fixed",
+        "R1 proves it :: R1 proves it, reworded",
+        "R2 is judged by review :: R2 is judged by review, fixed",
+      ],
+      "every dispute survives with its own proposal",
     );
-    assert.equal(matching().find((f) => f.criterionDisputed === "R1 proves it")!.alsoRaisedBy!.length, 1, "the identical duplicate folded into it");
-    assert.equal((matching().find((f) => f.criterionDisputed === "R2 is judged by review")!.alsoRaisedBy ?? []).length, 0, "the differing duplicate was not folded");
+    const identical = matching().filter((f) => f.criterionDispute?.proposedWording === "R1 proves it, fixed");
+    assert.equal(identical.length, 1, "the identical duplicate folded into one finding");
+    assert.equal(identical[0].alsoRaisedBy!.length, 1, "the identical duplicate folded into it");
+    const reworded = matching().find((f) => f.criterionDispute?.proposedWording === "R1 proves it, reworded")!;
+    assert.equal((reworded.alsoRaisedBy ?? []).length, 0, "the same criterion with different wording was not folded");
+    assert.deepEqual(
+      setup.conductor.state.phase.decisions
+        .filter((d) => d.amendment?.criterion === "R1 proves it")
+        .map((d) => d.amendment!.proposedWording)
+        .sort(),
+      ["R1 proves it, fixed", "R1 proves it, reworded"],
+      "each R1 proposal is voted on its own",
+    );
   } finally {
     await teardown(setup);
   }
