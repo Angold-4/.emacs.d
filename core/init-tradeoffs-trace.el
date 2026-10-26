@@ -549,6 +549,8 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
          (verify (org-element-property :VERIFY hl))
          (arch (org-element-property :ARCH hl))
          (where (org-element-property :WHERE hl))
+         ;; Plan 07a (D1): the declared domain this item serves.
+         (domain (org-element-property :DOMAIN hl))
          (title (string-trim (+tt--headline-title hl)))
          (item-id (org-element-property :ID hl))
          (where-line (+tt--property-line hl "WHERE"))
@@ -563,6 +565,9 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
       (title . ,title)
       (text . ,text)
       (rawText . ,raw)
+      ;; Plan 07a (D1): a `:DOMAIN:` property on any R/A/C item reaches the
+      ;; plan JSON (and so the contract) verbatim.
+      ,@(when domain `((domain . ,domain)))
       ;; Tags are an architecture property only (OD-1 R8: the requirement and
       ;; constraint schemas forbid extra fields).
       ,@(when (eq kind 'architecture)
@@ -631,6 +636,22 @@ so an old plan reaches the loop as items without changing meaning."
           (list `((id . "C1") (title . ,text) (text . ,text) (rawText . ,text)
                   (verify . ,(vector "review"))))))))))
 
+(defun +tt--parse-domains (value)
+  "Parse a #+TT_DOMAINS VALUE into a vector of (name . globs) alists.
+Whitespace separates `name=glob[,glob…]' tokens; a token without `=' keeps
+the whole token as its name and owns no globs.  Declaration order is kept,
+because `domainOf' takes the first match."
+  (vconcat
+   (mapcar
+    (lambda (token)
+      (let* ((eq (string-match "=" token))
+             (name (string-trim (if eq (substring token 0 eq) token)))
+             (globs (if eq
+                        (split-string (substring token (1+ eq)) "[ \t,]+" t)
+                      nil)))
+        `((name . ,name) (globs . ,(vconcat globs)))))
+    (split-string value "[ \t]+" t))))
+
 (defun +tt--parse-phase (hl)
   "Parse phase headline HL into (PHASE-ALIST . ERRORS)."
   (let* ((line (line-number-at-pos (org-element-property :begin hl)))
@@ -679,6 +700,10 @@ so an old plan reaches the loop as items without changing meaning."
          ;; whenever the phase runs two or more workers.
          (consolidate (or (org-element-property :CONSOLIDATE hl)
                           (+tt--keyword "TT_CONSOLIDATE")))
+         ;; Plan 07a (D1): the phase's declared domains. A per-plan keyword
+         ;; like #+TT_CONSOLIDATE; a phase's own :DOMAINS: overrides it.
+         (domains (or (org-element-property :DOMAINS hl)
+                      (+tt--keyword "TT_DOMAINS")))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -748,6 +773,8 @@ so an old plan reaches the loop as items without changing meaning."
                 `((leader . ,(string-trim leader))))
             ,@(when consolidate
                 `((consolidate . ,(string-trim consolidate))))
+            ,@(when domains
+                `((domains . ,(+tt--parse-domains domains))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
@@ -1047,6 +1074,12 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((c (+tt--keyword-at "TT_CONSOLIDATE")))
                       (and c (list (cons 'consolidate (string-trim (car c)))
                                    (cons 'consolidateLine (cdr c)))))
+                  ;; Plan 07a (D1): #+TT_DOMAINS, as written, so `tt lint' can
+                  ;; read the declared domains (and a phase's items against
+                  ;; them).
+                  ,@(let ((d (+tt--keyword-at "TT_DOMAINS")))
+                      (and d (list (cons 'domains (+tt--parse-domains (car d)))
+                                   (cons 'domainsLine (cdr d)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))

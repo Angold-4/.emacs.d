@@ -46,9 +46,24 @@
     "consolidate": {
       "description": "tt 09 (change 3): #+TT_CONSOLIDATE: off frozen into the contract. Present (false) only when the plan turned the combine step off; absent means on whenever the phase runs two or more lanes.",
       "const": false
+    },
+    "domains": {
+      "description": "Plan 07a (D1): the phase's declared domains (#+TT_DOMAINS), frozen into the contract. Absent means domain mode is off, exactly as today.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Domain" }
     }
   },
   "$defs": {
+    "Domain": {
+      "description": "Plan 07a (D1): one declared domain — a name and the repository-relative globs it owns.",
+      "type": "object",
+      "required": ["name", "globs"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "globs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
     "ContractVersion": {
       "type": "object",
       "required": ["snapshot", "sectionSha256"],

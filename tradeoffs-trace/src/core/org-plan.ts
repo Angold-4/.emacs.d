@@ -15,6 +15,7 @@
 import * as path from "node:path";
 
 import { expandPromptPath } from "./worker-prompt.ts";
+import { parseDomains, type Domain } from "./domains.ts";
 import type { LintItemInput, LintModels, LintPhaseInput, LintPlanInput } from "./plan-lint.ts";
 
 interface OrgNode {
@@ -133,6 +134,8 @@ function itemInput(node: OrgNode, kind: "architecture" | "requirement" | "constr
     rawText,
     line: node.line,
   };
+  // Plan 07a (D1): a `:DOMAIN:` property on any R/A/C item.
+  if (node.props.DOMAIN) item.domain = node.props.DOMAIN;
   if (kind === "architecture") {
     if (node.props.WHERE) item.where = node.props.WHERE;
     if (node.propLines.WHERE) item.whereLine = node.propLines.WHERE;
@@ -157,6 +160,7 @@ function parsePhaseNode(
   globalGenerated?: string[],
   globalRegen?: string[],
   globalWidePaths?: string[],
+  globalDomains?: Domain[],
 ): LintPhaseInput {
   const byTitle = (name: string) => node.children.find((c) => c.title === name);
   const goalNode = byTitle("Goal");
@@ -210,6 +214,13 @@ function parsePhaseNode(
     // tt 09 (change 3): the phase's own :CONSOLIDATE: (on/off), kept as
     // written so lint can name a bad value.
     ...(node.props.CONSOLIDATE ? { consolidate: node.props.CONSOLIDATE.trim() } : {}),
+    // Plan 07a (D1): the phase's own :DOMAINS: overrides the plan's
+    // #+TT_DOMAINS:, exactly like :GENERATED:.
+    ...(node.props.DOMAINS
+      ? { domains: parseDomains(node.props.DOMAINS) }
+      : globalDomains && globalDomains.length > 0
+        ? { domains: globalDomains }
+        : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));
@@ -368,7 +379,9 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   const globalGenerated = first("TT_GENERATED") ? splitList(first("TT_GENERATED")!.value) : undefined;
   const globalRegen = first("TT_REGEN") ? splitCommands(first("TT_REGEN")!.value) : undefined;
   const globalWidePaths = first("TT_WIDE_PATHS") ? splitList(first("TT_WIDE_PATHS")!.value) : undefined;
-  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths));
+  const globalDomainsKeyword = first("TT_DOMAINS");
+  const globalDomains = globalDomainsKeyword ? parseDomains(globalDomainsKeyword.value) : undefined;
+  const phases = roots.filter((r) => r.level === 1).map((r) => parsePhaseNode(r, [], globalFinalChecks, globalGenerated, globalRegen, globalWidePaths, globalDomains));
   const rerun = first("TT_RERUN");
   const envFile = first("TT_ENV_FILE")?.value;
   const workers = first("TT_WORKERS");
@@ -405,6 +418,8 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(golden && golden.value.trim().length > 0 ? { golden: golden.value.trim(), goldenLine: golden.line } : {}),
     ...(leader ? { leader: leader.value.trim(), leaderLine: leader.line } : {}),
     ...(consolidate ? { consolidate: consolidate.value.trim(), consolidateLine: consolidate.line } : {}),
+    ...(globalDomains && globalDomains.length > 0 ? { domains: globalDomains } : {}),
+    ...(globalDomainsKeyword ? { domainsLine: globalDomainsKeyword.line } : {}),
   };
 }
 

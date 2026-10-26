@@ -25,6 +25,7 @@ import * as fs from "node:fs";
 
 import { expandPromptPath, isLaneId } from "./worker-prompt.ts";
 import { matchesGlob } from "./boundaries.ts";
+import type { Domain } from "./domains.ts";
 import { parseVerify, verifyKindIssue } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
@@ -51,6 +52,8 @@ export type LintRule =
   | "item-arch"
   | "item-verify"
   | "item-text-loss"
+  // Plan 07a (D1): in domain mode an item must name a declared domain.
+  | "item-domain"
   // A `test` verify defined only where the phase's checks never run: tt
   // reports it missing on every candidate, a gate no owner command waives.
   | "verify-reach"
@@ -142,6 +145,8 @@ export interface LintItemInput {
   tags?: string[];
   /** Requirements only: the architecture ids the item is realised by. */
   arch?: string[];
+  /** Plan 07a (D1): the declared domain the item names (`:DOMAIN:`). */
+  domain?: string;
   /** Requirements and constraints: the raw `:VERIFY:` strings. */
   verify?: string[];
   line?: number;
@@ -201,6 +206,9 @@ export interface LintPhaseInput {
   /** tt 09 (change 3): the phase's own `:CONSOLIDATE:` (`on`/`off`),
    * overriding the plan's `#+TT_CONSOLIDATE:`. */
   consolidate?: unknown;
+  /** Plan 07a (D1): the phase's effective domains (`#+TT_DOMAINS:`, overridden
+   * by a phase `:DOMAINS:`). Absent means domain mode is off. */
+  domains?: Domain[];
 }
 
 export interface LintPlanInput {
@@ -279,6 +287,11 @@ export interface LintPlanInput {
   consolidate?: unknown;
   /** Lint-only: the 1-based line of `#+TT_CONSOLIDATE:`. */
   consolidateLine?: number;
+  /** Plan 07a (D1): the plan's `#+TT_DOMAINS:` — the declared domains, in
+   * declaration order. Absent means domain mode is off. */
+  domains?: Domain[];
+  /** Lint-only: the 1-based line of `#+TT_DOMAINS:`. */
+  domainsLine?: number;
   /** `#+TT_WORKER_PROMPT`: lane to the files appended to its worker. Kept
    * open (`unknown`) so a malformed value still reaches the linter. */
   workerPrompt?: Record<string, unknown>;
@@ -631,6 +644,32 @@ export function lintItems(phase: LintPhaseInput): LintFinding[] {
     } else {
       seen.set(id, item.line ?? 0);
     }
+    // Plan 07a (D1): in domain mode every R/A/C item names a declared domain.
+    if (phase.domains && phase.domains.length > 0) {
+      const names = phase.domains.map((d) => d.name);
+      const declared = new Set(names);
+      if (typeof item.domain !== "string" || item.domain.trim().length === 0) {
+        out.push(
+          finding(
+            "item-domain",
+            item,
+            item.line,
+            `the item ${id ?? "(no id)"} has no :DOMAIN:`,
+            `add :DOMAIN: <one of ${names.join(", ")}> (this plan declares #+TT_DOMAINS, so domain mode is on)`,
+          ),
+        );
+      } else if (!declared.has(item.domain)) {
+        out.push(
+          finding(
+            "item-domain",
+            item,
+            item.line,
+            `the item ${id ?? "(no id)"} names the undeclared domain ${item.domain}`,
+            `use one of the declared domains (${names.join(", ")}), or declare ${item.domain} in #+TT_DOMAINS`,
+          ),
+        );
+      }
+    }
     for (const raw of item.verify ?? []) {
       // Plan 06k2 (A5): a `:VERIFY:` kind the runtime cannot use (e.g.
       // `grep "x"`) is an error with the file and line, never silently read
@@ -777,7 +816,11 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
       }
     }
     for (const finding of lintPhaseSeats(phase, plan)) out.push(finding);
-    for (const finding of lintItems(phase)) out.push({ ...finding, sourceFile: plan.sourceFile });
+    // Plan 07a (D1): a hand-written JSON plan may declare the domains only at
+    // the plan level; the item rule reads the phase's effective list.
+    const phaseForDomains =
+      phase.domains === undefined && plan.domains && plan.domains.length > 0 ? { ...phase, domains: plan.domains } : phase;
+    for (const finding of lintItems(phaseForDomains)) out.push({ ...finding, sourceFile: plan.sourceFile });
     const acceptance = phase.acceptance ?? [];
     acceptance.forEach((item, i) => {
       const line = phase.acceptanceLines?.[i];

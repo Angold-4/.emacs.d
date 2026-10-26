@@ -210,6 +210,9 @@ export async function setupConductor(opts: {
   /** The phase's own goal text (default "do the thing"). A plan's prose is a
    * secret-value carrier too, so a test can quote one in it. */
   goal?: string;
+  /** Plan 07a (D1): the phase's declared domains, as Emacs would put them in
+   * the JSON plan. Absent means domain mode is off. */
+  domains?: import("../../src/core/domains.ts").Domain[];
   /** Plan 06b (OD-2 R1): an exact phase object (e.g. the real Emacs parser's
    * output) to use instead of the harness's built one. */
   phase?: import("../../src/conductor.ts").RunPlanPhase;
@@ -280,6 +283,7 @@ export async function setupConductor(opts: {
         boundaries: opts.boundaries ?? [],
         reserved: [],
         ...(opts.items ?? {}),
+        ...(opts.domains ? { domains: opts.domains } : {}),
         ...(opts.gate ? { gate: opts.gate } : {}),
         ...(opts.gateCleanup ? { gateCleanup: opts.gateCleanup } : {}),
       },

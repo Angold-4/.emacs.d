@@ -128,6 +128,15 @@
       "description": "Lint-only: the 1-based line of #+TT_CONSOLIDATE in the source Org file.",
       "type": "integer"
     },
+    "domains": {
+      "description": "Plan 07a (D1): #+TT_DOMAINS — the plan's declared domains (name=glob[,glob…]), in declaration order. Absent means domain mode is off.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Domain" }
+    },
+    "domainsLine": {
+      "description": "Lint-only: the 1-based line of #+TT_DOMAINS in the source Org file.",
+      "type": "integer"
+    },
     "workerPrompt": {
       "description": "#+TT_WORKER_PROMPT: per lane (a, b, ...), the absolute paths appended to that lane's worker system prompt (--append-system-prompt), in order. An empty list is `none`. A single worker uses lane a's.",
       "type": "object",
@@ -184,6 +193,11 @@
           "description": "tt 09 (change 3): the phase's own :CONSOLIDATE: (overrides #+TT_CONSOLIDATE) — on or off.",
           "type": "string"
         },
+        "domains": {
+          "description": "Plan 07a (D1): the phase's effective domains (#+TT_DOMAINS, overridden by the phase's :DOMAINS:). Absent means domain mode is off.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/Domain" }
+        },
         "architecture": { "type": "array", "items": { "$ref": "#/$defs/ArchitectureItem" } },
         "requirements": { "type": "array", "items": { "$ref": "#/$defs/RequirementItem" } },
         "constraints": { "type": "array", "items": { "$ref": "#/$defs/ConstraintItem" } }
@@ -202,7 +216,8 @@
         "where": { "type": "string" },
         "whereLine": { "type": "integer" },
         "rawText": { "type": "string" },
-        "line": { "type": "integer" }
+        "line": { "type": "integer" },
+        "domain": { "type": "string", "minLength": 1 }
       }
     },
     "RequirementItem": {
@@ -219,7 +234,8 @@
         "rawText": { "type": "string" },
         "line": { "type": "integer" },
         "archLine": { "type": "integer" },
-        "verifyLine": { "type": "integer" }
+        "verifyLine": { "type": "integer" },
+        "domain": { "type": "string", "minLength": 1 }
       }
     },
     "ConstraintItem": {
@@ -234,7 +250,18 @@
         "verify": { "type": "array", "items": { "type": "string" } },
         "rawText": { "type": "string" },
         "line": { "type": "integer" },
-        "verifyLine": { "type": "integer" }
+        "verifyLine": { "type": "integer" },
+        "domain": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Domain": {
+      "description": "Plan 07a (D1): one declared domain — a name and the repository-relative globs it owns.",
+      "type": "object",
+      "required": ["name", "globs"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "globs": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
     },
     "RoleModel": {

@@ -60,6 +60,23 @@ export const SUBMIT_EVALUATION_PARAMS: ParamShape = {
   required: ["evaluations"],
 };
 
+/** Plan 04b: `submit_review`'s `findings[]` — a reviewer finding. Plan 07a
+ * (D2) adds the six point fields (domain, item, where, expected, doneWhen,
+ * from); they are optional here and refused by the conductor in domain mode.
+ * Matches schemas/review.schema.json's `properties.findings.items`. */
+export const REVIEW_FINDING_PARAMS: ParamShape = {
+  properties: ["kind", "severity", "evidence", "linkedDecisionId", "sameAs", "criterionDispute", "reproduction", "runnable", "domain", "item", "where", "expected", "doneWhen", "from"],
+  required: ["kind", "severity", "evidence"],
+};
+
+/** Plan 04b: `submit_review`'s `blockers[]` — a finding without a severity.
+ * Plan 07a (D2) adds the same six point fields. Matches
+ * schemas/review.schema.json's `properties.blockers.items`. */
+export const REVIEW_BLOCKER_PARAMS: ParamShape = {
+  properties: ["kind", "evidence", "linkedDecisionId", "criterionDispute", "reproduction", "runnable", "domain", "item", "where", "expected", "doneWhen", "from"],
+  required: ["kind", "evidence"],
+};
+
 /** Matches schemas/review.schema.json's top level exactly — a Review
  * carries no conductor-assigned binding fields, so the model supplies
  * every field the record itself needs. `ballots`/`findings` (work packet

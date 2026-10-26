@@ -1704,7 +1704,7 @@ export function reduce(state: State, event: unknown): ReduceResult {
     // malformed at ingestion (F02): reject it before it can become state,
     // so `addressed` never has to choose between contradictory statements.
     if (ev.type === "REVIEW_SUBMITTED") {
-      const issue = reviewIngestionIssue(ev.review);
+      const issue = reviewIngestionIssue(ev.review, state.phase.contract.domains);
       if (issue) return rejected(state, issue);
     }
 

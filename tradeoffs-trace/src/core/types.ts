@@ -4,6 +4,8 @@
 //
 // Design references (docs/tradeoffs-trace.md) are noted per type.
 
+import type { Domain } from "./domains.ts";
+
 // ---------------------------------------------------------------------------
 // §7.1 Versions and binding
 // ---------------------------------------------------------------------------
@@ -96,6 +98,9 @@ export interface PhaseContract {
   phaseId: string;
   contractVersion: ContractVersion;
   goal: string;
+  /** Plan 07a (D1): the phase's declared domains (`#+TT_DOMAINS`), frozen
+   * into the contract. Absent means domain mode is off, exactly as today. */
+  domains?: Domain[];
   /** Plan 06i (A3): the phase's golden note — the current source a choice
    * that matches an earlier drafting decision is re-checked against. A
    * `contract` classification must cite it. */
@@ -338,6 +343,15 @@ export interface Finding {
    * variant limit can count the same requirement's blocking findings across
    * consecutive rounds. Set by the conductor when the finding is raised. */
   roundRaised?: number;
+  /** Plan 07a (D2): the domain-mode point fields — a declared `domain`, the
+   * R/A/C `item` it serves, `where` (`path:line symbol`), `expected` and the
+   * `doneWhen` command, plus the optional `from` (another lane's work). */
+  domain?: string;
+  item?: string;
+  where?: string;
+  expected?: string;
+  doneWhen?: string;
+  from?: { sha: string; paths: string[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +716,15 @@ export interface FindingDisclosure {
    * published only if it exits non-zero (and dropped with the run recorded
    * when it passes). */
   runnable?: string;
+  /** Plan 07a (D2): the domain-mode point fields. Required in domain mode
+   * (refused by `reviewIngestionIssue` naming the missing field), optional
+   * and ignored otherwise. */
+  domain?: string;
+  item?: string;
+  where?: string;
+  expected?: string;
+  doneWhen?: string;
+  from?: { sha: string; paths: string[] };
 }
 
 /** Plan 04b: one entry of a reviewer's `blockers` list. Exactly a finding
@@ -722,6 +745,13 @@ export interface BlockerDisclosure {
   /** Plan 05e: a runnable test or command, checked by the same 3a/3b rule as
    * an ordinary finding. */
   runnable?: string;
+  /** Plan 07a (D2): the domain-mode point fields, exactly as on a finding. */
+  domain?: string;
+  item?: string;
+  where?: string;
+  expected?: string;
+  doneWhen?: string;
+  from?: { sha: string; paths: string[] };
 }
 
 export interface Review {

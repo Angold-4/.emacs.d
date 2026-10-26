@@ -158,6 +158,7 @@ import type {
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
+import { whereKey, type Domain } from "./core/domains.ts";
 import {
   assertToolSet,
   launchArgs,
@@ -453,6 +454,9 @@ export interface RunPlanPhase {
    * the phase's `:WIDE_PATHS:`). A candidate whose diff touches one runs the
    * final check in its round. */
   widePaths?: string[];
+  /** Plan 07a (D1): the phase's declared domains (`#+TT_DOMAINS:`, overridden
+   * by a phase `:DOMAINS:`). Absent means domain mode is off. */
+  domains?: Domain[];
   /** Plan 06i (A3): the phase's golden note (`#+TT_GOLDEN:`, overridden by
    * the phase's `:GOLDEN:`). A choice justified only by an earlier drafting
    * decision is re-checked against it; a `contract` classification must cite
@@ -876,6 +880,9 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     phaseId: phase.id,
     contractVersion: contractVersionFor(phase),
     goal: phase.goal,
+    // Plan 07a (D1): the declared domains are frozen into the contract, so
+    // the ingestion check, the duplicate fold and the prompts read one list.
+    ...(phase.domains && phase.domains.length > 0 ? { domains: phase.domains.map((d) => ({ name: d.name, globs: [...d.globs] })) } : {}),
     acceptance,
     checks: phase.checks,
     boundaries: phase.boundaries,
@@ -4850,8 +4857,11 @@ export class Conductor {
           handle.doneResolve();
           return { ok: true };
         }
-        const issue = reviewIngestionIssue(review);
-        if (issue) return { ok: false, reason: issue };
+        const issue = reviewIngestionIssue(review, this.#state.phase.contract.domains);
+        if (issue) {
+          this.#log.append("review_ingestion_rejected", { reviewer: seat, agentId, lane, reason: issue });
+          return { ok: false, reason: issue };
+        }
         // A lane review judges the lane's own candidate, not the phase's
         // frozen one (which does not exist yet in round 1, and is another
         // tree after it): its anchors resolve against that candidate.
@@ -4916,6 +4926,15 @@ export class Conductor {
         // cheap and worth also rejecting here in case a script/model races
         // ahead of its own prompt.
         return { ok: false, reason: "submit_review called before submit_discovery was accepted (turn order)" };
+      }
+      // Plan 07a (D2): in domain mode every finding and blocker is one point;
+      // a point missing domain, item or doneWhen (or naming an undeclared
+      // domain) is refused back to the model, naming the field, before any
+      // event is applied. The reducer enforces the same rule on replay.
+      const pointIssue = reviewIngestionIssue(review, this.#state.phase.contract.domains);
+      if (pointIssue) {
+        this.#log.append("review_ingestion_rejected", { reviewer: review.reviewer, agentId, reason: pointIssue });
+        return { ok: false, reason: pointIssue };
       }
       if (this.#stubReviews) {
         this.#applyEvent({ type: "REVIEW_SUBMITTED", review });
@@ -6138,6 +6157,21 @@ export class Conductor {
     candidateSha: string,
     opts: { raisedAsBlocker?: boolean } = {},
   ): Promise<string | undefined> {
+    // Plan 07a (D2): in domain mode a reviewer's finding (never a blocker) is
+    // one point — `item`, `whereKey(where)` and `doneWhen`. A second reviewer
+    // naming the same point is recorded on the open finding
+    // (`FINDING_ALSO_RAISED`) instead of being raised again. Outside domain
+    // mode the fields are absent, so this never fires.
+    if (!opts.raisedAsBlocker && fd.item && fd.where && fd.doneWhen && (this.#state.phase.contract.domains?.length ?? 0) > 0) {
+      const key = whereKey(fd.where);
+      const existing = this.#state.phase.findings.find(
+        (f) => f.status === "open" && f.item === fd.item && f.doneWhen === fd.doneWhen && typeof f.where === "string" && whereKey(f.where) === key,
+      );
+      if (existing) {
+        this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer });
+        return undefined;
+      }
+    }
     // Plan 05e (finding #34): a new point on bytes the reviewers already
     // approved is an advisory finding, not a blocker, unless it violates an
     // acceptance item or a reserved rule. That applies to a point filed
@@ -6245,6 +6279,15 @@ export class Conductor {
       // blocking — the round rule's own sentence, so the record and the views
       // never disagree about it.
       ...(roundDowngrade !== undefined ? { severityReason: roundDowngrade } : {}),
+      // Plan 07a (D2): the domain-mode point fields, recorded verbatim so the
+      // open finding keeps its domain, item, where, expected, doneWhen and
+      // optional from. Outside domain mode none is set.
+      ...(typeof fd.domain === "string" && fd.domain.trim().length > 0 ? { domain: fd.domain.trim() } : {}),
+      ...(typeof fd.item === "string" && fd.item.trim().length > 0 ? { item: fd.item.trim() } : {}),
+      ...(typeof fd.where === "string" && fd.where.trim().length > 0 ? { where: fd.where.trim() } : {}),
+      ...(typeof fd.expected === "string" && fd.expected.trim().length > 0 ? { expected: fd.expected.trim() } : {}),
+      ...(typeof fd.doneWhen === "string" && fd.doneWhen.trim().length > 0 ? { doneWhen: fd.doneWhen.trim() } : {}),
+      ...(fd.from !== undefined ? { from: fd.from } : {}),
     };
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
@@ -7765,6 +7808,7 @@ export class Conductor {
         status: "open",
         boundCandidateSha: C,
         itemId: id,
+        ...(arch?.domain ? { domain: arch.domain } : {}),
       };
       this.#applyEvent({ type: "FINDING_RAISED", finding });
     }
@@ -8013,6 +8057,9 @@ export class Conductor {
       status: "open",
       boundCandidateSha: C,
       itemId: o.item.id,
+      // Plan 07a (D2): a conductor-raised item finding carries its item's
+      // declared domain and no doneWhen.
+      ...(o.item.domain ? { domain: o.item.domain } : {}),
     };
     this.#applyEvent({ type: "FINDING_RAISED", finding });
   }
@@ -8039,6 +8086,7 @@ export class Conductor {
         status: "open",
         boundCandidateSha: C,
         itemId: id,
+        ...(item?.domain ? { domain: item.domain } : {}),
       };
       this.#applyEvent({ type: "FINDING_RAISED", finding });
     }
@@ -14281,6 +14329,9 @@ export class Conductor {
       `Candidate checkout (read-only): ${candidateDir}`,
       ...secretPromptLines(this.#secretNames),
       ...goldenPromptLines(phase.contract.golden),
+      // Plan 07a (D2): domain mode names the domains and the point fields on
+      // turn 2 as well; empty outside domain mode.
+      ...domainPromptLines(phase.contract.domains),
       // Plan 01f: reviewers are told the conductor produces the gate's
       // evidence and shown the record when one exists (the failed gate that
       // sent the phase into this repair round, or a record reused for this
@@ -15087,6 +15138,20 @@ export function buildWorkerPrompt(
   return lines.join("\n");
 }
 
+/** Plan 07a (D2): the domain-mode section every reviewer prompt carries —
+ * each declared domain with its globs, and the point fields every finding
+ * must name. Empty outside domain mode, so the prompt is byte-identical to
+ * today's. */
+export function domainPromptLines(domains: readonly Domain[] | undefined): string[] {
+  if (!domains || domains.length === 0) return [];
+  return [
+    "",
+    "This phase declares domains (domain mode). Every finding and blocker is one point:",
+    ...domains.map((d) => `- ${d.name}: ${d.globs.join(", ")}`),
+    "Each point names `domain` (one of the declared names above), `item` (the R/A/C id it serves), `where` (`path:line symbol`), `expected` (what must be true, citing the design) and `doneWhen` (a shell command that exits 0 exactly when the point is fixed). One missing case is one finding.",
+  ];
+}
+
 export function buildReviewerPrompt(
   phase: PhaseState,
   reviewer: Reviewer,
@@ -15099,6 +15164,10 @@ export function buildReviewerPrompt(
     `Contract version: snapshot ${phase.contract.contractVersion.snapshot}`,
     ...secretPromptLines(secrets),
     ...goldenPromptLines(phase.contract.golden),
+    // Plan 07a (D2): in domain mode every finding is one point; name the
+    // domains and the fields. Outside domain mode this is empty, so the
+    // prompt is byte-identical to today's.
+    ...domainPromptLines(phase.contract.domains),
     ...directiveLines(directives),
     ...directiveAnswerLines(phase),
     // Plan 01f: the same rule every reviewer prompt carries — the conductor

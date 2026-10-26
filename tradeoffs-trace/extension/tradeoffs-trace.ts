@@ -57,6 +57,8 @@ import {
   SUBMIT_PHASE_PARAMS,
   SUBMIT_REVIEW_PARAMS,
   SUBMIT_ROUND_PANEL_VOTES_PARAMS,
+  REVIEW_BLOCKER_PARAMS,
+  REVIEW_FINDING_PARAMS,
 } from "./param-shapes.ts";
 
 function loadSchema(relPath: string): JSONSchema {
@@ -171,11 +173,28 @@ const BallotParam = Type.Object({
   ),
 });
 
+// Plan 07a (D2): the six point fields a domain-mode finding/blocker carries.
+// They are optional to the model (outside domain mode they are ignored); the
+// conductor refuses a point missing domain, item or doneWhen in domain mode.
+const pointFields: Record<string, TSchema> = {
+  domain: Type.Optional(Type.String({ description: "Plan 07a: the declared domain this point belongs to (required in domain mode)" })),
+  item: Type.Optional(Type.String({ description: "Plan 07a: the R/A/C item id this point serves (required in domain mode)" })),
+  where: Type.Optional(Type.String({ description: "Plan 07a: `path:line symbol`, e.g. `crates/x.rs:120 fn foo`" })),
+  expected: Type.Optional(Type.String({ description: "Plan 07a: what must be true, citing the design" })),
+  doneWhen: Type.Optional(Type.String({ description: "Plan 07a: a shell command that exits 0 exactly when the point is fixed (required in domain mode)" })),
+  from: Type.Optional(
+    Type.Object({
+      sha: Type.String({ description: "The other lane's commit" }),
+      paths: Type.Array(Type.String(), { description: "The paths to take from it" }),
+    }),
+  ),
+};
+
 // Plan 04b: a blocker is a finding without a severity — a blocker is always
 // blocking, so the reviewer never states one. Deliberately no `sameAs`: a
 // blocker is never folded into an existing finding, so a stop-the-work
 // request can never be silently dropped; cite the issue's evidence instead.
-const BlockerParam = Type.Object({
+const blockerFields: Record<string, TSchema> = {
   kind: StringEnum(["defect", "contract", "integration"] as const),
   evidence: Type.String({ description: "file:line, scenario, check result or plan clause — required, non-empty" }),
   linkedDecisionId: Type.Optional(Type.String()),
@@ -190,28 +209,18 @@ const BlockerParam = Type.Object({
     Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
   ),
   runnable: Type.Optional(Type.String({ description: "A runnable test or command that shows the claimed failure; the conductor re-runs it and publishes only if it fails" })),
-});
+  ...pointFields,
+};
+const BlockerParam = Type.Object(Object.fromEntries(REVIEW_BLOCKER_PARAMS.properties.map((key) => [key, blockerFields[key]])));
 
-const FindingParam = Type.Object({
-  kind: StringEnum(["defect", "contract", "integration"] as const),
+const findingFields: Record<string, TSchema> = {
+  ...blockerFields,
   severity: StringEnum(["blocking", "advisory"] as const),
-  evidence: Type.String({ description: "file:line, scenario, check result or plan clause — required, non-empty" }),
-  linkedDecisionId: Type.Optional(Type.String()),
   sameAs: Type.Optional(
     Type.String({ description: "Id of an already-open finding this repeats; you are recorded on it instead of a duplicate" }),
   ),
-  criterionDispute: Type.Optional(
-    Type.Object({
-      criterion: Type.String({ description: "One acceptance item of the phase contract, verbatim" }),
-      why: Type.String({ description: "Why it cannot be met as written" }),
-      proposedWording: Type.String({ description: "The wording that replaces it if the amendment passes" }),
-    }),
-  ),
-  reproduction: Type.Optional(
-    Type.Object({ command: Type.String({ description: "Command the conductor runs on a fresh disposable checkout" }) }),
-  ),
-  runnable: Type.Optional(Type.String({ description: "A runnable test or command that shows the claimed failure; the conductor re-runs it and publishes only if it fails" })),
-});
+};
+const FindingParam = Type.Object(Object.fromEntries(REVIEW_FINDING_PARAMS.properties.map((key) => [key, findingFields[key]])));
 
 const PriorDecisionParam = Type.Object({
   id: Type.String({ description: "The prior decision's id, as listed in the repair prompt" }),
