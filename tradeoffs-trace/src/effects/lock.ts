@@ -81,7 +81,8 @@ export interface CheckWindow {
   release: () => void;
 }
 
-const activeCheckWindows = new Set<string>();
+/** Open windows in this process: window dir -> the owners (run ids) holding one. */
+const activeCheckWindows = new Map<string, string[]>();
 const CHECK_WINDOW_STALE_MS = 6 * 60 * 60 * 1000;
 
 /** The window directory for a check lock: beside the lock, so a machine-wide
@@ -91,10 +92,13 @@ export function checkWindowDir(checkLockPath: string): string {
   return `${checkLockPath}.window.d`;
 }
 
-/** True while any check window for this check lock is open. */
-export function anyCheckWindowOpen(checkLockPath: string): boolean {
+/** True while any check window for this check lock is open. `exceptOwner`
+ * ignores the windows that owner (a run id) opened itself: since each lane's
+ * checks start at its submission (plan 09), a run's own check must not
+ * freeze its other lane's worker (exex 01b1 lost ~86 worker-minutes to it). */
+export function anyCheckWindowOpen(checkLockPath: string, exceptOwner?: string): boolean {
   const dir = checkWindowDir(checkLockPath);
-  if (activeCheckWindows.has(dir)) return true;
+  if ((activeCheckWindows.get(dir) ?? []).some((owner) => exceptOwner === undefined || owner !== exceptOwner)) return true;
   try {
     if (!fs.existsSync(dir)) return false;
     const now = Date.now();
@@ -105,6 +109,7 @@ export function anyCheckWindowOpen(checkLockPath: string): boolean {
           fs.rmSync(file, { force: true });
           continue;
         }
+        if (exceptOwner !== undefined && markerOwner(file) === exceptOwner) continue;
       } catch {
         // a vanished file is not a window
         continue;
@@ -146,15 +151,25 @@ function markerHolderAlive(file: string, name: string): boolean {
   }
 }
 
-/** Opens a check window for its caller's check run. The returned `release`
- * closes it; call it in a `finally`. */
-export function openCheckWindow(checkLockPath: string): CheckWindow {
+/** The owner a marker file records, if any. */
+function markerOwner(file: string): string | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { owner?: unknown };
+    return typeof parsed.owner === "string" ? parsed.owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Opens a check window for its caller's check run, owned by `owner` (the
+ * run id). The returned `release` closes it; call it in a `finally`. */
+export function openCheckWindow(checkLockPath: string, owner = ""): CheckWindow {
   const dir = checkWindowDir(checkLockPath);
-  activeCheckWindows.add(dir);
+  activeCheckWindows.set(dir, [...(activeCheckWindows.get(dir) ?? []), owner]);
   const file = path.join(dir, `${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
   try {
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
+    fs.writeFileSync(file, `${JSON.stringify({ pid: process.pid, owner, at: new Date().toISOString() })}\n`);
   } catch {
     // A read-only home must not stop the check; the in-process set still
     // pauses this process's own other runs.
@@ -164,7 +179,10 @@ export function openCheckWindow(checkLockPath: string): CheckWindow {
     release: () => {
       if (released) return;
       released = true;
-      activeCheckWindows.delete(dir);
+      const owners = [...(activeCheckWindows.get(dir) ?? [])];
+      owners.splice(owners.indexOf(owner), 1);
+      if (owners.length > 0) activeCheckWindows.set(dir, owners);
+      else activeCheckWindows.delete(dir);
       try {
         fs.rmSync(file, { force: true });
       } catch {

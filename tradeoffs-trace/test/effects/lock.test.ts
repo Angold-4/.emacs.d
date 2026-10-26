@@ -172,4 +172,20 @@ test("a check-window marker whose holder died is not an open window, and is remo
   assert.equal(anyCheckWindowOpen(lockPath), true);
   window.release();
   assert.equal(anyCheckWindowOpen(lockPath), false);
+
+  // A run's own window never pauses that run's other lane; another run's does,
+  // whether it is in this process or only a live marker on disk.
+  const own = openCheckWindow(lockPath, "run-a");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-a"), false, "a run's own window is not a window for it");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-b"), true, "another run's window is");
+  assert.equal(anyCheckWindowOpen(lockPath), true);
+  const other = openCheckWindow(lockPath, "run-b");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-a"), true, "a second run's window still pauses run-a");
+  other.release();
+  own.release();
+  const otherMarker = path.join(windowDir, `${live.pid}-0ther.json`);
+  fs.writeFileSync(otherMarker, `${JSON.stringify({ pid: live.pid, owner: "run-a", at: new Date().toISOString() })}\n`);
+  assert.equal(anyCheckWindowOpen(lockPath, "run-a"), false, "run-a's marker held by another process is still run-a's own");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-b"), true);
+  fs.rmSync(otherMarker, { force: true });
 });

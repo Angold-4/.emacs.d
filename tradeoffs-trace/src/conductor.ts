@@ -4188,7 +4188,7 @@ export class Conductor {
     };
     const iv = setInterval(() => {
       if (this.#closed) return;
-      const open = anyCheckWindowOpen(this.#checkLockPath);
+      const open = anyCheckWindowOpen(this.#checkLockPath, this.#state.phase.runId);
       if (open && !paused) pause();
       else if (!open && paused) resume();
     }, 100);
@@ -8951,7 +8951,7 @@ export class Conductor {
    * for the wide-path tier). */
   async #checkConsolidation(plan: ConsolidationPlan, sha: string): Promise<LaneCheck> {
     const lock = await acquireWaitingLock(this.#checkLockPath);
-    const window = openCheckWindow(this.#checkLockPath);
+    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     try {
       this.#log.append("consolidation_check_started", { round: plan.round, sha });
       const result = await this.#runLaneChecks("consolidator", sha, plan.winner.sha);
@@ -9019,7 +9019,7 @@ export class Conductor {
     const lock = await acquireWaitingLock(this.#checkLockPath);
     // Plan 06k1 (A4): the check holds the host-wide window for its duration,
     // so every other run's workers are paused while it runs.
-    const window = openCheckWindow(this.#checkLockPath);
+    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     try {
       this.#log.append("lane_check_started", { round, lane, candidateSha: sha });
       const result = await this.#runLaneChecks(lane, sha, this.#laneCheckBases.get(`${round}-${lane}`));
@@ -11640,7 +11640,7 @@ export class Conductor {
     // two runs' checks never overlap and every other run's workers pause
     // while this one runs.
     const lock = await acquireWaitingLock(this.#checkLockPath);
-    const window = openCheckWindow(this.#checkLockPath);
+    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
