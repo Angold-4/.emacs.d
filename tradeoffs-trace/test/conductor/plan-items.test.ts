@@ -220,11 +220,11 @@ test("TT_FINAL_ONLY_MISSING: a test verify missing from a round's output is left
   });
   try {
     await setup.conductor.start();
-    await waitFor(
-      () => (setup.conductor.state.phase.checkResolution ?? []).some((r) => r.id === "R1" && r.outcome === "missing"),
-      90_000,
-      50,
-      setup.runDir,
+    await waitFor(() => setup.conductor.state.phase.checks?.passed === true, 90_000, 50, setup.runDir);
+    assert.equal(
+      (setup.conductor.state.phase.checkResolution ?? []).some((r) => r.id === "R1"),
+      false,
+      "a missing test is not a round's verify outcome, so it cannot hold acceptance",
     );
     assert.equal(
       setup.conductor.state.phase.findings.some((f) => f.itemId === "R1" && f.raisedBy === "conductor"),

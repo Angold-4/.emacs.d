@@ -229,6 +229,7 @@ import {
   type PlanItems,
   type SeatItemVerdict,
   type VerdictContext,
+  type VerifyResolution,
 } from "./core/items.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -8017,6 +8018,19 @@ export class Conductor {
     this.#applyEvent({ type: "FINDING_RAISED", finding });
   }
 
+  /** The candidate's `test` verify outcomes from a check run's output. With
+   * TT_FINAL_ONLY_MISSING=1 and final checks declared, a test merely missing
+   * from the output is left out: the plan runs it only in #+TT_FINAL_CHECKS
+   * (exex 01b2, ODP-3), whose command fails the phase if it fails, so it must
+   * neither raise a finding nor hold acceptance before the final checks run.
+   * A failed test is always kept. */
+  #resolveVerifies(output: string): VerifyResolution[] {
+    const resolutions = resolveTestVerifies(this.#planItems(), output);
+    const finalOnlyMissing =
+      process.env.TT_FINAL_ONLY_MISSING === "1" && (this.#state.phase.contract.finalChecks ?? []).length > 0;
+    return finalOnlyMissing ? resolutions.filter((r) => r.outcome !== "missing") : resolutions;
+  }
+
   /** A `test` verify that is missing from or failed in the candidate's check
    * run is a blocking finding anchored to its item. */
   #applyTestVerifyFindings(C: string): void {
@@ -8024,20 +8038,10 @@ export class Conductor {
     const resolutions = this.#state.phase.checkResolution ?? [];
     const problems = testVerifyProblems(resolutions);
     if (problems.length === 0) return;
-    // TT_FINAL_ONLY_MISSING=1 (exex 01b2, 2026-10-27): a plan that keeps its
-    // slow corpus gates in #+TT_FINAL_CHECKS only cannot show those tests in
-    // a round's output, so a test that is merely missing from it is left to
-    // the final checks, which fail the phase if it fails. A failed test still
-    // raises a finding.
-    const finalOnlyMissing =
-      process.env.TT_FINAL_ONLY_MISSING === "1" && (this.#state.phase.contract.finalChecks ?? []).length > 0;
-    const unresolved = resolutions.filter(
-      (r) => r.outcome !== "passed" && !(finalOnlyMissing && r.outcome === "missing"),
-    );
-    for (const id of new Set(unresolved.map((r) => r.id))) {
+    for (const id of new Set(resolutions.filter((r) => r.outcome !== "passed").map((r) => r.id))) {
       if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === id)) continue;
       const item = flatItems(this.#planItems()).find((i) => i.id === id);
-      const lines = unresolved.filter((r) => r.id === id).map((r) => `test "${r.name}" ${r.outcome}`);
+      const lines = resolutions.filter((r) => r.id === id && r.outcome !== "passed").map((r) => `test "${r.name}" ${r.outcome}`);
       const finding: Finding = {
         id: `F-${this.#state.phase.phaseId}-test-${id}-${this.#state.phase.findings.length + 1}`,
         version: 1,
@@ -9016,7 +9020,7 @@ export class Conductor {
             })
             .join("\n");
           this.#laneCheckOutputs.set(sha, output);
-          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, resolveTestVerifies(this.#planItems(), output));
+          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(output));
         }
       } catch {
         // Not checked before the stop: the resumed round checks it now.
@@ -9190,7 +9194,7 @@ export class Conductor {
       // applies them); a loser's output must not touch the phase's item state.
       this.#laneCheckOutputs.set(candidateSha, combinedOutput);
       if (this.#itemsEnforced()) {
-        this.#laneCheckResolutions.set(candidateSha, resolveTestVerifies(this.#planItems(), combinedOutput));
+        this.#laneCheckResolutions.set(candidateSha, this.#resolveVerifies(combinedOutput));
       }
       return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
     } finally {
@@ -10232,7 +10236,7 @@ export class Conductor {
       this.#applyEvent({ type: "CHECKS_PASSED" });
       if (this.#itemsEnforced()) {
         const output = this.#laneCheckOutputs.get(winner.sha) ?? "";
-        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolveTestVerifies(this.#planItems(), output) });
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(output) });
         this.#applyTestVerifyFindings(winner.sha);
         if (build?.coverage) {
           this.#applyEvent({
@@ -11898,7 +11902,7 @@ export class Conductor {
       // the output is a blocking finding anchored to its item. The final
       // check's run does not re-resolve them.
       if (tier === "round" && this.#itemsEnforced()) {
-        const resolutions = resolveTestVerifies(this.#planItems(), combinedOutput);
+        const resolutions = this.#resolveVerifies(combinedOutput);
         this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions, checkTestLines: testResultLines(combinedOutput) });
         this.#applyTestVerifyFindings(candidateSha);
       }
