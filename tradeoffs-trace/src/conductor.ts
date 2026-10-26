@@ -8024,10 +8024,20 @@ export class Conductor {
     const resolutions = this.#state.phase.checkResolution ?? [];
     const problems = testVerifyProblems(resolutions);
     if (problems.length === 0) return;
-    for (const id of new Set(resolutions.filter((r) => r.outcome !== "passed").map((r) => r.id))) {
+    // TT_FINAL_ONLY_MISSING=1 (exex 01b2, 2026-10-27): a plan that keeps its
+    // slow corpus gates in #+TT_FINAL_CHECKS only cannot show those tests in
+    // a round's output, so a test that is merely missing from it is left to
+    // the final checks, which fail the phase if it fails. A failed test still
+    // raises a finding.
+    const finalOnlyMissing =
+      process.env.TT_FINAL_ONLY_MISSING === "1" && (this.#state.phase.contract.finalChecks ?? []).length > 0;
+    const unresolved = resolutions.filter(
+      (r) => r.outcome !== "passed" && !(finalOnlyMissing && r.outcome === "missing"),
+    );
+    for (const id of new Set(unresolved.map((r) => r.id))) {
       if (this.#state.phase.findings.some((f) => f.status === "open" && f.severity === "blocking" && f.itemId === id)) continue;
       const item = flatItems(this.#planItems()).find((i) => i.id === id);
-      const lines = resolutions.filter((r) => r.id === id && r.outcome !== "passed").map((r) => `test "${r.name}" ${r.outcome}`);
+      const lines = unresolved.filter((r) => r.id === id).map((r) => `test "${r.name}" ${r.outcome}`);
       const finding: Finding = {
         id: `F-${this.#state.phase.phaseId}-test-${id}-${this.#state.phase.findings.length + 1}`,
         version: 1,
