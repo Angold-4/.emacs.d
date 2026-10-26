@@ -87,6 +87,7 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "OVERRIDE_CAST",
   "FINDING_RAISED",
   "FINDING_CONFIRMED_REPAIRED",
+  "FINDING_FACT",
   "FINDING_EVALUATOR_REPAIRED",
   "FINDING_DISPROVED",
   "FINDING_ACCEPTED_BY_OWNER",
@@ -719,12 +720,6 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       // finding no longer holds". Every clause is checked, not assumed.
       const finding = p.findings.find((f) => f.id === event.findingId);
       if (!finding) return rejected(state, `unknown finding ${event.findingId}`);
-      if (finding.raisedBy !== event.byReviewer) {
-        return rejected(
-          state,
-          `only the raising reviewer (${finding.raisedBy}) may confirm finding ${event.findingId} repaired, not ${event.byReviewer}`,
-        );
-      }
       if (!p.candidate || event.candidateSha !== p.candidate.sha) {
         return rejected(state, `finding ${event.findingId} must be confirmed against the current candidate`);
       }
@@ -737,13 +732,28 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       if (!p.checks || p.checks.candidateSha !== event.candidateSha || p.checks.passed !== true) {
         return rejected(state, `checks must have passed on candidate ${event.candidateSha} before finding ${event.findingId} can close`);
       }
-      const review = p.reviews[event.byReviewer]?.review;
-      const statement = review?.findingStatements.find((s) => s.findingId === event.findingId);
-      if (!review || review.candidateSha !== event.candidateSha || !statement || statement.status !== "confirm") {
-        return rejected(
-          state,
-          `finding ${event.findingId} repaired requires ${event.byReviewer}'s review of candidate ${event.candidateSha} to confirm it`,
-        );
+      // Plan 07b (D3): a passing doneWhen fact recorded on this candidate is
+      // itself the confirmation — the conductor runs it in the check's own
+      // checkout and emits it only for the picked candidate. Without one, the
+      // raising reviewer's own confirming review is still required.
+      const fact = (p.doneWhenFacts ?? []).find(
+        (f) => f.findingId === event.findingId && f.candidateSha === event.candidateSha && f.exitCode === 0 && !f.timedOut,
+      );
+      if (!fact) {
+        if (finding.raisedBy !== event.byReviewer) {
+          return rejected(
+            state,
+            `only the raising reviewer (${finding.raisedBy}) may confirm finding ${event.findingId} repaired, not ${event.byReviewer}`,
+          );
+        }
+        const review = p.reviews[event.byReviewer]?.review;
+        const statement = review?.findingStatements.find((s) => s.findingId === event.findingId);
+        if (!review || review.candidateSha !== event.candidateSha || !statement || statement.status !== "confirm") {
+          return rejected(
+            state,
+            `finding ${event.findingId} repaired requires ${event.byReviewer}'s review of candidate ${event.candidateSha} to confirm it`,
+          );
+        }
       }
       const findings = p.findings.map((f) =>
         f.id === event.findingId
@@ -751,6 +761,24 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
           : f,
       );
       return ok({ ...state, phase: { ...p, findings } });
+    }
+
+    case "FINDING_FACT": {
+      // Plan 07b (D3): one open domain-mode finding's `doneWhen` result on one
+      // candidate, emitted only for the picked candidate. Record-only and
+      // idempotent: replaying the same fact leaves exactly one entry, so a
+      // resumed round's re-application cannot double-count.
+      const fact = {
+        findingId: event.findingId,
+        candidateSha: event.candidateSha,
+        exitCode: event.exitCode,
+        timedOut: event.timedOut,
+        outputTail: event.outputTail,
+      };
+      const others = (p.doneWhenFacts ?? []).filter(
+        (f) => !(f.findingId === fact.findingId && f.candidateSha === fact.candidateSha),
+      );
+      return ok({ ...state, phase: { ...p, doneWhenFacts: [...others, fact] } });
     }
 
     case "FINDING_EVALUATOR_REPAIRED": {

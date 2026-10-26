@@ -276,6 +276,16 @@ export interface CheckRecordCommand {
   log?: string;
 }
 
+/** Plan 07b (D3): one open domain-mode finding's `doneWhen` result, kept with
+ * the candidate's check resolutions so a resumed round reads it instead of
+ * running the command again. `candidateSha` is implicit (the record's own). */
+export interface CheckRecordFact {
+  findingId: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  outputTail: string;
+}
+
 /** `checks/<sha>/record.json`: what one candidate's check run did, which tier
  * it ran at, the final command when there was one, and the machine's load at
  * the run. The record tells the truth about the tier, so a reader can tell a
@@ -286,6 +296,9 @@ export interface CheckRecord {
   tier: CheckTier;
   passed: boolean;
   commands: CheckRecordCommand[];
+  /** Plan 07b (D3): the done-when facts this check run produced (empty when
+   * the checks failed or the plan has no domains). */
+  facts?: CheckRecordFact[];
   /** The final command this run included (empty for a `round` record). */
   finalCommands: string[];
   /** The machine's 1-minute load average when the run started. */
@@ -335,5 +348,22 @@ export function parseCheckRecord(value: unknown): CheckRecord | undefined {
     load1: r.load1,
     freeMemMB: r.freeMemMB,
     at: typeof r.at === "string" ? r.at : "",
+    ...(Array.isArray(r.facts) ? { facts: parseCheckRecordFacts(r.facts) } : {}),
   };
+}
+
+/** Plan 07b (D3): parse the record's done-when facts leniently — a malformed
+ * entry is dropped, never turned into a passing one. */
+function parseCheckRecordFacts(value: unknown[]): CheckRecordFact[] {
+  const out: CheckRecordFact[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") continue;
+    const f = raw as Record<string, unknown>;
+    if (typeof f.findingId !== "string" || f.findingId.length === 0) continue;
+    if (typeof f.timedOut !== "boolean") continue;
+    if (f.exitCode !== null && !isNumber(f.exitCode)) continue;
+    if (typeof f.outputTail !== "string") continue;
+    out.push({ findingId: f.findingId, exitCode: f.exitCode as number | null, timedOut: f.timedOut, outputTail: f.outputTail });
+  }
+  return out;
 }

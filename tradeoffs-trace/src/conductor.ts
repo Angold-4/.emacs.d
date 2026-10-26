@@ -83,7 +83,7 @@ import {
 } from "./core/triage.ts";
 import { resolveBinding } from "./core/binding.ts";
 import { next } from "./core/next.ts";
-import { checkCommands, checkTier, diffTouchesWidePath, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand, type CheckTier } from "./core/checks.ts";
+import { checkCommands, checkTier, diffTouchesWidePath, effectiveChecks, finalCheckOf, parseCheckRecord, type CheckRecord, type CheckRecordCommand, type CheckRecordFact, type CheckTier } from "./core/checks.ts";
 // Plan 05i: the pure environment preflight — parse every declared shell
 // command's executable and resolve it in the conductor's own PATH. See the
 // module's header.
@@ -140,6 +140,7 @@ import type {
   Event,
   Finding,
   FindingAnswer,
+  FindingFact,
   PriorDecisionStatement,
   FindingDisclosure,
   InFlightKey,
@@ -1496,6 +1497,10 @@ export class Conductor {
    * the winner's hand-off can resolve its `test` verifies without re-running
    * the checks. */
   #laneCheckOutputs = new Map<string, string>();
+  /** Plan 07b (D3): each lane candidate's own doneWhen facts, keyed by sha and
+   * persisted in its `record.json`. Only the picked candidate's are emitted as
+   * events; a loser's never repair anything. */
+  #laneFacts = new Map<string, FindingFact[]>();
   /** Plan 06g2: each lane candidate's own `test`-verify resolution. */
   #laneCheckResolutions = new Map<string, ReturnType<typeof resolveTestVerifies>>();
   /** Plan 06g2: this round's lane builds, keyed `<round>-<lane>` — the lane
@@ -9144,6 +9149,9 @@ export class Conductor {
             .join("\n");
           this.#laneCheckOutputs.set(sha, output);
           if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, resolveTestVerifies(this.#planItems(), output));
+          // Plan 07b (D3): the doneWhen facts the pre-stop check ran are read
+          // back, so the resumed hand-off records them without running again.
+          if (record.facts) this.#laneFacts.set(sha, record.facts.map((f) => ({ ...f, candidateSha: sha })));
         }
       } catch {
         // Not checked before the stop: the resumed round checks it now.
@@ -9302,6 +9310,16 @@ export class Conductor {
         if (!firstFailure) firstFailure = `the check \`${command}\` ${result.timedOut ? "timed out" : `exited ${result.exitCode}`}`;
         passed = false;
       }
+      // Plan 07b (D3): after a candidate's checks pass, run each open
+      // domain-mode finding's doneWhen in THIS checkout with the check
+      // environment, one at a time, bounded by the reproduction deadline. The
+      // results stay with the candidate (persisted in its record) so a resumed
+      // round reads them; only the picked candidate's become events.
+      const facts =
+        passed && (this.#state.phase.contract.domains?.length ?? 0) > 0
+          ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir)
+          : [];
+      this.#laneFacts.set(candidateSha, facts);
       this.#writeCheckRecord(outDir, {
         candidateSha,
         ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
@@ -9309,6 +9327,9 @@ export class Conductor {
         passed,
         commands: recordCommands,
         finalCommands,
+        ...(facts.length > 0
+          ? { facts: facts.map(({ findingId, exitCode, timedOut, outputTail }) => ({ findingId, exitCode, timedOut, outputTail })) }
+          : {}),
         load1: recordLoad1,
         freeMemMB: recordFreeMemMB,
         at: new Date().toISOString(),
@@ -9323,6 +9344,49 @@ export class Conductor {
     } finally {
       checkoutDir.dispose();
     }
+  }
+
+  /** Plan 07b (D3): run each open domain-mode finding's `doneWhen` in the
+   * candidate's own check checkout, with the check environment, one at a time,
+   * each bounded by the reproduction deadline. Correctness over speed: no
+   * parallelism, and a timeout is recorded, never retried. */
+  async #runDoneWhenFacts(lane: string, candidateSha: string, cwd: string): Promise<FindingFact[]> {
+    const open = this.#state.phase.findings.filter(
+      (f) => f.status === "open" && typeof f.doneWhen === "string" && f.doneWhen.trim().length > 0,
+    );
+    const facts: FindingFact[] = [];
+    for (const finding of open) {
+      const command = finding.doneWhen!;
+      const startedAt = Date.now();
+      const result = await runCommand({
+        command,
+        cwd,
+        env: this.#checkEnv(),
+        deadlineMs: this.#deadlines.reproductionMs,
+        termGraceMs: this.#deadlines.termGraceMs,
+        onIntent: ({ pgid }) => {
+          this.#onStageShIntent(pgid);
+          this.#log.intent(`done-when-${lane}-${pgid}`, { pgid });
+        },
+      }).result;
+      facts.push({
+        findingId: finding.id,
+        candidateSha,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        outputTail: result.output.slice(-2000),
+      });
+      this.#log.append("done_when_fact", {
+        lane,
+        findingId: finding.id,
+        candidateSha,
+        command,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    return facts;
   }
 
   /** Plan 06g2: the ids the lane's discoveries will have, in the order the
@@ -10357,6 +10421,32 @@ export class Conductor {
       // The winner's checks already ran (under the machine-wide lock); its
       // record is applied, never re-run.
       this.#applyEvent({ type: "CHECKS_PASSED" });
+      // Plan 07b (D3): the winner's doneWhen facts, run in its own check
+      // checkout. One FINDING_FACT per fact, then today's
+      // FINDING_CONFIRMED_REPAIRED for each exit 0. A losing lane's facts are
+      // never emitted, so they repair nothing.
+      const winnerFacts = this.#laneFacts.get(winner.sha) ?? [];
+      for (const fact of winnerFacts) {
+        this.#applyEvent({
+          type: "FINDING_FACT",
+          findingId: fact.findingId,
+          candidateSha: fact.candidateSha,
+          exitCode: fact.exitCode,
+          timedOut: fact.timedOut,
+          outputTail: fact.outputTail,
+        });
+      }
+      for (const fact of winnerFacts) {
+        if (fact.timedOut || fact.exitCode !== 0) continue;
+        const finding = this.#state.phase.findings.find((f) => f.id === fact.findingId);
+        if (!finding || finding.status !== "open") continue;
+        this.#applyEvent({
+          type: "FINDING_CONFIRMED_REPAIRED",
+          findingId: finding.id,
+          byReviewer: finding.raisedBy,
+          candidateSha: winner.sha,
+        });
+      }
       if (this.#itemsEnforced()) {
         const output = this.#laneCheckOutputs.get(winner.sha) ?? "";
         this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolveTestVerifies(this.#planItems(), output) });
@@ -10989,6 +11079,9 @@ export class Conductor {
         ...record,
         commands: record.commands.map((c) => ({ ...c, command: redactText(c.command, this.#secretMaskable) })),
         finalCommands: record.finalCommands.map((c) => redactText(c, this.#secretMaskable)),
+        ...(record.facts
+          ? { facts: record.facts.map((f) => ({ ...f, outputTail: redactText(f.outputTail, this.#secretMaskable) })) }
+          : {}),
       };
       fs.writeFileSync(path.join(outDir, "record.json"), `${JSON.stringify(masked, null, 2)}\n`);
     } catch (err) {
@@ -13694,6 +13787,10 @@ export class Conductor {
     const mine = (phase.messages ?? []).filter((m) => m.type === messageType);
     const raw = mine.filter((m) => m.state === "raw");
     const refused = mine.filter((m) => m.state === "refused");
+    // Plan 07b (D3/A3): the doneWhen facts of the candidate this evaluator
+    // judges. The section is absent when there are none (a plan without
+    // domains, or a round with no open point).
+    const facts = (phase.doneWhenFacts ?? []).filter((f) => f.candidateSha === C);
     let diff = "";
     try {
       diff = diffText(this.#plan.repo, phase.integrationHead, C);
@@ -13720,6 +13817,18 @@ export class Conductor {
       "```diff",
       redactText(diff, this.#secretMaskable),
       "```",
+      ...(facts.length > 0
+        ? [
+            "",
+            "Done-when facts for this candidate (each open finding's doneWhen command, run by the conductor in the candidate's own check checkout):",
+            ...facts.map((f) => {
+              const finding = phase.findings.find((x) => x.id === f.findingId);
+              const doneWhen = finding?.doneWhen ?? "(no doneWhen recorded)";
+              const outcome = f.timedOut ? "timed out" : `exit ${f.exitCode}`;
+              return `- ${f.findingId} \`${doneWhen}\`: ${outcome}`;
+            }),
+          ]
+        : []),
       "",
       `Raw ${messageType} messages to evaluate (${raw.length}) — each publish title must be ONE COMPLETE line of at most 80 characters:`,
       ...raw.map(

@@ -1179,6 +1179,10 @@ export interface PhaseState {
   findings: Finding[];
   ownerRequests: OwnerRequest[];
   corrections: Correction[];
+  /** Plan 07b (D3): the done-when facts recorded for the candidate the phase
+   * judges (one per open domain-mode finding). Recorded only at the winner's
+   * hand-off; a losing lane's fact never appears here. */
+  doneWhenFacts?: FindingFact[];
   /** Plan 06k1 (A2): decisions the owner ruled on by an owner correction or
    * directive that names the id as ruled. A ruling settles the decision on
    * every later candidate whose decision has the same id and choice, with no
@@ -2016,6 +2020,27 @@ export interface EvFindingConfirmedRepaired {
   candidateSha: string;
 }
 
+/** Plan 07b (D3): one open domain-mode finding's `doneWhen` run on one
+ * candidate, in that candidate's own check checkout with the check
+ * environment and the reproduction deadline. `exitCode` is null when the
+ * command was killed on timeout. Facts are recorded only for the picked
+ * candidate; a losing lane's fact repairs nothing. */
+export interface FindingFact {
+  findingId: string;
+  candidateSha: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  outputTail: string;
+}
+export interface EvFindingFact {
+  type: "FINDING_FACT";
+  findingId: string;
+  candidateSha: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  outputTail: string;
+}
+
 /** Plan 06n (A2/R3): the evaluator's open-finding re-check answered `repaired`
  * with a valid anchor on the current candidate. It closes the finding exactly
  * as a reviewer's confirmation does, with the evaluator as the confirmer. */
@@ -2788,6 +2813,7 @@ export type Event =
   | EvOverrideCast
   | EvFindingRaised
   | EvFindingConfirmedRepaired
+  | EvFindingFact
   | EvFindingEvaluatorRepaired
   | EvFindingDisproved
   | EvFindingAcceptedByOwner
