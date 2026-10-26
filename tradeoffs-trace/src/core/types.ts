@@ -315,6 +315,14 @@ export interface Finding {
    * (set when it was raised with a `criterionDispute`). A later amendment of
    * that item supersedes the finding. */
   criterionDisputed?: string;
+  /** Plan 07a (OD-7): the whole `criterionDispute` the reviewer raised with
+   * this finding — criterion, why and proposedWording. Stored verbatim so a
+   * duplicate point's dispute is compared as a whole and uniquely to THIS
+   * finding: a fold must never drop a different amendment, and an amendment
+   * lookup keyed only by criterion/seat/candidate is ambiguous when one seat
+   * raises two disputes on the same criterion. `criterionDisputed` stays the
+   * criterion-only view the rest of the conductor reads. */
+  criterionDispute?: CriterionDispute;
   /** Plan 01g: why this finding was closed without repair — set when an
    * amendment replaced the wording it cited. */
   supersededBy?: string;

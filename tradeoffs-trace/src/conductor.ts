@@ -6294,6 +6294,13 @@ export class Conductor {
       ...(fd.criterionDispute?.criterion && fd.criterionDispute.criterion.trim().length > 0
         ? { criterionDisputed: fd.criterionDispute.criterion }
         : {}),
+      // Plan 07a (OD-7): in domain mode keep the WHOLE dispute on THIS
+      // finding so the fold compares it as a whole and uniquely. Recovering it
+      // later from the amendment decision is ambiguous when one seat raises
+      // two disputes on the same criterion, and misses a dispute whose
+      // amendment was deduplicated or ignored. Outside domain mode the fold
+      // never fires, so the finding stays byte-identical to before (C1).
+      ...(domainMode && fd.criterionDispute !== undefined ? { criterionDispute: fd.criterionDispute } : {}),
       ...(reproduction !== undefined ? { reproduction } : {}),
       // Plan 06g (A6): why this finding is advisory although it was raised
       // blocking — the round rule's own sentence, so the record and the views
@@ -6352,37 +6359,36 @@ export class Conductor {
    *
    * The fold never loses information: the key is all four fields, so two
    * points in different domains (or with a different item, location or
-   * doneWhen) are never folded together. A duplicate carrying its own
-   * contract amendment (`criterionDispute`) or decision link
-   * (`linkedDecisionId`) is folded only when the open finding already carries
-   * exactly the same one; otherwise it is raised on its own, so its amendment
-   * is voted and its link kept. The whole dispute — criterion, reason and
-   * proposed wording — is compared, not just the criterion, so two seats
-   * disputing the same criterion with different wording stay two findings
-   * (D-M-68). A duplicate carrying neither always folds. The incoming values
-   * are trimmed and `where` may be absent, exactly as they are stored, so a
-   * trailing space cannot defeat the fold. Outside domain mode the fields are
-   * absent, so this never fires. Returns true when the duplicate was folded. */
+   * doneWhen) are never folded together. A duplicate is folded only when its
+   * contract amendment (`criterionDispute`) and decision link
+   * (`linkedDecisionId`) are compatible with the open finding's: both absent,
+   * or both present and exactly equal. One present and one absent, or two
+   * different ones, is raised on its own, so its amendment is voted and its
+   * link kept. The whole dispute — criterion, reason and proposed wording —
+   * is compared, and it is stored on the finding itself, so the comparison is
+   * unique to that finding (D-M-68). The incoming values are trimmed and
+   * `where` may be absent, exactly as they are stored, so a trailing space
+   * cannot defeat the fold. Outside domain mode the fields are absent, so
+   * this never fires. Returns true when the duplicate was folded. */
   #foldDuplicatePoint(fd: FindingDisclosure, reviewer: Reviewer, raisedAsBlocker: boolean): boolean {
     if (raisedAsBlocker || !fd.item || !fd.doneWhen) return false;
     if ((this.#state.phase.contract.domains?.length ?? 0) === 0) return false;
     const item = fd.item.trim();
     const doneWhen = fd.doneWhen.trim();
     const key = whereKey(fd.where ?? "");
-    // Lead round 11: the domain is part of the point's identity — the same
-    // item, location and doneWhen in two different domains is two points and
-    // is never folded. OD-7 (D-M-68): a duplicate with its own amendment or
-    // link is not folded into a finding that carries a different one — the
-    // fold would drop it. The whole `criterionDispute` (criterion, reason,
-    // proposed wording) and the `linkedDecisionId` must match exactly; the
-    // finding stores only the criterion, so its full dispute is read from the
-    // amendment decision it created. A duplicate carrying neither folds into
-    // the first open point.
+    // Owner-delegate round 12: the domain is part of the point's identity —
+    // the same item, location and doneWhen in two different domains is two
+    // points and is never folded. A duplicate is folded only when its dispute
+    // and link are both absent or exactly equal to the open finding's: one
+    // present and one absent is not a duplicate. The whole `criterionDispute`
+    // (criterion, reason, proposed wording) and the `linkedDecisionId` must
+    // match exactly. A duplicate carrying neither folds into the first open
+    // point.
     const domain = (fd.domain ?? "").trim();
     const existing = this.#state.phase.findings.find((f) => {
       if (f.status !== "open" || f.item !== item || f.doneWhen !== doneWhen || whereKey(f.where ?? "") !== key || (f.domain ?? "") !== domain) return false;
-      if (fd.criterionDispute !== undefined && !this.#sameCriterionDispute(fd.criterionDispute, this.#disputeOf(f))) return false;
-      if (fd.linkedDecisionId !== undefined && fd.linkedDecisionId !== f.linkedDecisionId) return false;
+      if (!this.#disputesCompatible(fd.criterionDispute, f.criterionDispute)) return false;
+      if (fd.linkedDecisionId !== f.linkedDecisionId) return false;
       return true;
     });
     if (!existing) return false;
@@ -6390,29 +6396,14 @@ export class Conductor {
     return true;
   }
 
-  /** OD-7 (D-M-68): the full `criterionDispute` a finding was raised with.
-   * The finding stores only the criterion (`criterionDisputed`); its reason
-   * and proposed wording live on the amendment decision it created. Returns
-   * undefined when the finding carried no dispute or no amendment decision
-   * was made (an empty or no-change proposal states no position). */
-  #disputeOf(f: Finding): CriterionDispute | undefined {
-    if (!f.criterionDisputed) return undefined;
-    const decision = this.#state.phase.decisions.find(
-      (d) =>
-        d.amendment !== undefined &&
-        d.amendment.criterion === f.criterionDisputed &&
-        d.amendment.raisedBy === f.raisedBy &&
-        d.boundCandidateSha === f.boundCandidateSha,
-    );
-    return decision?.amendment
-      ? { criterion: decision.amendment.criterion, why: decision.amendment.why, proposedWording: decision.amendment.proposedWording }
-      : undefined;
-  }
-
-  /** OD-7 (D-M-68): two criterion disputes are the same only when every field
-   * (criterion, reason and proposed wording) matches. */
-  #sameCriterionDispute(a: CriterionDispute | undefined, b: CriterionDispute | undefined): boolean {
-    return a !== undefined && b !== undefined && a.criterion === b.criterion && a.why === b.why && a.proposedWording === b.proposedWording;
+  /** Owner-delegate round-12 rule (D-M-68): two criterion disputes are
+   * compatible iff both are absent or both are deep-equal in every field
+   * (criterion, why and proposedWording). One present and one absent is NOT
+   * compatible, so a point raised with a dispute never folds into the same
+   * point raised without one (or vice versa). */
+  #disputesCompatible(a: CriterionDispute | undefined, b: CriterionDispute | undefined): boolean {
+    if (a === undefined || b === undefined) return a === b;
+    return a.criterion === b.criterion && a.why === b.why && a.proposedWording === b.proposedWording;
   }
 
   /** Plan 06b (OD-1 R6): the requirement item id whose text is the disputed
