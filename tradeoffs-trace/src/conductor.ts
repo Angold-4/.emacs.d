@@ -9352,7 +9352,15 @@ export class Conductor {
    * parallelism, and a timeout is recorded, never retried. */
   async #runDoneWhenFacts(lane: string, candidateSha: string, cwd: string): Promise<FindingFact[]> {
     const open = this.#state.phase.findings.filter(
-      (f) => f.status === "open" && typeof f.doneWhen === "string" && f.doneWhen.trim().length > 0,
+      (f) =>
+        f.status === "open" &&
+        // A domain-mode point only: a finding with no domain is never a
+        // doneWhen fact (conductor-raised findings carry a domain and no
+        // doneWhen; ingestion refuses a domain-mode finding without one).
+        typeof f.domain === "string" &&
+        f.domain.length > 0 &&
+        typeof f.doneWhen === "string" &&
+        f.doneWhen.trim().length > 0,
     );
     const facts: FindingFact[] = [];
     for (const finding of open) {
@@ -9366,7 +9374,9 @@ export class Conductor {
         termGraceMs: this.#deadlines.termGraceMs,
         onIntent: ({ pgid }) => {
           this.#onStageShIntent(pgid);
-          this.#log.intent(`done-when-${lane}-${pgid}`, { pgid });
+          // The finding id is in the key so a resumed round can tell which
+          // doneWhen a staged command was, not just that the lane staged one.
+          this.#log.intent(`done-when-${lane}-${finding.id}-${pgid}`, { pgid, findingId: finding.id, candidateSha });
         },
       }).result;
       facts.push({
@@ -9387,6 +9397,29 @@ export class Conductor {
       });
     }
     return facts;
+  }
+
+  /** Plan 07b (D3): one candidate's doneWhen facts — the in-memory cache
+   * first, then the candidate's persisted check record (a resumed round whose
+   * check already ran). Empty when the candidate has none. Reading the record
+   * here, not only in `#resumedLaneBuild`, keeps the hand-off correct even if
+   * the round was resumed in a way that did not rebuild the lane. */
+  #factsFor(candidateSha: string): FindingFact[] {
+    const cached = this.#laneFacts.get(candidateSha);
+    if (cached) return cached;
+    try {
+      const record = parseCheckRecord(
+        JSON.parse(fs.readFileSync(path.join(this.#paths.checks, candidateSha, "record.json"), "utf8")),
+      );
+      if (record?.facts) {
+        const facts = record.facts.map((f) => ({ ...f, candidateSha }));
+        this.#laneFacts.set(candidateSha, facts);
+        return facts;
+      }
+    } catch {
+      // No readable record: the candidate has no facts.
+    }
+    return [];
   }
 
   /** Plan 06g2: the ids the lane's discoveries will have, in the order the
@@ -10425,7 +10458,7 @@ export class Conductor {
       // checkout. One FINDING_FACT per fact, then today's
       // FINDING_CONFIRMED_REPAIRED for each exit 0. A losing lane's facts are
       // never emitted, so they repair nothing.
-      const winnerFacts = this.#laneFacts.get(winner.sha) ?? [];
+      const winnerFacts = this.#factsFor(winner.sha);
       for (const fact of winnerFacts) {
         this.#applyEvent({
           type: "FINDING_FACT",
