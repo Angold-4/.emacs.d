@@ -14,7 +14,7 @@ import { validate } from "../../src/core/schema.ts";
 import { buildContract, buildReviewerPrompt } from "../../src/conductor.ts";
 import type { PhaseState, Review } from "../../src/core/types.ts";
 
-test("domains: domainOf maps a path to the first declared domain whose glob matches", () => {
+test("domainOf maps a path to the first declared domain whose glob matches", () => {
   const domains = parseDomains("booking=src/b/*.ts gates=test/**");
   assert.deepEqual(
     domains,
@@ -33,7 +33,7 @@ test("domains: domainOf maps a path to the first declared domain whose glob matc
   assert.equal(domainOf("src/b/x.ts", []), undefined);
 });
 
-test("domains: whereKey takes the path and the symbol and ignores the line", () => {
+test("whereKey takes the path and the symbol and ignores the line", () => {
   const a = whereKey("crates/x.rs:120 fn foo");
   assert.equal(a, whereKey("crates/x.rs:98 fn foo"), "the line number is ignored");
   assert.notEqual(a, whereKey("crates/x.rs:120 fn bar"), "a different symbol differs");
@@ -102,6 +102,15 @@ test("tt lint refuses an item without a declared domain in domain mode", () => {
   // Without domains neither is an error.
   const plain = parseOrgPlan(DOMAIN_ORG.replace("#+TT_DOMAINS: booking=src/b/*.ts gates=test/**\n", ""), "/x/PLAN.org");
   assert.deepEqual(lintPlan(plain).filter((f) => f.rule === "item-domain"), []);
+});
+
+test("tt lint refuses a bad, duplicate or globless domain declaration", () => {
+  const malformed = DOMAIN_ORG.replace("#+TT_DOMAINS: booking=src/b/*.ts gates=test/**", "#+TT_DOMAINS: Booking=src/b/*.ts booking=src/b/*.ts booking= gates=test/**");
+  const findings = lintPlan(parseOrgPlan(malformed, "/x/PLAN.org")).filter((f) => f.rule === "domain");
+  assert.ok(findings.some((f) => /Booking/.test(f.problem)), `an invalid name is an error: ${JSON.stringify(findings)}`);
+  assert.ok(findings.some((f) => /more than once/.test(f.problem)), "a duplicate name is an error");
+  assert.ok(findings.some((f) => /owns no glob/.test(f.problem)), "a bare token is an error");
+  assert.deepEqual(lintPlan(parseOrgPlan(DOMAIN_ORG, "/x/PLAN.org")).filter((f) => f.rule === "domain"), []);
 });
 
 function reviewWith(finding: Record<string, unknown>, blockers: Array<Record<string, unknown>> = []): Review {

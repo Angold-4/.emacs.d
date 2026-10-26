@@ -194,7 +194,7 @@
           "type": "string"
         },
         "domains": {
-          "description": "Plan 07a (D1): the phase's effective domains (#+TT_DOMAINS, overridden by the phase's :DOMAINS:). Absent means domain mode is off.",
+          "description": "Plan 07a (D1): the plan's declared domains (#+TT_DOMAINS), carried onto every phase. Absent means domain mode is off.",
           "type": "array",
           "items": { "$ref": "#/$defs/Domain" }
         },

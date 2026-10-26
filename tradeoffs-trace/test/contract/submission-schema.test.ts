@@ -135,7 +135,7 @@ assertShapeMatchesSchema("review.blockers", REVIEW_BLOCKER_PARAMS, reviewProps.b
 
 const POINT_FIELDS = ["domain", "item", "where", "expected", "doneWhen", "from"];
 
-test("submission-schema: FindingParam and BlockerParam list the six point fields", () => {
+test("submit_review's finding and blocker params carry domain, item, where, expected, doneWhen and from", () => {
   for (const field of POINT_FIELDS) {
     assert.ok(REVIEW_FINDING_PARAMS.properties.includes(field), `FindingParam lists ${field}`);
     assert.ok(REVIEW_BLOCKER_PARAMS.properties.includes(field), `BlockerParam lists ${field}`);

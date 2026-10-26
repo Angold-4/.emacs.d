@@ -214,13 +214,9 @@ function parsePhaseNode(
     // tt 09 (change 3): the phase's own :CONSOLIDATE: (on/off), kept as
     // written so lint can name a bad value.
     ...(node.props.CONSOLIDATE ? { consolidate: node.props.CONSOLIDATE.trim() } : {}),
-    // Plan 07a (D1): the phase's own :DOMAINS: overrides the plan's
-    // #+TT_DOMAINS:, exactly like :GENERATED:.
-    ...(node.props.DOMAINS
-      ? { domains: parseDomains(node.props.DOMAINS) }
-      : globalDomains && globalDomains.length > 0
-        ? { domains: globalDomains }
-        : {}),
+    // Plan 07a (D1): the plan's #+TT_DOMAINS applies to every phase (there
+    // is no phase-level override; D1 makes it a per-plan switch).
+    ...(globalDomains && globalDomains.length > 0 ? { domains: globalDomains } : {}),
   };
   if (structured) {
     phase.architecture = (architecture?.children ?? []).map((c) => itemInput(c, "architecture"));

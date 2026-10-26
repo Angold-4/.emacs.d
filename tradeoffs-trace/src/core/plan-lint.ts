@@ -54,6 +54,9 @@ export type LintRule =
   | "item-text-loss"
   // Plan 07a (D1): in domain mode an item must name a declared domain.
   | "item-domain"
+  // Plan 07a (D1): a declared domain name must match [a-z0-9-]+, be unique,
+  // and own at least one glob.
+  | "domain"
   // A `test` verify defined only where the phase's checks never run: tt
   // reports it missing on every candidate, a gate no owner command waives.
   | "verify-reach"
@@ -206,8 +209,8 @@ export interface LintPhaseInput {
   /** tt 09 (change 3): the phase's own `:CONSOLIDATE:` (`on`/`off`),
    * overriding the plan's `#+TT_CONSOLIDATE:`. */
   consolidate?: unknown;
-  /** Plan 07a (D1): the phase's effective domains (`#+TT_DOMAINS:`, overridden
-   * by a phase `:DOMAINS:`). Absent means domain mode is off. */
+  /** Plan 07a (D1): the plan's declared domains (`#+TT_DOMAINS:`), carried
+   * onto every phase. Absent means domain mode is off. */
   domains?: Domain[];
 }
 
@@ -791,6 +794,7 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
     ...lintWorkerPrompt(plan),
     ...lintCheapFinalChecks(plan),
     ...lintConsolidate(plan),
+    ...lintDomains(plan),
   ];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
@@ -1117,6 +1121,41 @@ function consolidateFinding(keyword: string, value: unknown, phaseId: string, li
 export function lintConsolidate(plan: LintPlanInput): LintFinding[] {
   if (plan.consolidate === undefined || isConsolidateValue(plan.consolidate)) return [];
   return [consolidateFinding("#+TT_CONSOLIDATE:", plan.consolidate, "consolidate", plan.consolidateLine, plan.sourceFile)];
+}
+
+/** Plan 07a (D1): lint the declared domains. D1 says names are `[a-z0-9-]+`
+ * and unique, and each is `name=glob[,glob…]`; a name that breaks the grammar,
+ * a name declared twice, or a bare token with no glob is an error. Absent
+ * means no domains and no findings. */
+export function lintDomains(plan: LintPlanInput): LintFinding[] {
+  const domains = plan.domains ?? (plan.phases ?? []).find((p) => p.domains && p.domains.length > 0)?.domains;
+  if (!domains || domains.length === 0) return [];
+  const out: LintFinding[] = [];
+  const seen = new Set<string>();
+  for (const domain of domains) {
+    const name = typeof domain?.name === "string" ? domain.name : "";
+    const finding = (problem: string, fix: string): LintFinding => ({
+      severity: "error",
+      rule: "domain",
+      phaseId: "domains",
+      item: name.length > 0 ? name : "(unnamed)",
+      line: plan.domainsLine,
+      sourceFile: plan.sourceFile,
+      problem,
+      fix,
+    });
+    if (!/^[a-z0-9-]+$/.test(name)) {
+      out.push(finding(`the declared domain ${JSON.stringify(name)} is not a valid name`, "name each domain with [a-z0-9-]+ (lowercase letters, digits and hyphens)"));
+    }
+    if (seen.has(name)) {
+      out.push(finding(`the declared domain ${name} is declared more than once`, "give each domain a unique name"));
+    }
+    seen.add(name);
+    if (!Array.isArray(domain?.globs) || domain.globs.length === 0) {
+      out.push(finding(`the declared domain ${name} owns no glob`, `write ${name || "<name>"}=<glob>[,<glob>…] (a token without '=' owns nothing)`));
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

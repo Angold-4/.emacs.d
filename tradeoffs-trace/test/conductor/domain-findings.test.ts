@@ -337,8 +337,10 @@ test("a plan without TT_DOMAINS records no point fields and refuses nothing new"
     stubReviews: false,
     deadlines: FAST,
     workerScript,
-    // No domains: a finding with no point fields is accepted as before.
-    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state, { findings: [{ kind: "defect", severity: "advisory", evidence: "an ordinary finding" }] }),
+    // No domains: a finding with no point fields is accepted as before, and
+    // point fields a reviewer happens to send are ignored.
+    reviewerScriptFor: (reviewer, state) =>
+      reviewerScript(reviewer, state, { findings: [{ kind: "defect", severity: "advisory", evidence: "an ordinary finding", domain: "booking", item: "R1", where: "src/core/rounds.ts:1 fn", expected: "x", doneWhen: "true" }] }),
   });
   try {
     await setup.conductor.start();
@@ -346,7 +348,10 @@ test("a plan without TT_DOMAINS records no point fields and refuses nothing new"
     assert.equal(setup.conductor.state.phase.contract.domains, undefined, "no domains are frozen");
     assert.ok(!readEvents(setup.runDir).some((r) => r.kind === "review_ingestion_rejected"), "nothing new is refused");
     const finding = setup.conductor.state.phase.findings.find((f) => f.evidence === "an ordinary finding")!;
-    assert.equal(finding.domain, undefined);
+    assert.equal(finding.domain, undefined, "a point field is ignored outside domain mode");
+    assert.equal(finding.item, undefined);
+    assert.equal(finding.where, undefined);
+    assert.equal(finding.expected, undefined);
     assert.equal(finding.doneWhen, undefined);
   } finally {
     await teardown(setup);

@@ -454,8 +454,8 @@ export interface RunPlanPhase {
    * the phase's `:WIDE_PATHS:`). A candidate whose diff touches one runs the
    * final check in its round. */
   widePaths?: string[];
-  /** Plan 07a (D1): the phase's declared domains (`#+TT_DOMAINS:`, overridden
-   * by a phase `:DOMAINS:`). Absent means domain mode is off. */
+  /** Plan 07a (D1): the plan's declared domains (`#+TT_DOMAINS:`, a
+   * per-plan switch). Absent means domain mode is off. */
   domains?: Domain[];
   /** Plan 06i (A3): the phase's golden note (`#+TT_GOLDEN:`, overridden by
    * the phase's `:GOLDEN:`). A choice justified only by an earlier drafting
@@ -6157,12 +6157,16 @@ export class Conductor {
     candidateSha: string,
     opts: { raisedAsBlocker?: boolean } = {},
   ): Promise<string | undefined> {
+    // Plan 07a (D2): domain mode is on exactly when the contract declares
+    // domains. Outside it the point fields are optional and ignored, so a
+    // finding never gains them by accident.
+    const domainMode = (this.#state.phase.contract.domains?.length ?? 0) > 0;
     // Plan 07a (D2): in domain mode a reviewer's finding (never a blocker) is
     // one point — `item`, `whereKey(where)` and `doneWhen`. A second reviewer
     // naming the same point is recorded on the open finding
     // (`FINDING_ALSO_RAISED`) instead of being raised again. Outside domain
     // mode the fields are absent, so this never fires.
-    if (!opts.raisedAsBlocker && fd.item && fd.where && fd.doneWhen && (this.#state.phase.contract.domains?.length ?? 0) > 0) {
+    if (!opts.raisedAsBlocker && fd.item && fd.where && fd.doneWhen && domainMode) {
       const key = whereKey(fd.where);
       const existing = this.#state.phase.findings.find(
         (f) => f.status === "open" && f.item === fd.item && f.doneWhen === fd.doneWhen && typeof f.where === "string" && whereKey(f.where) === key,
@@ -6282,12 +6286,12 @@ export class Conductor {
       // Plan 07a (D2): the domain-mode point fields, recorded verbatim so the
       // open finding keeps its domain, item, where, expected, doneWhen and
       // optional from. Outside domain mode none is set.
-      ...(typeof fd.domain === "string" && fd.domain.trim().length > 0 ? { domain: fd.domain.trim() } : {}),
-      ...(typeof fd.item === "string" && fd.item.trim().length > 0 ? { item: fd.item.trim() } : {}),
-      ...(typeof fd.where === "string" && fd.where.trim().length > 0 ? { where: fd.where.trim() } : {}),
-      ...(typeof fd.expected === "string" && fd.expected.trim().length > 0 ? { expected: fd.expected.trim() } : {}),
-      ...(typeof fd.doneWhen === "string" && fd.doneWhen.trim().length > 0 ? { doneWhen: fd.doneWhen.trim() } : {}),
-      ...(fd.from !== undefined ? { from: fd.from } : {}),
+      ...(domainMode && typeof fd.domain === "string" && fd.domain.trim().length > 0 ? { domain: fd.domain.trim() } : {}),
+      ...(domainMode && typeof fd.item === "string" && fd.item.trim().length > 0 ? { item: fd.item.trim(), itemId: fd.item.trim() } : {}),
+      ...(domainMode && typeof fd.where === "string" && fd.where.trim().length > 0 ? { where: fd.where.trim() } : {}),
+      ...(domainMode && typeof fd.expected === "string" && fd.expected.trim().length > 0 ? { expected: fd.expected.trim() } : {}),
+      ...(domainMode && typeof fd.doneWhen === "string" && fd.doneWhen.trim().length > 0 ? { doneWhen: fd.doneWhen.trim() } : {}),
+      ...(domainMode && fd.from !== undefined ? { from: fd.from } : {}),
     };
     const result = validate(FINDING_SCHEMA, finding);
     if (!result.valid) return `raised finding fails schemas/finding.schema.json: ${result.errors.join("; ")}`;
@@ -7808,6 +7812,7 @@ export class Conductor {
         status: "open",
         boundCandidateSha: C,
         itemId: id,
+        item: id,
         ...(arch?.domain ? { domain: arch.domain } : {}),
       };
       this.#applyEvent({ type: "FINDING_RAISED", finding });
@@ -8057,6 +8062,7 @@ export class Conductor {
       status: "open",
       boundCandidateSha: C,
       itemId: o.item.id,
+      item: o.item.id,
       // Plan 07a (D2): a conductor-raised item finding carries its item's
       // declared domain and no doneWhen.
       ...(o.item.domain ? { domain: o.item.domain } : {}),
@@ -8086,6 +8092,7 @@ export class Conductor {
         status: "open",
         boundCandidateSha: C,
         itemId: id,
+        item: id,
         ...(item?.domain ? { domain: item.domain } : {}),
       };
       this.#applyEvent({ type: "FINDING_RAISED", finding });

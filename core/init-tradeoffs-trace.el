@@ -700,10 +700,10 @@ because `domainOf' takes the first match."
          ;; whenever the phase runs two or more workers.
          (consolidate (or (org-element-property :CONSOLIDATE hl)
                           (+tt--keyword "TT_CONSOLIDATE")))
-         ;; Plan 07a (D1): the phase's declared domains. A per-plan keyword
-         ;; like #+TT_CONSOLIDATE; a phase's own :DOMAINS: overrides it.
-         (domains (or (org-element-property :DOMAINS hl)
-                      (+tt--keyword "TT_DOMAINS")))
+         ;; Plan 07a (D1): the plan's declared domains. A per-plan keyword
+         ;; like #+TT_CONSOLIDATE; domain mode is on exactly when the plan
+         ;; declares one (there is no phase override).
+         (domains (+tt--keyword "TT_DOMAINS"))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
