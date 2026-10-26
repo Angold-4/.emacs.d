@@ -316,6 +316,37 @@ export function acquireWaitingLock(lockPath: string): Promise<Lock> {
   return spawnLockHelper(WAITING_HELPER_SCRIPT, lockPath);
 }
 
+/** How many checks may run on one host at once: one per lane of a two-lane
+ * round, so a lane's candidate never queues behind the other's (exex 01b1:
+ * 30–47 min per check, run one after the other). */
+export const DEFAULT_CHECK_SLOTS = 2;
+
+/** How long a check waits between attempts when every slot is held. */
+const CHECK_SLOT_POLL_MS = 250;
+
+/** The lock file of check slot `index`: slot 0 is the check lock itself, so a
+ * one-slot host behaves exactly as before; slot i is `<lockPath>.slot<i>`. */
+export function checkSlotPath(lockPath: string, index: number): string {
+  return index === 0 ? lockPath : `${lockPath}.slot${index}`;
+}
+
+/** Takes the first free of `slots` machine-wide check slots, waiting until one
+ * is free. Each slot is its own flock, so a holder that dies frees its slot
+ * as the plain lock does. Any failure other than a held slot is thrown. */
+export async function acquireCheckSlot(lockPath: string, slots: number = DEFAULT_CHECK_SLOTS): Promise<Lock> {
+  const count = Math.max(1, Math.floor(slots));
+  for (;;) {
+    for (let index = 0; index < count; index++) {
+      try {
+        return await acquireLock(checkSlotPath(lockPath, index));
+      } catch (err) {
+        if (!(err instanceof LockError) || !err.message.endsWith(": busy")) throw err;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, CHECK_SLOT_POLL_MS));
+  }
+}
+
 function spawnLockHelper(helperScript: string, lockPath: string): Promise<Lock> {
   // A machine-wide lock lives under `~/.tradeoffs-trace/`, which a fresh
   // machine (a CI runner) does not have yet; perl's open does not create it.

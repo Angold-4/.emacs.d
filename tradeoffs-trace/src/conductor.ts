@@ -234,7 +234,7 @@ import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
-import { acquireLock, acquireWaitingLock, anyCheckWindowOpen, openCheckWindow, PausableTimer, type Lock } from "./effects/lock.ts";
+import { acquireCheckSlot, acquireLock, acquireWaitingLock, anyCheckWindowOpen, DEFAULT_CHECK_SLOTS, openCheckWindow, PausableTimer, type Lock } from "./effects/lock.ts";
 import { childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
 import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
@@ -632,6 +632,9 @@ export interface ConductorOptions {
    * machine — never overlap in time. Defaults to
    * `~/.tradeoffs-trace/check.lock`. */
   checkLockPath?: string;
+  /** How many checks may run on the host at once (`TT_CHECK_SLOTS`, default
+   * 2: one per lane). Each slot is its own lock beside `checkLockPath`. */
+  checkSlots?: number;
   /** Decision briefs: when true, the conductor records a deterministic brief
    * for every open owner item after evaluation, so the owner always has one
    * above the evidence even when the evaluator's model did not call
@@ -1456,6 +1459,7 @@ export class Conductor {
    * under (default `~/.tradeoffs-trace/check.lock`), held only while one
    * candidate is checked. */
   #checkLockPath: string;
+  #checkSlots: number;
   /** Plan 06k1 (A6): the environment this run's checks need, recorded once at
    * start (PATH plus every variable the plan or the starter declares) and
    * re-used by every check and every resume, so a resume from a shell without
@@ -1690,6 +1694,7 @@ export class Conductor {
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
     this.#checkLockPath = opts.checkLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "check.lock");
+    this.#checkSlots = opts.checkSlots ?? (Number(process.env.TT_CHECK_SLOTS) || DEFAULT_CHECK_SLOTS);
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -8950,7 +8955,7 @@ export class Conductor {
    * machine-wide lock, exactly as a lane candidate's (the winner is its base
    * for the wide-path tier). */
   async #checkConsolidation(plan: ConsolidationPlan, sha: string): Promise<LaneCheck> {
-    const lock = await acquireWaitingLock(this.#checkLockPath);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
     const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     try {
       this.#log.append("consolidation_check_started", { round: plan.round, sha });
@@ -9016,7 +9021,7 @@ export class Conductor {
 
   /** One candidate's checks, run under the machine-wide lock (C2). */
   async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
-    const lock = await acquireWaitingLock(this.#checkLockPath);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
     // Plan 06k1 (A4): the check holds the host-wide window for its duration,
     // so every other run's workers are paused while it runs.
     const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
@@ -11636,10 +11641,10 @@ export class Conductor {
 
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     // Plan 06k1 (A4): every check run on the host — phase or final tier —
-    // holds the machine-wide check lock and the host-wide check window, so
-    // two runs' checks never overlap and every other run's workers pause
-    // while this one runs.
-    const lock = await acquireWaitingLock(this.#checkLockPath);
+    // holds one of the machine-wide check slots (at most `#checkSlots` checks
+    // at once) and the host-wide check window, so every other run's workers
+    // pause while this one runs.
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
     const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
