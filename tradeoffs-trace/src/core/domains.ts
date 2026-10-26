@@ -71,3 +71,22 @@ export function parseDomains(value: string | undefined): Domain[] {
   }
   return out;
 }
+
+/** Plan 07a (D1): the problems with a declared-domain list — a name that is
+ * not `[a-z0-9-]+`, a name declared twice, or a domain that owns no glob.
+ * One human-readable sentence per problem, in declaration order; empty when
+ * no domains are declared. This is the one place the grammar is decided, so
+ * the linter and any future caller agree. */
+export function domainDeclarationIssues(domains: readonly Domain[] | undefined): string[] {
+  if (!domains || domains.length === 0) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const domain of domains) {
+    const name = typeof domain?.name === "string" ? domain.name : "";
+    if (!/^[a-z0-9-]+$/.test(name)) out.push(`the declared domain ${JSON.stringify(name)} is not a valid name`);
+    if (seen.has(name)) out.push(`the declared domain ${name} is declared more than once`);
+    seen.add(name);
+    if (!Array.isArray(domain?.globs) || domain.globs.length === 0) out.push(`the declared domain ${name} owns no glob`);
+  }
+  return out;
+}

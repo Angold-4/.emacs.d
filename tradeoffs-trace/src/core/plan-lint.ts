@@ -25,7 +25,7 @@ import * as fs from "node:fs";
 
 import { expandPromptPath, isLaneId } from "./worker-prompt.ts";
 import { matchesGlob } from "./boundaries.ts";
-import type { Domain } from "./domains.ts";
+import { domainDeclarationIssues, type Domain } from "./domains.ts";
 import { parseVerify, verifyKindIssue } from "./items.ts";
 import { rerunTemplateIssue } from "./test-failures.ts";
 
@@ -1124,38 +1124,22 @@ export function lintConsolidate(plan: LintPlanInput): LintFinding[] {
 }
 
 /** Plan 07a (D1): lint the declared domains. D1 says names are `[a-z0-9-]+`
- * and unique, and each is `name=glob[,glob…]`; a name that breaks the grammar,
- * a name declared twice, or a bare token with no glob is an error. Absent
- * means no domains and no findings. */
+ * and unique, and each is `name=glob[,glob…]`; `domainDeclarationIssues` owns
+ * that grammar, so the linter and any other caller cannot drift. Absent means
+ * no domains and no findings. */
 export function lintDomains(plan: LintPlanInput): LintFinding[] {
   const domains = plan.domains ?? (plan.phases ?? []).find((p) => p.domains && p.domains.length > 0)?.domains;
   if (!domains || domains.length === 0) return [];
-  const out: LintFinding[] = [];
-  const seen = new Set<string>();
-  for (const domain of domains) {
-    const name = typeof domain?.name === "string" ? domain.name : "";
-    const finding = (problem: string, fix: string): LintFinding => ({
-      severity: "error",
-      rule: "domain",
-      phaseId: "domains",
-      item: name.length > 0 ? name : "(unnamed)",
-      line: plan.domainsLine,
-      sourceFile: plan.sourceFile,
-      problem,
-      fix,
-    });
-    if (!/^[a-z0-9-]+$/.test(name)) {
-      out.push(finding(`the declared domain ${JSON.stringify(name)} is not a valid name`, "name each domain with [a-z0-9-]+ (lowercase letters, digits and hyphens)"));
-    }
-    if (seen.has(name)) {
-      out.push(finding(`the declared domain ${name} is declared more than once`, "give each domain a unique name"));
-    }
-    seen.add(name);
-    if (!Array.isArray(domain?.globs) || domain.globs.length === 0) {
-      out.push(finding(`the declared domain ${name} owns no glob`, `write ${name || "<name>"}=<glob>[,<glob>…] (a token without '=' owns nothing)`));
-    }
-  }
-  return out;
+  return domainDeclarationIssues(domains).map((problem) => ({
+    severity: "error" as const,
+    rule: "domain" as const,
+    phaseId: "domains",
+    item: problem,
+    line: plan.domainsLine,
+    sourceFile: plan.sourceFile,
+    problem,
+    fix: "write each domain as <name>=<glob>[,<glob>…] with a unique [a-z0-9-]+ name and at least one glob",
+  }));
 }
 
 // ---------------------------------------------------------------------------

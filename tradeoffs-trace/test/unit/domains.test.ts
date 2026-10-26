@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { domainOf, parseDomains, whereKey } from "../../src/core/domains.ts";
+import { domainDeclarationIssues, domainOf, parseDomains, whereKey } from "../../src/core/domains.ts";
 import { reviewIngestionIssue } from "../../src/core/predicate.ts";
 import { lintPlan } from "../../src/core/plan-lint.ts";
 import { parseOrgPlan } from "../../src/core/org-plan.ts";
@@ -111,6 +111,14 @@ test("tt lint refuses a bad, duplicate or globless domain declaration", () => {
   assert.ok(findings.some((f) => /more than once/.test(f.problem)), "a duplicate name is an error");
   assert.ok(findings.some((f) => /owns no glob/.test(f.problem)), "a bare token is an error");
   assert.deepEqual(lintPlan(parseOrgPlan(DOMAIN_ORG, "/x/PLAN.org")).filter((f) => f.rule === "domain"), []);
+});
+
+test("domainDeclarationIssues names the bad, duplicate and globless domains", () => {
+  assert.deepEqual(domainDeclarationIssues(parseDomains("booking=src/** gates=test/**")), []);
+  const issues = domainDeclarationIssues(parseDomains("Booking=src/** booking=src/** booking= gates=test/**"));
+  assert.ok(issues.some((i) => /Booking/.test(i)), `an invalid name: ${JSON.stringify(issues)}`);
+  assert.ok(issues.some((i) => /more than once/.test(i)), "a duplicate name");
+  assert.ok(issues.some((i) => /owns no glob/.test(i)), "a bare token");
 });
 
 function reviewWith(finding: Record<string, unknown>, blockers: Array<Record<string, unknown>> = []): Review {

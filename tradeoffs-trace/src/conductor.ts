@@ -6164,12 +6164,16 @@ export class Conductor {
     // Plan 07a (D2): in domain mode a reviewer's finding (never a blocker) is
     // one point — `item`, `whereKey(where)` and `doneWhen`. A second reviewer
     // naming the same point is recorded on the open finding
-    // (`FINDING_ALSO_RAISED`) instead of being raised again. Outside domain
-    // mode the fields are absent, so this never fires.
-    if (!opts.raisedAsBlocker && fd.item && fd.where && fd.doneWhen && domainMode) {
-      const key = whereKey(fd.where);
+    // (`FINDING_ALSO_RAISED`) instead of being raised again. The incoming
+    // values are trimmed and `where` may be absent, exactly as they are
+    // stored, so a trailing space cannot defeat the fold. Outside domain mode
+    // the fields are absent, so this never fires.
+    if (!opts.raisedAsBlocker && fd.item && fd.doneWhen && domainMode) {
+      const item = fd.item.trim();
+      const doneWhen = fd.doneWhen.trim();
+      const key = whereKey(fd.where ?? "");
       const existing = this.#state.phase.findings.find(
-        (f) => f.status === "open" && f.item === fd.item && f.doneWhen === fd.doneWhen && typeof f.where === "string" && whereKey(f.where) === key,
+        (f) => f.status === "open" && f.item === item && f.doneWhen === doneWhen && whereKey(f.where ?? "") === key,
       );
       if (existing) {
         this.#applyEvent({ type: "FINDING_ALSO_RAISED", findingId: existing.id, reviewer });
@@ -6287,7 +6291,7 @@ export class Conductor {
       // open finding keeps its domain, item, where, expected, doneWhen and
       // optional from. Outside domain mode none is set.
       ...(domainMode && typeof fd.domain === "string" && fd.domain.trim().length > 0 ? { domain: fd.domain.trim() } : {}),
-      ...(domainMode && typeof fd.item === "string" && fd.item.trim().length > 0 ? { item: fd.item.trim(), itemId: fd.item.trim() } : {}),
+      ...(domainMode && typeof fd.item === "string" && fd.item.trim().length > 0 ? { item: fd.item.trim() } : {}),
       ...(domainMode && typeof fd.where === "string" && fd.where.trim().length > 0 ? { where: fd.where.trim() } : {}),
       ...(domainMode && typeof fd.expected === "string" && fd.expected.trim().length > 0 ? { expected: fd.expected.trim() } : {}),
       ...(domainMode && typeof fd.doneWhen === "string" && fd.doneWhen.trim().length > 0 ? { doneWhen: fd.doneWhen.trim() } : {}),
@@ -7812,8 +7816,9 @@ export class Conductor {
         status: "open",
         boundCandidateSha: C,
         itemId: id,
-        item: id,
-        ...(arch?.domain ? { domain: arch.domain } : {}),
+        ...((this.#state.phase.contract.domains?.length ?? 0) > 0
+          ? { item: id, ...(arch?.domain ? { domain: arch.domain } : {}) }
+          : {}),
       };
       this.#applyEvent({ type: "FINDING_RAISED", finding });
     }
@@ -8062,10 +8067,12 @@ export class Conductor {
       status: "open",
       boundCandidateSha: C,
       itemId: o.item.id,
-      item: o.item.id,
-      // Plan 07a (D2): a conductor-raised item finding carries its item's
-      // declared domain and no doneWhen.
-      ...(o.item.domain ? { domain: o.item.domain } : {}),
+      // Plan 07a (D2): only in domain mode does a conductor-raised item
+      // finding carry the point's `item` and its item's declared domain (and
+      // no doneWhen); outside domain mode the finding is exactly as before.
+      ...((this.#state.phase.contract.domains?.length ?? 0) > 0
+        ? { item: o.item.id, ...(o.item.domain ? { domain: o.item.domain } : {}) }
+        : {}),
     };
     this.#applyEvent({ type: "FINDING_RAISED", finding });
   }
@@ -8092,8 +8099,9 @@ export class Conductor {
         status: "open",
         boundCandidateSha: C,
         itemId: id,
-        item: id,
-        ...(item?.domain ? { domain: item.domain } : {}),
+        ...((this.#state.phase.contract.domains?.length ?? 0) > 0
+          ? { item: id, ...(item?.domain ? { domain: item.domain } : {}) }
+          : {}),
       };
       this.#applyEvent({ type: "FINDING_RAISED", finding });
     }
@@ -14239,6 +14247,10 @@ export class Conductor {
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
       ...goldenPromptLines(phase.contract.golden),
+      // Plan 07a (D2): domain mode names the domains and the point fields on
+      // turn 1 too, so a reviewer discovers against the same point shape it
+      // will submit in turn 2; empty outside domain mode.
+      ...domainPromptLines(phase.contract.domains),
       `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),

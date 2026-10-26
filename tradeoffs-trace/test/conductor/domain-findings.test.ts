@@ -330,6 +330,54 @@ test("a finding the conductor raises on an unmet item carries the item's domain"
   }
 });
 
+test("a point with trailing whitespace still folds into the open one", async () => {
+  const base = { domain: "booking", item: "R1", where: "src/core/rounds.ts:1 fn", expected: "x" };
+  const setup = await setupConductor({
+    items: ITEMS,
+    domains: DOMAINS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript,
+    reviewerScriptFor: (reviewer, state) =>
+      reviewerScript(reviewer, state, {
+        // One seat pads item/doneWhen; the stored values are trimmed, so the
+        // fold must compare trimmed values too.
+        findings: [{ kind: "defect", severity: "advisory", evidence: "padded point", ...base, item: reviewer === "M" ? "R1" : "R1 ", doneWhen: reviewer === "M" ? "true" : "true " }],
+      }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.item === "R1" && (f.alsoRaisedBy ?? []).length >= 2), 90_000, 50, setup.runDir);
+    assert.equal(setup.conductor.state.phase.findings.filter((f) => f.item === "R1").length, 1, "a padded point is the same point");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a conductor finding without TT_DOMAINS carries no domain", async () => {
+  const setup = await setupConductor({
+    items: ITEMS,
+    phaseChecks: [CHECK_OUTPUT],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript,
+    // R2 (review-only) unmet by two of three seats: the conductor raises the
+    // blocking finding. Without domains it must be exactly as before.
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state, { r2: reviewer === "B" ? "met" : "unmet" }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.findings.some((f) => f.itemId === "R2" && f.severity === "blocking"), 90_000, 50, setup.runDir);
+    const finding = setup.conductor.state.phase.findings.find((f) => f.itemId === "R2")!;
+    assert.equal(finding.domain, undefined, "a conductor finding carries no domain outside domain mode");
+    assert.equal(finding.item, undefined, "no point item outside domain mode");
+    assert.equal(finding.doneWhen, undefined);
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("a plan without TT_DOMAINS records no point fields and refuses nothing new", async () => {
   const setup = await setupConductor({
     items: ITEMS,
