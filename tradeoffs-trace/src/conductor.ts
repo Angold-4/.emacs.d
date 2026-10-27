@@ -9989,6 +9989,13 @@ export class Conductor {
         if (result.timedOut) this.#recordBound(tier === "final" ? "final-check" : "check", `${lane}:${candidateSha}`, checkLimitMs, Date.now() - startedAt);
         const recordFailure = this.#recordCheck(outDir, command, result);
         recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure));
+        // Plan 07e (A4/E4): a check whose own log the disk refused fails with
+        // `disk full`, never as a pass.
+        if (recordFailure === "disk-full") {
+          passed = false;
+          firstFailure = "disk full";
+          break;
+        }
         if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
           passed = false;
           firstFailure = "the checkout no longer matches the candidate commit";
@@ -10070,7 +10077,7 @@ export class Conductor {
           ? await this.#runDoneWhenFacts(lane, candidateSha, checkoutDir.dir, laneBase ?? this.#baselineBaseSha())
           : [];
       this.#laneFacts.set(candidateSha, facts);
-      this.#writeCheckRecord(outDir, {
+      const recordWritten = this.#writeCheckRecord(outDir, {
         candidateSha,
         ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
         tier,
@@ -10092,6 +10099,8 @@ export class Conductor {
         freeMemMB: recordFreeMemMB,
         at: new Date().toISOString(),
       });
+      // Plan 07e (A4/E4): a record the disk refused fails the lane's check.
+      if (!recordWritten) return { ok: false, note: "disk full" };
       // The item test-verifies are resolved for the winner only (the hand-off
       // applies them); a loser's output must not touch the phase's item state.
       this.#laneCheckOutputs.set(candidateSha, combinedOutput);
@@ -12039,7 +12048,7 @@ export class Conductor {
    * there was one, and the machine's load at the run. A `final` run
    * overwrites the candidate's `round` record, so the accepted candidate's
    * record is the one that ran the final check. */
-  #writeCheckRecord(outDir: string, record: CheckRecord): void {
+  #writeCheckRecord(outDir: string, record: CheckRecord): boolean {
     try {
       // The commands ran with plan secrets resolved; on disk they keep the
       // mask every other run file keeps.
@@ -12052,12 +12061,16 @@ export class Conductor {
           : {}),
       };
       fs.writeFileSync(path.join(outDir, "record.json"), `${JSON.stringify(masked, null, 2)}\n`);
+      return true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
         this.#noteDiskFull(err, "check record");
-        return;
+        // Plan 07e (A4/E4): the disk refused the record, so the check did not
+        // pass; the caller fails its action with `disk full`.
+        return false;
       }
       this.#log.append("error", { where: "check_record", error: String((err as Error)?.message ?? err) });
+      return true;
     }
   }
 
@@ -12954,6 +12967,14 @@ export class Conductor {
           }
           const recordFailure = this.#recordCheck(outDir, command, result);
           recordCommands.push(this.#checkRecordCommand(command, result, startedAt, recordFailure));
+          // Plan 07e (A4/E4): a check whose own log the disk refused fails its
+          // action with `disk full`, never as a pass (`#noteDiskFull` stops the
+          // run cleanly, exactly as for a command that reported ENOSPC).
+          if (recordFailure === "disk-full") {
+            passed = false;
+            this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full", command, exitCode: result.exitCode });
+            return;
+          }
           // Plan 05i: 126/127 means the shell could not execute the command
           // (`command not found` / `not executable`). That is the machine, not
           // the code: stop the run in ENV_BLOCKED instead of recording a
@@ -13058,7 +13079,7 @@ export class Conductor {
       }
       // Plan 07e (A4): write the record before events that a stop can refuse,
       // so an interrupted command keeps its own class even after log closure.
-      this.#writeCheckRecord(outDir, {
+      const recordWritten = this.#writeCheckRecord(outDir, {
         candidateSha,
         ...(this.#baselineBaseSha() ? { baseSha: this.#baselineBaseSha() } : {}),
         tier,
@@ -13069,6 +13090,12 @@ export class Conductor {
         freeMemMB: recordFreeMemMB,
         at: new Date().toISOString(),
       });
+      // Plan 07e (A4/E4): a record the disk refused fails the check, never a
+      // pass; the run is already stopping cleanly.
+      if (!recordWritten) {
+        this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full" });
+        return;
+      }
       if (this.#closed) return;
       // design §2.2: a checkout that no longer matches its candidate commit
       // invalidates that gate's result (never counted as passed — `passed`

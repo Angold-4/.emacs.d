@@ -485,6 +485,51 @@ test("plan 07e: tt lint refuses a zero, a negative or a non-numeric bound keywor
   assert.ok(findings.every((f) => f.severity === "error"));
 });
 
+test("tt lint refuses a zero negative or non-numeric bound keyword", () => {
+  const parsed = parseOrgPlan(
+    [
+      "#+TITLE: t",
+      "#+TT_EVALUATE_MINUTES: 0",
+      "#+TT_MERGE_MINUTES: -2",
+      "#+TT_OWNER_WAIT_MINUTES: four hours",
+      "",
+      "* p",
+      "  :PROPERTIES:",
+      "  :ID: p",
+      "  :END:",
+      "",
+    ].join("\n"),
+    "/plans/x/plan.org",
+  );
+  const findings = lintPlan(parsed).filter((f) => f.rule === "bound");
+  // Every bad value is an error naming its keyword and its line: Emacs drops
+  // such a value silently, the linter must not.
+  assert.deepEqual(
+    findings.map((f) => [f.severity, f.item?.split(":")[0], f.line]).sort(),
+    [
+      ["error", "TT_EVALUATE_MINUTES", 2],
+      ["error", "TT_MERGE_MINUTES", 3],
+      ["error", "TT_OWNER_WAIT_MINUTES", 4],
+    ],
+  );
+  // A positive whole number of minutes is accepted for the same keywords.
+  const good = parseOrgPlan(
+    [
+      "#+TT_EVALUATE_MINUTES: 10",
+      "#+TT_MERGE_MINUTES: 10",
+      "#+TT_OWNER_WAIT_MINUTES: 240",
+      "",
+      "* p",
+      "  :PROPERTIES:",
+      "  :ID: p",
+      "  :END:",
+      "",
+    ].join("\n"),
+    "/plans/x/plan.org",
+  );
+  assert.deepEqual(lintPlan(good).filter((f) => f.rule === "bound"), []);
+});
+
 test("plan 07e: every bound keyword accepts a positive whole number", () => {
   const parsed = parseOrgPlan(
     [
