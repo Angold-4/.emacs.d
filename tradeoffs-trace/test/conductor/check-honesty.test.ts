@@ -163,32 +163,35 @@ test("plan 07e: a silent check is class silent and a check killed by a stop is i
   }
 });
 
-test("plan 07e: a check that reports a full disk is class disk-full", async () => {
-  const fullDisk = "printf 'No space left on device\\n'; exit 1";
+test("plan 07e: a check stopped by a full disk is class disk-full", async () => {
+  // The full disk's own stop path (`#onDiskFull` calls `stop("disk full")`).
+  // A running check it cuts off is recorded as `disk-full`, never
+  // `interrupted`, and never as an ordinary failure.
   const setup = await setupConductor({
-    checks: [fullDisk],
-    phaseChecks: [fullDisk],
+    checks: ["sleep 6"],
+    phaseChecks: ["sleep 30"],
     rounds: 1,
     stubReviews: true,
-    deadlines: { ...FAST, checkMs: 10_000 },
+    deadlines: { ...FAST, checkMs: 60_000 },
     workerScript: () => quickWorker(),
     reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
   });
   try {
     await setup.conductor.start();
     await waitFor(
-      () => checkRecords(setup.runDir).some((r) => ((r.commands as Array<Record<string, unknown>>) ?? []).some((c) => c.class === "disk-full")),
+      () => readEvents(setup.runDir).some((r) => r.kind === "intent" && String(r.actionId ?? "").startsWith("check-sh-")),
       60_000,
-      100,
+      50,
       setup.runDir,
     );
-    const record = checkRecords(setup.runDir).find((r) =>
-      ((r.commands as Array<Record<string, unknown>>) ?? []).some((c) => c.class === "disk-full"),
-    )!;
-    const command = (record.commands as Array<Record<string, unknown>>).find((c) => c.class === "disk-full")!;
-    assert.equal(command.failureClass, "disk-full", "a full disk is its own class, never an ordinary failure");
+    await setup.conductor.stop("disk full");
+    await waitFor(() => checkRecords(setup.runDir).length > 0, 10_000, 50, setup.runDir);
+    const command = (checkRecords(setup.runDir)[0]!.commands as Array<Record<string, unknown>>)[0]!;
+    assert.equal(command.class, "disk-full", "a full disk is its own class, never an ordinary failure");
+    assert.equal(command.failureClass, "disk-full");
     assert.equal(command.note, "disk full");
     assert.equal(command.passed, false, "a full disk never passes the check");
+    assert.doesNotMatch(String(command.note), /interrupted/, "a full disk is not an interruption");
   } finally {
     await teardown(setup);
   }
