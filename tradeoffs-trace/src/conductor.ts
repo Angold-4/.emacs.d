@@ -4231,30 +4231,23 @@ export class Conductor {
       ...(answeringCommand(runId, phase) ? { command: redactText(answeringCommand(runId, phase)!, this.#secretMaskable) } : {}),
       waitKey: `${runId}:${wait}`,
     };
-    notify(entry, {
+    // 07e (E1/E2): an open owner request also reminds on the owner-wait bound.
+    // It never decides anything (C3) and never closes the request; each bound
+    // reminder is recorded as BOUND_REACHED so the log shows the cadence. A
+    // BLOCKED phase keeps today's single reminder, not this bound. The
+    // ordinary reminder and the bound are ONE call and one record: `notify`
+    // reports the bound itself, so an ordinary reminder landing on the same
+    // lattice point can neither swallow the bound nor make this branch depend
+    // on what its own append happened to be classified as.
+    const result = notify(entry, {
       root: path.dirname(this.#runDir),
       now: this.#now,
       reminderMs: this.#deadlines.notifyReminderMs,
+      ...(phase.phase === "AWAITING_OWNER" ? { everyMs: this.#deadlines.ownerWaitMs } : {}),
       onError: (message) => this.#logUnexpected("notify", new Error(message)),
     });
-    // 07e (E1/E2): an open owner request also reminds on the owner-wait bound.
-    // It never decides anything (C3) and never closes the request; each
-    // reminder is recorded as BOUND_REACHED so the log shows the cadence. A
-    // BLOCKED phase keeps today's single reminder, not this bound.
-    if (phase.phase === "AWAITING_OWNER") {
-      const bound = notify(entry, {
-        root: path.dirname(this.#runDir),
-        now: this.#now,
-        everyMs: this.#deadlines.ownerWaitMs,
-        onError: (message) => this.#logUnexpected("notify", new Error(message)),
-      });
-      // 07e (E2/A2): the bound is reached whenever the bound's own cadence
-      // appends a reminder, not only when `notify` happens to classify that
-      // append as a repeat of an earlier record (the wait's announcement is
-      // the ordinary reminder's record, which the bound must not depend on).
-      if (bound !== "none") {
-        this.#recordBound("owner-wait", `phase ${phase.phaseId}`, this.#deadlines.ownerWaitMs, this.#deadlines.ownerWaitMs);
-      }
+    if (result.bound) {
+      this.#recordBound("owner-wait", `phase ${phase.phaseId}`, result.bound.limitMs, result.bound.elapsedMs);
     }
   }
 
