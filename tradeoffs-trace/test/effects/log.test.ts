@@ -29,7 +29,7 @@ test("append fsyncs after every record", () => {
   }
 });
 
-test("plan 07e (E3/E4): ENOSPC is reported once, each append retries once, and a refused record is marked dropped", () => {
+test("plan 07e (E3): ENOSPC is reported once, fails the append visibly, and later appends are no-ops", () => {
   const logPath = path.join(dir, "events.jsonl");
   const enospc = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
   const writeMock = mock.method(fs, "writeSync", () => {
@@ -39,48 +39,19 @@ test("plan 07e (E3/E4): ENOSPC is reported once, each append retries once, and a
   const log = new EventLog(logPath, [], onDiskFull);
   try {
     const first = log.append("state", { a: 1 });
-    assert.equal(first.seq, 1, "the attempted record is still handed back (OD-1.3)");
-    assert.equal(first.dropped, true, "the refused record is explicitly marked dropped");
-    assert.equal(first.durable, false, "the refused record is explicitly marked not durable");
+    assert.equal(first, undefined, "a refused append hands back no record — the action failed, never 'recorded'");
     assert.equal(log.diskFull, true);
-    assert.equal(log.droppedAppends, 2, "both attempts of the ordinary append failed");
+    assert.equal(log.droppedAppends, 1, "the append did not reach the disk — the action failed, not succeeded");
     assert.equal(onDiskFull.mock.callCount(), 1);
-    assert.equal(writeMock.mock.callCount(), 2, "an ordinary append retries exactly once");
     const second = log.append("state", { a: 2 });
-    assert.equal(second.dropped, true, "an append the disk keeps refusing is handed back marked dropped");
-    assert.equal(second.seq, 2);
-    assert.equal(writeMock.mock.callCount(), 4, "the next append retries once too");
+    assert.equal(second, undefined, "an append dropped while the disk stays full is not passed off as written");
+    assert.equal(writeMock.mock.callCount(), 1, "no later append retries the full disk");
     assert.equal(onDiskFull.mock.callCount(), 1, "the notice is not repeated");
-    assert.equal(log.droppedAppends, 4, "every failed attempt is counted, never passed off as durable");
+    assert.equal(log.droppedAppends, 2, "the dropped records are counted, never passed off as durable");
     assert.deepEqual(readLog(logPath).records, [], "nothing the caller was told about is on disk");
   } finally {
     writeMock.mock.restore();
     log.close();
-  }
-});
-
-test("plan 07e (E4): an ordinary append's retry lands and clears the full-disk state", () => {
-  const logPath = path.join(dir, "events.jsonl");
-  const enospc = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
-  const realWriteSync = fs.writeSync;
-  let calls = 0;
-  const writeMock = mock.method(fs, "writeSync", (...args: Parameters<typeof fs.writeSync>) => {
-    calls += 1;
-    if (calls === 1) throw enospc;
-    return realWriteSync.apply(fs, args);
-  });
-  const log = new EventLog(logPath, [], mock.fn());
-  try {
-    const record = log.append("state", { a: 1 });
-    assert.equal(record.dropped, undefined, "a retry that landed hands back the durable record");
-    assert.equal(record.seq, 1);
-    assert.equal(log.diskFull, false, "the retried write landed, so the disk is writable again");
-    assert.equal(log.droppedAppends, 1);
-    log.close();
-    const { records } = readLog(logPath);
-    assert.deepEqual(records.map((r) => r.kind), ["state"], "the record survived the retry");
-  } finally {
-    writeMock.mock.restore();
   }
 });
 
@@ -93,12 +64,12 @@ test("plan 07e (E4): the shutdown and final-failure records retry once after ENO
   const log = new EventLog(logPath, [], mock.fn());
   try {
     log.append("state", { a: 1 });
-    assert.equal(writeMock.mock.callCount(), 2);
+    assert.equal(writeMock.mock.callCount(), 1);
     const critical = log.appendCritical("stop", { reason: "conductor stopped" });
-    assert.equal(critical.dropped, true, "a critical append the disk refused is handed back marked dropped");
+    assert.equal(critical, undefined, "a critical append the disk refused hands back no record either");
     // One bounded retry: two attempts for this record, never a loop.
-    assert.equal(writeMock.mock.callCount(), 4, "the shutdown record is retried exactly once");
-    assert.equal(log.droppedAppends, 4, "every failed attempt is counted");
+    assert.equal(writeMock.mock.callCount(), 3, "the shutdown record is retried exactly once");
+    assert.equal(log.droppedAppends, 3, "every failed attempt is counted");
   } finally {
     writeMock.mock.restore();
     log.close();
@@ -112,9 +83,7 @@ test("plan 07e (E4): a shutdown record lands on disk when storage recovers after
   let calls = 0;
   const writeMock = mock.method(fs, "writeSync", (...args: Parameters<typeof fs.writeSync>) => {
     calls += 1;
-    // Fail both attempts of the ordinary append, then let the shutdown record
-    // land on its first attempt.
-    if (calls <= 2) throw enospc;
+    if (calls === 1) throw enospc;
     return realWriteSync.apply(fs, args);
   });
   const log = new EventLog(logPath, [], mock.fn());
@@ -122,10 +91,10 @@ test("plan 07e (E4): a shutdown record lands on disk when storage recovers after
     log.append("state", { a: 1 });
     assert.equal(log.diskFull, true);
     const critical = log.appendCritical("stop", { reason: "conductor stopped" });
-    assert.equal(critical.dropped, undefined, "a retry that landed hands back the durable record");
+    assert.ok(critical, "a retry that landed hands back the durable record");
     assert.equal(critical.seq, 2);
     assert.equal(log.diskFull, false, "the retried write landed, so the disk is writable again");
-    assert.equal(log.droppedAppends, 2);
+    assert.equal(log.droppedAppends, 1);
     log.close();
     const { records } = readLog(logPath);
     assert.deepEqual(records.map((r) => r.kind), ["stop"], "the shutdown state was preserved");
