@@ -142,6 +142,17 @@ function reviewerWithPoints(bookingDone: string, gatesDone: string) {
   };
 }
 
+/** Plan 07c (C3): a decision a fixer reports instead of deciding it. */
+function fixerDisclosure(domain: string) {
+  return {
+    choice: `FIXER_DISCLOSURE_${domain}`,
+    whyItMatters: "the fixer met a decision outside its findings and reports it rather than deciding it",
+    alternatives: [{ option: "decide it silently", consequence: "the owner never sees the choice" }],
+    recommendation: { choice: "report it", reason: "a fixer decides no trade-off" },
+    classProposal: "detail",
+  };
+}
+
 function pickVote(seat: Reviewer, round: number, lane: string): { hello: unknown; steps: FakePiStep[] } {
   return {
     hello: { role: "picker" as const, tools: ROLE_TOOLS.picker },
@@ -378,13 +389,7 @@ test("a fixer's submit_phase without item coverage or answers to other findings 
 });
 
 test("a fixer's out-of-task decision disclosure reaches the phase record", async () => {
-  const disclosure = (domain: string) => ({
-    choice: `FIXER_DISCLOSURE_${domain}`,
-    whyItMatters: "the fixer met a decision outside its findings and reports it rather than deciding it",
-    alternatives: [{ option: "decide it silently", consequence: "the owner never sees the choice" }],
-    recommendation: { choice: "report it", reason: "a fixer decides no trade-off" },
-    classProposal: "detail",
-  });
+  const disclosure = fixerDisclosure;
   const setup = await setupConductor({
     phase: fixPhase({ finalChecks: ["true"] }),
     checks: ["true"],
@@ -487,7 +492,7 @@ test("the fixers' commits are merged in task order into the next round's single 
   }
 });
 
-test("a fixer whose commit conflicts is skipped with a note and the other fixer's work is the candidate", async () => {
+test("a fixer whose commit conflicts is skipped with a note, the other fixer's work is the candidate, and only its disclosures reach the phase record", async () => {
   const setup = await setupConductor({
     phase: fixPhase(),
     checks: ["true"],
@@ -500,11 +505,16 @@ test("a fixer whose commit conflicts is skipped with a note and the other fixer'
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
     // Both fixers add the SAME file with different content: an add/add
     // conflict on the second merge.
+    // Each fixer also reports a decision and a note (plan 07c C3).
     fixerScriptFor: (domain) => ({
       hello: defaultWorkerHello(),
       steps: [
         { kind: "call-sh", command: `printf '${domain}\\n' > shared.txt` },
-        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+        {
+          kind: "call-submit",
+          tool: "submit_phase",
+          args: { decisions: [fixerDisclosure(domain)], assumptions: [], deviations: [`FIXER_DEVIATION_${domain}`] },
+        },
       ],
     }),
   });
@@ -513,6 +523,11 @@ test("a fixer whose commit conflicts is skipped with a note and the other fixer'
     const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
     await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
     const record = fixed()!;
+    // Fix packet Z: only the merged fixer speaks for the candidate. The
+    // skipped (conflicting) fixer's decision and note describe code the
+    // candidate does not contain.
+    assert.deepEqual((record.disclosures ?? []).map((d) => d.choice), ["FIXER_DISCLOSURE_booking"], "only the merged fixer's decision is on ROUND_FIXED");
+    assert.deepEqual(record.added ?? [], ["FIXER_DEVIATION_booking"], "only the merged fixer's note is on ROUND_FIXED");
     assert.equal(record.merges.length, 1, "only the first merge landed");
     assert.equal(record.tasks.length, 2);
     const conflicted = record.tasks.find((t) => t.note?.includes("conflicted"));
@@ -525,6 +540,12 @@ test("a fixer whose commit conflicts is skipped with a note and the other fixer'
     // Its findings stay open.
     const open = setup.conductor.state.phase.findings.filter((f) => f.status === "open" && f.domain === conflicted!.domain);
     assert.ok(open.length > 0, "the conflicted fixer's findings stay open");
+    // The merged candidate's hand-off records the merged fixer's decision and
+    // never the skipped one's.
+    await waitFor(() => setup.conductor.state.phase.candidate?.sha === record.candidate, 120_000, 50, setup.runDir);
+    const choices = (setup.conductor.state.phase.decisions ?? []).map((d) => d.choice);
+    assert.ok(choices.includes("FIXER_DISCLOSURE_booking"), `the merged fixer's decision reached the phase record: ${JSON.stringify(choices)}`);
+    assert.ok(!choices.includes("FIXER_DISCLOSURE_gates"), `the skipped fixer's decision did not reach the phase record: ${JSON.stringify(choices)}`);
   } finally {
     await teardown(setup);
   }
@@ -944,3 +965,201 @@ function resumeConductor(setup: TestConductorSetup): Conductor {
     },
   });
 }
+
+// ---------------------------------------------------------------------------
+// Fix packet Z: a voted-down or vetoed decision is fixer work
+// ---------------------------------------------------------------------------
+
+const VETO_REASON = "VETO_REASON: the booking cache hides a stale price";
+const ALT_OPTION = "ALT_OPTION: read the price through without the cache";
+
+/** A round-1 lane worker that also discloses one decision of `cls`; later
+ * rounds disclose nothing. */
+function laneWorkerWithDecision(round: number, lane: string, cls: "delegated" | "reserved"): { hello: unknown; steps: FakePiStep[] } {
+  const decisions =
+    round === 1
+      ? [
+          {
+            choice: "cache the booking price per batch",
+            whyItMatters: "fewer reads per batch",
+            alternatives: [{ option: ALT_OPTION, consequence: "one more read per order" }],
+            recommendation: { choice: "cache it", reason: "fewer reads" },
+            classProposal: cls,
+          },
+        ]
+      : [];
+  return {
+    hello: defaultWorkerHello(),
+    steps: [
+      { kind: "call-sh", command: `printf 'lane ${lane} r${round}\\n' > lane-${lane}-r${round}.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions, assumptions: [], deviations: [] } },
+    ],
+  };
+}
+
+/** Round 1: M rejects the lane's decision (a veto, citing a booking path), A
+ * and B approve it; no seat raises a finding. Later rounds: empty reviews. */
+function reviewerVetoing(seat: Reviewer, _candidate: string, state: State): { hello: unknown; steps: FakePiStep[] } {
+  const K = state.phase.contract.contractVersion;
+  const round = state.phase.rounds?.length ?? 1;
+  const review = laneReview(seat, K);
+  if (round !== 1) return review;
+  const submit = review.steps[2] as { args: Record<string, unknown> };
+  submit.args.ballots = [
+    seat === "M"
+      ? { decisionId: "D-p1-$TT_CANDIDATE_SHA8-1", vote: "reject", rationale: VETO_REASON, evidence: ["booking/cache.ts:12 price"] }
+      : { decisionId: "D-p1-$TT_CANDIDATE_SHA8-1", vote: "approve", rationale: `${seat} approves`, evidence: ["README.md:1"] },
+  ];
+  return review;
+}
+
+function fixerIntents(runDir: string) {
+  return readLog(runPaths(runDir).events).records.filter((r) => r.kind === "intent" && (r.event as { fixer?: string }).fixer?.startsWith("fix-"));
+}
+
+test("a round blocked only by a vetoed decision is followed by a fix round with one fixer for its domain, briefed with the veto and the alternative", async () => {
+  const promptDir = fs.mkdtempSync("/tmp/tt-07z-veto-");
+  const promptLog = path.join(promptDir, "prompts.txt");
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => laneWorkerWithDecision(1, "a", "delegated"),
+    laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "delegated"),
+    laneReviewerScriptFor: reviewerVetoing,
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+    fixerScriptFor: (domain) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
+    const record = fixed()!;
+    const picked = setup.conductor.state.phase.rounds![0].picked!.sha;
+    const decisionId = `D-p1-${picked.slice(0, 8)}-1`;
+    // Round 1 had no finding: the vetoed decision alone blocked it.
+    assert.equal(setup.conductor.state.phase.findings.filter((f) => f.boundCandidateSha === picked).length, 0, "round 1 raised no finding");
+    assert.deepEqual(
+      record.tasks.map((t) => ({ domain: t.domain, findingIds: t.findingIds })),
+      [{ domain: "booking", findingIds: [decisionId] }],
+      "one task: the vetoed decision, in the domain of M's dissent evidence",
+    );
+    assert.equal(fixerIntents(setup.runDir).length, 1, "one fixer started");
+    await waitFor(() => {
+      try {
+        return fs.readFileSync(promptLog, "utf8").includes("You are fixer fix-booking");
+      } catch {
+        return false;
+      }
+    }, 60_000, 50, setup.runDir);
+    const brief = fs.readFileSync(promptLog, "utf8").split("\n=====\n").find((p) => p.includes("You are fixer fix-booking"))!;
+    assert.ok(brief.includes(decisionId), "the brief names the decision");
+    assert.ok(brief.includes(VETO_REASON), "the brief carries M's veto reason");
+    assert.ok(brief.includes(ALT_OPTION), "the brief carries the seats' alternative");
+    assert.match(brief, /vetoed by M/);
+    // The next round is the fix round's single lane on the merged candidate.
+    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 120_000, 50, setup.runDir);
+    assert.deepEqual(setup.conductor.state.phase.rounds![1].lanes, ["a"], "the next round is one lane");
+    assert.equal(setup.conductor.state.phase.rounds![1].base, record.candidate);
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptDir);
+  }
+});
+
+test("a vetoed reserved (owner) decision is never a fixer task", async () => {
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorkerWithDecision(1, "a", "reserved"),
+    laneWorkerScriptFor: (lane, round) => laneWorkerWithDecision(round, lane, "reserved"),
+    laneReviewerScriptFor: reviewerVetoing,
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => (setup.conductor.state.phase.rounds?.length ?? 0) >= 2, 180_000, 50, setup.runDir);
+    const rounds = setup.conductor.state.phase.rounds!;
+    const picked = rounds[0].picked!.sha;
+    const decision = setup.conductor.state.phase.decisions.find((d) => d.id === `D-p1-${picked.slice(0, 8)}-1`);
+    assert.equal(decision?.class, "reserved", "the vetoed decision is reserved");
+    assert.equal(rounds[0].fixed, undefined, "no fix round for a reserved decision");
+    assert.deepEqual(rounds[1].lanes, ["a", "b"], "the next round is today's two-lane round");
+    assert.equal(fixerIntents(setup.runDir).length, 0, "no fixer started");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("an unclassified domain-mode point with a doneWhen becomes a fixer task, not an owner request", async () => {
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints(BOOKING_DONE, GATES_DONE)(seat, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+    // The evaluator confirms each open point but gives NO impact class.
+    evaluatorScriptFor: (messageType, state) => ({
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks:
+              messageType === "finding"
+                ? state.phase.findings.filter((f) => f.status === "open").map((f) => ({ id: f.id, verdict: "confirmed", evidence: "README.md:1 evaluator: re-checked" }))
+                : [],
+          },
+        },
+      ],
+    }),
+    fixerScriptFor: (domain) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const points = phase.findings.filter((f) => f.domain === "booking" || f.domain === "gates");
+    assert.equal(points.length, 2, "M raised two points");
+    for (const point of points) {
+      const check = (phase.itemChecks ?? []).find((c) => c.itemId === point.id);
+      assert.equal(check?.impact, undefined, `the evaluator gave ${point.id} no impact`);
+      const triage = (phase.triage ?? []).find((r) => r.itemId === point.id);
+      assert.equal(triage?.disposition?.kind, "fix", `${point.id} is triaged fix: ${JSON.stringify(triage)}`);
+      assert.equal(triage?.impact, "contract", `${point.id} has impact contract`);
+      assert.ok(!phase.ownerRequests.some((r) => r.linkedFindingId === point.id), `${point.id} opened no owner request`);
+    }
+    assert.deepEqual(
+      fixed()!.tasks.map((t) => t.domain),
+      ["booking", "gates"],
+      "each unclassified point is a fixer task in its domain",
+    );
+  } finally {
+    await teardown(setup);
+  }
+});

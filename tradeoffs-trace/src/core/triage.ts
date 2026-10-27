@@ -456,12 +456,30 @@ function isConductorItemFinding(phase: PhaseState, id: string): boolean {
   return phase.findings.some((f) => f.id === id && f.raisedBy === "conductor" && f.itemId !== undefined);
 }
 
+/** Fix packet Z (07 D2/D4): a domain-mode reviewer point that carries a
+ * doneWhen and that the evaluator did not classify. Such a point names its
+ * plan item, its domain and the command that shows it closed, so it is a
+ * plan-contract record a fixer can close — a `fix` (impact `contract`), not
+ * an owner request. The evaluator still rules: a point it classified (as
+ * `judgement` included) or contradicted is read the ordinary way. */
+export function isUnclassifiedDomainPoint(phase: PhaseState, finding: Finding): boolean {
+  if ((phase.contract.domains?.length ?? 0) === 0) return false;
+  if (finding.raisedBy === "conductor" || finding.raisedBy === "owner") return false;
+  if (finding.kind === "contract") return false;
+  if (!isNonEmpty(finding.domain) || !isNonEmpty(finding.doneWhen)) return false;
+  const check = (phase.itemChecks ?? []).find((c) => c.itemId === finding.id);
+  if (check?.verdict === "contradicted" || impactOverride(phase, finding.id) === "judgement") return false;
+  return !isClassified(phase, finding.id);
+}
+
 /** The record's impact class: the evaluator's, or the one the record itself
  * establishes. */
 export function recordImpact(phase: PhaseState, id: string): Impact {
   if (impactOverride(phase, id)) return impactOverride(phase, id)!;
   if (isContractFinding(phase, id)) return "contract";
   if (isConductorItemFinding(phase, id)) return "wrong-output";
+  const finding = phase.findings.find((f) => f.id === id);
+  if (finding && isUnclassifiedDomainPoint(phase, finding)) return "contract";
   return "judgement";
 }
 
@@ -563,6 +581,16 @@ export function evidenceForFinding(finding: Finding, phase: PhaseState): TriageE
   }
   if (finding.status === "superseded") {
     return { classified: true, fate: "superseded", fateReason: finding.supersededBy ?? "superseded by a later candidate" };
+  }
+  // Fix packet Z: an unclassified domain-mode point with a doneWhen is a fix
+  // (impact `contract`, against the plan item it names), so a domain fixer
+  // closes it rather than the owner.
+  if (isUnclassifiedDomainPoint(phase, finding)) {
+    return {
+      classified: true,
+      contradictsPlan: true,
+      reason: `the domain point names plan item ${finding.item ?? finding.itemId ?? "?"} and doneWhen \`${finding.doneWhen}\`; the evaluator did not classify it, so a fixer fixes it`,
+    };
   }
   // A contract finding is a contract record by construction, even without an
   // evaluator check; a defect finding needs the evaluator's classification.
