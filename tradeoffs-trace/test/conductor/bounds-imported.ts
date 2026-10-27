@@ -227,8 +227,9 @@ test("a check that exceeds its bound records BOUND_REACHED and still fails as to
   }
 });
 
-test("plan 07e: a check that exits non-zero with no output is recorded as silent, not failed", async () => {
-  const setup = await setupConductor({
+test("a silent check is class silent and a check killed by a stop is interrupted", async () => {
+  // 1. A check that exits non-zero with nothing to say is `silent`.
+  const silent = await setupConductor({
     checks: ["exit 3"],
     phaseChecks: ["exit 3"],
     rounds: 1,
@@ -238,20 +239,21 @@ test("plan 07e: a check that exits non-zero with no output is recorded as silent
     reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
   });
   try {
-    await setup.conductor.start();
-    await waitFor(() => checkRecords(setup.runDir).length > 0, 60_000, 100, setup.runDir);
-    const record = checkRecords(setup.runDir)[0]!;
+    await silent.conductor.start();
+    await waitFor(() => checkRecords(silent.runDir).length > 0, 60_000, 100, silent.runDir);
+    const record = checkRecords(silent.runDir)[0]!;
     const command = (record.commands as Array<Record<string, unknown>>)[0]!;
-    assert.equal(command.class, "silent");
+    assert.equal(command.class, "silent", "a silent check is class silent, not an ordinary failure");
+    assert.equal(command.failureClass, "silent");
+    assert.equal(command.passed, false, "silence never passes a check");
     assert.equal(command.note, "check exited 3 with no output");
-    assert.match(fs.readFileSync(path.join(setup.runDir, "checks", String(record.candidateSha), String(command.log)), "utf8"), /check exited 3 with no output/);
+    assert.match(fs.readFileSync(path.join(silent.runDir, "checks", String(record.candidateSha), String(command.log)), "utf8"), /check exited 3 with no output/);
   } finally {
-    await teardown(setup);
+    await teardown(silent);
   }
-});
 
-test("plan 07e: a check the owner stops is recorded as interrupted, not failed", async () => {
-  const setup = await setupConductor({
+  // 2. A check the owner's stop killed is `interrupted`, never `failed`.
+  const stopped = await setupConductor({
     checks: ["sleep 6"],
     phaseChecks: ["sleep 30"],
     rounds: 1,
@@ -261,21 +263,22 @@ test("plan 07e: a check the owner stops is recorded as interrupted, not failed",
     reviewerScriptFor: (seat, state) => stubReviewer(seat, state),
   });
   try {
-    await setup.conductor.start();
+    await stopped.conductor.start();
     await waitFor(
-      () => readEvents(setup.runDir).some((r) => r.kind === "intent" && String(r.actionId ?? "").startsWith("check-sh-")),
+      () => readEvents(stopped.runDir).some((r) => r.kind === "intent" && String(r.actionId ?? "").startsWith("check-sh-")),
       60_000,
       50,
-      setup.runDir,
+      stopped.runDir,
     );
-    await setup.conductor.stop();
-    await waitFor(() => checkRecords(setup.runDir).length > 0, 10_000, 50, setup.runDir);
-    const command = (checkRecords(setup.runDir)[0]!.commands as Array<Record<string, unknown>>)[0]!;
-    assert.equal(command.class, "interrupted");
+    await stopped.conductor.stop();
+    await waitFor(() => checkRecords(stopped.runDir).length > 0, 10_000, 50, stopped.runDir);
+    const command = (checkRecords(stopped.runDir)[0]!.commands as Array<Record<string, unknown>>)[0]!;
+    assert.equal(command.class, "interrupted", "a stop is not a failure");
+    assert.equal(command.failureClass, "interrupted");
     assert.match(String(command.note), /interrupted/);
   } finally {
-    cleanupDir(setup.runRoot);
-    cleanupDir(setup.scriptsDir);
+    cleanupDir(stopped.runRoot);
+    cleanupDir(stopped.scriptsDir);
   }
 });
 
