@@ -16,6 +16,7 @@ import * as path from "node:path";
 
 import { expandPromptPath } from "./worker-prompt.ts";
 import { parseDomains, type Domain } from "./domains.ts";
+import { finalTestsOf } from "./items.ts";
 import type { LintItemInput, LintModels, LintPhaseInput, LintPlanInput } from "./plan-lint.ts";
 
 interface OrgNode {
@@ -148,6 +149,10 @@ function itemInput(node: OrgNode, kind: "architecture" | "requirement" | "constr
   if (kind === "requirement" || kind === "constraint") {
     item.verify = node.props.VERIFY ? [node.props.VERIFY] : [];
     if (node.propLines.VERIFY) item.verifyLine = node.propLines.VERIFY;
+    // `:VERIFY: test final "name"`: the final-only tests, flagged in the plan
+    // JSON exactly as the Emacs exporter flags them.
+    const finalTests = finalTestsOf(item.verify);
+    if (finalTests.length > 0) item.finalTests = finalTests;
   }
   return item;
 }

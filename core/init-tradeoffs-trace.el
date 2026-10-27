@@ -530,6 +530,41 @@ Org line the owner will edit rather than at a temporary JSON copy."
             (when (re-search-forward (concat "^[ \t]*:" (regexp-quote name) ":[ \t]*") drawer-end t)
               (line-number-at-pos))))))))
 
+(defun +tt--final-tests (verify)
+  "The `test final' verifies of the :VERIFY: string VERIFY, as plan JSON.
+Each is an alist (name file final) for `test final \"name\"' or
+`test final file::name'.  The scan reads VERIFY left to right as
+`parseVerify' in `src/core/items.ts' does: `test', an optional bare `final'
+keyword followed by whitespace or the end, then an optional quoted or bare
+name, so a quoted name is consumed whole.  The `file::' prefix is split off
+only when it is a path (it has a `/' or a file extension).  The final checks
+resolve these tests; a round's output may lack them.  Nil when VERIFY names
+none."
+  (let ((out nil) (pos 0) (case-fold-search t))
+    (while (and verify (string-match "\\btest\\b" verify pos))
+      (let* ((p (match-end 0))
+             (final (let ((rest (substring verify p)))
+                      (when (string-match "\\`\\([ \t]+final\\)\\(?:[ \t]\\|\\'\\)" rest)
+                        (setq p (+ p (match-end 1)))
+                        t)))
+             (name (let ((rest (substring verify p)))
+                     (when (string-match "\\`[ \t]+\\(?:\"\\([^\"]*\\)\"\\|\\([^ \t\n]+\\)\\)" rest)
+                       (setq p (+ p (match-end 0)))
+                       (or (match-string 1 rest) (match-string 2 rest))))))
+        (setq pos p)
+        (when final
+          (let* ((name (string-trim (or name "")))
+                 (sep (string-search "::" name))
+                 (left (and sep (> sep 0) (substring name 0 sep)))
+                 (file (and left (or (string-search "/" left)
+                                     (string-match-p "\\.[A-Za-z0-9]+\\'" left))
+                            left)))
+            (push `((name . ,(if file (substring name (+ sep 2)) name))
+                    ,@(when file `((file . ,file)))
+                    (final . t))
+                  out)))))
+    (nreverse out)))
+
 (defun +tt--parse-item (hl kind)
   "Parse one structured item headline HL of KIND into a plan-JSON alist.
 KIND is `architecture', `requirement' or `constraint'.  The item's text is
@@ -579,6 +614,10 @@ keeps the same text so `tt lint' can prove nothing was lost in parsing."
             ,@(when arch-line `((archLine . ,arch-line)))))
       ,@(when (memq kind '(requirement constraint))
           `((verify . ,(vconcat (and verify (list verify))))
+            ;; `:VERIFY: test final "name"': the final-only tests, flagged so
+            ;; the plan JSON says which tests the final checks resolve.
+            ,@(let ((finals (+tt--final-tests verify)))
+                (when finals `((finalTests . ,(vconcat finals)))))
             ,@(when verify-line `((verifyLine . ,verify-line)))))
       (line . ,line))))
 

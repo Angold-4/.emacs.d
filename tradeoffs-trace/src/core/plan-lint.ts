@@ -155,6 +155,8 @@ export interface LintItemInput {
   domain?: string;
   /** Requirements and constraints: the raw `:VERIFY:` strings. */
   verify?: string[];
+  /** Requirements and constraints: the `test final` verifies of `verify`. */
+  finalTests?: Array<{ name: string; file?: string; final: true }>;
   line?: number;
   archLine?: number;
   verifyLine?: number;
@@ -718,6 +720,19 @@ export function lintItems(phase: LintPhaseInput): LintFinding[] {
       for (const v of parseVerify(raw)) {
         if (v.kind === "test" && v.name.trim().length === 0) {
           out.push(finding("item-verify", item, item.verifyLine ?? item.line, `a test verify has no name: ${JSON.stringify(raw)}`, 'write test "<the test name>" (the name as the test runner prints it), or drop the test kind'));
+        }
+        // A final-only test is resolved by the final checks, so a phase
+        // without any has nothing that would ever run it.
+        if (v.kind === "test" && v.final && !(phase.finalChecks ?? []).some((c) => c.trim().length > 0)) {
+          out.push(
+            finding(
+              "item-verify",
+              item,
+              item.verifyLine ?? item.line,
+              `a test final verify needs final checks, and this phase has none: ${JSON.stringify(raw)}`,
+              "declare #+TT_FINAL_CHECKS (or the phase's :FINAL_CHECKS:) that runs the test, or drop final",
+            ),
+          );
         }
       }
     }
