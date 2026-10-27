@@ -7,7 +7,7 @@
 
 import { domainOf, whereKey, type Domain } from "./domains.ts";
 import type { Disposition } from "./triage.ts";
-import type { Ballot, Decision, DecisionClass, Finding } from "./types.ts";
+import type { Ballot, Decision, DecisionClass, Finding, FindingFact } from "./types.ts";
 
 /** Plan 07c (D4): the default `#+TT_FIXERS` — the most fixer tasks (one per
  * domain) a fix round may run. */
@@ -204,4 +204,15 @@ export function otherTaskIndexLines(tasks: readonly FixTask[], own: FixTask): st
   return tasks
     .filter((t) => t.domain !== own.domain)
     .map((t) => `- fix-${t.domain}: ${t.findingIds.join(", ")} (domain ${t.domain})`);
+}
+
+/** 07 (reduce by facts): true when `finding` is a domain point whose
+ * doneWhen fact on `candidateSha` did not exit 0 (it failed or timed out): the
+ * point is still open whatever an evaluator drop says (e.g. a drop as "already
+ * tracked by E-n", a ledger entry that no fixer reads). False when there is no
+ * candidate, no doneWhen, no domain, or no fact for this candidate. */
+export function factKeepsOpen(finding: Finding, facts: readonly FindingFact[], candidateSha: string | undefined): boolean {
+  if (!candidateSha || !nonEmpty(finding.doneWhen) || !nonEmpty(finding.domain)) return false;
+  const fact = facts.find((f) => f.findingId === finding.id && f.candidateSha === candidateSha);
+  return fact !== undefined && (fact.timedOut || fact.exitCode !== 0);
 }

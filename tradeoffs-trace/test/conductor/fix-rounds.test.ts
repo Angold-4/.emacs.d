@@ -18,6 +18,7 @@ import { readLog } from "../../src/effects/log.ts";
 import { FIXER_DUTY } from "../../src/core/fix-rounds.ts";
 import type { Domain } from "../../src/core/domains.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
+import type { PlanModels } from "../../src/core/roles.ts";
 import {
   cleanupDir,
   defaultReviewerHello,
@@ -1161,5 +1162,67 @@ test("an unclassified domain-mode point with a doneWhen becomes a fixer task, no
     );
   } finally {
     await teardown(setup);
+  }
+});
+
+// exex 01c1a (2026-10-27, run f4d01766): the fixers ran on the leader's model
+// (consolidator mode). A fixer is a mapper: it launches on the worker model.
+test("fixers launch on the worker model, not the consolidator's", async () => {
+  const argvDir = fs.mkdtempSync("/tmp/tt-fix-model-");
+  const models: PlanModels = { worker: { provider: "p-w", model: "m-w" }, reviewer: { provider: "p-r", model: "m-r" } };
+  const setup = await setupConductor({
+    phase: fixPhase(),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    models,
+    extraEnv: { FAKE_PI_ARGV_LOG: argvDir },
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints(BOOKING_DONE, GATES_DONE)(seat, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+    evaluatorScriptFor: (messageType, state) => ({
+      hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator },
+      steps: [
+        {
+          kind: "call-submit",
+          tool: "submit_evaluation",
+          args: {
+            evaluations: [],
+            itemChecks:
+              messageType === "finding"
+                ? state.phase.findings.filter((f) => f.status === "open").map((f) => ({ id: f.id, verdict: "confirmed", evidence: "README.md:1 evaluator: re-checked" }))
+                : [],
+          },
+        },
+      ],
+    }),
+    fixerScriptFor: (domain) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    const fixed = () => setup.conductor.state.phase.rounds?.[0]?.fixed;
+    await waitFor(() => fixed() !== undefined, 180_000, 50, setup.runDir);
+    assert.deepEqual(fixed()!.tasks.map((t) => t.domain), ["booking", "gates"], "two fixers ran");
+    const launches = fs
+      .readFileSync(path.join(argvDir, "worker.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => (JSON.parse(l) as { argv: string[] }).argv);
+    assert.ok(launches.length >= 4, `two lane workers and two fixers launched as workers: ${launches.length}`);
+    for (const argv of launches) {
+      const i = argv.indexOf("--model");
+      assert.equal(i >= 0 ? argv[i + 1] : undefined, "m-w", `every mapper (lane worker or fixer) runs on the worker model: ${argv.join(" ")}`);
+    }
+  } finally {
+    await teardown(setup);
+    fs.rmSync(argvDir, { recursive: true, force: true });
   }
 });
