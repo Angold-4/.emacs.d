@@ -111,6 +111,9 @@ const STAGE_OF: Record<string, string> = {
   REPAIRING: "implement",
   FREEZING: "freeze",
   CHECKING: "checks",
+  // Plan 07e (E3/A4): the final check is its own running unit, with its own
+  // `#+TT_FINAL_CHECK_MINUTES` bound — never folded into the ordinary check.
+  FINAL_CHECKING: "final-check",
   PROBING: "probe",
   REVIEWING: "review",
   EVALUATING: "evaluate",
@@ -125,7 +128,17 @@ const STAGE_OF: Record<string, string> = {
 
 /** The stages the conductor runs itself: no agent is expected to be active,
  * so "no agent activity" there is not idleness. */
-export const CONDUCTOR_STAGES = new Set(["baseline", "freeze", "checks", "probe", "evaluate", "resolve", "gate", "publish"]);
+export const CONDUCTOR_STAGES = new Set([
+  "baseline",
+  "freeze",
+  "checks",
+  "final-check",
+  "probe",
+  "evaluate",
+  "resolve",
+  "gate",
+  "publish",
+]);
 
 function stageDeadlineMs(): Record<string, number> {
   return {
@@ -133,6 +146,7 @@ function stageDeadlineMs(): Record<string, number> {
     implement: DEFAULT_DEADLINES.workerAttemptMs,
     freeze: DEFAULT_DEADLINES.freezeMs,
     checks: DEFAULT_DEADLINES.checkMs,
+    "final-check": DEFAULT_DEADLINES.finalCheckMs,
     probe: DEFAULT_DEADLINES.probeMs,
     gate: DEFAULT_DEADLINES.gateMs,
     review: DEFAULT_DEADLINES.reviewMs,
@@ -150,6 +164,7 @@ export function stageLimits(plan: Pick<RunPlanFile, "deadlines">): Record<string
     implement: d.workerAttemptMs,
     freeze: d.freezeMs,
     checks: d.checkMs,
+    "final-check": d.finalCheckMs,
     probe: d.probeMs,
     gate: d.gateMs,
     review: d.reviewMs,
@@ -167,6 +182,8 @@ export function stageBoundKind(stage: string): BoundKind | undefined {
       return "check";
     case "probe":
       return "check";
+    case "final-check":
+      return "final-check";
     case "review":
       return "review";
     case "evaluate":
