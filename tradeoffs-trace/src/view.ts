@@ -19,6 +19,8 @@ import { modelsCheckStatusText, parseModelsCheck, type ModelsCheck } from "./cor
 // Plan 01f: the gate stage's own record (the conductor's live proof).
 import { gateOutcomeText, parseGateRecord, type GateRecord } from "./core/gate.ts";
 import { acceptanceBlockers, decisionStatus, isLiveDecision } from "./core/predicate.ts";
+import { evaluationExceptions } from "./core/verdict.ts";
+import { recordedRunnerRevision } from "./effects/runner.ts";
 import { baselineCoversCommands, baselineStatusLine, parseBaseline, type Baseline } from "./core/test-failures.ts";
 // Plan 05i: the environment block's one-line reason and the resolved tool rows.
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
@@ -738,6 +740,71 @@ export function runCost(timeline: Timeline, spans: StageSpan[], now: Date): RunC
     ...(nextRoundMinutes !== undefined ? { nextRoundMinutes } : {}),
     text: parts.join(" · "),
   };
+}
+
+export interface WhyBlocker {
+  kind: string;
+  detail: string;
+  command: string;
+}
+
+/** Plan 07f (R3/A4): the report behind `tt why <run>`. It is built from the
+ * log alone (`rebuildTimelineWithEvents`), so it answers a stopped run too and
+ * never asks a conductor to speak. Every blocker carries the command that
+ * clears it. */
+export interface WhyReport {
+  runId: string;
+  phaseId: string;
+  phase: string;
+  accepted: boolean;
+  candidate?: string;
+  blockers: WhyBlocker[];
+  exceptions: string[];
+  runnerRevision?: string;
+  bounds: Array<{ kind: string; scope: string; limitMs: number; elapsedMs: number }>;
+}
+
+export function whyReport(runDir: string, plan: RunPlanFile): WhyReport {
+  const { timeline, events } = rebuildTimelineWithEvents(runDir, plan);
+  const phase = timeline.state.phase;
+  const blockers = acceptanceBlockers(phase);
+  const revision = recordedRunnerRevision(runDir);
+  const bounds = events
+    .filter((e): e is Extract<typeof e, { type: "BOUND_REACHED" }> => e.type === "BOUND_REACHED")
+    .map((e) => ({ kind: e.kind, scope: e.scope, limitMs: e.limitMs, elapsedMs: e.elapsedMs }));
+  return {
+    runId: path.basename(runDir),
+    phaseId: phase.phaseId,
+    phase: phase.phase,
+    accepted: blockers.length === 0,
+    ...(phase.candidate ? { candidate: phase.candidate.sha } : {}),
+    blockers: blockers.map((b) => ({ kind: b.kind, detail: b.detail, command: b.command })),
+    exceptions: evaluationExceptions(phase).map((e) => `${e.kind}: ${e.detail}`),
+    ...(revision !== undefined ? { runnerRevision: revision } : {}),
+    bounds,
+  };
+}
+
+export function whyText(report: WhyReport): string {
+  const lines = [
+    `run ${report.runId} · phase ${report.phaseId} · ${report.phase}`,
+    report.accepted ? "accepted: yes — no acceptance blocker" : `accepted: no — ${report.blockers.length} blocker(s)`,
+  ];
+  if (report.candidate) lines.push(`candidate: ${report.candidate}`);
+  if (report.runnerRevision) lines.push(`runner revision: ${report.runnerRevision}`);
+  if (report.blockers.length > 0) {
+    lines.push("", "Blockers:");
+    for (const b of report.blockers) lines.push(`- [${b.kind}] ${b.detail}`, `  ${b.command}`);
+  }
+  if (report.exceptions.length > 0) {
+    lines.push("", "Open evaluation exceptions:");
+    for (const e of report.exceptions) lines.push(`- ${e}`);
+  }
+  if (report.bounds.length > 0) {
+    lines.push("", "Bounds reached:");
+    for (const b of report.bounds) lines.push(`- ${b.kind} (${b.scope}): ${b.elapsedMs}ms of ${b.limitMs}ms`);
+  }
+  return lines.join("\n");
 }
 
 export function buildView(

@@ -90,10 +90,12 @@ test("acceptanceBlockers lists failed checks missing test verifies open points f
     ["check", "test-verify", "point", "decision", "owner-request"],
   );
   const decision = blockers.find((b) => b.kind === "decision")!;
-  assert.match(decision.command, /override/, "the flagged reserved decision is cleared by an owner override");
+  assert.match(decision.command, /"type":"ruling"/, "the flagged reserved decision is cleared by an owner ruling");
+  assert.match(decision.command, /tt input/, "the ruling is a `tt input` command");
   const owner = blockers.find((b) => b.kind === "owner-request")!;
   assert.match(owner.command, /resolve/, "the open owner request is cleared by resolving it");
   assert.match(blockers.find((b) => b.kind === "point")!.detail, /F-1, F-2/, "the two points are one per-domain blocker");
+  assert.match(blockers.find((b) => b.kind === "point")!.command, /tt why r1/, "a point names `tt why`, not an owner command that cannot close it");
   assert.equal(accept(phase, C, K), false, "accept() is the blocker list being non-empty");
 
   const cleared = {
@@ -132,5 +134,19 @@ test("an item met by two of three seats with resolving anchors is met whatever t
     acceptanceBlockers(phase).filter((b) => b.kind === "item"),
     [],
     "R1's strict seat majority is met",
+  );
+
+  const unreadable = basePhase({
+    ...phase,
+    reviews: {
+      M: { review: { ...REVIEW("M", "met"), items: [{ id: "R1", verdict: "met", evidence: "no-such-file.ts:3" }] } },
+      A: { review: REVIEW("A", "met") },
+      B: { review: REVIEW("B", "unmet") },
+    },
+  });
+  assert.deepEqual(
+    acceptanceBlockers(unreadable).filter((b) => b.kind === "item").map((b) => b.detail),
+    ["R1 is met (the seats split on it) without a majority of resolving anchors"],
+    "an anchor that does not resolve does not count, so M is not a second met seat",
   );
 });

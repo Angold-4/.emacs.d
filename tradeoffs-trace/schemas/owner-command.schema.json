@@ -15,6 +15,7 @@
     { "$ref": "#/$defs/Unneeded" },
     { "$ref": "#/$defs/Verdict" },
     { "$ref": "#/$defs/Miss" },
+    { "$ref": "#/$defs/Ruling" },
     { "$ref": "#/$defs/PauseResumeMode" },
     { "$ref": "#/$defs/DVResolve" },
     { "$ref": "#/$defs/DVOverride" },
@@ -27,7 +28,8 @@
     { "$ref": "#/$defs/DVCorrection" },
     { "$ref": "#/$defs/DVUnneeded" },
     { "$ref": "#/$defs/DVVerdict" },
-    { "$ref": "#/$defs/DVMiss" }
+    { "$ref": "#/$defs/DVMiss" },
+    { "$ref": "#/$defs/DVRuling" }
   ],
   "$defs": {
     "RecordBinding": {
@@ -309,6 +311,28 @@
         "kind": { "const": "miss" },
         "recordId": { "type": "string", "minLength": 1 },
         "sample": { "type": "string", "minLength": 1 }
+      }
+    },
+    "DVRuling": {
+      "description": "Plan 07f (A3, §3.3): the owner's ruling. It names the records it settles and is final when recorded — no ballots, no repair round, no queued correction.",
+      "type": "object",
+      "required": ["type", "text", "recordIds", "binding"],
+      "properties": {
+        "type": { "const": "ruling" },
+        "text": { "type": "string", "minLength": 1 },
+        "recordIds": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "binding": { "$ref": "#/$defs/NoteBinding" }
+      }
+    },
+    "Ruling": {
+      "description": "Plan 07f (A3, §3.3): a flat owner ruling naming one or more findings or decisions.",
+      "type": "object",
+      "required": ["kind", "text", "recordIds"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "ruling" },
+        "text": { "type": "string", "minLength": 1 },
+        "recordIds": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
       }
     },
     "Verdict": {

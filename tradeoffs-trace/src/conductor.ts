@@ -160,6 +160,7 @@ import type {
   OwnerInputState,
   PhaseContract,
   PhaseState,
+  Ruling,
   Review,
   Reviewer,
   RoundRecord,
@@ -8178,6 +8179,26 @@ export class Conductor {
     }
   }
 
+  /** Plan 07f (A2): close every live decision bound to an older candidate or
+   * contract version. It is record-only (`DECISION_CLOSED` carries the
+   * reason) and idempotent: only live decisions are closed. */
+  #closeStaleDecisions(): void {
+    const phase = this.#state.phase;
+    if (!phase.candidate) return;
+    const C = phase.candidate.sha;
+    const K = phase.contract.contractVersion;
+    for (const decision of phase.decisions) {
+      if (!isLiveDecision(decision) || decision.amendment) continue;
+      const sameCandidate = decision.boundCandidateSha === C;
+      const sameContract = sameVersion(decision.boundContractVersion, K);
+      if (sameCandidate && sameContract) continue;
+      const reason = !sameCandidate
+        ? `the phase moved past candidate ${decision.boundCandidateSha.slice(0, 8)}`
+        : `the contract moved past version ${decision.boundContractVersion.version}`;
+      this.#applyEvent({ type: "DECISION_CLOSED", decisionId: decision.id, reason });
+    }
+  }
+
   /** Plan 06i: the triage pass — after the reviews and the evaluator's
    * item checks, before the item tally. EVERY finding and EVERY discovered
    * decision of the ledger gets exactly one disposition from `disposition()`
@@ -8191,6 +8212,11 @@ export class Conductor {
    * explicitly left `unchecked` after its one re-prompt) is UNCLASSIFIED and
    * escalates — the conductor never guesses an impact. */
   #applyTriage(): void {
+    // Plan 07f (A2): a decision bound to an older candidate or contract
+    // version is closed when the phase moves, with its reason in the log, so
+    // no past record can linger as blocker or trade-off. Closed BEFORE the
+    // snapshot below, so this pass sees the closed records.
+    this.#closeStaleDecisions();
     const phase = this.#state.phase;
     if (!phase.candidate) return;
     const C = phase.candidate.sha;
@@ -15002,6 +15028,7 @@ export class Conductor {
       ...(phase.contract.golden ? ["", "Golden note (the current source a choice must be re-checked against; a `contract` classification must cite it):", phase.contract.golden] : []),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       ...ledgerPromptLines(phase.messages),
       // Plan 05j: the evaluator sees the entries its messages belong to, so a
       // topic raised as another type is visible to it (plan item 3's
@@ -15296,6 +15323,7 @@ export class Conductor {
       ...phase.contract.acceptance.map((a) => `- ${a}`),
       ...secretPromptLines(this.#secretNames),
       ...directiveLines(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       ...ledgerPromptLines(phase.messages),
       "",
       "Your read-only checkout of the candidate is the working directory. This is the diff against the base:",
@@ -15646,6 +15674,7 @@ export class Conductor {
       `Candidate checkout (read-only): ${candidateDir}`,
       ...referenceLines(runReferences(this.#runDir)),
       ...directiveLines(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       // Plan 04a: the settled ledger, so a fresh reviewer never re-raises
       // what is already settled.
       ...ledgerPromptLines(phase.messages),
@@ -15751,6 +15780,7 @@ export class Conductor {
       // Plan 01i: the directives in force, and the contract rule that binds
       // them — always stated, whether or not one is in force right now.
       ...reviewerTurn2DirectiveSection(phase.ownerDirectives),
+      ...rulingLines(phase.rulings),
       // Plan 01e: the base's own failing tests, so a reviewer does not raise
       // them as this candidate's defect (runtime doc §8: reviewers kept
       // flagging the 14 pre-existing exchange-state-machine failures).
@@ -16242,6 +16272,15 @@ export function directiveItemsOwed(directives: readonly OwnerDirective[] | undef
  * directive with a numbered list is shown as its items `OD-n.k`, so the
  * worker can answer each one. Empty when none is in force, so a prompt with
  * no directive gains no section. */
+export function rulingLines(rulings: readonly Ruling[] | undefined): string[] {
+  if (!rulings || rulings.length === 0) return [];
+  return [
+    "",
+    "Owner rulings (final when recorded; binding, never voted on):",
+    ...rulings.map((r) => `- ${r.text} [settles ${r.recordIds.join(", ")}]`),
+  ];
+}
+
 export function directiveLines(directives: readonly OwnerDirective[] | undefined): string[] {
   const inForce = (directives ?? []).filter((d) => d.status === "in-force");
   if (inForce.length === 0) return [];

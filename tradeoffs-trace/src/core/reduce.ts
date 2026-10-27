@@ -23,6 +23,7 @@ import {
   applyItemCarried,
   applyOverrideCast,
   applyOwnerRequestResolved,
+  autoResolveLinkedRequest,
   checkFindingAcceptedByOwner,
   checkItemCarried,
   checkOverrideCast,
@@ -105,6 +106,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "ROUND_PANEL_DECIDED",
   "CANDIDATE_APPROVED",
   "OWNER_REQUEST_OPENED",
+  "RULING_RECORDED",
+  "DECISION_CLOSED",
   "OWNER_REQUEST_RESOLVED",
   "ACCEPTED",
   "PUBLISH_INTENT",
@@ -971,6 +974,71 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
       const check = checkOwnerRequestResolved(p, event);
       if (!check.ok) return rejected(state, check.reason!);
       return ok({ ...state, phase: applyOwnerRequestResolved(p, event) });
+    }
+
+    case "RULING_RECORDED": {
+      // Plan 07f (A3/§3.2): a ruling is final when recorded. It settles every
+      // record it names at once — a decision by id and unchanged choice, a
+      // finding of ANY kind by acceptance — and answers the open owner
+      // requests about those records. It is record-only: no loop, no queue.
+      const ruling = (event as Extract<Event, { type: "RULING_RECORDED" }>).ruling;
+      if (!ruling || typeof ruling.text !== "string" || ruling.text.trim().length === 0) {
+        return rejected(state, "a ruling needs non-empty text");
+      }
+      if (!Array.isArray(ruling.recordIds) || ruling.recordIds.length === 0) {
+        return rejected(state, "a ruling must name at least one record id");
+      }
+      const unknown = ruling.recordIds.filter(
+        (id) => !p.decisions.some((d) => d.id === id) && !p.findings.some((f) => f.id === id),
+      );
+      if (unknown.length > 0) return rejected(state, `a ruling names unknown record(s): ${unknown.join(", ")}`);
+      const decided = new Map(p.decisions.map((d) => [d.id, d]));
+      const rulings = [...(p.rulings ?? [])];
+      if (!rulings.some((r) => r.id === ruling.id)) rulings.push(ruling);
+      const ruledDecisions = [...(p.ruledDecisions ?? [])];
+      for (const id of ruling.recordIds) {
+        const decision = decided.get(id);
+        if (!decision) continue;
+        const kept = ruledDecisions.filter((r) => r.id !== id);
+        ruledDecisions.length = 0;
+        ruledDecisions.push(...kept, { id, choice: decision.choice, by: ruling.id });
+      }
+      const findings = p.findings.map((f) =>
+        ruling.recordIds.includes(f.id) && f.status === "open"
+          ? { ...f, status: "accepted" as const, acceptedScope: ruling.text, version: f.version + 1 }
+          : f,
+      );
+      let next: PhaseState = { ...p, rulings, ruledDecisions, findings };
+      for (const id of ruling.recordIds) {
+        next = autoResolveLinkedRequest(next, id, "ruled", p.candidate?.sha ?? "", p.contract.contractVersion);
+      }
+      return ok({ ...state, phase: next });
+    }
+
+    case "DECISION_CLOSED": {
+      // Plan 07f (A2/C1): a record bound to an older candidate or contract
+      // version is closed when the phase moves, with its reason in the log.
+      // Record-only, and idempotent (a second close leaves the record as it
+      // is).
+      const closed = event as Extract<Event, { type: "DECISION_CLOSED" }>;
+      const decision = p.decisions.find((d) => d.id === closed.decisionId);
+      if (!decision) return rejected(state, `unknown decision ${closed.decisionId}`);
+      if (typeof closed.reason !== "string" || closed.reason.trim().length === 0) {
+        return rejected(state, "a closed decision needs its reason");
+      }
+      const decisions = p.decisions.map((d) =>
+        d.id === closed.decisionId && isLiveDecision(d)
+          ? { ...d, supersededBy: closed.reason, version: d.version + 1 }
+          : d,
+      );
+      const next = autoResolveLinkedRequest(
+        { ...p, decisions },
+        closed.decisionId,
+        "closed",
+        p.candidate?.sha ?? "",
+        p.contract.contractVersion,
+      );
+      return ok({ ...state, phase: next });
     }
 
     case "BRIEF_RETRY_ATTEMPTED": {

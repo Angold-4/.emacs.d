@@ -1021,8 +1021,9 @@ test("plan 06i: a blocking-severity judgement finding is accepted as a trade-off
 
 test("plan 06i: a discovered decision justified only by a drafting decision that contradicts the golden source is a fix, not a trade-off", async () => {
   // The evaluator reads the golden note fixture and classifies the discovered
-  // decision `contract` (it contradicts the golden source). Even after a 3-0
-  // approve vote the disposition is fix and acceptance waits.
+  // decision `contract` (it contradicts the golden source). The fix
+  // disposition is still recorded; Plan 07f (A2) no longer lets a triage
+  // disposition on a decision block acceptance, so the seats' approval settles it.
   // A fixture golden note. The plan's drafting decision (M's discovery) says
   // a settled offer may carry halt; the golden note says it never may.
   const GOLDEN = "A settled offer must never carry halt; a halted book settles as halt.";
@@ -1097,16 +1098,95 @@ test("plan 06i: a discovered decision justified only by a drafting decision that
   });
   await setup.conductor.start();
   try {
-    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 120_000, 20, setup.runDir);
+    // Plan 07f (A2/§7): a triage disposition is no longer an acceptance
+    // gate. The seats' 3-0 approval settles the decision; the evaluator's
+    // `contract` classification is still recorded as a fix, but it does not
+    // park the phase or hold acceptance.
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 20, setup.runDir);
     const phase = setup.conductor.state.phase;
-    assert.notEqual(phase.phase, "DONE", "the decision must not be accepted away");
     const decision = phase.decisions.find((d) => d.source === "reviewer-discovered")!;
     assert.ok(decision, "the discovered decision exists");
     const approvals = phase.ballots.filter((b) => b.decisionId === decision.id && b.vote === "approve");
     assert.equal(approvals.length, 3, "all three seats approved it");
     const record = (phase.triage ?? []).find((r) => r.itemId === decision.id);
     assert.ok(record, "the decision has a triage record");
-    assert.equal(record!.disposition?.kind, "fix", "a contract contradiction is a fix, not a trade-off");
+    assert.equal(record!.disposition?.kind, "fix", "a contract contradiction is still recorded as a fix");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("plan 07f (R6): a discovered decision without an impact class is settled by the seats' vote, not an owner request", async () => {
+  // Exex 01b3p2 B-9/B-11: an unclassified discovered decision used to become
+  // an owner request. Plan 07f makes it a trade-off with its own choice,
+  // alternative and why; the seats' ballots settle it.
+  const setup = await setupConductor({
+    checks: ["true"],
+    stubReviews: false,
+    phase: { id: "p1", goal: "settle a discovered decision by vote", acceptance: ["it works"], checks: ["true"], boundaries: [], reserved: [], provisional: false, rounds: 1 },
+    workerScript: () => ({ hello: defaultWorkerHello(), steps: [{ kind: "call-sh", command: WRITE_SRC }, submitPhaseStep()] }),
+    reviewerScriptFor: (reviewer, state) => {
+      const ballots = [
+        {
+          decisionId: "D-p1-$TT_CANDIDATE_SHA8-disc-M-1",
+          vote: "approve" as const,
+          rationale: "the choice is sound",
+          evidence: ["src/a.ts:1"],
+        },
+      ];
+      return {
+        hello: defaultReviewerHello(),
+        steps: [
+          discoveryStep(reviewer === "M" ? [disclosure("batch cancels per tick", "delegated")] : []),
+          { kind: "wait-for-prompt" },
+          { kind: "call-tool", tool: "read", args: { path: "src/a.ts" } },
+          { kind: "call-submit", tool: "submit_review", args: reviewArgs(reviewer, state, { ballots }) },
+        ],
+      };
+    },
+    // The evaluator never classifies the decision: an explicit `unchecked`
+    // entry keeps the harness's default classification from filling it in. A
+    // second identical step covers the one re-prompt today's evaluator gets.
+    evaluatorScriptFor: (messageType, state) => {
+      const raw = (state.phase.messages ?? []).filter((m) => m.type === messageType && m.state === "raw");
+      const decision = (state.phase.decisions ?? []).find((d) => d.source === "reviewer-discovered");
+      const submit = {
+        kind: "call-submit" as const,
+        tool: "submit_evaluation",
+        args: {
+          evaluations: raw.map((m) => ({ messageId: m.id, action: "publish", title: "reviewed item", summary: m.summary, context: m.context, evidence: m.evidence })),
+          ...(messageType === "tradeoff" && decision
+            ? { itemChecks: [{ id: decision.id, verdict: "unchecked", evidence: "the evaluator left this to the seats" }] }
+            : {}),
+        },
+      };
+      return { hello: { role: "evaluator" as const, tools: ROLE_TOOLS.evaluator }, steps: [submit, submit] };
+    },
+    deadlines: FAST,
+  });
+  await setup.conductor.start();
+  try {
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 20, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const decision = phase.decisions.find((d) => d.source === "reviewer-discovered")!;
+    assert.ok(decision, "the discovered decision exists");
+    const record = (phase.triage ?? []).find((r) => r.itemId === decision.id);
+    assert.equal(record?.disposition?.kind, "tradeoff", "an unclassified decision without ballots is a trade-off");
+    if (record?.disposition?.kind === "tradeoff") {
+      assert.equal(record.disposition.chosen, decision.choice, "the trade-off carries the decision's own choice");
+      assert.equal(record.disposition.alternative, decision.alternatives[0].option, "and its own alternative");
+      assert.equal(record.disposition.why, decision.whyItMatters, "and its own why");
+    }
+    assert.ok(
+      !phase.ownerRequests.some((r) => r.linkedDecisionId === decision.id),
+      "no owner request names the discovered decision",
+    );
+    assert.ok(
+      !readEvents(setup.runDir).some(
+        (r) => r.kind === "event" && (r.event as { type?: string }).type === "OWNER_REQUEST_OPENED" && JSON.stringify(r.event).includes(decision.id),
+      ),
+      "no triage owner request was opened for it",
+    );
   } finally {
     await teardown(setup);
   }

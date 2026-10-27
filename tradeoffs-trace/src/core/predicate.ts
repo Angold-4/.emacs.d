@@ -40,7 +40,6 @@ import type { Domain } from "./domains.ts";
 import { evidenceFileAnchors, evidenceHasAnchor, flatItems, isStructured, itemNeedsEvidence, itemsFromPhase, phaseItemOutcomes, testVerifyProblems } from "./items.ts";
 import { factKeepsOpen } from "./fix-rounds.ts";
 import {
-  blockingTriageRecords,
   discoveredDecisions,
   findingDispositionIsTradeoff,
   openFindings,
@@ -680,14 +679,6 @@ function recordBinding(
   return { runId: phase.runId, phaseId: phase.phaseId, recordId, candidateSha, recordVersion, contractVersion };
 }
 
-function overrideCommand(phase: PhaseState, C: string, K: ContractVersion, decision: Decision): string {
-  return inputCommand(phase, {
-    type: "override",
-    vote: "approve",
-    binding: recordBinding(phase, C, K, decision.id, decision.version),
-  });
-}
-
 function resolveCommand(phase: PhaseState, C: string, K: ContractVersion, request: PhaseState["ownerRequests"][number]): string {
   const option =
     request.options.find((o) => o.id === "repair")?.id ?? request.options.find((o) => o.id === "accept_risk")?.id ?? request.options[0]?.id ?? "repair";
@@ -704,6 +695,12 @@ function acceptFindingCommand(phase: PhaseState, C: string, K: ContractVersion, 
     scope: "trade-off",
     binding: recordBinding(phase, C, K, finding.id, finding.version),
   });
+}
+
+/** Plan 07f (A1/A3): the ONE owner command that settles a trade-off record:
+ * a ruling. It is applied at once and never queues a correction. */
+function rulingCommand(phase: PhaseState, detail: string, recordId: string): string {
+  return inputCommand(phase, { type: "ruling", text: detail, recordIds: [recordId] });
 }
 
 /** A2/C1: how one seat's evidence is resolved against the candidate. The
@@ -899,7 +896,6 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
   const open = openFindings(phase);
   const pointIds = new Set<string>();
   const pointsByDomain = new Map<string, string[]>();
-  const pointFindings = new Map<string, import("./types.ts").Finding>();
   for (const finding of open) {
     if (!finding.domain && !finding.doneWhen) continue;
     const proves = pointHasProvingFact(phase, finding);
@@ -909,73 +905,56 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
     // finding, or the fact/domain review proves it.
     if (!factKeepsOpen(finding, facts, C) && proves) continue;
     pointIds.add(finding.id);
-    pointFindings.set(finding.id, finding);
     const key = finding.domain ?? "ungrouped";
     pointsByDomain.set(key, [...(pointsByDomain.get(key) ?? []), finding.id]);
   }
   for (const [domain, ids] of pointsByDomain) {
-    const commands = ids
-      .map((id) => pointFindings.get(id))
-      .filter((f): f is import("./types.ts").Finding => f !== undefined)
-      .map((f) => acceptFindingCommand(phase, C, K, f));
     const names = ids.map(shortId).join(", ");
     blockers.push({
       kind: "point",
       detail: `open point${ids.length === 1 ? "" : "s"} in ${domain}: ${names} — no proving fact closes ${ids.length === 1 ? "it" : "them"}`,
-      command: commands.length > 0 ? commands.join(" && ") : `tt resume ${phase.runId}`,
+      // Plan 07f (A1): a point is a record with a domain and its next fix loop,
+      // not an owner decision. `tt why` prints the point with its domain and
+      // the command that shows the next step; no owner command can close it.
+      command: `tt why ${phase.runId}`,
     });
   }
 
-  // Plan 06i: a record the triage dispositioned `fix` blocks acceptance,
-  // whatever the reviewer's severity label and whatever round it was raised
-  // in. A blocking finding that has not been triaged yet still blocks (fail
-  // safe). Points already named above are not repeated.
+  // Plan 07f (A2): triage dispositions are no longer acceptance gates of
+  // their own (a `fix` on a finding, a decision or an amendment no longer
+  // blocks acceptance by itself). What remains is a blocking finding that is
+  // still OPEN — a point or a trade-off the owner closes with a ruling.
   const covered = new Set(pointIds);
-  const blockingIds = new Set<string>();
-  for (const record of blockingTriageRecords(phase)) {
-    if (!covered.has(record.itemId)) blockingIds.add(record.itemId);
-  }
   for (const finding of open) {
     if (finding.severity !== "blocking" || covered.has(finding.id)) continue;
-    if (!(phase.triage ?? []).some((t) => t.itemId === finding.id)) blockingIds.add(finding.id);
-  }
-  for (const id of blockingIds) {
+    // Plan 07f (A2): a disposition `tradeoff` settles the finding; its old
+    // blocking label no longer blocks acceptance. An untriaged finding still
+    // blocks (fail safe).
+    if (findingDispositionIsTradeoff(phase.triage, finding.id)) continue;
     blockers.push({
       kind: "finding",
-      detail: `blocking finding ${shortId(id)} open`,
-      command: `tt resume ${phase.runId}`,
+      detail: `blocking finding ${shortId(finding.id)} open`,
+      command: rulingCommand(phase, `accept ${shortId(finding.id)}`, finding.id),
     });
   }
 
-  // Plan 07f (F1): one blocker (and one override) per unsettled decision, so
-  // every outstanding decision has its own visible clearing action. A
-  // decision `decisionSettled` already settles is not a blocker whatever its
-  // binding (C1: acceptance keeps its old result for those records).
+  // Plan 07f (F1/A2): one blocker (and one ruling) per unsettled decision, so
+  // every outstanding decision has its own visible clearing action. A record
+  // bound to an older candidate or contract version was closed when the phase
+  // moved (conductor records DECISION_CLOSED); it never blocks acceptance.
   for (const decision of phase.decisions) {
-    // A decision superseded by a correction (design §7.5 step 1) is
-    // historical: the correction, not the original decision's vote or
-    // owner resolution, is what acceptance now depends on.
     if (!isLiveDecision(decision)) continue;
     // Plan 01g: an amendment record is never an acceptance blocker by itself.
     if (decision.amendment) continue;
     if (decisionSettled(decision, phase, C, K)) continue;
-    if (decision.boundCandidateSha !== C) {
-      blockers.push({
-        kind: "decision",
-        detail: `trade-off ${shortId(decision.id)} is not bound to the current candidate`,
-        // The owner's override is the one command that settles a decision
-        // without another review round; it also clears a flagged reserved one.
-        command: overrideCommand(phase, C, K, decision),
-      });
-      continue;
-    }
+    if (decision.boundCandidateSha !== C || !sameVersion(decision.boundContractVersion, K)) continue;
     const why = decisionStatus(decision, phase).reason ?? "failed";
     const veto = /([A-Za-z0-9_]+) veto/.exec(why);
     const verb = veto ? `vetoed by ${veto[1]}` : `failed (${why})`;
     blockers.push({
       kind: "decision",
       detail: `${shortId(decision.id)} ${verb}`,
-      command: overrideCommand(phase, C, K, decision),
+      command: rulingCommand(phase, `rule ${shortId(decision.id)} as recorded`, decision.id),
     });
   }
 

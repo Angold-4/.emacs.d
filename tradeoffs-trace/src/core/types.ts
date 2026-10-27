@@ -629,6 +629,21 @@ export interface RuledDecision {
   by: string;
 }
 
+/** Plan 07f (A3, §3.2): a recorded owner ruling — the third record kind. It
+ * settles the records it names at once and is final when recorded: no
+ * ballots, no evaluator pass, no repair round, and it is read by every later
+ * reducer brief. */
+export interface Ruling {
+  /** Stable id (`RUL-<command id>`). */
+  id: string;
+  /** The owner's text, verbatim. */
+  text: string;
+  /** The finding and decision ids it settles. */
+  recordIds: string[];
+  by: "owner" | "lead";
+  at?: string;
+}
+
 export interface Correction {
   id: string;
   version: number;
@@ -910,6 +925,15 @@ export interface MissCommand {
   sample?: string;
 }
 
+/** Plan 07f (A3, §3.3): the owner's `ruling` input. It names the records it
+ * settles and is applied at once — it never enters `queuedCorrections` and
+ * never forces a repair round. */
+export interface RulingCommand {
+  kind: "ruling";
+  text: string;
+  recordIds: string[];
+}
+
 export interface PauseResumeModeCommand {
   kind: "pause" | "resume" | "mode";
   mode?: "delegate" | "co-work";
@@ -937,6 +961,7 @@ export type OwnerCommand =
   | UnneededCommand
   | VerdictCommand
   | MissCommand
+  | RulingCommand
   | PauseResumeModeCommand;
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1223,10 @@ export interface PhaseState {
    * every later candidate whose decision has the same id and choice, with no
    * ballots and no re-tally. */
   ruledDecisions?: RuledDecision[];
+  /** Plan 07f (A3): every owner ruling recorded in this phase, in order. A
+   * ruling is final when recorded and is quoted in every later reducer
+   * brief. */
+  rulings?: Ruling[];
   ballots: Ballot[];
   overrides: Override[];
   /** Outstanding dispatches next() must not re-emit (design §9.3's intent
@@ -2375,6 +2404,24 @@ export interface EvOwnerInputRecorded {
   input: OwnerInputRecord;
 }
 
+/** Plan 07f (A3): one owner ruling, recorded. It settles every record it
+ * names (a decision by id and unchanged choice, any finding by acceptance)
+ * and answers any open owner request linked to them. Record-only: it moves no
+ * phase-state name and forces no loop. */
+export interface EvRulingRecorded {
+  type: "RULING_RECORDED";
+  ruling: Ruling;
+}
+
+/** Plan 07f (A2/C1): a decision the phase has moved past — it is bound to an
+ * older candidate or contract version — is closed, never left blocking. The
+ * reason is recorded in the log with the event. */
+export interface EvDecisionClosed {
+  type: "DECISION_CLOSED";
+  decisionId: string;
+  reason: string;
+}
+
 /** Plan 01i: records one owner directive (`OD-<seq>`) the moment it is
  * accepted. Record-only: it moves no phase-state name, it appends a binding
  * record the phase carries until withdrawn and every later prompt quotes. */
@@ -2957,6 +3004,8 @@ export type Event =
   | EvNoteAdded
   | EvOwnerCorrectionQueued
   | EvOwnerInputRecorded
+  | EvRulingRecorded
+  | EvDecisionClosed
   | EvDirectiveAdded
   | EvDirectiveWithdrawn
   | EvDirectiveDelivered
