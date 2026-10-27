@@ -719,7 +719,7 @@ export async function runConsolidation(host: ConsolidationHost): Promise<Consoli
   }
   if (host.stopRequested?.()) return { ok: false, fixes: 0, stopped: true };
   if (typeof build.sha !== "string" || build.sha.length === 0) {
-    return { ok: false, fixes: 0, note: build.note ?? "the consolidator produced no commit" };
+    return { ok: false, fixes: 0, note: build.note ?? "the consolidator produced no commit", ...submitted(build) };
   }
   const check = async (sha: string): Promise<LaneCheck> => {
     try {
@@ -741,23 +741,47 @@ export async function runConsolidation(host: ConsolidationHost): Promise<Consoli
     }
     if (typeof fixed.sha !== "string" || fixed.sha.length === 0 || fixed.sha === build.sha) {
       fixNote = fixed.note;
+      build = { ...build, disclosures: unionDisclosures(build.disclosures, fixed.disclosures) };
       break;
     }
-    build = { ...fixed, added: fixed.added ?? build.added, disclosures: fixed.disclosures ?? build.disclosures };
+    build = { ...fixed, added: fixed.added ?? build.added, disclosures: unionDisclosures(build.disclosures, fixed.disclosures) };
     result = await check(build.sha!);
   }
   if (host.stopRequested?.()) return { ok: false, fixes, stopped: true };
-  if (result.ok)
-    return {
-      ok: true,
-      sha: build.sha,
-      fixes,
-      ...(build.added ? { added: build.added } : {}),
-      ...(build.disclosures ? { disclosures: build.disclosures } : {}),
-    };
+  if (result.ok) return { ok: true, sha: build.sha, fixes, ...submitted(build) };
   return {
     ok: false,
     fixes,
     note: `its commit ${build.sha!.slice(0, 7)} failed the round checks: ${result.note ?? "a check command failed"}${fixNote ? ` (${fixNote})` : ""}`,
+    ...submitted(build),
   };
+}
+
+/** Plan 07c (C3): what a consolidator's or fixer's submissions reported —
+ * kept on every outcome, a failed one included, so a fixer's disclosures are
+ * never lost with its commit. */
+function submitted(build: LaneBuild): Pick<ConsolidationOutcome, "added" | "disclosures"> {
+  return {
+    ...(build.added ? { added: build.added } : {}),
+    ...(build.disclosures && build.disclosures.length > 0 ? { disclosures: build.disclosures } : {}),
+  };
+}
+
+/** Plan 07c (C3): a fixer's decisions across its submissions (its build and
+ * each fix), in order, each once — a later submission that leaves out an
+ * earlier decision does not drop it. */
+function unionDisclosures(
+  earlier: readonly DecisionDisclosure[] | undefined,
+  later: readonly DecisionDisclosure[] | undefined,
+): DecisionDisclosure[] | undefined {
+  if (!earlier && !later) return undefined;
+  const seen = new Set<string>();
+  const out: DecisionDisclosure[] = [];
+  for (const d of [...(earlier ?? []), ...(later ?? [])]) {
+    const key = JSON.stringify(d);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(d);
+  }
+  return out;
 }

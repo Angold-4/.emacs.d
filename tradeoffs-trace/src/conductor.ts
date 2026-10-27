@@ -9143,12 +9143,19 @@ export class Conductor {
       });
       this.#log.append("sweep", { ...sweepResult, fixer: opts.lane });
       const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} round ${opts.round} ${opts.roleWord}`);
+      const disclosures = handle.consolidationDisclosures ?? [];
       // A commit with the base's own tree changed nothing: it is no work.
       if (!fix && treeOf(this.#plan.repo, sha) === treeOf(this.#plan.repo, base)) {
         this.#log.completion(actionId, { round: opts.round, outcome: "unchanged", sha });
-        return { lane: opts.lane, note: opts.changedNothingNote ?? `the ${opts.roleWord} changed nothing on the base` };
+        // Plan 07c (C3): a fixer that changed nothing may still have reported
+        // a trade-off it met; its submission is kept with the note.
+        return {
+          lane: opts.lane,
+          note: opts.changedNothingNote ?? `the ${opts.roleWord} changed nothing on the base`,
+          ...(handle.consolidationAdded && handle.consolidationAdded.length > 0 ? { added: handle.consolidationAdded } : {}),
+          ...(disclosures.length > 0 ? { disclosures } : {}),
+        };
       }
-      const disclosures = handle.consolidationDisclosures ?? [];
       this.#log.completion(actionId, { round: opts.round, sha, added: handle.consolidationAdded });
       return { lane: opts.lane, sha, added: handle.consolidationAdded, ...(disclosures.length > 0 ? { disclosures } : {}) };
     } finally {
@@ -9322,7 +9329,7 @@ export class Conductor {
           `Your fixer commit ${sha.slice(0, 7)} FAILED the fix check (${this.#state.phase.contract.fixChecks ?? "none"}), so it cannot be merged.`,
           "",
           "Fix exactly what fails, in this worktree (it holds your commit). Change only what your findings need; do not delete, skip or #[ignore] a test to make the check pass.",
-          `Run \`${this.#state.phase.contract.fixChecks ?? "none"}\` until it passes, then call submit_phase again with decisions [] and assumptions [], and in deviations anything you changed.`,
+          `Run \`${this.#state.phase.contract.fixChecks ?? "none"}\` until it passes, then call submit_phase again with all your disclosures: in decisions every trade-off you met beyond your findings (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond your findings.`,
           `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
           "",
           `The failure: ${failure}`,
@@ -9343,7 +9350,8 @@ export class Conductor {
         });
         if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
           this.#log.append("fixer_fix_unchanged", { round, domain: task.domain, sha, fixedSha: fixed.sha });
-          return { lane, note: `its fix of ${sha.slice(0, 7)} changed nothing` };
+          // Plan 07c (C3): the fix's own submission is kept with the note.
+          return { lane, note: `its fix of ${sha.slice(0, 7)} changed nothing`, ...(fixed.disclosures ? { disclosures: fixed.disclosures } : {}) };
         }
         return fixed;
       },
@@ -9427,7 +9435,7 @@ export class Conductor {
       `- Your worktree starts from base ${base.slice(0, 7)}; the other fixers run in their own worktrees in parallel, so never touch their work.`,
       "- Run each finding's doneWhen command yourself until it passes.",
       "- Do not commit; tt commits your worktree when you submit. tt runs the fix check on your commit and sends a failure back to you.",
-      "- Call submit_phase when done: decisions [] and assumptions [], and in deviations anything you changed beyond these findings.",
+      "- Call submit_phase when done, reporting anything beyond these findings as a disclosure: in decisions every trade-off you met (reported, not decided), in assumptions what you assumed, and in deviations anything you changed beyond these findings.",
       `- You have about ${Math.max(1, Math.floor(this.#deadlines.workerAttemptMs / 60_000))} minutes.`,
     );
     return lines.join("\n");
@@ -9467,13 +9475,19 @@ export class Conductor {
       break;
     }
     // Plan 07c (D4.7): a resumed fix round's synthetic lane has no worker
-    // completion to restore from, so its check base and disclosures come from
-    // the recorded ROUND_FIXED whose merged candidate it is. Without this a
-    // resumed check loses base B (and the wide-path tier it selects).
-    const fixRecord = (this.#state.phase.rounds ?? []).find((r) => r.fixed?.candidate === sha)?.fixed;
-    if (fixRecord) {
-      if (!this.#laneCheckBases.has(key)) this.#laneCheckBases.set(key, fixRecord.base);
+    // completion to restore from, so its check base, start time and
+    // disclosures come from the previous round's recorded ROUND_FIXED, exactly
+    // as the fresh path sets them. The base is B even for a lane-fix commit of
+    // the merged candidate (whose own intent names the round base C), so a
+    // resumed check never diffs against the wrong base (or misses the final
+    // tier a wide path selects).
+    const fix = lane === "a" ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
+    const fixRecord = fix ? (this.#state.phase.rounds ?? []).find((r) => r.fixed?.candidate === fix.candidate)?.fixed : undefined;
+    if (fix && fixRecord) {
+      this.#laneCheckBases.set(key, fix.base);
+      if (!this.#laneStartedAt.has(key)) this.#laneStartedAt.set(key, Date.now());
       if (build.disclosures === undefined && fixRecord.disclosures) build = { ...build, disclosures: fixRecord.disclosures };
+      if (build.added === undefined && fixRecord.added) build = { ...build, added: fixRecord.added };
     }
     this.#laneBuilds.set(key, build);
     // A candidate checked before the stop: its output (for the hand-off's
@@ -9513,8 +9527,9 @@ export class Conductor {
     // so every other run's workers are paused while it runs.
     const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     try {
-      this.#log.append("lane_check_started", { round, lane, candidateSha: sha });
-      const result = await this.#runLaneChecks(lane, sha, this.#laneCheckBases.get(`${round}-${lane}`));
+      const laneBase = this.#laneCheckBases.get(`${round}-${lane}`);
+      this.#log.append("lane_check_started", { round, lane, candidateSha: sha, ...(laneBase ? { base: laneBase } : {}) });
+      const result = await this.#runLaneChecks(lane, sha, laneBase);
       this.#log.append("lane_check_finished", { round, lane, candidateSha: sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
       return result;
     } finally {

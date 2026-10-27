@@ -335,6 +335,8 @@ test("a fixer's prompt has its own findings in full and only a one-line index of
     assert.ok(booking!.includes(BOOKING_DONE), "its own doneWhen is in the brief");
     assert.ok(booking!.includes(gatesTask.findingIds[0]), "the other task's finding id is in the index");
     assert.ok(!booking!.includes("GATES_EXPECTED"), "the other task's expected text is NOT in the brief");
+    // Plan 07c (C3): anything beyond its findings is reported as a disclosure.
+    assert.ok(!booking!.includes("decisions []"), "the brief never asks the fixer for empty decisions");
   } finally {
     await teardown(setup);
     cleanupDir(promptDir);
@@ -404,10 +406,29 @@ test("a fixer's out-of-task decision disclosure reaches the phase record", async
   try {
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
-    const choices = (setup.conductor.state.phase.decisions ?? []).map((d) => d.choice);
-    assert.ok(choices.includes("FIXER_DISCLOSURE_booking"), `the booking fixer's disclosure reached the phase record: ${JSON.stringify(choices)}`);
-    assert.ok(choices.includes("FIXER_DISCLOSURE_gates"), `the gates fixer's disclosure reached the phase record: ${JSON.stringify(choices)}`);
-    const added = setup.conductor.state.phase.rounds?.[0]?.fixed?.added ?? [];
+    const fixed = setup.conductor.state.phase.rounds?.[0]?.fixed;
+    assert.ok(fixed?.candidate, "the fix round merged a candidate");
+    // ROUND_FIXED keeps every fixer's decisions, in task order (booking, gates).
+    assert.deepEqual(
+      (fixed!.disclosures ?? []).map((d) => d.choice),
+      ["FIXER_DISCLOSURE_booking", "FIXER_DISCLOSURE_gates"],
+      "the fixers' decisions are recorded on ROUND_FIXED in task order",
+    );
+    // The merged candidate's hand-off records them as the phase's own
+    // decisions, bound to that candidate.
+    const decisions = setup.conductor.state.phase.decisions ?? [];
+    const choices = decisions.map((d) => d.choice);
+    for (const domain of ["booking", "gates"]) {
+      const decision = decisions.find((d) => d.choice === `FIXER_DISCLOSURE_${domain}`);
+      assert.ok(decision, `the ${domain} fixer's disclosure reached the phase record: ${JSON.stringify(choices)}`);
+      assert.equal(decision!.source, "worker", `the ${domain} fixer's disclosure is the phase's own (worker) decision`);
+      assert.equal(decision!.boundCandidateSha, fixed!.candidate, `the ${domain} fixer's disclosure is bound to the merged candidate`);
+    }
+    assert.ok(
+      choices.indexOf("FIXER_DISCLOSURE_booking") < choices.indexOf("FIXER_DISCLOSURE_gates"),
+      `the phase records the fixers' decisions in task order: ${JSON.stringify(choices)}`,
+    );
+    const added = fixed!.added ?? [];
     assert.ok(added.includes("FIXER_DEVIATION_booking") && added.includes("FIXER_DEVIATION_gates"), `the fixers' notes are kept: ${JSON.stringify(added)}`);
   } finally {
     await teardown(setup);
@@ -595,16 +616,21 @@ test("a phase with domain findings reaches acceptance through a fix round", asyn
 test("a fix round resumed after ROUND_FIXED starts the next round from the recorded candidate", async () => {
   const counter = `/tmp/tt-07c-fixer-counter-${process.pid}`;
   fs.rmSync(counter, { force: true });
-  // Plan 07c (A4): the fix candidate touches a wide path, so the resumed
-  // check must diff against the recorded fix base B and run the final tier.
+  // Plan 07c (A4): the next round's check of the merged candidate is held
+  // until `release` exists, so the stop lands inside that unfinished round.
+  // The candidate touches a wide path, so the resumed check must diff against
+  // the recorded fix base B and run the final tier.
+  const release = `/tmp/tt-07c-resume-release-${process.pid}`;
+  fs.rmSync(release, { force: true });
   const finalMarker = `/tmp/tt-07c-resume-final-${process.pid}`;
   fs.rmSync(finalMarker, { force: true });
+  const hold = `if [ -f booking-fixed.txt ] && [ ! -f ${release} ]; then sleep 30; fi; true`;
+  const finalCheck = `echo final >> ${finalMarker}`;
   const promptDir = fs.mkdtempSync("/tmp/tt-07c-resume-");
   const promptLog = path.join(promptDir, "prompts.txt");
   const setup = await setupConductor({
-    phase: fixPhase({ finalChecks: [`echo final >> ${finalMarker}`], widePaths: ["booking-fixed.txt"] }),
+    phase: fixPhase({ checks: [hold], finalChecks: [finalCheck], widePaths: ["booking-fixed.txt"] }),
     checks: ["true"],
-    phaseChecks: ["true"],
     stubReviews: true,
     deadlines: FAST,
     extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
@@ -621,31 +647,58 @@ test("a fix round resumed after ROUND_FIXED starts the next round from the recor
       ],
     }),
   });
+  const roundTwoCheckStarts = () =>
+    readLog(runPaths(setup.runDir).events).records.filter(
+      (r) => r.kind === "lane_check_started" && (r.event as { round?: number }).round === 2,
+    );
   let resumed: Conductor | undefined;
   try {
     await setup.conductor.start();
     await waitFor(() => setup.conductor.state.phase.rounds?.[0]?.fixed !== undefined, 180_000, 50, setup.runDir);
-    const candidate = setup.conductor.state.phase.rounds![0].fixed!.candidate!;
+    const fixed = setup.conductor.state.phase.rounds![0].fixed!;
+    const candidate = fixed.candidate!;
+    assert.notEqual(fixed.base, candidate, "the fix base B is not the merged candidate");
+    // The next round has started and is checking the merged candidate (held).
+    await waitFor(() => roundTwoCheckStarts().length > 0, 60_000, 50, setup.runDir);
     await setup.conductor.stop();
     const runs = () => fs.readFileSync(counter, "utf8").split("\n").filter((l) => l.length > 0);
     const before = runs().length;
     assert.equal(before, 2, "two fixers ran before the stop");
+    const stoppedRound = setup.conductor.state.phase.rounds![1];
+    assert.equal(stoppedRound.candidates[0]?.sha, candidate, "the stopped round's candidate is the merged one");
+    assert.equal(stoppedRound.candidates[0]?.ok, undefined, "the stop left the next round unfinished (its candidate unchecked)");
+    const startsBefore = roundTwoCheckStarts().length;
 
+    fs.writeFileSync(release, "go\n");
     resumed = resumeConductor(setup);
     await resumed.start();
-    await waitFor(() => (resumed!.state.phase.rounds?.length ?? 0) >= 2, 180_000, 50, setup.runDir);
+    await waitFor(() => resumed!.state.phase.rounds?.[1]?.candidates[0]?.ok !== undefined, 180_000, 50, setup.runDir);
     assert.equal(runs().length, before, "no fixer started again after the resume");
     const second = resumed!.state.phase.rounds![1];
     assert.equal(second.base, candidate, "the next round's base is the recorded candidate");
     assert.equal(second.candidates[0].sha, candidate, "the next round's candidate is the recorded one");
-    // Plan 07c (A4): the synthetic lane's check base is restored from the
-    // recorded ROUND_FIXED, so the wide-path diff against B runs the final tier.
-    await waitFor(() => fs.existsSync(finalMarker), 120_000, 50, setup.runDir);
-    assert.ok(fs.existsSync(finalMarker), "the resumed check diffed against B and ran the final checks");
+    // Plan 07c (A4): the resumed (unfinished) round's check of the synthetic
+    // lane uses the recorded fix base B, exactly as the fresh check did.
+    const starts = roundTwoCheckStarts();
+    assert.ok(starts.length > startsBefore, "the resumed round checked the merged candidate again");
+    for (const r of starts) {
+      const e = r.event as { lane?: string; candidateSha?: string; base?: string };
+      assert.equal(e.candidateSha, candidate, "round 2 checks the merged candidate");
+      assert.equal(e.base, fixed.base, "the check of the merged candidate diffs against the fix base B");
+    }
+    // Its wide-path diff against B selects the final tier in the resumed check.
+    const record = JSON.parse(fs.readFileSync(path.join(runPaths(setup.runDir).checks, candidate, "record.json"), "utf8")) as {
+      commands: Array<{ command: string }>;
+    };
+    assert.ok(
+      record.commands.some((c) => c.command === finalCheck),
+      `the resumed check ran the final tier: ${JSON.stringify(record.commands.map((c) => c.command))}`,
+    );
   } finally {
     if (resumed) await resumed.stop();
     await teardown(setup);
     fs.rmSync(counter, { force: true });
+    fs.rmSync(release, { force: true });
     fs.rmSync(finalMarker, { force: true });
     cleanupDir(promptDir);
   }
