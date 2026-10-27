@@ -23,6 +23,7 @@
 
 import * as fs from "node:fs";
 
+import { boundByKeyword, boundIssue } from "./bounds.ts";
 import { expandPromptPath, isLaneId } from "./worker-prompt.ts";
 import { matchesGlob } from "./boundaries.ts";
 import { domainDeclarationIssues, type Domain } from "./domains.ts";
@@ -66,6 +67,10 @@ export type LintRule =
   | "cheap-final-check"
   // tt 09 (change 3): `#+TT_CONSOLIDATE` is `on` or `off`.
   | "consolidate"
+  // Plan 07e (E3): every bound keyword is a positive whole number, and the
+  // check-window opt-in is a known value.
+  | "bound"
+  | "check-window"
   // Plan 07c (D4): `#+TT_FIX_ROUNDS` needs `#+TT_DOMAINS`; the value is
   // `domains`, and `#+TT_FIXERS` is a positive whole number.
   | "fix-rounds";
@@ -322,6 +327,15 @@ export interface LintPlanInput {
   fixChecks?: unknown;
   /** Lint-only: the 1-based line of `#+TT_FIX_CHECKS:`. */
   fixChecksLine?: number;
+  /** Plan 07e (E3): every bound keyword's raw value, by keyword, and the
+   * 1-based line each was written on. */
+  bounds?: Record<string, unknown>;
+  boundLines?: Record<string, number>;
+  /** Plan 07e (E4): the `#+TT_CHECK_WINDOW:` opt-in, kept open so lint can
+   * name a value other than `exclusive`/`off`. */
+  checkWindow?: unknown;
+  /** Lint-only: the 1-based line of `#+TT_CHECK_WINDOW:`. */
+  checkWindowLine?: number;
   /** `#+TT_WORKER_PROMPT`: lane to the files appended to its worker. Kept
    * open (`unknown`) so a malformed value still reaches the linter. */
   workerPrompt?: Record<string, unknown>;
@@ -836,6 +850,8 @@ export function lintPlan(plan: LintPlanInput): LintFinding[] {
     ...lintConsolidate(plan),
     ...lintDomains(plan),
     ...lintFixRounds(plan),
+    ...lintBounds(plan),
+    ...lintCheckWindow(plan),
   ];
   for (const phase of plan.phases ?? []) {
     const phaseId = phase.id ?? "?";
@@ -1156,6 +1172,48 @@ function consolidateFinding(keyword: string, value: unknown, phaseId: string, li
     problem: `${keyword} must be on or off, got ${JSON.stringify(String(value))}`,
     fix: "write on (the default with two or more workers: a consolidator combines what each lane met) or off (the next round starts from the winner only)",
   };
+}
+
+/** Plan 07e (E3): a bound keyword set to zero, a negative number or a
+ * non-number is an error naming the keyword and its line. Emacs drops such a
+ * value silently; the linter must not. */
+export function lintBounds(plan: LintPlanInput): LintFinding[] {
+  const out: LintFinding[] = [];
+  for (const [keyword, raw] of Object.entries(plan.bounds ?? {})) {
+    const issue = boundIssue(raw);
+    if (!issue) continue;
+    const bound = boundByKeyword(keyword);
+    out.push({
+      severity: "error",
+      rule: "bound",
+      phaseId: "bounds",
+      item: `${keyword}: ${String(raw)}`,
+      line: plan.boundLines?.[keyword],
+      sourceFile: plan.sourceFile,
+      problem: `${keyword} ${issue}${bound ? ` (${bound.kind} bound, default ${bound.defaultValue}${bound.unit === "minutes" ? "m" : ""})` : ""}`,
+      fix: `set ${keyword} to a positive whole number${bound?.unit === "minutes" ? " of minutes" : ""}, or remove the keyword to keep the default`,
+    });
+  }
+  return out;
+}
+
+/** Plan 07e (E4): the check window is off unless the plan says `exclusive`. */
+export function lintCheckWindow(plan: LintPlanInput): LintFinding[] {
+  if (plan.checkWindow === undefined) return [];
+  const value = String(plan.checkWindow).trim();
+  if (value === "exclusive" || value === "off") return [];
+  return [
+    {
+      severity: "error",
+      rule: "check-window",
+      phaseId: "check-window",
+      item: `#+TT_CHECK_WINDOW: ${value}`,
+      line: plan.checkWindowLine,
+      sourceFile: plan.sourceFile,
+      problem: `#+TT_CHECK_WINDOW must be \`exclusive\` (opt in) or \`off\`, got "${value}"`,
+      fix: "write #+TT_CHECK_WINDOW: exclusive to pause workers for another run's check, or remove the keyword (off)",
+    },
+  ];
 }
 
 /** tt 09 (change 3): lint the plan's `#+TT_CONSOLIDATE:` value. */

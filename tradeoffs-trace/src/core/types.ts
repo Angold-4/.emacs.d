@@ -1629,6 +1629,26 @@ export interface EvAttemptTimedOut {
   type: "ATTEMPT_TIMED_OUT";
 }
 
+/** Plan 07e (E2/A2): a named bound was reached. Record-only: it changes no
+ * phase state, accepts nothing and rejects nothing. `action` is the table's
+ * own sentence for what the conductor did next. */
+export interface EvBoundReached {
+  type: "BOUND_REACHED";
+  kind: "worker-attempt" | "check" | "review" | "evaluate" | "gate" | "sh" | "fact" | "fixer-attempt" | "merge" | "final-check" | "owner-wait" | "rounds";
+  scope: string;
+  limitMs: number;
+  elapsedMs: number;
+  action: string;
+}
+
+/** Plan 07e (E2/A3): the rounds budget ran out. It names today's not-accepted
+ * reasons and leaves the state where it was: the existing
+ * REPAIR_BUDGET_EXHAUSTED transition still parks in AWAITING_OWNER. */
+export interface EvLeadCalled {
+  type: "LEAD_CALLED";
+  reasons: string[];
+}
+
 /** Plan 04a: one message type's evaluator state inside EVALUATING. */
 export interface EvaluatorOutcome {
   settled?: boolean;
@@ -2861,6 +2881,8 @@ export type Event =
   | EvCandidateApproved
   | EvSubmitPhase
   | EvAttemptTimedOut
+  | EvBoundReached
+  | EvLeadCalled
   | EvAttemptNoSubmission
   | EvAttemptInterrupted
   | EvWorkerResumed

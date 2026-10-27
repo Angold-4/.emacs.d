@@ -689,6 +689,8 @@ export function renderStatusText(
   // `held` and never signalled. One line each, with its pid, command and cwd.
   for (const h of held) lines.push(`held: ${h.pid} ${h.command} (cwd ${h.cwd})`);
   lines.push(`phase: ${phase.phaseId} — ${phase.phase}`);
+  // Plan 07e (E4): the pause cause is explicit in the status, never `idle`.
+  if (view.pausedBy) lines.push(`paused by run ${view.pausedBy}'s check`);
   const attempt = phase.attempt as { n: number; interrupted?: boolean } | undefined;
   if (attempt) lines.push(`attempt: ${attempt.n}${attempt.interrupted ? " (interrupted)" : ""}`);
   const candidate = phase.candidate as { sha: string } | undefined;
@@ -718,6 +720,7 @@ export function renderStatusText(
   if (env?.blocked) lines.push(envBlockedLine(env.blocked));
   if (phase.publishedI) lines.push(`published: ${phase.publishedI}`);
   lines.push(`pipeline: ${view.pipeline}`);
+  if (view.bounds) lines.push(`bounds: ${view.bounds}`);
   lines.push(`gates: ${view.gates}`);
   if (view.gate) lines.push(`gate: ${view.gate}`);
   if (view.baseline) lines.push(`base: ${view.baseline}`);

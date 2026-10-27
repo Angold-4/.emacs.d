@@ -455,6 +455,77 @@ test("plan lane-prompt: lint refuses a missing file, an empty file name and an u
   }
 });
 
+test("plan 07e: tt lint refuses a zero, a negative or a non-numeric bound keyword, naming it and its line", () => {
+  const parsed = parseOrgPlan(
+    [
+      "#+TITLE: t",
+      "#+TT_CHECK_MINUTES: 0",
+      "#+TT_MERGE_MINUTES: soon",
+      "#+TT_OWNER_WAIT_MINUTES: -5",
+      "",
+      "* p",
+      "  :PROPERTIES:",
+      "  :ID: p",
+      "  :END:",
+      "",
+    ].join("\n"),
+    "/plans/x/plan.org",
+  );
+  assert.equal(parsed.bounds?.TT_CHECK_MINUTES, "0");
+  assert.equal(parsed.boundLines?.TT_MERGE_MINUTES, 3);
+  const findings = lintPlan(parsed).filter((f) => f.rule === "bound");
+  assert.deepEqual(
+    findings.map((f) => [f.item?.split(":")[0], f.line]).sort(),
+    [
+      ["TT_CHECK_MINUTES", 2],
+      ["TT_MERGE_MINUTES", 3],
+      ["TT_OWNER_WAIT_MINUTES", 4],
+    ],
+  );
+  assert.ok(findings.every((f) => f.severity === "error"));
+});
+
+test("plan 07e: every bound keyword accepts a positive whole number", () => {
+  const parsed = parseOrgPlan(
+    [
+      "#+TT_SH_MINUTES: 3",
+      "#+TT_CHECK_MINUTES: 5",
+      "#+TT_ATTEMPT_MINUTES: 45",
+      "#+TT_GATE_MINUTES: 30",
+      "#+TT_REVIEW_MINUTES: 15",
+      "#+TT_EVALUATE_MINUTES: 10",
+      "#+TT_FACT_MINUTES: 5",
+      "#+TT_FIX_ATTEMPT_MINUTES: 45",
+      "#+TT_MERGE_MINUTES: 10",
+      "#+TT_FINAL_CHECK_MINUTES: 5",
+      "#+TT_OWNER_WAIT_MINUTES: 240",
+      "#+TT_ROUNDS: 3",
+      "",
+      "* p",
+      "  :PROPERTIES:",
+      "  :ID: p",
+      "  :END:",
+      "",
+    ].join("\n"),
+    "/plans/x/plan.org",
+  );
+  assert.equal(Object.keys(parsed.bounds ?? {}).length, 12);
+  assert.deepEqual(lintPlan(parsed).filter((f) => f.rule === "bound"), []);
+});
+
+test("plan 07e: #+TT_CHECK_WINDOW is `exclusive` or `off`, never silently something else", () => {
+  const parsed = parseOrgPlan("#+TT_CHECK_WINDOW: sometimes\n\n* p\n  :PROPERTIES:\n  :ID: p\n  :END:\n", "/plans/x/plan.org");
+  assert.equal(parsed.checkWindow, "sometimes");
+  assert.equal(parsed.checkWindowLine, 1);
+  const base = plan([{ id: "p", acceptance: ["it works"] }]);
+  assert.deepEqual(lintPlan({ ...base, checkWindow: "exclusive", checkWindowLine: 2 }).filter((f) => f.rule === "check-window"), []);
+  assert.deepEqual(lintPlan({ ...base, checkWindow: "off", checkWindowLine: 2 }).filter((f) => f.rule === "check-window"), []);
+  const bad = lintPlan({ ...base, checkWindow: "sometimes", checkWindowLine: 2 }).find((f) => f.rule === "check-window");
+  assert.ok(bad);
+  assert.equal(bad!.severity, "error");
+  assert.equal(bad!.line, 2);
+});
+
 test("plan lane-prompt: tt lint's Org reader reads #+TT_WORKER_PROMPT per lane, files in order, ~ and relative paths expanded", () => {
   const parsed = parseOrgPlan(
     "#+TITLE: t\n#+TT_WORKER_PROMPT: a=~/p/SKILL.md,shim.md b=none\n\n* p\n  :PROPERTIES:\n  :ID: p\n  :END:\n",

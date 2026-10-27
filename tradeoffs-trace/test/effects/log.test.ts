@@ -29,6 +29,28 @@ test("append fsyncs after every record", () => {
   }
 });
 
+test("plan 07e (E3): ENOSPC is reported once and later appends are no-ops", () => {
+  const logPath = path.join(dir, "events.jsonl");
+  const enospc = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+  const writeMock = mock.method(fs, "writeSync", () => {
+    throw enospc;
+  });
+  const onDiskFull = mock.fn();
+  const log = new EventLog(logPath, [], onDiskFull);
+  try {
+    const first = log.append("state", { a: 1 });
+    assert.equal(first.seq, 1, "the action still receives its record");
+    assert.equal(log.diskFull, true);
+    assert.equal(onDiskFull.mock.callCount(), 1);
+    log.append("state", { a: 2 });
+    assert.equal(writeMock.mock.callCount(), 1, "no later append retries the full disk");
+    assert.equal(onDiskFull.mock.callCount(), 1, "the notice is not repeated");
+  } finally {
+    writeMock.mock.restore();
+    log.close();
+  }
+});
+
 test("seq is monotonic within a session and across reopen", () => {
   const logPath = path.join(dir, "events.jsonl");
   const log1 = new EventLog(logPath);

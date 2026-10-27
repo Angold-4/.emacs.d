@@ -895,7 +895,37 @@ and an unknown id is refused by that command."
     (should (= (alist-get 'gateMs d) 2700000))
     ;; 02k: the review (and pick) turn limit, for large candidates.
     (should (= (alist-get 'reviewMs d) 1800000))
+    ;; Plan 07e: the final check follows the check when it has no keyword of
+    ;; its own, so a plan that sets only TT_CHECK_MINUTES is unchanged.
+    (should (= (alist-get 'finalCheckMs d) 1800000))
     (should-not (assq 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))))
+
+(ert-deftest tradeoffs-trace-plan-deadlines-07e ()
+  "Plan 07e (E1/E3): the six new bounds reach plan.json, raw values and
+lines reach lint, and the check-window opt-in is kept as written."
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_EVALUATE_MINUTES: 11\n"
+                                                   "#+TT_FACT_MINUTES: 6\n"
+                                                   "#+TT_FIX_ATTEMPT_MINUTES: 40\n"
+                                                   "#+TT_MERGE_MINUTES: 9\n"
+                                                   "#+TT_FINAL_CHECK_MINUTES: 7\n"
+                                                   "#+TT_OWNER_WAIT_MINUTES: 200\n"
+                                                   "#+TT_CHECK_WINDOW: exclusive\n"
+                                                   +tt-test--valid-plan))
+                          :plan))
+         (d (alist-get 'deadlines plan))
+         (bounds (alist-get 'bounds plan))
+         (lines (alist-get 'boundLines plan)))
+    (should (= (alist-get 'evaluateMs d) 660000))
+    (should (= (alist-get 'reproductionMs d) 360000))
+    (should (= (alist-get 'fixerAttemptMs d) 2400000))
+    (should (= (alist-get 'mergeMs d) 540000))
+    (should (= (alist-get 'finalCheckMs d) 420000))
+    (should (= (alist-get 'ownerWaitMs d) 12000000))
+    (should (equal (cdr (assoc "TT_EVALUATE_MINUTES" bounds)) "11"))
+    (should (= (cdr (assoc "TT_OWNER_WAIT_MINUTES" lines)) 6))
+    (should (equal (alist-get 'checkWindow plan) "exclusive"))
+    ;; A final-check keyword alone leaves the round check at its default.
+    (should-not (assq 'checkMs d))))
 
 (ert-deftest tradeoffs-trace-plan-gate ()
   "Plan 01f: :GATE: and :GATE_CLEANUP: parse into the phase."

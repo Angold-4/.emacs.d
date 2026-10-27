@@ -97,10 +97,19 @@ export function checkWindowDir(checkLockPath: string): string {
  * checks start at its submission (plan 09), a run's own check must not
  * freeze its other lane's worker (exex 01b1 lost ~86 worker-minutes to it). */
 export function anyCheckWindowOpen(checkLockPath: string, exceptOwner?: string): boolean {
+  return otherCheckWindowOwner(checkLockPath, exceptOwner) !== undefined;
+}
+
+/** Plan 07e (E4): the run id whose check window is open, ignoring
+ * `exceptOwner`'s own windows, or undefined when none is. The status names
+ * this id (`paused by run <id>'s check`), so a paused worker is never shown
+ * as idle. A marker with no owner reads `another`. */
+export function otherCheckWindowOwner(checkLockPath: string, exceptOwner?: string): string | undefined {
   const dir = checkWindowDir(checkLockPath);
-  if ((activeCheckWindows.get(dir) ?? []).some((owner) => exceptOwner === undefined || owner !== exceptOwner)) return true;
+  const active = (activeCheckWindows.get(dir) ?? []).find((owner) => exceptOwner === undefined || owner !== exceptOwner);
+  if (active !== undefined) return active.length > 0 ? active : "another";
   try {
-    if (!fs.existsSync(dir)) return false;
+    if (!fs.existsSync(dir)) return undefined;
     const now = Date.now();
     for (const name of fs.readdirSync(dir)) {
       const file = path.join(dir, name);
@@ -114,12 +123,12 @@ export function anyCheckWindowOpen(checkLockPath: string, exceptOwner?: string):
         // a vanished file is not a window
         continue;
       }
-      return true;
+      return markerOwner(file) ?? "another";
     }
   } catch {
     // an unreadable dir is not a window
   }
-  return false;
+  return undefined;
 }
 
 /** A marker's holder is alive unless its recorded pid is known dead. A holder

@@ -173,6 +173,8 @@ export async function setupConductor(opts: {
   /** Plan 05e: the default round-panel vote for every item. */
   defaultRoundPanelVote?: "keep" | "drop" | "downgrade";
   deadlines?: ConductorOptions["deadlines"];
+  /** Plan 07e (E4): the plan's `#+TT_CHECK_WINDOW` opt-in. */
+  checkWindow?: "exclusive" | "off";
   /** Extra argv tokens prepended before fake-pi.ts's own path — fake-pi
    * never parses argv, so these are inert except as a unique, greppable
    * marker in every agent process's command line (`ps`/`pgrep -f`), e.g.
@@ -274,6 +276,7 @@ export async function setupConductor(opts: {
     repo: repo.dir,
     integrationBranch: "main",
     checks: opts.globalChecks ?? opts.checks ?? ["true"],
+    ...(opts.checkWindow ? { checkWindow: opts.checkWindow } : {}),
     ...(opts.secrets ? { secrets: opts.secrets } : {}),
     ...(opts.envFile ? { envFile: opts.envFile } : {}),
     ...(opts.models ? { models: opts.models } : {}),

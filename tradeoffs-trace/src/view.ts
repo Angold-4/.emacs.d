@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DEFAULT_DEADLINES, rebuildTimelineWithEvents, runPaths, type RunPlanFile, type Timeline } from "./conductor.ts";
+import { boundText, type BoundKind } from "./core/bounds.ts";
 import { loopTapeHead, renderLoopTape, tapeLabel, type ChartModels } from "./charts.ts";
 import { laneRoundPhase } from "./core/loop-view.ts";
 import { effectiveChecks } from "./core/checks.ts";
@@ -154,6 +155,33 @@ export function stageLimits(plan: Pick<RunPlanFile, "deadlines">): Record<string
     review: d.reviewMs,
     evaluate: d.evaluateMs,
   };
+}
+
+/** Plan 07e (E3): the bound kind a pipeline stage spends. */
+export function stageBoundKind(stage: string): BoundKind | undefined {
+  switch (stage) {
+    case "implement":
+      return "worker-attempt";
+    case "baseline":
+    case "checks":
+      return "check";
+    case "probe":
+      return "check";
+    case "review":
+      return "review";
+    case "evaluate":
+      return "evaluate";
+    case "gate":
+      return "gate";
+    default:
+      return undefined;
+  }
+}
+
+/** `check 2m/5m` for one stage, or undefined when the stage has no bound. */
+export function stageBoundText(stage: string, elapsedMs: number, limitMs: number | undefined): string | undefined {
+  const kind = stageBoundKind(stage);
+  return kind && limitMs !== undefined ? boundText(kind, elapsedMs, limitMs) : undefined;
 }
 
 export interface StageSpan {
@@ -317,7 +345,10 @@ export function pipelineLine(spans: StageSpan[], limits: Record<string, number |
       // THIS attempt; a stage past its limit reads `limit reached`, never a
       // cumulative "over by".
       const left = limit === undefined ? "" : limit < s.ms ? " (limit reached)" : ` (${formatDuration(limit - s.ms)} left)`;
-      return `${name} ${d}…${left}`;
+      // Plan 07e (E3): name the bound and the used/limit pair in the same
+      // line, e.g. `checks 2m00s… (3m00s left) [check 2m/5m]`.
+      const bound = stageBoundText(s.stage, s.ms, limit);
+      return `${name} ${d}…${left}${bound ? ` [${bound}]` : ""}`;
     }
     return `${name}${s.failed ? " ✗" : ""} ${d}`;
   });
@@ -550,6 +581,10 @@ export interface RunView {
    * `views/review.org' renders. */
   review: string;
   needsYou: number;
+  /** Plan 07e (E3): the current stage's bound, `check 2m/5m`. */
+  bounds?: string;
+  /** Plan 07e (E4): the run whose check paused this run's worker. */
+  pausedBy?: string;
   /** Plan 01h: the few trade-offs that matter while the run is live, most
    * important first, at most 6. Undefined when there is nothing to show. */
   tradeoffs?: TradeoffEntry[];
@@ -795,10 +830,26 @@ export function buildView(
   const envBlocked = phase.env?.blocked ? envBlockedLine(phase.env.blocked) : undefined;
   const envTools = envToolsLines(phase.env?.tools);
 
+  // Plan 07e (E4): a worker paused by another run's check window is shown as
+  // exactly that, never as idle.
+  const pausedBy = (() => {
+    const paused = new Map<string, string>();
+    for (const r of records) {
+      if (r.kind === "worker_paused") {
+        const e = r.event as { agentId?: unknown; by?: unknown };
+        paused.set(String(e.agentId), typeof e.by === "string" && e.by.length > 0 ? e.by : "another");
+      } else if (r.kind === "worker_resumed") {
+        paused.delete(String((r.event as { agentId?: unknown }).agentId));
+      }
+    }
+    return paused.size > 0 ? [...paused.values()][0] : undefined;
+  })();
+
   let attention: string | undefined;
   if (envBlocked) attention = envBlocked;
   else if (phase.phase === "BLOCKED") attention = "BLOCKED";
   else if (needsYou > 0 || phase.phase === "AWAITING_OWNER") attention = "needs you";
+  else if (pausedBy) attention = `paused by run ${pausedBy}'s check`;
   else if (!alive && phase.phase !== "DONE") attention = "conductor stopped";
   else if (idleMinutes !== undefined && idleMinutes > 5) attention = `idle ${Math.round(idleMinutes)}m`;
   else if (t && t.byCategory.polling.ms > t.elapsedMs / 4) attention = "heavy polling";
@@ -843,6 +894,8 @@ export function buildView(
   // Plan 06k2 (A1): the lane round's own sub-phase, so the loop view shows
   // LANE REVIEW / PICK and the attempt clock stops when both lanes submit.
   const lanePhase = laneRoundPhase(phase);
+  const limits = stageLimits(plan);
+  const bounds = current ? stageBoundText(stage, current.ms, limits[stage]) : undefined;
   const tapeInput = {
     label: tapeLabel(phase.phaseId),
     round,
@@ -856,7 +909,7 @@ export function buildView(
     stops: timeline.stops ?? [],
     restarts: timeline.restarts ?? [],
     models: chartModelsFromPlan(plan.models, seatsOf(phase.contract)),
-    limits: stageLimits(plan),
+    limits,
     ...(lanePhase ? { lanePhase } : {}),
   };
   const tape = renderLoopTape(tapeInput);
@@ -911,7 +964,9 @@ export function buildView(
     stage,
     stageElapsed: formatDuration(current?.ms ?? 0),
     elapsed: firstAt ? formatDuration(endAt - Date.parse(firstAt)) : "0s",
-    pipeline: pipelineLine(spans, lanePhase ? { ...stageLimits(plan), implement: undefined } : stageLimits(plan)),
+    pipeline: pipelineLine(spans, lanePhase ? { ...limits, implement: undefined } : limits),
+    ...(bounds ? { bounds } : {}),
+    ...(pausedBy ? { pausedBy } : {}),
     gates,
     gate: gateRecord && gateRecord.candidateSha === C ? gateSummaryLine(gateRecord, phase.integrationHead) : undefined,
     baseline: baselineStatusLine(baseline),

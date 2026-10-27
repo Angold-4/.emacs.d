@@ -126,15 +126,18 @@ export class EventLog {
   #seq: number;
   #path: string;
   #secrets: readonly Secret[];
+  #onDiskFull: ((err: Error) => void) | undefined;
+  #diskFull = false;
 
   /** `secrets` (plan 01a): every appended record's payload is redacted before
    * it is serialized, so no value ever lands in `events.jsonl` — the file a
    * crash-recovered conductor, `tt state` and every view read back. The same
    * redaction the offline `tt redact` path uses, so a value used as a JSON key
    * is masked here too and a number is never touched. */
-  constructor(path: string, secrets: readonly Secret[] = []) {
+  constructor(path: string, secrets: readonly Secret[] = [], onDiskFull?: (err: Error) => void) {
     this.#path = path;
     this.#secrets = secrets;
+    this.#onDiskFull = onDiskFull;
     let lastSeq = 0;
     // Reopening: continue the seq counter from whatever is already on
     // disk (including a torn final line's seq if it happened to parse a
@@ -156,9 +159,29 @@ export class EventLog {
       actionId === undefined
         ? { seq: this.#seq, ts: new Date().toISOString(), kind, event: redacted }
         : { seq: this.#seq, ts: new Date().toISOString(), kind, actionId, event: redacted };
-    fs.writeSync(this.#fd, `${JSON.stringify(record)}\n`);
-    fs.fsyncSync(this.#fd);
+    if (this.#diskFull) return record;
+    try {
+      fs.writeSync(this.#fd, `${JSON.stringify(record)}\n`);
+      fs.fsyncSync(this.#fd);
+    } catch (err) {
+      // Plan 07e (E3): a full disk fails the action, visibly, and never
+      // crashes the conductor on an uncaught write error. The callback stops
+      // the run cleanly; later appends are no-ops while the disk stays full.
+      if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+        if (!this.#diskFull) {
+          this.#diskFull = true;
+          this.#onDiskFull?.(err as Error);
+        }
+        return record;
+      }
+      throw err;
+    }
     return record;
+  }
+
+  /** Plan 07e (E3): true once an append saw ENOSPC. */
+  get diskFull(): boolean {
+    return this.#diskFull;
   }
 
   /** Generates a fresh, stable action ID of the form `<kind>-<seq>-<rand>`,

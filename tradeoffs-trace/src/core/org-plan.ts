@@ -14,6 +14,7 @@
 
 import * as path from "node:path";
 
+import { boundKeywords } from "./bounds.ts";
 import { expandPromptPath } from "./worker-prompt.ts";
 import { parseDomains, type Domain } from "./domains.ts";
 import { finalTestsOf } from "./items.ts";
@@ -419,6 +420,18 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
   // tt 09-1: the global round checks, as one command (as Emacs sends it), so
   // the cheap-final-check rule sees what every candidate already runs.
   const globalChecks = first("TT_CHECKS")?.value?.trim();
+  // Plan 07e (E3): every bound keyword's raw text and line. Emacs silently
+  // drops an invalid number; lint must not.
+  const bounds: Record<string, string> = {};
+  const boundLines: Record<string, number> = {};
+  for (const keyword of boundKeywords()) {
+    const kw = first(keyword);
+    if (!kw) continue;
+    bounds[keyword] = kw.value.trim();
+    boundLines[keyword] = kw.line;
+  }
+  const checkWindowKeyword = first("TT_CHECK_WINDOW");
+  const checkWindow = checkWindowKeyword?.value.trim();
   return {
     ...(sourceFile ? { sourceFile } : {}),
     ...(globalChecks ? { checks: [globalChecks] } : {}),
@@ -444,6 +457,8 @@ export function parseOrgPlan(text: string, sourceFile?: string): LintPlanInput {
     ...(globalFixRounds ? { fixRounds: globalFixRounds, fixRoundsLine: globalFixRoundsKeyword!.line } : {}),
     ...(globalFixers !== undefined ? { fixers: globalFixers, fixersLine: globalFixersKeyword!.line } : {}),
     ...(globalFixChecks ? { fixChecks: globalFixChecks, fixChecksLine: globalFixChecksKeyword!.line } : {}),
+    ...(Object.keys(bounds).length > 0 ? { bounds, boundLines } : {}),
+    ...(checkWindow ? { checkWindow, checkWindowLine: checkWindowKeyword!.line } : {}),
   };
 }
 

@@ -60,6 +60,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
   "PANEL_DECIDED",
   "SUBMIT_PHASE",
   "ATTEMPT_TIMED_OUT",
+  "BOUND_REACHED",
+  "LEAD_CALLED",
   "ATTEMPT_NO_SUBMISSION",
   "ATTEMPT_INTERRUPTED",
   "WORKER_RESUMED",
@@ -1649,6 +1651,31 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
     // Plan 05j: the review lint's own record. Record-only: nothing about the
     // entries changes, the event is the log's copy of the view's first line.
     case "REVIEW_LINT_FAILED": {
+      return ok(state);
+    }
+
+    // Plan 07e (E2/A2): a named bound was reached. Record-only: no phase
+    // state changes, no candidate is accepted or rejected, and the owner is
+    // still the judge. `scope` and `action` make the log self-describing.
+    case "BOUND_REACHED": {
+      if (typeof event.kind !== "string" || event.kind.length === 0) {
+        return rejected(state, "a bound-reached event must name the bound kind");
+      }
+      if (typeof event.scope !== "string" || event.scope.length === 0) {
+        return rejected(state, "a bound-reached event must name its scope");
+      }
+      if (!Number.isFinite(event.limitMs) || event.limitMs < 0 || !Number.isFinite(event.elapsedMs) || event.elapsedMs < 0) {
+        return rejected(state, "a bound-reached event must carry non-negative limit and elapsed milliseconds");
+      }
+      return ok(state);
+    }
+
+    // Plan 07e (E2/A3): the rounds budget ran out. Record-only: the existing
+    // REPAIR_BUDGET_EXHAUSTED transition still decides where the phase goes.
+    case "LEAD_CALLED": {
+      if (!Array.isArray(event.reasons) || event.reasons.some((r) => typeof r !== "string")) {
+        return rejected(state, "a lead-called event must carry an array of reason strings");
+      }
       return ok(state);
     }
 

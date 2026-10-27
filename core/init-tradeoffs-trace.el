@@ -875,15 +875,21 @@ so no agent searches the file system for them."
       (nreverse out))))
 
 (defun +tt--plan-deadlines ()
-  "Per-plan time limits from #+TT_SH_MINUTES, #+TT_CHECK_MINUTES,
-#+TT_ATTEMPT_MINUTES, #+TT_GATE_MINUTES and #+TT_REVIEW_MINUTES, as the
-conductor's deadline fields in ms (or nil).  For repositories whose builds,
-suites and candidates outlast the defaults (3, 5, 45, 30, 15)."
+  "Per-plan time limits from every #+TT_*_MINUTES keyword, as the
+conductor's deadline fields in ms (or nil).  Each default is unchanged:
+sh 3, check 5, attempt 45, gate 30, review 15, evaluate 10, fact 5,
+fixer attempt 45, merge 10, owner wait 240, final check = check."
   (let ((ms (lambda (kw) (let ((v (+tt--keyword kw)))
                            (and v (string-match-p "\\`[0-9]+\\'" v) (* 60000 (string-to-number v))))))
         (out nil))
     (when-let* ((v (funcall ms "TT_SH_MINUTES"))) (push (cons 'shCommandMs v) out))
-    (when-let* ((v (funcall ms "TT_CHECK_MINUTES"))) (push (cons 'checkMs v) out) (push (cons 'probeMs v) out))
+    (let ((check (funcall ms "TT_CHECK_MINUTES"))
+          (final (funcall ms "TT_FINAL_CHECK_MINUTES")))
+      (when check (push (cons 'checkMs check) out) (push (cons 'probeMs check) out))
+      ;; Plan 07e (E1): the final check follows the ordinary check unless the
+      ;; plan sets its own keyword; a plan setting only TT_CHECK_MINUTES must
+      ;; behave exactly as before.
+      (when (or final check) (push (cons 'finalCheckMs (or final check)) out)))
     (when-let* ((v (funcall ms "TT_ATTEMPT_MINUTES"))) (push (cons 'workerAttemptMs v) out))
     ;; Plan 01f: a gate defaults to 30 minutes — a 15-minute --clean --build
     ;; fits, the old 8-minute sh limit did not (runtime doc §6).
@@ -891,7 +897,27 @@ suites and candidates outlast the defaults (3, 5, 45, 30, 15)."
     ;; 02k (2026-10-10): one review turn (and one pick turn) on a large
     ;; candidate outlasted the fixed 15 minutes and discarded a two-lane round.
     (when-let* ((v (funcall ms "TT_REVIEW_MINUTES"))) (push (cons 'reviewMs v) out))
+    (when-let* ((v (funcall ms "TT_EVALUATE_MINUTES"))) (push (cons 'evaluateMs v) out))
+    (when-let* ((v (funcall ms "TT_FACT_MINUTES"))) (push (cons 'reproductionMs v) out))
+    (when-let* ((v (funcall ms "TT_FIX_ATTEMPT_MINUTES"))) (push (cons 'fixerAttemptMs v) out))
+    (when-let* ((v (funcall ms "TT_MERGE_MINUTES"))) (push (cons 'mergeMs v) out))
+    (when-let* ((v (funcall ms "TT_OWNER_WAIT_MINUTES"))) (push (cons 'ownerWaitMs v) out))
     (nreverse out)))
+
+(defun +tt--plan-deadline-bounds ()
+  "The raw bound keywords and their 1-based lines, as (BOUNDS . LINES).
+Plan 07e (E3): Emacs drops an invalid number silently, so lint reads the
+value as written and names the keyword and line."
+  (let ((bounds nil) (lines nil))
+    (dolist (kw '("TT_SH_MINUTES" "TT_CHECK_MINUTES" "TT_ATTEMPT_MINUTES"
+                  "TT_GATE_MINUTES" "TT_REVIEW_MINUTES" "TT_EVALUATE_MINUTES"
+                  "TT_FACT_MINUTES" "TT_FIX_ATTEMPT_MINUTES" "TT_MERGE_MINUTES"
+                  "TT_FINAL_CHECK_MINUTES" "TT_OWNER_WAIT_MINUTES" "TT_ROUNDS"))
+      (let ((at (+tt--keyword-at kw)))
+        (when at
+          (push (cons kw (string-trim (car at))) bounds)
+          (push (cons kw (cdr at)) lines))))
+    (when bounds (cons (nreverse bounds) (nreverse lines)))))
 
 (defun +tt--plan-secrets ()
   "Secret names the plan declares with #+TT_SECRETS (space or comma separated).
@@ -1146,6 +1172,16 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                                    (cons 'fixChecksLine (cdr f)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
+                  ;; Plan 07e (E3): raw bound values and lines for `tt lint'.
+                  ,@(let ((b (+tt--plan-deadline-bounds)))
+                      (and b (list (cons 'bounds (car b))
+                                   (cons 'boundLines (cdr b)))))
+                  ;; Plan 07e (E4/A5): the check-window opt-in, as written so
+                  ;; lint can name a bad value (the conductor treats anything
+                  ;; but `exclusive' as off).
+                  ,@(let ((cw (+tt--keyword-at "TT_CHECK_WINDOW")))
+                      (and cw (list (cons 'checkWindow (string-trim (car cw)))
+                                    (cons 'checkWindowLine (cdr cw)))))
                   ,@(let ((r (+tt--plan-references dir)))
                       (and r `((references . ,(vconcat r)))))
                   ,@(let ((s (+tt--plan-secrets)))

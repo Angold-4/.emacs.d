@@ -272,6 +272,11 @@ export interface CheckRecordCommand {
   timedOut: boolean;
   durationMs: number;
   passed: boolean;
+  /** Plan 07e (E3): why a failed command produced no useful failure, kept
+   * distinct from an ordinary red check. `silent` exited non-zero with no
+   * output; `interrupted` was cut off by the owner's stop; `disk-full` could
+   * not record its output. */
+  failureClass?: "silent" | "interrupted" | "disk-full";
   /** The log file name under the candidate's checks directory. */
   log?: string;
 }
@@ -337,6 +342,9 @@ export function parseCheckRecord(value: unknown): CheckRecord | undefined {
       timedOut: e.timedOut,
       durationMs: e.durationMs,
       passed: e.passed,
+      ...(e.failureClass === "silent" || e.failureClass === "interrupted" || e.failureClass === "disk-full"
+        ? { failureClass: e.failureClass }
+        : {}),
       ...(typeof e.log === "string" ? { log: e.log } : {}),
     });
   }
