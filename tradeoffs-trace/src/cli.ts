@@ -1953,7 +1953,7 @@ async function cmdVerdict(
   let recorded = true;
   try {
     // Plan 07e (E4): a record the disk refused is not a recorded verdict.
-    recorded = log.append("event", event) !== undefined;
+    recorded = log.append("event", event).dropped !== true;
   } finally {
     log.close();
   }
@@ -2476,7 +2476,7 @@ async function cmdEntry(positional: string[], root: string, reason: string | und
   try {
     // Plan 07e (E4): an entry change is recorded only when every one of its
     // events reached the disk.
-    for (const event of expanded.events) if (log.append("event", event) === undefined) recorded = false;
+    for (const event of expanded.events) if (log.append("event", event).dropped === true) recorded = false;
   } finally {
     log.close();
   }

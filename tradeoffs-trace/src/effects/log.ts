@@ -36,6 +36,12 @@ export interface LogRecord {
   kind: string;
   actionId?: string;
   event: unknown;
+  /** Plan 07e (E3/E4, owner directive OD-1.3): an append the disk refused is
+   * still handed back as the attempted record, marked `dropped: true` (and
+   * `durable: false`) so no caller mistakes it for one that reached disk. A
+   * durable record carries neither field. */
+  dropped?: true;
+  durable?: false;
 }
 
 /** Thrown when a line other than the final one in the file fails to parse
@@ -118,6 +124,12 @@ export function pendingIntents(records: readonly LogRecord[]): LogRecord[] {
   return records.filter((r) => r.kind === "intent" && r.actionId !== undefined && !completed.has(r.actionId));
 }
 
+/** Plan 07e (E4): how many times one ordinary append may try to write after
+ * the disk reported ENOSPC. One retry is bounded on purpose: it lets evidence
+ * survive a disk that frees up, without adding an unbounded wait to a
+ * stopping conductor. */
+const ORDINARY_APPEND_ATTEMPTS = 2;
+
 /** Plan 07e (E4): how many times one critical append (the final failure, the
  * shutdown state) may try to write after the disk reported ENOSPC. One retry
  * is bounded on purpose: it preserves the evidence if storage recovers
@@ -127,8 +139,9 @@ const CRITICAL_APPEND_ATTEMPTS = 2;
 
 /** An open handle on a run's `events.jsonl`. Appends are synchronous and
  * each one is followed by `fsyncSync` before the call returns, so a caller
- * that receives a `LogRecord` back knows the record is durable. An append the
- * disk refused returns `undefined` — the record was NOT written, and the
+ * that receives a `LogRecord` without `dropped: true` knows the record is
+ * durable. An append the disk refused still returns the attempted record
+ * (owner directive OD-1.3), marked `dropped: true` and `durable: false`: the
  * caller must treat its action as failed rather than as recorded. */
 export class EventLog {
   #fd: number;
@@ -161,38 +174,33 @@ export class EventLog {
 
   /** Appends one record and fsyncs before returning. The record's `event`
    * payload is redacted (see the constructor), never the caller's own
-   * object. `undefined` means the write did not land (a full disk): the
-   * action failed and no record exists for it. */
-  append(kind: string, event: unknown, actionId?: string): LogRecord | undefined {
+   * object. An append the disk refused still returns the attempted record,
+   * marked `dropped: true` / `durable: false`: the action failed and no such
+   * record exists on disk. */
+  append(kind: string, event: unknown, actionId?: string): LogRecord {
     return this.#append(kind, event, actionId, false);
   }
 
   /** Plan 07e (E4): records the final failure or the shutdown state even
    * after an ENOSPC, with one bounded retry — the seats vetoed making those
    * last appends permanent no-ops, so the evidence still lands if storage
-   * frees up before the conductor exits. `undefined` when every attempt was
-   * refused too. */
-  appendCritical(kind: string, event: unknown, actionId?: string): LogRecord | undefined {
+   * frees up before the conductor exits. A record every attempt refused is
+   * still handed back, marked `dropped: true`. */
+  appendCritical(kind: string, event: unknown, actionId?: string): LogRecord {
     return this.#append(kind, event, actionId, true);
   }
 
-  #append(kind: string, event: unknown, actionId: string | undefined, critical: boolean): LogRecord | undefined {
+  #append(kind: string, event: unknown, actionId: string | undefined, critical: boolean): LogRecord {
     this.#seq += 1;
     const redacted = redactRecord(event, this.#secrets);
     const record: LogRecord =
       actionId === undefined
         ? { seq: this.#seq, ts: new Date().toISOString(), kind, event: redacted }
         : { seq: this.#seq, ts: new Date().toISOString(), kind, actionId, event: redacted };
-    // A full disk already failed this logger: an ordinary append is dropped
-    // and counted, never retried, so a stopping run cannot sit on the full
-    // disk rewriting bytes. Only a critical append retries, bounded. A
-    // dropped record is never handed back — the caller must not mistake it
-    // for a durable one.
-    if (this.#diskFull && !critical) {
-      this.#dropped += 1;
-      return undefined;
-    }
-    const attempts = critical ? CRITICAL_APPEND_ATTEMPTS : 1;
+    // Plan 07e (E4): a full disk does not turn later appends into permanent
+    // no-ops — each one is retried once, so evidence survives a disk that
+    // frees up. Any successful write clears the full-disk state.
+    const attempts = critical ? CRITICAL_APPEND_ATTEMPTS : ORDINARY_APPEND_ATTEMPTS;
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
         fs.writeSync(this.#fd, `${JSON.stringify(record)}\n`);
@@ -204,8 +212,8 @@ export class EventLog {
       } catch (err) {
         // Plan 07e (E3/E4): a full disk fails the action, visibly, and never
         // crashes the conductor on an uncaught write error. The callback stops
-        // the run cleanly; `droppedAppends` counts the records that never
-        // reached the disk so no caller mistakes them for durable.
+        // the run cleanly; `droppedAppends` counts the attempts that never
+        // reached the disk so no caller mistakes the record for durable.
         if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
           this.#dropped += 1;
           if (!this.#diskFull) {
@@ -217,9 +225,9 @@ export class EventLog {
         throw err;
       }
     }
-    // Every attempt was refused by the disk: no record exists, so none is
-    // returned.
-    return undefined;
+    // Every attempt was refused by the disk. Hand back the attempted record
+    // (owner directive OD-1.3), explicitly marked as not durable.
+    return { ...record, dropped: true, durable: false };
   }
 
   /** Plan 07e (E3): true once an append saw ENOSPC and no write has landed
@@ -228,9 +236,9 @@ export class EventLog {
     return this.#diskFull;
   }
 
-  /** Plan 07e (E4): how many records this logger failed to make durable —
-   * the visible failure of an append, so a caller never treats a dropped
-   * record as written. */
+  /** Plan 07e (E4): how many append attempts this logger failed to make
+   * durable — the visible failure of an append, so a caller never treats a
+   * dropped record as written. */
   get droppedAppends(): number {
     return this.#dropped;
   }
@@ -244,15 +252,15 @@ export class EventLog {
 
   /** Records that effect `actionId` (`action`, e.g. `{pgid}` or
    * `{worktreePath, baseSha}`) is about to be performed. Must be written
-   * before the effect happens (design §9.3); `undefined` when the disk refused
-   * the record. */
-  intent(actionId: string, action: unknown): LogRecord | undefined {
+   * before the effect happens (design §9.3); `dropped: true` when the disk
+   * refused the record. */
+  intent(actionId: string, action: unknown): LogRecord {
     return this.append("intent", action, actionId);
   }
 
   /** Records that effect `actionId` finished, with `outcome` describing
-   * the result; `undefined` when the disk refused the record. */
-  completion(actionId: string, outcome: unknown): LogRecord | undefined {
+   * the result; `dropped: true` when the disk refused the record. */
+  completion(actionId: string, outcome: unknown): LogRecord {
     return this.append("completion", outcome, actionId);
   }
 
