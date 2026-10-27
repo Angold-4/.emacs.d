@@ -948,7 +948,23 @@ written."
   ;; own default — today's value — applies to each one.
   (let ((d (alist-get 'deadlines (plist-get (+tt-test--parse +tt-test--valid-plan) :plan))))
     (dolist (field '(evaluateMs reproductionMs fixerAttemptMs mergeMs finalCheckMs ownerWaitMs))
-      (should-not (alist-get field d)))))
+      (should-not (alist-get field d))))
+  ;; An invalid value is never silently accepted: Emacs writes no deadline
+  ;; field for it, while the raw text and its line still reach lint, which
+  ;; refuses it (plan 07e E3/R8).
+  (let* ((plan (plist-get (+tt-test--parse (concat "#+TT_FACT_MINUTES: -1\n"
+                                                   "#+TT_MERGE_MINUTES: none\n"
+                                                   +tt-test--valid-plan))
+                          :plan))
+         (d (alist-get 'deadlines plan))
+         (bounds (alist-get 'bounds plan))
+         (lines (alist-get 'boundLines plan)))
+    (should (equal (cdr (assoc "TT_FACT_MINUTES" bounds)) "-1"))
+    (should (equal (cdr (assoc "TT_MERGE_MINUTES" bounds)) "none"))
+    (should (= (cdr (assoc "TT_FACT_MINUTES" lines)) 1))
+    (should (= (cdr (assoc "TT_MERGE_MINUTES" lines)) 2))
+    (should-not (alist-get 'reproductionMs d))
+    (should-not (alist-get 'mergeMs d))))
 
 (ert-deftest tradeoffs-trace-plan-gate ()
   "Plan 01f: :GATE: and :GATE_CLEANUP: parse into the phase."

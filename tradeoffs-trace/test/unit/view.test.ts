@@ -2,10 +2,14 @@
 // and a check-window pause is shown as a pause by a named run.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
 
+import type { RunPlanFile } from "../../src/conductor.ts";
 import { renderStatusText } from "../../src/render.ts";
-import { pipelineLine, stageBoundText, stageLimits, stageSpans } from "../../src/view.ts";
+import { buildView, pipelineLine, stageBoundText, stageLimits, stageSpans } from "../../src/view.ts";
 import type { Timeline } from "../../src/conductor.ts";
 
 test("plan 07e: the final check is its own running unit with its own bound", () => {
@@ -82,4 +86,44 @@ test("plan 07e: status prints the bound and the pause cause naming the other run
   );
   assert.match(text, /^bounds: check 2m\/5m$/m);
   assert.match(text, /^paused by run run-a's check$/m);
+});
+
+test("plan 07e: a check-window pause is shown only while the conductor is alive", () => {
+  // Decision disc-B: an unmatched `worker_paused` record survives watcher
+  // cleanup, so the pause may outrank `idle` but never a stopped conductor —
+  // a dead run must still be reported as stopped.
+  const plan = {
+    title: "pause test",
+    repo: "/tmp/tt-07e-pause",
+    integrationBranch: "main",
+    checks: ["true"],
+    phases: [{ id: "p1", goal: "g", acceptance: ["a"], checks: ["true"], boundaries: [] }],
+  } as unknown as RunPlanFile;
+  const dir = mkdtempSync(path.join(tmpdir(), "tt-07e-pause-"));
+  try {
+    const events = [
+      { seq: 1, ts: "2026-10-27T10:00:00.000Z", kind: "init", event: { runId: "r-pause", integrationHead: "H0" } },
+      { seq: 2, ts: "2026-10-27T10:00:00.000Z", kind: "event", event: { type: "ATTEMPT_STARTED" } },
+      // No matching `worker_resumed`: the pause record outlives the watcher.
+      { seq: 3, ts: "2026-10-27T10:00:30.000Z", kind: "worker_paused", event: { agentId: "w-a", by: "run-b" } },
+    ];
+    writeFileSync(path.join(dir, "events.jsonl"), `${events.map((e) => JSON.stringify(e)).join("\n")}\n`);
+    const now = new Date("2026-10-27T10:01:00.000Z");
+    assert.equal(buildView(dir, plan, true, now).attention, "paused by run run-b's check", "a live run shows the pause cause");
+    assert.equal(buildView(dir, plan, false, now).attention, "conductor stopped", "a dead conductor is never shown as paused");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("plan 07e: the final check inherits the plan's check bound when it has no keyword of its own", () => {
+  // A4: the conductor makes `finalCheckMs` follow `checkMs`; the status must
+  // not show the bare default to a plan that raised `TT_CHECK_MINUTES`.
+  const limits = stageLimits({ deadlines: { checkMs: 30 * 60_000 } });
+  assert.equal(limits.checks, 30 * 60_000);
+  assert.equal(limits["final-check"], 30 * 60_000, "the final check follows the ordinary check");
+  const own = stageLimits({ deadlines: { checkMs: 30 * 60_000, finalCheckMs: 7 * 60_000 } });
+  assert.equal(own["final-check"], 7 * 60_000, "its own keyword still wins");
+  const bare = stageLimits({});
+  assert.equal(bare["final-check"], bare.checks, "with no keyword both keep today's 5m");
 });

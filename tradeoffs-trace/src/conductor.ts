@@ -9946,7 +9946,6 @@ export class Conductor {
   async #runLaneChecks(lane: string, candidateSha: string, laneBase?: string): Promise<LaneCheck> {
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
     const outDir = path.join(this.#paths.checks, candidateSha);
-    fs.mkdirSync(outDir, { recursive: true });
     // Plan 06n (A5): a candidate whose diff against its lane's start touches a
     // wide path runs the final checks in this round; one that touches none
     // runs the round checks, exactly as before.
@@ -9970,6 +9969,17 @@ export class Conductor {
     let combinedOutput = "";
     let firstFailure: string | undefined;
     try {
+      // Plan 07e (A4/E4): creating the check directory is part of the check, so
+      // a full disk here is `disk full`, never an uncaught ENOSPC.
+      try {
+        fs.mkdirSync(outDir, { recursive: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+          this.#noteDiskFull(err, "check directory");
+          return { ok: false, note: "disk full" };
+        }
+        throw err;
+      }
       if (!verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha)) {
         passed = false;
         firstFailure = "the checkout no longer matches the candidate commit";
@@ -12874,7 +12884,6 @@ export class Conductor {
     crashAt("before_run_checks");
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
     const outDir = path.join(this.#paths.checks, candidateSha);
-    fs.mkdirSync(outDir, { recursive: true });
     // Plan 06c: `checkTier` decides which commands this candidate runs. From
     // CHECKING the candidate has not been reviewed yet, so the tier is
     // `round`; from FINAL_CHECKING it has passed review with no open blocker,
@@ -12899,6 +12908,20 @@ export class Conductor {
     const recordLoad1 = Math.round(loadavg()[0] * 100) / 100;
     const recordFreeMemMB = Math.round(os.freemem() / (1024 * 1024));
     try {
+      // Plan 07e (A4/E4): creating the check directory is part of the check,
+      // so a full disk here is recorded as `disk full` and fails the action —
+      // never an uncaught ENOSPC outside the honest-check cleanup. The
+      // `finally` below still disposes the checkout and releases the slot.
+      try {
+        fs.mkdirSync(outDir, { recursive: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOSPC") {
+          this.#noteDiskFull(err, "check directory");
+          this.#log.completion(actionId, { candidateSha, passed: false, reason: "disk full" });
+          return;
+        }
+        throw err;
+      }
       const before = verifyIntegrity(this.#plan.repo, checkoutDir.dir, candidateSha);
       let passed = before;
       let integrityViolated = !before;

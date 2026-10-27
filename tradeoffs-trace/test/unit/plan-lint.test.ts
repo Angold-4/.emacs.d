@@ -460,7 +460,9 @@ test("plan 07e: tt lint refuses a zero, a negative or a non-numeric bound keywor
     [
       "#+TITLE: t",
       "#+TT_CHECK_MINUTES: 0",
-      "#+TT_MERGE_MINUTES: soon",
+      "#+TT_FACT_MINUTES: -1",
+      // `none` is not a bound's value: the protocol has no "no limit".
+      "#+TT_MERGE_MINUTES: none",
       "#+TT_OWNER_WAIT_MINUTES: -5",
       "",
       "* p",
@@ -472,17 +474,27 @@ test("plan 07e: tt lint refuses a zero, a negative or a non-numeric bound keywor
     "/plans/x/plan.org",
   );
   assert.equal(parsed.bounds?.TT_CHECK_MINUTES, "0");
-  assert.equal(parsed.boundLines?.TT_MERGE_MINUTES, 3);
+  assert.equal(parsed.bounds?.TT_FACT_MINUTES, "-1");
+  assert.equal(parsed.bounds?.TT_MERGE_MINUTES, "none");
+  assert.equal(parsed.boundLines?.TT_FACT_MINUTES, 3);
+  assert.equal(parsed.boundLines?.TT_MERGE_MINUTES, 4);
   const findings = lintPlan(parsed).filter((f) => f.rule === "bound");
   assert.deepEqual(
     findings.map((f) => [f.item?.split(":")[0], f.line]).sort(),
     [
       ["TT_CHECK_MINUTES", 2],
-      ["TT_MERGE_MINUTES", 3],
-      ["TT_OWNER_WAIT_MINUTES", 4],
+      ["TT_FACT_MINUTES", 3],
+      ["TT_MERGE_MINUTES", 4],
+      ["TT_OWNER_WAIT_MINUTES", 5],
     ],
   );
   assert.ok(findings.every((f) => f.severity === "error"));
+  // The problem names the keyword and the value as written, so the owner sees
+  // what to change.
+  const merge = findings.find((f) => f.item?.startsWith("TT_MERGE_MINUTES"));
+  assert.match(merge?.problem ?? "", /TT_MERGE_MINUTES must be a positive whole number, got "none"/);
+  const fact = findings.find((f) => f.item?.startsWith("TT_FACT_MINUTES"));
+  assert.match(fact?.problem ?? "", /TT_FACT_MINUTES must be a positive whole number, got "-1"/);
 });
 
 test("tt lint refuses a zero negative or non-numeric bound keyword", () => {

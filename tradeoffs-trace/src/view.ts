@@ -158,13 +158,20 @@ function stageDeadlineMs(): Record<string, number> {
  * `#+TT_*_MINUTES` overrides applied (a plan that sets a 45-minute gate must
  * not be shown as "over by" while the conductor is running within it). */
 export function stageLimits(plan: Pick<RunPlanFile, "deadlines">): Record<string, number> {
-  const d = { ...DEFAULT_DEADLINES, ...(plan.deadlines ?? {}) };
+  const given = plan.deadlines ?? {};
+  const d = { ...DEFAULT_DEADLINES, ...given };
+  // Plan 07e (E1/A4): the final check follows the ordinary check unless the
+  // plan sets its own keyword, exactly as the conductor's deadlines do (and as
+  // the Emacs parser writes them). A plan that only sets
+  // `#+TT_CHECK_MINUTES` must not be shown the bare default for the final
+  // check.
+  const finalCheckMs = given.finalCheckMs ?? given.checkMs ?? DEFAULT_DEADLINES.finalCheckMs;
   return {
     baseline: d.checkMs,
     implement: d.workerAttemptMs,
     freeze: d.freezeMs,
     checks: d.checkMs,
-    "final-check": d.finalCheckMs,
+    "final-check": finalCheckMs,
     probe: d.probeMs,
     gate: d.gateMs,
     review: d.reviewMs,
@@ -866,8 +873,11 @@ export function buildView(
   if (envBlocked) attention = envBlocked;
   else if (phase.phase === "BLOCKED") attention = "BLOCKED";
   else if (needsYou > 0 || phase.phase === "AWAITING_OWNER") attention = "needs you";
-  else if (pausedBy) attention = `paused by run ${pausedBy}'s check`;
+  // Plan 07e (E5, decision disc-B): a pause explains a LIVE run's workers
+  // only. An unmatched `worker_paused` record survives watcher cleanup, so a
+  // stopped conductor is always reported as stopped — never as paused.
   else if (!alive && phase.phase !== "DONE") attention = "conductor stopped";
+  else if (pausedBy) attention = `paused by run ${pausedBy}'s check`;
   else if (idleMinutes !== undefined && idleMinutes > 5) attention = `idle ${Math.round(idleMinutes)}m`;
   else if (t && t.byCategory.polling.ms > t.elapsedMs / 4) attention = "heavy polling";
   // Decision briefs: the `needs you` line names the owner's actual question.
