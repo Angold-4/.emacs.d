@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import { decisionFixPoint, factKeepsOpen, fixTasks, FIXER_DUTY, otherTaskIndexLines, type DecisionFixPoint, type FixFinding } from "../../src/core/fix-rounds.ts";
-import { fixRoundCandidate, isFixRound } from "../../src/core/lanes.ts";
+import { fixRoundCandidate, isFixRound, repairsOnPick } from "../../src/core/lanes.ts";
 import { lintPlan } from "../../src/core/plan-lint.ts";
 import { reduce } from "../../src/core/reduce.ts";
 import { validate } from "../../src/core/schema.ts";
@@ -433,4 +433,21 @@ test("isFixRound marks the round that ran on a fix round's candidate, whose pick
   assert.equal(isFixRound([noCandidate, picked(2, "P2")] as never, 2), false);
   // Round 3, after the fix round, is ordinary again.
   assert.equal(isFixRound([fixed1, picked(2, "C", ["a"]), picked(3, "P3")] as never, 3), false);
+});
+
+// 07 hotfix (owner, 2026-10-28): a repair round after round 1 runs one lane on
+// the adopted pick; round 1, a regressed pick or an unadopted pick keep every
+// lane.
+test("repairsOnPick: a repair round on the adopted pick runs one lane", () => {
+  const round = (n: number, extra: object = {}) =>
+    ({ round: n, base: "B", lanes: ["a", "b"], candidates: [], picked: { lane: "b", sha: `P${n}`, votes: 3 }, ...extra }) as never;
+  const rounds = [round(1), round(2)];
+  assert.equal(repairsOnPick(rounds, 3, "P2"), true, "round 3 repairs round 2's adopted pick");
+  assert.equal(repairsOnPick(rounds, 1, "P2"), false, "round 1 keeps every lane");
+  assert.equal(repairsOnPick(rounds, 3, "P1"), false, "an older candidate is not round 2's pick");
+  assert.equal(repairsOnPick(rounds, 3, undefined), false, "no adopted candidate");
+  assert.equal(repairsOnPick([round(1), round(2, { regressed: true })], 3, "P2"), false, "a regressed pick restarts from the best");
+  assert.equal(repairsOnPick([round(1), round(2, { picked: undefined })], 3, "P2"), false, "a round with no pick");
+  assert.equal(repairsOnPick([round(1), round(2, { consolidated: { ok: true, sha: "K2", from: "P2" } })], 3, "K2"), true, "a consolidated pick");
+  assert.equal(repairsOnPick(rounds, 4, "P2"), false, "only the round right after the pick");
 });

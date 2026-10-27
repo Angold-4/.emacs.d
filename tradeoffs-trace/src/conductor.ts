@@ -51,6 +51,7 @@ import {
   runConsolidation,
   runRound,
   fixRoundCandidate,
+  repairsOnPick,
   isFixRound,
   type ConsolidationOutcome,
   type ConsolidationPlan,
@@ -10749,7 +10750,10 @@ export class Conductor {
       // Plan 07c (D4.7): the fix candidate is read for an unfinished round
       // too, so a resumed synthetic lane still knows its base and disclosures.
       const fix = fixRoundCandidate(this.#state.phase.rounds, round);
-      lanes = unfinished ? last!.lanes : fix ? ["a"] : this.#lanes();
+      // 07 hotfix: a repair round on the adopted pick runs one lane on it; the
+      // base below is already that pick (or its consolidation).
+      const onPick = !unfinished && !fix && repairsOnPick(this.#state.phase.rounds, round, this.#state.phase.candidate?.sha);
+      lanes = unfinished ? last!.lanes : fix || onPick ? ["a"] : this.#lanes();
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
       const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
       const restartGuard = this.#pickGuard(round);

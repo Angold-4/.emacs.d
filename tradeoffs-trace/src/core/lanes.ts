@@ -646,6 +646,23 @@ export function fixRoundCandidate(
   return { candidate: fixed.candidate, base: fixed.base };
 }
 
+/** 07 hotfix (owner, 2026-10-28): a repair round after round 1 runs ONE lane
+ * on the adopted pick instead of two fresh lanes. True when the round right
+ * before `round` picked a candidate, the phase adopted that pick as its
+ * candidate (it was evaluated and not accepted), and the pick did not regress.
+ * Round 1 keeps every lane; a regressed pick keeps today's restart from the
+ * best candidate. Pure, so the rule is unit-tested without a run. */
+export function repairsOnPick(
+  rounds: readonly RoundRecord[] | undefined,
+  round: number,
+  candidateSha: string | undefined,
+): boolean {
+  if (round <= 1 || !candidateSha) return false;
+  const previous = (rounds ?? []).find((r) => r.round === round - 1);
+  if (!previous?.picked || previous.regressed) return false;
+  return previous.picked.sha === candidateSha || previous.consolidated?.sha === candidateSha;
+}
+
 /** 07 (reduce by facts, G2): true when `round` ran on a fix round's merged
  * candidate — the round right after a fixed round. The regression guard never
  * undoes such a round's pick: the fixers repaired points from the same base,
