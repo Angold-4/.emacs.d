@@ -269,6 +269,7 @@
         "text": { "type": "string" },
         "arch": { "type": "array", "items": { "type": "string" } },
         "verify": { "type": "array", "items": { "type": "string" } },
+        "finalTests": { "$ref": "#/$defs/FinalTests" },
         "rawText": { "type": "string" },
         "line": { "type": "integer" },
         "archLine": { "type": "integer" },
@@ -286,10 +287,26 @@
         "title": { "type": "string" },
         "text": { "type": "string" },
         "verify": { "type": "array", "items": { "type": "string" } },
+        "finalTests": { "$ref": "#/$defs/FinalTests" },
         "rawText": { "type": "string" },
         "line": { "type": "integer" },
         "verifyLine": { "type": "integer" },
         "domain": { "type": "string", "minLength": 1 }
+      }
+    },
+    "FinalTests": {
+      "description": "The item's final-only test verifies (`:VERIFY: test final \"name\"`): the final checks resolve them, and a round's check output may lack them. Parsed from `verify` by both plan readers; absent when the item has none.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "final"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "file": { "type": "string", "minLength": 1 },
+          "final": { "const": true }
+        }
       }
     },
     "Domain": {

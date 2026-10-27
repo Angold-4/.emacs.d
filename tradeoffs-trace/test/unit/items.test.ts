@@ -15,12 +15,15 @@ import {
   coverageNoteLines,
   evidenceFileAnchors,
   evidenceTestNames,
+  finalTestsOf,
   itemsAccept,
   itemsFromPhase,
   itemCounts,
   itemMatrix,
   parseVerify,
   repairItemLines,
+  resolveFinalTestVerifies,
+  resolveRoundTestVerifies,
   resolveTestVerifies,
   reviewItemsIssues,
   reverify,
@@ -29,6 +32,8 @@ import {
   testOutcomeIn,
   testResultLines,
   verdictIssues,
+  verifyKindIssue,
+  verifyLabel,
   type Coverage,
   type PlanItems,
   type ReviewItems,
@@ -66,6 +71,57 @@ test("items: parseVerify reads test, review and evidence, with a file::name and 
   assert.deepEqual(parseVerify('test "a" review'), [{ kind: "test", name: "a" }, { kind: "review" }]);
   // A bare `test` is a nameless test verify; lint rejects it.
   assert.deepEqual(parseVerify("test"), [{ kind: "test", name: "" }]);
+});
+
+test("items: `test final` marks a final-only test verify, quoted or file::name", () => {
+  assert.deepEqual(parseVerify('test final "corpus gate"'), [{ kind: "test", name: "corpus gate", final: true }]);
+  assert.deepEqual(parseVerify("test final src/x.test.ts::works"), [{ kind: "test", file: "src/x.test.ts", name: "works", final: true }]);
+  assert.deepEqual(parseVerify("test final acceptance::mark_s11"), [{ kind: "test", name: "acceptance::mark_s11", final: true }]);
+  assert.deepEqual(parseVerify('test final "a" test "b" review'), [
+    { kind: "test", name: "a", final: true },
+    { kind: "test", name: "b" },
+    { kind: "review" },
+  ]);
+  // `final` is a keyword only when bare and followed by whitespace or the end.
+  assert.deepEqual(parseVerify('test "final"'), [{ kind: "test", name: "final" }]);
+  assert.deepEqual(parseVerify("test final_gate"), [{ kind: "test", name: "final_gate" }]);
+  assert.deepEqual(parseVerify("test final::gate"), [{ kind: "test", name: "final::gate" }]);
+  assert.deepEqual(parseVerify("test final"), [{ kind: "test", name: "", final: true }]);
+  // A name containing the words is consumed whole.
+  assert.deepEqual(parseVerify('test "my test final thing"'), [{ kind: "test", name: "my test final thing" }]);
+  assert.equal(verifyKindIssue('test final "corpus gate" review'), undefined);
+  assert.equal(verifyLabel(['test final "a" test "b"']), 'test final "a", test "b"');
+  assert.deepEqual(finalTestsOf(['test final "a" test "b"', "test final src/x.test.ts::c"]), [
+    { name: "a", final: true },
+    { name: "c", file: "src/x.test.ts", final: true },
+  ]);
+  assert.deepEqual(finalTestsOf(['test "b"', "review"]), []);
+});
+
+test("items: a round leaves out only a missing final-only test; the final tier resolves only final-only tests", () => {
+  const items: PlanItems = {
+    goal: "g",
+    architecture: [],
+    requirements: [
+      { id: "R1", title: "gate", text: "gate", arch: [], verify: ['test final "corpus gate"'] },
+      { id: "R2", title: "unit", text: "unit", arch: [], verify: ['test "unit works"'] },
+    ],
+    constraints: [],
+  };
+  // Neither ran in the round: the final-only one is left out, the other
+  // stays missing (it holds acceptance and raises a finding).
+  assert.deepEqual(resolveRoundTestVerifies(items, ""), [{ id: "R2", name: "unit works", outcome: "missing" }]);
+  // A final-only test that ran and failed in a round is kept.
+  assert.deepEqual(resolveRoundTestVerifies(items, "not ok 1 - corpus gate\nok 2 - unit works\n"), [
+    { id: "R1", name: "corpus gate", final: true, outcome: "failed" },
+    { id: "R2", name: "unit works", outcome: "passed" },
+  ]);
+  assert.deepEqual(resolveFinalTestVerifies(items, "ok 1 - unit works\nok 2 - corpus gate\n"), [
+    { id: "R1", name: "corpus gate", final: true, outcome: "passed" },
+  ]);
+  assert.deepEqual(resolveFinalTestVerifies(items, "ok 1 - unit works\n"), [
+    { id: "R1", name: "corpus gate", final: true, outcome: "missing" },
+  ]);
 });
 
 test("items: the old format synthesizes R1..Rn and C1, evidence for an evidence: item", () => {

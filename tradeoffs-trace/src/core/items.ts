@@ -52,6 +52,9 @@ export interface RequirementItem {
   arch: string[];
   /** The raw `:VERIFY:` strings, in order. Empty = `review`. */
   verify: string[];
+  /** The item's `test final` verifies, parsed from `verify` by the plan
+   * readers (`finalTestsOf`). Absent when the item has none. */
+  finalTests?: FinalTestRef[];
   /** Plan 07a (D1): the declared domain this item serves (`:DOMAIN:`). */
   domain?: string;
   rawText?: string;
@@ -63,6 +66,8 @@ export interface ConstraintItem {
   title: string;
   text: string;
   verify: string[];
+  /** The item's `test final` verifies (see RequirementItem.finalTests). */
+  finalTests?: FinalTestRef[];
   /** Plan 07a (D1): the declared domain this item serves (`:DOMAIN:`). */
   domain?: string;
   rawText?: string;
@@ -189,12 +194,24 @@ export function architectureIds(items: PlanItems): Set<string> {
 // VERIFY kinds
 // ---------------------------------------------------------------------------
 
-export type Verify = { kind: "test"; name: string; file?: string } | { kind: "review" } | { kind: "evidence" };
+/** A `test` verify. `final: true` (`:VERIFY: test final "name"`) marks a
+ * test the plan runs only in `#+TT_FINAL_CHECKS`: a round's check output may
+ * lack it, and the final checks resolve it instead. */
+export type TestVerify = { kind: "test"; name: string; file?: string; final?: true };
+export type Verify = TestVerify | { kind: "review" } | { kind: "evidence" };
 
-/** Parse one `:VERIFY:` string into its kinds. `review` is the default when
- * the string is empty. `test "name"` and `test file::name` are both accepted;
- * a bare `test` (no name) parses to a nameless test verify, which lint
- * rejects. Several kinds may be listed (`test "…" review`). */
+/** One final-only test verify as the plan JSON carries it (`finalTests`). */
+export interface FinalTestRef {
+  name: string;
+  file?: string;
+  final: true;
+}
+
+/** The `test` verify pattern every reader shares: `test`, an optional bare
+ * `final` keyword (followed by whitespace or the end), then an optional
+ * quoted or bare name. Groups: 1 test, 2 final, 3 quoted name, 4 bare name. */
+const TEST_VERIFY = String.raw`(\btest\b)(?:\s+(final)(?=\s|$))?(?:\s+(?:"([^"]*)"|(\S+)))?`;
+
 /** A verify's `file::` prefix is a path: it has a `/` or a file extension. */
 function isFilePath(text: string): boolean {
   return text.includes("/") || /\.[A-Za-z0-9]+$/.test(text);
@@ -208,22 +225,37 @@ function testRef(raw: string): { name: string; file?: string } {
   return sep > 0 && isFilePath(name.slice(0, sep)) ? { name: name.slice(sep + 2), file: name.slice(0, sep) } : { name };
 }
 
+/** Parse one `:VERIFY:` string into its kinds. `review` is the default when
+ * the string is empty. `test "name"` and `test file::name` are both accepted;
+ * `test final "name"` (or `test final file::name`) marks the test final-only.
+ * A bare `test` (no name) parses to a nameless test verify, which lint
+ * rejects. Several kinds may be listed (`test "…" review`). */
 export function parseVerify(raw: string | undefined): Verify[] {
   const text = (raw ?? "").trim();
   if (text.length === 0) return [{ kind: "review" }];
   const out: Verify[] = [];
-  const re = /(\btest\b)(?:\s+(?:"([^"]*)"|(\S+)))?|(\breview\b)|(\bevidence\b)/gi;
+  const re = new RegExp(String.raw`${TEST_VERIFY}|(\breview\b)|(\bevidence\b)`, "gi");
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     if (m[1] !== undefined) {
-      out.push({ kind: "test", ...testRef(m[2] ?? m[3] ?? "") });
-    } else if (m[4] !== undefined) {
-      out.push({ kind: "review" });
+      out.push({ kind: "test", ...testRef(m[3] ?? m[4] ?? ""), ...(m[2] !== undefined ? { final: true as const } : {}) });
     } else if (m[5] !== undefined) {
+      out.push({ kind: "review" });
+    } else if (m[6] !== undefined) {
       out.push({ kind: "evidence" });
     }
   }
   return out.length > 0 ? out : [{ kind: "review" }];
+}
+
+/** The `test final` verifies of an item's raw `:VERIFY:` strings, as the plan
+ * JSON's `finalTests` carries them. Empty when there are none (the readers
+ * then omit the field). The Emacs exporter builds the same list. */
+export function finalTestsOf(verify: readonly string[]): FinalTestRef[] {
+  return verify
+    .flatMap((v) => parseVerify(v))
+    .filter((v): v is TestVerify => v.kind === "test" && v.final === true)
+    .map((v) => ({ name: v.name, ...(v.file ? { file: v.file } : {}), final: true as const }));
 }
 
 /** Plan 06k2 (A5/A8): the first token of a `:VERIFY:` string that is not one
@@ -234,11 +266,11 @@ export function parseVerify(raw: string | undefined): Verify[] {
 export function verifyKindIssue(raw: string): string | undefined {
   const text = (raw ?? "").trim();
   if (text.length === 0) return undefined;
-  const re = /(\btest\b)(?:\s+(?:"([^"]*)"|(\S+)))?|(\breview\b)|(\bevidence\b)|(\S+)/gi;
+  const re = new RegExp(String.raw`${TEST_VERIFY}|(\breview\b)|(\bevidence\b)|(\S+)`, "gi");
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    if (m[1] !== undefined || m[4] !== undefined || m[5] !== undefined) continue;
-    if (m[6] !== undefined) return m[6];
+    if (m[1] !== undefined || m[5] !== undefined || m[6] !== undefined) continue;
+    if (m[7] !== undefined) return m[7];
   }
   return undefined;
 }
@@ -268,8 +300,8 @@ export function itemVerifies(item: FlatItem): Verify[] {
 }
 
 /** The test verifies of one item. */
-export function itemTestVerifies(item: FlatItem): Array<{ kind: "test"; name: string; file?: string }> {
-  return itemVerifies(item).filter((v): v is { kind: "test"; name: string; file?: string } => v.kind === "test");
+export function itemTestVerifies(item: FlatItem): TestVerify[] {
+  return itemVerifies(item).filter((v): v is TestVerify => v.kind === "test");
 }
 
 /** True when an item must be recorded by the owner before acceptance. */
@@ -280,7 +312,7 @@ export function itemNeedsEvidence(item: FlatItem): boolean {
 /** One short human label for a verify list: `test "x", review`. */
 export function verifyLabel(verify: readonly string[]): string {
   const kinds = parseVerify(verify.join(" ")).map((v) =>
-    v.kind === "test" ? `test "${v.name || "(no name)"}"` : v.kind,
+    v.kind === "test" ? `test ${v.final ? "final " : ""}"${v.name || "(no name)"}"` : v.kind,
   );
   return kinds.join(", ");
 }
@@ -401,6 +433,8 @@ export interface VerifyResolution {
   id: string;
   name: string;
   file?: string;
+  /** A `test final` verify: the final checks resolve it. */
+  final?: true;
   outcome: TestOutcome;
 }
 
@@ -472,10 +506,31 @@ export function resolveTestVerifies(items: PlanItems, checkOutput: string): Veri
   const out: VerifyResolution[] = [];
   for (const item of flatItems(items)) {
     for (const v of itemTestVerifies(item)) {
-      out.push({ id: item.id, name: v.name, ...(v.file ? { file: v.file } : {}), outcome: testOutcomeIn(checkOutput, v.name) });
+      out.push({
+        id: item.id,
+        name: v.name,
+        ...(v.file ? { file: v.file } : {}),
+        ...(v.final ? { final: true as const } : {}),
+        outcome: testOutcomeIn(checkOutput, v.name),
+      });
     }
   }
   return out;
+}
+
+/** A round's test verify outcomes: every test verify resolved against the
+ * round's check output, except a `test final` verify that is merely missing
+ * from it — the plan runs that test only in `#+TT_FINAL_CHECKS`, so it
+ * neither raises a finding nor holds acceptance here. A final-only test that
+ * ran and failed is kept, and every other missing test is kept. */
+export function resolveRoundTestVerifies(items: PlanItems, checkOutput: string): VerifyResolution[] {
+  return resolveTestVerifies(items, checkOutput).filter((r) => !(r.final && r.outcome === "missing"));
+}
+
+/** The final tier's outcomes: only the `test final` verifies, resolved
+ * against the final checks' output (the round checks plus the final ones). */
+export function resolveFinalTestVerifies(items: PlanItems, checkOutput: string): VerifyResolution[] {
+  return resolveTestVerifies(items, checkOutput).filter((r) => r.final === true);
 }
 
 /** The failing/missing test verifies that block acceptance: `id — test

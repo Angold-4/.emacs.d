@@ -220,6 +220,8 @@ import {
   requirementAndConstraintItems,
   phaseItemOutcomes,
   repairItemLines,
+  resolveFinalTestVerifies,
+  resolveRoundTestVerifies,
   resolveTestVerifies,
   reviewItemsIssues,
   reviewRequestLines,
@@ -8187,17 +8189,13 @@ export class Conductor {
     this.#applyEvent({ type: "FINDING_RAISED", finding });
   }
 
-  /** The candidate's `test` verify outcomes from a check run's output. With
-   * TT_FINAL_ONLY_MISSING=1 and final checks declared, a test merely missing
-   * from the output is left out: the plan runs it only in #+TT_FINAL_CHECKS
-   * (exex 01b2, ODP-3), whose command fails the phase if it fails, so it must
-   * neither raise a finding nor hold acceptance before the final checks run.
-   * A failed test is always kept. */
+  /** The candidate's `test` verify outcomes from a round's check output. A
+   * `:VERIFY: test final` test merely missing from it is left out: the plan
+   * runs that test only in #+TT_FINAL_CHECKS (exex 01b2), which resolve it,
+   * so it neither raises a finding nor holds acceptance before they run.
+   * Every other missing test, and every failed test, is kept. */
   #resolveVerifies(output: string): VerifyResolution[] {
-    const resolutions = resolveTestVerifies(this.#planItems(), output);
-    const finalOnlyMissing =
-      process.env.TT_FINAL_ONLY_MISSING === "1" && (this.#state.phase.contract.finalChecks ?? []).length > 0;
-    return finalOnlyMissing ? resolutions.filter((r) => r.outcome !== "missing") : resolutions;
+    return resolveRoundTestVerifies(this.#planItems(), output);
   }
 
   /** A `test` verify that is missing from or failed in the candidate's check
@@ -12558,16 +12556,42 @@ export class Conductor {
       });
       // Plan 06b: resolve every item's `test` verify against the candidate's
       // own (round) check run. A named test that is missing from or failed in
-      // the output is a blocking finding anchored to its item. The final
-      // check's run does not re-resolve them.
+      // the output is a blocking finding anchored to its item, except a
+      // `test final` one merely missing (#resolveVerifies). The final check's
+      // run resolves only the `test final` verifies, below.
       if (tier === "round" && this.#itemsEnforced()) {
         const resolutions = this.#resolveVerifies(combinedOutput);
         this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions, checkTestLines: testResultLines(combinedOutput) });
         this.#applyTestVerifyFindings(candidateSha);
       }
+      // `:VERIFY: test final`: the final checks resolve the final-only test
+      // verifies a round's output left out. One that is missing from or
+      // failed in this output fails the final checks, by name; when all
+      // passed they resolve as passed.
+      const finalVerifies =
+        tier === "final" && this.#itemsEnforced() ? resolveFinalTestVerifies(this.#planItems(), combinedOutput) : [];
+      const finalVerifyLines = finalVerifies
+        .filter((r) => r.outcome !== "passed")
+        .map((r) => `${r.id} test final "${r.name}" ${r.outcome === "missing" ? "is missing from the final check output" : "failed"}`);
       if (tier === "final") {
-        if (passed) {
+        if (passed && finalVerifyLines.length === 0) {
+          if (finalVerifies.length > 0) {
+            const kept = (this.#state.phase.checkResolution ?? []).filter(
+              (r) => !finalVerifies.some((f) => f.id === r.id && f.name === r.name),
+            );
+            this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: [...kept, ...finalVerifies] });
+          }
           this.#applyEvent({ type: "FINAL_CHECKS_PASSED", candidateSha });
+        } else if (passed) {
+          // Every command exited 0, but a final-only test did not pass in the
+          // output: the repair prompt names each one as a failure to fix.
+          this.#applyEvent({
+            type: "FINAL_CHECKS_FAILED",
+            evidence: `the final check on candidate ${candidateSha.slice(0, 9)} did not pass every final-only test: ${finalVerifyLines.join("; ")}`,
+            failures: finalVerifies
+              .filter((r) => r.outcome !== "passed")
+              .map((r) => ({ name: r.name, reproducesAlone: true, loadOnly: false, failingExitCode: null, rerunExitCodes: [] })),
+          });
         } else {
           const failing = recordCommands.filter((c) => !c.passed).map((c) => c.command);
           const tail = combinedOutput.split("\n").filter((l) => l.trim().length > 0).slice(-20).join("\n");
@@ -12589,7 +12613,7 @@ export class Conductor {
                 }));
           this.#applyEvent({
             type: "FINAL_CHECKS_FAILED",
-            evidence: `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${tail ? `\n${tail}` : ""}`,
+            evidence: `the final check failed on candidate ${candidateSha.slice(0, 9)}: ${failing.join(", ") || "(a check command exited non-zero)"}${finalVerifyLines.length > 0 ? `; ${finalVerifyLines.join("; ")}` : ""}${tail ? `\n${tail}` : ""}`,
             ...(finalFailures.length > 0 ? { failures: finalFailures } : {}),
           });
         }
