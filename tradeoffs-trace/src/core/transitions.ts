@@ -1338,17 +1338,16 @@ addRow({
     }),
 });
 
-// Plan 06k1 (A5, finding A-8): a correction arrived while the final check ran.
-// It is queued for the next attempt and granted its own round, so a passing
-// final check sends the phase to REPAIRING instead of accepting the candidate
-// without it.
+// Plan 07f (C2): a passing final check does not clear other acceptance
+// blockers. Repair only when the common predicate still reports a blocker;
+// the presence or delivery of a legacy queued correction is irrelevant.
 addRow({
-  id: "final-checks-passed-correction-queued",
+  id: "final-checks-passed-not-accepted",
   axis: "phase",
   from: "FINAL_CHECKING",
   trigger: "FINAL_CHECKS_PASSED",
-  guardName: "queuedCorrectionBlocksAcceptance",
-  guard: (s) => !acceptHoldsOnFinalPass(s) && (s.phase.queuedCorrections ?? []).length > 0,
+  guardName: "acceptDoesNotHoldOnFinalPass",
+  guard: (s) => !acceptHoldsOnFinalPass(s),
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
   apply: (s) => withPhase(s, { phase: "REPAIRING", inFlight: clearInFlight(s.phase, "run_final_checks") }),
