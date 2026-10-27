@@ -1545,6 +1545,14 @@ export interface RoundFixed {
   tasks: FixTaskRecord[];
   merges: { sha: string }[];
   candidate?: string;
+  /** Plan 07c (C3): the fixers' own decision disclosures, unioned. The merged
+   * candidate's synthetic lane build carries them so the hand-off records
+   * them as the phase's decisions — a fixer's out-of-task trade-off reaches
+   * the reviewers instead of being silently dropped. */
+  disclosures?: DecisionDisclosure[];
+  /** Plan 07c (C3): the fixers' own assumptions and deviations, unioned, so
+   * their free-form notes are kept rather than discarded. */
+  added?: string[];
 }
 
 export interface FlakeObservation {
@@ -1871,6 +1879,11 @@ export interface EvRoundFixed {
   tasks: FixTaskRecord[];
   merges: { sha: string }[];
   candidate?: string;
+  /** Plan 07c (C3): the fixers' unioned decision disclosures, replayed into
+   * the merged candidate's synthetic lane build at the hand-off. */
+  disclosures?: DecisionDisclosure[];
+  /** Plan 07c (C3): the fixers' unioned assumptions and deviations. */
+  added?: string[];
 }
 /** Plan 06n (A7): the round's evaluated pick `sha` lost `items` that the
  * phase's best candidate met, in code it changed, so it is not adopted as the

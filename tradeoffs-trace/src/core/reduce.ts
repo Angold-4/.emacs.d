@@ -716,6 +716,8 @@ function applyRecordEvent(state: State, event: Event): ReduceResult | undefined 
         })),
         merges: event.merges.map((m) => ({ sha: m.sha })),
         ...(event.candidate ? { candidate: event.candidate } : {}),
+        ...(event.disclosures && event.disclosures.length > 0 ? { disclosures: event.disclosures } : {}),
+        ...(event.added && event.added.length > 0 ? { added: event.added } : {}),
       };
       return ok({ ...state, phase: { ...p, rounds: replaceRound(p.rounds, { ...round, fixed }) } });
     }

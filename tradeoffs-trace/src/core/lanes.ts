@@ -697,6 +697,9 @@ export interface ConsolidationOutcome {
   fixes: number;
   /** What the consolidator says it changed beyond the taken work. */
   added?: string[];
+  /** Plan 07c (C3): the consolidator's/fixer's own decision disclosures, so a
+   * fix round can carry them onto the merged candidate. */
+  disclosures?: DecisionDisclosure[];
   /** The owner stopped the run mid-way: nothing is recorded. */
   stopped?: boolean;
 }
@@ -740,11 +743,18 @@ export async function runConsolidation(host: ConsolidationHost): Promise<Consoli
       fixNote = fixed.note;
       break;
     }
-    build = { ...fixed, added: fixed.added ?? build.added };
+    build = { ...fixed, added: fixed.added ?? build.added, disclosures: fixed.disclosures ?? build.disclosures };
     result = await check(build.sha!);
   }
   if (host.stopRequested?.()) return { ok: false, fixes, stopped: true };
-  if (result.ok) return { ok: true, sha: build.sha, fixes, ...(build.added ? { added: build.added } : {}) };
+  if (result.ok)
+    return {
+      ok: true,
+      sha: build.sha,
+      fixes,
+      ...(build.added ? { added: build.added } : {}),
+      ...(build.disclosures ? { disclosures: build.disclosures } : {}),
+    };
   return {
     ok: false,
     fixes,

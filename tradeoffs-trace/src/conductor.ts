@@ -1363,8 +1363,11 @@ interface AgentHandle {
    * lane or the phase. */
   consolidation?: { round: number; worktree: string };
   /** tt 09 (change 3): the consolidator's `submit_phase` report of what it
-   * changed beyond the taken work (its `deviations`). */
+   * changed beyond the taken work (its `deviations` and `assumptions`). */
   consolidationAdded?: string[];
+  /** Plan 07c (C3): the consolidator's/fixer's own `decisions` disclosures,
+   * kept so a fix round can carry them onto the merged candidate. */
+  consolidationDisclosures?: DecisionDisclosure[];
   /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
   pickSeat?: string;
   /** Plan 06h (A3): true when this pick turn is the top-two revote. */
@@ -4701,7 +4704,13 @@ export class Conductor {
       if (msg.tool === "submit_coverage") return { ok: true };
       if (msg.tool === "submit_phase") {
         const args = msg.args as SubmitPhaseArgs;
-        handle.consolidationAdded = (args.deviations ?? []).filter((d) => typeof d === "string" && d.trim().length > 0);
+        // Plan 07c (C3): a fixer's out-of-task trade-off is a `decisions`
+        // disclosure; keep it (and its assumptions and deviations) so the
+        // merged candidate's hand-off can record it.
+        handle.consolidationDisclosures = Array.isArray(args.decisions) ? args.decisions : [];
+        handle.consolidationAdded = [...(args.assumptions ?? []), ...(args.deviations ?? [])].filter(
+          (d) => typeof d === "string" && d.trim().length > 0,
+        );
         handle.doneResolve();
         return { ok: true };
       }
@@ -9139,8 +9148,9 @@ export class Conductor {
         this.#log.completion(actionId, { round: opts.round, outcome: "unchanged", sha });
         return { lane: opts.lane, note: opts.changedNothingNote ?? `the ${opts.roleWord} changed nothing on the base` };
       }
+      const disclosures = handle.consolidationDisclosures ?? [];
       this.#log.completion(actionId, { round: opts.round, sha, added: handle.consolidationAdded });
-      return { lane: opts.lane, sha, added: handle.consolidationAdded };
+      return { lane: opts.lane, sha, added: handle.consolidationAdded, ...(disclosures.length > 0 ? { disclosures } : {}) };
     } finally {
       this.#agents.delete(agentId);
     }
@@ -9203,6 +9213,11 @@ export class Conductor {
         })),
       ),
     );
+    // Plan 07c (C3): the fixers' own decision disclosures, unioned, so the
+    // merged candidate's hand-off records them (a fixer decides no trade-off
+    // but may report one; that report must reach the reviewers).
+    const disclosures = results.flatMap((r) => r.disclosures ?? []);
+    const added = results.flatMap((r) => r.added ?? []);
     if (stopped()) {
       this.#log.append("fix_round_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
       return "stopped";
@@ -9255,6 +9270,8 @@ export class Conductor {
       tasks: taskRecords,
       merges,
       ...(candidate ? { candidate } : {}),
+      ...(disclosures.length > 0 ? { disclosures } : {}),
+      ...(added.length > 0 ? { added } : {}),
     });
     this.#applyEvent({
       type: "ROUND_FIXED",
@@ -9263,6 +9280,8 @@ export class Conductor {
       tasks: taskRecords,
       merges,
       ...(candidate ? { candidate } : {}),
+      ...(disclosures.length > 0 ? { disclosures } : {}),
+      ...(added.length > 0 ? { added } : {}),
     });
     return undefined;
   }
@@ -9446,6 +9465,15 @@ export class Conductor {
       if (typeof intent?.base === "string" && !this.#laneCheckBases.has(key)) this.#laneCheckBases.set(key, intent.base);
       build = { ...(done.build ?? {}), lane, sha, ...(done.tainted !== undefined ? { tainted: done.tainted } : {}) };
       break;
+    }
+    // Plan 07c (D4.7): a resumed fix round's synthetic lane has no worker
+    // completion to restore from, so its check base and disclosures come from
+    // the recorded ROUND_FIXED whose merged candidate it is. Without this a
+    // resumed check loses base B (and the wide-path tier it selects).
+    const fixRecord = (this.#state.phase.rounds ?? []).find((r) => r.fixed?.candidate === sha)?.fixed;
+    if (fixRecord) {
+      if (!this.#laneCheckBases.has(key)) this.#laneCheckBases.set(key, fixRecord.base);
+      if (build.disclosures === undefined && fixRecord.disclosures) build = { ...build, disclosures: fixRecord.disclosures };
     }
     this.#laneBuilds.set(key, build);
     // A candidate checked before the stop: its output (for the hand-off's
@@ -10488,7 +10516,9 @@ export class Conductor {
           return;
         }
       }
-      const fix = !unfinished ? fixRoundCandidate(this.#state.phase.rounds, round) : undefined;
+      // Plan 07c (D4.7): the fix candidate is read for an unfinished round
+      // too, so a resumed synthetic lane still knows its base and disclosures.
+      const fix = fixRoundCandidate(this.#state.phase.rounds, round);
       lanes = unfinished ? last!.lanes : fix ? ["a"] : this.#lanes();
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
       const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
@@ -10565,7 +10595,13 @@ export class Conductor {
           if (fix && r === round && lane === "a") {
             this.#laneCheckBases.set(`${r}-${lane}`, fix.base);
             this.#laneStartedAt.set(`${r}-${lane}`, Date.now());
-            const built: LaneBuild = { lane, sha: fix.candidate };
+            const fixRecord = (this.#state.phase.rounds ?? []).find((x) => x.fixed?.candidate === fix.candidate)?.fixed;
+            const built: LaneBuild = {
+              lane,
+              sha: fix.candidate,
+              ...(fixRecord?.disclosures && fixRecord.disclosures.length > 0 ? { disclosures: fixRecord.disclosures } : {}),
+              ...(fixRecord?.added && fixRecord.added.length > 0 ? { added: fixRecord.added } : {}),
+            };
             this.#laneBuilds.set(`${r}-${lane}`, built);
             return built;
           }

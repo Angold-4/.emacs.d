@@ -341,7 +341,7 @@ test("a fixer's prompt has its own findings in full and only a one-line index of
   }
 });
 
-test("a fixer's submit_phase without item coverage or answers to other findings is accepted and its commit is merged", async () => {
+test("a fixer's submit_phase without item coverage or answers to other findings is accepted", async () => {
   const setup = await setupConductor({
     phase: fixPhase(),
     checks: ["true"],
@@ -370,6 +370,45 @@ test("a fixer's submit_phase without item coverage or answers to other findings 
     assert.equal(record.merges.length, 2, "both bare submissions merged");
     assert.ok(record.tasks.every((t) => typeof t.sha === "string" && t.sha.length > 0), "each task recorded its commit");
     assert.ok(record.candidate, "the merged candidate was recorded");
+  } finally {
+    await teardown(setup);
+  }
+});
+
+test("a fixer's out-of-task decision disclosure reaches the phase record", async () => {
+  const disclosure = (domain: string) => ({
+    choice: `FIXER_DISCLOSURE_${domain}`,
+    whyItMatters: "the fixer met a decision outside its findings and reports it rather than deciding it",
+    alternatives: [{ option: "decide it silently", consequence: "the owner never sees the choice" }],
+    recommendation: { choice: "report it", reason: "a fixer decides no trade-off" },
+    classProposal: "detail",
+  });
+  const setup = await setupConductor({
+    phase: fixPhase({ finalChecks: ["true"] }),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    workerScript: () => laneWorker(1, "a"),
+    laneWorkerScriptFor: (lane, round) => laneWorker(round, lane),
+    laneReviewerScriptFor: (seat, candidate, state) => reviewerWithPoints(BOOKING_DONE, GATES_DONE)(seat, candidate, state),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, state.phase.rounds?.length ?? 1, "a"),
+    fixerScriptFor: (domain) => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: `printf '${domain} fixed\\n' > ${domain}-fixed.txt` },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [disclosure(domain)], assumptions: [], deviations: [`FIXER_DEVIATION_${domain}`] } },
+      ],
+    }),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
+    const choices = (setup.conductor.state.phase.decisions ?? []).map((d) => d.choice);
+    assert.ok(choices.includes("FIXER_DISCLOSURE_booking"), `the booking fixer's disclosure reached the phase record: ${JSON.stringify(choices)}`);
+    assert.ok(choices.includes("FIXER_DISCLOSURE_gates"), `the gates fixer's disclosure reached the phase record: ${JSON.stringify(choices)}`);
+    const added = setup.conductor.state.phase.rounds?.[0]?.fixed?.added ?? [];
+    assert.ok(added.includes("FIXER_DEVIATION_booking") && added.includes("FIXER_DEVIATION_gates"), `the fixers' notes are kept: ${JSON.stringify(added)}`);
   } finally {
     await teardown(setup);
   }
@@ -556,10 +595,14 @@ test("a phase with domain findings reaches acceptance through a fix round", asyn
 test("a fix round resumed after ROUND_FIXED starts the next round from the recorded candidate", async () => {
   const counter = `/tmp/tt-07c-fixer-counter-${process.pid}`;
   fs.rmSync(counter, { force: true });
+  // Plan 07c (A4): the fix candidate touches a wide path, so the resumed
+  // check must diff against the recorded fix base B and run the final tier.
+  const finalMarker = `/tmp/tt-07c-resume-final-${process.pid}`;
+  fs.rmSync(finalMarker, { force: true });
   const promptDir = fs.mkdtempSync("/tmp/tt-07c-resume-");
   const promptLog = path.join(promptDir, "prompts.txt");
   const setup = await setupConductor({
-    phase: fixPhase(),
+    phase: fixPhase({ finalChecks: [`echo final >> ${finalMarker}`], widePaths: ["booking-fixed.txt"] }),
     checks: ["true"],
     phaseChecks: ["true"],
     stubReviews: true,
@@ -595,10 +638,15 @@ test("a fix round resumed after ROUND_FIXED starts the next round from the recor
     const second = resumed!.state.phase.rounds![1];
     assert.equal(second.base, candidate, "the next round's base is the recorded candidate");
     assert.equal(second.candidates[0].sha, candidate, "the next round's candidate is the recorded one");
+    // Plan 07c (A4): the synthetic lane's check base is restored from the
+    // recorded ROUND_FIXED, so the wide-path diff against B runs the final tier.
+    await waitFor(() => fs.existsSync(finalMarker), 120_000, 50, setup.runDir);
+    assert.ok(fs.existsSync(finalMarker), "the resumed check diffed against B and ran the final checks");
   } finally {
     if (resumed) await resumed.stop();
     await teardown(setup);
     fs.rmSync(counter, { force: true });
+    fs.rmSync(finalMarker, { force: true });
     cleanupDir(promptDir);
   }
 });
