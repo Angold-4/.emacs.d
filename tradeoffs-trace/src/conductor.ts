@@ -2722,7 +2722,9 @@ export class Conductor {
     // is logged (with why) before anything is torn down, so the record is
     // durable even if a later step is slow or fails.
     try {
-      this.#log?.append("stop", { reason: "conductor stopped", at: new Date().toISOString() });
+      // Plan 07e (E4): the shutdown record is retried once after an ENOSPC,
+      // so the last state survives a disk that frees up before the exit.
+      this.#log?.appendCritical("stop", { reason: "conductor stopped", at: new Date().toISOString() });
     } catch {
       // the log may already be closed (a second stop call); never fatal.
     }
@@ -2888,9 +2890,11 @@ export class Conductor {
       process.stderr.write(`tt: disk full — ${String((err as Error)?.message ?? err)}\n`);
     }
     // Record the distinct cause when the log itself is still writable (a
-    // check-output write can fail while events.jsonl succeeds). Once the log
-    // is full, `EventLog.append` is a no-op, so this cannot recurse.
-    this.#log.append("check_disk_full", {
+    // check-output write can fail while events.jsonl succeeds). Plan 07e
+    // (E4): this is the final failure record, so it gets one bounded retry
+    // instead of being a permanent no-op — if storage frees up, recovery
+    // still sees why the run stopped.
+    this.#log.appendCritical("check_disk_full", {
       where,
       reason: "disk full",
       error: String((err as Error)?.message ?? err),
