@@ -94,7 +94,9 @@ test("R1.correction: {X,honored} then {X,not_honored} in one review -> false", (
   const state = stateWith(reviews);
   const correction = state.phase.corrections[0];
   assert.equal(addressed(correction, state.phase, "C2", K), false);
-  assert.equal(accept(state.phase, "C2", K), false);
+  // Plan 07f (C2): a correction is a point for its domain, not an acceptance
+  // obligation. The addressed report still fails closed, but accept does not.
+  assert.equal(accept(state.phase, "C2", K), true);
 });
 
 test("R1.correction: {X,not_honored} then {X,honored} in one review -> false (order-independent)", () => {
@@ -106,7 +108,7 @@ test("R1.correction: {X,not_honored} then {X,honored} in one review -> false (or
   const state = stateWith(reviews);
   const correction = state.phase.corrections[0];
   assert.equal(addressed(correction, state.phase, "C2", K), false);
-  assert.equal(accept(state.phase, "C2", K), false);
+  assert.equal(accept(state.phase, "C2", K), true);
 });
 
 test("R1.correction: duplicate identical {X,honored},{X,honored} -> false", () => {
@@ -118,7 +120,7 @@ test("R1.correction: duplicate identical {X,honored},{X,honored} -> false", () =
   const state = stateWith(reviews);
   const correction = state.phase.corrections[0];
   assert.equal(addressed(correction, state.phase, "C2", K), false);
-  assert.equal(accept(state.phase, "C2", K), false);
+  assert.equal(accept(state.phase, "C2", K), true);
 });
 
 test("R1.correction: a review missing any statement for X -> false", () => {
@@ -127,7 +129,7 @@ test("R1.correction: a review missing any statement for X -> false", () => {
   const state = stateWith(reviews);
   const correction = state.phase.corrections[0];
   assert.equal(addressed(correction, state.phase, "C2", K), false);
-  assert.equal(accept(state.phase, "C2", K), false);
+  assert.equal(accept(state.phase, "C2", K), true);
 });
 
 test("R1.correction: an invalid/legacy status for X -> false", () => {
@@ -139,7 +141,7 @@ test("R1.correction: an invalid/legacy status for X -> false", () => {
   const state = stateWith(reviews, { skipSchemaCheck: true });
   const correction = state.phase.corrections[0];
   assert.equal(addressed(correction, state.phase, "C2", K), false);
-  assert.equal(accept(state.phase, "C2", K), false);
+  assert.equal(accept(state.phase, "C2", K), true);
 });
 
 test("R1.correction: a review bound to a different candidate -> false", () => {
@@ -157,5 +159,7 @@ test("R1.correction: a review bound to a different contract version -> false", (
   const state = stateWith(reviews);
   const correction = state.phase.corrections[0];
   assert.equal(addressed(correction, state.phase, "C2", K), false);
+  // The stale review itself is not acceptance-grade (a separate gate); the
+  // correction is no longer what holds acceptance here (plan 07f C2).
   assert.equal(accept(state.phase, "C2", K), false);
 });

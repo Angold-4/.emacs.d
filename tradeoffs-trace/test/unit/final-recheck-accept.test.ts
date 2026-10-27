@@ -56,7 +56,7 @@ test("with a gate declared, a final check that passes on recheck moves on to GAT
   assert.equal(r.state.phase.phase, "GATING");
 });
 
-test("a queued correction still repairs after a final check that passes on recheck", () => {
+test("a queued correction does not force repair after a final check that passes on recheck", () => {
   const queued = recheckedFinal({
     queuedCorrections: [{ id: "C-1", text: "use UTC everywhere" }],
     repairRoundsUsed: 0,
@@ -64,5 +64,21 @@ test("a queued correction still repairs after a final check that passes on reche
   });
   const r = reduce(queued, PASSED);
   assert.ok(r.ok, `FINAL_CHECKS_PASSED was rejected: ${!r.ok ? r.reason : ""}`);
-  assert.equal(r.state.phase.phase, "REPAIRING");
+  assert.equal(r.state.phase.phase, "ACCEPTED");
+  assert.equal(accept(r.state.phase, "C1", K), true);
+  assert.deepEqual(r.state.phase.queuedCorrections, queued.phase.queuedCorrections, "acceptance does not falsely claim delivery");
+  assert.equal(r.state.phase.repairRoundsUsed, 0, "delivery does not force another round");
+});
+
+test("a real acceptance blocker still repairs after a passing final recheck regardless of queued corrections", () => {
+  for (const queuedCorrections of [[], [{ id: "C-1", text: "use UTC everywhere" }]]) {
+    const state = recheckedFinal({
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: false },
+      queuedCorrections,
+    });
+    const r = reduce(state, PASSED);
+    assert.ok(r.ok, `FINAL_CHECKS_PASSED was rejected: ${!r.ok ? r.reason : ""}`);
+    assert.equal(r.state.phase.phase, "REPAIRING", "a passing final check cannot clear a failed probe");
+    assert.deepEqual(r.state.phase.queuedCorrections, queuedCorrections);
+  }
 });

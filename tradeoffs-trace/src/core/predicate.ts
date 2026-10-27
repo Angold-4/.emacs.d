@@ -636,8 +636,6 @@ export type AcceptanceBlockerKind =
   | "finding"
   | "decision"
   | "owner-request"
-  | "correction"
-  | "queued-correction"
   | "carry";
 
 export interface AcceptanceBlocker {
@@ -971,26 +969,10 @@ function acceptanceBlockersFor(phase: PhaseState, C: string, K: ContractVersion)
     });
   }
 
-  for (const correction of phase.corrections) {
-    if (correction.status !== "open") continue; // resolved/superseded already settled
-    if (addressed(correction, phase, C, K)) continue;
-    blockers.push({
-      kind: "correction",
-      detail: `owner correction ${shortId(correction.id)} has not been addressed by every seat`,
-      command: `tt resume ${phase.runId}`,
-    });
-  }
-
-  // Plan 06k1 (A5, finding A-8): a correction queued while the phase was
-  // reviewing, evaluating or final-checking has not reached a worker prompt
-  // yet. It is an acceptance obligation.
-  if ((phase.queuedCorrections ?? []).length > 0) {
-    blockers.push({
-      kind: "queued-correction",
-      detail: `${phase.queuedCorrections!.length} queued correction(s) have not been delivered`,
-      command: `tt resume ${phase.runId}`,
-    });
-  }
+  // Plan 07f (A3/C2, design §3.3): a correction is a point for its domain's
+  // next fix loop, never an acceptance obligation; a ruling applies at once.
+  // Acceptance therefore never waits for a correction to reach a worker and
+  // keeps no separate corrections/queued-corrections gates.
 
   return blockers;
 }

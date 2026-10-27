@@ -122,7 +122,7 @@ test("plan 06k1: a correction sent during review or final checks becomes the nex
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
     await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-late-review" && i.state === "queued"),
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-late-review" && i.state === "noted"),
       30_000,
       50,
       setup.runDir,
@@ -136,7 +136,7 @@ test("plan 06k1: a correction sent during review or final checks becomes the nex
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
     await waitFor(
-      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-late-final" && i.state === "queued"),
+      () => (setup.conductor.state.phase.ownerInputs ?? []).some((i) => i.id === "cmd-late-final" && i.state === "noted"),
       30_000,
       50,
       setup.runDir,
@@ -159,7 +159,7 @@ test("plan 06k1: a correction sent during review or final checks becomes the nex
   }
 });
 
-test("plan 06k1: a queued correction blocks acceptance until NOTES_DELIVERED clears it", () => {
+test("plan 06k1: a queued correction is not an acceptance obligation and delivery still clears it", () => {
   const K = CV();
   const ready = basePhase({
     phase: "RESOLVING",
@@ -175,14 +175,17 @@ test("plan 06k1: a queued correction blocks acceptance until NOTES_DELIVERED cle
   });
   assert.equal(accept(ready, "C1", K), true, "the candidate is otherwise acceptable");
   const queued = { ...ready, queuedCorrections: [{ id: "C-1", text: "use UTC everywhere" }] };
-  assert.equal(accept(queued, "C1", K), false, "a queued correction is an acceptance obligation");
+  // Design draft 7 §3.3 (A3): acceptance never waits for a correction to reach
+  // a worker. The correction is still recorded and still delivered; it just
+  // does not gate the candidate.
+  assert.equal(accept(queued, "C1", K), true, "a queued correction is not an acceptance obligation");
   const delivered = reduce(
     baseState(queued),
     { type: "NOTES_DELIVERED", phaseId: "p1", count: 1 },
   );
   assert.ok(delivered.ok, "the delivery applies");
-  assert.deepEqual(delivered.state.phase.queuedCorrections, [], "delivery clears the obligation");
-  assert.equal(accept(delivered.state.phase, "C1", K), true, "once delivered, the candidate is acceptable again");
+  assert.deepEqual(delivered.state.phase.queuedCorrections, [], "delivery clears the queue");
+  assert.equal(accept(delivered.state.phase, "C1", K), true, "and the candidate stays acceptable");
 });
 
 /** One clean reviewer, no findings: the phase would accept as soon as its
@@ -210,7 +213,7 @@ function cleanReviewer(reviewer: Reviewer, state: State): { hello: unknown; step
   };
 }
 
-test("plan 06k1: a correction queued during REVIEWING obliges a repair before DONE", async () => {
+test("plan 06k1: a correction queued during REVIEWING never blocks acceptance and stays recorded", async () => {
   const dir = fs.mkdtempSync("/tmp/tt-06k1-review-");
   const promptLog = path.join(dir, "prompts.log");
   const correction = "CORRECTION-BEFORE-DONE-REVIEW: cap the retry loop at 64";
@@ -238,12 +241,15 @@ test("plan 06k1: a correction queued during REVIEWING obliges a repair before DO
       text: correction,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
-    // The correction blocks acceptance, so a repair attempt runs and its
-    // prompt carries the correction. Before the A-8 fix the phase accepted
-    // here without the correction reaching any worker.
-    await waitFor(() => (setup.conductor.state.phase.repairRoundsUsed ?? 0) >= 1, 90_000, 20, setup.runDir);
+    // The correction never blocks acceptance (design draft 7 §3.3), so the
+    // phase accepts this candidate; the correction stays in the record for the
+    // next fix of its domain and is not silently dropped.
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
-    assert.match(fs.readFileSync(promptLog, "utf8"), new RegExp(correction), "the repair prompt carried the correction");
+    const phase = setup.conductor.state.phase;
+    assert.ok(
+      (phase.ownerNotes ?? []).some((n) => n.includes(correction)),
+      "the correction is still in the record after acceptance",
+    );
   } finally {
     await teardown(setup);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -278,10 +284,13 @@ test("plan 06k1: a correction queued during FINAL_CHECKING obliges a repair befo
       text: correction,
       binding: { runId: setup.conductor.state.phase.runId, phaseId: "p1" },
     });
-    // The final check passes, but the queued correction obliges a repair.
-    await waitFor(() => (setup.conductor.state.phase.repairRoundsUsed ?? 0) >= 1, 90_000, 20, setup.runDir);
+    // The final check passes and the correction is a note for the next fix
+    // session; it never obliges a repair before DONE.
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
-    assert.match(fs.readFileSync(promptLog, "utf8"), new RegExp(correction), "the repair prompt carried the correction");
+    assert.ok(
+      (setup.conductor.state.phase.ownerNotes ?? []).some((n) => n.includes(correction)),
+      "the correction is still recorded for a later session",
+    );
   } finally {
     await teardown(setup);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -389,7 +398,7 @@ test("plan 06k1: a correction queued with the budget spent grants its own round"
   assert.deepEqual(result.state.phase.ownerNotes, ["keep the fix"], "its text is queued for the next attempt");
 });
 
-test("plan 06k2: a note queued after the lane prompt is built stays queued", async () => {
+test("plan 06k2: a note queued after the lane prompt is built never enters that prompt and stays recorded", async () => {
   const dir = fs.mkdtempSync("/tmp/tt-06k2-lane-late-");
   const promptLog = path.join(dir, "prompts.log");
   const before = "CORRECTION-BEFORE-LANE-PROMPT: keep the marker file";
@@ -471,12 +480,19 @@ test("plan 06k2: a note queued after the lane prompt is built stays queued", asy
     await waitFor(() => (setup.conductor.state.phase.ownerNotes ?? []).some((n) => n.includes(late)), 60_000, 20, setup.runDir);
     await waitFor(() => setup.conductor.state.phase.phase === "DONE", 180_000, 50, setup.runDir);
     // The first NOTES_DELIVERED delivered only the pre-prompt correction; the
-    // late one stayed queued until a later attempt's prompt.
+    // late one was never injected into the prompt that was already built. It
+    // stays queued (design draft 7 §3.3: acceptance never waits for it), so a
+    // later session is the only place it may appear.
     const delivered = readEvents(setup.runDir).filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "NOTES_DELIVERED");
-    assert.ok(delivered.length >= 2, `both corrections were delivered in turn (${delivered.length} NOTES_DELIVERED)`);
+    assert.ok(delivered.length >= 1, "the round's prompt delivered its correction");
     assert.equal((delivered[0].event as { count?: number }).count, 1, "the round-1 lane prompt delivered only the note it carried");
-    assert.match(fs.readFileSync(promptLog, "utf8"), new RegExp(late), "the late correction reached a later attempt's prompt");
-    assert.equal(setup.conductor.state.phase.phase, "DONE");
+    assert.doesNotMatch(fs.readFileSync(promptLog, "utf8"), new RegExp(late), "the late correction never entered the already-built prompt");
+    const phase = setup.conductor.state.phase;
+    assert.ok(
+      (phase.ownerNotes ?? []).some((n) => n.includes(late)),
+      "the late correction is still recorded for a later session",
+    );
+    assert.equal(phase.phase, "DONE");
   } finally {
     await teardown(setup);
     fs.rmSync(dir, { recursive: true, force: true });

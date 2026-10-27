@@ -168,7 +168,7 @@ import type {
   State,
 } from "./core/types.ts";
 import { computeBoundaryTriggerPaths, computeUnreferencedHunks } from "./core/boundaries.ts";
-import { whereKey, type Domain } from "./core/domains.ts";
+import { domainOf, whereKey, type Domain } from "./core/domains.ts";
 // Plan 07c (D4): the fix-round task rule and the fixer's fixed duty text.
 import {
   decisionFixPoint,
@@ -4057,23 +4057,33 @@ export class Conductor {
       // next worker attempt's prompt verbatim; an applied correction at
       // AWAITING_OWNER resolves the open requests and starts a repair.
       const queueAsNote = outcome.kind === "queued";
-      // Plan 06k1 (A5): a correction that arrives while the phase is
-      // reviewing, evaluating, final-checking or parked is queued as a note
-      // for the next attempt AND grants its own round, so a spent budget
-      // cannot drop it. A plain note just queues.
+      // Plan 07f (A3/§3.3): an input that needs code work is a point for its
+      // domain's next session, never a legacy queued correction and never an
+      // acceptance obligation. In domain mode it becomes an owner point with
+      // that domain (and a path, when the text names one); otherwise it rides
+      // the note channel into the next fixer brief. A ruling never enters here
+      // (it is applied at once).
       const event: Event = queueAsNote
-        ? inputKind === "correction"
-          ? { type: "OWNER_CORRECTION_QUEUED", phaseId: this.#state.phase.phaseId, correctionId: `C-${commandId}`, text: inputText, grantedRounds: 3 }
-          : { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
+        ? { type: "NOTE_ADDED", phaseId: this.#state.phase.phaseId, text: inputText }
         : { type: "OWNER_CORRECTION", correctionId: `C-${commandId}`, text: inputText };
+      const point = queueAsNote && inputKind === "correction" ? this.#ownerPointForCorrection(commandId, inputText) : undefined;
       const result = reduce(this.#state, event);
       if (!result.ok) {
         this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, result.reason);
         this.#rejectInboxFile(file, commandId, result.reason);
         return;
       }
+      if (point) {
+        const pointResult = reduce(result.state, point);
+        if (!pointResult.ok) {
+          this.#recordOwnerInput(commandId, inputKind, inputText, "refused", undefined, pointResult.reason);
+          this.#rejectInboxFile(file, commandId, pointResult.reason);
+          return;
+        }
+      }
       this.#appliedCommandIds.add(commandId);
       this.#applyEvent(event, commandId);
+      if (point) this.#applyEvent(point, commandId);
       // Plan 01i: every input is also an owner directive — recorded here, on
       // top of the event above, so it is steered to every live agent now and
       // quoted in every later prompt.
@@ -4082,10 +4092,8 @@ export class Conductor {
       // The recorded effect the status view reads, never an inference: a
       // queued correction or steer is `queued`; a note is `noted`; a
       // correction applied at AWAITING_OWNER started a repair.
-      if (queueAsNote && inputKind === "note") {
-        this.#recordOwnerInput(commandId, "note", inputText, "noted");
-      } else if (queueAsNote) {
-        this.#recordOwnerInput(commandId, inputKind, inputText, "queued");
+      if (queueAsNote) {
+        this.#recordOwnerInput(commandId, inputKind === "correction" ? "correction" : "note", inputText, "noted");
       } else {
         this.#recordOwnerInput(commandId, "correction", inputText, "correction-started");
       }
@@ -6371,6 +6379,38 @@ export class Conductor {
     }
   }
 
+  /** Plan 07f (A3): a correction that arrives mid-state in domain mode is
+   * the owner's point for the domain its text touches. It becomes an open
+   * finding (so the next fix loop owns it), not a queued legacy correction.
+   * Outside domain mode there is no domain to route it to, so the note
+   * channel carries it instead. */
+  #ownerPointForCorrection(commandId: string, text: string): Event | undefined {
+    const phase = this.#state.phase;
+    const domains = phase.contract.domains;
+    if (!domains || domains.length === 0 || !phase.candidate) return undefined;
+    const path = /(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/.exec(text)?.[0];
+    const domain = path ? domainOf(path, domains) : domains.length === 1 ? domains[0].name : undefined;
+    if (!domain) return undefined;
+    const item = flatItems(this.#planItems()).find((i) => i.domain === domain)?.id;
+    return {
+      type: "FINDING_RAISED",
+      finding: {
+        id: `F-${phase.phaseId}-owner-${commandId}`,
+        version: 1,
+        phaseId: phase.phaseId,
+        kind: "defect",
+        severity: "blocking",
+        evidence: text,
+        raisedBy: "owner",
+        status: "open",
+        boundCandidateSha: phase.candidate.sha,
+        domain,
+        ...(item ? { item } : {}),
+        ...(path ? { where: path, expected: text } : { expected: text }),
+      },
+    };
+  }
+
   /** Plan 05e (3a/3b): record a finding whose claim the record (or its own
    * passing run) already contradicted — as an immediately disproved finding
    * and a dropped message, so no evaluator or panel ever sees it. */
@@ -8188,7 +8228,11 @@ export class Conductor {
     const C = phase.candidate.sha;
     const K = phase.contract.contractVersion;
     for (const decision of phase.decisions) {
-      if (!isLiveDecision(decision) || decision.amendment) continue;
+      // Plan 07f (A2/R3): an amendment is a decision like any other here. The
+      // stale one that blocked acceptance (bound to C1/v1 after the phase moved
+      // to C3/v3) must be closed with its reason, not skipped because it is an
+      // amendment.
+      if (!isLiveDecision(decision)) continue;
       const sameCandidate = decision.boundCandidateSha === C;
       const sameContract = sameVersion(decision.boundContractVersion, K);
       if (sameCandidate && sameContract) continue;

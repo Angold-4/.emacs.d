@@ -292,15 +292,15 @@ const BUILD: Record<string, Fixture> = {
     }),
     event: { type: "FINAL_CHECKS_PASSED", candidateSha: "C1" },
   },
-  // Plan 06k1 (A5, finding A-8): a correction queued during FINAL_CHECKING is
-  // an acceptance obligation; a passing final check repairs, not accepts.
-  "final-checks-passed-correction-queued": {
+  // Plan 07f (C2): a real blocker (the failed probe), not a queued
+  // correction, requires repair even after the final check passes.
+  "final-checks-passed-not-accepted": {
     state: baseState({
       phase: "FINAL_CHECKING",
       candidate: C1,
       integrationHead: "H0",
       checks: { candidateSha: "C1", passed: true },
-      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: true },
+      probe: { candidateSha: "C1", head: "H0", probedI: "I1", passed: false },
       reviews: acceptableReviews,
       inFlight: { run_final_checks: { actionId: "a1" } },
       queuedCorrections: [{ id: "C-1", text: "use UTC everywhere" }],
