@@ -8,8 +8,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { DEFAULT_DEADLINES } from "../../src/conductor.ts";
-import { cleanupDir, defaultReviewerHello, defaultWorkerHello, readEvents, setupConductor, waitFor, type FakePiStep, type TestConductorSetup } from "./harness.ts";
+import { Conductor, DEFAULT_DEADLINES, type RunPlanFile } from "../../src/conductor.ts";
+import { cleanupDir, defaultReviewerHello, defaultWorkerHello, FAKE_PI_PATH, readEvents, setupConductor, sleep, waitFor, type FakePiStep, type TestConductorSetup } from "./harness.ts";
 import type { Reviewer, State } from "../../src/core/types.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
 import type { Domain } from "../../src/core/domains.ts";
@@ -194,7 +194,7 @@ function checkRecords(runDir: string): Array<Record<string, unknown>> {
   return out;
 }
 
-test("plan 07e: a check past TT_CHECK_MINUTES records BOUND_REACHED, the record fails, and its pgid is gone", async () => {
+test("a check that exceeds its bound records BOUND_REACHED and still fails as today", async () => {
   const setup = await setupConductor({
     checks: ["sleep 5"],
     phaseChecks: ["sleep 5"],
@@ -414,7 +414,7 @@ async function setupFixRun(doneWhen: string, opts: { deadlines?: Record<string, 
   });
 }
 
-test("plan 07e: a doneWhen past TT_FACT_MINUTES records BOUND_REACHED, the fact is timed out, the point stays open", async () => {
+test("a done-when fact that exceeds its bound records BOUND_REACHED and repairs nothing", async () => {
   const setup = await setupFixRun("sleep 5", { deadlines: { reproductionMs: 1_500 } });
   try {
     await setup.conductor.start();
@@ -433,7 +433,10 @@ test("plan 07e: a doneWhen past TT_FACT_MINUTES records BOUND_REACHED, the fact 
   }
 });
 
-test("plan 07e: a fixer past its attempt bound is stopped and skipped with note bound: fixer-attempt, the other fixer merges", async () => {
+test("a fixer that exceeds its attempt bound records BOUND_REACHED and its task is skipped", async () => {
+  // No TT_FIX_ATTEMPT_MINUTES here: the plan's TT_ATTEMPT_MINUTES override is
+  // what bounds the fixer, exactly as it did before the new keyword existed
+  // (the bound it reaches is asserted below at 2 000 ms).
   const setup = await setupFixRun(BOOKING_DONE, {
     deadlines: { workerAttemptMs: 2_000 },
     fixerScriptFor: (domain) =>
@@ -467,7 +470,7 @@ test("plan 07e: a fixer past its attempt bound is stopped and skipped with note 
   }
 });
 
-test("plan 07e: a merge past TT_MERGE_MINUTES is aborted, recorded, and the first fixer's merge is the candidate", async () => {
+test("a fix merge that exceeds TT_MERGE_MINUTES is aborted and the merges done so far are the candidate", async () => {
   const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
   const shimDir = fs.mkdtempSync("/tmp/tt-07e-git-");
   const counter = path.join(shimDir, "count");
@@ -528,7 +531,7 @@ async function setupFailingRun(deadlines: Record<string, number> = {}) {
   });
 }
 
-test("plan 07e: an open owner request reminds once per TT_OWNER_WAIT_MINUTES and never answers itself", async () => {
+test("an owner request open past its bound sends a reminder and decides nothing", async () => {
   const setup = await setupFailingRun({ ownerWaitMs: 1_000, inboxPollMs: 100 });
   try {
     await setup.conductor.start();
@@ -546,6 +549,45 @@ test("plan 07e: an open owner request reminds once per TT_OWNER_WAIT_MINUTES and
     assert.ok(setup.conductor.state.phase.ownerRequests.some((r) => r.status === "open"));
   } finally {
     await teardown(setup);
+  }
+});
+
+// 07e (E2) / the seats' alternative to the vetoed in-memory clock: a resumption
+// preserves the waiting episode and its elapsed wait, so it does not postpone
+// an already-due reminder by restarting the countdown.
+test("a resumed owner wait keeps its elapsed wait and reminds on the bound instead of restarting the clock", async () => {
+  const ownerWaitMs = 6_000;
+  const setup = await setupFailingRun({ ownerWaitMs, inboxPollMs: 100 });
+  let resumed: Conductor | undefined;
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 240_000, 50, setup.runDir);
+    await setup.conductor.stop();
+    const before = coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait").length;
+    assert.equal(before, 0, "no reminder before the park passes its bound");
+    // Let the original park pass its bound while the conductor is stopped.
+    await sleep(ownerWaitMs + 500);
+    resumed = new Conductor({
+      runDir: setup.runDir,
+      plan: setup.plan as RunPlanFile,
+      piCommand: process.execPath,
+      piArgsPrefix: [FAKE_PI_PATH],
+      stubReviews: true,
+      deadlines: { ...FAST, checkMs: 10_000, ownerWaitMs, inboxPollMs: 100 },
+      checkLockPath: path.join(setup.runRoot, "check.lock"),
+    });
+    const restartedAt = Date.now();
+    await resumed.start();
+    // The resumed park is already past its bound: the reminder is due now, not
+    // one whole bound after the restart.
+    await waitFor(() => coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait").length > before, 3_000, 50, setup.runDir);
+    assert.ok(Date.now() - restartedAt < ownerWaitMs, "the reminder followed the original park, not a restarted clock");
+    assert.equal(resumed.state.phase.phase, "AWAITING_OWNER", "the reminder decides nothing");
+    assert.ok(resumed.state.phase.ownerRequests.some((r) => r.status === "open"));
+  } finally {
+    await (resumed ?? setup.conductor).stop();
+    cleanupDir(setup.runRoot);
+    cleanupDir(setup.scriptsDir);
   }
 });
 
