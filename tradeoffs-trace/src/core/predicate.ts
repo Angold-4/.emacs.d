@@ -706,11 +706,29 @@ function acceptFindingCommand(phase: PhaseState, C: string, K: ContractVersion, 
   });
 }
 
+/** A2/C1: how one seat's evidence is resolved against the candidate. The
+ * conductor, which owns the candidate's tree, installs its own resolver here
+ * (see `setSeatAnchorResolver`); the default is the best-effort check of the
+ * process's own tree that a pure fixture or unit test has. */
+export type SeatAnchorResolver = (evidence: string) => boolean;
+
+let seatAnchorResolver: SeatAnchorResolver | undefined;
+
+/** Plan 07f (A2): install the resolver `acceptanceBlockers` uses to decide
+ * whether a seat's item evidence resolves in the candidate. Only the
+ * conductor can see the candidate's own tree (a lane's candidate lives in
+ * its worktree, not in the conductor's cwd), so it passes its resolution in
+ * here; `undefined` restores the default. */
+export function setSeatAnchorResolver(resolver: SeatAnchorResolver | undefined): void {
+  seatAnchorResolver = resolver;
+}
+
 /** A2/C1: the review-lint anchor check applied to one seat's item evidence:
  * a file:line-range must resolve in the candidate (in range), while a test
  * name or a command the reviewer ran is an anchor by itself. A bare
  * file:line token that names no candidate file is not an anchor. */
 function seatAnchorResolves(evidence: string): boolean {
+  if (seatAnchorResolver) return seatAnchorResolver(evidence);
   if (!evidenceHasAnchor(evidence)) return false;
   const anchors = evidenceFileAnchors(evidence);
   if (anchors.length === 0) return true;

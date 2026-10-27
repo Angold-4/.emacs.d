@@ -216,7 +216,7 @@ import { resolvedCorrectionIdsFor } from "./core/predicate.ts";
 import { FAILED_VOTE_OPTIONS, isRepairForcingOption, openFindingOptions } from "./core/owner-requests.ts";
 import { BRIEF_GLOSSARY, briefIssue, enrichBriefRelated, evidenceFile, fallbackBrief, fallbackDecisionBrief, fallbackEntryBrief, parseCatalogs, renderGlossaryOrg, stripCodeTokens, stripCounts, type Catalogs, type OpenItemConcern } from "./core/briefs.ts";
 import { evaluationExceptions, notAcceptedReasons } from "./core/verdict.ts";
-import { itemsNeedingEvaluatorReverify, pendingEvidenceItems } from "./core/predicate.ts";
+import { itemsNeedingEvaluatorReverify, pendingEvidenceItems, setSeatAnchorResolver } from "./core/predicate.ts";
 // Plan 06b: the pure item machinery (coverage, test-verify resolution,
 // verdict validation, per-item majority, the matrix and the status counts).
 import {
@@ -232,6 +232,7 @@ import {
   coverageNoteLines,
   emptyCoverage,
   evidenceFileAnchors,
+  evidenceHasAnchor,
   itemsFromPhase,
   requirementAndConstraintItems,
   phaseItemOutcomes,
@@ -1816,6 +1817,11 @@ export class Conductor {
     this.#checkSlots = opts.checkSlots ?? (Number(process.env.TT_CHECK_SLOTS) || DEFAULT_CHECK_SLOTS);
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
+    // Plan 07f (A2): acceptance decides whether a seat's item evidence
+    // resolves in the candidate. Only this conductor can read the candidate's
+    // own tree (a lane's candidate lives in its worktree), so it installs the
+    // resolver the pure acceptance check calls.
+    setSeatAnchorResolver((evidence) => this.#seatEvidenceResolves(evidence));
   }
 
   get state(): State {
@@ -2721,6 +2727,10 @@ export class Conductor {
 
   async #doStop(): Promise<void> {
     this.#stopRequested = true;
+    // Plan 07f (A2): the installed anchor resolver names this conductor's
+    // candidate tree; drop it with the conductor so it can never answer for
+    // another one.
+    setSeatAnchorResolver(undefined);
     if (this.#budgetTimer) clearTimeout(this.#budgetTimer);
     if (this.#inboxTimer) clearInterval(this.#inboxTimer);
     if (this.#statusTimer) {
@@ -7978,6 +7988,16 @@ export class Conductor {
         return false;
       }
     });
+  }
+
+  /** Plan 07f (A2): a seat's item evidence resolves in the current
+   * candidate. A test name or a command the reviewer ran is an anchor by
+   * itself; a file:line anchor must name a tracked candidate file and an
+   * in-range line. */
+  #seatEvidenceResolves(evidence: string): boolean {
+    if (!evidenceHasAnchor(evidence)) return false;
+    if (evidenceFileAnchors(evidence).length === 0) return true;
+    return this.#candidateAnchorsValid(evidence);
   }
 
   /** Plan 06k2 (A2): the tracked files of the current candidate, for
