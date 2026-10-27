@@ -10750,9 +10750,18 @@ export class Conductor {
       // Plan 07c (D4.7): the fix candidate is read for an unfinished round
       // too, so a resumed synthetic lane still knows its base and disclosures.
       const fix = fixRoundCandidate(this.#state.phase.rounds, round);
-      // 07 hotfix: a repair round on the adopted pick runs one lane on it; the
-      // base below is already that pick (or its consolidation).
-      const onPick = !unfinished && !fix && repairsOnPick(this.#state.phase.rounds, round, this.#state.phase.candidate?.sha);
+      // 07 hotfix (opt-in, TT_REPAIR_ONE_LANE=1 until 07g1 removes the
+      // two-lane repair fallback): a repair round on the adopted pick runs one
+      // lane on it; the base below is already that pick (or its
+      // consolidation). A round where every lane lost a met item keeps the
+      // restart of every lane from the best candidate.
+      const pickRound = (this.#state.phase.rounds ?? []).find((r) => r.round === round - 1);
+      const onPick =
+        process.env.TT_REPAIR_ONE_LANE === "1" &&
+        !unfinished &&
+        !fix &&
+        repairsOnPick(this.#state.phase.rounds, round, this.#state.phase.candidate?.sha) &&
+        !(pickRound && everyLaneLost(pickRound, this.#pickGuard(pickRound.round)));
       lanes = unfinished ? last!.lanes : fix || onPick ? ["a"] : this.#lanes();
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
       const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
