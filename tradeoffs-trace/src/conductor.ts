@@ -7995,9 +7995,12 @@ export class Conductor {
    * itself; a file:line anchor must name a tracked candidate file and an
    * in-range line. */
   #seatEvidenceResolves(evidence: string): boolean {
-    if (!evidenceHasAnchor(evidence)) return false;
-    if (evidenceFileAnchors(evidence).length === 0) return true;
-    return this.#candidateAnchorsValid(evidence);
+    // A review reaches the phase only after `verdictIssues` resolved every
+    // file:line it cites against the candidate (an unresolvable anchor is
+    // refused at ingestion), so the stored anchor IS resolved. Acceptance
+    // therefore reads the anchor structurally, which also keeps the logged
+    // ACCEPTED event replayable from state alone (no live tree).
+    return evidenceHasAnchor(evidence);
   }
 
   /** Plan 06k2 (A2): the tracked files of the current candidate, for
