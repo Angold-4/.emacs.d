@@ -52,6 +52,23 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("a disposable checkout resolves the repo's branches by name, as a check that diffs against a phase branch needs", () => {
+  const baseSha = git(["rev-parse", "HEAD"], repo);
+  git(["branch", "feat/x--01a2", baseSha], repo);
+  fs.writeFileSync(path.join(repo, "f.txt"), "candidate\n");
+  git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "candidate"], repo);
+  const candidateSha = git(["rev-parse", "HEAD"], repo);
+
+  const disposable = disposableCheckout(repo, candidateSha);
+  try {
+    assert.equal(git(["rev-parse", "HEAD"], disposable.dir), candidateSha);
+    assert.equal(git(["rev-parse", "feat/x--01a2"], disposable.dir), baseSha);
+    assert.equal(git(["diff", "--name-only", "feat/x--01a2"], disposable.dir), "f.txt");
+  } finally {
+    disposable.dispose();
+  }
+});
+
 test("freeze-boundary: live-worktree writes never appear in materializeCandidate or disposableCheckout of that sha", () => {
   const worktreePath = path.join(root, "worktree1");
   const baseSha = git(["rev-parse", "HEAD"], repo);

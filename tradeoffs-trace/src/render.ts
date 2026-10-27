@@ -15,7 +15,9 @@ import * as path from "node:path";
 
 import type { Ballot, Decision, DecisionBrief, EnvBlockInfo, EnvTool, Finding, Message, Override, OwnerRequest, RoundRecord } from "./core/types.ts";
 import { candidateLabel, latestRegression } from "./core/rounds.ts";
+import { consolidationLine, latestConsolidationLine } from "./core/lanes.ts";
 import { seatsOf } from "./core/seats.ts";
+import { wireCandidateSha } from "./core/binding.ts";
 import { envBlockedLine, envToolsLines } from "./core/env-preflight.ts";
 import {
   projectEntries,
@@ -482,6 +484,9 @@ export function renderRoundsOrg(rounds: readonly RoundRecord[]): string {
         : "Winner: none",
       "",
     );
+    // tt 09 (change 3): the round's combine step, when it ran.
+    const consolidated = consolidationLine(round);
+    if (consolidated) lines.push(`${consolidated.charAt(0).toUpperCase()}${consolidated.slice(1)}`, "");
   }
   return lines.join("\n");
 }
@@ -515,12 +520,14 @@ export function projectEntryReview(
         ownerRequests: phase.ownerRequests,
         decisions: phase.decisions,
         overrides: phase.overrides,
+        // tt 09-5: a phase with no candidate binds NO_CANDIDATE, so a brief
+        // on it (a budget gate) can still be resolved.
         resolveBinding:
-          phase.contract?.contractVersion && phase.candidate?.sha && phase.runId && phase.phaseId
+          phase.contract?.contractVersion && phase.runId && phase.phaseId
             ? {
                 runId: phase.runId,
                 phaseId: phase.phaseId,
-                candidateSha: phase.candidate.sha,
+                candidateSha: wireCandidateSha(phase.candidate?.sha),
                 recordVersion: 1,
                 contractVersion: phase.contract.contractVersion,
               }
@@ -976,6 +983,12 @@ export function renderStatusView(input: StatusViewInput): string {
       const width = Math.max(...lanePanels.map((l) => cell(l).length));
       p2(`  ${lanePanels.map((l) => cell(l).padEnd(width)).join("  |  ")}`);
     }
+    // tt 09-6: each lane's check result and the seats' item verdicts.
+    for (const line of laneDetailLines(phase)) p2(line);
+    // tt 09 (change 3): the combine step between rounds, so the owner sees
+    // which commit the lanes start from and which items it carries.
+    const combined = latestConsolidationLine(phase.rounds as RoundRecord[] | undefined);
+    if (combined) p2(`  ${combined}`);
   }
   if (seatPanels.length > 0) {
     p2("Seats");
@@ -1130,6 +1143,55 @@ function lanePanelsOf(phase: Record<string, unknown>, view: { laneElapsed?: Reco
     const firstFailing = c?.ok === false ? firstFailingOfLane(c.note) : undefined;
     return { lane, ...(c?.sha ? { sha: c.sha.slice(0, 7) } : {}), state, elapsed, ...(firstFailing ? { firstFailing } : {}), health };
   });
+}
+
+/** tt 09-6: the owner sees per-item progress every round without asking. Under
+ * the lane table, each lane's CURRENT candidate gets at most two lines: its
+ * check result (green, or red with the first failing command, and how many
+ * times the lane fixed a red candidate this round), then each seat's item
+ * verdicts on it (met/total) and which items are not met by whom. Read from
+ * the round record alone (CANDIDATE_CHECKED's note names the first failing
+ * command; a resubmitted candidate starts a fresh record, so its reviews and
+ * check are its own). Empty for a phase without rounds. */
+export function laneDetailLines(phase: Record<string, unknown>): string[] {
+  const rounds = (phase.rounds as RoundRecord[] | undefined) ?? [];
+  const round = rounds[rounds.length - 1];
+  if (!round) return [];
+  const seats = seatsOf(phase.contract as never);
+  const out: string[] = [];
+  for (const lane of round.lanes) {
+    const c = round.candidates.find((x) => x.lane === lane);
+    const fixes = ` · fixes ${c?.fixes ?? 0}`;
+    const check = !c?.sha
+      ? `no candidate${c?.note ? `: ${truncate(c.note, 100)}` : " yet"}`
+      : c.ok === undefined
+        ? `${c.sha.slice(0, 7)} checking${fixes}`
+        : c.ok
+          ? `${c.sha.slice(0, 7)} green${fixes}`
+          : `${c.sha.slice(0, 7)} red — ${truncate((c.note ?? "a check failed").replace(/`([^`]*)`/, (_m, cmd: string) => `\`${truncate(cmd, 60)}\``), 140)}${fixes}`;
+    out.push(`  ${lane}  ${check}`);
+    const reviews = c?.sha ? (c.reviews ?? []) : [];
+    const verdicts = seats
+      .map((seat) => ({ seat, items: reviews.find((r) => r.seat === seat)?.review.items }))
+      .filter((s): s is { seat: string; items: NonNullable<typeof s.items> } => s.items !== undefined && s.items.length > 0);
+    if (verdicts.length === 0) continue;
+    const perSeat = seats.map((seat) => {
+      const v = verdicts.find((x) => x.seat === seat);
+      return v ? `${seat} ${v.items.filter((i) => i.verdict === "met").length}/${v.items.length}` : `${seat} …`;
+    });
+    // Which items a seat did not find met, by item, so the owner sees what
+    // this lane still lacks — the input the combine step works from.
+    const notMet = new Map<string, string[]>();
+    for (const v of verdicts) {
+      for (const item of v.items) {
+        if (item.verdict === "met") continue;
+        notMet.set(item.id, [...(notMet.get(item.id) ?? []), v.seat]);
+      }
+    }
+    const gaps = [...notMet.entries()].map(([id, by]) => `${id} (${by.join(",")})`);
+    out.push(`     items ${perSeat.join(" · ")}${gaps.length > 0 ? ` — not met: ${truncate(gaps.join(" "), 100)}` : ""}`);
+  }
+  return out;
 }
 
 /** The first failing test of one lane's check, from the lane's own check

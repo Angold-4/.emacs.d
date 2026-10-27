@@ -81,7 +81,8 @@ export interface CheckWindow {
   release: () => void;
 }
 
-const activeCheckWindows = new Set<string>();
+/** Open windows in this process: window dir -> the owners (run ids) holding one. */
+const activeCheckWindows = new Map<string, string[]>();
 const CHECK_WINDOW_STALE_MS = 6 * 60 * 60 * 1000;
 
 /** The window directory for a check lock: beside the lock, so a machine-wide
@@ -91,10 +92,13 @@ export function checkWindowDir(checkLockPath: string): string {
   return `${checkLockPath}.window.d`;
 }
 
-/** True while any check window for this check lock is open. */
-export function anyCheckWindowOpen(checkLockPath: string): boolean {
+/** True while any check window for this check lock is open. `exceptOwner`
+ * ignores the windows that owner (a run id) opened itself: since each lane's
+ * checks start at its submission (plan 09), a run's own check must not
+ * freeze its other lane's worker (exex 01b1 lost ~86 worker-minutes to it). */
+export function anyCheckWindowOpen(checkLockPath: string, exceptOwner?: string): boolean {
   const dir = checkWindowDir(checkLockPath);
-  if (activeCheckWindows.has(dir)) return true;
+  if ((activeCheckWindows.get(dir) ?? []).some((owner) => exceptOwner === undefined || owner !== exceptOwner)) return true;
   try {
     if (!fs.existsSync(dir)) return false;
     const now = Date.now();
@@ -105,6 +109,7 @@ export function anyCheckWindowOpen(checkLockPath: string): boolean {
           fs.rmSync(file, { force: true });
           continue;
         }
+        if (exceptOwner !== undefined && markerOwner(file) === exceptOwner) continue;
       } catch {
         // a vanished file is not a window
         continue;
@@ -146,15 +151,25 @@ function markerHolderAlive(file: string, name: string): boolean {
   }
 }
 
-/** Opens a check window for its caller's check run. The returned `release`
- * closes it; call it in a `finally`. */
-export function openCheckWindow(checkLockPath: string): CheckWindow {
+/** The owner a marker file records, if any. */
+function markerOwner(file: string): string | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { owner?: unknown };
+    return typeof parsed.owner === "string" ? parsed.owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Opens a check window for its caller's check run, owned by `owner` (the
+ * run id). The returned `release` closes it; call it in a `finally`. */
+export function openCheckWindow(checkLockPath: string, owner = ""): CheckWindow {
   const dir = checkWindowDir(checkLockPath);
-  activeCheckWindows.add(dir);
+  activeCheckWindows.set(dir, [...(activeCheckWindows.get(dir) ?? []), owner]);
   const file = path.join(dir, `${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`);
   try {
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
+    fs.writeFileSync(file, `${JSON.stringify({ pid: process.pid, owner, at: new Date().toISOString() })}\n`);
   } catch {
     // A read-only home must not stop the check; the in-process set still
     // pauses this process's own other runs.
@@ -164,7 +179,10 @@ export function openCheckWindow(checkLockPath: string): CheckWindow {
     release: () => {
       if (released) return;
       released = true;
-      activeCheckWindows.delete(dir);
+      const owners = [...(activeCheckWindows.get(dir) ?? [])];
+      owners.splice(owners.indexOf(owner), 1);
+      if (owners.length > 0) activeCheckWindows.set(dir, owners);
+      else activeCheckWindows.delete(dir);
       try {
         fs.rmSync(file, { force: true });
       } catch {
@@ -298,6 +316,37 @@ export function acquireWaitingLock(lockPath: string): Promise<Lock> {
   return spawnLockHelper(WAITING_HELPER_SCRIPT, lockPath);
 }
 
+/** How many checks may run on one host at once: one per lane of a two-lane
+ * round, so a lane's candidate never queues behind the other's (exex 01b1:
+ * 30–47 min per check, run one after the other). */
+export const DEFAULT_CHECK_SLOTS = 2;
+
+/** How long a check waits between attempts when every slot is held. */
+const CHECK_SLOT_POLL_MS = 250;
+
+/** The lock file of check slot `index`: slot 0 is the check lock itself, so a
+ * one-slot host behaves exactly as before; slot i is `<lockPath>.slot<i>`. */
+export function checkSlotPath(lockPath: string, index: number): string {
+  return index === 0 ? lockPath : `${lockPath}.slot${index}`;
+}
+
+/** Takes the first free of `slots` machine-wide check slots, waiting until one
+ * is free. Each slot is its own flock, so a holder that dies frees its slot
+ * as the plain lock does. Any failure other than a held slot is thrown. */
+export async function acquireCheckSlot(lockPath: string, slots: number = DEFAULT_CHECK_SLOTS): Promise<Lock> {
+  const count = Math.max(1, Math.floor(slots));
+  for (;;) {
+    for (let index = 0; index < count; index++) {
+      try {
+        return await acquireLock(checkSlotPath(lockPath, index));
+      } catch (err) {
+        if (!(err instanceof LockError) || !err.message.endsWith(": busy")) throw err;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, CHECK_SLOT_POLL_MS));
+  }
+}
+
 function spawnLockHelper(helperScript: string, lockPath: string): Promise<Lock> {
   // A machine-wide lock lives under `~/.tradeoffs-trace/`, which a fresh
   // machine (a CI runner) does not have yet; perl's open does not create it.
@@ -335,7 +384,11 @@ function spawnLockHelper(helperScript: string, lockPath: string): Promise<Lock> 
       reject(new LockError(lockPath, undefined, String(err)));
     });
 
-    child.once("exit", (code) => {
+    // 'close' (not 'exit'): it fires after the helper's stdio has closed, so
+    // `stderr` is complete. On 'exit' a busy helper could be read with empty
+    // stderr, so a held check slot was reported as a fatal "helper exited
+    // with code 1" instead of a busy slot to retry.
+    child.once("close", (code) => {
       if (settled) return;
       settled = true;
       const holderPid = readHolderPid(lockPath);

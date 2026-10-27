@@ -7,6 +7,7 @@
 // `<run>/conductor.log`, so the parent (this CLI invocation) returns the
 // run id immediately rather than blocking for the whole run.
 
+import { adoptRecordedPath } from "./effects/run-env.ts";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, existsSync, openSync, mkdirSync, writeFileSync, renameSync, rmSync, symlinkSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -20,7 +21,7 @@ import type { ReviewLintResult } from "./core/review-lint.ts";
 import { candidateAnchorFreshness, pendingOwnerInputs, projectEntryReview, renderStatusText, renderStatusView, reviewMessageFiles, runIds, statusViewInput } from "./render.ts";
 import { metricsForRunDir, projectMetrics } from "./metrics.ts";
 import { reduce } from "./core/reduce.ts";
-import { resolveBinding } from "./core/binding.ts";
+import { resolveBinding, wireCandidateSha } from "./core/binding.ts";
 import { decisionStatus } from "./core/predicate.ts";
 import {
   checkCoverageWarnings,
@@ -877,7 +878,7 @@ async function cmdProgram(sub: string | undefined, args: string[], root: string,
       const runDir = path.join(root, s.runId);
       if (conductorAlive(runDir)) continue;
       appendProgramEvent(dir, { type: "NODE_RESUMED", node, reason: "owner" });
-      launchDetached(runDir);
+      launchDetached(runDir, { root });
       restarted.push(node);
     }
     if (!programPidAlive(dir)) launchProgramScheduler(dir);
@@ -1024,22 +1025,43 @@ async function cmdStart(planPath: string, root: string, skipModelsCheck = false,
   if (skipModelsCheck && modelsCheckRefused(check).length > 0) {
     process.stderr.write("warning: --skip-models-check: starting with refused model(s)\n");
   }
-  launchDetached(runDir);
+  launchDetached(runDir, { root, announce: false });
 }
 
 /** Relaunch the conductor for an existing run (after a crash or reboot);
- * the conductor rebuilds state from the log and reconciles pending intents. */
-function launchDetached(runDir: string): void {
+ * the conductor rebuilds state from the log and reconciles pending intents.
+ *
+ * tt 09-5: a run is resumed by the runner it started under. `runnerFor` (the
+ * one chooser) names that runner's installed copy when the recorded revision
+ * is not this checkout's, and the conductor is spawned from THAT copy's CLI —
+ * on 2026-10-25 the operator had to find the old runner's cli by hand, because
+ * this checkout's conductor refuses a run recorded under another revision.
+ * When the recorded revision is not installed, this checkout's conductor is
+ * spawned as before and refuses with its clear RunnerMismatchError. A fresh
+ * run (`tt start`) is recorded under this checkout, so `announce` is off there
+ * and its stdout stays the bare run id callers read. */
+function launchDetached(runDir: string, opts: { root?: string; announce?: boolean } = {}): void {
   const p = runPaths(runDir);
-  const thisScript = fileURLToPath(import.meta.url);
+  const choice = runnerFor(runDir, opts.root ?? path.dirname(runDir));
   const out = openSync(p.log, "a");
   const err = openSync(p.log, "a");
-  const child = spawn(process.execPath, [thisScript, RUN_CONDUCTOR_FLAG, runDir], {
+  const child = spawn(process.execPath, [choice.cliPath, RUN_CONDUCTOR_FLAG, runDir], {
     detached: true,
     stdio: ["ignore", out, err],
   });
   child.unref();
   process.stdout.write(`${path.basename(runDir)}\n`);
+  if (opts.announce !== false) process.stdout.write(`${runnerUsedLine(runDir, choice)}\n`);
+}
+
+/** tt 09-5: the line `tt resume` prints naming the runner it launched. */
+function runnerUsedLine(runDir: string, choice: RunnerChoice): string {
+  if (!choice.current) return `runner ${choice.revision} (the run's own, installed at ${choice.packageRoot})`;
+  const recorded = recordedRunnerRevision(runDir);
+  if (recorded !== undefined && recorded !== choice.revision) {
+    return `runner ${choice.revision} (this checkout); the run was started under ${recorded}, which is not installed — the conductor will refuse; \`tt runner install ${recorded}\` and resume again`;
+  }
+  return `runner ${choice.revision} (this checkout)`;
 }
 
 /** Phase 1b work-packet item 6: a documented, test-only way for a `tt
@@ -1122,6 +1144,7 @@ function testStubReviews(): boolean {
  * script) to stay inside this packet's file scope. */
 async function runConductorProcess(runDir: string): Promise<void> {
   const p = runPaths(runDir);
+  adoptRecordedPath(runDir);
   const plan = JSON.parse(readFileSync(path.join(p.plan, "v1.json"), "utf8")) as RunPlanFile;
   const { piCommand, piArgsPrefix } = testPiInjection();
   // A plan's own limits (TT_*_MINUTES), then the test-only override.
@@ -2010,7 +2033,10 @@ async function cmdInput(runArg: string, root: string, file?: string): Promise<vo
   const kind = typeof raw.type === "string" ? raw.type : typeof raw.kind === "string" ? raw.kind : "input";
   const commandId = `input-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
   let command = raw;
-  if (!("binding" in raw)) {
+  // Only the decision-view form (`type`) carries a binding; the flat `kind`
+  // form names its own binding fields and the schema refuses an extra one
+  // (exex 01a1: a flat `resolve` was rejected because a binding was added).
+  if (!("binding" in raw) && typeof raw.kind !== "string") {
     const state = rebuildState(runDir, readPlan(runDir), { lenient: true });
     command = { ...raw, binding: { runId: state.phase.runId, phaseId: state.phase.phaseId } };
   }
@@ -2133,7 +2159,7 @@ async function cmdCarry(positional: string[], root: string, toPhase: string | un
   // Like every record command, the binding is the PHASE's current candidate
   // and contract plus the record's own version (owner-commands.ts's
   // checkItemCarried matches it the same way).
-  const boundCandidateSha = state.phase.candidate?.sha ?? "";
+  const boundCandidateSha = wireCandidateSha(state.phase.candidate?.sha);
   const boundContractVersion = state.phase.contract.contractVersion;
   const boundRecordVersion = finding ? finding.version : message!.messageVersion;
   const inbox = path.join(runDir, "inbox");
@@ -2231,7 +2257,7 @@ async function cmdDefer(
     binding: {
       runId: state.phase.runId,
       phaseId: state.phase.phaseId,
-      candidateSha: state.phase.candidate?.sha ?? "",
+      candidateSha: wireCandidateSha(state.phase.candidate?.sha),
       contractVersion: state.phase.contract.contractVersion,
       recordId,
       recordVersion: boundRecordVersion,
@@ -2471,7 +2497,7 @@ async function main(): Promise<void> {
   if (cmd === RUN_PROGRAM_FLAG) {
     // <root>/programs/<id>: node runs live in <root>, like any other run.
     const dir = rest[0];
-    const outcome = await runScheduler(dir, { runRoot: path.dirname(path.dirname(dir)), launch: launchDetached });
+    const outcome = await runScheduler(dir, { runRoot: path.dirname(path.dirname(dir)), launch: (runDir) => launchDetached(runDir, { root: path.dirname(path.dirname(dir)) }) });
     process.stdout.write(`program ${path.basename(dir)}: ${outcome}\n`);
     return;
   }
@@ -2539,7 +2565,7 @@ async function main(): Promise<void> {
     const runDir = resolveRunDir(positional[0], runRoot);
     const runPlan = readPlan(runDir);
     if (refuseMissingSecrets(runPlan.secrets, "resume the run", runPlan.envFile)) return;
-    launchDetached(runDir);
+    launchDetached(runDir, { root: runRoot });
   } else if (cmd === "program") {
     await cmdProgram(positional[0], positional.slice(1), runRoot, json, source, skipModelsCheck, envFile);
   } else if (cmd === "list") {

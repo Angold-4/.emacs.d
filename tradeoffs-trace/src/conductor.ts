@@ -37,7 +37,24 @@ import { advisoryReason, bestCandidate, blocksAcceptance, candidateLabel, carryB
 // Plan 06g2 (A1): `runRound` is the round's only orchestrator. The conductor
 // implements its `LaneHost` with the worktree, agent, check, review and vote
 // machinery below and calls it; it decides nothing about lanes itself.
-import { isLaneRound, laneFailureLines, lanesOfContract, repeatLaneBases, runRound, type LaneBuild, type LaneCheck, type LaneHost } from "./core/lanes.ts";
+import {
+  consolidatedBase,
+  consolidatedLabel,
+  consolidationEnabled,
+  consolidationLine,
+  consolidationPlan,
+  isLaneRound,
+  itemEvidence,
+  laneFailureLines,
+  lanesOfContract,
+  repeatLaneBases,
+  runConsolidation,
+  runRound,
+  type ConsolidationPlan,
+  type LaneBuild,
+  type LaneCheck,
+  type LaneHost,
+} from "./core/lanes.ts";
 // Plan 06h (A1/A2): the seat list, its leader and the lane count are the
 // plan's, read from one place (`seatsOf`/`leaderOf`).
 import { leaderOf, seatsOf, seatsRecordOf, workerCountOf } from "./core/seats.ts";
@@ -147,6 +164,7 @@ import {
   PI_VERSION,
   ROLE_TOOLS,
   type PlanModels,
+  type ModelRole,
   type Role,
   type ToolSetMismatch,
 } from "./core/roles.ts";
@@ -211,12 +229,13 @@ import {
   type PlanItems,
   type SeatItemVerdict,
   type VerdictContext,
+  type VerifyResolution,
 } from "./core/items.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
 
 import { EventLog, readLog, type LogRecord } from "./effects/log.ts";
-import { acquireLock, acquireWaitingLock, anyCheckWindowOpen, openCheckWindow, PausableTimer, type Lock } from "./effects/lock.ts";
+import { acquireCheckSlot, acquireLock, acquireWaitingLock, anyCheckWindowOpen, DEFAULT_CHECK_SLOTS, openCheckWindow, PausableTimer, type Lock } from "./effects/lock.ts";
 import { childEnv, runCommand, type RunCommandResult } from "./effects/shell.ts";
 import { groupStartedBefore, killGroup, loggedHeld, processAlive, signalProcess, sweep, type SweepResult } from "./effects/sweep.ts";
 import {
@@ -235,7 +254,7 @@ import {
   removeWorktree,
   candidateTree,
   saveUnsubmittedWork as gitSaveUnsubmittedWork,
-  verifyIntegrity, removedTestsBetween } from "./effects/git.ts";
+  verifyIntegrity, removedTestsBetween, headOf } from "./effects/git.ts";
 import { RunSocketServer, type HelloResult, type SubmitResult } from "./effects/socket.ts";
 import { PiAgent, spawnPiAgent } from "./effects/pi-rpc.ts";
 import { redactBytes, redactRecord, redactText, resolveSecrets, secretNames, secretPromptLines, utf16Kind, type Secret } from "./effects/secrets.ts";
@@ -411,6 +430,10 @@ export interface RunPlanPhase {
   /** Plan 06h (A1): `#+TT_LEADER:` (or the phase's own `:LEADER:`). Absent
    * means the first seat. */
   leader?: string;
+  /** tt 09 (change 3): `#+TT_CONSOLIDATE:` (or the phase's own
+   * `:CONSOLIDATE:`), `on` or `off`. Absent means on whenever the phase runs
+   * two or more lanes. */
+  consolidate?: string;
   /** Plan 06k1 (A3): `#+TT_VARIANT_LIMIT:` (or the phase's own
    * `:VARIANT_LIMIT:`). How many consecutive rounds may each raise a new
    * blocking finding of the same kind on one requirement before the owner is
@@ -574,7 +597,7 @@ export interface ConductorOptions {
    * against the real `pi` binary must pick a real provider/model, which
    * nothing else on `ConductorOptions` carries. Absent (the default): no
    * `--provider`/`--model` flag is added, i.e. Pi's own default. */
-  providerModelFor?: (role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined;
+  providerModelFor?: (role: ModelRole, seat?: string | number) => { provider?: string; model?: string } | undefined;
   extraEnv?: NodeJS.ProcessEnv;
   /** Plan 05i: the environment the preflight resolves declared executables
    * in (defaults to `process.env`, the conductor's own environment). Tests
@@ -610,6 +633,9 @@ export interface ConductorOptions {
    * machine — never overlap in time. Defaults to
    * `~/.tradeoffs-trace/check.lock`. */
   checkLockPath?: string;
+  /** How many checks may run on the host at once (`TT_CHECK_SLOTS`, default
+   * 2: one per lane). Each slot is its own lock beside `checkLockPath`. */
+  checkSlots?: number;
   /** Decision briefs: when true, the conductor records a deterministic brief
    * for every open owner item after evaluation, so the owner always has one
    * above the evidence even when the evaluator's model did not call
@@ -879,6 +905,9 @@ export function buildContract(phase: RunPlanPhase): PhaseContract {
     // reader has ONE source of the seat list (`seatsOf`).
     ...(phase.seats && phase.seats.length > 0 ? { seats: [...phase.seats] } : {}),
     ...(typeof phase.leader === "string" && phase.leader.length > 0 ? { leader: phase.leader } : {}),
+    // tt 09 (change 3): the combine step is on by default; only an explicit
+    // `off` is frozen, so every older contract keeps its shape.
+    ...(typeof phase.consolidate === "string" && phase.consolidate.trim().toLowerCase() === "off" ? { consolidate: false as const } : {}),
   };
 }
 
@@ -1301,6 +1330,13 @@ interface AgentHandle {
   /** Plan 06g2: a lane worker's `submit_coverage` payload, kept for the
    * winner's hand-off. */
   laneCoverage?: unknown;
+  /** tt 09 (change 3): set on the consolidator — the round it combines and
+   * its own worktree. Its submissions belong to the combine step, never to a
+   * lane or the phase. */
+  consolidation?: { round: number; worktree: string };
+  /** tt 09 (change 3): the consolidator's `submit_phase` report of what it
+   * changed beyond the taken work (its `deviations`). */
+  consolidationAdded?: string[];
   /** Plan 06g2: the seat this agent votes as, in the round's pick turn. */
   pickSeat?: string;
   /** Plan 06h (A3): true when this pick turn is the top-two revote. */
@@ -1400,7 +1436,7 @@ export class Conductor {
   #piArgsPrefix: string[];
   #piCommandFor: ((role: Role) => string | undefined) | undefined;
   #piArgsPrefixFor: ((role: Role) => string[] | undefined) | undefined;
-  #providerModelFor: ((role: Role, seat?: string | number) => { provider?: string; model?: string } | undefined) | undefined;
+  #providerModelFor: ((role: ModelRole, seat?: string | number) => { provider?: string; model?: string } | undefined) | undefined;
   #extraEnv: NodeJS.ProcessEnv;
   /** Plan 05i: the environment `#runEnvPreflight` resolves tools in. */
   #preflightEnv: NodeJS.ProcessEnv;
@@ -1424,6 +1460,7 @@ export class Conductor {
    * under (default `~/.tradeoffs-trace/check.lock`), held only while one
    * candidate is checked. */
   #checkLockPath: string;
+  #checkSlots: number;
   /** Plan 06k1 (A6): the environment this run's checks need, recorded once at
    * start (PATH plus every variable the plan or the starter declares) and
    * re-used by every check and every resume, so a resume from a shell without
@@ -1449,24 +1486,35 @@ export class Conductor {
    * review prompts need each lane's own disclosures. */
   #laneBuilds = new Map<string, LaneBuild>();
   /** Plan 06g2: each lane candidate's turn-1 discoveries, keyed
-   * `<round>-<lane>` then by seat. The phase has no candidate to bind them to
-   * while the round runs, so the winner's are applied at the hand-off. */
+   * `<round>-<lane>-<sha>` (`#laneReviewKey`) then by seat. The phase has no
+   * candidate to bind them to while the round runs, so the winner's are
+   * applied at the hand-off. 09-2: keyed by the candidate, not only the lane:
+   * a lane's reviews start at each submission, so a cancelled red candidate's
+   * discoveries must never reach its fixed successor. */
   #laneDiscoveries = new Map<string, Map<string, DecisionDisclosure[]>>();
   /** Plan 06g2: each lane candidate's discovery-id plan, computed ONCE — when
    * the first of its turn-2 prompts is built — and reused at the hand-off, so
    * the ids the seats balloted are the ids that appear even though the freeze
    * grows the phase's decision list in between. */
   #laneDiscoveryPlans = new Map<string, Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }>>();
-  /** Plan 06g2: the per-candidate discovery barrier, keyed `<round>-<lane>`. */
+  /** Plan 06g2: the per-candidate discovery barrier, keyed
+   * `<round>-<lane>-<sha>` (09-2: a cancelled candidate's seats never count
+   * as arrived for the lane's next candidate). */
   #laneBarriers = new Map<string, { arrived: Set<string>; waiters: Array<() => void> }>();
   /** Plan 06k2 (A7): each lane candidate's boundary-trigger decisions,
    * computed BEFORE its lane reviews so the seats ballot them with the rest;
    * reused at the hand-off so the ids that were balloted are the ids that
-   * appear. Keyed `<round>-<lane>`. */
+   * appear. Keyed `<round>-<lane>-<sha>` (09-2). */
   #laneTriggers = new Map<string, Decision[]>();
   /** Plan 06k2 (A7): the boundary paths each lane's triggers cover, for the
-   * sampling log at the hand-off. Keyed `<round>-<lane>`. */
+   * sampling log at the hand-off. Keyed `<round>-<lane>-<sha>` (09-2). */
   #laneTriggerPaths = new Map<string, string[]>();
+  /** 09-2 (async review): one lane candidate's review cancellation, keyed
+   * `<round>-<lane>-<sha>`. A candidate's reviews start at its submission,
+   * while its checks run; a failed check resolves this, and every stage of
+   * those reviews (start, turn 1, the discovery barrier, turn 2) ends at once
+   * without a retry. */
+  #laneReviewCancels = new Map<string, { cancelled: boolean; promise: Promise<"cancelled">; resolve: () => void }>();
   /** Plan 06k2 (A8): the absolute number of owner notes the round's lane
    * prompt actually carried, recorded when the prompt is built. A note
    * queued AFTER that build is not marked delivered by it. Keyed by round. */
@@ -1479,6 +1527,9 @@ export class Conductor {
    * `<round>-<lane>`, so its check can diff against its lane's start and
    * choose the final tier when a wide path is touched. */
   #laneCheckBases = new Map<string, string>();
+  /** exex 01a2: when each lane's worker started this round (`round-lane`), so
+   * a fix after a red check gets only the attempt time that is left. */
+  #laneStartedAt = new Map<string, number>();
   /** Plan 06k3 (A2, findings A-13/T-29): lanes whose unsubmitted-work ref
    * could not be written. Their dirty worktree is retained (never removed)
    * so the work is not lost, and the next attempt continues in it. */
@@ -1644,6 +1695,7 @@ export class Conductor {
     this.#now = opts.now ?? Date.now;
     this.#gateLockPath = opts.gateLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "gate.lock");
     this.#checkLockPath = opts.checkLockPath ?? path.join(os.homedir(), ".tradeoffs-trace", "check.lock");
+    this.#checkSlots = opts.checkSlots ?? (Number(process.env.TT_CHECK_SLOTS) || DEFAULT_CHECK_SLOTS);
     this.#integrationBranch = opts.plan.integrationBranch;
     this.#budgetRemainingMs = this.#deadlines.runBudgetMs;
   }
@@ -4142,7 +4194,7 @@ export class Conductor {
     };
     const iv = setInterval(() => {
       if (this.#closed) return;
-      const open = anyCheckWindowOpen(this.#checkLockPath);
+      const open = anyCheckWindowOpen(this.#checkLockPath, this.#state.phase.runId);
       if (open && !paused) pause();
       else if (!open && paused) resume();
     }, 100);
@@ -4586,6 +4638,22 @@ export class Conductor {
   async #onSubmitChecked(agentId: string, msg: SubmitMessage): Promise<SubmitResult> {
     const handle = this.#agents.get(agentId);
     if (!handle) return { ok: false, reason: "unknown agent" };
+    // tt 09 (change 3): the consolidator's submissions belong to the combine
+    // step, not to a lane or the phase. Its commit is judged by the round
+    // checks and then by the next round's reviews of the lanes built on it,
+    // so no coverage, finding-answer or directive gate applies to it.
+    if (handle.consolidation) {
+      if (msg.tool === "submit_coverage") return { ok: true };
+      if (msg.tool === "submit_phase") {
+        const args = msg.args as SubmitPhaseArgs;
+        handle.consolidationAdded = (args.deviations ?? []).filter((d) => typeof d === "string" && d.trim().length > 0);
+        handle.doneResolve();
+        return { ok: true };
+      }
+      if (msg.tool === "raise_tradeoff") {
+        return { ok: false, reason: "the consolidator raises no trade-off: take the listed lane's work, and name anything you changed beyond it in submit_phase's deviations" };
+      }
+    }
     if (msg.tool === "submit_coverage") {
       // Plan 06b: the worker's per-item coverage. It is recorded even when
       // incomplete (so the worker and the status see what is missing), but
@@ -4773,6 +4841,15 @@ export class Conductor {
         }
         if (review.reviewer !== seat) {
           return { ok: false, reason: `submit_review reviewer ${review.reviewer} does not match the seat this dispatch reviews as (${seat})` };
+        }
+        // 09-2 (async review): a review of a candidate that failed its checks
+        // (or was replaced by the lane's fix) was cancelled; one that still
+        // arrives is acknowledged so the late agent stops, and never counts.
+        const current = (this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane);
+        if (this.#laneReviewCancelled(round, lane, sha) || current?.sha !== sha || current.ok === false) {
+          this.#log.append("stale_lane_review_ignored", { round, lane, seat, candidateSha: sha, current: current?.sha ?? null });
+          handle.doneResolve();
+          return { ok: true };
         }
         const issue = reviewIngestionIssue(review);
         if (issue) return { ok: false, reason: issue };
@@ -5031,7 +5108,7 @@ export class Conductor {
       if (handle.laneReview !== undefined) {
         const discoveries = (msg.args as { discoveries?: DecisionDisclosure[] }).discoveries ?? [];
         handle.laneDiscoveries = discoveries;
-        const key = `${handle.laneReview.round}-${handle.laneReview.lane}`;
+        const key = this.#laneReviewKey(handle.laneReview.round, handle.laneReview.lane, handle.laneReview.sha);
         const bySeat = this.#laneDiscoveries.get(key) ?? new Map<string, DecisionDisclosure[]>();
         bySeat.set(handle.laneReview.seat, discoveries);
         this.#laneDiscoveries.set(key, bySeat);
@@ -6737,9 +6814,10 @@ export class Conductor {
       // Plan 06k2 (A7): the winner's triggers were computed before its lane
       // reviews and balloted there; apply exactly those records (never
       // create a second set nobody ever saw).
-      const cached = this.#laneTriggers.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+      const laneKey = this.#laneReviewKey(opts.lane.round, opts.lane.lane, candidateSha);
+      const cached = this.#laneTriggers.get(laneKey) ?? [];
       for (const decision of cached) this.#applyEvent({ type: "DECISION_ADDED", decision });
-      triggerPaths = this.#laneTriggerPaths.get(`${opts.lane.round}-${opts.lane.lane}`) ?? [];
+      triggerPaths = this.#laneTriggerPaths.get(laneKey) ?? [];
     } else {
       triggerPaths = computeBoundaryTriggerPaths(paths, contract.boundaries, acceptanceFiles, citationTexts);
     }
@@ -6859,6 +6937,8 @@ export class Conductor {
     // worker) or in the candidate it reviews — never in another lane's tree.
     if (handle.laneReview) return path.join(this.#paths.candidates, handle.laneReview.sha);
     if (handle.lane !== undefined) return this.#laneWorktree(handle.lane);
+    // tt 09 (change 3): the consolidator works in its own worktree.
+    if (handle.consolidation) return handle.consolidation.worktree;
     return handle.role === "worker" ? this.#paths.worktree : this.#candidateDir();
   }
 
@@ -7656,10 +7736,7 @@ export class Conductor {
       let text = "";
       let missingFile = false;
       let fileShaped = false;
-      for (const token of arch.where.split(/[\s,;]+/).filter(Boolean)) {
-        // Only a file-shaped token (a path or a name with an extension) can be
-        // grepped; a bare module name is left to the reviewers.
-        if (!/[/.]/.test(token)) continue;
+      for (const token of whereFileTokens(arch.where)) {
         fileShaped = true;
         try {
           text += `${readWhereText(path.join(dir, token))}\n`;
@@ -7941,6 +8018,19 @@ export class Conductor {
     this.#applyEvent({ type: "FINDING_RAISED", finding });
   }
 
+  /** The candidate's `test` verify outcomes from a check run's output. With
+   * TT_FINAL_ONLY_MISSING=1 and final checks declared, a test merely missing
+   * from the output is left out: the plan runs it only in #+TT_FINAL_CHECKS
+   * (exex 01b2, ODP-3), whose command fails the phase if it fails, so it must
+   * neither raise a finding nor hold acceptance before the final checks run.
+   * A failed test is always kept. */
+  #resolveVerifies(output: string): VerifyResolution[] {
+    const resolutions = resolveTestVerifies(this.#planItems(), output);
+    const finalOnlyMissing =
+      process.env.TT_FINAL_ONLY_MISSING === "1" && (this.#state.phase.contract.finalChecks ?? []).length > 0;
+    return finalOnlyMissing ? resolutions.filter((r) => r.outcome !== "missing") : resolutions;
+  }
+
   /** A `test` verify that is missing from or failed in the candidate's check
    * run is a blocking finding anchored to its item. */
   #applyTestVerifyFindings(C: string): void {
@@ -8056,6 +8146,10 @@ export class Conductor {
     // compares against THAT candidate.
     const repeated = repeatLaneBases(prev)?.[lane];
     if (repeated) return repeated;
+    // tt 09 (change 3): a round after a consolidation starts every lane from
+    // the consolidated commit.
+    const consolidated = consolidatedBase(rounds, round);
+    if (consolidated) return consolidated;
     // Otherwise the lane started from the phase's own candidate (a repair
     // round). Round 1 starts from the integration head, which is not a
     // candidate: an unchanged submission there is not a resubmission.
@@ -8153,6 +8247,10 @@ export class Conductor {
      * exists — the losing lane after the other lane won must not continue
      * from its own lost edits. */
     freshSession?: boolean;
+    /** tt 09 (change 3): the consolidator — a worker by its tools, on the
+     * `consolidator` model (`#+TT_MODELS consolidator=…`, else the leader
+     * seat's). */
+    consolidation?: { round: number; worktree: string };
   }): AgentHandle {
     let helloResolve!: (r: HelloResult) => void;
     const helloPromise = new Promise<HelloResult>((resolve) => {
@@ -8167,8 +8265,9 @@ export class Conductor {
       discoveryResolve = resolve;
     });
     fs.mkdirSync(opts.sessionDir, { recursive: true });
-    const providerModel =
-      opts.role === "worker"
+    const providerModel = opts.consolidation
+      ? this.#providerModelFor?.("consolidator", this.#laneLeader())
+      : opts.role === "worker"
         ? // Plan 06g2: `worker.1`/`worker.2` name a lane by its 1-based
           // position, which the caller passes as `seat`.
           this.#providerModelFor?.("worker", opts.seat ?? opts.lane)
@@ -8231,6 +8330,7 @@ export class Conductor {
       ...(opts.laneReview ? { laneReview: opts.laneReview } : {}),
       ...(opts.pickSeat !== undefined ? { pickSeat: opts.pickSeat } : {}),
       ...(opts.pickRevote ? { pickRevote: true } : {}),
+      ...(opts.consolidation ? { consolidation: opts.consolidation } : {}),
     };
     this.#agents.set(opts.agentId, handle);
     // Plan 06g2: record the lane agent's own process group, so a crashed
@@ -8262,12 +8362,29 @@ export class Conductor {
       lines.push(
         `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), but its evaluation lost ${previous.regressed.items.join(", ")}, which the best candidate ${base.slice(0, 7)} met, in code it changed. It was not adopted: every lane's worktree was reset to the best candidate ${base.slice(0, 7)}, so no lane's previous candidate is in the worktree. Keep what the best candidate met; ${winner.sha.slice(0, 7)} is for reference only.`,
       );
+    } else if (previous?.picked && previous.consolidated?.ok && previous.consolidated.sha === base) {
+      // tt 09 (change 3): the winner was combined with what the other lanes
+      // met; every lane starts from the consolidated commit and is told which
+      // items it carries, so no lane redoes them or drops them.
+      const winner = previous.picked;
+      const c = previous.consolidated;
+      const label = consolidatedLabel(previous.round, winner.lane, c.took);
+      lines.push(
+        `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}), and a consolidator combined it with the plan items another lane met and it did not: ${c.took.map((t) => `lane ${t.lane}'s ${t.items.join(", ")} (from ${t.sha.slice(0, 7)})`).join("; ")}. Every lane's worktree was reset to that consolidated commit ${label} ${base.slice(0, 7)} — this round's base — so no lane's own previous candidate is in the worktree. Keep everything it meets, including ${c.took.flatMap((t) => t.items).join(", ")}; build on it, do not redo or drop that work.`,
+      );
     } else if (previous?.picked) {
       const winner = previous.picked;
       const losers = previous.lanes.filter((l) => l !== winner.lane);
       lines.push(
         `Round ${previous.round} picked lane ${winner.lane} (candidate ${winner.sha.slice(0, 7)}). Every lane's worktree was reset to that candidate, so the losing lane${losers.length === 1 ? "" : "s"} (${losers.join(", ")}) ${losers.length === 1 ? "has" : "have"} its own previous candidate no longer in the worktree.`,
       );
+      // tt 09 (change 3): a consolidation that failed leaves the round on the
+      // winner; the items the other lane met are named with where they are.
+      if (previous.consolidated && !previous.consolidated.ok) {
+        lines.push(
+          `Combining it with what the other lane met failed (${previous.consolidated.note ?? "no reason recorded"}). These plan items were met by another lane and not by the winner — take that work from its candidate: ${previous.consolidated.took.map((t) => `lane ${t.lane} ${t.sha.slice(0, 7)}: ${t.items.join(", ")}`).join("; ")}.`,
+        );
+      }
     }
     // Plan 06n (A7/R9b): every lane lost an item the best candidate met, so
     // the round picked no lane and every lane restarts from the best
@@ -8348,10 +8465,20 @@ export class Conductor {
   /** One lane: its own worktree at the round's base, its own worker and its
    * own sweep (A2). Returns the frozen candidate sha and the lane's
    * disclosures, or a note saying why the lane produced none. */
-  async #buildLane(lane: string, round: number, base: string, prompt: string): Promise<LaneBuild> {
+  async #buildLane(
+    lane: string,
+    round: number,
+    base: string,
+    prompt: string,
+    fix?: { of: string; timeoutMs: number },
+  ): Promise<LaneBuild> {
     // Plan 06n (A5): remember this lane's own start, so its check can diff
-    // against it and pick the final tier when a wide path is touched.
-    this.#laneCheckBases.set(`${round}-${lane}`, base);
+    // against it and pick the final tier when a wide path is touched. A fix
+    // keeps the lane's original start: its candidate is still measured from it.
+    if (!fix) {
+      this.#laneCheckBases.set(`${round}-${lane}`, base);
+      this.#laneStartedAt.set(`${round}-${lane}`, Date.now());
+    }
     // Plan 06n (A1): when the previous round picked the OTHER lane, this lane
     // lost and its worktree was reset to the winner's candidate. It starts a
     // fresh session, never continuing from memory of its own lost edits. The
@@ -8360,9 +8487,12 @@ export class Conductor {
     // Plan 06n (A7): a round that restarts every lane from the best candidate
     // starts fresh every lane whose own previous candidate is not that base.
     const own = previous?.candidates.find((c) => c.lane === lane)?.sha;
+    // exex 01a2: a fix continues the lane's own session, which holds the work
+    // it is fixing.
     const freshSession =
-      (previous?.picked !== undefined && previous.picked.lane !== lane) ||
-      (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base);
+      !fix &&
+      ((previous?.picked !== undefined && previous.picked.lane !== lane) ||
+        (this.#laneRoundRestartFromBest === base && own !== undefined && own !== base));
     // Recorded so a test (and the owner) can see the session decision; the
     // production session dir still exists, the fresh start just skips
     // `--continue`.
@@ -8373,7 +8503,11 @@ export class Conductor {
     // single-worker reset — never a bare throw the round swallows without a
     // lane-specific reason.
     try {
-      if (this.#unsavedLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
+      if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
+        // exex 01a2: the worktree already holds the red candidate (its
+        // freeze commit); the worker fixes it in place.
+        this.#log.append("lane_worktree_reused", { lane, round, reason: `fixing its red candidate ${fix.of}` });
+      } else if (this.#unsavedLaneWorktrees.has(lane) && fs.existsSync(worktree)) {
         // Plan 06k3 (A2, findings A-13/T-29): the previous attempt's work
         // could not be written to a ref, so its dirty worktree is kept as-is
         // and the worker continues in it.
@@ -8390,7 +8524,7 @@ export class Conductor {
       return { lane, note: `the lane's worktree could not be created: ${error}` };
     }
     const actionId = this.#log.actionId(`lane_${round}_${lane}`);
-    this.#log.intent(actionId, { lane, round, worktree, base });
+    this.#log.intent(actionId, { lane, round, worktree, base, ...(fix ? { fixOf: fix.of } : {}) });
     let agentId = `lane-${round}-${lane}-${actionId}`;
     const sessionDir = path.join(this.#paths.sessions, `lane-worker-${lane}`);
     const spawnLane = (): AgentHandle =>
@@ -8454,11 +8588,12 @@ export class Conductor {
           this.#applyEvent({ type: "NOTES_DELIVERED", phaseId: this.#state.phase.phaseId, count: carried - deliveredCount });
         }
       }
-      const timeout = new PausableTimer<"timeout">(this.#deadlines.workerAttemptMs, "timeout");
+      const attemptMs = fix?.timeoutMs ?? this.#deadlines.workerAttemptMs;
+      const timeout = new PausableTimer<"timeout">(attemptMs, "timeout");
       // Plan 06k3 (A2): at 75% of the attempt the lane worker is told how many
       // minutes remain and to submit. The steer timer pauses with the attempt
       // clock.
-      const clockSteer = this.#scheduleClockSteer(agentId, handle.agent, this.#deadlines.workerAttemptMs);
+      const clockSteer = this.#scheduleClockSteer(agentId, handle.agent, attemptMs);
       // Plan 06k1 (A4): a lane worker pauses while another run's check window
       // is open, exactly like the single-candidate worker.
       const stopCheckWindowWatch = this.#watchCheckWindow(agentId, handle.agent, timeout, clockSteer.timer);
@@ -8535,6 +8670,315 @@ export class Conductor {
     }
   }
 
+  /** exex 01a2: a lane never hands in a red tree. Its worker gets the
+   * failing checks back on its own candidate, continuing its own session, with
+   * the attempt time it has left, and submits again. A lane with almost no
+   * time left keeps its red candidate for this round (the next round starts
+   * from it, `repeatLaneBases`). */
+  async #fixLane(lane: string, round: number, sha: string, failure: string): Promise<LaneBuild> {
+    const started = this.#laneStartedAt.get(`${round}-${lane}`) ?? Date.now();
+    const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - started);
+    // Under a minute (or a tenth of a short attempt) is too little to fix
+    // anything: the red candidate stays this round's record.
+    if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
+      this.#log.append("lane_fix_skipped", { lane, round, sha, reason: "no attempt time left" });
+      return { lane, note: `the lane's candidate ${sha.slice(0, 7)} is red and its attempt time is spent` };
+    }
+    const digest = this.#laneCheckFailureDigest(sha);
+    this.#log.append("lane_fix_started", { lane, round, sha, remainingMs });
+    const prompt = [
+      `Your round-${round} candidate ${sha.slice(0, 7)} FAILED the round checks, so its reviews were cancelled. A lane never hands in a red tree: a candidate's reviews count only once its checks pass.`,
+      "",
+      "Fix exactly what fails, in this worktree (it holds your candidate). Keep all your other work; do not delete, skip or #[ignore] a test, weaken an assertion, or remove required work to make a check pass (ODP-2) — if the failure is a real limit, raise it as a BLOCKER with the exact error instead.",
+      "Run the failing command yourself until it passes, then run the full round checks, then call submit_coverage and submit_phase again with your complete payload (your disclosures, coverage and answers, updated for what you changed).",
+      `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes of this attempt left.`,
+      "",
+      `The failure: ${failure}`,
+      ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
+    ].join("\n");
+    const fixed = await this.#buildLane(lane, round, sha, prompt, { of: sha, timeoutMs: remainingMs });
+    // A "fix" whose tree is the red candidate's own tree changed nothing:
+    // checking it again would only repeat the failure, so the loop ends.
+    if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
+      this.#log.append("lane_fix_unchanged", { lane, round, sha, fixedSha: fixed.sha });
+      return { lane, note: `the lane's fix of ${sha.slice(0, 7)} changed nothing` };
+    }
+    return fixed;
+  }
+
+  /** exex 01a2: the lines of a failed candidate's check output a worker needs
+   * to fix it — compile errors with their locations, failing tests and
+   * panics — at most `limit` lines, errors first. */
+  #laneCheckFailureDigest(sha: string, limit = 160): string {
+    const dir = path.join(this.#paths.checks, sha);
+    let text = "";
+    try {
+      for (const f of fs.readdirSync(dir)) if (f.endsWith(".log")) text += fs.readFileSync(path.join(dir, f), "utf8") + "\n";
+    } catch {
+      return "";
+    }
+    const lines = text.split("\n");
+    const keep: string[] = [];
+    for (let i = 0; i < lines.length && keep.length < limit; i++) {
+      const line = lines[i];
+      if (/^error(\[E\d+\])?:/.test(line) || /^warning: unused/.test(line)) {
+        // the message and its location/snippet lines
+        for (let j = i; j < Math.min(lines.length, i + 8) && keep.length < limit; j++) {
+          if (j > i && /^(error|warning)/.test(lines[j])) break;
+          keep.push(lines[j]);
+        }
+      } else if (/^test .* FAILED$/.test(line) || /panicked at/.test(line) || /^Diff in /.test(line) || /^---- .* stdout ----$/.test(line)) {
+        keep.push(line);
+        if (/panicked at/.test(line) && i + 1 < lines.length) keep.push(lines[i + 1]);
+      }
+    }
+    return keep.join("\n").trim();
+  }
+
+  // -------------------------------------------------------------------------
+  // tt 09 (change 3): combine the lanes
+  // -------------------------------------------------------------------------
+
+  /** The consolidator's own worktree, beside the lanes'. */
+  #consolidationWorktree(): string {
+    return path.join(this.#runDir, "worktrees", "consolidator");
+  }
+
+  /** tt 09 (change 3): the combine step after round `roundNo`, whose pick the
+   * phase evaluated and did not accept. When another passing lane met plan
+   * items the winner did not (`consolidationPlan`, the seats' per-item
+   * verdicts), a consolidator starts from the winner in its own worktree,
+   * takes that lane's work for exactly those items, and its commit goes
+   * through the round checks with the lane fix loop (`runConsolidation`).
+   * ROUND_CONSOLIDATED records the result either way: a green commit is the
+   * next round's base for every lane; a failure keeps today's base (the
+   * winner) and says why. Returns "stopped" when the owner's stop or a
+   * recheck ended it mid-way — nothing is recorded then. */
+  async #consolidateRound(roundNo: number): Promise<"stopped" | undefined> {
+    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === roundNo);
+    if (!record?.picked || record.consolidated || record.regressed) return undefined;
+    if (!consolidationEnabled(this.#state.phase.contract) || !this.#itemsEnforced()) return undefined;
+    // Only a pick the phase adopted and evaluated is combined (a round that
+    // was handed off and then not accepted).
+    if (this.#state.phase.candidate?.sha !== record.picked.sha) return undefined;
+    const itemIds = flatItems(this.#planItems()).map((i) => i.id);
+    const plan = consolidationPlan(record, itemIds, this.#laneSeats().length);
+    if (!plan) return undefined;
+    this.#log.append("consolidation_started", { round: roundNo, from: plan.winner.sha, lane: plan.winner.lane, took: plan.takes });
+    const startedAt = Date.now();
+    const stopped = (): boolean => this.#stopRequested || this.#recheckCancelledLaneRound;
+    const outcome = await runConsolidation({
+      build: () => this.#buildConsolidation(plan, this.#consolidationPrompt(plan)),
+      check: (sha) => this.#checkConsolidation(plan, sha),
+      fix: async (sha, failure) => {
+        const remainingMs = this.#deadlines.workerAttemptMs - (Date.now() - startedAt);
+        // The lane rule: too little time left to fix anything keeps the red
+        // commit, and the next round starts from the winner.
+        if (remainingMs < Math.min(60_000, this.#deadlines.workerAttemptMs / 10)) {
+          this.#log.append("consolidation_fix_skipped", { round: roundNo, sha, reason: "no attempt time left" });
+          return { lane: "consolidator", note: "its attempt time is spent" };
+        }
+        this.#log.append("consolidation_fix_started", { round: roundNo, sha, remainingMs });
+        const digest = this.#laneCheckFailureDigest(sha);
+        const prompt = [
+          `Your consolidated commit ${sha.slice(0, 7)} FAILED the round checks, so it cannot be the next round's base.`,
+          "",
+          "Fix exactly what fails, in this worktree (it holds your commit). Keep the winner's work and the work you took; do not delete, skip or #[ignore] a test, weaken an assertion, or drop a taken item to make a check pass.",
+          "Run the failing command until it passes, then call submit_phase again (decisions [], assumptions [], and in deviations every change you made beyond the taken work).",
+          `You have about ${Math.max(1, Math.floor(remainingMs / 60_000))} minutes left.`,
+          "",
+          `The failure: ${failure}`,
+          ...(digest ? ["", "Its output (errors first):", "```", digest, "```"] : []),
+        ].join("\n");
+        const fixed = await this.#buildConsolidation(plan, prompt, { of: sha, timeoutMs: remainingMs });
+        if (fixed.sha && treeOf(this.#plan.repo, fixed.sha) === treeOf(this.#plan.repo, sha)) {
+          this.#log.append("consolidation_fix_unchanged", { round: roundNo, sha, fixedSha: fixed.sha });
+          return { lane: "consolidator", note: `its fix of ${sha.slice(0, 7)} changed nothing` };
+        }
+        return fixed;
+      },
+      stopRequested: stopped,
+    });
+    if (outcome.stopped || stopped()) {
+      this.#log.append("consolidation_stopped", { round: roundNo, reason: this.#stopRequested ? "the owner stopped the run" : "a recheck stopped it" });
+      return "stopped";
+    }
+    // The consolidator's own diff beyond the taken lanes' files, measured
+    // (07: its extra diff must be small and reported, not just requested).
+    let extraFiles: string[] | undefined;
+    if (outcome.ok && outcome.sha) {
+      try {
+        const taken = new Set(plan.takes.flatMap((t) => diffNameOnly(this.#plan.repo, plan.winner.sha, t.sha)));
+        extraFiles = diffNameOnly(this.#plan.repo, plan.winner.sha, outcome.sha).filter((f) => !taken.has(f));
+      } catch {
+        extraFiles = undefined;
+      }
+    }
+    this.#log.append(outcome.ok ? "consolidation_passed" : "consolidation_failed", {
+      round: roundNo,
+      from: plan.winner.sha,
+      took: plan.takes,
+      ...(outcome.sha ? { sha: outcome.sha } : {}),
+      ...(outcome.note ? { note: outcome.note } : {}),
+      ...(outcome.added ? { added: outcome.added } : {}),
+      ...(extraFiles ? { extraFiles } : {}),
+      fixes: outcome.fixes,
+      ms: Date.now() - startedAt,
+    });
+    this.#applyEvent({
+      type: "ROUND_CONSOLIDATED",
+      round: roundNo,
+      from: plan.winner.sha,
+      lane: plan.winner.lane,
+      took: plan.takes,
+      ok: outcome.ok,
+      ...(outcome.ok && outcome.sha ? { sha: outcome.sha } : {}),
+      ...(outcome.note ? { note: outcome.note } : {}),
+      ...(outcome.added && outcome.added.length > 0 ? { added: outcome.added } : {}),
+      fixes: outcome.fixes,
+    });
+    return undefined;
+  }
+
+  /** tt 09 (change 3): the consolidator's prompt — the winner and the other
+   * lanes' commits, the exact items to take (id, text and the seats' evidence
+   * anchors), and 07's constraints on a consolidator. */
+  #consolidationPrompt(plan: ConsolidationPlan): string {
+    const record = (this.#state.phase.rounds ?? []).find((r) => r.round === plan.round);
+    const items = flatItems(this.#planItems());
+    const winner = candidateLabel(plan.round, plan.winner.lane);
+    const lines: string[] = [
+      `You are the CONSOLIDATOR of round ${plan.round} of phase ${this.#state.phase.phaseId}. Goal of the phase: ${this.#state.phase.contract.goal}`,
+      "",
+      `Round ${plan.round} ran ${record?.lanes.length ?? 2} lanes from one base. The seats picked lane ${plan.winner.lane} (${winner}, commit ${plan.winner.sha}), and its evaluation did not accept the phase. Another lane met plan items the winner did not (a strict majority of the seats said so). Your worktree holds the winner's commit ${plan.winner.sha}. Your one job: take the other lane's work for EXACTLY these items onto it, so the next round starts from both lanes' strengths.`,
+      "",
+    ];
+    for (const take of plan.takes) {
+      const candidate = record?.candidates.find((c) => c.lane === take.lane && c.sha === take.sha);
+      lines.push(`From lane ${take.lane} (${candidateLabel(plan.round, take.lane)}, commit ${take.sha}):`);
+      for (const id of take.items) {
+        const item = items.find((i) => i.id === id);
+        lines.push(`- ${id}${item ? ` ${oneLine(item.title)}: ${oneLine(item.text, 600)}` : ""}`);
+        const evidence = candidate ? itemEvidence(candidate, id, this.#laneSeats()) : [];
+        if (evidence.length > 0) lines.push(`  the seats' evidence it is met: ${evidence.map((e) => oneLine(e, 300)).join(" | ")}`);
+      }
+      lines.push("");
+    }
+    lines.push(
+      "How:",
+      `- Read the other lane's work with git (both commits are in this repository): \`git diff ${plan.winner.sha.slice(0, 12)} <lane commit>\`, \`git show <lane commit>:<path>\`, and \`git checkout <lane commit> -- <path>\` for a file only that lane changed.`,
+      "- Keep everything the winner already meets. Never rewrite the winner's work wholesale and never revert it; take the other lane's work only for the listed items.",
+      "- Do not weaken, skip, #[ignore] or delete a test, and do not drop a test either lane wrote for these items.",
+      "- Keep your own extra diff small: change only what integrating the two needs (a conflict, a call site, an import).",
+      "- Do not commit; tt commits your worktree when you submit. tt runs the round checks on your commit and sends any failure back to you, so run only a fast compile and the targeted tests of the items you took.",
+      "- Then call submit_phase with decisions [] and assumptions [], and in deviations one line per change you made beyond the taken work (path — why), or none.",
+      `- You have about ${Math.max(1, Math.floor(this.#deadlines.workerAttemptMs / 60_000))} minutes.`,
+    );
+    return lines.join("\n");
+  }
+
+  /** tt 09 (change 3): one consolidator run in its own worktree at the
+   * winner (or, for a fix, on its own red commit, continuing its session),
+   * frozen to a commit. Mirrors `#buildLane` without the lane-only parts (no
+   * owner-note delivery, no saved unsubmitted work: a failed consolidation
+   * only falls back to the winner). */
+  async #buildConsolidation(plan: ConsolidationPlan, prompt: string, fix?: { of: string; timeoutMs: number }): Promise<LaneBuild> {
+    const worktree = this.#consolidationWorktree();
+    try {
+      if (fix && fs.existsSync(worktree) && headOf(worktree) === fix.of) {
+        this.#log.append("consolidation_worktree_reused", { round: plan.round, reason: `fixing its red commit ${fix.of}` });
+      } else {
+        if (fs.existsSync(worktree)) removeWorktree(this.#plan.repo, worktree);
+        createWorktree(this.#plan.repo, worktree, plan.winner.sha);
+      }
+    } catch (err) {
+      const error = String((err as Error)?.message ?? err);
+      this.#log.append("consolidation_worktree_failed", { round: plan.round, error });
+      return { lane: "consolidator", note: `its worktree could not be created: ${error}` };
+    }
+    const actionId = this.#log.actionId(`consolidate_${plan.round}`);
+    this.#log.intent(actionId, { round: plan.round, consolidator: true, worktree, base: plan.winner.sha, ...(fix ? { fixOf: fix.of } : {}) });
+    const agentId = `consolidate-${plan.round}-${actionId}`;
+    const handle = this.#spawnLaneAgent({
+      role: "worker",
+      agentId,
+      cwd: worktree,
+      sessionDir: path.join(this.#paths.sessions, `consolidator-${plan.round}`),
+      // It owes submit_phase only: no coverage turn (TT_ITEMS=0).
+      env: { ...this.#laneEnv(worktree, this.#piEnvFor?.("worker", agentId) ?? {}), TT_ITEMS: "0" },
+      consolidation: { round: plan.round, worktree },
+      // A fix continues the session that holds the work; a first build (or a
+      // restart's re-run) starts fresh.
+      ...(fix ? {} : { freshSession: true }),
+    });
+    try {
+      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      if (hello === "timeout" || !hello.ok) {
+        await handle.agent.terminate();
+        const note = hello === "timeout" ? "the consolidator did not start (hello timed out)" : "the consolidator failed to start";
+        this.#log.completion(actionId, { round: plan.round, outcome: "no-commit", reason: note });
+        return { lane: "consolidator", note };
+      }
+      await handle.agent.prompt(prompt);
+      const timeout = new PausableTimer<"timeout">(fix?.timeoutMs ?? this.#deadlines.workerAttemptMs, "timeout");
+      const outcome = await Promise.race([
+        handle.donePromise.then(() => "submitted" as const),
+        handle.agent.waitSettled().then(() => "settled" as const),
+        handle.agent.waitExit().then(() => "exited" as const),
+        handle.agent.waitCompactionFailed().then(() => "compactionFailed" as const),
+        handle.agent.waitModelFailed().then(() => "modelFailed" as const),
+        timeout.promise,
+      ]);
+      timeout.cancel();
+      await handle.agent.terminate();
+      // A settle with no submission also resolves `donePromise`
+      // (`#onNoSubmission`); only a recorded submit_phase is a submission.
+      if (outcome !== "submitted" || handle.consolidationAdded === undefined) {
+        const note =
+          outcome === "timeout"
+            ? "the consolidator timed out before submitting"
+            : handle.agent.modelFailureReason
+              ? `the consolidator ended without submitting: ${handle.agent.modelFailureReason}`
+              : `the consolidator ended without submit_phase (${outcome})`;
+        this.#log.completion(actionId, { round: plan.round, outcome: "no-commit", reason: note });
+        return { lane: "consolidator", note };
+      }
+      const sweepResult: SweepResult = await sweep(worktree, {
+        ownPgids: this.#ownPgids(),
+        exceptPids: [],
+        cwdUnder: this.#laneSweepRoot(worktree),
+      });
+      this.#log.append("sweep", { ...sweepResult, consolidator: true });
+      const sha = freezeCommit(worktree, actionId, `phase ${this.#state.phase.phaseId} round ${plan.round} consolidation`);
+      // A commit with the winner's own tree took nothing: it is no base.
+      if (!fix && treeOf(this.#plan.repo, sha) === treeOf(this.#plan.repo, plan.winner.sha)) {
+        this.#log.completion(actionId, { round: plan.round, outcome: "unchanged", sha });
+        return { lane: "consolidator", note: "the consolidator changed nothing on the winner" };
+      }
+      this.#log.completion(actionId, { round: plan.round, consolidatedSha: sha, added: handle.consolidationAdded });
+      return { lane: "consolidator", sha, added: handle.consolidationAdded };
+    } finally {
+      this.#agents.delete(agentId);
+    }
+  }
+
+  /** tt 09 (change 3): the round checks on a consolidated commit, under the
+   * machine-wide lock, exactly as a lane candidate's (the winner is its base
+   * for the wide-path tier). */
+  async #checkConsolidation(plan: ConsolidationPlan, sha: string): Promise<LaneCheck> {
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
+    try {
+      this.#log.append("consolidation_check_started", { round: plan.round, sha });
+      const result = await this.#runLaneChecks("consolidator", sha, plan.winner.sha);
+      this.#log.append("consolidation_check_finished", { round: plan.round, sha, passed: result.ok, ...(result.note ? { note: result.note } : {}) });
+      return result;
+    } finally {
+      window.release();
+      await lock.release();
+    }
+  }
+
   /** Plan 06n (A3/A4/A5): a candidate kept from a round stopped mid-way.
    * The live build's in-memory records died with the stopped conductor, so
    * they are restored from the lane's own intent (its start) and completion
@@ -8576,7 +9020,7 @@ export class Conductor {
             })
             .join("\n");
           this.#laneCheckOutputs.set(sha, output);
-          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, resolveTestVerifies(this.#planItems(), output));
+          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(output));
         }
       } catch {
         // Not checked before the stop: the resumed round checks it now.
@@ -8588,10 +9032,10 @@ export class Conductor {
 
   /** One candidate's checks, run under the machine-wide lock (C2). */
   async #checkLaneCandidate(round: number, lane: string, sha: string): Promise<LaneCheck> {
-    const lock = await acquireWaitingLock(this.#checkLockPath);
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
     // Plan 06k1 (A4): the check holds the host-wide window for its duration,
     // so every other run's workers are paused while it runs.
-    const window = openCheckWindow(this.#checkLockPath);
+    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     try {
       this.#log.append("lane_check_started", { round, lane, candidateSha: sha });
       const result = await this.#runLaneChecks(lane, sha, this.#laneCheckBases.get(`${round}-${lane}`));
@@ -8750,7 +9194,7 @@ export class Conductor {
       // applies them); a loser's output must not touch the phase's item state.
       this.#laneCheckOutputs.set(candidateSha, combinedOutput);
       if (this.#itemsEnforced()) {
-        this.#laneCheckResolutions.set(candidateSha, resolveTestVerifies(this.#planItems(), combinedOutput));
+        this.#laneCheckResolutions.set(candidateSha, this.#resolveVerifies(combinedOutput));
       }
       return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
     } finally {
@@ -8771,10 +9215,10 @@ export class Conductor {
     lane: string,
     sha: string,
   ): Array<{ seat: string; disclosure: DecisionDisclosure; id: string; index: number }> {
-    const key = `${round}-${lane}`;
+    const key = this.#laneReviewKey(round, lane, sha);
     const cached = this.#laneDiscoveryPlans.get(key);
     if (cached) return cached;
-    const build = this.#laneBuilds.get(key);
+    const build = this.#laneBuilds.get(`${round}-${lane}`);
     const workerDecisions = build
       ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
       : [];
@@ -8795,16 +9239,17 @@ export class Conductor {
    * reviewers ballot them with the candidate's other records. Citations
    * count every decision and finding of the phase (superseded ones
    * included), plus the lane's own worker decisions, so a path an earlier
-   * round's decision cited is not re-triggered. Cached by `<round>-<lane>`,
-   * so the hand-off applies exactly the ids the seats balloted. */
+   * round's decision cited is not re-triggered. Cached by
+   * `<round>-<lane>-<sha>`, so the hand-off applies exactly the ids the seats
+   * balloted. */
   #laneTriggerDecisions(round: number, lane: string, sha: string): Decision[] {
-    const key = `${round}-${lane}`;
+    const key = this.#laneReviewKey(round, lane, sha);
     const cached = this.#laneTriggers.get(key);
     if (cached) return cached;
     let out: Decision[] = [];
     try {
       const contract = this.#state.phase.contract;
-      const build = this.#laneBuilds.get(key);
+      const build = this.#laneBuilds.get(`${round}-${lane}`);
       const workerDecisions = build
         ? this.#assembleDecisions(sha, { disclosures: build.disclosures ?? [], dispute: build.dispute })
         : [];
@@ -8935,16 +9380,20 @@ export class Conductor {
       await this.#runLaneReviewOnce(round, lane, sha, seat);
       return;
     } catch (err) {
+      // 09-2: a cancelled review (its candidate failed its checks) is never
+      // retried; `runRound` discards it.
+      if (this.#laneReviewCancelled(round, lane, sha)) throw err;
       this.#log.append("lane_review_retried", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
     }
     try {
       await this.#runLaneReviewOnce(round, lane, sha, seat, true);
     } catch (err) {
+      if (this.#laneReviewCancelled(round, lane, sha)) throw err;
       // Plan 06k3 (A1, finding A-1): only now — after the retry also failed —
       // does this seat arrive at the discovery barrier. Marking it arrived
       // while a retry was still coming let the other seats build and cache
       // their turn-2 plan without the retry's discovery.
-      this.#laneArriveAtBarrier(round, lane, seat);
+      this.#laneArriveAtBarrier(round, lane, sha, seat);
       this.#log.append("lane_review_retry_failed", { round, lane, seat, reason: String((err as Error)?.message ?? err) });
       throw err;
     }
@@ -8956,8 +9405,12 @@ export class Conductor {
    * three seats' discoveries merge behind a per-candidate barrier, and turn 2
    * reviews the lane's decisions, findings and item verdicts. A review that
    * cannot be taken THROWS: the round then fails and repeats, so a winner is
-   * never handed off with fewer than K × N reviews. */
+   * never handed off with fewer than K × N reviews. 09-2: it starts at the
+   * candidate's submission, while its checks run, and a failed check cancels
+   * it (`#cancelLaneReviews`). */
   async #runLaneReviewOnce(round: number, lane: string, sha: string, seat: string, retry = false): Promise<void> {
+    // 09-2: a review of a candidate already cancelled never spawns an agent.
+    if (this.#laneReviewCancelled(round, lane, sha)) throw new Error(`the review was cancelled: ${candidateLabel(round, lane)} failed its checks`);
     const candidateDir = path.join(this.#paths.candidates, sha);
     const actionId = this.#log.actionId(`lane_review_${round}_${lane}_${seat}`);
     this.#log.intent(actionId, { round, lane, seat, candidateSha: sha, ...(retry ? { retry: true } : {}) });
@@ -8972,8 +9425,10 @@ export class Conductor {
       // candidate must not carry the first's review in context (M's veto of
       // the shared session), and a later round re-reviews from scratch. Plan
       // 06k3 (A1): the retry gets its OWN session dir, so the fresh agent does
-      // not inherit the failed attempt's context.
-      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}${retry ? "-retry" : ""}`),
+      // not inherit the failed attempt's context. 09-2: and per candidate — a
+      // lane's fixed candidate is reviewed in the same round as its cancelled
+      // red one, never in that one's session.
+      sessionDir: path.join(this.#paths.sessions, `lane-reviewer-${round}-${lane}-${seat}-${sha.slice(0, 12)}${retry ? "-retry" : ""}`),
       env: this.#laneEnv(candidateDir, {
         ...(this.#piEnvFor?.("reviewer", agentId) ?? {}),
         TT_CANDIDATE_SHA: sha,
@@ -8985,11 +9440,20 @@ export class Conductor {
       laneReview: { round, lane, sha, seat },
     });
     const lanePhase = this.#lanePhase(round, lane, sha);
+    // 09-2: every wait below also ends the moment the candidate's checks
+    // fail (`#cancelLaneReviews`), so a cancelled review stops at once.
+    const cancelled = this.#laneReviewCancel(round, lane, sha).promise;
+    const endCancelled = async (stage: string): Promise<never> => {
+      await handle.agent.terminate();
+      this.#log.completion(actionId, { round, lane, seat, ok: false, reason: `cancelled: the candidate failed its checks (${stage})` });
+      throw new Error(`the review was cancelled: ${candidateLabel(round, lane)} failed its checks`);
+    };
     // Plan 06k3 (A3): the lane's reproduction table, computed once per
-    // candidate after its checks.
+    // candidate.
     await this.#ensureReproductionTable(lanePhase, sha);
     try {
-      const hello = await raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello");
+      const hello = await Promise.race([raceTimeout(handle.helloPromise, this.#deadlines.helloTimeoutMs, "hello"), cancelled]);
+      if (hello === "cancelled") return await endCancelled("start");
       if (hello === "timeout" || !hello.ok) {
         await handle.agent.terminate();
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: "the reviewer did not start" });
@@ -9010,11 +9474,16 @@ export class Conductor {
 
       // Turn 1: discover, before the worker's own disclosure is shown.
       const settled1 = nextSettle();
-      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn1Prompt(seat as Reviewer, lanePhase, candidateDir)));
+      await handle.agent.prompt(
+        this.#agentPrompt(
+          [this.#buildReviewerTurn1Prompt(seat as Reviewer, lanePhase, candidateDir), ...this.#laneChecksRunningLines(round, lane, sha)].join("\n"),
+        ),
+      );
       const raced1 = await Promise.race([
         handle.discoveryPromise.then(() => "discovered" as const),
         timeout.promise,
         settled1,
+        cancelled,
         // A crashed reviewer ends the attempt at once, never at reviewMs.
         handle.agent.waitExit().then(() => "exited" as const),
         // Plan 06l (A3/A-8): a terminal model failure (404, context overflow)
@@ -9025,6 +9494,10 @@ export class Conductor {
       // The discovery reply and the turn's own settle are two channels; the
       // settle can win the race. What matters is whether the discovery was
       // ACCEPTED, so the recorded discovery (not the race's winner) decides.
+      if (raced1 === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("turn 1");
+      }
       const turn1 = raced1 !== "discovered" && handle.laneDiscoveries !== undefined ? ("discovered" as const) : raced1;
       if (turn1 !== "discovered") {
         timeout.cancel();
@@ -9040,7 +9513,11 @@ export class Conductor {
         this.#log.completion(actionId, { round, lane, seat, ok: false, reason: why });
         throw new Error(why);
       }
-      const turn1Settled = await Promise.race([settled1, timeout.promise]);
+      const turn1Settled = await Promise.race([settled1, timeout.promise, cancelled]);
+      if (turn1Settled === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("turn 1");
+      }
       if (turn1Settled === "timeout") {
         timeout.cancel();
         await handle.agent.terminate();
@@ -9050,10 +9527,18 @@ export class Conductor {
       // The per-candidate discovery barrier: no seat gets turn 2 until all
       // three have finished turn 1 on THIS candidate, so every turn-2 prompt
       // lists the same merged records and every seat can ballot the others'.
-      this.#laneArriveAtBarrier(round, lane, seat);
+      this.#laneArriveAtBarrier(round, lane, sha, seat);
       timeout.cancel();
       timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
-      const barrier = await Promise.race([this.#laneBarrierReleased(round, lane).then(() => "released" as const), timeout.promise]);
+      const barrier = await Promise.race([
+        this.#laneBarrierReleased(round, lane, sha).then(() => "released" as const),
+        timeout.promise,
+        cancelled,
+      ]);
+      if (barrier === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("waiting for the other seats' discovery");
+      }
       if (barrier === "timeout") {
         timeout.cancel();
         await handle.agent.terminate();
@@ -9068,7 +9553,11 @@ export class Conductor {
       timeout = cancelableTimeout(this.#deadlines.reviewMs, "timeout" as const);
       const merged = this.#lanePhase(round, lane, sha, { final: true });
       const settled2 = nextSettle();
-      await handle.agent.prompt(this.#agentPrompt(this.#buildReviewerTurn2Prompt(seat as Reviewer, handle, merged, candidateDir)));
+      await handle.agent.prompt(
+        this.#agentPrompt(
+          [this.#buildReviewerTurn2Prompt(seat as Reviewer, handle, merged, candidateDir), ...this.#laneChecksRunningLines(round, lane, sha)].join("\n"),
+        ),
+      );
       const reviewRecorded = () =>
         ((this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane)?.reviews ?? []).some(
           (r) => r.seat === seat,
@@ -9077,10 +9566,15 @@ export class Conductor {
         handle.donePromise.then(() => "submitted" as const),
         timeout.promise,
         settled2,
+        cancelled,
         handle.agent.waitExit().then(() => "exited" as const),
         handle.agent.waitModelFailed().then(() => "failed" as const),
         handle.agent.waitCompactionFailed().then(() => "failed" as const),
       ]);
+      if (turn2 === "cancelled") {
+        timeout.cancel();
+        return await endCancelled("turn 2");
+      }
       // Same channel race as turn 1: the recorded review, not the race's
       // winner, says whether the submission landed.
       if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
@@ -9094,14 +9588,20 @@ export class Conductor {
               `findingStatements, items and arch, then end your turn.`,
           ),
         );
-        turn2 = await Promise.race([
+        const reprompted = await Promise.race([
           handle.donePromise.then(() => "submitted" as const),
           timeout.promise,
           settled3,
+          cancelled,
           handle.agent.waitExit().then(() => "exited" as const),
           handle.agent.waitModelFailed().then(() => "failed" as const),
           handle.agent.waitCompactionFailed().then(() => "failed" as const),
         ]);
+        if (reprompted === "cancelled") {
+          timeout.cancel();
+          return await endCancelled("turn 2");
+        }
+        turn2 = reprompted;
         if (turn2 !== "submitted" && reviewRecorded()) turn2 = "submitted";
       }
       timeout.cancel();
@@ -9128,11 +9628,66 @@ export class Conductor {
     }
   }
 
+  /** 09-2: the key of one lane candidate's review state (discoveries, their
+   * id plan, triggers, barrier, cancellation). */
+  #laneReviewKey(round: number, lane: string, sha: string): string {
+    return `${round}-${lane}-${sha}`;
+  }
+
+  /** 09-2: one lane candidate's review cancellation, created on first use. */
+  #laneReviewCancel(round: number, lane: string, sha: string): { cancelled: boolean; promise: Promise<"cancelled">; resolve: () => void } {
+    const key = this.#laneReviewKey(round, lane, sha);
+    let entry = this.#laneReviewCancels.get(key);
+    if (!entry) {
+      let resolve!: () => void;
+      const promise = new Promise<"cancelled">((r) => (resolve = () => r("cancelled")));
+      entry = { cancelled: false, promise, resolve };
+      this.#laneReviewCancels.set(key, entry);
+    }
+    return entry;
+  }
+
+  /** 09-2: true once this lane candidate's reviews were cancelled. */
+  #laneReviewCancelled(round: number, lane: string, sha: string): boolean {
+    return this.#laneReviewCancels.get(this.#laneReviewKey(round, lane, sha))?.cancelled === true;
+  }
+
+  /** 09-2 (async review): the candidate failed its checks, so its in-flight
+   * reviews are cancelled: every stage of them ends at once (no retry), their
+   * agents are terminated, and a submission that still arrives is ignored. */
+  #cancelLaneReviews(round: number, lane: string, sha: string): void {
+    const entry = this.#laneReviewCancel(round, lane, sha);
+    if (entry.cancelled) return;
+    entry.cancelled = true;
+    entry.resolve();
+    try {
+      this.#log.append("lane_reviews_cancelled", { round, lane, candidateSha: sha });
+    } catch {
+      // a stopping conductor may already have closed its log.
+    }
+    for (const handle of this.#agents.values()) {
+      const r = handle.laneReview;
+      if (r && r.round === round && r.lane === lane && r.sha === sha) void handle.agent.terminate().catch(() => undefined);
+    }
+  }
+
+  /** 09-2: a lane review starts at the candidate's submission, so its checks
+   * may still be running when a turn's prompt is built. The reviewer is told
+   * so, and judges the code and the delta; the conductor owns the check
+   * result. Empty once the candidate's check result is recorded. */
+  #laneChecksRunningLines(round: number, lane: string, sha: string): string[] {
+    const candidate = (this.#state.phase.rounds ?? []).find((r) => r.round === round)?.candidates.find((c) => c.lane === lane);
+    if (candidate?.sha !== sha || candidate.ok !== undefined) return [];
+    return [
+      "This candidate's checks are running in parallel with your review; the conductor reports their result (a failed check cancels this review). Judge the code and the delta; do not run the checks yourself.",
+    ];
+  }
+
   /** The per-(round, lane) discovery barrier: every seat that arrives waits
    * until all of the round's seats have, exactly like the single-candidate
    * path's `#discoveryBarrier` but keyed by the candidate under review. */
-  #laneArriveAtBarrier(round: number, lane: string, seat: string): void {
-    const key = `${round}-${lane}`;
+  #laneArriveAtBarrier(round: number, lane: string, sha: string, seat: string): void {
+    const key = this.#laneReviewKey(round, lane, sha);
     const barrier = this.#laneBarriers.get(key) ?? { arrived: new Set<string>(), waiters: [] };
     if (barrier.arrived.has(seat)) return;
     barrier.arrived.add(seat);
@@ -9140,8 +9695,8 @@ export class Conductor {
     if (this.#laneSeats().every((s) => barrier.arrived.has(s))) barrier.waiters.splice(0).forEach((f) => f());
   }
 
-  #laneBarrierReleased(round: number, lane: string): Promise<void> {
-    const key = `${round}-${lane}`;
+  #laneBarrierReleased(round: number, lane: string, sha: string): Promise<void> {
+    const key = this.#laneReviewKey(round, lane, sha);
     const barrier = this.#laneBarriers.get(key);
     if (barrier && this.#laneSeats().every((s) => barrier.arrived.has(s))) return Promise.resolve();
     return new Promise<void>((resolve) => {
@@ -9323,7 +9878,9 @@ export class Conductor {
       .map((r) => {
         const votes = r.votes.map((v) => `${v.seat}→${v.lane}`).join(" ");
         const picked = r.picked ? `${candidateLabel(r.round, r.picked.lane)} won (${r.picked.votes} vote(s))` : "no winner";
-        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}`;
+        // tt 09 (change 3): the round's combine step, when it ran.
+        const consolidated = consolidationLine(r);
+        return `round ${r.round} from ${r.base.slice(0, 7)}: ${r.lanes.map((l) => candidateLabel(r.round, l)).join(", ")}${votes ? ` — votes ${votes}` : ""} — ${picked}${consolidated ? ` — ${consolidated}` : ""}`;
       });
   }
 
@@ -9365,19 +9922,34 @@ export class Conductor {
       // pick is adopted as the base or, when it lost a met item in code it
       // changed, recorded as a regression (ITEMS_REGRESSED).
       if (!unfinished) this.#recordRegression(last);
+      // tt 09 (change 3): a pick the phase did not accept is combined with
+      // the plan items another lane met and it did not, before the next
+      // round starts; a green consolidation is that round's base for every
+      // lane. Recorded as ROUND_CONSOLIDATED, so a restart never redoes it.
+      if (!unfinished && last?.picked) {
+        const consolidated = await this.#consolidateRound(last.round);
+        if (consolidated === "stopped") {
+          // A recheck stopped the consolidator (the phase is CHECKING again),
+          // or the owner stopped the run: nothing was recorded, and the next
+          // start consolidates again.
+          this.#recheckCancelledLaneRound = false;
+          return;
+        }
+      }
       const previous = last ? (this.#state.phase.rounds ?? []).find((r) => r.round === last.round) : undefined;
       const previousGuard = previous ? this.#pickGuard(previous.round) : undefined;
       const restartGuard = this.#pickGuard(round);
       // An unfinished round resumes from its own base. A new round starts from
       // the phase's candidate (the last adopted pick) — or, when that pick
-      // regressed, from the best candidate.
+      // regressed, from the best candidate; tt 09 (change 3): or, when that
+      // pick was consolidated, from the consolidated commit.
       const base = unfinished
         ? last!.base
         : previous?.regressed && restartGuard
           ? restartGuard.best.sha
           : round === 1
             ? this.#state.phase.integrationHead
-            : (this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
+            : (consolidatedBase(this.#state.phase.rounds, round) ?? this.#state.phase.candidate?.sha ?? this.#state.phase.integrationHead);
       // 02k: a repeat of a round that failed only for a missing review or vote
       // restarts each lane that passed its checks from its own candidate.
       // Plan 06n (A7/R9b): a round where every lane lost an item restarts
@@ -9442,7 +10014,16 @@ export class Conductor {
         // recorded build (payload, start and check output).
         resumeLane: (r, lane, sha) => this.#resumedLaneBuild(r, lane, sha),
         checkCandidate: (r, lane, sha) => this.#checkLaneCandidate(r, lane, sha),
+        // exex 01a2: a red candidate goes back to its own lane's worker.
+        fixLane: async (lane, r, sha, failure) => {
+          const fixed = await this.#fixLane(lane, r, sha, failure);
+          if (fixed.sha) this.#laneBuilds.set(`${r}-${lane}`, fixed);
+          return fixed;
+        },
         reviewCandidate: (r, lane, sha, seat) => this.#runLaneReview(r, lane, sha, seat),
+        // 09-2 (async review): a candidate that failed its checks has its
+        // in-flight reviews ended.
+        cancelReviews: (r, lane, sha) => this.#cancelLaneReviews(r, lane, sha),
         pickTurn: (r, at, seat, passing, revote) => this.#runPickTurn(r, at, seat, passing, revote),
         emit: (event) => this.#applyEvent(event),
         // Plan 06n (A7): the pick compares each lane's item reviews against
@@ -9570,12 +10151,13 @@ export class Conductor {
   #clearLaneRound(round: number): void {
     for (const lane of this.#lanes()) {
       this.#laneBuilds.delete(`${round}-${lane}`);
-      this.#laneDiscoveries.delete(`${round}-${lane}`);
-      this.#laneDiscoveryPlans.delete(`${round}-${lane}`);
-      this.#laneBarriers.delete(`${round}-${lane}`);
-      this.#laneTriggers.delete(`${round}-${lane}`);
-      this.#laneTriggerPaths.delete(`${round}-${lane}`);
       this.#laneCheckBases.delete(`${round}-${lane}`);
+      // 09-2: the per-candidate review state is keyed `<round>-<lane>-<sha>`,
+      // one entry per candidate the lane submitted this round.
+      const prefix = `${round}-${lane}-`;
+      for (const map of [this.#laneDiscoveries, this.#laneDiscoveryPlans, this.#laneBarriers, this.#laneTriggers, this.#laneTriggerPaths, this.#laneReviewCancels]) {
+        for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key);
+      }
     }
     this.#lanePromptDeliveredNoteCount.delete(round);
   }
@@ -9654,7 +10236,7 @@ export class Conductor {
       this.#applyEvent({ type: "CHECKS_PASSED" });
       if (this.#itemsEnforced()) {
         const output = this.#laneCheckOutputs.get(winner.sha) ?? "";
-        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolveTestVerifies(this.#planItems(), output) });
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(output) });
         this.#applyTestVerifyFindings(winner.sha);
         if (build?.coverage) {
           this.#applyEvent({
@@ -11070,11 +11652,11 @@ export class Conductor {
 
   async #runChecks(actionId: string, candidateSha: string): Promise<void> {
     // Plan 06k1 (A4): every check run on the host — phase or final tier —
-    // holds the machine-wide check lock and the host-wide check window, so
-    // two runs' checks never overlap and every other run's workers pause
-    // while this one runs.
-    const lock = await acquireWaitingLock(this.#checkLockPath);
-    const window = openCheckWindow(this.#checkLockPath);
+    // holds one of the machine-wide check slots (at most `#checkSlots` checks
+    // at once) and the host-wide check window, so every other run's workers
+    // pause while this one runs.
+    const lock = await acquireCheckSlot(this.#checkLockPath, this.#checkSlots);
+    const window = openCheckWindow(this.#checkLockPath, this.#state.phase.runId);
     this.#log.intent(actionId, { candidateSha });
     crashAt("before_run_checks");
     const checkoutDir = disposableCheckout(this.#plan.repo, candidateSha);
@@ -11320,7 +11902,7 @@ export class Conductor {
       // the output is a blocking finding anchored to its item. The final
       // check's run does not re-resolve them.
       if (tier === "round" && this.#itemsEnforced()) {
-        const resolutions = resolveTestVerifies(this.#planItems(), combinedOutput);
+        const resolutions = this.#resolveVerifies(combinedOutput);
         this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions, checkTestLines: testResultLines(combinedOutput) });
         this.#applyTestVerifyFindings(candidateSha);
       }
@@ -14395,6 +14977,18 @@ export function referenceLines(references: string[]): string[] {
   ];
 }
 
+/** The `:WHERE:` tokens the symbol check can read as files: a path or a name
+ * with an extension. A bare module name, and a glob (`crates/x/src/**`, which
+ * names no single file and was read as a missing one, raising a false
+ * deviation on every candidate: exex 01b1 F-110/F-119), are left to the
+ * reviewers. */
+export function whereFileTokens(where: string): string[] {
+  return where
+    .split(/[\s,;]+/)
+    .filter(Boolean)
+    .filter((token) => /[/.]/.test(token) && !/[*?[\]{}]/.test(token));
+}
+
 /** Plan 06k2 (A5): the golden-source section every worker, reviewer and
  * evaluator prompt carries, so a choice is re-checked against the current
  * source rather than an earlier drafting decision. Empty when the contract
@@ -14492,7 +15086,12 @@ export function buildWorkerPrompt(
     "If a criterion cannot be met AS WRITTEN (not merely unmet yet), say so instead of faking it: call submit_phase with `criterionDispute` = { criterion: <one acceptance item above, verbatim>, why, proposedWording }. The conductor records it as an amendment the reviewers vote on; if the normal tally passes, the wording is replaced for this phase and the next candidate is judged against it. A criterion that is merely unmet is a normal repair, not a dispute.",
     "How to work:",
     `- The conductor runs the phase checks itself on a fresh checkout after you call submit_phase${contract.checks.length > 0 ? ` (${contract.checks.join("; ")})` : ""}. Do NOT run the full check suite yourself; run only the narrow tests for the files you change (one test file, or the project's fast test target). With node --test, pass --test-force-exit so a test that leaks a process cannot hold the command open. Do not pipe test output through tail or head: a command killed at the per-command time limit then returns nothing. If a test file is slow, run one test at a time with --test-name-pattern.`,
-    `- Plan 06l (A2): between edits run \`tt test --changed --run "$TT_RUN_DIR"\` (the matching worker tool): it runs only the plan's check test files that import a file you changed, reuses a recorded pass when the tree is unchanged, prints failures only, and has its own time budget. Run the full checks once before submitting.`,
+    `- Plan 06l (A2): between edits run \`tt test --changed --run "$TT_RUN_DIR"\` (the matching worker tool): it runs only the plan's check test files that import a file you changed, reuses a recorded pass when the tree is unchanged, prints failures only, and has its own time budget.`,
+    // 09-4 (exex 01a2): lanes spent 40-70 min per attempt running the release
+    // gates themselves because the prompt told them to run the full checks
+    // before submitting. The conductor runs them on submit and hands a failure
+    // back to the same lane to fix in the same round (26d7b5f).
+    "- Do NOT run the full checks, release builds, corpus gates or verifiers over every crate before submitting: submit as soon as your change compiles and the narrow tests you touched pass. The conductor runs the phase checks on submit; if one fails, it hands the failing command and its errors straight back to you in this same attempt to fix and submit again. A fast, accurate submission is the goal; the reviewers judge the delta.",
     "- Run commands in the foreground. Backgrounding (&, nohup, setsid) and sleeps longer than 30 s are refused.",
     "- Edit files with the edit and write tools.",
     "- In submit_phase, write each decision's choice as one plain sentence of at most 20 words; put the reasoning in whyItMatters and the alternatives. Disclose choices that change behaviour, interfaces, guarantees or cost.",

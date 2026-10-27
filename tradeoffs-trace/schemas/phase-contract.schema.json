@@ -42,6 +42,10 @@
       "description": "Plan 06h: #+TT_LEADER frozen into the contract. Absent means the first seat.",
       "type": "string",
       "minLength": 1
+    },
+    "consolidate": {
+      "description": "tt 09 (change 3): #+TT_CONSOLIDATE: off frozen into the contract. Present (false) only when the plan turned the combine step off; absent means on whenever the phase runs two or more lanes.",
+      "const": false
     }
   },
   "$defs": {

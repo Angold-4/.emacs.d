@@ -56,6 +56,10 @@
           "description": "`panel=reviewers`: each panel seat follows the reviewer model of its position.",
           "type": "string",
           "enum": ["reviewers"]
+        },
+        "consolidator": {
+          "description": "tt 09 (change 3): the consolidator that combines the lanes. Absent: the leader seat's reviewer model.",
+          "$ref": "#/$defs/RoleModel"
         }
       }
     },
@@ -116,6 +120,14 @@
       "description": "Lint-only: the 1-based line of #+TT_LEADER in the source Org file.",
       "type": "integer"
     },
+    "consolidate": {
+      "description": "tt 09 (change 3): #+TT_CONSOLIDATE — on (the default with two or more workers) or off. Kept as written so `tt lint` can name a bad value.",
+      "type": "string"
+    },
+    "consolidateLine": {
+      "description": "Lint-only: the 1-based line of #+TT_CONSOLIDATE in the source Org file.",
+      "type": "integer"
+    },
     "workerPrompt": {
       "description": "#+TT_WORKER_PROMPT: per lane (a, b, ...), the absolute paths appended to that lane's worker system prompt (--append-system-prompt), in order. An empty list is `none`. A single worker uses lane a's.",
       "type": "object",
@@ -167,6 +179,10 @@
           "description": "Plan 06h: the phase's own :LEADER: (overrides #+TT_LEADER).",
           "type": "string",
           "minLength": 1
+        },
+        "consolidate": {
+          "description": "tt 09 (change 3): the phase's own :CONSOLIDATE: (overrides #+TT_CONSOLIDATE) — on or off.",
+          "type": "string"
         },
         "architecture": { "type": "array", "items": { "$ref": "#/$defs/ArchitectureItem" } },
         "requirements": { "type": "array", "items": { "$ref": "#/$defs/RequirementItem" } },

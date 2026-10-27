@@ -306,9 +306,15 @@ success/failure boolean."
       (let* ((cli (expand-file-name "src/cli.ts" (+tt--runner-dir root)))
              (default-directory (file-name-as-directory root))
              (out (generate-new-buffer " *tt-async*"))
-             (err-buf (generate-new-buffer " *tt-async-stderr*")))
+             (err-buf (generate-new-buffer " *tt-async-stderr*"))
+             ;; An explicit stderr pipe with a silent sentinel: given a bare
+             ;; buffer, `make-process' makes this pipe itself with the default
+             ;; sentinel, which writes "Process tt-async stderr finished" into
+             ;; ERR-BUF, so the reported text could end with that line.
+             (err-pipe (make-pipe-process :name "tt-async stderr" :buffer err-buf
+                                          :noquery t :sentinel #'ignore)))
         (make-process
-         :name "tt-async" :buffer out :stderr err-buf :noquery t :connection-type 'pipe
+         :name "tt-async" :buffer out :stderr err-pipe :noquery t :connection-type 'pipe
          :command (append (list +tt-node cli) args (list "--root" (directory-file-name root)))
          :sentinel
          (lambda (proc _event)
@@ -667,6 +673,12 @@ so an old plan reaches the loop as items without changing meaning."
                         (+tt--keyword "TT_REVIEWERS")))
          (leader (or (org-element-property :LEADER hl)
                      (+tt--keyword "TT_LEADER")))
+         ;; tt 09 (change 3): whether a consolidator combines the lanes
+         ;; after a pick that is not accepted.  A phase's own :CONSOLIDATE:
+         ;; overrides the plan's #+TT_CONSOLIDATE; neither keeps it on
+         ;; whenever the phase runs two or more workers.
+         (consolidate (or (org-element-property :CONSOLIDATE hl)
+                          (+tt--keyword "TT_CONSOLIDATE")))
          ;; Plan 01f: the conductor's own expensive, live proof. `:GATE:` is
          ;; the command it runs once per candidate the reviewers accepted,
          ;; before acceptance; `:GATE_CLEANUP:` releases what the gate took,
@@ -734,6 +746,8 @@ so an old plan reaches the loop as items without changing meaning."
                 `((seats . ,(vconcat (split-string reviewers "[ \t,]+" t)))))
             ,@(when leader
                 `((leader . ,(string-trim leader))))
+            ,@(when consolidate
+                `((consolidate . ,(string-trim consolidate))))
             (boundaries . ,(vconcat (and boundaries (split-string boundaries))))
             (reserved . ,(vconcat reserved-list))
             (provisional . ,(if provisional t :false))
@@ -863,11 +877,13 @@ other lanes by naming one of its own."
         (setq plan (cons `(workerPromptFromProgram . ,(vconcat (nreverse inherited))) plan)))
       plan)))
 
-(defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel" "curator")
+(defconst +tt--model-roles '("worker" "reviewer" "evaluator" "panel" "curator" "consolidator")
   "Roles #+TT_MODELS may assign a model to (design §2.1).
 Plan 05j adds `curator': the round's linking agent. It runs whether or not
 the plan names a model — on the `curator' model when given, else the
-evaluator's, else Pi's default, exactly like an evaluator (OD-2).")
+evaluator's, else Pi's default, exactly like an evaluator (OD-2).
+tt 09 adds `consolidator': the agent that combines the lanes, on the
+leader seat's reviewer model unless the plan names one.")
 
 (defconst +tt--reviewer-seats '("M" "A" "B")
   "Reviewer seats #+TT_MODELS may name as `reviewer.SEAT' (design §2.1).")
@@ -1026,6 +1042,11 @@ Return a plist (:plan ALIST :errors ((LINE . MESSAGE) ...))."
                   ,@(let ((l (+tt--keyword-at "TT_LEADER")))
                       (and l (list (cons 'leader (string-trim (car l)))
                                    (cons 'leaderLine (cdr l)))))
+                  ;; tt 09 (change 3): #+TT_CONSOLIDATE (on/off), as
+                  ;; written, so `tt lint' can name a bad value.
+                  ,@(let ((c (+tt--keyword-at "TT_CONSOLIDATE")))
+                      (and c (list (cons 'consolidate (string-trim (car c)))
+                                   (cons 'consolidateLine (cdr c)))))
                   ,@(let ((d (+tt--plan-deadlines)))
                       (and d `((deadlines . ,d))))
                   ,@(let ((r (+tt--plan-references dir)))

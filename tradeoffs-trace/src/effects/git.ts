@@ -187,6 +187,11 @@ function cloneCheckout(repo: string, sha: string, dir: string): void {
     }
     try {
       git(["clone", "-q", "--no-hardlinks", "--no-checkout", repo, dir]);
+      // A clone keeps the repo's branches only as origin/<name>, so a check
+      // that diffs against a branch by name ("git diff feat/x--01a2") failed
+      // with "bad revision" in every round (exex 01b1 run 75f19154). Give the
+      // checkout the repo's branch names, as the repo itself has them.
+      git(["-C", dir, "fetch", "-q", "--update-head-ok", "origin", "+refs/heads/*:refs/heads/*"]);
       git(["-C", dir, "checkout", "-q", "--detach", sha]);
       return;
     } catch (err) {
@@ -592,4 +597,15 @@ export function removedTestsBetween(repo: string, base: string, candidateSha: st
     candidate: show(candidateSha, path),
   }));
   return removedTests(files);
+}
+
+/** exex 01a2: the commit a worktree's HEAD is at, or undefined when it cannot
+ * be read (a fix reuses a lane's worktree only when it still holds the red
+ * candidate). */
+export function headOf(worktree: string): string | undefined {
+  try {
+    return git(["-C", worktree, "rev-parse", "HEAD"]);
+  } catch {
+    return undefined;
+  }
 }

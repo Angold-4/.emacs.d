@@ -515,6 +515,25 @@ export function decisionSettled(decision: Decision, phase: PhaseState, C: string
   return settledByOwnerRequest(phase, "reserved_decision", decision.id, "approve", C, K);
 }
 
+/** A plain grant/stop repair-budget gate request (no linked record) is moot once the
+ * phase's current candidate would be accepted without it: the gate asked
+ * "more rounds or stop?" because items were open, and the owner has since
+ * settled every one of them through their own requests (exex 01a1: a failed
+ * vote and an open finding resolved, all items met, yet the gate still
+ * offered only grant/stop). Inlined rather than isBudgetGateRequest, which
+ * lives in owner-requests.ts, a module that imports this one. */
+export function budgetGateIsMoot(phase: PhaseState, r: PhaseState["ownerRequests"][number]): boolean {
+  if (r.origin !== "repair_budget_exhausted" || r.linkedDecisionId || r.linkedFindingId || r.linkedCorrectionId) {
+    return false;
+  }
+  // Plan 06g: the "accept with carried items" gate asks the owner about the
+  // open advisories themselves, so it is never moot.
+  if (r.options.some((o) => o.id === "accept_carried")) return false;
+  if (!phase.candidate) return false;
+  const without = { ...phase, ownerRequests: phase.ownerRequests.filter((o) => o.id !== r.id) };
+  return accept(without, phase.candidate.sha, phase.contract.contractVersion);
+}
+
 /** accept(C, K): the only way a phase may reach ACCEPTED. */
 export function accept(phase: PhaseState, C: string, K: ContractVersion): boolean {
   // Mechanical gates are facts (ODP-1, ODP-2): the checks must have passed
@@ -629,7 +648,11 @@ export function accept(phase: PhaseState, C: string, K: ContractVersion): boolea
   // Plan 06i: a non-blocking owner request (a late discovery's escalation)
   // is visible but does not gate acceptance; an open request whose linked
   // item is already closed is moot and does not gate it either.
-  if (phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) {
+  if (
+    phase.ownerRequests.some(
+      (r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r) && !budgetGateIsMoot(phase, r),
+    )
+  ) {
     return false;
   }
 

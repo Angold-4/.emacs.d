@@ -23,6 +23,7 @@ import {
   applyOwnerRequestResolved,
   autoResolveLinkedRequest,
   awaitingOwnerTarget,
+  ownerParkCleared,
   checkFindingAcceptedByOwner,
   checkItemCarried,
   checkOverrideCast,
@@ -1883,7 +1884,10 @@ addRow({
     const e = ev as Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
     if (!request || !isBudgetGateRequest(request) || e.option !== "grant") return false;
     if (!ownerRequestResolved.guardValid(s, ev)) return false;
-    return awaitingOwnerTarget(ownerRequestResolved.applyPhase(s, ev)) !== "AWAITING_OWNER";
+    // tt 09-5: the gate's own two options need no candidate — a phase whose
+    // every attempt produced nothing parks here too, and its grant (a fresh
+    // attempt) or stop must move it once no other request is open.
+    return ownerParkCleared(ownerRequestResolved.applyPhase(s, ev));
   },
   to: "REPAIRING",
   actions: REPAIR_ATTEMPT_ACTIONS,
@@ -1926,7 +1930,10 @@ addRow({
     const e = ev as Extract<Event, { type: "OWNER_REQUEST_RESOLVED" }>;
     if (!request || !isBudgetGateRequest(request) || e.option !== "stop") return false;
     if (!ownerRequestResolved.guardValid(s, ev)) return false;
-    return awaitingOwnerTarget(ownerRequestResolved.applyPhase(s, ev)) !== "AWAITING_OWNER";
+    // tt 09-5: the gate's own two options need no candidate — a phase whose
+    // every attempt produced nothing parks here too, and its grant (a fresh
+    // attempt) or stop must move it once no other request is open.
+    return ownerParkCleared(ownerRequestResolved.applyPhase(s, ev));
   },
   to: "BLOCKED",
   actions: [],

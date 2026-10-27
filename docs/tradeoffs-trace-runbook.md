@@ -999,6 +999,30 @@ path, a run whose checks use a different lock (tests use a per-run lock) never
 pauses another run's workers. The pause and resume are recorded in the run's
 log (`worker_paused` / `worker_resumed`).
 
+### Combining the lanes (`#+TT_CONSOLIDATE`)
+
+tt 09 (change 3). When a round picked a winner the phase did not accept, and
+another passing lane met a plan item the winner did not (a strict majority of
+the seats said `met`, or `fits` for an A), a **consolidator** runs before the
+next round. It starts from the winner's commit in its own worktree
+(`worktrees/consolidator`), takes the other lane's work for exactly those
+items, and submits with `submit_phase` (its `deviations` list what it changed
+beyond the taken work). Its commit goes through the round checks with the
+lane fix loop (at most five fixes, within one worker attempt). A green commit
+becomes the base of **every** lane in the next round, and each lane's prompt
+names it and the items it carries; a consolidation that produced nothing or
+stayed red is recorded with its reason and the next round starts from the
+winner, as before. `ROUND_CONSOLIDATED` records either result, so the status
+(`consolidated C2-a+b <sha> = C2-a + lane b's items R6, C3`), `tt summary` and
+a restart all read it from the log.
+
+- The consolidator runs on `#+TT_MODELS consolidator=…`, else on the leader
+  seat's reviewer model.
+- `#+TT_CONSOLIDATE: off` (or a phase's own `:CONSOLIDATE: off`) turns it off;
+  the default is on whenever the phase runs two or more workers. `tt lint`
+  refuses any value other than `on` or `off`. A single-worker plan never
+  consolidates.
+
 ## Triage
 
 Every finding and every discovered decision of the candidate ends in exactly

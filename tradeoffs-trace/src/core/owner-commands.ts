@@ -8,6 +8,7 @@
 import { checkBinding, checkTupleBinding } from "./binding.ts";
 import { applyMessageEvent } from "./messages.ts";
 import { isBudgetGateRequest, isRepairForcingOption } from "./owner-requests.ts";
+import { budgetGateIsMoot } from "./predicate.ts";
 import { findOwnerRequest, ownerRequestIsStale } from "./triage.ts";
 import type { BindingTuple, ContractVersion, Decision, Event, Message, PhaseState, RuledDecision } from "./types.ts";
 
@@ -561,14 +562,24 @@ export function applyOverrideCast(phase: PhaseState, event: EvOverrideCast): Pha
  * commands, which all require a record that itself requires a candidate). */
 export type AwaitingOwnerTarget = "AWAITING_OWNER" | "REPAIRING" | "RESOLVING";
 
-export function awaitingOwnerTarget(phase: PhaseState): AwaitingOwnerTarget {
+/** True once no owner request still parks the phase. */
+export function ownerParkCleared(phase: PhaseState): boolean {
   // The owner's "accept with carried items" for this candidate answers every
   // open request, as accept() does; an open correction still needs its round.
   const carried = Boolean(phase.acceptedWithCarried && phase.candidate && phase.carriedCandidateSha === phase.candidate.sha);
   // Plan 06i: a non-blocking request (a late discovery's escalation) does not
   // park the phase, and neither does a stale one (its item is closed or
   // superseded): the park agrees with accept(), which ignores both.
-  if (!carried && phase.ownerRequests.some((r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r))) return "AWAITING_OWNER";
+  return (
+    carried ||
+    !phase.ownerRequests.some(
+      (r) => r.status === "open" && r.blocking !== false && !ownerRequestIsStale(phase, r) && !budgetGateIsMoot(phase, r),
+    )
+  );
+}
+
+export function awaitingOwnerTarget(phase: PhaseState): AwaitingOwnerTarget {
+  if (!ownerParkCleared(phase)) return "AWAITING_OWNER";
   if (phase.corrections.some((c) => c.status === "open")) return "REPAIRING";
   if (phase.candidate) return "RESOLVING";
   return "AWAITING_OWNER";

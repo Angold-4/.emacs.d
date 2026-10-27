@@ -38,6 +38,7 @@
 import type { Decision, DecisionBrief, Message, MessageType, Override, OwnerRequest } from "./types.ts";
 import { clampMessageTitle } from "./messages.ts";
 import { renderBriefOrg, renderBriefsSection } from "./briefs.ts";
+import { wireCandidateSha } from "./binding.ts";
 
 // ---------------------------------------------------------------------------
 // Anchors
@@ -1168,9 +1169,12 @@ export function renderProgramEntryReview(opts: EntryReviewOptions): string {
     const entryIds = ownerMarkedEntryIds(perPhase.find((ph) => ph.phaseId === p.phaseId)?.projected.views ?? []);
     const showable = briefableIdsFor(p.ownerRequests, p.decisions, p.overrides, p.candidate?.sha ?? opts.newestCandidateSha, entryIds);
     const requests = p.ownerRequests ?? [];
+    // tt 09-5: a phase with no candidate (a budget gate after every attempt
+    // timed out) still carries a binding, naming NO_CANDIDATE, so its brief
+    // can be answered.
     const binding =
-      p.contract?.contractVersion && p.candidate?.sha && p.runId && p.phaseId
-        ? { runId: p.runId, phaseId: p.phaseId, candidateSha: p.candidate.sha, recordVersion: 1, contractVersion: p.contract.contractVersion }
+      p.contract?.contractVersion && p.runId && p.phaseId
+        ? { runId: p.runId, phaseId: p.phaseId, candidateSha: wireCandidateSha(p.candidate?.sha), recordVersion: 1, contractVersion: p.contract.contractVersion }
         : undefined;
     const phaseSha = p.candidate?.sha ?? opts.newestCandidateSha;
     for (const brief of p.briefs ?? []) {

@@ -2061,6 +2061,29 @@ RET chooses an option and sends the same encoding."
           (kill-buffer buf))
       (delete-directory dir t)))))
 
+(ert-deftest tradeoffs-trace-brief-resolve-on-a-phase-with-no-candidate ()
+  "tt 09-5: a brief on a phase with no candidate carries `:CANDIDATE_SHA: none'
+and still resolves — the binding sends \"none\", never an empty or missing sha."
+  (let ((dir (make-temp-file "tt-ert-review" t))
+        (written nil)
+        (+tt-test--review-org (string-replace "   :CANDIDATE_SHA: C1\n" "   :CANDIDATE_SHA: none\n"
+                                              +tt-test--review-org)))
+    (unwind-protect
+        (let ((buf (+tt-test--review-buffer dir)))
+          (with-current-buffer buf
+            (cl-letf (((symbol-function '+tt--write-command)
+                       (lambda (_run-dir command) (setq written command) "cmd-1"))
+                      ((symbol-function 'read-string) (lambda (&rest _) "")))
+              (goto-char (point-min))
+              (search-forward "Should a vendor excluded")
+              (goto-char (match-beginning 0))
+              (+tt-review--brief-resolve "repair")
+              (should (equal (alist-get 'type written) "resolve"))
+              (should (equal (alist-get 'option written) "repair"))
+              (should (equal (alist-get 'candidateSha (alist-get 'binding written)) "none"))))
+          (kill-buffer buf))
+      (delete-directory dir t))))
+
 (defconst +tt-test--brief-override-org
   (concat "#+TITLE: tradeoffs-trace review\n"
           "#+CONTRACT_VERSION: v1\n"
@@ -3520,6 +3543,23 @@ own :WORKERS:/:ROUNDS: property overrides the plan's keyword."
          (plan (plist-get (+tt-test--parse text) :plan)))
     (should (= (alist-get 'workers (aref (alist-get 'phases plan) 0)) 2))
     (should (= (alist-get 'rounds (aref (alist-get 'phases plan) 0)) 4))))
+
+(ert-deftest tradeoffs-trace-plan-consolidate ()
+  "tt 09 (change 3): #+TT_CONSOLIDATE and a phase's own :CONSOLIDATE: reach
+the plan JSON as written, with the keyword's line for `tt lint'; a plan that
+names neither carries no field (the combine step stays on with 2+ workers)."
+  (let* ((text (concat "#+TT_WORKERS: 2\n#+TT_CONSOLIDATE: off\n" +tt-test--valid-plan))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (alist-get 'consolidate plan) "off"))
+    (should (= (alist-get 'consolidateLine plan) 2))
+    (should (equal (alist-get 'consolidate (aref (alist-get 'phases plan) 0)) "off")))
+  (let* ((plan (plist-get (+tt-test--parse +tt-test--valid-plan) :plan)))
+    (should-not (assq 'consolidate plan))
+    (should-not (assq 'consolidate (aref (alist-get 'phases plan) 0))))
+  (let* ((text (replace-regexp-in-string ":END:" "  :CONSOLIDATE: on\n  :END:"
+                                         (concat "#+TT_CONSOLIDATE: off\n" +tt-test--valid-plan) :fixedcase))
+         (plan (plist-get (+tt-test--parse text) :plan)))
+    (should (equal (alist-get 'consolidate (aref (alist-get 'phases plan) 0)) "on"))))
 
 (ert-deftest tradeoffs-trace-plan-seats ()
   "Plan 06h (A1): #+TT_REVIEWERS and #+TT_LEADER reach the plan JSON, a

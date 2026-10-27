@@ -14,7 +14,7 @@ import { test } from "node:test";
 
 import { rebuildState, type RunPlanFile } from "../../src/conductor.ts";
 import { renderStatusView, statusViewInput } from "../../src/render.ts";
-import { buildView } from "../../src/view.ts";
+import { buildView, roundsSection } from "../../src/view.ts";
 import { readLog } from "../../src/effects/log.ts";
 import { runPaths } from "../../src/conductor.ts";
 import { ROLE_TOOLS } from "../../src/core/roles.ts";
@@ -229,6 +229,8 @@ test("plan 06g: a two-lane plan parsed by the real Emacs parser builds two candi
   // 2. Run it with fake-pi.
   const promptLog = path.join(dir, "lane-prompts.txt");
   const setup = await setupConductor({
+    // One check slot: this test pins the serial-lock behaviour (C2).
+    checkSlots: 1,
     phase,
     checks: ["true"],
     phaseChecks: ["true"],
@@ -797,7 +799,12 @@ test("plan 06g: one lane crashing leaves the other candidate checked, reviewed a
   }
 });
 
-test("plan 06g: both candidates failing checks repeats the round from the same base with both lanes' failures", async () => {
+// exex 01a2 (replaces plan 06g's "repeats from the same base"): both lanes'
+// round-1 candidates are red, and each lane's fix changes nothing, so the
+// round ends with no passing candidate. Round 2 keeps the round's base but
+// each lane continues from ITS OWN red candidate (never thrown away), carries
+// both lanes' failures in its prompt, fixes the tree and passes.
+test("exex 01a2: when both lanes are still red, the repeat continues each lane from its own candidate with both failures", async () => {
   const promptLog = fs.mkdtempSync("/tmp/tt-06g2-prompts-");
   const setup = await setupConductor({
     phase: lanePhase(),
@@ -816,7 +823,13 @@ test("plan 06g: both candidates failing checks repeats the round from the same b
               { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
             ],
           }
-        : laneWorker(lane),
+        : {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: `rm -f lane-marker.txt && printf 'lane ${lane}\n' > lane-${lane}.txt` },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          },
     laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
     pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", "the only candidate"),
   });
@@ -826,8 +839,17 @@ test("plan 06g: both candidates failing checks repeats the round from the same b
     const phase = setup.conductor.state.phase;
     assert.equal(phase.rounds?.length, 2, "the round repeated");
     const [first, second] = phase.rounds!;
-    assert.deepEqual(first.candidates.map((c) => c.ok), [false, false], "round 1: both candidates failed their checks");
-    assert.equal(second.base, first.base, "the repeat starts from the same base");
+    assert.deepEqual(first.candidates.map((c) => c.ok), [false, false], "round 1: both candidates stayed red");
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.equal(records.filter((r) => r.kind === "lane_fix_unchanged").length, 2, "each lane's fix changed nothing, so its loop ended");
+    assert.equal(second.base, first.base, "the round's base is unchanged");
+    const roundTwo = records.find((r) => r.kind === "intent" && (r.event as { round?: number }).round === 2 && (r.event as { laneBases?: unknown }).laneBases);
+    assert.deepEqual(
+      (roundTwo!.event as { laneBases: Record<string, string> }).laneBases,
+      Object.fromEntries(first.candidates.map((c) => [c.lane, c.sha])),
+      "each lane continues from its own red candidate",
+    );
+    assert.deepEqual(second.candidates.map((c) => c.ok), [true, true], "round 2 fixed both trees");
     // A round costs ONE attempt, whatever its lanes: round 1 failed, round 2 ran.
     assert.equal(phase.repairRoundsUsed, 1);
     // Both lanes' prompts of round 2 carry both failures of round 1.
@@ -1297,5 +1319,309 @@ test("plan 06n (R9b): when both lanes lose a met item no lane is picked and both
   } finally {
     await teardown(setup);
     cleanupDir(dir);
+  }
+});
+
+// exex 01a2: a lane never hands in a red tree. Lane a's first candidate fails
+// the round check; the conductor gives the failure back to lane a's own
+// worker (continuing its session, on its own candidate), which fixes it and
+// submits again. Only the green commit is reviewed, and the round picks.
+test("exex 01a2: a red lane candidate goes back to its own worker, which fixes it in the same round", async () => {
+  const promptLog = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))), ".lane-fix-"));
+  const launches: Record<string, number> = {};
+  const setup = await setupConductor({
+    phase: lanePhase({ checks: ["test ! -f red.txt"] }),
+    checks: ["test ! -f red.txt"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 60_000 },
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: path.join(promptLog, "prompts.txt") },
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => {
+      launches[lane] = (launches[lane] ?? 0) + 1;
+      if (lane !== "a") return laneWorker(lane);
+      return launches[lane] === 1
+        ? {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "printf 'lane a\\n' > lane-a.txt && printf 'broken\\n' > red.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          }
+        : {
+            hello: defaultWorkerHello(),
+            steps: [
+              { kind: "call-sh", command: "rm red.txt" },
+              { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+            ],
+          };
+    },
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} prefers a`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 120_000, 50, setup.runDir);
+    const round = setup.conductor.state.phase.rounds![0];
+    const a = round.candidates.find((c) => c.lane === "a")!;
+    assert.equal(launches.a, 2, "lane a's worker was launched once to build and once to fix");
+    assert.equal(a.fixes, 1);
+    assert.equal(a.ok, true, "the fixed candidate passed its own check");
+    assert.equal(round.picked?.lane, "a");
+    const reviewed = (a.reviews ?? []).map((r) => r.review.candidateSha);
+    assert.ok(reviewed.length > 0 && reviewed.every((sha) => sha === a.sha), "only the green commit was reviewed");
+    const prompts = fs.readFileSync(path.join(promptLog, "prompts.txt"), "utf8");
+    assert.match(prompts, /FAILED the round checks, so its reviews were cancelled/);
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.ok(records.some((r) => r.kind === "lane_fix_started"), "the fix is recorded");
+    // 09-2: the red candidate's reviews started at its submission and were
+    // cancelled when its check failed; none was retried.
+    const cancels = records.filter((r) => r.kind === "lane_reviews_cancelled").map((r) => r.event as { lane: string; candidateSha: string });
+    assert.equal(cancels.length, 1, "only the red candidate's reviews were cancelled");
+    assert.equal(cancels[0].lane, "a");
+    assert.notEqual(cancels[0].candidateSha, a.sha);
+    assert.equal(records.filter((r) => r.kind === "lane_review_retried").length, 0, "a cancelled review is never retried");
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptLog);
+  }
+});
+
+// tt 09 (change 3): combine the lanes. Round 1's two lanes each meet a
+// different plan item (lane a R1, lane b R2); the seats pick lane a and the
+// phase does not accept it. A consolidator (fake-pi) starts from lane a's
+// commit and takes lane b's file for R2; the checks pass, and round 2's lanes
+// both start from the consolidated commit and are told what it carries.
+function combineSetup(
+  promptLog: string,
+  consolidator: (round: number, laneB: string) => FakePiStep[],
+  consolidatorRuns: number[],
+): Promise<TestConductorSetup> {
+  return setupConductor({
+    phase: lanePhase({
+      requirements: [
+        { id: "R1", title: "R1 holds", text: "lane a's half: R1 holds", arch: [], verify: ["review"] },
+        { id: "R2", title: "R2 holds", text: "lane b's half: R2 holds", arch: [], verify: ["review"] },
+      ],
+      constraints: [],
+    }),
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: { ...FAST, workerAttemptMs: 60_000 },
+    extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
+    workerScript: () => structuredLaneWorker("a"),
+    laneWorkerScriptFor: (lane, round) => structuredLaneWorker(lane, round),
+    laneReviewerScriptFor: (seat, _candidate, state, lane) => {
+      const round = liveRound(state);
+      const K = state.phase.contract.contractVersion;
+      const read = `lane-${lane}.txt`;
+      const ev = `lane-${lane}.txt:1`;
+      // Round 1: each lane meets its own half only. Round 2 (from the
+      // consolidated commit) meets both.
+      const items =
+        round === 1
+          ? [
+              { id: "R1", verdict: lane === "a" ? "met" : "unmet", evidence: `${ev} R1 ${lane === "a" ? "is done" : "is missing"}` },
+              { id: "R2", verdict: lane === "b" ? "met" : "unmet", evidence: `${ev} R2 ${lane === "b" ? "is done" : "is missing"}` },
+            ]
+          : [
+              { id: "R1", verdict: "met", evidence: `${ev} R1` },
+              { id: "R2", verdict: "met", evidence: `${ev} R2` },
+            ];
+      if (round === 1) {
+        return seat === "M"
+          ? laneReview("M", K, { items, read, findings: [{ kind: "defect", severity: "blocking", evidence: `${ev} R2 is unmet on the main path` }] })
+          : laneReview(seat as Reviewer, K, { items, read });
+      }
+      const open = (state.phase.findings ?? []).filter((f) => f.status === "open" && f.raisedBy === "M");
+      return seat === "M"
+        ? laneReview("M", K, { items, read, findingStatements: open.map((f) => ({ findingId: f.id, status: "withdraw", evidence: "fixed in this candidate" })) })
+        : laneReview(seat as Reviewer, K, { items, read });
+    },
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), "a", `${seat} picks a`),
+    consolidatorScriptFor: (round, _n, state) => {
+      consolidatorRuns.push(round);
+      const b = state.phase.rounds!.find((r) => r.round === round)!.candidates.find((c) => c.lane === "b")!.sha!;
+      return { hello: defaultWorkerHello(), steps: consolidator(round, b) };
+    },
+  });
+}
+
+test("tt 09: a consolidator combines the winner with the item the other lane met, and the next round's lanes start from it", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-09-combine-");
+  const promptLog = path.join(dir, "prompts.txt");
+  const consolidatorRuns: number[] = [];
+  const setup = await combineSetup(
+    promptLog,
+    (_round, b) => [
+      // Take lane b's work for R2: its file, from its commit.
+      { kind: "call-sh", command: `git checkout ${b} -- lane-b.txt` },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+    consolidatorRuns,
+  );
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
+    const phase = setup.conductor.state.phase;
+    const rounds = phase.rounds!;
+    assert.equal(rounds.length, 2, "two rounds ran");
+    const [first, second] = rounds;
+    assert.equal(first.picked?.lane, "a", "the seats picked lane a");
+    const b = first.candidates.find((c) => c.lane === "b")!;
+    assert.deepEqual(consolidatorRuns, [1], "one consolidator ran, after round 1");
+
+    // The combine step is recorded with what it took, and it is green.
+    const c = first.consolidated!;
+    assert.equal(c.ok, true, `the consolidation passed: ${c.note ?? ""}`);
+    assert.equal(c.from, first.picked!.sha);
+    assert.deepEqual(c.took, [{ lane: "b", sha: b.sha, items: ["R2"] }]);
+    // The consolidated commit sits on the winner and carries lane b's file.
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: setup.repo.dir, encoding: "utf8" }).trim();
+    assert.equal(git("rev-parse", `${c.sha}^`), first.picked!.sha, "the consolidator started from the winner");
+    assert.equal(git("show", `${c.sha}:lane-b.txt`), git("show", `${b.sha}:lane-b.txt`), "it took lane b's work");
+    assert.equal(git("show", `${c.sha}:lane-a.txt`), git("show", `${first.picked!.sha}:lane-a.txt`), "it kept the winner's work");
+    const { records } = readLog(runPaths(setup.runDir).events);
+    assert.ok(records.some((r) => r.kind === "consolidation_check_finished" && (r.event as { passed?: boolean }).passed === true), "the round checks ran on it");
+
+    // Round 2 starts both lanes from the consolidated commit.
+    assert.equal(second.base, c.sha, "round 2's base is the consolidated commit");
+    const intents = records.filter((r) => {
+      const e = r.event as { round?: number; lane?: string; worktree?: string };
+      return r.kind === "intent" && e.round === 2 && typeof e.lane === "string" && typeof e.worktree === "string";
+    });
+    assert.deepEqual(intents.map((r) => (r.event as { base?: string }).base), [c.sha, c.sha], "both lanes start from it");
+    // The consolidator was told the exact item, its commits and the constraints.
+    const prompts = fs.readFileSync(promptLog, "utf8").split("=====");
+    const consolidator = prompts.find((p) => p.includes("You are the CONSOLIDATOR of round 1"));
+    assert.ok(consolidator, "the consolidator was prompted");
+    assert.match(consolidator!, new RegExp(`From lane b \\(C1-b, commit ${b.sha}\\)`));
+    assert.match(consolidator!, /- R2 R2 holds: lane b's half: R2 holds/);
+    assert.match(consolidator!, /the seats' evidence it is met: M: lane-b\.txt:1 R2 is done/);
+    assert.doesNotMatch(consolidator!, /- R1 /, "it takes only what the winner lacks");
+    assert.match(consolidator!, /Never rewrite the winner's work wholesale/);
+    // Each round-2 lane is told its base is the consolidated commit and what it carries.
+    const r2 = prompts.filter((p) => p.includes("Round 2 of this phase"));
+    assert.equal(r2.length, 2, "both lanes were prompted in round 2");
+    for (const prompt of r2) {
+      assert.match(prompt, new RegExp(`consolidated commit C1-a\\+b ${c.sha!.slice(0, 7)}`));
+      assert.match(prompt, /lane b's R2/);
+    }
+    // The views show it.
+    const view = buildView(setup.runDir, setup.plan as RunPlanFile, false);
+    const status = renderStatusView(statusViewInput({ runDir: setup.runDir, plan: setup.plan as RunPlanFile, state: setup.conductor.state, view, alive: false }));
+    assert.match(status, new RegExp(`round 2 starts from consolidated C1-a\\+b ${c.sha!.slice(0, 7)} = C1-a \\+ lane b's items R2`));
+    assert.match(roundsSection(phase).join("\n"), /consolidated C1-a\+b/, "tt summary's rounds section names it too");
+    // A restart folds the same record back from the log.
+    const rebuilt = rebuildState(setup.runDir, setup.plan);
+    assert.deepEqual(rebuilt.phase.rounds![0].consolidated, c);
+    assert.equal(phase.candidate?.sha, second.picked?.sha, "round 2's pick was accepted");
+  } finally {
+    await teardown(setup);
+    cleanupDir(dir);
+  }
+});
+
+// tt 09 (change 3): a consolidator that takes nothing is no base. The failure
+// is recorded with its reason, round 2 starts from the winner exactly as
+// before, and its lanes are told where the other lane's items are.
+test("tt 09: a consolidation that changes nothing falls back to the winner and records why", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-09-combine-fail-");
+  const promptLog = path.join(dir, "prompts.txt");
+  const consolidatorRuns: number[] = [];
+  const setup = await combineSetup(
+    promptLog,
+    () => [{ kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } }],
+    consolidatorRuns,
+  );
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 240_000, 50, setup.runDir);
+    const [first, second] = setup.conductor.state.phase.rounds!;
+    const b = first.candidates.find((c) => c.lane === "b")!;
+    assert.deepEqual(consolidatorRuns, [1]);
+    assert.deepEqual(first.consolidated, {
+      from: first.picked!.sha,
+      lane: "a",
+      took: [{ lane: "b", sha: b.sha, items: ["R2"] }],
+      ok: false,
+      note: "the consolidator changed nothing on the winner",
+      fixes: 0,
+    });
+    assert.equal(second.base, first.picked!.sha, "round 2 starts from the winner, as before");
+    const r2 = fs.readFileSync(promptLog, "utf8").split("=====").filter((p) => p.includes("Round 2 of this phase"));
+    assert.equal(r2.length, 2);
+    for (const prompt of r2) {
+      assert.match(prompt, /Combining it with what the other lane met failed \(the consolidator changed nothing on the winner\)/);
+      assert.match(prompt, new RegExp(`lane b ${b.sha!.slice(0, 7)}: R2`));
+    }
+  } finally {
+    await teardown(setup);
+    cleanupDir(dir);
+  }
+});
+
+// tt 09-2 (async review): a candidate's reviews start when its lane submits,
+// while its checks run. Each check sleeps 3 s (and, with one check slot, the
+// machine-wide lock queues lane b's behind lane a's), so every lane's reviews are dispatched
+// before its check finishes, the reviewers are told the checks are running,
+// the two checks still never overlap, and the round completes.
+test("09-2: a lane's reviews are dispatched before its check finishes, and the round completes", async () => {
+  const promptDir = fs.mkdtempSync(path.join(fs.realpathSync(path.dirname(fileURLToPath(import.meta.url))), ".lane-async-"));
+  const setup = await setupConductor({
+    // One check slot: this test pins the serial-lock behaviour (C2).
+    checkSlots: 1,
+    phase: lanePhase({ checks: ["sleep 3 && true"] }),
+    checks: ["sleep 3 && true"],
+    phaseChecks: ["true"],
+    stubReviews: true,
+    deadlines: FAST,
+    extraReviewerEnv: (seat) => ({ FAKE_PI_PROMPT_LOG: path.join(promptDir, `reviewer-${seat}.txt`) }),
+    workerScript: () => laneWorker("a"),
+    laneWorkerScriptFor: (lane) => laneWorker(lane),
+    laneReviewerScriptFor: (seat, _candidate, state) => laneReview(seat as Reviewer, state.phase.contract.contractVersion),
+    pickScriptFor: (seat, state) => pickVote(seat as Reviewer, liveRound(state), seat === "B" ? "a" : "b", `${seat} picks`),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "DONE", 150_000, 50, setup.runDir);
+    const records = readLog(runPaths(setup.runDir).events).records;
+    const round = setup.conductor.state.phase.rounds![0];
+    for (const c of round.candidates) {
+      // The lane's review dispatches (one intent per seat) come before its
+      // check's finish record.
+      const finished = records.find(
+        (r) => r.kind === "lane_check_finished" && (r.event as { lane?: string }).lane === c.lane && (r.event as { candidateSha?: string }).candidateSha === c.sha,
+      );
+      assert.ok(finished, `lane ${c.lane}'s check finished`);
+      const dispatched = records.filter(
+        (r) => r.kind === "intent" && (r.event as { candidateSha?: string }).candidateSha === c.sha && typeof (r.event as { seat?: string }).seat === "string",
+      );
+      assert.equal(dispatched.length, 3, `lane ${c.lane}: one review per seat, dispatched once`);
+      for (const d of dispatched) {
+        assert.ok(Date.parse(d.ts) < Date.parse(finished!.ts), `lane ${c.lane}: review ${d.ts} dispatched before its check finished (${finished!.ts})`);
+      }
+      assert.equal(c.ok, true);
+      assert.deepEqual((c.reviews ?? []).map((r) => r.seat).sort(), ["A", "B", "M"], `lane ${c.lane}: all three reviews count`);
+    }
+    // The pick waited for all six reviews, and the round picked.
+    const submitted = records.filter((r) => r.kind === "lane_review_submitted").map((r) => Date.parse(r.ts));
+    assert.equal(submitted.length, 6);
+    const firstPick = Math.min(
+      ...records.filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "PICK_VOTE").map((r) => Date.parse(r.ts)),
+    );
+    assert.ok(firstPick >= Math.max(...submitted), "no seat voted before every review was in");
+    assert.equal(round.picked?.lane, "b");
+    assert.equal(records.filter((r) => r.kind === "lane_reviews_cancelled").length, 0, "a passing candidate's reviews are never cancelled");
+    // C2 still holds: the two checks never overlap.
+    const [first, second] = checkIntervals(setup.runDir).sort((x, y) => x.start - y.start);
+    assert.ok(first.finish <= second.start, "the two checks never overlap");
+    // The reviewers were told the checks run in parallel with them.
+    const prompts = ["M", "A", "B"].map((seat) => fs.readFileSync(path.join(promptDir, `reviewer-${seat}.txt`), "utf8")).join("\n");
+    assert.match(prompts, /checks are running in parallel with your review; the conductor reports their result/);
+  } finally {
+    await teardown(setup);
+    cleanupDir(promptDir);
   }
 });

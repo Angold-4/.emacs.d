@@ -11,6 +11,7 @@
 // rather than conductor state, and pause/resume/mode) is not this phase's
 // work and maps to `undefined`, which the conductor rejects visibly.
 
+import { candidateFromWire } from "./binding.ts";
 import { entryVerdictEvents, type Entry } from "./entries.ts";
 import type { ContractVersion, Event, Message, OwnerCommand, State } from "./types.ts";
 
@@ -138,7 +139,7 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
         // omitted entirely when absent so the event shape is unchanged for
         // every other option.
         ...(command.note && command.note.trim().length > 0 ? { note: command.note } : {}),
-        boundCandidateSha: command.boundCandidateSha,
+        boundCandidateSha: candidateFromWire(command.boundCandidateSha),
         boundContractVersion: command.boundContractVersion,
         boundRecordVersion: command.requestVersion,
       };
@@ -148,7 +149,7 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
         override: {
           decisionId: command.decisionId,
           vote: command.vote,
-          boundCandidateSha: command.boundCandidateSha,
+          boundCandidateSha: candidateFromWire(command.boundCandidateSha),
           boundContractVersion: command.boundContractVersion,
           boundRecordVersion: command.decisionVersion,
         },
@@ -159,7 +160,7 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
         findingId: command.findingId,
         scope: command.scope,
         by: "owner",
-        boundCandidateSha: command.boundCandidateSha,
+        boundCandidateSha: candidateFromWire(command.boundCandidateSha),
         boundContractVersion: command.boundContractVersion,
         boundRecordVersion: command.findingVersion,
       };
@@ -170,7 +171,7 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
         targetRecordId: command.targetRecordId,
         correctionText: command.correctionText,
         contractChange: command.contractChange,
-        boundCandidateSha: command.boundCandidateSha,
+        boundCandidateSha: candidateFromWire(command.boundCandidateSha),
         boundContractVersion: command.boundContractVersion,
         boundRecordVersion: command.targetRecordVersion,
       };
@@ -192,7 +193,7 @@ export function ownerCommandToEvent(command: OwnerCommand, commandId: string): E
         messageId: command.messageId,
         verdict: command.verdict,
         ...(command.reason && command.reason.trim().length > 0 ? { reason: command.reason } : {}),
-        boundCandidateSha: command.boundCandidateSha,
+        boundCandidateSha: candidateFromWire(command.boundCandidateSha),
         boundContractVersion: command.boundContractVersion,
         boundRecordVersion: command.messageVersion,
       };
@@ -261,11 +262,14 @@ export function normalizeDecisionViewCommand(raw: unknown, commandId: string): N
   const b = bindingParts(binding as Record<string, unknown>);
   const bound = (): { boundCandidateSha: string; boundContractVersion: ContractVersion; boundRecordVersion: number } | { error: string } => {
     if (b.recordId === "") return { error: "the binding is missing 'recordId'" };
-    if (b.candidateSha === "") return { error: "the binding is missing 'candidateSha'" };
+    // tt 09-5: a phase with no candidate is bound by the explicit
+    // NO_CANDIDATE ("none"), read back as the empty sha tt compares; an
+    // absent or empty candidateSha is still a missing one.
+    if (b.candidateSha === "") return { error: "the binding is missing 'candidateSha' (write \"none\" for a phase with no candidate)" };
     if (b.recordVersion === undefined) return { error: "the binding is missing 'recordVersion'" };
     if (!b.contractVersion || typeof b.contractVersion !== "object") return { error: "the binding is missing 'contractVersion'" };
     return {
-      boundCandidateSha: b.candidateSha,
+      boundCandidateSha: candidateFromWire(b.candidateSha),
       boundContractVersion: b.contractVersion as ContractVersion,
       boundRecordVersion: b.recordVersion,
     };

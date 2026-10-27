@@ -148,6 +148,22 @@ test("output capture, streamed and accumulated", async () => {
   assert.ok(streamed.join("").includes("world"));
 });
 
+// 09-2: the result waits for the pipes to drain, not only for `exit`. A fast
+// failing check's whole output (its failing test names) must be in the
+// result, or the conductor cannot classify the failure.
+test("09-2: a command that prints and exits at once hands back all of its output", async () => {
+  const runs = await Promise.all(
+    Array.from({ length: 20 }, () =>
+      runCommand({ command: "head -c 200000 /dev/zero | tr '\\0' x; printf '\\n✖ %s\\n' 'a flaky test'; exit 1" }).result,
+    ),
+  );
+  for (const outcome of runs) {
+    assert.equal(outcome.exitCode, 1);
+    assert.equal(outcome.output.length >= 200_000, true, `output was cut at ${outcome.output.length} bytes`);
+    assert.ok(outcome.output.endsWith("✖ a flaky test\n"));
+  }
+});
+
 test("R2.F13 childEnv: strips exactly the test-runner recursion markers, preserving ordinary configuration", () => {
   const source: NodeJS.ProcessEnv = {
     PATH: "/x/y",

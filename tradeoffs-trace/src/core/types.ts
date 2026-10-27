@@ -127,6 +127,10 @@ export interface PhaseContract {
   seats?: string[];
   /** Plan 06h (A2): the frozen leader. Absent means the first seat. */
   leader?: string;
+  /** tt 09 (change 3): `#+TT_CONSOLIDATE: off` frozen into the contract.
+   * Present (false) only when the plan turned the combine step off; absent
+   * means on whenever the phase runs two or more lanes. */
+  consolidate?: false;
   /** Plan 06b: the structured items of the frozen contract. The FSM,
    * prompts, checks, verdicts and acceptance all read these; absent on an
    * old-format phase, where `itemsFromPhase` synthesizes R1..Rn from
@@ -1376,6 +1380,9 @@ export interface LaneCandidateRecord {
    * candidate. Set only once a review arrives; absent on a candidate whose
    * reviews have not been recorded (or on a plan without lanes). */
   reviews?: Array<{ seat: string; review: Review }>;
+  /** exex 01a2: how many times this lane fixed a candidate that failed its
+   * checks and submitted again in this round. Absent means none. */
+  fixes?: number;
 }
 
 /** Plan 06k1 (A1): what the losing lane had that the seat's pick did not.
@@ -1426,6 +1433,39 @@ export interface RoundRecord {
    * adopted as the next round's base; the next round restarts from the best
    * candidate. */
   regressed?: { items: string[]; sha: string };
+  /** tt 09 (change 3): set by ROUND_CONSOLIDATED once the picked-but-not-
+   * accepted winner was combined with the items another lane met and it did
+   * not. `ok` with a `sha` makes that commit the next round's base for every
+   * lane; `ok` false records why the next round starts from the winner. */
+  consolidated?: RoundConsolidation;
+}
+
+/** tt 09 (change 3): one lane's work a consolidation takes onto the winner —
+ * the plan items a strict majority of the seats said that lane met and the
+ * winner did not. */
+export interface ConsolidationTake {
+  lane: string;
+  sha: string;
+  items: string[];
+}
+
+/** tt 09 (change 3): the combine step of one round, as ROUND_CONSOLIDATED
+ * records it. */
+export interface RoundConsolidation {
+  /** The winner the consolidator started from (the round's pick). */
+  from: string;
+  /** The winner's lane. */
+  lane: string;
+  took: ConsolidationTake[];
+  ok: boolean;
+  /** The consolidated commit, when `ok`. */
+  sha?: string;
+  /** Why the consolidation failed (`ok` false). */
+  note?: string;
+  /** What the consolidator says it changed beyond the taken work. */
+  added?: string[];
+  /** How many times the consolidator fixed a red commit. */
+  fixes?: number;
 }
 
 export interface FlakeObservation {
@@ -1721,6 +1761,23 @@ export interface EvAttemptNoSubmission {
    * process exited, settled, or failed its model call terminally (a 404, a
    * context overflow) without submitting. Absent for a plain silent settle. */
   note?: string;
+}
+/** tt 09 (change 3): the combine step between a picked-but-not-accepted
+ * round and the next one. `from` is the round's pick, `took` the other lanes'
+ * items it integrated. Record-only: an `ok` consolidation's `sha` is the next
+ * round's base for every lane; a failed one (`ok` false, `note`) leaves the
+ * next round on the winner. */
+export interface EvRoundConsolidated {
+  type: "ROUND_CONSOLIDATED";
+  round: number;
+  from: string;
+  lane: string;
+  took: ConsolidationTake[];
+  ok: boolean;
+  sha?: string;
+  note?: string;
+  added?: string[];
+  fixes?: number;
 }
 /** Plan 06n (A7): the round's evaluated pick `sha` lost `items` that the
  * phase's best candidate met, in code it changed, so it is not adopted as the
@@ -2672,6 +2729,7 @@ export type Event =
   | EvAttemptInterrupted
   | EvWorkerResumed
   | EvItemsRegressed
+  | EvRoundConsolidated
   | EvFreezeCompleted
   | EvFreezeTimedOut
   | EvFreezeInterrupted

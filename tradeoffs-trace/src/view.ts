@@ -27,6 +27,7 @@ import { countsLine, isStructured, matrixMarkdown, overturnCounts, phaseItemCoun
 // the review renderer shows, so the two views never disagree.
 import { reviewSummary } from "./render.ts";
 import { candidateLabel } from "./core/rounds.ts";
+import { consolidatedLabel, consolidationLine } from "./core/lanes.ts";
 import { seatsOf } from "./core/seats.ts";
 import { computeSeatTable, renderSeatTable, seatRoundStates, type SeatRound, type SeatTable } from "./core/seat-table.ts";
 import { computeMetrics, flakesLine, metricsLine, metricsSummary, timelineEndMs, type PhaseMetrics } from "./metrics.ts";
@@ -1204,6 +1205,9 @@ export function roundsSection(phase: PhaseState): string[] {
       .filter((c) => (c.reviews ?? []).length > 0)
       .map((c) => `${candidateLabel(round.round, c.lane)}: ${(c.reviews ?? []).map((r) => r.seat).sort().join("/")}`);
     if (reviewed.length > 0) lines.push(`  reviews — ${reviewed.join(" · ")}`);
+    // tt 09 (change 3): the round's combine step, when it ran.
+    const consolidated = consolidationLine(round);
+    if (consolidated) lines.push(`  ${consolidated}`);
   }
   return lines;
 }
@@ -1235,12 +1239,17 @@ export function lanesView(phase: PhaseState): string[] {
   const passing = round.candidates.filter((c) => c.ok === true).length;
   // Plan 06h (A2): the review count is the configured seat count, never 3.
   const seats = seatsOf(phase.contract).length;
+  // tt 09 (change 3): a round that starts from a consolidated commit says so.
+  const from = (phase.rounds ?? []).find((r) => r.consolidated?.ok && r.consolidated.sha === round.base && r.round < round.round);
+  const fromLabel = from?.consolidated ? ` (consolidated ${consolidatedLabel(from.round, from.consolidated.lane, from.consolidated.took)})` : "";
   lines.push(
-    `round ${round.round} from ${round.base.slice(0, 7)}: ${round.lanes.length} worker run(s), ${passing * seats} review(s)`,
+    `round ${round.round} from ${round.base.slice(0, 7)}${fromLabel}: ${round.lanes.length} worker run(s), ${passing * seats} review(s)`,
   );
   if (round.votes.length > 0) {
     lines.push(`votes: ${round.votes.map((v) => `${v.seat}→${v.lane}`).join(" · ")}`);
   }
+  const consolidated = consolidationLine(round);
+  if (consolidated) lines.push(consolidated);
   return lines;
 }
 

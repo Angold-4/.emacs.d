@@ -38,7 +38,7 @@
       "properties": {
         "runId": { "type": "string", "minLength": 1 },
         "phaseId": { "type": "string", "minLength": 1 },
-        "candidateSha": { "type": "string", "minLength": 1 },
+        "candidateSha": { "type": "string", "minLength": 1, "description": "The candidate the sender saw, or \"none\" (tt 09-5) when the phase has no candidate, e.g. a repair-budget gate after every attempt timed out." },
         "contractVersion": { "$ref": "#/$defs/ContractVersion" },
         "recordId": { "type": "string", "minLength": 1 },
         "recordVersion": { "type": "integer" }
@@ -234,7 +234,7 @@
         "requestVersion": { "type": "integer" },
         "option": { "type": "string", "minLength": 1 },
         "note": { "type": "string", "minLength": 1 },
-        "boundCandidateSha": { "type": "string", "minLength": 1 },
+        "boundCandidateSha": { "type": "string", "minLength": 1, "description": "The candidate the sender saw, or \"none\" (tt 09-5) when the phase has no candidate, e.g. a repair-budget gate after every attempt timed out." },
         "boundContractVersion": { "$ref": "#/$defs/ContractVersion" }
       }
     },

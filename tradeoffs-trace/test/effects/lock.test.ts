@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { acquireLock, acquireWaitingLock, anyCheckWindowOpen, checkWindowDir, Lock, LockError, openCheckWindow } from "../../src/effects/lock.ts";
+import { acquireCheckSlot, acquireLock, acquireWaitingLock, anyCheckWindowOpen, checkSlotPath, checkWindowDir, Lock, LockError, openCheckWindow } from "../../src/effects/lock.ts";
 
 let dir: string;
 const spawned: ChildProcess[] = [];
@@ -172,4 +172,47 @@ test("a check-window marker whose holder died is not an open window, and is remo
   assert.equal(anyCheckWindowOpen(lockPath), true);
   window.release();
   assert.equal(anyCheckWindowOpen(lockPath), false);
+
+  // A run's own window never pauses that run's other lane; another run's does,
+  // whether it is in this process or only a live marker on disk.
+  const own = openCheckWindow(lockPath, "run-a");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-a"), false, "a run's own window is not a window for it");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-b"), true, "another run's window is");
+  assert.equal(anyCheckWindowOpen(lockPath), true);
+  const other = openCheckWindow(lockPath, "run-b");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-a"), true, "a second run's window still pauses run-a");
+  other.release();
+  own.release();
+  const otherMarker = path.join(windowDir, `${live.pid}-0ther.json`);
+  fs.writeFileSync(otherMarker, `${JSON.stringify({ pid: live.pid, owner: "run-a", at: new Date().toISOString() })}\n`);
+  assert.equal(anyCheckWindowOpen(lockPath, "run-a"), false, "run-a's marker held by another process is still run-a's own");
+  assert.equal(anyCheckWindowOpen(lockPath, "run-b"), true);
+  fs.rmSync(otherMarker, { force: true });
+});
+
+test("two check slots let two checks run at once; a third waits until one is released", async () => {
+  const lockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tt-slots-")), "check.lock");
+  const first = await acquireCheckSlot(lockPath, 2);
+  const second = await acquireCheckSlot(lockPath, 2);
+  assert.deepEqual([first.path, second.path].sort(), [checkSlotPath(lockPath, 0), checkSlotPath(lockPath, 1)].sort());
+  let thirdHeld = false;
+  const third = acquireCheckSlot(lockPath, 2).then((lock) => {
+    thirdHeld = true;
+    return lock;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(thirdHeld, false, "every slot is held, so the third check waits");
+  await first.release();
+  const got = await third;
+  assert.equal(got.path, first.path, "the third check takes the released slot");
+  await second.release();
+  await got.release();
+});
+
+test("one check slot is the plain check lock, as before", async () => {
+  const lockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tt-slots-")), "check.lock");
+  const only = await acquireCheckSlot(lockPath, 1);
+  assert.equal(only.path, lockPath);
+  await assert.rejects(acquireLock(lockPath), LockError);
+  await only.release();
 });
