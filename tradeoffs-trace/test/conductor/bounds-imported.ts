@@ -763,6 +763,56 @@ test("plan 07e: the owner-wait bound keeps its own cadence, so the ordinary remi
   }
 });
 
+test("plan 07e: an ordinary reminder landing on the bound neither swallows nor doubles the bound", async () => {
+  // A2: the bound is reported by the one notification call, so an ordinary
+  // reminder whose own interval ends on the same lattice point cannot hide it
+  // (it must still be recorded) and cannot make a second record (one call, one
+  // append).
+  let nowMs = Date.now();
+  const setup = await setupFailingRun({ ownerWaitMs: 1_000, notifyReminderMs: 1_000, inboxPollMs: 100 }, () => nowMs);
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.phase === "AWAITING_OWNER", 240_000, 50, setup.runDir);
+    const parkStart = nowMs;
+    const records = () => {
+      const file = path.join(setup.runRoot, "notifications.jsonl");
+      if (!fs.existsSync(file)) return [];
+      return fs
+        .readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as { reminder?: boolean });
+    };
+    // The ordinary reminder and the first owner-wait bound fall due together.
+    nowMs = parkStart + 1_000;
+    await waitFor(
+      () => coreEvents(setup.runDir).some((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait"),
+      10_000,
+      50,
+      setup.runDir,
+    );
+    const bounds = coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait");
+    assert.equal(bounds.length, 1, "the coincident bound is recorded exactly once");
+    assert.equal(bounds[0].limitMs, 1_000);
+    assert.ok(Number(bounds[0].elapsedMs) >= 1_000, `elapsed ${String(bounds[0].elapsedMs)}`);
+    assert.equal(records().length, 2, "one reminder record serves both cadences");
+    assert.equal(records().filter((r) => r.reminder === true).length, 1, "and only one reminder is sent");
+    // The next bound is a later lattice point, and the phase never moves.
+    nowMs = parkStart + 2_000;
+    await waitFor(
+      () => coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait").length === 2,
+      10_000,
+      50,
+      setup.runDir,
+    );
+    assert.equal(coreEvents(setup.runDir).filter((e) => e.type === "BOUND_REACHED" && e.kind === "owner-wait").length, 2, "one record per bound");
+    assert.equal(setup.conductor.state.phase.phase, "AWAITING_OWNER", "the bound decides nothing");
+  } finally {
+    await teardown(setup);
+  }
+});
+
 test("an owner request open past its bound sends a reminder and decides nothing", async () => {
   const setup = await setupFailingRun({ ownerWaitMs: 1_000, inboxPollMs: 100 });
   try {
