@@ -110,7 +110,9 @@ export const BOUNDS: readonly BoundDefinition[] = Object.freeze([
     field: "mergeMs",
     unit: "minutes",
     defaultValue: 10,
-    action: "kill the merge and skip that fixer's commit",
+    // 07e E1: abort the merge and keep what merged before it; the fix round's
+    // candidate is the merges done so far, never the timed-out one.
+    action: "abort the merge; the fix round's candidate is the merges done so far",
   },
   {
     kind: "final-check",
