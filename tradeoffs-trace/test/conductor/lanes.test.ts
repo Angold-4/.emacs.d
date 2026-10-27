@@ -1396,6 +1396,7 @@ function combineSetup(
   promptLog: string,
   consolidator: (round: number, laneB: string) => FakePiStep[],
   consolidatorRuns: number[],
+  deadlines: Record<string, number> = {},
 ): Promise<TestConductorSetup> {
   return setupConductor({
     phase: lanePhase({
@@ -1408,7 +1409,7 @@ function combineSetup(
     checks: ["true"],
     phaseChecks: ["true"],
     stubReviews: true,
-    deadlines: { ...FAST, workerAttemptMs: 60_000 },
+    deadlines: { ...FAST, workerAttemptMs: 60_000, ...deadlines },
     extraWorkerEnv: { FAKE_PI_PROMPT_LOG: promptLog },
     workerScript: () => structuredLaneWorker("a"),
     laneWorkerScriptFor: (lane, round) => structuredLaneWorker(lane, round),
@@ -1556,6 +1557,44 @@ test("tt 09: a consolidation that changes nothing falls back to the winner and r
       assert.match(prompt, /Combining it with what the other lane met failed \(the consolidator changed nothing on the winner\)/);
       assert.match(prompt, new RegExp(`lane b ${b.sha!.slice(0, 7)}: R2`));
     }
+  } finally {
+    await teardown(setup);
+    cleanupDir(dir);
+  }
+});
+
+// 07e (E2/A2): the consolidator's own attempt is bounded too — its timeout
+// branch names the worker-attempt bound, exactly as a lane's does, and the
+// combine falls back to the winner as today.
+test("a consolidator that exceeds its attempt bound records BOUND_REACHED worker-attempt", async () => {
+  const dir = fs.mkdtempSync("/tmp/tt-07e-consolidator-bound-");
+  const promptLog = path.join(dir, "prompts.txt");
+  const consolidatorRuns: number[] = [];
+  const setup = await combineSetup(
+    promptLog,
+    () => [
+      { kind: "sleep", ms: 5_000 },
+      { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+    ],
+    consolidatorRuns,
+    { workerAttemptMs: 2_500 },
+  );
+  try {
+    await setup.conductor.start();
+    await waitFor(
+      () =>
+        readEvents(setup.runDir).some(
+          (r) => r.kind === "event" && (r.event as { type?: string }).type === "BOUND_REACHED" && (r.event as { kind?: string }).kind === "worker-attempt" && (r.event as { scope?: string }).scope === "consolidator",
+        ),
+      60_000,
+      50,
+      setup.runDir,
+    );
+    const bound = readEvents(setup.runDir)
+      .filter((r) => r.kind === "event" && (r.event as { type?: string }).type === "BOUND_REACHED")
+      .map((r) => r.event as { kind: string; scope: string; limitMs: number })
+      .find((b) => b.kind === "worker-attempt" && b.scope === "consolidator")!;
+    assert.equal(bound.limitMs, 2_500);
   } finally {
     await teardown(setup);
     cleanupDir(dir);

@@ -132,7 +132,7 @@ test("plan 07e: a worker sh command past its bound records BOUND_REACHED sh", as
   }
 });
 
-test("plan 07e: an exhausted repair budget records BOUND_REACHED rounds and LEAD_CALLED, then parks exactly as before", async () => {
+test("an exhausted repair budget records BOUND_REACHED rounds and LEAD_CALLED and parks in AWAITING_OWNER as today", async () => {
   const setup = await setupConductor({
     checks: ["false"],
     workerScript: () => ({ hello: defaultWorkerHello(), steps: [submitPhase()] }),

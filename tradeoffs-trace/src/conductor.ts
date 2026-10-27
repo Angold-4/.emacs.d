@@ -9352,11 +9352,18 @@ export class Conductor {
       // A settle with no submission also resolves `donePromise`
       // (`#onNoSubmission`); only a recorded submit_phase is a submission.
       if (outcome !== "submitted" || handle.consolidationAdded === undefined) {
-        // Plan 07e (E2): the fixer's attempt bound is named in the log and in
-        // the task note, so a skipped fixer is never mistaken for a red one.
-        if (outcome === "timeout" && opts.actionKind === "fixer") {
-          const limitMs = fix?.timeoutMs ?? this.#deadlines.fixerAttemptMs;
-          this.#recordBound("fixer-attempt", opts.lane, limitMs, Math.max(limitMs, Date.now() - startedAt));
+        // Plan 07e (E2/A2): every timed-out attempt names its bound — the
+        // fixer's own, or the worker attempt a consolidator runs under. The
+        // fixer's is also named in its task note, so a skipped fixer is never
+        // mistaken for a red one.
+        if (outcome === "timeout") {
+          if (opts.actionKind === "fixer") {
+            const limitMs = fix?.timeoutMs ?? this.#deadlines.fixerAttemptMs;
+            this.#recordBound("fixer-attempt", opts.lane, limitMs, Math.max(limitMs, Date.now() - startedAt));
+          } else {
+            const limitMs = fix?.timeoutMs ?? this.#deadlines.workerAttemptMs;
+            this.#recordBound("worker-attempt", opts.lane, limitMs, Math.max(limitMs, Date.now() - startedAt));
+          }
         }
         const note =
           outcome === "timeout"

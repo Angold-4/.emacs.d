@@ -181,7 +181,7 @@ test("plan 06k1: a check in one run pauses the workers of another run and resume
   }
 });
 
-test("plan 07e: without #+TT_CHECK_WINDOW exclusive, another run's check window does NOT pause this run", async () => {
+test("without TT_CHECK_WINDOW exclusive another run's open check window does not pause this run's workers", async () => {
   const markerA = "tt-07e-nowindow-A";
   const markerB = "tt-07e-nowindow-B";
   const checkLockPath = path.join(mkdtempSync("/tmp/tt-07e-window-"), "check.lock");
