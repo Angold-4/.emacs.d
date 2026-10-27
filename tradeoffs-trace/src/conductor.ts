@@ -237,6 +237,7 @@ import {
   type PlanItems,
   type SeatItemVerdict,
   type VerdictContext,
+  type VerifyResolution,
 } from "./core/items.ts";
 import type { HelloMessage, SubmitMessage } from "./core/protocol.ts";
 import { validate } from "./core/schema.ts";
@@ -8186,6 +8187,19 @@ export class Conductor {
     this.#applyEvent({ type: "FINDING_RAISED", finding });
   }
 
+  /** The candidate's `test` verify outcomes from a check run's output. With
+   * TT_FINAL_ONLY_MISSING=1 and final checks declared, a test merely missing
+   * from the output is left out: the plan runs it only in #+TT_FINAL_CHECKS
+   * (exex 01b2, ODP-3), whose command fails the phase if it fails, so it must
+   * neither raise a finding nor hold acceptance before the final checks run.
+   * A failed test is always kept. */
+  #resolveVerifies(output: string): VerifyResolution[] {
+    const resolutions = resolveTestVerifies(this.#planItems(), output);
+    const finalOnlyMissing =
+      process.env.TT_FINAL_ONLY_MISSING === "1" && (this.#state.phase.contract.finalChecks ?? []).length > 0;
+    return finalOnlyMissing ? resolutions.filter((r) => r.outcome !== "missing") : resolutions;
+  }
+
   /** A `test` verify that is missing from or failed in the candidate's check
    * run is a blocking finding anchored to its item. */
   #applyTestVerifyFindings(C: string): void {
@@ -9507,7 +9521,7 @@ export class Conductor {
             })
             .join("\n");
           this.#laneCheckOutputs.set(sha, output);
-          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, resolveTestVerifies(this.#planItems(), output));
+          if (this.#itemsEnforced()) this.#laneCheckResolutions.set(sha, this.#resolveVerifies(output));
           // Plan 07b (D3): the doneWhen facts the pre-stop check ran are read
           // back, so the resumed hand-off records them without running again.
           if (record.facts) this.#laneFacts.set(sha, record.facts.map((f) => ({ ...f, candidateSha: sha })));
@@ -9698,7 +9712,7 @@ export class Conductor {
       // applies them); a loser's output must not touch the phase's item state.
       this.#laneCheckOutputs.set(candidateSha, combinedOutput);
       if (this.#itemsEnforced()) {
-        this.#laneCheckResolutions.set(candidateSha, resolveTestVerifies(this.#planItems(), combinedOutput));
+        this.#laneCheckResolutions.set(candidateSha, this.#resolveVerifies(combinedOutput));
       }
       return passed ? { ok: true } : { ok: false, note: firstFailure ?? "a check command failed" };
     } finally {
@@ -10878,7 +10892,7 @@ export class Conductor {
       }
       if (this.#itemsEnforced()) {
         const output = this.#laneCheckOutputs.get(winner.sha) ?? "";
-        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolveTestVerifies(this.#planItems(), output) });
+        this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: this.#resolveVerifies(output) });
         this.#applyTestVerifyFindings(winner.sha);
         if (build?.coverage) {
           this.#applyEvent({
@@ -12547,7 +12561,7 @@ export class Conductor {
       // the output is a blocking finding anchored to its item. The final
       // check's run does not re-resolve them.
       if (tier === "round" && this.#itemsEnforced()) {
-        const resolutions = resolveTestVerifies(this.#planItems(), combinedOutput);
+        const resolutions = this.#resolveVerifies(combinedOutput);
         this.#applyEvent({ type: "ITEM_STATE_UPDATED", checkResolution: resolutions, checkTestLines: testResultLines(combinedOutput) });
         this.#applyTestVerifyFindings(candidateSha);
       }

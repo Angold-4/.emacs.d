@@ -195,6 +195,49 @@ test("plan-items: a requirement whose test verify is missing from the check outp
   }
 });
 
+test("TT_FINAL_ONLY_MISSING: a test verify missing from a round's output is left to the final checks", async () => {
+  // exex 01b2 (2026-10-27): the corpus gates run only in #+TT_FINAL_CHECKS,
+  // so a round's output cannot show them; with the switch on, a merely
+  // missing test raises no blocking finding (the final checks fail the phase
+  // if the gate fails).
+  const previous = process.env.TT_FINAL_ONLY_MISSING;
+  process.env.TT_FINAL_ONLY_MISSING = "1";
+  const setup = await setupConductor({
+    items: { ...ITEMS, finalChecks: ["true"] },
+    checks: ["true"],
+    phaseChecks: ["true"],
+    stubReviews: false,
+    deadlines: FAST,
+    workerScript: () => ({
+      hello: defaultWorkerHello(),
+      steps: [
+        { kind: "call-sh", command: WRITE_ROUNDS },
+        { kind: "call-submit", tool: "submit_coverage", args: coverage() },
+        { kind: "call-submit", tool: "submit_phase", args: { decisions: [], assumptions: [], deviations: [] } },
+      ],
+    }),
+    reviewerScriptFor: (reviewer, state) => reviewerScript(reviewer, state.phase.candidate?.sha, state.phase.contract.contractVersion, review({})),
+  });
+  try {
+    await setup.conductor.start();
+    await waitFor(() => setup.conductor.state.phase.checks?.passed === true, 90_000, 50, setup.runDir);
+    assert.equal(
+      (setup.conductor.state.phase.checkResolution ?? []).some((r) => r.id === "R1"),
+      false,
+      "a missing test is not a round's verify outcome, so it cannot hold acceptance",
+    );
+    assert.equal(
+      setup.conductor.state.phase.findings.some((f) => f.itemId === "R1" && f.raisedBy === "conductor"),
+      false,
+      "a missing test is left to the final checks",
+    );
+  } finally {
+    await teardown(setup);
+    if (previous === undefined) delete process.env.TT_FINAL_ONLY_MISSING;
+    else process.env.TT_FINAL_ONLY_MISSING = previous;
+  }
+});
+
 test("plan 06j: a named test in coloured spec-reporter output resolves as passed", async () => {
   // Plan 06j (A2): the conductor inherited FORCE_COLOR=3 from the owner's
   // shell, so node's spec reporter coloured every line. The check prints the
